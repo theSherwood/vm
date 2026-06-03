@@ -7,9 +7,10 @@
 //!   so dominance analysis is impossible to need (verifier is a linear pass).
 //! - Every block ends in exactly one terminator.
 //!
-//! This is the Phase-1 *slice*: a deliberately small instruction set
-//! (`i32`/`i64` const + add, `br`/`br_if`/`return`) chosen to close the
-//! text -> binary -> verify -> interp loop end to end. Extend per §3b.
+//! Phase-1 integer core: `i32`/`i64` constants, the full integer arithmetic /
+//! bitwise / shift / comparison set, `i32`↔`i64` conversions, `select`, and the
+//! `br`/`br_if`/`br_table`/`return` terminators. Float, memory, calls, and
+//! capabilities come in later batches per §3b.
 #![forbid(unsafe_code)]
 
 extern crate alloc;
@@ -55,28 +56,215 @@ impl ValType {
     }
 }
 
+/// The integer width an op operates at. Maps to the `i32`/`i64` text prefix.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntTy {
+    I32,
+    I64,
+}
+
+impl IntTy {
+    pub fn val(self) -> ValType {
+        match self {
+            IntTy::I32 => ValType::I32,
+            IntTy::I64 => ValType::I64,
+        }
+    }
+    pub fn prefix(self) -> &'static str {
+        match self {
+            IntTy::I32 => "i32",
+            IntTy::I64 => "i64",
+        }
+    }
+}
+
+/// Binary integer ops (same type in, same type out). Wrapping arithmetic; `div`/`rem`
+/// trap on `/0` and on `INT_MIN/-1` (signed); shifts take the amount mod bitwidth.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    DivS,
+    DivU,
+    RemS,
+    RemU,
+    And,
+    Or,
+    Xor,
+    Shl,
+    ShrS,
+    ShrU,
+}
+
+impl BinOp {
+    pub const ALL: [BinOp; 13] = [
+        BinOp::Add,
+        BinOp::Sub,
+        BinOp::Mul,
+        BinOp::DivS,
+        BinOp::DivU,
+        BinOp::RemS,
+        BinOp::RemU,
+        BinOp::And,
+        BinOp::Or,
+        BinOp::Xor,
+        BinOp::Shl,
+        BinOp::ShrS,
+        BinOp::ShrU,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BinOp::Add => "add",
+            BinOp::Sub => "sub",
+            BinOp::Mul => "mul",
+            BinOp::DivS => "div_s",
+            BinOp::DivU => "div_u",
+            BinOp::RemS => "rem_s",
+            BinOp::RemU => "rem_u",
+            BinOp::And => "and",
+            BinOp::Or => "or",
+            BinOp::Xor => "xor",
+            BinOp::Shl => "shl",
+            BinOp::ShrS => "shr_s",
+            BinOp::ShrU => "shr_u",
+        }
+    }
+
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<BinOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<BinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Integer comparisons (same type in, `i32` 0/1 out).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    LtS,
+    LtU,
+    LeS,
+    LeU,
+    GtS,
+    GtU,
+    GeS,
+    GeU,
+}
+
+impl CmpOp {
+    pub const ALL: [CmpOp; 10] = [
+        CmpOp::Eq,
+        CmpOp::Ne,
+        CmpOp::LtS,
+        CmpOp::LtU,
+        CmpOp::LeS,
+        CmpOp::LeU,
+        CmpOp::GtS,
+        CmpOp::GtU,
+        CmpOp::GeS,
+        CmpOp::GeU,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CmpOp::Eq => "eq",
+            CmpOp::Ne => "ne",
+            CmpOp::LtS => "lt_s",
+            CmpOp::LtU => "lt_u",
+            CmpOp::LeS => "le_s",
+            CmpOp::LeU => "le_u",
+            CmpOp::GtS => "gt_s",
+            CmpOp::GtU => "gt_u",
+            CmpOp::GeS => "ge_s",
+            CmpOp::GeU => "ge_u",
+        }
+    }
+
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<CmpOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<CmpOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Width-changing integer conversions between `i32` and `i64`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConvOp {
+    /// `i64.extend_i32_s`: sign-extend `i32` → `i64`.
+    ExtendI32S,
+    /// `i64.extend_i32_u`: zero-extend `i32` → `i64`.
+    ExtendI32U,
+    /// `i32.wrap_i64`: truncate `i64` → `i32`.
+    WrapI64,
+}
+
+impl ConvOp {
+    /// `(text name, source type, result type)`.
+    pub fn sig(self) -> (&'static str, ValType, ValType) {
+        match self {
+            ConvOp::ExtendI32S => ("i64.extend_i32_s", ValType::I32, ValType::I64),
+            ConvOp::ExtendI32U => ("i64.extend_i32_u", ValType::I32, ValType::I64),
+            ConvOp::WrapI64 => ("i32.wrap_i64", ValType::I64, ValType::I32),
+        }
+    }
+    pub fn from_name(s: &str) -> Option<ConvOp> {
+        [ConvOp::ExtendI32S, ConvOp::ExtendI32U, ConvOp::WrapI64]
+            .into_iter()
+            .find(|o| o.sig().0 == s)
+    }
+}
+
 /// Non-terminator instructions. Each produces exactly one result whose index is
 /// the next block-local value index (implicit, by position).
 #[derive(Clone, PartialEq, Debug)]
 pub enum Inst {
-    I32Const(i32),
-    I64Const(i64),
-    /// `i32.add a b` — both operands must be `i32`; result `i32`.
-    I32Add(ValIdx, ValIdx),
-    /// `i64.add a b` — both operands must be `i64`; result `i64`.
-    I64Add(ValIdx, ValIdx),
+    ConstI32(i32),
+    ConstI64(i64),
+    /// Binary integer op; operands and result are `ty`.
+    IntBin {
+        ty: IntTy,
+        op: BinOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Integer compare; operands are `ty`, result is `i32` 0/1.
+    IntCmp {
+        ty: IntTy,
+        op: CmpOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// `T.eqz`: 1 if the operand is zero else 0; result `i32`.
+    Eqz {
+        ty: IntTy,
+        a: ValIdx,
+    },
+    /// Width conversion (see `ConvOp`).
+    Convert {
+        op: ConvOp,
+        a: ValIdx,
+    },
+    /// Branchless choice: `cond` is `i32`; `a`/`b` share a type `T`; result `T`.
+    Select {
+        cond: ValIdx,
+        a: ValIdx,
+        b: ValIdx,
+    },
 }
 
-impl Inst {
-    /// The result type this opcode produces given well-typed operands (§3a:
-    /// "inferred result types"). Operand-type *checking* is the verifier's job.
-    pub fn result_type(&self) -> ValType {
-        match self {
-            Inst::I32Const(_) | Inst::I32Add(..) => ValType::I32,
-            Inst::I64Const(_) | Inst::I64Add(..) => ValType::I64,
-        }
-    }
-}
+/// One branch edge: a target block plus the argument values for its parameters.
+pub type Edge = (BlockIdx, Vec<ValIdx>);
 
 /// Block terminators. Exactly one per block; only at the block end.
 #[derive(Clone, PartialEq, Debug)]
@@ -90,6 +278,13 @@ pub enum Terminator {
         then_args: Vec<ValIdx>,
         else_blk: BlockIdx,
         else_args: Vec<ValIdx>,
+    },
+    /// Indexed multi-way branch. `idx` (`i32`) selects `targets[idx]`, or `default`
+    /// when out of range. Each edge carries its own block arguments.
+    BrTable {
+        idx: ValIdx,
+        targets: Vec<Edge>,
+        default: Edge,
     },
     /// Return values matching the function's result signature.
     Return(Vec<ValIdx>),

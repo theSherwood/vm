@@ -2,31 +2,57 @@
 //! bespoke compression. The design goal is that decode and verify *fuse* into one
 //! linear pass; this crate is the decode half (verification lives in `svm-verify`).
 //!
+//! Opcode map (one byte): families are laid out in contiguous ranges so the encoder
+//! is `base + op.index()` and the decoder is a range match:
+//!   `0x10..` constants · `0x20..` i32 arith · `0x30` i32 eqz · `0x31..` i32 cmp ·
+//!   `0x40..` i64 arith · `0x50` i64 eqz · `0x51..` i64 cmp · `0x60..` convert ·
+//!   `0x70` select · `0x80..` terminators.
+//!
 //! **Decoding is escape-TCB and untrusted-input-facing:** it must reject malformed
 //! input with `Err` and **never panic, never OOM, always terminate** on arbitrary
 //! bytes (fuzzed in the `svm` crate). We therefore never pre-allocate from an
 //! untrusted count, and we reject counts that cannot fit in the remaining bytes.
 #![forbid(unsafe_code)]
 
-use svm_ir::{Block, Func, Inst, Module, Terminator, ValType};
+use svm_ir::{
+    BinOp, Block, CmpOp, ConvOp, Edge, Func, Inst, IntTy, Module, Terminator, ValIdx, ValType,
+};
 
-mod tag {
+mod op {
     // Value types.
     pub const T_I32: u8 = 0;
     pub const T_I64: u8 = 1;
     pub const T_F32: u8 = 2;
     pub const T_F64: u8 = 3;
 
-    // Instruction opcodes.
-    pub const I32_CONST: u8 = 0x10;
-    pub const I64_CONST: u8 = 0x11;
-    pub const I32_ADD: u8 = 0x20;
-    pub const I64_ADD: u8 = 0x21;
+    // Constants.
+    pub const CONST_I32: u8 = 0x10;
+    pub const CONST_I64: u8 = 0x11;
 
-    // Terminator opcodes.
-    pub const BR: u8 = 0x40;
-    pub const BR_IF: u8 = 0x41;
-    pub const RETURN: u8 = 0x42;
+    // Family bases (each op is `base + op.index()`) and their inclusive range ends.
+    pub const I32_BIN: u8 = 0x20; // + BinOp index (0..=12)
+    pub const I32_BIN_END: u8 = 0x2C;
+    pub const I32_EQZ: u8 = 0x30;
+    pub const I32_CMP: u8 = 0x31; // + CmpOp index (0..=9)
+    pub const I32_CMP_END: u8 = 0x3A;
+    pub const I64_BIN: u8 = 0x40;
+    pub const I64_BIN_END: u8 = 0x4C;
+    pub const I64_EQZ: u8 = 0x50;
+    pub const I64_CMP: u8 = 0x51;
+    pub const I64_CMP_END: u8 = 0x5A;
+
+    // Conversions.
+    pub const EXTEND_I32_S: u8 = 0x60;
+    pub const EXTEND_I32_U: u8 = 0x61;
+    pub const WRAP_I64: u8 = 0x62;
+
+    pub const SELECT: u8 = 0x70;
+
+    // Terminators.
+    pub const BR: u8 = 0x80;
+    pub const BR_IF: u8 = 0x81;
+    pub const BR_TABLE: u8 = 0x82;
+    pub const RETURN: u8 = 0x83;
 }
 
 const MAGIC: [u8; 4] = *b"SVM\x00";
@@ -82,21 +108,42 @@ fn encode_func(out: &mut Vec<u8>, f: &Func) {
 
 fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
     match inst {
-        Inst::I32Const(c) => {
-            out.push(tag::I32_CONST);
+        Inst::ConstI32(c) => {
+            out.push(op::CONST_I32);
             write_sleb(out, *c as i64);
         }
-        Inst::I64Const(c) => {
-            out.push(tag::I64_CONST);
+        Inst::ConstI64(c) => {
+            out.push(op::CONST_I64);
             write_sleb(out, *c);
         }
-        Inst::I32Add(a, b) => {
-            out.push(tag::I32_ADD);
+        Inst::IntBin { ty, op: o, a, b } => {
+            out.push(bin_base(*ty) + o.index());
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
-        Inst::I64Add(a, b) => {
-            out.push(tag::I64_ADD);
+        Inst::IntCmp { ty, op: o, a, b } => {
+            out.push(cmp_base(*ty) + o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::Eqz { ty, a } => {
+            out.push(match ty {
+                IntTy::I32 => op::I32_EQZ,
+                IntTy::I64 => op::I64_EQZ,
+            });
+            write_uleb(out, *a as u64);
+        }
+        Inst::Convert { op: o, a } => {
+            out.push(match o {
+                ConvOp::ExtendI32S => op::EXTEND_I32_S,
+                ConvOp::ExtendI32U => op::EXTEND_I32_U,
+                ConvOp::WrapI64 => op::WRAP_I64,
+            });
+            write_uleb(out, *a as u64);
+        }
+        Inst::Select { cond, a, b } => {
+            out.push(op::SELECT);
+            write_uleb(out, *cond as u64);
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
@@ -106,9 +153,8 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
 fn encode_term(out: &mut Vec<u8>, t: &Terminator) {
     match t {
         Terminator::Br { target, args } => {
-            out.push(tag::BR);
-            write_uleb(out, *target as u64);
-            write_idxs(out, args);
+            out.push(op::BR);
+            write_edge(out, *target, args);
         }
         Terminator::BrIf {
             cond,
@@ -117,18 +163,47 @@ fn encode_term(out: &mut Vec<u8>, t: &Terminator) {
             else_blk,
             else_args,
         } => {
-            out.push(tag::BR_IF);
+            out.push(op::BR_IF);
             write_uleb(out, *cond as u64);
-            write_uleb(out, *then_blk as u64);
-            write_idxs(out, then_args);
-            write_uleb(out, *else_blk as u64);
-            write_idxs(out, else_args);
+            write_edge(out, *then_blk, then_args);
+            write_edge(out, *else_blk, else_args);
+        }
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
+            out.push(op::BR_TABLE);
+            write_uleb(out, *idx as u64);
+            write_uleb(out, targets.len() as u64);
+            for (t, args) in targets {
+                write_edge(out, *t, args);
+            }
+            write_edge(out, default.0, &default.1);
         }
         Terminator::Return(vals) => {
-            out.push(tag::RETURN);
+            out.push(op::RETURN);
             write_idxs(out, vals);
         }
     }
+}
+
+fn bin_base(ty: IntTy) -> u8 {
+    match ty {
+        IntTy::I32 => op::I32_BIN,
+        IntTy::I64 => op::I64_BIN,
+    }
+}
+fn cmp_base(ty: IntTy) -> u8 {
+    match ty {
+        IntTy::I32 => op::I32_CMP,
+        IntTy::I64 => op::I64_CMP,
+    }
+}
+
+fn write_edge(out: &mut Vec<u8>, target: u32, args: &[ValIdx]) {
+    write_uleb(out, target as u64);
+    write_idxs(out, args);
 }
 
 fn write_types(out: &mut Vec<u8>, ts: &[ValType]) {
@@ -147,10 +222,10 @@ fn write_idxs(out: &mut Vec<u8>, idxs: &[u32]) {
 
 fn type_tag(t: ValType) -> u8 {
     match t {
-        ValType::I32 => tag::T_I32,
-        ValType::I64 => tag::T_I64,
-        ValType::F32 => tag::T_F32,
-        ValType::F64 => tag::T_F64,
+        ValType::I32 => op::T_I32,
+        ValType::I64 => op::T_I64,
+        ValType::F32 => op::T_F32,
+        ValType::F64 => op::T_F64,
     }
 }
 
@@ -237,33 +312,111 @@ fn decode_block(c: &mut Cursor) -> Result<Block, DecodeError> {
 }
 
 fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
-    let op = c.byte()?;
-    Ok(match op {
-        tag::I32_CONST => Inst::I32Const(c.sleb_i32()?),
-        tag::I64_CONST => Inst::I64Const(c.sleb()?),
-        tag::I32_ADD => Inst::I32Add(c.idx()?, c.idx()?),
-        tag::I64_ADD => Inst::I64Add(c.idx()?, c.idx()?),
+    let b = c.byte()?;
+    Ok(match b {
+        op::CONST_I32 => Inst::ConstI32(c.sleb_i32()?),
+        op::CONST_I64 => Inst::ConstI64(c.sleb()?),
+
+        op::I32_BIN..=op::I32_BIN_END => int_bin(IntTy::I32, b - op::I32_BIN, c)?,
+        op::I64_BIN..=op::I64_BIN_END => int_bin(IntTy::I64, b - op::I64_BIN, c)?,
+
+        op::I32_EQZ => Inst::Eqz {
+            ty: IntTy::I32,
+            a: c.idx()?,
+        },
+        op::I64_EQZ => Inst::Eqz {
+            ty: IntTy::I64,
+            a: c.idx()?,
+        },
+
+        op::I32_CMP..=op::I32_CMP_END => int_cmp(IntTy::I32, b - op::I32_CMP, c)?,
+        op::I64_CMP..=op::I64_CMP_END => int_cmp(IntTy::I64, b - op::I64_CMP, c)?,
+
+        op::EXTEND_I32_S => Inst::Convert {
+            op: ConvOp::ExtendI32S,
+            a: c.idx()?,
+        },
+        op::EXTEND_I32_U => Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: c.idx()?,
+        },
+        op::WRAP_I64 => Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: c.idx()?,
+        },
+
+        op::SELECT => Inst::Select {
+            cond: c.idx()?,
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+
         other => return Err(DecodeError::BadOpcode(other)),
     })
 }
 
+fn int_bin(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = BinOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    Ok(Inst::IntBin {
+        ty,
+        op,
+        a: c.idx()?,
+        b: c.idx()?,
+    })
+}
+
+fn int_cmp(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = CmpOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    Ok(Inst::IntCmp {
+        ty,
+        op,
+        a: c.idx()?,
+        b: c.idx()?,
+    })
+}
+
 fn decode_term(c: &mut Cursor) -> Result<Terminator, DecodeError> {
-    let op = c.byte()?;
-    Ok(match op {
-        tag::BR => Terminator::Br {
-            target: c.idx()?,
-            args: decode_idxs(c)?,
-        },
-        tag::BR_IF => Terminator::BrIf {
-            cond: c.idx()?,
-            then_blk: c.idx()?,
-            then_args: decode_idxs(c)?,
-            else_blk: c.idx()?,
-            else_args: decode_idxs(c)?,
-        },
-        tag::RETURN => Terminator::Return(decode_idxs(c)?),
+    let b = c.byte()?;
+    Ok(match b {
+        op::BR => {
+            let (target, args) = decode_edge(c)?;
+            Terminator::Br { target, args }
+        }
+        op::BR_IF => {
+            let cond = c.idx()?;
+            let (then_blk, then_args) = decode_edge(c)?;
+            let (else_blk, else_args) = decode_edge(c)?;
+            Terminator::BrIf {
+                cond,
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+            }
+        }
+        op::BR_TABLE => {
+            let idx = c.idx()?;
+            let n = c.count()?;
+            let mut targets = Vec::new();
+            for _ in 0..n {
+                targets.push(decode_edge(c)?);
+            }
+            let default = decode_edge(c)?;
+            Terminator::BrTable {
+                idx,
+                targets,
+                default,
+            }
+        }
+        op::RETURN => Terminator::Return(decode_idxs(c)?),
         other => return Err(DecodeError::BadOpcode(other)),
     })
+}
+
+fn decode_edge(c: &mut Cursor) -> Result<Edge, DecodeError> {
+    let target = c.idx()?;
+    let args = decode_idxs(c)?;
+    Ok((target, args))
 }
 
 fn decode_types(c: &mut Cursor) -> Result<Vec<ValType>, DecodeError> {
@@ -277,10 +430,10 @@ fn decode_types(c: &mut Cursor) -> Result<Vec<ValType>, DecodeError> {
 
 fn decode_type(c: &mut Cursor) -> Result<ValType, DecodeError> {
     Ok(match c.byte()? {
-        tag::T_I32 => ValType::I32,
-        tag::T_I64 => ValType::I64,
-        tag::T_F32 => ValType::F32,
-        tag::T_F64 => ValType::F64,
+        op::T_I32 => ValType::I32,
+        op::T_I64 => ValType::I64,
+        op::T_F32 => ValType::F32,
+        op::T_F64 => ValType::F64,
         other => return Err(DecodeError::BadType(other)),
     })
 }

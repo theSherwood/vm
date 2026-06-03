@@ -8,7 +8,7 @@
 //! flow is bounded by `fuel` (a stand-in for §5 metering), so it always terminates.
 #![forbid(unsafe_code)]
 
-use svm_ir::{Func, FuncIdx, Inst, Module, Terminator, ValIdx};
+use svm_ir::{BinOp, CmpOp, ConvOp, Func, FuncIdx, Inst, IntTy, Module, Terminator, ValIdx};
 
 /// A runtime value. Mirrors `ValType`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -24,6 +24,10 @@ pub enum Value {
 pub enum Trap {
     /// Ran out of fuel (potential infinite loop) — see `run`.
     OutOfFuel,
+    /// Integer division or remainder by zero (§3b).
+    DivByZero,
+    /// Signed `INT_MIN / -1` (or `rem_s`) overflow (§3b).
+    IntOverflow,
     /// Structurally invalid in a way a verified module never is (defensive only).
     Malformed,
 }
@@ -57,9 +61,8 @@ fn run_func(f: &Func, args: &[Value], fuel: &mut u64) -> Result<Vec<Value>, Trap
         step(fuel)?;
         match &block.term {
             Terminator::Br { target, args } => {
-                let next = collect(&vals, args)?;
+                vals = collect(&vals, args)?;
                 block_idx = *target as usize;
-                vals = next;
             }
             Terminator::BrIf {
                 cond,
@@ -68,18 +71,23 @@ fn run_func(f: &Func, args: &[Value], fuel: &mut u64) -> Result<Vec<Value>, Trap
                 else_blk,
                 else_args,
             } => {
-                let taken = match get(&vals, *cond)? {
-                    Value::I32(c) => c != 0,
-                    _ => return Err(Trap::Malformed),
-                };
-                let (target, edge_args) = if taken {
+                let (target, edge_args) = if as_i32(get(&vals, *cond)?)? != 0 {
                     (*then_blk, then_args)
                 } else {
                     (*else_blk, else_args)
                 };
-                let next = collect(&vals, edge_args)?;
+                vals = collect(&vals, edge_args)?;
                 block_idx = target as usize;
-                vals = next;
+            }
+            Terminator::BrTable {
+                idx,
+                targets,
+                default,
+            } => {
+                let i = as_i32(get(&vals, *idx)?)? as u32 as usize;
+                let (target, edge_args) = targets.get(i).unwrap_or(default);
+                vals = collect(&vals, edge_args)?;
+                block_idx = *target as usize;
             }
             Terminator::Return(out) => return collect(&vals, out),
         }
@@ -88,20 +96,149 @@ fn run_func(f: &Func, args: &[Value], fuel: &mut u64) -> Result<Vec<Value>, Trap
 
 fn eval_inst(inst: &Inst, vals: &[Value]) -> Result<Value, Trap> {
     Ok(match inst {
-        Inst::I32Const(c) => Value::I32(*c),
-        Inst::I64Const(c) => Value::I64(*c),
-        Inst::I32Add(a, b) => {
-            let a = as_i32(get(vals, *a)?)?;
-            let b = as_i32(get(vals, *b)?)?;
-            // Two's-complement wrap (§3b: integer add wraps, no trap).
-            Value::I32(a.wrapping_add(b))
+        Inst::ConstI32(c) => Value::I32(*c),
+        Inst::ConstI64(c) => Value::I64(*c),
+        Inst::IntBin { ty, op, a, b } => match ty {
+            IntTy::I32 => Value::I32(bin32(
+                *op,
+                as_i32(get(vals, *a)?)?,
+                as_i32(get(vals, *b)?)?,
+            )?),
+            IntTy::I64 => Value::I64(bin64(
+                *op,
+                as_i64(get(vals, *a)?)?,
+                as_i64(get(vals, *b)?)?,
+            )?),
+        },
+        Inst::IntCmp { ty, op, a, b } => {
+            let r = match ty {
+                IntTy::I32 => cmp32(*op, as_i32(get(vals, *a)?)?, as_i32(get(vals, *b)?)?),
+                IntTy::I64 => cmp64(*op, as_i64(get(vals, *a)?)?, as_i64(get(vals, *b)?)?),
+            };
+            Value::I32(r as i32)
         }
-        Inst::I64Add(a, b) => {
-            let a = as_i64(get(vals, *a)?)?;
-            let b = as_i64(get(vals, *b)?)?;
-            Value::I64(a.wrapping_add(b))
+        Inst::Eqz { ty, a } => {
+            let r = match ty {
+                IntTy::I32 => as_i32(get(vals, *a)?)? == 0,
+                IntTy::I64 => as_i64(get(vals, *a)?)? == 0,
+            };
+            Value::I32(r as i32)
+        }
+        Inst::Convert { op, a } => match op {
+            ConvOp::ExtendI32S => Value::I64(as_i32(get(vals, *a)?)? as i64),
+            ConvOp::ExtendI32U => Value::I64(as_i32(get(vals, *a)?)? as u32 as i64),
+            ConvOp::WrapI64 => Value::I32(as_i64(get(vals, *a)?)? as i32),
+        },
+        Inst::Select { cond, a, b } => {
+            if as_i32(get(vals, *cond)?)? != 0 {
+                get(vals, *a)?
+            } else {
+                get(vals, *b)?
+            }
         }
     })
+}
+
+fn bin32(op: BinOp, a: i32, b: i32) -> Result<i32, Trap> {
+    Ok(match op {
+        BinOp::Add => a.wrapping_add(b),
+        BinOp::Sub => a.wrapping_sub(b),
+        BinOp::Mul => a.wrapping_mul(b),
+        BinOp::DivS => {
+            check_div(b == 0, a == i32::MIN && b == -1)?;
+            a.wrapping_div(b)
+        }
+        BinOp::DivU => {
+            check_div(b == 0, false)?;
+            ((a as u32) / (b as u32)) as i32
+        }
+        BinOp::RemS => {
+            check_div(b == 0, a == i32::MIN && b == -1)?;
+            a.wrapping_rem(b)
+        }
+        BinOp::RemU => {
+            check_div(b == 0, false)?;
+            ((a as u32) % (b as u32)) as i32
+        }
+        BinOp::And => a & b,
+        BinOp::Or => a | b,
+        BinOp::Xor => a ^ b,
+        // Shift amount is taken mod bitwidth (`wrapping_sh*` masks rhs to 0..31).
+        BinOp::Shl => a.wrapping_shl(b as u32),
+        BinOp::ShrS => a.wrapping_shr(b as u32),
+        BinOp::ShrU => ((a as u32).wrapping_shr(b as u32)) as i32,
+    })
+}
+
+fn bin64(op: BinOp, a: i64, b: i64) -> Result<i64, Trap> {
+    Ok(match op {
+        BinOp::Add => a.wrapping_add(b),
+        BinOp::Sub => a.wrapping_sub(b),
+        BinOp::Mul => a.wrapping_mul(b),
+        BinOp::DivS => {
+            check_div(b == 0, a == i64::MIN && b == -1)?;
+            a.wrapping_div(b)
+        }
+        BinOp::DivU => {
+            check_div(b == 0, false)?;
+            ((a as u64) / (b as u64)) as i64
+        }
+        BinOp::RemS => {
+            check_div(b == 0, a == i64::MIN && b == -1)?;
+            a.wrapping_rem(b)
+        }
+        BinOp::RemU => {
+            check_div(b == 0, false)?;
+            ((a as u64) % (b as u64)) as i64
+        }
+        BinOp::And => a & b,
+        BinOp::Or => a | b,
+        BinOp::Xor => a ^ b,
+        BinOp::Shl => a.wrapping_shl(b as u32),
+        BinOp::ShrS => a.wrapping_shr(b as u32),
+        BinOp::ShrU => ((a as u64).wrapping_shr(b as u32)) as i64,
+    })
+}
+
+#[inline]
+fn check_div(by_zero: bool, overflow: bool) -> Result<(), Trap> {
+    if by_zero {
+        Err(Trap::DivByZero)
+    } else if overflow {
+        Err(Trap::IntOverflow)
+    } else {
+        Ok(())
+    }
+}
+
+fn cmp32(op: CmpOp, a: i32, b: i32) -> bool {
+    match op {
+        CmpOp::Eq => a == b,
+        CmpOp::Ne => a != b,
+        CmpOp::LtS => a < b,
+        CmpOp::LtU => (a as u32) < (b as u32),
+        CmpOp::LeS => a <= b,
+        CmpOp::LeU => (a as u32) <= (b as u32),
+        CmpOp::GtS => a > b,
+        CmpOp::GtU => (a as u32) > (b as u32),
+        CmpOp::GeS => a >= b,
+        CmpOp::GeU => (a as u32) >= (b as u32),
+    }
+}
+
+fn cmp64(op: CmpOp, a: i64, b: i64) -> bool {
+    match op {
+        CmpOp::Eq => a == b,
+        CmpOp::Ne => a != b,
+        CmpOp::LtS => a < b,
+        CmpOp::LtU => (a as u64) < (b as u64),
+        CmpOp::LeS => a <= b,
+        CmpOp::LeU => (a as u64) <= (b as u64),
+        CmpOp::GtS => a > b,
+        CmpOp::GtU => (a as u64) > (b as u64),
+        CmpOp::GeS => a >= b,
+        CmpOp::GeU => (a as u64) >= (b as u64),
+    }
 }
 
 #[inline]

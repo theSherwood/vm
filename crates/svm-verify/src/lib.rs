@@ -8,6 +8,9 @@
 //! type, then appending the result type), and finally check the terminator's branch
 //! arguments against each target block's declared parameter types.
 //!
+//! Result types are computed here from opcode + operand types (§3a "inferred result
+//! types"); for the one polymorphic op (`select`) the result is the operand type.
+//!
 //! **Fail-closed:** any violation returns `Err`; the verifier never panics on any
 //! input (that property is fuzzed — see the `svm` crate). A module that verifies is
 //! the precondition for the escape-freedom contract (§2a); soundness of *this code*
@@ -91,18 +94,39 @@ fn verify_func(fi: u32, f: &Func) -> Result<(), VerifyError> {
 /// Check one instruction's operands against the running type vector and return the
 /// result type to append. Operands must reference strictly-earlier indices.
 fn check_inst(fi: u32, bi: u32, inst: &Inst, types: &[ValType]) -> Result<ValType, VerifyError> {
-    match inst {
-        Inst::I32Const(_) | Inst::I64Const(_) => {}
-        Inst::I32Add(a, b) => {
-            expect(fi, bi, types, *a, ValType::I32)?;
-            expect(fi, bi, types, *b, ValType::I32)?;
+    let cx = Cx { fi, bi, types };
+    Ok(match inst {
+        Inst::ConstI32(_) => ValType::I32,
+        Inst::ConstI64(_) => ValType::I64,
+        Inst::IntBin { ty, a, b, .. } => {
+            let t = ty.val();
+            cx.expect(*a, t)?;
+            cx.expect(*b, t)?;
+            t
         }
-        Inst::I64Add(a, b) => {
-            expect(fi, bi, types, *a, ValType::I64)?;
-            expect(fi, bi, types, *b, ValType::I64)?;
+        Inst::IntCmp { ty, a, b, .. } => {
+            let t = ty.val();
+            cx.expect(*a, t)?;
+            cx.expect(*b, t)?;
+            ValType::I32
         }
-    }
-    Ok(inst.result_type())
+        Inst::Eqz { ty, a } => {
+            cx.expect(*a, ty.val())?;
+            ValType::I32
+        }
+        Inst::Convert { op, a } => {
+            let (_, src, dst) = op.sig();
+            cx.expect(*a, src)?;
+            dst
+        }
+        Inst::Select { cond, a, b } => {
+            cx.expect(*cond, ValType::I32)?;
+            // Polymorphic: `a` defines the result type, `b` must match it.
+            let t = cx.type_of(*a)?;
+            cx.expect(*b, t)?;
+            t
+        }
+    })
 }
 
 fn check_terminator(
@@ -113,9 +137,10 @@ fn check_terminator(
     nblocks: u32,
     f: &Func,
 ) -> Result<(), VerifyError> {
+    let cx = Cx { fi, bi, types };
     match term {
         Terminator::Br { target, args } => {
-            check_branch(fi, bi, *target, args, types, nblocks, f)?;
+            check_edge(&cx, *target, args, nblocks, f)?;
         }
         Terminator::BrIf {
             cond,
@@ -124,9 +149,21 @@ fn check_terminator(
             else_blk,
             else_args,
         } => {
-            expect(fi, bi, types, *cond, ValType::I32)?;
-            check_branch(fi, bi, *then_blk, then_args, types, nblocks, f)?;
-            check_branch(fi, bi, *else_blk, else_args, types, nblocks, f)?;
+            cx.expect(*cond, ValType::I32)?;
+            check_edge(&cx, *then_blk, then_args, nblocks, f)?;
+            check_edge(&cx, *else_blk, else_args, nblocks, f)?;
+        }
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
+            cx.expect(*idx, ValType::I32)?;
+            for (t, args) in targets {
+                check_edge(&cx, *t, args, nblocks, f)?;
+            }
+            let (t, args) = default;
+            check_edge(&cx, *t, args, nblocks, f)?;
         }
         Terminator::Return(vals) => {
             if vals.len() != f.results.len() {
@@ -138,7 +175,7 @@ fn check_terminator(
                 });
             }
             for (v, want) in vals.iter().zip(&f.results) {
-                expect(fi, bi, types, *v, *want)?;
+                cx.expect(*v, *want)?;
             }
         }
     }
@@ -147,62 +184,68 @@ fn check_terminator(
 
 /// Check a single branch edge: target in range, arg count + types match the target
 /// block's declared parameters exactly.
-fn check_branch(
-    fi: u32,
-    bi: u32,
+fn check_edge(
+    cx: &Cx,
     target: BlockIdx,
     args: &[ValIdx],
-    types: &[ValType],
     nblocks: u32,
     f: &Func,
 ) -> Result<(), VerifyError> {
     if target >= nblocks {
         return Err(VerifyError::BlockOutOfRange {
-            func: fi,
-            block: bi,
+            func: cx.fi,
+            block: cx.bi,
             target,
         });
     }
     let target_params = &f.blocks[target as usize].params;
     if args.len() != target_params.len() {
         return Err(VerifyError::ArgCountMismatch {
-            func: fi,
-            block: bi,
+            func: cx.fi,
+            block: cx.bi,
             target,
             expected: target_params.len(),
             found: args.len(),
         });
     }
     for (v, want) in args.iter().zip(target_params) {
-        expect(fi, bi, types, *v, *want)?;
+        cx.expect(*v, *want)?;
     }
     Ok(())
 }
 
-/// An operand must be defined earlier in this block and have exactly `want`'s type.
-fn expect(
+/// Bundles the location + running type vector for concise operand checks.
+struct Cx<'a> {
     fi: u32,
     bi: u32,
-    types: &[ValType],
-    v: ValIdx,
-    want: ValType,
-) -> Result<(), VerifyError> {
-    let found = types
-        .get(v as usize)
-        .copied()
-        .ok_or(VerifyError::ValueOutOfRange {
-            func: fi,
-            block: bi,
-            value: v,
-            defined: types.len() as u32,
-        })?;
-    if found != want {
-        return Err(VerifyError::TypeMismatch {
-            func: fi,
-            block: bi,
-            expected: want,
-            found,
-        });
+    types: &'a [ValType],
+}
+
+impl Cx<'_> {
+    /// The type of an earlier-defined operand, or `ValueOutOfRange`.
+    fn type_of(&self, v: ValIdx) -> Result<ValType, VerifyError> {
+        self.types
+            .get(v as usize)
+            .copied()
+            .ok_or(VerifyError::ValueOutOfRange {
+                func: self.fi,
+                block: self.bi,
+                value: v,
+                defined: self.types.len() as u32,
+            })
     }
-    Ok(())
+
+    /// An operand must be defined earlier in this block and have exactly `want`'s type.
+    fn expect(&self, v: ValIdx, want: ValType) -> Result<(), VerifyError> {
+        let found = self.type_of(v)?;
+        if found != want {
+            return Err(VerifyError::TypeMismatch {
+                func: self.fi,
+                block: self.bi,
+                expected: want,
+                found,
+            });
+        }
+        Ok(())
+    }
 }

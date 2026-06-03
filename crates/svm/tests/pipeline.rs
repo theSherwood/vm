@@ -7,8 +7,8 @@
 
 use svm::{assemble, load};
 use svm_encode::{decode_module, encode_module};
-use svm_interp::{run, Value};
-use svm_ir::Inst;
+use svm_interp::{run, Trap, Value};
+use svm_ir::{BinOp, Inst, IntTy};
 use svm_text::{parse_module, print_module};
 use svm_verify::{verify_module, VerifyError};
 
@@ -44,7 +44,59 @@ block2(v7: i32):
 }
 "#;
 
-const CORPUS: &[&str] = &[ADD, CONST42, LOOP_SUM];
+// (v0 < v1) ? 100 : (v0 - v1)^2  — exercises sub/mul/lt_s/select/const.
+const ARITH: &str = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.sub v0 v1
+  v3 = i32.mul v2 v2
+  v4 = i32.lt_s v0 v1
+  v5 = i32.const 100
+  v6 = select v4 v5 v3
+  return v6
+}
+"#;
+
+// sign-extend i32 -> i64, then add a large i64 constant.
+const CONV: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.extend_i32_s v0
+  v2 = i64.const 1000000000000
+  v3 = i64.add v1 v2
+  return v3
+}
+"#;
+
+const DIV: &str = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.div_s v0 v1
+  return v2
+}
+"#;
+
+// br_table: idx selects 10/20/30, else default 99.
+const BRTABLE: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  br_table v0 [block1(), block2(), block3()] block4()
+block1():
+  v1 = i32.const 10
+  return v1
+block2():
+  v2 = i32.const 20
+  return v2
+block3():
+  v3 = i32.const 30
+  return v3
+block4():
+  v4 = i32.const 99
+  return v4
+}
+"#;
+
+const CORPUS: &[&str] = &[ADD, CONST42, LOOP_SUM, ARITH, CONV, DIV, BRTABLE];
 
 #[test]
 fn corpus_parses_and_verifies() {
@@ -153,7 +205,12 @@ fn verifier_rejects_forward_value_reference() {
             results: vec![ValType::I32],
             blocks: vec![Block {
                 params: vec![],
-                insts: vec![Inst::I32Add(0, 1)], // no values defined yet
+                insts: vec![Inst::IntBin {
+                    ty: IntTy::I32,
+                    op: BinOp::Add,
+                    a: 0,
+                    b: 1,
+                }], // no values defined yet
                 term: Terminator::Return(vec![0]),
             }],
         }],
@@ -173,7 +230,7 @@ fn verifier_rejects_bad_branch_target() {
             results: vec![ValType::I32],
             blocks: vec![Block {
                 params: vec![],
-                insts: vec![Inst::I32Const(1)],
+                insts: vec![Inst::ConstI32(1)],
                 term: Terminator::Br {
                     target: 7, // does not exist
                     args: vec![],
@@ -204,5 +261,101 @@ fn verifier_rejects_entry_param_mismatch() {
     assert!(matches!(
         verify_module(&m),
         Err(VerifyError::EntryParamsMismatch { .. })
+    ));
+}
+
+// ---- expanded instruction set: results + traps ----
+
+fn run1(src: &str, args: &[Value]) -> Result<Vec<Value>, Trap> {
+    let m = load(&assemble(src).unwrap()).unwrap();
+    let mut fuel = 100_000u64;
+    run(&m, 0, args, &mut fuel)
+}
+
+#[test]
+fn arith_select_results() {
+    assert_eq!(
+        run1(ARITH, &[Value::I32(3), Value::I32(5)]),
+        Ok(vec![Value::I32(100)]) // 3 < 5 -> 100
+    );
+    assert_eq!(
+        run1(ARITH, &[Value::I32(5), Value::I32(3)]),
+        Ok(vec![Value::I32(4)]) // (5-3)^2 = 4
+    );
+}
+
+#[test]
+fn conversion_results() {
+    assert_eq!(
+        run1(CONV, &[Value::I32(5)]),
+        Ok(vec![Value::I64(1_000_000_000_005)])
+    );
+    // sign extension: -1 i32 -> -1 i64, + 1e12 = 999999999999
+    assert_eq!(
+        run1(CONV, &[Value::I32(-1)]),
+        Ok(vec![Value::I64(999_999_999_999)])
+    );
+}
+
+#[test]
+fn div_traps() {
+    assert_eq!(
+        run1(DIV, &[Value::I32(6), Value::I32(3)]),
+        Ok(vec![Value::I32(2)])
+    );
+    assert_eq!(
+        run1(DIV, &[Value::I32(7), Value::I32(0)]),
+        Err(Trap::DivByZero)
+    );
+    assert_eq!(
+        run1(DIV, &[Value::I32(i32::MIN), Value::I32(-1)]),
+        Err(Trap::IntOverflow)
+    );
+}
+
+#[test]
+fn br_table_dispatch() {
+    for (idx, want) in [(0, 10), (1, 20), (2, 30), (3, 99), (7, 99)] {
+        assert_eq!(
+            run1(BRTABLE, &[Value::I32(idx)]),
+            Ok(vec![Value::I32(want)]),
+            "br_table idx={idx}"
+        );
+    }
+}
+
+#[test]
+fn shifts_take_amount_mod_bitwidth() {
+    // i32.shl by 33 == shl by 1 (amount mod 32).
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.shl v0 v1
+  return v2
+}
+"#;
+    assert_eq!(
+        run1(src, &[Value::I32(1), Value::I32(33)]),
+        Ok(vec![Value::I32(2)])
+    );
+}
+
+#[test]
+fn verifier_rejects_select_type_mismatch() {
+    // select of an i32 and an i64 — operands must share a type.
+    let m = parse_module(
+        r#"
+func (i32, i64) -> (i32) {
+block0(v0: i32, v1: i64):
+  v2 = i32.const 1
+  v3 = select v2 v0 v1
+  return v3
+}
+"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::TypeMismatch { .. })
     ));
 }
