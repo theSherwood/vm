@@ -8,7 +8,10 @@
 //! flow is bounded by `fuel` (a stand-in for §5 metering), so it always terminates.
 #![forbid(unsafe_code)]
 
-use svm_ir::{BinOp, CmpOp, ConvOp, Func, FuncIdx, Inst, IntTy, Module, Terminator, ValIdx};
+use svm_ir::{
+    BinOp, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, IToF, Inst,
+    IntTy, Module, Terminator, ValIdx,
+};
 
 /// A runtime value. Mirrors `ValType`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -136,6 +139,204 @@ fn eval_inst(inst: &Inst, vals: &[Value]) -> Result<Value, Trap> {
                 get(vals, *b)?
             }
         }
+        Inst::ConstF32(bits) => Value::F32(f32::from_bits(*bits)),
+        Inst::ConstF64(bits) => Value::F64(f64::from_bits(*bits)),
+        Inst::FBin { ty, op, a, b } => match ty {
+            FloatTy::F32 => Value::F32(fbin32(
+                *op,
+                as_f32(get(vals, *a)?)?,
+                as_f32(get(vals, *b)?)?,
+            )),
+            FloatTy::F64 => Value::F64(fbin64(
+                *op,
+                as_f64(get(vals, *a)?)?,
+                as_f64(get(vals, *b)?)?,
+            )),
+        },
+        Inst::FUn { ty, op, a } => match ty {
+            FloatTy::F32 => Value::F32(fun32(*op, as_f32(get(vals, *a)?)?)),
+            FloatTy::F64 => Value::F64(fun64(*op, as_f64(get(vals, *a)?)?)),
+        },
+        Inst::FCmp { ty, op, a, b } => {
+            let r = match ty {
+                FloatTy::F32 => fcmp32(*op, as_f32(get(vals, *a)?)?, as_f32(get(vals, *b)?)?),
+                FloatTy::F64 => fcmp64(*op, as_f64(get(vals, *a)?)?, as_f64(get(vals, *b)?)?),
+            };
+            Value::I32(r as i32)
+        }
+        Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?)?,
+        Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?)?,
+        Inst::Cast { op, a } => cast(*op, get(vals, *a)?)?,
+    })
+}
+
+fn fbin32(op: FBinOp, a: f32, b: f32) -> f32 {
+    match op {
+        FBinOp::Add => a + b,
+        FBinOp::Sub => a - b,
+        FBinOp::Mul => a * b,
+        FBinOp::Div => a / b,
+        FBinOp::Min => fmin32(a, b),
+        FBinOp::Max => fmax32(a, b),
+        FBinOp::Copysign => a.copysign(b),
+    }
+}
+
+fn fbin64(op: FBinOp, a: f64, b: f64) -> f64 {
+    match op {
+        FBinOp::Add => a + b,
+        FBinOp::Sub => a - b,
+        FBinOp::Mul => a * b,
+        FBinOp::Div => a / b,
+        FBinOp::Min => fmin64(a, b),
+        FBinOp::Max => fmax64(a, b),
+        FBinOp::Copysign => a.copysign(b),
+    }
+}
+
+fn fun32(op: FUnOp, a: f32) -> f32 {
+    match op {
+        FUnOp::Abs => a.abs(),
+        FUnOp::Neg => -a,
+        FUnOp::Sqrt => a.sqrt(),
+        FUnOp::Ceil => a.ceil(),
+        FUnOp::Floor => a.floor(),
+        FUnOp::Trunc => a.trunc(),
+        FUnOp::Nearest => a.round_ties_even(),
+    }
+}
+
+fn fun64(op: FUnOp, a: f64) -> f64 {
+    match op {
+        FUnOp::Abs => a.abs(),
+        FUnOp::Neg => -a,
+        FUnOp::Sqrt => a.sqrt(),
+        FUnOp::Ceil => a.ceil(),
+        FUnOp::Floor => a.floor(),
+        FUnOp::Trunc => a.trunc(),
+        FUnOp::Nearest => a.round_ties_even(),
+    }
+}
+
+fn fcmp32(op: FCmpOp, a: f32, b: f32) -> bool {
+    match op {
+        FCmpOp::Eq => a == b,
+        FCmpOp::Ne => a != b,
+        FCmpOp::Lt => a < b,
+        FCmpOp::Le => a <= b,
+        FCmpOp::Gt => a > b,
+        FCmpOp::Ge => a >= b,
+    }
+}
+
+fn fcmp64(op: FCmpOp, a: f64, b: f64) -> bool {
+    match op {
+        FCmpOp::Eq => a == b,
+        FCmpOp::Ne => a != b,
+        FCmpOp::Lt => a < b,
+        FCmpOp::Le => a <= b,
+        FCmpOp::Gt => a > b,
+        FCmpOp::Ge => a >= b,
+    }
+}
+
+// wasm min/max: NaN propagates; for ±0, min prefers -0 and max prefers +0.
+fn fmin32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            a
+        } else {
+            b
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+fn fmax32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            b
+        } else {
+            a
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+fn fmin64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            a
+        } else {
+            b
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+fn fmax64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            b
+        } else {
+            a
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+// Float→int casts are saturating with NaN→0 (Rust `as` matches wasm `trunc_sat`).
+fn fto_i(op: FToI, v: Value) -> Result<Value, Trap> {
+    Ok(match op {
+        FToI::F32I32S => Value::I32(as_f32(v)? as i32),
+        FToI::F32I32U => Value::I32(as_f32(v)? as u32 as i32),
+        FToI::F32I64S => Value::I64(as_f32(v)? as i64),
+        FToI::F32I64U => Value::I64(as_f32(v)? as u64 as i64),
+        FToI::F64I32S => Value::I32(as_f64(v)? as i32),
+        FToI::F64I32U => Value::I32(as_f64(v)? as u32 as i32),
+        FToI::F64I64S => Value::I64(as_f64(v)? as i64),
+        FToI::F64I64U => Value::I64(as_f64(v)? as u64 as i64),
+    })
+}
+
+fn i_to_f(op: IToF, v: Value) -> Result<Value, Trap> {
+    Ok(match op {
+        IToF::I32F32S => Value::F32(as_i32(v)? as f32),
+        IToF::I32F32U => Value::F32(as_i32(v)? as u32 as f32),
+        IToF::I64F32S => Value::F32(as_i64(v)? as f32),
+        IToF::I64F32U => Value::F32(as_i64(v)? as u64 as f32),
+        IToF::I32F64S => Value::F64(as_i32(v)? as f64),
+        IToF::I32F64U => Value::F64(as_i32(v)? as u32 as f64),
+        IToF::I64F64S => Value::F64(as_i64(v)? as f64),
+        IToF::I64F64U => Value::F64(as_i64(v)? as u64 as f64),
+    })
+}
+
+fn cast(op: CastOp, v: Value) -> Result<Value, Trap> {
+    Ok(match op {
+        CastOp::Demote => Value::F32(as_f64(v)? as f32),
+        CastOp::Promote => Value::F64(as_f32(v)? as f64),
+        CastOp::ReinterpI32F32 => Value::F32(f32::from_bits(as_i32(v)? as u32)),
+        CastOp::ReinterpF32I32 => Value::I32(as_f32(v)?.to_bits() as i32),
+        CastOp::ReinterpI64F64 => Value::F64(f64::from_bits(as_i64(v)? as u64)),
+        CastOp::ReinterpF64I64 => Value::I64(as_f64(v)?.to_bits() as i64),
     })
 }
 
@@ -268,6 +469,22 @@ fn as_i32(v: Value) -> Result<i32, Trap> {
 fn as_i64(v: Value) -> Result<i64, Trap> {
     match v {
         Value::I64(x) => Ok(x),
+        _ => Err(Trap::Malformed),
+    }
+}
+
+#[inline]
+fn as_f32(v: Value) -> Result<f32, Trap> {
+    match v {
+        Value::F32(x) => Ok(x),
+        _ => Err(Trap::Malformed),
+    }
+}
+
+#[inline]
+fn as_f64(v: Value) -> Result<f64, Trap> {
+    match v {
+        Value::F64(x) => Ok(x),
         _ => Err(Trap::Malformed),
     }
 }

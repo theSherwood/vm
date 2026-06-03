@@ -15,7 +15,8 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::{
-    BinOp, Block, CmpOp, ConvOp, Edge, Func, Inst, IntTy, Module, Terminator, ValIdx, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF,
+    Inst, IntTy, Module, Terminator, ValIdx, ValType,
 };
 
 mod op {
@@ -28,6 +29,8 @@ mod op {
     // Constants.
     pub const CONST_I32: u8 = 0x10;
     pub const CONST_I64: u8 = 0x11;
+    pub const CONST_F32: u8 = 0x12; // + 4 raw bytes (LE bits)
+    pub const CONST_F64: u8 = 0x13; // + 8 raw bytes (LE bits)
 
     // Family bases (each op is `base + op.index()`) and their inclusive range ends.
     pub const I32_BIN: u8 = 0x20; // + BinOp index (0..=12)
@@ -47,6 +50,26 @@ mod op {
     pub const WRAP_I64: u8 = 0x62;
 
     pub const SELECT: u8 = 0x70;
+
+    // Float families.
+    pub const F32_BIN: u8 = 0x90; // + FBinOp index (0..=6)
+    pub const F32_BIN_END: u8 = 0x96;
+    pub const F32_UN: u8 = 0x98; // + FUnOp index (0..=6)
+    pub const F32_UN_END: u8 = 0x9E;
+    pub const F64_BIN: u8 = 0xA0;
+    pub const F64_BIN_END: u8 = 0xA6;
+    pub const F64_UN: u8 = 0xA8;
+    pub const F64_UN_END: u8 = 0xAE;
+    pub const F32_CMP: u8 = 0xB0; // + FCmpOp index (0..=5)
+    pub const F32_CMP_END: u8 = 0xB5;
+    pub const F64_CMP: u8 = 0xB8;
+    pub const F64_CMP_END: u8 = 0xBD;
+    pub const CAST: u8 = 0xC0; // + CastOp index (0..=5)
+    pub const CAST_END: u8 = 0xC5;
+    pub const FTOI: u8 = 0xD0; // + FToI index (0..=7)
+    pub const FTOI_END: u8 = 0xD7;
+    pub const ITOF: u8 = 0xE0; // + IToF index (0..=7)
+    pub const ITOF_END: u8 = 0xE7;
 
     // Terminators.
     pub const BR: u8 = 0x80;
@@ -147,6 +170,59 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
+        Inst::ConstF32(bits) => {
+            out.push(op::CONST_F32);
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+        Inst::ConstF64(bits) => {
+            out.push(op::CONST_F64);
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+        Inst::FBin { ty, op: o, a, b } => {
+            out.push(fbin_base(*ty) + o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::FUn { ty, op: o, a } => {
+            out.push(fun_base(*ty) + o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::FCmp { ty, op: o, a, b } => {
+            out.push(fcmp_base(*ty) + o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::FToISat { op: o, a } => {
+            out.push(op::FTOI + o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::IToFConv { op: o, a } => {
+            out.push(op::ITOF + o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::Cast { op: o, a } => {
+            out.push(op::CAST + o.index());
+            write_uleb(out, *a as u64);
+        }
+    }
+}
+
+fn fbin_base(ty: FloatTy) -> u8 {
+    match ty {
+        FloatTy::F32 => op::F32_BIN,
+        FloatTy::F64 => op::F64_BIN,
+    }
+}
+fn fun_base(ty: FloatTy) -> u8 {
+    match ty {
+        FloatTy::F32 => op::F32_UN,
+        FloatTy::F64 => op::F64_UN,
+    }
+}
+fn fcmp_base(ty: FloatTy) -> u8 {
+    match ty {
+        FloatTy::F32 => op::F32_CMP,
+        FloatTy::F64 => op::F64_CMP,
     }
 }
 
@@ -351,7 +427,59 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             b: c.idx()?,
         },
 
+        op::CONST_F32 => Inst::ConstF32(c.u32_le()?),
+        op::CONST_F64 => Inst::ConstF64(c.u64_le()?),
+
+        op::F32_BIN..=op::F32_BIN_END => fbin(FloatTy::F32, b - op::F32_BIN, c)?,
+        op::F64_BIN..=op::F64_BIN_END => fbin(FloatTy::F64, b - op::F64_BIN, c)?,
+        op::F32_UN..=op::F32_UN_END => fun(FloatTy::F32, b - op::F32_UN, c)?,
+        op::F64_UN..=op::F64_UN_END => fun(FloatTy::F64, b - op::F64_UN, c)?,
+        op::F32_CMP..=op::F32_CMP_END => fcmp(FloatTy::F32, b - op::F32_CMP, c)?,
+        op::F64_CMP..=op::F64_CMP_END => fcmp(FloatTy::F64, b - op::F64_CMP, c)?,
+
+        op::CAST..=op::CAST_END => Inst::Cast {
+            op: CastOp::from_index(b - op::CAST).ok_or(DecodeError::BadOpcode(b))?,
+            a: c.idx()?,
+        },
+        op::FTOI..=op::FTOI_END => Inst::FToISat {
+            op: FToI::from_index(b - op::FTOI).ok_or(DecodeError::BadOpcode(b))?,
+            a: c.idx()?,
+        },
+        op::ITOF..=op::ITOF_END => Inst::IToFConv {
+            op: IToF::from_index(b - op::ITOF).ok_or(DecodeError::BadOpcode(b))?,
+            a: c.idx()?,
+        },
+
         other => return Err(DecodeError::BadOpcode(other)),
+    })
+}
+
+fn fbin(ty: FloatTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = FBinOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    Ok(Inst::FBin {
+        ty,
+        op,
+        a: c.idx()?,
+        b: c.idx()?,
+    })
+}
+
+fn fun(ty: FloatTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = FUnOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    Ok(Inst::FUn {
+        ty,
+        op,
+        a: c.idx()?,
+    })
+}
+
+fn fcmp(ty: FloatTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = FCmpOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    Ok(Inst::FCmp {
+        ty,
+        op,
+        a: c.idx()?,
+        b: c.idx()?,
     })
 }
 
@@ -528,6 +656,20 @@ impl<'a> Cursor<'a> {
     fn sleb_i32(&mut self) -> Result<i32, DecodeError> {
         let v = self.sleb()?;
         i32::try_from(v).map_err(|_| DecodeError::IntTooLarge)
+    }
+
+    /// Read 4 raw little-endian bytes as `u32` (float-constant bits).
+    fn u32_le(&mut self) -> Result<u32, DecodeError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Read 8 raw little-endian bytes as `u64` (float-constant bits).
+    fn u64_le(&mut self) -> Result<u64, DecodeError> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
 
     /// Read a value index (`u32`).

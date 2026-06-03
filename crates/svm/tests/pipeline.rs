@@ -359,3 +359,82 @@ block0(v0: i32, v1: i64):
         Err(VerifyError::TypeMismatch { .. })
     ));
 }
+
+// ---- floats ----
+
+// area = pi * r * r  (f64), then floor it to an i32 via trunc_sat.
+const CIRCLE: &str = r#"
+func (f64) -> (i32) {
+block0(v0: f64):
+  v1 = f64.const 3.14159265358979
+  v2 = f64.mul v0 v0
+  v3 = f64.mul v1 v2
+  v4 = f64.floor v3
+  v5 = i32.trunc_sat_f64_s v4
+  return v5
+}
+"#;
+
+// round-trip an i32 through f32 and back; also exercises convert + sqrt.
+const FSQRT: &str = r#"
+func (i32) -> (f32) {
+block0(v0: i32):
+  v1 = f32.convert_i32_s v0
+  v2 = f32.sqrt v1
+  return v2
+}
+"#;
+
+#[test]
+fn float_corpus_roundtrips() {
+    for src in [CIRCLE, FSQRT] {
+        let m = parse_module(src).expect("parse");
+        verify_module(&m).expect("verify");
+        // binary round-trip
+        assert_eq!(m, decode_module(&encode_module(&m)).unwrap());
+        // text round-trip
+        assert_eq!(m, parse_module(&print_module(&m)).unwrap());
+    }
+}
+
+#[test]
+fn float_arithmetic_results() {
+    // r = 2.0 -> area = pi*4 = 12.566.. -> floor 12.
+    assert_eq!(run1(CIRCLE, &[Value::F64(2.0)]), Ok(vec![Value::I32(12)]));
+    // sqrt(16) = 4.0
+    assert_eq!(run1(FSQRT, &[Value::I32(16)]), Ok(vec![Value::F32(4.0)]));
+    // sqrt(2) ~ 1.4142135
+    match run1(FSQRT, &[Value::I32(2)]) {
+        Ok(v) => match v[..] {
+            [Value::F32(x)] => assert!((x - 2.0f32.sqrt()).abs() < 1e-6),
+            _ => panic!("wrong result shape"),
+        },
+        e => panic!("unexpected {e:?}"),
+    }
+}
+
+#[test]
+fn float_const_bits_roundtrip() {
+    // f32.const printed and reparsed must preserve bits exactly.
+    let src = "func () -> (f32) {\nblock0():\n  v0 = f32.const 1.5\n  return v0\n}\n";
+    let m = parse_module(src).unwrap();
+    assert_eq!(m, parse_module(&print_module(&m)).unwrap());
+    assert_eq!(run1(src, &[]), Ok(vec![Value::F32(1.5)]));
+}
+
+#[test]
+fn reinterpret_preserves_bits() {
+    // f32.reinterpret_i32 then i32.reinterpret_f32 is identity on the bit pattern.
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = f32.reinterpret_i32 v0
+  v2 = i32.reinterpret_f32 v1
+  return v2
+}
+"#;
+    assert_eq!(
+        run1(src, &[Value::I32(0x4048_f5c3u32 as i32)]),
+        Ok(vec![Value::I32(0x4048_f5c3u32 as i32)])
+    );
+}

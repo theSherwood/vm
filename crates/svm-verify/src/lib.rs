@@ -126,6 +126,39 @@ fn check_inst(fi: u32, bi: u32, inst: &Inst, types: &[ValType]) -> Result<ValTyp
             cx.expect(*b, t)?;
             t
         }
+        Inst::ConstF32(_) => ValType::F32,
+        Inst::ConstF64(_) => ValType::F64,
+        Inst::FBin { ty, a, b, .. } => {
+            let t = ty.val();
+            cx.expect(*a, t)?;
+            cx.expect(*b, t)?;
+            t
+        }
+        Inst::FUn { ty, a, .. } => {
+            cx.expect(*a, ty.val())?;
+            ty.val()
+        }
+        Inst::FCmp { ty, a, b, .. } => {
+            let t = ty.val();
+            cx.expect(*a, t)?;
+            cx.expect(*b, t)?;
+            ValType::I32
+        }
+        Inst::FToISat { op, a } => {
+            let (from, to, _) = op.parts();
+            cx.expect(*a, from.val())?;
+            to.val()
+        }
+        Inst::IToFConv { op, a } => {
+            let (from, to, _) = op.parts();
+            cx.expect(*a, from.val())?;
+            to.val()
+        }
+        Inst::Cast { op, a } => {
+            let (_, src, dst) = op.sig();
+            cx.expect(*a, src)?;
+            dst
+        }
     })
 }
 

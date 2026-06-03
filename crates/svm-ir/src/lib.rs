@@ -225,6 +225,319 @@ impl ConvOp {
     }
 }
 
+/// Float width. Maps to the `f32`/`f64` text prefix.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloatTy {
+    F32,
+    F64,
+}
+
+impl FloatTy {
+    pub fn val(self) -> ValType {
+        match self {
+            FloatTy::F32 => ValType::F32,
+            FloatTy::F64 => ValType::F64,
+        }
+    }
+    pub fn prefix(self) -> &'static str {
+        match self {
+            FloatTy::F32 => "f32",
+            FloatTy::F64 => "f64",
+        }
+    }
+}
+
+/// Binary float ops (IEEE 754, no traps; same type in and out).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    Copysign,
+}
+
+impl FBinOp {
+    pub const ALL: [FBinOp; 7] = [
+        FBinOp::Add,
+        FBinOp::Sub,
+        FBinOp::Mul,
+        FBinOp::Div,
+        FBinOp::Min,
+        FBinOp::Max,
+        FBinOp::Copysign,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            FBinOp::Add => "add",
+            FBinOp::Sub => "sub",
+            FBinOp::Mul => "mul",
+            FBinOp::Div => "div",
+            FBinOp::Min => "min",
+            FBinOp::Max => "max",
+            FBinOp::Copysign => "copysign",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<FBinOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<FBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Unary float ops (IEEE 754, no traps).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FUnOp {
+    Abs,
+    Neg,
+    Sqrt,
+    Ceil,
+    Floor,
+    Trunc,
+    Nearest,
+}
+
+impl FUnOp {
+    pub const ALL: [FUnOp; 7] = [
+        FUnOp::Abs,
+        FUnOp::Neg,
+        FUnOp::Sqrt,
+        FUnOp::Ceil,
+        FUnOp::Floor,
+        FUnOp::Trunc,
+        FUnOp::Nearest,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            FUnOp::Abs => "abs",
+            FUnOp::Neg => "neg",
+            FUnOp::Sqrt => "sqrt",
+            FUnOp::Ceil => "ceil",
+            FUnOp::Floor => "floor",
+            FUnOp::Trunc => "trunc",
+            FUnOp::Nearest => "nearest",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<FUnOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<FUnOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Float comparisons (same type in, `i32` 0/1 out).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl FCmpOp {
+    pub const ALL: [FCmpOp; 6] = [
+        FCmpOp::Eq,
+        FCmpOp::Ne,
+        FCmpOp::Lt,
+        FCmpOp::Le,
+        FCmpOp::Gt,
+        FCmpOp::Ge,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            FCmpOp::Eq => "eq",
+            FCmpOp::Ne => "ne",
+            FCmpOp::Lt => "lt",
+            FCmpOp::Le => "le",
+            FCmpOp::Gt => "gt",
+            FCmpOp::Ge => "ge",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<FCmpOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<FCmpOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Saturating float→int conversions (`trunc_sat`): NaN→0, out-of-range saturates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FToI {
+    F32I32S,
+    F32I32U,
+    F32I64S,
+    F32I64U,
+    F64I32S,
+    F64I32U,
+    F64I64S,
+    F64I64U,
+}
+
+impl FToI {
+    pub const ALL: [FToI; 8] = [
+        FToI::F32I32S,
+        FToI::F32I32U,
+        FToI::F32I64S,
+        FToI::F32I64U,
+        FToI::F64I32S,
+        FToI::F64I32U,
+        FToI::F64I64S,
+        FToI::F64I64U,
+    ];
+    /// `(from float, to int, signed)`.
+    pub fn parts(self) -> (FloatTy, IntTy, bool) {
+        match self {
+            FToI::F32I32S => (FloatTy::F32, IntTy::I32, true),
+            FToI::F32I32U => (FloatTy::F32, IntTy::I32, false),
+            FToI::F32I64S => (FloatTy::F32, IntTy::I64, true),
+            FToI::F32I64U => (FloatTy::F32, IntTy::I64, false),
+            FToI::F64I32S => (FloatTy::F64, IntTy::I32, true),
+            FToI::F64I32U => (FloatTy::F64, IntTy::I32, false),
+            FToI::F64I64S => (FloatTy::F64, IntTy::I64, true),
+            FToI::F64I64U => (FloatTy::F64, IntTy::I64, false),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            FToI::F32I32S => "i32.trunc_sat_f32_s",
+            FToI::F32I32U => "i32.trunc_sat_f32_u",
+            FToI::F32I64S => "i64.trunc_sat_f32_s",
+            FToI::F32I64U => "i64.trunc_sat_f32_u",
+            FToI::F64I32S => "i32.trunc_sat_f64_s",
+            FToI::F64I32U => "i32.trunc_sat_f64_u",
+            FToI::F64I64S => "i64.trunc_sat_f64_s",
+            FToI::F64I64U => "i64.trunc_sat_f64_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<FToI> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<FToI> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Int→float conversions (`convert`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IToF {
+    I32F32S,
+    I32F32U,
+    I64F32S,
+    I64F32U,
+    I32F64S,
+    I32F64U,
+    I64F64S,
+    I64F64U,
+}
+
+impl IToF {
+    pub const ALL: [IToF; 8] = [
+        IToF::I32F32S,
+        IToF::I32F32U,
+        IToF::I64F32S,
+        IToF::I64F32U,
+        IToF::I32F64S,
+        IToF::I32F64U,
+        IToF::I64F64S,
+        IToF::I64F64U,
+    ];
+    /// `(from int, to float, signed)`.
+    pub fn parts(self) -> (IntTy, FloatTy, bool) {
+        match self {
+            IToF::I32F32S => (IntTy::I32, FloatTy::F32, true),
+            IToF::I32F32U => (IntTy::I32, FloatTy::F32, false),
+            IToF::I64F32S => (IntTy::I64, FloatTy::F32, true),
+            IToF::I64F32U => (IntTy::I64, FloatTy::F32, false),
+            IToF::I32F64S => (IntTy::I32, FloatTy::F64, true),
+            IToF::I32F64U => (IntTy::I32, FloatTy::F64, false),
+            IToF::I64F64S => (IntTy::I64, FloatTy::F64, true),
+            IToF::I64F64U => (IntTy::I64, FloatTy::F64, false),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            IToF::I32F32S => "f32.convert_i32_s",
+            IToF::I32F32U => "f32.convert_i32_u",
+            IToF::I64F32S => "f32.convert_i64_s",
+            IToF::I64F32U => "f32.convert_i64_u",
+            IToF::I32F64S => "f64.convert_i32_s",
+            IToF::I32F64U => "f64.convert_i32_u",
+            IToF::I64F64S => "f64.convert_i64_s",
+            IToF::I64F64U => "f64.convert_i64_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<IToF> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<IToF> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Float width-change (`demote`/`promote`) and bit-`reinterpret` casts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CastOp {
+    Demote,  // f64 -> f32
+    Promote, // f32 -> f64
+    ReinterpI32F32,
+    ReinterpF32I32,
+    ReinterpI64F64,
+    ReinterpF64I64,
+}
+
+impl CastOp {
+    pub const ALL: [CastOp; 6] = [
+        CastOp::Demote,
+        CastOp::Promote,
+        CastOp::ReinterpI32F32,
+        CastOp::ReinterpF32I32,
+        CastOp::ReinterpI64F64,
+        CastOp::ReinterpF64I64,
+    ];
+    /// `(text name, source type, result type)`.
+    pub fn sig(self) -> (&'static str, ValType, ValType) {
+        match self {
+            CastOp::Demote => ("f32.demote_f64", ValType::F64, ValType::F32),
+            CastOp::Promote => ("f64.promote_f32", ValType::F32, ValType::F64),
+            CastOp::ReinterpI32F32 => ("f32.reinterpret_i32", ValType::I32, ValType::F32),
+            CastOp::ReinterpF32I32 => ("i32.reinterpret_f32", ValType::F32, ValType::I32),
+            CastOp::ReinterpI64F64 => ("f64.reinterpret_i64", ValType::I64, ValType::F64),
+            CastOp::ReinterpF64I64 => ("i64.reinterpret_f64", ValType::F64, ValType::I64),
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<CastOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<CastOp> {
+        Self::ALL.iter().copied().find(|o| o.sig().0 == s)
+    }
+}
+
 /// Non-terminator instructions. Each produces exactly one result whose index is
 /// the next block-local value index (implicit, by position).
 #[derive(Clone, PartialEq, Debug)]
@@ -260,6 +573,44 @@ pub enum Inst {
         cond: ValIdx,
         a: ValIdx,
         b: ValIdx,
+    },
+    /// `f32`/`f64` constants, stored as raw bits for exact (NaN-safe) round-tripping.
+    ConstF32(u32),
+    ConstF64(u64),
+    /// Binary float op; operands and result are `ty`.
+    FBin {
+        ty: FloatTy,
+        op: FBinOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Unary float op; operand and result are `ty`.
+    FUn {
+        ty: FloatTy,
+        op: FUnOp,
+        a: ValIdx,
+    },
+    /// Float compare; operands are `ty`, result is `i32` 0/1.
+    FCmp {
+        ty: FloatTy,
+        op: FCmpOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Saturating float→int conversion.
+    FToISat {
+        op: FToI,
+        a: ValIdx,
+    },
+    /// Int→float conversion.
+    IToFConv {
+        op: IToF,
+        a: ValIdx,
+    },
+    /// `demote`/`promote`/`reinterpret` cast.
+    Cast {
+        op: CastOp,
+        a: ValIdx,
     },
 }
 

@@ -21,7 +21,10 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use svm_ir::{BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, Module, Terminator, ValType};
+use svm_ir::{
+    BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
+    IntTy, Module, Terminator, ValType,
+};
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -89,6 +92,16 @@ fn print_inst(inst: &Inst) -> String {
         Inst::Eqz { ty, a } => format!("{}.eqz v{a}", ty.prefix()),
         Inst::Convert { op, a } => format!("{} v{a}", op.sig().0),
         Inst::Select { cond, a, b } => format!("select v{cond} v{a} v{b}"),
+        // `{:?}` gives the shortest round-tripping form with a decimal point
+        // (e.g. `2.0`, `1.5`, `-3.25`), so it re-tokenizes as a number.
+        Inst::ConstF32(bits) => format!("f32.const {:?}", f32::from_bits(*bits)),
+        Inst::ConstF64(bits) => format!("f64.const {:?}", f64::from_bits(*bits)),
+        Inst::FBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
+        Inst::FUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
+        Inst::FCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
+        Inst::FToISat { op, a } => format!("{} v{a}", op.name()),
+        Inst::IToFConv { op, a } => format!("{} v{a}", op.name()),
+        Inst::Cast { op, a } => format!("{} v{a}", op.sig().0),
     }
 }
 
@@ -161,6 +174,7 @@ enum Tok {
     Arrow,
     Ident(String),
     Int(i64),
+    Float(f64),
 }
 
 fn tokenize(src: &str) -> Result<Vec<Tok>, ParseError> {
@@ -191,13 +205,13 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, ParseError> {
                     toks.push(Tok::Arrow);
                     i += 2;
                 } else {
-                    let (tok, ni) = lex_int(bytes, i)?;
+                    let (tok, ni) = lex_number(bytes, i)?;
                     toks.push(tok);
                     i = ni;
                 }
             }
             b'0'..=b'9' => {
-                let (tok, ni) = lex_int(bytes, i)?;
+                let (tok, ni) = lex_number(bytes, i)?;
                 toks.push(tok);
                 i = ni;
             }
@@ -221,23 +235,51 @@ fn push(toks: &mut Vec<Tok>, t: Tok, i: &mut usize) {
     *i += 1;
 }
 
-fn lex_int(bytes: &[u8], start: usize) -> Result<(Tok, usize), ParseError> {
+/// Lex an integer or float literal. A `.` or exponent makes it a float.
+fn lex_number(bytes: &[u8], start: usize) -> Result<(Tok, usize), ParseError> {
     let mut i = start;
     if bytes[i] == b'-' {
         i += 1;
     }
-    let digits_start = i;
+    let mut has_digit = false;
+    let mut is_float = false;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
+        has_digit = true;
     }
-    if i == digits_start {
-        return err("expected digits in integer");
+    if i < bytes.len() && bytes[i] == b'.' {
+        is_float = true;
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            has_digit = true;
+        }
+    }
+    if i < bytes.len() && (bytes[i] | 0x20) == b'e' {
+        is_float = true;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if !has_digit {
+        return err("expected digits in number");
     }
     let s = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
-    let v: i64 = s
-        .parse()
-        .map_err(|_| ParseError(format!("integer out of range: {s}")))?;
-    Ok((Tok::Int(v), i))
+    if is_float {
+        let v: f64 = s
+            .parse()
+            .map_err(|_| ParseError(format!("invalid float: {s}")))?;
+        Ok((Tok::Float(v), i))
+    } else {
+        let v: i64 = s
+            .parse()
+            .map_err(|_| ParseError(format!("integer out of range: {s}")))?;
+        Ok((Tok::Int(v), i))
+    }
 }
 
 fn is_ident_start(c: u8) -> bool {
@@ -490,6 +532,7 @@ impl<'a> Parser<'a> {
     fn parse_inst(&mut self, names: &HashMap<String, u32>) -> Result<Inst, ParseError> {
         let op = self.ident()?;
 
+        // Ops whose full name is matched directly (no `prefix.suffix` split).
         if op == "select" {
             let cond = self.value(names)?;
             let a = self.value(names)?;
@@ -497,19 +540,49 @@ impl<'a> Parser<'a> {
             return Ok(Inst::Select { cond, a, b });
         }
         if let Some(cv) = ConvOp::from_name(&op) {
-            let a = self.value(names)?;
-            return Ok(Inst::Convert { op: cv, a });
+            return Ok(Inst::Convert {
+                op: cv,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = FToI::from_name(&op) {
+            return Ok(Inst::FToISat {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = IToF::from_name(&op) {
+            return Ok(Inst::IToFConv {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = CastOp::from_name(&op) {
+            return Ok(Inst::Cast {
+                op: o,
+                a: self.value(names)?,
+            });
         }
 
         let (prefix, suffix) = op
             .split_once('.')
             .ok_or_else(|| ParseError(format!("unknown opcode `{op}`")))?;
-        let ty = match prefix {
-            "i32" => IntTy::I32,
-            "i64" => IntTy::I64,
-            _ => return err(format!("unknown opcode `{op}`")),
-        };
+        match prefix {
+            "i32" => self.parse_int_inst(IntTy::I32, suffix, &op, names),
+            "i64" => self.parse_int_inst(IntTy::I64, suffix, &op, names),
+            "f32" => self.parse_float_inst(FloatTy::F32, suffix, &op, names),
+            "f64" => self.parse_float_inst(FloatTy::F64, suffix, &op, names),
+            _ => err(format!("unknown opcode `{op}`")),
+        }
+    }
 
+    fn parse_int_inst(
+        &mut self,
+        ty: IntTy,
+        suffix: &str,
+        op: &str,
+        names: &HashMap<String, u32>,
+    ) -> Result<Inst, ParseError> {
         if suffix == "const" {
             let v = self.parse_int()?;
             return Ok(match ty {
@@ -521,8 +594,10 @@ impl<'a> Parser<'a> {
             });
         }
         if suffix == "eqz" {
-            let a = self.value(names)?;
-            return Ok(Inst::Eqz { ty, a });
+            return Ok(Inst::Eqz {
+                ty,
+                a: self.value(names)?,
+            });
         }
         if let Some(o) = BinOp::from_name(suffix) {
             let a = self.value(names)?;
@@ -533,6 +608,40 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::IntCmp { ty, op: o, a, b });
+        }
+        err(format!("unknown opcode `{op}`"))
+    }
+
+    fn parse_float_inst(
+        &mut self,
+        ty: FloatTy,
+        suffix: &str,
+        op: &str,
+        names: &HashMap<String, u32>,
+    ) -> Result<Inst, ParseError> {
+        if suffix == "const" {
+            let v = self.parse_float()?;
+            return Ok(match ty {
+                FloatTy::F32 => Inst::ConstF32((v as f32).to_bits()),
+                FloatTy::F64 => Inst::ConstF64(v.to_bits()),
+            });
+        }
+        if let Some(o) = FBinOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::FBin { ty, op: o, a, b });
+        }
+        if let Some(o) = FUnOp::from_name(suffix) {
+            return Ok(Inst::FUn {
+                ty,
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = FCmpOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::FCmp { ty, op: o, a, b });
         }
         err(format!("unknown opcode `{op}`"))
     }
@@ -611,6 +720,15 @@ impl<'a> Parser<'a> {
         match self.next()? {
             Tok::Int(v) => Ok(*v),
             other => err(format!("expected integer, found {other:?}")),
+        }
+    }
+
+    /// A float literal — accepts an integer token too (e.g. `f64.const 2`).
+    fn parse_float(&mut self) -> Result<f64, ParseError> {
+        match self.next()? {
+            Tok::Float(v) => Ok(*v),
+            Tok::Int(v) => Ok(*v as f64),
+            other => err(format!("expected number, found {other:?}")),
         }
     }
 }
