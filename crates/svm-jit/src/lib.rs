@@ -37,7 +37,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     BinOp, Block, CastOp, ConvOp, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx, Inst, IntTy,
     IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, ValType,
@@ -91,13 +91,19 @@ fn float_clif_ty(t: FloatTy) -> Type {
     }
 }
 
-/// Compile `func` and run it on slot-encoded `args` (each `i64` is one parameter
-/// slot; `i32` params occupy the low 32 bits). Returns the result slots. Intended for
-/// the differential harness (see the `svm` crate's JIT tests).
+/// Compile the whole module and run `func` on slot-encoded `args` (each `i64` is one
+/// parameter slot; `i32`/`f32` occupy the low 32 bits). Returns the result slots.
+/// Intended for the differential harness (see the `svm` crate's JIT tests).
+///
+/// All functions are compiled with a **natural CLIF ABI** — `(mem_base, params…) ->
+/// (results…)` — so direct/tail calls are ordinary CLIF calls; the entry is wrapped
+/// in a fixed buffer-ABI trampoline so any arity is callable from Rust.
 pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<i64>, JitError> {
-    let f = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
-    // Reject the not-yet-lowered surface up front so we never emit partial CLIF.
-    ensure_supported(f)?;
+    let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
+    // Calls can reach any function, so every function must be lowerable.
+    for f in &m.funcs {
+        ensure_supported(f)?;
+    }
 
     // Allocate the guest window (zeroed, + guard margin) if the module declares memory.
     // `mask` is the §4 confinement mask; `mem_base` is null when there is no window.
@@ -117,6 +123,8 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<
     let mut flags = settings::builder();
     // A JIT'd function is called directly, not relocated into a shared object.
     let _ = flags.set("is_pic", "false");
+    // Cranelift's x64 `return_call` (tail calls, §3b) lowering requires frame pointers.
+    let _ = flags.set("preserve_frame_pointers", "true");
     let isa = cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
@@ -124,24 +132,46 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<
     let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     let mut module = JITModule::new(builder);
 
-    let mut ctx = module.make_context();
-    build_clif(&mut ctx.func, f, mask)?;
+    // Declare every function (natural ABI) up front so calls can reference any of them.
+    let ids: Vec<_> = m
+        .funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let sig = natural_sig(&mut module, f);
+            module
+                .declare_function(&format!("f{i}"), Linkage::Local, &sig)
+                .map_err(|e| JitError::Backend(e.to_string()))
+        })
+        .collect::<Result<_, _>>()?;
 
-    let id = module
-        .declare_function("f", Linkage::Export, &ctx.func.signature)
+    // Define each function body. `clear_context` after each define resets the cached
+    // CFG/domtree so the next function never compiles against a stale CFG.
+    let mut ctx = module.make_context();
+    for (f, id) in m.funcs.iter().zip(&ids) {
+        build_clif(&mut module, &ids, &mut ctx.func, f, mask)?;
+        module
+            .define_function(*id, &mut ctx)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module.clear_context(&mut ctx);
+    }
+
+    // The buffer-ABI trampoline for the entry, exported so Rust can call it.
+    build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry);
+    let tramp = module
+        .declare_function("trampoline", Linkage::Export, &ctx.func.signature)
         .map_err(|e| JitError::Backend(e.to_string()))?;
     module
-        .define_function(id, &mut ctx)
+        .define_function(tramp, &mut ctx)
         .map_err(|e| JitError::Backend(e.to_string()))?;
     module.clear_context(&mut ctx);
     module
         .finalize_definitions()
         .map_err(|e| JitError::Backend(e.to_string()))?;
 
-    let code = module.get_finalized_function(id);
-    // SAFETY: `code` points at a finalized function with exactly this signature
-    // (`build_clif` set it). `module` owns the executable page and stays alive until
-    // after the call below.
+    let code = module.get_finalized_function(tramp);
+    // SAFETY: `code` is the finalized trampoline with exactly this signature
+    // (`build_trampoline` set it). `module` owns the executable page until dropped.
     let run: extern "C" fn(*const i64, *mut i64, *mut u8) = unsafe { std::mem::transmute(code) };
 
     let mut window = window;
@@ -150,15 +180,33 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<
     } else {
         window.as_mut_ptr()
     };
-    let mut results = vec![0i64; f.results.len()];
-    // SAFETY: `run` reads `f.params.len()` arg slots, writes `f.results.len()` result
-    // slots, and accesses only `[mem_base, mem_base + size + GUARD)` (the masking
-    // lowering confines every effective address to `< size`, plus the guard margin).
-    // All three buffers outlive the call.
+    let mut results = vec![0i64; entry.results.len()];
+    // SAFETY: `run` reads `entry.params.len()` arg slots, writes `entry.results.len()`
+    // result slots, and accesses only `[mem_base, mem_base + size + GUARD)` (masking
+    // confines every effective address to `< size`, plus the guard margin). All three
+    // buffers outlive the call.
     run(args.as_ptr(), results.as_mut_ptr(), mem_base);
     drop(window);
     drop(module); // frees the executable memory after the call has returned
     Ok(results)
+}
+
+/// The natural CLIF signature for an IR function: `(mem_base: i64, params…) ->
+/// (results…)`. `mem_base` is threaded through every call so loads/stores reach the
+/// window without a global.
+fn natural_sig(module: &mut JITModule, f: &Func) -> cranelift_codegen::ir::Signature {
+    let mut sig = module.make_signature();
+    // The `tail` calling convention so `return_call` (guaranteed tail calls, §3b) is
+    // available; a normal `call` from the trampoline works against it too.
+    sig.call_conv = cranelift_codegen::isa::CallConv::Tail;
+    sig.params.push(AbiParam::new(I64)); // mem_base
+    for p in &f.params {
+        sig.params.push(AbiParam::new(clif_ty(*p)));
+    }
+    for r in &f.results {
+        sig.returns.push(AbiParam::new(clif_ty(*r)));
+    }
+    sig
 }
 
 /// Reject functions using any op outside the integer slice, so `build_clif` can lower
@@ -182,6 +230,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Cast { .. }
                 | Inst::Load { .. }
                 | Inst::Store { .. }
+                | Inst::Call { .. }
                 | Inst::Convert { .. } => {}
                 Inst::IntBin { op, .. } => match op {
                     // Trapping ops need fault plumbing (deferred).
@@ -203,6 +252,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
             Terminator::Br { .. }
             | Terminator::BrIf { .. }
             | Terminator::Return(_)
+            | Terminator::ReturnCall { .. }
             | Terminator::Unreachable => {}
             _ => return Err(JitError::Unsupported("terminator")),
         }
@@ -211,32 +261,36 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
 }
 
 /// Per-function lowering context shared across blocks.
-struct Lower {
-    /// Holds `results_ptr` so any block's `return` can store to it.
-    results_var: Variable,
-    /// Holds `mem_base` (the window base) for load/store lowering.
+struct Lower<'a> {
+    /// Holds `mem_base` (the window base) for load/store lowering and call threading.
     mem_var: Variable,
     /// The §4 confinement mask (`size - 1`); `0` when the module has no memory.
     mask: u64,
+    /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
+    ids: &'a [FuncId],
 }
 
-/// Build the CLIF for one IR function into `clif`.
-fn build_clif(clif: &mut Function, f: &Func, mask: u64) -> Result<(), JitError> {
+/// Build the natural-ABI CLIF for one IR function: `(mem_base, params…) ->
+/// (results…)`. The CLIF entry block holds the native params and jumps into IR
+/// block 0 passing the parameters as its block args.
+fn build_clif(
+    module: &mut JITModule,
+    ids: &[FuncId],
+    clif: &mut Function,
+    f: &Func,
+    mask: u64,
+) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
     }
-    // Native signature: (args_ptr: i64, results_ptr: i64, mem_base: i64) -> ().
-    clif.signature.params.push(AbiParam::new(I64));
-    clif.signature.params.push(AbiParam::new(I64));
-    clif.signature.params.push(AbiParam::new(I64));
+    clif.signature = natural_sig(module, f);
     clif.name = UserFuncName::user(0, 0);
 
     let mut fbctx = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(clif, &mut fbctx);
 
     // One CLIF block per IR block, with params mirroring the IR block params. A
-    // separate CLIF entry block holds the native params and jumps into IR block 0
-    // with the loaded function arguments.
+    // separate CLIF entry block holds the native params and jumps into IR block 0.
     let blocks: Vec<_> = f.blocks.iter().map(|_| b.create_block()).collect();
     for (i, blk) in f.blocks.iter().enumerate() {
         for p in &blk.params {
@@ -244,41 +298,28 @@ fn build_clif(clif: &mut Function, f: &Func, mask: u64) -> Result<(), JitError> 
         }
     }
     let entry = b.create_block();
-    b.append_block_param(entry, I64); // args_ptr
-    b.append_block_param(entry, I64); // results_ptr
     b.append_block_param(entry, I64); // mem_base
+    for p in &f.params {
+        b.append_block_param(entry, clif_ty(*p));
+    }
     b.switch_to_block(entry);
     b.seal_block(entry);
-    let args_ptr = b.block_params(entry)[0];
-    let results_ptr = b.block_params(entry)[1];
-    let mem_base = b.block_params(entry)[2];
+    let mem_base = b.block_params(entry)[0];
 
-    // `results_ptr` / `mem_base` are needed across blocks; stash them in variables so
-    // any block can read them without threading them through block params.
-    let results_var = b.declare_var(I64);
-    b.def_var(results_var, results_ptr);
+    // `mem_base` is needed across blocks; stash it in a variable.
     let mem_var = b.declare_var(I64);
     b.def_var(mem_var, mem_base);
-    let lower = Lower {
-        results_var,
-        mem_var,
-        mask,
-    };
+    let lower = Lower { mem_var, mask, ids };
 
-    // Load the function arguments from the args buffer, decoding each i64 slot to the
-    // parameter's type.
-    let mut entry_args: Vec<BlockArg> = Vec::with_capacity(f.params.len());
-    for (i, p) in f.params.iter().enumerate() {
-        let slot = b
-            .ins()
-            .load(I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
-        let v = decode_slot(&mut b, slot, *p);
-        entry_args.push(BlockArg::from(v));
-    }
+    // Jump into IR block 0 passing the function parameters (entry params after mem_base).
+    let entry_args: Vec<BlockArg> = b.block_params(entry)[1..]
+        .iter()
+        .map(|v| BlockArg::from(*v))
+        .collect();
     b.ins().jump(blocks[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(&mut b, blk, blocks[i], &blocks, &lower)?;
+        lower_block(module, &mut b, blk, blocks[i], &blocks, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -286,8 +327,51 @@ fn build_clif(clif: &mut Function, f: &Func, mask: u64) -> Result<(), JitError> 
     Ok(())
 }
 
+/// Build the fixed buffer-ABI trampoline `fn(args_ptr, results_ptr, mem_base)` that
+/// decodes the entry function's args from `args_ptr`, calls it (natural ABI), and
+/// stores its results to `results_ptr`. This is what Rust calls, so any arity works.
+fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncId, entry: &Func) {
+    clif.signature.params.push(AbiParam::new(I64)); // args_ptr
+    clif.signature.params.push(AbiParam::new(I64)); // results_ptr
+    clif.signature.params.push(AbiParam::new(I64)); // mem_base
+    clif.name = UserFuncName::user(0, 1);
+
+    let mut fbctx = FunctionBuilderContext::new();
+    let mut b = FunctionBuilder::new(clif, &mut fbctx);
+    let blk = b.create_block();
+    b.append_block_param(blk, I64);
+    b.append_block_param(blk, I64);
+    b.append_block_param(blk, I64);
+    b.switch_to_block(blk);
+    b.seal_block(blk);
+    let args_ptr = b.block_params(blk)[0];
+    let results_ptr = b.block_params(blk)[1];
+    let mem_base = b.block_params(blk)[2];
+
+    // Decode args (mem_base first), call the entry, store results.
+    let mut call_args = vec![mem_base];
+    for (i, p) in entry.params.iter().enumerate() {
+        let slot = b
+            .ins()
+            .load(I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
+        call_args.push(decode_slot(&mut b, slot, *p));
+    }
+    let callee = module.declare_func_in_func(entry_id, b.func);
+    let call = b.ins().call(callee, &call_args);
+    let rets: Vec<Value> = b.inst_results(call).to_vec();
+    for (i, r) in rets.iter().enumerate() {
+        let slot = encode_slot(&mut b, *r);
+        b.ins()
+            .store(MemFlags::trusted(), slot, results_ptr, (i * 8) as i32);
+    }
+    b.ins().return_(&[]);
+    b.seal_all_blocks();
+    b.finalize();
+}
+
 /// Lower one IR block's body + terminator into its CLIF block.
 fn lower_block(
+    module: &mut JITModule,
     b: &mut FunctionBuilder,
     blk: &Block,
     cb: cranelift_codegen::ir::Block,
@@ -299,6 +383,18 @@ fn lower_block(
     let mut vals: Vec<Value> = b.block_params(cb).to_vec();
 
     for inst in &blk.insts {
+        // `call` appends 0..N results — handle it before the single-value match.
+        if let Inst::Call { func, args } = inst {
+            let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
+            let callee = module.declare_func_in_func(callee_id, b.func);
+            let mut cargs = vec![b.use_var(lower.mem_var)];
+            for a in args {
+                cargs.push(get(&vals, *a)?);
+            }
+            let call = b.ins().call(callee, &cargs);
+            vals.extend_from_slice(b.inst_results(call));
+            continue;
+        }
         let v = match inst {
             Inst::ConstI32(c) => b.ins().iconst(I32, *c as i64),
             Inst::ConstI64(c) => b.ins().iconst(I64, *c),
@@ -435,14 +531,22 @@ fn lower_block(
             b.ins().brif(c, tb, &ta, eb, &ea);
         }
         Terminator::Return(outs) => {
-            let results_ptr = b.use_var(lower.results_var);
-            for (i, o) in outs.iter().enumerate() {
-                let v = get(&vals, *o)?;
-                let slot = encode_slot(b, v);
-                b.ins()
-                    .store(MemFlags::trusted(), slot, results_ptr, (i * 8) as i32);
+            // Natural ABI: return the result values directly (CLIF multi-return).
+            let rets: Vec<Value> = outs
+                .iter()
+                .map(|o| get(&vals, *o))
+                .collect::<Result<_, _>>()?;
+            b.ins().return_(&rets);
+        }
+        Terminator::ReturnCall { func, args } => {
+            // Tail call (§3b): replace this frame with the callee, threading mem_base.
+            let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
+            let callee = module.declare_func_in_func(callee_id, b.func);
+            let mut cargs = vec![b.use_var(lower.mem_var)];
+            for a in args {
+                cargs.push(get(&vals, *a)?);
             }
-            b.ins().return_(&[]);
+            b.ins().return_call(callee, &cargs);
         }
         Terminator::Unreachable => {
             b.ins()

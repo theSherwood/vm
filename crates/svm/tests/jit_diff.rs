@@ -427,6 +427,119 @@ block0(v0: i32, v1: f64):
     );
 }
 
+// ---- calls ----
+
+/// Run the differential check against function index `idx` (not just 0).
+fn assert_jit_matches_interp_at(src: &str, idx: u32, inputs: &[Vec<Value>]) {
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let results_ty = m.funcs[idx as usize].results.clone();
+    for args in inputs {
+        let mut fuel = 10_000_000u64;
+        let want = run(&m, idx, args, &mut fuel).expect("interp ok");
+        let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+        let got_slots = match compile_and_run(&m, idx, &slots) {
+            Ok(s) => s,
+            Err(JitError::Unsupported(_)) => return,
+            Err(e) => panic!("JIT failed: {e:?}"),
+        };
+        let got: Vec<Value> = results_ty
+            .iter()
+            .zip(got_slots)
+            .map(|(t, s)| from_slot(*t, s))
+            .collect();
+        for (w, g) in want.iter().zip(&got) {
+            assert!(
+                values_equal(w, g),
+                "interp/JIT disagree: {want:?} vs {got:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn jit_matches_interp_direct_call() {
+    // f1 = square; f0 calls f1 twice and sums — exercises direct call + mem_base
+    // threading (no memory here, but the ABI still passes it).
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = call 1 (v0)
+  v3 = call 1 (v1)
+  v4 = i32.add v2 v3
+  return v4
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.mul v0 v0
+  return v1
+}
+"#;
+    assert_jit_matches_interp_at(src, 0, &[i32s(&[3, 4]), i32s(&[-2, 5]), i32s(&[0, 0])]);
+}
+
+#[test]
+fn jit_matches_interp_call_through_memory() {
+    // The callee writes to the window; the caller reads it back — confirms mem_base
+    // is threaded so both frames address the same window.
+    let src = r#"
+memory 16
+
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = call 1 (v0, v1)
+  v3 = i64.load v0
+  return v3
+}
+
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  i64.store v0 v1
+  v2 = i64.const 0
+  return v2
+}
+"#;
+    assert_jit_matches_interp_at(
+        src,
+        0,
+        &[
+            vec![Value::I64(16), Value::I64(0xCAFE)],
+            vec![Value::I64(128), Value::I64(-7)],
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_return_call_tail_recursion() {
+    // Tail-recursive factorial accumulator f(n, acc) = n==0 ? acc : f(n-1, acc*n) via
+    // `return_call` — must run in O(1) native stack and agree with the interpreter.
+    // Values flow between blocks only through block parameters (block-local SSA).
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.eqz v0
+  br_if v2 block1(v1) block2(v0, v1)
+block1(v3: i32):
+  return v3
+block2(v4: i32, v5: i32):
+  v6 = i32.mul v5 v4
+  v7 = i32.const -1
+  v8 = i32.add v4 v7
+  return_call 0(v8, v6)
+}
+"#;
+    assert_jit_matches_interp_at(
+        src,
+        0,
+        &[
+            vec![Value::I32(1), Value::I32(1)],
+            vec![Value::I32(5), Value::I32(1)],
+            vec![Value::I32(10), Value::I32(1)],
+        ],
+    );
+}
+
 #[test]
 fn jit_matches_interp_float_mem_roundtrip() {
     let src = r#"
