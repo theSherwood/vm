@@ -1,0 +1,29 @@
+[package]
+name = "svm-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# This crate is intentionally OUTSIDE the workspace (see root Cargo.toml `exclude`).
+# It requires a nightly toolchain + cargo-fuzz:
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run decode_verify
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+svm = { path = "../crates/svm" }
+svm-encode = { path = "../crates/svm-encode" }
+svm-verify = { path = "../crates/svm-verify" }
+svm-interp = { path = "../crates/svm-interp" }
+
+[[bin]]
+name = "decode_verify"
+path = "fuzz_targets/decode_verify.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

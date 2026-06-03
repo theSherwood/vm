@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/svm-ir",
+    "crates/svm-text",
+    "crates/svm-encode",
+    "crates/svm-verify",
+    "crates/svm-interp",
+    "crates/svm",
+]
+# `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); kept out of the workspace
+# so stable `cargo build --workspace` / `cargo test` never pull it in.
+exclude = ["fuzz"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.94"
+
+# Keep the escape-TCB crates dependency-free (small, fast to compile, easy to audit).
+# External deps live only in dev/bench/fuzz.
+[workspace.dependencies]
+svm-ir = { path = "crates/svm-ir" }
+svm-text = { path = "crates/svm-text" }
+svm-encode = { path = "crates/svm-encode" }
+svm-verify = { path = "crates/svm-verify" }
+svm-interp = { path = "crates/svm-interp" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

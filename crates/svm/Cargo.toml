@@ -1,0 +1,20 @@
+[package]
+name = "svm"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Intentionally dependency-free (no criterion etc.) to keep build times low and the
+# TCB auditable. The benchmark harness uses only std (src/bin/bench.rs).
+[dependencies]
+svm-ir.workspace = true
+svm-text.workspace = true
+svm-encode.workspace = true
+svm-verify.workspace = true
+svm-interp.workspace = true
+
+[[bin]]
+name = "svm-bench"
+path = "src/bin/bench.rs"
