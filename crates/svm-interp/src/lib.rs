@@ -146,7 +146,8 @@ fn run_func<'a>(
                     // (mask + type_id/generation check) and dispatch to the mock host.
                     let h = as_i32(get(&vals, *handle)?)?;
                     let argv = collect(&vals, args)?;
-                    let results = host.dispatch(*type_id, *op, h, &argv, mem)?;
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let results = host.cap_dispatch(*type_id, *op, h, &argv, gm)?;
                     vals.extend(results);
                 } else if let Some(v) = eval_inst(inst, &vals, mem)? {
                     vals.push(v);
@@ -562,6 +563,47 @@ pub mod iface {
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 
+/// The guest window a capability handler borrows `(ptr, len)` buffers from (§7). Both
+/// the interpreter's lazily-paged [`Mem`] and a JIT's flat window implement this, so a
+/// single host dispatch ([`Host::cap_dispatch`]) serves both backends. The methods
+/// bounds-check `[ptr, ptr+len) ⊆ [0, size)` and return `None` (→ `-EFAULT`) otherwise.
+pub trait GuestMem {
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>>;
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()>;
+}
+
+/// A [`GuestMem`] over a flat, contiguous window slice — the JIT's representation. The
+/// slice may include trailing guard bytes; `size` is the *logical* window so the §7
+/// bounds check matches the interpreter exactly.
+pub struct WindowMem<'a> {
+    window: &'a mut [u8],
+    size: u64,
+}
+
+impl<'a> WindowMem<'a> {
+    pub fn new(window: &'a mut [u8], size: u64) -> WindowMem<'a> {
+        WindowMem { window, size }
+    }
+}
+
+impl GuestMem for WindowMem<'_> {
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        let end = ptr.checked_add(len)?;
+        if end > self.size {
+            return None;
+        }
+        Some(self.window[ptr as usize..end as usize].to_vec())
+    }
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        let end = ptr.checked_add(data.len() as u64)?;
+        if end > self.size {
+            return None;
+        }
+        self.window[ptr as usize..end as usize].copy_from_slice(data);
+        Some(())
+    }
+}
+
 /// Which standard stream a `Stream` handle is bound to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StreamRole {
@@ -688,13 +730,17 @@ impl Host {
     /// Dispatch a `cap.call` (§3c): resolve the handle, then run the mock operation.
     /// Returns the op's result values (negative-errno encoded in an `i64` for the
     /// fallible ops, §3e D42), or a `Trap` for escape/exit. `mem` backs buffer args.
-    fn dispatch(
+    /// Dispatch a `cap.call` (§3c): resolve the handle in the host-owned table, then run
+    /// the bound capability op. Public so a JIT can drive the same handlers via a
+    /// [`WindowMem`] over its window; the interpreter passes its [`Mem`]. `mem` is
+    /// `None` when the module declares no memory (buffer ops then return `-EFAULT`).
+    pub fn cap_dispatch(
         &mut self,
         type_id: u32,
         op: u32,
         handle: i32,
         args: &[Value],
-        mem: &mut Option<Mem>,
+        mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<Value>, Trap> {
         match self.resolve(handle, type_id)? {
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
@@ -725,7 +771,7 @@ impl Host {
         role: StreamRole,
         op: u32,
         args: &[Value],
-        mem: &mut Option<Mem>,
+        mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<Value>, Trap> {
         let ret = |v: i64| Ok(vec![Value::I64(v)]);
         match op {
@@ -739,7 +785,7 @@ impl Host {
                 let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
                 let n = (len as usize).min(avail.len());
                 let chunk = avail[..n].to_vec();
-                let Some(m) = mem.as_mut() else {
+                let Some(m) = mem else {
                     return ret(EFAULT);
                 };
                 if m.write_bytes(ptr, &chunk).is_none() {
@@ -757,7 +803,7 @@ impl Host {
                 };
                 let ptr = as_i64(*args.first().ok_or(Trap::Malformed)?)? as u64;
                 let len = as_i64(*args.get(1).ok_or(Trap::Malformed)?)? as u64;
-                let Some(m) = mem.as_ref() else {
+                let Some(m) = mem else {
                     return ret(EFAULT);
                 };
                 match m.read_bytes(ptr, len) {
@@ -826,7 +872,7 @@ impl Mem {
     /// must lie fully within the window. Returns the bytes, or `None` (→ `-EFAULT`).
     /// Confinement holds regardless; this explicit check is the recoverable guest-bug
     /// path, not a safety boundary.
-    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+    fn read_bytes_impl(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         let end = ptr.checked_add(len)?;
         if end > self.window.size() {
             return None;
@@ -835,7 +881,7 @@ impl Mem {
     }
 
     /// Borrow-validate and write a `(ptr, len)` capability buffer (§7). `None` → `-EFAULT`.
-    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+    fn write_bytes_impl(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
         let end = ptr.checked_add(data.len() as u64)?;
         if end > self.window.size() {
             return None;
@@ -871,6 +917,15 @@ impl Mem {
         self.pages
             .entry(off / PAGE)
             .or_insert_with(|| vec![0u8; PAGE as usize])[idx] = b;
+    }
+}
+
+impl GuestMem for Mem {
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        self.read_bytes_impl(ptr, len)
+    }
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        self.write_bytes_impl(ptr, data)
     }
 }
 
