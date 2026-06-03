@@ -1064,3 +1064,100 @@ block0(v0: i32):
         Err(VerifyError::ResultCountMismatch { .. })
     ));
 }
+
+// ---- trapping float->int conversions + ptr ops ----
+
+const TRUNC_TRAP: &str = r#"
+func (f64) -> (i32) {
+block0(v0: f64):
+  v1 = i32.trunc_f64_s v0
+  return v1
+}
+"#;
+
+#[test]
+fn trapping_trunc_roundtrips_and_traps() {
+    let m = parse_module(TRUNC_TRAP).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
+    assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
+
+    // In range -> truncates toward zero.
+    assert_eq!(
+        run1at(TRUNC_TRAP, 0, &[Value::F64(3.9)]),
+        Ok(vec![Value::I32(3)])
+    );
+    assert_eq!(
+        run1at(TRUNC_TRAP, 0, &[Value::F64(-3.9)]),
+        Ok(vec![Value::I32(-3)])
+    );
+    // i32::MIN is exactly representable and in range.
+    assert_eq!(
+        run1at(TRUNC_TRAP, 0, &[Value::F64(-2147483648.0)]),
+        Ok(vec![Value::I32(i32::MIN)])
+    );
+    // NaN traps.
+    assert_eq!(
+        run1at(TRUNC_TRAP, 0, &[Value::F64(f64::NAN)]),
+        Err(Trap::BadConversion)
+    );
+    // Out of range (2^31) traps; saturating would have clamped instead.
+    assert_eq!(
+        run1at(TRUNC_TRAP, 0, &[Value::F64(2147483648.0)]),
+        Err(Trap::BadConversion)
+    );
+    assert_eq!(
+        run1at(TRUNC_TRAP, 0, &[Value::F64(f64::INFINITY)]),
+        Err(Trap::BadConversion)
+    );
+}
+
+#[test]
+fn trapping_vs_saturating_trunc_differ_out_of_range() {
+    // Same input, two ops: trunc_sat clamps, trunc traps.
+    let sat = r#"
+func (f32) -> (i32) {
+block0(v0: f32):
+  v1 = i32.trunc_sat_f32_s v0
+  return v1
+}
+"#;
+    let trap = r#"
+func (f32) -> (i32) {
+block0(v0: f32):
+  v1 = i32.trunc_f32_s v0
+  return v1
+}
+"#;
+    assert_eq!(
+        run1at(sat, 0, &[Value::F32(1e30)]),
+        Ok(vec![Value::I32(i32::MAX)])
+    );
+    assert_eq!(
+        run1at(trap, 0, &[Value::F32(1e30)]),
+        Err(Trap::BadConversion)
+    );
+}
+
+#[test]
+fn ptr_ops_roundtrip_and_compute() {
+    // base + offset via ptr.add, bracketed by from_int/to_int provenance casts.
+    let src = r#"
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = ptr.from_int v0
+  v3 = ptr.add v2 v1
+  v4 = ptr.to_int v3
+  return v4
+}
+"#;
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
+    assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
+    // off-CHERI these are i64 identity / wrapping add: 1000 + 24 = 1024.
+    assert_eq!(
+        run1at(src, 0, &[Value::I64(1000), Value::I64(24)]),
+        Ok(vec![Value::I64(1024)])
+    );
+}

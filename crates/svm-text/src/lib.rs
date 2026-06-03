@@ -113,7 +113,12 @@ fn print_inst(inst: &Inst) -> String {
         Inst::FUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
         Inst::FCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::FToISat { op, a } => format!("{} v{a}", op.name()),
+        Inst::FToITrap { op, a } => format!("{} v{a}", op.trap_name()),
         Inst::IToFConv { op, a } => format!("{} v{a}", op.name()),
+        Inst::PtrAdd { a, b } => format!("ptr.add v{a} v{b}"),
+        Inst::PtrCast { to_int, a } => {
+            format!("ptr.{} v{a}", if *to_int { "to_int" } else { "from_int" })
+        }
         Inst::Cast { op, a } => format!("{} v{a}", op.sig().0),
         Inst::Load {
             op,
@@ -751,6 +756,23 @@ impl<'a> Parser<'a> {
         if let Some(o) = FToI::from_name(&op) {
             return Ok(Inst::FToISat {
                 op: o,
+                a: self.value(names)?,
+            });
+        }
+        if let Some(o) = FToI::from_trap_name(&op) {
+            return Ok(Inst::FToITrap {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
+        if op == "ptr.add" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::PtrAdd { a, b });
+        }
+        if op == "ptr.from_int" || op == "ptr.to_int" {
+            return Ok(Inst::PtrCast {
+                to_int: op == "ptr.to_int",
                 a: self.value(names)?,
             });
         }

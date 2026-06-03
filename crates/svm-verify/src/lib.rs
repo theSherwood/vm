@@ -261,10 +261,19 @@ fn check_inst(
             cx.expect(*b, t)?;
             ValType::I32
         }
-        Inst::FToISat { op, a } => {
+        Inst::FToISat { op, a } | Inst::FToITrap { op, a } => {
             let (from, to, _) = op.parts();
             cx.expect(*a, from.val())?;
             to.val()
+        }
+        Inst::PtrAdd { a, b } => {
+            cx.expect(*a, ValType::I64)?;
+            cx.expect(*b, ValType::I64)?;
+            ValType::I64
+        }
+        Inst::PtrCast { a, .. } => {
+            cx.expect(*a, ValType::I64)?;
+            ValType::I64
         }
         Inst::IToFConv { op, a } => {
             let (from, to, _) = op.parts();

@@ -482,6 +482,23 @@ impl FToI {
     pub fn from_name(s: &str) -> Option<FToI> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
+    /// The **trapping** spelling (`trunc`, no `_sat`) of the same conversion — NaN
+    /// and out-of-range inputs trap instead of saturating.
+    pub fn trap_name(self) -> &'static str {
+        match self {
+            FToI::F32I32S => "i32.trunc_f32_s",
+            FToI::F32I32U => "i32.trunc_f32_u",
+            FToI::F32I64S => "i64.trunc_f32_s",
+            FToI::F32I64U => "i64.trunc_f32_u",
+            FToI::F64I32S => "i32.trunc_f64_s",
+            FToI::F64I32U => "i32.trunc_f64_u",
+            FToI::F64I64S => "i64.trunc_f64_s",
+            FToI::F64I64U => "i64.trunc_f64_u",
+        }
+    }
+    pub fn from_trap_name(s: &str) -> Option<FToI> {
+        Self::ALL.iter().copied().find(|o| o.trap_name() == s)
+    }
 }
 
 /// Int→float conversions (`convert`).
@@ -776,6 +793,12 @@ pub enum Inst {
         op: FToI,
         a: ValIdx,
     },
+    /// Trapping float→int conversion: NaN or out-of-range input traps (vs the
+    /// saturating [`Inst::FToISat`] default).
+    FToITrap {
+        op: FToI,
+        a: ValIdx,
+    },
     /// Int→float conversion.
     IToFConv {
         op: IToF,
@@ -824,6 +847,19 @@ pub enum Inst {
         ty: FuncType,
         idx: ValIdx,
         args: Vec<ValIdx>,
+    },
+    /// Pointer arithmetic: `ptr + integer_offset`. Off-CHERI a plain `i64` wrapping
+    /// add; the distinct opcode lets the JIT/CHERI backend see pointer provenance
+    /// (§3b/§10). Operands and result are `i64`.
+    PtrAdd {
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// `ptr.from_int` (`to_int = false`) / `ptr.to_int` (`to_int = true`): a free,
+    /// no-op `i64`↔`i64` provenance cast off-CHERI (§3a/§10).
+    PtrCast {
+        to_int: bool,
+        a: ValIdx,
     },
 }
 

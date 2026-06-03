@@ -43,6 +43,8 @@ pub enum Trap {
     IndirectCallType,
     /// Reached an `unreachable`/`trap` terminator (§3b).
     Unreachable,
+    /// A trapping float→int conversion saw NaN or an out-of-range value (§3b).
+    BadConversion,
     /// Structurally invalid in a way a verified module never is (defensive only).
     Malformed,
 }
@@ -250,7 +252,13 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             Value::I32(r as i32)
         }
         Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?)?,
+        Inst::FToITrap { op, a } => trunc_trap(*op, get(vals, *a)?)?,
         Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?)?,
+        Inst::PtrAdd { a, b } => {
+            Value::I64(as_i64(get(vals, *a)?)?.wrapping_add(as_i64(get(vals, *b)?)?))
+        }
+        // `ptr.from_int`/`ptr.to_int` are a no-op off-CHERI: pass the i64 through.
+        Inst::PtrCast { a, .. } => Value::I64(as_i64(get(vals, *a)?)?),
         Inst::Cast { op, a } => cast(*op, get(vals, *a)?)?,
         // A funcref is just the function index as plain i32 data (§3c).
         Inst::RefFunc { func } => Value::I32(*func as i32),
@@ -422,6 +430,42 @@ fn fto_i(op: FToI, v: Value) -> Result<Value, Trap> {
         FToI::F64I32U => Value::I32(as_f64(v)? as u32 as i32),
         FToI::F64I64S => Value::I64(as_f64(v)? as i64),
         FToI::F64I64U => Value::I64(as_f64(v)? as u64 as i64),
+    })
+}
+
+/// Trapping float→int conversion (`trunc`, vs the saturating `trunc_sat`): NaN and
+/// out-of-range inputs trap. Work in `f64` (promoting `f32` is exact), and trap
+/// unless the truncation toward zero fits the target — `f > MIN-1 && f < MAX+1`
+/// (using the exact float boundary constants; the `i64` signed lower bound is
+/// closed because `-2^63 - 1` is not representable and rounds to `-2^63`).
+fn trunc_trap(op: FToI, v: Value) -> Result<Value, Trap> {
+    let (from, to, signed) = op.parts();
+    let f: f64 = match from {
+        FloatTy::F32 => as_f32(v)? as f64,
+        FloatTy::F64 => as_f64(v)?,
+    };
+    if f.is_nan() {
+        return Err(Trap::BadConversion);
+    }
+    // Bounds are written as explicit comparisons so the open-vs-closed distinction is
+    // visible: the i64-signed *lower* bound is closed (`>=`) because `-2^63 - 1` is
+    // not representable and rounds to `-2^63`; the rest are open.
+    #[allow(clippy::manual_range_contains)]
+    let in_range = match (to, signed) {
+        (IntTy::I32, true) => f > -2_147_483_649.0 && f < 2_147_483_648.0,
+        (IntTy::I32, false) => f > -1.0 && f < 4_294_967_296.0,
+        (IntTy::I64, true) => f >= -9_223_372_036_854_775_808.0 && f < 9_223_372_036_854_775_808.0,
+        (IntTy::I64, false) => f > -1.0 && f < 18_446_744_073_709_551_616.0,
+    };
+    if !in_range {
+        return Err(Trap::BadConversion);
+    }
+    // In range, so the cast is exact (truncating toward zero, no saturation).
+    Ok(match (to, signed) {
+        (IntTy::I32, true) => Value::I32(f as i32),
+        (IntTy::I32, false) => Value::I32(f as u32 as i32),
+        (IntTy::I64, true) => Value::I64(f as i64),
+        (IntTy::I64, false) => Value::I64(f as u64 as i64),
     })
 }
 

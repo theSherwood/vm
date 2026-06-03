@@ -60,6 +60,9 @@ mod op {
     pub const CALL: u8 = 0x73; // direct call: uleb funcidx, then arg idx-list
     pub const CALL_INDIRECT: u8 = 0x74; // sig (params,results), idx, arg idx-list
     pub const REF_FUNC: u8 = 0x75; // uleb funcidx -> i32 funcref
+    pub const PTR_FROM_INT: u8 = 0x76; // i64 -> i64 (no-op provenance cast)
+    pub const PTR_TO_INT: u8 = 0x77;
+    pub const PTR_ADD: u8 = 0x78; // (i64, i64) -> i64
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -83,8 +86,10 @@ mod op {
     pub const F64_CMP_END: u8 = 0xBD;
     pub const CAST: u8 = 0xC0; // + CastOp index (0..=5)
     pub const CAST_END: u8 = 0xC5;
-    pub const FTOI: u8 = 0xD0; // + FToI index (0..=7)
+    pub const FTOI: u8 = 0xD0; // saturating trunc_sat: + FToI index (0..=7)
     pub const FTOI_END: u8 = 0xD7;
+    pub const FTOI_TRAP: u8 = 0xD8; // trapping trunc: + FToI index (0..=7)
+    pub const FTOI_TRAP_END: u8 = 0xDF;
     pub const ITOF: u8 = 0xE0; // + IToF index (0..=7)
     pub const ITOF_END: u8 = 0xE7;
 
@@ -270,6 +275,23 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::RefFunc { func } => {
             out.push(op::REF_FUNC);
             write_uleb(out, *func as u64);
+        }
+        Inst::FToITrap { op: o, a } => {
+            out.push(op::FTOI_TRAP + o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::PtrAdd { a, b } => {
+            out.push(op::PTR_ADD);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::PtrCast { to_int, a } => {
+            out.push(if *to_int {
+                op::PTR_TO_INT
+            } else {
+                op::PTR_FROM_INT
+            });
+            write_uleb(out, *a as u64);
         }
         Inst::CallIndirect { ty, idx, args } => {
             out.push(op::CALL_INDIRECT);
@@ -534,6 +556,22 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             args: decode_idxs(c)?,
         },
         op::REF_FUNC => Inst::RefFunc { func: c.idx()? },
+        op::PTR_FROM_INT => Inst::PtrCast {
+            to_int: false,
+            a: c.idx()?,
+        },
+        op::PTR_TO_INT => Inst::PtrCast {
+            to_int: true,
+            a: c.idx()?,
+        },
+        op::PTR_ADD => Inst::PtrAdd {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::FTOI_TRAP..=op::FTOI_TRAP_END => Inst::FToITrap {
+            op: FToI::from_index(b - op::FTOI_TRAP).ok_or(DecodeError::BadOpcode(b))?,
+            a: c.idx()?,
+        },
         op::CALL_INDIRECT => Inst::CallIndirect {
             ty: FuncType {
                 params: decode_types(c)?,
