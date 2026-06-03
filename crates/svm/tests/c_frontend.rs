@@ -73,13 +73,12 @@ fn run_c(src: &str) -> Vec<Value> {
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
 
-    // `main` takes the initial data-stack pointer (§3d) as its first IR parameter; the
-    // runtime hands it the bottom of the data stack.
-    const SP0: i64 = 16;
+    // Function 0 is the synthetic `_start`: it initializes globals and calls `main` with
+    // the initial data-SP (§3d), so we run it with no arguments.
     let mut fuel = 10_000_000u64;
-    let want = run(&m, 0, &[Value::I64(SP0)], &mut fuel).expect("interp run");
+    let want = run(&m, 0, &[], &mut fuel).expect("interp run");
 
-    match compile_and_run(&m, 0, &[SP0]).expect("jit compile") {
+    match compile_and_run(&m, 0, &[]).expect("jit compile") {
         JitOutcome::Returned(slots) => {
             let got: Vec<Value> = m.funcs[0]
                 .results
@@ -375,5 +374,54 @@ fn c_structs_end_to_end() {
                           int s=0; for (int i=0;i<3;i=i+1) s += a[i].x + a[i].y; return s; }"
         ),
         8
+    );
+}
+
+#[test]
+fn c_globals_end_to_end() {
+    // initialized scalar global
+    assert_eq!(i32_of("int g = 42; int main() { return g; }"), 42);
+    // mutable global persists across writes
+    assert_eq!(
+        i32_of(
+            "int counter; int bump() { counter = counter + 1; return counter; } \
+                int main() { bump(); bump(); return bump(); }"
+        ),
+        3
+    );
+    // global array initializer
+    assert_eq!(
+        i32_of("int arr[3] = {10, 20, 30}; int main() { return arr[0] + arr[1] + arr[2]; }"),
+        60
+    );
+    // global + array + string literal together
+    assert_eq!(
+        i32_of(
+            "int g = 42; int arr[3] = {10,20,30}; \
+                int main() { char *s = \"AB\"; return g + arr[0]+arr[1]+arr[2] + s[0] + s[1]; }"
+        ),
+        233
+    );
+    // a global struct
+    assert_eq!(
+        i32_of(
+            "struct P { int x; int y; }; struct P p = {3, 4}; \
+                int main() { return p.x * p.x + p.y * p.y; }"
+        ),
+        25
+    );
+}
+
+#[test]
+fn c_string_literals_end_to_end() {
+    // string literal indexing + a simple strlen loop over a data-stack copy
+    assert_eq!(
+        i32_of("int main() { char *s = \"hello\"; int n = 0; while (s[n]) n = n + 1; return n; }"),
+        5
+    );
+    // sum of byte values of a string literal
+    assert_eq!(
+        i32_of("int main() { char *s = \"ABC\"; return s[0] + s[1] + s[2]; }"),
+        65 + 66 + 67
     );
 }

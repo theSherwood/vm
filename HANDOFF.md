@@ -155,8 +155,13 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
    `gen_addr`/`gen_expr`. **Still TODO here:** by-value aggregate args/returns → hidden
    pointer (`sret`, §3d D39) and whole-struct assignment (`s1 = s2` memcpy) — currently
    only *pointers* to aggregates pass/return. chibicc computes all layout/offsets.
-3. **Globals + string literals** — a data segment at fixed window offsets (§3d "Globals
-   → data segments"); `&global` = a ptr constant. Needed for `printf("...")`.
+3. ~~**Globals + string literals**~~ — **DONE** (scalar/array/struct globals, mutable
+   globals, string literals). Laid out at fixed window offsets in a data region [16,
+   `data_end`); a synthetic **`_start`** (function 0) writes initializer bytes then calls
+   `main` with the initial data-SP (`data_end`). The harness runs function 0 with **no
+   args**. **Note:** uses per-byte init stores, not a real IR data segment — the §3a
+   read-only data section (and globals holding pointers/relocations) is still TODO and
+   would be a cross-cutting `svm-ir`/text/encode/verify/interp/jit change.
 4. **stdio via the powerbox** — `printf` → `Stream.write`, `exit` → `Exit` through
    `cap.call` (§3c/§3e). This is the visible **hello-world** milestone. Will need the
    harness to provide capabilities and a tiny mini-libc shim (guest C or hand-written

@@ -19,9 +19,13 @@
 // to its i64 address in value context), and `s.field` / `p->field` add the member offset
 // (`ND_MEMBER`); initializers lower to per-element/-member scalar stores. By-value
 // aggregate *arguments/returns* (sret, §3d D39) and whole-struct assignment are not done
-// yet — pointers to aggregates are fine. `break`/`continue`/`switch`, indirect calls,
-// globals, and floats come next; anything unsupported is a hard error (so we never emit
-// IR we cannot stand behind).
+// yet — pointers to aggregates are fine. **Globals + string literals** live at fixed
+// window offsets in a data region below the data stack; a synthetic **`_start`**
+// (function 0) writes their initializer bytes into the window then calls `main` with the
+// initial data-SP. (A real read-only data segment per §3a later replaces the byte stores;
+// globals holding pointers/relocations are not handled yet.) `break`/`continue`/`switch`,
+// indirect calls, and floats come next; anything unsupported is a hard error (so we never
+// emit IR we cannot stand behind).
 
 #include "chibicc.h"
 
@@ -39,15 +43,22 @@ static int cur_frame; // the current function's data-stack frame size (bytes)
 // data-SP; we make it an explicit value, relying on the masking lowering for §4 safety.)
 #define SP "v0"
 
-// The module's function definitions, in emission/index order (main first, so it is
-// function 0 — what the test harness runs). `call` targets a function by this index.
+// The module's function definitions (main first). `call` targets a function by index.
+// A synthetic `_start` is emitted as function 0 when `main` exists, so real functions
+// start at `start_off` (1); `_start` sets up the data-SP and calls `main`.
 static Obj *funcs[1024];
 static int nfuncs;
+static int start_off; // 1 if a `_start` occupies function index 0, else 0
+
+// Globals + string literals live at fixed window offsets in the data region [16,
+// data_end); the data stack starts at data_end (main's initial data-SP, baked into
+// `_start`). The low 16 bytes stay reserved so no address is 0 (C NULL).
+static int data_end = 16;
 
 static int func_index(Obj *fn) {
   for (int i = 0; i < nfuncs; i++)
     if (funcs[i] == fn)
-      return i;
+      return start_off + i;
   error_tok(fn->tok, "codegen_ir: call to a function with no definition (no linker yet)");
 }
 
@@ -150,13 +161,16 @@ static void gen_store(Type *ty, int addr, int val) {
 static int gen_addr(Node *node) {
   switch (node->kind) {
   case ND_VAR: {
-    if (!node->var->is_local)
-      error_tok(node->tok, "codegen_ir: global variables not supported yet");
-    // The local lives at sp + frame-offset (§3d data stack).
-    int off = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", off, node->var->offset);
     int r = nv++;
-    fprintf(o, "  v%d = i64.add " SP " v%d\n", r, off);
+    if (node->var->is_local) {
+      // The local lives at sp + frame-offset (§3d data stack).
+      int off = nv++;
+      fprintf(o, "  v%d = i64.const %d\n", off, node->var->offset);
+      fprintf(o, "  v%d = i64.add " SP " v%d\n", r, off);
+    } else {
+      // A global lives at a fixed window offset in the data region below the stack.
+      fprintf(o, "  v%d = i64.const %d\n", r, node->var->offset);
+    }
     return r;
   }
   case ND_DEREF:
@@ -610,31 +624,92 @@ static void gen_func(Obj *fn) {
   fprintf(o, "}\n\n");
 }
 
+// Lay globals + string literals out at fixed window offsets in the data region from 16;
+// set `data_end` (the data-stack base). Returns true if any global exists.
+static bool layout_globals(Obj *prog) {
+  int off = 16;
+  bool any = false;
+  for (Obj *g = prog; g; g = g->next) {
+    if (g->is_function)
+      continue;
+    off = align_to(off, g->align);
+    g->offset = off;
+    off += g->ty->size;
+    any = true;
+  }
+  data_end = align_to(off, 16);
+  return any;
+}
+
+// Emit stores that write a global's initializer bytes into its window slot. Per-byte for
+// simplicity (these run once, in `_start`); a future real data segment (§3a) replaces it.
+static void emit_init_data(int base, char *data, int sz) {
+  for (int i = 0; i < sz; i++) {
+    int a = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", a, base + i);
+    int z = nv++;
+    fprintf(o, "  v%d = i32.const %d\n", z, (unsigned char)data[i]);
+    fprintf(o, "  i32.store8 v%d v%d\n", a, z);
+  }
+}
+
+// Synthetic entry (function 0): initialize global data, then call `main` with the initial
+// data-SP (= data_end). The harness runs this with no arguments.
+static void emit_start(Obj *prog, Obj *main_fn) {
+  Type *mret = main_fn->ty->return_ty;
+  bool is_void = mret->kind == TY_VOID;
+  fprintf(o, "func () -> (%s) {\n", is_void ? "" : irty(mret));
+  fprintf(o, "block0():\n");
+  nv = 0;
+  for (Obj *g = prog; g; g = g->next) {
+    if (g->is_function || !g->init_data)
+      continue;
+    if (g->rel)
+      error_tok(g->tok, "codegen_ir: global initialized with a pointer (relocation) "
+                        "not supported yet");
+    emit_init_data(g->offset, g->init_data, g->ty->size);
+  }
+  int sp = nv++;
+  fprintf(o, "  v%d = i64.const %d\n", sp, data_end);
+  if (is_void) {
+    fprintf(o, "  call %d (v%d)\n  return\n", func_index(main_fn), sp);
+  } else {
+    int r = nv++;
+    fprintf(o, "  v%d = call %d (v%d)\n  return v%d\n", r, func_index(main_fn), sp, r);
+  }
+  fprintf(o, "}\n\n");
+}
+
 void codegen_ir(Obj *prog, FILE *out) {
   o = out;
 
-  // Order the function definitions with `main` first, so it is function index 0 (what
-  // the harness runs) and `call` can target any function by index. Also assign each
-  // function's data-stack offsets and note whether the module needs a window.
+  // Order the function definitions with `main` first. A `_start` wrapper (function 0)
+  // then sets up the data-SP and calls `main`, so real functions begin at index 1.
   nfuncs = 0;
-  bool need_mem = false;
   for (Obj *fn = prog; fn; fn = fn->next)
     if (fn->is_function && fn->is_definition && fn->name && !strcmp(fn->name, "main"))
       funcs[nfuncs++] = fn;
   for (Obj *fn = prog; fn; fn = fn->next)
     if (fn->is_function && fn->is_definition && !(fn->name && !strcmp(fn->name, "main")))
       funcs[nfuncs++] = fn;
+
+  bool has_main = nfuncs > 0 && funcs[0]->name && !strcmp(funcs[0]->name, "main");
+  start_off = has_main ? 1 : 0;
+
+  bool need_mem = layout_globals(prog);
   for (int i = 0; i < nfuncs; i++) {
     assign_offsets(funcs[i]);
     if (funcs[i]->locals)
       need_mem = true;
   }
 
-  // A 2^16-byte window is ample for the data stack of the small programs we lower today
-  // (the size becomes program-driven once a real data-SP / heap land).
+  // A 2^16-byte window is ample for the globals + data stack of the programs we lower
+  // today (the size becomes program-driven once a real data segment / heap land).
   if (need_mem)
     fprintf(o, "memory 16\n\n");
 
+  if (has_main)
+    emit_start(prog, funcs[0]);
   for (int i = 0; i < nfuncs; i++)
     gen_func(funcs[i]);
 }
