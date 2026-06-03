@@ -443,6 +443,98 @@ against the window before the host borrows it in place (§9's "arg bounds-check"
 
 ---
 
+## 3d. C ABI & frontend lowering (Phase 2)  [SETTLED]
+
+How the chibicc-style frontend lowers C to the IR. Resolves the §18 "C ABI"
+checklist item. Two settled decisions — the **out-of-band control stack** (§5) and
+**windowed/masked memory** (§4) — *force* most of the ABI's shape; the rest is
+chosen for simplicity (AGENTS.md) and wasm-parity (§1a), since the MVP is a
+whole-program single module that links to no external platform ABI.
+
+### The forced two-stack split
+A pointer to an address-taken local must be a **window offset** (so access through
+it is masked + confined, §4). The control stack is **out-of-band** (§5), *not* in
+the window — so an address-taken local cannot live there, or its `&` would mask to
+the wrong window location. Hence the SafeStack split:
+
+| Stack | Where | Holds | Guest-addressable |
+|---|---|---|---|
+| **Control stack** | out-of-band (Cranelift-managed machine stack) | return addrs, callee-saved regs, SSA spills | **No** |
+| **Data stack** | in the window, per-thread, guard-paged (§5) | address-taken locals, by-value aggregate copies, `alloca`, varargs buffers, `sret` slots | Yes (confined) |
+
+The frontend manages the data stack via a per-thread **data-SP** held in the
+per-thread `vmctx` (the context the JIT already needs for window base/mask,
+handle-table base, function-table base, fuel; register-pinning the data-SP is a
+lowering detail). Overflow hits the guard page → fault → §5 detect-and-kill; frames
+larger than a guard page emit a stack-probe (stack-clash mitigation).
+
+### Local classification (address-taken vs SSA)
+One frontend pass, justified by the split above:
+- **SSA-value local** — a scalar never address-taken and non-`volatile` → an SSA
+  value (register / out-of-band spill). Heap overruns cannot corrupt it.
+- **Data-stack local** — address-taken, any array/struct/union accessed by pointer,
+  `volatile`, or address-escaping → a window data-stack slot with explicit
+  `ptr.add`/load/store. Cranelift never sees it as a value.
+
+(chibicc allocates all locals to memory first; we run the reverse — promote
+non-address-taken scalars to SSA. This is the pass that matters for speed.)
+
+### Data model & type mapping
+- **LP64, little-endian** (§3b): `int`=i32; `long`=`long long`=pointer=`size_t`=8 B;
+  `ptrdiff_t`=i64.
+- `char` = **signed** i8 (pinned; matches x86-64 / chibicc). `_Bool`=i8 (0/1).
+  `short`=i16. `i8`/`i16` are access widths only (§3a); arguments take the usual C
+  integer promotions to i32.
+- `float`=f32, `double`=f64, **`long double`=f64** (no 80-bit; pinned).
+- `enum`=i32 unless declared wider. **Function pointers = funcref indices** (§3c),
+  stored as integers in memory.
+
+### Struct/union layout
+Adopt the **standard C / x86-64-SysV layout rules** — natural alignment, tail
+padding to the struct's alignment, little-endian bitfield packing. chibicc already
+implements them and the whole-program MVP needs no external-ABI compatibility, so
+"standard and well-understood" beats novel. `sizeof(void*)`=8.
+
+### Calling convention (guest↔guest)
+IR signatures are typed; Cranelift assigns machine registers. The C-level mapping:
+- **Scalars** (int/float/pointer) → direct typed IR params (with C promotions).
+- **By-value aggregates → by hidden pointer everywhere (D39).** All by-value
+  struct/union args and returns pass via a caller-allocated copy in the data stack;
+  returns use an `sret` hidden first pointer the callee writes through. Only scalars
+  pass directly. This is the simplest correct rule and ~wasm parity (clang's wasm
+  ABI is essentially this); register-classification (unwrapping small structs) is a
+  deferred optimization, not MVP.
+- **Varargs** → clang-wasm-style: the caller marshals variadic args
+  (default-promoted) into a contiguous **data-stack buffer** and passes a pointer as
+  the trailing hidden arg; `va_list` = that pointer, `va_arg` = load + bump. No
+  register-save area.
+
+### Globals / statics → data segments
+- Initialized globals + string literals → module **data section** (§3a), copied to
+  fixed window offsets at instantiation. `&global` = a ptr constant.
+- BSS → a zeroed window region (size + offset only; the window is zero-filled).
+- **Const globals + string literals → a read-only data segment (D40):** mapped RO
+  via the memory capability (`protect`, §4) at instantiation; a write faults →
+  §5 detect-and-kill. One extra `protect` call buys cheap self-corruption detection.
+- **`_Thread_local` deferred** to when threads land (MVP is single-thread); treated
+  as an ordinary global until then.
+
+### `malloc`/`free` = guest code over `map`
+Not a VM primitive. The frontend's mini-libc implements `malloc`/`free`/`calloc`/
+`realloc` as **guest C** managing a window heap region, grown via the **`map`
+capability** (§4), guard-page-bracketed (§5). MVP allocator = simple free-list/bump;
+under the Phase-3 "fixed-size window, eager mapping" simplification it bumps within
+a pre-mapped heap.
+
+### Phase-2 C subset (the "compilability proof" target)
+- **In:** `alloca`/VLAs (data-SP bump); computed `goto` (native — irreducible CFG,
+  §3); the full scalar/aggregate/vararg conventions above.
+- **Deferred:** `setjmp`/`longjmp` and C++ EH → lower onto the §12 stack-switch
+  primitive (stubbed in Phase 1); `_Thread_local` (with threads).
+- **Out:** inline asm; 80-bit `long double`.
+
+---
+
 ## 4. Memory model  [SETTLED] (some details PARKED)
 
 - Each domain gets a large **reserved virtual-address window** (e.g. 2^40,
@@ -1203,10 +1295,10 @@ as open-ended, not a byproduct of the build.
 **Pre-MVP specification checklist** (design → spec transition):
 - ✅ Instruction set, trap/UB semantics, FP/endianness, verifier rules, entry &
   instantiation contract — **§3b**.
-- ⬜ **C ABI (Phase 2 blocker):** stack-frame / data-stack model; address-taken vs
-  SSA-value local split; struct layout + alignment; by-value aggregates; varargs;
-  calling convention; globals/statics → data segments. Plus toolchain/linking
-  (MVP = whole-program single module) and `malloc`/`free` over the `map` capability.
+- ✅ **C ABI (Phase 2 blocker):** two-stack split, address-taken/SSA local split,
+  LP64 type mapping, struct layout, by-pointer aggregates, varargs, data segments,
+  const RO data, `malloc`/`free` over `map`, Phase-2 C subset — **§3d**. Remaining:
+  toolchain/linking (MVP = whole-program single module) is trivial under §3d.
 - ⬜ **Concrete window params (Phase 3):** §4 is parked — MVP simplification =
   fixed-size window, eager mapping, no demand paging; pin page size, masking
   constant, guard-page placement, minimal map/unmap/protect.
@@ -1256,3 +1348,5 @@ as open-ended, not a byproduct of the build.
 | D36 | Goal = relative to wasm: as secure as wasm (host), faster on interface/64-bit/startup with **compute pegged at Wasmtime parity** (shared Cranelift), simpler+more flexible interface | Settled | Absolute "escape impossible" not certifiable by this team; relative bar is reachable and measurable (§1a) |
 | D37 | Capabilities are **inert typed table indices**, not a sealed value class; a forged index traps or re-selects an own grant (authority binds to the table entry) | Settled | Removes §3a/§7 contradiction; lets handle/funcref live in registers/memory and lets C function pointers lower to function-table indices |
 | D38 | Confinement = **guard-when-bounded, mask-when-not**, masking the **final effective address**, implemented as one isolated separately-fuzzable lowering pass | Settled | Matches wasm32 hot path (zero instructions), beats wasm64; final-address masking closes the large-immediate escape; isolation makes it fuzzable as the security hinge |
+| D39 | C ABI: forced **two-stack split** (out-of-band control stack + in-window guard-paged data stack); address-taken→data stack, scalar non-address-taken→SSA; LP64/little-endian; **by-value aggregates by hidden pointer** (sret); clang-wasm-style vararg buffer | Settled | Window+masking (§4) and out-of-band control stack (§5) force the split; by-pointer is simplest-correct and ~wasm parity; whole-program MVP needs no external-ABI match (§3d) |
+| D40 | Const globals + string literals in a **read-only data segment** (`protect` at instantiation) | Settled | One extra protect call → writes to const data fault → §5 detect-and-kill; cheap self-corruption detection |
