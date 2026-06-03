@@ -136,6 +136,40 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.extend_from_slice(&callee.results);
                 continue;
             }
+            if let Inst::RefFunc { func } = inst {
+                if *func as usize >= funcs.len() {
+                    return Err(VerifyError::CallFuncOutOfRange {
+                        func: fi,
+                        block: bi,
+                        callee: *func,
+                    });
+                }
+                types.push(ValType::I32); // a funcref is a plain i32 index (§3c)
+                continue;
+            }
+            if let Inst::CallIndirect { ty, idx, args } = inst {
+                {
+                    let cx = Cx {
+                        fi,
+                        bi,
+                        types: &types,
+                    };
+                    cx.expect(*idx, ValType::I32)?;
+                    if args.len() != ty.params.len() {
+                        return Err(VerifyError::CallArgCountMismatch {
+                            func: fi,
+                            block: bi,
+                            expected: ty.params.len(),
+                            found: args.len(),
+                        });
+                    }
+                    for (a, want) in args.iter().zip(&ty.params) {
+                        cx.expect(*a, *want)?;
+                    }
+                }
+                types.extend_from_slice(&ty.results);
+                continue;
+            }
             // A value-producing instruction appends its result type; `Store` does not.
             if let Some(result) = check_inst(fi, bi, inst, &types, has_memory)? {
                 types.push(result);
@@ -249,7 +283,10 @@ fn check_inst(
             op.info().1
         }
         // Handled before/around the match; listed for exhaustiveness (no panic).
-        Inst::Store { .. } | Inst::Call { .. } => return Ok(None),
+        Inst::Store { .. }
+        | Inst::Call { .. }
+        | Inst::RefFunc { .. }
+        | Inst::CallIndirect { .. } => return Ok(None),
     };
     Ok(Some(ty))
 }

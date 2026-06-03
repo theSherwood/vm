@@ -11,8 +11,8 @@
 use std::collections::BTreeMap;
 
 use svm_ir::{
-    BinOp, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, IToF, Inst,
-    IntTy, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
+    BinOp, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, FuncType,
+    IToF, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
 };
 
 /// A runtime value. Mirrors `ValType`.
@@ -37,14 +37,21 @@ pub enum Trap {
     MemoryFault,
     /// Call recursion exceeded the interpreter's depth bound (host-stack guard).
     StackOverflow,
+    /// `call_indirect` selected an empty table slot or a function whose signature
+    /// did not match the call's type (the §3c table type-id check).
+    IndirectCallType,
     /// Structurally invalid in a way a verified module never is (defensive only).
     Malformed,
 }
 
-/// Maximum nested `call` depth before the interpreter traps. Bounds host-stack use
-/// so adversarial (or merely deep) guest recursion can never overflow the Rust
-/// stack — it yields a clean `Trap::StackOverflow` instead.
-const MAX_CALL_DEPTH: u32 = 1024;
+/// Maximum nested `call` depth before the interpreter traps. This bounds the host
+/// stack the recursive interpreter consumes, so adversarial (or merely deep) guest
+/// recursion yields a clean `Trap::StackOverflow` instead of crashing the process.
+///
+/// Kept conservative because each frame must fit even a small (≈2 MiB) thread stack
+/// — this is a reference-oracle limit, not the production recursion ceiling (the JIT
+/// uses the guest's guard-paged data stack, §5, not host recursion).
+const MAX_CALL_DEPTH: u32 = 256;
 
 /// Run `func` with `args`, consuming up to `*fuel` execution steps.
 ///
@@ -81,11 +88,16 @@ fn run_func(
 
         for inst in &block.insts {
             step(fuel)?;
-            // `Call` recurses (it needs module context + appends 0..N results); the
-            // rest go through `eval_inst`, which appends one value or (for `Store`) none.
+            // Calls recurse (module context + 0..N results); the rest go through
+            // `eval_inst`, which appends one value or (for `Store`) none.
             if let Inst::Call { func, args } = inst {
                 let argv = collect(&vals, args)?;
                 let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
+                let results = run_func(callee, &argv, fuel, mem, funcs, depth + 1)?;
+                vals.extend(results);
+            } else if let Inst::CallIndirect { ty, idx, args } = inst {
+                let callee = table_lookup(funcs, as_i32(get(&vals, *idx)?)?, ty)?;
+                let argv = collect(&vals, args)?;
                 let results = run_func(callee, &argv, fuel, mem, funcs, depth + 1)?;
                 vals.extend(results);
             } else if let Some(v) = eval_inst(inst, &vals, mem)? {
@@ -214,6 +226,8 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?)?,
         Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?)?,
         Inst::Cast { op, a } => cast(*op, get(vals, *a)?)?,
+        // A funcref is just the function index as plain i32 data (§3c).
+        Inst::RefFunc { func } => Value::I32(*func as i32),
         Inst::Load {
             op, addr, offset, ..
         } => {
@@ -222,9 +236,21 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             m.load(a, *offset, *op)?
         }
         // Handled before/around the match; listed for exhaustiveness (no panic).
-        Inst::Store { .. } | Inst::Call { .. } => return Ok(None),
+        Inst::Store { .. } | Inst::Call { .. } | Inst::CallIndirect { .. } => return Ok(None),
     };
     Ok(Some(v))
+}
+
+/// Resolve a `call_indirect`: mask the index into the power-of-two-padded function
+/// table, then check the selected entry's signature against `ty` (the §3c table
+/// type-id check). Masking — not branching — keeps the table load Spectre-v1 safe.
+fn table_lookup<'a>(funcs: &'a [Func], idx: i32, ty: &FuncType) -> Result<&'a Func, Trap> {
+    let mask = funcs.len().next_power_of_two() - 1;
+    let slot = (idx as u32 as usize) & mask;
+    match funcs.get(slot) {
+        Some(c) if c.params == ty.params && c.results == ty.results => Ok(c),
+        _ => Err(Trap::IndirectCallType),
+    }
 }
 
 fn fbin32(op: FBinOp, a: f32, b: f32) -> f32 {

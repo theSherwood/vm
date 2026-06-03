@@ -751,3 +751,113 @@ fn run1at(src: &str, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
     let mut fuel = 1_000_000u64;
     run(&m, func, args, &mut fuel)
 }
+
+// ---- indirect calls (function table, §3c) ----
+
+// func0/func1 are (i32,i32)->(i32) implementations; func2 dispatches to one of
+// them via call_indirect on a funcref built with ref.func.
+const INDIRECT: &str = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.add v0 v1
+  return v2
+}
+
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.sub v0 v1
+  return v2
+}
+
+func (i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32):
+  v3 = call_indirect (i32, i32) -> (i32) v0 (v1, v2)
+  return v3
+}
+"#;
+
+#[test]
+fn indirect_corpus_roundtrips() {
+    let m = parse_module(INDIRECT).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
+    assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
+}
+
+#[test]
+fn indirect_call_dispatches_by_index() {
+    // func2(idx, 10, 3): idx 0 -> add = 13, idx 1 -> sub = 7.
+    assert_eq!(
+        run1at(INDIRECT, 2, &[Value::I32(0), Value::I32(10), Value::I32(3)]),
+        Ok(vec![Value::I32(13)])
+    );
+    assert_eq!(
+        run1at(INDIRECT, 2, &[Value::I32(1), Value::I32(10), Value::I32(3)]),
+        Ok(vec![Value::I32(7)])
+    );
+}
+
+#[test]
+fn indirect_call_type_mismatch_traps() {
+    // func0 here is ()->() ; dispatching it through an (i32,i32)->(i32) site must
+    // trap on the signature check rather than misinterpret the call.
+    let src = r#"
+func () -> () {
+block0():
+  return
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 5
+  v2 = call_indirect (i32, i32) -> (i32) v0 (v1, v1)
+  return v2
+}
+"#;
+    // index 0 selects the ()->() function -> signature mismatch.
+    assert_eq!(
+        run1at(src, 1, &[Value::I32(0)]),
+        Err(Trap::IndirectCallType)
+    );
+}
+
+#[test]
+fn indirect_call_index_is_masked_then_type_checked() {
+    // 3 functions -> table padded to 4 (pow2), mask 3. An out-of-range index is
+    // masked back in: idx 4 masks to 0 (the add fn), idx 5 masks to 1 (sub).
+    assert_eq!(
+        run1at(INDIRECT, 2, &[Value::I32(4), Value::I32(10), Value::I32(3)]),
+        Ok(vec![Value::I32(13)]) // 4 & 3 == 0 -> add
+    );
+    assert_eq!(
+        run1at(INDIRECT, 2, &[Value::I32(5), Value::I32(10), Value::I32(3)]),
+        Ok(vec![Value::I32(7)]) // 5 & 3 == 1 -> sub
+    );
+    // idx 2 masks to 2 (the dispatcher itself), whose signature differs from the
+    // call site -> trap on the type check rather than recurse.
+    assert_eq!(
+        run1at(INDIRECT, 2, &[Value::I32(2), Value::I32(10), Value::I32(3)]),
+        Err(Trap::IndirectCallType)
+    );
+}
+
+#[test]
+fn ref_func_then_indirect_call() {
+    // Build a funcref with ref.func, then call through it.
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 100
+  v2 = i32.add v0 v1
+  return v2
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = ref.func 0
+  v2 = call_indirect (i32) -> (i32) v1 (v0)
+  return v2
+}
+"#;
+    assert_eq!(run1at(src, 1, &[Value::I32(7)]), Ok(vec![Value::I32(107)]));
+}

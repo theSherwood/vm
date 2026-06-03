@@ -15,8 +15,8 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF,
-    Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValIdx, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
+    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValIdx, ValType,
 };
 
 mod op {
@@ -51,6 +51,8 @@ mod op {
 
     pub const SELECT: u8 = 0x70;
     pub const CALL: u8 = 0x73; // direct call: uleb funcidx, then arg idx-list
+    pub const CALL_INDIRECT: u8 = 0x74; // sig (params,results), idx, arg idx-list
+    pub const REF_FUNC: u8 = 0x75; // uleb funcidx -> i32 funcref
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -249,6 +251,17 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::Call { func, args } => {
             out.push(op::CALL);
             write_uleb(out, *func as u64);
+            write_idxs(out, args);
+        }
+        Inst::RefFunc { func } => {
+            out.push(op::REF_FUNC);
+            write_uleb(out, *func as u64);
+        }
+        Inst::CallIndirect { ty, idx, args } => {
+            out.push(op::CALL_INDIRECT);
+            write_types(out, &ty.params);
+            write_types(out, &ty.results);
+            write_uleb(out, *idx as u64);
             write_idxs(out, args);
         }
     }
@@ -482,6 +495,15 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         },
         op::CALL => Inst::Call {
             func: c.idx()?,
+            args: decode_idxs(c)?,
+        },
+        op::REF_FUNC => Inst::RefFunc { func: c.idx()? },
+        op::CALL_INDIRECT => Inst::CallIndirect {
+            ty: FuncType {
+                params: decode_types(c)?,
+                results: decode_types(c)?,
+            },
+            idx: c.idx()?,
             args: decode_idxs(c)?,
         },
 

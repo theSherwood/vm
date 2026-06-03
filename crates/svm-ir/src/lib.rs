@@ -757,6 +757,20 @@ pub enum Inst {
         func: FuncIdx,
         args: Vec<ValIdx>,
     },
+    /// `ref.func`: materialize a function reference — just the function index as an
+    /// `i32` (a `funcref` is a forgeable integer, §3c). The verifier checks the index
+    /// is in range; the *value* is plain data.
+    RefFunc {
+        func: FuncIdx,
+    },
+    /// Indirect call through the function table (§3c): mask `idx` into the table,
+    /// runtime-check the selected function's signature against `ty`, then call.
+    /// `idx` is an `i32` table index; results are `ty.results`.
+    CallIndirect {
+        ty: FuncType,
+        idx: ValIdx,
+        args: Vec<ValIdx>,
+    },
 }
 
 impl Inst {
@@ -764,14 +778,23 @@ impl Inst {
     ///
     /// Most instructions append exactly one; `Store` appends none; a `Call` appends
     /// its callee's result count, so it needs the per-function result arities
-    /// (indexed by [`FuncIdx`]) to answer.
+    /// (indexed by [`FuncIdx`]) to answer; `CallIndirect` carries its own signature.
     pub fn result_count(&self, fn_results: &[usize]) -> usize {
         match self {
             Inst::Store { .. } => 0,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
+            Inst::CallIndirect { ty, .. } => ty.results.len(),
             _ => 1,
         }
     }
+}
+
+/// A function signature — the immediate carried by `call_indirect` and (later) the
+/// function-table type ids. Equality is structural (the runtime "type_id" check).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct FuncType {
+    pub params: Vec<ValType>,
+    pub results: Vec<ValType>,
 }
 
 /// One branch edge: a target block plus the argument values for its parameters.

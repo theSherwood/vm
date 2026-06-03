@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
-    IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncType,
+    IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -132,6 +132,13 @@ fn print_inst(inst: &Inst) -> String {
             memarg(*offset, *align)
         ),
         Inst::Call { func, args } => format!("call {func}{}", arglist(args)),
+        Inst::RefFunc { func } => format!("ref.func {func}"),
+        Inst::CallIndirect { ty, idx, args } => format!(
+            "call_indirect ({}) -> ({}) v{idx}{}",
+            types(&ty.params),
+            types(&ty.results),
+            arglist(args)
+        ),
     }
 }
 
@@ -684,6 +691,24 @@ impl<'a> Parser<'a> {
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
             let args = self.parse_value_list(names)?;
             return Ok(Inst::Call { func, args });
+        }
+        if op == "ref.func" {
+            let n = self.parse_int()?;
+            let func = u32::try_from(n)
+                .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
+            return Ok(Inst::RefFunc { func });
+        }
+        if op == "call_indirect" {
+            let params = self.parse_type_list()?;
+            self.expect(&Tok::Arrow)?;
+            let results = self.parse_type_list()?;
+            let idx = self.value(names)?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::CallIndirect {
+                ty: FuncType { params, results },
+                idx,
+                args,
+            });
         }
         if let Some(cv) = ConvOp::from_name(&op) {
             return Ok(Inst::Convert {
