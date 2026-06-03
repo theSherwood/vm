@@ -5,16 +5,21 @@
 // resolved here into the IR's total semantics (§3b), and the *verifier* — not this code
 // — is what enforces escape-freedom (§2a), so the frontend is outside the escape-TCB.
 //
-// Status (grown incrementally): a single `int`/`long` function whose body is integer
-// expressions + `return` — constants, +/-/*/'/'%, bitwise, shifts, comparisons, unary
-// minus/not/bitnot, and integer casts. Locals, control flow, calls, pointers/memory,
-// and floats are added in later passes; anything unsupported is a hard error (so we
-// never emit IR we cannot stand behind).
+// Status (grown incrementally): a single paramless `int`/`long`/`void` function whose
+// body is integer expressions + `return` — constants, +/-/*'/'%, bitwise, shifts,
+// comparisons, unary minus/not/bitnot, integer casts — plus **scalar locals** (in the
+// §3d data-stack window: load/store, assignment, `&`/`*`, pointers to locals). Control
+// flow, calls/params, arrays/structs, and floats are added in later passes; anything
+// unsupported is a hard error (so we never emit IR we cannot stand behind).
 
 #include "chibicc.h"
 
 static FILE *o;
 static int nv; // next SSA value index in the current function
+
+// The data stack (address-taken locals, §3d) lives in the window. We reserve the low
+// bytes so a local's address is never 0 (C `NULL`), and lay locals out from there.
+#define STACK_BASE 16
 
 // Map an integer C type to its IR scalar type. (LP64: int=i32, long/pointer=i64, §3d.)
 static char *irty(Type *ty) {
@@ -37,6 +42,85 @@ static char *irty(Type *ty) {
 static bool is64(Type *ty) { return irty(ty)[1] == '6'; }
 
 static int gen_expr(Node *node); // emits the IR, returns the result's SSA index
+static int gen_addr(Node *node); // emits the IR, returns the SSA index of an lvalue's address
+
+// True if a value of type `ty` is held *by address* (arrays/aggregates): reading the
+// lvalue yields its address, not a loaded scalar.
+static bool by_address(Type *ty) {
+  return ty->kind == TY_ARRAY || ty->kind == TY_STRUCT || ty->kind == TY_UNION;
+}
+
+// Load the C value of type `ty` from address `addr` (an SSA i64); return its SSA index.
+static int gen_load(Type *ty, int addr) {
+  if (by_address(ty))
+    return addr; // arrays/aggregates decay to their address
+  int r = nv++;
+  switch (ty->kind) {
+  case TY_BOOL:
+    fprintf(o, "  v%d = i32.load8_u v%d\n", r, addr);
+    break;
+  case TY_CHAR:
+    fprintf(o, "  v%d = i32.load8_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+    break;
+  case TY_SHORT:
+    fprintf(o, "  v%d = i32.load16_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+    break;
+  case TY_INT:
+  case TY_ENUM:
+    fprintf(o, "  v%d = i32.load v%d\n", r, addr);
+    break;
+  case TY_LONG:
+  case TY_PTR:
+    fprintf(o, "  v%d = i64.load v%d\n", r, addr);
+    break;
+  default:
+    error_tok(ty->name, "codegen_ir: unsupported load type");
+  }
+  return r;
+}
+
+// Store SSA value `val` of type `ty` to address `addr` (an SSA i64). Narrow stores keep
+// the low bytes (matching C truncation on assignment).
+static void gen_store(Type *ty, int addr, int val) {
+  switch (ty->kind) {
+  case TY_BOOL:
+  case TY_CHAR:
+    fprintf(o, "  i32.store8 v%d v%d\n", addr, val);
+    break;
+  case TY_SHORT:
+    fprintf(o, "  i32.store16 v%d v%d\n", addr, val);
+    break;
+  case TY_INT:
+  case TY_ENUM:
+    fprintf(o, "  i32.store v%d v%d\n", addr, val);
+    break;
+  case TY_LONG:
+  case TY_PTR:
+    fprintf(o, "  i64.store v%d v%d\n", addr, val);
+    break;
+  default:
+    error_tok(ty->name, "codegen_ir: unsupported store type");
+  }
+}
+
+// The address of an lvalue, as an SSA i64.
+static int gen_addr(Node *node) {
+  switch (node->kind) {
+  case ND_VAR:
+    if (!node->var->is_local)
+      error_tok(node->tok, "codegen_ir: global variables not supported yet");
+    int r = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", r, node->var->offset);
+    return r;
+  case ND_DEREF:
+    return gen_expr(node->lhs); // the pointer value *is* the address
+  case ND_COMMA:
+    gen_expr(node->lhs);
+    return gen_addr(node->rhs);
+  default:
+    error_tok(node->tok, "codegen_ir: expression is not an lvalue");
+  }
+}
 
 // Emit `vR = <prefix>.<op> vA vB` over the operands' (common) width; return R.
 static int binop(Node *node, char *op) {
@@ -145,8 +229,53 @@ static int gen_expr(Node *node) {
   case ND_COMMA:
     gen_expr(node->lhs);
     return gen_expr(node->rhs);
+  case ND_VAR:
+    return gen_load(node->ty, gen_addr(node));
+  case ND_DEREF:
+    return gen_load(node->ty, gen_addr(node));
+  case ND_ADDR:
+    return gen_addr(node->lhs);
+  case ND_ASSIGN: {
+    int addr = gen_addr(node->lhs);
+    int val = gen_expr(node->rhs);
+    gen_store(node->lhs->ty, addr, val);
+    return val; // an assignment is an expression yielding the stored value
+  }
+  case ND_NULL_EXPR: {
+    // "Do nothing" (e.g. a non-VLA size computation). Materialize a harmless value so
+    // the (always-discarded) result index is still valid.
+    int r = nv++;
+    fprintf(o, "  v%d = i32.const 0\n", r);
+    return r;
+  }
+  case ND_MEMZERO: {
+    // Zero-initialize the variable's whole window region (§3d data stack).
+    int sz = node->var->ty->size;
+    int base = node->var->offset;
+    for (int i = 0; i < sz;) {
+      int a = nv++;
+      fprintf(o, "  v%d = i64.const %d\n", a, base + i);
+      int z = nv++;
+      if (sz - i >= 8) {
+        fprintf(o, "  v%d = i64.const 0\n  i64.store v%d v%d\n", z, a, z);
+        i += 8;
+      } else if (sz - i >= 4) {
+        fprintf(o, "  v%d = i32.const 0\n  i32.store v%d v%d\n", z, a, z);
+        i += 4;
+      } else if (sz - i >= 2) {
+        fprintf(o, "  v%d = i32.const 0\n  i32.store16 v%d v%d\n", z, a, z);
+        i += 2;
+      } else {
+        fprintf(o, "  v%d = i32.const 0\n  i32.store8 v%d v%d\n", z, a, z);
+        i += 1;
+      }
+    }
+    int r = nv++;
+    fprintf(o, "  v%d = i32.const 0\n", r); // discarded result
+    return r;
+  }
   default:
-    error_tok(node->tok, "codegen_ir: unsupported expression");
+    error_tok(node->tok, "codegen_ir: unsupported expression (kind=%d)", node->kind);
   }
 }
 
@@ -168,8 +297,21 @@ static void gen_stmt(Node *node) {
     }
     return;
   default:
-    error_tok(node->tok, "codegen_ir: unsupported statement");
+    error_tok(node->tok, "codegen_ir: unsupported statement (kind=%d)", node->kind);
   }
+}
+
+// Lay this function's locals out in the data-stack frame (the window), from STACK_BASE.
+// (One fixed frame per function for now — fine until calls share the window via a
+// data-SP, §3d.) Sets each local's `offset` and the frame `stack_size`.
+static void assign_offsets(Obj *fn) {
+  int off = STACK_BASE;
+  for (Obj *v = fn->locals; v; v = v->next) {
+    off = align_to(off, v->align);
+    v->offset = off;
+    off += v->ty->size;
+  }
+  fn->stack_size = align_to(off, 16);
 }
 
 static void gen_func(Obj *fn) {
@@ -191,6 +333,20 @@ static void gen_func(Obj *fn) {
 
 void codegen_ir(Obj *prog, FILE *out) {
   o = out;
+
+  // Assign data-stack offsets and decide whether the module needs a window.
+  bool need_mem = false;
+  for (Obj *fn = prog; fn; fn = fn->next)
+    if (fn->is_function && fn->is_definition) {
+      assign_offsets(fn);
+      if (fn->locals)
+        need_mem = true;
+    }
+  // A 2^16-byte window is ample for the data stack of the small programs we lower today
+  // (the size becomes program-driven once calls/heap land).
+  if (need_mem)
+    fprintf(o, "memory 16\n\n");
+
   for (Obj *fn = prog; fn; fn = fn->next)
     if (fn->is_function)
       gen_func(fn);

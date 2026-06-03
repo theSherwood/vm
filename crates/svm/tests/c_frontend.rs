@@ -11,6 +11,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use svm_interp::{run, Value};
+use svm_ir::ValType;
+use svm_jit::{compile_and_run, JitOutcome};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -63,14 +65,38 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
-/// Compile + verify + run `main` (function 0), returning its results.
+/// Compile + verify + run `main` (function 0) on **both** the interpreter and the JIT,
+/// assert they agree, and return the results. So every C test is also a JIT diff test.
 fn run_c(src: &str) -> Vec<Value> {
     let ir = c_to_ir(src);
     let m =
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+
     let mut fuel = 1_000_000u64;
-    run(&m, 0, &[], &mut fuel).expect("run")
+    let want = run(&m, 0, &[], &mut fuel).expect("interp run");
+
+    match compile_and_run(&m, 0, &[]).expect("jit compile") {
+        JitOutcome::Returned(slots) => {
+            let got: Vec<Value> = m.funcs[0]
+                .results
+                .iter()
+                .zip(slots)
+                .map(|(t, s)| match t {
+                    ValType::I32 => Value::I32(s as i32),
+                    ValType::I64 => Value::I64(s),
+                    ValType::F32 => Value::F32(f32::from_bits(s as u32)),
+                    ValType::F64 => Value::F64(f64::from_bits(s as u64)),
+                })
+                .collect();
+            assert_eq!(
+                want, got,
+                "interp/JIT disagree for C:\n{src}\n--- IR ---\n{ir}"
+            );
+        }
+        other => panic!("JIT did not return for C:\n{src}\ngot {other:?}"),
+    }
+    want
 }
 
 fn i32_of(src: &str) -> i32 {
@@ -118,5 +144,54 @@ fn c_long_arithmetic_end_to_end() {
     assert_eq!(
         i32_of("int main() { return (int)(1000000L * 1000000L % 1000000007L); }"),
         { ((1_000_000i64 * 1_000_000) % 1_000_000_007) as i32 }
+    );
+}
+
+#[test]
+fn c_locals_and_assignment_end_to_end() {
+    assert_eq!(i32_of("int main() { int x = 5; return x; }"), 5);
+    assert_eq!(
+        i32_of("int main() { int x = 5; int y = 7; return x * y + x; }"),
+        40
+    );
+    assert_eq!(i32_of("int main() { int x = 5; x = x + 1; return x; }"), 6);
+    assert_eq!(
+        i32_of("int main() { int a = 2; int b = 3; int c = a * b; return c; }"),
+        6
+    );
+    // y is an independent copy of x.
+    assert_eq!(
+        i32_of("int main() { int x = 10; int y = x; x = 20; return y; }"),
+        10
+    );
+    // chained assignment returns the assigned value.
+    assert_eq!(
+        i32_of("int main() { int x; int y; y = x = 9; return x + y; }"),
+        18
+    );
+}
+
+#[test]
+fn c_long_locals_end_to_end() {
+    assert_eq!(
+        i32_of("int main() { long x = 5000000000; return (int)(x / 1000000); }"),
+        5000
+    );
+}
+
+#[test]
+fn c_pointers_to_locals_end_to_end() {
+    // &x / *p over a data-stack local (the §3d masked-memory model).
+    assert_eq!(
+        i32_of("int main() { int x = 42; int *p = &x; return *p; }"),
+        42
+    );
+    assert_eq!(
+        i32_of("int main() { int x = 42; int *p = &x; *p = 99; return x; }"),
+        99
+    );
+    assert_eq!(
+        i32_of("int main() { long n = 7; long *p = &n; *p = *p + 1; return (int)n; }"),
+        8
     );
 }
