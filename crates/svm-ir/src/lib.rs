@@ -876,6 +876,16 @@ pub enum Terminator {
     },
     /// Return values matching the function's result signature.
     Return(Vec<ValIdx>),
+    /// Tail call (`return_call`): replace the current frame with a direct callee
+    /// whose results are this function's results. Args match the callee's params.
+    ReturnCall { func: FuncIdx, args: Vec<ValIdx> },
+    /// Indirect tail call (`return_call_indirect`): like [`Terminator::ReturnCall`]
+    /// but dispatched through the function table (masked + signature-checked, §3c).
+    ReturnCallIndirect {
+        ty: FuncType,
+        idx: ValIdx,
+        args: Vec<ValIdx>,
+    },
     /// Abort: control must not reach here. Delivers a trap to the host (§3b/§5).
     /// Covers both `unreachable` and language-level `trap`/`assert` failure.
     Unreachable,

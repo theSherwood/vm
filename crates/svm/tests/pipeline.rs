@@ -957,3 +957,110 @@ block2():
     assert_eq!(run1at(src, 0, &[Value::I32(1)]), Err(Trap::Unreachable));
     assert_eq!(run1at(src, 0, &[Value::I32(0)]), Ok(vec![Value::I32(7)]));
 }
+
+// ---- tail calls (return_call / return_call_indirect) ----
+
+// Tail-recursive sum: sum(n, acc) = n==0 ? acc : sum(n-1, acc+n), via return_call.
+// Values flow between blocks only through block parameters (block-local SSA).
+const TAILSUM: &str = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.eqz v0
+  br_if v2 block1(v1) block2(v0, v1)
+block1(v3: i32):
+  return v3
+block2(v4: i32, v5: i32):
+  v6 = i32.const -1
+  v7 = i32.add v4 v6
+  v8 = i32.add v5 v4
+  return_call 0(v7, v8)
+}
+"#;
+
+/// Reference sum with the same wrapping i32 arithmetic the interpreter uses.
+fn wrapping_sum(n: i32) -> i32 {
+    let mut acc = 0i32;
+    let mut k = n;
+    while k != 0 {
+        acc = acc.wrapping_add(k);
+        k -= 1;
+    }
+    acc
+}
+
+#[test]
+fn tailcall_roundtrips_and_computes() {
+    let m = parse_module(TAILSUM).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
+    assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
+
+    // sum(10, 0) = 55
+    assert_eq!(
+        run1at(TAILSUM, 0, &[Value::I32(10), Value::I32(0)]),
+        Ok(vec![Value::I32(55)])
+    );
+}
+
+#[test]
+fn deep_tail_recursion_is_constant_host_stack() {
+    // 100_000 tail calls — far beyond MAX_CALL_DEPTH (256). A non-tail
+    // implementation would StackOverflow; tail calls must run in O(1) host stack.
+    let m = load(&assemble(TAILSUM).unwrap()).unwrap();
+    let mut fuel = 100_000_000u64;
+    let n = 100_000i32;
+    let r = run(&m, 0, &[Value::I32(n), Value::I32(0)], &mut fuel).unwrap();
+    assert_eq!(r, vec![Value::I32(wrapping_sum(n))]);
+}
+
+#[test]
+fn return_call_indirect_tail_dispatches() {
+    // The tail-sum body, but tail-calling *indirectly* through table index 0.
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.eqz v0
+  br_if v2 block1(v1) block2(v0, v1)
+block1(v3: i32):
+  return v3
+block2(v4: i32, v5: i32):
+  v6 = i32.const -1
+  v7 = i32.add v4 v6
+  v8 = i32.add v5 v4
+  v9 = i32.const 0
+  return_call_indirect (i32, i32) -> (i32) v9 (v7, v8)
+}
+"#;
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(m, decode_module(&encode_module(&m)).unwrap());
+    assert_eq!(m, parse_module(&print_module(&m)).unwrap());
+    assert_eq!(
+        run1at(src, 0, &[Value::I32(5), Value::I32(0)]),
+        Ok(vec![Value::I32(15)])
+    );
+}
+
+#[test]
+fn verifier_rejects_tail_call_result_mismatch() {
+    // callee returns i64 but the caller's result is i32 -> tail results must match.
+    let m = parse_module(
+        r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  return v1
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  return_call 0(v0)
+}
+"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::ResultCountMismatch { .. })
+    ));
+}

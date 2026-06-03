@@ -193,6 +193,13 @@ fn print_term(t: &Terminator) -> String {
                 format!("return {}", vs.join(", "))
             }
         }
+        Terminator::ReturnCall { func, args } => format!("return_call {func}{}", arglist(args)),
+        Terminator::ReturnCallIndirect { ty, idx, args } => format!(
+            "return_call_indirect ({}) -> ({}) v{idx}{}",
+            types(&ty.params),
+            types(&ty.results),
+            arglist(args)
+        ),
         Terminator::Unreachable => "unreachable".to_string(),
     }
 }
@@ -441,6 +448,15 @@ enum PTerm {
         default: PEdge,
     },
     Return(Vec<u32>),
+    ReturnCall {
+        func: u32,
+        args: Vec<u32>,
+    },
+    ReturnCallIndirect {
+        ty: FuncType,
+        idx: u32,
+        args: Vec<u32>,
+    },
     Unreachable,
 }
 
@@ -544,6 +560,10 @@ impl<'a> Parser<'a> {
                     default: edge(default)?,
                 },
                 PTerm::Return(v) => Terminator::Return(v),
+                PTerm::ReturnCall { func, args } => Terminator::ReturnCall { func, args },
+                PTerm::ReturnCallIndirect { ty, idx, args } => {
+                    Terminator::ReturnCallIndirect { ty, idx, args }
+                }
                 PTerm::Unreachable => Terminator::Unreachable,
             };
             blocks.push(Block {
@@ -613,7 +633,12 @@ impl<'a> Parser<'a> {
             };
             if matches!(
                 kw.as_str(),
-                "br" | "br_if" | "br_table" | "return" | "unreachable"
+                "br" | "br_if"
+                    | "br_table"
+                    | "return"
+                    | "return_call"
+                    | "return_call_indirect"
+                    | "unreachable"
             ) {
                 let term = self.parse_term(&names)?;
                 return Ok(PBlock {
@@ -882,6 +907,25 @@ impl<'a> Parser<'a> {
                 }
             }
             "unreachable" => PTerm::Unreachable,
+            "return_call" => {
+                let n = self.parse_int()?;
+                let func = u32::try_from(n)
+                    .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
+                let args = self.parse_value_list(names)?;
+                PTerm::ReturnCall { func, args }
+            }
+            "return_call_indirect" => {
+                let params = self.parse_type_list()?;
+                self.expect(&Tok::Arrow)?;
+                let results = self.parse_type_list()?;
+                let idx = self.value(names)?;
+                let args = self.parse_value_list(names)?;
+                PTerm::ReturnCallIndirect {
+                    ty: FuncType { params, results },
+                    idx,
+                    args,
+                }
+            }
             "return" => {
                 let mut vals = Vec::new();
                 // Comma-separated value list; a return ends the block, so any ident

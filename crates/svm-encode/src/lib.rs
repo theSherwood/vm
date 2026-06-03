@@ -93,6 +93,8 @@ mod op {
     pub const BR_IF: u8 = 0x81;
     pub const BR_TABLE: u8 = 0x82;
     pub const RETURN: u8 = 0x83;
+    pub const RETURN_CALL: u8 = 0x85; // uleb funcidx, arg idx-list
+    pub const RETURN_CALL_INDIRECT: u8 = 0x86; // sig (params,results), idx, arg idx-list
     pub const UNREACHABLE: u8 = 0x8F;
 }
 
@@ -332,6 +334,18 @@ fn encode_term(out: &mut Vec<u8>, t: &Terminator) {
         Terminator::Return(vals) => {
             out.push(op::RETURN);
             write_idxs(out, vals);
+        }
+        Terminator::ReturnCall { func, args } => {
+            out.push(op::RETURN_CALL);
+            write_uleb(out, *func as u64);
+            write_idxs(out, args);
+        }
+        Terminator::ReturnCallIndirect { ty, idx, args } => {
+            out.push(op::RETURN_CALL_INDIRECT);
+            write_types(out, &ty.params);
+            write_types(out, &ty.results);
+            write_uleb(out, *idx as u64);
+            write_idxs(out, args);
         }
         Terminator::Unreachable => out.push(op::UNREACHABLE),
     }
@@ -662,6 +676,18 @@ fn decode_term(c: &mut Cursor) -> Result<Terminator, DecodeError> {
             }
         }
         op::RETURN => Terminator::Return(decode_idxs(c)?),
+        op::RETURN_CALL => Terminator::ReturnCall {
+            func: c.idx()?,
+            args: decode_idxs(c)?,
+        },
+        op::RETURN_CALL_INDIRECT => Terminator::ReturnCallIndirect {
+            ty: FuncType {
+                params: decode_types(c)?,
+                results: decode_types(c)?,
+            },
+            idx: c.idx()?,
+            args: decode_idxs(c)?,
+        },
         op::UNREACHABLE => Terminator::Unreachable,
         other => return Err(DecodeError::BadOpcode(other)),
     })

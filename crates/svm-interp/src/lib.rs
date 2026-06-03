@@ -68,78 +68,96 @@ pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<
     run_func(f, args, fuel, &mut mem, &m.funcs, 0)
 }
 
-fn run_func(
-    f: &Func,
+fn run_func<'a>(
+    mut f: &'a Func,
     args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
-    funcs: &[Func],
+    funcs: &'a [Func],
     depth: u32,
 ) -> Result<Vec<Value>, Trap> {
     if depth > MAX_CALL_DEPTH {
         return Err(Trap::StackOverflow);
     }
-    // Block-local value vector: parameters first, then instruction results.
-    let mut block_idx: usize = 0;
     // Entry block parameters are the function arguments (verifier guarantees the
     // count/types; we still copy defensively).
     let mut vals: Vec<Value> = args.to_vec();
 
-    loop {
-        let block = f.blocks.get(block_idx).ok_or(Trap::Malformed)?;
+    // Outer loop: a *tail* call replaces the current function in place — same host
+    // frame, no depth growth — restarting here with the callee and its args. So
+    // tail-recursive guests run in O(1) host stack (bounded only by fuel).
+    'tail: loop {
+        let mut block_idx: usize = 0;
 
-        for inst in &block.insts {
+        loop {
+            let block = f.blocks.get(block_idx).ok_or(Trap::Malformed)?;
+
+            for inst in &block.insts {
+                step(fuel)?;
+                // Non-tail calls recurse (they append 0..N results and continue);
+                // the rest go through `eval_inst` (one value, or none for `Store`).
+                if let Inst::Call { func, args } = inst {
+                    let argv = collect(&vals, args)?;
+                    let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
+                    let results = run_func(callee, &argv, fuel, mem, funcs, depth + 1)?;
+                    vals.extend(results);
+                } else if let Inst::CallIndirect { ty, idx, args } = inst {
+                    let callee = table_lookup(funcs, as_i32(get(&vals, *idx)?)?, ty)?;
+                    let argv = collect(&vals, args)?;
+                    let results = run_func(callee, &argv, fuel, mem, funcs, depth + 1)?;
+                    vals.extend(results);
+                } else if let Some(v) = eval_inst(inst, &vals, mem)? {
+                    vals.push(v);
+                }
+            }
+
             step(fuel)?;
-            // Calls recurse (module context + 0..N results); the rest go through
-            // `eval_inst`, which appends one value or (for `Store`) none.
-            if let Inst::Call { func, args } = inst {
-                let argv = collect(&vals, args)?;
-                let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
-                let results = run_func(callee, &argv, fuel, mem, funcs, depth + 1)?;
-                vals.extend(results);
-            } else if let Inst::CallIndirect { ty, idx, args } = inst {
-                let callee = table_lookup(funcs, as_i32(get(&vals, *idx)?)?, ty)?;
-                let argv = collect(&vals, args)?;
-                let results = run_func(callee, &argv, fuel, mem, funcs, depth + 1)?;
-                vals.extend(results);
-            } else if let Some(v) = eval_inst(inst, &vals, mem)? {
-                vals.push(v);
+            match &block.term {
+                Terminator::Br { target, args } => {
+                    vals = collect(&vals, args)?;
+                    block_idx = *target as usize;
+                }
+                Terminator::BrIf {
+                    cond,
+                    then_blk,
+                    then_args,
+                    else_blk,
+                    else_args,
+                } => {
+                    let (target, edge_args) = if as_i32(get(&vals, *cond)?)? != 0 {
+                        (*then_blk, then_args)
+                    } else {
+                        (*else_blk, else_args)
+                    };
+                    vals = collect(&vals, edge_args)?;
+                    block_idx = target as usize;
+                }
+                Terminator::BrTable {
+                    idx,
+                    targets,
+                    default,
+                } => {
+                    let i = as_i32(get(&vals, *idx)?)? as u32 as usize;
+                    let (target, edge_args) = targets.get(i).unwrap_or(default);
+                    vals = collect(&vals, edge_args)?;
+                    block_idx = *target as usize;
+                }
+                Terminator::Return(out) => return collect(&vals, out),
+                Terminator::Unreachable => return Err(Trap::Unreachable),
+                Terminator::ReturnCall { func, args } => {
+                    let argv = collect(&vals, args)?;
+                    f = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
+                    vals = argv;
+                    continue 'tail;
+                }
+                Terminator::ReturnCallIndirect { ty, idx, args } => {
+                    let callee = table_lookup(funcs, as_i32(get(&vals, *idx)?)?, ty)?;
+                    let argv = collect(&vals, args)?;
+                    f = callee;
+                    vals = argv;
+                    continue 'tail;
+                }
             }
-        }
-
-        step(fuel)?;
-        match &block.term {
-            Terminator::Br { target, args } => {
-                vals = collect(&vals, args)?;
-                block_idx = *target as usize;
-            }
-            Terminator::BrIf {
-                cond,
-                then_blk,
-                then_args,
-                else_blk,
-                else_args,
-            } => {
-                let (target, edge_args) = if as_i32(get(&vals, *cond)?)? != 0 {
-                    (*then_blk, then_args)
-                } else {
-                    (*else_blk, else_args)
-                };
-                vals = collect(&vals, edge_args)?;
-                block_idx = target as usize;
-            }
-            Terminator::BrTable {
-                idx,
-                targets,
-                default,
-            } => {
-                let i = as_i32(get(&vals, *idx)?)? as u32 as usize;
-                let (target, edge_args) = targets.get(i).unwrap_or(default);
-                vals = collect(&vals, edge_args)?;
-                block_idx = *target as usize;
-            }
-            Terminator::Return(out) => return collect(&vals, out),
-            Terminator::Unreachable => return Err(Trap::Unreachable),
         }
     }
 }

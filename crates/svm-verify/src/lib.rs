@@ -176,7 +176,7 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
             }
         }
 
-        check_terminator(fi, bi, &b.term, &types, nblocks, f)?;
+        check_terminator(fi, bi, &b.term, &types, nblocks, f, funcs)?;
     }
     Ok(())
 }
@@ -302,6 +302,7 @@ fn check_terminator(
     types: &[ValType],
     nblocks: u32,
     f: &Func,
+    funcs: &[Func],
 ) -> Result<(), VerifyError> {
     let cx = Cx { fi, bi, types };
     match term {
@@ -344,8 +345,54 @@ fn check_terminator(
                 cx.expect(*v, *want)?;
             }
         }
+        Terminator::ReturnCall { func, args } => {
+            let callee = funcs
+                .get(*func as usize)
+                .ok_or(VerifyError::CallFuncOutOfRange {
+                    func: fi,
+                    block: bi,
+                    callee: *func,
+                })?;
+            check_tail_call(&cx, args, &callee.params, &callee.results, &f.results)?;
+        }
+        Terminator::ReturnCallIndirect { ty, idx, args } => {
+            cx.expect(*idx, ValType::I32)?;
+            check_tail_call(&cx, args, &ty.params, &ty.results, &f.results)?;
+        }
         // Aborts unconditionally; references nothing, so nothing to check.
         Terminator::Unreachable => {}
+    }
+    Ok(())
+}
+
+/// Shared checks for `return_call`/`return_call_indirect`: the args match the
+/// callee's parameters, and the callee's results equal *this* function's results
+/// (a tail call returns the callee's results as our own).
+fn check_tail_call(
+    cx: &Cx,
+    args: &[ValIdx],
+    callee_params: &[ValType],
+    callee_results: &[ValType],
+    func_results: &[ValType],
+) -> Result<(), VerifyError> {
+    if args.len() != callee_params.len() {
+        return Err(VerifyError::CallArgCountMismatch {
+            func: cx.fi,
+            block: cx.bi,
+            expected: callee_params.len(),
+            found: args.len(),
+        });
+    }
+    for (a, want) in args.iter().zip(callee_params) {
+        cx.expect(*a, *want)?;
+    }
+    if callee_results != func_results {
+        return Err(VerifyError::ResultCountMismatch {
+            func: cx.fi,
+            block: cx.bi,
+            expected: func_results.len(),
+            found: callee_results.len(),
+        });
     }
     Ok(())
 }
