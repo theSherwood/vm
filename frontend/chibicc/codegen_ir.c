@@ -5,28 +5,51 @@
 // resolved here into the IR's total semantics (§3b), and the *verifier* — not this code
 // — is what enforces escape-freedom (§2a), so the frontend is outside the escape-TCB.
 //
-// Status (grown incrementally): a single paramless `int`/`long`/`void` function with
-// integer expressions (constants, +/-/*'/'%, bitwise, shifts, comparisons, unary
-// -/!/~, integer casts), **scalar locals** in the §3d data-stack window (load/store,
-// assignment, `&`/`*`, pointers to locals), and **structured control flow** —
-// `if`/`else`, `while`, `for` — lowered to a param-free block CFG (state lives in
-// memory, so values never cross a block). Calls/params, `break`/`continue`/`switch`,
-// short-circuit `&&`/`||`/`?:`, arrays/structs, and floats come next; anything
-// unsupported is a hard error (so we never emit IR we cannot stand behind).
+// Status (grown incrementally): `int`/`long`/`void` functions with integer expressions
+// (constants, +/-/*'/'%, bitwise, shifts, comparisons, unary -/!/~, integer casts),
+// **scalar locals** in the §3d data-stack window (load/store, assignment, `&`/`*`,
+// pointers to locals), **structured control flow** (`if`/`else`, `while`, `for` → a
+// block CFG), and **functions** — parameters and **direct calls incl. recursion**, made
+// correct by threading the **data-stack pointer**: it is parameter `v0` of every
+// function and block, a local lives at `sp + offset`, and a call gives the callee a
+// fresh frame at `sp + frame_size` so recursion never clobbers a parent frame.
+// `break`/`continue`/`switch`, short-circuit `&&`/`||`/`?:`, indirect calls,
+// arrays/structs, globals, and floats come next; anything unsupported is a hard error
+// (so we never emit IR we cannot stand behind).
 
 #include "chibicc.h"
 
 static FILE *o;
 static int nv;    // next SSA value index in the *current block* (blocks are param-free,
                   // so values never cross a block boundary — they reset per block)
-static int nb;    // next block label number in the current function
-static bool term; // is the current block already terminated?
+static int nb;        // next block label number in the current function
+static bool term;     // is the current block already terminated?
+static int cur_frame; // the current function's data-stack frame size (bytes)
 
-// Open a new IR block with label `id`: emit its header and reset per-block state. (Block
-// labels are resolved by name, so forward references to not-yet-opened blocks are fine.)
+// The data-stack pointer (frame base) is threaded as the first parameter of every IR
+// function and every IR block — `v0` in each block (§3d). A local at frame offset N
+// lives at `sp + N`; a call gives the callee a fresh frame at `sp + cur_frame`, so
+// recursion/reentrancy never clobber a parent frame. (A real backend register-pins the
+// data-SP; we make it an explicit value, relying on the masking lowering for §4 safety.)
+#define SP "v0"
+
+// The module's function definitions, in emission/index order (main first, so it is
+// function 0 — what the test harness runs). `call` targets a function by this index.
+static Obj *funcs[1024];
+static int nfuncs;
+
+static int func_index(Obj *fn) {
+  for (int i = 0; i < nfuncs; i++)
+    if (funcs[i] == fn)
+      return i;
+  error_tok(fn->tok, "codegen_ir: call to a function with no definition (no linker yet)");
+}
+
+// Open a new IR block with label `id`: emit its header (taking the data-SP as `v0`) and
+// reset per-block state. Block labels resolve by name, so forward references are fine.
 static void open_block(int id) {
-  fprintf(o, "block%d():\n", id);
-  nv = 0;
+  fprintf(o, "block%d(" SP ": i64):\n", id);
+  nv = 1; // v0 is the data-SP parameter
   term = false;
 }
 
@@ -119,12 +142,16 @@ static void gen_store(Type *ty, int addr, int val) {
 // The address of an lvalue, as an SSA i64.
 static int gen_addr(Node *node) {
   switch (node->kind) {
-  case ND_VAR:
+  case ND_VAR: {
     if (!node->var->is_local)
       error_tok(node->tok, "codegen_ir: global variables not supported yet");
+    // The local lives at sp + frame-offset (§3d data stack).
+    int off = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", off, node->var->offset);
     int r = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", r, node->var->offset);
+    fprintf(o, "  v%d = i64.add " SP " v%d\n", r, off);
     return r;
+  }
   case ND_DEREF:
     return gen_expr(node->lhs); // the pointer value *is* the address
   case ND_COMMA:
@@ -248,6 +275,35 @@ static int gen_expr(Node *node) {
     return gen_load(node->ty, gen_addr(node));
   case ND_ADDR:
     return gen_addr(node->lhs);
+  case ND_FUNCALL: {
+    if (node->lhs->kind != ND_VAR || !node->lhs->var->is_function)
+      error_tok(node->tok, "codegen_ir: only direct calls are supported yet");
+    // Evaluate the arguments (already cast to the parameter types by the parser).
+    int argv[64];
+    int n = 0;
+    for (Node *a = node->args; a; a = a->next) {
+      if (n == 64)
+        error_tok(node->tok, "codegen_ir: too many call arguments");
+      argv[n++] = gen_expr(a);
+    }
+    // The callee gets a fresh frame above ours: callee_sp = sp + our frame size.
+    int fs = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", fs, cur_frame);
+    int csp = nv++;
+    fprintf(o, "  v%d = i64.add " SP " v%d\n", csp, fs);
+
+    int idx = func_index(node->lhs->var);
+    bool is_void = node->ty->kind == TY_VOID;
+    int r = is_void ? 0 : nv++;
+    if (is_void)
+      fprintf(o, "  call %d (v%d", idx, csp);
+    else
+      fprintf(o, "  v%d = call %d (v%d", r, idx, csp);
+    for (int i = 0; i < n; i++)
+      fprintf(o, ", v%d", argv[i]);
+    fprintf(o, ")\n");
+    return r; // for a void call the value is discarded
+  }
   case ND_ASSIGN: {
     int addr = gen_addr(node->lhs);
     int val = gen_expr(node->rhs);
@@ -298,19 +354,19 @@ static void gen_stmt(Node *node);
 static void gen_if(Node *node) {
   int c = gen_expr(node->cond);
   int t = nb++, e = nb++, end = nb++;
-  fprintf(o, "  br_if v%d block%d() block%d()\n", c, t, e);
+  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, t, e);
   term = true;
 
   open_block(t);
   gen_stmt(node->then);
   if (!term)
-    fprintf(o, "  br block%d()\n", end);
+    fprintf(o, "  br block%d(" SP ")\n", end);
 
   open_block(e);
   if (node->els)
     gen_stmt(node->els);
   if (!term)
-    fprintf(o, "  br block%d()\n", end);
+    fprintf(o, "  br block%d(" SP ")\n", end);
 
   open_block(end);
 }
@@ -321,15 +377,15 @@ static void gen_for(Node *node) {
   if (node->init)
     gen_stmt(node->init);
   int cond = nb++, body = nb++, end = nb++;
-  fprintf(o, "  br block%d()\n", cond);
+  fprintf(o, "  br block%d(" SP ")\n", cond);
   term = true;
 
   open_block(cond);
   if (node->cond) {
     int c = gen_expr(node->cond);
-    fprintf(o, "  br_if v%d block%d() block%d()\n", c, body, end);
+    fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, body, end);
   } else {
-    fprintf(o, "  br block%d()\n", body); // `for(;;)` — unconditional
+    fprintf(o, "  br block%d(" SP ")\n", body); // `for(;;)` — unconditional
   }
   term = true;
 
@@ -338,7 +394,7 @@ static void gen_for(Node *node) {
   if (!term) {
     if (node->inc)
       gen_expr(node->inc);
-    fprintf(o, "  br block%d()\n", cond);
+    fprintf(o, "  br block%d(" SP ")\n", cond);
   }
 
   open_block(end);
@@ -376,11 +432,10 @@ static void gen_stmt(Node *node) {
   }
 }
 
-// Lay this function's locals out in the data-stack frame (the window), from STACK_BASE.
-// (One fixed frame per function for now — fine until calls share the window via a
-// data-SP, §3d.) Sets each local's `offset` and the frame `stack_size`.
+// Lay this function's locals out as *frame-relative* offsets (from 0); each local lives
+// at `sp + offset` at run time (§3d). Sets each local's `offset` and `stack_size`.
 static void assign_offsets(Obj *fn) {
-  int off = STACK_BASE;
+  int off = 0;
   for (Obj *v = fn->locals; v; v = v->next) {
     off = align_to(off, v->align);
     v->offset = off;
@@ -392,16 +447,38 @@ static void assign_offsets(Obj *fn) {
 static void gen_func(Obj *fn) {
   if (!fn->is_definition)
     return;
-  if (fn->params)
-    error_tok(fn->tok, "codegen_ir: function parameters not supported yet");
 
   nb = 0;
+  cur_frame = fn->stack_size;
   Type *ret = fn->ty->return_ty;
+
+  // Signature: `func (i64 sp, <param tys>) -> (<ret ty>)` — the data-SP is param 0.
+  fprintf(o, "func (i64");
+  for (Obj *p = fn->params; p; p = p->next)
+    fprintf(o, ", %s", irty(p->ty));
   if (ret->kind == TY_VOID)
-    fprintf(o, "func () -> () {\n");
+    fprintf(o, ") -> () {\n");
   else
-    fprintf(o, "func () -> (%s) {\n", irty(ret));
-  open_block(nb++); // the entry block (index 0)
+    fprintf(o, ") -> (%s) {\n", irty(ret));
+
+  // Entry block: params are `sp` (v0) then the C params (v1..vN). Spill each C param to
+  // its data-stack slot (sp + offset) so the body reads/writes it like any other local.
+  fprintf(o, "block%d(" SP ": i64", nb++);
+  int np = 1;
+  for (Obj *p = fn->params; p; p = p->next)
+    fprintf(o, ", v%d: %s", np++, irty(p->ty));
+  fprintf(o, "):\n");
+  nv = np;
+  term = false;
+  int pi = 1;
+  for (Obj *p = fn->params; p; p = p->next) {
+    int off = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", off, p->offset);
+    int addr = nv++;
+    fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
+    gen_store(p->ty, addr, pi++);
+  }
+
   gen_stmt(fn->body);
   // Falling off the end: C `main` returns 0; for other paths it is UB, and returning a
   // zero is a safe, defined value. Every block needs a terminator (§3b).
@@ -419,20 +496,28 @@ static void gen_func(Obj *fn) {
 void codegen_ir(Obj *prog, FILE *out) {
   o = out;
 
-  // Assign data-stack offsets and decide whether the module needs a window.
+  // Order the function definitions with `main` first, so it is function index 0 (what
+  // the harness runs) and `call` can target any function by index. Also assign each
+  // function's data-stack offsets and note whether the module needs a window.
+  nfuncs = 0;
   bool need_mem = false;
   for (Obj *fn = prog; fn; fn = fn->next)
-    if (fn->is_function && fn->is_definition) {
-      assign_offsets(fn);
-      if (fn->locals)
-        need_mem = true;
-    }
+    if (fn->is_function && fn->is_definition && fn->name && !strcmp(fn->name, "main"))
+      funcs[nfuncs++] = fn;
+  for (Obj *fn = prog; fn; fn = fn->next)
+    if (fn->is_function && fn->is_definition && !(fn->name && !strcmp(fn->name, "main")))
+      funcs[nfuncs++] = fn;
+  for (int i = 0; i < nfuncs; i++) {
+    assign_offsets(funcs[i]);
+    if (funcs[i]->locals)
+      need_mem = true;
+  }
+
   // A 2^16-byte window is ample for the data stack of the small programs we lower today
-  // (the size becomes program-driven once calls/heap land).
+  // (the size becomes program-driven once a real data-SP / heap land).
   if (need_mem)
     fprintf(o, "memory 16\n\n");
 
-  for (Obj *fn = prog; fn; fn = fn->next)
-    if (fn->is_function)
-      gen_func(fn);
+  for (int i = 0; i < nfuncs; i++)
+    gen_func(funcs[i]);
 }

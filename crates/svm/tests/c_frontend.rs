@@ -73,10 +73,13 @@ fn run_c(src: &str) -> Vec<Value> {
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
 
-    let mut fuel = 1_000_000u64;
-    let want = run(&m, 0, &[], &mut fuel).expect("interp run");
+    // `main` takes the initial data-stack pointer (§3d) as its first IR parameter; the
+    // runtime hands it the bottom of the data stack.
+    const SP0: i64 = 16;
+    let mut fuel = 10_000_000u64;
+    let want = run(&m, 0, &[Value::I64(SP0)], &mut fuel).expect("interp run");
 
-    match compile_and_run(&m, 0, &[]).expect("jit compile") {
+    match compile_and_run(&m, 0, &[SP0]).expect("jit compile") {
         JitOutcome::Returned(slots) => {
             let got: Vec<Value> = m.funcs[0]
                 .results
@@ -226,5 +229,46 @@ fn c_control_flow_end_to_end() {
     assert_eq!(
         i32_of("int main() { int a = 0; int b = 1; for (int i = 0; i < 10; i = i + 1) { int t = a + b; a = b; b = t; } return a; }"),
         55
+    );
+}
+
+#[test]
+fn c_function_calls_end_to_end() {
+    // direct call with parameters
+    assert_eq!(
+        i32_of("int add(int a, int b) { return a + b; } int main() { return add(3, 4) * 2; }"),
+        14
+    );
+    // a callee with its own locals must not clobber the caller's frame (fresh data-SP)
+    assert_eq!(
+        i32_of(
+            "int sq(int x) { int t = x * x; return t; } \
+             int main() { int a = sq(3); int b = sq(4); return a + b; }"
+        ),
+        25
+    );
+}
+
+#[test]
+fn c_recursion_end_to_end() {
+    // Recursion is the real test of per-call frames (§3d data stack): each activation of
+    // fib has its own `n`, so the parent's `n` survives across the recursive calls.
+    assert_eq!(
+        i32_of("int fib(int n) { if (n < 2) return n; return fib(n-1) + fib(n-2); } int main() { return fib(10); }"),
+        55
+    );
+    assert_eq!(
+        i32_of("int fact(int n) { if (n <= 1) return 1; return n * fact(n-1); } int main() { return fact(6); }"),
+        720
+    );
+    // mutual recursion
+    assert_eq!(
+        i32_of(
+            "int is_even(int n); \
+             int is_odd(int n) { if (n == 0) return 0; return is_even(n - 1); } \
+             int is_even(int n) { if (n == 0) return 1; return is_odd(n - 1); } \
+             int main() { return is_even(10) + is_odd(7); }"
+        ),
+        2
     );
 }
