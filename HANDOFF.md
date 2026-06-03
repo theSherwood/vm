@@ -184,7 +184,19 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
    `case_block_of` map for the body's `ND_CASE` labels; supports fall-through, `case`
    ranges, mid-position `default`, and `continue` passing through to an enclosing loop.
    **Still TODO:** general `goto`/user labels (`ND_LABEL`/non-loop `ND_GOTO`) still error.
-7. **(Perf, later) SSA-promotion pass** — promote non-address-taken, non-`volatile`
+7a. ~~**Varargs / `printf`**~~ — **DONE**. Flat-buffer varargs ABI (§3d): a custom
+   `include/stdarg.h` (`va_list` = a pointer; `va_arg` = load + bump 8); `__va_area__` is
+   now a pointer (chibicc `parse.c` change); `gen_func` adds a hidden trailing buffer
+   pointer on variadic functions; the call site marshals promoted args into a buffer
+   between the caller/callee frames. `printf` is guest C over `write` (the `LIBC` prelude
+   in the test). **Two important fixes landed here:** (a) expression-level control flow
+   (`&&`/`||`/`?:`) opens blocks and *stranded* values computed earlier in the same C
+   expression — now spilled to a per-frame scratch region (`eval2`/`spill`/`reload`,
+   `has_branch`); (b) `if`/`for`/`do`/`while` conditions are normalized to an i32 truth
+   via `gen_truth` (a `long`/pointer condition is i64, but `br_if` needs i32). Also: a
+   cast to `void` now just discards. **Still TODO:** `fd`→stream mapping, float varargs
+   beyond `double`, `%`-width/precision in the mini-printf.
+8. **(Perf, later) SSA-promotion pass** — promote non-address-taken, non-`volatile`
    scalars from memory to real SSA values (DESIGN §3d "the pass that matters for speed").
    This also removes the redundant `memzero` and most loads/stores.
 

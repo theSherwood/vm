@@ -3239,7 +3239,9 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   fn->params = locals;
 
   if (ty->is_variadic)
-    fn->va_area = new_lvar("__va_area__", array_of(ty_char, 136));
+    // SVM ABI (§3d): __va_area__ is a pointer to the caller-marshalled varargs buffer,
+    // not an x86-64 register-save area. See include/stdarg.h and codegen_ir.c.
+    fn->va_area = new_lvar("__va_area__", pointer_to(ty_char));
   fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
 
   tok = skip(tok, "{");

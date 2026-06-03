@@ -31,10 +31,15 @@
 // `-`/`!`, literals, and all int<->float / float<->float conversions (float->int is
 // saturating, §3b). **`break`/`continue`** (a loop-context stack) and **`switch`** (a
 // dispatch chain threading the value through `(sp, val)` compare blocks, with
-// fall-through and `case` ranges) work. Indirect calls, by-value aggregate args/returns,
-// general `goto`, varargs/`printf`, and `malloc` remain; anything unsupported is a hard
-// error (so we never emit IR we cannot stand behind). The everything-in-memory model
-// (no SSA promotion yet) is the main perf gap.
+// fall-through and `case` ranges) work. **Varargs** use a flat-buffer ABI (§3d): the
+// caller marshals promoted args into a buffer between the frames and passes a hidden
+// pointer; the callee sees it as `__va_area__` (see include/stdarg.h) — enough for a
+// guest-C `printf`. Expression-level control flow (`&&`/`||`/`?:`) opens blocks, which
+// would strand values computed earlier in the same C expression; such values are spilled
+// to a per-frame scratch region (`eval2`/`spill`/`reload`) and reloaded in the merge
+// block. Indirect calls, by-value aggregate args/returns, general `goto`, and `malloc`
+// remain; anything unsupported is a hard error (so we never emit IR we cannot stand
+// behind). The everything-in-memory model (no SSA promotion yet) is the main perf gap.
 
 #include "chibicc.h"
 
@@ -148,6 +153,66 @@ static bool is_flt(Type *ty) {
 static int gen_expr(Node *node); // emits the IR, returns the result's SSA index
 static int gen_addr(Node *node); // emits the IR, returns the SSA index of an lvalue's address
 
+// Per-function scratch region (last SCRATCH_BYTES of the frame) for spilling SSA values
+// across expression-level control flow (&&/||/?:), which opens new blocks. Such a branch
+// strands any value computed earlier in the same C expression (it lives in the old
+// block), so we store it to scratch and reload it in the merge block.
+#define SCRATCH_BYTES 512
+static int cur_scratch; // frame offset of this function's scratch region
+static int spill_top;   // next free scratch slot (8-byte slots, LIFO)
+
+// True if evaluating `n` opens any block (so values live across it must be spilled).
+static bool has_branch(Node *n) {
+  if (!n)
+    return false;
+  if (n->kind == ND_LOGAND || n->kind == ND_LOGOR || n->kind == ND_COND)
+    return true;
+  if (has_branch(n->lhs) || has_branch(n->rhs) || has_branch(n->cond) ||
+      has_branch(n->then) || has_branch(n->els))
+    return true;
+  for (Node *a = n->args; a; a = a->next)
+    if (has_branch(a))
+      return true;
+  return false;
+}
+
+// Spill SSA value `v` (IR type `irt`) to the next scratch slot; return the slot index.
+static int spill(int v, char *irt) {
+  int idx = spill_top++;
+  int off = nv++;
+  fprintf(o, "  v%d = i64.const %d\n", off, cur_scratch + idx * 8);
+  int a = nv++;
+  fprintf(o, "  v%d = i64.add " SP " v%d\n", a, off);
+  fprintf(o, "  %s.store v%d v%d\n", irt, a, v);
+  return idx;
+}
+
+// Reload a spilled value from scratch slot `idx`.
+static int reload(int idx, char *irt) {
+  int off = nv++;
+  fprintf(o, "  v%d = i64.const %d\n", off, cur_scratch + idx * 8);
+  int a = nv++;
+  fprintf(o, "  v%d = i64.add " SP " v%d\n", a, off);
+  int r = nv++;
+  fprintf(o, "  v%d = %s.load v%d\n", r, irt, a);
+  return r;
+}
+
+// Evaluate `a` then `b`, returning both result indices valid in the final block: if `b`
+// opens a block, spill `a` across it (via scratch memory, which all blocks share).
+static void eval2(Node *a, Node *b, int *va, int *vb) {
+  *va = gen_expr(a);
+  if (has_branch(b)) {
+    int save = spill_top;
+    int idx = spill(*va, irty(a->ty));
+    *vb = gen_expr(b);
+    *va = reload(idx, irty(a->ty));
+    spill_top = save;
+  } else {
+    *vb = gen_expr(b);
+  }
+}
+
 // True if a value of type `ty` is held *by address* (arrays/aggregates): reading the
 // lvalue yields its address, not a loaded scalar.
 static bool by_address(Type *ty) {
@@ -225,16 +290,18 @@ static void gen_store(Type *ty, int addr, int val) {
 static int gen_addr(Node *node) {
   switch (node->kind) {
   case ND_VAR: {
-    int r = nv++;
     if (node->var->is_local) {
-      // The local lives at sp + frame-offset (§3d data stack).
+      // The local lives at sp + frame-offset (§3d data stack). Emit the const (lower
+      // index) before the add that uses it, so value numbering stays monotonic.
       int off = nv++;
       fprintf(o, "  v%d = i64.const %d\n", off, node->var->offset);
+      int r = nv++;
       fprintf(o, "  v%d = i64.add " SP " v%d\n", r, off);
-    } else {
-      // A global lives at a fixed window offset in the data region below the stack.
-      fprintf(o, "  v%d = i64.const %d\n", r, node->var->offset);
+      return r;
     }
+    // A global lives at a fixed window offset in the data region below the stack.
+    int r = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", r, node->var->offset);
     return r;
   }
   case ND_DEREF:
@@ -258,8 +325,8 @@ static int gen_addr(Node *node) {
 
 // Emit `vR = <prefix>.<op> vA vB` over the operands' (common) width; return R.
 static int binop(Node *node, char *op) {
-  int a = gen_expr(node->lhs);
-  int b = gen_expr(node->rhs);
+  int a, b;
+  eval2(node->lhs, node->rhs, &a, &b);
   int r = nv++;
   fprintf(o, "  v%d = %s.%s v%d v%d\n", r, irty(node->lhs->ty), op, a, b);
   return r;
@@ -268,8 +335,8 @@ static int binop(Node *node, char *op) {
 // A comparison: the op width is the operands' type; the result is always i32 0/1. Integer
 // `lt`/`le` take a signedness suffix; float compares (and `eq`/`ne`) do not.
 static int cmpop(Node *node, char *base, bool sign) {
-  int a = gen_expr(node->lhs);
-  int b = gen_expr(node->rhs);
+  int a, b;
+  eval2(node->lhs, node->rhs, &a, &b);
   int r = nv++;
   Type *ot = node->lhs->ty;
   char *p = irty(ot);
@@ -306,6 +373,9 @@ static int gen_convert(int a, Type *from, Type *to) {
 }
 
 static int gen_cast(Node *node) {
+  // A cast to void just discards the value (after evaluating it for side effects).
+  if (node->ty->kind == TY_VOID)
+    return gen_expr(node->lhs);
   return gen_convert(gen_expr(node->lhs), node->lhs->ty, node->ty);
 }
 
@@ -420,8 +490,9 @@ static int gen_builtin_stream(Node *node, int slot, int op) {
   if (!a || !a->next || !a->next->next)
     error_tok(node->tok, "codegen_ir: write/read(fd, buf, len) expects 3 arguments");
   gen_expr(a); // fd — evaluated for effect, then ignored (always the std stream)
-  int buf = gen_expr(a->next);
-  int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int buf, lenv;
+  eval2(a->next, a->next->next, &buf, &lenv);
+  int len = widen_i64(lenv, a->next->next->ty);
   int h = load_handle(slot);
   int r = nv++;
   fprintf(o, "  v%d = cap.call 0 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, buf, len);
@@ -553,17 +624,76 @@ static int gen_expr(Node *node) {
       if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
         return gen_builtin_exit(node);
     }
-    // Evaluate the arguments (already cast to the parameter types by the parser).
+    // Evaluate the arguments (already cast to parameter types / default-promoted by the
+    // parser). Keep their types too, for marshalling variadic args. If any argument opens
+    // a block, spill each across the rest so all values land in the final block.
     int argv[64];
+    Type *argt[64];
     int n = 0;
+    bool argbranch = false;
+    for (Node *a = node->args; a; a = a->next)
+      argbranch |= has_branch(a);
+    int spillsave = spill_top;
+    int spillslot[64];
     for (Node *a = node->args; a; a = a->next) {
       if (n == 64)
         error_tok(node->tok, "codegen_ir: too many call arguments");
-      argv[n++] = gen_expr(a);
+      argt[n] = a->ty;
+      argv[n] = gen_expr(a);
+      if (argbranch)
+        spillslot[n] = spill(argv[n], irty(a->ty));
+      n++;
     }
-    // The callee gets a fresh frame above ours: callee_sp = sp + our frame size.
+    if (argbranch) {
+      for (int i = 0; i < n; i++)
+        argv[i] = reload(spillslot[i], irty(argt[i]));
+      spill_top = spillsave;
+    }
+
+    bool variadic = node->func_ty && node->func_ty->is_variadic;
+    int nfixed = n;
+    int vbuf = 0; // the marshalled-varargs buffer pointer (passed as the trailing arg)
+    int extra = 0;
+    if (variadic) {
+      nfixed = 0;
+      for (Type *pt = node->func_ty->params; pt; pt = pt->next)
+        nfixed++;
+      int nva = n - nfixed;
+      // Marshal the variadic args into a buffer just above our frame (and below the
+      // callee's): one promoted 8-byte slot each (§3d).
+      int fc = nv++;
+      fprintf(o, "  v%d = i64.const %d\n", fc, cur_frame);
+      vbuf = nv++;
+      fprintf(o, "  v%d = i64.add " SP " v%d\n", vbuf, fc);
+      for (int j = 0; j < nva; j++) {
+        int v = argv[nfixed + j];
+        Type *t = argt[nfixed + j];
+        int addr = vbuf;
+        if (j > 0) {
+          int o2 = nv++;
+          fprintf(o, "  v%d = i64.const %d\n", o2, j * 8);
+          addr = nv++;
+          fprintf(o, "  v%d = i64.add v%d v%d\n", addr, vbuf, o2);
+        }
+        if (is_flt(t)) {
+          if (!is64(t)) { // promote float -> double (defensive; parser usually did)
+            int p = nv++;
+            fprintf(o, "  v%d = f64.promote_f32 v%d\n", p, v);
+            v = p;
+          }
+          fprintf(o, "  f64.store v%d v%d\n", addr, v);
+        } else if (is64(t)) {
+          fprintf(o, "  i64.store v%d v%d\n", addr, v);
+        } else {
+          fprintf(o, "  i32.store v%d v%d\n", addr, v);
+        }
+      }
+      extra = align_to(nva * 8, 16); // the callee frame sits above the buffer
+    }
+
+    // The callee gets a fresh frame above ours (and above any varargs buffer).
     int fs = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", fs, cur_frame);
+    fprintf(o, "  v%d = i64.const %d\n", fs, cur_frame + extra);
     int csp = nv++;
     fprintf(o, "  v%d = i64.add " SP " v%d\n", csp, fs);
 
@@ -574,14 +704,25 @@ static int gen_expr(Node *node) {
       fprintf(o, "  call %d (v%d", idx, csp);
     else
       fprintf(o, "  v%d = call %d (v%d", r, idx, csp);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < nfixed; i++)
       fprintf(o, ", v%d", argv[i]);
+    if (variadic)
+      fprintf(o, ", v%d", vbuf); // the hidden varargs-buffer pointer
     fprintf(o, ")\n");
     return r; // for a void call the value is discarded
   }
   case ND_ASSIGN: {
     int addr = gen_addr(node->lhs);
-    int val = gen_expr(node->rhs);
+    int val;
+    if (has_branch(node->rhs)) {
+      int save = spill_top;
+      int idx = spill(addr, "i64");
+      val = gen_expr(node->rhs);
+      addr = reload(idx, "i64");
+      spill_top = save;
+    } else {
+      val = gen_expr(node->rhs);
+    }
     gen_store(node->lhs->ty, addr, val);
     return val; // an assignment is an expression yielding the stored value
   }
@@ -630,7 +771,7 @@ static void gen_stmt(Node *node);
 
 // `if (cond) then [else els]` → a diamond of param-free blocks (state is in memory).
 static void gen_if(Node *node) {
-  int c = gen_expr(node->cond);
+  int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
   int t = nb++, e = nb++, end = nb++;
   fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, t, e);
   term = true;
@@ -661,7 +802,7 @@ static void gen_for(Node *node) {
 
   open_block(cond);
   if (node->cond) {
-    int c = gen_expr(node->cond);
+    int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
     fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, body, end);
   } else {
     fprintf(o, "  br block%d(" SP ")\n", body); // `for(;;)` — unconditional
@@ -697,7 +838,7 @@ static void gen_do(Node *node) {
     fprintf(o, "  br block%d(" SP ")\n", cont);
 
   open_block(cont);
-  int c = gen_expr(node->cond);
+  int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
   fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, body, end);
 
   open_block(end);
@@ -838,6 +979,8 @@ static void assign_offsets(Obj *fn) {
     v->offset = off;
     off += v->ty->size;
   }
+  // Reserve the spill scratch region at the top of the frame (see SCRATCH_BYTES).
+  off = align_to(off, 16) + SCRATCH_BYTES;
   fn->stack_size = align_to(off, 16);
 }
 
@@ -847,23 +990,31 @@ static void gen_func(Obj *fn) {
 
   nb = 0;
   cur_frame = fn->stack_size;
+  cur_scratch = fn->stack_size - SCRATCH_BYTES; // scratch sits at the top of the frame
+  spill_top = 0;
   Type *ret = fn->ty->return_ty;
+  bool variadic = fn->ty->is_variadic;
 
-  // Signature: `func (i64 sp, <param tys>) -> (<ret ty>)` — the data-SP is param 0.
+  // Signature: `func (i64 sp, <param tys> [, i64 va_ptr]) -> (<ret ty>)`. v0 is the
+  // data-SP; a variadic function takes a trailing pointer to the marshalled args (§3d).
   fprintf(o, "func (i64");
   for (Obj *p = fn->params; p; p = p->next)
     fprintf(o, ", %s", irty(p->ty));
+  if (variadic)
+    fprintf(o, ", i64");
   if (ret->kind == TY_VOID)
     fprintf(o, ") -> () {\n");
   else
     fprintf(o, ") -> (%s) {\n", irty(ret));
 
-  // Entry block: params are `sp` (v0) then the C params (v1..vN). Spill each C param to
-  // its data-stack slot (sp + offset) so the body reads/writes it like any other local.
+  // Entry block: params are `sp` (v0), the C params (v1..vN), then the va pointer.
   fprintf(o, "block%d(" SP ": i64", nb++);
   int np = 1;
   for (Obj *p = fn->params; p; p = p->next)
     fprintf(o, ", v%d: %s", np++, irty(p->ty));
+  int va_param = np;
+  if (variadic)
+    fprintf(o, ", v%d: i64", np++);
   fprintf(o, "):\n");
   nv = np;
   term = false;
@@ -874,6 +1025,14 @@ static void gen_func(Obj *fn) {
     int addr = nv++;
     fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
     gen_store(p->ty, addr, pi++);
+  }
+  // Stash the va pointer into __va_area__'s slot so va_start can load it.
+  if (variadic) {
+    int off = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", off, fn->va_area->offset);
+    int addr = nv++;
+    fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
+    fprintf(o, "  i64.store v%d v%d\n", addr, va_param);
   }
 
   gen_stmt(fn->body);
@@ -945,11 +1104,16 @@ static void emit_start(Obj *prog, Obj *main_fn) {
   }
   int sp = nv++;
   fprintf(o, "  v%d = i64.const %d\n", sp, data_end);
+  // `int main()` (empty parens) is variadic in chibicc, so it expects the hidden va
+  // pointer; main never reads it, so any in-window pointer (the sp) does.
+  char va[24] = "";
+  if (main_fn->ty->is_variadic)
+    snprintf(va, sizeof va, ", v%d", sp);
   if (is_void) {
-    fprintf(o, "  call %d (v%d)\n  return\n", func_index(main_fn), sp);
+    fprintf(o, "  call %d (v%d%s)\n  return\n", func_index(main_fn), sp, va);
   } else {
     int r = nv++;
-    fprintf(o, "  v%d = call %d (v%d)\n  return v%d\n", r, func_index(main_fn), sp, r);
+    fprintf(o, "  v%d = call %d (v%d%s)\n  return v%d\n", r, func_index(main_fn), sp, va, r);
   }
   fprintf(o, "}\n\n");
 }

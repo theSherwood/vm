@@ -697,3 +697,136 @@ fn c_switch_end_to_end() {
         8
     );
 }
+
+/// A tiny freestanding libc (`printf` family over the `write` builtin + varargs) prepended
+/// to the printf tests — exercises the §3d flat-buffer varargs ABI through real code.
+const LIBC: &str = r#"
+#include <stdarg.h>
+int write(int fd, char *buf, long n);
+static void __putc(char c) { write(1, &c, 1); }
+static void __puts(char *s) { while (*s) { __putc(*s); s = s + 1; } }
+static void __putu(unsigned long v, int base) {
+  char buf[24]; int i = 0;
+  if (v == 0) { __putc('0'); return; }
+  while (v) { int d = v % base; buf[i] = (d < 10 ? '0' + d : 'a' + d - 10); i = i + 1; v = v / base; }
+  while (i) { i = i - 1; __putc(buf[i]); }
+}
+static void __putd(long v) {
+  if (v < 0) { __putc('-'); __putu((unsigned long)(-v), 10); } else { __putu((unsigned long)v, 10); }
+}
+int printf(char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  int i = 0;
+  while (fmt[i]) {
+    if (fmt[i] != '%') { __putc(fmt[i]); i = i + 1; continue; }
+    i = i + 1;
+    int lng = 0;
+    while (fmt[i] == 'l') { lng = 1; i = i + 1; }
+    char c = fmt[i]; i = i + 1;
+    if (c == 'd') { if (lng) __putd(va_arg(ap, long)); else __putd(va_arg(ap, int)); }
+    else if (c == 'u') { if (lng) __putu(va_arg(ap, unsigned long), 10); else __putu(va_arg(ap, unsigned int), 10); }
+    else if (c == 'x') { if (lng) __putu(va_arg(ap, unsigned long), 16); else __putu(va_arg(ap, unsigned int), 16); }
+    else if (c == 'c') __putc((char)va_arg(ap, int));
+    else if (c == 's') __puts(va_arg(ap, char*));
+    else if (c == '%') __putc('%');
+    else { __putc('%'); __putc(c); }
+  }
+  va_end(ap);
+  return 0;
+}
+"#;
+
+fn stdout_of(body: &str) -> String {
+    let r = run_c_full(&format!("{LIBC}\n{body}"));
+    String::from_utf8(r.stdout).expect("utf-8 stdout")
+}
+
+#[test]
+fn c_varargs_end_to_end() {
+    // a hand-rolled variadic function summing its args (the raw §3d ABI)
+    assert_eq!(
+        i32_of("#include <stdarg.h>\n\
+                int sum(int n, ...) { va_list ap; va_start(ap, n); int s = 0; \
+                  for (int i = 0; i < n; i = i + 1) s = s + va_arg(ap, int); va_end(ap); return s; } \
+                int main() { return sum(4, 10, 20, 30, 40); }"),
+        100
+    );
+    // mixed int/long/double through one va_list
+    assert_eq!(
+        i32_of("#include <stdarg.h>\n\
+                int f(int n, ...) { va_list ap; va_start(ap, n); \
+                  int a = va_arg(ap, int); long b = va_arg(ap, long); double c = va_arg(ap, double); \
+                  va_end(ap); return a + (int)b + (int)c; } \
+                int main() { return f(3, 100, 2000000000000L, 7.0); }"),
+        100 + 2000000000000i64 as i32 + 7
+    );
+}
+
+#[test]
+fn c_printf_end_to_end() {
+    assert_eq!(
+        stdout_of("int main() { printf(\"hello, world\\n\"); return 0; }"),
+        "hello, world\n"
+    );
+    assert_eq!(
+        stdout_of("int main() { printf(\"%d + %d = %d\\n\", 2, 3, 2 + 3); return 0; }"),
+        "2 + 3 = 5\n"
+    );
+    assert_eq!(
+        stdout_of("int main() { printf(\"%s is %d\\n\", \"answer\", 42); return 0; }"),
+        "answer is 42\n"
+    );
+    assert_eq!(
+        stdout_of("int main() { printf(\"%c%c%c\", 'a', 'b', 'c'); return 0; }"),
+        "abc"
+    );
+    assert_eq!(
+        stdout_of("int main() { printf(\"%x %x\\n\", 255, 4096); return 0; }"),
+        "ff 1000\n"
+    );
+    assert_eq!(
+        stdout_of("int main() { printf(\"neg %d\\n\", -17); return 0; }"),
+        "neg -17\n"
+    );
+    assert_eq!(
+        stdout_of("int main() { printf(\"%ld\\n\", 5000000000L); return 0; }"),
+        "5000000000\n"
+    );
+    assert_eq!(
+        stdout_of("int main() { printf(\"100%%\\n\"); return 0; }"),
+        "100%\n"
+    );
+    // printf driven by a loop (FizzBuzz-ish)
+    assert_eq!(
+        stdout_of(
+            "int main() { for (int i = 1; i <= 5; i = i + 1) printf(\"%d \", i * i); return 0; }"
+        ),
+        "1 4 9 16 25 "
+    );
+}
+
+#[test]
+fn c_branching_operands_spill_regression() {
+    // A value computed before a control-flow sub-expression must survive the branch it
+    // opens (it is spilled to scratch and reloaded in the merge block). Earlier tests used
+    // a *single* &&/||/?: as the whole expression and so missed this stranding bug.
+    assert_eq!(
+        i32_of(
+            "int main() { int x = 5; return (x > 0 && x < 10) + (0 || 3) + (x > 3 ? 100 : 7); }"
+        ),
+        1 + 1 + 100
+    );
+    // a branching argument among several call arguments
+    assert_eq!(
+        i32_of(
+            "int add3(int a, int b, int c) { return a + b + c; } \
+                int main() { int x = 2; return add3(10, x > 0 ? 5 : 9, 100); }"
+        ),
+        115
+    );
+    // assignment whose rhs branches: the lhs address must survive
+    assert_eq!(
+        i32_of("int main() { int a[2]; a[0] = 0; a[1] = 0; int i = 1; a[i] = (i ? 42 : 7); return a[1]; }"),
+        42
+    );
+}
