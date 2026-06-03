@@ -197,6 +197,74 @@ block2(v7: i32):
 }
 
 #[test]
+fn jit_matches_interp_mem_store_load_roundtrip() {
+    // Store an i64 at the given address, read it back — exercises the §4 masking
+    // lowering (mem_base + ((addr+offset) & mask)) against the interpreter.
+    let src = r#"
+memory 16
+
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  i64.store v0 v1
+  v2 = i64.load v0
+  return v2
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            vec![Value::I64(0), Value::I64(0x0123_4567_89AB_CDEF)],
+            vec![Value::I64(64), Value::I64(-1)],
+            vec![Value::I64(65528), Value::I64(42)], // last aligned 8-byte slot (2^16-8)
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_mem_narrow_store_load() {
+    // store8 keeps the low byte; load8_u zero-extends, load8_s sign-extends.
+    let src = r#"
+memory 16
+
+func (i64, i32) -> (i32) {
+block0(v0: i64, v1: i32):
+  i32.store8 v0 v1
+  v2 = i32.load8_u v0
+  v3 = i32.load8_s v0
+  v4 = i32.add v2 v3
+  return v4
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            vec![Value::I64(0), Value::I32(0x1FF)], // truncates to 0xFF
+            vec![Value::I64(10), Value::I32(0x80)], // 128: u=128, s=-128
+            vec![Value::I64(7), Value::I32(0x41)],  // 'A'
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_mem_masking_aliases_out_of_window() {
+    // I1: an out-of-window address must alias back via the mask, identically in the
+    // JIT and the interpreter. Store at offset 8, read at (2^16 + 8) — same cell.
+    let src = r#"
+memory 16
+
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 8
+  i64.store v1 v0
+  v2 = i64.const 65544
+  v3 = i64.load v2
+  return v3
+}
+"#;
+    assert_jit_matches_interp(src, &[vec![Value::I64(0xDEAD_BEEF)], vec![Value::I64(-99)]]);
+}
+
+#[test]
 fn jit_matches_interp_no_args_const() {
     let src = r#"
 func () -> (i32) {

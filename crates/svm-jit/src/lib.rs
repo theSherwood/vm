@@ -6,31 +6,51 @@
 //! lowering. Correctness is established by **differential testing against the
 //! reference interpreter** (§18, invariants I1/I4), the oracle in `svm-interp`.
 //!
-//! ## Status: integer vertical slice
-//! This first slice lowers `i32`/`i64` scalars: constants, the non-trapping integer
-//! arithmetic/bitwise/shift/rotate ops, comparisons, `eqz`, `select`, `clz/ctz/
-//! popcnt`, and the `br`/`br_if`/`return` terminators. Anything else returns
-//! [`JitError::Unsupported`] so the differential harness can skip it for now. Memory
-//! (with the §4 masking lowering), calls, `br_table`, floats, conversions, and traps
-//! grow from here — each added under the same interpreter-differential check.
+//! ## Status: integer slice + the §4 memory masking lowering
+//! Lowers `i32`/`i64` scalars: constants, the non-trapping integer arithmetic/
+//! bitwise/shift/rotate ops, comparisons, `eqz`, `select`, `clz/ctz/popcnt`, the
+//! `br`/`br_if`/`return` terminators, and **integer loads/stores with confinement
+//! masking** — the security-critical I1 lowering. Anything else returns
+//! [`JitError::Unsupported`] so the differential harness skips it. Calls, `br_table`,
+//! floats, conversions, and trapping ops grow from here under the same check.
+//!
+//! ## The masking lowering (§4, invariant I1)
+//! Every access masks the **final effective address** into the window —
+//! `(addr + offset) & (size - 1)` — then adds the window base. This is exactly
+//! [`svm_mask::Window::confine`] (the isolated, separately-fuzzed spec), so the JIT
+//! and that unit lower the same arithmetic. The window allocation carries a small
+//! guard margin so a masked base near the top plus the access width never escapes the
+//! allocation (a real deployment uses guard *pages* + a fault for the width overrun).
 //!
 //! ## Calling convention
 //! To support any arity behind one native signature, a compiled function is
-//! `extern "C" fn(args: *const i64, results: *mut i64)`: the entry loads the IR
-//! function's parameters from `args` (one `i64` slot each) and `return` stores the
-//! results to `results`. The caller ([`compile_and_run`]) marshals values in and out
-//! of those slots.
+//! `extern "C" fn(args: *const i64, results: *mut i64, mem_base: *mut u8)`: the entry
+//! loads the IR parameters from `args` (one `i64` slot each), `return` stores results
+//! to `results`, and loads/stores are relative to `mem_base`. The caller
+//! ([`compile_and_run`]) marshals values and owns the window.
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I32, I64};
+use cranelift_codegen::ir::types::{I16, I32, I64, I8};
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Type, UserFuncName, Value,
+    AbiParam, BlockArg, Endianness, Function, InstBuilder, MemFlags, Type, UserFuncName, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
-use svm_ir::{BinOp, Block, Func, FuncIdx, Inst, IntUnOp, Module as IrModule, Terminator, ValType};
+use svm_ir::{
+    BinOp, Block, Func, FuncIdx, Inst, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator,
+    ValType,
+};
+
+/// Largest window the reference JIT will back with a flat host allocation. Real
+/// deployments reserve a huge guard-paged virtual range (§4); for the differential
+/// harness we allocate `1 << size_log2` bytes (+ a guard margin), so cap it.
+const MAX_JIT_WINDOW_LOG2: u8 = 26; // 64 MiB
+/// Guard margin past the window so a masked base near the top plus an access width
+/// never reads/writes outside the allocation (models the §4 guard region; a real
+/// impl uses guard *pages* + a fault). 8 = widest scalar access.
+const GUARD: usize = 8;
 
 /// Why the JIT could not compile (or run) a function. The integer slice rejects
 /// anything it does not yet lower with [`JitError::Unsupported`]; the differential
@@ -63,6 +83,21 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<
     // Reject the not-yet-lowered surface up front so we never emit partial CLIF.
     ensure_supported(f)?;
 
+    // Allocate the guest window (zeroed, + guard margin) if the module declares memory.
+    // `mask` is the §4 confinement mask; `mem_base` is null when there is no window.
+    let (window, mask): (Vec<u8>, u64) = match m.memory {
+        Some(mc) => {
+            if mc.size_log2 > MAX_JIT_WINDOW_LOG2 {
+                return Err(JitError::Unsupported(
+                    "window too large for the reference JIT",
+                ));
+            }
+            let size = 1usize << mc.size_log2;
+            (vec![0u8; size + GUARD], (size as u64) - 1)
+        }
+        None => (Vec::new(), 0),
+    };
+
     let mut flags = settings::builder();
     // A JIT'd function is called directly, not relocated into a shared object.
     let _ = flags.set("is_pic", "false");
@@ -74,7 +109,7 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<
     let mut module = JITModule::new(builder);
 
     let mut ctx = module.make_context();
-    build_clif(&mut ctx.func, f)?;
+    build_clif(&mut ctx.func, f, mask)?;
 
     let id = module
         .declare_function("f", Linkage::Export, &ctx.func.signature)
@@ -91,12 +126,21 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<
     // SAFETY: `code` points at a finalized function with exactly this signature
     // (`build_clif` set it). `module` owns the executable page and stays alive until
     // after the call below.
-    let run: extern "C" fn(*const i64, *mut i64) = unsafe { std::mem::transmute(code) };
+    let run: extern "C" fn(*const i64, *mut i64, *mut u8) = unsafe { std::mem::transmute(code) };
 
+    let mut window = window;
+    let mem_base = if window.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        window.as_mut_ptr()
+    };
     let mut results = vec![0i64; f.results.len()];
-    // SAFETY: `run` reads `f.params.len()` arg slots and writes `f.results.len()`
-    // result slots; both buffers are sized to match (the harness verified arity).
-    run(args.as_ptr(), results.as_mut_ptr());
+    // SAFETY: `run` reads `f.params.len()` arg slots, writes `f.results.len()` result
+    // slots, and accesses only `[mem_base, mem_base + size + GUARD)` (the masking
+    // lowering confines every effective address to `< size`, plus the guard margin).
+    // All three buffers outlive the call.
+    run(args.as_ptr(), results.as_mut_ptr(), mem_base);
+    drop(window);
     drop(module); // frees the executable memory after the call has returned
     Ok(results)
 }
@@ -130,6 +174,16 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                     IntUnOp::Clz | IntUnOp::Ctz | IntUnOp::Popcnt => {}
                     _ => return Err(JitError::Unsupported("int extend ops")),
                 },
+                Inst::Load { op, .. } => {
+                    if matches!(op.info().1, ValType::F32 | ValType::F64) {
+                        return Err(JitError::Unsupported("float load"));
+                    }
+                }
+                Inst::Store { op, .. } => {
+                    if matches!(op.info().1, ValType::F32 | ValType::F64) {
+                        return Err(JitError::Unsupported("float store"));
+                    }
+                }
                 _ => return Err(JitError::Unsupported("instruction")),
             }
         }
@@ -144,12 +198,23 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
     Ok(())
 }
 
+/// Per-function lowering context shared across blocks.
+struct Lower {
+    /// Holds `results_ptr` so any block's `return` can store to it.
+    results_var: Variable,
+    /// Holds `mem_base` (the window base) for load/store lowering.
+    mem_var: Variable,
+    /// The §4 confinement mask (`size - 1`); `0` when the module has no memory.
+    mask: u64,
+}
+
 /// Build the CLIF for one IR function into `clif`.
-fn build_clif(clif: &mut Function, f: &Func) -> Result<(), JitError> {
+fn build_clif(clif: &mut Function, f: &Func, mask: u64) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
     }
-    // Native signature: (args_ptr: i64, results_ptr: i64) -> ().
+    // Native signature: (args_ptr: i64, results_ptr: i64, mem_base: i64) -> ().
+    clif.signature.params.push(AbiParam::new(I64));
     clif.signature.params.push(AbiParam::new(I64));
     clif.signature.params.push(AbiParam::new(I64));
     clif.name = UserFuncName::user(0, 0);
@@ -158,8 +223,8 @@ fn build_clif(clif: &mut Function, f: &Func) -> Result<(), JitError> {
     let mut b = FunctionBuilder::new(clif, &mut fbctx);
 
     // One CLIF block per IR block, with params mirroring the IR block params. A
-    // separate CLIF entry block holds the native (args_ptr, results_ptr) params and
-    // jumps into IR block 0 with the loaded function arguments.
+    // separate CLIF entry block holds the native params and jumps into IR block 0
+    // with the loaded function arguments.
     let blocks: Vec<_> = f.blocks.iter().map(|_| b.create_block()).collect();
     for (i, blk) in f.blocks.iter().enumerate() {
         for p in &blk.params {
@@ -169,15 +234,24 @@ fn build_clif(clif: &mut Function, f: &Func) -> Result<(), JitError> {
     let entry = b.create_block();
     b.append_block_param(entry, I64); // args_ptr
     b.append_block_param(entry, I64); // results_ptr
+    b.append_block_param(entry, I64); // mem_base
     b.switch_to_block(entry);
     b.seal_block(entry);
     let args_ptr = b.block_params(entry)[0];
     let results_ptr = b.block_params(entry)[1];
+    let mem_base = b.block_params(entry)[2];
 
-    // `results_ptr` is needed by every `return`; stash it in a variable so any block
-    // can read it without threading it through block params.
+    // `results_ptr` / `mem_base` are needed across blocks; stash them in variables so
+    // any block can read them without threading them through block params.
     let results_var = b.declare_var(I64);
     b.def_var(results_var, results_ptr);
+    let mem_var = b.declare_var(I64);
+    b.def_var(mem_var, mem_base);
+    let lower = Lower {
+        results_var,
+        mem_var,
+        mask,
+    };
 
     // Load the function arguments from the args buffer, narrowing i32 params.
     let mut entry_args: Vec<BlockArg> = Vec::with_capacity(f.params.len());
@@ -195,7 +269,7 @@ fn build_clif(clif: &mut Function, f: &Func) -> Result<(), JitError> {
     b.ins().jump(blocks[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(&mut b, blk, blocks[i], &blocks, results_var)?;
+        lower_block(&mut b, blk, blocks[i], &blocks, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -209,7 +283,7 @@ fn lower_block(
     blk: &Block,
     cb: cranelift_codegen::ir::Block,
     blocks: &[cranelift_codegen::ir::Block],
-    results_var: Variable,
+    lower: &Lower,
 ) -> Result<(), JitError> {
     b.switch_to_block(cb);
     // The CLIF block params are the IR block params; seed the value map with them.
@@ -246,6 +320,23 @@ fn lower_block(
                 let (c, x, y) = (get(&vals, *cond)?, get(&vals, *a)?, get(&vals, *rb)?);
                 b.ins().select(c, x, y)
             }
+            Inst::Load {
+                op, addr, offset, ..
+            } => {
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset);
+                lower_load(b, *op, phys)
+            }
+            Inst::Store {
+                op,
+                addr,
+                value,
+                offset,
+                ..
+            } => {
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset);
+                lower_store(b, *op, phys, get(&vals, *value)?);
+                continue; // store produces no value
+            }
             _ => return Err(JitError::Unsupported("instruction")),
         };
         vals.push(v);
@@ -272,7 +363,7 @@ fn lower_block(
             b.ins().brif(c, tb, &ta, eb, &ea);
         }
         Terminator::Return(outs) => {
-            let results_ptr = b.use_var(results_var);
+            let results_ptr = b.use_var(lower.results_var);
             for (i, o) in outs.iter().enumerate() {
                 let v = get(&vals, *o)?;
                 // Widen i32 results to fill the i64 slot (sign-extend; the harness
@@ -298,6 +389,62 @@ fn lower_block(
 
 fn get(vals: &[Value], i: u32) -> Result<Value, JitError> {
     vals.get(i as usize).copied().ok_or(JitError::Malformed)
+}
+
+/// The §4 confinement masking lowering (invariant I1): compute the physical address
+/// `mem_base + ((addr + offset) & mask)`. The `(addr + offset) & mask` is exactly
+/// `svm_mask::Window::confine`, so the JIT and the isolated masking unit agree.
+fn mask_addr(b: &mut FunctionBuilder, lower: &Lower, addr: Value, offset: u64) -> Value {
+    let off = b.ins().iconst(I64, offset as i64);
+    let eff = b.ins().iadd(addr, off);
+    let m = b.ins().iconst(I64, lower.mask as i64);
+    let masked = b.ins().band(eff, m);
+    let base = b.use_var(lower.mem_var);
+    b.ins().iadd(base, masked)
+}
+
+/// Little-endian, may-trap memory access flags (the window is host memory; the guard
+/// margin absorbs width overrun, so this never faults in practice).
+fn mem_flags() -> MemFlags {
+    let mut mf = MemFlags::new();
+    mf.set_endianness(Endianness::Little);
+    mf
+}
+
+/// The CLIF type holding `width` raw bytes.
+fn width_ty(width: u32) -> Type {
+    match width {
+        1 => I8,
+        2 => I16,
+        4 => I32,
+        _ => I64,
+    }
+}
+
+fn lower_load(b: &mut FunctionBuilder, op: LoadOp, phys: Value) -> Value {
+    let (_, rty, width, signed) = op.info();
+    let load_ty = width_ty(width);
+    let raw = b.ins().load(load_ty, mem_flags(), phys, 0);
+    let result_ty = clif_ty(rty);
+    if load_ty == result_ty {
+        raw
+    } else if signed {
+        b.ins().sextend(result_ty, raw) // narrow signed load: sign-extend
+    } else {
+        b.ins().uextend(result_ty, raw) // narrow unsigned load: zero-extend
+    }
+}
+
+fn lower_store(b: &mut FunctionBuilder, op: StoreOp, phys: Value, value: Value) {
+    let (_, _, width) = op.info();
+    let store_ty = width_ty(width);
+    // Narrow stores keep only the low `width` bytes (matches the interpreter).
+    let v = if b.func.dfg.value_type(value) == store_ty {
+        value
+    } else {
+        b.ins().ireduce(store_ty, value)
+    };
+    b.ins().store(mem_flags(), v, phys, 0);
 }
 
 /// Map IR edge args to CLIF block-call args (`BlockArg`, the 0.132 block-call type).
