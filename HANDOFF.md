@@ -150,11 +150,11 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
    Lowered with option (b): the merge block carries the result as a second block param
    `(sp, v1: ty)`. See `gen_logand`/`gen_logor`/`gen_cond` + `gen_truth`/`gen_expr_as`/
    `open_merge` in `codegen_ir.c`. Tested incl. short-circuit side effects + chained `?:`.
-2. **Arrays + structs/unions** — `arr[i]` is already `*(arr+i)` in chibicc (pointer
-   arith with element-size scaling baked into the AST); add `ND_MEMBER` to `gen_addr`
-   (`addr(lhs) + member->offset`). By-value aggregate args/returns → hidden-pointer
-   (`sret`) per §3d "by hidden pointer everywhere" (D39); `ND_MEMZERO`/copies already
-   partly handled. chibicc computes all layout.
+2. ~~**Arrays + structs/unions**~~ — **DONE** (member read/write, indexing, `->`, 2D,
+   array-of-struct, initializers). `irty(TY_ARRAY)=i64` (decay); `ND_MEMBER` in
+   `gen_addr`/`gen_expr`. **Still TODO here:** by-value aggregate args/returns → hidden
+   pointer (`sret`, §3d D39) and whole-struct assignment (`s1 = s2` memcpy) — currently
+   only *pointers* to aggregates pass/return. chibicc computes all layout/offsets.
 3. **Globals + string literals** — a data segment at fixed window offsets (§3d "Globals
    → data segments"); `&global` = a ptr constant. Needed for `printf("...")`.
 4. **stdio via the powerbox** — `printf` → `Stream.write`, `exit` → `Exit` through

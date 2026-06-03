@@ -14,9 +14,14 @@
 // function and block, a local lives at `sp + offset`, and a call gives the callee a
 // fresh frame at `sp + frame_size` so recursion never clobbers a parent frame.
 // Short-circuit `&&`/`||` and ternary `?:` lower to a diamond whose merge block carries
-// the result as a second block parameter (alongside the data-SP). `break`/`continue`/
-// `switch`, indirect calls, arrays/structs, globals, and floats come next; anything
-// unsupported is a hard error (so we never emit IR we cannot stand behind).
+// the result as a second block parameter (alongside the data-SP). **Arrays and
+// structs/unions** work too: indexing is chibicc's `*(base + i*size)` (an array decays
+// to its i64 address in value context), and `s.field` / `p->field` add the member offset
+// (`ND_MEMBER`); initializers lower to per-element/-member scalar stores. By-value
+// aggregate *arguments/returns* (sret, §3d D39) and whole-struct assignment are not done
+// yet — pointers to aggregates are fine. `break`/`continue`/`switch`, indirect calls,
+// globals, and floats come next; anything unsupported is a hard error (so we never emit
+// IR we cannot stand behind).
 
 #include "chibicc.h"
 
@@ -69,6 +74,7 @@ static char *irty(Type *ty) {
     return "i32";
   case TY_LONG:
   case TY_PTR:
+  case TY_ARRAY: // an array decays to its address (a pointer) in value context
     return "i64";
   default:
     error_tok(ty->name, "codegen_ir: unsupported type");
@@ -158,6 +164,15 @@ static int gen_addr(Node *node) {
   case ND_COMMA:
     gen_expr(node->lhs);
     return gen_addr(node->rhs);
+  case ND_MEMBER: {
+    // &(s.field) = &s + field offset.
+    int base = gen_addr(node->lhs);
+    int off = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", off, node->member->offset);
+    int r = nv++;
+    fprintf(o, "  v%d = i64.add v%d v%d\n", r, base, off);
+    return r;
+  }
   default:
     error_tok(node->tok, "codegen_ir: expression is not an lvalue");
   }
@@ -372,6 +387,8 @@ static int gen_expr(Node *node) {
   case ND_VAR:
     return gen_load(node->ty, gen_addr(node));
   case ND_DEREF:
+    return gen_load(node->ty, gen_addr(node));
+  case ND_MEMBER:
     return gen_load(node->ty, gen_addr(node));
   case ND_ADDR:
     return gen_addr(node->lhs);

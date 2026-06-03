@@ -321,3 +321,59 @@ fn c_short_circuit_and_ternary_end_to_end() {
         10
     );
 }
+
+#[test]
+fn c_arrays_end_to_end() {
+    // index + store/load over a data-stack array
+    assert_eq!(
+        i32_of("int main() { int a[3]; a[0]=10; a[1]=20; a[2]=30; int s=0; for(int i=0;i<3;i=i+1) s=s+a[i]; return s; }"),
+        60
+    );
+    // pointer walking: *(a+i)
+    assert_eq!(
+        i32_of("int main() { int a[4]; for(int i=0;i<4;i=i+1) *(a+i)=i*i; int *p=a; return p[0]+p[1]+p[2]+p[3]; }"),
+        14
+    );
+    // array initializer (lowered to per-element stores) + reverse sum
+    assert_eq!(
+        i32_of("int main() { int a[5] = {1,2,3,4,5}; int s=0; for(int i=4;i>=0;i=i-1) s=s*10+a[i]; return s; }"),
+        54321
+    );
+    // 2D array
+    assert_eq!(
+        i32_of("int main() { int m[2][2]; m[0][0]=1; m[0][1]=2; m[1][0]=3; m[1][1]=4; return m[0][0]+m[0][1]+m[1][0]+m[1][1]; }"),
+        10
+    );
+}
+
+#[test]
+fn c_structs_end_to_end() {
+    // member read/write
+    assert_eq!(
+        i32_of("struct P { int x; int y; }; int main() { struct P p; p.x=3; p.y=4; return p.x*p.x + p.y*p.y; }"),
+        25
+    );
+    // struct initializer (member-wise) + mixed widths
+    assert_eq!(
+        i32_of("struct R { int lo; long hi; }; int main() { struct R r = {7, 5000000000}; return r.lo + (int)(r.hi / 1000000); }"),
+        5007
+    );
+    // pointer to struct: p->field, and writing through it
+    assert_eq!(
+        i32_of(
+            "struct P { int x; int y; }; \
+             int sx(struct P *p) { return p->x; } \
+             int main() { struct P p; p.x=11; p.y=22; struct P *q=&p; q->x = q->x + q->y; return sx(q); }"
+        ),
+        33
+    );
+    // array of structs
+    assert_eq!(
+        i32_of(
+            "struct Pt { int x; int y; }; \
+             int main() { struct Pt a[3]; for (int i=0;i<3;i=i+1) { a[i].x=i; a[i].y=i*i; } \
+                          int s=0; for (int i=0;i<3;i=i+1) s += a[i].x + a[i].y; return s; }"
+        ),
+        8
+    );
+}
