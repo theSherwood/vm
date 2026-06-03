@@ -195,3 +195,36 @@ fn c_pointers_to_locals_end_to_end() {
         8
     );
 }
+
+#[test]
+fn c_control_flow_end_to_end() {
+    // if / else
+    assert_eq!(
+        i32_of("int main() { int x = 5; if (x > 3) return 1; else return 2; }"),
+        1
+    );
+    assert_eq!(
+        i32_of("int main() { int x = 1; if (x > 3) return 1; return 2; }"),
+        2
+    );
+    // while: sum 1..=100
+    assert_eq!(
+        i32_of("int main() { int s = 0; int i = 1; while (i <= 100) { s = s + i; i = i + 1; } return s; }"),
+        5050
+    );
+    // for: factorial of 5
+    assert_eq!(
+        i32_of("int main() { int f = 1; for (int i = 1; i <= 5; i = i + 1) f = f * i; return f; }"),
+        120
+    );
+    // nested + early return: first divisor of 91 above 1
+    assert_eq!(
+        i32_of("int main() { for (int i = 2; i < 91; i = i + 1) { if (91 % i == 0) return i; } return 91; }"),
+        7
+    );
+    // fibonacci(10) iteratively
+    assert_eq!(
+        i32_of("int main() { int a = 0; int b = 1; for (int i = 0; i < 10; i = i + 1) { int t = a + b; a = b; b = t; } return a; }"),
+        55
+    );
+}

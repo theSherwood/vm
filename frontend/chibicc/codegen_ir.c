@@ -5,17 +5,30 @@
 // resolved here into the IR's total semantics (§3b), and the *verifier* — not this code
 // — is what enforces escape-freedom (§2a), so the frontend is outside the escape-TCB.
 //
-// Status (grown incrementally): a single paramless `int`/`long`/`void` function whose
-// body is integer expressions + `return` — constants, +/-/*'/'%, bitwise, shifts,
-// comparisons, unary minus/not/bitnot, integer casts — plus **scalar locals** (in the
-// §3d data-stack window: load/store, assignment, `&`/`*`, pointers to locals). Control
-// flow, calls/params, arrays/structs, and floats are added in later passes; anything
+// Status (grown incrementally): a single paramless `int`/`long`/`void` function with
+// integer expressions (constants, +/-/*'/'%, bitwise, shifts, comparisons, unary
+// -/!/~, integer casts), **scalar locals** in the §3d data-stack window (load/store,
+// assignment, `&`/`*`, pointers to locals), and **structured control flow** —
+// `if`/`else`, `while`, `for` — lowered to a param-free block CFG (state lives in
+// memory, so values never cross a block). Calls/params, `break`/`continue`/`switch`,
+// short-circuit `&&`/`||`/`?:`, arrays/structs, and floats come next; anything
 // unsupported is a hard error (so we never emit IR we cannot stand behind).
 
 #include "chibicc.h"
 
 static FILE *o;
-static int nv; // next SSA value index in the current function
+static int nv;    // next SSA value index in the *current block* (blocks are param-free,
+                  // so values never cross a block boundary — they reset per block)
+static int nb;    // next block label number in the current function
+static bool term; // is the current block already terminated?
+
+// Open a new IR block with label `id`: emit its header and reset per-block state. (Block
+// labels are resolved by name, so forward references to not-yet-opened blocks are fine.)
+static void open_block(int id) {
+  fprintf(o, "block%d():\n", id);
+  nv = 0;
+  term = false;
+}
 
 // The data stack (address-taken locals, §3d) lives in the window. We reserve the low
 // bytes so a local's address is never 0 (C `NULL`), and lay locals out from there.
@@ -279,14 +292,75 @@ static int gen_expr(Node *node) {
   }
 }
 
+static void gen_stmt(Node *node);
+
+// `if (cond) then [else els]` → a diamond of param-free blocks (state is in memory).
+static void gen_if(Node *node) {
+  int c = gen_expr(node->cond);
+  int t = nb++, e = nb++, end = nb++;
+  fprintf(o, "  br_if v%d block%d() block%d()\n", c, t, e);
+  term = true;
+
+  open_block(t);
+  gen_stmt(node->then);
+  if (!term)
+    fprintf(o, "  br block%d()\n", end);
+
+  open_block(e);
+  if (node->els)
+    gen_stmt(node->els);
+  if (!term)
+    fprintf(o, "  br block%d()\n", end);
+
+  open_block(end);
+}
+
+// `for (init; cond; inc) body` (and `while`, with init/inc absent): cond/body/end blocks
+// with a back-edge. (break/continue, which chibicc lowers to gotos, are not yet handled.)
+static void gen_for(Node *node) {
+  if (node->init)
+    gen_stmt(node->init);
+  int cond = nb++, body = nb++, end = nb++;
+  fprintf(o, "  br block%d()\n", cond);
+  term = true;
+
+  open_block(cond);
+  if (node->cond) {
+    int c = gen_expr(node->cond);
+    fprintf(o, "  br_if v%d block%d() block%d()\n", c, body, end);
+  } else {
+    fprintf(o, "  br block%d()\n", body); // `for(;;)` — unconditional
+  }
+  term = true;
+
+  open_block(body);
+  gen_stmt(node->then);
+  if (!term) {
+    if (node->inc)
+      gen_expr(node->inc);
+    fprintf(o, "  br block%d()\n", cond);
+  }
+
+  open_block(end);
+}
+
 static void gen_stmt(Node *node) {
   switch (node->kind) {
   case ND_BLOCK:
-    for (Node *n = node->body; n; n = n->next)
+    for (Node *n = node->body; n; n = n->next) {
+      if (term)
+        break; // unreachable after a terminator (drop dead code)
       gen_stmt(n);
+    }
     return;
   case ND_EXPR_STMT:
     gen_expr(node->lhs); // value discarded
+    return;
+  case ND_IF:
+    gen_if(node);
+    return;
+  case ND_FOR:
+    gen_for(node);
     return;
   case ND_RETURN:
     if (node->lhs) {
@@ -295,6 +369,7 @@ static void gen_stmt(Node *node) {
     } else {
       fprintf(o, "  return\n");
     }
+    term = true;
     return;
   default:
     error_tok(node->tok, "codegen_ir: unsupported statement (kind=%d)", node->kind);
@@ -320,14 +395,24 @@ static void gen_func(Obj *fn) {
   if (fn->params)
     error_tok(fn->tok, "codegen_ir: function parameters not supported yet");
 
-  nv = 0;
+  nb = 0;
   Type *ret = fn->ty->return_ty;
   if (ret->kind == TY_VOID)
     fprintf(o, "func () -> () {\n");
   else
     fprintf(o, "func () -> (%s) {\n", irty(ret));
-  fprintf(o, "block0():\n");
+  open_block(nb++); // the entry block (index 0)
   gen_stmt(fn->body);
+  // Falling off the end: C `main` returns 0; for other paths it is UB, and returning a
+  // zero is a safe, defined value. Every block needs a terminator (§3b).
+  if (!term) {
+    if (ret->kind == TY_VOID) {
+      fprintf(o, "  return\n");
+    } else {
+      int z = nv++;
+      fprintf(o, "  v%d = %s.const 0\n  return v%d\n", z, irty(ret), z);
+    }
+  }
   fprintf(o, "}\n\n");
 }
 
