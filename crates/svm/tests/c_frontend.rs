@@ -2,6 +2,11 @@
 //! to our text IR, which we verify and run on the reference interpreter. This is the
 //! Phase-2 "it works" milestone (`DESIGN.md` §18) — real C through the whole pipeline.
 //!
+//! Each test runs `main` on **both** the interpreter and the JIT and asserts they agree
+//! (results + captured stdout/exit), so every test doubles as a JIT differential test. A
+//! second tier (`c_matches_gcc_*`) compiles the *same* C with native `cc` and compares
+//! exit code + stdout, validating C semantics against a real compiler.
+//!
 //! Requires a C toolchain (`make` + `cc`) to build the frontend; skipped-by-build only
 //! if those are absent. The frontend is outside the escape-TCB (§2a): whatever IR it
 //! emits still goes through the verifier before it runs.
@@ -910,5 +915,132 @@ fn c_malloc_with_printf_end_to_end() {
                    for (int i=0;i<n;i=i+1) printf(\"%d \", a[i]); free(a); return 0; }"
         ),
         "1 4 9 16 "
+    );
+}
+
+// ---- differential against native `cc`: same C source, two compilers, compare ----
+//
+// The VM runs `LIBC + body` (our printf/malloc over the powerbox); native `cc` runs
+// `<real headers> + body` (the system printf/malloc). Identical observable behaviour
+// (process exit code + stdout) validates our frontend's *C semantics* against a real
+// compiler — a check that interp/JIT agreement alone cannot give.
+
+/// Compile `src` with native `cc` and run it; return (exit code low byte, stdout).
+fn native_run(src: &str) -> (u8, Vec<u8>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("svm_gcc_{}_{id}", std::process::id()));
+    let cfile = base.with_extension("c");
+    let exe = base.with_extension("exe");
+    std::fs::write(&cfile, src).unwrap();
+    let status = Command::new("cc")
+        .args(["-w", "-O0", "-o"])
+        .arg(&exe)
+        .arg(&cfile)
+        .status()
+        .expect("run cc");
+    assert!(status.success(), "native cc failed to compile:\n{src}");
+    let out = Command::new(&exe).output().expect("run native exe");
+    let code = out.status.code().unwrap_or(-1) as u8;
+    (code, out.stdout)
+}
+
+/// Assert our VM and native `cc` agree on a program's exit code and stdout.
+fn assert_matches_gcc(body: &str) {
+    let vm = run_c_full(&format!("{LIBC}\n{body}"));
+    let (vm_code, vm_out) = match vm.outcome {
+        Outcome::Returned(ref v) => match v.as_slice() {
+            [Value::I32(x)] => (*x as u8, vm.stdout.clone()),
+            [Value::I64(x)] => (*x as u8, vm.stdout.clone()),
+            other => panic!("unexpected result {other:?} for:\n{body}"),
+        },
+        Outcome::Exited(c) => (c as u8, vm.stdout.clone()),
+    };
+    let native_src = format!(
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n{body}"
+    );
+    let (g_code, g_out) = native_run(&native_src);
+    assert_eq!(
+        vm_code, g_code,
+        "exit code: VM={vm_code} cc={g_code} for:\n{body}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&vm_out),
+        String::from_utf8_lossy(&g_out),
+        "stdout differs from cc for:\n{body}"
+    );
+}
+
+#[test]
+fn c_matches_gcc_arithmetic_and_control_flow() {
+    assert_matches_gcc("int main() { return 6 * 7 - 1; }");
+    assert_matches_gcc("int main() { return 100 / 7 + 100 % 7; }");
+    assert_matches_gcc("int main() { return (0xff & 0x3c) | (1 << 5); }");
+    assert_matches_gcc("int main() { int s=0; for (int i=1;i<=20;i++) s+=i; return s; }");
+    assert_matches_gcc(
+        "int main() { int x=5; return (x>0 && x<10) + (0 || 3) + (x>3 ? 100 : 7); }",
+    );
+    assert_matches_gcc("int main() { int s=0,i=0; do { s+=i; i++; } while (i<6); return s; }");
+    assert_matches_gcc(
+        "int main() { int s=0; for (int i=0;i<6;i++){ switch(i){case 2:continue;case 5:break;} s+=i; } return s; }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_functions_and_recursion() {
+    assert_matches_gcc(
+        "int fib(int n){ if(n<2)return n; return fib(n-1)+fib(n-2);} int main(){ return fib(13); }",
+    );
+    assert_matches_gcc(
+        "int gcd(int a,int b){ while(b){ int t=b; b=a%b; a=t; } return a; } int main(){ return gcd(1071, 462); }",
+    );
+    assert_matches_gcc(
+        "int ack(int m,int n){ if(m==0)return n+1; if(n==0)return ack(m-1,1); return ack(m-1, ack(m,n-1)); } int main(){ return ack(2,3); }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_floats() {
+    assert_matches_gcc("int main() { double x=3.5,y=2.25; return (int)(x*y*100); }");
+    assert_matches_gcc(
+        "int main() { float a=1.5f; double s=0; for(int i=0;i<10;i++) s+=a*i; return (int)s; }",
+    );
+    assert_matches_gcc(
+        "int main() { double x=100; for(int i=0;i<5;i++) x=x/2 + 1; return (int)(x*16); }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_printf() {
+    assert_matches_gcc("int main(){ printf(\"%d %d %d\\n\", 1, -2, 30000); return 0; }");
+    assert_matches_gcc("int main(){ printf(\"%s=%d, %x, %ld%%\\n\", \"k\", 42, 3735928559, 9000000000L); return 0; }");
+    assert_matches_gcc(
+        "int main(){ for(int i=1;i<=12;i++) printf(\"%d \", i*i); printf(\"\\n\"); return 0; }",
+    );
+    assert_matches_gcc(
+        "int main(){ char *s=\"hello\"; for(int i=0;s[i];i++) printf(\"%c.\", s[i]); return 0; }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_malloc_and_data_structures() {
+    // bubble sort a malloc'd array, print it
+    assert_matches_gcc(
+        "int main(){ int n=8; int *a=malloc(n*sizeof(int)); int seed[8]={5,2,8,1,9,3,7,4}; \
+         for(int i=0;i<n;i++) a[i]=seed[i]; \
+         for(int i=0;i<n;i++) for(int j=0;j<n-1-i;j++) if(a[j]>a[j+1]){int t=a[j];a[j]=a[j+1];a[j+1]=t;} \
+         for(int i=0;i<n;i++) printf(\"%d\", a[i]); free(a); return 0; }",
+    );
+    // sieve of Eratosthenes, count primes < 100
+    assert_matches_gcc(
+        "int main(){ int n=100; char *p=calloc(n,1); int c=0; \
+         for(int i=2;i<n;i++) if(!p[i]){ c++; for(int j=i*2;j<n;j+=i) p[j]=1; } return c; }",
+    );
+    // linked list of structs
+    assert_matches_gcc(
+        "struct N{int v; struct N*next;}; int main(){ struct N*h=0; \
+         for(int i=1;i<=6;i++){ struct N*x=malloc(sizeof(struct N)); x->v=i*i; x->next=h; h=x; } \
+         int s=0; for(struct N*p=h;p;p=p->next) s+=p->v; return s; }",
     );
 }
