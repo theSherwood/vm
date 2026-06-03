@@ -51,16 +51,17 @@ pub fn print_module(m: &Module) -> String {
         let _ = writeln!(s, "memory {}", mem.size_log2);
         s.push('\n');
     }
+    let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     for (i, f) in m.funcs.iter().enumerate() {
         if i > 0 {
             s.push('\n');
         }
-        print_func(&mut s, f);
+        print_func(&mut s, f, &fn_results);
     }
     s
 }
 
-fn print_func(s: &mut String, f: &Func) {
+fn print_func(s: &mut String, f: &Func, fn_results: &[usize]) {
     let _ = writeln!(
         s,
         "func ({}) -> ({}) {{",
@@ -79,12 +80,14 @@ fn print_func(s: &mut String, f: &Func) {
 
         let mut next = b.params.len() as u32; // next value index in this block
         for inst in &b.insts {
-            if inst.produces_value() {
-                let _ = writeln!(s, "  v{} = {}", next, print_inst(inst));
-                next += 1;
-            } else {
-                // No-result instruction (`store`): no `vN =` binding.
+            let n = inst.result_count(fn_results);
+            if n == 0 {
+                // No-result instruction (`store`, void `call`): no `vN =` binding.
                 let _ = writeln!(s, "  {}", print_inst(inst));
+            } else {
+                let lhs: Vec<String> = (0..n).map(|k| format!("v{}", next + k as u32)).collect();
+                let _ = writeln!(s, "  {} = {}", lhs.join(", "), print_inst(inst));
+                next += n as u32;
             }
         }
         let _ = writeln!(s, "  {}", print_term(&b.term));
@@ -128,6 +131,7 @@ fn print_inst(inst: &Inst) -> String {
             op.info().0,
             memarg(*offset, *align)
         ),
+        Inst::Call { func, args } => format!("call {func}{}", arglist(args)),
     }
 }
 
@@ -334,9 +338,14 @@ fn is_ident_char(c: u8) -> bool {
 /// Parse a module from text.
 pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     let toks = tokenize(src)?;
+    // Calls may forward-reference functions defined later, so we need every
+    // function's result arity before parsing bodies (it determines how many value
+    // indices a `call` binds). A cheap header-only prescan supplies it.
+    let fn_results = prescan_fn_results(&toks)?;
     let mut p = Parser {
         toks: &toks,
         pos: 0,
+        fn_results,
     };
     let mut funcs = Vec::new();
     let mut memory = None;
@@ -356,9 +365,47 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     Ok(Module { funcs, memory })
 }
 
+/// Header-only pass: each function's result count, indexed by function order.
+/// Skips `memory` decls and function bodies (brace-matched).
+fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        fn_results: Vec::new(),
+    };
+    let mut out = Vec::new();
+    while !p.at_end() {
+        match p.peek() {
+            Some(Tok::Ident(s)) if s == "memory" => {
+                p.next()?;
+                p.parse_int()?;
+            }
+            Some(Tok::Ident(s)) if s == "func" => {
+                p.next()?;
+                let _params = p.parse_type_list()?;
+                p.expect(&Tok::Arrow)?;
+                out.push(p.parse_type_list()?.len());
+                p.expect(&Tok::LBrace)?;
+                let mut depth = 1usize;
+                while depth > 0 {
+                    match p.next()? {
+                        Tok::LBrace => depth += 1,
+                        Tok::RBrace => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            _ => return err("expected `func` or `memory`"),
+        }
+    }
+    Ok(out)
+}
+
 struct Parser<'a> {
     toks: &'a [Tok],
     pos: usize,
+    /// Result arity of each function (by index), from the prescan.
+    fn_results: Vec<usize>,
 }
 
 /// A branch edge whose target is still a label name.
@@ -553,39 +600,69 @@ impl<'a> Parser<'a> {
                 Some(Tok::Ident(s)) => s.clone(),
                 _ => return err("expected instruction or terminator"),
             };
-            match kw.as_str() {
-                "br" | "br_if" | "br_table" | "return" => {
-                    let term = self.parse_term(&names)?;
-                    return Ok(PBlock {
-                        label,
-                        params,
-                        insts,
-                        term,
-                    });
+            if matches!(kw.as_str(), "br" | "br_if" | "br_table" | "return") {
+                let term = self.parse_term(&names)?;
+                return Ok(PBlock {
+                    label,
+                    params,
+                    insts,
+                    term,
+                });
+            }
+
+            // A value-producing instruction is `name(, name)* = opcode operands`; a
+            // no-result instruction (`store`, void `call`) is just `opcode operands`.
+            // The binding LHS (idents/commas ending in `=`) is what tells them apart.
+            let lhs = self.try_binding_lhs();
+            let inst = self.parse_inst(&names)?;
+            let n = inst.result_count(&self.fn_results);
+            match lhs {
+                Some(lhs) => {
+                    if lhs.len() != n {
+                        return err(format!(
+                            "instruction produces {n} result(s) but {} name(s) bound",
+                            lhs.len()
+                        ));
+                    }
+                    for name in lhs {
+                        if names.insert(name.clone(), next_idx).is_some() {
+                            return err(format!("duplicate value name `{name}`"));
+                        }
+                        next_idx += 1;
+                    }
                 }
-                // A value-producing instruction is `name = opcode operands`; a
-                // no-result instruction (`store`) is just `opcode operands`. The `=`
-                // following the first token tells them apart.
-                _ if matches!(self.toks.get(self.pos + 1), Some(Tok::Equals)) => {
-                    let name = self.ident()?;
-                    self.expect(&Tok::Equals)?;
-                    let inst = self.parse_inst(&names)?;
-                    if !inst.produces_value() {
-                        return err("instruction produces no value; remove the `name =`");
-                    }
-                    if names.insert(name.clone(), next_idx).is_some() {
-                        return err(format!("duplicate value name `{name}`"));
-                    }
-                    next_idx += 1;
-                    insts.push(inst);
+                None if n == 0 => {}
+                None => return err("expected `name =` for a value-producing instruction"),
+            }
+            insts.push(inst);
+        }
+    }
+
+    /// If the upcoming tokens are a binding LHS — `ident (, ident)* =` — consume them
+    /// and return the names; otherwise consume nothing and return `None`.
+    fn try_binding_lhs(&mut self) -> Option<Vec<String>> {
+        let start = self.pos;
+        let mut names = Vec::new();
+        loop {
+            match self.toks.get(self.pos) {
+                Some(Tok::Ident(s)) => {
+                    names.push(s.clone());
+                    self.pos += 1;
                 }
                 _ => {
-                    // No-result instruction: the opcode is the first token.
-                    let inst = self.parse_inst(&names)?;
-                    if inst.produces_value() {
-                        return err("expected `name =` for a value-producing instruction");
-                    }
-                    insts.push(inst);
+                    self.pos = start;
+                    return None;
+                }
+            }
+            match self.toks.get(self.pos) {
+                Some(Tok::Comma) => self.pos += 1,
+                Some(Tok::Equals) => {
+                    self.pos += 1;
+                    return Some(names);
+                }
+                _ => {
+                    self.pos = start;
+                    return None;
                 }
             }
         }
@@ -600,6 +677,13 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::Select { cond, a, b });
+        }
+        if op == "call" {
+            let n = self.parse_int()?;
+            let func = u32::try_from(n)
+                .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::Call { func, args });
         }
         if let Some(cv) = ConvOp::from_name(&op) {
             return Ok(Inst::Convert {
@@ -780,6 +864,12 @@ impl<'a> Parser<'a> {
     /// Parse `label(arg, arg, ...)`.
     fn parse_edge(&mut self, names: &HashMap<String, u32>) -> Result<PEdge, ParseError> {
         let label = self.ident()?;
+        let args = self.parse_value_list(names)?;
+        Ok((label, args))
+    }
+
+    /// Parse a parenthesized, comma-separated value list `(v, v, ...)`.
+    fn parse_value_list(&mut self, names: &HashMap<String, u32>) -> Result<Vec<u32>, ParseError> {
         let mut args = Vec::new();
         self.expect(&Tok::LParen)?;
         while self.peek() != Some(&Tok::RParen) {
@@ -789,7 +879,7 @@ impl<'a> Parser<'a> {
             args.push(self.value(names)?);
         }
         self.expect(&Tok::RParen)?;
-        Ok((label, args))
+        Ok(args)
     }
 
     fn value(&mut self, names: &HashMap<String, u32>) -> Result<u32, ParseError> {

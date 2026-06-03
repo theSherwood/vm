@@ -750,13 +750,27 @@ pub enum Inst {
         offset: u64,
         align: u8,
     },
+    /// Direct call to a function by index (fully static; the verifier checks the
+    /// index and argument types). Appends the callee's result values — **0, 1, or
+    /// many** — at the next block-local indices.
+    Call {
+        func: FuncIdx,
+        args: Vec<ValIdx>,
+    },
 }
 
 impl Inst {
-    /// Whether this instruction appends a value at the next block-local index.
-    /// Everything does except `Store` (which writes memory and yields nothing).
-    pub fn produces_value(&self) -> bool {
-        !matches!(self, Inst::Store { .. })
+    /// How many values this instruction appends at the next block-local indices.
+    ///
+    /// Most instructions append exactly one; `Store` appends none; a `Call` appends
+    /// its callee's result count, so it needs the per-function result arities
+    /// (indexed by [`FuncIdx`]) to answer.
+    pub fn result_count(&self, fn_results: &[usize]) -> usize {
+        match self {
+            Inst::Store { .. } => 0,
+            Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
+            _ => 1,
+        }
     }
 }
 

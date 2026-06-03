@@ -35,9 +35,16 @@ pub enum Trap {
     IntOverflow,
     /// A memory access crossed the top of the window (guard-region fault, §4/§5).
     MemoryFault,
+    /// Call recursion exceeded the interpreter's depth bound (host-stack guard).
+    StackOverflow,
     /// Structurally invalid in a way a verified module never is (defensive only).
     Malformed,
 }
+
+/// Maximum nested `call` depth before the interpreter traps. Bounds host-stack use
+/// so adversarial (or merely deep) guest recursion can never overflow the Rust
+/// stack — it yields a clean `Trap::StackOverflow` instead.
+const MAX_CALL_DEPTH: u32 = 1024;
 
 /// Run `func` with `args`, consuming up to `*fuel` execution steps.
 ///
@@ -46,9 +53,10 @@ pub enum Trap {
 /// for fuzzing and for never hanging a test.
 pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<Vec<Value>, Trap> {
     let f = m.funcs.get(func as usize).ok_or(Trap::Malformed)?;
-    // One linear-memory window per run, zero-initialized and lazily paged.
+    // One linear-memory window per run, zero-initialized and lazily paged. The whole
+    // module shares it (all functions address the same window).
     let mut mem = m.memory.map(|mc| Mem::new(mc.size_log2));
-    run_func(f, args, fuel, &mut mem)
+    run_func(f, args, fuel, &mut mem, &m.funcs, 0)
 }
 
 fn run_func(
@@ -56,7 +64,12 @@ fn run_func(
     args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
+    funcs: &[Func],
+    depth: u32,
 ) -> Result<Vec<Value>, Trap> {
+    if depth > MAX_CALL_DEPTH {
+        return Err(Trap::StackOverflow);
+    }
     // Block-local value vector: parameters first, then instruction results.
     let mut block_idx: usize = 0;
     // Entry block parameters are the function arguments (verifier guarantees the
@@ -68,8 +81,14 @@ fn run_func(
 
         for inst in &block.insts {
             step(fuel)?;
-            // Most instructions append a value; `Store` writes memory and yields none.
-            if let Some(v) = eval_inst(inst, &vals, mem)? {
+            // `Call` recurses (it needs module context + appends 0..N results); the
+            // rest go through `eval_inst`, which appends one value or (for `Store`) none.
+            if let Inst::Call { func, args } = inst {
+                let argv = collect(&vals, args)?;
+                let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
+                let results = run_func(callee, &argv, fuel, mem, funcs, depth + 1)?;
+                vals.extend(results);
+            } else if let Some(v) = eval_inst(inst, &vals, mem)? {
                 vals.push(v);
             }
         }
@@ -202,8 +221,8 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             let a = as_i64(get(vals, *addr)?)? as u64;
             m.load(a, *offset, *op)?
         }
-        // Handled before the match; listed for exhaustiveness (defensive, no panic).
-        Inst::Store { .. } => return Ok(None),
+        // Handled before/around the match; listed for exhaustiveness (no panic).
+        Inst::Store { .. } | Inst::Call { .. } => return Ok(None),
     };
     Ok(Some(v))
 }

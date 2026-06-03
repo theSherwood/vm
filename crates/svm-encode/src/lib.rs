@@ -50,6 +50,7 @@ mod op {
     pub const WRAP_I64: u8 = 0x62;
 
     pub const SELECT: u8 = 0x70;
+    pub const CALL: u8 = 0x73; // direct call: uleb funcidx, then arg idx-list
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -244,6 +245,11 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
             out.push(*align);
+        }
+        Inst::Call { func, args } => {
+            out.push(op::CALL);
+            write_uleb(out, *func as u64);
+            write_idxs(out, args);
         }
     }
 }
@@ -473,6 +479,10 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             cond: c.idx()?,
             a: c.idx()?,
             b: c.idx()?,
+        },
+        op::CALL => Inst::Call {
+            func: c.idx()?,
+            args: decode_idxs(c)?,
         },
 
         op::CONST_F32 => Inst::ConstF32(c.u32_le()?),

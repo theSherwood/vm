@@ -60,6 +60,15 @@ pub enum VerifyError {
     MemoryNotDeclared { func: u32, block: u32 },
     /// The declared window size (`1 << size_log2`) is not representable.
     MemorySizeTooLarge { size_log2: u8 },
+    /// A `call` referenced a function index that does not exist.
+    CallFuncOutOfRange { func: u32, block: u32, callee: u32 },
+    /// A `call`'s argument count did not match the callee's parameter count.
+    CallArgCountMismatch {
+        func: u32,
+        block: u32,
+        expected: usize,
+        found: usize,
+    },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -75,12 +84,12 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     }
     let has_memory = m.memory.is_some();
     for (fi, f) in m.funcs.iter().enumerate() {
-        verify_func(fi as u32, f, has_memory)?;
+        verify_func(fi as u32, f, &m.funcs, has_memory)?;
     }
     Ok(())
 }
 
-fn verify_func(fi: u32, f: &Func, has_memory: bool) -> Result<(), VerifyError> {
+fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<(), VerifyError> {
     // Per function: the entry block's parameters are the function's parameters.
     match f.blocks.first() {
         Some(entry) if entry.params == f.params => {}
@@ -96,6 +105,37 @@ fn verify_func(fi: u32, f: &Func, has_memory: bool) -> Result<(), VerifyError> {
         let mut types: Vec<ValType> = b.params.clone();
 
         for inst in &b.insts {
+            // `Call` needs the whole-module signatures and appends 0..N results, so
+            // it is checked here rather than in `check_inst`.
+            if let Inst::Call { func, args } = inst {
+                let callee = funcs
+                    .get(*func as usize)
+                    .ok_or(VerifyError::CallFuncOutOfRange {
+                        func: fi,
+                        block: bi,
+                        callee: *func,
+                    })?;
+                if args.len() != callee.params.len() {
+                    return Err(VerifyError::CallArgCountMismatch {
+                        func: fi,
+                        block: bi,
+                        expected: callee.params.len(),
+                        found: args.len(),
+                    });
+                }
+                {
+                    let cx = Cx {
+                        fi,
+                        bi,
+                        types: &types,
+                    };
+                    for (a, want) in args.iter().zip(&callee.params) {
+                        cx.expect(*a, *want)?;
+                    }
+                }
+                types.extend_from_slice(&callee.results);
+                continue;
+            }
             // A value-producing instruction appends its result type; `Store` does not.
             if let Some(result) = check_inst(fi, bi, inst, &types, has_memory)? {
                 types.push(result);
@@ -208,8 +248,8 @@ fn check_inst(
             cx.expect(*addr, ValType::I64)?;
             op.info().1
         }
-        // Handled before the match; listed for exhaustiveness (defensive, no panic).
-        Inst::Store { .. } => return Ok(None),
+        // Handled before/around the match; listed for exhaustiveness (no panic).
+        Inst::Store { .. } | Inst::Call { .. } => return Ok(None),
     };
     Ok(Some(ty))
 }

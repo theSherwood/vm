@@ -581,3 +581,173 @@ fn verifier_rejects_memory_op_without_memory() {
         Err(VerifyError::MemoryNotDeclared { .. })
     ));
 }
+
+// ---- direct calls ----
+
+// func0 returns its arg + arg; func1 calls func0 and adds 1.
+const CALL_SIMPLE: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.add v0 v0
+  return v1
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = call 0(v0)
+  v2 = i32.const 1
+  v3 = i32.add v1 v2
+  return v3
+}
+"#;
+
+// recursive factorial: func0(n) = n <= 1 ? 1 : n * func0(n-1).
+const FACT: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 1
+  v2 = i32.le_s v0 v1
+  br_if v2 block1() block2(v0)
+block1():
+  v3 = i32.const 1
+  return v3
+block2(v4: i32):
+  v5 = i32.const 1
+  v6 = i32.sub v4 v5
+  v7 = call 0(v6)
+  v8 = i32.mul v4 v7
+  return v8
+}
+"#;
+
+// func0 returns two values (quotient, remainder); func1 sums them.
+const CALL_MULTI: &str = r#"
+func (i32, i32) -> (i32, i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.div_s v0 v1
+  v3 = i32.rem_s v0 v1
+  return v2, v3
+}
+
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2, v3 = call 0(v0, v1)
+  v4 = i32.add v2 v3
+  return v4
+}
+"#;
+
+#[test]
+fn call_corpus_roundtrips() {
+    for src in [CALL_SIMPLE, FACT, CALL_MULTI] {
+        let m = parse_module(src).expect("parse");
+        verify_module(&m).expect("verify");
+        assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
+        assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
+    }
+}
+
+#[test]
+fn direct_call_computes() {
+    // func1(5) = (5+5) + 1 = 11
+    assert_eq!(
+        run1at(CALL_SIMPLE, 1, &[Value::I32(5)]),
+        Ok(vec![Value::I32(11)])
+    );
+}
+
+#[test]
+fn recursive_factorial() {
+    for (n, want) in [(0, 1), (1, 1), (5, 120), (7, 5040)] {
+        assert_eq!(
+            run1at(FACT, 0, &[Value::I32(n)]),
+            Ok(vec![Value::I32(want)]),
+            "fact({n})"
+        );
+    }
+}
+
+#[test]
+fn multi_result_call() {
+    // 17 / 5 = 3 rem 2; sum = 5.
+    assert_eq!(
+        run1at(CALL_MULTI, 1, &[Value::I32(17), Value::I32(5)]),
+        Ok(vec![Value::I32(5)])
+    );
+}
+
+#[test]
+fn verifier_rejects_call_to_missing_function() {
+    // Hand-built: the text parser can't bind results for an unknown callee arity, so
+    // we construct the IR directly to exercise the verifier's range check.
+    use svm_ir::{Block, Func, Module, Terminator, ValType};
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I32],
+            results: vec![ValType::I32],
+            blocks: vec![Block {
+                params: vec![ValType::I32],
+                insts: vec![Inst::Call {
+                    func: 9, // does not exist
+                    args: vec![0],
+                }],
+                term: Terminator::Return(vec![0]),
+            }],
+        }],
+        memory: None,
+    };
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::CallFuncOutOfRange { .. })
+    ));
+}
+
+#[test]
+fn verifier_rejects_call_arg_type_mismatch() {
+    // call passes an i64 where the callee wants i32.
+    let m = parse_module(
+        r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  return v0
+}
+
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = call 0(v0)
+  return v1
+}
+"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::TypeMismatch { .. })
+    ));
+}
+
+#[test]
+fn unbounded_recursion_traps_not_overflows() {
+    // func0 calls itself unconditionally -> must hit the depth bound and trap as
+    // StackOverflow (never crash the host stack), well within fuel.
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = call 0(v0)
+  return v1
+}
+"#;
+    let m = load(&assemble(src).unwrap()).unwrap();
+    let mut fuel = 10_000_000u64;
+    assert_eq!(
+        run(&m, 0, &[Value::I32(0)], &mut fuel),
+        Err(Trap::StackOverflow)
+    );
+}
+
+/// Run a specific function index (the corpus helpers default to func 0).
+fn run1at(src: &str, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
+    let m = load(&assemble(src).unwrap()).unwrap();
+    let mut fuel = 1_000_000u64;
+    run(&m, func, args, &mut fuel)
+}
