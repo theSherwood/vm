@@ -545,6 +545,84 @@ a pre-mapped heap.
 
 ---
 
+## 3e. MVP capability set  [SETTLED]
+
+The first concrete interfaces the §3c handle table dispatches and the §3d C runtime
+calls (`malloc` over `map`, stdio, `exit`). Resolves the §18 checklist item. Four
+interfaces — `Stream`, `Exit`, `Clock`, `Memory` — plus the powerbox layout.
+
+### Shared conventions
+- **Invocation:** `cap.call <handle> <op-index> args… → results` (§3c); each
+  interface is a fixed numbered method table; op-index + interface type are static,
+  so the handler is a compile-time-constant direct call.
+- **Args (§7 calling convention):** scalars in registers; **buffers as
+  `(ptr: i64, len: i64)`**, **borrow-only** in the MVP (host reads/writes in place;
+  own/transfer reserved). The trampoline validates `[ptr, ptr+len) ⊆ [0, size)` —
+  violation → `-EFAULT` (recoverable guest bug, not an escape; masking keeps it
+  in-window regardless).
+- **Error model = negative-errno (D42):** each op returns a signed `i64` — `≥ 0` is
+  the success value (e.g. byte count), `< 0` is `-errno`. Syscall-shaped (§7), maps
+  1:1 onto the C libc shim. Errors **do not trap**; traps stay reserved for
+  escape/fatal (§3b).
+- **Sync now, async later:** blocking-capable ops (`Stream.read/write`) are
+  **synchronous** in the MVP (single fiber → §12 ordinary blocking). The §12
+  submit/complete async form is added later **without changing the interface**.
+- **§9 cost-ladder placement:** `Clock` → path 2 (vDSO-style read); `Stream` r/w →
+  path 4 (direct confined syscall on a granted fd); `Memory` → path 3 (confined
+  kernel syscall); `Exit` → path 6 (supervisor teardown, rare).
+
+### Interfaces
+
+**`Stream`** — byte stream (stdin/stdout/stderr now; files/sockets reuse it via §7
+attenuation later) — **D43**:
+| op | signature | semantics |
+|---|---|---|
+| 0 | `read(buf, len) -> i64` | bytes read `≥0` (0 = EOF) or `-errno`; borrow (host writes guest buf); blocking-capable |
+| 1 | `write(buf, len) -> i64` | bytes written `≥0` or `-errno`; borrow (host reads guest buf); blocking-capable |
+| 2 | `close() -> i64` | optional in MVP (exit reclaims all); included for completeness |
+
+**`Exit`** — lifecycle:
+| op | signature | semantics |
+|---|---|---|
+| 0 | `exit(code: i32)` | terminate the domain with `code`; **noreturn** (no results); frontend emits `unreachable` after |
+
+**`Clock`**:
+| op | signature | semantics |
+|---|---|---|
+| 0 | `now(clock_id: i32) -> i64` | nanoseconds; `clock_id` 0 = monotonic, 1 = realtime (Unix epoch); non-blocking |
+
+**`Memory`** (the §14 `AddressSpace` capability, attenuable to a window sub-range;
+window-relative, page-aligned offsets):
+| op | signature | semantics |
+|---|---|---|
+| 0 | `map(offset, len, prot: i32) -> i64` | commit pages; `prot` = `READ\|WRITE` (no `EXEC` — guest data is never executed as code, §3c) |
+| 1 | `unmap(offset, len) -> i64` | decommit |
+| 2 | `protect(offset, len, prot: i32) -> i64` | change perms — backs the D40 read-only const segment |
+
+Out-of-range / misaligned → `-EINVAL`. Under the Phase-3 simplification (fixed-size
+window, **eager mapping**) `map` is barely exercised (`malloc` bumps within a
+pre-mapped heap), but the ops give the allocator and RO-data setup a real target.
+
+### Powerbox (instantiation grant)
+`entry(h0…h5, args_buffer)`, imports declared in this order (§3b):
+```
+h0: Stream  (stdin,  readable)   h3: Exit
+h1: Stream  (stdout, writable)   h4: Clock
+h2: Stream  (stderr, writable)   h5: Memory (the window heap region)
+args_buffer: borrowed buffer at a known window offset
+```
+**`args_buffer` layout (pure bytes, §7):** `{ argc: u32, envc: u32 }` then
+`argc + envc` NUL-terminated UTF-8 strings packed in order. The C entry wrapper
+scans it to build `argv[]`/`envp[]` on the data stack, calls `main(argc, argv)`,
+then `cap.call h3 exit(ret)` (§3d).
+
+### Deferred
+`File`/`Directory`/`openAt`, `Connector`/networking (§7), async submit/complete
+forms, the own/transfer buffer bit, multi-fiber/TLS clocks, revocation — none block
+the Phase-1 core loop.
+
+---
+
 ## 4. Memory model  [SETTLED] (some details PARKED)
 
 - Each domain gets a large **reserved virtual-address window** (e.g. 2^40,
@@ -1322,7 +1400,8 @@ as open-ended, not a byproduct of the build.
 - ⬜ **Concrete window params (Phase 3):** §4 is parked — MVP simplification =
   fixed-size window, eager mapping, no demand paging; pin page size, masking
   constant, guard-page placement, minimal map/unmap/protect.
-- ⬜ **Minimal MVP capability set:** console/stdio, exit, clock, memory (`map`).
+- ✅ **Minimal MVP capability set:** `Stream` (stdio), `Exit`, `Clock`, `Memory`
+  (`map`/`unmap`/`protect`); negative-errno model; powerbox + args-buffer — **§3e**.
 - ⬜ **TCB / threat-model writeup:** make the §3b rule-7 contract precise
   ("verified ⇒ invariants ⇒ escape impossible") — anchors the security work.
 
@@ -1371,3 +1450,6 @@ as open-ended, not a byproduct of the build.
 | D39 | C ABI: forced **two-stack split** (out-of-band control stack + in-window guard-paged data stack); address-taken→data stack, scalar non-address-taken→SSA; LP64/little-endian; **by-value aggregates by hidden pointer** (sret); clang-wasm-style vararg buffer | Settled | Window+masking (§4) and out-of-band control stack (§5) force the split; by-pointer is simplest-correct and ~wasm parity; whole-program MVP needs no external-ABI match (§3d) |
 | D40 | Const globals + string literals in a **read-only data segment** (`protect` at instantiation) | Settled | One extra protect call → writes to const data fault → §5 detect-and-kill; cheap self-corruption detection |
 | D41 | A fiber owns a **stack pair** (in-window data stack + out-of-band control stack); stacks are **per-fiber**; the control stack is unreachable by guest masking (CFI) but **charged to the guest's memory quota** (so a fiber-bomb self-OOMs, not the host) | Settled | Reconciles the §3d two-stack split with §12 fibers; keeps both CFI (§5) and "fibers metered/sandbox-safe" (§12/§15); switch swaps both SPs, ~ns |
+| D42 | MVP cap ops use a **negative-errno `i64`** result (`≥0` success value, `<0` `-errno`); errors never trap; buffer args are borrow-only `(ptr,len)` validated at the trampoline (`-EFAULT` on overflow) | Settled | Syscall-shaped (§7), 1:1 with the C libc shim; keeps traps reserved for escape/fatal (§3b) |
+| D43 | MVP capability set = `Stream` (stdio via 3 handles), `Exit`, `Clock`, `Memory`; stdio reuses one `Stream` interface (not a bespoke Console) so files/sockets compose later | Settled | First concrete handle-table interfaces (§3c) + C-runtime targets (§3d); orthogonal, one interface to verify (§3e) |
+| D44 | Powerbox = `entry(stdin, stdout, stderr, exit, clock, memory, args_buffer)`; args buffer = `{argc,envc}` + packed NUL-terminated strings | Settled | Concrete instantiation grant + C `main` wrapper contract (§3b/§3d/§3e) |
