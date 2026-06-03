@@ -316,6 +316,33 @@ fn div_traps() {
     );
 }
 
+const REM_S: &str = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.rem_s v0 v1
+  return v2
+}
+"#;
+
+#[test]
+fn rem_s_overflow_is_zero_not_a_trap() {
+    // wasm `rem_s`: only a zero divisor traps; `INT_MIN % -1 == 0` (no overflow trap —
+    // that is unique to `div_s`). Regression for an over-trapping bug the JIT diff
+    // harness surfaced.
+    assert_eq!(
+        run1(REM_S, &[Value::I32(i32::MIN), Value::I32(-1)]),
+        Ok(vec![Value::I32(0)])
+    );
+    assert_eq!(
+        run1(REM_S, &[Value::I32(7), Value::I32(3)]),
+        Ok(vec![Value::I32(1)])
+    );
+    assert_eq!(
+        run1(REM_S, &[Value::I32(7), Value::I32(0)]),
+        Err(Trap::DivByZero)
+    );
+}
+
 #[test]
 fn br_table_dispatch() {
     for (idx, want) in [(0, 10), (1, 20), (2, 30), (3, 99), (7, 99)] {

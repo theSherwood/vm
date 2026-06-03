@@ -32,7 +32,8 @@ pub enum Trap {
     OutOfFuel,
     /// Integer division or remainder by zero (§3b).
     DivByZero,
-    /// Signed `INT_MIN / -1` (or `rem_s`) overflow (§3b).
+    /// Signed `div_s` of `INT_MIN / -1` overflow (§3b). `rem_s` does **not** trap here
+    /// (`INT_MIN % -1 == 0`).
     IntOverflow,
     /// A memory access crossed the top of the window (guard-region fault, §4/§5).
     MemoryFault,
@@ -919,7 +920,9 @@ fn bin32(op: BinOp, a: i32, b: i32) -> Result<i32, Trap> {
             ((a as u32) / (b as u32)) as i32
         }
         BinOp::RemS => {
-            check_div(b == 0, a == i32::MIN && b == -1)?;
+            // `rem_s` traps only on a zero divisor; `INT_MIN % -1` is defined as 0 (no
+            // overflow trap — only `div_s` traps there). `wrapping_rem` yields 0.
+            check_div(b == 0, false)?;
             a.wrapping_rem(b)
         }
         BinOp::RemU => {
@@ -975,7 +978,8 @@ fn bin64(op: BinOp, a: i64, b: i64) -> Result<i64, Trap> {
             ((a as u64) / (b as u64)) as i64
         }
         BinOp::RemS => {
-            check_div(b == 0, a == i64::MIN && b == -1)?;
+            // `rem_s` traps only on a zero divisor; `INT_MIN % -1` is defined as 0.
+            check_div(b == 0, false)?;
             a.wrapping_rem(b)
         }
         BinOp::RemU => {

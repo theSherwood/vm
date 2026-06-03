@@ -4,9 +4,9 @@
 //! escape-freedom argument leans on, so it is wired up alongside the very first JIT
 //! slice and grows with the lowering.
 
-use svm_interp::{run, Value};
+use svm_interp::{run, Trap, Value};
 use svm_ir::ValType;
-use svm_jit::{compile_and_run, JitError};
+use svm_jit::{compile_and_run, JitError, JitOutcome, TrapKind};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -551,39 +551,72 @@ block0(v0: i32, v1: f64):
 
 // ---- calls ----
 
-/// Run the differential check against function index `idx` (not just 0).
-///
-/// If the interpreter *traps* on an input, the JIT is **not** run on it: we have no
-/// trap-catching infrastructure yet, so a JIT trap would abort the process. Trapping
-/// inputs are skipped here (the trap semantics are covered by the interpreter's own
-/// tests); the JIT is checked for agreement on the non-trapping inputs.
+/// The JIT trap kind an interpreter `Trap` should correspond to, or `None` for traps
+/// the scalar JIT does not model (memory-guard fault, fuel, stack, capabilities) — those
+/// are skipped rather than asserted.
+fn interp_trap_kind(t: &Trap) -> Option<TrapKind> {
+    match t {
+        Trap::DivByZero => Some(TrapKind::DivByZero),
+        Trap::IntOverflow => Some(TrapKind::IntOverflow),
+        Trap::BadConversion => Some(TrapKind::BadConversion),
+        Trap::Unreachable => Some(TrapKind::Unreachable),
+        Trap::IndirectCallType => Some(TrapKind::IndirectCallType),
+        _ => None,
+    }
+}
+
+/// Run the differential check against function index `idx` (not just 0): the JIT and
+/// interpreter must agree on the result **and on whether/why they trap** (§18).
 fn assert_jit_matches_interp_at(src: &str, idx: u32, inputs: &[Vec<Value>]) {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let results_ty = m.funcs[idx as usize].results.clone();
     for args in inputs {
         let mut fuel = 10_000_000u64;
-        let want = match run(&m, idx, args, &mut fuel) {
-            Ok(v) => v,
-            Err(_) => continue, // interpreter traps -> don't run the JIT (would abort)
-        };
+        let interp = run(&m, idx, args, &mut fuel);
+
         let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-        let got_slots = match compile_and_run(&m, idx, &slots) {
-            Ok(s) => s,
-            Err(JitError::Unsupported(_)) => return,
-            Err(e) => panic!("JIT failed: {e:?}"),
+        let outcome = match compile_and_run(&m, idx, &slots) {
+            Ok(o) => o,
+            Err(JitError::Unsupported(_)) => return, // op not lowered yet — skip module
+            Err(e) => panic!("JIT failed to compile {src:?}: {e:?}"),
         };
-        let got: Vec<Value> = results_ty
-            .iter()
-            .zip(got_slots)
-            .map(|(t, s)| from_slot(*t, s))
-            .collect();
-        assert_eq!(want.len(), got.len(), "result arity mismatch on {src:?}");
-        for (w, g) in want.iter().zip(&got) {
-            assert!(
-                values_equal(w, g),
-                "interp/JIT disagree on {src:?} for {args:?}: {want:?} vs {got:?}"
-            );
+
+        match (interp, outcome) {
+            (Ok(want), JitOutcome::Returned(got_slots)) => {
+                let got: Vec<Value> = results_ty
+                    .iter()
+                    .zip(got_slots)
+                    .map(|(t, s)| from_slot(*t, s))
+                    .collect();
+                assert_eq!(want.len(), got.len(), "result arity mismatch on {src:?}");
+                for (w, g) in want.iter().zip(&got) {
+                    assert!(
+                        values_equal(w, g),
+                        "interp/JIT disagree on {src:?} for {args:?}: {want:?} vs {got:?}"
+                    );
+                }
+            }
+            (Err(trap), JitOutcome::Trapped(kind)) => {
+                // A trap the JIT models must match in kind; one it doesn't model (e.g.
+                // memory-guard fault) is fine either way.
+                if let Some(want) = interp_trap_kind(&trap) {
+                    assert_eq!(
+                        kind, want,
+                        "JIT trapped {kind:?} but interp trapped {trap:?} on {src:?} for {args:?}"
+                    );
+                }
+            }
+            (Err(trap), JitOutcome::Returned(_)) => {
+                // OK only if it's a trap the JIT doesn't model (e.g. memory-guard fault).
+                assert!(
+                    interp_trap_kind(&trap).is_none(),
+                    "interp trapped {trap:?} but JIT returned on {src:?} for {args:?}"
+                );
+            }
+            (Ok(want), JitOutcome::Trapped(kind)) => {
+                panic!("interp returned {want:?} but JIT trapped {kind:?} on {src:?} for {args:?}")
+            }
         }
     }
 }

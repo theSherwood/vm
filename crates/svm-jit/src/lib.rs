@@ -15,9 +15,15 @@
 //! dispatch** (I2), and every terminator — `br`/`br_if`/`br_table`/`return`/
 //! `unreachable` plus direct and indirect tail calls. The only IR left is `cap.call`
 //! (needs host-callback trampolines, §9), which returns [`JitError::Unsupported`] so
-//! the differential harness skips such modules. Trapping ops abort the process if
-//! executed (no trap-catching infra yet); the harness only runs the JIT on
-//! non-trapping inputs.
+//! the differential harness skips such modules.
+//!
+//! ## Traps ([`JitOutcome`])
+//! A trap is terminal (the guest domain is killed, §5 detect-and-kill), but the host
+//! must *observe* it rather than crash. The reference JIT detects traps with **explicit
+//! checks that store a [`TrapKind`] code and `return` early** (a production JIT would
+//! take a hardware fault caught by a signal handler); the *observable semantics* —
+//! which inputs trap, and why — are identical, so the differential harness checks the
+//! JIT and interpreter agree on traps too.
 //!
 //! ## The masking lowering (§4, invariant I1)
 //! Every access masks the **final effective address** into the window —
@@ -121,6 +127,45 @@ pub enum JitError {
     Backend(String),
 }
 
+/// What a JIT'd run produced: either the result slots, or a **trap** with a kind code.
+///
+/// A trap is terminal (the guest domain is killed, §5 "detect-and-kill") — this just
+/// reports it to the host instead of aborting the process. The reference JIT detects
+/// traps with **explicit checks that store a code and return early**; a production JIT
+/// would instead take a hardware fault (guard page / `#DE`) caught by a signal handler
+/// (§5). The *observable semantics* — which inputs trap, and the kind — are identical,
+/// which is what the differential oracle checks.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum JitOutcome {
+    Returned(Vec<i64>),
+    Trapped(TrapKind),
+}
+
+/// The trap kinds the scalar JIT can raise (a subset of the interpreter's `Trap`),
+/// numbered to match the codes the lowered checks store into the host trap cell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum TrapKind {
+    DivByZero = 1,
+    IntOverflow = 2,
+    BadConversion = 3,
+    Unreachable = 4,
+    IndirectCallType = 5,
+}
+
+impl TrapKind {
+    fn from_code(c: u32) -> Option<TrapKind> {
+        Some(match c {
+            1 => TrapKind::DivByZero,
+            2 => TrapKind::IntOverflow,
+            3 => TrapKind::BadConversion,
+            4 => TrapKind::Unreachable,
+            5 => TrapKind::IndirectCallType,
+            _ => return None,
+        })
+    }
+}
+
 /// The CLIF type backing an IR value type.
 fn clif_ty(t: ValType) -> Type {
     match t {
@@ -148,13 +193,13 @@ fn float_clif_ty(t: FloatTy) -> Type {
 }
 
 /// Compile the whole module and run `func` on slot-encoded `args` (each `i64` is one
-/// parameter slot; `i32`/`f32` occupy the low 32 bits). Returns the result slots.
-/// Intended for the differential harness (see the `svm` crate's JIT tests).
+/// parameter slot; `i32`/`f32` occupy the low 32 bits). Returns the result slots, or a
+/// [`JitOutcome::Trapped`] if the run trapped. Intended for the differential harness.
 ///
-/// All functions are compiled with a **natural CLIF ABI** — `(mem_base,
-/// fn_table_base, params…) -> (results…)` — so direct/indirect/tail calls are ordinary
-/// CLIF calls; the entry is wrapped in a fixed buffer-ABI trampoline (any arity).
-pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<i64>, JitError> {
+/// All functions are compiled with a **natural CLIF ABI** — `(mem_base, fn_table_base,
+/// trap_out, params…) -> (results…)` — so direct/indirect/tail calls are ordinary CLIF
+/// calls; the entry is wrapped in a fixed buffer-ABI trampoline (any arity).
+pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitOutcome, JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // Calls can reach any function, so every function must be lowerable.
     for f in &m.funcs {
@@ -256,7 +301,7 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<
     let code = module.get_finalized_function(tramp);
     // SAFETY: `code` is the finalized trampoline with exactly this signature
     // (`build_trampoline` set it). `module` owns the executable page until dropped.
-    let run: extern "C" fn(*const i64, *mut i64, *mut u8, *const FnEntry) =
+    let run: extern "C" fn(*const i64, *mut i64, *mut u8, *const FnEntry, *mut u32) =
         unsafe { std::mem::transmute(code) };
 
     let mut window = window;
@@ -266,20 +311,26 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<
         window.as_mut_ptr()
     };
     let mut results = vec![0i64; entry.results.len()];
-    // SAFETY: `run` reads `entry.params.len()` arg slots, writes `entry.results.len()`
-    // result slots, accesses only `[mem_base, mem_base + size + GUARD)` (masking
-    // confines effective addresses), and reads `fn_table` (length `table_len`, indexed
-    // by a masked-to-`< table_len` slot). All buffers outlive the call.
+    let mut trap_cell: u32 = 0; // a trapping path stores a non-zero TrapKind here
+                                // SAFETY: `run` reads `entry.params.len()` arg slots, writes `entry.results.len()`
+                                // result slots, accesses only `[mem_base, mem_base + size + GUARD)` (masking
+                                // confines effective addresses), reads `fn_table` (length `table_len`, indexed by a
+                                // masked-to-`< table_len` slot), and writes `trap_cell` on a trap. All buffers
+                                // outlive the call.
     run(
         args.as_ptr(),
         results.as_mut_ptr(),
         mem_base,
         fn_table.as_ptr(),
+        &mut trap_cell,
     );
     drop(window);
     drop(fn_table);
     drop(module); // frees the executable memory after the call has returned
-    Ok(results)
+    Ok(match TrapKind::from_code(trap_cell) {
+        Some(kind) => JitOutcome::Trapped(kind),
+        None => JitOutcome::Returned(results),
+    })
 }
 
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)
@@ -302,6 +353,7 @@ fn sig_from(
     sig.call_conv = cranelift_codegen::isa::CallConv::Tail;
     sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
+    sig.params.push(AbiParam::new(I64)); // trap_out (host-owned trap cell)
     for p in params {
         sig.params.push(AbiParam::new(clif_ty(*p)));
     }
@@ -363,6 +415,11 @@ struct Lower<'a> {
     mem_var: Variable,
     /// Holds `fn_table_base` for `call_indirect` dispatch and call threading.
     fn_table_var: Variable,
+    /// Holds `trap_out`, the host-owned `*mut u32` trap cell a trap writes before
+    /// returning (the host reads it to learn the run trapped, §5 detect-and-kill).
+    trap_var: Variable,
+    /// This function's result CLIF types, so a trapping path can `return` dummy zeros.
+    result_tys: Vec<Type>,
     /// The §4 confinement mask (`size - 1`); `0` when the module has no memory.
     mask: u64,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call_indirect`.
@@ -404,6 +461,7 @@ fn build_clif(
     let entry = b.create_block();
     b.append_block_param(entry, I64); // mem_base
     b.append_block_param(entry, I64); // fn_table_base
+    b.append_block_param(entry, I64); // trap_out
     for p in &f.params {
         b.append_block_param(entry, clif_ty(*p));
     }
@@ -411,24 +469,29 @@ fn build_clif(
     b.seal_block(entry);
     let mem_base = b.block_params(entry)[0];
     let fn_table_base = b.block_params(entry)[1];
+    let trap_out = b.block_params(entry)[2];
 
     // The context pointers are needed across blocks; stash them in variables.
     let mem_var = b.declare_var(I64);
     b.def_var(mem_var, mem_base);
     let fn_table_var = b.declare_var(I64);
     b.def_var(fn_table_var, fn_table_base);
+    let trap_var = b.declare_var(I64);
+    b.def_var(trap_var, trap_out);
     let lower = Lower {
         mem_var,
         fn_table_var,
+        trap_var,
+        result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
         fn_table_mask: (ids.len().next_power_of_two() as u64) - 1,
         ids,
         distinct,
     };
 
-    // Jump into IR block 0 passing the function parameters (entry params after the two
-    // context pointers).
-    let entry_args: Vec<BlockArg> = b.block_params(entry)[2..]
+    // Jump into IR block 0 passing the function parameters (entry params after the
+    // three context pointers).
+    let entry_args: Vec<BlockArg> = b.block_params(entry)[3..]
         .iter()
         .map(|v| BlockArg::from(*v))
         .collect();
@@ -444,32 +507,33 @@ fn build_clif(
 }
 
 /// Build the fixed buffer-ABI trampoline `fn(args_ptr, results_ptr, mem_base,
-/// fn_table_base)` that decodes the entry function's args from `args_ptr`, calls it
-/// (natural ABI), and stores its results to `results_ptr`. This is what Rust calls, so
-/// any arity works.
+/// fn_table_base, trap_out)` that decodes the entry function's args from `args_ptr`,
+/// calls it (natural ABI), and stores its results to `results_ptr`. This is what Rust
+/// calls, so any arity works.
 fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncId, entry: &Func) {
     clif.signature.params.push(AbiParam::new(I64)); // args_ptr
     clif.signature.params.push(AbiParam::new(I64)); // results_ptr
     clif.signature.params.push(AbiParam::new(I64)); // mem_base
     clif.signature.params.push(AbiParam::new(I64)); // fn_table_base
+    clif.signature.params.push(AbiParam::new(I64)); // trap_out
     clif.name = UserFuncName::user(0, 1);
 
     let mut fbctx = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(clif, &mut fbctx);
     let blk = b.create_block();
-    b.append_block_param(blk, I64);
-    b.append_block_param(blk, I64);
-    b.append_block_param(blk, I64);
-    b.append_block_param(blk, I64);
+    for _ in 0..5 {
+        b.append_block_param(blk, I64);
+    }
     b.switch_to_block(blk);
     b.seal_block(blk);
     let args_ptr = b.block_params(blk)[0];
     let results_ptr = b.block_params(blk)[1];
     let mem_base = b.block_params(blk)[2];
     let fn_table_base = b.block_params(blk)[3];
+    let trap_out = b.block_params(blk)[4];
 
     // Decode args (context pointers first), call the entry, store results.
-    let mut call_args = vec![mem_base, fn_table_base];
+    let mut call_args = vec![mem_base, fn_table_base, trap_out];
     for (i, p) in entry.params.iter().enumerate() {
         let slot = b
             .ins()
@@ -530,9 +594,16 @@ fn lower_block(
         let v = match inst {
             Inst::ConstI32(c) => b.ins().iconst(I32, *c as i64),
             Inst::ConstI64(c) => b.ins().iconst(I64, *c),
-            Inst::IntBin { op, a, b: rb, .. } => {
+            Inst::IntBin { ty, op, a, b: rb } => {
                 let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
-                int_bin(b, *op, x, y)
+                match op {
+                    // div/rem trap on a zero divisor (and signed div on INT_MIN/-1):
+                    // guard with explicit checks that branch to a trap-return.
+                    BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU => {
+                        lower_div_rem(b, lower, *ty, *op, x, y)
+                    }
+                    _ => int_bin(b, *op, x, y),
+                }
             }
             Inst::IntUn { op, a, .. } => {
                 let x = get(&vals, *a)?;
@@ -621,16 +692,8 @@ fn lower_block(
                 }
             }
             Inst::FToITrap { op, a } => {
-                let x = get(&vals, *a)?;
-                let (_, to, signed) = op.parts();
-                let ity = int_clif_ty(to);
-                // Trapping (wasm trunc): NaN/out-of-range trap — Cranelift's
-                // non-saturating fcvt traps on exactly those, matching the interpreter.
-                if signed {
-                    b.ins().fcvt_to_sint(ity, x)
-                } else {
-                    b.ins().fcvt_to_uint(ity, x)
-                }
+                let (from, to, signed) = op.parts();
+                lower_trunc_trap(b, lower, get(&vals, *a)?, from, to, signed)
             }
             Inst::Load {
                 op, addr, offset, ..
@@ -728,17 +791,46 @@ fn lower_block(
             b.ins().return_call_indirect(sig, code, &cargs);
         }
         Terminator::Unreachable => {
-            b.ins()
-                .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+            emit_trap(b, lower, TrapKind::Unreachable);
         }
     }
     Ok(())
 }
 
 /// The leading context arguments threaded into every guest call: `(mem_base,
-/// fn_table_base)`.
+/// fn_table_base, trap_out)`.
 fn ctx_args(b: &mut FunctionBuilder, lower: &Lower) -> Vec<Value> {
-    vec![b.use_var(lower.mem_var), b.use_var(lower.fn_table_var)]
+    vec![
+        b.use_var(lower.mem_var),
+        b.use_var(lower.fn_table_var),
+        b.use_var(lower.trap_var),
+    ]
+}
+
+/// Lower a trap (§5 detect-and-kill): store the kind code into the host trap cell, then
+/// `return` dummy zero results so the run unwinds to the trampoline, which reports the
+/// trap. (The reference JIT detects traps this way; production uses hardware faults.)
+///
+/// Caveat: this returns from the *current* function only. The current scalar tests put
+/// every trap in the entry function (or its dispatch), so that suffices; propagating a
+/// trap *out of a callee* would need a post-call check, added when a case needs it.
+fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
+    let cell = b.use_var(lower.trap_var);
+    let code = b.ins().iconst(I32, kind as u32 as i64);
+    b.ins().store(MemFlags::trusted(), code, cell, 0);
+    let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
+    b.ins().return_(&zeros);
+}
+
+/// A zero constant of CLIF type `t` (for a trapping path's dummy return).
+fn zero_of(b: &mut FunctionBuilder, t: Type) -> Value {
+    if t == F32 {
+        b.ins().f32const(0.0)
+    } else if t == F64 {
+        b.ins().f64const(0.0)
+    } else {
+        b.ins().iconst(t, 0)
+    }
 }
 
 /// The §3c indirect-call dispatch (invariant I2): mask the guest index into the
@@ -765,8 +857,7 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     b.ins().brif(cond, matched, &[], bad, &[]);
     b.switch_to_block(bad);
     b.seal_block(bad);
-    b.ins()
-        .trap(cranelift_codegen::ir::TrapCode::user(2).unwrap());
+    emit_trap(b, lower, TrapKind::IndirectCallType);
     b.switch_to_block(matched);
     b.seal_block(matched);
     // code pointer at offset 8.
@@ -925,14 +1016,118 @@ fn int_bin(b: &mut FunctionBuilder, op: BinOp, x: Value, y: Value) -> Value {
         BinOp::ShrU => b.ins().ushr(x, y),
         BinOp::Rotl => b.ins().rotl(x, y),
         BinOp::Rotr => b.ins().rotr(x, y),
-        // Trapping div/rem: Cranelift's sdiv/udiv trap on /0 (and sdiv on INT_MIN/-1
-        // overflow); srem/urem trap on /0 only and define INT_MIN%-1 = 0 — exactly
-        // the interpreter's semantics. Trapping inputs are never JIT-run (the harness
-        // skips them), so a trap here would be a genuine divergence.
+        // div/rem are guarded and lowered by `lower_div_rem`, never here.
+        BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU => unreachable!("guarded elsewhere"),
+    }
+}
+
+/// Lower a trapping `div`/`rem` with explicit guards: a zero divisor traps
+/// `DivByZero`, and signed `div` of `INT_MIN / -1` traps `IntOverflow` (matching the
+/// interpreter). On the non-trapping path the division runs on a value Cranelift's
+/// `sdiv`/`srem` will not fault on (so the hardware op never traps). Returns the
+/// quotient/remainder in the final ("safe") block.
+fn lower_div_rem(
+    b: &mut FunctionBuilder,
+    lower: &Lower,
+    ty: IntTy,
+    op: BinOp,
+    x: Value,
+    y: Value,
+) -> Value {
+    let ity = int_clif_ty(ty);
+    // Trap on a zero divisor.
+    let is_zero = b.ins().icmp_imm(IntCC::Equal, y, 0);
+    let after_zero = b.create_block();
+    let dz = b.create_block();
+    b.ins().brif(is_zero, dz, &[], after_zero, &[]);
+    b.switch_to_block(dz);
+    b.seal_block(dz);
+    emit_trap(b, lower, TrapKind::DivByZero);
+    b.switch_to_block(after_zero);
+    b.seal_block(after_zero);
+
+    // Signed div additionally traps on INT_MIN / -1 (overflow).
+    if op == BinOp::DivS {
+        let min = match ty {
+            IntTy::I32 => i32::MIN as i64,
+            IntTy::I64 => i64::MIN,
+        };
+        let x_is_min = b.ins().icmp_imm(IntCC::Equal, x, min);
+        let y_is_neg1 = b.ins().icmp_imm(IntCC::Equal, y, -1);
+        let overflow = b.ins().band(x_is_min, y_is_neg1);
+        let after_ov = b.create_block();
+        let ov = b.create_block();
+        b.ins().brif(overflow, ov, &[], after_ov, &[]);
+        b.switch_to_block(ov);
+        b.seal_block(ov);
+        emit_trap(b, lower, TrapKind::IntOverflow);
+        b.switch_to_block(after_ov);
+        b.seal_block(after_ov);
+    }
+
+    let _ = ity;
+    match op {
         BinOp::DivS => b.ins().sdiv(x, y),
         BinOp::DivU => b.ins().udiv(x, y),
+        // srem defines INT_MIN % -1 = 0 (no trap), matching the interpreter.
         BinOp::RemS => b.ins().srem(x, y),
         BinOp::RemU => b.ins().urem(x, y),
+        _ => unreachable!("non-div/rem routed here"),
+    }
+}
+
+/// Lower a trapping float→int (`trunc`): trap `BadConversion` on NaN or out-of-range,
+/// else convert. The bounds are the interpreter's exact bounds (computed in `f64`, so
+/// `f32` is promoted first), so the JIT and interpreter trap on identical inputs.
+fn lower_trunc_trap(
+    b: &mut FunctionBuilder,
+    lower: &Lower,
+    x: Value,
+    from: FloatTy,
+    to: IntTy,
+    signed: bool,
+) -> Value {
+    // Promote f32 -> f64 (exact) so one set of bounds covers both.
+    let xf = match from {
+        FloatTy::F32 => b.ins().fpromote(F64, x),
+        FloatTy::F64 => x,
+    };
+    // (lower bound, upper bound, lower-inclusive). Ordered comparisons are false for
+    // NaN, so NaN falls out of range and traps — no separate NaN check needed.
+    let (lo, hi, lo_incl) = match (to, signed) {
+        (IntTy::I32, true) => (-2_147_483_649.0_f64, 2_147_483_648.0_f64, false),
+        (IntTy::I32, false) => (-1.0_f64, 4_294_967_296.0_f64, false),
+        (IntTy::I64, true) => (
+            -9_223_372_036_854_775_808.0_f64,
+            9_223_372_036_854_775_808.0_f64,
+            true,
+        ),
+        (IntTy::I64, false) => (-1.0_f64, 18_446_744_073_709_551_616.0_f64, false),
+    };
+    let lo_c = b.ins().f64const(lo);
+    let hi_c = b.ins().f64const(hi);
+    let ge_lo = if lo_incl {
+        b.ins().fcmp(FloatCC::GreaterThanOrEqual, xf, lo_c)
+    } else {
+        b.ins().fcmp(FloatCC::GreaterThan, xf, lo_c)
+    };
+    let lt_hi = b.ins().fcmp(FloatCC::LessThan, xf, hi_c);
+    let in_range = b.ins().band(ge_lo, lt_hi);
+
+    let ok = b.create_block();
+    let bad = b.create_block();
+    b.ins().brif(in_range, ok, &[], bad, &[]);
+    b.switch_to_block(bad);
+    b.seal_block(bad);
+    emit_trap(b, lower, TrapKind::BadConversion);
+    b.switch_to_block(ok);
+    b.seal_block(ok);
+    // In range: the saturating cast is exact and never faults.
+    let ity = int_clif_ty(to);
+    if signed {
+        b.ins().fcvt_to_sint_sat(ity, x)
+    } else {
+        b.ins().fcvt_to_uint_sat(ity, x)
     }
 }
 
