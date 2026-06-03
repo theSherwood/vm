@@ -398,29 +398,38 @@ memory** (same trust class as the control stack, §5):
 struct HandleEntry {
     type_id:    u32,      // interface type
     generation: u32,      // use-after-close detection (D37); index = (generation, slot)
+    methods:    *const Vtable, // per-entry dispatch table for this binding (host-owned)
     object:     *mut (),  // host-side capability state — guest NEVER writes this
 }
 handle_table: [HandleEntry; pow2]   // per domain, shared across its threads
 ```
 **`cap.call <op_index>(h, args)`** — `op_index` is an immediate and the handle's
-interface `I` is the static type, so **the handler is a compile-time constant**:
+interface `I` is the static type (so the *signature* is static); the dispatch
+**target is per-entry** (D45):
 ```
 j = slot(h) & (len-1)
 e = handle_table[j]
 trap if e.type_id != I.id            // forged / wrong-type index → inert
 trap if e.generation != gen(h)       // closed / revoked → defined trap (D37)
-I.handlers[op_index](e.object, args) // DIRECT call — handler known at compile time
+e.methods[op_index](e.object, args)  // dispatch through the binding's vtable
 ```
 Consequences:
-- `cap.call` is **static dispatch + a runtime-checked receiver**, *not* an indirect
-  branch — no Spectre-BTI mitigation needed on it, and the JIT inlines the known
-  handler to ~free (this is §9's "inline-able to ~free").
+- **Dispatch is per-entry, not per-type** (D45). One interface type has many
+  implementations — one per handle (the powerbox's `stdout` and a plugin's `stdout`
+  are both `handle<Stream>` yet dispatch to different host code), and §14 *requires*
+  this: a capability may be **pass-through** or **parent-virtualized**, and the child
+  can't tell which. So the general `cap.call` is an **indirect** call through the
+  entry's vtable (retpoline / eIBRS, like `call_indirect`, §9). The JIT
+  **devirtualizes** it to a direct, inline-able call (§9's "inline-able to ~free")
+  when it can prove the binding — e.g. a powerbox import never reassigned — exactly
+  the optimization deferred for `call_indirect`. Cross-domain / slow capabilities are
+  just a vtable whose entries are trampoline stubs (marshal to supervisor / ring
+  submit, §9).
 - A forged handle index is **inert**: it traps (wrong type / dead generation /
   OOB-masked-to-wrong-type) or selects one of *this domain's own* granted type-`I`
-  capabilities. The guest never supplies `e.object` (host memory), so it cannot aim a
-  handler at an arbitrary object — only at host-installed grants. Cross-domain / slow
-  capabilities make `I.handlers[op_index]` a statically-known trampoline stub
-  (marshal to supervisor / ring submit, §9) — still a direct call.
+  capabilities. The guest never supplies `e.methods`/`e.object` (host memory), so it
+  cannot aim a handler at arbitrary code or an arbitrary object — only at
+  host-installed grants.
 
 **Attenuation needs no new IR.** `subdir`, `readonly`, `Connector`-narrowing, etc.
 are simply **interface operations whose result type is a handle**: the host allocates
@@ -550,6 +559,10 @@ a pre-mapped heap.
 The first concrete interfaces the §3c handle table dispatches and the §3d C runtime
 calls (`malloc` over `map`, stdio, `exit`). Resolves the §18 checklist item. Four
 interfaces — `Stream`, `Exit`, `Clock`, `Memory` — plus the powerbox layout.
+**These four are not special:** they are ordinary instances of the general,
+host-extensible capability mechanism (§7 "Host-defined capabilities &
+discoverability") — a host adds new capabilities the same way the runtime provides
+these.
 
 ### Shared conventions
 - **Invocation:** `cap.call <handle> <op-index> args… → results` (§3c); each
@@ -732,6 +745,51 @@ domain's egress = the transitive closure of its granted capabilities).
 - Mechanically this is a syscall-style numbered-op interface — what compiler
   backends already emit — so C/Rust/non-OO toolchains target it with no
   impedance mismatch.
+
+### Host-defined capabilities & discoverability  [SETTLED] (registry DEFERRED)
+The set of capabilities is **open and host-extensible by construction** — the VM,
+verifier, and TCB enumerate *no* fixed list. The §3e MVP four are ordinary
+instances of this mechanism. A capability interface is just **data + host code**:
+
+- **Interface signature** — an ordered list of op signatures (params/results in IR
+  types; a result may be `handle<…>`/`funcref<…>` for attenuation). It lives in the
+  **guest module's own type section** (§3a), so the verifier statically type-checks
+  every `cap.call` with zero host knowledge — self-contained and verifiable.
+- **Implementation** — a method table (vtable, §3c) of handler pointers registered
+  **host-side**, entirely outside the guest/verifier/TCB.
+
+**A host adds a capability** by (1) publishing the interface signature out-of-band
+(a header-like artifact the toolchain agrees on — *tooling*, never spec/TCB, per
+"structured data = pure bytes" below) and (2) implementing + registering the
+handlers under a **name**. No VM or verifier change. "Expose a custom capability"
+and "expose stdio" are the same act.
+
+**Binding happens once, at instantiation** (§3b): a module's `imports` declare the
+interfaces it expects = the structural signature (from the type section) + a
+**name/tag** for matching. The host's instantiation policy resolves each named
+import to a registered implementation (host decides what to grant), allocates a
+`HandleEntry` (§3c) with that interface's `type_id` + vtable + host `object`, and
+binds it into the powerbox in declared order. Instantiation **validates the
+implementation's signature against the import's declared signature** (structural
+compare, fail-closed) — type-safety across the boundary **without an IDL**.
+
+**Discoverability is static by default — and that is load-bearing, not just
+simple.** The powerbox is fixed at instantiation; the guest holds exactly what it
+imported and was granted; a missing required import **fails closed**. There is
+deliberately **no "list all capabilities" call** — that would be ambient authority
+(forbidden above), and the §9 egress analysis ("egress = the transitive closure of
+granted capabilities") *requires* the grant set to be statically bounded;
+unrestricted dynamic discovery would void it. Introspection is also unnecessary in
+the core: handles are statically typed `handle<I>`, so the guest already knows each
+handle's interface and ops — nothing to discover about a held handle.
+
+- **Optional discovery = a capability** (DEFERRED, host-layer): when genuine late
+  binding is needed (plugin host, service mesh), the ocap-correct answer is a
+  granted **`Resolver`/registry capability** — an ordinary interface, e.g.
+  `lookup(name) -> handle<…>`. You can only discover via a capability you were
+  granted, you only get back what that registry is scoped to offer, and it lives
+  **above the VM, outside the TCB** (like cross-domain channels). It does not widen
+  ambient authority — it is just another node in the grant graph. Not built now.
 
 ### Calling convention  [SETTLED]
 The whole platform-level ABI is three things:
@@ -959,6 +1017,9 @@ requirement.
   vs. capabilities-live-until-close for v1.
 - **Cross-domain channels** (§7 DEFERRED): host-layer feature; zero-copy
   self-describing format; designed later, above the VM layer.
+- **Registry / discovery capability** (§7 DEFERRED): optional `Resolver`
+  (`lookup(name) -> handle`) for late binding; host-layer, outside the TCB; not
+  ambient authority. Core stays static-import-only (egress analysis needs it).
 - **MTE** (§10): optional probabilistic intra-guest detection in the §5 hardened
   tier (CHERI settled — host-hardening only, never the guest value model).
 - **Type system / value model / binary encoding** — now settled in **§3a**.
@@ -1453,3 +1514,5 @@ as open-ended, not a byproduct of the build.
 | D42 | MVP cap ops use a **negative-errno `i64`** result (`≥0` success value, `<0` `-errno`); errors never trap; buffer args are borrow-only `(ptr,len)` validated at the trampoline (`-EFAULT` on overflow) | Settled | Syscall-shaped (§7), 1:1 with the C libc shim; keeps traps reserved for escape/fatal (§3b) |
 | D43 | MVP capability set = `Stream` (stdio via 3 handles), `Exit`, `Clock`, `Memory`; stdio reuses one `Stream` interface (not a bespoke Console) so files/sockets compose later | Settled | First concrete handle-table interfaces (§3c) + C-runtime targets (§3d); orthogonal, one interface to verify (§3e) |
 | D44 | Powerbox = `entry(stdin, stdout, stderr, exit, clock, memory, args_buffer)`; args buffer = `{argc,envc}` + packed NUL-terminated strings | Settled | Concrete instantiation grant + C `main` wrapper contract (§3b/§3d/§3e) |
+| D45 | `cap.call` dispatch is **per-entry** (vtable in the `HandleEntry`), not per-type — generally an indirect call (retpoline/eIBRS), devirtualized to direct/inline when the binding is statically known | Settled | Corrects §3c over-claim; one interface type has many implementations per handle, and §14 virtualization (pass-through vs parent-emulated) needs per-handle dispatch; forgery checks unchanged |
+| D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **discovery is static by default**, optional `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; static imports keep no-ambient-authority + the §9 egress-closure analysis intact; registry stays outside the TCB |
