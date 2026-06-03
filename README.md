@@ -1,5 +1,7 @@
 # Sandbox VM
 
+[![CI](https://github.com/thesherwood/vm/actions/workflows/ci.yml/badge.svg)](https://github.com/thesherwood/vm/actions/workflows/ci.yml)
+
 A compilation target and sandbox VM: as secure (for the host) as WebAssembly,
 faster than wasm on the interface / 64-bit-memory / startup axes, with a simpler and
 more flexible interface, and real virtual memory.
