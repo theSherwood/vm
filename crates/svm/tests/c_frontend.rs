@@ -10,11 +10,68 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use svm_interp::{run, Value};
+use core::ffi::c_void;
+use svm_interp::{run_with_host, GuestMem, Host, StreamRole, Trap, Value, WindowMem};
 use svm_ir::ValType;
-use svm_jit::{compile_and_run, JitOutcome};
+use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind, EXIT_CODE};
 use svm_text::parse_module;
 use svm_verify::verify_module;
+
+fn to_slot(v: Value) -> i64 {
+    match v {
+        Value::I32(x) => x as i64,
+        Value::I64(x) => x,
+        Value::F32(x) => x.to_bits() as i64,
+        Value::F64(x) => x.to_bits() as i64,
+    }
+}
+
+/// Bridge the JIT's capability-thunk ABI to the interpreter's `Host` — the host
+/// trampoline a real embedder supplies (§9). Mirrors the one in `jit_diff.rs`, so both
+/// backends share capability semantics.
+///
+/// # Safety
+/// Honours the `CapThunk` contract: `ctx` is a `*mut Host`, the slot/window pointers are
+/// valid for their lengths, and `trap_out` is live.
+unsafe extern "C" fn cap_thunk(
+    ctx: *mut c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    type_id: u32,
+    op: u32,
+    handle: i32,
+    args: *const i64,
+    n_args: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) {
+    let host = &mut *(ctx as *mut Host);
+    let arg_slots = std::slice::from_raw_parts(args, n_args as usize);
+    let mut empty: [u8; 0] = [];
+    let window: &mut [u8] = if mem_base.is_null() {
+        &mut empty
+    } else {
+        std::slice::from_raw_parts_mut(mem_base, mem_size as usize)
+    };
+    let mut wm = WindowMem::new(window, mem_size);
+    let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
+        None
+    } else {
+        Some(&mut wm)
+    };
+    match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
+        Ok(res) => {
+            let out = std::slice::from_raw_parts_mut(results, n_results as usize);
+            for (o, r) in out.iter_mut().zip(res) {
+                *o = r;
+            }
+            *trap_out = 0;
+        }
+        Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
+        Err(_) => *trap_out = TrapKind::CapFault as i64,
+    }
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -65,40 +122,96 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
-/// Compile + verify + run `main` (function 0) on **both** the interpreter and the JIT,
-/// assert they agree, and return the results. So every C test is also a JIT diff test.
-fn run_c(src: &str) -> Vec<Value> {
+/// What a C program did: either `main` returned normally (with its result values) or it
+/// called `exit(code)`. Plus the bytes it wrote to stdout/stderr through the powerbox.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Returned(Vec<Value>),
+    Exited(i32),
+}
+struct CRun {
+    outcome: Outcome,
+    stdout: Vec<u8>,
+}
+
+/// Compile + verify + run function 0 (the synthetic `_start`) on **both** the interpreter
+/// and the JIT under identical mock powerboxes, assert they agree on the outcome *and* the
+/// observable host effects (stdout/stderr), and return both. So every C test is also a JIT
+/// differential test, capability effects included.
+fn run_c_full(src: &str) -> CRun {
     let ir = c_to_ir(src);
     let m =
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
 
-    // Function 0 is the synthetic `_start`: it initializes globals and calls `main` with
-    // the initial data-SP (§3d), so we run it with no arguments.
-    let mut fuel = 10_000_000u64;
-    let want = run(&m, 0, &[], &mut fuel).expect("interp run");
+    // `_start(stdout, stdin, exit)` takes the powerbox handles. Grant them identically on
+    // both hosts (grants are deterministic, so the handle values match).
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let grant = |h: &mut Host| {
+        [
+            Value::I32(h.grant_stream(StreamRole::Out)),
+            Value::I32(h.grant_stream(StreamRole::In)),
+            Value::I32(h.grant_exit()),
+        ]
+    };
+    let args = grant(&mut hi);
+    assert_eq!(args, grant(&mut hj), "grants are deterministic");
 
-    match compile_and_run(&m, 0, &[]).expect("jit compile") {
-        JitOutcome::Returned(slots) => {
-            let got: Vec<Value> = m.funcs[0]
-                .results
-                .iter()
-                .zip(slots)
-                .map(|(t, s)| match t {
-                    ValType::I32 => Value::I32(s as i32),
-                    ValType::I64 => Value::I64(s),
-                    ValType::F32 => Value::F32(f32::from_bits(s as u32)),
-                    ValType::F64 => Value::F64(f64::from_bits(s as u64)),
-                })
-                .collect();
+    let mut fuel = 50_000_000u64;
+    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let jit = compile_and_run_with_host(
+        &m,
+        0,
+        &slots,
+        cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+
+    let typed = |s: &[i64]| -> Vec<Value> {
+        m.funcs[0]
+            .results
+            .iter()
+            .zip(s)
+            .map(|(t, &v)| match t {
+                ValType::I32 => Value::I32(v as i32),
+                ValType::I64 => Value::I64(v),
+                ValType::F32 => Value::F32(f32::from_bits(v as u32)),
+                ValType::F64 => Value::F64(f64::from_bits(v as u64)),
+            })
+            .collect()
+    };
+    let outcome = match (interp, jit) {
+        (Ok(want), JitOutcome::Returned(got)) => {
             assert_eq!(
-                want, got,
-                "interp/JIT disagree for C:\n{src}\n--- IR ---\n{ir}"
+                want,
+                typed(&got),
+                "interp/JIT result disagree:\n{src}\n{ir}"
             );
+            Outcome::Returned(want)
         }
-        other => panic!("JIT did not return for C:\n{src}\ngot {other:?}"),
+        (Err(Trap::Exit(want)), JitOutcome::Exited(got)) => {
+            assert_eq!(want, got, "interp/JIT exit code disagree:\n{src}");
+            Outcome::Exited(want)
+        }
+        (i, j) => panic!("interp/JIT outcome disagree for:\n{src}\ninterp={i:?} jit={j:?}\n{ir}"),
+    };
+    assert_eq!(hi.stdout, hj.stdout, "stdout differs:\n{src}");
+    assert_eq!(hi.stderr, hj.stderr, "stderr differs:\n{src}");
+    CRun {
+        outcome,
+        stdout: hi.stdout,
     }
-    want
+}
+
+/// Run a normally-returning program and return its result values.
+fn run_c(src: &str) -> Vec<Value> {
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => v,
+        Outcome::Exited(c) => panic!("expected a normal return, but the program exited({c})"),
+    }
 }
 
 fn i32_of(src: &str) -> i32 {
@@ -423,5 +536,64 @@ fn c_string_literals_end_to_end() {
     assert_eq!(
         i32_of("int main() { char *s = \"ABC\"; return s[0] + s[1] + s[2]; }"),
         65 + 66 + 67
+    );
+}
+
+#[test]
+fn c_hello_world_end_to_end() {
+    // The milestone: real C writing to stdout through the powerbox (Stream.write), with
+    // a guest strlen, run on both backends and checked against the captured bytes.
+    let r = run_c_full(
+        "int write(int fd, char *buf, int n); \
+         int strlen(char *s) { int n = 0; while (s[n]) n = n + 1; return n; } \
+         int main() { char *s = \"hello, world\\n\"; write(1, s, strlen(s)); return 0; }",
+    );
+    assert_eq!(r.outcome, Outcome::Returned(vec![Value::I32(0)]));
+    assert_eq!(r.stdout, b"hello, world\n");
+}
+
+#[test]
+fn c_stdout_from_loop_end_to_end() {
+    // Build a buffer of digits on the data stack, then write it in one call.
+    let r = run_c_full(
+        "int write(int fd, char *buf, int n); \
+         int main() { char buf[10]; for (int i = 0; i < 10; i = i + 1) buf[i] = '0' + i; \
+                      write(1, buf, 10); return 0; }",
+    );
+    assert_eq!(r.stdout, b"0123456789");
+}
+
+#[test]
+fn c_exit_code_end_to_end() {
+    // exit(code) reaches the Exit capability; both backends report the same terminal code.
+    let r = run_c_full(
+        "void exit(int code); \
+         int main() { exit(7); return 0; }",
+    );
+    assert_eq!(r.outcome, Outcome::Exited(7));
+}
+
+#[test]
+fn c_write_after_partial_then_exit() {
+    // Output is flushed before exit, and code after exit() is dead.
+    let r = run_c_full(
+        "int write(int fd, char *buf, int n); void exit(int code); \
+         int main() { write(1, \"bye\\n\", 4); exit(3); return 99; }",
+    );
+    assert_eq!(r.outcome, Outcome::Exited(3));
+    assert_eq!(r.stdout, b"bye\n");
+}
+
+#[test]
+fn c_partial_initializer_zero_fill_end_to_end() {
+    // A partial initializer relies on ND_MEMZERO zeroing the *rest* of the local at the
+    // correct sp-relative address (regression test for the data-SP memzero fix).
+    assert_eq!(
+        i32_of("int main() { int a[5] = {1, 2}; return a[0]+a[1]+a[2]+a[3]+a[4]; }"),
+        3
+    );
+    assert_eq!(
+        i32_of("struct P { int x; int y; int z; }; int main() { struct P p = {7}; return p.x + p.y + p.z; }"),
+        7
     );
 }

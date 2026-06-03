@@ -21,11 +21,14 @@
 // aggregate *arguments/returns* (sret, §3d D39) and whole-struct assignment are not done
 // yet — pointers to aggregates are fine. **Globals + string literals** live at fixed
 // window offsets in a data region below the data stack; a synthetic **`_start`**
-// (function 0) writes their initializer bytes into the window then calls `main` with the
-// initial data-SP. (A real read-only data segment per §3a later replaces the byte stores;
-// globals holding pointers/relocations are not handled yet.) `break`/`continue`/`switch`,
-// indirect calls, and floats come next; anything unsupported is a hard error (so we never
-// emit IR we cannot stand behind).
+// (function 0) takes the powerbox capability handles, stashes them in a reserved region,
+// writes globals' initializer bytes into the window, then calls `main` with the initial
+// data-SP. (A real read-only data segment per §3a later replaces the byte stores; globals
+// holding pointers/relocations are not handled yet.) **Stdio over the powerbox** (§3e):
+// `write`/`read`/`exit` are recognized builtins lowered to `cap.call` on the stashed
+// Stream/Exit handles — so real C reaches stdout/stdin and terminates with an exit code.
+// `break`/`continue`/`switch`, indirect calls, and floats come next; anything unsupported
+// is a hard error (so we never emit IR we cannot stand behind).
 
 #include "chibicc.h"
 
@@ -52,8 +55,15 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 
 // Globals + string literals live at fixed window offsets in the data region [16,
 // data_end); the data stack starts at data_end (main's initial data-SP, baked into
-// `_start`). The low 16 bytes stay reserved so no address is 0 (C NULL).
+// `_start`). The low 16 bytes are a runtime-reserved region: it holds the powerbox
+// capability handles (so no global/local address is 0 = C NULL either).
 static int data_end = 16;
+
+// Capability handles the runtime hands `_start` (§3c/§3e) are stashed in the reserved
+// region; the stdio builtins load them from here. Layout: stdout@0, stdin@4, exit@8.
+#define STDOUT_SLOT 0
+#define STDIN_SLOT 4
+#define EXIT_SLOT 8
 
 static int func_index(Obj *fn) {
   for (int i = 0; i < nfuncs; i++)
@@ -325,6 +335,58 @@ static int gen_cond(Node *node) {
   return 1;
 }
 
+// Widen an i32 value to i64 (for capability args that cross as i64 slots).
+static int widen_i64(int v, Type *ty) {
+  if (is64(ty))
+    return v;
+  int r = nv++;
+  fprintf(o, "  v%d = i64.extend_i32_%s v%d\n", r, ty->is_unsigned ? "u" : "s", v);
+  return r;
+}
+
+// Load a stashed capability handle from the reserved region.
+static int load_handle(int slot) {
+  int a = nv++;
+  fprintf(o, "  v%d = i64.const %d\n", a, slot);
+  int h = nv++;
+  fprintf(o, "  v%d = i32.load v%d\n", h, a);
+  return h;
+}
+
+// Stdio builtins map directly onto the powerbox (§3e): the lowest libc layer. `write`/
+// `read` → Stream.write/read on the stdout/stdin handle (fd is ignored for now — always
+// the std stream); `exit` → Exit then `unreachable`. A function with these names need
+// only be *declared* in the C source; we intercept the call instead of emitting `call`.
+static int gen_builtin_stream(Node *node, int slot, int op) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next)
+    error_tok(node->tok, "codegen_ir: write/read(fd, buf, len) expects 3 arguments");
+  gen_expr(a); // fd — evaluated for effect, then ignored (always the std stream)
+  int buf = gen_expr(a->next);
+  int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int h = load_handle(slot);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 0 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, buf, len);
+  if (node->ty->kind == TY_VOID)
+    return 0;
+  if (is64(node->ty))
+    return r;
+  int w = nv++;
+  fprintf(o, "  v%d = i32.wrap_i64 v%d\n", w, r);
+  return w;
+}
+
+static int gen_builtin_exit(Node *node) {
+  if (!node->args)
+    error_tok(node->tok, "codegen_ir: exit(code) expects 1 argument");
+  int code = gen_expr(node->args);
+  int h = load_handle(EXIT_SLOT);
+  fprintf(o, "  cap.call 1 0 (i32) -> () v%d (v%d)\n", h, code);
+  fprintf(o, "  unreachable\n"); // Exit is noreturn (§3e)
+  term = true;
+  return 0;
+}
+
 static int gen_expr(Node *node) {
   switch (node->kind) {
   case ND_NUM: {
@@ -409,6 +471,16 @@ static int gen_expr(Node *node) {
   case ND_FUNCALL: {
     if (node->lhs->kind != ND_VAR || !node->lhs->var->is_function)
       error_tok(node->tok, "codegen_ir: only direct calls are supported yet");
+    // Intercept the stdio builtins (powerbox §3e) before treating it as a guest call.
+    char *fname = node->lhs->var->name;
+    if (fname) {
+      if (!strcmp(fname, "write"))
+        return gen_builtin_stream(node, STDOUT_SLOT, 1);
+      if (!strcmp(fname, "read"))
+        return gen_builtin_stream(node, STDIN_SLOT, 0);
+      if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
+        return gen_builtin_exit(node);
+    }
     // Evaluate the arguments (already cast to the parameter types by the parser).
     int argv[64];
     int n = 0;
@@ -449,12 +521,15 @@ static int gen_expr(Node *node) {
     return r;
   }
   case ND_MEMZERO: {
-    // Zero-initialize the variable's whole window region (§3d data stack).
+    // Zero-initialize the local's whole frame region (§3d data stack). ND_MEMZERO is only
+    // emitted for stack locals, so the address is sp-relative: sp + (offset + i).
     int sz = node->var->ty->size;
     int base = node->var->offset;
     for (int i = 0; i < sz;) {
+      int off = nv++;
+      fprintf(o, "  v%d = i64.const %d\n", off, base + i);
       int a = nv++;
-      fprintf(o, "  v%d = i64.const %d\n", a, base + i);
+      fprintf(o, "  v%d = i64.add " SP " v%d\n", a, off);
       int z = nv++;
       if (sz - i >= 8) {
         fprintf(o, "  v%d = i64.const 0\n  i64.store v%d v%d\n", z, a, z);
@@ -653,14 +728,22 @@ static void emit_init_data(int base, char *data, int sz) {
   }
 }
 
-// Synthetic entry (function 0): initialize global data, then call `main` with the initial
-// data-SP (= data_end). The harness runs this with no arguments.
+// Synthetic entry (function 0): stash the powerbox capability handles, initialize global
+// data, then call `main` with the initial data-SP (= data_end). The runtime invokes this
+// with the granted handles `(stdout, stdin, exit)` as i32 arguments.
 static void emit_start(Obj *prog, Obj *main_fn) {
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
-  fprintf(o, "func () -> (%s) {\n", is_void ? "" : irty(mret));
-  fprintf(o, "block0():\n");
-  nv = 0;
+  fprintf(o, "func (i32, i32, i32) -> (%s) {\n", is_void ? "" : irty(mret));
+  fprintf(o, "block0(v0: i32, v1: i32, v2: i32):\n"); // stdout, stdin, exit
+  nv = 3;
+  // Stash each handle in its reserved slot so the stdio builtins can load it.
+  int slots[3] = {STDOUT_SLOT, STDIN_SLOT, EXIT_SLOT};
+  for (int i = 0; i < 3; i++) {
+    int a = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", a, slots[i]);
+    fprintf(o, "  i32.store v%d v%d\n", a, i);
+  }
   for (Obj *g = prog; g; g = g->next) {
     if (g->is_function || !g->init_data)
       continue;
@@ -696,7 +779,9 @@ void codegen_ir(Obj *prog, FILE *out) {
   bool has_main = nfuncs > 0 && funcs[0]->name && !strcmp(funcs[0]->name, "main");
   start_off = has_main ? 1 : 0;
 
-  bool need_mem = layout_globals(prog);
+  // `_start` stashes the capability handles in the window, so a module with an entry
+  // always needs one.
+  bool need_mem = layout_globals(prog) || has_main;
   for (int i = 0; i < nfuncs; i++) {
     assign_offsets(funcs[i]);
     if (funcs[i]->locals)

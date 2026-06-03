@@ -162,11 +162,17 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
    args**. **Note:** uses per-byte init stores, not a real IR data segment — the §3a
    read-only data section (and globals holding pointers/relocations) is still TODO and
    would be a cross-cutting `svm-ir`/text/encode/verify/interp/jit change.
-4. **stdio via the powerbox** — `printf` → `Stream.write`, `exit` → `Exit` through
-   `cap.call` (§3c/§3e). This is the visible **hello-world** milestone. Will need the
-   harness to provide capabilities and a tiny mini-libc shim (guest C or hand-written
-   IR). Look at how `cap.call` is tested in `crates/svm/tests/` and the interp/JIT
-   capability paths (`c87de68` added `cap.call` to the JIT).
+4. ~~**stdio via the powerbox**~~ — **DONE** (hello-world works). `write`/`read`/`exit`
+   are recognized **builtins** in `gen_expr`'s `ND_FUNCALL` (a declared-only prototype is
+   enough), lowered to `cap.call` on Stream/Exit. `_start` now takes the capability
+   handles `(stdout, stdin, exit)` and stashes them in reserved window slots (offsets
+   0/4/8) that the builtins load. The harness (`run_c_full`) grants the caps on two
+   `Host`s and runs both backends with `cap_thunk`, asserting outcome **and** stdout/
+   stderr agree. **Still TODO:** real `printf` (format parsing), `fd`→stream mapping
+   (stderr is not yet distinguished from stdout — `write` always uses the stdout handle),
+   and `malloc`/`free` (guest libc over the `map` cap, §3d).
+   *Latent bug fixed here:* `ND_MEMZERO` was zeroing locals at their **absolute** offset
+   instead of `sp + offset` (harmless until the handle slots occupied low memory).
 5. **Floats** (`float`/`double` = f32/f64) — extend `irty`, arithmetic, casts, loads.
 6. **`break` / `continue` / `switch` / `goto`** — chibicc lowers break/continue to
    `ND_GOTO` against `brk_label`/`cont_label`; add a label→block map and handle
