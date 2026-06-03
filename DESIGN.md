@@ -462,11 +462,21 @@ the wrong window location. Hence the SafeStack split:
 | **Control stack** | out-of-band (Cranelift-managed machine stack) | return addrs, callee-saved regs, SSA spills | **No** |
 | **Data stack** | in the window, per-thread, guard-paged (§5) | address-taken locals, by-value aggregate copies, `alloca`, varargs buffers, `sret` slots | Yes (confined) |
 
-The frontend manages the data stack via a per-thread **data-SP** held in the
-per-thread `vmctx` (the context the JIT already needs for window base/mask,
+The frontend manages the data stack via a **data-SP** (per-fiber state — see below)
+held in `vmctx` (the context the JIT already needs for window base/mask,
 handle-table base, function-table base, fuel; register-pinning the data-SP is a
 lowering detail). Overflow hits the guard page → fault → §5 detect-and-kill; frames
 larger than a guard page emit a stack-probe (stack-clash mitigation).
+
+**This split *is* the fiber model.** A stackful fiber (§12) owns the **pair** of
+stacks — control + data — and switching swaps both SPs; the data-SP and
+callee-saved are per-fiber, while window base/mask and the table bases are
+per-domain (shared, constant). The control stack lives in VA unreachable by guest
+masking (CFI) but is **charged to the guest's quota** (§15) so a fiber-bomb OOMs
+itself, not the host (§12). Nothing in this ABI dangles across a suspend: all
+§3d data (aggregates, `alloca`, varargs, `sret`) lives on the data stack, which
+travels with the fiber. The stack-switch must be modeled as a **call-clobbering**
+control op (§3b/§6) so Cranelift spills live values to the control stack around it.
 
 ### Local classification (address-taken vs SSA)
 One frontend pass, justified by the split above:
@@ -586,12 +596,15 @@ policy and the demand-paging/userfaultfd plumbing are deferred.
 **Incorruptible by guest writes:**
 - SSA locals / virtual registers — not addressable.
 - Return addresses and saved registers — live on a **host-managed control
-  stack, outside guest-addressable memory**. This gives control-flow integrity:
-  even with arbitrary heap corruption, the guest cannot forge a return address
-  or jump into host code. No ROP into the host.
+  stack, outside guest-addressable memory** (VA outside `[base, base+size)`, so
+  guest masking can never produce an address for it — §4). This gives control-flow
+  integrity: even with arbitrary heap corruption, the guest cannot forge a return
+  address or jump into host code. No ROP into the host. **The control stack is
+  *per-fiber*** (§12), not per-thread: each fiber owns a control+data stack pair,
+  and a vCPU executes on the current fiber's pair.
 
 **Corruptible but bounded:**
-- Heap and the per-thread data stack live in the window, **bracketed by guard
+- Heap and the **per-fiber** data stack live in the window, **bracketed by guard
   pages**, so overruns fault rather than silently corrupting neighbors.
 
 **Detection → kill mechanisms:**
@@ -724,7 +737,8 @@ capability; the host decides the realization.
   implementation-defined, so the JIT maps deterministically.
   Cross-domain atomics over shared memory (§13) are hardware-coherent — the same
   model applies unchanged across the boundary.
-- Per-thread out-of-band control stack; per-thread guard-paged data stack.
+- **Per-fiber** out-of-band control stack + per-fiber guard-paged data stack (a
+  fiber owns the *pair*, §12); a vCPU/OS-thread runs on the current fiber's pair.
 - Per-domain handle namespace, shared across the domain's threads.
 - **Cross-domain sharing is explicit** via shared regions (§13). Cross-domain
   pointers are **not portable** (window-relative), so shared data uses
@@ -888,10 +902,16 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
 
 ### Fibers & vCPUs (the two primitives)
 - **Fiber** — a first-class suspendable stack (an application of §6 stack
-  switching). Create = allocate a stack in the window; switch = userspace register
-  save/restore + SP swap (~ns, no syscall, no flush). **Free and uncapped** — it
-  is guest memory, already metered by the window (a fiber-bomb OOMs itself,
-  sandbox-safe). The unit of *concurrency*.
+  switching). Because of the two-stack split (§3d), a fiber owns a **stack pair**:
+  an in-window guard-paged **data stack** + an **out-of-band control stack**
+  (return addresses/spills, unreachable by guest masking — §5). Create = allocate
+  the pair; switch = save/restore callee-saved + swap *both* SPs (native SP → the
+  control stack and its spills follow automatically; plus the per-fiber data-SP)
+  (~ns, no syscall, no flush). **Free and uncapped, but quota-metered:** the data
+  stack is guest memory; the control stack is out-of-band yet its pages are
+  **charged against the guest's memory quota** (§15). So a fiber-bomb OOMs *itself*
+  (sandbox-safe) — it cannot exhaust *host* memory via out-of-band stacks. The unit
+  of *concurrency*. (`setjmp`/`longjmp` and C++ EH lower onto this switch — §3d.)
 - **vCPU** — a capability to run on a physical core, granted with a quota from the
   domain's core-set (§9). Each is an OS thread the host scheduler runs. **Capped**
   — real cores, so resource metering + Spectre core-isolation apply. The unit of
@@ -1350,3 +1370,4 @@ as open-ended, not a byproduct of the build.
 | D38 | Confinement = **guard-when-bounded, mask-when-not**, masking the **final effective address**, implemented as one isolated separately-fuzzable lowering pass | Settled | Matches wasm32 hot path (zero instructions), beats wasm64; final-address masking closes the large-immediate escape; isolation makes it fuzzable as the security hinge |
 | D39 | C ABI: forced **two-stack split** (out-of-band control stack + in-window guard-paged data stack); address-taken→data stack, scalar non-address-taken→SSA; LP64/little-endian; **by-value aggregates by hidden pointer** (sret); clang-wasm-style vararg buffer | Settled | Window+masking (§4) and out-of-band control stack (§5) force the split; by-pointer is simplest-correct and ~wasm parity; whole-program MVP needs no external-ABI match (§3d) |
 | D40 | Const globals + string literals in a **read-only data segment** (`protect` at instantiation) | Settled | One extra protect call → writes to const data fault → §5 detect-and-kill; cheap self-corruption detection |
+| D41 | A fiber owns a **stack pair** (in-window data stack + out-of-band control stack); stacks are **per-fiber**; the control stack is unreachable by guest masking (CFI) but **charged to the guest's memory quota** (so a fiber-bomb self-OOMs, not the host) | Settled | Reconciles the §3d two-stack split with §12 fibers; keeps both CFI (§5) and "fibers metered/sandbox-safe" (§12/§15); switch swaps both SPs, ~ns |
