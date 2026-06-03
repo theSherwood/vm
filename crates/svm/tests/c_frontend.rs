@@ -1,0 +1,122 @@
+//! End-to-end C: the vendored chibicc fork (`frontend/chibicc`, `--emit-ir`) compiles C
+//! to our text IR, which we verify and run on the reference interpreter. This is the
+//! Phase-2 "it works" milestone (`DESIGN.md` §18) — real C through the whole pipeline.
+//!
+//! Requires a C toolchain (`make` + `cc`) to build the frontend; skipped-by-build only
+//! if those are absent. The frontend is outside the escape-TCB (§2a): whatever IR it
+//! emits still goes through the verifier before it runs.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
+
+use svm_interp::{run, Value};
+use svm_text::parse_module;
+use svm_verify::verify_module;
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
+}
+
+/// Build the chibicc fork once per test binary, returning the path to its binary.
+fn chibicc() -> &'static Path {
+    static CC: OnceLock<PathBuf> = OnceLock::new();
+    CC.get_or_init(|| {
+        let dir = repo_root().join("frontend/chibicc");
+        let status = Command::new("make")
+            .arg("-s")
+            .current_dir(&dir)
+            .status()
+            .expect("run `make` to build the chibicc fork");
+        assert!(status.success(), "chibicc build failed");
+        dir.join("chibicc")
+    })
+    .as_path()
+}
+
+/// Compile a C source string to our text IR via the frontend.
+fn c_to_ir(src: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("svm_cfe_{}_{id}", std::process::id()));
+    let cfile = base.with_extension("c");
+    let irfile = base.with_extension("svm");
+    std::fs::write(&cfile, src).unwrap();
+
+    let status = Command::new(chibicc())
+        .args([
+            "-cc1",
+            "--emit-ir",
+            "-cc1-input",
+            cfile.to_str().unwrap(),
+            "-cc1-output",
+            irfile.to_str().unwrap(),
+            cfile.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run chibicc");
+    assert!(status.success(), "chibicc failed on:\n{src}");
+    std::fs::read_to_string(&irfile).unwrap()
+}
+
+/// Compile + verify + run `main` (function 0), returning its results.
+fn run_c(src: &str) -> Vec<Value> {
+    let ir = c_to_ir(src);
+    let m =
+        parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    let mut fuel = 1_000_000u64;
+    run(&m, 0, &[], &mut fuel).expect("run")
+}
+
+fn i32_of(src: &str) -> i32 {
+    match run_c(src).as_slice() {
+        [Value::I32(x)] => *x,
+        other => panic!("expected one i32 result, got {other:?}"),
+    }
+}
+
+#[test]
+fn c_integer_arithmetic_end_to_end() {
+    assert_eq!(i32_of("int main() { return 42; }"), 42);
+    assert_eq!(i32_of("int main() { return 6 * 7 - 1; }"), 41);
+    assert_eq!(i32_of("int main() { return (2 + 3) * 4; }"), 20);
+    assert_eq!(i32_of("int main() { return 100 / 7; }"), 14);
+    assert_eq!(i32_of("int main() { return 100 % 7; }"), 2);
+    assert_eq!(i32_of("int main() { return -5 + 2; }"), -3);
+    assert_eq!(i32_of("int main() { return ~0; }"), -1);
+    assert_eq!(i32_of("int main() { return !0; }"), 1);
+    assert_eq!(i32_of("int main() { return !5; }"), 0);
+}
+
+#[test]
+fn c_bitwise_and_shifts_end_to_end() {
+    assert_eq!(i32_of("int main() { return 0xff & 0x0f; }"), 0x0f);
+    assert_eq!(i32_of("int main() { return 0xf0 | 0x0f; }"), 0xff);
+    assert_eq!(i32_of("int main() { return 0xff ^ 0x0f; }"), 0xf0);
+    assert_eq!(i32_of("int main() { return 1 << 4; }"), 16);
+    assert_eq!(i32_of("int main() { return 256 >> 3; }"), 32);
+}
+
+#[test]
+fn c_comparisons_end_to_end() {
+    assert_eq!(i32_of("int main() { return 1 < 2; }"), 1);
+    assert_eq!(i32_of("int main() { return 2 < 1; }"), 0);
+    assert_eq!(i32_of("int main() { return 5 == 5; }"), 1);
+    assert_eq!(i32_of("int main() { return 5 != 5; }"), 0);
+    assert_eq!(i32_of("int main() { return 3 >= 3; }"), 1);
+    assert_eq!(i32_of("int main() { return 2 > 3; }"), 0);
+}
+
+#[test]
+fn c_long_arithmetic_end_to_end() {
+    // `long` is i64 (LP64); the result is truncated to i32 by the `int main` return cast.
+    assert_eq!(
+        i32_of("int main() { return (int)(1000000L * 1000000L % 1000000007L); }"),
+        { ((1_000_000i64 * 1_000_000) % 1_000_000_007) as i32 }
+    );
+}

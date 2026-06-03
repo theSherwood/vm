@@ -20,7 +20,11 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > **masking lowering** (I1), function-table **indirect-call dispatch** (I2), direct/
 > indirect/tail calls, trap detection, and **`cap.call` through a host thunk** — all
 > **differential-tested against the interpreter** oracle (§18), including trap kinds and
-> host side effects. Still ahead: production trap-catching (guard pages + signal
+> host side effects. A **C frontend** has begun (`frontend/chibicc`, a vendored chibicc
+> fork with an `--emit-ir` backend, §3d): real C — integer expressions, casts,
+> comparisons — compiles to our IR, verifies, and runs end to end (the §18 Phase-2 "it
+> works" milestone). Still ahead: growing the frontend (locals, control flow, calls,
+> pointers/memory, stdio/`malloc`), production trap-catching (guard pages + signal
 > handler), atomics, SIMD, and capability extras. This is a research build; "appears to
 > work" is reachable, "is certified secure" is an explicit post-MVP workstream (see
 > `DESIGN.md` §2a/§18).
