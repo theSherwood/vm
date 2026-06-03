@@ -1505,8 +1505,13 @@ browser — good enough here.
 ## 18. Build plan & MVP estimate  [PLANNING]
 
 **Implementation context:** Claude Code implements; a non-expert guides. No deep
-JIT/systems expertise on the team. Frontend = a chibicc-style C compiler emitting
-our IR. Codegen lowers to **Cranelift** (don't write our own backend).
+JIT/systems expertise on the team. **Host (escape-TCB: verifier, runtime, JIT glue)
+= Rust** (Cranelift-native; best-in-class fuzzing via `cargo-fuzz` + `arbitrary`;
+memory-safe TCB; compiler-as-safety-net for the agent — D49). **Frontend = a
+chibicc-style C compiler in C** (untrusted-for-escape per §2a, so its language
+carries no sandbox-safety cost) emitting our IR. Codegen lowers to **Cranelift**
+(don't write our own backend). Compile-time tax accepted, mitigated by `cargo check`
++ cached Cranelift builds.
 
 **Why a single speed multiplier misleads.** Agent speedup here is wildly
 non-uniform. *Fast* (volume / known patterns): chibicc frontend, IR + encoding,
@@ -1624,3 +1629,4 @@ as open-ended, not a byproduct of the build.
 | D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **discovery is static by default**, optional `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; static imports keep no-ambient-authority + the §9 egress-closure analysis intact; registry stays outside the TCB |
 | D47 | Escape-freedom is the **conjunction** `Verified ∧ Correct(JIT) ∧ Correct(runtime) ∧ Correct(host/HW)`, not "verified ⇒ safe"; TCB split into **escape-TCB vs authority-TCB**; decomposed into invariants **I1–I5** (owner + validation each); written as a **structured-prose contract**, not a proof | Settled | Puts risk where it lives (JIT dominates, not the verifier); makes host-extensible caps safe (authority-TCB ≠ escape-TCB); anchors the security work; matches the "as secure as wasm" bar (§2a) |
 | D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
+| D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |
