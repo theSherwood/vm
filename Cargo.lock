@@ -25,10 +25,15 @@ name = "svm-interp"
 version = "0.0.0"
 dependencies = [
  "svm-ir",
+ "svm-mask",
 ]
 
 [[package]]
 name = "svm-ir"
+version = "0.0.0"
+
+[[package]]
+name = "svm-mask"
 version = "0.0.0"
 
 [[package]]

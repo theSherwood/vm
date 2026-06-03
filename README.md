@@ -19,12 +19,13 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 | Crate | Role | TCB? |
 |---|---|---|
 | `svm-ir` | Core IR: block-local typed SSA over a CFG (§3a/§3b) | escape-TCB |
+| `svm-mask` | Confinement masking — the isolated, separately-fuzzed unit (§4, I1) | escape-TCB |
 | `svm-encode` | Binary encode + **decode** (untrusted-input-facing) (§3a) | escape-TCB |
 | `svm-verify` | The verifier — single linear pass, fail-closed (§2a I2/I3/I4; §3b) | escape-TCB |
 | `svm-interp` | Reference interpreter — the differential oracle (§18) | — |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
 | `svm` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |
-| `fuzz/` | cargo-fuzz target (nightly); mirrors the stable smoke fuzz | — |
+| `fuzz/` | cargo-fuzz targets (nightly); mirror the stable smoke fuzz | — |
 
 The escape-TCB crates are deliberately **dependency-free** (small, fast to compile,
 auditable). The host is Rust; the (future) frontend is C; codegen will lower to
@@ -47,12 +48,15 @@ For coverage-guided fuzzing (nightly):
 
 ```sh
 cargo install cargo-fuzz
-cargo +nightly fuzz run decode_verify
+cargo +nightly fuzz run decode_verify   # decode/verify/interp never crash
+cargo +nightly fuzz run mask            # the confinement-masking invariant (I1)
+cargo +nightly fuzz run roundtrip       # binary + text round-trip identity
 ```
 
-Invariant under test (the security hinge, §2a): on arbitrary bytes, `decode` fails
-closed (never panics/OOMs/hangs), `verify` never panics, and any *verified* module
-is safe to interpret.
+Invariants under test (the security hinge, §2a/§4): on arbitrary bytes, `decode`
+fails closed (never panics/OOMs/hangs), `verify` never panics, any *verified* module
+is safe to interpret, the masking unit confines every access into its window, and
+the formats round-trip without changing the IR.
 
 ## Example IR (text form)
 

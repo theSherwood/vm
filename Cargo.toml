@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/svm-ir",
+    "crates/svm-mask",
     "crates/svm-text",
     "crates/svm-encode",
     "crates/svm-verify",
@@ -21,6 +22,7 @@ rust-version = "1.94"
 # External deps live only in dev/bench/fuzz.
 [workspace.dependencies]
 svm-ir = { path = "crates/svm-ir" }
+svm-mask = { path = "crates/svm-mask" }
 svm-text = { path = "crates/svm-text" }
 svm-encode = { path = "crates/svm-encode" }
 svm-verify = { path = "crates/svm-verify" }

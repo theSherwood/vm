@@ -6,6 +6,8 @@
 //!   1. `decode_module` never panics / OOMs / hangs on arbitrary bytes.
 //!   2. `verify_module` never panics on any decoded module.
 //!   3. A *verified* module never panics the interpreter (bounded by fuel).
+//!   4. Binary round-trip is identity on every decodable module; text round-trip is
+//!      identity on every verified module (mirrors the `roundtrip` fuzz target).
 
 use svm::default_args;
 use svm_encode::{decode_module, encode_module};
@@ -38,8 +40,20 @@ impl Rng {
 fn drive(bytes: &[u8]) {
     // 1. Decode must fail-closed, never panic.
     if let Ok(m) = decode_module(bytes) {
+        // 4a. Binary round-trip is identity on every decodable module.
+        assert_eq!(
+            decode_module(&encode_module(&m)),
+            Ok(m.clone()),
+            "binary round-trip"
+        );
         // 2. Verify must never panic.
         if verify_module(&m).is_ok() {
+            // 4b. Text round-trip is identity on every verified module.
+            assert_eq!(
+                svm_text::parse_module(&svm_text::print_module(&m)),
+                Ok(m.clone()),
+                "text round-trip"
+            );
             // 3. A verified module is safe to interpret (bounded by fuel).
             for (fi, f) in m.funcs.iter().enumerate() {
                 let args = default_args(&f.params);

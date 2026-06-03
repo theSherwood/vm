@@ -14,6 +14,7 @@ use svm_ir::{
     BinOp, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, FuncType,
     IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
 };
+use svm_mask::Window;
 
 /// A runtime value. Mirrors `ValType`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -457,56 +458,40 @@ fn cast(op: CastOp, v: Value) -> Result<Value, Trap> {
 /// window (e.g. `size_log2 = 63`) never eagerly allocates — safe to fuzz.
 const PAGE: u64 = 4096;
 
-/// A guest linear-memory window. The whole point is the **confinement invariant**:
-/// every access is masked to `[0, size)` with `addr & (size − 1)` (size is a power
-/// of two), and an access that would cross the top of the window faults (modeling
-/// the §4 guard region). This is the semantics the JIT masking lowering is
-/// differential-tested against (§18).
+/// A guest linear-memory window. Confinement itself lives in [`svm_mask::Window`]
+/// (the isolated, separately-fuzzed security unit, §4); `Mem` just owns the lazily
+/// paged backing store and threads accesses through that confinement. This is the
+/// semantics the JIT masking lowering is differential-tested against (§18).
 struct Mem {
-    size: u64,
-    mask: u64,
+    window: Window,
     pages: BTreeMap<u64, Vec<u8>>,
 }
 
 impl Mem {
     fn new(size_log2: u8) -> Mem {
-        // `size_log2 < 64` for verified modules; clamp defensively so an unverified
-        // (fuzzed) module can never trigger a shift overflow panic.
-        let size = 1u64 << size_log2.min(63);
         Mem {
-            size,
-            mask: size - 1,
+            window: Window::new(size_log2),
             pages: BTreeMap::new(),
-        }
-    }
-
-    /// The confined final effective offset: mask of `addr + offset` into `[0, size)`.
-    /// Masking the *final* address (after folding the immediate offset) is the
-    /// load-bearing security property — see §4.
-    fn confine(&self, addr: u64, offset: u64) -> u64 {
-        addr.wrapping_add(offset) & self.mask
-    }
-
-    /// Confine, then guard-check that the whole `width`-byte access stays in-window.
-    /// A boundary-crossing access faults (the guard region, §4).
-    fn range(&self, addr: u64, offset: u64, width: u32) -> Result<u64, Trap> {
-        let base = self.confine(addr, offset);
-        match base.checked_add(width as u64) {
-            Some(end) if end <= self.size => Ok(base),
-            _ => Err(Trap::MemoryFault),
         }
     }
 
     fn load(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Value, Trap> {
         let (_, rty, width, signed) = op.info();
-        let base = self.range(addr, offset, width)?;
+        // Confine the access (mask + guard check); a window-crossing access faults.
+        let base = self
+            .window
+            .checked(addr, offset, width)
+            .ok_or(Trap::MemoryFault)?;
         let raw = self.read_le(base, width);
         Ok(decode_loaded(rty, width, signed, raw))
     }
 
     fn store(&mut self, addr: u64, offset: u64, op: StoreOp, v: Value) -> Result<(), Trap> {
         let (_, _, width) = op.info();
-        let base = self.range(addr, offset, width)?;
+        let base = self
+            .window
+            .checked(addr, offset, width)
+            .ok_or(Trap::MemoryFault)?;
         // `write_le` keeps only the low `width` bytes, so narrow stores truncate.
         self.write_le(base, width, store_bits(v));
         Ok(())
