@@ -137,18 +137,24 @@ fn run_func<'a>(
                 } else if let Inst::CapCall {
                     type_id,
                     op,
+                    sig,
                     handle,
                     args,
-                    ..
                 } = inst
                 {
                     // Capability call (§3c): resolve the handle in the host-owned table
                     // (mask + type_id/generation check) and dispatch to the mock host.
+                    // Args/results cross as i64 slots (the shared host-dispatch ABI).
                     let h = as_i32(get(&vals, *handle)?)?;
-                    let argv = collect(&vals, args)?;
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in args {
+                        argv.push(val_to_slot(get(&vals, *a)?));
+                    }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let results = host.cap_dispatch(*type_id, *op, h, &argv, gm)?;
-                    vals.extend(results);
+                    let results = host.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
+                    for (s, ty) in results.iter().zip(&sig.results) {
+                        vals.push(slot_to_val(*ty, *s));
+                    }
                 } else if let Some(v) = eval_inst(inst, &vals, mem)? {
                     vals.push(v);
                 }
@@ -731,34 +737,35 @@ impl Host {
     /// Returns the op's result values (negative-errno encoded in an `i64` for the
     /// fallible ops, §3e D42), or a `Trap` for escape/exit. `mem` backs buffer args.
     /// Dispatch a `cap.call` (§3c): resolve the handle in the host-owned table, then run
-    /// the bound capability op. Public so a JIT can drive the same handlers via a
-    /// [`WindowMem`] over its window; the interpreter passes its [`Mem`]. `mem` is
-    /// `None` when the module declares no memory (buffer ops then return `-EFAULT`).
-    pub fn cap_dispatch(
+    /// the bound capability op. Public and **slot-based** (`i64` per scalar; `i32` in
+    /// the low bits) so both backends drive the same handlers without per-arg type tags
+    /// — the interpreter converts its `Value`s, a JIT passes its slots directly. `mem`
+    /// is `None` when the module declares no memory (buffer ops then return `-EFAULT`).
+    pub fn cap_dispatch_slots(
         &mut self,
         type_id: u32,
         op: u32,
         handle: i32,
-        args: &[Value],
+        args: &[i64],
         mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<Value>, Trap> {
+    ) -> Result<Vec<i64>, Trap> {
         match self.resolve(handle, type_id)? {
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
             Binding::Exit => {
                 // op 0: exit(code: i32) — noreturn. Propagate as a (non-error) trap.
-                let code = as_i32(*args.first().ok_or(Trap::Malformed)?)?;
+                let code = *args.first().ok_or(Trap::Malformed)? as i32;
                 Err(Trap::Exit(code))
             }
             Binding::Clock => {
                 // op 0: now(clock_id) -> i64 nanoseconds (deterministic, increasing).
                 let now = self.clock_ns;
                 self.clock_ns = self.clock_ns.wrapping_add(1);
-                Ok(vec![Value::I64(now)])
+                Ok(vec![now])
             }
             Binding::Memory => {
                 // map/unmap/protect: the window is eagerly mapped, so these succeed
                 // as no-ops (0); an unknown op is -EINVAL.
-                Ok(vec![Value::I64(if op <= 2 { 0 } else { EINVAL })])
+                Ok(vec![if op <= 2 { 0 } else { EINVAL }])
             }
         }
     }
@@ -770,18 +777,18 @@ impl Host {
         &mut self,
         role: StreamRole,
         op: u32,
-        args: &[Value],
+        args: &[i64],
         mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<Value>, Trap> {
-        let ret = |v: i64| Ok(vec![Value::I64(v)]);
+    ) -> Result<Vec<i64>, Trap> {
+        let ret = |v: i64| Ok(vec![v]);
         match op {
             0 => {
                 // read(buf, len) -> bytes read (>=0) or -errno; only stdin is readable.
                 if role != StreamRole::In {
                     return ret(EINVAL);
                 }
-                let ptr = as_i64(*args.first().ok_or(Trap::Malformed)?)? as u64;
-                let len = as_i64(*args.get(1).ok_or(Trap::Malformed)?)? as u64;
+                let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+                let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
                 let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
                 let n = (len as usize).min(avail.len());
                 let chunk = avail[..n].to_vec();
@@ -801,8 +808,8 @@ impl Host {
                     StreamRole::Err => &mut self.stderr,
                     StreamRole::In => return ret(EINVAL),
                 };
-                let ptr = as_i64(*args.first().ok_or(Trap::Malformed)?)? as u64;
-                let len = as_i64(*args.get(1).ok_or(Trap::Malformed)?)? as u64;
+                let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+                let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
                 let Some(m) = mem else {
                     return ret(EFAULT);
                 };
@@ -1113,6 +1120,27 @@ fn collect(vals: &[Value], idxs: &[ValIdx]) -> Result<Vec<Value>, Trap> {
 }
 
 #[inline]
+/// Encode a value into its `i64` capability-ABI slot (scalars; `i32`/`f32` in the low
+/// bits). Mirrors the JIT's marshalling so both drive the same slot-based dispatch.
+fn val_to_slot(v: Value) -> i64 {
+    match v {
+        Value::I32(x) => x as i64,
+        Value::I64(x) => x,
+        Value::F32(x) => x.to_bits() as i64,
+        Value::F64(x) => x.to_bits() as i64,
+    }
+}
+
+/// Decode a capability-ABI result slot back to a `Value` of the declared type.
+fn slot_to_val(ty: ValType, s: i64) -> Value {
+    match ty {
+        ValType::I32 => Value::I32(s as i32),
+        ValType::I64 => Value::I64(s),
+        ValType::F32 => Value::F32(f32::from_bits(s as u32)),
+        ValType::F64 => Value::F64(f64::from_bits(s as u64)),
+    }
+}
+
 fn as_i32(v: Value) -> Result<i32, Trap> {
     match v {
         Value::I32(x) => Ok(x),

@@ -6,16 +6,14 @@
 //! lowering. Correctness is established by **differential testing against the
 //! reference interpreter** (§18, invariants I1/I4), the oracle in `svm-interp`.
 //!
-//! ## Status
-//! Lowers the **whole scalar surface**: `i32`/`i64`/`f32`/`f64` consts, all integer
-//! and float arithmetic/bitwise/shift/rotate/compare ops (incl. trapping `div`/`rem`),
+//! ## Status: the whole IR
+//! Lowers every IR op: `i32`/`i64`/`f32`/`f64` consts, all integer and float
+//! arithmetic/bitwise/shift/rotate/compare ops (incl. trapping `div`/`rem`),
 //! `eqz`/`select`/`clz`/`ctz`/`popcnt`, every conversion (extend/wrap/demote/promote/
-//! reinterpret, int↔float, saturating **and** trapping `trunc`), **integer loads/
-//! stores with confinement masking** (I1) and **indirect calls with function-table
-//! dispatch** (I2), and every terminator — `br`/`br_if`/`br_table`/`return`/
-//! `unreachable` plus direct and indirect tail calls. The only IR left is `cap.call`
-//! (needs host-callback trampolines, §9), which returns [`JitError::Unsupported`] so
-//! the differential harness skips such modules.
+//! reinterpret, int↔float, saturating **and** trapping `trunc`), **loads/stores with
+//! confinement masking** (I1), **indirect calls with function-table dispatch** (I2),
+//! **`cap.call` through a host thunk** (§9, see [`CapThunk`]), and every terminator —
+//! `br`/`br_if`/`br_table`/`return`/`unreachable` plus direct and indirect tail calls.
 //!
 //! ## Traps ([`JitOutcome`])
 //! A trap is terminal (the guest domain is killed, §5 detect-and-kill), but the host
@@ -49,7 +47,7 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F64, I16, I32, I64, I8};
 use cranelift_codegen::ir::{
     AbiParam, BlockArg, BlockCall, Endianness, Function, InstBuilder, JumpTableData, MemFlags,
-    Type, UserFuncName, Value,
+    StackSlotData, StackSlotKind, Type, UserFuncName, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -139,10 +137,13 @@ pub enum JitError {
 pub enum JitOutcome {
     Returned(Vec<i64>),
     Trapped(TrapKind),
+    /// The guest invoked the `Exit` capability with this code (§3e) — terminal, but not
+    /// an error.
+    Exited(i32),
 }
 
-/// The trap kinds the scalar JIT can raise (a subset of the interpreter's `Trap`),
-/// numbered to match the codes the lowered checks store into the host trap cell.
+/// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
+/// match the codes the lowered checks / the host thunk store into the trap cell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum TrapKind {
@@ -151,7 +152,13 @@ pub enum TrapKind {
     BadConversion = 3,
     Unreachable = 4,
     IndirectCallType = 5,
+    /// Forged / closed / wrong-type capability handle (§3c).
+    CapFault = 6,
 }
+
+/// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
+/// 32 bits of the `i64` cell). Distinct from every [`TrapKind`].
+pub const EXIT_CODE: u32 = 7;
 
 impl TrapKind {
     fn from_code(c: u32) -> Option<TrapKind> {
@@ -161,9 +168,52 @@ impl TrapKind {
             3 => TrapKind::BadConversion,
             4 => TrapKind::Unreachable,
             5 => TrapKind::IndirectCallType,
+            6 => TrapKind::CapFault,
             _ => return None,
         })
     }
+}
+
+/// The host callback the JIT invokes for `cap.call` (§9's trampoline). The caller wires
+/// it to its capability host; the JIT bakes the function + ctx addresses in as constants
+/// and calls it. Scalars cross as `i64` slots (`i32` in the low bits), buffers as the
+/// `(ptr, len)` window borrow. On return, `*trap_out` is `0` for success, a [`TrapKind`]
+/// code for a trap, or `EXIT_CODE | (exit_code << 32)` for an `Exit`.
+///
+/// # Safety
+/// `ctx` is the caller's host pointer; `args`/`results` point at `n_args`/`n_results`
+/// `i64` slots; `[mem_base, mem_base+mem_size)` is the guest window (`mem_base` null if
+/// none); `trap_out` points at the live trap cell. All must outlive the call.
+pub type CapThunk = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    type_id: u32,
+    op: u32,
+    handle: i32,
+    args: *const i64,
+    n_args: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+);
+
+/// The default thunk for [`compile_and_run`] (no host): an empty powerbox, so every
+/// `cap.call` is inert — a `CapFault` — exactly like the interpreter's `run`.
+unsafe extern "C" fn empty_cap_thunk(
+    _ctx: *mut core::ffi::c_void,
+    _mem_base: *mut u8,
+    _mem_size: u64,
+    _type_id: u32,
+    _op: u32,
+    _handle: i32,
+    _args: *const i64,
+    _n_args: u64,
+    _results: *mut i64,
+    _n_results: u64,
+    trap_out: *mut i64,
+) {
+    unsafe { *trap_out = TrapKind::CapFault as i64 };
 }
 
 /// The CLIF type backing an IR value type.
@@ -200,6 +250,24 @@ fn float_clif_ty(t: FloatTy) -> Type {
 /// trap_out, params…) -> (results…)` — so direct/indirect/tail calls are ordinary CLIF
 /// calls; the entry is wrapped in a fixed buffer-ABI trampoline (any arity).
 pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitOutcome, JitError> {
+    // No host: an empty powerbox, so any `cap.call` is an inert CapFault (like `run`).
+    compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
+}
+
+/// Like [`compile_and_run`], but `cap.call`s dispatch through `cap_thunk` with the
+/// caller's `cap_ctx` (the powerbox host). The thunk + ctx addresses are baked into the
+/// compiled code as constants — valid because the module is compiled, run once, then
+/// discarded here.
+///
+/// # Safety
+/// `cap_thunk`/`cap_ctx` must stay valid for the call and honour the [`CapThunk`] contract.
+pub fn compile_and_run_with_host(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<JitOutcome, JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // Calls can reach any function, so every function must be lowerable.
     for f in &m.funcs {
@@ -250,11 +318,17 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitO
     // basis for the `call_indirect` type check (matching the interpreter).
     let distinct = distinct_types(&m.funcs);
 
+    // The host thunk + ctx addresses, baked into `cap.call` sites as constants.
+    let cap = CapEnv {
+        thunk_addr: cap_thunk as usize as i64,
+        ctx_addr: cap_ctx as usize as i64,
+    };
+
     // Define each function body. `clear_context` after each define resets the cached
     // CFG/domtree so the next function never compiles against a stale CFG.
     let mut ctx = module.make_context();
     for (f, id) in m.funcs.iter().zip(&ids) {
-        build_clif(&mut module, &ids, &distinct, &mut ctx.func, f, mask)?;
+        build_clif(&mut module, &ids, &distinct, cap, &mut ctx.func, f, mask)?;
         module
             .define_function(*id, &mut ctx)
             .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -301,7 +375,7 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitO
     let code = module.get_finalized_function(tramp);
     // SAFETY: `code` is the finalized trampoline with exactly this signature
     // (`build_trampoline` set it). `module` owns the executable page until dropped.
-    let run: extern "C" fn(*const i64, *mut i64, *mut u8, *const FnEntry, *mut u32) =
+    let run: extern "C" fn(*const i64, *mut i64, *mut u8, *const FnEntry, *mut i64) =
         unsafe { std::mem::transmute(code) };
 
     let mut window = window;
@@ -311,12 +385,13 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitO
         window.as_mut_ptr()
     };
     let mut results = vec![0i64; entry.results.len()];
-    let mut trap_cell: u32 = 0; // a trapping path stores a non-zero TrapKind here
-                                // SAFETY: `run` reads `entry.params.len()` arg slots, writes `entry.results.len()`
-                                // result slots, accesses only `[mem_base, mem_base + size + GUARD)` (masking
-                                // confines effective addresses), reads `fn_table` (length `table_len`, indexed by a
-                                // masked-to-`< table_len` slot), and writes `trap_cell` on a trap. All buffers
-                                // outlive the call.
+    // Trap cell: 0 = ok; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit
+    // code for an Exit. A trapping path (or the cap thunk) writes it.
+    let mut trap_cell: i64 = 0;
+    // SAFETY: `run` reads `entry.params.len()` arg slots, writes `entry.results.len()`
+    // result slots, accesses only `[mem_base, mem_base + size + GUARD)` (masking confines
+    // effective addresses), reads `fn_table` (length `table_len`, indexed by a masked-to-
+    // `< table_len` slot), and writes `trap_cell`. All buffers outlive the call.
     run(
         args.as_ptr(),
         results.as_mut_ptr(),
@@ -327,9 +402,14 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitO
     drop(window);
     drop(fn_table);
     drop(module); // frees the executable memory after the call has returned
-    Ok(match TrapKind::from_code(trap_cell) {
-        Some(kind) => JitOutcome::Trapped(kind),
-        None => JitOutcome::Returned(results),
+
+    let code = trap_cell as u32;
+    Ok(if code == 0 {
+        JitOutcome::Returned(results)
+    } else if code == EXIT_CODE {
+        JitOutcome::Exited((trap_cell >> 32) as i32)
+    } else {
+        JitOutcome::Trapped(TrapKind::from_code(code).ok_or(JitError::Malformed)?)
     })
 }
 
@@ -387,6 +467,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Store { .. }
                 | Inst::Call { .. }
                 | Inst::CallIndirect { .. }
+                | Inst::CapCall { .. }
                 | Inst::IntBin { .. }
                 | Inst::Convert { .. } => {}
                 Inst::IntUn { op, .. } => match op {
@@ -409,14 +490,21 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
     Ok(())
 }
 
+/// The host `cap.call` thunk + ctx addresses, baked into each `cap.call` as constants.
+#[derive(Clone, Copy)]
+struct CapEnv {
+    thunk_addr: i64,
+    ctx_addr: i64,
+}
+
 /// Per-function lowering context shared across blocks.
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
     mem_var: Variable,
     /// Holds `fn_table_base` for `call_indirect` dispatch and call threading.
     fn_table_var: Variable,
-    /// Holds `trap_out`, the host-owned `*mut u32` trap cell a trap writes before
-    /// returning (the host reads it to learn the run trapped, §5 detect-and-kill).
+    /// Holds `trap_out`, the host-owned `*mut i64` trap cell a trap (or the cap thunk)
+    /// writes before returning (the host reads it to learn the run trapped, §5).
     trap_var: Variable,
     /// This function's result CLIF types, so a trapping path can `return` dummy zeros.
     result_tys: Vec<Type>,
@@ -424,6 +512,8 @@ struct Lower<'a> {
     mask: u64,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call_indirect`.
     fn_table_mask: u64,
+    /// The host `cap.call` thunk + ctx (constant addresses).
+    cap: CapEnv,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
     /// Distinct module signatures, for `call_indirect` type ids.
@@ -437,6 +527,7 @@ fn build_clif(
     module: &mut JITModule,
     ids: &[FuncId],
     distinct: &[FuncType],
+    cap: CapEnv,
     clif: &mut Function,
     f: &Func,
     mask: u64,
@@ -485,6 +576,7 @@ fn build_clif(
         result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
         fn_table_mask: (ids.len().next_power_of_two() as u64) - 1,
+        cap,
         ids,
         distinct,
     };
@@ -589,6 +681,19 @@ fn lower_block(
             }
             let call = b.ins().call_indirect(sig, code, &cargs);
             vals.extend_from_slice(b.inst_results(call));
+            continue;
+        }
+        if let Inst::CapCall {
+            type_id,
+            op,
+            sig,
+            handle,
+            args,
+        } = inst
+        {
+            lower_cap_call(
+                module, b, lower, *type_id, *op, sig, *handle, args, &mut vals,
+            )?;
             continue;
         }
         let v = match inst {
@@ -816,7 +921,7 @@ fn ctx_args(b: &mut FunctionBuilder, lower: &Lower) -> Vec<Value> {
 /// trap *out of a callee* would need a post-call check, added when a case needs it.
 fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
     let cell = b.use_var(lower.trap_var);
-    let code = b.ins().iconst(I32, kind as u32 as i64);
+    let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
     b.ins().store(MemFlags::trusted(), code, cell, 0);
     let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
     b.ins().return_(&zeros);
@@ -862,6 +967,103 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     b.seal_block(matched);
     // code pointer at offset 8.
     b.ins().load(I64, MemFlags::trusted(), entry_addr, 8)
+}
+
+/// Lower a `cap.call` (§3c/§9): marshal the arg slots into a stack buffer, call the host
+/// thunk (a baked-in constant address) with the cap immediates + the guest window, and
+/// — unless it set the trap cell — read the result slots back. A trap from the thunk
+/// (CapFault / Exit) propagates like any other (return early; the cell is already set).
+#[allow(clippy::too_many_arguments)]
+fn lower_cap_call(
+    module: &mut JITModule,
+    b: &mut FunctionBuilder,
+    lower: &Lower,
+    type_id: u32,
+    op: u32,
+    sig: &FuncType,
+    handle: u32,
+    args: &[u32],
+    vals: &mut Vec<Value>,
+) -> Result<(), JitError> {
+    let n_args = args.len();
+    let n_res = sig.results.len();
+
+    // Marshal the args into a stack buffer of i64 slots (null pointer when there are 0).
+    let args_ptr = if n_args == 0 {
+        b.ins().iconst(I64, 0)
+    } else {
+        let ss = b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (n_args * 8) as u32,
+            3,
+        ));
+        let addr = b.ins().stack_addr(I64, ss, 0);
+        for (i, a) in args.iter().enumerate() {
+            let v = get(vals, *a)?;
+            let slot = encode_slot(b, v);
+            b.ins()
+                .store(MemFlags::trusted(), slot, addr, (i * 8) as i32);
+        }
+        addr
+    };
+    let res_ss = if n_res == 0 {
+        None
+    } else {
+        Some(b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (n_res * 8) as u32,
+            3,
+        )))
+    };
+    let res_ptr = match res_ss {
+        Some(ss) => b.ins().stack_addr(I64, ss, 0),
+        None => b.ins().iconst(I64, 0),
+    };
+
+    // Assemble the thunk arguments (see `CapThunk`).
+    let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);
+    let mem_base = b.use_var(lower.mem_var);
+    let mem_size = b.ins().iconst(I64, lower.mask.wrapping_add(1) as i64);
+    let tid = b.ins().iconst(I32, type_id as i64);
+    let opc = b.ins().iconst(I32, op as i64);
+    let h = get(vals, handle)?;
+    let na = b.ins().iconst(I64, n_args as i64);
+    let nr = b.ins().iconst(I64, n_res as i64);
+    let trap_out = b.use_var(lower.trap_var);
+    let thunk = b.ins().iconst(I64, lower.cap.thunk_addr);
+
+    let mut tsig = module.make_signature(); // host C ABI (matches `extern "C"`)
+    for t in [I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64] {
+        tsig.params.push(AbiParam::new(t));
+    }
+    let tsigref = b.import_signature(tsig);
+    let call_args = [
+        ctx, mem_base, mem_size, tid, opc, h, args_ptr, na, res_ptr, nr, trap_out,
+    ];
+    b.ins().call_indirect(tsigref, thunk, &call_args);
+
+    // If the thunk set the trap cell, propagate (return early; the cell already holds
+    // the kind / exit code).
+    let tc = b.ins().load(I64, MemFlags::trusted(), trap_out, 0);
+    let trapped = b.ins().icmp_imm(IntCC::NotEqual, tc, 0);
+    let trapret = b.create_block();
+    let cont = b.create_block();
+    b.ins().brif(trapped, trapret, &[], cont, &[]);
+    b.switch_to_block(trapret);
+    b.seal_block(trapret);
+    let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
+    b.ins().return_(&zeros);
+    b.switch_to_block(cont);
+    b.seal_block(cont);
+
+    // Read the result slots back.
+    if let Some(ss) = res_ss {
+        for (i, rty) in sig.results.iter().enumerate() {
+            let slot = b.ins().stack_load(I64, ss, (i * 8) as i32);
+            vals.push(decode_slot(b, slot, *rty));
+        }
+    }
+    Ok(())
 }
 
 fn get(vals: &[Value], i: u32) -> Result<Value, JitError> {

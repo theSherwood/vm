@@ -561,6 +561,7 @@ fn interp_trap_kind(t: &Trap) -> Option<TrapKind> {
         Trap::BadConversion => Some(TrapKind::BadConversion),
         Trap::Unreachable => Some(TrapKind::Unreachable),
         Trap::IndirectCallType => Some(TrapKind::IndirectCallType),
+        Trap::CapFault => Some(TrapKind::CapFault),
         _ => None,
     }
 }
@@ -582,41 +583,56 @@ fn assert_jit_matches_interp_at(src: &str, idx: u32, inputs: &[Vec<Value>]) {
             Err(e) => panic!("JIT failed to compile {src:?}: {e:?}"),
         };
 
-        match (interp, outcome) {
-            (Ok(want), JitOutcome::Returned(got_slots)) => {
-                let got: Vec<Value> = results_ty
-                    .iter()
-                    .zip(got_slots)
-                    .map(|(t, s)| from_slot(*t, s))
-                    .collect();
-                assert_eq!(want.len(), got.len(), "result arity mismatch on {src:?}");
-                for (w, g) in want.iter().zip(&got) {
-                    assert!(
-                        values_equal(w, g),
-                        "interp/JIT disagree on {src:?} for {args:?}: {want:?} vs {got:?}"
-                    );
-                }
-            }
-            (Err(trap), JitOutcome::Trapped(kind)) => {
-                // A trap the JIT models must match in kind; one it doesn't model (e.g.
-                // memory-guard fault) is fine either way.
-                if let Some(want) = interp_trap_kind(&trap) {
-                    assert_eq!(
-                        kind, want,
-                        "JIT trapped {kind:?} but interp trapped {trap:?} on {src:?} for {args:?}"
-                    );
-                }
-            }
-            (Err(trap), JitOutcome::Returned(_)) => {
-                // OK only if it's a trap the JIT doesn't model (e.g. memory-guard fault).
+        compare_outcome(interp, outcome, &results_ty, src, args);
+    }
+}
+
+/// Assert a single interpreter result and JIT outcome agree (value-equal, or the same
+/// trap kind / exit code; traps the JIT doesn't model are not asserted).
+fn compare_outcome(
+    interp: Result<Vec<Value>, Trap>,
+    outcome: JitOutcome,
+    results_ty: &[ValType],
+    src: &str,
+    args: &[Value],
+) {
+    match (interp, outcome) {
+        (Ok(want), JitOutcome::Returned(got_slots)) => {
+            let got: Vec<Value> = results_ty
+                .iter()
+                .zip(got_slots)
+                .map(|(t, s)| from_slot(*t, s))
+                .collect();
+            assert_eq!(want.len(), got.len(), "result arity mismatch on {src:?}");
+            for (w, g) in want.iter().zip(&got) {
                 assert!(
-                    interp_trap_kind(&trap).is_none(),
-                    "interp trapped {trap:?} but JIT returned on {src:?} for {args:?}"
+                    values_equal(w, g),
+                    "interp/JIT disagree on {src:?} for {args:?}: {want:?} vs {got:?}"
                 );
             }
-            (Ok(want), JitOutcome::Trapped(kind)) => {
-                panic!("interp returned {want:?} but JIT trapped {kind:?} on {src:?} for {args:?}")
+        }
+        (Err(trap), JitOutcome::Trapped(kind)) => {
+            // A trap the JIT models must match in kind; one it doesn't model (e.g.
+            // memory-guard fault) is fine either way.
+            if let Some(want) = interp_trap_kind(&trap) {
+                assert_eq!(
+                    kind, want,
+                    "JIT trapped {kind:?} but interp trapped {trap:?} on {src:?} for {args:?}"
+                );
             }
+        }
+        (Err(trap), JitOutcome::Returned(_)) => {
+            // OK only if it's a trap the JIT doesn't model (e.g. memory-guard fault).
+            assert!(
+                interp_trap_kind(&trap).is_none(),
+                "interp trapped {trap:?} but JIT returned on {src:?} for {args:?}"
+            );
+        }
+        (Err(Trap::Exit(want)), JitOutcome::Exited(got)) => {
+            assert_eq!(want, got, "exit code mismatch on {src:?} for {args:?}");
+        }
+        (interp, outcome) => {
+            panic!("interp/JIT outcome mismatch on {src:?} for {args:?}: {interp:?} vs {outcome:?}")
         }
     }
 }
@@ -816,4 +832,170 @@ block0(v0: i64, v1: f64):
             vec![Value::I64(65528), Value::F64(f64::INFINITY)],
         ],
     );
+}
+
+// ---- cap.call: the JIT dispatches through a host thunk to the interpreter's Host ----
+
+use core::ffi::c_void;
+use svm_interp::{run_with_host, GuestMem, Host, StreamRole, WindowMem};
+use svm_jit::{compile_and_run_with_host, EXIT_CODE};
+
+/// Bridge the JIT's `CapThunk` ABI to the interpreter's `Host::cap_dispatch_slots`.
+/// This is the host "trampoline" (§9) a real embedder supplies; here it drives the same
+/// mock Host the interpreter uses, so the two backends share capability semantics.
+///
+/// # Safety
+/// Honours the `CapThunk` contract: `ctx` is a `*mut Host`, the slot/window pointers are
+/// valid for their lengths, and `trap_out` is live.
+unsafe extern "C" fn cap_thunk(
+    ctx: *mut c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    type_id: u32,
+    op: u32,
+    handle: i32,
+    args: *const i64,
+    n_args: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) {
+    let host = &mut *(ctx as *mut Host);
+    let arg_slots = std::slice::from_raw_parts(args, n_args as usize);
+    let mut empty: [u8; 0] = [];
+    let window: &mut [u8] = if mem_base.is_null() {
+        &mut empty
+    } else {
+        std::slice::from_raw_parts_mut(mem_base, mem_size as usize)
+    };
+    let mut wm = WindowMem::new(window, mem_size);
+    let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
+        None
+    } else {
+        Some(&mut wm)
+    };
+
+    match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
+        Ok(res) => {
+            let out = std::slice::from_raw_parts_mut(results, n_results as usize);
+            for (o, r) in out.iter_mut().zip(res) {
+                *o = r;
+            }
+            *trap_out = 0;
+        }
+        Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
+        // CapFault (forged/wrong-type/closed) and anything else map to a CapFault trap.
+        Err(_) => *trap_out = TrapKind::CapFault as i64,
+    }
+}
+
+/// Drive `src(args)` through the interpreter (on `hi`) and the JIT (on `hj`) and assert
+/// they agree on the result/trap/exit *and* on the observable host effects. `hi` and `hj`
+/// must be set up identically by the caller (grants are deterministic, so handle indices
+/// match).
+fn assert_cap_agrees(src: &str, args: &[Value], hi: &mut Host, hj: &mut Host) {
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let results_ty = m.funcs[0].results.clone();
+
+    let mut fuel = 10_000_000u64;
+    let interp = run_with_host(&m, 0, args, &mut fuel, hi);
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let jit = compile_and_run_with_host(&m, 0, &slots, cap_thunk, hj as *mut Host as *mut c_void)
+        .expect("jit compiles");
+
+    compare_outcome(interp, jit, &results_ty, src, args);
+    assert_eq!(hi.stdout, hj.stdout, "stdout differs on {src:?}");
+    assert_eq!(hi.stderr, hj.stderr, "stderr differs on {src:?}");
+}
+
+#[test]
+fn jit_cap_clock_now() {
+    let src = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i32.const 0
+  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  return v2
+}
+"#;
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let ci = hi.grant_clock();
+    let cj = hj.grant_clock();
+    assert_eq!(ci, cj, "grants are deterministic");
+    assert_cap_agrees(src, &[Value::I32(ci)], &mut hi, &mut hj);
+}
+
+#[test]
+fn jit_cap_stream_write_captures_output() {
+    // Store "Hi" into the window, then Stream.write(ptr=0, len=2) — exercises a buffer
+    // arg through the §7 window borrow in the JIT thunk.
+    let src = r#"
+memory 16
+
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i32.const 72
+  i32.store8 v1 v2
+  v3 = i64.const 1
+  v4 = i32.const 105
+  i32.store8 v3 v4
+  v5 = i64.const 0
+  v6 = i64.const 2
+  v7 = cap.call 0 1 (i64, i64) -> (i64) v0 (v5, v6)
+  return v7
+}
+"#;
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let oi = hi.grant_stream(StreamRole::Out);
+    let oj = hj.grant_stream(StreamRole::Out);
+    assert_eq!(oi, oj);
+    assert_cap_agrees(src, &[Value::I32(oi)], &mut hi, &mut hj);
+    assert_eq!(hj.stdout, b"Hi", "JIT captured the written bytes");
+}
+
+#[test]
+fn jit_cap_exit_propagates_code() {
+    let src = r#"
+func (i32) -> () {
+block0(v0: i32):
+  v1 = i32.const 7
+  cap.call 1 0 (i32) -> () v0 (v1)
+  unreachable
+}
+"#;
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let ei = hi.grant_exit();
+    let ej = hj.grant_exit();
+    assert_eq!(ei, ej);
+    assert_cap_agrees(src, &[Value::I32(ei)], &mut hi, &mut hj);
+}
+
+#[test]
+fn jit_cap_forged_handle_is_capfault() {
+    // A forged handle index must be inert in the JIT too (CapFault), matching interp.
+    let src = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i32.const 0
+  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  return v2
+}
+"#;
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    // No grants: any handle is forged. Also test a wrong-type handle (a Stream called
+    // as a Clock) in a second pass.
+    assert_cap_agrees(src, &[Value::I32(0x7fff)], &mut hi, &mut hj);
+
+    let mut hi2 = Host::new();
+    let mut hj2 = Host::new();
+    let si = hi2.grant_stream(StreamRole::Out);
+    let sj = hj2.grant_stream(StreamRole::Out);
+    assert_eq!(si, sj);
+    assert_cap_agrees(src, &[Value::I32(si)], &mut hi2, &mut hj2);
 }
