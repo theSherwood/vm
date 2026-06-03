@@ -10,9 +10,13 @@ The full design lives in [`DESIGN.md`](DESIGN.md); the working agreement (keep i
 simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 [`AGENTS.md`](AGENTS.md).
 
-> Status: **Phase 1** — building the core loop (IR + text/binary formats + verifier
-> + reference interpreter). This is a research build; "appears to work" is reachable,
-> "is certified secure" is an explicit post-MVP workstream (see `DESIGN.md` §2a/§18).
+> Status: **Phase 1** — the core loop is in place. The full **scalar IR** (integer /
+> float ops, linear memory with confinement masking, direct / indirect / tail calls +
+> the function table, `select`, `br_table`, `unreachable`) flows through
+> text ⇄ binary ⇄ verifier ⇄ reference interpreter, with the masking unit isolated and
+> fuzzed. Still ahead: capabilities (`cap.call` / handle table), atomics, SIMD, and the
+> JIT. This is a research build; "appears to work" is reachable, "is certified secure"
+> is an explicit post-MVP workstream (see `DESIGN.md` §2a/§18).
 
 ## Layout
 

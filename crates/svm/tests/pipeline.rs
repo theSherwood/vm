@@ -1161,3 +1161,87 @@ block0(v0: i64, v1: i64):
         Ok(vec![Value::I64(1024)])
     );
 }
+
+// ---- verifier fail-closed coverage for the newer ops (escape-TCB rejection paths) ----
+
+/// Every program here is ill-typed/ill-formed in one specific way; the verifier
+/// must reject each (it is the TCB contract that a bad module never verifies).
+#[test]
+fn verifier_rejects_newer_op_violations() {
+    let cases: &[(&str, &str)] = &[
+        // call_indirect index operand must be i32, not i64.
+        (
+            "indirect index not i32",
+            r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = call_indirect (i64) -> (i64) v0 (v0)
+  return v1
+}
+"#,
+        ),
+        // ptr.add operands must be i64.
+        (
+            "ptr.add on i32",
+            r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = ptr.add v0 v0
+  return v1
+}
+"#,
+        ),
+        // trapping trunc operand must be a float, not an integer.
+        (
+            "trunc on i32",
+            r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.trunc_f64_s v0
+  return v1
+}
+"#,
+        ),
+        // a store needs the address to be i64.
+        (
+            "store address not i64",
+            r#"
+memory 16
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  i32.store v0 v1
+  return v1
+}
+"#,
+        ),
+    ];
+    for (name, src) in cases {
+        let m = parse_module(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        assert!(
+            verify_module(&m).is_err(),
+            "{name}: verifier accepted an ill-typed module"
+        );
+    }
+}
+
+#[test]
+fn verifier_rejects_oversized_memory() {
+    // A window of 1 << 64 is not representable -> rejected.
+    let m = parse_module("memory 64\nfunc () -> () {\nblock0():\n  return\n}\n").unwrap();
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::MemorySizeTooLarge { .. })
+    ));
+}
+
+#[test]
+fn verifier_rejects_ref_func_out_of_range() {
+    let m = parse_module(
+        "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = ref.func 9\n  return v0\n}\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::CallFuncOutOfRange { .. })
+    ));
+}
