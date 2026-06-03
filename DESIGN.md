@@ -328,6 +328,121 @@ Single fused decode+verify forward pass, O(module size):
 
 ---
 
+## 3c. Function table & handle table (the index model)  [SETTLED]
+
+Concretizes how `funcref`/`handle` values work, resolving the earlier
+sealed-vs-inert ambiguity in favor of **inert typed indices** (D37).
+
+### Unifying model
+Two per-domain, **host-owned** tables — the **function table** (code) and the
+**handle table** (authority). A `funcref`/`handle` value is a **forgeable integer
+index** into one of them; confinement happens **at the use site** (bounds + type
+check against the host-owned table), never by sealing the value.
+
+**No guest-visible value needs to be unforgeable.** Every escape vector is closed
+at *use* or by *out-of-band storage*:
+
+| Escape vector | Confined by |
+|---|---|
+| memory access | mask of final effective address (§4) — use-site |
+| indirect call `call_indirect` | function-table bounds + type check — use-site |
+| capability call `cap.call` | handle-table bounds + type + liveness, **host-owned table** — use-site |
+| direct call / branch | static targets, verifier-checked — no runtime value |
+| **return** | out-of-band control stack (§5) — not guest-addressable at all |
+
+So the §3a two-class model is really: **forgeable plain data (everything, indices
+included), confined at use, plus the out-of-band control stack as the one thing the
+guest cannot name.** The linchpin for both tables is **host-ownership** — the guest
+holds indices but can never write a table entry, so a forged index only ever
+selects among entries the *host* installed. This formally retires §3a's "no opcode
+produces a handle from plain data" language: int↔handle and int↔funcref casts are
+*allowed* (C needs them — e.g. a C `int fd` that *is* a handle index); safety is the
+use-site checks, not value sealing.
+
+### Function table
+**Contents:** exactly the domain's own functions (domain-global indices across all
+linked modules, §13/§14, assigned at instantiation/link). There are **no imported
+host functions** (§7: all host access is `cap.call`), so `call_indirect` cannot
+leave guest code and carries **zero host authority** — pure intra-guest control flow.
+
+**Representation** — flat, power-of-two-padded, **AoS** (the two fields are always
+read together → one cache line; per AGENTS.md data-oriented design):
+```
+struct FnEntry { type_id: u32, code: *const u8 }   // host-owned, guest-unwritable
+fn_table: [FnEntry; pow2]                           // indexed by function index
+```
+- `funcref<Sig>` value = a function index (a plain integer).
+- `ref.func <funcidx>` → `funcref<Sig_funcidx>` (the index; direct, no check).
+- `call <funcidx>(args)` → fully static direct call (verifier checks funcidx + types).
+- `call_indirect <Sig>(fref, args)` — **always runtime-checks** (D38, wasm parity;
+  JIT devirtualization is a later optimization, not MVP):
+  ```
+  i = fref & (len-1)                  // mask, not branch → Spectre-v1 safe table load
+  trap if fn_table[i].type_id != Sig.id
+  call fn_table[i].code (args)        // indirect branch → retpoline / eIBRS (§9)
+  ```
+
+**C function pointers** lower with no friction: the pointer *is* the integer index;
+storing, comparing, casting to/from `void*`, and building dispatch arrays are
+ordinary integer ops in guest memory — **no `table.set/get/grow` needed** (a mutable
+array of function pointers is just an array of indices in guest memory). Accepted
+casualties (standard wasm): function-pointer *arithmetic*, and casting a *data*
+pointer into a callable funcref (a guest-internal JIT) — the latter simply traps at
+`call_indirect`, which is correct for a sandbox. **Deferred:** mutable/growable
+function tables and `table.*` opcodes — add only if a language demands them.
+
+### Handle table (the powerbox)
+**Representation** — flat, pow2-padded, AoS, **host-owned and outside guest-writable
+memory** (same trust class as the control stack, §5):
+```
+struct HandleEntry {
+    type_id:    u32,      // interface type
+    generation: u32,      // use-after-close detection (D37); index = (generation, slot)
+    object:     *mut (),  // host-side capability state — guest NEVER writes this
+}
+handle_table: [HandleEntry; pow2]   // per domain, shared across its threads
+```
+**`cap.call <op_index>(h, args)`** — `op_index` is an immediate and the handle's
+interface `I` is the static type, so **the handler is a compile-time constant**:
+```
+j = slot(h) & (len-1)
+e = handle_table[j]
+trap if e.type_id != I.id            // forged / wrong-type index → inert
+trap if e.generation != gen(h)       // closed / revoked → defined trap (D37)
+I.handlers[op_index](e.object, args) // DIRECT call — handler known at compile time
+```
+Consequences:
+- `cap.call` is **static dispatch + a runtime-checked receiver**, *not* an indirect
+  branch — no Spectre-BTI mitigation needed on it, and the JIT inlines the known
+  handler to ~free (this is §9's "inline-able to ~free").
+- A forged handle index is **inert**: it traps (wrong type / dead generation /
+  OOB-masked-to-wrong-type) or selects one of *this domain's own* granted type-`I`
+  capabilities. The guest never supplies `e.object` (host memory), so it cannot aim a
+  handler at an arbitrary object — only at host-installed grants. Cross-domain / slow
+  capabilities make `I.handlers[op_index]` a statically-known trampoline stub
+  (marshal to supervisor / ring submit, §9) — still a direct call.
+
+**Attenuation needs no new IR.** `subdir`, `readonly`, `Connector`-narrowing, etc.
+are simply **interface operations whose result type is a handle**: the host allocates
+a new, more-restricted entry in the *caller's* handle table and returns its index.
+Since `cap.call` results can already be handle-typed, attenuation and the initial
+powerbox (instantiation fills the first N entries, §3b) reuse the existing mechanism
+— zero extra surface.
+
+**Buffer args** (`(ptr,len)` + own/borrow, §7) are validated at the trampoline: the
+ptr is a guest window offset, so the trampoline masks/bounds-checks `(ptr,len)`
+against the window before the host borrows it in place (§9's "arg bounds-check").
+
+### Verifier delta
+- `ref.func f`: `f` in range → result `funcref<Sig_f>`.
+- `call_indirect Sig`: operand `funcref`; args match `Sig` params; results = `Sig` results.
+- `cap.call op_index`: operand `handle<I>`; `op_index < I.op_count` (static, type
+  section); args/results match `I.ops[op_index]` (results may be handle/funcref-typed).
+- int↔funcref and int↔handle conversions allowed (plain-data-like) — use-site checks
+  carry safety.
+
+---
+
 ## 4. Memory model  [SETTLED] (some details PARKED)
 
 - Each domain gets a large **reserved virtual-address window** (e.g. 2^40,
