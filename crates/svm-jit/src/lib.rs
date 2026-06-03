@@ -6,13 +6,17 @@
 //! lowering. Correctness is established by **differential testing against the
 //! reference interpreter** (§18, invariants I1/I4), the oracle in `svm-interp`.
 //!
-//! ## Status: integer slice + the §4 memory masking lowering
-//! Lowers `i32`/`i64` scalars: constants, the non-trapping integer arithmetic/
-//! bitwise/shift/rotate ops, comparisons, `eqz`, `select`, `clz/ctz/popcnt`, the
-//! `br`/`br_if`/`return` terminators, and **integer loads/stores with confinement
-//! masking** — the security-critical I1 lowering. Anything else returns
-//! [`JitError::Unsupported`] so the differential harness skips it. Calls, `br_table`,
-//! floats, conversions, and trapping ops grow from here under the same check.
+//! ## Status
+//! Lowers the full scalar surface: `i32`/`i64`/`f32`/`f64` consts, all integer and
+//! float arithmetic/bitwise/shift/rotate/compare ops (incl. trapping `div`/`rem`),
+//! `eqz`/`select`/`clz`/`ctz`/`popcnt`, every conversion (extend/wrap/demote/promote/
+//! reinterpret, int↔float, saturating **and** trapping `trunc`), **integer loads/
+//! stores with confinement masking** (the security-critical I1 lowering), and the
+//! `br`/`br_if`/`br_table`/`return`/`return_call`/`unreachable` terminators incl.
+//! direct and tail calls. Anything else returns [`JitError::Unsupported`] so the
+//! differential harness skips it. Still ahead: indirect calls + `cap.call` (the
+//! function/handle tables). Trapping ops abort the process if executed (no
+//! trap-catching infra yet); the harness only runs the JIT on non-trapping inputs.
 //!
 //! ## The masking lowering (§4, invariant I1)
 //! Every access masks the **final effective address** into the window —
@@ -32,7 +36,8 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F64, I16, I32, I64, I8};
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, Endianness, Function, InstBuilder, MemFlags, Type, UserFuncName, Value,
+    AbiParam, BlockArg, BlockCall, Endianness, Function, InstBuilder, JumpTableData, MemFlags,
+    Type, UserFuncName, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -226,31 +231,25 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::FUn { .. }
                 | Inst::FCmp { .. }
                 | Inst::FToISat { .. }
+                | Inst::FToITrap { .. }
                 | Inst::IToFConv { .. }
                 | Inst::Cast { .. }
                 | Inst::Load { .. }
                 | Inst::Store { .. }
                 | Inst::Call { .. }
+                | Inst::IntBin { .. }
                 | Inst::Convert { .. } => {}
-                Inst::IntBin { op, .. } => match op {
-                    // Trapping ops need fault plumbing (deferred).
-                    BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU => {
-                        return Err(JitError::Unsupported("trapping div/rem"))
-                    }
-                    _ => {}
-                },
                 Inst::IntUn { op, .. } => match op {
                     IntUnOp::Clz | IntUnOp::Ctz | IntUnOp::Popcnt => {}
                     _ => return Err(JitError::Unsupported("int extend ops")),
                 },
-                // Trapping float→int needs fault plumbing (deferred).
-                Inst::FToITrap { .. } => return Err(JitError::Unsupported("trapping trunc")),
                 _ => return Err(JitError::Unsupported("instruction")),
             }
         }
         match &blk.term {
             Terminator::Br { .. }
             | Terminator::BrIf { .. }
+            | Terminator::BrTable { .. }
             | Terminator::Return(_)
             | Terminator::ReturnCall { .. }
             | Terminator::Unreachable => {}
@@ -488,6 +487,18 @@ fn lower_block(
                     b.ins().fcvt_to_uint_sat(ity, x)
                 }
             }
+            Inst::FToITrap { op, a } => {
+                let x = get(&vals, *a)?;
+                let (_, to, signed) = op.parts();
+                let ity = int_clif_ty(to);
+                // Trapping (wasm trunc): NaN/out-of-range trap — Cranelift's
+                // non-saturating fcvt traps on exactly those, matching the interpreter.
+                if signed {
+                    b.ins().fcvt_to_sint(ity, x)
+                } else {
+                    b.ins().fcvt_to_uint(ity, x)
+                }
+            }
             Inst::Load {
                 op, addr, offset, ..
             } => {
@@ -529,6 +540,31 @@ fn lower_block(
             let tb = *blocks.get(*then_blk as usize).ok_or(JitError::Malformed)?;
             let eb = *blocks.get(*else_blk as usize).ok_or(JitError::Malformed)?;
             b.ins().brif(c, tb, &ta, eb, &ea);
+        }
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
+            let index = get(&vals, *idx)?;
+            // Build a BlockCall (target block + its edge args) for each table entry
+            // and the default; Cranelift masks the index and selects, default on OOB.
+            let mut entries = Vec::with_capacity(targets.len());
+            for (t, args) in targets {
+                let ba = map_args(&vals, args)?;
+                let blk = *blocks.get(*t as usize).ok_or(JitError::Malformed)?;
+                entries.push(BlockCall::new(
+                    blk,
+                    ba.iter().copied(),
+                    &mut b.func.dfg.value_lists,
+                ));
+            }
+            let (dt, dargs) = default;
+            let dba = map_args(&vals, dargs)?;
+            let dblk = *blocks.get(*dt as usize).ok_or(JitError::Malformed)?;
+            let dcall = BlockCall::new(dblk, dba.iter().copied(), &mut b.func.dfg.value_lists);
+            let jt = b.create_jump_table(JumpTableData::new(dcall, &entries));
+            b.ins().br_table(index, jt);
         }
         Terminator::Return(outs) => {
             // Natural ABI: return the result values directly (CLIF multi-return).
@@ -709,8 +745,14 @@ fn int_bin(b: &mut FunctionBuilder, op: BinOp, x: Value, y: Value) -> Value {
         BinOp::ShrU => b.ins().ushr(x, y),
         BinOp::Rotl => b.ins().rotl(x, y),
         BinOp::Rotr => b.ins().rotr(x, y),
-        // Trapping div/rem are rejected by `ensure_supported`.
-        BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU => unreachable!("rejected earlier"),
+        // Trapping div/rem: Cranelift's sdiv/udiv trap on /0 (and sdiv on INT_MIN/-1
+        // overflow); srem/urem trap on /0 only and define INT_MIN%-1 = 0 — exactly
+        // the interpreter's semantics. Trapping inputs are never JIT-run (the harness
+        // skips them), so a trap here would be a genuine divergence.
+        BinOp::DivS => b.ins().sdiv(x, y),
+        BinOp::DivU => b.ins().udiv(x, y),
+        BinOp::RemS => b.ins().srem(x, y),
+        BinOp::RemU => b.ins().urem(x, y),
     }
 }
 

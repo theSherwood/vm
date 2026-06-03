@@ -33,34 +33,7 @@ fn from_slot(t: ValType, s: i64) -> Value {
 
 /// Assert the JIT and the interpreter agree on `src(args)` for every input row.
 fn assert_jit_matches_interp(src: &str, inputs: &[Vec<Value>]) {
-    let m = parse_module(src).expect("parse");
-    verify_module(&m).expect("verify");
-    let results_ty = m.funcs[0].results.clone();
-
-    for args in inputs {
-        let mut fuel = 10_000_000u64;
-        let want = run(&m, 0, args, &mut fuel).expect("interp ok");
-
-        let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-        let got_slots = match compile_and_run(&m, 0, &slots) {
-            Ok(s) => s,
-            Err(JitError::Unsupported(_)) => return, // not in this slice yet — skip
-            Err(e) => panic!("JIT failed: {e:?}"),
-        };
-        let got: Vec<Value> = results_ty
-            .iter()
-            .zip(got_slots)
-            .map(|(t, s)| from_slot(*t, s))
-            .collect();
-
-        assert_eq!(want.len(), got.len(), "result arity mismatch on {src:?}");
-        for (w, g) in want.iter().zip(&got) {
-            assert!(
-                values_equal(w, g),
-                "interp/JIT disagree on {src:?} for args {args:?}: {want:?} vs {got:?}"
-            );
-        }
-    }
+    assert_jit_matches_interp_at(src, 0, inputs);
 }
 
 /// Bit-exact equality, except any two NaNs of the same width are considered equal:
@@ -282,6 +255,155 @@ block0(v0: i64):
     assert_jit_matches_interp(src, &[vec![Value::I64(0xDEAD_BEEF)], vec![Value::I64(-99)]]);
 }
 
+// ---- br_table, trapping ops, unreachable ----
+
+#[test]
+fn jit_matches_interp_br_table() {
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  br_table v0 [block1(), block2(), block3()] block4()
+block1():
+  v1 = i32.const 10
+  return v1
+block2():
+  v2 = i32.const 20
+  return v2
+block3():
+  v3 = i32.const 30
+  return v3
+block4():
+  v4 = i32.const 99
+  return v4
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            i32s(&[0]),
+            i32s(&[1]),
+            i32s(&[2]),
+            i32s(&[3]),  // out of range -> default
+            i32s(&[-1]), // huge unsigned -> default
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_br_table_with_args() {
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  br_table v0 [block1(v1), block2(v1)] block3(v1)
+block1(v2: i32):
+  v3 = i32.const 1
+  v4 = i32.add v2 v3
+  return v4
+block2(v5: i32):
+  v6 = i32.const 2
+  v7 = i32.add v5 v6
+  return v7
+block3(v8: i32):
+  return v8
+}
+"#;
+    assert_jit_matches_interp(src, &[i32s(&[0, 100]), i32s(&[1, 100]), i32s(&[9, 100])]);
+}
+
+#[test]
+fn jit_matches_interp_div_rem_signed() {
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.div_s v0 v1
+  v3 = i32.rem_s v0 v1
+  v4 = i32.add v2 v3
+  return v4
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            i32s(&[7, 3]),
+            i32s(&[-7, 3]),
+            i32s(&[7, -3]),
+            i32s(&[100, 7]),
+            i32s(&[10, 0]),        // div/rem by zero -> interp traps -> skipped
+            i32s(&[i32::MIN, -1]), // div_s overflow -> interp traps -> skipped
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_rem_s_int_min_neg_one() {
+    // i32.rem_s INT_MIN, -1 = 0 with NO trap (wasm special case). This input is *not*
+    // skipped, so the JIT must lower srem to give 0 (not a hardware overflow trap).
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.rem_s v0 v1
+  return v2
+}
+"#;
+    assert_jit_matches_interp(src, &[i32s(&[i32::MIN, -1]), i32s(&[7, 3]), i32s(&[-7, 3])]);
+}
+
+#[test]
+fn jit_matches_interp_div_rem_unsigned() {
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.div_u v0 v1
+  v3 = i32.rem_u v0 v1
+  v4 = i32.add v2 v3
+  return v4
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[i32s(&[100, 7]), i32s(&[-1, 3]), i32s(&[5, 0])], // /0 skipped
+    );
+}
+
+#[test]
+fn jit_matches_interp_trapping_trunc() {
+    let src = r#"
+func (f64) -> (i32) {
+block0(v0: f64):
+  v1 = i32.trunc_f64_s v0
+  return v1
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            f64s(&[3.9]),
+            f64s(&[-3.9]),
+            f64s(&[100.0]),
+            f64s(&[f64::NAN]), // traps -> skipped
+            f64s(&[1e18]),     // out of range -> traps -> skipped
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_unreachable_in_untaken_branch() {
+    // The JIT compiles the `unreachable` block (a trap) but must not execute it when
+    // the branch is not taken. v0 != 0 -> returns 5; v0 == 0 -> interp traps -> skipped.
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  br_if v0 block1() block2()
+block1():
+  v1 = i32.const 5
+  return v1
+block2():
+  unreachable
+}
+"#;
+    assert_jit_matches_interp(src, &[i32s(&[1]), i32s(&[42]), i32s(&[0])]);
+}
+
 #[test]
 fn jit_matches_interp_no_args_const() {
     let src = r#"
@@ -430,13 +552,21 @@ block0(v0: i32, v1: f64):
 // ---- calls ----
 
 /// Run the differential check against function index `idx` (not just 0).
+///
+/// If the interpreter *traps* on an input, the JIT is **not** run on it: we have no
+/// trap-catching infrastructure yet, so a JIT trap would abort the process. Trapping
+/// inputs are skipped here (the trap semantics are covered by the interpreter's own
+/// tests); the JIT is checked for agreement on the non-trapping inputs.
 fn assert_jit_matches_interp_at(src: &str, idx: u32, inputs: &[Vec<Value>]) {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let results_ty = m.funcs[idx as usize].results.clone();
     for args in inputs {
         let mut fuel = 10_000_000u64;
-        let want = run(&m, idx, args, &mut fuel).expect("interp ok");
+        let want = match run(&m, idx, args, &mut fuel) {
+            Ok(v) => v,
+            Err(_) => continue, // interpreter traps -> don't run the JIT (would abort)
+        };
         let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
         let got_slots = match compile_and_run(&m, idx, &slots) {
             Ok(s) => s,
@@ -448,10 +578,11 @@ fn assert_jit_matches_interp_at(src: &str, idx: u32, inputs: &[Vec<Value>]) {
             .zip(got_slots)
             .map(|(t, s)| from_slot(*t, s))
             .collect();
+        assert_eq!(want.len(), got.len(), "result arity mismatch on {src:?}");
         for (w, g) in want.iter().zip(&got) {
             assert!(
                 values_equal(w, g),
-                "interp/JIT disagree: {want:?} vs {got:?}"
+                "interp/JIT disagree on {src:?} for {args:?}: {want:?} vs {got:?}"
             );
         }
     }
