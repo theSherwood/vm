@@ -32,8 +32,9 @@ pub enum Trap {
     OutOfFuel,
     /// Integer division or remainder by zero (§3b).
     DivByZero,
-    /// Signed `div_s` of `INT_MIN / -1` overflow (§3b). `rem_s` does **not** trap here
-    /// (`INT_MIN % -1 == 0`).
+    /// Signed `div_s` of `INT_MIN / -1`: the quotient `+2^31` is not representable, so
+    /// it traps (§3b: trap only when there is no representable result). `rem_s` does
+    /// **not** trap here — the remainder `0` *is* representable.
     IntOverflow,
     /// A memory access crossed the top of the window (guard-region fault, §4/§5).
     MemoryFault,
@@ -920,8 +921,10 @@ fn bin32(op: BinOp, a: i32, b: i32) -> Result<i32, Trap> {
             ((a as u32) / (b as u32)) as i32
         }
         BinOp::RemS => {
-            // `rem_s` traps only on a zero divisor; `INT_MIN % -1` is defined as 0 (no
-            // overflow trap — only `div_s` traps there). `wrapping_rem` yields 0.
+            // `rem_s` traps only on a zero divisor. `INT_MIN % -1 == 0` — a perfectly
+            // representable result, so it does *not* trap: traps are for results with no
+            // representable value (§3b), and only the *quotient* overflows here, not the
+            // remainder. (`wrapping_rem` yields 0.) See `div_s`, which does trap.
             check_div(b == 0, false)?;
             a.wrapping_rem(b)
         }
@@ -978,7 +981,8 @@ fn bin64(op: BinOp, a: i64, b: i64) -> Result<i64, Trap> {
             ((a as u64) / (b as u64)) as i64
         }
         BinOp::RemS => {
-            // `rem_s` traps only on a zero divisor; `INT_MIN % -1` is defined as 0.
+            // Only a zero divisor traps; `INT_MIN % -1 == 0` is representable (only the
+            // quotient overflows, not the remainder), so it returns 0 — see `bin32`.
             check_div(b == 0, false)?;
             a.wrapping_rem(b)
         }

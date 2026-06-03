@@ -326,9 +326,10 @@ block0(v0: i32, v1: i32):
 
 #[test]
 fn rem_s_overflow_is_zero_not_a_trap() {
-    // wasm `rem_s`: only a zero divisor traps; `INT_MIN % -1 == 0` (no overflow trap —
-    // that is unique to `div_s`). Regression for an over-trapping bug the JIT diff
-    // harness surfaced.
+    // Design choice (§3b): trap only when there is no representable result. `INT_MIN %
+    // -1 == 0` is representable (only the *quotient* overflows, not the remainder), so
+    // `rem_s` returns 0 — unlike `div_s`, whose quotient `+2^31` does not fit and traps.
+    // Regression for an over-trapping bug the JIT differential harness surfaced.
     assert_eq!(
         run1(REM_S, &[Value::I32(i32::MIN), Value::I32(-1)]),
         Ok(vec![Value::I32(0)])

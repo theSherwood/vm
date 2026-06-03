@@ -1069,7 +1069,8 @@ fn lower_div_rem(
     match op {
         BinOp::DivS => b.ins().sdiv(x, y),
         BinOp::DivU => b.ins().udiv(x, y),
-        // srem defines INT_MIN % -1 = 0 (no trap), matching the interpreter.
+        // `INT_MIN % -1 == 0` is representable so `rem_s` does not trap (only `div_s`
+        // does); Cranelift's `srem` yields 0 here, matching the interpreter.
         BinOp::RemS => b.ins().srem(x, y),
         BinOp::RemU => b.ins().urem(x, y),
         _ => unreachable!("non-div/rem routed here"),
