@@ -641,6 +641,98 @@ block0(v0: i64, v1: i64):
     );
 }
 
+// f1 = +10, f2 = *2, both (i32)->(i32); f0 dispatches indirectly. Index masks into the
+// power-of-two-padded table: 1->f1, 2->f2, 0->f0 (type mismatch -> trap), 3->padding.
+const INDIRECT: &str = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = call_indirect (i32) -> (i32) v0 (v1)
+  return v2
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 10
+  v2 = i32.add v0 v1
+  return v2
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 2
+  v2 = i32.mul v0 v1
+  return v2
+}
+"#;
+
+#[test]
+fn jit_matches_interp_call_indirect() {
+    assert_jit_matches_interp_at(
+        INDIRECT,
+        0,
+        &[
+            i32s(&[1, 5]),  // -> f1(5) = 15
+            i32s(&[2, 5]),  // -> f2(5) = 10
+            i32s(&[1, -3]), // -> f1(-3) = 7
+            i32s(&[0, 5]),  // wrong type (f0) -> interp traps -> skipped
+            i32s(&[3, 5]),  // padding slot -> interp traps -> skipped
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_ref_func_indirect() {
+    // `ref.func 2` materializes the index of f2 (*2); dispatch through it.
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = ref.func 2
+  v2 = call_indirect (i32) -> (i32) v1 (v0)
+  return v2
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 10
+  v2 = i32.add v0 v1
+  return v2
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 2
+  v2 = i32.mul v0 v1
+  return v2
+}
+"#;
+    assert_jit_matches_interp_at(src, 0, &[i32s(&[5]), i32s(&[-4]), i32s(&[0])]);
+}
+
+#[test]
+fn jit_matches_interp_return_call_indirect() {
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  return_call_indirect (i32) -> (i32) v0 (v1)
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 10
+  v2 = i32.add v0 v1
+  return v2
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 2
+  v2 = i32.mul v0 v1
+  return v2
+}
+"#;
+    assert_jit_matches_interp_at(src, 0, &[i32s(&[1, 5]), i32s(&[2, 5]), i32s(&[0, 5])]);
+}
+
 #[test]
 fn jit_matches_interp_return_call_tail_recursion() {
     // Tail-recursive factorial accumulator f(n, acc) = n==0 ? acc : f(n-1, acc*n) via

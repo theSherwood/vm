@@ -15,13 +15,14 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > the function table, `select`, `br_table`, `unreachable`) plus **capabilities**
 > (`cap.call` over a host-owned handle table, and the MVP powerbox — `Stream` / `Exit`
 > / `Clock` / `Memory`, §3c/§3e) flow through text ⇄ binary ⇄ verifier ⇄ reference
-> interpreter, with the masking unit isolated and fuzzed. The **Cranelift JIT** (§9) has
-> begun: an integer slice (consts, int arith/bitwise/shift, compares, `select`,
-> `br`/`br_if`, multi-block loops) **plus the §4 memory masking lowering** (invariant
-> I1) is **differential-tested against the interpreter** oracle (§18). Still ahead:
-> growing the JIT (calls, floats, conversions, trapping ops), atomics, SIMD, and
-> capability extras. This is a research build; "appears to work" is reachable, "is
-> certified secure" is an explicit post-MVP workstream (see `DESIGN.md` §2a/§18).
+> interpreter, with the masking unit isolated and fuzzed. The **Cranelift JIT** (§9)
+> now lowers the **whole scalar surface** — integer/float ops, conversions, the §4
+> memory **masking lowering** (I1), function-table **indirect-call dispatch** (I2), and
+> direct/indirect/tail calls — all **differential-tested against the interpreter**
+> oracle (§18); only `cap.call` is left (host-callback trampolines). Still ahead:
+> finishing the JIT (`cap.call`, trap-catching), atomics, SIMD, and capability extras.
+> This is a research build; "appears to work" is reachable, "is certified secure" is an
+> explicit post-MVP workstream (see `DESIGN.md` §2a/§18).
 
 ## Layout
 
