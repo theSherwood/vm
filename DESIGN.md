@@ -116,6 +116,109 @@ available but not the default.
 
 ---
 
+## 2a. TCB & escape-freedom contract  [SETTLED]
+
+The security spine. Makes the §3b rule-7 line ("verified ⇒ escape impossible")
+precise, names exactly what is trusted, and decomposes the escape-freedom claim
+into invariants each with an owner and a validation method — so the security work
+has a concrete anchor. **Level (D47): a structured-prose contract** — precise
+invariants + trust assumptions + the table below, *not* a formal proof. This is the
+"as secure as wasm" bar (Wasmtime has no proof either); a mechanized treatment is a
+post-MVP audit item (§18), not attempted now.
+
+### The honest contract
+"Verified ⇒ escape impossible" is **false as written** — verification is one link,
+and the smallest. The true statement:
+
+> **Verified(module) ∧ Correct(JIT) ∧ Correct(runtime/memory-model) ∧
+> Correct(host OS + MMU + CPU) ⟹ escape-free.**
+
+The dominant escape-TCB component is the **JIT** (Cranelift + our masking lowering +
+our CLIF generation), not the verifier. Stating this is the point: it puts the risk
+where it actually lives (§18).
+
+### What "escape-free" buys — the load-bearing theorem
+Even a guest with **arbitrary write access to its entire window** (conceded — §1
+self-corruption is a non-goal) **cannot escape**, because the three escape-bearing
+things are out of reach: memory access is mask-confined (I1); return addresses live
+on an out-of-band stack it cannot name (I2/I5); indirect control flow is
+table-confined to its own verified functions (I2). Its only authority is the
+capabilities it was handed (I3). *That* is what verification + the memory model +
+the out-of-band stack buy — not "the verifier makes it safe."
+
+### The TCB, in two tiers
+- **Escape-TCB** (a bug breaks the sandbox for everyone): verifier; JIT incl.
+  masking lowering; runtime memory-model plumbing (window setup, guard pages,
+  mmap/mprotect, signal/fault handlers); handle-table + control-stack management;
+  supervisor; and below us the host kernel / MMU / CPU.
+- **Authority-TCB** (a bug lets *one capability* misuse/leak *its own* authority,
+  but **cannot escape**): the per-capability host handlers. This split is what makes
+  host-extensible capabilities (§7) safe to be open-ended — adding a capability adds
+  authority-TCB, not escape-TCB, *provided handlers obey the hygiene rules below*.
+
+### Trust boundary & adversary
+- **The boundary is verified IR, not the source or frontend** (the eBPF model). A
+  malicious/buggy frontend or hand-written adversarial IR is **in scope and
+  handled**: if it passes the verifier, escape-freedom holds. The frontend is
+  **untrusted for escape** (trusted only for program *correctness*) — so "the
+  frontend resolves C UB" (§3b) is a correctness concern; **I4 totality is enforced
+  by the verifier + IR semantics regardless of frontend intent.**
+- **The adversary controls:** the IR (any verifier-passing module), all window
+  memory (arbitrary reads/writes), the timing/sequencing of `cap.call`s, and
+  concurrency/data races.
+- **The adversary does *not* control:** the generated machine code, the out-of-band
+  control stack, or the handle table (all host-owned).
+
+### Invariants × owner × validation (the anchor)
+Escape-freedom decomposes into five sub-invariants; their conjunction is the theorem:
+
+| Invariant | Owner | Validated by |
+|---|---|---|
+| **I1 Memory confinement** — every access ∈ `[base, base+size)` | masking lowering (JIT) | the isolated masking-fuzz unit + differential vs interpreter (§18) |
+| **I2 Control-flow integrity** — transfers only to verified entries/blocks/out-of-band returns; indirect calls table-confined | verifier + out-of-band stack (runtime) + table dispatch | verifier fuzzing; CFI self-tests |
+| **I3 Capability integrity** — authority only via held handles; host-owned table; no opcode mints authority; fail-closed signature check | verifier (sealing-as-typing) + runtime | verifier fuzzing; forged-index tests |
+| **I4 IR totality** — no UB; every op = defined value or defined trap | IR semantics (JIT + interpreter) + verifier | differential JIT-vs-interpreter |
+| **I5 Stack integrity** — control stack unreachable by masking; data overflow → guard fault | runtime (placement) + JIT (stack probes) | guard-page + stack-clash tests |
+
+### Scope
+- **In scope:** architectural escape; hostile/malformed/adversarial IR; **Spectre**
+  (managed, not eliminated — see below).
+- **Non-goals / out of scope:** intra-domain self-corruption (§1); covert/timing
+  channels (mitigated, residual leak accepted — §9); **availability / DoS (D48): a
+  non-goal — bounded by metering (fuel/quota/preemption) + the kill path, contained
+  not prevented** (incl. the §17 GPU coarse-preemption weak spot); hardware fault
+  injection (rowhammer/voltage — below our trust line, noted not defended); the
+  correctness of our own build toolchain producing the JIT (trusted).
+
+### Microarchitectural posture (one precise statement)
+I1–I5 prevent **architectural** escape. They do **not** prevent **microarchitectural**
+leakage (Spectre, covert channels); that is *mitigated, not eliminated* —
+mask-not-branch (I1 doubles as Spectre-v1), retpoline/eIBRS on indirect dispatch,
+IBPB/BHB + VERW + L1D flush on distrust-domain switch, no SMT across distrusting
+domains (§9). **The robust distrust boundary is a separate process** (§2). In-process
+isolation (tiers 0/1) is defense-in-depth, never a hard Spectre boundary.
+
+### Fail-closed
+Verification rejects on any error; every runtime check (bounds / type / generation /
+guard) traps to §5 detect-and-kill. The system only ever fails toward
+"reject/kill the guest," never toward "let it through."
+
+### Handler hygiene (authority-TCB rules)
+A capability handler must: treat borrowed guest buffers as **hostile and volatile**
+— validate-on-use, copy if stability is needed, **no TOCTOU** (a concurrent guest
+thread may mutate a borrowed buffer mid-call, §12/§13); exercise **only the caller's
+authority**; and (fast in-process runtime) stay **secret-less** (§9). These rules
+are what keep an authority-TCB bug from becoming an escape.
+
+### Residual risk (honest)
+Per the contract, escape-freedom rests on JIT/runtime correctness, which **this team
+cannot certify** (§18). The mitigations are the differential interpreter-oracle, the
+isolated masking-fuzz unit, and verifier fuzzing — strong bug-finders, not proofs.
+**Closing the gap to "certified" is the separate post-MVP workstream** (expert
+review, fuzzing infra, audit), tracked as open-ended in §18.
+
+---
+
 ## 3. Execution model & verification  [SETTLED]
 
 - Typed **SSA** over a **CFG of basic blocks**, with **explicit typed block
@@ -311,9 +414,11 @@ Single fused decode+verify forward pass, O(module size):
    well-typed and that static indices are in range; runtime bounds- + type-checks
    the entry on use. Safety is positional: the table holds only this domain's
    granted authority, so a forged index is inert.
-7. **Contract:** a module that passes verification + the memory model (§4) + the
-   out-of-band control stack (§5) ⟹ **escape is impossible.** (Soundness *of the
-   verifier/JIT* is the separate, hard problem — §18.)
+7. **Contract:** verification is *one* conjunct of escape-freedom, not the whole of
+   it — the precise statement, the full TCB, the I1–I5 invariants, and the scope are
+   in **§2a**. Short form: `Verified ∧ Correct(JIT) ∧ Correct(runtime) ∧
+   Correct(host/HW) ⟹ escape-free`; soundness of the JIT/runtime is the separate,
+   hard problem (§18).
 
 ### Entry & instantiation contract
 - A module declares an **entry function** with a fixed signature and the
@@ -1463,8 +1568,9 @@ as open-ended, not a byproduct of the build.
   constant, guard-page placement, minimal map/unmap/protect.
 - ✅ **Minimal MVP capability set:** `Stream` (stdio), `Exit`, `Clock`, `Memory`
   (`map`/`unmap`/`protect`); negative-errno model; powerbox + args-buffer — **§3e**.
-- ⬜ **TCB / threat-model writeup:** make the §3b rule-7 contract precise
-  ("verified ⇒ invariants ⇒ escape impossible") — anchors the security work.
+- ✅ **TCB / threat-model writeup:** the honest conjunction contract, escape-TCB vs
+  authority-TCB, the I1–I5 invariants × owner × validation table, scope (DoS a
+  non-goal), microarch posture, handler hygiene — **§2a**.
 
 
 
@@ -1516,3 +1622,5 @@ as open-ended, not a byproduct of the build.
 | D44 | Powerbox = `entry(stdin, stdout, stderr, exit, clock, memory, args_buffer)`; args buffer = `{argc,envc}` + packed NUL-terminated strings | Settled | Concrete instantiation grant + C `main` wrapper contract (§3b/§3d/§3e) |
 | D45 | `cap.call` dispatch is **per-entry** (vtable in the `HandleEntry`), not per-type — generally an indirect call (retpoline/eIBRS), devirtualized to direct/inline when the binding is statically known | Settled | Corrects §3c over-claim; one interface type has many implementations per handle, and §14 virtualization (pass-through vs parent-emulated) needs per-handle dispatch; forgery checks unchanged |
 | D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **discovery is static by default**, optional `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; static imports keep no-ambient-authority + the §9 egress-closure analysis intact; registry stays outside the TCB |
+| D47 | Escape-freedom is the **conjunction** `Verified ∧ Correct(JIT) ∧ Correct(runtime) ∧ Correct(host/HW)`, not "verified ⇒ safe"; TCB split into **escape-TCB vs authority-TCB**; decomposed into invariants **I1–I5** (owner + validation each); written as a **structured-prose contract**, not a proof | Settled | Puts risk where it lives (JIT dominates, not the verifier); makes host-extensible caps safe (authority-TCB ≠ escape-TCB); anchors the security work; matches the "as secure as wasm" bar (§2a) |
+| D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
