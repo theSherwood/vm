@@ -95,10 +95,12 @@ pub enum BinOp {
     Shl,
     ShrS,
     ShrU,
+    Rotl,
+    Rotr,
 }
 
 impl BinOp {
-    pub const ALL: [BinOp; 13] = [
+    pub const ALL: [BinOp; 15] = [
         BinOp::Add,
         BinOp::Sub,
         BinOp::Mul,
@@ -112,6 +114,8 @@ impl BinOp {
         BinOp::Shl,
         BinOp::ShrS,
         BinOp::ShrU,
+        BinOp::Rotl,
+        BinOp::Rotr,
     ];
 
     pub fn name(self) -> &'static str {
@@ -129,6 +133,8 @@ impl BinOp {
             BinOp::Shl => "shl",
             BinOp::ShrS => "shr_s",
             BinOp::ShrU => "shr_u",
+            BinOp::Rotl => "rotl",
+            BinOp::Rotr => "rotr",
         }
     }
 
@@ -194,6 +200,48 @@ impl CmpOp {
         Self::ALL.get(i as usize).copied()
     }
     pub fn from_name(s: &str) -> Option<CmpOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Unary integer ops (same type in and out). `clz`/`ctz`/`popcnt` are bit counts;
+/// `extendN_s` sign-extends the low N bits. (`extend32_s` on `i32` is the identity.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntUnOp {
+    Clz,
+    Ctz,
+    Popcnt,
+    Extend8S,
+    Extend16S,
+    Extend32S,
+}
+
+impl IntUnOp {
+    pub const ALL: [IntUnOp; 6] = [
+        IntUnOp::Clz,
+        IntUnOp::Ctz,
+        IntUnOp::Popcnt,
+        IntUnOp::Extend8S,
+        IntUnOp::Extend16S,
+        IntUnOp::Extend32S,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            IntUnOp::Clz => "clz",
+            IntUnOp::Ctz => "ctz",
+            IntUnOp::Popcnt => "popcnt",
+            IntUnOp::Extend8S => "extend8_s",
+            IntUnOp::Extend16S => "extend16_s",
+            IntUnOp::Extend32S => "extend32_s",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<IntUnOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<IntUnOp> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
 }
@@ -678,6 +726,12 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+    /// Unary integer op; operand and result are `ty`.
+    IntUn {
+        ty: IntTy,
+        op: IntUnOp,
+        a: ValIdx,
+    },
     /// `T.eqz`: 1 if the operand is zero else 0; result `i32`.
     Eqz {
         ty: IntTy,
@@ -822,6 +876,9 @@ pub enum Terminator {
     },
     /// Return values matching the function's result signature.
     Return(Vec<ValIdx>),
+    /// Abort: control must not reach here. Delivers a trap to the host (§3b/§5).
+    /// Covers both `unreachable` and language-level `trap`/`assert` failure.
+    Unreachable,
 }
 
 /// A basic block: a typed parameter list, a straight-line body, one terminator.

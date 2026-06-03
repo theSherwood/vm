@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use svm_ir::{
     BinOp, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, FuncType,
-    IToF, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
+    IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
 };
 
 /// A runtime value. Mirrors `ValType`.
@@ -40,6 +40,8 @@ pub enum Trap {
     /// `call_indirect` selected an empty table slot or a function whose signature
     /// did not match the call's type (the §3c table type-id check).
     IndirectCallType,
+    /// Reached an `unreachable`/`trap` terminator (§3b).
+    Unreachable,
     /// Structurally invalid in a way a verified module never is (defensive only).
     Malformed,
 }
@@ -137,6 +139,7 @@ fn run_func(
                 block_idx = *target as usize;
             }
             Terminator::Return(out) => return collect(&vals, out),
+            Terminator::Unreachable => return Err(Trap::Unreachable),
         }
     }
 }
@@ -179,6 +182,10 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             };
             Value::I32(r as i32)
         }
+        Inst::IntUn { ty, op, a } => match ty {
+            IntTy::I32 => Value::I32(intun32(*op, as_i32(get(vals, *a)?)?)),
+            IntTy::I64 => Value::I64(intun64(*op, as_i64(get(vals, *a)?)?)),
+        },
         Inst::Eqz { ty, a } => {
             let r = match ty {
                 IntTy::I32 => as_i32(get(vals, *a)?)? == 0,
@@ -576,7 +583,32 @@ fn bin32(op: BinOp, a: i32, b: i32) -> Result<i32, Trap> {
         BinOp::Shl => a.wrapping_shl(b as u32),
         BinOp::ShrS => a.wrapping_shr(b as u32),
         BinOp::ShrU => ((a as u32).wrapping_shr(b as u32)) as i32,
+        // Rotation amount is also mod bitwidth (`rotate_*` reduces it internally).
+        BinOp::Rotl => a.rotate_left(b as u32),
+        BinOp::Rotr => a.rotate_right(b as u32),
     })
+}
+
+fn intun32(op: IntUnOp, a: i32) -> i32 {
+    match op {
+        IntUnOp::Clz => (a as u32).leading_zeros() as i32,
+        IntUnOp::Ctz => (a as u32).trailing_zeros() as i32,
+        IntUnOp::Popcnt => (a as u32).count_ones() as i32,
+        IntUnOp::Extend8S => (a as i8) as i32,
+        IntUnOp::Extend16S => (a as i16) as i32,
+        IntUnOp::Extend32S => a, // identity for i32
+    }
+}
+
+fn intun64(op: IntUnOp, a: i64) -> i64 {
+    match op {
+        IntUnOp::Clz => (a as u64).leading_zeros() as i64,
+        IntUnOp::Ctz => (a as u64).trailing_zeros() as i64,
+        IntUnOp::Popcnt => (a as u64).count_ones() as i64,
+        IntUnOp::Extend8S => (a as i8) as i64,
+        IntUnOp::Extend16S => (a as i16) as i64,
+        IntUnOp::Extend32S => (a as i32) as i64,
+    }
 }
 
 fn bin64(op: BinOp, a: i64, b: i64) -> Result<i64, Trap> {
@@ -606,6 +638,8 @@ fn bin64(op: BinOp, a: i64, b: i64) -> Result<i64, Trap> {
         BinOp::Shl => a.wrapping_shl(b as u32),
         BinOp::ShrS => a.wrapping_shr(b as u32),
         BinOp::ShrU => ((a as u64).wrapping_shr(b as u32)) as i64,
+        BinOp::Rotl => a.rotate_left(b as u32),
+        BinOp::Rotr => a.rotate_right(b as u32),
     })
 }
 

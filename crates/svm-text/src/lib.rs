@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncType,
-    IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
+    IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -100,6 +100,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::ConstI32(c) => format!("i32.const {c}"),
         Inst::ConstI64(c) => format!("i64.const {c}"),
         Inst::IntBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
+        Inst::IntUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
         Inst::IntCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::Eqz { ty, a } => format!("{}.eqz v{a}", ty.prefix()),
         Inst::Convert { op, a } => format!("{} v{a}", op.sig().0),
@@ -192,6 +193,7 @@ fn print_term(t: &Terminator) -> String {
                 format!("return {}", vs.join(", "))
             }
         }
+        Terminator::Unreachable => "unreachable".to_string(),
     }
 }
 
@@ -439,6 +441,7 @@ enum PTerm {
         default: PEdge,
     },
     Return(Vec<u32>),
+    Unreachable,
 }
 
 impl<'a> Parser<'a> {
@@ -541,6 +544,7 @@ impl<'a> Parser<'a> {
                     default: edge(default)?,
                 },
                 PTerm::Return(v) => Terminator::Return(v),
+                PTerm::Unreachable => Terminator::Unreachable,
             };
             blocks.push(Block {
                 params: b.params,
@@ -607,7 +611,10 @@ impl<'a> Parser<'a> {
                 Some(Tok::Ident(s)) => s.clone(),
                 _ => return err("expected instruction or terminator"),
             };
-            if matches!(kw.as_str(), "br" | "br_if" | "br_table" | "return") {
+            if matches!(
+                kw.as_str(),
+                "br" | "br_if" | "br_table" | "return" | "unreachable"
+            ) {
                 let term = self.parse_term(&names)?;
                 return Ok(PBlock {
                     label,
@@ -792,6 +799,13 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
+        if let Some(o) = IntUnOp::from_name(suffix) {
+            return Ok(Inst::IntUn {
+                ty,
+                op: o,
+                a: self.value(names)?,
+            });
+        }
         if let Some(o) = BinOp::from_name(suffix) {
             let a = self.value(names)?;
             let b = self.value(names)?;
@@ -867,6 +881,7 @@ impl<'a> Parser<'a> {
                     default,
                 }
             }
+            "unreachable" => PTerm::Unreachable,
             "return" => {
                 let mut vals = Vec::new();
                 // Comma-separated value list; a return ends the block, so any ident

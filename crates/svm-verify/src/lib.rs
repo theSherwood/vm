@@ -223,6 +223,10 @@ fn check_inst(
             cx.expect(*b, t)?;
             ValType::I32
         }
+        Inst::IntUn { ty, a, .. } => {
+            cx.expect(*a, ty.val())?;
+            ty.val()
+        }
         Inst::Eqz { ty, a } => {
             cx.expect(*a, ty.val())?;
             ValType::I32
@@ -340,6 +344,8 @@ fn check_terminator(
                 cx.expect(*v, *want)?;
             }
         }
+        // Aborts unconditionally; references nothing, so nothing to check.
+        Terminator::Unreachable => {}
     }
     Ok(())
 }

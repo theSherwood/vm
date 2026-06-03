@@ -861,3 +861,99 @@ block0(v0: i32):
 "#;
     assert_eq!(run1at(src, 1, &[Value::I32(7)]), Ok(vec![Value::I32(107)]));
 }
+
+// ---- completed integer ops + unreachable ----
+
+// exercises clz/ctz/popcnt/rotl/rotr/extend8_s and an unreachable arm.
+const BITOPS: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.clz v0
+  v2 = i32.ctz v0
+  v3 = i32.add v1 v2
+  v4 = i32.popcnt v0
+  v5 = i32.add v3 v4
+  return v5
+}
+"#;
+
+#[test]
+fn bitops_roundtrip_and_compute() {
+    let m = parse_module(BITOPS).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
+    assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
+
+    // v0 = 0x00010000 (bit 16 set): clz=15, ctz=16, popcnt=1 -> 32.
+    assert_eq!(
+        run1at(BITOPS, 0, &[Value::I32(0x0001_0000)]),
+        Ok(vec![Value::I32(32)])
+    );
+    // v0 = 0: clz=32, ctz=32, popcnt=0 -> 64.
+    assert_eq!(
+        run1at(BITOPS, 0, &[Value::I32(0)]),
+        Ok(vec![Value::I32(64)])
+    );
+}
+
+#[test]
+fn rotate_ops() {
+    let src = r#"
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.rotl v0 v1
+  return v2
+}
+"#;
+    // rotl(0x12345678, 8) = 0x34567812
+    assert_eq!(
+        run1at(src, 0, &[Value::I32(0x1234_5678), Value::I32(8)]),
+        Ok(vec![Value::I32(0x3456_7812u32 as i32)])
+    );
+    // rotation amount is mod 32: rotl by 40 == rotl by 8.
+    assert_eq!(
+        run1at(src, 0, &[Value::I32(0x1234_5678), Value::I32(40)]),
+        Ok(vec![Value::I32(0x3456_7812u32 as i32)])
+    );
+}
+
+#[test]
+fn extend8_s_sign_extends() {
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.extend8_s v0
+  return v1
+}
+"#;
+    assert_eq!(
+        run1at(src, 0, &[Value::I32(0xff)]),
+        Ok(vec![Value::I32(-1)])
+    );
+    assert_eq!(
+        run1at(src, 0, &[Value::I32(0x7f)]),
+        Ok(vec![Value::I32(127)])
+    );
+}
+
+#[test]
+fn unreachable_traps() {
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  br_if v0 block1() block2()
+block1():
+  unreachable
+block2():
+  v1 = i32.const 7
+  return v1
+}
+"#;
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(m, decode_module(&encode_module(&m)).unwrap());
+    assert_eq!(m, parse_module(&print_module(&m)).unwrap());
+    // cond != 0 -> block1 -> unreachable trap; cond == 0 -> block2 -> 7.
+    assert_eq!(run1at(src, 0, &[Value::I32(1)]), Err(Trap::Unreachable));
+    assert_eq!(run1at(src, 0, &[Value::I32(0)]), Ok(vec![Value::I32(7)]));
+}

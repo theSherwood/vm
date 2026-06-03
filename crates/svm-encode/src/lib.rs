@@ -16,7 +16,8 @@
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValIdx, ValType,
+    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator, ValIdx,
+    ValType,
 };
 
 mod op {
@@ -32,14 +33,20 @@ mod op {
     pub const CONST_F32: u8 = 0x12; // + 4 raw bytes (LE bits)
     pub const CONST_F64: u8 = 0x13; // + 8 raw bytes (LE bits)
 
+    // Unary integer ops (`base + IntUnOp index`, 0..=5).
+    pub const I32_UN: u8 = 0x14;
+    pub const I32_UN_END: u8 = 0x19;
+    pub const I64_UN: u8 = 0x1A;
+    pub const I64_UN_END: u8 = 0x1F;
+
     // Family bases (each op is `base + op.index()`) and their inclusive range ends.
-    pub const I32_BIN: u8 = 0x20; // + BinOp index (0..=12)
-    pub const I32_BIN_END: u8 = 0x2C;
+    pub const I32_BIN: u8 = 0x20; // + BinOp index (0..=14)
+    pub const I32_BIN_END: u8 = 0x2E;
     pub const I32_EQZ: u8 = 0x30;
     pub const I32_CMP: u8 = 0x31; // + CmpOp index (0..=9)
     pub const I32_CMP_END: u8 = 0x3A;
     pub const I64_BIN: u8 = 0x40;
-    pub const I64_BIN_END: u8 = 0x4C;
+    pub const I64_BIN_END: u8 = 0x4E;
     pub const I64_EQZ: u8 = 0x50;
     pub const I64_CMP: u8 = 0x51;
     pub const I64_CMP_END: u8 = 0x5A;
@@ -81,11 +88,12 @@ mod op {
     pub const ITOF: u8 = 0xE0; // + IToF index (0..=7)
     pub const ITOF_END: u8 = 0xE7;
 
-    // Terminators.
+    // Terminators (decoded in a separate context from instruction opcodes).
     pub const BR: u8 = 0x80;
     pub const BR_IF: u8 = 0x81;
     pub const BR_TABLE: u8 = 0x82;
     pub const RETURN: u8 = 0x83;
+    pub const UNREACHABLE: u8 = 0x8F;
 }
 
 const MAGIC: [u8; 4] = *b"SVM\x00";
@@ -168,6 +176,10 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(cmp_base(*ty) + o.index());
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
+        }
+        Inst::IntUn { ty, op: o, a } => {
+            out.push(un_base(*ty) + o.index());
+            write_uleb(out, *a as u64);
         }
         Inst::Eqz { ty, a } => {
             out.push(match ty {
@@ -321,6 +333,7 @@ fn encode_term(out: &mut Vec<u8>, t: &Terminator) {
             out.push(op::RETURN);
             write_idxs(out, vals);
         }
+        Terminator::Unreachable => out.push(op::UNREACHABLE),
     }
 }
 
@@ -334,6 +347,12 @@ fn cmp_base(ty: IntTy) -> u8 {
     match ty {
         IntTy::I32 => op::I32_CMP,
         IntTy::I64 => op::I64_CMP,
+    }
+}
+fn un_base(ty: IntTy) -> u8 {
+    match ty {
+        IntTy::I32 => op::I32_UN,
+        IntTy::I64 => op::I64_UN,
     }
 }
 
@@ -459,6 +478,9 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
     Ok(match b {
         op::CONST_I32 => Inst::ConstI32(c.sleb_i32()?),
         op::CONST_I64 => Inst::ConstI64(c.sleb()?),
+
+        op::I32_UN..=op::I32_UN_END => int_un(IntTy::I32, b - op::I32_UN, c)?,
+        op::I64_UN..=op::I64_UN_END => int_un(IntTy::I64, b - op::I64_UN, c)?,
 
         op::I32_BIN..=op::I32_BIN_END => int_bin(IntTy::I32, b - op::I32_BIN, c)?,
         op::I64_BIN..=op::I64_BIN_END => int_bin(IntTy::I64, b - op::I64_BIN, c)?,
@@ -597,6 +619,15 @@ fn int_cmp(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
     })
 }
 
+fn int_un(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = IntUnOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    Ok(Inst::IntUn {
+        ty,
+        op,
+        a: c.idx()?,
+    })
+}
+
 fn decode_term(c: &mut Cursor) -> Result<Terminator, DecodeError> {
     let b = c.byte()?;
     Ok(match b {
@@ -631,6 +662,7 @@ fn decode_term(c: &mut Cursor) -> Result<Terminator, DecodeError> {
             }
         }
         op::RETURN => Terminator::Return(decode_idxs(c)?),
+        op::UNREACHABLE => Terminator::Unreachable,
         other => return Err(DecodeError::BadOpcode(other)),
     })
 }
