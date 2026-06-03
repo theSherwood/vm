@@ -16,7 +16,7 @@
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF,
-    Inst, IntTy, Module, Terminator, ValIdx, ValType,
+    Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValIdx, ValType,
 };
 
 mod op {
@@ -50,6 +50,13 @@ mod op {
     pub const WRAP_I64: u8 = 0x62;
 
     pub const SELECT: u8 = 0x70;
+
+    // Memory ops. Each carries: address operand, [value operand for stores], an
+    // immediate uleb offset, and an alignment-hint byte.
+    pub const STORE: u8 = 0x84; // + StoreOp index (0..=8) -> 0x84..=0x8C
+    pub const STORE_END: u8 = 0x8C;
+    pub const LOAD: u8 = 0xF0; // + LoadOp index (0..=13) -> 0xF0..=0xFD
+    pub const LOAD_END: u8 = 0xFD;
 
     // Float families.
     pub const F32_BIN: u8 = 0x90; // + FBinOp index (0..=6)
@@ -95,6 +102,8 @@ pub enum DecodeError {
     LebOverflow,
     /// A count exceeded the bytes that could possibly satisfy it (anti-OOM/DoS).
     CountTooLarge,
+    /// The memory-presence flag byte was neither 0 nor 1.
+    BadMemoryFlag(u8),
     /// Bytes remained after a complete module was decoded.
     TrailingBytes,
 }
@@ -108,6 +117,14 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     out.push(VERSION);
+    // Memory descriptor: presence flag, then `size_log2` if present.
+    match &m.memory {
+        None => out.push(0),
+        Some(mem) => {
+            out.push(1);
+            out.push(mem.size_log2);
+        }
+    }
     write_uleb(&mut out, m.funcs.len() as u64);
     for f in &m.funcs {
         encode_func(&mut out, f);
@@ -203,6 +220,30 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::Cast { op: o, a } => {
             out.push(op::CAST + o.index());
             write_uleb(out, *a as u64);
+        }
+        Inst::Load {
+            op: o,
+            addr,
+            offset,
+            align,
+        } => {
+            out.push(op::LOAD + o.index());
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *offset);
+            out.push(*align);
+        }
+        Inst::Store {
+            op: o,
+            addr,
+            value,
+            offset,
+            align,
+        } => {
+            out.push(op::STORE + o.index());
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *value as u64);
+            write_uleb(out, *offset);
+            out.push(*align);
         }
     }
 }
@@ -346,6 +387,13 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     if v != VERSION {
         return Err(DecodeError::BadVersion(v));
     }
+    let memory = match c.byte()? {
+        0 => None,
+        1 => Some(Memory {
+            size_log2: c.byte()?,
+        }),
+        other => return Err(DecodeError::BadMemoryFlag(other)),
+    };
     let nfuncs = c.count()?;
     let mut funcs = Vec::new();
     for _ in 0..nfuncs {
@@ -354,7 +402,7 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     if !c.at_end() {
         return Err(DecodeError::TrailingBytes);
     }
-    Ok(Module { funcs })
+    Ok(Module { funcs, memory })
 }
 
 fn decode_func(c: &mut Cursor) -> Result<Func, DecodeError> {
@@ -448,6 +496,20 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::ITOF..=op::ITOF_END => Inst::IToFConv {
             op: IToF::from_index(b - op::ITOF).ok_or(DecodeError::BadOpcode(b))?,
             a: c.idx()?,
+        },
+
+        op::LOAD..=op::LOAD_END => Inst::Load {
+            op: LoadOp::from_index(b - op::LOAD).ok_or(DecodeError::BadOpcode(b))?,
+            addr: c.idx()?,
+            offset: c.uleb()?,
+            align: c.byte()?,
+        },
+        op::STORE..=op::STORE_END => Inst::Store {
+            op: StoreOp::from_index(b - op::STORE).ok_or(DecodeError::BadOpcode(b))?,
+            addr: c.idx()?,
+            value: c.idx()?,
+            offset: c.uleb()?,
+            align: c.byte()?,
         },
 
         other => return Err(DecodeError::BadOpcode(other)),

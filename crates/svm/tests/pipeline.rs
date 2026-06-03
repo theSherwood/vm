@@ -214,6 +214,7 @@ fn verifier_rejects_forward_value_reference() {
                 term: Terminator::Return(vec![0]),
             }],
         }],
+        memory: None,
     };
     assert!(matches!(
         verify_module(&m),
@@ -237,6 +238,7 @@ fn verifier_rejects_bad_branch_target() {
                 },
             }],
         }],
+        memory: None,
     };
     assert!(matches!(
         verify_module(&m),
@@ -257,6 +259,7 @@ fn verifier_rejects_entry_param_mismatch() {
                 term: Terminator::Return(vec![]),
             }],
         }],
+        memory: None,
     };
     assert!(matches!(
         verify_module(&m),
@@ -437,4 +440,144 @@ block0(v0: i32):
         run1(src, &[Value::I32(0x4048_f5c3u32 as i32)]),
         Ok(vec![Value::I32(0x4048_f5c3u32 as i32)])
     );
+}
+
+// ---- linear memory + confinement masking (I1) ----
+
+// store a value then load it back at the same address.
+const MEM_ROUNDTRIP: &str = r#"
+memory 16
+
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  i64.store v0 v1
+  v2 = i64.load v0
+  return v2
+}
+"#;
+
+// narrow store/load: store low byte, load it back zero- and sign-extended.
+const MEM_NARROW: &str = r#"
+memory 16
+
+func (i64, i32) -> (i32) {
+block0(v0: i64, v1: i32):
+  i32.store8 v0 v1
+  v2 = i32.load8_u v0
+  return v2
+}
+"#;
+
+#[test]
+fn memory_corpus_roundtrips() {
+    for src in [MEM_ROUNDTRIP, MEM_NARROW] {
+        let m = parse_module(src).expect("parse");
+        verify_module(&m).expect("verify");
+        assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
+        assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
+    }
+}
+
+#[test]
+fn store_then_load_roundtrips() {
+    assert_eq!(
+        run1(
+            MEM_ROUNDTRIP,
+            &[Value::I64(128), Value::I64(0x0123_4567_89ab_cdef)]
+        ),
+        Ok(vec![Value::I64(0x0123_4567_89ab_cdef)])
+    );
+}
+
+#[test]
+fn narrow_store_load_truncates_and_extends() {
+    // store8 of 0x1ff keeps only 0xff; load8_u zero-extends -> 255.
+    assert_eq!(
+        run1(MEM_NARROW, &[Value::I64(8), Value::I32(0x1ff)]),
+        Ok(vec![Value::I32(255)])
+    );
+    // load8_s of 0x80 sign-extends -> -128.
+    let signed = r#"
+memory 16
+func (i64, i32) -> (i32) {
+block0(v0: i64, v1: i32):
+  i32.store8 v0 v1
+  v2 = i32.load8_s v0
+  return v2
+}
+"#;
+    assert_eq!(
+        run1(signed, &[Value::I64(8), Value::I32(0x80)]),
+        Ok(vec![Value::I32(-128)])
+    );
+}
+
+#[test]
+fn confinement_masks_out_of_window_address() {
+    // The window is 2^16 bytes. A store at offset (2^16 + 8) must alias offset 8
+    // after masking, so a load at 8 observes it. This is invariant I1: every access
+    // is masked into [0, size).
+    let src = r#"
+memory 16
+func (i64, i64, i64) -> (i64) {
+block0(v0: i64, v1: i64, v2: i64):
+  i64.store v0 v2
+  v3 = i64.load v1
+  return v3
+}
+"#;
+    let big = 65536 + 8; // 2^16 + 8 aliases 8
+    assert_eq!(
+        run1(
+            src,
+            &[Value::I64(big), Value::I64(8), Value::I64(0xdead_beef)]
+        ),
+        Ok(vec![Value::I64(0xdead_beef)])
+    );
+}
+
+#[test]
+fn access_crossing_window_top_faults() {
+    // size = 2^16; an 8-byte load whose masked base is size-4 crosses the top and
+    // must fault against the guard region.
+    let src = r#"
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.load v0
+  return v1
+}
+"#;
+    assert_eq!(run1(src, &[Value::I64(65536 - 4)]), Err(Trap::MemoryFault));
+    // an in-window aligned access at the same window is fine.
+    assert_eq!(run1(src, &[Value::I64(65536 - 8)]), Ok(vec![Value::I64(0)]));
+}
+
+#[test]
+fn offset_immediate_folds_into_effective_address() {
+    // store at base=0 offset=16, load at base=16 offset=0 -> same address.
+    let src = r#"
+memory 16
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 777
+  i32.store v0 v1 offset=16
+  v2 = i32.load v0 offset=16
+  return v2
+}
+"#;
+    assert_eq!(run1(src, &[Value::I64(0)]), Ok(vec![Value::I32(777)]));
+}
+
+#[test]
+fn verifier_rejects_memory_op_without_memory() {
+    // load with no `memory` declaration -> rejected.
+    let m = parse_module(
+        "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64.load v0\n  return v1\n}\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::MemoryNotDeclared { .. })
+    ));
 }

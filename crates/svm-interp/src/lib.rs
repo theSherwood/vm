@@ -8,9 +8,11 @@
 //! flow is bounded by `fuel` (a stand-in for §5 metering), so it always terminates.
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 use svm_ir::{
     BinOp, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, IToF, Inst,
-    IntTy, Module, Terminator, ValIdx,
+    IntTy, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
 };
 
 /// A runtime value. Mirrors `ValType`.
@@ -31,6 +33,8 @@ pub enum Trap {
     DivByZero,
     /// Signed `INT_MIN / -1` (or `rem_s`) overflow (§3b).
     IntOverflow,
+    /// A memory access crossed the top of the window (guard-region fault, §4/§5).
+    MemoryFault,
     /// Structurally invalid in a way a verified module never is (defensive only).
     Malformed,
 }
@@ -42,10 +46,17 @@ pub enum Trap {
 /// for fuzzing and for never hanging a test.
 pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<Vec<Value>, Trap> {
     let f = m.funcs.get(func as usize).ok_or(Trap::Malformed)?;
-    run_func(f, args, fuel)
+    // One linear-memory window per run, zero-initialized and lazily paged.
+    let mut mem = m.memory.map(|mc| Mem::new(mc.size_log2));
+    run_func(f, args, fuel, &mut mem)
 }
 
-fn run_func(f: &Func, args: &[Value], fuel: &mut u64) -> Result<Vec<Value>, Trap> {
+fn run_func(
+    f: &Func,
+    args: &[Value],
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+) -> Result<Vec<Value>, Trap> {
     // Block-local value vector: parameters first, then instruction results.
     let mut block_idx: usize = 0;
     // Entry block parameters are the function arguments (verifier guarantees the
@@ -57,8 +68,10 @@ fn run_func(f: &Func, args: &[Value], fuel: &mut u64) -> Result<Vec<Value>, Trap
 
         for inst in &block.insts {
             step(fuel)?;
-            let v = eval_inst(inst, &vals)?;
-            vals.push(v);
+            // Most instructions append a value; `Store` writes memory and yields none.
+            if let Some(v) = eval_inst(inst, &vals, mem)? {
+                vals.push(v);
+            }
         }
 
         step(fuel)?;
@@ -97,8 +110,23 @@ fn run_func(f: &Func, args: &[Value], fuel: &mut u64) -> Result<Vec<Value>, Trap
     }
 }
 
-fn eval_inst(inst: &Inst, vals: &[Value]) -> Result<Value, Trap> {
-    Ok(match inst {
+fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Option<Value>, Trap> {
+    // `Store` is the only instruction that produces no value.
+    if let Inst::Store {
+        op,
+        addr,
+        value,
+        offset,
+        ..
+    } = inst
+    {
+        let m = mem.as_mut().ok_or(Trap::Malformed)?;
+        let a = as_i64(get(vals, *addr)?)? as u64;
+        let v = get(vals, *value)?;
+        m.store(a, *offset, *op, v)?;
+        return Ok(None);
+    }
+    let v = match inst {
         Inst::ConstI32(c) => Value::I32(*c),
         Inst::ConstI64(c) => Value::I64(*c),
         Inst::IntBin { ty, op, a, b } => match ty {
@@ -167,7 +195,17 @@ fn eval_inst(inst: &Inst, vals: &[Value]) -> Result<Value, Trap> {
         Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?)?,
         Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?)?,
         Inst::Cast { op, a } => cast(*op, get(vals, *a)?)?,
-    })
+        Inst::Load {
+            op, addr, offset, ..
+        } => {
+            let m = mem.as_ref().ok_or(Trap::Malformed)?;
+            let a = as_i64(get(vals, *addr)?)? as u64;
+            m.load(a, *offset, *op)?
+        }
+        // Handled before the match; listed for exhaustiveness (defensive, no panic).
+        Inst::Store { .. } => return Ok(None),
+    };
+    Ok(Some(v))
 }
 
 fn fbin32(op: FBinOp, a: f32, b: f32) -> f32 {
@@ -338,6 +376,131 @@ fn cast(op: CastOp, v: Value) -> Result<Value, Trap> {
         CastOp::ReinterpI64F64 => Value::F64(f64::from_bits(as_i64(v)? as u64)),
         CastOp::ReinterpF64I64 => Value::I64(as_f64(v)?.to_bits() as i64),
     })
+}
+
+// ----------------------------------------------------------------------------
+// Linear memory — the confinement-masking *reference* (§4, invariant I1)
+// ----------------------------------------------------------------------------
+
+/// Page size for the lazy backing store. Lazy paging means interpreter memory is
+/// bounded by what a (fuel-limited) run actually touches, so even a huge declared
+/// window (e.g. `size_log2 = 63`) never eagerly allocates — safe to fuzz.
+const PAGE: u64 = 4096;
+
+/// A guest linear-memory window. The whole point is the **confinement invariant**:
+/// every access is masked to `[0, size)` with `addr & (size − 1)` (size is a power
+/// of two), and an access that would cross the top of the window faults (modeling
+/// the §4 guard region). This is the semantics the JIT masking lowering is
+/// differential-tested against (§18).
+struct Mem {
+    size: u64,
+    mask: u64,
+    pages: BTreeMap<u64, Vec<u8>>,
+}
+
+impl Mem {
+    fn new(size_log2: u8) -> Mem {
+        // `size_log2 < 64` for verified modules; clamp defensively so an unverified
+        // (fuzzed) module can never trigger a shift overflow panic.
+        let size = 1u64 << size_log2.min(63);
+        Mem {
+            size,
+            mask: size - 1,
+            pages: BTreeMap::new(),
+        }
+    }
+
+    /// The confined final effective offset: mask of `addr + offset` into `[0, size)`.
+    /// Masking the *final* address (after folding the immediate offset) is the
+    /// load-bearing security property — see §4.
+    fn confine(&self, addr: u64, offset: u64) -> u64 {
+        addr.wrapping_add(offset) & self.mask
+    }
+
+    /// Confine, then guard-check that the whole `width`-byte access stays in-window.
+    /// A boundary-crossing access faults (the guard region, §4).
+    fn range(&self, addr: u64, offset: u64, width: u32) -> Result<u64, Trap> {
+        let base = self.confine(addr, offset);
+        match base.checked_add(width as u64) {
+            Some(end) if end <= self.size => Ok(base),
+            _ => Err(Trap::MemoryFault),
+        }
+    }
+
+    fn load(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Value, Trap> {
+        let (_, rty, width, signed) = op.info();
+        let base = self.range(addr, offset, width)?;
+        let raw = self.read_le(base, width);
+        Ok(decode_loaded(rty, width, signed, raw))
+    }
+
+    fn store(&mut self, addr: u64, offset: u64, op: StoreOp, v: Value) -> Result<(), Trap> {
+        let (_, _, width) = op.info();
+        let base = self.range(addr, offset, width)?;
+        // `write_le` keeps only the low `width` bytes, so narrow stores truncate.
+        self.write_le(base, width, store_bits(v));
+        Ok(())
+    }
+
+    fn read_le(&self, base: u64, width: u32) -> u64 {
+        let mut raw = 0u64;
+        for k in 0..width as u64 {
+            raw |= (self.byte(base + k) as u64) << (8 * k);
+        }
+        raw
+    }
+
+    fn write_le(&mut self, base: u64, width: u32, raw: u64) {
+        for k in 0..width as u64 {
+            self.set_byte(base + k, (raw >> (8 * k)) as u8);
+        }
+    }
+
+    /// Read one byte; unwritten pages read as zero.
+    fn byte(&self, off: u64) -> u8 {
+        let idx = (off % PAGE) as usize;
+        self.pages.get(&(off / PAGE)).map_or(0, |p| p[idx])
+    }
+
+    fn set_byte(&mut self, off: u64, b: u8) {
+        let idx = (off % PAGE) as usize;
+        self.pages
+            .entry(off / PAGE)
+            .or_insert_with(|| vec![0u8; PAGE as usize])[idx] = b;
+    }
+}
+
+/// Turn `width` raw little-endian bytes into the loaded value, sign- or zero-
+/// extending narrow integer loads into the i32/i64 result type.
+fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
+    match rty {
+        ValType::F32 => Value::F32(f32::from_bits(raw as u32)),
+        ValType::F64 => Value::F64(f64::from_bits(raw)),
+        ValType::I32 | ValType::I64 => {
+            let bits = width * 8;
+            let ext = if signed && bits < 64 {
+                let shift = 64 - bits;
+                (((raw << shift) as i64) >> shift) as u64 // arithmetic sign-extend
+            } else {
+                raw
+            };
+            if rty == ValType::I32 {
+                Value::I32(ext as i32)
+            } else {
+                Value::I64(ext as i64)
+            }
+        }
+    }
+}
+
+/// The low 64 bits of a value, for storing (the store width selects how many bytes).
+fn store_bits(v: Value) -> u64 {
+    match v {
+        Value::I32(x) => x as u32 as u64,
+        Value::I64(x) => x as u64,
+        Value::F32(x) => x.to_bits() as u64,
+        Value::F64(x) => x.to_bits(),
+    }
 }
 
 fn bin32(op: BinOp, a: i32, b: i32) -> Result<i32, Trap> {

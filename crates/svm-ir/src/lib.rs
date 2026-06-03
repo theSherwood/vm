@@ -538,8 +538,128 @@ impl CastOp {
     }
 }
 
-/// Non-terminator instructions. Each produces exactly one result whose index is
-/// the next block-local value index (implicit, by position).
+/// Memory load ops. Each reads `width` little-endian bytes at the confined effective
+/// address and produces `result`; narrow integer loads sign- or zero-extend per
+/// `signed` into the (i32/i64) result type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoadOp {
+    I32,
+    I64,
+    F32,
+    F64,
+    I32_8S,
+    I32_8U,
+    I32_16S,
+    I32_16U,
+    I64_8S,
+    I64_8U,
+    I64_16S,
+    I64_16U,
+    I64_32S,
+    I64_32U,
+}
+
+impl LoadOp {
+    pub const ALL: [LoadOp; 14] = [
+        LoadOp::I32,
+        LoadOp::I64,
+        LoadOp::F32,
+        LoadOp::F64,
+        LoadOp::I32_8S,
+        LoadOp::I32_8U,
+        LoadOp::I32_16S,
+        LoadOp::I32_16U,
+        LoadOp::I64_8S,
+        LoadOp::I64_8U,
+        LoadOp::I64_16S,
+        LoadOp::I64_16U,
+        LoadOp::I64_32S,
+        LoadOp::I64_32U,
+    ];
+    /// `(text name, result type, access width in bytes, sign-extended)`.
+    pub fn info(self) -> (&'static str, ValType, u32, bool) {
+        match self {
+            LoadOp::I32 => ("i32.load", ValType::I32, 4, false),
+            LoadOp::I64 => ("i64.load", ValType::I64, 8, false),
+            LoadOp::F32 => ("f32.load", ValType::F32, 4, false),
+            LoadOp::F64 => ("f64.load", ValType::F64, 8, false),
+            LoadOp::I32_8S => ("i32.load8_s", ValType::I32, 1, true),
+            LoadOp::I32_8U => ("i32.load8_u", ValType::I32, 1, false),
+            LoadOp::I32_16S => ("i32.load16_s", ValType::I32, 2, true),
+            LoadOp::I32_16U => ("i32.load16_u", ValType::I32, 2, false),
+            LoadOp::I64_8S => ("i64.load8_s", ValType::I64, 1, true),
+            LoadOp::I64_8U => ("i64.load8_u", ValType::I64, 1, false),
+            LoadOp::I64_16S => ("i64.load16_s", ValType::I64, 2, true),
+            LoadOp::I64_16U => ("i64.load16_u", ValType::I64, 2, false),
+            LoadOp::I64_32S => ("i64.load32_s", ValType::I64, 4, true),
+            LoadOp::I64_32U => ("i64.load32_u", ValType::I64, 4, false),
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<LoadOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<LoadOp> {
+        Self::ALL.iter().copied().find(|o| o.info().0 == s)
+    }
+}
+
+/// Memory store ops. Each writes the low `width` little-endian bytes of the value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreOp {
+    I32,
+    I64,
+    F32,
+    F64,
+    I32_8,
+    I32_16,
+    I64_8,
+    I64_16,
+    I64_32,
+}
+
+impl StoreOp {
+    pub const ALL: [StoreOp; 9] = [
+        StoreOp::I32,
+        StoreOp::I64,
+        StoreOp::F32,
+        StoreOp::F64,
+        StoreOp::I32_8,
+        StoreOp::I32_16,
+        StoreOp::I64_8,
+        StoreOp::I64_16,
+        StoreOp::I64_32,
+    ];
+    /// `(text name, value type, access width in bytes)`.
+    pub fn info(self) -> (&'static str, ValType, u32) {
+        match self {
+            StoreOp::I32 => ("i32.store", ValType::I32, 4),
+            StoreOp::I64 => ("i64.store", ValType::I64, 8),
+            StoreOp::F32 => ("f32.store", ValType::F32, 4),
+            StoreOp::F64 => ("f64.store", ValType::F64, 8),
+            StoreOp::I32_8 => ("i32.store8", ValType::I32, 1),
+            StoreOp::I32_16 => ("i32.store16", ValType::I32, 2),
+            StoreOp::I64_8 => ("i64.store8", ValType::I64, 1),
+            StoreOp::I64_16 => ("i64.store16", ValType::I64, 2),
+            StoreOp::I64_32 => ("i64.store32", ValType::I64, 4),
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<StoreOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<StoreOp> {
+        Self::ALL.iter().copied().find(|o| o.info().0 == s)
+    }
+}
+
+/// Non-terminator instructions. Each produces exactly one result — appended at the
+/// next block-local value index — **except `Store`, which produces no value** (see
+/// [`Inst::produces_value`]).
 #[derive(Clone, PartialEq, Debug)]
 pub enum Inst {
     ConstI32(i32),
@@ -612,6 +732,32 @@ pub enum Inst {
         op: CastOp,
         a: ValIdx,
     },
+    /// Load `op`'s width from the confined effective address `addr + offset`.
+    /// `align` is a power-of-two alignment *hint* (log2); it does not affect
+    /// semantics (unaligned access is allowed). Confinement masking is implicit.
+    Load {
+        op: LoadOp,
+        addr: ValIdx,
+        offset: u64,
+        align: u8,
+    },
+    /// Store `value` (`op`'s width) at the confined effective address. Produces no
+    /// SSA result. `align` is a hint (see [`Inst::Load`]).
+    Store {
+        op: StoreOp,
+        addr: ValIdx,
+        value: ValIdx,
+        offset: u64,
+        align: u8,
+    },
+}
+
+impl Inst {
+    /// Whether this instruction appends a value at the next block-local index.
+    /// Everything does except `Store` (which writes memory and yields nothing).
+    pub fn produces_value(&self) -> bool {
+        !matches!(self, Inst::Store { .. })
+    }
 }
 
 /// One branch edge: a target block plus the argument values for its parameters.
@@ -658,8 +804,28 @@ pub struct Func {
     pub blocks: Vec<Block>,
 }
 
-/// A module: a flat list of functions (the Phase-1 slice has no other sections yet).
+/// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —
+/// a power of two, so confinement is a single `addr & (size − 1)` mask. The window
+/// is a reserved virtual range; guest pointers are offsets into it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Memory {
+    pub size_log2: u8,
+}
+
+impl Memory {
+    /// Window size in bytes (`1 << size_log2`). `size_log2` is verified `< 64`.
+    pub fn size(self) -> u64 {
+        1u64 << self.size_log2
+    }
+    /// The confinement mask (`size − 1`).
+    pub fn mask(self) -> u64 {
+        self.size() - 1
+    }
+}
+
+/// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
     pub funcs: Vec<Func>,
+    pub memory: Option<Memory>,
 }

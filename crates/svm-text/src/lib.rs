@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
-    IntTy, Module, Terminator, ValType,
+    IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -47,6 +47,10 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ParseError> {
 /// Render a module to canonical text.
 pub fn print_module(m: &Module) -> String {
     let mut s = String::new();
+    if let Some(mem) = &m.memory {
+        let _ = writeln!(s, "memory {}", mem.size_log2);
+        s.push('\n');
+    }
     for (i, f) in m.funcs.iter().enumerate() {
         if i > 0 {
             s.push('\n');
@@ -75,8 +79,13 @@ fn print_func(s: &mut String, f: &Func) {
 
         let mut next = b.params.len() as u32; // next value index in this block
         for inst in &b.insts {
-            let _ = writeln!(s, "  v{} = {}", next, print_inst(inst));
-            next += 1;
+            if inst.produces_value() {
+                let _ = writeln!(s, "  v{} = {}", next, print_inst(inst));
+                next += 1;
+            } else {
+                // No-result instruction (`store`): no `vN =` binding.
+                let _ = writeln!(s, "  {}", print_inst(inst));
+            }
         }
         let _ = writeln!(s, "  {}", print_term(&b.term));
     }
@@ -102,7 +111,36 @@ fn print_inst(inst: &Inst) -> String {
         Inst::FToISat { op, a } => format!("{} v{a}", op.name()),
         Inst::IToFConv { op, a } => format!("{} v{a}", op.name()),
         Inst::Cast { op, a } => format!("{} v{a}", op.sig().0),
+        Inst::Load {
+            op,
+            addr,
+            offset,
+            align,
+        } => format!("{} v{addr}{}", op.info().0, memarg(*offset, *align)),
+        Inst::Store {
+            op,
+            addr,
+            value,
+            offset,
+            align,
+        } => format!(
+            "{} v{addr} v{value}{}",
+            op.info().0,
+            memarg(*offset, *align)
+        ),
     }
+}
+
+/// Render the optional `offset=`/`align=` suffix, omitting zero defaults.
+fn memarg(offset: u64, align: u8) -> String {
+    let mut s = String::new();
+    if offset != 0 {
+        let _ = write!(s, " offset={offset}");
+    }
+    if align != 0 {
+        let _ = write!(s, " align={align}");
+    }
+    s
 }
 
 fn print_term(t: &Terminator) -> String {
@@ -301,10 +339,21 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
         pos: 0,
     };
     let mut funcs = Vec::new();
+    let mut memory = None;
     while !p.at_end() {
-        funcs.push(p.parse_func()?);
+        match p.peek() {
+            // Module-level `memory <size_log2>` declaration.
+            Some(Tok::Ident(s)) if s == "memory" => {
+                p.next()?;
+                let n = p.parse_int()?;
+                let size_log2 = u8::try_from(n)
+                    .map_err(|_| ParseError(format!("memory size_log2 out of range: {n}")))?;
+                memory = Some(Memory { size_log2 });
+            }
+            _ => funcs.push(p.parse_func()?),
+        }
     }
-    Ok(Module { funcs })
+    Ok(Module { funcs, memory })
 }
 
 struct Parser<'a> {
@@ -514,15 +563,28 @@ impl<'a> Parser<'a> {
                         term,
                     });
                 }
-                _ => {
-                    // `name = opcode operands`
+                // A value-producing instruction is `name = opcode operands`; a
+                // no-result instruction (`store`) is just `opcode operands`. The `=`
+                // following the first token tells them apart.
+                _ if matches!(self.toks.get(self.pos + 1), Some(Tok::Equals)) => {
                     let name = self.ident()?;
                     self.expect(&Tok::Equals)?;
                     let inst = self.parse_inst(&names)?;
+                    if !inst.produces_value() {
+                        return err("instruction produces no value; remove the `name =`");
+                    }
                     if names.insert(name.clone(), next_idx).is_some() {
                         return err(format!("duplicate value name `{name}`"));
                     }
                     next_idx += 1;
+                    insts.push(inst);
+                }
+                _ => {
+                    // No-result instruction: the opcode is the first token.
+                    let inst = self.parse_inst(&names)?;
+                    if inst.produces_value() {
+                        return err("expected `name =` for a value-producing instruction");
+                    }
                     insts.push(inst);
                 }
             }
@@ -561,6 +623,28 @@ impl<'a> Parser<'a> {
             return Ok(Inst::Cast {
                 op: o,
                 a: self.value(names)?,
+            });
+        }
+        if let Some(o) = LoadOp::from_name(&op) {
+            let addr = self.value(names)?;
+            let (offset, align) = self.parse_memarg()?;
+            return Ok(Inst::Load {
+                op: o,
+                addr,
+                offset,
+                align,
+            });
+        }
+        if let Some(o) = StoreOp::from_name(&op) {
+            let addr = self.value(names)?;
+            let value = self.value(names)?;
+            let (offset, align) = self.parse_memarg()?;
+            return Ok(Inst::Store {
+                op: o,
+                addr,
+                value,
+                offset,
+                align,
             });
         }
 
@@ -721,6 +805,34 @@ impl<'a> Parser<'a> {
             Tok::Int(v) => Ok(*v),
             other => err(format!("expected integer, found {other:?}")),
         }
+    }
+
+    /// Parse the optional `offset=<int>` / `align=<int>` suffix of a memory op
+    /// (either order, both optional; defaults 0).
+    fn parse_memarg(&mut self) -> Result<(u64, u8), ParseError> {
+        let mut offset = 0u64;
+        let mut align = 0u8;
+        while let Some(Tok::Ident(s)) = self.peek() {
+            let key = s.clone();
+            match key.as_str() {
+                "offset" => {
+                    self.next()?;
+                    self.expect(&Tok::Equals)?;
+                    let v = self.parse_int()?;
+                    offset = u64::try_from(v)
+                        .map_err(|_| ParseError(format!("offset out of range: {v}")))?;
+                }
+                "align" => {
+                    self.next()?;
+                    self.expect(&Tok::Equals)?;
+                    let v = self.parse_int()?;
+                    align = u8::try_from(v)
+                        .map_err(|_| ParseError(format!("align out of range: {v}")))?;
+                }
+                _ => break,
+            }
+        }
+        Ok((offset, align))
     }
 
     /// A float literal — accepts an integer token too (e.g. `f64.const 2`).

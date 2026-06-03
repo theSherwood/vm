@@ -56,17 +56,31 @@ pub enum VerifyError {
         expected: usize,
         found: usize,
     },
+    /// A load/store appeared but the module declares no linear memory.
+    MemoryNotDeclared { func: u32, block: u32 },
+    /// The declared window size (`1 << size_log2`) is not representable.
+    MemorySizeTooLarge { size_log2: u8 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
 pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
+    // A declared window must have a representable size (`1 << size_log2`, with the
+    // mask `size - 1` well-defined). `size_log2 == 63` is the largest window.
+    if let Some(mem) = &m.memory {
+        if mem.size_log2 >= 64 {
+            return Err(VerifyError::MemorySizeTooLarge {
+                size_log2: mem.size_log2,
+            });
+        }
+    }
+    let has_memory = m.memory.is_some();
     for (fi, f) in m.funcs.iter().enumerate() {
-        verify_func(fi as u32, f)?;
+        verify_func(fi as u32, f, has_memory)?;
     }
     Ok(())
 }
 
-fn verify_func(fi: u32, f: &Func) -> Result<(), VerifyError> {
+fn verify_func(fi: u32, f: &Func, has_memory: bool) -> Result<(), VerifyError> {
     // Per function: the entry block's parameters are the function's parameters.
     match f.blocks.first() {
         Some(entry) if entry.params == f.params => {}
@@ -82,8 +96,10 @@ fn verify_func(fi: u32, f: &Func) -> Result<(), VerifyError> {
         let mut types: Vec<ValType> = b.params.clone();
 
         for inst in &b.insts {
-            let result = check_inst(fi, bi, inst, &types)?;
-            types.push(result);
+            // A value-producing instruction appends its result type; `Store` does not.
+            if let Some(result) = check_inst(fi, bi, inst, &types, has_memory)? {
+                types.push(result);
+            }
         }
 
         check_terminator(fi, bi, &b.term, &types, nblocks, f)?;
@@ -92,10 +108,33 @@ fn verify_func(fi: u32, f: &Func) -> Result<(), VerifyError> {
 }
 
 /// Check one instruction's operands against the running type vector and return the
-/// result type to append. Operands must reference strictly-earlier indices.
-fn check_inst(fi: u32, bi: u32, inst: &Inst, types: &[ValType]) -> Result<ValType, VerifyError> {
+/// result type to append (`None` for `Store`). Operands must reference
+/// strictly-earlier indices.
+fn check_inst(
+    fi: u32,
+    bi: u32,
+    inst: &Inst,
+    types: &[ValType],
+    has_memory: bool,
+) -> Result<Option<ValType>, VerifyError> {
     let cx = Cx { fi, bi, types };
-    Ok(match inst {
+    // `Store` is the only instruction that yields no value; handle it up front so the
+    // main match can produce a single result type.
+    if let Inst::Store {
+        op, addr, value, ..
+    } = inst
+    {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*addr, ValType::I64)?;
+        cx.expect(*value, op.info().1)?;
+        return Ok(None);
+    }
+    let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
         Inst::IntBin { ty, a, b, .. } => {
@@ -159,7 +198,20 @@ fn check_inst(fi: u32, bi: u32, inst: &Inst, types: &[ValType]) -> Result<ValTyp
             cx.expect(*a, src)?;
             dst
         }
-    })
+        Inst::Load { op, addr, .. } => {
+            if !has_memory {
+                return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*addr, ValType::I64)?;
+            op.info().1
+        }
+        // Handled before the match; listed for exhaustiveness (defensive, no panic).
+        Inst::Store { .. } => return Ok(None),
+    };
+    Ok(Some(ty))
 }
 
 fn check_terminator(
