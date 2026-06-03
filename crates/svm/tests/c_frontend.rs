@@ -597,3 +597,50 @@ fn c_partial_initializer_zero_fill_end_to_end() {
         7
     );
 }
+
+#[test]
+fn c_floats_end_to_end() {
+    // double arithmetic, truncated back to int on return
+    assert_eq!(
+        i32_of("int main() { double x = 3.5; double y = 2.0; return (int)(x * y + 1.0); }"),
+        8
+    );
+    // float (f32) arithmetic
+    assert_eq!(
+        i32_of("int main() { float a = 1.5f; float b = 0.5f; return (int)((a + b) * 4.0f); }"),
+        8
+    );
+    // int -> double -> int conversions
+    assert_eq!(
+        i32_of("int main() { int n = 7; double d = n; d = d / 2.0; return (int)(d * 10); }"),
+        35
+    );
+    // float comparisons (result is int 0/1)
+    assert_eq!(
+        i32_of("int main() { double x = 3.14; return x > 3.0 && x < 4.0; }"),
+        1
+    );
+    assert_eq!(i32_of("int main() { double x = 3.14; return x < 3.0; }"), 0);
+    // unary float negation
+    assert_eq!(
+        i32_of("int main() { double x = 5.0; return (int)(-x + 8.0); }"),
+        3
+    );
+    // !x on a float
+    assert_eq!(i32_of("int main() { double x = 0.0; return !x; }"), 1);
+    // float parameter + return value through a call, and a float ternary
+    assert_eq!(
+        i32_of(
+            "double sq(double x) { return x * x; } \
+                int main() { double r = sq(3.0); return (int)(r > 8.0 ? r : 0.0); }"
+        ),
+        9
+    );
+    // f32 <-> f64 promotion/demotion
+    assert_eq!(
+        i32_of(
+            "int main() { float f = 2.5f; double d = f; float g = d + 1.5; return (int)(g * 2); }"
+        ),
+        8
+    );
+}

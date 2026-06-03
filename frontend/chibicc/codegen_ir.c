@@ -27,8 +27,10 @@
 // holding pointers/relocations are not handled yet.) **Stdio over the powerbox** (§3e):
 // `write`/`read`/`exit` are recognized builtins lowered to `cap.call` on the stashed
 // Stream/Exit handles — so real C reaches stdout/stdin and terminates with an exit code.
-// `break`/`continue`/`switch`, indirect calls, and floats come next; anything unsupported
-// is a hard error (so we never emit IR we cannot stand behind).
+// **Floats** (`float`=f32, `double`/`long double`=f64) work too: arithmetic, compares,
+// `-`/`!`, literals, and all int<->float / float<->float conversions (float->int is
+// saturating, §3b). `break`/`continue`/`switch` and indirect calls come next; anything
+// unsupported is a hard error (so we never emit IR we cannot stand behind).
 
 #include "chibicc.h"
 
@@ -97,13 +99,24 @@ static char *irty(Type *ty) {
   case TY_PTR:
   case TY_ARRAY: // an array decays to its address (a pointer) in value context
     return "i64";
+  case TY_FLOAT:
+    return "f32";
+  case TY_DOUBLE:
+  case TY_LDOUBLE: // long double = f64 (no 80-bit; pinned, §3d)
+    return "f64";
   default:
     error_tok(ty->name, "codegen_ir: unsupported type");
   }
 }
 
-// True if `ty` is a 64-bit value in our model.
+// True if `ty` is a 64-bit value in our model (i64 or f64). Used within a known int- or
+// float-only context, so the i64/f64 ambiguity never matters.
 static bool is64(Type *ty) { return irty(ty)[1] == '6'; }
+
+// True if `ty` is a floating-point type.
+static bool is_flt(Type *ty) {
+  return ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE || ty->kind == TY_LDOUBLE;
+}
 
 static int gen_expr(Node *node); // emits the IR, returns the result's SSA index
 static int gen_addr(Node *node); // emits the IR, returns the SSA index of an lvalue's address
@@ -137,6 +150,13 @@ static int gen_load(Type *ty, int addr) {
   case TY_PTR:
     fprintf(o, "  v%d = i64.load v%d\n", r, addr);
     break;
+  case TY_FLOAT:
+    fprintf(o, "  v%d = f32.load v%d\n", r, addr);
+    break;
+  case TY_DOUBLE:
+  case TY_LDOUBLE:
+    fprintf(o, "  v%d = f64.load v%d\n", r, addr);
+    break;
   default:
     error_tok(ty->name, "codegen_ir: unsupported load type");
   }
@@ -161,6 +181,13 @@ static void gen_store(Type *ty, int addr, int val) {
   case TY_LONG:
   case TY_PTR:
     fprintf(o, "  i64.store v%d v%d\n", addr, val);
+    break;
+  case TY_FLOAT:
+    fprintf(o, "  f32.store v%d v%d\n", addr, val);
+    break;
+  case TY_DOUBLE:
+  case TY_LDOUBLE:
+    fprintf(o, "  f64.store v%d v%d\n", addr, val);
     break;
   default:
     error_tok(ty->name, "codegen_ir: unsupported store type");
@@ -211,49 +238,53 @@ static int binop(Node *node, char *op) {
   return r;
 }
 
-// A comparison: the op width is the operands' type; the result is always i32 0/1.
+// A comparison: the op width is the operands' type; the result is always i32 0/1. Integer
+// `lt`/`le` take a signedness suffix; float compares (and `eq`/`ne`) do not.
 static int cmpop(Node *node, char *base, bool sign) {
   int a = gen_expr(node->lhs);
   int b = gen_expr(node->rhs);
   int r = nv++;
-  char *p = irty(node->lhs->ty);
-  if (sign)
-    fprintf(o, "  v%d = %s.%s_%s v%d v%d\n", r, p, base,
-            node->lhs->ty->is_unsigned ? "u" : "s", a, b);
+  Type *ot = node->lhs->ty;
+  char *p = irty(ot);
+  if (sign && !is_flt(ot))
+    fprintf(o, "  v%d = %s.%s_%s v%d v%d\n", r, p, base, ot->is_unsigned ? "u" : "s", a, b);
   else
     fprintf(o, "  v%d = %s.%s v%d v%d\n", r, p, base, a, b);
   return r;
 }
 
-// An integer cast: i32<->i64 extend/wrap; same-width casts are no-ops here (narrowing
-// to char/short within i32 is handled when locals/loads land).
-static int gen_cast(Node *node) {
-  int a = gen_expr(node->lhs);
-  bool from64 = is64(node->lhs->ty);
-  bool to64 = is64(node->ty);
-  if (from64 == to64)
-    return a;
+// Convert SSA value `a` of type `from` to type `to` (the C "usual conversions"): int<->
+// int (extend/wrap), float<->float (promote/demote), and int<->float. float->int is
+// **saturating** (`trunc_sat`) so an out-of-range conversion is total, not a trap (§3b).
+static int gen_convert(int a, Type *from, Type *to) {
+  bool ff = is_flt(from), tf = is_flt(to);
+  if (is64(from) == is64(to) && ff == tf)
+    return a; // same IR type — no-op
   int r = nv++;
-  if (to64)
-    fprintf(o, "  v%d = i64.extend_i32_%s v%d\n", r,
-            node->lhs->ty->is_unsigned ? "u" : "s", a);
-  else
-    fprintf(o, "  v%d = i32.wrap_i64 v%d\n", r, a);
+  if (!ff && !tf) {
+    if (is64(to))
+      fprintf(o, "  v%d = i64.extend_i32_%s v%d\n", r, from->is_unsigned ? "u" : "s", a);
+    else
+      fprintf(o, "  v%d = i32.wrap_i64 v%d\n", r, a);
+  } else if (ff && tf) {
+    fprintf(o, "  v%d = %s v%d\n", r, is64(to) ? "f64.promote_f32" : "f32.demote_f64", a);
+  } else if (!ff && tf) {
+    fprintf(o, "  v%d = %s.convert_%s_%s v%d\n", r, irty(to), irty(from),
+            from->is_unsigned ? "u" : "s", a);
+  } else {
+    fprintf(o, "  v%d = %s.trunc_sat_%s_%s v%d\n", r, irty(to), irty(from),
+            to->is_unsigned ? "u" : "s", a);
+  }
   return r;
 }
 
-// Evaluate `node` and convert the result to `target`'s width (i32<->i64).
+static int gen_cast(Node *node) {
+  return gen_convert(gen_expr(node->lhs), node->lhs->ty, node->ty);
+}
+
+// Evaluate `node` and convert the result to `target` (used for the `?:` arms).
 static int gen_expr_as(Node *node, Type *target) {
-  int v = gen_expr(node);
-  bool from64 = is64(node->ty), to64 = is64(target);
-  if (from64 == to64)
-    return v;
-  int r = nv++;
-  if (to64)
-    fprintf(o, "  v%d = i64.extend_i32_%s v%d\n", r, node->ty->is_unsigned ? "u" : "s", v);
-  else
-    fprintf(o, "  v%d = i32.wrap_i64 v%d\n", r, v);
-  return r;
+  return gen_convert(gen_expr(node), node->ty, target);
 }
 
 // Evaluate `node` to an i32 truth value (0/1): `(v != 0)` over the operand's width.
@@ -391,7 +422,10 @@ static int gen_expr(Node *node) {
   switch (node->kind) {
   case ND_NUM: {
     int r = nv++;
-    fprintf(o, "  v%d = %s.const %ld\n", r, irty(node->ty), (long)node->val);
+    if (is_flt(node->ty))
+      fprintf(o, "  v%d = %s.const %.17g\n", r, irty(node->ty), (double)node->fval);
+    else
+      fprintf(o, "  v%d = %s.const %ld\n", r, irty(node->ty), (long)node->val);
     return r;
   }
   case ND_ADD:
@@ -401,7 +435,7 @@ static int gen_expr(Node *node) {
   case ND_MUL:
     return binop(node, "mul");
   case ND_DIV:
-    return binop(node, node->ty->is_unsigned ? "div_u" : "div_s");
+    return binop(node, is_flt(node->ty) ? "div" : node->ty->is_unsigned ? "div_u" : "div_s");
   case ND_MOD:
     return binop(node, node->ty->is_unsigned ? "rem_u" : "rem_s");
   case ND_BITAND:
@@ -423,20 +457,31 @@ static int gen_expr(Node *node) {
   case ND_LE:
     return cmpop(node, "le", true);
   case ND_NEG: {
-    // -x  ==  0 - x
     int a = gen_expr(node->lhs);
     char *p = irty(node->ty);
-    int z = nv++;
-    fprintf(o, "  v%d = %s.const 0\n", z, p);
     int r = nv++;
-    fprintf(o, "  v%d = %s.sub v%d v%d\n", r, p, z, a);
+    if (is_flt(node->ty)) {
+      fprintf(o, "  v%d = %s.neg v%d\n", r, p, a);
+    } else {
+      // -x  ==  0 - x
+      int z = nv++;
+      fprintf(o, "  v%d = %s.const 0\n", z, p);
+      fprintf(o, "  v%d = %s.sub v%d v%d\n", r, p, z, a);
+    }
     return r;
   }
   case ND_NOT: {
     // !x  ==  (x == 0), result i32
     int a = gen_expr(node->lhs);
+    Type *ot = node->lhs->ty;
     int r = nv++;
-    fprintf(o, "  v%d = %s.eqz v%d\n", r, irty(node->lhs->ty), a);
+    if (is_flt(ot)) {
+      int z = nv++;
+      fprintf(o, "  v%d = %s.const 0\n", z, irty(ot));
+      fprintf(o, "  v%d = %s.eq v%d v%d\n", r, irty(ot), a, z);
+    } else {
+      fprintf(o, "  v%d = %s.eqz v%d\n", r, irty(ot), a);
+    }
     return r;
   }
   case ND_BITNOT: {

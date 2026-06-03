@@ -173,7 +173,10 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
    and `malloc`/`free` (guest libc over the `map` cap, §3d).
    *Latent bug fixed here:* `ND_MEMZERO` was zeroing locals at their **absolute** offset
    instead of `sp + offset` (harmless until the handle slots occupied low memory).
-5. **Floats** (`float`/`double` = f32/f64) — extend `irty`, arithmetic, casts, loads.
+5. ~~**Floats** (`float`/`double` = f32/f64)~~ — **DONE** (arithmetic, compares, `-`/`!`,
+   literals via `node->fval`, locals/params/returns, and all int↔float / f32↔f64
+   conversions; float→int is saturating `trunc_sat` for total semantics). `gen_convert`
+   is the one place all numeric conversions live (used by casts and `?:` arms).
 6. **`break` / `continue` / `switch` / `goto`** — chibicc lowers break/continue to
    `ND_GOTO` against `brk_label`/`cont_label`; add a label→block map and handle
    `ND_GOTO`/`ND_LABEL`/`ND_SWITCH`/`ND_CASE`.
