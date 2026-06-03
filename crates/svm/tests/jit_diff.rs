@@ -10,12 +10,14 @@ use svm_jit::{compile_and_run, JitError};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
-/// Marshal a `Value` into its `i64` calling-convention slot (§ JIT calling convention).
+/// Marshal a `Value` into its `i64` calling-convention slot (§ JIT calling
+/// convention). Floats travel as their bit pattern in the low bits.
 fn to_slot(v: Value) -> i64 {
     match v {
         Value::I32(x) => x as i64,
         Value::I64(x) => x,
-        other => panic!("integer slice only: {other:?}"),
+        Value::F32(x) => x.to_bits() as i64,
+        Value::F64(x) => x.to_bits() as i64,
     }
 }
 
@@ -24,7 +26,8 @@ fn from_slot(t: ValType, s: i64) -> Value {
     match t {
         ValType::I32 => Value::I32(s as i32),
         ValType::I64 => Value::I64(s),
-        other => panic!("integer slice only: {other:?}"),
+        ValType::F32 => Value::F32(f32::from_bits(s as u32)),
+        ValType::F64 => Value::F64(f64::from_bits(s as u64)),
     }
 }
 
@@ -50,10 +53,25 @@ fn assert_jit_matches_interp(src: &str, inputs: &[Vec<Value>]) {
             .map(|(t, s)| from_slot(*t, s))
             .collect();
 
-        assert_eq!(
-            want, got,
-            "interp/JIT disagree on {src:?} for args {args:?}"
-        );
+        assert_eq!(want.len(), got.len(), "result arity mismatch on {src:?}");
+        for (w, g) in want.iter().zip(&got) {
+            assert!(
+                values_equal(w, g),
+                "interp/JIT disagree on {src:?} for args {args:?}: {want:?} vs {got:?}"
+            );
+        }
+    }
+}
+
+/// Bit-exact equality, except any two NaNs of the same width are considered equal:
+/// IEEE NaN payloads are non-deterministic across backends (Cranelift vs the
+/// interpreter), and we do not yet enforce canonical-NaN. `-0.0` and `+0.0` still
+/// differ (their bits differ), as they must.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::F32(x), Value::F32(y)) => x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+        (Value::F64(x), Value::F64(y)) => x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+        _ => a == b,
     }
 }
 
@@ -274,4 +292,159 @@ block0():
 }
 "#;
     assert_jit_matches_interp(src, &[vec![]]);
+}
+
+// ---- floats + conversions ----
+
+fn f64s(xs: &[f64]) -> Vec<Value> {
+    xs.iter().map(|x| Value::F64(*x)).collect()
+}
+
+#[test]
+fn jit_matches_interp_f64_arith() {
+    let src = r#"
+func (f64, f64) -> (f64) {
+block0(v0: f64, v1: f64):
+  v2 = f64.add v0 v1
+  v3 = f64.mul v2 v0
+  v4 = f64.sub v3 v1
+  v5 = f64.div v4 v0
+  return v5
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            f64s(&[3.0, 4.0]),
+            f64s(&[-1.5, 2.25]),
+            f64s(&[1.0, 0.0]), // division by zero -> +inf
+            f64s(&[f64::INFINITY, 1.0]),
+            f64s(&[f64::NAN, 2.0]), // NaN propagation
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_f32_unary_and_minmax() {
+    let src = r#"
+func (f32, f32) -> (f32) {
+block0(v0: f32, v1: f32):
+  v2 = f32.abs v0
+  v3 = f32.neg v1
+  v4 = f32.min v2 v3
+  v5 = f32.max v4 v1
+  v6 = f32.sqrt v5
+  v7 = f32.ceil v6
+  v8 = f32.copysign v7 v1
+  return v8
+}
+"#;
+    let f32s = |a: f32, b: f32| vec![Value::F32(a), Value::F32(b)];
+    assert_jit_matches_interp(
+        src,
+        &[
+            f32s(4.0, -9.0),
+            f32s(-2.5, 3.5),
+            f32s(0.0, -0.0), // signed-zero handling in min/max/copysign
+            f32s(f32::NAN, 1.0),
+            f32s(2.0, f32::INFINITY),
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_float_compares() {
+    let src = r#"
+func (f64, f64) -> (i32) {
+block0(v0: f64, v1: f64):
+  v2 = f64.lt v0 v1
+  v3 = f64.ge v0 v1
+  v4 = f64.ne v0 v1
+  v5 = i32.add v2 v3
+  v6 = i32.add v5 v4
+  return v6
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            f64s(&[1.0, 2.0]),
+            f64s(&[2.0, 2.0]),
+            f64s(&[f64::NAN, 1.0]), // NaN: lt/ge false, ne true (unordered)
+            f64s(&[-0.0, 0.0]),     // equal
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_int_extend_wrap() {
+    let src = r#"
+func (i32, i64) -> (i64) {
+block0(v0: i32, v1: i64):
+  v2 = i64.extend_i32_s v0
+  v3 = i64.extend_i32_u v0
+  v4 = i32.wrap_i64 v1
+  v5 = i64.extend_i32_s v4
+  v6 = i64.add v2 v3
+  v7 = i64.add v6 v5
+  return v7
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            vec![Value::I32(-1), Value::I64(0x1_0000_0007)],
+            vec![Value::I32(i32::MIN), Value::I64(-1)],
+            vec![Value::I32(123456), Value::I64(0xDEAD_BEEF_CAFE)],
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_int_float_conversions() {
+    // i32 -> f64 (signed/unsigned), back via saturating trunc; reinterpret too.
+    let src = r#"
+func (i32, f64) -> (i64) {
+block0(v0: i32, v1: f64):
+  v2 = f64.convert_i32_s v0
+  v3 = f64.convert_i32_u v0
+  v4 = f64.add v2 v3
+  v5 = f64.add v4 v1
+  v6 = i64.trunc_sat_f64_s v5
+  v7 = i64.reinterpret_f64 v5
+  v8 = i64.add v6 v7
+  return v8
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            vec![Value::I32(-1), Value::F64(0.5)],
+            vec![Value::I32(1000), Value::F64(-3.5)],
+            vec![Value::I32(i32::MIN), Value::F64(1e18)], // saturates on trunc
+            vec![Value::I32(7), Value::F64(f64::NAN)],    // trunc_sat NaN -> 0
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_float_mem_roundtrip() {
+    let src = r#"
+memory 16
+
+func (i64, f64) -> (f64) {
+block0(v0: i64, v1: f64):
+  f64.store v0 v1
+  v2 = f64.load v0
+  return v2
+}
+"#;
+    assert_jit_matches_interp(
+        src,
+        &[
+            vec![Value::I64(0), Value::F64(123.456)],
+            vec![Value::I64(32), Value::F64(-2.5)],
+            vec![Value::I64(65528), Value::F64(f64::INFINITY)],
+        ],
+    );
 }

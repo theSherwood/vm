@@ -29,8 +29,8 @@
 //! to `results`, and loads/stores are relative to `mem_base`. The caller
 //! ([`compile_and_run`]) marshals values and owns the window.
 
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I16, I32, I64, I8};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::types::{F32, F64, I16, I32, I64, I8};
 use cranelift_codegen::ir::{
     AbiParam, BlockArg, Endianness, Function, InstBuilder, MemFlags, Type, UserFuncName, Value,
 };
@@ -39,8 +39,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use svm_ir::{
-    BinOp, Block, Func, FuncIdx, Inst, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator,
-    ValType,
+    BinOp, Block, CastOp, ConvOp, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx, Inst, IntTy,
+    IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, ValType,
 };
 
 /// Largest window the reference JIT will back with a flat host allocation. Real
@@ -70,8 +70,24 @@ fn clif_ty(t: ValType) -> Type {
     match t {
         ValType::I32 => I32,
         ValType::I64 => I64,
-        // Floats are not in this slice; lowering rejects them before this is reached.
-        ValType::F32 | ValType::F64 => I64,
+        ValType::F32 => F32,
+        ValType::F64 => F64,
+    }
+}
+
+/// The CLIF type for an integer-class IR type (operands to int↔float conversions).
+fn int_clif_ty(t: IntTy) -> Type {
+    match t {
+        IntTy::I32 => I32,
+        IntTy::I64 => I64,
+    }
+}
+
+/// The CLIF type for a float-class IR type.
+fn float_clif_ty(t: FloatTy) -> Type {
+    match t {
+        FloatTy::F32 => F32,
+        FloatTy::F64 => F64,
     }
 }
 
@@ -148,20 +164,25 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<Vec<
 /// Reject functions using any op outside the integer slice, so `build_clif` can lower
 /// the remainder totally. Keeping the check separate keeps the lowering readable.
 fn ensure_supported(f: &Func) -> Result<(), JitError> {
-    for ty in f.params.iter().chain(&f.results) {
-        if matches!(ty, ValType::F32 | ValType::F64) {
-            return Err(JitError::Unsupported("float types"));
-        }
-    }
     for blk in &f.blocks {
-        for ty in &blk.params {
-            if matches!(ty, ValType::F32 | ValType::F64) {
-                return Err(JitError::Unsupported("float block params"));
-            }
-        }
         for inst in &blk.insts {
             match inst {
-                Inst::ConstI32(_) | Inst::ConstI64(_) | Inst::Select { .. } => {}
+                Inst::ConstI32(_)
+                | Inst::ConstI64(_)
+                | Inst::ConstF32(_)
+                | Inst::ConstF64(_)
+                | Inst::Select { .. }
+                | Inst::IntCmp { .. }
+                | Inst::Eqz { .. }
+                | Inst::FBin { .. }
+                | Inst::FUn { .. }
+                | Inst::FCmp { .. }
+                | Inst::FToISat { .. }
+                | Inst::IToFConv { .. }
+                | Inst::Cast { .. }
+                | Inst::Load { .. }
+                | Inst::Store { .. }
+                | Inst::Convert { .. } => {}
                 Inst::IntBin { op, .. } => match op {
                     // Trapping ops need fault plumbing (deferred).
                     BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU => {
@@ -169,21 +190,12 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                     }
                     _ => {}
                 },
-                Inst::IntCmp { .. } | Inst::Eqz { .. } => {}
                 Inst::IntUn { op, .. } => match op {
                     IntUnOp::Clz | IntUnOp::Ctz | IntUnOp::Popcnt => {}
                     _ => return Err(JitError::Unsupported("int extend ops")),
                 },
-                Inst::Load { op, .. } => {
-                    if matches!(op.info().1, ValType::F32 | ValType::F64) {
-                        return Err(JitError::Unsupported("float load"));
-                    }
-                }
-                Inst::Store { op, .. } => {
-                    if matches!(op.info().1, ValType::F32 | ValType::F64) {
-                        return Err(JitError::Unsupported("float store"));
-                    }
-                }
+                // Trapping float→int needs fault plumbing (deferred).
+                Inst::FToITrap { .. } => return Err(JitError::Unsupported("trapping trunc")),
                 _ => return Err(JitError::Unsupported("instruction")),
             }
         }
@@ -253,17 +265,14 @@ fn build_clif(clif: &mut Function, f: &Func, mask: u64) -> Result<(), JitError> 
         mask,
     };
 
-    // Load the function arguments from the args buffer, narrowing i32 params.
+    // Load the function arguments from the args buffer, decoding each i64 slot to the
+    // parameter's type.
     let mut entry_args: Vec<BlockArg> = Vec::with_capacity(f.params.len());
     for (i, p) in f.params.iter().enumerate() {
         let slot = b
             .ins()
             .load(I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
-        let v = if clif_ty(*p) == I32 {
-            b.ins().ireduce(I32, slot)
-        } else {
-            slot
-        };
+        let v = decode_slot(&mut b, slot, *p);
         entry_args.push(BlockArg::from(v));
     }
     b.ins().jump(blocks[0], &entry_args);
@@ -320,6 +329,69 @@ fn lower_block(
                 let (c, x, y) = (get(&vals, *cond)?, get(&vals, *a)?, get(&vals, *rb)?);
                 b.ins().select(c, x, y)
             }
+            Inst::ConstF32(bits) => {
+                // Materialize via the exact bit pattern (NaN-safe), then bitcast.
+                let i = b.ins().iconst(I32, *bits as i64);
+                b.ins().bitcast(F32, MemFlags::new(), i)
+            }
+            Inst::ConstF64(bits) => {
+                let i = b.ins().iconst(I64, *bits as i64);
+                b.ins().bitcast(F64, MemFlags::new(), i)
+            }
+            Inst::FBin { op, a, b: rb, .. } => {
+                let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
+                float_bin(b, *op, x, y)
+            }
+            Inst::FUn { op, a, .. } => {
+                let x = get(&vals, *a)?;
+                float_un(b, *op, x)
+            }
+            Inst::FCmp { op, a, b: rb, .. } => {
+                let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
+                let c = b.ins().fcmp(float_cc(*op), x, y);
+                b.ins().uextend(I32, c) // bool (I8) -> i32 0/1
+            }
+            Inst::Convert { op, a } => {
+                let x = get(&vals, *a)?;
+                match op {
+                    ConvOp::ExtendI32S => b.ins().sextend(I64, x),
+                    ConvOp::ExtendI32U => b.ins().uextend(I64, x),
+                    ConvOp::WrapI64 => b.ins().ireduce(I32, x),
+                }
+            }
+            Inst::Cast { op, a } => {
+                let x = get(&vals, *a)?;
+                match op {
+                    CastOp::Demote => b.ins().fdemote(F32, x),
+                    CastOp::Promote => b.ins().fpromote(F64, x),
+                    CastOp::ReinterpI32F32 => b.ins().bitcast(F32, MemFlags::new(), x),
+                    CastOp::ReinterpF32I32 => b.ins().bitcast(I32, MemFlags::new(), x),
+                    CastOp::ReinterpI64F64 => b.ins().bitcast(F64, MemFlags::new(), x),
+                    CastOp::ReinterpF64I64 => b.ins().bitcast(I64, MemFlags::new(), x),
+                }
+            }
+            Inst::IToFConv { op, a } => {
+                let x = get(&vals, *a)?;
+                let (_, to, signed) = op.parts();
+                let fty = float_clif_ty(to);
+                if signed {
+                    b.ins().fcvt_from_sint(fty, x)
+                } else {
+                    b.ins().fcvt_from_uint(fty, x)
+                }
+            }
+            Inst::FToISat { op, a } => {
+                let x = get(&vals, *a)?;
+                let (_, to, signed) = op.parts();
+                let ity = int_clif_ty(to);
+                // Saturating (wasm trunc_sat): NaN→0, out-of-range→clamp — exactly
+                // Cranelift's saturating fcvt, so it matches the interpreter.
+                if signed {
+                    b.ins().fcvt_to_sint_sat(ity, x)
+                } else {
+                    b.ins().fcvt_to_uint_sat(ity, x)
+                }
+            }
             Inst::Load {
                 op, addr, offset, ..
             } => {
@@ -366,13 +438,7 @@ fn lower_block(
             let results_ptr = b.use_var(lower.results_var);
             for (i, o) in outs.iter().enumerate() {
                 let v = get(&vals, *o)?;
-                // Widen i32 results to fill the i64 slot (sign-extend; the harness
-                // reads back only the low 32 bits for an i32 result type).
-                let slot = if b.func.dfg.value_type(v) == I32 {
-                    b.ins().sextend(I64, v)
-                } else {
-                    v
-                };
+                let slot = encode_slot(b, v);
                 b.ins()
                     .store(MemFlags::trusted(), slot, results_ptr, (i * 8) as i32);
             }
@@ -423,6 +489,10 @@ fn width_ty(width: u32) -> Type {
 
 fn lower_load(b: &mut FunctionBuilder, op: LoadOp, phys: Value) -> Value {
     let (_, rty, width, signed) = op.info();
+    // Float loads read the float type directly (no extension).
+    if matches!(rty, ValType::F32 | ValType::F64) {
+        return b.ins().load(clif_ty(rty), mem_flags(), phys, 0);
+    }
     let load_ty = width_ty(width);
     let raw = b.ins().load(load_ty, mem_flags(), phys, 0);
     let result_ty = clif_ty(rty);
@@ -436,7 +506,12 @@ fn lower_load(b: &mut FunctionBuilder, op: LoadOp, phys: Value) -> Value {
 }
 
 fn lower_store(b: &mut FunctionBuilder, op: StoreOp, phys: Value, value: Value) {
-    let (_, _, width) = op.info();
+    let (_, vty, width) = op.info();
+    // Float stores write the float bits directly.
+    if matches!(vty, ValType::F32 | ValType::F64) {
+        b.ins().store(mem_flags(), value, phys, 0);
+        return;
+    }
     let store_ty = width_ty(width);
     // Narrow stores keep only the low `width` bytes (matches the interpreter).
     let v = if b.func.dfg.value_type(value) == store_ty {
@@ -445,6 +520,69 @@ fn lower_store(b: &mut FunctionBuilder, op: StoreOp, phys: Value, value: Value) 
         b.ins().ireduce(store_ty, value)
     };
     b.ins().store(mem_flags(), v, phys, 0);
+}
+
+/// Decode an `i64` calling-convention slot to a value of IR type `ty`.
+fn decode_slot(b: &mut FunctionBuilder, slot: Value, ty: ValType) -> Value {
+    match ty {
+        ValType::I64 => slot,
+        ValType::I32 => b.ins().ireduce(I32, slot),
+        ValType::F32 => {
+            let i = b.ins().ireduce(I32, slot);
+            b.ins().bitcast(F32, MemFlags::new(), i)
+        }
+        ValType::F64 => b.ins().bitcast(F64, MemFlags::new(), slot),
+    }
+}
+
+/// Encode a value into its `i64` calling-convention slot (the harness reads back the
+/// low 32 bits for i32/f32 results).
+fn encode_slot(b: &mut FunctionBuilder, v: Value) -> Value {
+    match b.func.dfg.value_type(v) {
+        I64 => v,
+        I32 => b.ins().uextend(I64, v),
+        F32 => {
+            let i = b.ins().bitcast(I32, MemFlags::new(), v);
+            b.ins().uextend(I64, i)
+        }
+        F64 => b.ins().bitcast(I64, MemFlags::new(), v),
+        _ => v,
+    }
+}
+
+fn float_bin(b: &mut FunctionBuilder, op: FBinOp, x: Value, y: Value) -> Value {
+    match op {
+        FBinOp::Add => b.ins().fadd(x, y),
+        FBinOp::Sub => b.ins().fsub(x, y),
+        FBinOp::Mul => b.ins().fmul(x, y),
+        FBinOp::Div => b.ins().fdiv(x, y),
+        FBinOp::Min => b.ins().fmin(x, y),
+        FBinOp::Max => b.ins().fmax(x, y),
+        FBinOp::Copysign => b.ins().fcopysign(x, y),
+    }
+}
+
+fn float_un(b: &mut FunctionBuilder, op: FUnOp, x: Value) -> Value {
+    match op {
+        FUnOp::Abs => b.ins().fabs(x),
+        FUnOp::Neg => b.ins().fneg(x),
+        FUnOp::Sqrt => b.ins().sqrt(x),
+        FUnOp::Ceil => b.ins().ceil(x),
+        FUnOp::Floor => b.ins().floor(x),
+        FUnOp::Trunc => b.ins().trunc(x),
+        FUnOp::Nearest => b.ins().nearest(x),
+    }
+}
+
+fn float_cc(op: FCmpOp) -> FloatCC {
+    match op {
+        FCmpOp::Eq => FloatCC::Equal,
+        FCmpOp::Ne => FloatCC::NotEqual, // unordered ≠ (NaN ne x is true), wasm semantics
+        FCmpOp::Lt => FloatCC::LessThan,
+        FCmpOp::Le => FloatCC::LessThanOrEqual,
+        FCmpOp::Gt => FloatCC::GreaterThan,
+        FCmpOp::Ge => FloatCC::GreaterThanOrEqual,
+    }
 }
 
 /// Map IR edge args to CLIF block-call args (`BlockArg`, the 0.132 block-call type).
