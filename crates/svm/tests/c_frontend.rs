@@ -644,3 +644,56 @@ fn c_floats_end_to_end() {
         8
     );
 }
+
+#[test]
+fn c_break_continue_end_to_end() {
+    // continue skips 5, break stops at 10: sum 0..=9 minus 5 = 40
+    assert_eq!(
+        i32_of("int main() { int s=0; for (int i=0;i<20;i=i+1) { if (i==5) continue; if (i==10) break; s=s+i; } return s; }"),
+        40
+    );
+    // break out of a while
+    assert_eq!(
+        i32_of("int main() { int i=0; while (1) { if (i>=7) break; i=i+1; } return i; }"),
+        7
+    );
+    // do/while runs the body at least once
+    assert_eq!(
+        i32_of("int main() { int n=0; int i=0; do { n=n+i; i=i+1; } while (i<5); return n; }"),
+        10
+    );
+    // continue in a while must still make progress (no infinite loop)
+    assert_eq!(
+        i32_of("int main() { int i=0; int s=0; while (i<10) { i=i+1; if (i%2==0) continue; s=s+i; } return s; }"),
+        25
+    );
+    // nested loops: break only exits the inner loop
+    assert_eq!(
+        i32_of("int main() { int c=0; for (int i=0;i<3;i=i+1) for (int j=0;j<5;j=j+1) { if (j==2) break; c=c+1; } return c; }"),
+        6
+    );
+}
+
+#[test]
+fn c_switch_end_to_end() {
+    // basic dispatch + default
+    let prog = "int classify(int n) { switch (n) { case 0: return 100; case 1: case 2: return 200; default: return 999; } } \
+                int main() { return classify(0) + classify(1) + classify(2) + classify(5); }";
+    assert_eq!(i32_of(prog), 100 + 200 + 200 + 999);
+    // fall-through accumulation with break
+    assert_eq!(
+        i32_of("int main() { int x = 0; int n = 2; switch (n) { case 2: x = x + 2; case 1: x = x + 1; break; case 0: x = 99; } return x; }"),
+        3
+    );
+    // break ends the switch; default in the middle
+    assert_eq!(
+        i32_of("int f(int n) { int r = 0; switch (n) { default: r = 7; break; case 1: r = 1; break; } return r; } \
+                int main() { return f(1) * 10 + f(42); }"),
+        17
+    );
+    // switch inside a loop: break exits the switch, not the loop
+    assert_eq!(
+        i32_of("int main() { int s = 0; for (int i = 0; i < 5; i = i + 1) { switch (i) { case 2: continue; case 4: break; } s = s + i; } return s; }"),
+        8
+    );
+}

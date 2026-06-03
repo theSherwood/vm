@@ -177,9 +177,13 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
    literals via `node->fval`, locals/params/returns, and all int↔float / f32↔f64
    conversions; float→int is saturating `trunc_sat` for total semantics). `gen_convert`
    is the one place all numeric conversions live (used by casts and `?:` arms).
-6. **`break` / `continue` / `switch` / `goto`** — chibicc lowers break/continue to
-   `ND_GOTO` against `brk_label`/`cont_label`; add a label→block map and handle
-   `ND_GOTO`/`ND_LABEL`/`ND_SWITCH`/`ND_CASE`.
+6. ~~**`break` / `continue` / `switch`**~~ — **DONE**. A `LoopCtx` stack maps a
+   break/continue `ND_GOTO` (matched by `unique_label`) to the loop's end/cont block;
+   `for`/`while` gained a `cont` block, plus `do`/`while` (`gen_do`). `switch` (`gen_switch`)
+   is a dispatch chain threading the value through `(sp, val)` compare blocks, with a
+   `case_block_of` map for the body's `ND_CASE` labels; supports fall-through, `case`
+   ranges, mid-position `default`, and `continue` passing through to an enclosing loop.
+   **Still TODO:** general `goto`/user labels (`ND_LABEL`/non-loop `ND_GOTO`) still error.
 7. **(Perf, later) SSA-promotion pass** — promote non-address-taken, non-`volatile`
    scalars from memory to real SSA values (DESIGN §3d "the pass that matters for speed").
    This also removes the redundant `memzero` and most loads/stores.

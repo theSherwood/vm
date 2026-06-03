@@ -29,8 +29,12 @@
 // Stream/Exit handles — so real C reaches stdout/stdin and terminates with an exit code.
 // **Floats** (`float`=f32, `double`/`long double`=f64) work too: arithmetic, compares,
 // `-`/`!`, literals, and all int<->float / float<->float conversions (float->int is
-// saturating, §3b). `break`/`continue`/`switch` and indirect calls come next; anything
-// unsupported is a hard error (so we never emit IR we cannot stand behind).
+// saturating, §3b). **`break`/`continue`** (a loop-context stack) and **`switch`** (a
+// dispatch chain threading the value through `(sp, val)` compare blocks, with
+// fall-through and `case` ranges) work. Indirect calls, by-value aggregate args/returns,
+// general `goto`, varargs/`printf`, and `malloc` remain; anything unsupported is a hard
+// error (so we never emit IR we cannot stand behind). The everything-in-memory model
+// (no SSA promotion yet) is the main perf gap.
 
 #include "chibicc.h"
 
@@ -40,6 +44,29 @@ static int nv;    // next SSA value index in the *current block* (blocks are par
 static int nb;        // next block label number in the current function
 static bool term;     // is the current block already terminated?
 static int cur_frame; // the current function's data-stack frame size (bytes)
+
+// Stack of enclosing loops/switches, so `break`/`continue` (which chibicc lowers to a
+// goto against the loop's brk/cont label) can branch to the right block.
+struct LoopCtx {
+  char *brk_label;
+  int brk_blk;
+  char *cont_label;
+  int cont_blk;
+};
+static struct LoopCtx loopstk[64];
+static int loopsp;
+
+// Each `case`/`default` label gets its own IR block; this append-only map (keyed by the
+// chibicc node) lets the body's ND_CASE find the block the switch dispatch branches to.
+static Node *case_node[4096];
+static int case_blk[4096];
+static int ncase;
+static int case_block_of(Node *n) {
+  for (int i = 0; i < ncase; i++)
+    if (case_node[i] == n)
+      return case_blk[i];
+  return -1; // unreachable: every case is registered before the body is emitted
+}
 
 // The data-stack pointer (frame base) is threaded as the first parameter of every IR
 // function and every IR block — `v0` in each block (§3d). A local at frame offset N
@@ -622,12 +649,13 @@ static void gen_if(Node *node) {
   open_block(end);
 }
 
-// `for (init; cond; inc) body` (and `while`, with init/inc absent): cond/body/end blocks
-// with a back-edge. (break/continue, which chibicc lowers to gotos, are not yet handled.)
+// `for (init; cond; inc) body` (and `while`, with init/inc absent): cond/body/cont/end
+// blocks with a back-edge. `continue` targets the `cont` block (which runs `inc` then
+// re-tests `cond`); `break` targets `end`.
 static void gen_for(Node *node) {
   if (node->init)
     gen_stmt(node->init);
-  int cond = nb++, body = nb++, end = nb++;
+  int cond = nb++, body = nb++, cont = nb++, end = nb++;
   fprintf(o, "  br block%d(" SP ")\n", cond);
   term = true;
 
@@ -641,13 +669,96 @@ static void gen_for(Node *node) {
   term = true;
 
   open_block(body);
+  loopstk[loopsp++] = (struct LoopCtx){node->brk_label, end, node->cont_label, cont};
   gen_stmt(node->then);
-  if (!term) {
-    if (node->inc)
-      gen_expr(node->inc);
-    fprintf(o, "  br block%d(" SP ")\n", cond);
+  loopsp--;
+  if (!term)
+    fprintf(o, "  br block%d(" SP ")\n", cont);
+
+  open_block(cont);
+  if (node->inc)
+    gen_expr(node->inc);
+  fprintf(o, "  br block%d(" SP ")\n", cond);
+
+  open_block(end);
+}
+
+// `do body while (cond)`: body runs once, then `cont` re-tests. `break` → end.
+static void gen_do(Node *node) {
+  int body = nb++, cont = nb++, end = nb++;
+  fprintf(o, "  br block%d(" SP ")\n", body);
+  term = true;
+
+  open_block(body);
+  loopstk[loopsp++] = (struct LoopCtx){node->brk_label, end, node->cont_label, cont};
+  gen_stmt(node->then);
+  loopsp--;
+  if (!term)
+    fprintf(o, "  br block%d(" SP ")\n", cont);
+
+  open_block(cont);
+  int c = gen_expr(node->cond);
+  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, body, end);
+
+  open_block(end);
+}
+
+// `switch (cond) { case ...: ... }` — a dispatch chain that threads the switch value
+// through `(sp, val)` compare blocks (values can't otherwise cross blocks), branching to
+// each case's block; the body's ND_CASE labels open those blocks and fall through.
+static void gen_switch(Node *node) {
+  int v = gen_expr(node->cond);
+  char *p = irty(node->cond->ty);
+
+  for (Node *c = node->case_next; c; c = c->case_next) {
+    case_node[ncase] = c;
+    case_blk[ncase++] = nb++;
+  }
+  int end = nb++;
+  int defblk = node->default_case ? nb++ : end;
+  if (node->default_case) {
+    case_node[ncase] = node->default_case;
+    case_blk[ncase++] = defblk;
   }
 
+  // Dispatch: each compare block tests one case and forwards (sp, val) to the next.
+  int check = nb++;
+  fprintf(o, "  br block%d(" SP ", v%d)\n", check, v);
+  term = true;
+  for (Node *c = node->case_next; c; c = c->case_next) {
+    fprintf(o, "block%d(" SP ": i64, v1: %s):\n", check, p);
+    nv = 2;
+    int next = nb++;
+    int hit = nv++;
+    if (c->begin == c->end) {
+      int k = nv++;
+      fprintf(o, "  v%d = %s.const %ld\n", k, p, c->begin);
+      fprintf(o, "  v%d = %s.eq v1 v%d\n", hit, p, k);
+    } else {
+      // [GNU] case range begin..end: (val - begin) <=u (end - begin)
+      int kb = nv++;
+      fprintf(o, "  v%d = %s.const %ld\n", kb, p, c->begin);
+      int d = nv++;
+      fprintf(o, "  v%d = %s.sub v1 v%d\n", d, p, kb);
+      int kr = nv++;
+      fprintf(o, "  v%d = %s.const %ld\n", kr, p, c->end - c->begin);
+      fprintf(o, "  v%d = %s.le_u v%d v%d\n", hit, p, d, kr);
+    }
+    fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ", v1)\n", hit,
+            case_block_of(c), next);
+    check = next;
+  }
+  // No case matched → default (or break past the switch).
+  fprintf(o, "block%d(" SP ": i64, v1: %s):\n  br block%d(" SP ")\n", check, p, defblk);
+  term = true;
+
+  // The body: ND_CASE labels open their blocks; `break` (cont_label NULL so `continue`
+  // passes through to an enclosing loop) targets `end`.
+  loopstk[loopsp++] = (struct LoopCtx){node->brk_label, end, NULL, -1};
+  gen_stmt(node->then);
+  loopsp--;
+  if (!term)
+    fprintf(o, "  br block%d(" SP ")\n", end);
   open_block(end);
 }
 
@@ -655,11 +766,25 @@ static void gen_stmt(Node *node) {
   switch (node->kind) {
   case ND_BLOCK:
     for (Node *n = node->body; n; n = n->next) {
-      if (term)
-        break; // unreachable after a terminator (drop dead code)
+      // Drop dead code after a terminator — but a `case`/`default` label reopens a
+      // reachable block, so it is always emitted.
+      if (term && n->kind != ND_CASE)
+        continue;
       gen_stmt(n);
     }
     return;
+  case ND_SWITCH:
+    gen_switch(node);
+    return;
+  case ND_CASE: {
+    // A case/default label: fall-through from the previous case branches in here.
+    int blk = case_block_of(node);
+    if (!term)
+      fprintf(o, "  br block%d(" SP ")\n", blk);
+    open_block(blk);
+    gen_stmt(node->lhs);
+    return;
+  }
   case ND_EXPR_STMT:
     gen_expr(node->lhs); // value discarded
     return;
@@ -669,6 +794,27 @@ static void gen_stmt(Node *node) {
   case ND_FOR:
     gen_for(node);
     return;
+  case ND_DO:
+    gen_do(node);
+    return;
+  case ND_GOTO: {
+    // break/continue: branch to the matching enclosing loop's break/continue block.
+    for (int i = loopsp - 1; i >= 0; i--) {
+      if (node->unique_label && loopstk[i].brk_label &&
+          !strcmp(node->unique_label, loopstk[i].brk_label)) {
+        fprintf(o, "  br block%d(" SP ")\n", loopstk[i].brk_blk);
+        term = true;
+        return;
+      }
+      if (node->unique_label && loopstk[i].cont_label &&
+          !strcmp(node->unique_label, loopstk[i].cont_label)) {
+        fprintf(o, "  br block%d(" SP ")\n", loopstk[i].cont_blk);
+        term = true;
+        return;
+      }
+    }
+    error_tok(node->tok, "codegen_ir: general goto/labels not supported yet");
+  }
   case ND_RETURN:
     if (node->lhs) {
       int v = gen_expr(node->lhs);
