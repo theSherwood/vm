@@ -703,6 +703,27 @@ fn c_switch_end_to_end() {
 const LIBC: &str = r#"
 #include <stdarg.h>
 int write(int fd, char *buf, long n);
+
+// A bump allocator over a pre-mapped window heap (§3d): the heap is just a big BSS
+// global, malloc bumps within it, free is a no-op. (A real free-list / growth via the
+// `map` capability is deferred — this is the MVP "fixed-size window" allocator.)
+static char __heap[32768];
+static long __heap_used = 0;
+void *malloc(long n) {
+  n = (n + 7) & ~7;
+  if (n < 0 || __heap_used + n > 32768) return 0;
+  char *p = __heap + __heap_used;
+  __heap_used = __heap_used + n;
+  return p;
+}
+void *calloc(long count, long size) {
+  long n = count * size;
+  char *p = malloc(n);
+  if (p) for (long i = 0; i < n; i = i + 1) p[i] = 0;
+  return p;
+}
+void free(void *p) {}
+
 static void __putc(char c) { write(1, &c, 1); }
 static void __puts(char *s) { while (*s) { __putc(*s); s = s + 1; } }
 static void __putu(unsigned long v, int base) {
@@ -828,5 +849,66 @@ fn c_branching_operands_spill_regression() {
     assert_eq!(
         i32_of("int main() { int a[2]; a[0] = 0; a[1] = 0; int i = 1; a[i] = (i ? 42 : 7); return a[1]; }"),
         42
+    );
+}
+
+/// Run `LIBC + body` and return the i32 result of `main` (for malloc tests etc.).
+fn i32_libc(body: &str) -> i32 {
+    match run_c_full(&format!("{LIBC}\n{body}")).outcome {
+        Outcome::Returned(v) => match v.as_slice() {
+            [Value::I32(x)] => *x,
+            other => panic!("expected one i32, got {other:?}"),
+        },
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
+#[test]
+fn c_malloc_end_to_end() {
+    // allocate, fill, sum, free (free is a no-op bump allocator)
+    assert_eq!(
+        i32_libc(
+            "int main() { int *a = malloc(5 * sizeof(int)); \
+                  for (int i=0;i<5;i=i+1) a[i]=i*i; int s=0; for (int i=0;i<5;i=i+1) s=s+a[i]; \
+                  free(a); return s; }"
+        ),
+        30
+    );
+    // two allocations are disjoint
+    assert_eq!(
+        i32_libc(
+            "int main() { int *a = malloc(8); int *b = malloc(8); \
+                  *a = 11; *b = 22; return *a + *b + (a == b ? 1000 : 0); }"
+        ),
+        33
+    );
+    // calloc zero-initializes
+    assert_eq!(
+        i32_libc(
+            "int main() { int *a = calloc(4, sizeof(int)); int s = 0; \
+                  for (int i=0;i<4;i=i+1) s=s+a[i]; a[2]=7; return s + a[2]; }"
+        ),
+        7
+    );
+    // a heap-allocated linked list
+    assert_eq!(
+        i32_libc("struct N { int v; struct N *next; }; \
+                  int main() { struct N *head = 0; \
+                    for (int i=1;i<=5;i=i+1) { struct N *n = malloc(sizeof(struct N)); n->v=i; n->next=head; head=n; } \
+                    int s=0; for (struct N *p=head; p; p=p->next) s=s+p->v; return s; }"),
+        15
+    );
+}
+
+#[test]
+fn c_malloc_with_printf_end_to_end() {
+    // build a dynamic array and print it
+    assert_eq!(
+        stdout_of(
+            "int main() { int n = 4; int *a = malloc(n * sizeof(int)); \
+                   for (int i=0;i<n;i=i+1) a[i] = (i+1)*(i+1); \
+                   for (int i=0;i<n;i=i+1) printf(\"%d \", a[i]); free(a); return 0; }"
+        ),
+        "1 4 9 16 "
     );
 }

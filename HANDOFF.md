@@ -196,6 +196,11 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
    via `gen_truth` (a `long`/pointer condition is i64, but `br_if` needs i32). Also: a
    cast to `void` now just discards. **Still TODO:** `fd`→stream mapping, float varargs
    beyond `double`, `%`-width/precision in the mini-printf.
+7b. ~~**`malloc`/`free`**~~ — **DONE**, and it needed **no frontend changes**: it is
+   ordinary guest C — a bump allocator over a big BSS-global window heap, `free` a no-op
+   (the §3d MVP "fixed-size window" allocator). Lives in the test `LIBC` prelude alongside
+   `printf`; `calloc` too. (Real free-list reclamation / heap growth via the `map`
+   capability is deferred.) Demonstrated with a heap-allocated linked list of structs.
 8. **(Perf, later) SSA-promotion pass** — promote non-address-taken, non-`volatile`
    scalars from memory to real SSA values (DESIGN §3d "the pass that matters for speed").
    This also removes the redundant `memzero` and most loads/stores.

@@ -37,9 +37,12 @@
 // guest-C `printf`. Expression-level control flow (`&&`/`||`/`?:`) opens blocks, which
 // would strand values computed earlier in the same C expression; such values are spilled
 // to a per-frame scratch region (`eval2`/`spill`/`reload`) and reloaded in the merge
-// block. Indirect calls, by-value aggregate args/returns, general `goto`, and `malloc`
-// remain; anything unsupported is a hard error (so we never emit IR we cannot stand
-// behind). The everything-in-memory model (no SSA promotion yet) is the main perf gap.
+// block. `malloc`/`free` need no frontend support — they are ordinary guest C (a bump
+// allocator over a window heap, §3d). Indirect calls, by-value aggregate args/returns,
+// and general `goto` remain; anything unsupported is a hard error (so we never emit IR we
+// cannot stand behind). The everything-in-memory model (no SSA promotion yet) is the main
+// perf gap. This is enough C surface for a capable VM: globals, structs, pointers, loops,
+// recursion, floats, varargs/`printf`, and heap allocation all run on interp and JIT.
 
 #include "chibicc.h"
 

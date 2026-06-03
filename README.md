@@ -20,14 +20,19 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > **masking lowering** (I1), function-table **indirect-call dispatch** (I2), direct/
 > indirect/tail calls, trap detection, and **`cap.call` through a host thunk** — all
 > **differential-tested against the interpreter** oracle (§18), including trap kinds and
-> host side effects. A **C frontend** has begun (`frontend/chibicc`, a vendored chibicc
-> fork with an `--emit-ir` backend, §3d): real C — integer expressions, casts,
-> comparisons — compiles to our IR, verifies, and runs end to end (the §18 Phase-2 "it
-> works" milestone). Still ahead: growing the frontend (locals, control flow, calls,
-> pointers/memory, stdio/`malloc`), production trap-catching (guard pages + signal
-> handler), atomics, SIMD, and capability extras. This is a research build; "appears to
-> work" is reachable, "is certified secure" is an explicit post-MVP workstream (see
-> `DESIGN.md` §2a/§18).
+> host side effects. A **C frontend** (`frontend/chibicc`, a vendored chibicc fork with an
+> `--emit-ir` backend, §3d) compiles a broad C subset — ints/longs/floats, locals,
+> pointers, arrays, structs/unions, globals & string literals, the full operator set
+> incl. short-circuit `&&`/`||`/`?:`, `if`/`while`/`for`/`do`/`switch` with
+> `break`/`continue`, functions and **recursion** (via a threaded data-stack pointer),
+> **varargs + a guest-C `printf`** over the powerbox, and **`malloc`/`free`** (a guest
+> bump allocator) — all of which **verify and run identically on the interpreter and the
+> JIT**, hello-world and a heap-allocated linked list included (the §18 Phase-2 "it works"
+> milestone). Still ahead: the §3d SSA-promotion pass (the perf gap — locals are
+> memory-resident today), by-value aggregate args / general `goto`, production
+> trap-catching (guard pages + signal handler), atomics, SIMD, and capability extras. This
+> is a research build; "appears to work" is reachable, "is certified secure" is an explicit
+> post-MVP workstream (see `DESIGN.md` §2a/§18).
 
 ## Layout
 
