@@ -13,9 +13,10 @@
 // correct by threading the **data-stack pointer**: it is parameter `v0` of every
 // function and block, a local lives at `sp + offset`, and a call gives the callee a
 // fresh frame at `sp + frame_size` so recursion never clobbers a parent frame.
-// `break`/`continue`/`switch`, short-circuit `&&`/`||`/`?:`, indirect calls,
-// arrays/structs, globals, and floats come next; anything unsupported is a hard error
-// (so we never emit IR we cannot stand behind).
+// Short-circuit `&&`/`||` and ternary `?:` lower to a diamond whose merge block carries
+// the result as a second block parameter (alongside the data-SP). `break`/`continue`/
+// `switch`, indirect calls, arrays/structs, globals, and floats come next; anything
+// unsupported is a hard error (so we never emit IR we cannot stand behind).
 
 #include "chibicc.h"
 
@@ -202,6 +203,99 @@ static int gen_cast(Node *node) {
   return r;
 }
 
+// Evaluate `node` and convert the result to `target`'s width (i32<->i64).
+static int gen_expr_as(Node *node, Type *target) {
+  int v = gen_expr(node);
+  bool from64 = is64(node->ty), to64 = is64(target);
+  if (from64 == to64)
+    return v;
+  int r = nv++;
+  if (to64)
+    fprintf(o, "  v%d = i64.extend_i32_%s v%d\n", r, node->ty->is_unsigned ? "u" : "s", v);
+  else
+    fprintf(o, "  v%d = i32.wrap_i64 v%d\n", r, v);
+  return r;
+}
+
+// Evaluate `node` to an i32 truth value (0/1): `(v != 0)` over the operand's width.
+static int gen_truth(Node *node) {
+  int v = gen_expr(node);
+  char *p = irty(node->ty);
+  int z = nv++;
+  fprintf(o, "  v%d = %s.const 0\n", z, p);
+  int r = nv++;
+  fprintf(o, "  v%d = %s.ne v%d v%d\n", r, p, v, z);
+  return r;
+}
+
+// Open a merge block taking `(sp, v1: ty)`: the carried result is v1, nv resumes at 2.
+static void open_merge(int id, char *ty) {
+  fprintf(o, "block%d(" SP ": i64, v1: %s):\n", id, ty);
+  nv = 2;
+  term = false;
+}
+
+// `a && b` and `a || b` → i32 0/1, short-circuit; the result is carried into the merge.
+static int gen_logand(Node *node) {
+  int ta = gen_truth(node->lhs);
+  int rhs = nb++, fls = nb++, merge = nb++;
+  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", ta, rhs, fls);
+  open_block(rhs);
+  int tb = gen_truth(node->rhs);
+  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, tb);
+  open_block(fls);
+  int z = nv++;
+  fprintf(o, "  v%d = i32.const 0\n", z);
+  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, z);
+  open_merge(merge, "i32");
+  return 1;
+}
+
+static int gen_logor(Node *node) {
+  int ta = gen_truth(node->lhs);
+  int tru = nb++, rhs = nb++, merge = nb++;
+  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", ta, tru, rhs);
+  open_block(tru);
+  int one = nv++;
+  fprintf(o, "  v%d = i32.const 1\n", one);
+  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, one);
+  open_block(rhs);
+  int tb = gen_truth(node->rhs);
+  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, tb);
+  open_merge(merge, "i32");
+  return 1;
+}
+
+// `cond ? then : els` → branches converted to the result type, carried into the merge.
+static int gen_cond(Node *node) {
+  int c = gen_truth(node->cond);
+  int th = nb++, el = nb++, merge = nb++;
+  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, th, el);
+
+  if (node->ty->kind == TY_VOID) {
+    // A void `?:` — both arms are evaluated for effect only, no carried value.
+    open_block(th);
+    gen_expr(node->then);
+    if (!term)
+      fprintf(o, "  br block%d(" SP ")\n", merge);
+    open_block(el);
+    gen_expr(node->els);
+    if (!term)
+      fprintf(o, "  br block%d(" SP ")\n", merge);
+    open_block(merge);
+    return 0;
+  }
+
+  open_block(th);
+  int vt = gen_expr_as(node->then, node->ty);
+  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, vt);
+  open_block(el);
+  int ve = gen_expr_as(node->els, node->ty);
+  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, ve);
+  open_merge(merge, irty(node->ty));
+  return 1;
+}
+
 static int gen_expr(Node *node) {
   switch (node->kind) {
   case ND_NUM: {
@@ -266,6 +360,12 @@ static int gen_expr(Node *node) {
   }
   case ND_CAST:
     return gen_cast(node);
+  case ND_LOGAND:
+    return gen_logand(node);
+  case ND_LOGOR:
+    return gen_logor(node);
+  case ND_COND:
+    return gen_cond(node);
   case ND_COMMA:
     gen_expr(node->lhs);
     return gen_expr(node->rhs);

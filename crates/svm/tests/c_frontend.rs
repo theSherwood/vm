@@ -272,3 +272,52 @@ fn c_recursion_end_to_end() {
         2
     );
 }
+
+#[test]
+fn c_short_circuit_and_ternary_end_to_end() {
+    // basic truth values (&&, ||, ?:)
+    assert_eq!(
+        i32_of("int main() { int x = 5; return x > 0 && x < 10; }"),
+        1
+    );
+    assert_eq!(
+        i32_of("int main() { int x = 5; return x > 9 && x < 10; }"),
+        0
+    );
+    assert_eq!(i32_of("int main() { return 0 || 3; }"), 1);
+    assert_eq!(i32_of("int main() { return 0 || 0; }"), 0);
+    assert_eq!(
+        i32_of("int main() { int x = 5; return x > 3 ? 100 : 200; }"),
+        100
+    );
+    assert_eq!(
+        i32_of("int main() { int x = 1; return x > 3 ? 100 : 200; }"),
+        200
+    );
+    // && and || normalize to 0/1 even for non-1 truthy operands
+    assert_eq!(i32_of("int main() { return 7 && 4; }"), 1);
+    // short-circuit must NOT evaluate the RHS side effect
+    assert_eq!(
+        i32_of("int main() { int x = 5; (x == 5) || (x = 99); return x; }"),
+        5
+    );
+    assert_eq!(
+        i32_of("int main() { int x = 5; (x != 5) && (x = 99); return x; }"),
+        5
+    );
+    // ...but DOES evaluate it when not short-circuited
+    assert_eq!(
+        i32_of("int main() { int x = 5; (x == 0) || (x = 42); return x; }"),
+        42
+    );
+    // ternary with mixed-width arms (result is long); chained ternary
+    assert_eq!(
+        i32_of("int main() { int g = 85; return g >= 90 ? 4 : g >= 80 ? 3 : g >= 70 ? 2 : 1; }"),
+        3
+    );
+    // ternary only evaluates the taken arm
+    assert_eq!(
+        i32_of("int main() { int x = 0; int c = 1; c ? (x = 10) : (x = 20); return x; }"),
+        10
+    );
+}

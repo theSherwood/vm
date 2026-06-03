@@ -146,11 +146,10 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
 
 ## 5. Roadmap (in suggested order — all incremental, no open design questions)
 
-1. **Short-circuit `&&` / `||` and ternary `?:`** (`ND_LOGAND`/`ND_LOGOR`/`ND_COND`).
-   These introduce control flow *inside an expression*, and the result must survive the
-   merge. Two options: (a) store the result to a scratch data-stack slot and reload after
-   the merge block (fits the everything-in-memory model — simplest), or (b) give the
-   merge block a 1-value param. Recommend (a).
+1. ~~**Short-circuit `&&` / `||` and ternary `?:`**~~ — **DONE** (commit after `0f03686`).
+   Lowered with option (b): the merge block carries the result as a second block param
+   `(sp, v1: ty)`. See `gen_logand`/`gen_logor`/`gen_cond` + `gen_truth`/`gen_expr_as`/
+   `open_merge` in `codegen_ir.c`. Tested incl. short-circuit side effects + chained `?:`.
 2. **Arrays + structs/unions** — `arr[i]` is already `*(arr+i)` in chibicc (pointer
    arith with element-size scaling baked into the AST); add `ND_MEMBER` to `gen_addr`
    (`addr(lhs) + member->offset`). By-value aggregate args/returns → hidden-pointer
