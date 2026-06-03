@@ -18,3 +18,8 @@ svm-interp.workspace = true
 [[bin]]
 name = "svm-bench"
 path = "src/bin/bench.rs"
+
+# The Cranelift JIT is pulled in only for the differential tests (§18), so it stays
+# out of the umbrella crate's normal build and the auditable dependency-free core.
+[dev-dependencies]
+svm-jit.workspace = true

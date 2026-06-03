@@ -15,10 +15,13 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > the function table, `select`, `br_table`, `unreachable`) plus **capabilities**
 > (`cap.call` over a host-owned handle table, and the MVP powerbox — `Stream` / `Exit`
 > / `Clock` / `Memory`, §3c/§3e) flow through text ⇄ binary ⇄ verifier ⇄ reference
-> interpreter, with the masking unit isolated and fuzzed. Still ahead: the JIT, atomics,
-> SIMD, and capability extras (attenuation, async, revocation, a module-level interface
-> section). This is a research build; "appears to work" is reachable, "is certified
-> secure" is an explicit post-MVP workstream (see `DESIGN.md` §2a/§18).
+> interpreter, with the masking unit isolated and fuzzed. The **Cranelift JIT** (§9) has
+> begun: an integer vertical slice (consts, int arith/bitwise/shift, compares, `select`,
+> `br`/`br_if`, multi-block loops) is **differential-tested against the interpreter**
+> oracle (§18). Still ahead: growing the JIT (memory + the §4 masking lowering, calls,
+> floats, traps), atomics, SIMD, and capability extras. This is a research build;
+> "appears to work" is reachable, "is certified secure" is an explicit post-MVP
+> workstream (see `DESIGN.md` §2a/§18).
 
 ## Layout
 
@@ -29,9 +32,14 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 | `svm-encode` | Binary encode + **decode** (untrusted-input-facing) (§3a) | escape-TCB |
 | `svm-verify` | The verifier — single linear pass, fail-closed (§2a I2/I3/I4; §3b) | escape-TCB |
 | `svm-interp` | Reference interpreter — the differential oracle (§18) | — |
+| `svm-jit` | Cranelift JIT — CLIF lowering + (later) the §4 masking lowering (§9) | escape-TCB† |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
 | `svm` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |
 | `fuzz/` | cargo-fuzz targets (nightly); mirror the stable smoke fuzz | — |
+
+†`svm-jit` is escape-TCB but, by design (§1), shares Wasmtime's codegen — so unlike
+the other TCB crates it *does* take a dependency (Cranelift). The dependency-free rule
+covers only the small audit-critical crates (`svm-ir`/`svm-mask`/`svm-encode`/`svm-verify`).
 
 The escape-TCB crates are deliberately **dependency-free** (small, fast to compile,
 auditable). The host is Rust; the (future) frontend is C; codegen will lower to
