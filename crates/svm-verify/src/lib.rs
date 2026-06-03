@@ -170,6 +170,34 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.extend_from_slice(&ty.results);
                 continue;
             }
+            if let Inst::CapCall {
+                sig, handle, args, ..
+            } = inst
+            {
+                {
+                    let cx = Cx {
+                        fi,
+                        bi,
+                        types: &types,
+                    };
+                    // The handle is a forgeable i32 index; safety is the runtime
+                    // use-site check (host-owned table type_id/generation), not typing.
+                    cx.expect(*handle, ValType::I32)?;
+                    if args.len() != sig.params.len() {
+                        return Err(VerifyError::CallArgCountMismatch {
+                            func: fi,
+                            block: bi,
+                            expected: sig.params.len(),
+                            found: args.len(),
+                        });
+                    }
+                    for (a, want) in args.iter().zip(&sig.params) {
+                        cx.expect(*a, *want)?;
+                    }
+                }
+                types.extend_from_slice(&sig.results);
+                continue;
+            }
             // A value-producing instruction appends its result type; `Store` does not.
             if let Some(result) = check_inst(fi, bi, inst, &types, has_memory)? {
                 types.push(result);
@@ -299,7 +327,8 @@ fn check_inst(
         Inst::Store { .. }
         | Inst::Call { .. }
         | Inst::RefFunc { .. }
-        | Inst::CallIndirect { .. } => return Ok(None),
+        | Inst::CallIndirect { .. }
+        | Inst::CapCall { .. } => return Ok(None),
     };
     Ok(Some(ty))
 }

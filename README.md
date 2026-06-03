@@ -12,11 +12,13 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 
 > Status: **Phase 1** — the core loop is in place. The full **scalar IR** (integer /
 > float ops, linear memory with confinement masking, direct / indirect / tail calls +
-> the function table, `select`, `br_table`, `unreachable`) flows through
-> text ⇄ binary ⇄ verifier ⇄ reference interpreter, with the masking unit isolated and
-> fuzzed. Still ahead: capabilities (`cap.call` / handle table), atomics, SIMD, and the
-> JIT. This is a research build; "appears to work" is reachable, "is certified secure"
-> is an explicit post-MVP workstream (see `DESIGN.md` §2a/§18).
+> the function table, `select`, `br_table`, `unreachable`) plus **capabilities**
+> (`cap.call` over a host-owned handle table, and the MVP powerbox — `Stream` / `Exit`
+> / `Clock` / `Memory`, §3c/§3e) flow through text ⇄ binary ⇄ verifier ⇄ reference
+> interpreter, with the masking unit isolated and fuzzed. Still ahead: the JIT, atomics,
+> SIMD, and capability extras (attenuation, async, revocation, a module-level interface
+> section). This is a research build; "appears to work" is reachable, "is certified
+> secure" is an explicit post-MVP workstream (see `DESIGN.md` §2a/§18).
 
 ## Layout
 

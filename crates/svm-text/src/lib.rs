@@ -145,6 +145,18 @@ fn print_inst(inst: &Inst) -> String {
             types(&ty.results),
             arglist(args)
         ),
+        Inst::CapCall {
+            type_id,
+            op,
+            sig,
+            handle,
+            args,
+        } => format!(
+            "cap.call {type_id} {op} ({}) -> ({}) v{handle}{}",
+            types(&sig.params),
+            types(&sig.results),
+            arglist(args)
+        ),
     }
 }
 
@@ -744,6 +756,24 @@ impl<'a> Parser<'a> {
             return Ok(Inst::CallIndirect {
                 ty: FuncType { params, results },
                 idx,
+                args,
+            });
+        }
+        if op == "cap.call" {
+            let type_id = u32::try_from(self.parse_int()?)
+                .map_err(|_| ParseError("cap.call type_id out of range".into()))?;
+            let op_index = u32::try_from(self.parse_int()?)
+                .map_err(|_| ParseError("cap.call op index out of range".into()))?;
+            let params = self.parse_type_list()?;
+            self.expect(&Tok::Arrow)?;
+            let results = self.parse_type_list()?;
+            let handle = self.value(names)?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::CapCall {
+                type_id,
+                op: op_index,
+                sig: FuncType { params, results },
+                handle,
                 args,
             });
         }

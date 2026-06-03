@@ -63,6 +63,7 @@ mod op {
     pub const PTR_FROM_INT: u8 = 0x76; // i64 -> i64 (no-op provenance cast)
     pub const PTR_TO_INT: u8 = 0x77;
     pub const PTR_ADD: u8 = 0x78; // (i64, i64) -> i64
+    pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -298,6 +299,21 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_types(out, &ty.params);
             write_types(out, &ty.results);
             write_uleb(out, *idx as u64);
+            write_idxs(out, args);
+        }
+        Inst::CapCall {
+            type_id,
+            op,
+            sig,
+            handle,
+            args,
+        } => {
+            out.push(op::CAP_CALL);
+            write_uleb(out, *type_id as u64);
+            write_uleb(out, *op as u64);
+            write_types(out, &sig.params);
+            write_types(out, &sig.results);
+            write_uleb(out, *handle as u64);
             write_idxs(out, args);
         }
     }
@@ -578,6 +594,16 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
                 results: decode_types(c)?,
             },
             idx: c.idx()?,
+            args: decode_idxs(c)?,
+        },
+        op::CAP_CALL => Inst::CapCall {
+            type_id: c.idx()?,
+            op: c.idx()?,
+            sig: FuncType {
+                params: decode_types(c)?,
+                results: decode_types(c)?,
+            },
+            handle: c.idx()?,
             args: decode_idxs(c)?,
         },
 

@@ -861,6 +861,27 @@ pub enum Inst {
         to_int: bool,
         a: ValIdx,
     },
+    /// Capability call (§3c): invoke operation `op` of the interface identified by
+    /// `type_id` on the capability named by `handle` — a forgeable `i32` index into
+    /// the **host-owned** handle table. At this use site the index is masked into the
+    /// table and the entry's `type_id`/generation are re-checked, so a forged index is
+    /// **inert**: it traps (wrong type / dead generation) or selects one of this
+    /// domain's own granted `type_id` capabilities — never host memory or arbitrary
+    /// code (§3c). `sig` is the operation's static signature; its results are appended.
+    ///
+    /// Phase-1 simplification: `type_id`/`op`/`sig` are inlined immediates (mirroring
+    /// `call_indirect`'s inlined `FuncType`). A module-level interface/type section —
+    /// which would let the verifier also bound `op` and cross-check `sig` against the
+    /// canonical interface — is deferred to §13 linking. Safety does **not** depend on
+    /// it: the host-owned table's use-site checks carry it, and the host handler
+    /// treats all guest inputs as hostile (§2a authority-TCB).
+    CapCall {
+        type_id: u32,
+        op: u32,
+        sig: FuncType,
+        handle: ValIdx,
+        args: Vec<ValIdx>,
+    },
 }
 
 impl Inst {
@@ -874,6 +895,7 @@ impl Inst {
             Inst::Store { .. } => 0,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
+            Inst::CapCall { sig, .. } => sig.results.len(),
             _ => 1,
         }
     }

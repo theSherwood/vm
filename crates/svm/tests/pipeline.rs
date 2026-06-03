@@ -7,7 +7,7 @@
 
 use svm::{assemble, load};
 use svm_encode::{decode_module, encode_module};
-use svm_interp::{run, Trap, Value};
+use svm_interp::{run, run_with_host, Host, StreamRole, Trap, Value};
 use svm_ir::{BinOp, Inst, IntTy};
 use svm_text::{parse_module, print_module};
 use svm_verify::{verify_module, VerifyError};
@@ -1243,5 +1243,208 @@ fn verifier_rejects_ref_func_out_of_range() {
     assert!(matches!(
         verify_module(&m),
         Err(VerifyError::CallFuncOutOfRange { .. })
+    ));
+}
+
+// ---- capabilities: cap.call, the host-owned handle table, the mock powerbox (§3c/§3e) ----
+
+// Store "Hi" into the window, then write(ptr=0, len=2) to the Stream handle (v0).
+const CAP_WRITE: &str = r#"
+memory 16
+
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i32.const 72
+  i32.store8 v1 v2
+  v3 = i64.const 1
+  v4 = i32.const 105
+  i32.store8 v3 v4
+  v5 = i64.const 0
+  v6 = i64.const 2
+  v7 = cap.call 0 1 (i64, i64) -> (i64) v0 (v5, v6)
+  return v7
+}
+"#;
+
+#[test]
+fn cap_stream_write_captures_output() {
+    let m = parse_module(CAP_WRITE).expect("parse");
+    verify_module(&m).expect("verify");
+    // cap.call round-trips through both formats.
+    assert_eq!(m, decode_module(&encode_module(&m)).unwrap(), "binary");
+    assert_eq!(m, parse_module(&print_module(&m)).unwrap(), "text");
+
+    let mut host = Host::new();
+    let stdout = host.grant_stream(StreamRole::Out);
+    let mut fuel = 10_000u64;
+    let r = run_with_host(&m, 0, &[Value::I32(stdout)], &mut fuel, &mut host).unwrap();
+    assert_eq!(r, vec![Value::I64(2)], "write returns the byte count");
+    assert_eq!(host.stdout, b"Hi", "host captured the written bytes");
+}
+
+// read(ptr=0, len=4) from the Stream handle, then load the first byte back.
+const CAP_READ: &str = r#"
+memory 16
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 4
+  v3 = cap.call 0 0 (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = i32.load8_u v1
+  return v4
+}
+"#;
+
+#[test]
+fn cap_stream_read_fills_memory() {
+    let m = parse_module(CAP_READ).unwrap();
+    verify_module(&m).unwrap();
+    let mut host = Host::new();
+    host.stdin = b"ABCD".to_vec();
+    let stdin = host.grant_stream(StreamRole::In);
+    let mut fuel = 10_000u64;
+    let r = run_with_host(&m, 0, &[Value::I32(stdin)], &mut fuel, &mut host).unwrap();
+    assert_eq!(
+        r,
+        vec![Value::I32(65)],
+        "first byte 'A' read into the window"
+    );
+}
+
+// exit(code) is noreturn; the frontend emits `unreachable` after it.
+const CAP_EXIT: &str = r#"
+func (i32) -> () {
+block0(v0: i32):
+  v1 = i32.const 7
+  cap.call 1 0 (i32) -> () v0 (v1)
+  unreachable
+}
+"#;
+
+#[test]
+fn cap_exit_traps_with_code() {
+    let m = parse_module(CAP_EXIT).unwrap();
+    verify_module(&m).unwrap();
+    let mut host = Host::new();
+    let exit = host.grant_exit();
+    let mut fuel = 1000u64;
+    let r = run_with_host(&m, 0, &[Value::I32(exit)], &mut fuel, &mut host);
+    assert_eq!(r, Err(Trap::Exit(7)));
+}
+
+const CAP_CLOCK: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i32.const 0
+  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  return v2
+}
+"#;
+
+#[test]
+fn cap_clock_is_deterministic_and_monotonic() {
+    let m = parse_module(CAP_CLOCK).unwrap();
+    verify_module(&m).unwrap();
+    let mut host = Host::new();
+    let clk = host.grant_clock();
+    let mut fuel = 1000u64;
+    let a = run_with_host(&m, 0, &[Value::I32(clk)], &mut fuel, &mut host).unwrap();
+    let mut fuel = 1000u64;
+    let b = run_with_host(&m, 0, &[Value::I32(clk)], &mut fuel, &mut host).unwrap();
+    assert_eq!(a, vec![Value::I64(0)]);
+    assert_eq!(b, vec![Value::I64(1)], "clock advances deterministically");
+}
+
+#[test]
+fn cap_forged_wrong_type_and_closed_handles_are_inert() {
+    // The CAP_CLOCK program calls type_id=2 (Clock). Each bad handle must be inert
+    // (Trap::CapFault) — never an escape, never a panic.
+    let m = parse_module(CAP_CLOCK).unwrap();
+    verify_module(&m).unwrap();
+
+    // (a) A forged index into an empty table.
+    let mut host = Host::new();
+    let mut fuel = 1000u64;
+    assert_eq!(
+        run_with_host(&m, 0, &[Value::I32(0x7fff)], &mut fuel, &mut host),
+        Err(Trap::CapFault),
+    );
+
+    // (b) A real handle of the WRONG interface type (a Stream invoked as a Clock).
+    let mut host = Host::new();
+    let stream = host.grant_stream(StreamRole::Out);
+    let mut fuel = 1000u64;
+    assert_eq!(
+        run_with_host(&m, 0, &[Value::I32(stream)], &mut fuel, &mut host),
+        Err(Trap::CapFault),
+    );
+
+    // (c) A closed handle — dead generation (use-after-close, D37).
+    let mut host = Host::new();
+    let clk = host.grant_clock();
+    host.close(clk);
+    let mut fuel = 1000u64;
+    assert_eq!(
+        run_with_host(&m, 0, &[Value::I32(clk)], &mut fuel, &mut host),
+        Err(Trap::CapFault),
+    );
+}
+
+#[test]
+fn cap_reusing_a_closed_slot_does_not_alias_old_handle() {
+    // Close a handle, then grant another (reusing the slot). The old handle value must
+    // still be inert — the per-slot generation advanced (ABA-safe).
+    let m = parse_module(CAP_CLOCK).unwrap();
+    verify_module(&m).unwrap();
+    let mut host = Host::new();
+    let old = host.grant_clock();
+    host.close(old);
+    let _new = host.grant_clock(); // reuses the freed slot, bumps its generation
+    let mut fuel = 1000u64;
+    assert_eq!(
+        run_with_host(&m, 0, &[Value::I32(old)], &mut fuel, &mut host),
+        Err(Trap::CapFault),
+        "stale handle must not alias the new grant in the same slot",
+    );
+}
+
+// A buffer that runs past the window: the §7 trampoline reports -EFAULT (recoverable),
+// NOT a trap — and writes nothing.
+const CAP_WRITE_OOB: &str = r#"
+memory 16
+
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 100000
+  v3 = cap.call 0 1 (i64, i64) -> (i64) v0 (v1, v2)
+  return v3
+}
+"#;
+
+#[test]
+fn cap_buffer_out_of_range_is_efault_not_trap() {
+    let m = parse_module(CAP_WRITE_OOB).unwrap();
+    verify_module(&m).unwrap();
+    let mut host = Host::new();
+    let stdout = host.grant_stream(StreamRole::Out);
+    let mut fuel = 10_000u64;
+    let r = run_with_host(&m, 0, &[Value::I32(stdout)], &mut fuel, &mut host).unwrap();
+    assert_eq!(r, vec![Value::I64(-14)], "-EFAULT, a recoverable guest bug");
+    assert!(host.stdout.is_empty(), "nothing written on EFAULT");
+}
+
+#[test]
+fn verifier_rejects_cap_call_non_i32_handle() {
+    // The handle operand must be the i32 index; an i64 handle is rejected.
+    let m = parse_module(
+        "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = cap.call 2 0 () -> (i64) v0 ()\n  return v1\n}\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::TypeMismatch { .. })
     ));
 }

@@ -45,6 +45,12 @@ pub enum Trap {
     Unreachable,
     /// A trapping float→int conversion saw NaN or an out-of-range value (§3b).
     BadConversion,
+    /// A `cap.call` named a handle that is forged, closed/revoked (dead generation),
+    /// or the wrong interface type — the index was **inert** (§3c). Not an escape.
+    CapFault,
+    /// The guest invoked the `Exit` capability; carries the requested exit code. Not
+    /// an error — the domain asked to terminate (§3e). Propagates like a trap.
+    Exit(i32),
     /// Structurally invalid in a way a verified module never is (defensive only).
     Malformed,
 }
@@ -64,11 +70,27 @@ const MAX_CALL_DEPTH: u32 = 256;
 /// instruction and per branch so that even an infinite loop terminates — important
 /// for fuzzing and for never hanging a test.
 pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<Vec<Value>, Trap> {
+    // No capabilities granted: an empty powerbox (any `cap.call` is inert → `CapFault`).
+    let mut host = Host::new();
+    run_with_host(m, func, args, fuel, &mut host)
+}
+
+/// Like [`run`], but with a caller-provided [`Host`] (the powerbox): grant the entry
+/// function's capabilities into `host`, pass their handle indices in `args`, then read
+/// effects (`host.stdout`, etc.) back afterwards. This is how a capability-using guest
+/// is driven (§3c/§3e).
+pub fn run_with_host(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
     let f = m.funcs.get(func as usize).ok_or(Trap::Malformed)?;
     // One linear-memory window per run, zero-initialized and lazily paged. The whole
     // module shares it (all functions address the same window).
     let mut mem = m.memory.map(|mc| Mem::new(mc.size_log2));
-    run_func(f, args, fuel, &mut mem, &m.funcs, 0)
+    run_func(f, args, fuel, &mut mem, &m.funcs, host, 0)
 }
 
 fn run_func<'a>(
@@ -77,6 +99,7 @@ fn run_func<'a>(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     funcs: &'a [Func],
+    host: &mut Host,
     depth: u32,
 ) -> Result<Vec<Value>, Trap> {
     if depth > MAX_CALL_DEPTH {
@@ -102,12 +125,26 @@ fn run_func<'a>(
                 if let Inst::Call { func, args } = inst {
                     let argv = collect(&vals, args)?;
                     let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
-                    let results = run_func(callee, &argv, fuel, mem, funcs, depth + 1)?;
+                    let results = run_func(callee, &argv, fuel, mem, funcs, host, depth + 1)?;
                     vals.extend(results);
                 } else if let Inst::CallIndirect { ty, idx, args } = inst {
                     let callee = table_lookup(funcs, as_i32(get(&vals, *idx)?)?, ty)?;
                     let argv = collect(&vals, args)?;
-                    let results = run_func(callee, &argv, fuel, mem, funcs, depth + 1)?;
+                    let results = run_func(callee, &argv, fuel, mem, funcs, host, depth + 1)?;
+                    vals.extend(results);
+                } else if let Inst::CapCall {
+                    type_id,
+                    op,
+                    handle,
+                    args,
+                    ..
+                } = inst
+                {
+                    // Capability call (§3c): resolve the handle in the host-owned table
+                    // (mask + type_id/generation check) and dispatch to the mock host.
+                    let h = as_i32(get(&vals, *handle)?)?;
+                    let argv = collect(&vals, args)?;
+                    let results = host.dispatch(*type_id, *op, h, &argv, mem)?;
                     vals.extend(results);
                 } else if let Some(v) = eval_inst(inst, &vals, mem)? {
                     vals.push(v);
@@ -270,7 +307,10 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             m.load(a, *offset, *op)?
         }
         // Handled before/around the match; listed for exhaustiveness (no panic).
-        Inst::Store { .. } | Inst::Call { .. } | Inst::CallIndirect { .. } => return Ok(None),
+        Inst::Store { .. }
+        | Inst::Call { .. }
+        | Inst::CallIndirect { .. }
+        | Inst::CapCall { .. } => return Ok(None),
     };
     Ok(Some(v))
 }
@@ -494,6 +534,245 @@ fn cast(op: CastOp, v: Value) -> Result<Value, Trap> {
 }
 
 // ----------------------------------------------------------------------------
+// Capabilities — the host-owned handle table + a deterministic mock powerbox
+// (§3c index model, §3e MVP interface set). This is the reference oracle's
+// stand-in for real host capabilities: deterministic, in-process, so it can be a
+// differential oracle. The *security* of the model lives in `Host::resolve`
+// (use-site mask + type_id + generation check → forged indices are inert).
+// ----------------------------------------------------------------------------
+
+/// MVP interface type-ids (§3e). Phase-1: a `type_id` is just a small constant a
+/// handle-table entry carries and `cap.call` re-checks. (A module-level interface
+/// section that globalizes ids across linked modules is deferred to §13.)
+pub mod iface {
+    /// `Stream` — byte stream: op 0 `read`, op 1 `write`, op 2 `close` (§3e D43).
+    pub const STREAM: u32 = 0;
+    /// `Exit` — lifecycle: op 0 `exit(code)` (noreturn).
+    pub const EXIT: u32 = 1;
+    /// `Clock` — op 0 `now(clock_id) -> i64` nanoseconds.
+    pub const CLOCK: u32 = 2;
+    /// `Memory` — op 0 `map`, 1 `unmap`, 2 `protect` (§3e; eager-mapped → no-ops).
+    pub const MEMORY: u32 = 3;
+}
+
+/// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
+/// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal.
+const EFAULT: i64 = -14; // buffer not fully within the window
+const EINVAL: i64 = -22; // bad op / argument
+
+/// Which standard stream a `Stream` handle is bound to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StreamRole {
+    In,
+    Out,
+    Err,
+}
+
+/// The host-side object a handle-table entry dispatches to — the mock equivalent of
+/// §3c's `(methods, object)`. The guest never names or writes this (it lives in host
+/// memory); it is selected only by a *granted* handle index.
+#[derive(Clone, Copy, Debug)]
+enum Binding {
+    Stream(StreamRole),
+    Exit,
+    Clock,
+    Memory,
+}
+
+/// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
+/// per-slot and only advances on (re)grant, so a closed handle's value can never
+/// alias a later grant of the same slot (ABA-safe use-after-close detection, D37).
+#[derive(Clone, Copy, Debug, Default)]
+struct Slot {
+    generation: u32,
+    entry: Option<Binding>,
+    type_id: u32,
+}
+
+/// `log2` of the handle-table capacity. A handle value packs `(generation, slot)`:
+/// `slot = h & (cap-1)`, `generation = h >> CAP_LOG2`.
+const CAP_LOG2: u32 = 8;
+const CAP: usize = 1 << CAP_LOG2;
+
+/// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
+/// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
+/// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
+/// back `stdout`/`stderr`. Deterministic by design so it serves as a §18 oracle.
+pub struct Host {
+    table: Vec<Slot>, // CAP slots, host-owned
+    /// Bytes a `Stream{In}` handle's `read` draws from.
+    pub stdin: Vec<u8>,
+    stdin_pos: usize,
+    /// Bytes written by `Stream{Out}` / `Stream{Err}` `write`s.
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Monotonic nanosecond counter; each `Clock.now` returns it then advances by one,
+    /// so reads are deterministic and strictly increasing.
+    pub clock_ns: i64,
+}
+
+impl Default for Host {
+    fn default() -> Host {
+        Host::new()
+    }
+}
+
+impl Host {
+    pub fn new() -> Host {
+        Host {
+            table: vec![Slot::default(); CAP],
+            stdin: Vec::new(),
+            stdin_pos: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            clock_ns: 0,
+        }
+    }
+
+    /// Install a host binding in a free slot and return the guest handle — a forgeable
+    /// `i32` index encoding `(generation, slot)`. This is how the powerbox (and, later,
+    /// attenuation) hands authority to the guest (§3c). Panics only if the table is
+    /// full (a host bug, not reachable from guest code).
+    fn grant(&mut self, type_id: u32, binding: Binding) -> i32 {
+        let slot = self
+            .table
+            .iter()
+            .position(|s| s.entry.is_none())
+            .expect("handle table full");
+        let s = &mut self.table[slot];
+        s.generation = s.generation.wrapping_add(1); // advance per (re)grant (ABA-safe)
+        s.entry = Some(binding);
+        s.type_id = type_id;
+        ((s.generation << CAP_LOG2) | slot as u32) as i32
+    }
+
+    /// Grant a `Stream` capability bound to `role` (a powerbox stdio grant, §3e).
+    pub fn grant_stream(&mut self, role: StreamRole) -> i32 {
+        self.grant(iface::STREAM, Binding::Stream(role))
+    }
+    pub fn grant_exit(&mut self) -> i32 {
+        self.grant(iface::EXIT, Binding::Exit)
+    }
+    pub fn grant_clock(&mut self) -> i32 {
+        self.grant(iface::CLOCK, Binding::Clock)
+    }
+    pub fn grant_memory(&mut self) -> i32 {
+        self.grant(iface::MEMORY, Binding::Memory)
+    }
+
+    /// Close a handle (§3c): free the slot but keep its generation, so the old handle
+    /// value is now a dead generation and any later `cap.call` on it traps (D37).
+    pub fn close(&mut self, handle: i32) {
+        let slot = (handle as u32 as usize) & (CAP - 1);
+        self.table[slot].entry = None;
+    }
+
+    /// Resolve a handle at a `cap.call` use site (§3c) — **the security hinge**: mask
+    /// the index into the host-owned table (never branch), then re-check the entry's
+    /// interface `type_id` and `generation`. A forged / closed / wrong-type index is
+    /// inert: it faults, or at worst selects one of *this domain's own* granted
+    /// `type_id` capabilities. The guest never supplies the binding.
+    fn resolve(&self, handle: i32, type_id: u32) -> Result<Binding, Trap> {
+        let h = handle as u32;
+        let slot = (h as usize) & (CAP - 1); // mask, not branch (Spectre-v1 safe)
+        let gen = h >> CAP_LOG2;
+        let s = &self.table[slot];
+        match s.entry {
+            Some(b) if s.type_id == type_id && s.generation == gen => Ok(b),
+            _ => Err(Trap::CapFault),
+        }
+    }
+
+    /// Dispatch a `cap.call` (§3c): resolve the handle, then run the mock operation.
+    /// Returns the op's result values (negative-errno encoded in an `i64` for the
+    /// fallible ops, §3e D42), or a `Trap` for escape/exit. `mem` backs buffer args.
+    fn dispatch(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[Value],
+        mem: &mut Option<Mem>,
+    ) -> Result<Vec<Value>, Trap> {
+        match self.resolve(handle, type_id)? {
+            Binding::Stream(role) => self.stream_op(role, op, args, mem),
+            Binding::Exit => {
+                // op 0: exit(code: i32) — noreturn. Propagate as a (non-error) trap.
+                let code = as_i32(*args.first().ok_or(Trap::Malformed)?)?;
+                Err(Trap::Exit(code))
+            }
+            Binding::Clock => {
+                // op 0: now(clock_id) -> i64 nanoseconds (deterministic, increasing).
+                let now = self.clock_ns;
+                self.clock_ns = self.clock_ns.wrapping_add(1);
+                Ok(vec![Value::I64(now)])
+            }
+            Binding::Memory => {
+                // map/unmap/protect: the window is eagerly mapped, so these succeed
+                // as no-ops (0); an unknown op is -EINVAL.
+                Ok(vec![Value::I64(if op <= 2 { 0 } else { EINVAL })])
+            }
+        }
+    }
+
+    /// `Stream` ops (§3e D43): 0 `read`, 1 `write`, 2 `close`. Buffers are `(ptr,len)`,
+    /// borrow-only — the host reads/writes the guest window in place after the §7
+    /// trampoline bounds-checks `[ptr,ptr+len) ⊆ [0,size)` (violation → `-EFAULT`).
+    fn stream_op(
+        &mut self,
+        role: StreamRole,
+        op: u32,
+        args: &[Value],
+        mem: &mut Option<Mem>,
+    ) -> Result<Vec<Value>, Trap> {
+        let ret = |v: i64| Ok(vec![Value::I64(v)]);
+        match op {
+            0 => {
+                // read(buf, len) -> bytes read (>=0) or -errno; only stdin is readable.
+                if role != StreamRole::In {
+                    return ret(EINVAL);
+                }
+                let ptr = as_i64(*args.first().ok_or(Trap::Malformed)?)? as u64;
+                let len = as_i64(*args.get(1).ok_or(Trap::Malformed)?)? as u64;
+                let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
+                let n = (len as usize).min(avail.len());
+                let chunk = avail[..n].to_vec();
+                let Some(m) = mem.as_mut() else {
+                    return ret(EFAULT);
+                };
+                if m.write_bytes(ptr, &chunk).is_none() {
+                    return ret(EFAULT);
+                }
+                self.stdin_pos += n;
+                ret(n as i64)
+            }
+            1 => {
+                // write(buf, len) -> bytes written (>=0) or -errno; stdin is not writable.
+                let sink = match role {
+                    StreamRole::Out => &mut self.stdout,
+                    StreamRole::Err => &mut self.stderr,
+                    StreamRole::In => return ret(EINVAL),
+                };
+                let ptr = as_i64(*args.first().ok_or(Trap::Malformed)?)? as u64;
+                let len = as_i64(*args.get(1).ok_or(Trap::Malformed)?)? as u64;
+                let Some(m) = mem.as_ref() else {
+                    return ret(EFAULT);
+                };
+                match m.read_bytes(ptr, len) {
+                    Some(bytes) => {
+                        sink.extend_from_slice(&bytes);
+                        ret(len as i64)
+                    }
+                    None => ret(EFAULT),
+                }
+            }
+            2 => ret(0), // close: no-op in the MVP (exit reclaims all)
+            _ => ret(EINVAL),
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Linear memory — the confinement-masking *reference* (§4, invariant I1)
 // ----------------------------------------------------------------------------
 
@@ -539,6 +818,30 @@ impl Mem {
         // `write_le` keeps only the low `width` bytes, so narrow stores truncate.
         self.write_le(base, width, store_bits(v));
         Ok(())
+    }
+
+    /// Borrow-validate and read a `(ptr, len)` capability buffer (§7): `[ptr, ptr+len)`
+    /// must lie fully within the window. Returns the bytes, or `None` (→ `-EFAULT`).
+    /// Confinement holds regardless; this explicit check is the recoverable guest-bug
+    /// path, not a safety boundary.
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        let end = ptr.checked_add(len)?;
+        if end > self.window.size() {
+            return None;
+        }
+        Some((0..len).map(|k| self.byte(ptr + k)).collect())
+    }
+
+    /// Borrow-validate and write a `(ptr, len)` capability buffer (§7). `None` → `-EFAULT`.
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        let end = ptr.checked_add(data.len() as u64)?;
+        if end > self.window.size() {
+            return None;
+        }
+        for (k, b) in data.iter().enumerate() {
+            self.set_byte(ptr + k as u64, *b);
+        }
+        Some(())
     }
 
     fn read_le(&self, base: u64, width: u32) -> u64 {
