@@ -158,7 +158,91 @@ block3(v18: i64):
     ),
 };
 
-const KERNELS: &[Kernel] = &[ALU, MEMSUM];
+const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER];
+
+/// `(i64 n) -> i64`: like `memsum` but the store and the load go to **different, per-iter
+/// varying** slots — write slot `(i·M1)&1023`, read slot `(i·M2)&1023` (M1,M2 odd, so each
+/// is a bijection mod 1024 → scattered across all slots). This defeats the same-address
+/// bounds-check CSE/prefetch that `memsum` allowed, so it's the harder, more realistic test
+/// of "mask vs bounds check" — does our memory gap survive when accesses are varied?
+const SCATTER: Kernel = Kernel {
+    name: "scatter",
+    ir: "\
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i64.const 2654435761
+  v11 = i64.mul v9 v10
+  v12 = i64.const 1023
+  v13 = i64.and v11 v12
+  v14 = i64.const 8
+  v15 = i64.mul v13 v14
+  i64.store v15 v9
+  v16 = i64.const 2246822519
+  v17 = i64.mul v9 v16
+  v18 = i64.and v17 v12
+  v19 = i64.mul v18 v14
+  v20 = i64.load v19
+  v21 = i64.add v8 v20
+  v22 = i64.const 1
+  v23 = i64.add v9 v22
+  br block1(v7, v21, v23)
+block3(v24: i64):
+  return v24
+}
+",
+    wat32: r#"
+(module
+  (memory 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (i64.store
+          (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2654435761)))
+                            (i32.const 1023)) (i32.const 8))
+          (local.get $i))
+        (local.set $acc
+          (i64.add (local.get $acc)
+            (i64.load
+              (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2246822519)))
+                                (i32.const 1023)) (i32.const 8)))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    wat64: Some(
+        r#"
+(module
+  (memory i64 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (i64.store
+          (i64.mul (i64.and (i64.mul (local.get $i) (i64.const 2654435761))
+                            (i64.const 1023)) (i64.const 8))
+          (local.get $i))
+        (local.set $acc
+          (i64.add (local.get $acc)
+            (i64.load
+              (i64.mul (i64.and (i64.mul (local.get $i) (i64.const 2246822519))
+                                (i64.const 1023)) (i64.const 8)))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    ),
+};
 
 const N_SMALL: i64 = 1_000;
 const N_BIG: i64 = 2_000_000;
@@ -216,7 +300,9 @@ fn main() {
     if !csv {
         println!(
             "SVM JIT vs Wasmtime — both via Cranelift.  ratio = svm / wasm  (<1 = svm faster)\n\
-             Expect: alu compute ≈1×; cold-start <1×; memsum  wasm32 < svm < wasm64.\n\
+             Expect: alu compute ≈1×; cold-start <1×.  Memory: wasm32 < svm always (guard\n\
+             pages are free); svm < wasm64 once addresses *vary* (scatter) so Wasmtime can't\n\
+             CSE the bounds check — memsum (same addr) lets it, so wasm64 looks ~tied there.\n\
              N_big={N_BIG} N_small={N_SMALL}\n"
         );
         println!(

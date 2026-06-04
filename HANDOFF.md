@@ -443,24 +443,25 @@ Have (✅):
   Each kernel is written once in our IR text and once in equivalent WAT (results
   cross-checked before timing); both lower via Cranelift, so it's a like-for-like §1a check.
   Measures steady-state **compute** (per-iteration, isolated by big-vs-small subtraction so
-  compile cancels) and **cold start** (source → first result). The memory kernel is timed
+  compile cancels) and **cold start** (source → first result). The memory kernels are timed
   against **both wasm32 and wasm64** (`Config::wasm_memory64`). `cargo run --release` from
   `bench/`; `--csv` for a line per kernel. **Representative numbers** (ratio = svm ÷ wasm;
   `<1` = svm faster; machine-dependent — watch the *ratio*, not the absolute ns):
   - `alu` (tight i64 mul/add loop): compute **≈1.0–1.05×** (parity, as designed — shared
-    backend); cold start **≈0.3×** (we're ~3× faster — "SSA on the wire, no SSA
+    backend); cold start **≈0.3–0.45×** (we're ~2–3× faster — "SSA on the wire, no SSA
     reconstruction", §1a). *Both theses confirmed.*
-  - `memsum` (store+load per iter): ordering is **wasm32 (~0.75) < wasm64 (~0.97) < svm
-    (~1.16)** ns/it, i.e. svm is **~1.5× slower than wasm32** and **~1.2× slower than
-    wasm64**. Two findings: (a) wasm64's explicit bounds check *is* measurably costlier than
-    wasm32's zero-instruction guard trick (~0.2 ns/it), as §1a predicts; but (b) **§1a's
-    "faster than wasm64" is *not* borne out — we trail both.** Our per-access masking is
-    heavier here than assumed (possibly a redundant mask on the store+load to the *same*
-    address that Cranelift CSEs for Wasmtime but not for us, plus the base-add), and the
-    prescribed **"guard-when-bounded, mask-when-not"** fast path (§1a, D36–D38) is
-    unimplemented. The honest read: the memory path is the real perf gap, worse than the
-    design's optimistic framing — caveat that this is one tiny-window, same-address
-    microbenchmark, so a varied-address workload may differ.
+  - `memsum` (store+load to the **same** address each iter): **wasm32 ~0.69 < svm ~1.10 ≈
+    wasm64 ~1.23** ns/it. svm is ~1.6× wasm32, ~tied with wasm64. Wasmtime CSEs the two
+    bounds checks (same address) into ~one here, so wasm64 looks tied — a flattering case.
+  - `scatter` (store + load to **different, per-iter varying** slots — the realistic test):
+    **wasm32 ~1.03 < svm ~1.58 < wasm64 ~2.0** ns/it → svm **~1.53× slower than wasm32** but
+    **~0.78× = ~1.3× *faster* than wasm64**. With varied addresses Wasmtime can't CSE the
+    check, so wasm64 pays a full bounds check per access (its cost ~doubles vs `memsum`) and
+    **our mask wins** — confirming §1a's "faster than wasm64." The honest net: §1a's *two*
+    memory claims hold directionally — we beat wasm64 (clearly, on varied access) and trail
+    wasm32 — but "wash-or-*slightly* worse than wasm32" is optimistic: we're ~1.5× wasm32,
+    and the prescribed **"guard-when-bounded, mask-when-not"** fast path (§4, D36–D38) that
+    would close it is unimplemented (the JIT always masks).
 
 Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
 regressions one commit old"):
@@ -471,18 +472,17 @@ regressions one commit old"):
 - [ ] **No C-frontend program benches** — e.g. the SSA-promotion win (loop body ~22→0 memory
   ops) is uncaptured end-to-end; nothing would flag it if promotion regressed. The `bench/`
   kernels are hand-written IR, not chibicc output.
-- [ ] **The memory path trails *both* wasm32 (~1.5×) and wasm64 (~1.2×)** — the real perf gap
-  the bench surfaced, two parts: (1) the unimplemented **"guard-when-bounded"** wasm32-style
-  large-guard fast path (§4, D36–D38) closes the wasm32 gap; (2) *separately*, trailing
-  wasm64 means our per-access masking itself is heavier than a bounds check here — worth
-  inspecting the emitted load/store (redundant mask on same-address store+load? base-add?
-  missed CSE?) before assuming guard-when-bounded fixes everything.
+- [ ] **The memory path trails wasm32 ~1.5×** (both kernels) — the real perf gap the bench
+  surfaced. The fix is the design's own unimplemented **"guard-when-bounded, mask-when-not"**
+  wasm32-style large-guard fast path (§4, D36–D38): the JIT masks every access today. (vs
+  wasm64 we're already ahead on varied access — see `scatter` — so this is specifically the
+  wasm32 gap.)
 
 ### Suggested next pickups (ranked)
-1. **Investigate + close the memory-path gap** (the bench's headline finding: svm trails
-   wasm32 ~1.5× *and* wasm64 ~1.2×). Start by reading the JIT's emitted load/store (is the
-   same-address store+load masked twice? base-add hoistable? CSE?), then the design's
-   **"guard-when-bounded, mask-when-not"** fast path (§4, D36–D38) for the wasm32 gap.
+1. **"Guard-when-bounded, mask-when-not" JIT load/store path** (§4, D36–D38) — the bench's
+   headline gap: svm trails wasm32 ~1.5× on both memory kernels because the JIT masks every
+   access, where wasm32 gets a free guard-page access when the offset is provably bounded.
+   This is the design's own prescription and the first measured perf win on the table.
    (Caveat: guard *pages* tie into the Phase-3 trap-catching work.)
 2. **Production trap-catching** (guard pages + signal handler, §4/§5) — the big MVP item;
    also upgrades the escape-oracle from final-memory diff to true fault detection, and backs
