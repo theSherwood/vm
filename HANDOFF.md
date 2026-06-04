@@ -494,11 +494,9 @@ regressions one commit old"):
   `--check` reruns (best-of-`--reps 5`) and **exits non-zero** if any ratio grew past `--tol`
   (default 25%, a band that absorbs runner noise — a real regression like losing mask-elision was
   +26%, losing SSA promotion far more). Verified non-vacuous (a tightened baseline trips it). A
-  **non-gating** `bench` job for `ci.yml` (nightly/`workflow_dispatch`, `continue-on-error`, wide
+  **non-gating** `bench` job in `ci.yml` (nightly/`workflow_dispatch`, `continue-on-error`, wide
   `--tol 0.4`) runs `--check` so a gross regression surfaces without blocking merges on shared-
-  runner noise — it is *written and tested but not committed into `ci.yml`*: pushing workflow files
-  needs the `workflow` OAuth scope, which the session that wrote it lacked, so it ships as a patch:
-  **`git apply bench/ci-bench-job.patch`** then push from an env with `workflow` scope. **Still TODO
+  runner noise. **Still TODO
   (minor):** `crates/svm/src/bin/bench.rs` (the in-tree interp
   throughput bench) still just prints; over-time *storage* of the numbers (vs. recompute-and-compare)
   isn't kept — `--check` compares against the committed baseline, which is enough for "one commit old."
@@ -531,8 +529,7 @@ regressions one commit old"):
    pages are mapped (to stay in differential lockstep) and changes the masking constant.
 2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
    `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
-   win end-to-end at ≈parity — see Benchmarking gaps). The non-gating CI `bench` job ships as
-   **`bench/ci-bench-job.patch`** (`git apply` it — workflow-scope push restriction kept it out of `ci.yml`).
+   win end-to-end at ≈parity — see Benchmarking gaps); a non-gating nightly CI `bench` job runs `--check`.
 3. **Real Memory capability** (`map`/`unmap`/`protect` beyond no-op stubs) — guest-visible
    virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`. Natural
    companion to (1) (demand paging reuses the fault handler).
@@ -542,6 +539,6 @@ CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounde
 loops + indirect calls in the generative fuzzer; guard pages + signal-handler detect-and-kill;
 **over-time bench regression tracking** (`bench/ --save-baseline`/`--check` vs a committed
 ratio baseline, + an `alu_c` chibicc-compiled kernel tracking the SSA-promotion win end-to-end;
-a non-gating nightly CI `bench` job ships as `bench/ci-bench-job.patch` — workflow-scope push
-restriction); **a structural SSA-promotion guard** (`c_frontend` asserts zero loop-body memory ops on
+a non-gating nightly CI `bench` job running `--check`); **a structural SSA-promotion guard**
+(`c_frontend` asserts zero loop-body memory ops on
 promotable loops, so the promotion win can't silently regress).)*
