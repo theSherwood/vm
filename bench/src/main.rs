@@ -14,6 +14,10 @@
 //!
 //! Each kernel is written once in our IR text and once (or twice) in equivalent WAT; we
 //! assert all engines agree on the result before timing (so we never benchmark a miscompile).
+//! One kernel (`alu_c`) instead gets its IR from the **chibicc frontend** (the same recurrence
+//! as `alu`, compiled from C), so its steady-state time tracks the **SSA-promotion win
+//! end-to-end** — it should stay at ≈parity with `alu`; if a promotable loop body regressed to
+//! memory it would drift toward the memory-bound path. It is skipped if the frontend can't build.
 //!
 //! Methodology (kept simple + dependency-light, like `crates/svm/src/bin/bench.rs`):
 //!   - *compute* is isolated by **subtraction**: time the kernel at a large and a small
@@ -259,12 +263,122 @@ block3(v24: i64):
 const N_SMALL: i64 = 1_000;
 const N_BIG: i64 = 2_000_000;
 
-/// Compile + run our IR entry once and return the single `i64` result.
-fn svm_call(m: &svm_ir::Module, n: i64) -> i64 {
-    match compile_and_run(m, 0, &[n]) {
+/// Compile + run a kernel's IR entry once and return the single `i64` result. `lead` is the
+/// fixed leading args (e.g. the data-stack pointer chibicc threads as v0); `n` is appended.
+fn svm_call(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
+    let mut args: Vec<i64> = lead.to_vec();
+    args.push(n);
+    match compile_and_run(m, entry, &args) {
         Ok(JitOutcome::Returned(s)) => s[0],
         other => panic!("svm jit produced {other:?}"),
     }
+}
+
+/// A kernel resolved for this run: IR text — hand-written, or generated from C through the
+/// chibicc frontend — plus how to invoke its entry. `svm_call` appends `n` after `lead_args`.
+struct Resolved {
+    name: String,
+    ir: String,
+    entry: u32,
+    lead_args: Vec<i64>,
+    wat32: String,
+    wat64: Option<String>,
+}
+
+/// The hand-written [`KERNELS`] plus, when the C frontend is buildable, the `alu_c` kernel
+/// (same algorithm as `alu`, but lowered from C — see [`alu_from_c`]).
+fn resolve_kernels() -> Vec<Resolved> {
+    let mut v: Vec<Resolved> = KERNELS
+        .iter()
+        .map(|k| Resolved {
+            name: k.name.to_string(),
+            ir: k.ir.to_string(),
+            entry: 0,
+            lead_args: Vec::new(),
+            wat32: k.wat32.to_string(),
+            wat64: k.wat64.map(|w| w.to_string()),
+        })
+        .collect();
+    match alu_from_c() {
+        Ok(r) => v.push(r),
+        Err(e) => eprintln!("note: skipping the `alu_c` kernel (C frontend unavailable): {e}"),
+    }
+    v
+}
+
+/// The same LCG recurrence as `alu`, but lowered from C through the chibicc frontend — so its
+/// steady-state time tracks the **SSA-promotion win end-to-end**: if a promotable loop body
+/// regressed back to memory, `alu_c` would drift toward the memory-bound path while the
+/// hand-written (already register-only) `alu` would not. Reuses `alu`'s WAT as the oracle,
+/// since the algorithm is identical. Returns `Err` (caller skips it) if the frontend is absent.
+fn alu_from_c() -> Result<Resolved, String> {
+    const SRC: &str = "long run(long n){\n  long acc = 0;\n  \
+        for (long i = 0; i < n; i++)\n    \
+        acc = acc * 6364136223846793005L + 1442695040888963407L + i;\n  \
+        return acc;\n}\nint main(){ return (int)run(0); }\n";
+    let ir = compile_c_to_ir(SRC)?;
+    let m = svm_text::parse_module(&ir).map_err(|e| format!("parse frontend IR: {e:?}"))?;
+    // Find `run` by signature: the unique `(i64, i64) -> (i64)` function (`main` returns i32,
+    // `_start` takes three i32s). Robust against the frontend's function ordering.
+    let entry = m
+        .funcs
+        .iter()
+        .position(|f| {
+            f.params == [svm_ir::ValType::I64, svm_ir::ValType::I64]
+                && f.results == [svm_ir::ValType::I64]
+        })
+        .ok_or("no `run(i64,i64)->i64` entry in frontend output")? as u32;
+    Ok(Resolved {
+        name: "alu_c".to_string(),
+        ir,
+        entry,
+        // `run` threads the data-stack pointer as v0; the body is fully promoted so it is never
+        // used (Cranelift DCEs it) — any value works. `n` is appended by `svm_call`.
+        lead_args: vec![0],
+        wat32: ALU.wat32.to_string(),
+        wat64: None,
+    })
+}
+
+/// Build the chibicc fork (idempotent `make`) and compile `src` to our text IR. Returns `Err`
+/// (so the caller can skip the kernel) if the C toolchain / frontend is unavailable.
+fn compile_c_to_ir(src: &str) -> Result<String, String> {
+    use std::process::Command;
+    // `CARGO_MANIFEST_DIR` is `<repo>/bench`; the frontend lives at `<repo>/frontend/chibicc`.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("no repo root above CARGO_MANIFEST_DIR")?;
+    let dir = root.join("frontend/chibicc");
+    let ok = Command::new("make")
+        .arg("-s")
+        .current_dir(&dir)
+        .status()
+        .map_err(|e| format!("run make: {e}"))?
+        .success();
+    if !ok {
+        return Err("chibicc build failed".into());
+    }
+    let base = std::env::temp_dir().join(format!("svm_bench_{}", std::process::id()));
+    let cfile = base.with_extension("c");
+    let irfile = base.with_extension("svm");
+    std::fs::write(&cfile, src).map_err(|e| format!("write temp C: {e}"))?;
+    let ok = Command::new(dir.join("chibicc"))
+        .args([
+            "-cc1",
+            "--emit-ir",
+            "-cc1-input",
+            cfile.to_str().unwrap(),
+            "-cc1-output",
+            irfile.to_str().unwrap(),
+            cfile.to_str().unwrap(),
+        ])
+        .status()
+        .map_err(|e| format!("run chibicc: {e}"))?
+        .success();
+    if !ok {
+        return Err("chibicc --emit-ir failed".into());
+    }
+    std::fs::read_to_string(&irfile).map_err(|e| format!("read frontend IR: {e}"))
 }
 
 /// Compile + instantiate a wasm module and return its `(i64) -> i64` entry, store and all.
@@ -325,15 +439,17 @@ impl Raw {
 
 /// Time one kernel, taking the **best (min)** of `reps` passes per engine. Cross-checks every
 /// engine agrees on the result first, so we never benchmark a miscompile.
-fn measure(engine: &Engine, k: &Kernel, reps: u32) -> Raw {
-    let m = svm_text::parse_module(k.ir).expect("parse our IR text");
-    let wasm32 = wat::parse_str(k.wat32).expect("assemble wasm32 WAT");
+fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
+    let m = svm_text::parse_module(&k.ir).expect("parse our IR text");
+    let wasm32 = wat::parse_str(&k.wat32).expect("assemble wasm32 WAT");
     let wasm64 = k
         .wat64
+        .as_deref()
         .map(|wat| wat::parse_str(wat).expect("assemble wasm64 WAT"));
+    let svm = |n: i64| svm_call(&m, k.entry, &k.lead_args, n);
 
     // Cross-check every engine agrees before timing (never benchmark a miscompile).
-    let ours = svm_call(&m, N_SMALL);
+    let ours = svm(N_SMALL);
     {
         let (mut s32, run32) = wasm_entry(engine, &wasm32);
         assert_eq!(
@@ -363,10 +479,10 @@ fn measure(engine: &Engine, k: &Kernel, reps: u32) -> Raw {
     for _ in 0..reps.max(1) {
         // --- steady-state compute (subtraction isolates the loop body) ---
         let svm_big = per_call(25, || {
-            black_box(svm_call(&m, N_BIG));
+            black_box(svm(N_BIG));
         });
         let svm_small = per_call(25, || {
-            black_box(svm_call(&m, N_SMALL));
+            black_box(svm(N_SMALL));
         });
         raw.svm_ns = raw
             .svm_ns
@@ -383,7 +499,7 @@ fn measure(engine: &Engine, k: &Kernel, reps: u32) -> Raw {
 
         // --- cold start: source bytes → first result for a trivial (n=0) program (wasm32) ---
         let svm_cold = per_call(60, || {
-            black_box(svm_call(&m, 0));
+            black_box(svm(0));
         }) * 1e3;
         raw.svm_cold = raw.svm_cold.min(svm_cold);
         let wmt_cold = per_call(60, || {
@@ -404,7 +520,7 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 /// Write the tracked ratios to a baseline file (`kernel,compute32,compute64,cold`; `NA` for a
 /// kernel with no wasm64 form). The header documents what the numbers are + how to regenerate.
-fn save_baseline(path: &str, results: &[(&Kernel, Raw)]) {
+fn save_baseline(path: &str, results: &[(Resolved, Raw)]) {
     let mut out = String::from(
         "# svm-bench baseline — the tracked signal is the RATIO (svm / wasm), which is far more\n\
          # portable across machines than the absolute ns. `--check` flags any ratio that grew\n\
@@ -457,7 +573,7 @@ fn load_baseline(path: &str) -> std::collections::HashMap<String, BaseRow> {
 /// Rerun, compare each ratio to the baseline, print a table, and return `true` if **no** ratio
 /// regressed past `tol` (a fractional increase, e.g. `0.25` = 25%). A missing baseline kernel
 /// is reported but not a regression; an unexpectedly *improved* ratio just prints `ok`.
-fn check_baseline(path: &str, results: &[(&Kernel, Raw)], tol: f64) -> bool {
+fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
     let base = load_baseline(path);
     println!(
         "regression check vs {path}  (tol {:.0}%, ratio = svm/wasm, lower is better)\n",
@@ -469,7 +585,7 @@ fn check_baseline(path: &str, results: &[(&Kernel, Raw)], tol: f64) -> bool {
     );
     let mut ok = true;
     for (k, raw) in results {
-        let Some(b) = base.get(k.name) else {
+        let Some(b) = base.get(k.name.as_str()) else {
             println!(
                 "{:<8} {:<16} {:>9} {:>9} {:>8}  MISSING",
                 k.name, "(all)", "-", "-", "-"
@@ -509,7 +625,7 @@ fn check_baseline(path: &str, results: &[(&Kernel, Raw)], tol: f64) -> bool {
     ok
 }
 
-fn print_table(results: &[(&Kernel, Raw)]) {
+fn print_table(results: &[(Resolved, Raw)]) {
     println!(
         "SVM JIT vs Wasmtime — both via Cranelift.  ratio = svm / wasm  (<1 = svm faster)\n\
          Expect: alu compute ≈1×; cold-start <1×.  Memory: wasm32 < svm always (guard\n\
@@ -538,7 +654,7 @@ fn print_table(results: &[(&Kernel, Raw)]) {
     }
 }
 
-fn print_csv(results: &[(&Kernel, Raw)]) {
+fn print_csv(results: &[(Resolved, Raw)]) {
     for (k, raw) in results {
         let (c32, c64, cold) = raw.ratios();
         let (w64s, r64) = match (raw.w64_ns, c64) {
@@ -576,9 +692,12 @@ fn main() {
     config.wasm_memory64(true);
     let engine = Engine::new(&config).expect("engine");
 
-    let results: Vec<(&Kernel, Raw)> = KERNELS
-        .iter()
-        .map(|k| (k, measure(&engine, k, reps)))
+    let results: Vec<(Resolved, Raw)> = resolve_kernels()
+        .into_iter()
+        .map(|k| {
+            let raw = measure(&engine, &k, reps);
+            (k, raw)
+        })
         .collect();
 
     if let Some(path) = save {

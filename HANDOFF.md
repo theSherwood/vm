@@ -488,25 +488,28 @@ Have (✅):
 
 Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
 regressions one commit old"):
-- [~] **Over-time tracking — *tool done*, no CI job yet.** `bench/` now has
+- [x] **Over-time tracking — *done* (tool + non-gating CI).** `bench/` has
   **`--save-baseline FILE`** / **`--check FILE`**: the committed **`bench/baseline.txt`** records
   the per-kernel **ratios** (svm÷wasm — the machine-portable signal, not the absolute ns), and
   `--check` reruns (best-of-`--reps 5`) and **exits non-zero** if any ratio grew past `--tol`
   (default 25%, a band that absorbs runner noise — a real regression like losing mask-elision was
-  +26%, losing SSA promotion far more). Verified non-vacuous (a tightened baseline trips it).
-  So a regression *can* now be caught one commit old by running `--check` locally. **Still TODO:**
-  wire it into CI (awkward — noisy shared runners; a `workflow_dispatch`/nightly `--check` that
-  warns rather than gates is the likely shape), and `crates/svm/src/bin/bench.rs` (the in-tree
-  interp throughput bench) still just prints.
-- [~] **C-frontend promotion guard — *structural test done*, timing bench not.** The headline
-  §3 SSA-promotion win (loop body ~22→0 memory ops) is now pinned **deterministically** by
+  +26%, losing SSA promotion far more). Verified non-vacuous (a tightened baseline trips it). A
+  **non-gating** `bench` job for `ci.yml` (nightly/`workflow_dispatch`, `continue-on-error`, wide
+  `--tol 0.4`) runs `--check` so a gross regression surfaces without blocking merges on shared-
+  runner noise — it is *written and tested locally but not yet committed*: pushing workflow files
+  needs the `workflow` OAuth scope, which the session that wrote it lacked, so apply that one
+  `ci.yml` hunk by hand. **Still TODO (minor):** `crates/svm/src/bin/bench.rs` (the in-tree interp
+  throughput bench) still just prints; over-time *storage* of the numbers (vs. recompute-and-compare)
+  isn't kept — `--check` compares against the committed baseline, which is enough for "one commit old."
+- [x] **C-frontend promotion guard — *done* (structural test + `alu_c` timing kernel).** The
+  headline §3 SSA-promotion win (loop body ~22→0 memory ops) is pinned **deterministically** by
   `c_frontend::c_ssa_promotion_eliminates_loop_body_memory_ops`: it compiles promotable hot loops
   and asserts **zero** `Load`/`Store` outside each function's entry block (`loop_region_mem_ops`),
-  with an address-taken control proving the metric isn't blind. This catches a promotion
-  regression one commit old in CI, without timing noise — a better guard for *this* optimization
-  than a wall-clock bench. **Still TODO (optional):** an end-to-end *timing* kernel in `bench/`
-  from chibicc output (the `bench/` kernels are still hand-written IR), if we want the wall-clock
-  win tracked too.
+  with an address-taken control proving the metric isn't blind — a promotion regression fails the
+  gating job one commit old, with no timing noise. The **wall-clock** win is now *also* tracked:
+  the `bench/` **`alu_c`** kernel takes its IR from chibicc (same recurrence as `alu`, compiled
+  from C) and times it — it sits at ≈parity with `alu` (compute ratio ~1.02× here); a loop body
+  regressing to memory would drift it toward the memory-bound path.
 - [x] **Mask elision (§1a "mask-when-not", D36–D38)** — *done*: a conservative upper-bound
   analysis in the JIT (`ub_of`/`in_window`) drops the `& mask` when the address is provably
   `< size`, closing ~half the wasm32 gap (memsum 1.6→1.36×, scatter 1.53→1.21×) and widening
@@ -525,10 +528,10 @@ regressions one commit old"):
    guard and the JIT can elide the mask without a proof (the wasm32 fast path), closing the
    residual ~1.2–1.36× gap incl. data-SP–relative C locals. Needs the interp to model which
    pages are mapped (to stay in differential lockstep) and changes the masking constant.
-2. ~~**Over-time bench tracking**~~ — **tool DONE** (`bench/ --save-baseline`/`--check` vs
-   committed `bench/baseline.txt`, ratio-based, non-vacuous; see Benchmarking gaps). Remaining:
-   wire a non-gating CI/nightly `--check`, and add a C-frontend program kernel (below) so the
-   SSA-promotion win is tracked end-to-end.
+2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
+   `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
+   win end-to-end at ≈parity — see Benchmarking gaps). The non-gating CI `bench` job is written but
+   **needs to be applied to `ci.yml` by hand** (workflow-scope push restriction).
 3. **Real Memory capability** (`map`/`unmap`/`protect` beyond no-op stubs) — guest-visible
    virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`. Natural
    companion to (1) (demand paging reuses the fault handler).
@@ -537,5 +540,7 @@ regressions one commit old"):
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
 loops + indirect calls in the generative fuzzer; guard pages + signal-handler detect-and-kill;
 **over-time bench regression tracking** (`bench/ --save-baseline`/`--check` vs a committed
-ratio baseline); **a structural SSA-promotion guard** (`c_frontend` asserts zero loop-body
-memory ops on promotable loops, so the promotion win can't silently regress).)*
+ratio baseline, + an `alu_c` chibicc-compiled kernel tracking the SSA-promotion win end-to-end;
+a non-gating nightly CI `bench` job is written but needs hand-applying to `ci.yml` — workflow
+scope); **a structural SSA-promotion guard** (`c_frontend` asserts zero loop-body memory ops on
+promotable loops, so the promotion win can't silently regress).)*
