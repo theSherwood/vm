@@ -15,7 +15,10 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > the function table, `select`, `br_table`, `unreachable`) plus **capabilities**
 > (`cap.call` over a host-owned handle table, and the MVP powerbox — `Stream` / `Exit`
 > / `Clock` / `Memory`, §3c/§3e) flow through text ⇄ binary ⇄ verifier ⇄ reference
-> interpreter, with the masking unit isolated and fuzzed. The **Cranelift JIT** (§9)
+> interpreter, with the masking unit isolated and fuzzed, and a **generative
+> interpreter-vs-JIT differential fuzzer** (a verifier-valid IR generator → both backends
+> must agree on result + trap; stable-CI seed loop + a libFuzzer `diff` target). The
+> **Cranelift JIT** (§9)
 > now lowers the **entire IR** — integer/float ops, conversions, the §4 memory
 > **masking lowering** (I1), function-table **indirect-call dispatch** (I2), direct/
 > indirect/tail calls, trap detection, and **`cap.call` through a host thunk** — all

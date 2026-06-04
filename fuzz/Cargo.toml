@@ -14,9 +14,11 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 svm = { path = "../crates/svm" }
+svm-ir = { path = "../crates/svm-ir" }
 svm-encode = { path = "../crates/svm-encode" }
 svm-verify = { path = "../crates/svm-verify" }
 svm-interp = { path = "../crates/svm-interp" }
+svm-jit = { path = "../crates/svm-jit" }
 svm-mask = { path = "../crates/svm-mask" }
 svm-text = { path = "../crates/svm-text" }
 
@@ -37,6 +39,13 @@ bench = false
 [[bin]]
 name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diff"
+path = "fuzz_targets/diff.rs"
 test = false
 doc = false
 bench = false
