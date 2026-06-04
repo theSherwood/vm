@@ -75,7 +75,14 @@ mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill h
 /// Largest window the reference JIT will back with a host allocation. Real deployments
 /// reserve a huge guard-paged virtual range (§4); for the differential harness we map
 /// `1 << size_log2` bytes (+ a guard page on unix), so cap it.
-const MAX_JIT_WINDOW_LOG2: u8 = 26; // 64 MiB
+const MAX_JIT_WINDOW_LOG2: u8 = 26; // 64 MiB (the backed `mapped` extent)
+
+/// Largest **reserved** virtual range (the mask domain) the reference JIT will `mmap` per
+/// window. The reservation is `PROT_NONE` + `MAP_NORESERVE`, so this is virtual address space,
+/// not committed memory; `2^40` matches `DESIGN.md` §4's host-configurable example. A real host
+/// chooses this per its VA budget; the reference just caps it so a fuzzed/oversized request
+/// can't ask for an absurd reservation.
+const MAX_JIT_RESERVED_LOG2: u8 = 40; // 1 TiB of reserved VA (lazy)
 
 /// A function-table entry (§3c `FnEntry`): host-owned, guest-unwritable. `type_id`
 /// identifies the signature (distinct-`FuncType` index); `code` is the finalized
@@ -284,7 +291,9 @@ pub fn compile_and_run_with_host(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
 ) -> Result<JitOutcome, JitError> {
-    Ok(run_inner(m, func, args, cap_thunk, cap_ctx, None)?.0)
+    // Fully-mapped window (`reserved_log2 = 0` ⇒ raised to `mapped`); callers needing a larger
+    // reserved range use the `_reserved` capture entry.
+    Ok(run_inner(m, func, args, cap_thunk, cap_ctx, None, 0)?.0)
 }
 
 /// Like [`compile_and_run`], but seed the guest window with `init_mem` (its low bytes) and
@@ -298,6 +307,24 @@ pub fn compile_and_run_capture(
     args: &[i64],
     init_mem: &[u8],
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    // Fully-mapped window (`reserved == mapped`): historical behaviour.
+    compile_and_run_capture_reserved(m, func, args, init_mem, 0)
+}
+
+/// Like [`compile_and_run_capture`], but with a host **reservation policy**: the window masks
+/// into `[0, 2^reserved_log2)` (the mask domain) while only the declared `1 << size_log2` bytes
+/// are backed — an access into the reserved-but-unmapped tail faults (§4 "guard-when-bounded";
+/// detect-and-kill, §5). `reserved_log2` is raised to at least `size_log2` (so `0` ⇒ fully
+/// mapped) and capped at the reference JIT's [`MAX_JIT_RESERVED_LOG2`]. This is the JIT side of
+/// the escape-oracle under the decoupled `reserved`/`mapped` model; both backends must be driven
+/// with the *same* `reserved_log2` to stay in differential lockstep.
+pub fn compile_and_run_capture_reserved(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    reserved_log2: u8,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
     run_inner(
         m,
         func,
@@ -305,6 +332,7 @@ pub fn compile_and_run_capture(
         empty_cap_thunk,
         core::ptr::null_mut(),
         Some(init_mem),
+        reserved_log2,
     )
 }
 
@@ -315,6 +343,7 @@ fn run_inner(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     init_mem: Option<&[u8]>,
+    reserved_log2: u8,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // Calls can reach any function, so every function must be lowerable.
@@ -322,8 +351,10 @@ fn run_inner(
         ensure_supported(f)?;
     }
 
-    // Allocate the guest window (zeroed, + a PROT_NONE guard page on unix) if the module
-    // declares memory. `mask` is the §4 confinement mask; `mem_base` is null when none.
+    // Allocate the guest window if the module declares memory: `mapped` backed RW bytes inside
+    // a host-configured `reserved` virtual range whose unmapped tail + guard page fault (§4).
+    // `mask` is the §4 confinement mask (`reserved − 1`, the mask domain); `win_size` is the
+    // backed `mapped` extent (what we seed/snapshot); `mem_base` is null when none.
     let (mut window, mask, win_size): (mem::GuestWindow, u64, usize) = match m.memory {
         Some(mc) => {
             if mc.size_log2 > MAX_JIT_WINDOW_LOG2 {
@@ -331,10 +362,18 @@ fn run_inner(
                     "window too large for the reference JIT",
                 ));
             }
-            let size = 1usize << mc.size_log2;
-            (mem::GuestWindow::new(size), (size as u64) - 1, size)
+            let mapped = 1usize << mc.size_log2;
+            // Host reservation policy: at least `mapped` (fully mapped if `reserved_log2` is
+            // smaller, e.g. 0), capped so the reference JIT's reservation stays sane.
+            let reserved_log2 = reserved_log2.max(mc.size_log2).min(MAX_JIT_RESERVED_LOG2);
+            let reserved = 1usize << reserved_log2;
+            (
+                mem::GuestWindow::new(mapped, reserved),
+                (1u64 << reserved_log2) - 1,
+                mapped,
+            )
         }
-        None => (mem::GuestWindow::new(0), 0, 0),
+        None => (mem::GuestWindow::new(0, 0), 0, 0),
     };
     // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
     if let Some(init) = init_mem {

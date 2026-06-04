@@ -108,13 +108,32 @@ pub fn run_capture(
     fuel: &mut u64,
     init_mem: &[u8],
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+    // Fully-mapped window (`reserved == mapped`): historical behaviour.
+    run_capture_reserved(m, func, args, fuel, init_mem, 0)
+}
+
+/// Like [`run_capture`], but with a host **reservation policy**: confinement masks into
+/// `[0, 2^reserved_log2)` while only the declared `1 << size_log2` bytes are backed, so an
+/// access into the reserved-but-unmapped tail faults (`Trap::MemoryFault`) instead of wrapping
+/// (the deliberate I1 change for the §4 "guard-when-bounded" model). `reserved_log2` is raised
+/// to at least `size_log2` (so `0` ⇒ fully mapped). This is the interpreter side of the
+/// escape-oracle under the decoupled model and must be driven with the **same** `reserved_log2`
+/// as the JIT's [`svm_jit::compile_and_run_capture_reserved`] to stay in differential lockstep.
+pub fn run_capture_reserved(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    reserved_log2: u8,
+) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
     let mut host = Host::new();
     let f = match m.funcs.get(func as usize) {
         Some(f) => f,
         None => return (Err(Trap::Malformed), Vec::new()),
     };
     let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::new(mc.size_log2);
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm
     });
@@ -877,9 +896,20 @@ struct Mem {
 }
 
 impl Mem {
+    /// A fully-mapped window of `1 << size_log2` bytes (`mapped == reserved`).
     fn new(size_log2: u8) -> Mem {
+        Mem::with_reservation(size_log2, size_log2)
+    }
+
+    /// A window whose mask domain is `1 << reserved_log2` bytes but whose backed region is the
+    /// declared `1 << mapped_log2` prefix; an access into the reserved-but-unmapped tail faults
+    /// (the §4 "guard-when-bounded" model). `reserved_log2` is raised to at least `mapped_log2`,
+    /// so passing `0` yields a fully-mapped window. Lazy paging means a huge mask domain (or
+    /// reservation) never eagerly allocates.
+    fn with_reservation(reserved_log2: u8, mapped_log2: u8) -> Mem {
+        let reserved_log2 = reserved_log2.max(mapped_log2);
         Mem {
-            window: Window::new(size_log2),
+            window: Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63)),
             pages: BTreeMap::new(),
         }
     }
@@ -912,7 +942,7 @@ impl Mem {
     /// path, not a safety boundary.
     fn read_bytes_impl(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         let end = ptr.checked_add(len)?;
-        if end > self.window.size() {
+        if end > self.window.mapped() {
             return None;
         }
         Some((0..len).map(|k| self.byte(ptr + k)).collect())
@@ -921,7 +951,7 @@ impl Mem {
     /// Borrow-validate and write a `(ptr, len)` capability buffer (§7). `None` → `-EFAULT`.
     fn write_bytes_impl(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
         let end = ptr.checked_add(data.len() as u64)?;
-        if end > self.window.size() {
+        if end > self.window.mapped() {
             return None;
         }
         for (k, b) in data.iter().enumerate() {
@@ -960,15 +990,15 @@ impl Mem {
     /// Seed the low bytes of the window from `init` (escape-oracle, §18). Bytes past the
     /// window size are ignored — confinement only concerns `[0, size)`.
     fn seed(&mut self, init: &[u8]) {
-        let n = (init.len() as u64).min(self.window.size());
+        let n = (init.len() as u64).min(self.window.mapped());
         for i in 0..n {
             self.set_byte(i, init[i as usize]);
         }
     }
 
-    /// Snapshot the low `n` bytes of the window (clamped to the window size).
+    /// Snapshot the low `n` bytes of the window (clamped to the backed `mapped` extent).
     fn snapshot(&self, n: u64) -> Vec<u8> {
-        let n = n.min(self.window.size());
+        let n = n.min(self.window.mapped());
         (0..n).map(|i| self.byte(i)).collect()
     }
 }

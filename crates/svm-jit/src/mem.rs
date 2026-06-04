@@ -55,52 +55,72 @@ mod imp {
         (n + align - 1) & !(align - 1)
     }
 
-    /// An `mmap`'d guest window: `rw` readable/writable bytes (≥ `size`, page-rounded)
-    /// followed by one `PROT_NONE` guard page. `size` is the logical window `[0, size)`.
+    /// An `mmap`'d guest window: `mapped` readable/writable bytes (the backed prefix,
+    /// `[0, mapped)`) inside a larger `reserved` virtual range whose tail `[mapped, reserved)`
+    /// plus one trailing `PROT_NONE` guard page are unmapped. Confinement masks every address
+    /// into `[0, reserved)` (the JIT mask const = `reserved − 1`), so an access lands either in
+    /// the backed prefix or in the unmapped tail/guard — where it faults (§4/§5 detect-and-kill).
+    /// A fully-mapped window is just `reserved == mapped` (the historical single-extent case).
     pub(crate) struct GuestWindow {
         base: *mut u8,
-        size: usize,
-        total: usize, // rw + guard page (the full mapping length)
+        mapped: usize, // backed RW bytes `[0, mapped)` (the logical window the guest declared)
+        total: usize,  // full mapping length: reserved (page-rounded) + one guard page
     }
 
     impl GuestWindow {
-        pub(crate) fn new(size: usize) -> GuestWindow {
-            if size == 0 {
+        /// Reserve `reserved` bytes (page-rounded) + a guard page as `PROT_NONE`, then make the
+        /// `mapped` backed prefix readable/writable. `reserved` is raised to at least `mapped`.
+        ///
+        /// For the unmapped tail's fault boundary to agree with the interpreter's byte-exact
+        /// `mapped` bound, `mapped` must be page-aligned whenever `reserved > mapped` — true for
+        /// any `size_log2 >= 12`, which every caller of the decoupled form satisfies.
+        pub(crate) fn new(mapped: usize, reserved: usize) -> GuestWindow {
+            if mapped == 0 {
                 return GuestWindow {
                     base: std::ptr::null_mut(),
-                    size: 0,
+                    mapped: 0,
                     total: 0,
                 };
             }
             let page = page_size();
-            let rw = round_up(size, page);
-            let total = rw + page; // one guard page after the rw region
-                                   // SAFETY: a fresh anonymous mapping; checked against MAP_FAILED below.
+            let reserved = reserved.max(mapped);
+            let rw = round_up(mapped, page);
+            let total = round_up(reserved, page) + page; // reserved + one guard page
+                                                         // SAFETY: a fresh anonymous reservation; MAP_NORESERVE so a huge `reserved` costs
+                                                         // only virtual address space (no commit) until pages are touched. Checked below.
             let base = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
                     total,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                     -1,
                     0,
                 )
             };
             assert!(base != libc::MAP_FAILED, "svm-jit: window mmap failed");
             let base = base as *mut u8;
-            // SAFETY: protect the trailing page so any access past `rw` faults.
-            let rc = unsafe { libc::mprotect(base.add(rw) as *mut c_void, page, libc::PROT_NONE) };
-            assert!(rc == 0, "svm-jit: guard-page mprotect failed");
-            GuestWindow { base, size, total }
+            // SAFETY: make the backed prefix `[0, rw)` readable/writable; the tail + guard stay
+            // PROT_NONE so any access past `mapped` faults.
+            let rc = unsafe {
+                libc::mprotect(base as *mut c_void, rw, libc::PROT_READ | libc::PROT_WRITE)
+            };
+            assert!(rc == 0, "svm-jit: window mprotect failed");
+            GuestWindow {
+                base,
+                mapped,
+                total,
+            }
         }
 
-        /// The logical window `[0, size)`, readable/writable (anonymous mmap is zeroed).
+        /// The logical (backed) window `[0, mapped)`, readable/writable (anonymous mmap is
+        /// zeroed). Bytes in the reserved-but-unmapped tail are not part of this slice.
         pub(crate) fn rw_mut(&mut self) -> &mut [u8] {
-            if self.size == 0 {
+            if self.mapped == 0 {
                 return &mut [];
             }
-            // SAFETY: `[base, base+size)` is mapped RW for the window's lifetime.
-            unsafe { std::slice::from_raw_parts_mut(self.base, self.size) }
+            // SAFETY: `[base, base+mapped)` is mapped RW for the window's lifetime.
+            unsafe { std::slice::from_raw_parts_mut(self.base, self.mapped) }
         }
 
         pub(crate) fn base(&self) -> *mut u8 {
@@ -108,9 +128,10 @@ mod imp {
         }
 
         /// The address range a fault must land in to be attributed to this window (the whole
-        /// mapping, so the guard page is covered). `(0, 0)` when there is no window.
+        /// reservation, so the unmapped tail + guard page are covered). `(0, 0)` when there is
+        /// no window.
         fn fault_range(&self) -> (usize, usize) {
-            if self.size == 0 {
+            if self.mapped == 0 {
                 (0, 0)
             } else {
                 (self.base as usize, self.base as usize + self.total)
@@ -177,7 +198,7 @@ mod imp {
     // than a pile of "unresolved import" follow-on errors.
     pub(crate) struct GuestWindow;
     impl GuestWindow {
-        pub(crate) fn new(_size: usize) -> GuestWindow {
+        pub(crate) fn new(_mapped: usize, _reserved: usize) -> GuestWindow {
             GuestWindow
         }
         pub(crate) fn rw_mut(&mut self) -> &mut [u8] {
