@@ -227,7 +227,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
     let nfuncs = sigs.len();
     let can_call = fi + 1 < nfuncs;
     loop {
-        match bb.g.below(18) {
+        match bb.g.below(19) {
             0 => {
                 let ty = bb.g.inttype();
                 let op = BinOp::from_index(bb.g.below(15) as u8).unwrap();
@@ -386,6 +386,39 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     let args: Vec<ValIdx> = (0..4).map(|_| bb.want(ValType::I32)).collect();
                     bb.push0(Inst::CallIndirect { ty, idx, args });
                 }
+            }
+            18 => {
+                // cap.call with an *ungranted* handle. The fuzzer grants no capabilities, so
+                // the handle resolves to nothing in the host-owned table and the call is
+                // **inert** — it traps `CapFault` on both backends (interp: empty `Host`; JIT:
+                // `empty_cap_thunk`), so they agree under the both-trap rule. This is the I2
+                // check for capabilities (§3c: "a forged handle is inert — never host memory or
+                // arbitrary code") and the first *generative* exercise of the JIT's cap.call
+                // lowering (handle marshalling + thunk ABI + trap plumbing). The signature is
+                // int-typed so the (dead, post-trap) result values keep the pool float-free.
+                // NB: only the fault path is covered — the *success* path needs a deterministic
+                // mock powerbox granted identically to both backends (future work, see HANDOFF).
+                let params: Vec<ValType> =
+                    (0..bb.g.below(4)).map(|_| bb.g.inttype().val()).collect();
+                let results: Vec<ValType> =
+                    (0..bb.g.below(3)).map(|_| bb.g.inttype().val()).collect();
+                let handle = bb.want(ValType::I32);
+                let args: Vec<ValIdx> = params.iter().map(|&t| bb.want(t)).collect();
+                let (type_id, op) = (bb.g.below(256), bb.g.below(256));
+                let sig = FuncType {
+                    params,
+                    results: results.clone(),
+                };
+                bb.push_multi(
+                    Inst::CapCall {
+                        type_id,
+                        op,
+                        sig,
+                        handle,
+                        args,
+                    },
+                    &results,
+                );
             }
             _ => continue, // a mem/call kind that isn't available here — re-roll
         }

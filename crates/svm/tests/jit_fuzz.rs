@@ -21,12 +21,12 @@ fn jit_matches_interp_on_generated_modules() {
     }
 }
 
-/// Guard that the generator actually covers loops (back-edges) and indirect calls — so the
-/// differential above is exercising them, not silently regressing to forward-only DAGs.
+/// Guard that the generator actually covers loops (back-edges), indirect calls, and cap.calls —
+/// so the differential above is exercising them, not silently regressing to forward-only DAGs.
 #[test]
-fn generator_covers_loops_and_indirect_calls() {
+fn generator_covers_loops_indirect_and_cap_calls() {
     use svm_ir::{Inst, Terminator};
-    let (mut loops, mut indirect) = (0u32, 0u32);
+    let (mut loops, mut indirect, mut cap) = (0u32, 0u32, 0u32);
     for seed in 0..2000u64 {
         let mut g = Gen::from_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED_5EED);
         let m = irgen::gen_module(&mut g);
@@ -49,9 +49,15 @@ fn generator_covers_loops_and_indirect_calls() {
                     .iter()
                     .filter(|i| matches!(i, Inst::CallIndirect { .. }))
                     .count() as u32;
+                cap += blk
+                    .insts
+                    .iter()
+                    .filter(|i| matches!(i, Inst::CapCall { .. }))
+                    .count() as u32;
             }
         }
     }
     assert!(loops > 0, "generator produced no loop back-edges");
     assert!(indirect > 0, "generator produced no call_indirect");
+    assert!(cap > 0, "generator produced no cap.call");
 }

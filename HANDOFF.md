@@ -324,10 +324,11 @@ non-zero). When the interpreter — the §4 masking reference — runs to comple
 access it made was in-window, so the JIT lowering the same masking must leave an identical
 window; a mismatch is an access that escaped or was mis-masked. Pinned by
 `tests/escape_oracle.rs` and verified non-vacuous (corrupting the JIT mask makes it fail).
-Loops/back-edges and `call_indirect` are now generated (the trap-kind is no longer asserted
-when both backends trap — see §10); out-of-allocation accesses now fault into the guard page
-and are caught as `MemoryFault` (§4/§5). Remaining: `cap.call` in the generator and
-float-module coverage (NaN bits aren't pinned across backends).
+Loops/back-edges, `call_indirect`, and `cap.call` (inert/ungranted ⇒ both-`CapFault`) are now
+generated (the trap-kind is no longer asserted when both backends trap — see §10); out-of-
+allocation accesses now fault into the guard page and are caught as `MemoryFault` (§4/§5).
+Remaining: the cap.call *success* path (a mock powerbox granted to both backends) and
+float-module memory coverage (NaN bits aren't pinned across backends).
 
 ---
 
@@ -447,9 +448,17 @@ Have (✅ continuously, except where noted):
   different ones among several reachable traps — e.g. a dead trapping float→int convert).
 
 Gaps (priority order):
-- [ ] **`cap.call` not generated**, and loops are a single counted shape (no nested/irreducible
-  loops, no data-dependent trip counts). `cap.call` needs a mock powerbox in the fuzzer (today
-  it'd always `CapFault`); richer loop shapes need a JIT step-cap/fuel to stay terminating.
+- [~] **`cap.call` — *inert (fault) path generated*, success path not; loops still one shape.**
+  The generator now emits `cap.call` with an **ungranted** handle (`gen_inst` arm 18): the fuzzer
+  grants no caps, so it is inert on both backends (interp empty `Host` / JIT `empty_cap_thunk` ⇒
+  both `CapFault`, agreeing under the both-trap rule) — the I2 check for capabilities (§3c, "a
+  forged handle is inert") and the first generative exercise of the JIT's cap.call lowering
+  (handle marshalling + thunk ABI + trap plumbing). A coverage-guard test asserts it's produced.
+  **Still TODO:** the *success* path needs a deterministic **mock powerbox** granted identically
+  to both backends (a `run_capture`-with-host on interp + a `compile_and_run_capture`-with-thunk
+  on JIT, both already nearly present) so a returning cap.call is differentially tested too.
+  Loops are still a single counted shape (no nested/irreducible loops, no data-dependent trip
+  counts); richer loop shapes need a JIT step-cap/fuel to stay terminating.
 - [ ] **Escape-oracle excludes float modules** (NaN-payload nondeterminism). A canonical-NaN
   normalization, or comparing only integer-store bytes, would extend coverage to them.
 - [x] **Guard-page fault detection (unix)** — beyond the final-memory divergence check, a
