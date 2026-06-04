@@ -64,7 +64,9 @@ The compute target is therefore **parity with Wasmtime**; the entire speed budge
 is spent *around* compute, where wasm is weak:
 - **Host-call / I/O-bound:** faster, often substantially — no component-model
   lift/lower marshalling; zero-copy borrow buffers read in place via the page
-  table (§7); trampolines inlinable to ~free; batched async rings (§9, §13).
+  table (§7), so a guest region can be handed straight to a device/GPU with no
+  copy-out (vs browser wasm's mandatory linear-memory→JS hop); trampolines
+  inlinable to ~free; batched async rings (§9, §13).
   *This is the strongest, most defensible win.*
 - **64-bit address space:** faster than wasm64 (one AND mask vs explicit bounds
   check). Against wasm32 it would be a *wash or slightly worse* — so confinement
@@ -88,6 +90,32 @@ structured data = pure bytes — §7). More flexible than *shipping* wasm: nativ
 irreducible control flow (wasm cannot express it), first-class stack switching as
 one primitive, tail calls, multi-return, and an open capability surface vs a fixed
 WASI menu (§6).
+
+**Capability differentiators (beyond speed & interface).** The wins above are speed
+and interface; the architecture also has things wasm *structurally* lacks, each
+already specified in its own section and collected here so the "why not just ship
+wasm?" answer lives in one place:
+- **Guest-visible, flexible virtual memory** — the guest holds an attenuable
+  `AddressSpace` capability (`map`/`unmap`/`protect` within its window, §4/§14),
+  not just `memory.grow` on one linear blob: sparse address spaces, lazy/demand
+  page supply, and lending sub-ranges out. Large or sparse programs that fight
+  wasm's flat linear memory are the target.
+- **Nested sandboxes (VM-in-VM) + composition (VM-beside-VM)** — a guest can use an
+  `Instantiator` capability to spawn a child domain in a power-of-two **sub-window**
+  with an **attenuated** subset of its own capabilities (§13/§14); confinement
+  composes to any depth at depth-independent per-access cost. wasm has no native
+  *runtime* nesting (only interpreter-in-wasm or link-time component composition),
+  so multi-tenant hosts and plugin-in-plugin fall out for free.
+- **Lean by exclusion** — no GC, no JS interop, no UTF-16 / `externref` /
+  component-IDL surface. This deliberately narrows the market to systems/native
+  languages (C/C++/Rust/Zig/Swift) — managed languages are *not* first-class — in
+  exchange for a small verifier and ABI, which is the actual product.
+
+Not a differentiator: the *code-generation* TCB. Sharing Cranelift means a codegen
+miscompile is an escape exactly as in Wasmtime (the compute-parity point above), so
+the small, auditable surface is the **verifier + interface**, not the backend;
+shrinking codegen trust would need output verification (Veriwasm-style), an unbuilt
+post-MVP aspiration wasm shares.
 
 **Net:** the design supports the restated goals, contingent on three commitments —
 (1) state speed as around-compute + compute-parity; (2) confinement is
