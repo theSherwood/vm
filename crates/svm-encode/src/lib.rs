@@ -15,7 +15,7 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
+    BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
     FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator, ValIdx,
     ValType,
 };
@@ -123,6 +123,8 @@ pub enum DecodeError {
     CountTooLarge,
     /// The memory-presence flag byte was neither 0 nor 1.
     BadMemoryFlag(u8),
+    /// A data segment's `readonly` flag byte was neither 0 nor 1.
+    BadDataFlag(u8),
     /// Bytes remained after a complete module was decoded.
     TrailingBytes,
 }
@@ -143,6 +145,15 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
             out.push(1);
             out.push(mem.size_log2);
         }
+    }
+    // Data segments (§3a / D40): count, then each `readonly` flag, `offset`, and length-prefixed
+    // bytes.
+    write_uleb(&mut out, m.data.len() as u64);
+    for d in &m.data {
+        out.push(d.readonly as u8);
+        write_uleb(&mut out, d.offset);
+        write_uleb(&mut out, d.bytes.len() as u64);
+        out.extend_from_slice(&d.bytes);
     }
     write_uleb(&mut out, m.funcs.len() as u64);
     for f in &m.funcs {
@@ -484,6 +495,24 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         }),
         other => return Err(DecodeError::BadMemoryFlag(other)),
     };
+    // Data segments (§3a / D40), mirroring the encoder.
+    let ndata = c.count()?;
+    let mut data = Vec::with_capacity(ndata);
+    for _ in 0..ndata {
+        let readonly = match c.byte()? {
+            0 => false,
+            1 => true,
+            other => return Err(DecodeError::BadDataFlag(other)),
+        };
+        let offset = c.uleb()?;
+        let len = c.count()?;
+        let bytes = c.take(len)?.to_vec();
+        data.push(Data {
+            offset,
+            readonly,
+            bytes,
+        });
+    }
     let nfuncs = c.count()?;
     let mut funcs = Vec::new();
     for _ in 0..nfuncs {
@@ -492,7 +521,11 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     if !c.at_end() {
         return Err(DecodeError::TrailingBytes);
     }
-    Ok(Module { funcs, memory })
+    Ok(Module {
+        funcs,
+        memory,
+        data,
+    })
 }
 
 fn decode_func(c: &mut Cursor) -> Result<Func, DecodeError> {

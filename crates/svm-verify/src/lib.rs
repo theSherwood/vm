@@ -60,6 +60,10 @@ pub enum VerifyError {
     MemoryNotDeclared { func: u32, block: u32 },
     /// The declared window size (`1 << size_log2`) is not representable.
     MemorySizeTooLarge { size_log2: u8 },
+    /// A `data` segment was declared but the module has no linear memory to place it in.
+    DataWithoutMemory { seg: u32 },
+    /// A `data` segment's `[offset, offset+len)` does not fit within the declared window.
+    DataOutOfWindow { seg: u32 },
     /// A `call` referenced a function index that does not exist.
     CallFuncOutOfRange { func: u32, block: u32, callee: u32 },
     /// A `call`'s argument count did not match the callee's parameter count.
@@ -80,6 +84,19 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
             return Err(VerifyError::MemorySizeTooLarge {
                 size_log2: mem.size_log2,
             });
+        }
+    }
+    // Data segments must fit within the declared window `[0, size)` (§3a / D40). The runtime
+    // copies them in (and protects `readonly` ones) at instantiation, so an out-of-window or
+    // memory-less segment is rejected here, fail-closed.
+    for (i, d) in m.data.iter().enumerate() {
+        let seg = i as u32;
+        let Some(mem) = &m.memory else {
+            return Err(VerifyError::DataWithoutMemory { seg });
+        };
+        let end = d.offset.checked_add(d.bytes.len() as u64);
+        if end.is_none_or(|e| e > mem.size()) {
+            return Err(VerifyError::DataOutOfWindow { seg });
         }
     }
     let has_memory = m.memory.is_some();

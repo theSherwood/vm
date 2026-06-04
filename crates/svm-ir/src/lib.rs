@@ -999,4 +999,18 @@ pub const DEFAULT_RESERVED_LOG2: u8 = 40;
 pub struct Module {
     pub funcs: Vec<Func>,
     pub memory: Option<Memory>,
+    /// Initialized data segments placed in the window at instantiation (§3a): each writes
+    /// `bytes` at `offset`, and a `readonly` segment is then mapped read-only (D40 — a write
+    /// to it faults, §4/§5). Like an ELF loader laying out `.data`/`.rodata`; replaces the
+    /// frontend's per-byte `_start` init stores.
+    pub data: Vec<Data>,
+}
+
+/// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`
+/// at instantiation; `readonly` ones are protected after the copy so guest writes fault.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Data {
+    pub offset: u64,
+    pub readonly: bool,
+    pub bytes: Vec<u8>,
 }

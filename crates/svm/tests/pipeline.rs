@@ -125,6 +125,56 @@ fn text_roundtrip_is_identity() {
 }
 
 #[test]
+fn data_section_parses_roundtrips_and_verifies() {
+    // `data [ro] <offset> "<bytes>"` (§3a / D40): RO + RW segments, incl. non-UTF-8 bytes.
+    let src = "data ro 16 \"hi\\x00\\xff\"\ndata 32 \"abc\"\nmemory 8\n\
+               func () -> (i32) {\nblock0():\n  v0 = i32.const 0\n  return v0\n}\n";
+    let m = parse_module(src).expect("parse");
+    assert_eq!(
+        m.data,
+        vec![
+            svm_ir::Data {
+                offset: 16,
+                readonly: true,
+                bytes: vec![b'h', b'i', 0, 0xff]
+            },
+            svm_ir::Data {
+                offset: 32,
+                readonly: false,
+                bytes: vec![b'a', b'b', b'c']
+            },
+        ]
+    );
+    verify_module(&m).expect("verify");
+    // text and binary round-trips preserve the segments exactly.
+    assert_eq!(parse_module(&print_module(&m)).expect("reparse"), m);
+    assert_eq!(decode_module(&encode_module(&m)).expect("decode"), m);
+}
+
+#[test]
+fn verify_rejects_out_of_window_data() {
+    // window = 2^3 = 8 bytes; a 4-byte segment at offset 6 overruns `[0, 8)`.
+    let src = "data 6 \"abcd\"\nmemory 3\n\
+               func () -> (i32) {\nblock0():\n  v0 = i32.const 0\n  return v0\n}\n";
+    let m = parse_module(src).expect("parse");
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::DataOutOfWindow { seg: 0 })
+    ));
+}
+
+#[test]
+fn verify_rejects_data_without_memory() {
+    let src = "data 0 \"x\"\n\
+               func () -> (i32) {\nblock0():\n  v0 = i32.const 0\n  return v0\n}\n";
+    let m = parse_module(src).expect("parse");
+    assert!(matches!(
+        verify_module(&m),
+        Err(VerifyError::DataWithoutMemory { seg: 0 })
+    ));
+}
+
+#[test]
 fn text_and_binary_execution_agree() {
     // Differential: interpreting the parsed text and the decoded binary must match.
     let m1 = parse_module(LOOP_SUM).unwrap();
@@ -215,6 +265,7 @@ fn verifier_rejects_forward_value_reference() {
             }],
         }],
         memory: None,
+        data: Vec::new(),
     };
     assert!(matches!(
         verify_module(&m),
@@ -239,6 +290,7 @@ fn verifier_rejects_bad_branch_target() {
             }],
         }],
         memory: None,
+        data: Vec::new(),
     };
     assert!(matches!(
         verify_module(&m),
@@ -260,6 +312,7 @@ fn verifier_rejects_entry_param_mismatch() {
             }],
         }],
         memory: None,
+        data: Vec::new(),
     };
     assert!(matches!(
         verify_module(&m),
@@ -732,6 +785,7 @@ fn verifier_rejects_call_to_missing_function() {
             }],
         }],
         memory: None,
+        data: Vec::new(),
     };
     assert!(matches!(
         verify_module(&m),

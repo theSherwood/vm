@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncType,
-    IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
+    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -47,6 +47,15 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ParseError> {
 /// Render a module to canonical text.
 pub fn print_module(m: &Module) -> String {
     let mut s = String::new();
+    for d in &m.data {
+        let _ = writeln!(
+            s,
+            "data {}{} \"{}\"",
+            if d.readonly { "ro " } else { "" },
+            d.offset,
+            escape_bytes(&d.bytes)
+        );
+    }
     if let Some(mem) = &m.memory {
         let _ = writeln!(s, "memory {}", mem.size_log2);
         s.push('\n');
@@ -57,6 +66,23 @@ pub fn print_module(m: &Module) -> String {
             s.push('\n');
         }
         print_func(&mut s, f, &fn_results);
+    }
+    s
+}
+
+/// Escape data-segment bytes for the text form: printable ASCII verbatim (except `\` and `"`),
+/// everything else as `\xHH`. Round-trips through [`lex_string`].
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for &b in bytes {
+        match b {
+            b'\\' => s.push_str("\\\\"),
+            b'"' => s.push_str("\\\""),
+            0x20..=0x7e => s.push(b as char),
+            _ => {
+                let _ = write!(s, "\\x{b:02x}");
+            }
+        }
     }
     s
 }
@@ -250,6 +276,9 @@ enum Tok {
     Ident(String),
     Int(i64),
     Float(f64),
+    /// A byte string `"..."` (data-segment bytes), with `\\`, `\"`, `\n`, `\t`, `\r`, `\0`,
+    /// and `\xHH` hex escapes — so arbitrary (non-UTF-8) bytes are representable.
+    Str(Vec<u8>),
 }
 
 fn tokenize(src: &str) -> Result<Vec<Tok>, ParseError> {
@@ -287,6 +316,11 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, ParseError> {
             }
             b'0'..=b'9' => {
                 let (tok, ni) = lex_number(bytes, i)?;
+                toks.push(tok);
+                i = ni;
+            }
+            b'"' => {
+                let (tok, ni) = lex_string(bytes, i)?;
                 toks.push(tok);
                 i = ni;
             }
@@ -357,6 +391,65 @@ fn lex_number(bytes: &[u8], start: usize) -> Result<(Tok, usize), ParseError> {
     }
 }
 
+/// Lex a byte string `"..."` starting at `bytes[start] == '"'`. Supports `\\`, `\"`, `\n`,
+/// `\t`, `\r`, `\0`, and `\xHH` (two hex digits) escapes; every other byte is taken verbatim.
+/// Returns the [`Tok::Str`] and the index just past the closing quote.
+fn lex_string(bytes: &[u8], start: usize) -> Result<(Tok, usize), ParseError> {
+    let mut i = start + 1; // past the opening quote
+    let mut out = Vec::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Ok((Tok::Str(out), i + 1)),
+            b'\\' => {
+                i += 1;
+                let e = *bytes
+                    .get(i)
+                    .ok_or_else(|| ParseError("unterminated escape in string".into()))?;
+                match e {
+                    b'\\' => out.push(b'\\'),
+                    b'"' => out.push(b'"'),
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'0' => out.push(0),
+                    b'x' => {
+                        let hi = bytes.get(i + 1).copied().and_then(hex_val);
+                        let lo = bytes.get(i + 2).copied().and_then(hex_val);
+                        match (hi, lo) {
+                            (Some(h), Some(l)) => {
+                                out.push(h * 16 + l);
+                                i += 2;
+                            }
+                            _ => return Err(ParseError("invalid \\xHH escape".into())),
+                        }
+                    }
+                    _ => {
+                        return Err(ParseError(format!(
+                            "unknown string escape: \\{}",
+                            e as char
+                        )))
+                    }
+                }
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Err(ParseError("unterminated string".into()))
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn is_ident_start(c: u8) -> bool {
     c.is_ascii_alphabetic() || c == b'_' || c == b'%'
 }
@@ -382,6 +475,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     };
     let mut funcs = Vec::new();
     let mut memory = None;
+    let mut data: Vec<Data> = Vec::new();
     while !p.at_end() {
         match p.peek() {
             // Module-level `memory <size_log2>` declaration.
@@ -392,10 +486,31 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     .map_err(|_| ParseError(format!("memory size_log2 out of range: {n}")))?;
                 memory = Some(Memory { size_log2 });
             }
+            // Module-level `data [ro] <offset> "<bytes>"` segment (§3a / D40).
+            Some(Tok::Ident(s)) if s == "data" => {
+                p.next()?;
+                let readonly = matches!(p.peek(), Some(Tok::Ident(k)) if k == "ro");
+                if readonly {
+                    p.next()?;
+                }
+                let n = p.parse_int()?;
+                let offset = u64::try_from(n)
+                    .map_err(|_| ParseError(format!("negative data offset: {n}")))?;
+                let bytes = p.parse_str()?;
+                data.push(Data {
+                    offset,
+                    readonly,
+                    bytes,
+                });
+            }
             _ => funcs.push(p.parse_func()?),
         }
     }
-    Ok(Module { funcs, memory })
+    Ok(Module {
+        funcs,
+        memory,
+        data,
+    })
 }
 
 /// Header-only pass: each function's result count, indexed by function order.
@@ -412,6 +527,15 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
             Some(Tok::Ident(s)) if s == "memory" => {
                 p.next()?;
                 p.parse_int()?;
+            }
+            Some(Tok::Ident(s)) if s == "data" => {
+                // `data [ro] <offset> "<bytes>"` — skip past it in the header prescan.
+                p.next()?;
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "ro") {
+                    p.next()?;
+                }
+                p.parse_int()?;
+                p.parse_str()?;
             }
             Some(Tok::Ident(s)) if s == "func" => {
                 p.next()?;
@@ -1030,6 +1154,14 @@ impl<'a> Parser<'a> {
         match self.next()? {
             Tok::Int(v) => Ok(*v),
             other => err(format!("expected integer, found {other:?}")),
+        }
+    }
+
+    /// Parse a byte-string literal (data-segment bytes).
+    fn parse_str(&mut self) -> Result<Vec<u8>, ParseError> {
+        match self.next()? {
+            Tok::Str(b) => Ok(b.clone()),
+            other => err(format!("expected a string, found {other:?}")),
         }
     }
 

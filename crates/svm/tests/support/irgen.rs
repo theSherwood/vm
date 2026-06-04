@@ -637,7 +637,11 @@ pub fn gen_module(g: &mut Gen) -> Module {
     let funcs = (0..nfuncs)
         .map(|fi| gen_func(g, fi, &sigs, has_mem))
         .collect();
-    Module { funcs, memory }
+    Module {
+        funcs,
+        memory,
+        data: Vec::new(),
+    }
 }
 
 /// Random argument `Value`s matching `params` (for invoking the entry function). Defined
