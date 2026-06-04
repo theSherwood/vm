@@ -4,7 +4,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: "0 7 * * *"   # daily extended fuzz
+    - cron: "0 7 * * *" # daily extended fuzz
   workflow_dispatch:
 concurrency:
   group: ci-${{ github.ref }}
@@ -26,13 +26,17 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
   fuzz:
-    name: cargo-fuzz (decode_verify)
+    name: cargo-fuzz (escape-TCB targets)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode_verify, diff, mask]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: fuzz }
       - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz run decode_verify -- -max_total_time=300 -rss_limit_mb=4096
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
