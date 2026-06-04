@@ -488,10 +488,16 @@ Have (✅):
 
 Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
 regressions one commit old"):
-- [ ] **No over-time tracking / no CI bench job** — `bench.rs` and `bench/` both print and
-  forget; nothing stores or diffs results across commits, so a regression isn't caught "one
-  commit old." (A bench job is awkward in CI — noisy shared runners — but even logging the
-  `--csv` line per commit would help.)
+- [~] **Over-time tracking — *tool done*, no CI job yet.** `bench/` now has
+  **`--save-baseline FILE`** / **`--check FILE`**: the committed **`bench/baseline.txt`** records
+  the per-kernel **ratios** (svm÷wasm — the machine-portable signal, not the absolute ns), and
+  `--check` reruns (best-of-`--reps 5`) and **exits non-zero** if any ratio grew past `--tol`
+  (default 25%, a band that absorbs runner noise — a real regression like losing mask-elision was
+  +26%, losing SSA promotion far more). Verified non-vacuous (a tightened baseline trips it).
+  So a regression *can* now be caught one commit old by running `--check` locally. **Still TODO:**
+  wire it into CI (awkward — noisy shared runners; a `workflow_dispatch`/nightly `--check` that
+  warns rather than gates is the likely shape), and `crates/svm/src/bin/bench.rs` (the in-tree
+  interp throughput bench) still just prints.
 - [ ] **No C-frontend program benches** — e.g. the SSA-promotion win (loop body ~22→0 memory
   ops) is uncaptured end-to-end; nothing would flag it if promotion regressed. The `bench/`
   kernels are hand-written IR, not chibicc output.
@@ -513,12 +519,16 @@ regressions one commit old"):
    guard and the JIT can elide the mask without a proof (the wasm32 fast path), closing the
    residual ~1.2–1.36× gap incl. data-SP–relative C locals. Needs the interp to model which
    pages are mapped (to stay in differential lockstep) and changes the masking constant.
-2. **Over-time bench tracking** — log the `--csv` line per commit so memory/compute
-   regressions (e.g. a future masking change) are caught one commit old.
+2. ~~**Over-time bench tracking**~~ — **tool DONE** (`bench/ --save-baseline`/`--check` vs
+   committed `bench/baseline.txt`, ratio-based, non-vacuous; see Benchmarking gaps). Remaining:
+   wire a non-gating CI/nightly `--check`, and add a C-frontend program kernel (below) so the
+   SSA-promotion win is tracked end-to-end.
 3. **Real Memory capability** (`map`/`unmap`/`protect` beyond no-op stubs) — guest-visible
    virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`. Natural
    companion to (1) (demand paging reuses the fault handler).
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
-loops + indirect calls in the generative fuzzer; guard pages + signal-handler detect-and-kill.)*
+loops + indirect calls in the generative fuzzer; guard pages + signal-handler detect-and-kill;
+**over-time bench regression tracking** (`bench/ --save-baseline`/`--check` vs a committed
+ratio baseline).)*

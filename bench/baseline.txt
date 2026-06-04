@@ -1,0 +1,8 @@
+# svm-bench baseline — the tracked signal is the RATIO (svm / wasm), which is far more
+# portable across machines than the absolute ns. `--check` flags any ratio that grew
+# past the tolerance (svm got relatively slower). Regenerate after an intended change:
+#   cargo run --release -- --save-baseline baseline.txt
+# columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime
+alu,1.013,NA,0.340
+memsum,1.119,0.560,0.407
+scatter,1.366,0.708,0.419

@@ -25,8 +25,20 @@
 //!     runs but the full function is still compiled).
 //!
 //! This is a watch-it-over-time regression harness, not a statistical benchmark. Run with:
-//!   cargo run --release            # from bench/
-//!   cargo run --release -- --csv   # machine-readable line per kernel
+//!   cargo run --release                          # from bench/, human table
+//!   cargo run --release -- --csv                 # machine-readable line per kernel
+//!   cargo run --release -- --save-baseline FILE  # record the current ratios
+//!   cargo run --release -- --check FILE           # rerun + flag any ratio regression
+//!
+//! **Over-time regression tracking (AGENTS.md "catch regressions one commit old").** The
+//! absolute ns are machine-dependent, so the *tracked* quantity is the **ratio** (svm ÷
+//! wasm) per kernel — far more portable across machines than the raw timings. `--save-baseline`
+//! writes the three ratios per kernel (compute-vs-wasm32, compute-vs-wasm64, cold-vs-Wasmtime)
+//! to a committed file; `--check` reruns and **exits non-zero** if any ratio has grown by more
+//! than `--tol` (default 25%, i.e. svm got relatively slower) — that band absorbs runner noise
+//! while still catching a real regression (e.g. losing mask-elision moved `scatter` ≈1.21→1.53,
+//! +26%; losing SSA promotion would be far larger). `--check`/`--save-baseline` default to
+//! `--reps 5` (best-of, to stabilise the comparison); plain/`--csv` use one pass for speed.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -289,109 +301,295 @@ fn wasm_compute_ns(store: &mut Store<()>, run: &TypedFunc<i64, i64>) -> f64 {
     (big - small) * 1e9 / (N_BIG - N_SMALL) as f64
 }
 
-fn main() {
-    let csv = std::env::args().any(|a| a == "--csv");
-    // Enable the memory64 proposal so `(memory i64 …)` modules compile; it does not change
-    // how wasm32 modules are lowered, so the wasm32 numbers stay comparable.
-    let mut config = Config::new();
-    config.wasm_memory64(true);
-    let engine = Engine::new(&config).expect("engine");
+/// Raw per-iteration timings for one kernel (ns for compute, ms for cold start), each the
+/// **min over `reps`** measurements (best observed per engine — the noise floor we compare).
+struct Raw {
+    svm_ns: f64,
+    w32_ns: f64,
+    w64_ns: Option<f64>,
+    svm_cold: f64,
+    wmt_cold: f64,
+}
 
-    if !csv {
-        println!(
-            "SVM JIT vs Wasmtime — both via Cranelift.  ratio = svm / wasm  (<1 = svm faster)\n\
-             Expect: alu compute ≈1×; cold-start <1×.  Memory: wasm32 < svm always (guard\n\
-             pages are free); svm < wasm64 once addresses *vary* (scatter) so Wasmtime can't\n\
-             CSE the bounds check — memsum (same addr) lets it, so wasm64 looks ~tied there.\n\
-             N_big={N_BIG} N_small={N_SMALL}\n"
-        );
-        println!(
-            "{:<8} | {:>8} {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
-            "kernel", "svm", "wasm32", "ratio", "wasm64", "ratio", "svm", "wasm32", "ratio"
-        );
-        println!(
-            "{:<8} | {:>8} {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
-            "", "ns/it", "ns/it", "", "ns/it", "", "cold ms", "cold ms", ""
-        );
+impl Raw {
+    /// The three machine-portable ratios we track: compute vs wasm32, compute vs wasm64
+    /// (when the kernel has a wasm64 form), cold start vs Wasmtime. Higher = svm slower.
+    fn ratios(&self) -> (f64, Option<f64>, f64) {
+        (
+            self.svm_ns / self.w32_ns,
+            self.w64_ns.map(|v| self.svm_ns / v),
+            self.svm_cold / self.wmt_cold,
+        )
     }
+}
 
-    for k in KERNELS {
-        let m = svm_text::parse_module(k.ir).expect("parse our IR text");
-        let wasm32 = wat::parse_str(k.wat32).expect("assemble wasm32 WAT");
-        let (mut s32, run32) = wasm_entry(&engine, &wasm32);
+/// Time one kernel, taking the **best (min)** of `reps` passes per engine. Cross-checks every
+/// engine agrees on the result first, so we never benchmark a miscompile.
+fn measure(engine: &Engine, k: &Kernel, reps: u32) -> Raw {
+    let m = svm_text::parse_module(k.ir).expect("parse our IR text");
+    let wasm32 = wat::parse_str(k.wat32).expect("assemble wasm32 WAT");
+    let wasm64 = k
+        .wat64
+        .map(|wat| wat::parse_str(wat).expect("assemble wasm64 WAT"));
 
-        // Cross-check every engine agrees before timing (never benchmark a miscompile).
-        let ours = svm_call(&m, N_SMALL);
+    // Cross-check every engine agrees before timing (never benchmark a miscompile).
+    let ours = svm_call(&m, N_SMALL);
+    {
+        let (mut s32, run32) = wasm_entry(engine, &wasm32);
         assert_eq!(
             ours,
             run32.call(&mut s32, N_SMALL).unwrap(),
             "kernel `{}`: svm vs wasm32 disagree",
             k.name
         );
-
-        // --- steady-state compute ---
-        let svm_big = per_call(25, || {
-            black_box(svm_call(&m, N_BIG));
-        });
-        let svm_small = per_call(25, || {
-            black_box(svm_call(&m, N_SMALL));
-        });
-        let svm_ns = (svm_big - svm_small) * 1e9 / (N_BIG - N_SMALL) as f64;
-        let w32_ns = wasm_compute_ns(&mut s32, &run32);
-
-        let w64 = k.wat64.map(|wat| {
-            let wasm64 = wat::parse_str(wat).expect("assemble wasm64 WAT");
-            let (mut s64, run64) = wasm_entry(&engine, &wasm64);
+        if let Some(w) = &wasm64 {
+            let (mut s64, run64) = wasm_entry(engine, w);
             assert_eq!(
                 ours,
                 run64.call(&mut s64, N_SMALL).unwrap(),
                 "kernel `{}`: svm vs wasm64 disagree",
                 k.name
             );
-            wasm_compute_ns(&mut s64, &run64)
+        }
+    }
+
+    let mut raw = Raw {
+        svm_ns: f64::INFINITY,
+        w32_ns: f64::INFINITY,
+        w64_ns: wasm64.as_ref().map(|_| f64::INFINITY),
+        svm_cold: f64::INFINITY,
+        wmt_cold: f64::INFINITY,
+    };
+    for _ in 0..reps.max(1) {
+        // --- steady-state compute (subtraction isolates the loop body) ---
+        let svm_big = per_call(25, || {
+            black_box(svm_call(&m, N_BIG));
         });
+        let svm_small = per_call(25, || {
+            black_box(svm_call(&m, N_SMALL));
+        });
+        raw.svm_ns = raw
+            .svm_ns
+            .min((svm_big - svm_small) * 1e9 / (N_BIG - N_SMALL) as f64);
+
+        let (mut s32, run32) = wasm_entry(engine, &wasm32);
+        raw.w32_ns = raw.w32_ns.min(wasm_compute_ns(&mut s32, &run32));
+
+        if let Some(w) = &wasm64 {
+            let (mut s64, run64) = wasm_entry(engine, w);
+            let v = wasm_compute_ns(&mut s64, &run64);
+            raw.w64_ns = Some(raw.w64_ns.unwrap().min(v));
+        }
 
         // --- cold start: source bytes → first result for a trivial (n=0) program (wasm32) ---
         let svm_cold = per_call(60, || {
             black_box(svm_call(&m, 0));
         }) * 1e3;
+        raw.svm_cold = raw.svm_cold.min(svm_cold);
         let wmt_cold = per_call(60, || {
-            let (mut s, f) = wasm_entry(&engine, &wasm32);
+            let (mut s, f) = wasm_entry(engine, &wasm32);
             black_box(f.call(&mut s, 0).unwrap());
         }) * 1e3;
+        raw.wmt_cold = raw.wmt_cold.min(wmt_cold);
+    }
+    raw
+}
 
-        if csv {
-            let (w64s, r64) = match w64 {
-                Some(v) => (format!("{v:.3}"), format!("{:.3}", svm_ns / v)),
-                None => ("NA".into(), "NA".into()),
-            };
-            println!(
-                "{},{:.3},{:.3},{:.3},{w64s},{r64},{:.4},{:.4},{:.3}",
-                k.name,
-                svm_ns,
-                w32_ns,
-                svm_ns / w32_ns,
-                svm_cold,
-                wmt_cold,
-                svm_cold / wmt_cold
-            );
-        } else {
-            let (w64s, r64) = match w64 {
-                Some(v) => (format!("{v:.3}"), format!("{:.2}×", svm_ns / v)),
-                None => ("—".into(), "—".into()),
-            };
-            println!(
-                "{:<8} | {:>8.3} {:>8.3} {:>5.2}× | {:>8} {:>6} | {:>8.4} {:>8.4} {:>5.2}×",
-                k.name,
-                svm_ns,
-                w32_ns,
-                svm_ns / w32_ns,
-                w64s,
-                r64,
-                svm_cold,
-                wmt_cold,
-                svm_cold / wmt_cold
-            );
+/// Value following `flag` in the arg list, if present (`--flag value`).
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Write the tracked ratios to a baseline file (`kernel,compute32,compute64,cold`; `NA` for a
+/// kernel with no wasm64 form). The header documents what the numbers are + how to regenerate.
+fn save_baseline(path: &str, results: &[(&Kernel, Raw)]) {
+    let mut out = String::from(
+        "# svm-bench baseline — the tracked signal is the RATIO (svm / wasm), which is far more\n\
+         # portable across machines than the absolute ns. `--check` flags any ratio that grew\n\
+         # past the tolerance (svm got relatively slower). Regenerate after an intended change:\n\
+         #   cargo run --release -- --save-baseline baseline.txt\n\
+         # columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime\n",
+    );
+    for (k, raw) in results {
+        let (c32, c64, cold) = raw.ratios();
+        let c64s = c64
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "NA".into());
+        out.push_str(&format!("{},{:.3},{c64s},{:.3}\n", k.name, c32, cold));
+    }
+    std::fs::write(path, out).unwrap_or_else(|e| panic!("write baseline `{path}`: {e}"));
+    eprintln!("wrote baseline to {path}");
+}
+
+/// One tracked baseline row loaded from a file.
+struct BaseRow {
+    compute32: f64,
+    compute64: Option<f64>,
+    cold: f64,
+}
+
+/// Parse a baseline file written by [`save_baseline`] (comments/blank lines skipped).
+fn load_baseline(path: &str) -> std::collections::HashMap<String, BaseRow> {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read baseline `{path}`: {e}"));
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
+        let f: Vec<&str> = line.split(',').collect();
+        assert!(f.len() == 4, "baseline line `{line}`: want 4 fields");
+        map.insert(
+            f[0].to_string(),
+            BaseRow {
+                compute32: f[1].parse().expect("compute32"),
+                compute64: (f[2] != "NA").then(|| f[2].parse().expect("compute64")),
+                cold: f[3].parse().expect("cold"),
+            },
+        );
+    }
+    map
+}
+
+/// Rerun, compare each ratio to the baseline, print a table, and return `true` if **no** ratio
+/// regressed past `tol` (a fractional increase, e.g. `0.25` = 25%). A missing baseline kernel
+/// is reported but not a regression; an unexpectedly *improved* ratio just prints `ok`.
+fn check_baseline(path: &str, results: &[(&Kernel, Raw)], tol: f64) -> bool {
+    let base = load_baseline(path);
+    println!(
+        "regression check vs {path}  (tol {:.0}%, ratio = svm/wasm, lower is better)\n",
+        tol * 100.0
+    );
+    println!(
+        "{:<8} {:<16} {:>9} {:>9} {:>8}  status",
+        "kernel", "metric", "baseline", "current", "delta"
+    );
+    let mut ok = true;
+    for (k, raw) in results {
+        let Some(b) = base.get(k.name) else {
+            println!(
+                "{:<8} {:<16} {:>9} {:>9} {:>8}  MISSING",
+                k.name, "(all)", "-", "-", "-"
+            );
+            continue;
+        };
+        let (c32, c64, cold) = raw.ratios();
+        let mut row = |metric: &str, baseline: f64, current: f64| {
+            let delta = current / baseline - 1.0;
+            let regressed = delta > tol;
+            ok &= !regressed;
+            println!(
+                "{:<8} {:<16} {:>9.3} {:>9.3} {:>+7.1}%  {}",
+                k.name,
+                metric,
+                baseline,
+                current,
+                delta * 100.0,
+                if regressed { "REGRESSED" } else { "ok" }
+            );
+        };
+        row("compute/wasm32", b.compute32, c32);
+        if let (Some(bv), Some(cv)) = (b.compute64, c64) {
+            row("compute/wasm64", bv, cv);
+        }
+        row("cold/wasmtime", b.cold, cold);
+    }
+    if ok {
+        println!("\nOK - no ratio regressed past {:.0}%.", tol * 100.0);
+    } else {
+        println!(
+            "\nREGRESSION - a ratio grew past {:.0}% (svm got relatively slower). If intended,\n\
+             re-baseline with `--save-baseline {path}`.",
+            tol * 100.0
+        );
+    }
+    ok
+}
+
+fn print_table(results: &[(&Kernel, Raw)]) {
+    println!(
+        "SVM JIT vs Wasmtime — both via Cranelift.  ratio = svm / wasm  (<1 = svm faster)\n\
+         Expect: alu compute ≈1×; cold-start <1×.  Memory: wasm32 < svm always (guard\n\
+         pages are free); svm < wasm64 once addresses *vary* (scatter) so Wasmtime can't\n\
+         CSE the bounds check — memsum (same addr) lets it, so wasm64 looks ~tied there.\n\
+         N_big={N_BIG} N_small={N_SMALL}\n"
+    );
+    println!(
+        "{:<8} | {:>8} {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
+        "kernel", "svm", "wasm32", "ratio", "wasm64", "ratio", "svm", "wasm32", "ratio"
+    );
+    println!(
+        "{:<8} | {:>8} {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
+        "", "ns/it", "ns/it", "", "ns/it", "", "cold ms", "cold ms", ""
+    );
+    for (k, raw) in results {
+        let (c32, c64, cold) = raw.ratios();
+        let (w64s, r64) = match (raw.w64_ns, c64) {
+            (Some(v), Some(r)) => (format!("{v:.3}"), format!("{r:.2}×")),
+            _ => ("—".into(), "—".into()),
+        };
+        println!(
+            "{:<8} | {:>8.3} {:>8.3} {:>5.2}× | {:>8} {:>6} | {:>8.4} {:>8.4} {:>5.2}×",
+            k.name, raw.svm_ns, raw.w32_ns, c32, w64s, r64, raw.svm_cold, raw.wmt_cold, cold
+        );
+    }
+}
+
+fn print_csv(results: &[(&Kernel, Raw)]) {
+    for (k, raw) in results {
+        let (c32, c64, cold) = raw.ratios();
+        let (w64s, r64) = match (raw.w64_ns, c64) {
+            (Some(v), Some(r)) => (format!("{v:.3}"), format!("{r:.3}")),
+            _ => ("NA".into(), "NA".into()),
+        };
+        println!(
+            "{},{:.3},{:.3},{:.3},{w64s},{r64},{:.4},{:.4},{:.3}",
+            k.name, raw.svm_ns, raw.w32_ns, c32, raw.svm_cold, raw.wmt_cold, cold
+        );
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let csv = args.iter().any(|a| a == "--csv");
+    let save = flag_value(&args, "--save-baseline");
+    let check = flag_value(&args, "--check");
+    let tol = flag_value(&args, "--tol")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.25);
+    // `--check`/`--save-baseline` take best-of-5 to stabilise the comparison; the live views
+    // (table/csv) use a single fast pass. `--reps N` overrides.
+    let reps = flag_value(&args, "--reps")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if save.is_some() || check.is_some() {
+            5
+        } else {
+            1
+        });
+
+    // Enable the memory64 proposal so `(memory i64 …)` modules compile; it does not change
+    // how wasm32 modules are lowered, so the wasm32 numbers stay comparable.
+    let mut config = Config::new();
+    config.wasm_memory64(true);
+    let engine = Engine::new(&config).expect("engine");
+
+    let results: Vec<(&Kernel, Raw)> = KERNELS
+        .iter()
+        .map(|k| (k, measure(&engine, k, reps)))
+        .collect();
+
+    if let Some(path) = save {
+        save_baseline(&path, &results);
+    } else if let Some(path) = check {
+        if !check_baseline(&path, &results, tol) {
+            std::process::exit(1);
+        }
+    } else if csv {
+        print_csv(&results);
+    } else {
+        print_table(&results);
     }
 }
