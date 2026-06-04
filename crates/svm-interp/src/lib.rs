@@ -623,6 +623,11 @@ pub mod iface {
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 
+/// Cap ABI `prot` bits for the `Memory` capability (§3e): the low two bits of the `i32`
+/// argument. There is no `EXEC` bit — guest data is never executed as code (§3c).
+const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+
 /// The guest window a capability handler borrows `(ptr, len)` buffers from (§7). Both
 /// the interpreter's lazily-paged [`Mem`] and a JIT's flat window implement this, so a
 /// single host dispatch ([`Host::cap_dispatch`]) serves both backends. The methods
@@ -630,6 +635,21 @@ const EINVAL: i64 = -22; // bad op / argument
 pub trait GuestMem {
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>>;
     fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()>;
+
+    /// `Memory` capability ops (§3e): (re)commit / decommit / re-protect window pages. `offset`
+    /// is page-aligned and `[offset, offset+len)` window-relative; `prot` is `READ|WRITE`. Each
+    /// returns `0` or a negative errno (`-EINVAL`). The default is a success no-op — overridden
+    /// by the interpreter's paged [`Mem`] (the reference semantics); a flat-window backend
+    /// (e.g. a JIT) wires its own `mprotect`-backed implementation.
+    fn map(&mut self, _offset: u64, _len: u64, _prot: i32) -> i64 {
+        0
+    }
+    fn unmap(&mut self, _offset: u64, _len: u64) -> i64 {
+        0
+    }
+    fn protect(&mut self, _offset: u64, _len: u64, _prot: i32) -> i64 {
+        0
+    }
 }
 
 /// A [`GuestMem`] over a flat, contiguous window slice — the JIT's representation. The
@@ -817,9 +837,22 @@ impl Host {
                 Ok(vec![now])
             }
             Binding::Memory => {
-                // map/unmap/protect: the window is eagerly mapped, so these succeed
-                // as no-ops (0); an unknown op is -EINVAL.
-                Ok(vec![if op <= 2 { 0 } else { EINVAL }])
+                // map(off,len,prot) / unmap(off,len) / protect(off,len,prot) on the window's
+                // pages (§3e). With no window there is nothing to address (-EINVAL); the effect
+                // is applied to whichever backend's memory `mem` wraps (interp `Mem` here, a
+                // JIT's flat window via its own impl), keeping the two in differential lockstep.
+                let Some(mem) = mem else {
+                    return Ok(vec![EINVAL]);
+                };
+                let off = *args.first().unwrap_or(&0) as u64;
+                let len = *args.get(1).unwrap_or(&0) as u64;
+                let prot = *args.get(2).unwrap_or(&0) as i32;
+                Ok(vec![match op {
+                    0 => mem.map(off, len, prot),
+                    1 => mem.unmap(off, len),
+                    2 => mem.protect(off, len, prot),
+                    _ => EINVAL,
+                }])
             }
         }
     }
@@ -890,13 +923,28 @@ impl Host {
 /// window (e.g. `size_log2 = 63`) never eagerly allocates — safe to fuzz.
 const PAGE: u64 = 4096;
 
+/// Non-default protection of a backed page (absent ⇒ the default, read+write). This is the
+/// guest-visible `protect`/`unmap` state (§3e Memory cap / §4): a page in `[0, mapped)` is
+/// readable+writable unless the guest has `protect`ed it read-only or `unmap`ped it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageProt {
+    /// `protect`ed read-only: reads succeed, a store faults (the D40 const-segment mechanism).
+    Ro,
+    /// `unmap`ped: any access faults.
+    Unmapped,
+}
+
 /// A guest linear-memory window. Confinement itself lives in [`svm_mask::Window`]
-/// (the isolated, separately-fuzzed security unit, §4); `Mem` just owns the lazily
-/// paged backing store and threads accesses through that confinement. This is the
-/// semantics the JIT masking lowering is differential-tested against (§18).
+/// (the isolated, separately-fuzzed security unit, §4); `Mem` owns the lazily paged backing
+/// store, threads accesses through that confinement, and carries the guest-visible page
+/// protection map (`map`/`unmap`/`protect`, §3e). This is the semantics the JIT is
+/// differential-tested against (§18).
 struct Mem {
     window: Window,
     pages: BTreeMap<u64, Vec<u8>>,
+    /// Page index (`offset / PAGE`) ⇒ non-default protection. A page absent from the map is
+    /// the default (read+write, within `[0, mapped)`). Only pages in `[0, mapped)` appear.
+    prot: BTreeMap<u64, PageProt>,
 }
 
 impl Mem {
@@ -910,7 +958,26 @@ impl Mem {
         Mem {
             window: Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63)),
             pages: BTreeMap::new(),
+            prot: BTreeMap::new(),
         }
+    }
+
+    /// Enforce the page protection map for a `width`-byte access at confined offset `base`:
+    /// a store to a read-only page, or any access to an unmapped page, faults (§4/§5). No-op
+    /// when the map is empty (the common case), so unprotected windows pay nothing.
+    fn check_prot(&self, base: u64, width: u32, write: bool) -> Result<(), Trap> {
+        if self.prot.is_empty() {
+            return Ok(());
+        }
+        let last = base + width as u64 - 1;
+        for page in (base / PAGE)..=(last / PAGE) {
+            match self.prot.get(&page) {
+                Some(PageProt::Unmapped) => return Err(Trap::MemoryFault),
+                Some(PageProt::Ro) if write => return Err(Trap::MemoryFault),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn load(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Value, Trap> {
@@ -920,6 +987,7 @@ impl Mem {
             .window
             .checked(addr, offset, width)
             .ok_or(Trap::MemoryFault)?;
+        self.check_prot(base, width, false)?;
         let raw = self.read_le(base, width);
         Ok(decode_loaded(rty, width, signed, raw))
     }
@@ -930,9 +998,37 @@ impl Mem {
             .window
             .checked(addr, offset, width)
             .ok_or(Trap::MemoryFault)?;
+        self.check_prot(base, width, true)?;
         // `write_le` keeps only the low `width` bytes, so narrow stores truncate.
         self.write_le(base, width, store_bits(v));
         Ok(())
+    }
+
+    /// Validate a `map`/`unmap`/`protect` range (§3e): the offset must be page-aligned and the
+    /// whole `[offset, offset+len)` must lie within the backed `[0, mapped)` (growth into the
+    /// reserved tail is deferred in the fixed-window MVP). Returns the inclusive page-index range
+    /// it covers, or `Err(EINVAL)`.
+    fn prot_pages(&self, offset: u64, len: u64) -> Result<core::ops::RangeInclusive<u64>, i64> {
+        if len == 0 || !offset.is_multiple_of(PAGE) {
+            return Err(EINVAL);
+        }
+        let end = offset.checked_add(len).ok_or(EINVAL)?;
+        if end > self.window.mapped() {
+            return Err(EINVAL);
+        }
+        Ok((offset / PAGE)..=((end - 1) / PAGE)) // len need not be a page multiple; round up
+    }
+
+    /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ default read+write (absent from
+    /// the map), `READ` only ⇒ read-only, neither ⇒ unmapped.
+    fn set_prot(&mut self, page: u64, prot: i32) {
+        if prot & PROT_WRITE != 0 {
+            self.prot.remove(&page); // read+write is the default (no entry)
+        } else if prot & PROT_READ != 0 {
+            self.prot.insert(page, PageProt::Ro);
+        } else {
+            self.prot.insert(page, PageProt::Unmapped);
+        }
     }
 
     /// Borrow-validate and read a `(ptr, len)` capability buffer (§7): `[ptr, ptr+len)`
@@ -1008,6 +1104,47 @@ impl GuestMem for Mem {
     }
     fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
         self.write_bytes_impl(ptr, data)
+    }
+
+    /// §3e op 0 `map`: (re)commit pages with `prot`, zero-filling them (a fresh commit). The
+    /// fixed-window MVP only re-maps pages within `[0, mapped)` (growth into the reserved tail
+    /// is deferred); out-of-range / misaligned → `-EINVAL`.
+    fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        let pages = match self.prot_pages(offset, len) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        for page in pages {
+            self.set_prot(page, prot);
+            self.pages.remove(&page); // commit ⇒ fresh zeroed page
+        }
+        0
+    }
+
+    /// §3e op 1 `unmap`: decommit pages — any later access faults, and a re-`map` reads zero.
+    fn unmap(&mut self, offset: u64, len: u64) -> i64 {
+        let pages = match self.prot_pages(offset, len) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        for page in pages {
+            self.prot.insert(page, PageProt::Unmapped);
+            self.pages.remove(&page);
+        }
+        0
+    }
+
+    /// §3e op 2 `protect`: change the protection of mapped pages without touching their backing
+    /// (the D40 read-only const-segment mechanism: `protect(READ)` ⇒ later stores fault).
+    fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        let pages = match self.prot_pages(offset, len) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        for page in pages {
+            self.set_prot(page, prot);
+        }
+        0
     }
 }
 
@@ -1244,5 +1381,94 @@ fn as_f64(v: Value) -> Result<f64, Trap> {
     match v {
         Value::F64(x) => Ok(x),
         _ => Err(Trap::Malformed),
+    }
+}
+
+#[cfg(test)]
+mod prot_tests {
+    //! White-box tests for the guest-visible page-protection model (`map`/`unmap`/`protect`,
+    //! §3e Memory cap / §4) — the reference semantics the JIT's `mprotect`-backed side is
+    //! differential-tested against next.
+    use super::*;
+
+    /// A fully-mapped 64 KiB window (`mapped == reserved`, 16 pages).
+    fn mem64k() -> Mem {
+        Mem::with_reservation(0, 16)
+    }
+
+    #[test]
+    fn protect_read_only_faults_store_allows_load() {
+        let mut m = mem64k();
+        let v = Value::I64(0x1122_3344_5566_7788u64 as i64);
+        assert!(m.store(0, 0, StoreOp::I64, v).is_ok());
+        assert_eq!(m.protect(0, PAGE, PROT_READ), 0);
+        // a store to the RO page faults; the value is still readable
+        assert_eq!(
+            m.store(0, 0, StoreOp::I64, Value::I64(1)),
+            Err(Trap::MemoryFault)
+        );
+        assert_eq!(m.load(0, 0, LoadOp::I64), Ok(v));
+        // an adjacent, unprotected page is unaffected
+        assert!(m.store(PAGE, 0, StoreOp::I64, Value::I64(7)).is_ok());
+    }
+
+    #[test]
+    fn protect_rw_restores_writability() {
+        let mut m = mem64k();
+        assert_eq!(m.protect(0, PAGE, PROT_READ), 0);
+        assert_eq!(
+            m.store(0, 0, StoreOp::I64, Value::I64(1)),
+            Err(Trap::MemoryFault)
+        );
+        assert_eq!(m.protect(0, PAGE, PROT_READ | PROT_WRITE), 0);
+        assert!(m.store(0, 0, StoreOp::I64, Value::I64(1)).is_ok());
+    }
+
+    #[test]
+    fn unmap_faults_then_remap_zeroes() {
+        let mut m = mem64k();
+        assert!(m.store(0, 0, StoreOp::I64, Value::I64(0x42)).is_ok());
+        assert_eq!(m.unmap(0, PAGE), 0);
+        assert_eq!(m.load(0, 0, LoadOp::I64), Err(Trap::MemoryFault));
+        assert_eq!(
+            m.store(0, 0, StoreOp::I64, Value::I64(1)),
+            Err(Trap::MemoryFault)
+        );
+        // re-commit ⇒ accessible again and zeroed
+        assert_eq!(m.map(0, PAGE, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(m.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
+        assert!(m.store(0, 0, StoreOp::I64, Value::I64(1)).is_ok());
+    }
+
+    #[test]
+    fn bad_args_einval() {
+        let mut m = mem64k();
+        assert_eq!(m.protect(1, PAGE, PROT_READ), EINVAL); // misaligned offset
+        assert_eq!(m.protect(0, 0, PROT_READ), EINVAL); // zero length
+        assert_eq!(m.unmap(65536, PAGE), EINVAL); // offset == mapped ⇒ out of range
+        assert_eq!(m.map(0, 1 << 20, PROT_WRITE), EINVAL); // len past mapped
+    }
+
+    #[test]
+    fn cross_page_store_faults_if_either_page_protected() {
+        let mut m = mem64k();
+        // page 1 read-only; an 8-byte store straddling the page-0/1 boundary touches page 1.
+        assert_eq!(m.protect(PAGE, PAGE, PROT_READ), 0);
+        assert_eq!(
+            m.store(PAGE - 4, 0, StoreOp::I64, Value::I64(1)),
+            Err(Trap::MemoryFault)
+        );
+        // fully within page 0 (still rw) is fine
+        assert!(m.store(PAGE - 8, 0, StoreOp::I64, Value::I64(1)).is_ok());
+    }
+
+    #[test]
+    fn unprotected_window_is_unrestricted() {
+        // With an empty protection map, check_prot is a no-op: every in-window access works.
+        let mut m = mem64k();
+        for off in [0u64, 8, PAGE, 65536 - 8] {
+            assert!(m.store(off, 0, StoreOp::I64, Value::I64(0x55)).is_ok());
+            assert_eq!(m.load(off, 0, LoadOp::I64), Ok(Value::I64(0x55)));
+        }
     }
 }

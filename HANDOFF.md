@@ -581,8 +581,19 @@ regressions one commit old"):
    `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
    win end-to-end at ≈parity — see Benchmarking gaps); a non-gating nightly CI `bench` job runs `--check`.
 3. **Real Memory capability** (`map`/`unmap`/`protect` beyond no-op stubs) — guest-visible
-   virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`. Natural
-   companion to (1) (demand paging reuses the fault handler).
+   virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`. Now in
+   progress (unblocked by the reservation work). **Increment 1 ✅ (interp spec):** `Mem` carries a
+   per-page protection map (`PageProt::Ro`/`Unmapped`, absent ⇒ rw); `load`/`store` enforce it
+   (`check_prot`); `GuestMem` gained `map`/`unmap`/`protect` (default no-op; interp `Mem`
+   implements them within `[0, mapped)` — `protect`→RO for D40, `unmap`→fault, `map`→re-commit
+   zeroed; misaligned/out-of-range ⇒ `-EINVAL`); `cap_dispatch_slots`' Memory arm calls them.
+   White-box `prot_tests` pin the semantics. **Increment 2 (next):** the JIT side — an
+   `mprotect`-backed `GuestMem` for the flat window (the cap thunk in `jit_diff`/`c_frontend`
+   wraps the window as `WindowMem`, which is `forbid(unsafe)` in svm-interp, so the real
+   `mprotect` impl lives JIT/harness-side), then a differential test (grant Memory, `protect` a
+   page, store → both detect-and-kill). **Deferred:** growth (`map` into the reserved tail =
+   sparse address space, §98), demand paging on fault, and a guest consumer (RO data segment /
+   `malloc` over `map`).
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
