@@ -543,10 +543,14 @@ regressions one commit old"):
    faults outside the backed `[0, mapped)`. `new` stays fully-mapped (`mapped == reserved`) and
    `size()` aliases `reserved()`, so **no behavior change** and no caller churn; a second property
    test + the `mask` fuzz target now drive the split (incl. the unmapped-tail fault). (3) JIT
-   reserves `~2^32`+guard, maps `mapped` RW, rest `PROT_NONE`; mask const = `reserved-1`;
+   reserves a **host-configured** large window (§4: "e.g. 2^40, host-configurable" — *not* a
+   fixed 2^32; the reservation only has to be large enough that the guard absorbs the bounded
+   offset reach) + guard, maps `mapped` RW, rest `PROT_NONE`; mask const = `reserved-1`;
    elision threshold → `reserved`; interp confines to `reserved` and **faults** outside `mapped`
    (a deliberate I1 change: out-of-`mapped` accesses now trap instead of wrapping — more
-   wasm-faithful; both backends adopt it to stay in differential lockstep). (4) bound the
+   wasm-faithful; both backends adopt it to stay in differential lockstep). The reservation
+   size is a host/instantiation policy threaded in, not a constant baked into `svm-mask` (which
+   stays policy-free: it confines to whatever `reserved_log2`/`mapped` it is handed). (4) bound the
    loop-invariant SP base once (LICM hoists it) so per-iter SP-relative accesses elide; re-measure
    `locals_c` toward parity.
 2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
