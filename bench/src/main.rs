@@ -349,10 +349,11 @@ fn alu_from_c() -> Result<Resolved, String> {
 
 /// A **data-SP–relative** memory loop from C: an address-taken `volatile` stack array, so each
 /// iteration stores/loads through `sp + (i & 255)*8` — and `sp` is an *unbounded* i64 block
-/// param, so the JIT cannot prove the address in-window and masks every access. This is exactly
-/// the case the large-reserved-window / guard-when-bounded work (§4, §1a) targets: it should
-/// move toward wasm32 parity once the SP base is provably bounded and the per-access mask elides.
-/// `memsum`/`scatter` don't exercise it (their indices are already provably small ⇒ pre-elided).
+/// param, so the JIT cannot prove the address in-window and masks every access. This is the
+/// **accepted-cost** case (D50): closing the ~2.26× wasm32 gap would require 32-bit window
+/// addressing, which we deliberately do *not* pursue — we keep the clean 64-bit model and pay
+/// one mask (it still beats wasm64). Kept as a tracked metric so the mask path can't *regress
+/// further*. `memsum`/`scatter` don't exercise it (their indices are provably small ⇒ pre-elided).
 fn locals_from_c() -> Result<Resolved, String> {
     const SRC: &str = "long run(long n){\n  volatile long a[256];\n  long acc = 0;\n  \
         for (long i = 0; i < n; i++) { a[i & 255] = i; acc += a[i & 255]; }\n  \

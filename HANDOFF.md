@@ -531,9 +531,12 @@ regressions one commit old"):
   to C locals.
 
 ### Suggested next pickups (ranked)
-1. **Large reserved window → full guard-when-bounded** (§4) — *in progress, staged.* A multi-GB
-   reserved window so 32-bit-bounded indices fit under the guard and the JIT can elide the mask
-   without a proof (the wasm32 fast path), closing the residual gap incl. data-SP–relative C
+1. ✅ **Large reserved window → guard-when-bounded** (§4) — **DONE** (Increments 2–4 below; the
+   final SP-elision step was decided *against*, D50). The decoupled `reserved`/`mapped` model is
+   the default: a large reserved range with only `mapped` backed, out-of-`mapped` → detect-and-kill.
+   *Original framing:* a multi-GB reserved window so 32-bit-bounded indices fit under the guard and
+   the JIT can elide the mask without a proof (the wasm32 fast path), closing the residual gap incl.
+   data-SP–relative C
    locals. **Plan:** (1) ✅ a `bench/` **`locals_c`** kernel (address-taken `volatile` stack array
    ⇒ per-iter `sp + (i&255)*8`, `sp` an unbounded i64 block param ⇒ masked every access) now
    measures the case — it starts at **2.26× vs wasm32**, the worst kernel and the target metric
@@ -562,18 +565,18 @@ regressions one commit old"):
    unaffected (all c_frontend/jit_diff/pipeline tests pass; only one wrap-asserting test was updated
    to the fault model: `pipeline::confinement_faults_out_of_window_address`). Bench confirms it's
    perf-neutral (same instruction sequence; memsum/scatter still pre-elide since their ub `< 2^40`).
-   (4) **next — the actual perf payoff (`locals_c` 2.26× → parity), still open:** make per-iter
-   SP-relative accesses elide. **Key soundness finding (don't repeat the dead ends):** the address
-   is `sp + dyn_offset` with `sp` an unbounded `i64` block param. Eliding requires it *provably
-   `< reserved`*. Masking `sp` alone does **not** work — masking `sp & (reserved-1)` leaves
-   `sp+offset > reserved` (un-elidable), and masking `sp & (mapped-1)` **diverges from the interp**
-   (which masks the *full* address to `reserved`, then faults outside `mapped`) for any `sp ≥ mapped`
-   → an escape/mismatch. The **sound** mechanism is the wasm32 trick (§4 "guard-when-bounded"):
-   compute the window address in **32-bit arithmetic** so it's `< 2^32` *by construction*
-   (`ub_of(ExtendI32U) = 0xFFFF_FFFF`, already handled) ⇒ elides against a `≥ 2^32` reservation, and
-   the interp computes the same 32-bit-wrapped address ⇒ no divergence. That is a **frontend/IR
-   change** (the C data-SP + window-address arithmetic become 32-bit; `#define SP` is currently
-   `i64`), so it's the next slice — *not* a JIT-only `ub_of`/LICM tweak.
+   (4) ❌ **decided NOT to pursue (D50)** — the remaining `locals_c` ~2.26× wasm32 gap (data-SP
+   relative `sp + dyn_offset`, `sp` an unbounded `i64` block param) is an **accepted cost** of the
+   64-bit model. **Key soundness finding (don't reopen the dead ends):** eliding needs the address
+   *provably `< reserved`*. Masking `sp` alone does **not** work — `sp & (reserved-1)` leaves
+   `sp+offset > reserved` (un-elidable), and `sp & (mapped-1)` **diverges from the interp** (which
+   masks the *full* address to `reserved`, then faults outside `mapped`) for any `sp ≥ mapped` → a
+   spec mismatch. The only **sound** elision is the wasm32 trick: compute window addresses in
+   **32-bit arithmetic** so the address is `< 2^32` *by construction* (`ub_of(ExtendI32U)` already
+   handles it) and the interp computes the same 32-bit value ⇒ no divergence. That caps the elided
+   window at 4 GiB and reworks the frontend pointer model (`#define SP` is `i64`) for one benchmark
+   — **not worth trading the clean 64-bit address space** (D50). `locals_c` stays a tracked metric
+   (no further regression), and it still beats wasm64.
 2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
    `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
    win end-to-end at ≈parity — see Benchmarking gaps); a non-gating nightly CI `bench` job runs `--check`.

@@ -69,11 +69,17 @@ is spent *around* compute, where wasm is weak:
   inlinable to ~free; batched async rings (§9, §13).
   *This is the strongest, most defensible win.*
 - **64-bit address space:** faster than wasm64 (one AND mask vs explicit bounds
-  check). Against wasm32 it would be a *wash or slightly worse* — so confinement
-  is **"guard-when-bounded, mask-when-not"**: use wasm's zero-instruction
-  large-guard-region trick where the offset is provably bounded (the wasm32 common
-  case, zero added instructions), and mask only the unbounded 64-bit window (§4).
-  This matches wasm32 on the hot path and beats wasm64.
+  check) — confirmed across all memory kernels. Against wasm32 confinement is
+  **"guard-when-bounded, mask-when-not"**: where the effective address is *provably
+  bounded* (the common indexed-array case — `(i & K)*W`), the mask elides and we
+  approach wasm32's free guarded access (bench: ~1.2–1.4× wasm32, well under
+  wasm64). Where the base is an **unbounded value** — notably the threaded data-SP
+  in C-frontend locals (`sp + (i & 255)*8`) — we **mask** (bench `locals_c`: ~2.26×
+  wasm32, still under wasm64). Closing that last gap would need wasm32-style
+  **32-bit window addressing** (so the address is `< 2^32` by construction); we
+  **accept the mask cost instead, keeping the clean 64-bit model** (D50). So the
+  honest claim is: **beats wasm64 everywhere; matches wasm32 on bounded offsets and
+  pays ~1 mask on unbounded-base accesses.**
 - **Startup / JIT latency:** faster — SSA on the wire (no SSA reconstruction);
   decls-before-bodies ⇒ parallel per-function verify+JIT (§3a).
 - **Irregular control flow:** marginally faster — native irreducible CFG avoids
@@ -1690,3 +1696,4 @@ as open-ended, not a byproduct of the build.
 | D47 | Escape-freedom is the **conjunction** `Verified ∧ Correct(JIT) ∧ Correct(runtime) ∧ Correct(host/HW)`, not "verified ⇒ safe"; TCB split into **escape-TCB vs authority-TCB**; decomposed into invariants **I1–I5** (owner + validation each); written as a **structured-prose contract**, not a proof | Settled | Puts risk where it lives (JIT dominates, not the verifier); makes host-extensible caps safe (authority-TCB ≠ escape-TCB); anchors the security work; matches the "as secure as wasm" bar (§2a) |
 | D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
 | D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |
+| D50 | **Accept the mask cost on unbounded-base accesses; do not pursue 32-bit window addressing.** Mask elision (§4 guard-when-bounded) covers *provably-bounded* addresses; for an unbounded base (the threaded data-SP in C locals) we keep the single AND mask (`locals_c` ~2.26× wasm32, still < wasm64) rather than lower window addresses as 32-bit | Settled | The 64-bit address space is a core goal (D36/§1a); the only sound way to elide an unbounded-base access is the wasm32 trick (32-bit address arithmetic, address `< 2^32` by construction so it matches the interp and elides) — masking the i64 data-SP alone is un-elidable or diverges from the interp (an escape). That trick caps the elided window at 4 GiB and reworks the frontend's pointer model for one benchmark; not worth trading the clean 64-bit model. Revisit only if a real workload makes the data-SP mask a measured bottleneck |
