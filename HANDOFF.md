@@ -498,9 +498,15 @@ regressions one commit old"):
   wire it into CI (awkward — noisy shared runners; a `workflow_dispatch`/nightly `--check` that
   warns rather than gates is the likely shape), and `crates/svm/src/bin/bench.rs` (the in-tree
   interp throughput bench) still just prints.
-- [ ] **No C-frontend program benches** — e.g. the SSA-promotion win (loop body ~22→0 memory
-  ops) is uncaptured end-to-end; nothing would flag it if promotion regressed. The `bench/`
-  kernels are hand-written IR, not chibicc output.
+- [~] **C-frontend promotion guard — *structural test done*, timing bench not.** The headline
+  §3 SSA-promotion win (loop body ~22→0 memory ops) is now pinned **deterministically** by
+  `c_frontend::c_ssa_promotion_eliminates_loop_body_memory_ops`: it compiles promotable hot loops
+  and asserts **zero** `Load`/`Store` outside each function's entry block (`loop_region_mem_ops`),
+  with an address-taken control proving the metric isn't blind. This catches a promotion
+  regression one commit old in CI, without timing noise — a better guard for *this* optimization
+  than a wall-clock bench. **Still TODO (optional):** an end-to-end *timing* kernel in `bench/`
+  from chibicc output (the `bench/` kernels are still hand-written IR), if we want the wall-clock
+  win tracked too.
 - [x] **Mask elision (§1a "mask-when-not", D36–D38)** — *done*: a conservative upper-bound
   analysis in the JIT (`ub_of`/`in_window`) drops the `& mask` when the address is provably
   `< size`, closing ~half the wasm32 gap (memsum 1.6→1.36×, scatter 1.53→1.21×) and widening
@@ -531,4 +537,5 @@ regressions one commit old"):
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
 loops + indirect calls in the generative fuzzer; guard pages + signal-handler detect-and-kill;
 **over-time bench regression tracking** (`bench/ --save-baseline`/`--check` vs a committed
-ratio baseline).)*
+ratio baseline); **a structural SSA-promotion guard** (`c_frontend` asserts zero loop-body
+memory ops on promotable loops, so the promotion win can't silently regress).)*

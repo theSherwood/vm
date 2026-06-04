@@ -127,6 +127,22 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
+/// Count `Load`/`Store` instructions that live **outside each function's entry block**
+/// (`blocks[0]`). The frontend's one-time setup — `_start` writing globals/strings, and a
+/// function's `__va_area__`/spill prologue — all lands in entry blocks, so this isolates
+/// *steady-state* memory traffic: loop bodies and post-entry control flow. A fully
+/// SSA-promoted scalar loop has **zero** here (its locals are block params, not memory) —
+/// the §3 promotion win this guards against silently regressing.
+fn loop_region_mem_ops(ir: &str) -> usize {
+    let m = parse_module(ir).expect("frontend IR should parse");
+    m.funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter().skip(1)) // skip each function's entry block
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, svm_ir::Inst::Load { .. } | svm_ir::Inst::Store { .. }))
+        .count()
+}
+
 /// What a C program did: either `main` returned normally (with its result values) or it
 /// called `exit(code)`. Plus the bytes it wrote to stdout/stderr through the powerbox.
 #[derive(Debug, PartialEq)]
@@ -1073,4 +1089,41 @@ fn c_matches_gcc_ssa_promotion() {
     );
     // Post- vs pre-increment used for their values (sequenced, so well-defined).
     assert_matches_gcc("int main(){ int i=5; int j=i++; int k=++i; return i*100 + j*10 + k; }");
+}
+
+/// Structural guard for the headline §3 SSA-promotion win: a hot loop over non-address-taken
+/// scalars must lower to **zero loop-body memory ops** ("~22 → 0" in the design notes). The
+/// `c_matches_gcc_*` tests only pin *correctness*, which the everything-in-memory lowering
+/// also satisfies — so they would stay green if promotion silently stopped firing. This pins
+/// the optimization itself: it fails the moment a promotable loop body goes back to memory.
+#[test]
+fn c_ssa_promotion_eliminates_loop_body_memory_ops() {
+    // Each: a tight loop whose scalars (accumulator, counter) are never address-taken, so
+    // every one promotes to a block param — the loop body should touch memory zero times.
+    // (A `?:`/`&&`/`||` *inside* the loop is deliberately avoided here: it spills "stranded"
+    // sub-expression values to scratch by design — see §7a — which is correct but not zero.)
+    let promoted = [
+        "int main(){ int s=0; for(int i=0;i<10;i++) s += i*i; return s; }",
+        "int main(){ int i=0,s=0; while(i<10){ s+=i; s*=2; ++i; } return s; }",
+        "int main(){ long acc=0; for(int i=0;i<20;i++) acc += (long)i*3 - (i>>1); return (int)acc; }",
+    ];
+    for src in promoted {
+        let ir = c_to_ir(src);
+        assert_eq!(
+            loop_region_mem_ops(&ir),
+            0,
+            "SSA promotion should leave zero loop-body memory ops for:\n{src}\n--- IR ---\n{ir}"
+        );
+        // Belt and suspenders: the promoted form must still compute the right answer.
+        run_c(src);
+    }
+
+    // Non-vacuous control: take the accumulator's address, forcing it to stay in memory. The
+    // metric must now *see* the loop's load/store — otherwise the zeros above prove nothing.
+    let in_memory = "int main(){ int s=0; int *p=&s; for(int i=0;i<10;i++) *p += i*i; return s; }";
+    let ir = c_to_ir(in_memory);
+    assert!(
+        loop_region_mem_ops(&ir) > 0,
+        "an address-taken accumulator must keep loop-body memory ops (else the guard is blind):\n{ir}"
+    );
 }
