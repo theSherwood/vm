@@ -508,11 +508,13 @@ version = "0.0.0"
 name = "svm-jit"
 version = "0.0.0"
 dependencies = [
+ "cc",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "libc",
  "svm-ir",
 ]
 

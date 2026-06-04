@@ -537,9 +537,13 @@ regressions one commit old"):
    locals. **Plan:** (1) ✅ a `bench/` **`locals_c`** kernel (address-taken `volatile` stack array
    ⇒ per-iter `sp + (i&255)*8`, `sp` an unbounded i64 block param ⇒ masked every access) now
    measures the case — it starts at **2.26× vs wasm32**, the worst kernel and the target metric
-   (memsum/scatter are already pre-elided, so they don't show it). (2) decouple `reserved` (mask
-   domain) from `mapped` (fault bound) in `svm-mask` + its property/fuzz tests, no behavior change.
-   (3) JIT reserves `~2^32`+guard, maps `mapped` RW, rest `PROT_NONE`; mask const = `reserved-1`;
+   (memsum/scatter are already pre-elided, so they don't show it). (2) ✅ decoupled `reserved`
+   (mask domain) from `mapped` (fault bound) in `svm-mask`: `Window::with_mapped(reserved_log2,
+   mapped)` + `reserved()`/`mapped()` accessors; `confine` masks into `[0, reserved)`, `checked`
+   faults outside the backed `[0, mapped)`. `new` stays fully-mapped (`mapped == reserved`) and
+   `size()` aliases `reserved()`, so **no behavior change** and no caller churn; a second property
+   test + the `mask` fuzz target now drive the split (incl. the unmapped-tail fault). (3) JIT
+   reserves `~2^32`+guard, maps `mapped` RW, rest `PROT_NONE`; mask const = `reserved-1`;
    elision threshold → `reserved`; interp confines to `reserved` and **faults** outside `mapped`
    (a deliberate I1 change: out-of-`mapped` accesses now trap instead of wrapping — more
    wasm-faithful; both backends adopt it to stay in differential lockstep). (4) bound the
