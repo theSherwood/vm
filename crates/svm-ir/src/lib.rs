@@ -985,6 +985,15 @@ impl Memory {
     }
 }
 
+/// The reference host's **default reservation policy** (§4): the size (`log2`) of the reserved
+/// virtual range a window's `mapped` bytes live inside. DESIGN §4 makes this host-configurable
+/// ("e.g. 2^40"); this is the default the reference `run`/`compile_and_run` entries apply when a
+/// caller doesn't pass one. It is *policy*, not verified semantics — both backends share this one
+/// constant so they stay in differential lockstep, and the masking unit (`svm-mask`) never
+/// hard-codes a reservation. The reserved range is `PROT_NONE` + lazily paged, so a large value
+/// costs virtual address space, not committed memory.
+pub const DEFAULT_RESERVED_LOG2: u8 = 40;
+
 /// A module: a flat list of functions plus an optional linear-memory window.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {

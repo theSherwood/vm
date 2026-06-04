@@ -11,13 +11,15 @@ use svm_jit::{compile_and_run_capture, compile_and_run_capture_reserved, JitOutc
 
 /// Parse + verify a module, then run it on both backends with `init` seeding the window;
 /// return both final-window snapshots (asserting both ran to completion and agree on the
-/// result). This is exactly the escape-oracle contract the fuzzer asserts.
+/// result). These cases test **wrap-confinement** (an out-of-window address aliasing back in),
+/// which is the behaviour of a *fully-mapped* window (`reserved == mapped`), so they pin the
+/// reservation to fully-mapped; the `reserved_*` cases below cover the decoupled fault model.
 fn both_windows(src: &str, init: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let m = svm::text::parse_module(src).expect("parse");
     svm::verify::verify_module(&m).expect("verify");
     let mut fuel = 1_000_000u64;
-    let (ir, imem) = run_capture(&m, 0, &[Value::I32(0)], &mut fuel, init);
-    let (jo, jmem) = compile_and_run_capture(&m, 0, &[0i64], init).expect("jit");
+    let (ir, imem) = run_capture_reserved(&m, 0, &[Value::I32(0)], &mut fuel, init, 0);
+    let (jo, jmem) = compile_and_run_capture_reserved(&m, 0, &[0i64], init, 0).expect("jit");
     assert!(ir.is_ok(), "interp trapped: {ir:?}");
     assert!(
         matches!(jo, JitOutcome::Returned(_)),

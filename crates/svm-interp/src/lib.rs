@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use svm_ir::{
     BinOp, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, FuncType,
     IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
+    DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 
@@ -89,9 +90,12 @@ pub fn run_with_host(
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
     let f = m.funcs.get(func as usize).ok_or(Trap::Malformed)?;
-    // One linear-memory window per run, zero-initialized and lazily paged. The whole
-    // module shares it (all functions address the same window).
-    let mut mem = m.memory.map(|mc| Mem::new(mc.size_log2));
+    // One linear-memory window per run, zero-initialized and lazily paged. The whole module
+    // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
+    // backed, so an out-of-`mapped` access faults (detect-and-kill) instead of wrapping.
+    let mut mem = m
+        .memory
+        .map(|mc| Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2));
     run_func(f, args, fuel, &mut mem, &m.funcs, host, 0)
 }
 
@@ -108,8 +112,8 @@ pub fn run_capture(
     fuel: &mut u64,
     init_mem: &[u8],
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
-    // Fully-mapped window (`reserved == mapped`): historical behaviour.
-    run_capture_reserved(m, func, args, fuel, init_mem, 0)
+    // Default reservation policy (§4): a large reserved range, only `mapped` backed.
+    run_capture_reserved(m, func, args, fuel, init_mem, DEFAULT_RESERVED_LOG2)
 }
 
 /// Like [`run_capture`], but with a host **reservation policy**: confinement masks into
@@ -896,11 +900,6 @@ struct Mem {
 }
 
 impl Mem {
-    /// A fully-mapped window of `1 << size_log2` bytes (`mapped == reserved`).
-    fn new(size_log2: u8) -> Mem {
-        Mem::with_reservation(size_log2, size_log2)
-    }
-
     /// A window whose mask domain is `1 << reserved_log2` bytes but whose backed region is the
     /// declared `1 << mapped_log2` prefix; an access into the reserved-but-unmapped tail faults
     /// (the §4 "guard-when-bounded" model). `reserved_log2` is raised to at least `mapped_log2`,

@@ -68,6 +68,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     BinOp, Block, CastOp, ConvOp, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx, FuncType, Inst,
     IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, ValType,
+    DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -291,9 +292,18 @@ pub fn compile_and_run_with_host(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
 ) -> Result<JitOutcome, JitError> {
-    // Fully-mapped window (`reserved_log2 = 0` ⇒ raised to `mapped`); callers needing a larger
-    // reserved range use the `_reserved` capture entry.
-    Ok(run_inner(m, func, args, cap_thunk, cap_ctx, None, 0)?.0)
+    // Default reservation policy (§4): a large reserved range, only `mapped` backed. Callers
+    // wanting a specific reservation use the `_reserved` capture entry.
+    Ok(run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        None,
+        DEFAULT_RESERVED_LOG2,
+    )?
+    .0)
 }
 
 /// Like [`compile_and_run`], but seed the guest window with `init_mem` (its low bytes) and
@@ -307,8 +317,8 @@ pub fn compile_and_run_capture(
     args: &[i64],
     init_mem: &[u8],
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
-    // Fully-mapped window (`reserved == mapped`): historical behaviour.
-    compile_and_run_capture_reserved(m, func, args, init_mem, 0)
+    // Default reservation policy (§4): a large reserved range, only `mapped` backed.
+    compile_and_run_capture_reserved(m, func, args, init_mem, DEFAULT_RESERVED_LOG2)
 }
 
 /// Like [`compile_and_run_capture`], but with a host **reservation policy**: the window masks

@@ -555,9 +555,25 @@ regressions one commit old"):
    + `reserved_in_mapped_access_matches` pin the semantics, and the generative fuzzer
    (`run_differential`) runs a **second `reserved > mapped` pass** so the 4000 seeds + `diff`
    libFuzzer target exercise the large reservation, mask/elision-to-`reserved`, and interp↔JIT
-   trap-agreement on tail faults. (4) **next:** bound the loop-invariant SP base once (LICM hoists
-   it) so per-iter SP-relative accesses elide; flip the production reservation default and
-   re-measure `locals_c` toward parity.
+   trap-agreement on tail faults. (3b) ✅ **flipped the production default** to the §4 large-reserved
+   model: `svm_ir::DEFAULT_RESERVED_LOG2 = 40` (host policy, shared by both backends so they stay in
+   lockstep), applied by the non-`_reserved` `run`/`compile_and_run` entries. Out-of-`mapped`
+   accesses now **fault by default** (detect-and-kill, demand-paging-ready) — valid programs are
+   unaffected (all c_frontend/jit_diff/pipeline tests pass; only one wrap-asserting test was updated
+   to the fault model: `pipeline::confinement_faults_out_of_window_address`). Bench confirms it's
+   perf-neutral (same instruction sequence; memsum/scatter still pre-elide since their ub `< 2^40`).
+   (4) **next — the actual perf payoff (`locals_c` 2.26× → parity), still open:** make per-iter
+   SP-relative accesses elide. **Key soundness finding (don't repeat the dead ends):** the address
+   is `sp + dyn_offset` with `sp` an unbounded `i64` block param. Eliding requires it *provably
+   `< reserved`*. Masking `sp` alone does **not** work — masking `sp & (reserved-1)` leaves
+   `sp+offset > reserved` (un-elidable), and masking `sp & (mapped-1)` **diverges from the interp**
+   (which masks the *full* address to `reserved`, then faults outside `mapped`) for any `sp ≥ mapped`
+   → an escape/mismatch. The **sound** mechanism is the wasm32 trick (§4 "guard-when-bounded"):
+   compute the window address in **32-bit arithmetic** so it's `< 2^32` *by construction*
+   (`ub_of(ExtendI32U) = 0xFFFF_FFFF`, already handled) ⇒ elides against a `≥ 2^32` reservation, and
+   the interp computes the same 32-bit-wrapped address ⇒ no divergence. That is a **frontend/IR
+   change** (the C data-SP + window-address arithmetic become 32-bit; `#define SP` is currently
+   `i64`), so it's the next slice — *not* a JIT-only `ub_of`/LICM tweak.
 2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
    `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
    win end-to-end at ≈parity — see Benchmarking gaps); a non-gating nightly CI `bench` job runs `--check`.

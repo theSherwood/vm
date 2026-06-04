@@ -541,10 +541,11 @@ block0(v0: i64, v1: i32):
 }
 
 #[test]
-fn confinement_masks_out_of_window_address() {
-    // The window is 2^16 bytes. A store at offset (2^16 + 8) must alias offset 8
-    // after masking, so a load at 8 observes it. This is invariant I1: every access
-    // is masked into [0, size).
+fn confinement_faults_out_of_window_address() {
+    // The window is 2^16 bytes *backed*, inside a large reserved range (the §4 default policy).
+    // A store at offset (2^16 + 8) lands in the reserved-but-unmapped tail, so it **faults**
+    // (detect-and-kill, §4/§5) rather than wrapping in — the deliberate decoupled-model
+    // behaviour (invariant I1: confined to `reserved`, faults outside the backed `mapped`).
     let src = r#"
 memory 16
 func (i64, i64, i64) -> (i64) {
@@ -554,11 +555,19 @@ block0(v0: i64, v1: i64, v2: i64):
   return v3
 }
 "#;
-    let big = 65536 + 8; // 2^16 + 8 aliases 8
+    let big = 65536 + 8; // 2^16 + 8 — in the unmapped tail
     assert_eq!(
         run1(
             src,
             &[Value::I64(big), Value::I64(8), Value::I64(0xdead_beef)]
+        ),
+        Err(Trap::MemoryFault)
+    );
+    // An in-window access is unaffected: store at 8, load it back.
+    assert_eq!(
+        run1(
+            src,
+            &[Value::I64(8), Value::I64(8), Value::I64(0xdead_beef)]
         ),
         Ok(vec![Value::I64(0xdead_beef)])
     );
