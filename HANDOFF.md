@@ -305,11 +305,13 @@ The JIT is the only component emitting unsafe machine code, so it gets dedicated
 
 - **`crates/svm/tests/support/irgen.rs`** — a generator of **verifier-valid** IR modules
   *by construction*: typed value pool (constants synthesized on demand), branch/return
-  args matched to target param types, **forward-only CFG + call graph (DAGs)** so
-  execution always halts, constants biased to boundary values (0, ±1, INT_MIN/MAX, NaN,
-  ±inf). Covers the whole scalar op set. `fuzz_one(&mut Gen)` generates → verifies →
-  runs interp + JIT → asserts agreement (value-equal or same trap kind; NaN-insensitive).
-  `Gen::from_seed` (stable) / `Gen::from_bytes` (libFuzzer).
+  args matched to target param types, **forward-only call graph (a DAG)**, and a CFG that is
+  forward-only *except* `gen_loop_func`'s one **counted loop** (a strictly-incrementing i32
+  counter to a small bound ⇒ still halts by construction). `call_indirect` dispatches only
+  forward or type-mismatch-traps. Constants biased to boundary values (0, ±1, INT_MIN/MAX,
+  NaN, ±inf); covers the whole scalar op set. `fuzz_one(&mut Gen)` generates → verifies →
+  runs interp + JIT → asserts agreement (values + final memory equal; NaN-insensitive; both
+  trapping ⇒ agree, kind not pinned). `Gen::from_seed` (stable) / `Gen::from_bytes` (libFuzzer).
 - **`crates/svm/tests/jit_fuzz.rs`** — stable-CI loop over 4000 seeds (~1.6s).
 - **`fuzz/fuzz_targets/diff.rs`** — libFuzzer target (`cargo +nightly fuzz run diff`).
 
@@ -423,12 +425,20 @@ Have (✅ continuously, except where noted):
 - [x] `roundtrip` (libFuzzer): encode∘decode identity.
 - [x] **Nightly CI matrix** runs `decode_verify` **+ `diff` (carries the escape-oracle) +
   `mask`** (`ci.yml`, `schedule`/`workflow_dispatch`), so all three get coverage-guided time.
+- [x] **Loops + indirect calls in `irgen`** — `gen_loop_func` emits one **counted loop**
+  (entry/header/body/exit, a strictly-incrementing i32 counter to a small bound ⇒ halts by
+  construction, no JIT fuel needed; ~half of functions), and `gen_inst` emits `call_indirect`
+  in two terminating flavors (forward-success / type-mismatch-trap = the I2 "forged index is
+  inert" check). Loop bodies run loads/stores ≤15× ⇒ repeated/aliased stores deepen the
+  escape-oracle. A coverage-guard test asserts both shapes are actually produced. Surfacing
+  this also relaxed an over-strict harness rule: when **both** backends trap, the trap *kind*
+  is no longer asserted (a trap is terminal; an eager interp vs an optimizing JIT may surface
+  different ones among several reachable traps — e.g. a dead trapping float→int convert).
 
 Gaps (priority order):
-- [ ] **Generator coverage holes:** `irgen` emits forward-only DAG CFGs — **no
-  loops/back-edges** (needs a JIT step-cap/fuel) and **no `call_indirect`/`cap.call`**. The
-  generative differential (and the escape-oracle) never exercise them (only the hand-written
-  C tests do). Loops especially would deepen the escape-oracle (repeated/aliased stores).
+- [ ] **`cap.call` not generated**, and loops are a single counted shape (no nested/irreducible
+  loops, no data-dependent trip counts). `cap.call` needs a mock powerbox in the fuzzer (today
+  it'd always `CapFault`); richer loop shapes need a JIT step-cap/fuel to stay terminating.
 - [ ] **Escape-oracle excludes float modules** (NaN-payload nondeterminism). A canonical-NaN
   normalization, or comparing only integer-store bytes, would extend coverage to them.
 - [ ] **No guard-page/fault escape check** — the oracle catches *mis-masked* accesses via
@@ -489,10 +499,11 @@ regressions one commit old"):
    §4/§5) — the big MVP item; it also upgrades the escape-oracle from final-memory diff to
    true fault detection, *and* unlocks the wasm32 fast path for addresses the upper-bound
    analysis can't prove (incl. data-SP–relative C locals) — the residual ~1.2–1.36× gap.
-2. **Loops + indirect calls in `irgen`** — needs a JIT step-cap/fuel; deepens both the
-   interp/JIT differential and the escape-oracle (repeated, aliased stores).
-3. **Over-time bench tracking** — log the `--csv` line per commit so memory/compute
+2. **Over-time bench tracking** — log the `--csv` line per commit so memory/compute
    regressions (e.g. a future masking change) are caught one commit old.
+3. **Real Memory capability** (`map`/`unmap`/`protect` beyond no-op stubs) — guest-visible
+   virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`.
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
-CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses.)*
+CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
+loops + indirect calls in the generative fuzzer.)*

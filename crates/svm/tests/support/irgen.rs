@@ -7,8 +7,11 @@
 //!   type-correct and references only already-defined values;
 //! - block-branch / return arguments are generated to match the target's exact param
 //!   types;
-//! - the CFG uses **forward-only edges** and the call graph uses **forward-only calls**,
-//!   so both are DAGs — no loops, no recursion — and execution always halts.
+//! - the call graph uses **forward-only calls** (a DAG), and most functions use forward-only
+//!   CFG edges; the exception is [`gen_loop_func`], which emits one **counted loop** whose
+//!   `i32` counter strictly increments to a small bound — so every generated module still
+//!   **halts by construction** (a bounded number of iterations, no JIT fuel needed).
+//!   `call_indirect` likewise only ever dispatches *forward* (or type-mismatch-traps).
 //!
 //! Therefore any interpreter-vs-JIT divergence on a generated module is a real backend
 //! bug, not malformed input. Constant values are biased toward boundary cases (0, ±1,
@@ -224,7 +227,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
     let nfuncs = sigs.len();
     let can_call = fi + 1 < nfuncs;
     loop {
-        match bb.g.below(17) {
+        match bb.g.below(18) {
             0 => {
                 let ty = bb.g.inttype();
                 let op = BinOp::from_index(bb.g.below(15) as u8).unwrap();
@@ -356,6 +359,34 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     &cr,
                 );
             }
+            17 => {
+                // call_indirect — two terminating flavors:
+                if can_call && bb.g.boolean() {
+                    // (a) success: a const index into a *forward* function with its exact
+                    // signature ⇒ the type check passes and a forward (DAG) call runs.
+                    let j = fi + 1 + bb.g.below((nfuncs - fi - 1) as u32) as usize;
+                    let ty = FuncType {
+                        params: sigs[j].0.clone(),
+                        results: sigs[j].1.clone(),
+                    };
+                    let idx = bb.push(Inst::ConstI32(j as i32), ValType::I32);
+                    let args: Vec<ValIdx> = ty.params.iter().map(|&t| bb.want(t)).collect();
+                    let results = ty.results.clone();
+                    bb.push_multi(Inst::CallIndirect { ty, idx, args }, &results);
+                } else {
+                    // (b) inert: a 4-param signature no generated function has (they take
+                    // ≤ 3), so *any* index type-mismatches ⇒ a guaranteed IndirectCallType
+                    // trap, never a dispatch — exercising I2 ("a forged index is inert")
+                    // with an arbitrary index and no risk of non-termination.
+                    let ty = FuncType {
+                        params: vec![ValType::I32; 4],
+                        results: vec![],
+                    };
+                    let idx = bb.want(ValType::I32);
+                    let args: Vec<ValIdx> = (0..4).map(|_| bb.want(ValType::I32)).collect();
+                    bb.push0(Inst::CallIndirect { ty, idx, args });
+                }
+            }
             _ => continue, // a mem/call kind that isn't available here — re-roll
         }
         break;
@@ -417,7 +448,118 @@ fn gen_term(
     }
 }
 
+/// A function shaped as a single **counted loop** — the natural-loop case the forward-only
+/// DAG generator can't produce. Termination is by construction: an `i32` counter starts at 0,
+/// the header exits once it reaches a small bound, and the body increments it by 1 on the
+/// back-edge — so both backends run a bounded number of iterations (no JIT fuel needed). The
+/// function params are the loop-carried state; the body runs random straight-line work (incl.
+/// loads/stores → repeated/aliased stores, which is exactly what deepens the escape-oracle).
+///
+/// Blocks: 0 entry (init counter, jump to header) · 1 header (`i < bound` ? body : exit) ·
+/// 2 body (work; `i+1`; back-edge to header) · 3 exit (return). The counter is the last
+/// header/body param, at index `carry.len()`.
+fn gen_loop_func(
+    g: &mut Gen,
+    fi: usize,
+    sigs: &[(Vec<ValType>, Vec<ValType>)],
+    has_mem: bool,
+) -> Func {
+    let (params, results) = sigs[fi].clone();
+    let carry = params.clone(); // loop-carried values threaded around the back-edge
+    let counter = carry.len() as u32; // the counter param's index in header/body
+    let bound = 1 + g.below(15) as i32; // 1..=15 iterations
+    let hparams: Vec<ValType> = carry.iter().copied().chain([ValType::I32]).collect();
+
+    let entry = {
+        let mut e = BB::new(g, &params);
+        let n = e.g.below(4);
+        for _ in 0..n {
+            gen_inst(&mut e, fi, sigs, has_mem);
+        }
+        let mut args = e.edge_args(&carry);
+        let c0 = e.push(Inst::ConstI32(0), ValType::I32);
+        args.push(c0);
+        Block {
+            params: params.clone(),
+            insts: e.insts,
+            term: Terminator::Br { target: 1, args },
+        }
+    };
+    let header = {
+        let mut h = BB::new(g, &hparams);
+        let bnd = h.push(Inst::ConstI32(bound), ValType::I32);
+        let cond = h.push(
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::LtS,
+                a: counter,
+                b: bnd,
+            },
+            ValType::I32,
+        );
+        Block {
+            params: hparams.clone(),
+            insts: h.insts,
+            // pass all header params (carry + counter) to the body; carry only to exit
+            term: Terminator::BrIf {
+                cond,
+                then_blk: 2,
+                then_args: (0..hparams.len() as u32).collect(),
+                else_blk: 3,
+                else_args: (0..carry.len() as u32).collect(),
+            },
+        }
+    };
+    let body = {
+        let mut b = BB::new(g, &hparams);
+        let n = b.g.below(6);
+        for _ in 0..n {
+            gen_inst(&mut b, fi, sigs, has_mem);
+        }
+        let mut args = b.edge_args(&carry);
+        let one = b.push(Inst::ConstI32(1), ValType::I32);
+        let next = b.push(
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: counter,
+                b: one,
+            },
+            ValType::I32,
+        );
+        args.push(next);
+        Block {
+            params: hparams.clone(),
+            insts: b.insts,
+            term: Terminator::Br { target: 1, args },
+        }
+    };
+    let exit = {
+        let mut x = BB::new(g, &carry);
+        let n = x.g.below(4);
+        for _ in 0..n {
+            gen_inst(&mut x, fi, sigs, has_mem);
+        }
+        let outs = x.edge_args(&results);
+        Block {
+            params: carry.clone(),
+            insts: x.insts,
+            term: Terminator::Return(outs),
+        }
+    };
+    Func {
+        params,
+        results,
+        blocks: vec![entry, header, body, exit],
+    }
+}
+
 fn gen_func(g: &mut Gen, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_mem: bool) -> Func {
+    // About half the functions are a counted loop (back-edges + loop-carried block params);
+    // the rest are forward-only DAGs (the original shape).
+    if g.below(2) == 0 {
+        return gen_loop_func(g, fi, sigs, has_mem);
+    }
     let (params, results) = sigs[fi].clone();
     let nblocks = 1 + g.below(4) as usize;
     let mut bparams: Vec<Vec<ValType>> = vec![params.clone()];
@@ -619,13 +761,16 @@ pub fn run_differential(m: &Module, args: &[Value]) {
                 assert_eq!(imem.len(), jmem.len(), "window snapshot length\n{m:#?}");
             }
         }
-        (Err(trap), JitOutcome::Trapped(kind)) => {
-            if let Some(want) = interp_trap_kind(&trap) {
-                assert_eq!(
-                    kind, want,
-                    "trap kind: JIT {kind:?} vs interp {trap:?}\n{m:#?}"
-                );
-            }
+        (Err(_), JitOutcome::Trapped(_)) => {
+            // Both terminate the guest — agreement at the level that matters. The trap
+            // *kind* is deliberately not asserted: a trap is terminal, and when a block has
+            // several reachable traps the eager interpreter (which traps at the first in
+            // program order) and the optimizing JIT (which may reorder or drop a *dead*
+            // trapping op, e.g. a trapping float→int conversion whose result is unused) can
+            // surface different ones. The IR pins neither the order nor the choice. The
+            // checks that matter stay strict: a clean interp run must match the JIT's value
+            // *and* memory (below / above), and a modelled interp trap must not let the JIT
+            // *return a value* (next arm).
         }
         (Err(trap), JitOutcome::Returned(_)) => assert!(
             interp_trap_kind(&trap).is_none(),

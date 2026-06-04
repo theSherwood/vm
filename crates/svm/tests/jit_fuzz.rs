@@ -20,3 +20,38 @@ fn jit_matches_interp_on_generated_modules() {
         fuzz_one(&mut g);
     }
 }
+
+/// Guard that the generator actually covers loops (back-edges) and indirect calls — so the
+/// differential above is exercising them, not silently regressing to forward-only DAGs.
+#[test]
+fn generator_covers_loops_and_indirect_calls() {
+    use svm_ir::{Inst, Terminator};
+    let (mut loops, mut indirect) = (0u32, 0u32);
+    for seed in 0..2000u64 {
+        let mut g = Gen::from_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED_5EED);
+        let m = irgen::gen_module(&mut g);
+        for f in &m.funcs {
+            for (bi, blk) in f.blocks.iter().enumerate() {
+                let back = |t: u32| t as usize <= bi; // a back-edge re-enters this/an earlier block
+                let has_back = match &blk.term {
+                    Terminator::Br { target, .. } => back(*target),
+                    Terminator::BrIf {
+                        then_blk, else_blk, ..
+                    } => back(*then_blk) || back(*else_blk),
+                    Terminator::BrTable {
+                        targets, default, ..
+                    } => targets.iter().any(|(t, _)| back(*t)) || back(default.0),
+                    _ => false,
+                };
+                loops += has_back as u32;
+                indirect += blk
+                    .insts
+                    .iter()
+                    .filter(|i| matches!(i, Inst::CallIndirect { .. }))
+                    .count() as u32;
+            }
+        }
+    }
+    assert!(loops > 0, "generator produced no loop back-edges");
+    assert!(indirect > 0, "generator produced no call_indirect");
+}
