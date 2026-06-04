@@ -1044,3 +1044,33 @@ fn c_matches_gcc_malloc_and_data_structures() {
          int s=0; for(struct N*p=h;p;p=p->next) s+=p->v; return s; }",
     );
 }
+
+#[test]
+fn c_matches_gcc_ssa_promotion() {
+    // Exercise the SSA-promotion pass (DESIGN §3d): scalar locals that are never
+    // address-taken become real SSA values threaded through block params. These programs
+    // lean on the cases that pass relies on — and would break if promotion were wrong:
+    // every compound-assignment / inc-dec flavour (which chibicc desugars through `&x`,
+    // un-desugared by the frontend), promoted values crossing loop back-edges and
+    // &&/||/?: merges, and a promoted local read before assignment on one path.
+    assert_matches_gcc(
+        "int main(){ int a=1,b=2,c=3; a+=b; b*=c; c-=a; a<<=1; b|=5; c%=4; \
+         return a*1000 + b*10 + c; }",
+    );
+    assert_matches_gcc(
+        "int main(){ int i=0,s=0; while(i<10){ s+=i*i; ++i; } i=10; do { s-=i--; } while(i); return s; }",
+    );
+    assert_matches_gcc(
+        "int main(){ int x=0; for(int i=0;i<8;i++){ x += (i&1) ? i*2 : -i; if(i==5) x++; } return x; }",
+    );
+    // A promoted local assigned only inside a conditional, then read after the merge.
+    assert_matches_gcc("int main(){ int x=7; int y; if(x>3) y=x*x; else y=0; return y; }");
+    // A long accumulator and a promoted pointer walking a local array (`arr` is
+    // address-taken so it stays in memory; `p` and `sum` promote).
+    assert_matches_gcc(
+        "int main(){ int arr[5]={4,8,15,16,23}; long sum=0; \
+         for(int *p=arr; p<arr+5; p++) sum += *p; return (int)sum; }",
+    );
+    // Post- vs pre-increment used for their values (sequenced, so well-defined).
+    assert_matches_gcc("int main(){ int i=5; int j=i++; int k=++i; return i*100 + j*10 + k; }");
+}

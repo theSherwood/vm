@@ -7,8 +7,11 @@ Branch: **`main`** (this work has been committing straight to `main`; the remote
 **Status in one line:** Phase 2 ("real C runs") is **complete** — the C frontend is at the
 agreed stopping point (broad subset, two-tier tested) — and we're into Phase 3 (the JIT +
 windowed memory + capabilities exist; a generative interp↔JIT differential fuzzer now
-guards the JIT). The big Phase-3 remainders are production trap-catching (guard pages +
-signal handler, §4/§5) and the §3d SSA-promotion perf pass.
+guards the JIT). The §3d **SSA-promotion perf pass now exists** (item 8 below): scalar
+locals that are never address-taken are promoted to SSA values threaded as block params, so
+the JIT register-allocates them — a hot loop body went from ~22 load/store ops to **0**. The
+big Phase-3 remainder is production trap-catching (guard pages + signal handler, §4/§5); the
+other open item is the §8 verifier escape-oracle fuzzer.
 
 ---
 
@@ -85,9 +88,13 @@ verifier re-checks whatever it emits.
 
 ## 3. The lowering model (read this before extending `codegen_ir.c`)
 
-**Everything-in-memory, with a threaded data-stack pointer.** This is chibicc's own
-"allocate all locals to memory first" model (DESIGN §3d), *without* the SSA-promotion
-pass yet (that's the documented "reverse" pass that matters for speed — not done).
+**Everything-in-memory, with a threaded data-stack pointer** — *then* the SSA-promotion
+pass lifts the easy locals back out. The base model is chibicc's own "allocate all locals
+to memory first" (DESIGN §3d); promotion (the documented "reverse" pass that matters for
+speed) now runs on top of it. **A promoted local is no longer in memory at all:** it is a
+real SSA value threaded as a block parameter of every block, exactly like the data-SP (see
+"SSA promotion" below). The memory model below still governs every *non*-promoted local
+(address-taken, narrow, aggregate, `_Atomic`).
 
 - **Locals live in the window data stack.** Each local gets a **frame-relative offset**
   (`assign_offsets`, from 0). A local is accessed at run time as `sp + offset` via typed
@@ -111,10 +118,32 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
 - **The harness passes the initial data-SP** (`SP0 = 16`) as `main`'s `v0`. The low
   `[0,16)` window bytes are reserved so `&local` (= `sp + offset ≥ 16`) is never `NULL`.
 
+### SSA promotion (the §3d "reverse" pass — `prepare_func`/`scan`/`undo_compound` + threading)
+- **Which locals promote:** a local that is a **full-width scalar** (`int`/`long`/`enum`/
+  pointer/`float`/`double`), **never address-taken**, not `_Atomic`, not the hidden
+  `__va_area__`/alloca object, and not a synthetic temp. Narrow types (`char`/`short`/
+  `_Bool`) stay in memory so their **store truncation** keeps happening; aggregates are
+  by-address. `prepare_func` decides this per function and records it by setting the local's
+  `offset` to the sentinel **`-(slot+1)`** (a memory local keeps a `≥0` offset).
+- **How a promoted local lives:** as a **block parameter of every block** (slot `s` ⇒ `v(s+1)`,
+  right after the data-SP `v0`), with `curval[s]` tracking its current SSA value in the
+  current block. A read returns `curval`; an assignment rebinds it; `ND_MEMZERO` binds a
+  typed zero — **no load/store/memzero is emitted**. This is the same "thread it through
+  every block" trick already used for the data-SP, so it is SSA-valid by construction (the
+  block param *is* the φ) — no dominance/liveness analysis; Cranelift drops the dead ones.
+  `cvals()`/`cparams()` build the arg/param suffixes; every branch site passes `cvals()`.
+- **The compound-assignment catch:** chibicc lowers `A op= B` and `A++`/`A--` to
+  `tmp = (T*)&A, *tmp = *tmp op B` — taking `&A`, which would block promotion of every loop
+  counter/accumulator. `undo_compound` (run by the `rewrite` AST pass before analysis)
+  recognizes that exact shape for a **plain-variable** `A` and rewrites it back to the direct
+  `A = A op B` (no address). Other lvalues (`a[i] += …`, `s.f += …`, `*p += …`) keep
+  chibicc's form — their `tmp` is just a normal (often itself-promoted) pointer.
+
 ### Known quirks / inefficiencies (correct, just not optimal — don't "fix" without need)
-- **Redundant `memzero`:** chibicc emits `ND_MEMZERO` (zero-init) before every
-  initializer, even for a fully-initialized scalar, so `int x = 5;` stores 0 then 5. The
-  SSA-promotion / optimization pass (deferred) is where this goes away.
+- **Redundant `memzero`/init for promoted scalars:** chibicc still emits `ND_MEMZERO` then
+  the initializer, so `int x = 5;` lowers to a dead `i32.const 0` (the bind) followed by the
+  real `5`. For a promoted local these are dead **SSA consts**, not stores, and Cranelift
+  DCEs them; for a memory local it's the old store-0-then-store-5. Harmless either way.
 - **Over-reserved frames:** every function frame includes chibicc's hidden
   `__alloca_size__` (8 B), and `int main()` (empty parens ⇒ chibicc treats it as
   variadic) also gets `__va_area__` (136 B) — hence `main`'s `cur_frame = 144`. Harmless
@@ -136,9 +165,15 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
 - `gen_if` / `gen_for` (handles both `for` and `while`) — the block CFG.
 - `gen_stmt` — `ND_BLOCK` (drops dead code after a terminator), `ND_EXPR_STMT`, `ND_IF`,
   `ND_FOR`, `ND_RETURN`.
-- `gen_func` — signature (`func (i64 sp, params...) -> (ret)`), entry block, param spill,
-  fall-off-end default `return 0`.
-- `codegen_ir` — orders funcs (main first), assigns offsets, emits `memory`, emits funcs.
+- `gen_func` — signature (`func (i64 sp, params...) -> (ret)`), entry block, param spill
+  (or curval bind for promoted params), fall-off-end default `return 0`.
+- `prepare_func(fn)` — the per-function analysis: `rewrite` (un-desugar compound assign) →
+  `scan` (collect address-taken locals) → classify + lay out (promoted slot sentinel vs
+  memory offset) + `stack_size`. Run for each func in `codegen_ir` before `gen_func`.
+- `open_block`/`open_merge` + `cvals()`/`cparams()` — block headers and branch args that
+  carry the data-SP **and the promoted locals** (`MERGE_VAL = npromo+1` is the carried
+  result/switch-value slot, after the promoted ones).
+- `codegen_ir` — orders funcs (main first), runs `prepare_func`, emits `memory`, emits funcs.
 
 **chibicc AST facts learned (save you time):**
 - `Obj` = function or variable; `Node` = AST node; `Type` (`TypeKind`, `->kind`,
@@ -221,9 +256,14 @@ runs." History order:
    (the §3d MVP "fixed-size window" allocator). Lives in the test `LIBC` prelude alongside
    `printf`; `calloc` too. (Real free-list reclamation / heap growth via the `map`
    capability is deferred.) Demonstrated with a heap-allocated linked list of structs.
-8. **(Perf, later) SSA-promotion pass** — promote non-address-taken, non-`volatile`
-   scalars from memory to real SSA values (DESIGN §3d "the pass that matters for speed").
-   This also removes the redundant `memzero` and most loads/stores.
+8. ~~**(Perf) SSA-promotion pass**~~ — **DONE**. Non-address-taken full-width scalar locals
+   are promoted from memory to real SSA values, threaded as block params (see the "SSA
+   promotion" subsection in §3). Removes the per-access masked load/store and the redundant
+   `memzero` (now dead consts Cranelift DCEs); a hot loop body dropped from ~22 memory ops
+   to 0. **Still TODO here:** narrow scalars (`char`/`short`/`_Bool`) stay in memory (we
+   don't re-emit store truncation on SSA assignment yet); `volatile` is not honored because
+   chibicc discards the qualifier (no regression — the old memory path didn't honor it
+   either); and there is no general copy-propagation/DCE beyond what Cranelift does.
 
 ---
 
@@ -240,7 +280,8 @@ runs." History order:
   GitHub MCP tools (`mcp__github__actions_list` / `_get`); the list payload is large, so
   fetch and parse the saved file with `python3 -c "import json; ..."`.
 - Recent C-frontend commits for reference: `34d104e` (vendor + expressions), `078dd71`
-  (locals/pointers), `ead1bb2` (control flow), `a0c39ad` (functions/recursion).
+  (locals/pointers), `ead1bb2` (control flow), `a0c39ad` (functions/recursion); SSA
+  promotion is the most recent.
 
 ---
 
@@ -249,8 +290,8 @@ runs." History order:
 make -C frontend/chibicc
 printf 'int fib(int n){if(n<2)return n;return fib(n-1)+fib(n-2);} int main(){return fib(10);}\n' > /tmp/t.c
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input /tmp/t.c -cc1-output /tmp/t.svm /tmp/t.c
-cat /tmp/t.svm            # func 0 = _start, func 1 = main calling func 2 = fib (sp-threaded)
-cargo test -p svm --test c_frontend   # 33 tests, all green (interp == JIT, and == cc)
+cat /tmp/t.svm            # func 0 = _start, func 1 = main calling func 2 = fib; n promotes to v1
+cargo test -p svm --test c_frontend   # 34 tests, all green (interp == JIT, and == cc)
 cargo test -p svm --test jit_fuzz     # 4000 generated modules, interp == JIT
 ```
 If those pass, you're oriented.
@@ -292,11 +333,15 @@ incompleteness not contradiction:
   every memory access is masked, so even a buggy/hostile data-SP cannot escape (the
   data-SP is a plain value, not trusted). Making it an explicit value rather than a
   register-pinned `vmctx` slot is exactly the "lowering detail" §3d calls it.
-- **§3d implemented as a documented subset:** everything-in-memory (SSA-promotion = the
-  deferred perf pass), flat-buffer varargs, guest `malloc` over the window, LP64 + pinned
-  `char`/`long double`. **Deferred SETTLED features (not contradictions):** by-value
-  aggregate args/returns by hidden pointer (D39), const→RO data segment via `protect`
-  (D40), a real IR data section (we use `_start` byte-stores).
+- **§3d implemented as a documented subset:** everything-in-memory **plus the SSA-promotion
+  reverse pass** (non-address-taken full-width scalars → SSA values; narrow scalars and
+  address-taken/aggregate locals stay in memory), flat-buffer varargs, guest `malloc` over
+  the window, LP64 + pinned `char`/`long double`. The promotion split (SSA value vs
+  data-stack slot) is exactly the §3d "local classification" — minus the data-SP being
+  register-pinned in `vmctx`, which is still a plain threaded value. **Deferred SETTLED
+  features (not contradictions):** by-value aggregate args/returns by hidden pointer (D39),
+  const→RO data segment via `protect` (D40), a real IR data section (we use `_start`
+  byte-stores), and narrow-scalar promotion.
 - **De-risking moves from §18 now in place:** interpreter-as-oracle differential fuzzing
   (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend. **Still missing:** the
   verifier escape-oracle fuzzer (see §8).

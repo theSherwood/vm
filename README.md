@@ -31,9 +31,11 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > **varargs + a guest-C `printf`** over the powerbox, and **`malloc`/`free`** (a guest
 > bump allocator) — all of which **verify and run identically on the interpreter and the
 > JIT**, hello-world and a heap-allocated linked list included (the §18 Phase-2 "it works"
-> milestone). Still ahead: the §3d SSA-promotion pass (the perf gap — locals are
-> memory-resident today), by-value aggregate args / general `goto`, production
-> trap-catching (guard pages + signal handler), atomics, SIMD, and capability extras. This
+> milestone). The §3d **SSA-promotion pass** lifts non-address-taken scalar locals out of
+> memory into SSA values (threaded as block params), so the JIT register-allocates them — a
+> hot loop body drops from ~22 load/store ops to zero. Still ahead: by-value aggregate args /
+> general `goto`, production trap-catching (guard pages + signal handler), narrow-scalar
+> promotion, atomics, SIMD, and capability extras. This
 > is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
 

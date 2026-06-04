@@ -38,17 +38,24 @@
 // would strand values computed earlier in the same C expression; such values are spilled
 // to a per-frame scratch region (`eval2`/`spill`/`reload`) and reloaded in the merge
 // block. `malloc`/`free` need no frontend support — they are ordinary guest C (a bump
-// allocator over a window heap, §3d). Indirect calls, by-value aggregate args/returns,
-// and general `goto` remain; anything unsupported is a hard error (so we never emit IR we
-// cannot stand behind). The everything-in-memory model (no SSA promotion yet) is the main
-// perf gap. This is enough C surface for a capable VM: globals, structs, pointers, loops,
-// recursion, floats, varargs/`printf`, and heap allocation all run on interp and JIT.
+// allocator over a window heap, §3d). **SSA promotion** (§3d "the pass that matters for
+// speed") now runs the reverse of chibicc's allocate-all-locals-to-memory: a scalar local
+// that is never address-taken becomes a real SSA value threaded as a block parameter (like
+// the data-SP), so the JIT keeps it in a register instead of issuing a masked load/store
+// per access — eliminating most of the loop-body memory traffic. chibicc's `A op= B`
+// desugaring (`tmp = &A, *tmp = *tmp op B`) is un-desugared for plain-variable targets so
+// loop counters/accumulators promote; address-taken locals, narrow types (char/short/
+// _Bool, whose store truncation we keep in memory), aggregates, and `_Atomic` stay in
+// memory. Indirect calls, by-value aggregate args/returns, and general `goto` remain;
+// anything unsupported is a hard error (so we never emit IR we cannot stand behind). This
+// is enough C surface for a capable VM: globals, structs, pointers, loops, recursion,
+// floats, varargs/`printf`, and heap allocation all run on interp and JIT.
 
 #include "chibicc.h"
 
 static FILE *o;
-static int nv;    // next SSA value index in the *current block* (blocks are param-free,
-                  // so values never cross a block boundary — they reset per block)
+static int nv;    // next SSA value index in the *current block* (resets per block; the only
+                  // values crossing a block are its parameters — the data-SP + promoted locals)
 static int nb;        // next block label number in the current function
 static bool term;     // is the current block already terminated?
 static int cur_frame; // the current function's data-stack frame size (bytes)
@@ -109,11 +116,77 @@ static int func_index(Obj *fn) {
   error_tok(fn->tok, "codegen_ir: call to a function with no definition (no linker yet)");
 }
 
-// Open a new IR block with label `id`: emit its header (taking the data-SP as `v0`) and
-// reset per-block state. Block labels resolve by name, so forward references are fine.
+// --- SSA promotion (DESIGN §3d "the pass that matters for speed") ----------------------
+//
+// chibicc allocates every local to memory; we run the reverse pass and promote scalar
+// locals that are never address-taken to real SSA values, so the JIT register-allocates
+// them instead of issuing a masked load/store per access. State no longer lives only in
+// memory, so a promoted local must cross block boundaries: like the data-SP (v0), each
+// promoted local is threaded as a block parameter of *every* block, and its current SSA
+// value is tracked per block. A promoted local with slot `s` is block parameter v(s+1)
+// (right after the data-SP); merge/dispatch blocks carry their extra value after those.
+//
+// This "thread every promoted local through every block" shape is the same one already
+// proven correct for the data-SP: it is SSA-valid by construction (each block parameter is
+// the φ), so it needs no dominance/liveness analysis — Cranelift drops the dead ones.
+#define MAXPROMO 256
+static int npromo;                 // promoted locals in the current function
+static char *promo_ty[MAXPROMO];   // IR type of each promoted slot
+static int curval[MAXPROMO];       // current SSA value of each slot in the current block
+
+// A local is promoted iff its frame offset was set to the sentinel -(slot+1) (see
+// prepare_func); a real memory local keeps a non-negative offset.
+static bool is_promoted(Obj *v) { return v->is_local && v->offset < 0; }
+static int slot_of(Obj *v) { return -v->offset - 1; }
+
+// Only full-width scalars are promoted: a narrow type (char/short/_Bool) would need its
+// store-truncation re-emitted on every assignment, so it stays in memory where the narrow
+// store/load already does it. Aggregates live by address; `_Atomic` needs real memory.
+static bool promotable_ty(Type *ty) {
+  if (ty->is_atomic)
+    return false;
+  switch (ty->kind) {
+  case TY_INT:
+  case TY_LONG:
+  case TY_ENUM:
+  case TY_PTR:
+  case TY_FLOAT:
+  case TY_DOUBLE:
+  case TY_LDOUBLE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// The current block's promoted-local block-argument list (", vA, vB, ...") for a branch,
+// and the matching parameter declaration (", vS: ty, ...") for a block header. Both return
+// a pointer into a static buffer, so use the result before the next call.
+static char *cvals(void) {
+  static char buf[8192];
+  int p = 0;
+  buf[0] = '\0';
+  for (int s = 0; s < npromo; s++)
+    p += snprintf(buf + p, sizeof buf - p, ", v%d", curval[s]);
+  return buf;
+}
+static char *cparams(void) {
+  static char buf[8192];
+  int p = 0;
+  buf[0] = '\0';
+  for (int s = 0; s < npromo; s++)
+    p += snprintf(buf + p, sizeof buf - p, ", v%d: %s", s + 1, promo_ty[s]);
+  return buf;
+}
+
+// Open a new IR block with label `id`: emit its header (the data-SP `v0` plus every
+// promoted local as a parameter) and reset per-block state. Block labels resolve by name,
+// so forward references are fine. On entry each promoted slot's value is its parameter.
 static void open_block(int id) {
-  fprintf(o, "block%d(" SP ": i64):\n", id);
-  nv = 1; // v0 is the data-SP parameter
+  fprintf(o, "block%d(" SP ": i64%s):\n", id, cparams());
+  nv = npromo + 1; // v0 is the data-SP; v1..vN are the promoted locals
+  for (int s = 0; s < npromo; s++)
+    curval[s] = s + 1;
   term = false;
 }
 
@@ -294,6 +367,8 @@ static int gen_addr(Node *node) {
   switch (node->kind) {
   case ND_VAR: {
     if (node->var->is_local) {
+      if (is_promoted(node->var))
+        error_tok(node->tok, "codegen_ir: internal — address of a promoted local");
       // The local lives at sp + frame-offset (§3d data stack). Emit the const (lower
       // index) before the add that uses it, so value numbering stays monotonic.
       int off = nv++;
@@ -398,10 +473,14 @@ static int gen_truth(Node *node) {
   return r;
 }
 
-// Open a merge block taking `(sp, v1: ty)`: the carried result is v1, nv resumes at 2.
+// Open a merge/dispatch block taking `(sp, <promoted locals>, vR: ty)`: the carried value
+// vR follows the promoted locals at index npromo+1, and nv resumes after it.
+#define MERGE_VAL (npromo + 1)
 static void open_merge(int id, char *ty) {
-  fprintf(o, "block%d(" SP ": i64, v1: %s):\n", id, ty);
-  nv = 2;
+  fprintf(o, "block%d(" SP ": i64%s, v%d: %s):\n", id, cparams(), MERGE_VAL, ty);
+  nv = npromo + 2;
+  for (int s = 0; s < npromo; s++)
+    curval[s] = s + 1;
   term = false;
 }
 
@@ -409,61 +488,64 @@ static void open_merge(int id, char *ty) {
 static int gen_logand(Node *node) {
   int ta = gen_truth(node->lhs);
   int rhs = nb++, fls = nb++, merge = nb++;
-  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", ta, rhs, fls);
+  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", ta, rhs, cvals(), fls,
+          cvals());
   open_block(rhs);
   int tb = gen_truth(node->rhs);
-  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, tb);
+  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), tb);
   open_block(fls);
   int z = nv++;
   fprintf(o, "  v%d = i32.const 0\n", z);
-  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, z);
+  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), z);
   open_merge(merge, "i32");
-  return 1;
+  return MERGE_VAL;
 }
 
 static int gen_logor(Node *node) {
   int ta = gen_truth(node->lhs);
   int tru = nb++, rhs = nb++, merge = nb++;
-  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", ta, tru, rhs);
+  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", ta, tru, cvals(), rhs,
+          cvals());
   open_block(tru);
   int one = nv++;
   fprintf(o, "  v%d = i32.const 1\n", one);
-  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, one);
+  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), one);
   open_block(rhs);
   int tb = gen_truth(node->rhs);
-  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, tb);
+  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), tb);
   open_merge(merge, "i32");
-  return 1;
+  return MERGE_VAL;
 }
 
 // `cond ? then : els` → branches converted to the result type, carried into the merge.
 static int gen_cond(Node *node) {
   int c = gen_truth(node->cond);
   int th = nb++, el = nb++, merge = nb++;
-  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, th, el);
+  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, th, cvals(), el,
+          cvals());
 
   if (node->ty->kind == TY_VOID) {
     // A void `?:` — both arms are evaluated for effect only, no carried value.
     open_block(th);
     gen_expr(node->then);
     if (!term)
-      fprintf(o, "  br block%d(" SP ")\n", merge);
+      fprintf(o, "  br block%d(" SP "%s)\n", merge, cvals());
     open_block(el);
     gen_expr(node->els);
     if (!term)
-      fprintf(o, "  br block%d(" SP ")\n", merge);
+      fprintf(o, "  br block%d(" SP "%s)\n", merge, cvals());
     open_block(merge);
     return 0;
   }
 
   open_block(th);
   int vt = gen_expr_as(node->then, node->ty);
-  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, vt);
+  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), vt);
   open_block(el);
   int ve = gen_expr_as(node->els, node->ty);
-  fprintf(o, "  br block%d(" SP ", v%d)\n", merge, ve);
+  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), ve);
   open_merge(merge, irty(node->ty));
-  return 1;
+  return MERGE_VAL;
 }
 
 // Widen an i32 value to i64 (for capability args that cross as i64 slots).
@@ -607,6 +689,8 @@ static int gen_expr(Node *node) {
     gen_expr(node->lhs);
     return gen_expr(node->rhs);
   case ND_VAR:
+    if (node->var->is_local && is_promoted(node->var))
+      return curval[slot_of(node->var)]; // a promoted local is its current SSA value
     return gen_load(node->ty, gen_addr(node));
   case ND_DEREF:
     return gen_load(node->ty, gen_addr(node));
@@ -715,6 +799,14 @@ static int gen_expr(Node *node) {
     return r; // for a void call the value is discarded
   }
   case ND_ASSIGN: {
+    // Assigning a promoted local just rebinds its current SSA value — no store. The rhs
+    // was cast to the lhs type by the parser, so its IR type already matches the slot.
+    if (node->lhs->kind == ND_VAR && node->lhs->var->is_local &&
+        is_promoted(node->lhs->var)) {
+      int val = gen_expr(node->rhs);
+      curval[slot_of(node->lhs->var)] = val;
+      return val;
+    }
     int addr = gen_addr(node->lhs);
     int val;
     if (has_branch(node->rhs)) {
@@ -737,6 +829,14 @@ static int gen_expr(Node *node) {
     return r;
   }
   case ND_MEMZERO: {
+    // A promoted local is zero-initialized by binding it to a typed zero (no store).
+    if (node->var->is_local && is_promoted(node->var)) {
+      int s = slot_of(node->var);
+      int z = nv++;
+      fprintf(o, "  v%d = %s.const 0\n", z, promo_ty[s]);
+      curval[s] = z;
+      return z;
+    }
     // Zero-initialize the local's whole frame region (§3d data stack). ND_MEMZERO is only
     // emitted for stack locals, so the address is sp-relative: sp + (offset + i).
     int sz = node->var->ty->size;
@@ -776,19 +876,19 @@ static void gen_stmt(Node *node);
 static void gen_if(Node *node) {
   int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
   int t = nb++, e = nb++, end = nb++;
-  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, t, e);
+  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, t, cvals(), e, cvals());
   term = true;
 
   open_block(t);
   gen_stmt(node->then);
   if (!term)
-    fprintf(o, "  br block%d(" SP ")\n", end);
+    fprintf(o, "  br block%d(" SP "%s)\n", end, cvals());
 
   open_block(e);
   if (node->els)
     gen_stmt(node->els);
   if (!term)
-    fprintf(o, "  br block%d(" SP ")\n", end);
+    fprintf(o, "  br block%d(" SP "%s)\n", end, cvals());
 
   open_block(end);
 }
@@ -800,15 +900,16 @@ static void gen_for(Node *node) {
   if (node->init)
     gen_stmt(node->init);
   int cond = nb++, body = nb++, cont = nb++, end = nb++;
-  fprintf(o, "  br block%d(" SP ")\n", cond);
+  fprintf(o, "  br block%d(" SP "%s)\n", cond, cvals());
   term = true;
 
   open_block(cond);
   if (node->cond) {
     int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
-    fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, body, end);
+    fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, body, cvals(), end,
+            cvals());
   } else {
-    fprintf(o, "  br block%d(" SP ")\n", body); // `for(;;)` — unconditional
+    fprintf(o, "  br block%d(" SP "%s)\n", body, cvals()); // `for(;;)` — unconditional
   }
   term = true;
 
@@ -817,12 +918,12 @@ static void gen_for(Node *node) {
   gen_stmt(node->then);
   loopsp--;
   if (!term)
-    fprintf(o, "  br block%d(" SP ")\n", cont);
+    fprintf(o, "  br block%d(" SP "%s)\n", cont, cvals());
 
   open_block(cont);
   if (node->inc)
     gen_expr(node->inc);
-  fprintf(o, "  br block%d(" SP ")\n", cond);
+  fprintf(o, "  br block%d(" SP "%s)\n", cond, cvals());
 
   open_block(end);
 }
@@ -830,7 +931,7 @@ static void gen_for(Node *node) {
 // `do body while (cond)`: body runs once, then `cont` re-tests. `break` → end.
 static void gen_do(Node *node) {
   int body = nb++, cont = nb++, end = nb++;
-  fprintf(o, "  br block%d(" SP ")\n", body);
+  fprintf(o, "  br block%d(" SP "%s)\n", body, cvals());
   term = true;
 
   open_block(body);
@@ -838,11 +939,12 @@ static void gen_do(Node *node) {
   gen_stmt(node->then);
   loopsp--;
   if (!term)
-    fprintf(o, "  br block%d(" SP ")\n", cont);
+    fprintf(o, "  br block%d(" SP "%s)\n", cont, cvals());
 
   open_block(cont);
   int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
-  fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ")\n", c, body, end);
+  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, body, cvals(), end,
+          cvals());
 
   open_block(end);
 }
@@ -865,35 +967,37 @@ static void gen_switch(Node *node) {
     case_blk[ncase++] = defblk;
   }
 
-  // Dispatch: each compare block tests one case and forwards (sp, val) to the next.
+  // Dispatch: each compare block carries (sp, <promoted locals>, val) and forwards the
+  // value (at index MERGE_VAL, after the promoted locals) to the next compare block.
   int check = nb++;
-  fprintf(o, "  br block%d(" SP ", v%d)\n", check, v);
+  fprintf(o, "  br block%d(" SP "%s, v%d)\n", check, cvals(), v);
   term = true;
   for (Node *c = node->case_next; c; c = c->case_next) {
-    fprintf(o, "block%d(" SP ": i64, v1: %s):\n", check, p);
-    nv = 2;
+    open_merge(check, p);
+    int val = MERGE_VAL;
     int next = nb++;
     int hit = nv++;
     if (c->begin == c->end) {
       int k = nv++;
       fprintf(o, "  v%d = %s.const %ld\n", k, p, c->begin);
-      fprintf(o, "  v%d = %s.eq v1 v%d\n", hit, p, k);
+      fprintf(o, "  v%d = %s.eq v%d v%d\n", hit, p, val, k);
     } else {
       // [GNU] case range begin..end: (val - begin) <=u (end - begin)
       int kb = nv++;
       fprintf(o, "  v%d = %s.const %ld\n", kb, p, c->begin);
       int d = nv++;
-      fprintf(o, "  v%d = %s.sub v1 v%d\n", d, p, kb);
+      fprintf(o, "  v%d = %s.sub v%d v%d\n", d, p, val, kb);
       int kr = nv++;
       fprintf(o, "  v%d = %s.const %ld\n", kr, p, c->end - c->begin);
       fprintf(o, "  v%d = %s.le_u v%d v%d\n", hit, p, d, kr);
     }
-    fprintf(o, "  br_if v%d block%d(" SP ") block%d(" SP ", v1)\n", hit,
-            case_block_of(c), next);
+    fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s, v%d)\n", hit,
+            case_block_of(c), cvals(), next, cvals(), val);
     check = next;
   }
   // No case matched → default (or break past the switch).
-  fprintf(o, "block%d(" SP ": i64, v1: %s):\n  br block%d(" SP ")\n", check, p, defblk);
+  open_merge(check, p);
+  fprintf(o, "  br block%d(" SP "%s)\n", defblk, cvals());
   term = true;
 
   // The body: ND_CASE labels open their blocks; `break` (cont_label NULL so `continue`
@@ -902,7 +1006,7 @@ static void gen_switch(Node *node) {
   gen_stmt(node->then);
   loopsp--;
   if (!term)
-    fprintf(o, "  br block%d(" SP ")\n", end);
+    fprintf(o, "  br block%d(" SP "%s)\n", end, cvals());
   open_block(end);
 }
 
@@ -924,7 +1028,7 @@ static void gen_stmt(Node *node) {
     // A case/default label: fall-through from the previous case branches in here.
     int blk = case_block_of(node);
     if (!term)
-      fprintf(o, "  br block%d(" SP ")\n", blk);
+      fprintf(o, "  br block%d(" SP "%s)\n", blk, cvals());
     open_block(blk);
     gen_stmt(node->lhs);
     return;
@@ -946,13 +1050,13 @@ static void gen_stmt(Node *node) {
     for (int i = loopsp - 1; i >= 0; i--) {
       if (node->unique_label && loopstk[i].brk_label &&
           !strcmp(node->unique_label, loopstk[i].brk_label)) {
-        fprintf(o, "  br block%d(" SP ")\n", loopstk[i].brk_blk);
+        fprintf(o, "  br block%d(" SP "%s)\n", loopstk[i].brk_blk, cvals());
         term = true;
         return;
       }
       if (node->unique_label && loopstk[i].cont_label &&
           !strcmp(node->unique_label, loopstk[i].cont_label)) {
-        fprintf(o, "  br block%d(" SP ")\n", loopstk[i].cont_blk);
+        fprintf(o, "  br block%d(" SP "%s)\n", loopstk[i].cont_blk, cvals());
         term = true;
         return;
       }
@@ -973,14 +1077,139 @@ static void gen_stmt(Node *node) {
   }
 }
 
-// Lay this function's locals out as *frame-relative* offsets (from 0); each local lives
-// at `sp + offset` at run time (§3d). Sets each local's `offset` and `stack_size`.
-static void assign_offsets(Obj *fn) {
-  int off = 0;
+// The set of locals whose address is taken (so they cannot be promoted), collected per
+// function by `scan` below.
+static Obj *ataken[4096];
+static int n_ataken;
+static void mark_ataken(Obj *v) {
+  for (int i = 0; i < n_ataken; i++)
+    if (ataken[i] == v)
+      return;
+  if (n_ataken < 4096)
+    ataken[n_ataken++] = v;
+}
+static bool is_ataken(Obj *v) {
+  for (int i = 0; i < n_ataken; i++)
+    if (ataken[i] == v)
+      return true;
+  return false;
+}
+
+// Walk the AST and mark every local whose address is taken with `&`. Anything reachable
+// only through an address (e.g. `&a[i]` reads `i` but takes the array's address) is found
+// by the recursion. `&local` is the only way a *scalar* local's address escapes here.
+static void scan(Node *n) {
+  if (!n)
+    return;
+  if (n->kind == ND_ADDR && n->lhs && n->lhs->kind == ND_VAR && n->lhs->var->is_local)
+    mark_ataken(n->lhs->var);
+  scan(n->lhs);
+  scan(n->rhs);
+  scan(n->cond);
+  scan(n->then);
+  scan(n->els);
+  scan(n->init);
+  scan(n->inc);
+  for (Node *b = n->body; b; b = b->next)
+    scan(b);
+  for (Node *a = n->args; a; a = a->next)
+    scan(a);
+}
+
+// True for chibicc's synthetic unnamed locals (e.g. the `tmp = &A` temporary it injects
+// for compound assignment); they have an empty name, which a real C variable never has.
+static bool is_synthetic(Obj *v) { return v->is_local && v->name && v->name[0] == '\0'; }
+
+// Within `n`, repoint any `*tmp` (DEREF of the synthetic pointer `tmp`) to the lvalue `A`.
+static void repoint_deref(Node *n, Obj *tmp, Node *a) {
+  if (!n)
+    return;
+  if (n->lhs && n->lhs->kind == ND_DEREF && n->lhs->lhs->kind == ND_VAR &&
+      n->lhs->lhs->var == tmp)
+    n->lhs = a;
+  else
+    repoint_deref(n->lhs, tmp, a);
+  if (n->rhs && n->rhs->kind == ND_DEREF && n->rhs->lhs->kind == ND_VAR &&
+      n->rhs->lhs->var == tmp)
+    n->rhs = a;
+  else
+    repoint_deref(n->rhs, tmp, a);
+}
+
+// chibicc lowers `A op= B` (and `A++`/`A--`) to `tmp = &A, *tmp = *tmp op B`, taking the
+// address of A so it is evaluated once. That `&A` would block promotion of A. When A is a
+// plain variable its address has no side effects, so we undo the desugaring back to the
+// direct `A = A op B` (no address taken) — letting loop counters and accumulators promote.
+// Other lvalues (`a[i] += …`, `s.f += …`, `*p += …`) keep chibicc's form unchanged.
+static Node *undo_compound(Node *n) {
+  if (n->kind != ND_COMMA)
+    return n;
+  Node *e1 = n->lhs, *e2 = n->rhs;
+  if (e1->kind != ND_ASSIGN || e1->lhs->kind != ND_VAR || !is_synthetic(e1->lhs->var))
+    return n;
+  // chibicc assigns `tmp = (T*)&A`, so peel the pointer cast off the `&A`.
+  Node *addr = e1->rhs;
+  while (addr->kind == ND_CAST)
+    addr = addr->lhs;
+  if (addr->kind != ND_ADDR)
+    return n;
+  Node *a = addr->lhs;   // the lvalue whose address was taken
+  if (a->kind != ND_VAR) // only plain variables have a side-effect-free address
+    return n;
+  Obj *tmp = e1->lhs->var;
+  if (e2->kind != ND_ASSIGN || e2->lhs->kind != ND_DEREF ||
+      e2->lhs->lhs->kind != ND_VAR || e2->lhs->lhs->var != tmp)
+    return n;
+  // Rewrite `*tmp = *tmp op B` into `A = A op B`, reusing the existing nodes.
+  e2->lhs = a;                    // assignment target: A
+  repoint_deref(e2->rhs, tmp, a); // the `*tmp` operand(s) inside the op: A
+  e2->next = n->next;             // preserve list position
+  return e2;
+}
+
+// Run `undo_compound` over the whole tree (children first, so nested compounds collapse
+// before their parents), rewriting each child slot in place.
+static void rewrite(Node **pp) {
+  Node *n = *pp;
+  if (!n)
+    return;
+  rewrite(&n->lhs);
+  rewrite(&n->rhs);
+  rewrite(&n->cond);
+  rewrite(&n->then);
+  rewrite(&n->els);
+  rewrite(&n->init);
+  rewrite(&n->inc);
+  for (Node **b = &n->body; *b; b = &(*b)->next)
+    rewrite(b);
+  for (Node **a = &n->args; *a; a = &(*a)->next)
+    rewrite(a);
+  *pp = undo_compound(n);
+}
+
+// Classify and lay out a function's locals (DESIGN §3d). First un-desugar compound
+// assignment and find address-taken locals; then give each promotable scalar local an SSA
+// slot (recorded as a negative `offset` sentinel) and each remaining local a frame-relative
+// memory offset, with the spill scratch region reserved at the top of the frame.
+static void prepare_func(Obj *fn) {
+  if (!fn->is_definition)
+    return;
+  rewrite(&fn->body);
+  n_ataken = 0;
+  scan(fn->body);
+
+  int slot = 0, off = 0;
   for (Obj *v = fn->locals; v; v = v->next) {
-    off = align_to(off, v->align);
-    v->offset = off;
-    off += v->ty->size;
+    bool promote = promotable_ty(v->ty) && !is_ataken(v) && !is_synthetic(v) &&
+                   v != fn->va_area && v != fn->alloca_bottom && slot < MAXPROMO;
+    if (promote) {
+      v->offset = -(slot + 1); // sentinel: a promoted local has no frame slot
+      slot++;
+    } else {
+      off = align_to(off, v->align);
+      v->offset = off;
+      off += v->ty->size;
+    }
   }
   // Reserve the spill scratch region at the top of the frame (see SCRATCH_BYTES).
   off = align_to(off, 16) + SCRATCH_BYTES;
@@ -997,6 +1226,16 @@ static void gen_func(Obj *fn) {
   spill_top = 0;
   Type *ret = fn->ty->return_ty;
   bool variadic = fn->ty->is_variadic;
+
+  // Rebuild the promoted-slot tables from the offset sentinels set by prepare_func.
+  npromo = 0;
+  for (Obj *v = fn->locals; v; v = v->next)
+    if (is_promoted(v)) {
+      int s = slot_of(v);
+      promo_ty[s] = irty(v->ty);
+      if (s + 1 > npromo)
+        npromo = s + 1;
+    }
 
   // Signature: `func (i64 sp, <param tys> [, i64 va_ptr]) -> (<ret ty>)`. v0 is the
   // data-SP; a variadic function takes a trailing pointer to the marshalled args (§3d).
@@ -1021,13 +1260,23 @@ static void gen_func(Obj *fn) {
   fprintf(o, "):\n");
   nv = np;
   term = false;
+  // Each C parameter: a promoted param's current value *is* its incoming SSA value (no
+  // store); a memory param is spilled to its frame slot as before.
+  bool param_slot[MAXPROMO] = {false};
   int pi = 1;
   for (Obj *p = fn->params; p; p = p->next) {
-    int off = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", off, p->offset);
-    int addr = nv++;
-    fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
-    gen_store(p->ty, addr, pi++);
+    if (is_promoted(p)) {
+      int s = slot_of(p);
+      curval[s] = pi;
+      param_slot[s] = true;
+    } else {
+      int off = nv++;
+      fprintf(o, "  v%d = i64.const %d\n", off, p->offset);
+      int addr = nv++;
+      fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
+      gen_store(p->ty, addr, pi);
+    }
+    pi++;
   }
   // Stash the va pointer into __va_area__'s slot so va_start can load it.
   if (variadic) {
@@ -1037,6 +1286,15 @@ static void gen_func(Obj *fn) {
     fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
     fprintf(o, "  i64.store v%d v%d\n", addr, va_param);
   }
+  // A promoted non-parameter local starts defined (zero) so it is a valid SSA value on
+  // every path before its first assignment (and this subsumes its ND_MEMZERO).
+  for (Obj *v = fn->locals; v; v = v->next)
+    if (is_promoted(v) && !param_slot[slot_of(v)]) {
+      int s = slot_of(v);
+      int z = nv++;
+      fprintf(o, "  v%d = %s.const 0\n", z, promo_ty[s]);
+      curval[s] = z;
+    }
 
   gen_stmt(fn->body);
   // Falling off the end: C `main` returns 0; for other paths it is UB, and returning a
@@ -1085,6 +1343,7 @@ static void emit_init_data(int base, char *data, int sz) {
 // data, then call `main` with the initial data-SP (= data_end). The runtime invokes this
 // with the granted handles `(stdout, stdin, exit)` as i32 arguments.
 static void emit_start(Obj *prog, Obj *main_fn) {
+  npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
   fprintf(o, "func (i32, i32, i32) -> (%s) {\n", is_void ? "" : irty(mret));
@@ -1141,7 +1400,7 @@ void codegen_ir(Obj *prog, FILE *out) {
   // always needs one.
   bool need_mem = layout_globals(prog) || has_main;
   for (int i = 0; i < nfuncs; i++) {
-    assign_offsets(funcs[i]);
+    prepare_func(funcs[i]);
     if (funcs[i]->locals)
       need_mem = true;
   }
