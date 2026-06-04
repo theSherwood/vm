@@ -614,7 +614,7 @@ pub mod iface {
     pub const EXIT: u32 = 1;
     /// `Clock` — op 0 `now(clock_id) -> i64` nanoseconds.
     pub const CLOCK: u32 = 2;
-    /// `Memory` — op 0 `map`, 1 `unmap`, 2 `protect` (§3e; eager-mapped → no-ops).
+    /// `Memory` — op 0 `map`, 1 `unmap`, 2 `protect` (§3e; real page protection — see `Mem`).
     pub const MEMORY: u32 = 3;
 }
 

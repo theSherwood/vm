@@ -587,13 +587,17 @@ regressions one commit old"):
    (`check_prot`); `GuestMem` gained `map`/`unmap`/`protect` (default no-op; interp `Mem`
    implements them within `[0, mapped)` — `protect`→RO for D40, `unmap`→fault, `map`→re-commit
    zeroed; misaligned/out-of-range ⇒ `-EINVAL`); `cap_dispatch_slots`' Memory arm calls them.
-   White-box `prot_tests` pin the semantics. **Increment 2 (next):** the JIT side — an
-   `mprotect`-backed `GuestMem` for the flat window (the cap thunk in `jit_diff`/`c_frontend`
-   wraps the window as `WindowMem`, which is `forbid(unsafe)` in svm-interp, so the real
-   `mprotect` impl lives JIT/harness-side), then a differential test (grant Memory, `protect` a
-   page, store → both detect-and-kill). **Deferred:** growth (`map` into the reserved tail =
-   sparse address space, §98), demand paging on fault, and a guest consumer (RO data segment /
-   `malloc` over `map`).
+   White-box `prot_tests` pin the semantics. **Increment 2 ✅ (JIT side + differential):** the
+   `jit_diff` cap-thunk now wraps the window as `MprotectWindow` (a `GuestMem` whose
+   `map`/`unmap`/`protect` call real `libc::mprotect` on the window pages; `read`/`write` like
+   `WindowMem`) instead of the no-op `WindowMem` — so a `protect`ed page is genuinely RO and a
+   store to it faults into the guard → `MemoryFault`. `jit_cap_memory_protect_read_only_faults_store`
+   pins it: the interp (page-map) and JIT (mprotect+guard) both detect-and-kill on a post-`protect`
+   store, non-vacuously (a no-op JIT `protect` would diverge). Added `libc` as an svm dev-dep.
+   **Deferred (increment 3+):** growth (`map` into the reserved tail = sparse address space, §98);
+   page **zeroing** on (re)`map` is mirrored in the interp but not yet in the JIT side (so
+   map-after-unmap isn't differentially tested); demand paging on fault; a guest consumer (RO data
+   segment via D40 / `malloc` over `map`); and surfacing the Memory cap in the generative fuzzer.
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;

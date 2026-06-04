@@ -23,3 +23,6 @@ path = "src/bin/bench.rs"
 # out of the umbrella crate's normal build and the auditable dependency-free core.
 [dev-dependencies]
 svm-jit.workspace = true
+# For the JIT-side `mprotect`-backed Memory-capability test harness (real page protection on
+# the guest window, mirroring the interpreter's page-protection model). Unix-only test.
+libc = "0.2"
