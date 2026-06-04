@@ -421,13 +421,10 @@ Have (✅ continuously, except where noted):
 - [x] `fuzz/mask` (libFuzzer): the confinement-masking unit — masked address always in
   `[0,size)` (D38, the escape hinge).
 - [x] `roundtrip` (libFuzzer): encode∘decode identity.
+- [x] **Nightly CI matrix** runs `decode_verify` **+ `diff` (carries the escape-oracle) +
+  `mask`** (`ci.yml`, `schedule`/`workflow_dispatch`), so all three get coverage-guided time.
 
 Gaps (priority order):
-- [ ] **Nightly CI still only runs `decode_verify`.** Wiring `diff` (carries the
-  escape-oracle) and `mask` into the nightly matrix is a ~one-line `ci.yml` change — but
-  pushing `.github/workflows/*` from this environment needs the `workflow` OAuth scope,
-  which the session lacks, so it must be done by a human (or a token with that scope). Until
-  then the escape-oracle still runs on every push via the 4000 stable `jit_fuzz` seeds.
 - [ ] **Generator coverage holes:** `irgen` emits forward-only DAG CFGs — **no
   loops/back-edges** (needs a JIT step-cap/fuel) and **no `call_indirect`/`cap.call`**. The
   generative differential (and the escape-oracle) never exercise them (only the hand-written
@@ -442,26 +439,44 @@ Gaps (priority order):
 Have (✅):
 - [x] `crates/svm/src/bin/bench.rs`: decode / verify / **interp** throughput on one
   hand-written loop (`sum 0..N`), ns/iter, dependency-free.
+- [x] **`bench/` — JIT vs Wasmtime** (out-of-workspace, like `fuzz/`; pulls in Wasmtime).
+  Each kernel is written once in our IR text and once in equivalent WAT (results
+  cross-checked before timing); both lower via Cranelift, so it's a like-for-like §1a check.
+  Measures steady-state **compute** (per-iteration, isolated by big-vs-small subtraction so
+  compile cancels) and **cold start** (source → first result). `cargo run --release` from
+  `bench/`; `--csv` for a line per kernel. **Representative numbers** (ratio = svm ÷
+  wasmtime; machine-dependent, watch the *ratio* not the absolute ns):
+  - `alu` (tight i64 mul/add loop): compute **≈1.0×** (parity, as designed — shared backend);
+    cold start **≈0.3×** (we're ~3.5× faster — "SSA on the wire, no SSA reconstruction", §1a).
+  - `memsum` (store+load per iter): compute **≈1.65×** (we're *slower*) — the §1a "mask vs
+    wasm32 guard-page" cost: we emit an `AND` per access, wasm32 uses the zero-instruction
+    guard trick. The prescribed mitigation — **"guard-when-bounded, mask-when-not"** (§1a,
+    D36–D38) — isn't implemented (the JIT always masks), so this is the bench surfacing a
+    known optimization gap, not a surprise.
 
 Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
 regressions one commit old"):
-- [ ] **No JIT benchmark** — only interp; the JIT *is* the perf story.
-- [ ] **No wasm/Wasmtime baseline** — the §1a compute-parity / around-compute thesis is
-  unvalidated.
-- [ ] **No compile / JIT-latency measurement** — the "SSA on the wire" startup claim (§1a)
-  is unmeasured.
-- [ ] **No over-time tracking / no CI bench job** — it prints and forgets; a regression
-  isn't caught "one commit old."
-- [ ] **No C-frontend program benches** — e.g. the SSA-promotion win (loop body ~22→0
-  memory ops) is uncaptured; nothing would flag it if promotion regressed.
+- [ ] **No over-time tracking / no CI bench job** — `bench.rs` and `bench/` both print and
+  forget; nothing stores or diffs results across commits, so a regression isn't caught "one
+  commit old." (A bench job is awkward in CI — noisy shared runners — but even logging the
+  `--csv` line per commit would help.)
+- [ ] **No C-frontend program benches** — e.g. the SSA-promotion win (loop body ~22→0 memory
+  ops) is uncaptured end-to-end; nothing would flag it if promotion regressed. The `bench/`
+  kernels are hand-written IR, not chibicc output.
+- [ ] **`memsum` 1.65× is the unimplemented "guard-when-bounded" path** — the first real
+  perf item the bench points at; wiring the wasm32-style large-guard-region fast path (§4)
+  into the JIT load/store lowering should close most of it.
 
 ### Suggested next pickups (ranked)
-1. **JIT + Wasmtime comparison bench with regression tracking** — validates the parity
-   thesis and would guard perf work like the promotion pass. (The weakest area now.)
-2. **Loops + indirect calls in `irgen`** — needs a JIT step-cap/fuel; deepens both the
+1. **"Guard-when-bounded" JIT load/store path** (§4, D36–D38) — the `memsum` 1.65× the bench
+   just surfaced; the wasm32-style large-guard-region fast path is the design's own
+   prescription and the first measured perf win on the table. (Caveat: guard *pages* tie
+   into the Phase-3 trap-catching work.)
+2. **Production trap-catching** (guard pages + signal handler, §4/§5) — the big MVP item;
+   also upgrades the escape-oracle from final-memory diff to true fault detection, and backs
+   the guard-when-bounded path above.
+3. **Loops + indirect calls in `irgen`** — needs a JIT step-cap/fuel; deepens both the
    interp/JIT differential and the escape-oracle (repeated, aliased stores).
-3. **Production trap-catching** (guard pages + signal handler, §4/§5) — the big MVP item;
-   also upgrades the escape-oracle from final-memory diff to true fault detection.
 
-*(Done this session: SSA-promotion pass; the escape-oracle fuzzer. The matching nightly
-`diff`/`mask` CI wiring is written but unpushed — workflow-scope limitation, see the gap above.)*
+*(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
+CI, merged); the JIT-vs-Wasmtime bench harness.)*

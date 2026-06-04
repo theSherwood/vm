@@ -2,4 +2,5 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
+/bench/target
 **/*.rs.bk

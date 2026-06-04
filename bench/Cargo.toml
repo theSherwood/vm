@@ -1,0 +1,25 @@
+# Out-of-workspace (like `fuzz/`): pulls in Wasmtime, so the escape-TCB crates and the
+# stable `cargo build --workspace` never see it. Run with `cargo run --release` from here.
+[package]
+name = "svm-bench-vs-wasmtime"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "bench-vs-wasmtime"
+path = "src/main.rs"
+
+[dependencies]
+svm-ir = { path = "../crates/svm-ir" }
+svm-text = { path = "../crates/svm-text" }
+svm-jit = { path = "../crates/svm-jit" }
+# Minimal Wasmtime: the Cranelift compiler + the runtime, nothing else (no component
+# model / gc / async), so we compare like-for-like (both lower core wasm via Cranelift).
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "std"] }
+wat = "1"
+
+[profile.release]
+opt-level = 3
+
+[workspace]

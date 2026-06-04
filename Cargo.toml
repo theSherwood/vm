@@ -10,9 +10,10 @@ members = [
     "crates/svm-jit",
     "crates/svm",
 ]
-# `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); kept out of the workspace
-# so stable `cargo build --workspace` / `cargo test` never pull it in.
-exclude = ["fuzz"]
+# `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); `bench/` pulls in Wasmtime for
+# the comparison harness. Both are kept out of the workspace so stable
+# `cargo build --workspace` / `cargo test` never pull them in.
+exclude = ["fuzz", "bench"]
 
 [workspace.package]
 edition = "2021"
