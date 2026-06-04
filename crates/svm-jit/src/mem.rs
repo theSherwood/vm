@@ -7,9 +7,12 @@
 //! confines every access to `[0, size)`, so this fires on a width-overrun at the very top
 //! of the window or — defense-in-depth — a masking/elision bug the guard caught.
 //!
-//! On non-unix targets there is no hardware guard: the window is a plain zeroed heap buffer
-//! (with the old small margin) and the entry is called directly. Confinement still holds
-//! (it is the masking lowering, not the guard), so this is purely a missing safety net.
+//! Non-unix hosts (Windows, no-MMU) are **not supported yet** and the crate refuses to build
+//! there (`compile_error!`, below). Without the guard we cannot make the same escape
+//! guarantee, and guard-*relying* mask elision (§4 "guard-when-bounded") would be real
+//! host-memory UB. The Windows equivalent — `VirtualAlloc(MEM_RESERVE/COMMIT)` +
+//! `VirtualProtect(PAGE_NOACCESS)` + a Vectored Exception Handler — is TODO; the goal is to
+//! run *identically* on Windows once it lands (see `DESIGN.md` §4 "Platform support").
 
 use crate::TrapKind;
 use core::ffi::c_void;
@@ -148,55 +151,52 @@ mod imp {
     }
 }
 
-// ---- non-unix: plain heap window, no hardware guard, direct call -----------------------
+// ---- non-unix: unsupported until the guard path is built (see DESIGN.md §4) ------------
+//
+// Confinement's escape guarantee (and the guard the elision leans on) is the unix
+// `PROT_NONE` guard page + SIGSEGV/SIGBUS handler above. On Windows / other non-unix hosts
+// we cannot yet make that guarantee — and guard-relying elision would be host-memory UB
+// without the guard — so we refuse to build rather than run with weaker guarantees. The
+// equivalent (`VirtualAlloc(MEM_RESERVE/COMMIT)` + `VirtualProtect(PAGE_NOACCESS)` + a
+// Vectored Exception Handler) is TODO; the goal is to run *identically* on Windows.
 #[cfg(not(unix))]
 mod imp {
     use super::*;
 
-    /// Small heap margin past the window so a masked base near the top plus an access width
-    /// stays in-bounds (matches the historical behaviour; no hardware guard here).
-    const FALLBACK_MARGIN: usize = 8;
+    compile_error!(
+        "svm-jit supports only unix hosts for now: memory confinement relies on PROT_NONE \
+         guard pages + a SIGSEGV/SIGBUS handler (see mem.rs / trap_shim.c), so we refuse to \
+         build/run on Windows or other non-unix targets rather than weaken the escape \
+         guarantee. The equivalent (VirtualAlloc + VirtualProtect(PAGE_NOACCESS) + a Vectored \
+         Exception Handler) is not built yet — see DESIGN.md §4 \"Platform support\". \
+         Goal: run identically on Windows once that lands."
+    );
 
-    pub(crate) struct GuestWindow {
-        buf: Vec<u8>,
-        size: usize,
-    }
-
+    // Unreachable: the `compile_error!` above aborts every non-unix build. These stubs exist
+    // only so the `pub(crate) use imp::{…}` below resolves to that single, clear error rather
+    // than a pile of "unresolved import" follow-on errors.
+    pub(crate) struct GuestWindow;
     impl GuestWindow {
-        pub(crate) fn new(size: usize) -> GuestWindow {
-            let buf = if size == 0 {
-                Vec::new()
-            } else {
-                vec![0u8; size + FALLBACK_MARGIN]
-            };
-            GuestWindow { buf, size }
+        pub(crate) fn new(_size: usize) -> GuestWindow {
+            GuestWindow
         }
         pub(crate) fn rw_mut(&mut self) -> &mut [u8] {
-            &mut self.buf[..self.size]
+            &mut []
         }
         pub(crate) fn base(&self) -> *mut u8 {
-            if self.size == 0 {
-                std::ptr::null_mut()
-            } else {
-                self.buf.as_ptr() as *mut u8
-            }
+            core::ptr::null_mut()
         }
     }
 
-    /// # Safety
-    /// Same contract as the unix version; here the call is direct (no guard), so an
-    /// out-of-window access is undefined behaviour — confinement relies on masking.
     pub(crate) unsafe fn run_guarded(
         _window: &GuestWindow,
-        code: *const u8,
-        args: *const i64,
-        results: *mut i64,
-        mem_base: *mut u8,
-        fn_table: *const c_void,
-        trap_cell: *mut i64,
+        _code: *const u8,
+        _args: *const i64,
+        _results: *mut i64,
+        _mem_base: *mut u8,
+        _fn_table: *const c_void,
+        _trap_cell: *mut i64,
     ) -> bool {
-        let f: Entry = std::mem::transmute(code);
-        f(args, results, mem_base, fn_table, trap_cell);
         false
     }
 }

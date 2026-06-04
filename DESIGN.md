@@ -800,9 +800,41 @@ the Phase-1 core loop.
   it is fuzzed and differential-tested in isolation against the interpreter and
   native.
 
+**Guard sizing & the 64-bit framing (clarification).** The window is a *64-bit*
+address space (e.g. 2^40 above); there is **no 32-bit index type** as in wasm32,
+so the guard region behind the window does **not** need to span 2^32. It only has
+to cover the largest *immediate offset + access width* the bounded case will trust
+without re-proving the full base bound (pages-to-MiB of reach), because the base
+itself is either proven in-window or masked. "Bounded" here means *proven by the
+JIT's upper-bound analysis*, **not** free-by-type; a genuinely unknown 64-bit
+address always masks. Two strengths of elision follow, and they differ in what
+they trust:
+- *Conservative (no guard reliance):* the whole access `[addr+offset, +width)` is
+  proven `< size`, so the unmasked address already equals the masked one. Sound on
+  **every** target — it never depends on a fault.
+- *Guard-relying:* only the base is proven in-window; an `offset+width` overrun off
+  the top is caught by the guard fault. Sound **only where the guard region exists**
+  (see Platform support). This is the wasm32-style win, and it is gated on the guard.
+
 *Reconciling "virtual memory" with "fast":* don't emulate an MMU — borrow the
 host's. The guest gets genuine paging semantics with zero software translation,
 and the bounded window makes escape impossible without per-access checks.
+
+### Platform support  [unix only, for now]
+
+Confinement's guard region + fault recovery are implemented on **unix** (`mmap` +
+`mprotect(PROT_NONE)` + a SIGSEGV/SIGBUS handler — see `crates/svm-jit/src/mem.rs`
+and `trap_shim.c`). On **Windows / non-unix** the equivalent —
+`VirtualAlloc(MEM_RESERVE/COMMIT)` + `VirtualProtect(PAGE_NOACCESS)` + a Vectored
+Exception Handler (and `userfaultfd` → `PAGE_GUARD`/VEH for demand paging) — is
+**not built yet**. Until it lands we **refuse to build/run there** (`svm-jit`
+emits a `compile_error!` on non-unix targets) rather than run with a weaker
+guarantee: without the guard we cannot make the same escape guarantee, and
+guard-relying elision (above) would be real host-memory UB. The conservative,
+provably-in-window elision needs no guard and is sound everywhere, but the
+guard-relying win stays gated on the guard. **Goal: run *identically* on Windows
+once the guard path lands** — same confinement, same detect-and-kill, same
+elision. (TODO: implement the Windows backend.)
 
 A window may itself be a power-of-two-aligned **sub-region of a parent window**
 (see §14); confinement is then `base + (offset & (size−1))` with `base`/`size`
