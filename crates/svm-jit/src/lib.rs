@@ -31,6 +31,16 @@
 //! guard margin so a masked base near the top plus the access width never escapes the
 //! allocation (a real deployment uses guard *pages* + a fault for the width overrun).
 //!
+//! **Mask elision (§1a "mask-when-not", D36–D38).** A conservative per-block upper-bound
+//! analysis ([`ub_of`]) proves some effective addresses are *already* `< size`; for those
+//! the `& mask` is dropped ([`in_window`] / `mask_addr`'s `elide`), since the unmasked
+//! address already equals the masked one and stays in-window — closing part of the gap to
+//! wasm32's free guard-page accesses. This is the subset of guard-when-bounded that needs no
+//! guard region (it only elides *provably in-window* accesses, never relying on a fault); the
+//! full wasm32-style large-guard version awaits real guard pages (§5). A wrong bound would be
+//! a confinement escape, so the analysis is upper-bound-only (unknown ⇒ mask) and the
+//! elision is differentially guarded by the escape-oracle (final-memory equality, §18).
+//!
 //! ## Indirect-call dispatch (§3c, invariant I2)
 //! `call_indirect` masks the guest index into a host-owned, power-of-two-padded
 //! function table, checks the slot's `type_id` against the call's signature (trap on
@@ -696,6 +706,11 @@ fn lower_block(
     b.switch_to_block(cb);
     // The CLIF block params are the IR block params; seed the value map with them.
     let mut vals: Vec<Value> = b.block_params(cb).to_vec();
+    // Parallel upper-bound map (for mask elision); block params are unknown. Kept in lockstep
+    // with `vals` so `ubs[i]` always describes IR value `i` (a misalignment could mis-elide,
+    // so it is grown at the same points `vals` is). `size` confines via `mask` (= size−1).
+    let mut ubs: Vec<u64> = vec![UB_TOP; vals.len()];
+    let size = lower.mask.wrapping_add(1);
 
     for inst in &blk.insts {
         // `call`/`call_indirect` append 0..N results — handle before the single-value
@@ -709,6 +724,7 @@ fn lower_block(
             }
             let call = b.ins().call(callee, &cargs);
             vals.extend_from_slice(b.inst_results(call));
+            ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
         }
         if let Inst::CallIndirect { ty, idx, args } = inst {
@@ -720,6 +736,7 @@ fn lower_block(
             }
             let call = b.ins().call_indirect(sig, code, &cargs);
             vals.extend_from_slice(b.inst_results(call));
+            ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
         }
         if let Inst::CapCall {
@@ -733,6 +750,7 @@ fn lower_block(
             lower_cap_call(
                 module, b, lower, *type_id, *op, sig, *handle, args, &mut vals,
             )?;
+            ubs.resize(vals.len(), UB_TOP); // cap-call results are unknown
             continue;
         }
         let v = match inst {
@@ -842,7 +860,8 @@ fn lower_block(
             Inst::Load {
                 op, addr, offset, ..
             } => {
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset);
+                let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
                 lower_load(b, *op, phys)
             }
             Inst::Store {
@@ -852,13 +871,17 @@ fn lower_block(
                 offset,
                 ..
             } => {
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset);
+                let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
             _ => return Err(JitError::Unsupported("instruction")),
         };
+        // Single-result instruction: record its value and a sound upper bound in lockstep.
+        let u = ub_of(inst, &ubs);
         vals.push(v);
+        ubs.push(u);
     }
 
     match &blk.term {
@@ -1112,13 +1135,88 @@ fn get(vals: &[Value], i: u32) -> Result<Value, JitError> {
 /// The §4 confinement masking lowering (invariant I1): compute the physical address
 /// `mem_base + ((addr + offset) & mask)`. The `(addr + offset) & mask` is exactly
 /// `svm_mask::Window::confine`, so the JIT and the isolated masking unit agree.
-fn mask_addr(b: &mut FunctionBuilder, lower: &Lower, addr: Value, offset: u64) -> Value {
-    let off = b.ins().iconst(I64, offset as i64);
-    let eff = b.ins().iadd(addr, off);
-    let m = b.ins().iconst(I64, lower.mask as i64);
-    let masked = b.ins().band(eff, m);
+///
+/// When `elide` is set the `& mask` is dropped — but **only** the caller's
+/// [`in_window`] proof (the address is provably `< size`) may set it, so the unmasked
+/// `addr + offset` already equals the masked value and stays in `[0, size)`. This is the
+/// "mask-when-not" / elide-when-provably-bounded half of §1a (D36–D38); a wrong proof is a
+/// confinement escape, caught by the escape-oracle (final-memory differential, §18).
+fn mask_addr(
+    b: &mut FunctionBuilder,
+    lower: &Lower,
+    addr: Value,
+    offset: u64,
+    elide: bool,
+) -> Value {
+    // Fold the immediate only when non-zero, so an offset-0 access keeps a minimal address
+    // expression (helps Cranelift's GVN / store-to-load forwarding recognize equal addresses).
+    let eff = if offset == 0 {
+        addr
+    } else {
+        let off = b.ins().iconst(I64, offset as i64);
+        b.ins().iadd(addr, off)
+    };
+    let confined = if elide {
+        eff
+    } else {
+        let m = b.ins().iconst(I64, lower.mask as i64);
+        b.ins().band(eff, m)
+    };
     let base = b.use_var(lower.mem_var);
-    b.ins().iadd(base, masked)
+    b.ins().iadd(base, confined)
+}
+
+/// Unknown upper bound — the value may be anything (so its accesses must be masked).
+const UB_TOP: u64 = u64::MAX;
+
+/// The recorded upper bound of IR value `i` (unknown if out of range — defensive).
+fn ub_at(ubs: &[u64], i: u32) -> u64 {
+    ubs.get(i as usize).copied().unwrap_or(UB_TOP)
+}
+
+/// A **sound, conservative upper bound** on an SSA value's unsigned (`u64`) magnitude, used
+/// only to decide mask elision. Every rule must never under-estimate the real maximum;
+/// anything not modelled returns [`UB_TOP`]. Lower bounds are irrelevant (a `u64` is `≥ 0`),
+/// so only the upper bound is tracked. Indexed like the value map (block params = `UB_TOP`).
+fn ub_of(inst: &Inst, ubs: &[u64]) -> u64 {
+    let ub = |i: u32| ubs.get(i as usize).copied().unwrap_or(UB_TOP);
+    match inst {
+        Inst::ConstI64(c) => *c as u64,
+        Inst::ConstI32(c) => *c as u32 as u64,
+        Inst::IntBin { op, a, b, .. } => {
+            let (x, y) = (ub(*a), ub(*b));
+            match op {
+                // a & b ≤ min(a, b); a|b, a^b, a+b ≤ a + b; a*b ≤ a * b (wrap ⇒ Top).
+                BinOp::And => x.min(y),
+                BinOp::Add | BinOp::Or | BinOp::Xor => x.checked_add(y).unwrap_or(UB_TOP),
+                BinOp::Mul => x.checked_mul(y).unwrap_or(UB_TOP),
+                _ => UB_TOP,
+            }
+        }
+        // Zero-extend: the i64 value is the (≤ u32::MAX) source, no wider.
+        Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a,
+        } => ub(*a).min(0xFFFF_FFFF),
+        Inst::Convert {
+            op: ConvOp::WrapI64,
+            ..
+        } => 0xFFFF_FFFF,
+        _ => UB_TOP,
+    }
+}
+
+/// True iff every access `[addr+offset, addr+offset+width)` is provably within `[0, size)`
+/// given `addr ≤ addr_ub` — i.e. the mask is redundant and can be elided. Saturating/checked
+/// throughout so an overflow can only make this *false* (fall back to masking), never escape.
+fn in_window(addr_ub: u64, offset: u64, width: u32, size: u64) -> bool {
+    match addr_ub
+        .checked_add(offset)
+        .and_then(|s| s.checked_add(width as u64))
+    {
+        Some(top) => top <= size,
+        None => false,
+    }
 }
 
 /// Little-endian, may-trap memory access flags (the window is host memory; the guard

@@ -450,18 +450,18 @@ Have (✅):
   - `alu` (tight i64 mul/add loop): compute **≈1.0–1.05×** (parity, as designed — shared
     backend); cold start **≈0.3–0.45×** (we're ~2–3× faster — "SSA on the wire, no SSA
     reconstruction", §1a). *Both theses confirmed.*
-  - `memsum` (store+load to the **same** address each iter): **wasm32 ~0.69 < svm ~1.10 ≈
-    wasm64 ~1.23** ns/it. svm is ~1.6× wasm32, ~tied with wasm64. Wasmtime CSEs the two
-    bounds checks (same address) into ~one here, so wasm64 looks tied — a flattering case.
+    Both memory kernels now exercise the **mask-elision** path (below): their `(i&K)*8`
+    addresses are provably in-window, so the JIT drops the `& mask`.
+  - `memsum` (store+load to the **same** address each iter): **wasm32 ~0.69 < svm ~0.94 <
+    wasm64 ~1.25** ns/it → svm ~1.36× wasm32, **~0.72× (faster) than wasm64**. (Pre-elision
+    svm was ~1.10; Wasmtime CSEs the same-address bounds check, which still helps it.)
   - `scatter` (store + load to **different, per-iter varying** slots — the realistic test):
-    **wasm32 ~1.03 < svm ~1.58 < wasm64 ~2.0** ns/it → svm **~1.53× slower than wasm32** but
-    **~0.78× = ~1.3× *faster* than wasm64**. With varied addresses Wasmtime can't CSE the
-    check, so wasm64 pays a full bounds check per access (its cost ~doubles vs `memsum`) and
-    **our mask wins** — confirming §1a's "faster than wasm64." The honest net: §1a's *two*
-    memory claims hold directionally — we beat wasm64 (clearly, on varied access) and trail
-    wasm32 — but "wash-or-*slightly* worse than wasm32" is optimistic: we're ~1.5× wasm32,
-    and the prescribed **"guard-when-bounded, mask-when-not"** fast path (§4, D36–D38) that
-    would close it is unimplemented (the JIT always masks).
+    **wasm32 ~1.03 < svm ~1.27 < wasm64 ~2.0** ns/it → svm **~1.21× wasm32** (pre-elision
+    ~1.53×) and **~0.62× = ~1.6× *faster* than wasm64**. Varied addresses defeat Wasmtime's
+    bounds-check CSE, so wasm64 pays a full check per access while our (now-elided) mask
+    wins big. Net: §1a's two memory claims both hold — we clearly **beat wasm64**, and the
+    **wasm32 gap is now ~1.2–1.36×** (mask elision closed roughly half of it; the residual
+    is wasm32's truly-free guard-page access, which needs real guard pages, §5).
 
 Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
 regressions one commit old"):
@@ -472,23 +472,27 @@ regressions one commit old"):
 - [ ] **No C-frontend program benches** — e.g. the SSA-promotion win (loop body ~22→0 memory
   ops) is uncaptured end-to-end; nothing would flag it if promotion regressed. The `bench/`
   kernels are hand-written IR, not chibicc output.
-- [ ] **The memory path trails wasm32 ~1.5×** (both kernels) — the real perf gap the bench
-  surfaced. The fix is the design's own unimplemented **"guard-when-bounded, mask-when-not"**
-  wasm32-style large-guard fast path (§4, D36–D38): the JIT masks every access today. (vs
-  wasm64 we're already ahead on varied access — see `scatter` — so this is specifically the
-  wasm32 gap.)
+- [x] **Mask elision (§1a "mask-when-not", D36–D38)** — *done*: a conservative upper-bound
+  analysis in the JIT (`ub_of`/`in_window`) drops the `& mask` when the address is provably
+  `< size`, closing ~half the wasm32 gap (memsum 1.6→1.36×, scatter 1.53→1.21×) and widening
+  the wasm64 lead. Guarded by the escape-oracle (a wrong bound diverges final memory / faults;
+  verified non-vacuous). Pinned by `escape_oracle::elided_bounded_address_confines`.
+- [ ] **Residual wasm32 gap (~1.2–1.36×)** needs the *full* guard-when-bounded: real **guard
+  pages** so even addresses we *can't* prove bounded (and the common data-SP–relative C
+  locals, where `sp` is an unbounded block param) get the wasm32 zero-instruction access.
+  That ties into Phase-3 trap-catching (guard pages + signal handler, §5). Also: the elision
+  is per-block (block params = unknown); proving the threaded data-SP bounded would extend it
+  to C locals.
 
 ### Suggested next pickups (ranked)
-1. **"Guard-when-bounded, mask-when-not" JIT load/store path** (§4, D36–D38) — the bench's
-   headline gap: svm trails wasm32 ~1.5× on both memory kernels because the JIT masks every
-   access, where wasm32 gets a free guard-page access when the offset is provably bounded.
-   This is the design's own prescription and the first measured perf win on the table.
-   (Caveat: guard *pages* tie into the Phase-3 trap-catching work.)
-2. **Production trap-catching** (guard pages + signal handler, §4/§5) — the big MVP item;
-   also upgrades the escape-oracle from final-memory diff to true fault detection, and backs
-   the guard-when-bounded path above.
-3. **Loops + indirect calls in `irgen`** — needs a JIT step-cap/fuel; deepens both the
+1. **Production trap-catching → full guard-when-bounded** (guard pages + signal handler,
+   §4/§5) — the big MVP item; it also upgrades the escape-oracle from final-memory diff to
+   true fault detection, *and* unlocks the wasm32 fast path for addresses the upper-bound
+   analysis can't prove (incl. data-SP–relative C locals) — the residual ~1.2–1.36× gap.
+2. **Loops + indirect calls in `irgen`** — needs a JIT step-cap/fuel; deepens both the
    interp/JIT differential and the escape-oracle (repeated, aliased stores).
+3. **Over-time bench tracking** — log the `--csv` line per commit so memory/compute
+   regressions (e.g. a future masking change) are caught one commit old.
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
-CI, merged); the JIT-vs-Wasmtime bench harness.)*
+CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses.)*

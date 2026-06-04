@@ -94,3 +94,42 @@ block0(v0: i32):
     assert_eq!(imem, init, "interp did not preserve the seeded window");
     assert_eq!(jmem, init, "jit did not preserve the seeded window");
 }
+
+/// The JIT elides the confinement mask when the address is *provably* in-window (the §1a
+/// "mask-when-not" path). This pins that the elided path stays confined: `addr = (n & 7)*8`
+/// is provably ≤ 56 in a 256-byte window, so the mask is dropped — yet for adversarial `n`
+/// (incl. negative / i64::MAX, whose low bits still confine via `& 7`) the interpreter (which
+/// always masks) and the JIT must still leave an identical window and land at the same slot.
+#[test]
+fn elided_bounded_address_confines() {
+    let src = "\
+memory 8
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 7
+  v2 = i64.and v0 v1
+  v3 = i64.const 8
+  v4 = i64.mul v2 v3
+  v5 = i64.const 171
+  i64.store v4 v5
+  v6 = i64.load v4
+  return v6
+}
+";
+    let m = svm::text::parse_module(src).expect("parse");
+    svm::verify::verify_module(&m).expect("verify");
+    for n in [0i64, 5, 0x12345, -1, i64::MAX, 9_999_999] {
+        let init = [0u8; 256];
+        let mut fuel = 1_000_000u64;
+        let (ir, imem) = run_capture(&m, 0, &[Value::I64(n)], &mut fuel, &init);
+        let (jo, jmem) = compile_and_run_capture(&m, 0, &[n], &init).expect("jit");
+        assert_eq!(ir.ok(), Some(vec![Value::I64(171)]), "interp result n={n}");
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[171]),
+            "jit {jo:?} n={n}"
+        );
+        assert_eq!(imem, jmem, "elided-address windows diverge at n={n}");
+        let slot = ((n as u64 & 7) * 8) as usize;
+        assert_eq!(imem[slot], 171, "store landed at wrong slot for n={n}");
+    }
+}
