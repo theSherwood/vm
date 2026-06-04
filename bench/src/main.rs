@@ -7,9 +7,13 @@
 //!     a tight inner loop"). A ratio near 1.0× is the expected, healthy result.
 //!   - **cold start → we should be faster** ("SSA on the wire: no SSA reconstruction from a
 //!     stack machine"). Source bytes → first result for a trivial program.
+//!   - **memory: faster than wasm64, ~wash-or-worse than wasm32** (§1a). Our 64-bit window
+//!     masks the final address (one `AND`); wasm32 gets the zero-instruction large-guard
+//!     trick (so it wins), while wasm64 must emit an explicit bounds check per access (so a
+//!     mask beats it). The memory kernel is therefore timed against *both* wasm memory types.
 //!
-//! Each kernel is written once in our IR text and once in the equivalent WAT; we assert the
-//! two engines agree on the result before timing (so we never benchmark a miscompile).
+//! Each kernel is written once in our IR text and once (or twice) in equivalent WAT; we
+//! assert all engines agree on the result before timing (so we never benchmark a miscompile).
 //!
 //! Methodology (kept simple + dependency-light, like `crates/svm/src/bin/bench.rs`):
 //!   - *compute* is isolated by **subtraction**: time the kernel at a large and a small
@@ -28,14 +32,17 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use svm_jit::{compile_and_run, JitOutcome};
-use wasmtime::{Engine, Instance, Module, Store, TypedFunc};
+use wasmtime::{Config, Engine, Instance, Module, Store, TypedFunc};
 
 struct Kernel {
     name: &'static str,
     /// Our IR text: `func (i64 n) -> (i64)`, entry = function 0.
     ir: &'static str,
-    /// Equivalent core wasm: `(func (export "run") (param i64) (result i64))`.
-    wat: &'static str,
+    /// Core wasm32 (`(memory N)`): `(func (export "run") (param i64) (result i64))`.
+    wat32: &'static str,
+    /// Equivalent wasm64 (`(memory i64 N)`), for kernels that touch memory — `None` for
+    /// pure-compute kernels, where the memory type is irrelevant.
+    wat64: Option<&'static str>,
 }
 
 /// `(i64 n) -> i64`: an LCG-style recurrence over `n` iterations — a tight `i64` mul/add
@@ -64,7 +71,7 @@ block3(v17: i64):
   return v17
 }
 ",
-    wat: r#"
+    wat32: r#"
 (module
   (func (export "run") (param $n i64) (result i64)
     (local $acc i64) (local $i i64)
@@ -81,10 +88,13 @@ block3(v17: i64):
         (br $loop)))
     (local.get $acc)))
 "#,
+    wat64: None,
 };
 
 /// `(i64 n) -> i64`: store then load `i` through a windowed address each iteration, so the
-/// memory path (our 64-bit mask vs wasm32's bounds check) is exercised. Result = Σ i.
+/// memory path is exercised. Result = Σ i (independent of where it lands). Timed against
+/// both wasm32 (i32 address + guard page) and wasm64 (i64 address + bounds check); we use a
+/// 64-bit masked address, so the design expects wasm32 < us < wasm64.
 const MEMSUM: Kernel = Kernel {
     name: "memsum",
     ir: "\
@@ -112,7 +122,7 @@ block3(v18: i64):
   return v18
 }
 ",
-    wat: r#"
+    wat32: r#"
 (module
   (memory 1)
   (func (export "run") (param $n i64) (result i64)
@@ -128,6 +138,24 @@ block3(v18: i64):
         (br $loop)))
     (local.get $acc)))
 "#,
+    wat64: Some(
+        r#"
+(module
+  (memory i64 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64) (local $addr i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $addr
+          (i64.mul (i64.and (local.get $i) (i64.const 1023)) (i64.const 8)))
+        (i64.store (local.get $addr) (local.get $i))
+        (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    ),
 };
 
 const KERNELS: &[Kernel] = &[ALU, MEMSUM];
@@ -143,6 +171,17 @@ fn svm_call(m: &svm_ir::Module, n: i64) -> i64 {
     }
 }
 
+/// Compile + instantiate a wasm module and return its `(i64) -> i64` entry, store and all.
+fn wasm_entry(engine: &Engine, wasm: &[u8]) -> (Store<()>, TypedFunc<i64, i64>) {
+    let module = Module::new(engine, wasm).expect("wasmtime compile");
+    let mut store = Store::new(engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
+    let run = instance
+        .get_typed_func(&mut store, "run")
+        .expect("entry `run`");
+    (store, run)
+}
+
 /// Average wall time per call of `f`, in seconds, after a short warm-up.
 fn per_call(iters: u32, mut f: impl FnMut()) -> f64 {
     for _ in 0..(iters / 4).max(1) {
@@ -155,43 +194,56 @@ fn per_call(iters: u32, mut f: impl FnMut()) -> f64 {
     t.elapsed().as_secs_f64() / iters as f64
 }
 
+/// Per-iteration steady-state compute (ns) of a compiled wasm entry, via subtraction.
+fn wasm_compute_ns(store: &mut Store<()>, run: &TypedFunc<i64, i64>) -> f64 {
+    let big = per_call(100, || {
+        black_box(run.call(&mut *store, N_BIG).unwrap());
+    });
+    let small = per_call(100, || {
+        black_box(run.call(&mut *store, N_SMALL).unwrap());
+    });
+    (big - small) * 1e9 / (N_BIG - N_SMALL) as f64
+}
+
 fn main() {
     let csv = std::env::args().any(|a| a == "--csv");
-    let engine = Engine::default(); // Cranelift, default opt level
+    // Enable the memory64 proposal so `(memory i64 …)` modules compile; it does not change
+    // how wasm32 modules are lowered, so the wasm32 numbers stay comparable.
+    let mut config = Config::new();
+    config.wasm_memory64(true);
+    let engine = Engine::new(&config).expect("engine");
 
     if !csv {
         println!(
-            "SVM JIT vs Wasmtime — both via Cranelift (expect compute ≈ 1.0×, cold-start < 1.0×)\n\
+            "SVM JIT vs Wasmtime — both via Cranelift.  ratio = svm / wasm  (<1 = svm faster)\n\
+             Expect: alu compute ≈1×; cold-start <1×; memsum  wasm32 < svm < wasm64.\n\
              N_big={N_BIG} N_small={N_SMALL}\n"
         );
         println!(
-            "{:<8} {:>14} {:>14} {:>7} {:>13} {:>13} {:>7}",
-            "kernel", "svm ns/it", "wmt ns/it", "ratio", "svm cold ms", "wmt cold ms", "ratio"
+            "{:<8} | {:>8} {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
+            "kernel", "svm", "wasm32", "ratio", "wasm64", "ratio", "svm", "wasm32", "ratio"
+        );
+        println!(
+            "{:<8} | {:>8} {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
+            "", "ns/it", "ns/it", "", "ns/it", "", "cold ms", "cold ms", ""
         );
     }
 
     for k in KERNELS {
         let m = svm_text::parse_module(k.ir).expect("parse our IR text");
-        let wasm = wat::parse_str(k.wat).expect("assemble WAT");
+        let wasm32 = wat::parse_str(k.wat32).expect("assemble wasm32 WAT");
+        let (mut s32, run32) = wasm_entry(&engine, &wasm32);
 
-        // Compile the wasm once; instantiate once; grab the typed entry.
-        let module = Module::new(&engine, &wasm).expect("wasmtime compile");
-        let mut store = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
-        let run: TypedFunc<i64, i64> = instance
-            .get_typed_func(&mut store, "run")
-            .expect("entry `run`");
-
-        // Never benchmark a miscompile: the two engines must agree on the result.
+        // Cross-check every engine agrees before timing (never benchmark a miscompile).
         let ours = svm_call(&m, N_SMALL);
-        let theirs = run.call(&mut store, N_SMALL).expect("wasmtime call");
         assert_eq!(
-            ours, theirs,
-            "kernel `{}` disagrees: svm={ours} wasmtime={theirs}",
+            ours,
+            run32.call(&mut s32, N_SMALL).unwrap(),
+            "kernel `{}`: svm vs wasm32 disagree",
             k.name
         );
 
-        // --- steady-state compute (per-iteration, compile cancelled by subtraction) ---
+        // --- steady-state compute ---
         let svm_big = per_call(25, || {
             black_box(svm_call(&m, N_BIG));
         });
@@ -199,39 +251,57 @@ fn main() {
             black_box(svm_call(&m, N_SMALL));
         });
         let svm_ns = (svm_big - svm_small) * 1e9 / (N_BIG - N_SMALL) as f64;
+        let w32_ns = wasm_compute_ns(&mut s32, &run32);
 
-        let wmt_big = per_call(100, || {
-            black_box(run.call(&mut store, N_BIG).unwrap());
+        let w64 = k.wat64.map(|wat| {
+            let wasm64 = wat::parse_str(wat).expect("assemble wasm64 WAT");
+            let (mut s64, run64) = wasm_entry(&engine, &wasm64);
+            assert_eq!(
+                ours,
+                run64.call(&mut s64, N_SMALL).unwrap(),
+                "kernel `{}`: svm vs wasm64 disagree",
+                k.name
+            );
+            wasm_compute_ns(&mut s64, &run64)
         });
-        let wmt_small = per_call(100, || {
-            black_box(run.call(&mut store, N_SMALL).unwrap());
-        });
-        let wmt_ns = (wmt_big - wmt_small) * 1e9 / (N_BIG - N_SMALL) as f64;
 
-        // --- cold start: source bytes → first result for a trivial (n=0) program ---
+        // --- cold start: source bytes → first result for a trivial (n=0) program (wasm32) ---
         let svm_cold = per_call(60, || {
             black_box(svm_call(&m, 0));
         }) * 1e3;
         let wmt_cold = per_call(60, || {
-            let module = Module::new(&engine, &wasm).unwrap();
-            let mut s = Store::new(&engine, ());
-            let inst = Instance::new(&mut s, &module, &[]).unwrap();
-            let f: TypedFunc<i64, i64> = inst.get_typed_func(&mut s, "run").unwrap();
+            let (mut s, f) = wasm_entry(&engine, &wasm32);
             black_box(f.call(&mut s, 0).unwrap());
         }) * 1e3;
 
         if csv {
+            let (w64s, r64) = match w64 {
+                Some(v) => (format!("{v:.3}"), format!("{:.3}", svm_ns / v)),
+                None => ("NA".into(), "NA".into()),
+            };
             println!(
-                "{},{:.3},{:.3},{:.3},{:.4},{:.4}",
-                k.name, svm_ns, wmt_ns, svm_ns / wmt_ns, svm_cold, wmt_cold
-            );
-        } else {
-            println!(
-                "{:<8} {:>14.3} {:>14.3} {:>6.2}× {:>13.4} {:>13.4} {:>6.2}×",
+                "{},{:.3},{:.3},{:.3},{w64s},{r64},{:.4},{:.4},{:.3}",
                 k.name,
                 svm_ns,
-                wmt_ns,
-                svm_ns / wmt_ns,
+                w32_ns,
+                svm_ns / w32_ns,
+                svm_cold,
+                wmt_cold,
+                svm_cold / wmt_cold
+            );
+        } else {
+            let (w64s, r64) = match w64 {
+                Some(v) => (format!("{v:.3}"), format!("{:.2}×", svm_ns / v)),
+                None => ("—".into(), "—".into()),
+            };
+            println!(
+                "{:<8} | {:>8.3} {:>8.3} {:>5.2}× | {:>8} {:>6} | {:>8.4} {:>8.4} {:>5.2}×",
+                k.name,
+                svm_ns,
+                w32_ns,
+                svm_ns / w32_ns,
+                w64s,
+                r64,
                 svm_cold,
                 wmt_cold,
                 svm_cold / wmt_cold
