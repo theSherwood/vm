@@ -531,11 +531,20 @@ regressions one commit old"):
   to C locals.
 
 ### Suggested next pickups (ranked)
-1. **Large reserved window → full guard-when-bounded** (§4) — builds on the new guard-page +
-   signal foundation: a multi-GB reserved window so 32-bit-bounded indices fit under the
-   guard and the JIT can elide the mask without a proof (the wasm32 fast path), closing the
-   residual ~1.2–1.36× gap incl. data-SP–relative C locals. Needs the interp to model which
-   pages are mapped (to stay in differential lockstep) and changes the masking constant.
+1. **Large reserved window → full guard-when-bounded** (§4) — *in progress, staged.* A multi-GB
+   reserved window so 32-bit-bounded indices fit under the guard and the JIT can elide the mask
+   without a proof (the wasm32 fast path), closing the residual gap incl. data-SP–relative C
+   locals. **Plan:** (1) ✅ a `bench/` **`locals_c`** kernel (address-taken `volatile` stack array
+   ⇒ per-iter `sp + (i&255)*8`, `sp` an unbounded i64 block param ⇒ masked every access) now
+   measures the case — it starts at **2.26× vs wasm32**, the worst kernel and the target metric
+   (memsum/scatter are already pre-elided, so they don't show it). (2) decouple `reserved` (mask
+   domain) from `mapped` (fault bound) in `svm-mask` + its property/fuzz tests, no behavior change.
+   (3) JIT reserves `~2^32`+guard, maps `mapped` RW, rest `PROT_NONE`; mask const = `reserved-1`;
+   elision threshold → `reserved`; interp confines to `reserved` and **faults** outside `mapped`
+   (a deliberate I1 change: out-of-`mapped` accesses now trap instead of wrapping — more
+   wasm-faithful; both backends adopt it to stay in differential lockstep). (4) bound the
+   loop-invariant SP base once (LICM hoists it) so per-iter SP-relative accesses elide; re-measure
+   `locals_c` toward parity.
 2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
    `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
    win end-to-end at ≈parity — see Benchmarking gaps); a non-gating nightly CI `bench` job runs `--check`.

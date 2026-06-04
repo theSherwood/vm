@@ -285,8 +285,8 @@ struct Resolved {
     wat64: Option<String>,
 }
 
-/// The hand-written [`KERNELS`] plus, when the C frontend is buildable, the `alu_c` kernel
-/// (same algorithm as `alu`, but lowered from C — see [`alu_from_c`]).
+/// The hand-written [`KERNELS`] plus, when the C frontend is buildable, the chibicc-lowered
+/// kernels (`alu_c`, `locals_c` — see [`alu_from_c`] / [`locals_from_c`]).
 fn resolve_kernels() -> Vec<Resolved> {
     let mut v: Vec<Resolved> = KERNELS
         .iter()
@@ -299,27 +299,24 @@ fn resolve_kernels() -> Vec<Resolved> {
             wat64: k.wat64.map(|w| w.to_string()),
         })
         .collect();
-    match alu_from_c() {
-        Ok(r) => v.push(r),
-        Err(e) => eprintln!("note: skipping the `alu_c` kernel (C frontend unavailable): {e}"),
+    for k in [alu_from_c(), locals_from_c()] {
+        match k {
+            Ok(r) => v.push(r),
+            Err(e) => eprintln!("note: skipping a C-frontend kernel (frontend unavailable): {e}"),
+        }
     }
     v
 }
 
-/// The same LCG recurrence as `alu`, but lowered from C through the chibicc frontend — so its
-/// steady-state time tracks the **SSA-promotion win end-to-end**: if a promotable loop body
-/// regressed back to memory, `alu_c` would drift toward the memory-bound path while the
-/// hand-written (already register-only) `alu` would not. Reuses `alu`'s WAT as the oracle,
-/// since the algorithm is identical. Returns `Err` (caller skips it) if the frontend is absent.
-fn alu_from_c() -> Result<Resolved, String> {
-    const SRC: &str = "long run(long n){\n  long acc = 0;\n  \
-        for (long i = 0; i < n; i++)\n    \
-        acc = acc * 6364136223846793005L + 1442695040888963407L + i;\n  \
-        return acc;\n}\nint main(){ return (int)run(0); }\n";
-    let ir = compile_c_to_ir(SRC)?;
+/// Compile `src` through the chibicc frontend and wrap its `run` as a kernel timed against
+/// `wat32`. `run` is found by signature — the unique `(i64, i64) -> (i64)` function (`main`
+/// returns i32, `_start` takes three i32s) — so this is robust against the frontend's function
+/// ordering. `lead` is the args before `n`: `run` threads the data-stack pointer as v0, so it is
+/// the initial SP (0 is safe here — the frame is tiny and self-contained). Returns `Err` (caller
+/// skips the kernel) if the frontend can't be built/run.
+fn c_kernel(name: &str, src: &str, lead: Vec<i64>, wat32: String) -> Result<Resolved, String> {
+    let ir = compile_c_to_ir(src)?;
     let m = svm_text::parse_module(&ir).map_err(|e| format!("parse frontend IR: {e:?}"))?;
-    // Find `run` by signature: the unique `(i64, i64) -> (i64)` function (`main` returns i32,
-    // `_start` takes three i32s). Robust against the frontend's function ordering.
     let entry = m
         .funcs
         .iter()
@@ -329,15 +326,56 @@ fn alu_from_c() -> Result<Resolved, String> {
         })
         .ok_or("no `run(i64,i64)->i64` entry in frontend output")? as u32;
     Ok(Resolved {
-        name: "alu_c".to_string(),
+        name: name.to_string(),
         ir,
         entry,
-        // `run` threads the data-stack pointer as v0; the body is fully promoted so it is never
-        // used (Cranelift DCEs it) — any value works. `n` is appended by `svm_call`.
-        lead_args: vec![0],
-        wat32: ALU.wat32.to_string(),
+        lead_args: lead,
+        wat32,
         wat64: None,
     })
+}
+
+/// The same LCG recurrence as `alu`, but lowered from C — so its steady-state time tracks the
+/// **SSA-promotion win end-to-end**: if a promotable loop body regressed back to memory, `alu_c`
+/// would drift toward the memory-bound path while the hand-written (already register-only) `alu`
+/// would not. Reuses `alu`'s WAT as the oracle, since the algorithm is identical.
+fn alu_from_c() -> Result<Resolved, String> {
+    const SRC: &str = "long run(long n){\n  long acc = 0;\n  \
+        for (long i = 0; i < n; i++)\n    \
+        acc = acc * 6364136223846793005L + 1442695040888963407L + i;\n  \
+        return acc;\n}\nint main(){ return (int)run(0); }\n";
+    c_kernel("alu_c", SRC, vec![0], ALU.wat32.to_string())
+}
+
+/// A **data-SP–relative** memory loop from C: an address-taken `volatile` stack array, so each
+/// iteration stores/loads through `sp + (i & 255)*8` — and `sp` is an *unbounded* i64 block
+/// param, so the JIT cannot prove the address in-window and masks every access. This is exactly
+/// the case the large-reserved-window / guard-when-bounded work (§4, §1a) targets: it should
+/// move toward wasm32 parity once the SP base is provably bounded and the per-access mask elides.
+/// `memsum`/`scatter` don't exercise it (their indices are already provably small ⇒ pre-elided).
+fn locals_from_c() -> Result<Resolved, String> {
+    const SRC: &str = "long run(long n){\n  volatile long a[256];\n  long acc = 0;\n  \
+        for (long i = 0; i < n; i++) { a[i & 255] = i; acc += a[i & 255]; }\n  \
+        return acc;\n}\nint main(){ return (int)run(0); }\n";
+    // wasm32 oracle: the same store-then-load-and-sum through a windowed slot `(i&255)*8`.
+    // Result is Σ i (the slot is overwritten then read back each iteration), matching the C run.
+    const WAT32: &str = r#"
+(module
+  (memory 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64) (local $addr i32)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $addr
+          (i32.mul (i32.and (i32.wrap_i64 (local.get $i)) (i32.const 255)) (i32.const 8)))
+        (i64.store (local.get $addr) (local.get $i))
+        (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#;
+    c_kernel("locals_c", SRC, vec![0], WAT32.to_string())
 }
 
 /// Build the chibicc fork (idempotent `make`) and compile `src` to our text IR. Returns `Err`

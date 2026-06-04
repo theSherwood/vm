@@ -3,7 +3,8 @@
 # past the tolerance (svm got relatively slower). Regenerate after an intended change:
 #   cargo run --release -- --save-baseline baseline.txt
 # columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime
-alu,1.020,NA,0.345
-memsum,1.156,0.578,0.409
-scatter,1.387,0.743,0.421
-alu_c,1.018,NA,1.098
+alu,1.016,NA,0.272
+memsum,1.492,1.117,0.334
+scatter,1.444,0.823,0.332
+alu_c,1.026,NA,0.995
+locals_c,2.264,NA,0.998
