@@ -242,6 +242,55 @@ fn i32_of(src: &str) -> i32 {
     }
 }
 
+/// D40 (§3a/§4): a string literal lives in a **read-only** data segment, so writing through a
+/// pointer to it (UB in C) detect-and-kills on both backends instead of silently corrupting the
+/// literal. The first real C consumer of the read-only data section.
+#[cfg(unix)]
+#[test]
+fn c_write_to_string_literal_faults() {
+    let src = "int main() { char *s = \"hi\"; s[0] = 'X'; return 0; }";
+    let ir = c_to_ir(src);
+    assert!(
+        ir.contains("data ro "),
+        "expected a read-only data segment:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let grant = |h: &mut Host| {
+        [
+            Value::I32(h.grant_stream(StreamRole::Out)),
+            Value::I32(h.grant_stream(StreamRole::In)),
+            Value::I32(h.grant_exit()),
+        ]
+    };
+    let args = grant(&mut hi);
+    grant(&mut hj);
+    let mut fuel = 50_000_000u64;
+    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let jit = compile_and_run_with_host(
+        &m,
+        0,
+        &slots,
+        cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+
+    assert_eq!(
+        interp,
+        Err(Trap::MemoryFault),
+        "interp: write to a string literal must fault\n{ir}"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Trapped(TrapKind::MemoryFault)),
+        "jit: write to a string literal must detect-and-kill, got {jit:?}\n{ir}"
+    );
+}
+
 #[test]
 fn c_integer_arithmetic_end_to_end() {
     assert_eq!(i32_of("int main() { return 42; }"), 42);

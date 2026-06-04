@@ -1310,19 +1310,53 @@ static void gen_func(Obj *fn) {
   fprintf(o, "}\n\n");
 }
 
-// Lay globals + string literals out at fixed window offsets in the data region from 16;
-// set `data_end` (the data-stack base). Returns true if any global exists.
+// Window page size, matching the runtime (`svm-interp`/`svm-jit` use 4 KiB). Read-only data is
+// laid out on its own page(s) so a `data ro` segment can be protected without touching writable
+// data (protection is page-granular).
+#define DATA_PAGE 4096
+
+// A read-only data global (§3a / D40): a string literal — an anonymous (`.L..`) char array with
+// initializer bytes (this includes `__func__`/`__FUNCTION__`). chibicc tracks no `const`, and
+// these are the non-modifiable data; writing to one is UB, so mapping it read-only turns that
+// into a clean detect-and-kill fault.
+static bool is_rodata(Obj *g) {
+  return !g->is_function && g->init_data && g->name && g->name[0] == '.' && g->name[1] == 'L' &&
+         g->ty->kind == TY_ARRAY && g->ty->base && g->ty->base->kind == TY_CHAR;
+}
+
+// Lay globals out at fixed window offsets; set `data_end` (the data-stack base). Writable data
+// (and the [0,16) handle slots) goes first from 16, then a page boundary, then read-only string
+// literals on their own page(s), then another page boundary before the data stack — so the
+// `data ro` segments are page-isolated for protection (§3a / D40). Returns true if any global.
 static bool layout_globals(Obj *prog) {
   int off = 16;
   bool any = false;
+  // Pass 1: writable globals (and BSS) packed from 16.
   for (Obj *g = prog; g; g = g->next) {
-    if (g->is_function)
+    if (g->is_function || is_rodata(g))
       continue;
     off = align_to(off, g->align);
     g->offset = off;
     off += g->ty->size;
     any = true;
   }
+  // Pass 2: read-only string literals, on a fresh page so they share no page with writable data.
+  bool any_ro = false;
+  for (Obj *g = prog; g; g = g->next) {
+    if (!is_rodata(g))
+      continue;
+    if (!any_ro) {
+      off = align_to(off, DATA_PAGE);
+      any_ro = true;
+    }
+    off = align_to(off, g->align);
+    g->offset = off;
+    off += g->ty->size;
+    any = true;
+  }
+  // End the RO region on a page boundary too, so the data stack never shares its page.
+  if (any_ro)
+    off = align_to(off, DATA_PAGE);
   data_end = align_to(off, 16);
   return any;
 }
@@ -1336,7 +1370,7 @@ static void emit_data_segments(Obj *prog) {
     if (g->rel)
       error_tok(g->tok, "codegen_ir: global initialized with a pointer (relocation) "
                         "not supported yet");
-    fprintf(o, "data %d \"", g->offset);
+    fprintf(o, "data %s%d \"", is_rodata(g) ? "ro " : "", g->offset);
     for (int i = 0; i < g->ty->size; i++) {
       unsigned char c = (unsigned char)g->init_data[i];
       if (c == '\\')

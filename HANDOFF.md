@@ -397,8 +397,14 @@ this is the index.)
 - [x] **Verifier escape-oracle fuzzer** — *done*: the differential now byte-compares the
   final guest window across interp + JIT (verified ⇒ in-window), in the 4000 stable seeds
   (every push) and the `diff` libFuzzer target. See Fuzzing below.
+- [x] **Real read-only data segment (§3a / D40) — *done*.** The IR has a `data [ro] <off> "<bytes>"`
+  section (`svm_ir::Data`, text/encode/verify); both backends place segments at instantiation and
+  map `readonly` ones RO (interp page-map / JIT `mprotect`); the chibicc frontend emits one `data`
+  segment per global (string literals → `data ro`, page-isolated) and no longer byte-stores in
+  `_start`. A C write to a string literal detect-and-kills on both backends
+  (`c_frontend::c_write_to_string_literal_faults`).
 - [ ] *(optional, deferred even within MVP — not blockers)* by-value aggregate args/returns
-  (`sret`, D39); a real RO data segment (§3a/D40, vs `_start` byte-stores); general `goto`.
+  (`sret`, D39); general `goto`.
 
 > **Ceiling reminder (§18):** the MVP target is *"appears to work"* — well-evidenced now.
 > *"Is certified secure"* is **not** an MVP deliverable; it's a separate, open-ended
