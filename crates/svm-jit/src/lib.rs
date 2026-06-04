@@ -391,6 +391,24 @@ fn run_inner(
         window.rw_mut()[..n].copy_from_slice(&init[..n]);
     }
 
+    // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
+    // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
+    // verifier already bounds every segment to `[0, size)`. Done while the window is fully RW.
+    if let Some(mc) = m.memory {
+        let size = 1u64 << mc.size_log2;
+        let rw = window.rw_mut();
+        for d in &m.data {
+            let end = (d.offset + d.bytes.len() as u64).min(size) as usize;
+            let start = (d.offset as usize).min(end);
+            rw[start..end].copy_from_slice(&d.bytes[..end - start]);
+        }
+    }
+    for d in &m.data {
+        if d.readonly && !d.bytes.is_empty() {
+            window.protect_ro(d.offset, d.bytes.len() as u64);
+        }
+    }
+
     let mut flags = settings::builder();
     // A JIT'd function is called directly, not relocated into a shared object.
     let _ = flags.set("is_pic", "false");

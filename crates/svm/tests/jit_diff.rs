@@ -52,6 +52,46 @@ fn i32s(xs: &[i32]) -> Vec<Value> {
     xs.iter().map(|x| Value::I32(*x)).collect()
 }
 
+/// §3a/D40 read-only data segment: the runtime copies the bytes in and maps the segment RO at
+/// instantiation, so a guest **store** to it faults (detect-and-kill) while a **load** reads the
+/// initialized byte — identically on the interpreter (page-protection map) and the JIT (real
+/// `mprotect`, fault caught by the guard).
+#[cfg(unix)]
+#[test]
+fn data_readonly_segment_write_faults_load_reads() {
+    // memory 13 = 8 KiB (2 pages); a RO segment starts at page 1 (offset 4096).
+    let store = "data ro 4096 \"\\xab\\xcd\"\nmemory 13\n\
+        func () -> (i32) {\nblock0():\n  v0 = i64.const 4096\n  v1 = i32.const 1\n  \
+        i32.store8 v0 v1\n  v2 = i32.const 0\n  return v2\n}\n";
+    let m = parse_module(store).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 100_000u64;
+    assert_eq!(
+        run(&m, 0, &[], &mut fuel),
+        Err(Trap::MemoryFault),
+        "interp: store to RO data must fault"
+    );
+    assert!(
+        matches!(
+            compile_and_run(&m, 0, &[]).expect("jit"),
+            JitOutcome::Trapped(TrapKind::MemoryFault)
+        ),
+        "jit: store to RO data must detect-and-kill"
+    );
+
+    // A load of the same RO byte succeeds and reads the initialized value (0xab) on both.
+    let load = "data ro 4096 \"\\xab\\xcd\"\nmemory 13\n\
+        func () -> (i32) {\nblock0():\n  v0 = i64.const 4096\n  v1 = i32.load8_u v0\n  return v1\n}\n";
+    let m = parse_module(load).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 100_000u64;
+    assert_eq!(run(&m, 0, &[], &mut fuel), Ok(vec![Value::I32(0xab)]));
+    assert!(matches!(
+        compile_and_run(&m, 0, &[]).expect("jit"),
+        JitOutcome::Returned(ref s) if s == &[0xab]
+    ));
+}
+
 #[test]
 fn jit_matches_interp_add() {
     let src = r#"

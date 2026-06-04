@@ -11,8 +11,8 @@
 use std::collections::BTreeMap;
 
 use svm_ir::{
-    BinOp, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, FuncType,
-    IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
+    BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx,
+    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
     DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
@@ -93,9 +93,11 @@ pub fn run_with_host(
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
     // backed, so an out-of-`mapped` access faults (detect-and-kill) instead of wrapping.
-    let mut mem = m
-        .memory
-        .map(|mc| Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2));
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        mm.init_data(&m.data); // §3a/D40 data segments (copy + RO-protect)
+        mm
+    });
     run_func(f, args, fuel, &mut mem, &m.funcs, host, 0)
 }
 
@@ -139,6 +141,7 @@ pub fn run_capture_reserved(
     let mut mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
+        mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
         mm
     });
     let r = run_func(f, args, fuel, &mut mem, &m.funcs, &mut host, 0);
@@ -1028,6 +1031,26 @@ impl Mem {
             self.prot.insert(page, PageProt::Ro);
         } else {
             self.prot.insert(page, PageProt::Unmapped);
+        }
+    }
+
+    /// Place initialized data segments at instantiation (§3a / D40): write every segment's bytes,
+    /// then mark the pages of each `readonly` segment read-only (so the init writes themselves
+    /// don't fault). RO protection is page-granular, so a producer keeps RO data on its own pages
+    /// (the verifier already bounds each segment to `[0, size)`).
+    fn init_data(&mut self, data: &[Data]) {
+        for d in data {
+            for (i, &b) in d.bytes.iter().enumerate() {
+                self.set_byte(d.offset + i as u64, b);
+            }
+        }
+        for d in data {
+            if d.readonly && !d.bytes.is_empty() {
+                let last = d.offset + d.bytes.len() as u64 - 1;
+                for page in (d.offset / PAGE)..=(last / PAGE) {
+                    self.prot.insert(page, PageProt::Ro);
+                }
+            }
         }
     }
 

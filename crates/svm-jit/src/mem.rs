@@ -147,6 +147,28 @@ mod imp {
             };
         }
 
+        /// Map the whole pages touched by `[offset, offset+len)` **read-only** — the D40 const
+        /// data segment (§3a/§4): a later guest write to them faults into the guarded range. The
+        /// data must already be written (this only changes protection). A producer keeps RO data
+        /// on its own pages; protection is page-granular, so a shared page would over-protect.
+        pub(crate) fn protect_ro(&self, offset: u64, len: u64) {
+            if self.mapped == 0 || len == 0 {
+                return;
+            }
+            let page = page_size();
+            let start = (offset as usize / page) * page;
+            let end = round_up((offset + len) as usize, page);
+            // SAFETY: `[base+start, base+end)` lies within the backed region (the caller bounds
+            // `offset+len <= mapped`, which is page-rounded up to `rw`), owned for the lifetime.
+            unsafe {
+                libc::mprotect(
+                    self.base.add(start) as *mut c_void,
+                    end - start,
+                    libc::PROT_READ,
+                )
+            };
+        }
+
         /// The address range a fault must land in to be attributed to this window (the whole
         /// reservation, so the unmapped tail + guard page are covered). `(0, 0)` when there is
         /// no window.
@@ -228,6 +250,7 @@ mod imp {
             core::ptr::null_mut()
         }
         pub(crate) fn restore_rw(&self) {}
+        pub(crate) fn protect_ro(&self, _offset: u64, _len: u64) {}
     }
 
     pub(crate) unsafe fn run_guarded(
