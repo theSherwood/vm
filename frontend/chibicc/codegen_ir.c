@@ -1327,22 +1327,36 @@ static bool layout_globals(Obj *prog) {
   return any;
 }
 
-// Emit stores that write a global's initializer bytes into its window slot. Per-byte for
-// simplicity (these run once, in `_start`); a future real data segment (§3a) replaces it.
-static void emit_init_data(int base, char *data, int sz) {
-  for (int i = 0; i < sz; i++) {
-    int a = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", a, base + i);
-    int z = nv++;
-    fprintf(o, "  v%d = i32.const %d\n", z, (unsigned char)data[i]);
-    fprintf(o, "  i32.store8 v%d v%d\n", a, z);
+// Emit a module-level `data` segment (§3a) for each initialized global: the runtime copies
+// the bytes into the window at instantiation, replacing the old per-byte `_start` init stores.
+static void emit_data_segments(Obj *prog) {
+  for (Obj *g = prog; g; g = g->next) {
+    if (g->is_function || !g->init_data)
+      continue;
+    if (g->rel)
+      error_tok(g->tok, "codegen_ir: global initialized with a pointer (relocation) "
+                        "not supported yet");
+    fprintf(o, "data %d \"", g->offset);
+    for (int i = 0; i < g->ty->size; i++) {
+      unsigned char c = (unsigned char)g->init_data[i];
+      if (c == '\\')
+        fprintf(o, "\\\\");
+      else if (c == '"')
+        fprintf(o, "\\\"");
+      else if (c >= 0x20 && c <= 0x7e)
+        fputc(c, o);
+      else
+        fprintf(o, "\\x%02x", c);
+    }
+    fprintf(o, "\"\n");
   }
 }
 
-// Synthetic entry (function 0): stash the powerbox capability handles, initialize global
-// data, then call `main` with the initial data-SP (= data_end). The runtime invokes this
-// with the granted handles `(stdout, stdin, exit)` as i32 arguments.
-static void emit_start(Obj *prog, Obj *main_fn) {
+// Synthetic entry (function 0): stash the powerbox capability handles, then call `main` with
+// the initial data-SP (= data_end). Global data is now placed by module-level `data` segments
+// (§3a, see `emit_data_segments`), not written here. The runtime invokes this with the granted
+// handles `(stdout, stdin, exit)` as i32 arguments.
+static void emit_start(Obj *main_fn) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
@@ -1355,14 +1369,6 @@ static void emit_start(Obj *prog, Obj *main_fn) {
     int a = nv++;
     fprintf(o, "  v%d = i64.const %d\n", a, slots[i]);
     fprintf(o, "  i32.store v%d v%d\n", a, i);
-  }
-  for (Obj *g = prog; g; g = g->next) {
-    if (g->is_function || !g->init_data)
-      continue;
-    if (g->rel)
-      error_tok(g->tok, "codegen_ir: global initialized with a pointer (relocation) "
-                        "not supported yet");
-    emit_init_data(g->offset, g->init_data, g->ty->size);
   }
   int sp = nv++;
   fprintf(o, "  v%d = i64.const %d\n", sp, data_end);
@@ -1410,8 +1416,11 @@ void codegen_ir(Obj *prog, FILE *out) {
   if (need_mem)
     fprintf(o, "memory 16\n\n");
 
+  // Global initializers become module-level `data` segments (§3a), placed by the runtime.
+  emit_data_segments(prog);
+
   if (has_main)
-    emit_start(prog, funcs[0]);
+    emit_start(funcs[0]);
   for (int i = 0; i < nfuncs; i++)
     gen_func(funcs[i]);
 }
