@@ -215,11 +215,13 @@ runs." History order:
    only *pointers* to aggregates pass/return. chibicc computes all layout/offsets.
 3. ~~**Globals + string literals**~~ — **DONE** (scalar/array/struct globals, mutable
    globals, string literals). Laid out at fixed window offsets in a data region [16,
-   `data_end`); a synthetic **`_start`** (function 0) writes initializer bytes then calls
+   `data_end`); a synthetic **`_start`** (function 0) sets up the data-SP and calls
    `main` with the initial data-SP (`data_end`). The harness runs function 0 with **no
-   args**. **Note:** uses per-byte init stores, not a real IR data segment — the §3a
-   read-only data section (and globals holding pointers/relocations) is still TODO and
-   would be a cross-cutting `svm-ir`/text/encode/verify/interp/jit change.
+   args**. **Update (now done):** globals are emitted as **real IR `data` segments**
+   (`emit_data_segments`, replacing the old per-byte `_start` init stores), with string
+   literals as page-isolated `data ro` (read-only) segments — the §3a/D40 work that was
+   originally TODO here. See §10's "Real read-only data segment" item. **Still TODO:**
+   globals holding pointers/relocations.
 4. ~~**stdio via the powerbox**~~ — **DONE** (hello-world works). `write`/`read`/`exit`
    are recognized **builtins** in `gen_expr`'s `ND_FUNCALL` (a declared-only prototype is
    enough), lowered to `cap.call` on Stream/Exit. `_start` now takes the capability
@@ -390,10 +392,15 @@ this is the index.)
   *perf*-unlocking guard-when-bounded (needs a large window — below); div/rem/trunc still use
   explicit in-code trap checks (correct; converting them to #DE faults is optional).
 - [ ] **Real window / Memory capability** — pin page size + masking constant + the *large*
-  reserved window; make `map`/`unmap`/`protect` real. Today they are **no-op stubs**
-  (`svm-interp` ~L765) over a fixed-size, eagerly-mapped window; `malloc` is a guest bump
-  allocator, not backed by `map`. §4 is "parked" at the MVP simplification. The guard-page +
-  signal foundation above is the piece this builds on (demand paging = handling faults).
+  reserved window; make `map`/`unmap`/`protect` real. **Largely done now** (see suggested
+  pickups #1 and #3): the large reserved-window model is the default (`DEFAULT_RESERVED_LOG2
+  = 40`, masking constant `reserved - 1`), and `map`/`unmap`/`protect` are **real**, not
+  stubs — the interp `Mem` enforces a per-page protection map (`svm-interp`, the `map`/
+  `unmap`/`protect` impls + `check_prot`), and the JIT side uses real `libc::mprotect` on the
+  window pages, differentially fuzzed. `malloc` is still a guest bump allocator, not backed by
+  `map`. **Still left** (so this stays unchecked): **demand paging** on fault, **growth**
+  into the reserved tail (sparse address space, §98), and surfacing the Memory cap in the
+  *main* irgen fuzzer. The guard-page + signal foundation above is what demand paging builds on.
 - [x] **Verifier escape-oracle fuzzer** — *done*: the differential now byte-compares the
   final guest window across interp + JIT (verified ⇒ in-window), in the 4000 stable seeds
   (every push) and the `diff` libFuzzer target. See Fuzzing below.

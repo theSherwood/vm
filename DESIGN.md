@@ -405,7 +405,9 @@ security — UB in a sandbox IR would void the escape guarantee.
   + `store8/16/32` (C char/short). Address operand + immediate offset + alignment
   *hint* (unaligned allowed). Confinement masking is implicit (JIT-inserted).
 - **Atomics** (C11, §12): atomic load/store at orderings; RMW `add sub and or xor
-  exchange cmpxchg` at orderings; `fence`; `wait`/`notify` (futex).
+  exchange cmpxchg` at orderings; `fence`; `wait`/`notify` (futex). *(Specified here for
+  completeness, but **deferred to Phase 4** with the rest of the concurrency model — see
+  §18; the scalar MVP, Phases 1–3, ships without them. Not yet in the IR.)*
 - **Calls** (produce results): `call <func>`, `call_indirect <funcref>` (typed;
   static check, runtime check only for dynamic dispatch), `cap.call <handle>
   <op-index>` (handle type + op-index → signature; async/sync per the operation).

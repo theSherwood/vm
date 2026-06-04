@@ -10,12 +10,13 @@ The full design lives in [`DESIGN.md`](DESIGN.md); the working agreement (keep i
 simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 [`AGENTS.md`](AGENTS.md).
 
-> Status: **Phase 1** — the core loop is in place. The full **scalar IR** (integer /
+> Status: **Phase 2 complete, into Phase 3** — the core loop, the Cranelift JIT, and the
+> C frontend are all in place. The full **scalar IR** (integer /
 > float ops, linear memory with confinement masking, direct / indirect / tail calls +
 > the function table, `select`, `br_table`, `unreachable`) plus **capabilities**
 > (`cap.call` over a host-owned handle table, and the MVP powerbox — `Stream` / `Exit`
 > / `Clock` / `Memory`, §3c/§3e) flow through text ⇄ binary ⇄ verifier ⇄ reference
-> interpreter, with the masking unit isolated and fuzzed, and a **generative
+> interpreter ⇄ JIT, with the masking unit isolated and fuzzed, and a **generative
 > interpreter-vs-JIT differential fuzzer** (a verifier-valid IR generator → both backends
 > must agree on result + trap; stable-CI seed loop + a libFuzzer `diff` target). The
 > **Cranelift JIT** (§9)
@@ -33,9 +34,13 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > JIT**, hello-world and a heap-allocated linked list included (the §18 Phase-2 "it works"
 > milestone). The §3d **SSA-promotion pass** lifts non-address-taken scalar locals out of
 > memory into SSA values (threaded as block params), so the JIT register-allocates them — a
-> hot loop body drops from ~22 load/store ops to zero. Still ahead: by-value aggregate args /
-> general `goto`, production trap-catching (guard pages + signal handler), narrow-scalar
-> promotion, atomics, SIMD, and capability extras. This
+> hot loop body drops from ~22 load/store ops to zero. **Production trap-catching** is in
+> (unix): an `mmap`'d window with a `PROT_NONE` guard page + a SIGSEGV/SIGBUS handler turns
+> an out-of-window fault into a clean `MemoryFault` (§4/§5 detect-and-kill), and the large
+> reserved-window model is the default; **read-only data segments** (§3a/D40) and a real
+> **Memory capability** (`map`/`unmap`/`protect`) exist. Still ahead: by-value aggregate
+> args / general `goto`, narrow-scalar promotion, demand paging, atomics + the rest of the
+> concurrency model (Phase 4), SIMD, and capability extras. This
 > is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
 
@@ -48,7 +53,7 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 | `svm-encode` | Binary encode + **decode** (untrusted-input-facing) (§3a) | escape-TCB |
 | `svm-verify` | The verifier — single linear pass, fail-closed (§2a I2/I3/I4; §3b) | escape-TCB |
 | `svm-interp` | Reference interpreter — the differential oracle (§18) | — |
-| `svm-jit` | Cranelift JIT — CLIF lowering + (later) the §4 masking lowering (§9) | escape-TCB† |
+| `svm-jit` | Cranelift JIT — CLIF lowering + the §4 masking lowering + guard page/signal (§9) | escape-TCB† |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
 | `svm` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |
 | `fuzz/` | cargo-fuzz targets (nightly); mirror the stable smoke fuzz | — |
@@ -58,7 +63,7 @@ the other TCB crates it *does* take a dependency (Cranelift). The dependency-fre
 covers only the small audit-critical crates (`svm-ir`/`svm-mask`/`svm-encode`/`svm-verify`).
 
 The escape-TCB crates are deliberately **dependency-free** (small, fast to compile,
-auditable). The host is Rust; the (future) frontend is C; codegen will lower to
+auditable). The host is Rust; the frontend (`frontend/chibicc`) is C; codegen lowers to
 Cranelift (`DESIGN.md` D49 / D36).
 
 ## Build & test
