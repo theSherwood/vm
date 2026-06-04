@@ -348,3 +348,95 @@ incompleteness not contradiction:
 - **The hard ceiling still holds:** "appears to work" is well-supported now (two-tier C
   diff + generative JIT diff); "is certified secure" remains the separate post-MVP
   workstream §2a/§18 describes — unchanged by this work.
+
+---
+
+## 10. Status & open-work tracker (phases, fuzzing, benchmarking)
+
+A single trackable place for "where are we / what's left," anchored to DESIGN §18's phase
+plan. Check items off as they land. (Mechanism details live in the sections referenced;
+this is the index.)
+
+### Phase status (DESIGN §18)
+- [x] **Phase 1 — core loop:** IR + text/binary + verifier + interpreter.
+- [x] **Phase 2 — compilability proof:** chibicc→IR; real C on interp + JIT, two-tier
+  tested (interp == JIT == native `cc`); SSA promotion landed (§5 item 8, §3).
+- [ ] **Phase 3 — Solid MVP (in progress):** the MVP remainder below.
+- [ ] **Phase 4 — post-MVP:** deferred (below).
+
+### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
+- [ ] **Production trap-catching** — guard pages + a signal handler → §5 detect-and-kill.
+  *The big one.* Today: masking confines and the interp/JIT detect traps via in-code
+  checks; there is **no hardware-fault path** (see `svm-jit` ~L133, marked as where it
+  goes). Systems-fiddly, debug-heavy — §18's fat-tail phase.
+- [ ] **Real window / Memory capability** — pin page size + masking constant + guard-page
+  placement; make `map`/`unmap`/`protect` real. Today they are **no-op stubs**
+  (`svm-interp` ~L765) over a fixed-size, eagerly-mapped window; `malloc` is a guest bump
+  allocator, not backed by `map`. §4 is "parked" at the MVP simplification.
+- [ ] **Verifier escape-oracle fuzzer** — see Fuzzing below; the one expert-free security
+  validation still missing.
+- [ ] *(optional, deferred even within MVP — not blockers)* by-value aggregate args/returns
+  (`sret`, D39); a real RO data segment (§3a/D40, vs `_start` byte-stores); general `goto`.
+
+> **Ceiling reminder (§18):** the MVP target is *"appears to work"* — well-evidenced now.
+> *"Is certified secure"* is **not** an MVP deliverable; it's a separate, open-ended
+> post-MVP workstream (expert review + audit). Green tests ≠ secure.
+
+### Phase 4 / post-MVP (DESIGN-specified, none built)
+- [ ] Concurrency: fibers / vCPUs / M:N green threads, atomics, the C11 memory model,
+  real threads (§12).
+- [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
+  virtual memory** — *most of the §1a differentiators live here.*
+- [ ] Spectre hardening (§9); split-host supervisor; monitoring.
+- [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
+  `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
+  are not).
+- [ ] **Language on-ramp:** native **LLVM backend** (the differentiator vehicle) and/or an
+  optional **wasm bridge** (compat). chibicc stays the MVP frontend; this is breadth work.
+
+### Fuzzing — have vs. gaps
+Have (✅ continuously, except where noted):
+- [x] `decode_verify` (libFuzzer) + `fuzz_smoke` (stable, every push/PR): decode
+  fail-closed; verify never panics; a *verified* module never **panics** the interp
+  (fuel-bounded). **Robustness, not escape.**
+- [x] `diff` (libFuzzer) + `jit_fuzz` (stable, 4000 seeds every push/PR): interp == JIT on
+  generated verifier-valid modules (`irgen.rs`, §8).
+- [x] `fuzz/mask` (libFuzzer): the confinement-masking unit — masked address always in
+  `[0,size)` (D38, the escape hinge).
+- [x] `roundtrip` (libFuzzer): encode∘decode identity.
+
+Gaps (priority order):
+- [ ] **Escape-oracle — highest value.** Assert *verified ⇒ every memory access stays
+  in-window* (final-memory + no-out-of-window check on interp **and** JIT), by extending
+  `irgen.rs`. Today only "doesn't panic" is checked, **not escape** — AGENTS.md invariant
+  #1 / §18 "the one security validation that needs no expert in the loop." (Was the
+  alternative to the SSA-promotion pickup this session.)
+- [ ] **CI nightly only runs `decode_verify`.** The `mask` target (the escape hinge!) and
+  `diff` are in no scheduled job — add them to the nightly matrix (`ci.yml`).
+- [ ] **Generator coverage holes:** `irgen` emits forward-only DAG CFGs — **no
+  loops/back-edges** (needs a JIT step-cap/fuel) and **no `call_indirect`/`cap.call`**. The
+  generative differential never exercises them (only the hand-written C tests do).
+
+### Benchmarking — have vs. gaps
+Have (✅):
+- [x] `crates/svm/src/bin/bench.rs`: decode / verify / **interp** throughput on one
+  hand-written loop (`sum 0..N`), ns/iter, dependency-free.
+
+Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
+regressions one commit old"):
+- [ ] **No JIT benchmark** — only interp; the JIT *is* the perf story.
+- [ ] **No wasm/Wasmtime baseline** — the §1a compute-parity / around-compute thesis is
+  unvalidated.
+- [ ] **No compile / JIT-latency measurement** — the "SSA on the wire" startup claim (§1a)
+  is unmeasured.
+- [ ] **No over-time tracking / no CI bench job** — it prints and forgets; a regression
+  isn't caught "one commit old."
+- [ ] **No C-frontend program benches** — e.g. the SSA-promotion win (loop body ~22→0
+  memory ops) is uncaptured; nothing would flag it if promotion regressed.
+
+### Suggested next pickups (ranked)
+1. **Escape-oracle fuzzer** — security spine, well-scoped, builds on `irgen` (§8).
+2. **JIT + Wasmtime comparison bench with regression tracking** — validates the parity
+   thesis and would guard perf work like the promotion pass.
+3. **Cheap wins** — wire `mask`/`diff` into nightly CI; add loops + indirect calls to the
+   generator.
