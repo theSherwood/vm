@@ -430,7 +430,16 @@ fn run_inner(
     // CFG/domtree so the next function never compiles against a stale CFG.
     let mut ctx = module.make_context();
     for (f, id) in m.funcs.iter().zip(&ids) {
-        build_clif(&mut module, &ids, &distinct, cap, &mut ctx.func, f, mask)?;
+        build_clif(
+            &mut module,
+            &ids,
+            &distinct,
+            cap,
+            &mut ctx.func,
+            f,
+            mask,
+            win_size as u64,
+        )?;
         module
             .define_function(*id, &mut ctx)
             .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -501,7 +510,10 @@ fn run_inner(
     if faulted {
         trap_cell = mem::FAULT_TRAP;
     }
-    // Snapshot the in-window bytes (escape-oracle).
+    // Snapshot the in-window bytes (escape-oracle). The guest may have made pages non-readable
+    // via the Memory cap (unmap/protect), so restore RW first — else this read faults outside the
+    // guarded call and crashes the host.
+    window.restore_rw();
     let final_mem = window.rw_mut()[..win_size].to_vec();
     drop(window);
     drop(fn_table);
@@ -613,8 +625,12 @@ struct Lower<'a> {
     trap_var: Variable,
     /// This function's result CLIF types, so a trapping path can `return` dummy zeros.
     result_tys: Vec<Type>,
-    /// The §4 confinement mask (`size - 1`); `0` when the module has no memory.
+    /// The §4 confinement mask (`reserved - 1`); `0` when the module has no memory.
     mask: u64,
+    /// The backed `mapped` extent in bytes — the guest window length handed to the `cap.call`
+    /// thunk (`[mem_base, mem_base+mapped)`), so buffer borrows and Memory-cap ops bound against
+    /// the *backed* region, not the larger reserved mask domain. `0` when the module has no memory.
+    mapped: u64,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call_indirect`.
     fn_table_mask: u64,
     /// The host `cap.call` thunk + ctx (constant addresses).
@@ -628,6 +644,7 @@ struct Lower<'a> {
 /// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
 /// -> (results…)`. The CLIF entry block holds the native params and jumps into IR
 /// block 0 passing the parameters as its block args.
+#[allow(clippy::too_many_arguments)]
 fn build_clif(
     module: &mut JITModule,
     ids: &[FuncId],
@@ -636,6 +653,7 @@ fn build_clif(
     clif: &mut Function,
     f: &Func,
     mask: u64,
+    mapped: u64,
 ) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
@@ -680,6 +698,7 @@ fn build_clif(
         trap_var,
         result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
+        mapped,
         fn_table_mask: (ids.len().next_power_of_two() as u64) - 1,
         cap,
         ids,
@@ -1141,7 +1160,7 @@ fn lower_cap_call(
     // Assemble the thunk arguments (see `CapThunk`).
     let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);
     let mem_base = b.use_var(lower.mem_var);
-    let mem_size = b.ins().iconst(I64, lower.mask.wrapping_add(1) as i64);
+    let mem_size = b.ins().iconst(I64, lower.mapped as i64);
     let tid = b.ins().iconst(I32, type_id as i64);
     let opc = b.ins().iconst(I32, op as i64);
     let h = get(vals, handle)?;

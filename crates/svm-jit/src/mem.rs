@@ -127,6 +127,26 @@ mod imp {
             self.base
         }
 
+        /// Re-enable read+write on the whole backed region `[0, mapped)`. The guest may have
+        /// changed page protections through the `Memory` capability (`unmap`→`PROT_NONE`,
+        /// `protect`→read-only), so a snapshot read of the window could otherwise fault *outside*
+        /// the guarded call and crash the host. Idempotent; a no-op cost when nothing changed.
+        pub(crate) fn restore_rw(&self) {
+            if self.mapped == 0 {
+                return;
+            }
+            let page = page_size();
+            let rw = round_up(self.mapped, page);
+            // SAFETY: `[base, base+rw)` is the window's backed region, owned for its lifetime.
+            unsafe {
+                libc::mprotect(
+                    self.base as *mut c_void,
+                    rw,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+        }
+
         /// The address range a fault must land in to be attributed to this window (the whole
         /// reservation, so the unmapped tail + guard page are covered). `(0, 0)` when there is
         /// no window.
@@ -207,6 +227,7 @@ mod imp {
         pub(crate) fn base(&self) -> *mut u8 {
             core::ptr::null_mut()
         }
+        pub(crate) fn restore_rw(&self) {}
     }
 
     pub(crate) unsafe fn run_guarded(

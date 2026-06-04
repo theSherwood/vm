@@ -959,8 +959,15 @@ impl GuestMem for MprotectWindow {
         Some(())
     }
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
-        // Re-commit with the requested protection. NB: page *zeroing* on (re)map is not yet
-        // mirrored here — the differential test exercises `protect`, not map-after-unmap.
+        // Re-commit: zero the range (matching the interpreter's fresh-page semantics on a
+        // (re)map), then apply the requested protection. mprotect to RW first so a previously
+        // unmapped/RO range is writable for the zero-fill.
+        let rw = self.mprotect_range(offset, len, 2 /* WRITE ⇒ RW */);
+        if rw != 0 {
+            return rw;
+        }
+        // SAFETY: `[base+offset, +len)` is in-range (mprotect_range validated it) and now RW.
+        unsafe { std::ptr::write_bytes(self.base.add(offset as usize), 0, len as usize) };
         self.mprotect_range(offset, len, prot)
     }
     fn unmap(&mut self, offset: u64, len: u64) -> i64 {
@@ -1098,6 +1105,108 @@ block0(v0: i32):
     let mj = hj.grant_memory();
     assert_eq!(mi, mj, "grants are deterministic");
     assert_cap_agrees(src, &[Value::I32(mi)], &mut hi, &mut hj);
+}
+
+/// Generate a random straight-line program that drives the `Memory` capability (handle in `v0`):
+/// a mix of `protect`/`unmap`/`map` on whole pages of a 64 KiB window, interleaved with
+/// 8-byte stores and loads (loads accumulate into the returned sum). Page-aligned, in-range
+/// args, so the ops succeed (or fault deterministically) identically on both backends. Returns
+/// IR text. Deterministic in `seed` (SplitMix64).
+#[cfg(unix)]
+fn gen_memory_program(seed: u64) -> String {
+    let mut state = seed;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut body = String::new();
+    let mut nv = 1u32; // v0 is the Memory handle (entry param); defined values start at v1
+    let mut fresh = |body: &mut String, line: String| {
+        let v = nv;
+        nv += 1;
+        body.push_str(&format!("  v{v} = {line}\n"));
+        v
+    };
+    let acc0 = fresh(&mut body, "i64.const 0".into()); // running sum of loads
+    let mut acc = acc0;
+    let nops = 3 + next() % 8; // 3..=10 ops
+    for _ in 0..nops {
+        match next() % 5 {
+            0 | 1 => {
+                // protect(page, prot) — prot 0 (none/unmapped), 1 (RO), 3 (RW)
+                let page = next() % 16;
+                let prot = [0i32, 1, 3][(next() % 3) as usize];
+                let off = fresh(&mut body, format!("i64.const {}", page * 4096));
+                let len = fresh(&mut body, "i64.const 4096".into());
+                let pr = fresh(&mut body, format!("i32.const {prot}"));
+                fresh(
+                    &mut body,
+                    format!("cap.call 3 2 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
+                );
+            }
+            2 => {
+                // unmap(page)
+                let page = next() % 16;
+                let off = fresh(&mut body, format!("i64.const {}", page * 4096));
+                let len = fresh(&mut body, "i64.const 4096".into());
+                fresh(
+                    &mut body,
+                    format!("cap.call 3 1 (i64, i64) -> (i64) v0 (v{off}, v{len})"),
+                );
+            }
+            3 => {
+                // map(page, prot) — re-commit readable (RO or RW)
+                let page = next() % 16;
+                let prot = [1i32, 3][(next() % 2) as usize];
+                let off = fresh(&mut body, format!("i64.const {}", page * 4096));
+                let len = fresh(&mut body, "i64.const 4096".into());
+                let pr = fresh(&mut body, format!("i32.const {prot}"));
+                fresh(
+                    &mut body,
+                    format!("cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
+                );
+            }
+            4 => {
+                // store an 8-byte value at an aligned in-window address
+                let addr = (next() % 65536) & !7;
+                let val = next() as i64;
+                let a = fresh(&mut body, format!("i64.const {addr}"));
+                let v = fresh(&mut body, format!("i64.const {val}"));
+                body.push_str(&format!("  i64.store v{a} v{v}\n"));
+            }
+            _ => {
+                // load + accumulate
+                let addr = (next() % 65536) & !7;
+                let a = fresh(&mut body, format!("i64.const {addr}"));
+                let ld = fresh(&mut body, format!("i64.load v{a}"));
+                acc = fresh(&mut body, format!("i64.add v{acc} v{ld}"));
+            }
+        }
+    }
+    format!("memory 16\nfunc (i32) -> (i64) {{\nblock0(v0: i32):\n{body}  return v{acc}\n}}\n")
+}
+
+/// Generative differential coverage of the `Memory` capability: random `map`/`unmap`/`protect`
+/// sequences interleaved with stores/loads must produce the **same** result/trap on the
+/// interpreter (page-protection map) and the JIT (real `mprotect`, faults caught by the guard).
+/// A protected/unmapped page makes a store or load fault on both; a re-`map` zero-fills on both.
+#[cfg(unix)]
+#[test]
+fn jit_cap_memory_protect_map_unmap_differential() {
+    for seed in 0..500u64 {
+        let src = gen_memory_program(seed);
+        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse seed {seed}: {e:?}\n{src}"));
+        verify_module(&m).unwrap_or_else(|e| panic!("verify seed {seed}: {e:?}\n{src}"));
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        let mi = hi.grant_memory();
+        let mj = hj.grant_memory();
+        assert_eq!(mi, mj);
+        assert_cap_agrees(&src, &[Value::I32(mi)], &mut hi, &mut hj);
+    }
 }
 
 #[test]

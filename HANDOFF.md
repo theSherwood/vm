@@ -594,10 +594,19 @@ regressions one commit old"):
    store to it faults into the guard → `MemoryFault`. `jit_cap_memory_protect_read_only_faults_store`
    pins it: the interp (page-map) and JIT (mprotect+guard) both detect-and-kill on a post-`protect`
    store, non-vacuously (a no-op JIT `protect` would diverge). Added `libc` as an svm dev-dep.
-   **Deferred (increment 3+):** growth (`map` into the reserved tail = sparse address space, §98);
-   page **zeroing** on (re)`map` is mirrored in the interp but not yet in the JIT side (so
-   map-after-unmap isn't differentially tested); demand paging on fault; a guest consumer (RO data
-   segment via D40 / `malloc` over `map`); and surfacing the Memory cap in the generative fuzzer.
+   **Increment 3 ✅ (generative fuzzing + 2 bug fixes it surfaced):**
+   `jit_cap_memory_protect_map_unmap_differential` generates 500 random map/unmap/protect + store/
+   load sequences and asserts interp (page-map) == JIT (mprotect+guard) on result/trap. JIT-side
+   `map` now zero-fills (parity with the interp), so map-after-unmap is covered. Two real bugs the
+   fuzzer caught: **(a)** `run_inner` always snapshots `window.rw_mut()[..mapped]` after the run, so
+   a guest-`unmap`ped (`PROT_NONE`) page made the snapshot read fault *outside* the guarded call and
+   crash the host → fixed with `GuestWindow::restore_rw()` (mprotect the backed region RW before the
+   snapshot). **(b)** the JIT passed `mem_size = reserved` (the mask domain, 2^40) to the cap thunk
+   instead of the backed `mapped` extent, so buffer borrows / Memory-cap ops bounded against the
+   wrong size → now threads `mapped` into `Lower` and passes it. **Deferred (increment 4+):** growth
+   (`map` into the reserved tail = sparse address space, §98); demand paging on fault; surfacing the
+   Memory cap in the *main* irgen fuzzer (capture path needs restore_rw, now in place) — **next is
+   (1): a guest consumer**, D40 const→read-only data segment via `protect` at `_start`.
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
