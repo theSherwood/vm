@@ -1,0 +1,29 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index cff91b6..31152cc 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -40,3 +40,24 @@ jobs:
+         with: { workspaces: fuzz }
+       - run: cargo install cargo-fuzz --locked
+       - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
++  bench:
++    # Non-gating perf signal (DESIGN §1a). Wall-clock on shared runners is noisy and the
++    # committed `bench/baseline.txt` records *another* machine's ratios, so this never blocks a
++    # merge (`continue-on-error`) and runs only nightly / on demand. A wide `--tol` (40%) means
++    # only a gross regression — e.g. SSA promotion or mask-elision silently dropping, which is
++    # multiples, not percent — trips it; small cross-machine drift is ignored. (The *exact*
++    # promotion guard is the deterministic `c_frontend` memory-op test in the gating job.)
++    name: bench regression check (non-gating)
++    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
++    runs-on: ubuntu-latest
++    continue-on-error: true
++    steps:
++      - uses: actions/checkout@v4
++      - uses: dtolnay/rust-toolchain@stable
++      - uses: Swatinem/rust-cache@v2
++        with: { workspaces: bench }
++      # `cargo run` builds the chibicc fork itself (for the `alu_c` kernel); make + cc are
++      # preinstalled on ubuntu-latest. If the frontend can't build, that kernel is skipped.
++      - name: bench --check vs committed baseline
++        working-directory: bench
++        run: cargo run --release -- --check baseline.txt --tol 0.4
