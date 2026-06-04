@@ -10,8 +10,9 @@ windowed memory + capabilities exist; a generative interp↔JIT differential fuz
 guards the JIT). The §3d **SSA-promotion perf pass now exists** (item 8 below): scalar
 locals that are never address-taken are promoted to SSA values threaded as block params, so
 the JIT register-allocates them — a hot loop body went from ~22 load/store ops to **0**. The
-big Phase-3 remainder is production trap-catching (guard pages + signal handler, §4/§5); the
-other open item is the §8 verifier escape-oracle fuzzer.
+big Phase-3 remainder is production trap-catching (guard pages + signal handler, §4/§5). The
+§18 verifier escape-oracle now exists (the differential byte-compares the final guest window
+across interp + JIT: verified ⇒ in-window) — see §8 / §10.
 
 ---
 
@@ -312,12 +313,17 @@ The JIT is the only component emitting unsafe machine code, so it gets dedicated
 - **`crates/svm/tests/jit_fuzz.rs`** — stable-CI loop over 4000 seeds (~1.6s).
 - **`fuzz/fuzz_targets/diff.rs`** — libFuzzer target (`cargo +nightly fuzz run diff`).
 
-Found no divergences. Natural extensions (if you return to fuzzing): loops/back-edges
-(needs a JIT step-cap or fuel), `call_indirect`/`cap.call`, and a **final-memory +
-escape-freedom** assertion (no out-of-window access) — which would realize the §18
-de-risking move *"fuzz the verifier: verified ⇒ cannot escape,"* the one
-design-recommended validation still missing (today `fuzz_smoke`/`decode_verify` only
-check "verify never panics / verified modules don't panic the interp," not escape).
+Found no divergences. **The escape-oracle now lives here too** (§18 *"verified ⇒ cannot
+escape"*): for a float-free module with memory, `run_differential` byte-compares the **final
+guest window** across interp + JIT (via `run_capture` / `compile_and_run_capture`, seeded
+non-zero). When the interpreter — the §4 masking reference — runs to completion, every
+access it made was in-window, so the JIT lowering the same masking must leave an identical
+window; a mismatch is an access that escaped or was mis-masked. Pinned by
+`tests/escape_oracle.rs` and verified non-vacuous (corrupting the JIT mask makes it fail).
+Remaining extensions: loops/back-edges (needs a JIT step-cap or fuel) and
+`call_indirect`/`cap.call` in the generator; float-module coverage (NaN bits aren't pinned);
+and true guard-page fault detection (the Phase-3 trap-catching item) for out-of-allocation
+— not just mis-masked — accesses.
 
 ---
 
@@ -343,8 +349,9 @@ incompleteness not contradiction:
   const→RO data segment via `protect` (D40), a real IR data section (we use `_start`
   byte-stores), and narrow-scalar promotion.
 - **De-risking moves from §18 now in place:** interpreter-as-oracle differential fuzzing
-  (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend. **Still missing:** the
-  verifier escape-oracle fuzzer (see §8).
+  (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend, **and the verifier
+  escape-oracle** (verified ⇒ in-window final memory, §8/§10). The honest residual is true
+  guard-page fault detection (Phase-3 trap-catching), not the validation itself.
 - **The hard ceiling still holds:** "appears to work" is well-supported now (two-tier C
   diff + generative JIT diff); "is certified secure" remains the separate post-MVP
   workstream §2a/§18 describes — unchanged by this work.
@@ -373,8 +380,9 @@ this is the index.)
   placement; make `map`/`unmap`/`protect` real. Today they are **no-op stubs**
   (`svm-interp` ~L765) over a fixed-size, eagerly-mapped window; `malloc` is a guest bump
   allocator, not backed by `map`. §4 is "parked" at the MVP simplification.
-- [ ] **Verifier escape-oracle fuzzer** — see Fuzzing below; the one expert-free security
-  validation still missing.
+- [x] **Verifier escape-oracle fuzzer** — *done*: the differential now byte-compares the
+  final guest window across interp + JIT (verified ⇒ in-window), in the 4000 stable seeds
+  (every push) and the `diff` libFuzzer target. See Fuzzing below.
 - [ ] *(optional, deferred even within MVP — not blockers)* by-value aggregate args/returns
   (`sret`, D39); a real RO data segment (§3a/D40, vs `_start` byte-stores); general `goto`.
 
@@ -401,21 +409,34 @@ Have (✅ continuously, except where noted):
   (fuel-bounded). **Robustness, not escape.**
 - [x] `diff` (libFuzzer) + `jit_fuzz` (stable, 4000 seeds every push/PR): interp == JIT on
   generated verifier-valid modules (`irgen.rs`, §8).
+- [x] **Escape-oracle** — `run_differential` now also byte-compares the **final guest
+  window** across interp + JIT for float-free modules: when the interpreter (the masking
+  reference) completes, every access was in-window, so the JIT's window must match exactly;
+  a mismatch is an access that escaped/wasn't masked into `[0,size)` (§4/§18). Threaded via
+  `run_capture` (interp) / `compile_and_run_capture` (JIT); seeded non-zero so a divergent
+  *read* shows too. Float modules are excluded (NaN bits aren't pinned across backends).
+  Plumbing pinned by `tests/escape_oracle.rs`; **verified non-vacuous** (corrupting the JIT
+  mask makes the fuzzer fail). Runs in the 4000 stable seeds (every push) *and* the `diff`
+  libFuzzer target (`cargo +nightly fuzz run diff`).
 - [x] `fuzz/mask` (libFuzzer): the confinement-masking unit — masked address always in
   `[0,size)` (D38, the escape hinge).
 - [x] `roundtrip` (libFuzzer): encode∘decode identity.
 
 Gaps (priority order):
-- [ ] **Escape-oracle — highest value.** Assert *verified ⇒ every memory access stays
-  in-window* (final-memory + no-out-of-window check on interp **and** JIT), by extending
-  `irgen.rs`. Today only "doesn't panic" is checked, **not escape** — AGENTS.md invariant
-  #1 / §18 "the one security validation that needs no expert in the loop." (Was the
-  alternative to the SSA-promotion pickup this session.)
-- [ ] **CI nightly only runs `decode_verify`.** The `mask` target (the escape hinge!) and
-  `diff` are in no scheduled job — add them to the nightly matrix (`ci.yml`).
+- [ ] **Nightly CI still only runs `decode_verify`.** Wiring `diff` (carries the
+  escape-oracle) and `mask` into the nightly matrix is a ~one-line `ci.yml` change — but
+  pushing `.github/workflows/*` from this environment needs the `workflow` OAuth scope,
+  which the session lacks, so it must be done by a human (or a token with that scope). Until
+  then the escape-oracle still runs on every push via the 4000 stable `jit_fuzz` seeds.
 - [ ] **Generator coverage holes:** `irgen` emits forward-only DAG CFGs — **no
   loops/back-edges** (needs a JIT step-cap/fuel) and **no `call_indirect`/`cap.call`**. The
-  generative differential never exercises them (only the hand-written C tests do).
+  generative differential (and the escape-oracle) never exercise them (only the hand-written
+  C tests do). Loops especially would deepen the escape-oracle (repeated/aliased stores).
+- [ ] **Escape-oracle excludes float modules** (NaN-payload nondeterminism). A canonical-NaN
+  normalization, or comparing only integer-store bytes, would extend coverage to them.
+- [ ] **No guard-page/fault escape check** — the oracle catches *mis-masked* accesses via
+  final-memory divergence, but a truly out-of-allocation access relies on a crash; real
+  guard-page + signal detection is the Phase-3 trap-catching item.
 
 ### Benchmarking — have vs. gaps
 Have (✅):
@@ -435,8 +456,12 @@ regressions one commit old"):
   memory ops) is uncaptured; nothing would flag it if promotion regressed.
 
 ### Suggested next pickups (ranked)
-1. **Escape-oracle fuzzer** — security spine, well-scoped, builds on `irgen` (§8).
-2. **JIT + Wasmtime comparison bench with regression tracking** — validates the parity
-   thesis and would guard perf work like the promotion pass.
-3. **Cheap wins** — wire `mask`/`diff` into nightly CI; add loops + indirect calls to the
-   generator.
+1. **JIT + Wasmtime comparison bench with regression tracking** — validates the parity
+   thesis and would guard perf work like the promotion pass. (The weakest area now.)
+2. **Loops + indirect calls in `irgen`** — needs a JIT step-cap/fuel; deepens both the
+   interp/JIT differential and the escape-oracle (repeated, aliased stores).
+3. **Production trap-catching** (guard pages + signal handler, §4/§5) — the big MVP item;
+   also upgrades the escape-oracle from final-memory diff to true fault detection.
+
+*(Done this session: SSA-promotion pass; the escape-oracle fuzzer. The matching nightly
+`diff`/`mask` CI wiring is written but unpushed — workflow-scope limitation, see the gap above.)*

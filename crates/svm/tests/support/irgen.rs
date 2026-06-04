@@ -482,8 +482,8 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<svm_interp::Value> {
 
 // ---- shared differential check (used by jit_fuzz.rs and the libFuzzer `diff` target) ----
 
-use svm_interp::{run, Trap, Value};
-use svm_jit::{compile_and_run, JitError, JitOutcome, TrapKind};
+use svm_interp::{run_capture, Trap, Value};
+use svm_jit::{compile_and_run_capture, JitError, JitOutcome, TrapKind};
 use svm_verify::verify_module;
 
 fn to_slot(v: Value) -> i64 {
@@ -523,14 +523,69 @@ fn interp_trap_kind(t: &Trap) -> Option<TrapKind> {
     }
 }
 
+fn is_float(t: ValType) -> bool {
+    matches!(t, ValType::F32 | ValType::F64)
+}
+
+/// True if `m` involves any floating-point value anywhere. The escape-oracle byte-compares
+/// the final window, but the IR does **not** pin NaN bit-patterns across backends (that's
+/// why [`values_equal`] is NaN-insensitive), so a computed NaN that reaches memory could
+/// differ *legitimately* — a false escape. Confinement is about *addresses*, which integer
+/// modules exercise fully, so the memory oracle runs on float-free modules only; float
+/// coverage stays at the (NaN-insensitive) value level.
+fn has_float(m: &Module) -> bool {
+    let any = |ts: &[ValType]| ts.iter().copied().any(is_float);
+    m.funcs.iter().any(|f| {
+        any(&f.params)
+            || any(&f.results)
+            || f.blocks.iter().any(|b| {
+                any(&b.params)
+                    || b.insts.iter().any(|inst| match inst {
+                        Inst::ConstF32(_)
+                        | Inst::ConstF64(_)
+                        | Inst::FBin { .. }
+                        | Inst::FUn { .. }
+                        | Inst::FCmp { .. }
+                        | Inst::FToISat { .. }
+                        | Inst::FToITrap { .. }
+                        | Inst::IToFConv { .. } => true,
+                        Inst::Cast { op, .. } => {
+                            let (_, from, to) = op.sig();
+                            is_float(from) || is_float(to)
+                        }
+                        Inst::Load { op, .. } => is_float(op.info().1),
+                        Inst::Store { op, .. } => is_float(op.info().1),
+                        _ => false,
+                    })
+            })
+    })
+}
+
 /// Run `m`'s entry on both backends and assert they agree (result value-equal, or same
-/// modelled trap kind). Panics with the offending module on divergence.
+/// modelled trap kind) — **and**, for a float-free module with memory, that they leave a
+/// byte-identical window (the escape-oracle, §18). Panics with the offending module.
 pub fn run_differential(m: &Module, args: &[Value]) {
     let results = m.funcs[0].results.clone();
+
+    // Escape-oracle seed: a non-zero, varied pattern over the window, so a divergent or
+    // under-masked load/store shows up as a final-memory mismatch (zero-init could hide a
+    // bad read that returns 0). Only for float-free modules (NaN bits aren't pinned across
+    // backends), and capped so a huge *declared* window doesn't allocate here (the JIT also
+    // rejects windows above its backing cap → `Unsupported`, skipped below).
+    let mem_oracle = !has_float(m) && matches!(m.memory, Some(mc) if mc.size_log2 <= 20);
+    let init: Vec<u8> = if mem_oracle {
+        let size = 1usize << m.memory.unwrap().size_log2;
+        (0..size)
+            .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut fuel = 5_000_000u64;
-    let interp = run(m, 0, args, &mut fuel);
+    let (interp, imem) = run_capture(m, 0, args, &mut fuel, &init);
     let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let jit = match compile_and_run(m, 0, &slots) {
+    let (jit, jmem) = match compile_and_run_capture(m, 0, &slots, &init) {
         Ok(o) => o,
         Err(JitError::Unsupported(_)) => return, // generator only emits lowered ops; be safe
         Err(e) => panic!("JIT failed to compile a verified module: {e:?}\n{m:#?}"),
@@ -548,6 +603,20 @@ pub fn run_differential(m: &Module, args: &[Value]) {
                     values_equal(w, g),
                     "interp/JIT disagree: {want:?} vs {got:?}\n{m:#?}"
                 );
+            }
+            // Escape-oracle: both ran to completion, so the interpreter (the masking
+            // reference, §4) confined every access to `[0, size)` — the JIT, lowering the
+            // same masking arithmetic on the same inputs, must therefore leave an identical
+            // window. A mismatch means a JIT access escaped or was mis-masked.
+            if mem_oracle {
+                if let Some(i) = imem.iter().zip(&jmem).position(|(a, b)| a != b) {
+                    panic!(
+                        "escape-oracle: interp/JIT final memory differs at byte {i} \
+                         (interp={:#04x} jit={:#04x}) — an access not masked into [0,size)\n{m:#?}",
+                        imem[i], jmem[i]
+                    );
+                }
+                assert_eq!(imem.len(), jmem.len(), "window snapshot length\n{m:#?}");
             }
         }
         (Err(trap), JitOutcome::Trapped(kind)) => {

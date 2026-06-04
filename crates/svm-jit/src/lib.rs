@@ -268,6 +268,38 @@ pub fn compile_and_run_with_host(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
 ) -> Result<JitOutcome, JitError> {
+    Ok(run_inner(m, func, args, cap_thunk, cap_ctx, None)?.0)
+}
+
+/// Like [`compile_and_run`], but seed the guest window with `init_mem` (its low bytes) and
+/// return the final window contents — the JIT side of the **escape-oracle** (§18). A
+/// verified module that runs to completion must leave a window byte-identical to the
+/// interpreter's [`svm_interp::run_capture`]; any divergence is a confinement/codegen
+/// escape — a load/store whose effective address was not masked into `[0, size)`.
+pub fn compile_and_run_capture(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    run_inner(
+        m,
+        func,
+        args,
+        empty_cap_thunk,
+        core::ptr::null_mut(),
+        Some(init_mem),
+    )
+}
+
+fn run_inner(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    init_mem: Option<&[u8]>,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // Calls can reach any function, so every function must be lowerable.
     for f in &m.funcs {
@@ -276,7 +308,7 @@ pub fn compile_and_run_with_host(
 
     // Allocate the guest window (zeroed, + guard margin) if the module declares memory.
     // `mask` is the §4 confinement mask; `mem_base` is null when there is no window.
-    let (window, mask): (Vec<u8>, u64) = match m.memory {
+    let (mut window, mask, win_size): (Vec<u8>, u64, usize) = match m.memory {
         Some(mc) => {
             if mc.size_log2 > MAX_JIT_WINDOW_LOG2 {
                 return Err(JitError::Unsupported(
@@ -284,10 +316,15 @@ pub fn compile_and_run_with_host(
                 ));
             }
             let size = 1usize << mc.size_log2;
-            (vec![0u8; size + GUARD], (size as u64) - 1)
+            (vec![0u8; size + GUARD], (size as u64) - 1, size)
         }
-        None => (Vec::new(), 0),
+        None => (Vec::new(), 0, 0),
     };
+    // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
+    if let Some(init) = init_mem {
+        let n = init.len().min(win_size);
+        window[..n].copy_from_slice(&init[..n]);
+    }
 
     let mut flags = settings::builder();
     // A JIT'd function is called directly, not relocated into a shared object.
@@ -378,7 +415,6 @@ pub fn compile_and_run_with_host(
     let run: extern "C" fn(*const i64, *mut i64, *mut u8, *const FnEntry, *mut i64) =
         unsafe { std::mem::transmute(code) };
 
-    let mut window = window;
     let mem_base = if window.is_empty() {
         std::ptr::null_mut()
     } else {
@@ -399,18 +435,21 @@ pub fn compile_and_run_with_host(
         fn_table.as_ptr(),
         &mut trap_cell,
     );
+    // Snapshot the in-window bytes (escape-oracle); the GUARD margin is excluded.
+    let final_mem = window.get(..win_size).unwrap_or(&[]).to_vec();
     drop(window);
     drop(fn_table);
     drop(module); // frees the executable memory after the call has returned
 
     let code = trap_cell as u32;
-    Ok(if code == 0 {
+    let outcome = if code == 0 {
         JitOutcome::Returned(results)
     } else if code == EXIT_CODE {
         JitOutcome::Exited((trap_cell >> 32) as i32)
     } else {
         JitOutcome::Trapped(TrapKind::from_code(code).ok_or(JitError::Malformed)?)
-    })
+    };
+    Ok((outcome, final_mem))
 }
 
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)

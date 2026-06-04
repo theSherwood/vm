@@ -95,6 +95,37 @@ pub fn run_with_host(
     run_func(f, args, fuel, &mut mem, &m.funcs, host, 0)
 }
 
+/// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
+/// window contents (the same number of bytes) alongside the result. This is the
+/// **escape-oracle** path (§18): a *verified* module must keep every access in-window, so a
+/// run that completes without trapping must leave a window byte-identical to the JIT's. The
+/// non-zero seed makes a divergent (e.g. under-masked) *read* observable, not just a write.
+/// With no declared memory the snapshot is empty.
+pub fn run_capture(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+    let mut host = Host::new();
+    let f = match m.funcs.get(func as usize) {
+        Some(f) => f,
+        None => return (Err(Trap::Malformed), Vec::new()),
+    };
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::new(mc.size_log2);
+        mm.seed(init_mem);
+        mm
+    });
+    let r = run_func(f, args, fuel, &mut mem, &m.funcs, &mut host, 0);
+    let snap = mem
+        .as_ref()
+        .map(|mm| mm.snapshot(init_mem.len() as u64))
+        .unwrap_or_default();
+    (r, snap)
+}
+
 fn run_func<'a>(
     mut f: &'a Func,
     args: &[Value],
@@ -924,6 +955,21 @@ impl Mem {
         self.pages
             .entry(off / PAGE)
             .or_insert_with(|| vec![0u8; PAGE as usize])[idx] = b;
+    }
+
+    /// Seed the low bytes of the window from `init` (escape-oracle, §18). Bytes past the
+    /// window size are ignored — confinement only concerns `[0, size)`.
+    fn seed(&mut self, init: &[u8]) {
+        let n = (init.len() as u64).min(self.window.size());
+        for i in 0..n {
+            self.set_byte(i, init[i as usize]);
+        }
+    }
+
+    /// Snapshot the low `n` bytes of the window (clamped to the window size).
+    fn snapshot(&self, n: u64) -> Vec<u8> {
+        let n = n.min(self.window.size());
+        (0..n).map(|i| self.byte(i)).collect()
     }
 }
 

@@ -1,0 +1,96 @@
+//! Escape-oracle plumbing tests (`DESIGN.md` §4/§18): the generative differential
+//! (`jit_fuzz`/`diff`) now also byte-compares the final guest window across the interpreter
+//! and JIT for float-free modules — realizing the §18 move *"verified ⇒ cannot escape"* at
+//! the module level (the `fuzz/mask` unit already proves the masking arithmetic in
+//! isolation). The broad coverage is the seed loop; these hand-written cases pin the
+//! mechanism down: that an **out-of-window address is confined to the same in-window byte**
+//! on both backends, and that the capture path reflects guest stores.
+
+use svm_interp::{run_capture, Value};
+use svm_jit::{compile_and_run_capture, JitOutcome};
+
+/// Parse + verify a module, then run it on both backends with `init` seeding the window;
+/// return both final-window snapshots (asserting both ran to completion and agree on the
+/// result). This is exactly the escape-oracle contract the fuzzer asserts.
+fn both_windows(src: &str, init: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let m = svm::text::parse_module(src).expect("parse");
+    svm::verify::verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    let (ir, imem) = run_capture(&m, 0, &[Value::I32(0)], &mut fuel, init);
+    let (jo, jmem) = compile_and_run_capture(&m, 0, &[0i64], init).expect("jit");
+    assert!(ir.is_ok(), "interp trapped: {ir:?}");
+    assert!(
+        matches!(jo, JitOutcome::Returned(_)),
+        "jit did not return: {jo:?}"
+    );
+    (imem, jmem)
+}
+
+#[test]
+fn out_of_window_store_confines_identically() {
+    // Window = 2^8 = 256 bytes. A store to 261 must alias to 261 & 255 = 5 on *both*
+    // backends (the §4 mask), land there, and leave nothing else touched.
+    let src = "\
+memory 8
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i64.const 261
+  v2 = i32.const 171
+  i32.store8 v1 v2
+  v3 = i32.const 0
+  return v3
+}
+";
+    let (imem, jmem) = both_windows(src, &[0u8; 256]);
+    assert_eq!(imem, jmem, "escape-oracle: interp/JIT windows diverge");
+    assert_eq!(
+        imem[5], 171,
+        "out-of-window store did not confine to offset 5"
+    );
+    assert_eq!(
+        imem.iter().filter(|&&b| b != 0).count(),
+        1,
+        "spurious writes"
+    );
+}
+
+#[test]
+fn far_address_and_offset_fold_into_window() {
+    // A huge base plus a folded immediate offset must still mask to an in-window byte,
+    // identically on both backends. base = i64::MAX (0x7fff..ff), offset 8 → wraps.
+    let src = "\
+memory 8
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i64.const 9223372036854775807
+  v2 = i32.const 200
+  i32.store8 v1 v2 offset=8
+  v3 = i32.const 0
+  return v3
+}
+";
+    let (imem, jmem) = both_windows(src, &[0u8; 256]);
+    assert_eq!(imem, jmem, "escape-oracle: interp/JIT windows diverge");
+    // (i64::MAX + 8) & 255 = (0x...07 + 8) & 0xff = 7. The exact byte matters less than the
+    // two backends agreeing on it — that agreement *is* the confinement property.
+    assert_eq!(imem.iter().filter(|&&b| b == 200).count(), 1, "store lost");
+}
+
+#[test]
+fn seed_survives_when_untouched() {
+    // A no-op body must leave the seeded window exactly as provided, on both backends — so
+    // a real divergence later can't hide behind a zeroed window.
+    let init: Vec<u8> = (0..256)
+        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+        .collect();
+    let src = "\
+memory 8
+func (i32) -> (i32) {
+block0(v0: i32):
+  return v0
+}
+";
+    let (imem, jmem) = both_windows(src, &init);
+    assert_eq!(imem, init, "interp did not preserve the seeded window");
+    assert_eq!(jmem, init, "jit did not preserve the seeded window");
+}
