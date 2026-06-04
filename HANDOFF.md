@@ -1,8 +1,14 @@
-# Handoff — C frontend (chibicc → SVM IR)
+# Handoff — C frontend (chibicc → SVM IR) + differential fuzzing
 
-Pick-up notes for continuing the C-frontend work in a fresh session. Written 2026-06-03.
-Branch: **`main`** (this session has been committing straight to `main`; the remote is
+Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-04**.
+Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
+
+**Status in one line:** Phase 2 ("real C runs") is **complete** — the C frontend is at the
+agreed stopping point (broad subset, two-tier tested) — and we're into Phase 3 (the JIT +
+windowed memory + capabilities exist; a generative interp↔JIT differential fuzzer now
+guards the JIT). The big Phase-3 remainders are production trap-catching (guard pages +
+signal handler, §4/§5) and the §3d SSA-promotion perf pass.
 
 ---
 
@@ -24,9 +30,12 @@ Workspace crates (`crates/`):
 - `svm-jit` — Cranelift JIT (`compile_and_run`, `JitOutcome`).
 - `svm-mask` — the isolated masking unit.
 - `svm` — umbrella crate + integration tests (`crates/svm/tests/`).
+- `fuzz/` — libFuzzer targets (out of workspace; nightly + `cargo-fuzz`).
 
-**Phase 2 ("it works") is underway**: real C compiles → verifies → runs identically on
-interpreter and JIT. That C frontend is what this handoff is about.
+Two big things exist beyond the core loop: (1) **the C frontend** (most of this doc), and
+(2) **a generative interp↔JIT differential fuzzer** (see §8). Test crates:
+`c_frontend.rs` (C, two tiers), `jit_diff.rs` (hand-written JIT diff), `jit_fuzz.rs`
+(generative diff), `pipeline.rs`, `fuzz_smoke.rs`.
 
 ---
 
@@ -47,20 +56,26 @@ dispatches to `codegen_ir` (see `cc1()` in `main.c`, where the wiring lives). Bu
 `make -C frontend/chibicc` (needs `make` + a C compiler; both present in CI). Build
 artifacts (`*.o`, the `chibicc` binary) are git-ignored.
 
-### Test harness
-**`crates/svm/tests/c_frontend.rs`** — `make`s the fork once, compiles each C snippet to
-IR, **verifies it**, and runs `main` (function 0) on **both the interpreter and the
-JIT**, asserting they agree. So every C test doubles as a JIT differential test. Run:
+### Test harness (`crates/svm/tests/c_frontend.rs`, 33 tests, two tiers)
+`make`s the fork once, compiles each C snippet to IR, **verifies it**, then:
+- **Tier 1 (all tests):** runs `main` (function 0 = `_start`) on **both the interpreter
+  and the JIT** under identical mock powerboxes and asserts they agree on result, trap,
+  and captured stdout/exit. Every C test is also a JIT differential test.
+- **Tier 2 (`c_matches_gcc_*`):** compiles the *same* C with native **`cc`** (real
+  stdio/stdlib) and asserts identical exit code + stdout — a real-compiler oracle for C
+  semantics. ~15 programs incl. recursion (Ackermann), floats, printf, bubble sort, sieve,
+  linked list. Needs `cc` (already required to build the fork).
 ```
 cargo test -p svm --test c_frontend
 ```
 
-### What C is supported today (≈10 tests, all green)
-`int` / `long` / `void` functions; integer expressions (constants, `+ - * / %`, bitwise,
-shifts, comparisons, unary `- ! ~`, integer casts, comma); **scalar locals**, assignment,
-`&` / `*`, pointers to locals; **control flow** `if`/`else`, `while`, `for`; **multiple
-functions, parameters, direct calls, and recursion** (incl. mutual recursion). Validated
-end-to-end: `fib(10)=55`, `fact(6)=720`, iterative Fibonacci, prime-divisor loops, etc.
+### What C is supported today (the agreed stopping point)
+`int`/`long`/`char`/`short`/`_Bool`/`enum`, `float`/`double`; pointers, arrays,
+structs/unions (`.`/`->`, indexing, initializers); globals + string literals; the full
+operator set incl. short-circuit `&&`/`||`/`?:`; `if`/`else`/`while`/`for`/`do`/`switch`
+with `break`/`continue`; functions, parameters, **recursion**, **varargs**; **`printf`**
+and `exit` over the powerbox; **`malloc`/`free`/`calloc`** (guest bump allocator). All
+verify and run identically on interp + JIT, and match native `cc`.
 
 Anything unsupported is a **hard `error_tok`** (with the AST node kind), by design — we
 never emit IR we can't stand behind. The frontend is outside the escape-TCB (§2a): the
@@ -144,7 +159,12 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
 
 ---
 
-## 5. Roadmap (in suggested order — all incremental, no open design questions)
+## 5. C-frontend roadmap — items 1–7 all DONE (the agreed stopping point)
+
+The frontend was taken as far as needed for "a capable VM"; items 1–7 below are complete.
+Only item 8 (a perf pass) and the inline "Still TODO" notes (by-value aggregate `sret`,
+general `goto`, a real RO data segment, `fd`→stream mapping) remain, and none block "C
+runs." History order:
 
 1. ~~**Short-circuit `&&` / `||` and ternary `?:`**~~ — **DONE** (commit after `0f03686`).
    Lowered with option (b): the merge block carries the result as a second block param
@@ -229,7 +249,57 @@ pass yet (that's the documented "reverse" pass that matters for speed — not do
 make -C frontend/chibicc
 printf 'int fib(int n){if(n<2)return n;return fib(n-1)+fib(n-2);} int main(){return fib(10);}\n' > /tmp/t.c
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input /tmp/t.c -cc1-output /tmp/t.svm /tmp/t.c
-cat /tmp/t.svm            # should show func 0 = main calling func 1 = fib, with sp threading
-cargo test -p svm --test c_frontend   # ~10 tests, all green (interp == JIT)
+cat /tmp/t.svm            # func 0 = _start, func 1 = main calling func 2 = fib (sp-threaded)
+cargo test -p svm --test c_frontend   # 33 tests, all green (interp == JIT, and == cc)
+cargo test -p svm --test jit_fuzz     # 4000 generated modules, interp == JIT
 ```
-If those pass, you're oriented — continue at §5 item 1.
+If those pass, you're oriented.
+
+---
+
+## 8. Generative interp↔JIT differential fuzzer (§18 "interpreter-as-oracle")
+
+The JIT is the only component emitting unsafe machine code, so it gets dedicated fuzzing.
+
+- **`crates/svm/tests/support/irgen.rs`** — a generator of **verifier-valid** IR modules
+  *by construction*: typed value pool (constants synthesized on demand), branch/return
+  args matched to target param types, **forward-only CFG + call graph (DAGs)** so
+  execution always halts, constants biased to boundary values (0, ±1, INT_MIN/MAX, NaN,
+  ±inf). Covers the whole scalar op set. `fuzz_one(&mut Gen)` generates → verifies →
+  runs interp + JIT → asserts agreement (value-equal or same trap kind; NaN-insensitive).
+  `Gen::from_seed` (stable) / `Gen::from_bytes` (libFuzzer).
+- **`crates/svm/tests/jit_fuzz.rs`** — stable-CI loop over 4000 seeds (~1.6s).
+- **`fuzz/fuzz_targets/diff.rs`** — libFuzzer target (`cargo +nightly fuzz run diff`).
+
+Found no divergences. Natural extensions (if you return to fuzzing): loops/back-edges
+(needs a JIT step-cap or fuel), `call_indirect`/`cap.call`, and a **final-memory +
+escape-freedom** assertion (no out-of-window access) — which would realize the §18
+de-risking move *"fuzz the verifier: verified ⇒ cannot escape,"* the one
+design-recommended validation still missing (today `fuzz_smoke`/`decode_verify` only
+check "verify never panics / verified modules don't panic the interp," not escape).
+
+---
+
+## 9. Where the project stands vs DESIGN.md (compliance, honest)
+
+Largely compliant; simplifications are the ones the design *sanctions*, deferrals are
+incompleteness not contradiction:
+- **Phase 2 complete** (real C on interp + JIT). Solidly into **Phase 3** (JIT + masked
+  window + caps done). Phase-3 remainder = production trap-catching (guard pages + signal
+  handler, §4 still ⬜/parked = "fixed-size window, eager mapping" MVP, which is what we
+  do) and demand paging (deferred).
+- **§2a escape-TCB intact:** the frontend is untrusted; all its output is re-verified;
+  every memory access is masked, so even a buggy/hostile data-SP cannot escape (the
+  data-SP is a plain value, not trusted). Making it an explicit value rather than a
+  register-pinned `vmctx` slot is exactly the "lowering detail" §3d calls it.
+- **§3d implemented as a documented subset:** everything-in-memory (SSA-promotion = the
+  deferred perf pass), flat-buffer varargs, guest `malloc` over the window, LP64 + pinned
+  `char`/`long double`. **Deferred SETTLED features (not contradictions):** by-value
+  aggregate args/returns by hidden pointer (D39), const→RO data segment via `protect`
+  (D40), a real IR data section (we use `_start` byte-stores).
+- **De-risking moves from §18 now in place:** interpreter-as-oracle differential fuzzing
+  (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend. **Still missing:** the
+  verifier escape-oracle fuzzer (see §8).
+- **The hard ceiling still holds:** "appears to work" is well-supported now (two-tier C
+  diff + generative JIT diff); "is certified secure" remains the separate post-MVP
+  workstream §2a/§18 describes — unchanged by this work.
