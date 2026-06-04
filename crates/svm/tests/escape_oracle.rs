@@ -133,3 +133,31 @@ block0(v0: i64):
         assert_eq!(imem[slot], 171, "store landed at wrong slot for n={n}");
     }
 }
+
+/// Detect-and-kill (§4/§5): a store that overruns the top of the window must fault into the
+/// guard page and be caught as a clean MemoryFault — the host survives, no crash. (Unix
+/// only: other targets have no hardware guard and the masked access reads a heap margin.)
+#[cfg(unix)]
+#[test]
+fn guard_page_fault_is_detect_and_kill() {
+    // memory 16 = 64 KiB (page-aligned ⇒ guard page begins exactly at the top). An 8-byte
+    // store at 65532 writes [65532,65540), crossing into the guard page at 65536.
+    let src = "\
+memory 16
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i64.const 65532
+  v2 = i64.const 0
+  i64.store v1 v2
+  v3 = i32.const 0
+  return v3
+}
+";
+    let m = svm::text::parse_module(src).expect("parse");
+    svm::verify::verify_module(&m).expect("verify");
+    let out = svm_jit::compile_and_run(&m, 0, &[0]).expect("jit");
+    assert!(
+        matches!(out, JitOutcome::Trapped(svm_jit::TrapKind::MemoryFault)),
+        "expected a caught MemoryFault, got {out:?}"
+    );
+}

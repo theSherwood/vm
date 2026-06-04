@@ -17,11 +17,13 @@
 //!
 //! ## Traps ([`JitOutcome`])
 //! A trap is terminal (the guest domain is killed, §5 detect-and-kill), but the host
-//! must *observe* it rather than crash. The reference JIT detects traps with **explicit
-//! checks that store a [`TrapKind`] code and `return` early** (a production JIT would
-//! take a hardware fault caught by a signal handler); the *observable semantics* —
-//! which inputs trap, and why — are identical, so the differential harness checks the
-//! JIT and interpreter agree on traps too.
+//! must *observe* it rather than crash. Arithmetic traps (div/rem-by-zero, trapping
+//! `trunc`, `unreachable`, indirect-call type) are detected with **explicit checks that
+//! store a [`TrapKind`] code and `return` early**; **memory faults** use a real
+//! **`PROT_NONE` guard page + a SIGSEGV/SIGBUS handler** that unwinds the call as
+//! [`TrapKind::MemoryFault`] (see `mem.rs` / `trap_shim.c`, unix). Either way the
+//! *observable semantics* are identical, so the differential harness checks the JIT and
+//! interpreter agree on traps too.
 //!
 //! ## The masking lowering (§4, invariant I1)
 //! Every access masks the **final effective address** into the window —
@@ -68,14 +70,12 @@ use svm_ir::{
     IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, ValType,
 };
 
-/// Largest window the reference JIT will back with a flat host allocation. Real
-/// deployments reserve a huge guard-paged virtual range (§4); for the differential
-/// harness we allocate `1 << size_log2` bytes (+ a guard margin), so cap it.
+mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
+
+/// Largest window the reference JIT will back with a host allocation. Real deployments
+/// reserve a huge guard-paged virtual range (§4); for the differential harness we map
+/// `1 << size_log2` bytes (+ a guard page on unix), so cap it.
 const MAX_JIT_WINDOW_LOG2: u8 = 26; // 64 MiB
-/// Guard margin past the window so a masked base near the top plus an access width
-/// never reads/writes outside the allocation (models the §4 guard region; a real
-/// impl uses guard *pages* + a fault). 8 = widest scalar access.
-const GUARD: usize = 8;
 
 /// A function-table entry (§3c `FnEntry`): host-owned, guest-unwritable. `type_id`
 /// identifies the signature (distinct-`FuncType` index); `code` is the finalized
@@ -164,6 +164,11 @@ pub enum TrapKind {
     IndirectCallType = 5,
     /// Forged / closed / wrong-type capability handle (§3c).
     CapFault = 6,
+    /// A guest memory access faulted into the window's guard region (§4/§5) — caught by
+    /// the signal handler and turned into detect-and-kill. The masking lowering confines
+    /// every access to `[0, size)`, so in practice this is a width-overrun at the very top
+    /// of the window, or (defense-in-depth) a masking/elision bug that the guard caught.
+    MemoryFault = 8,
 }
 
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
@@ -179,6 +184,7 @@ impl TrapKind {
             4 => TrapKind::Unreachable,
             5 => TrapKind::IndirectCallType,
             6 => TrapKind::CapFault,
+            8 => TrapKind::MemoryFault,
             _ => return None,
         })
     }
@@ -316,9 +322,9 @@ fn run_inner(
         ensure_supported(f)?;
     }
 
-    // Allocate the guest window (zeroed, + guard margin) if the module declares memory.
-    // `mask` is the §4 confinement mask; `mem_base` is null when there is no window.
-    let (mut window, mask, win_size): (Vec<u8>, u64, usize) = match m.memory {
+    // Allocate the guest window (zeroed, + a PROT_NONE guard page on unix) if the module
+    // declares memory. `mask` is the §4 confinement mask; `mem_base` is null when none.
+    let (mut window, mask, win_size): (mem::GuestWindow, u64, usize) = match m.memory {
         Some(mc) => {
             if mc.size_log2 > MAX_JIT_WINDOW_LOG2 {
                 return Err(JitError::Unsupported(
@@ -326,14 +332,14 @@ fn run_inner(
                 ));
             }
             let size = 1usize << mc.size_log2;
-            (vec![0u8; size + GUARD], (size as u64) - 1, size)
+            (mem::GuestWindow::new(size), (size as u64) - 1, size)
         }
-        None => (Vec::new(), 0, 0),
+        None => (mem::GuestWindow::new(0), 0, 0),
     };
     // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
     if let Some(init) = init_mem {
         let n = init.len().min(win_size);
-        window[..n].copy_from_slice(&init[..n]);
+        window.rw_mut()[..n].copy_from_slice(&init[..n]);
     }
 
     let mut flags = settings::builder();
@@ -420,33 +426,34 @@ fn run_inner(
         .collect();
 
     let code = module.get_finalized_function(tramp);
-    // SAFETY: `code` is the finalized trampoline with exactly this signature
-    // (`build_trampoline` set it). `module` owns the executable page until dropped.
-    let run: extern "C" fn(*const i64, *mut i64, *mut u8, *const FnEntry, *mut i64) =
-        unsafe { std::mem::transmute(code) };
-
-    let mem_base = if window.is_empty() {
-        std::ptr::null_mut()
-    } else {
-        window.as_mut_ptr()
-    };
+    let mem_base = window.base();
     let mut results = vec![0i64; entry.results.len()];
     // Trap cell: 0 = ok; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit
     // code for an Exit. A trapping path (or the cap thunk) writes it.
     let mut trap_cell: i64 = 0;
-    // SAFETY: `run` reads `entry.params.len()` arg slots, writes `entry.results.len()`
-    // result slots, accesses only `[mem_base, mem_base + size + GUARD)` (masking confines
-    // effective addresses), reads `fn_table` (length `table_len`, indexed by a masked-to-
-    // `< table_len` slot), and writes `trap_cell`. All buffers outlive the call.
-    run(
-        args.as_ptr(),
-        results.as_mut_ptr(),
-        mem_base,
-        fn_table.as_ptr(),
-        &mut trap_cell,
-    );
-    // Snapshot the in-window bytes (escape-oracle); the GUARD margin is excluded.
-    let final_mem = window.get(..win_size).unwrap_or(&[]).to_vec();
+    // SAFETY: `code` is the finalized trampoline with the entry signature
+    // (`build_trampoline` set it). It reads `entry.params.len()` arg slots, writes
+    // `entry.results.len()` result slots, accesses only the guarded window (masking
+    // confines effective addresses; any escape faults into the guard page), reads
+    // `fn_table` (length `table_len`, masked index), and writes `trap_cell`. All buffers
+    // outlive the call; `module` owns the executable page until dropped below.
+    let faulted = unsafe {
+        mem::run_guarded(
+            &window,
+            code,
+            args.as_ptr(),
+            results.as_mut_ptr(),
+            mem_base,
+            fn_table.as_ptr() as *const core::ffi::c_void,
+            &mut trap_cell,
+        )
+    };
+    // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host.
+    if faulted {
+        trap_cell = mem::FAULT_TRAP;
+    }
+    // Snapshot the in-window bytes (escape-oracle).
+    let final_mem = window.rw_mut()[..win_size].to_vec();
     drop(window);
     drop(fn_table);
     drop(module); // frees the executable memory after the call has returned

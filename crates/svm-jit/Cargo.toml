@@ -13,3 +13,13 @@ cranelift-jit = "0.132.0"
 cranelift-module = "0.132.0"
 cranelift-native = "0.132.0"
 svm-ir.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Guard-paged window + the SIGSEGV/SIGBUS detect-and-kill handler (§4/§5) — unix only;
+# other targets fall back to a plain heap window with no hardware guard.
+libc = "0.2"
+
+[target.'cfg(unix)'.build-dependencies]
+# Compiles src/trap_shim.c (the setjmp/siglongjmp recovery — a macro that needs the C
+# compiler's returns_twice handling, so it can't be sound raw FFI).
+cc = "1"

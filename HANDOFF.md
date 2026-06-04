@@ -9,8 +9,10 @@ agreed stopping point (broad subset, two-tier tested) — and we're into Phase 3
 windowed memory + capabilities exist; a generative interp↔JIT differential fuzzer now
 guards the JIT). The §3d **SSA-promotion perf pass now exists** (item 8 below): scalar
 locals that are never address-taken are promoted to SSA values threaded as block params, so
-the JIT register-allocates them — a hot loop body went from ~22 load/store ops to **0**. The
-big Phase-3 remainder is production trap-catching (guard pages + signal handler, §4/§5). The
+the JIT register-allocates them — a hot loop body went from ~22 load/store ops to **0**.
+Memory **detect-and-kill** now exists too: an `mmap`'d window + `PROT_NONE` guard page + a
+SIGSEGV/SIGBUS handler turn an out-of-window fault into a clean `MemoryFault` (§4/§5, unix).
+The remaining Phase-3 memory work is the *large* reserved window (the §4 perf/VM model). The
 §18 verifier escape-oracle now exists (the differential byte-compares the final guest window
 across interp + JIT: verified ⇒ in-window) — see §8 / §10.
 
@@ -322,10 +324,10 @@ non-zero). When the interpreter — the §4 masking reference — runs to comple
 access it made was in-window, so the JIT lowering the same masking must leave an identical
 window; a mismatch is an access that escaped or was mis-masked. Pinned by
 `tests/escape_oracle.rs` and verified non-vacuous (corrupting the JIT mask makes it fail).
-Remaining extensions: loops/back-edges (needs a JIT step-cap or fuel) and
-`call_indirect`/`cap.call` in the generator; float-module coverage (NaN bits aren't pinned);
-and true guard-page fault detection (the Phase-3 trap-catching item) for out-of-allocation
-— not just mis-masked — accesses.
+Loops/back-edges and `call_indirect` are now generated (the trap-kind is no longer asserted
+when both backends trap — see §10); out-of-allocation accesses now fault into the guard page
+and are caught as `MemoryFault` (§4/§5). Remaining: `cap.call` in the generator and
+float-module coverage (NaN bits aren't pinned across backends).
 
 ---
 
@@ -334,9 +336,9 @@ and true guard-page fault detection (the Phase-3 trap-catching item) for out-of-
 Largely compliant; simplifications are the ones the design *sanctions*, deferrals are
 incompleteness not contradiction:
 - **Phase 2 complete** (real C on interp + JIT). Solidly into **Phase 3** (JIT + masked
-  window + caps done). Phase-3 remainder = production trap-catching (guard pages + signal
-  handler, §4 still ⬜/parked = "fixed-size window, eager mapping" MVP, which is what we
-  do) and demand paging (deferred).
+  window + caps + **guard-page/signal detect-and-kill** done). Phase-3 remainder = the §4
+  *large* reserved window + demand paging (still the "fixed-size window, eager mapping" MVP
+  today), which the new guard-page/signal foundation is built to extend.
 - **§2a escape-TCB intact:** the frontend is untrusted; all its output is re-verified;
   every memory access is masked, so even a buggy/hostile data-SP cannot escape (the
   data-SP is a plain value, not trusted). Making it an explicit value rather than a
@@ -351,9 +353,9 @@ incompleteness not contradiction:
   const→RO data segment via `protect` (D40), a real IR data section (we use `_start`
   byte-stores), and narrow-scalar promotion.
 - **De-risking moves from §18 now in place:** interpreter-as-oracle differential fuzzing
-  (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend, **and the verifier
-  escape-oracle** (verified ⇒ in-window final memory, §8/§10). The honest residual is true
-  guard-page fault detection (Phase-3 trap-catching), not the validation itself.
+  (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend, **the verifier escape-oracle**
+  (verified ⇒ in-window final memory, §8/§10), **and guard-page/signal detect-and-kill**
+  (§4/§5, unix) so a gross out-of-window access faults cleanly rather than corrupting the host.
 - **The hard ceiling still holds:** "appears to work" is well-supported now (two-tier C
   diff + generative JIT diff); "is certified secure" remains the separate post-MVP
   workstream §2a/§18 describes — unchanged by this work.
@@ -374,14 +376,23 @@ this is the index.)
 - [ ] **Phase 4 — post-MVP:** deferred (below).
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
-- [ ] **Production trap-catching** — guard pages + a signal handler → §5 detect-and-kill.
-  *The big one.* Today: masking confines and the interp/JIT detect traps via in-code
-  checks; there is **no hardware-fault path** (see `svm-jit` ~L133, marked as where it
-  goes). Systems-fiddly, debug-heavy — §18's fat-tail phase.
-- [ ] **Real window / Memory capability** — pin page size + masking constant + guard-page
-  placement; make `map`/`unmap`/`protect` real. Today they are **no-op stubs**
+- [x] **Production trap-catching (memory)** — *done (unix)*: the JIT window is now `mmap`'d
+  with a trailing `PROT_NONE` **guard page**, and the entry runs under a SIGSEGV/SIGBUS
+  handler (`crates/svm-jit/src/{mem.rs,trap_shim.c}`, a small `cc`-built C shim for sound
+  `sigsetjmp`/`siglongjmp`). A fault in the window's guarded range unwinds out of the call as
+  `TrapKind::MemoryFault` — §5 **detect-and-kill**, host survives — instead of corrupting it.
+  Confinement is still the masking lowering; the guard is the safety net (width-overrun at
+  the top now faults cleanly, and a masking/elision bug faults locally instead of corrupting
+  the host). `cfg(unix)`; other targets fall back to the old heap window (no guard).
+  Verified non-vacuous by `escape_oracle::guard_page_fault_is_detect_and_kill`; whole suite +
+  4000 fuzz seeds green (the handler is exercised by width-overruns). **Not yet:** the
+  *perf*-unlocking guard-when-bounded (needs a large window — below); div/rem/trunc still use
+  explicit in-code trap checks (correct; converting them to #DE faults is optional).
+- [ ] **Real window / Memory capability** — pin page size + masking constant + the *large*
+  reserved window; make `map`/`unmap`/`protect` real. Today they are **no-op stubs**
   (`svm-interp` ~L765) over a fixed-size, eagerly-mapped window; `malloc` is a guest bump
-  allocator, not backed by `map`. §4 is "parked" at the MVP simplification.
+  allocator, not backed by `map`. §4 is "parked" at the MVP simplification. The guard-page +
+  signal foundation above is the piece this builds on (demand paging = handling faults).
 - [x] **Verifier escape-oracle fuzzer** — *done*: the differential now byte-compares the
   final guest window across interp + JIT (verified ⇒ in-window), in the 4000 stable seeds
   (every push) and the `diff` libFuzzer target. See Fuzzing below.
@@ -441,9 +452,11 @@ Gaps (priority order):
   it'd always `CapFault`); richer loop shapes need a JIT step-cap/fuel to stay terminating.
 - [ ] **Escape-oracle excludes float modules** (NaN-payload nondeterminism). A canonical-NaN
   normalization, or comparing only integer-store bytes, would extend coverage to them.
-- [ ] **No guard-page/fault escape check** — the oracle catches *mis-masked* accesses via
-  final-memory divergence, but a truly out-of-allocation access relies on a crash; real
-  guard-page + signal detection is the Phase-3 trap-catching item.
+- [x] **Guard-page fault detection (unix)** — beyond the final-memory divergence check, a
+  gross out-of-window access now faults into the `PROT_NONE` guard page and is caught as a
+  clean `MemoryFault` (detect-and-kill, see the trap-catching item above) rather than relying
+  on a wild-pointer crash. (The fuzzer could be extended to assert "verified ⇒ no guard
+  fault" as a second escape signal.)
 
 ### Benchmarking — have vs. gaps
 Have (✅):
@@ -495,15 +508,17 @@ regressions one commit old"):
   to C locals.
 
 ### Suggested next pickups (ranked)
-1. **Production trap-catching → full guard-when-bounded** (guard pages + signal handler,
-   §4/§5) — the big MVP item; it also upgrades the escape-oracle from final-memory diff to
-   true fault detection, *and* unlocks the wasm32 fast path for addresses the upper-bound
-   analysis can't prove (incl. data-SP–relative C locals) — the residual ~1.2–1.36× gap.
+1. **Large reserved window → full guard-when-bounded** (§4) — builds on the new guard-page +
+   signal foundation: a multi-GB reserved window so 32-bit-bounded indices fit under the
+   guard and the JIT can elide the mask without a proof (the wasm32 fast path), closing the
+   residual ~1.2–1.36× gap incl. data-SP–relative C locals. Needs the interp to model which
+   pages are mapped (to stay in differential lockstep) and changes the masking constant.
 2. **Over-time bench tracking** — log the `--csv` line per commit so memory/compute
    regressions (e.g. a future masking change) are caught one commit old.
 3. **Real Memory capability** (`map`/`unmap`/`protect` beyond no-op stubs) — guest-visible
-   virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`.
+   virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`. Natural
+   companion to (1) (demand paging reuses the fault handler).
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
-loops + indirect calls in the generative fuzzer.)*
+loops + indirect calls in the generative fuzzer; guard pages + signal-handler detect-and-kill.)*
