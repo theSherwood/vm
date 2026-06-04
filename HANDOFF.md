@@ -542,17 +542,22 @@ regressions one commit old"):
    mapped)` + `reserved()`/`mapped()` accessors; `confine` masks into `[0, reserved)`, `checked`
    faults outside the backed `[0, mapped)`. `new` stays fully-mapped (`mapped == reserved`) and
    `size()` aliases `reserved()`, so **no behavior change** and no caller churn; a second property
-   test + the `mask` fuzz target now drive the split (incl. the unmapped-tail fault). (3) JIT
-   reserves a **host-configured** large window (§4: "e.g. 2^40, host-configurable" — *not* a
-   fixed 2^32; the reservation only has to be large enough that the guard absorbs the bounded
-   offset reach) + guard, maps `mapped` RW, rest `PROT_NONE`; mask const = `reserved-1`;
-   elision threshold → `reserved`; interp confines to `reserved` and **faults** outside `mapped`
-   (a deliberate I1 change: out-of-`mapped` accesses now trap instead of wrapping — more
-   wasm-faithful; both backends adopt it to stay in differential lockstep). The reservation
-   size is a host/instantiation policy threaded in, not a constant baked into `svm-mask` (which
-   stays policy-free: it confines to whatever `reserved_log2`/`mapped` it is handed). (4) bound the
-   loop-invariant SP base once (LICM hoists it) so per-iter SP-relative accesses elide; re-measure
-   `locals_c` toward parity.
+   test + the `mask` fuzz target now drive the split (incl. the unmapped-tail fault). (3) ✅ both
+   backends adopt the decoupled model in lockstep: JIT `GuestWindow::new(mapped, reserved)`
+   reserves a **host-configured** large window (§4: "e.g. 2^40, host-configurable" — *not* a fixed
+   2^32; capped at `MAX_JIT_RESERVED_LOG2 = 2^40`) as `PROT_NONE`+`MAP_NORESERVE` (a huge reserve
+   costs only VA) + guard page, maps `mapped` RW; mask const = `reserved-1`; elision threshold →
+   `reserved`. Interp `Mem::with_reservation` mirrors it. Out-of-`mapped` accesses now **fault**
+   instead of wrapping (the I1 change). Reservation is host policy threaded through the `_reserved`
+   capture entries (`run_capture_reserved` / `compile_and_run_capture_reserved`), **not** baked
+   into `svm-mask` (still policy-free); default everywhere is fully-mapped (`reserved == mapped`),
+   so existing callers are unchanged. Tested: `escape_oracle::reserved_tail_access_faults_identically`
+   + `reserved_in_mapped_access_matches` pin the semantics, and the generative fuzzer
+   (`run_differential`) runs a **second `reserved > mapped` pass** so the 4000 seeds + `diff`
+   libFuzzer target exercise the large reservation, mask/elision-to-`reserved`, and interp↔JIT
+   trap-agreement on tail faults. (4) **next:** bound the loop-invariant SP base once (LICM hoists
+   it) so per-iter SP-relative accesses elide; flip the production reservation default and
+   re-measure `locals_c` toward parity.
 2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
    `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
    win end-to-end at ≈parity — see Benchmarking gaps); a non-gating nightly CI `bench` job runs `--check`.

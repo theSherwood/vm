@@ -657,8 +657,8 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<svm_interp::Value> {
 
 // ---- shared differential check (used by jit_fuzz.rs and the libFuzzer `diff` target) ----
 
-use svm_interp::{run_capture, Trap, Value};
-use svm_jit::{compile_and_run_capture, JitError, JitOutcome, TrapKind};
+use svm_interp::{run_capture_reserved, Trap, Value};
+use svm_jit::{compile_and_run_capture_reserved, JitError, JitOutcome, TrapKind};
 use svm_verify::verify_module;
 
 fn to_slot(v: Value) -> i64 {
@@ -740,8 +740,6 @@ fn has_float(m: &Module) -> bool {
 /// modelled trap kind) — **and**, for a float-free module with memory, that they leave a
 /// byte-identical window (the escape-oracle, §18). Panics with the offending module.
 pub fn run_differential(m: &Module, args: &[Value]) {
-    let results = m.funcs[0].results.clone();
-
     // Escape-oracle seed: a non-zero, varied pattern over the window, so a divergent or
     // under-masked load/store shows up as a final-memory mismatch (zero-init could hide a
     // bad read that returns 0). Only for float-free modules (NaN bits aren't pinned across
@@ -757,10 +755,33 @@ pub fn run_differential(m: &Module, args: &[Value]) {
         Vec::new()
     };
 
+    // Pass 1 — fully-mapped window (`reserved == mapped`): full escape-oracle memory coverage
+    // (generated addresses wrap into `[0, mapped)`, so completing runs compare the final window).
+    differential_pass(m, args, &init, mem_oracle, 0);
+
+    // Pass 2 — a host reservation `reserved > mapped`: exercises the decoupled model (§4) under
+    // fuzzing — the large `PROT_NONE` reservation, mask-to-`reserved`, elision-to-`reserved`, and
+    // the guard catching out-of-`mapped`. Generated addresses now mostly land in the unmapped
+    // tail, so the two backends must **agree on trapping** there (the new strong check); the
+    // memory comparison still fires for runs whose every access happened to stay in `mapped`.
+    if let Some(mc) = m.memory {
+        // `+8` keeps the reservation modest (lazy VA) while leaving a large unmapped tail. The
+        // generator pins `size_log2 = 16` (page-aligned `mapped`), so the interp's byte-exact
+        // bound and the JIT's page-granular guard agree on the fault boundary.
+        differential_pass(m, args, &init, mem_oracle, mc.size_log2.saturating_add(8));
+    }
+}
+
+/// One differential pass at a given host reservation (`reserved_log2`; `0` ⇒ fully mapped):
+/// run the entry on both backends and assert they agree (result value-equal, or same-modelled
+/// trap), and — for a float-free module with memory whose run completes — that they leave a
+/// byte-identical window (the escape-oracle, §18). Panics with the offending module.
+fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, reserved_log2: u8) {
+    let results = m.funcs[0].results.clone();
     let mut fuel = 5_000_000u64;
-    let (interp, imem) = run_capture(m, 0, args, &mut fuel, &init);
+    let (interp, imem) = run_capture_reserved(m, 0, args, &mut fuel, init, reserved_log2);
     let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let (jit, jmem) = match compile_and_run_capture(m, 0, &slots, &init) {
+    let (jit, jmem) = match compile_and_run_capture_reserved(m, 0, &slots, init, reserved_log2) {
         Ok(o) => o,
         Err(JitError::Unsupported(_)) => return, // generator only emits lowered ops; be safe
         Err(e) => panic!("JIT failed to compile a verified module: {e:?}\n{m:#?}"),
