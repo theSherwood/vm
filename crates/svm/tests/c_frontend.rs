@@ -905,6 +905,60 @@ fn c_function_pointers_end_to_end() {
     );
 }
 
+#[test]
+fn c_by_value_aggregates_end_to_end() {
+    // Struct passed by value (callee copies the caller's value into its own frame, §3d).
+    assert_eq!(
+        i32_of(
+            "struct P { int x, y; }; \
+             int sum(struct P p){ return p.x + p.y; } \
+             int main(){ struct P p; p.x = 19; p.y = 23; return sum(p); }"
+        ),
+        42
+    );
+    // Struct *returned* by value (the sret ABI), then read back, assigned, and re-used.
+    assert_eq!(
+        i32_of(
+            "struct P { int x, y; }; \
+             struct P mk(int a, int b){ struct P p; p.x = a; p.y = b; return p; } \
+             int main(){ struct P p = mk(30, 12); struct P q = p; /* whole-struct copy */ \
+               return q.x + q.y; }"
+        ),
+        42
+    );
+    // A function taking *and* returning structs by value, plus a member of a call result.
+    assert_eq!(
+        i32_of(
+            "struct P { int x, y; }; \
+             struct P add(struct P a, struct P b){ struct P r; r.x=a.x+b.x; r.y=a.y+b.y; return r; } \
+             struct P mk(int a,int b){ struct P p; p.x=a; p.y=b; return p; } \
+             int main(){ struct P s = add(mk(1,2), mk(3,4)); return s.x*10 + s.y + mk(0,26).y; }"
+        ),
+        // s = (4, 6); 4*10 + 6 + 26 = 72
+        72
+    );
+    // An odd-sized struct (13 bytes: int + char + int) exercises the 4/2/1 memcpy chunks,
+    // and a struct >16 bytes (no register classification — always by pointer, §3d).
+    assert_eq!(
+        i32_of(
+            "struct Q { int a; char b; int c; }; \
+             struct Q bump(struct Q q){ q.a++; q.b++; q.c++; return q; } \
+             int main(){ struct Q q; q.a=10; q.b=20; q.c=30; struct Q r = bump(q); \
+               return r.a + r.b + r.c; }"
+        ),
+        63
+    );
+    // A union by value round-trips its active member.
+    assert_eq!(
+        i32_of(
+            "union U { int i; char c[4]; }; \
+             union U pass(union U u){ return u; } \
+             int main(){ union U u; u.i = 0x41424344; union U v = pass(u); return v.c[0]; }"
+        ),
+        0x44
+    );
+}
+
 /// I2 (§2a/§3c): an indirect call re-checks the selected function's signature at the use
 /// site, so a function pointer cast to the wrong type — here a no-arg `int(*)(void)` aimed
 /// at a 2-arg function — **traps** (the function-table type-id check), identically on both
@@ -1186,6 +1240,33 @@ fn c_matches_gcc_function_pointers() {
         "int add(int a,int b){ return a + b; } int sub(int a,int b){ return a - b; } \
          int main(){ int (*ops[2])(int,int) = {add, sub}; int s = 0; \
            for (int i=0;i<2;i++) s += ops[i](10, 3); printf(\"%d\\n\", s); return s; }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_aggregates() {
+    // Structs by value through args and returns (the sret ABI), with printf output,
+    // validated against native `cc`.
+    assert_matches_gcc(
+        "struct V { int x, y, z; }; \
+         struct V add(struct V a, struct V b){ \
+           struct V r; r.x=a.x+b.x; r.y=a.y+b.y; r.z=a.z+b.z; return r; } \
+         int dot(struct V a, struct V b){ return a.x*b.x + a.y*b.y + a.z*b.z; } \
+         int main(){ struct V a = {1,2,3}, b = {4,5,6}; \
+           struct V s = add(a, b); \
+           printf(\"%d %d %d\\n\", s.x, s.y, s.z); \
+           printf(\"%d\\n\", dot(a, b)); \
+           return s.x + s.y + s.z; }",
+    );
+    // A struct returned from one call fed straight into another, plus a function pointer
+    // whose signature passes/returns a struct by value (composes increment 1 + 2).
+    assert_matches_gcc(
+        "struct P { int x, y; }; \
+         struct P mk(int a, int b){ struct P p; p.x=a; p.y=b; return p; } \
+         struct P swap(struct P p){ struct P r; r.x=p.y; r.y=p.x; return r; } \
+         int main(){ struct P (*f)(struct P) = swap; \
+           struct P p = f(mk(7, 9)); \
+           printf(\"%d,%d\\n\", p.x, p.y); return p.x - p.y; }",
     );
 }
 

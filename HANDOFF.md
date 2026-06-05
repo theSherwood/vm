@@ -81,8 +81,23 @@ structs/unions (`.`/`->`, indexing, initializers); globals + string literals; th
 operator set incl. short-circuit `&&`/`||`/`?:`; `if`/`else`/`while`/`for`/`do`/`switch`
 with `break`/`continue`; functions, parameters, **recursion**, **function pointers**
 (indirect calls via `call_indirect`, dispatch tables, callbacks, fn-ptr struct members),
+**by-value structs/unions** (passed/returned by value, whole-aggregate assignment),
 **varargs**; **`printf`** and `exit` over the powerbox; **`malloc`/`free`/`calloc`** (guest
 bump allocator). All verify and run identically on interp + JIT, and match native `cc`.
+
+**By-value aggregates (sret, §3d D39).** Every by-value struct/union goes by hidden
+pointer (no SysV register classification). A **struct/union return** makes the IR function
+`(i64 sp, i64 sret, params…) -> ()`: the caller passes the address of chibicc's
+`ret_buffer` (an lvar in the caller frame) as a hidden first arg, the callee writes the
+result through it, and the call's value is that buffer address (so `f(x).field` and `s =
+f(x)` work — `gen_addr(ND_FUNCALL)` returns it). A **by-value struct/union arg** is passed
+as the lvalue address (`pass_irty`=i64); the callee `gen_memcpy`s it into its own frame
+slot in the prologue (by-value semantics). **Whole-aggregate assignment** is a
+`gen_memcpy`. Two chibicc quirks handled: a same-type aggregate cast on an assignment rhs
+(`gen_convert` no-ops when held by-address), and **union first-member init** — chibicc emits
+`v.i = (int)expr`, an aggregate→scalar cast that `gen_convert` lowers as a *load* of the
+member's bytes (only array/function decay returns the address). `irty(TY_FUNC)`/`is_agg`/
+`pass_irty`/`gen_memcpy` are the new helpers.
 
 **Indirect calls (function pointers).** A function designator decays to its `ref.func`
 index (an i32 funcref, §3c) widened to the 8-byte C pointer rep (`irty(TY_FUNC)`=i64,

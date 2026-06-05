@@ -30,8 +30,9 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > incl. short-circuit `&&`/`||`/`?:`, `if`/`while`/`for`/`do`/`switch` with
 > `break`/`continue`, functions and **recursion** (via a threaded data-stack pointer),
 > **function pointers** (a function designator decays to its `ref.func` index; `fp(args)`
-> lowers to `call_indirect` through the function table, I2), **varargs + a guest-C
-> `printf`** over the powerbox, and **`malloc`/`free`** (a guest
+> lowers to `call_indirect` through the function table, I2), **by-value structs/unions**
+> (passed by hidden pointer, returned via `sret`, D39; whole-aggregate assignment),
+> **varargs + a guest-C `printf`** over the powerbox, and **`malloc`/`free`** (a guest
 > bump allocator) — all of which **verify and run identically on the interpreter and the
 > JIT**, hello-world and a heap-allocated linked list included (the §18 Phase-2 "it works"
 > milestone). The §3d **SSA-promotion pass** lifts non-address-taken scalar locals out of
@@ -40,8 +41,8 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > (unix): an `mmap`'d window with a `PROT_NONE` guard page + a SIGSEGV/SIGBUS handler turns
 > an out-of-window fault into a clean `MemoryFault` (§4/§5 detect-and-kill), and the large
 > reserved-window model is the default; **read-only data segments** (§3a/D40) and a real
-> **Memory capability** (`map`/`unmap`/`protect`) exist. Still ahead: by-value aggregate
-> args/returns (sret), general `goto`, narrow-scalar promotion, demand paging, atomics + the rest of the
+> **Memory capability** (`map`/`unmap`/`protect`) exist. Still ahead: general `goto`,
+> narrow-scalar promotion, demand paging, atomics + the rest of the
 > concurrency model (Phase 4), SIMD, and capability extras. This
 > is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
