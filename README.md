@@ -97,6 +97,7 @@ cargo run -p svm-run -- crates/svm-run/demos/clay/clay_demo.c  # the Clay UI lay
 cargo run -p svm-run -- crates/svm-run/demos/jsmn/jsmn_demo.c  # the jsmn JSON tokenizer
 cargo run -p svm-run -- crates/svm-run/demos/sha256/sha_demo.c # SHA-256 (known test vectors)
 cargo run -p svm-run -- crates/svm-run/demos/xxhash/xxh_demo.c # xxHash (XXH32/XXH64)
+cargo run -p svm-run -- crates/svm-run/demos/tinfl/tinfl_demo.c # miniz tinfl (DEFLATE inflate)
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
@@ -118,6 +119,10 @@ native build with no new fixes, validating string handling, escapes, nesting, an
 vectors; it flushed a `func_index` null-token crash on undefined-function calls (now a clean error).
 **`xxhash/xxh_demo.c`** runs [xxHash](https://github.com/Cyan4973/xxHash)'s scalar XXH32/XXH64
 against the standard vectors; it added `_Static_assert` (C11) support to the frontend.
+**`tinfl/tinfl_demo.c`** runs [miniz](https://github.com/richgel999/miniz)'s `tinfl` DEFLATE/zlib
+*inflate* engine — a coroutine-style state machine (a deeply nested `switch`, bit-buffer shifts,
+Huffman tables, a 32 KiB LZ77 dictionary inside the decompressor struct); it inflates an embedded
+zlib stream byte-identically to a native build, with no new fixes.
 
 Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
 located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —

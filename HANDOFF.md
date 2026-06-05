@@ -120,6 +120,16 @@ now supports **`_Static_assert`** (C11) / `static_assert` (C23) at file and bloc
 (`static_assertion` in parse.c) — it was parsed as a function call. Tests `demo_sha256_*` /
 `demo_xxhash_*` and `c_matches_gcc_static_assert`.
 
+**Fifth real library — tinfl / miniz inflate (clean).** miniz's standalone DEFLATE/zlib
+*inflate* engine (`demos/tinfl/`, MIT, vendored) — a fresh shape: a coroutine-style state
+machine (a deeply nested `switch` driven by `TINFL_CR_*` macros + a saved program counter),
+bit-buffer shifts, Huffman fast/slow lookup tables, and a 32 KiB LZ77 dictionary carried inside
+the `tinfl_decompressor` struct. `tinfl_demo.c` inflates an embedded zlib stream (`blob.inc`) and
+writes the result; it ran **byte-identical to native cc with no new fixes** — good evidence the
+goto/switch lowering and struct layout hold up under a gnarly real-world state machine. The one
+vendoring edit: `miniz_tinfl.c`'s `#include "miniz.h"` → `#include "miniz_tinfl.h"` (so the
+inflate path is self-contained, no deflate/zip headers). Test `demo_tinfl_matches_native`.
+
 ### Invocation
 ```
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.svm a.c

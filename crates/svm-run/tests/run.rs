@@ -234,6 +234,16 @@ fn demo_xxhash_matches_native() {
     assert_demo_matches_cc("xxhash/xxh_demo.c");
 }
 
+/// tinfl (miniz, MIT, vendored) — miniz's standalone DEFLATE/zlib *inflate* engine. A new shape:
+/// a coroutine-style inflate state machine (a deeply nested `switch` driven by `TINFL_CR_*`
+/// macros), bit-buffer shifts, Huffman lookup tables, and a 32 KiB LZ77 dictionary inside the
+/// `tinfl_decompressor` struct. Inflates an embedded zlib stream and writes the result; output
+/// matches a native `cc` build byte-for-byte. It ran identically with no new fixes.
+#[test]
+fn demo_tinfl_matches_native() {
+    assert_demo_matches_cc("tinfl/tinfl_demo.c");
+}
+
 /// If the chibicc frontend is buildable, the CLI compiles and runs the C demo too — the same
 /// greeting from C source. Skipped (not failed) when the toolchain is unavailable.
 #[test]
