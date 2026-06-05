@@ -376,7 +376,15 @@ this is the index.)
 - [x] **Phase 2 — compilability proof:** chibicc→IR; real C on interp + JIT, two-tier
   tested (interp == JIT == native `cc`); SSA promotion landed (§5 item 8, §3).
 - [ ] **Phase 3 — Solid MVP (in progress):** the MVP remainder below.
-- [ ] **Phase 4 — post-MVP:** deferred (below).
+- [ ] **Phase 3.5 — Cross-platform parity:** port to **Windows** (PAL:
+  `VirtualAlloc`/`VirtualProtect` + **VEH/SEH** detect-and-kill) and validate
+  **macOS** (Mach-exception path, which can intercept ahead of BSD signals); stand
+  up a gating **Linux/Windows/macOS CI matrix** so parity holds from here on.
+  Confinement masking is already portable (§16/D51); only the non-TCB PAL differs.
+  Starting point: the JIT `compile_error!`s off unix, the guard/detect-and-kill
+  path is `cfg(unix)`, and CI is `ubuntu-latest` only — this phase makes all three
+  OSes first-class. Tier-1 MPK stays Linux-only (degrades to tier 0/3 elsewhere).
+- [ ] **Phase 4 — post-MVP:** deferred (below), developed against the parity matrix.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
 - [x] **Production trap-catching (memory)** — *done (unix)*: the JIT window is now `mmap`'d

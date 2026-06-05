@@ -1525,7 +1525,9 @@ Windows tier 1 degrades to tier 0 (masking + MMU) or tier 3 (separate process). 
 
 **Staging:** Linux + macOS first (the current unix path; the `compile_error!` in `svm-jit`
 is a *temporary* gate, not a permanent stance), Windows VEH/SEH next. Window/mask/interp
-logic is platform-independent; only the PAL is per-OS.
+logic is platform-independent; only the PAL is per-OS. Windows is scheduled as its own
+milestone — **Phase 3.5 (§18)** — after which Linux/Windows/macOS are kept at parity by a
+gating three-OS CI matrix.
 
 ---
 
@@ -1732,17 +1734,30 @@ debugging. The slow part dominates schedule + risk — and is exactly where the
 team has **no expert safety net**.
 
 **Phases (wide error bars):**
-1. **Core loop** — IR + encoding + verifier + interpreter; run hand-written IR.
-   *~2–6 weeks.*
-2. **Compilability proof** — chibicc→IR frontend; real C runs on the interpreter.
-   The "it works" milestone; mostly agent-fast. *~1–3 months total.*
-3. **Solid MVP** — Cranelift JIT + windowed memory model (masking, mmap, guard
-   pages) + capability runtime; real C running fast in a confined window.
-   *~6–15 months, median ~9–12, fat tail.* This is where the systems plumbing and
-   deep debugging concentrate.
-4. **Deferred (post-MVP):** full concurrency (fibers/vCPUs/M:N), nesting, shared
-   memory, isolation tiers, Spectre hardening, split-host supervisor, monitoring,
-   GPU, SIMD, revocation.
+- **Phase 1 — Core loop** — IR + encoding + verifier + interpreter; run
+  hand-written IR. *~2–6 weeks.*
+- **Phase 2 — Compilability proof** — chibicc→IR frontend; real C runs on the
+  interpreter. The "it works" milestone; mostly agent-fast. *~1–3 months total.*
+- **Phase 3 — Solid MVP** — Cranelift JIT + windowed memory model (masking, mmap,
+  guard pages) + capability runtime; real C running fast in a confined window.
+  *~6–15 months, median ~9–12, fat tail.* This is where the systems plumbing and
+  deep debugging concentrate.
+- **Phase 3.5 — Cross-platform parity** — port the runtime to **Windows** and lock
+  parity across **Linux / Windows / macOS** from here on. The escape-critical core
+  is already portable (confinement masking is pure arithmetic), so only the non-TCB
+  **Platform Abstraction Layer** differs (§16/D51): VA management
+  (`VirtualAlloc`/`VirtualProtect`), the detect-and-kill safety net (Windows
+  **VEH/SEH**; macOS **Mach exceptions**, which can intercept ahead of BSD
+  signals), and later the futex layer (`WaitOnAddress`, once §12 concurrency
+  lands). Starting point today is honest: the JIT `compile_error!`s off unix and CI
+  is Linux-only. macOS is largely free on the POSIX path; the real work is Windows
+  VEH/SEH and a **three-OS gating CI matrix** that keeps every *later* phase green
+  on all three. Tier-1 MPK stays Linux-only and degrades to tier 0/3 elsewhere —
+  parity is of the *portable* tiers, stated honestly. *~1–2 months, gated on a
+  solid Phase-3 MVP.*
+- **Phase 4 — Deferred (post-MVP), developed against the parity matrix** — full
+  concurrency (fibers/vCPUs/M:N), nesting, shared memory, isolation tiers, Spectre
+  hardening, split-host supervisor, monitoring, GPU, SIMD, revocation.
 
 **The hard ceiling (call it out, don't bury it):** in this configuration
 **"appears to work" is reachable; "is actually secure" is not.** The verifier +
@@ -1841,7 +1856,7 @@ as open-ended, not a byproduct of the build.
 | D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
 | D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |
 | D50 | **Accept the mask cost on unbounded-base accesses; do not pursue 32-bit window addressing.** Mask elision (§4 guard-when-bounded) covers *provably-bounded* addresses; for an unbounded base (the threaded data-SP in C locals) we keep the single AND mask (`locals_c` ~2.26× wasm32, still < wasm64) rather than lower window addresses as 32-bit | Settled | The 64-bit address space is a core goal (D36/§1a); the only sound way to elide an unbounded-base access is the wasm32 trick (32-bit address arithmetic, address `< 2^32` by construction so it matches the interp and elides) — masking the i64 data-SP alone is un-elidable or diverges from the interp (an escape). That trick caps the elided window at 4 GiB and reworks the frontend's pointer model for one benchmark; not worth trading the clean 64-bit model. Revisit only if a real workload makes the data-SP mask a measured bottleneck |
-| D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement masking stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
+| D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement masking stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere. Scheduled as **Phase 3.5** (§18): port Windows, then hold Linux/Windows/macOS parity via a gating three-OS CI matrix | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
 | D52 | **Capability-boundary record/replay** as the primary debugging differentiator: all nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + deterministic mode (§12) gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5) | Proposed | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary; the control stack survives heap corruption |
 | D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`) | Proposed | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
 | D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset) and wasm→IR bridge (compat) — vehicle priority deferred.** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | Open (strategy settled) | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
