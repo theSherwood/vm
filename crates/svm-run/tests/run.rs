@@ -254,6 +254,16 @@ fn demo_perlin_matches_native() {
     assert_demo_matches_cc("perlin/perlin_demo.c");
 }
 
+/// tiny-regex-c (kokke, Unlicense/public domain, vendored) — a Rob-Pike-style backtracking
+/// matcher: `re_match` recurses through `matchpattern`/`matchstar`/`matchplus`, retrying on
+/// failure. Recursion-with-backtracking is a new control-flow shape for the series (a workout for
+/// data-stack threading + general goto/branch lowering). Runs a table of (pattern, text) cases and
+/// prints match index/length; output matches a native `cc` build with no new fixes.
+#[test]
+fn demo_regex_matches_native() {
+    assert_demo_matches_cc("regex/regex_demo.c");
+}
+
 /// If the chibicc frontend is buildable, the CLI compiles and runs the C demo too — the same
 /// greeting from C source. Skipped (not failed) when the toolchain is unavailable.
 #[test]

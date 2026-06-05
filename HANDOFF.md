@@ -142,6 +142,17 @@ between native cc and our JIT would land in the digits. It matched **byte-for-by
 fixes** — good first evidence the f32 lowering is sound on real code. Test
 `demo_perlin_matches_native`.
 
+**Seventh real library — tiny-regex-c / backtracking recursion (clean).**
+[tiny-regex-c](https://github.com/kokke/tiny-regex-c) (kokke, public domain, `demos/regex/`) is a
+Rob-Pike-style matcher whose `re_match` recurses through
+`matchpattern` → `matchstar`/`matchplus`/`matchquestion` → `matchpattern`, **backtracking** on
+failure — a new control-flow shape (a workout for the threaded data-stack pointer and general
+goto/branch lowering). Vendored with one minimal edit: the libc `<stdio.h>`/`<ctype.h>` includes
+and the printf-only `re_print` debug helper (not in `re.h`'s API) are guarded behind
+`#ifndef RE_FREESTANDING`; the driver defines it and supplies `isdigit`/`isalpha`/`isspace`. A
+table of (pattern, text) cases prints match index/length and matches native cc **byte-for-byte,
+no new fixes**. Test `demo_regex_matches_native`.
+
 ### Invocation
 ```
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.svm a.c

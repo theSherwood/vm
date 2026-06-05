@@ -99,6 +99,7 @@ cargo run -p svm-run -- crates/svm-run/demos/sha256/sha_demo.c # SHA-256 (known 
 cargo run -p svm-run -- crates/svm-run/demos/xxhash/xxh_demo.c # xxHash (XXH32/XXH64)
 cargo run -p svm-run -- crates/svm-run/demos/tinfl/tinfl_demo.c # miniz tinfl (DEFLATE inflate)
 cargo run -p svm-run -- crates/svm-run/demos/perlin/perlin_demo.c # stb_perlin (3D Perlin noise, floats)
+cargo run -p svm-run -- crates/svm-run/demos/regex/regex_demo.c   # tiny-regex-c (backtracking matcher)
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
@@ -129,6 +130,11 @@ Perlin noise) — the first **floating-point-heavy** shakedown (dense f32 gradie
 quintic ease polynomial, trilinear lerps, int↔float conversion, octave multiply/accumulate); it
 prints fixed-point-scaled noise so any f32 divergence would show in the digits, and it matches a
 native build byte-for-byte.
+**`regex/regex_demo.c`** runs [tiny-regex-c](https://github.com/kokke/tiny-regex-c) — a
+Rob-Pike-style **backtracking** matcher (`re_match` recurses through
+`matchpattern`/`matchstar`/`matchplus`, retrying on failure), a new control-flow shape that
+exercises data-stack threading and goto/branch lowering; it matches a native build with no new
+fixes.
 
 Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
 located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —
