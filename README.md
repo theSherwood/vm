@@ -96,6 +96,7 @@ cargo run -p svm-run -- crates/svm-run/demos/rational.c  # exact-rational arithm
 cargo run -p svm-run -- crates/svm-run/demos/clay/clay_demo.c  # the Clay UI layout library!
 cargo run -p svm-run -- crates/svm-run/demos/jsmn/jsmn_demo.c  # the jsmn JSON tokenizer
 cargo run -p svm-run -- crates/svm-run/demos/sha256/sha_demo.c # SHA-256 (known test vectors)
+cargo run -p svm-run -- crates/svm-run/demos/xxhash/xxh_demo.c # xxHash (XXH32/XXH64)
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
@@ -115,6 +116,8 @@ native build with no new fixes, validating string handling, escapes, nesting, an
 **`sha256/sha_demo.c`** runs Brad Conte's public-domain SHA-256 — the pure integer/bit shape
 (32-bit wrapping arithmetic, rotates-as-shifts, a round-key table) — matching the standard test
 vectors; it flushed a `func_index` null-token crash on undefined-function calls (now a clean error).
+**`xxhash/xxh_demo.c`** runs [xxHash](https://github.com/Cyan4973/xxHash)'s scalar XXH32/XXH64
+against the standard vectors; it added `_Static_assert` (C11) support to the frontend.
 
 Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
 located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —

@@ -1310,6 +1310,21 @@ fn c_matches_gcc_global_relocations() {
 }
 
 #[test]
+fn c_matches_gcc_static_assert() {
+    // C11 `_Static_assert(const-expr, msg);` — a compile-time check that emits nothing when the
+    // expression is non-zero, at file *and* block scope. chibicc previously treated it as a
+    // function call (`implicit declaration`). Found via xxHash. (Only the `_Static_assert`
+    // keyword is exercised here — the C23 `static_assert` spelling needs <assert.h>/C23 on gcc.)
+    assert_matches_gcc(
+        "_Static_assert(sizeof(int) == 4, \"int is 4 bytes\"); \
+         _Static_assert(sizeof(long) == 8, \"LP64 long\"); \
+         int main(){ _Static_assert(1 + 1 == 2, \"arithmetic\"); \
+           int n = 0; for (int i = 0; i < 5; i++) { _Static_assert(2 * 3 == 6, \"loop\"); n += i; } \
+           printf(\"%d %d %d\\n\", (int)sizeof(int), (int)sizeof(long), n); return n; }",
+    );
+}
+
+#[test]
 fn c_matches_gcc_packed_enums() {
     // `enum __attribute__((packed))` sizes to the smallest integer type holding its values
     // (gcc semantics), so a struct containing small enums has the **same layout** as gcc —

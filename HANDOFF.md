@@ -110,6 +110,16 @@ frontend is robust enough that a clean library just works. Test `demo_jsmn_match
 (Also fixed `assert_demo_matches_cc` to flatten `/` in subdir demo names — it was silently
 skipping the comparison for `jsmn/jsmn_demo.c`.)
 
+**Hash libraries — SHA-256 and xxHash (one fix each).** Two integer/bit-shape shakedowns:
+B-Con's public-domain **SHA-256** (`demos/sha256/`) and Cyan4973's **xxHash** XXH32/XXH64
+(`demos/xxhash/`, scalar: `XXH_INLINE_ALL` + `XXH_NO_XXH3` + `XXH_NO_STREAM`). Both match native
+cc + the standard test vectors; each demo provides the one or two `mem*` functions its library
+uses (no libc). Fixes they drove: (1) `func_index` no longer segfaults reporting an
+undefined-function call (a libc declaration has no source token) — clean error now; (2) chibicc
+now supports **`_Static_assert`** (C11) / `static_assert` (C23) at file and block scope
+(`static_assertion` in parse.c) — it was parsed as a function call. Tests `demo_sha256_*` /
+`demo_xxhash_*` and `c_matches_gcc_static_assert`.
+
 ### Invocation
 ```
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.svm a.c

@@ -226,6 +226,14 @@ fn demo_sha256_matches_native() {
     assert_demo_matches_cc("sha256/sha_demo.c");
 }
 
+/// xxHash (Cyan4973/xxHash, BSD-2-Clause, vendored) — XXH32/XXH64 in a self-contained scalar
+/// build. Another integer/bit shape (multiply/rotate hashing); output matches a native `cc`
+/// build and the standard test vectors. The shakedown added `_Static_assert` support.
+#[test]
+fn demo_xxhash_matches_native() {
+    assert_demo_matches_cc("xxhash/xxh_demo.c");
+}
+
 /// If the chibicc frontend is buildable, the CLI compiles and runs the C demo too — the same
 /// greeting from C source. Skipped (not failed) when the toolchain is unavailable.
 #[test]

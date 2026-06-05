@@ -1791,6 +1791,22 @@ static Node *stmt(Token **rest, Token *tok) {
   return expr_stmt(rest, tok);
 }
 
+// static_assert = ("_Static_assert" | "static_assert") "(" const-expr ("," string)? ")" ";"
+// (C11 `_Static_assert` / C23 `static_assert`, the latter with an optional message). A
+// compile-time check: if the constant expression is zero, error; otherwise it emits nothing.
+static Token *static_assertion(Token **rest, Token *tok) {
+  tok = skip(tok->next, "(");
+  Token *start = tok;
+  int64_t result = const_expr(&tok, tok);
+  if (consume(&tok, tok, ",") && tok->kind == TK_STR)
+    tok = tok->next; // skip the message string literal
+  tok = skip(tok, ")");
+  *rest = skip(tok, ";");
+  if (result == 0)
+    error_tok(start, "static assertion failed");
+  return *rest;
+}
+
 // compound-stmt = (typedef | declaration | stmt)* "}"
 static Node *compound_stmt(Token **rest, Token *tok) {
   Node *node = new_node(ND_BLOCK, tok);
@@ -1800,6 +1816,10 @@ static Node *compound_stmt(Token **rest, Token *tok) {
   enter_scope();
 
   while (!equal(tok, "}")) {
+    if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
+      tok = static_assertion(&tok, tok);
+      continue;
+    }
     if (is_typename(tok) && !equal(tok->next, ":")) {
       VarAttr attr = {};
       Type *basety = declspec(&tok, tok, &attr);
@@ -3373,6 +3393,11 @@ Obj *parse(Token *tok) {
   globals = NULL;
 
   while (tok->kind != TK_EOF) {
+    if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
+      tok = static_assertion(&tok, tok);
+      continue;
+    }
+
     VarAttr attr = {};
     Type *basety = declspec(&tok, tok, &attr);
 
