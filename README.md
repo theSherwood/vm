@@ -95,6 +95,7 @@ cargo run -p svm-run -- crates/svm-run/demos/calc.c      # a recursive-descent c
 cargo run -p svm-run -- crates/svm-run/demos/rational.c  # exact-rational arithmetic
 cargo run -p svm-run -- crates/svm-run/demos/clay/clay_demo.c  # the Clay UI layout library!
 cargo run -p svm-run -- crates/svm-run/demos/jsmn/jsmn_demo.c  # the jsmn JSON tokenizer
+cargo run -p svm-run -- crates/svm-run/demos/sha256/sha_demo.c # SHA-256 (known test vectors)
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
@@ -111,6 +112,9 @@ windows, a contiguous JIT code arena, gcc-parity packed-enum/struct layout) — 
 **`jsmn/jsmn_demo.c`** runs the [jsmn](https://github.com/zserge/jsmn) zero-allocation JSON
 tokenizer — a different shape (char/state-machine string scanning) that ran identically to a
 native build with no new fixes, validating string handling, escapes, nesting, and error paths.
+**`sha256/sha_demo.c`** runs Brad Conte's public-domain SHA-256 — the pure integer/bit shape
+(32-bit wrapping arithmetic, rotates-as-shifts, a round-key table) — matching the standard test
+vectors; it flushed a `func_index` null-token crash on undefined-function calls (now a clean error).
 
 Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
 located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —

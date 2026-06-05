@@ -217,6 +217,15 @@ fn demo_jsmn_matches_native() {
     assert_demo_matches_cc("jsmn/jsmn_demo.c");
 }
 
+/// SHA-256 (B-Con's `crypto-algorithms`, public domain, vendored) — a pure integer/bit shape
+/// (32-bit wrapping arithmetic, rotates-as-shifts, a round-key table). Hashes a few strings
+/// sandboxed and prints the hex digests; must match a native `cc` build (and the standard test
+/// vectors). The shakedown turned a `func_index` null-token crash into a clean error.
+#[test]
+fn demo_sha256_matches_native() {
+    assert_demo_matches_cc("sha256/sha_demo.c");
+}
+
 /// If the chibicc frontend is buildable, the CLI compiles and runs the C demo too — the same
 /// greeting from C source. Skipped (not failed) when the toolchain is unavailable.
 #[test]

@@ -144,7 +144,12 @@ static int func_index(Obj *fn) {
   for (int i = 0; i < nfuncs; i++)
     if (funcs[i] == fn)
       return start_off + i;
-  error_tok(fn->tok, "codegen_ir: call to a function with no definition (no linker yet)");
+  // Called/referenced a declared-but-undefined function (e.g. a libc function with no body in
+  // this whole-program TU). A library declaration has no source token, so report by name —
+  // `error_tok(NULL, …)` would dereference a null token and crash.
+  if (fn->tok)
+    error_tok(fn->tok, "codegen_ir: call to '%s' with no definition (no linker yet)", fn->name);
+  error("codegen_ir: call to '%s' with no definition (no linker yet)", fn->name);
 }
 
 // --- SSA promotion (DESIGN §3d "the pass that matters for speed") ----------------------
