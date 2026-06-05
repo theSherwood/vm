@@ -1310,6 +1310,31 @@ fn c_matches_gcc_global_relocations() {
 }
 
 #[test]
+fn c_matches_gcc_clay_fixes() {
+    // Four frontend/IR fixes surfaced by compiling the Clay layout library, each validated
+    // against native `cc`.
+    // (a) ternary `?:` returning a struct by value (gen_cond aggregate result → i64 address):
+    assert_matches_gcc(
+        "struct P{int x,y;}; struct P pick(int c){ struct P a={1,2},b={3,4}; return c?a:b; } \
+         int main(){ struct P p=pick(1); printf(\"%d %d\\n\",p.x,p.y); return p.x+p.y; }",
+    );
+    // (b) struct return > 16 bytes (chibicc prepends a hidden return-buffer param; no longer
+    //     double-counted against our own sret):
+    assert_matches_gcc(
+        "struct Big{int a,b,c,d,e;}; struct Big mk(int x){ struct Big b={x,x+1,x+2,x+3,x+4}; return b; } \
+         int main(){ struct Big b=mk(10); printf(\"%d\\n\", b.a+b.e); return b.a+b.e; }",
+    );
+    // (c) mixed-width shift `uint64_t << int` (shift amount widened to the value's width):
+    assert_matches_gcc(
+        "int main(){ unsigned long h=12345; h+=(h<<10); h^=(h>>6); printf(\"%lu\\n\",h); return (int)(h&255); }",
+    );
+    // (d) an unsigned 32-bit constant 0xFFFFFFFF (`i32.const` accepts the full u32 range):
+    assert_matches_gcc(
+        "int main(){ unsigned int m=0xFFFFFFFFu; printf(\"%u\\n\", m); return (int)(m & 7); }",
+    );
+}
+
+#[test]
 fn c_matches_gcc_aggregates() {
     // Two upstream chibicc parser bugs, found via the Clay layout library and fixed in
     // `frontend/chibicc/parse.c`, both around designated initializers into **anonymous**

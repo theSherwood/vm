@@ -260,6 +260,7 @@ static bool is_flt(Type *ty) {
 
 static int gen_expr(Node *node); // emits the IR, returns the result's SSA index
 static int gen_addr(Node *node); // emits the IR, returns the SSA index of an lvalue's address
+static int gen_convert(int a, Type *from, Type *to); // int/float width + signedness conversion
 
 // Per-function scratch region (last SCRATCH_BYTES of the frame) for spilling SSA values
 // across expression-level control flow (&&/||/?:), which opens new blocks. Such a branch
@@ -335,6 +336,18 @@ static bool is_agg(Type *ty) { return ty->kind == TY_STRUCT || ty->kind == TY_UN
 // The IR type of a C parameter/argument *as passed*: a by-value aggregate goes by hidden
 // pointer (i64); everything else is its ordinary value type (an array already decays).
 static char *pass_irty(Type *ty) { return is_agg(ty) ? "i64" : irty(ty); }
+
+// chibicc prepends a hidden return-buffer pointer to `fn->params` for struct/union returns
+// **larger than 16 bytes** (its SysV ABI, parse.c). Our §3d ABI returns *every* by-value
+// aggregate through our own sret pointer regardless of size, so skip chibicc's hidden param —
+// otherwise we emit it *and* our sret, double-counting (the function then has one param too
+// many vs. the call site). Returns the first *guest-visible* parameter.
+static Obj *guest_params(Obj *fn) {
+  Type *r = fn->ty->return_ty;
+  if (is_agg(r) && r->size > 16 && fn->params)
+    return fn->params->next;
+  return fn->params;
+}
 
 // Load the C value of type `ty` from address `addr` (an SSA i64); return its SSA index.
 static int gen_load(Type *ty, int addr) {
@@ -487,6 +500,12 @@ static int gen_addr(Node *node) {
 static int binop(Node *node, char *op) {
   int a, b;
   eval2(node->lhs, node->rhs, &a, &b);
+  // Shifts don't undergo the usual arithmetic conversions: the shift amount keeps its own
+  // (promoted) width, which may differ from the value's (e.g. `uint64_t << int`). Our
+  // `iN.shl/shr` require both operands at width N, so widen/narrow the amount to match.
+  bool shift = !strcmp(op, "shl") || !strcmp(op, "shr_s") || !strcmp(op, "shr_u");
+  if (shift && is64(node->lhs->ty) != is64(node->rhs->ty))
+    b = gen_convert(b, node->rhs->ty, node->lhs->ty);
   int r = nv++;
   fprintf(o, "  v%d = %s.%s v%d v%d\n", r, irty(node->lhs->ty), op, a, b);
   return r;
@@ -635,7 +654,9 @@ static int gen_cond(Node *node) {
   open_block(el);
   int ve = gen_expr_as(node->els, node->ty);
   fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), ve);
-  open_merge(merge, irty(node->ty));
+  // An aggregate-typed `?:` carries the selected arm's *address* (by-address, §3d), so the
+  // merge value is an i64 pointer; `pass_irty` maps a struct/union to i64, scalars to their type.
+  open_merge(merge, pass_irty(node->ty));
   return MERGE_VAL;
 }
 
@@ -1441,7 +1462,7 @@ static void gen_func(Obj *fn) {
   fprintf(o, "func (i64");
   if (is_agg(ret))
     fprintf(o, ", i64"); // the hidden sret pointer
-  for (Obj *p = fn->params; p; p = p->next)
+  for (Obj *p = guest_params(fn); p; p = p->next)
     fprintf(o, ", %s", pass_irty(p->ty));
   if (variadic)
     fprintf(o, ", i64");
@@ -1460,7 +1481,7 @@ static void gen_func(Obj *fn) {
     sret_slot = fn->stack_size - SCRATCH_BYTES - 16; // the slot reserved by prepare_func
     fprintf(o, ", v%d: i64", np++);
   }
-  for (Obj *p = fn->params; p; p = p->next)
+  for (Obj *p = guest_params(fn); p; p = p->next)
     fprintf(o, ", v%d: %s", np++, pass_irty(p->ty));
   int va_param = np;
   if (variadic)
@@ -1473,7 +1494,7 @@ static void gen_func(Obj *fn) {
   // to the caller's value, so the callee copies it into its own frame — by-value, §3d).
   bool param_slot[MAXPROMO] = {false};
   int pi = (sret_param < 0) ? 1 : 2; // incoming param values follow sp (and sret, if any)
-  for (Obj *p = fn->params; p; p = p->next) {
+  for (Obj *p = guest_params(fn); p; p = p->next) {
     if (is_promoted(p)) {
       int s = slot_of(p);
       curval[s] = pi;
