@@ -1,0 +1,18 @@
+; A minimal sandboxed program in text IR (no frontend needed). Its entry is the powerbox
+; `_start(stdout, stdin, exit)` shape — three i32 capability handles — so `svm-run` grants the
+; real powerbox and wires stdout to the terminal. It writes a greeting via the `Stream` cap
+; (type_id 0, op 1 = write) and returns 0.
+;
+;   svm-run crates/svm-run/demos/hello.svm
+memory 16
+
+data 0 "hello, sandbox!\n"
+
+func (i32, i32, i32) -> (i32) {
+block0(v0: i32, v1: i32, v2: i32):
+  v3 = i64.const 0
+  v4 = i64.const 16
+  v5 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v4)
+  v6 = i32.const 0
+  return v6
+}

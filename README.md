@@ -61,6 +61,7 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 | `svm-jit` | Cranelift JIT — CLIF lowering + the §4 masking lowering + guard page/signal (§9) | escape-TCB† |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
 | `svm` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |
+| `svm-run` | Embedding runtime + **`svm-run` CLI**: instantiate with the powerbox, run on the JIT | — |
 | `fuzz/` | cargo-fuzz targets (nightly); mirror the stable smoke fuzz | — |
 
 †`svm-jit` is escape-TCB but, by design (§1), shares Wasmtime's codegen — so unlike
@@ -80,6 +81,25 @@ cargo fmt   --all --check
 cargo clippy --workspace --all-targets
 cargo run --release --bin svm-bench   # decode / verify / interp throughput
 ```
+
+## Run a program in the sandbox
+
+The `svm-run` CLI compiles (if needed), verifies, and runs a guest program on the JIT under
+the MVP powerbox (§3e) — `stdout`/`stderr` go to the real streams and it exits with the
+guest's code:
+
+```sh
+cargo run -p svm-run -- crates/svm-run/demos/hello.svm   # text IR → "hello, sandbox!"
+cargo run -p svm-run -- crates/svm-run/demos/hello.c     # C source (via the chibicc frontend)
+echo 'int main(){ return 42; }' > /tmp/r.c
+cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
+```
+
+Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
+located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —
+`svm_run::run_powerbox(&module, stdin)` returns the outcome plus captured output; it is the one
+reusable host glue (the `cap.call` trampoline + powerbox grant), not escape-TCB (the verifier,
+run first, is what makes a module safe).
 
 ## Fuzzing
 
