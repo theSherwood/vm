@@ -906,6 +906,41 @@ fn c_function_pointers_end_to_end() {
 }
 
 #[test]
+fn c_goto_end_to_end() {
+    // Forward goto: jump past the rest of a loop body to a label after it.
+    assert_eq!(
+        i32_of(
+            "int main(){ int s=0; for(int i=0;i<5;i++){ if(i==3) goto done; s+=i; } \
+                done: return s; }"
+        ),
+        1 + 2 // i = 0,1,2 before the goto at i==3
+    );
+    // Backward goto building a loop by hand (the label precedes the goto).
+    assert_eq!(
+        i32_of("int main(){ int i=0,s=0; loop: if(i<5){ s+=i; i++; goto loop; } return s; }"),
+        1 + 2 + 3 + 4 // i = 0..4
+    );
+    // Multi-level loop exit — the classic reason goto survives in C.
+    assert_eq!(
+        i32_of(
+            "int main(){ int s=0; for(int i=0;i<4;i++) for(int j=0;j<4;j++){ \
+                if(i*j>=6) goto out; s++; } out: return s; }"
+        ),
+        // counts (i,j) pairs until i*j>=6: (0,*)4 (1,*)4 (2,0..2)3 → 11, then 2*3=6 stops
+        11
+    );
+    // A `cleanup:` label reached by an early `goto` (the error-handling idiom), with a
+    // promoted local threaded across the jump.
+    assert_eq!(
+        i32_of(
+            "int main(){ int rc=0; int *p=0; if(!p){ rc=42; goto cleanup; } rc=1; \
+                cleanup: return rc; }"
+        ),
+        42
+    );
+}
+
+#[test]
 fn c_by_value_aggregates_end_to_end() {
     // Struct passed by value (callee copies the caller's value into its own frame, §3d).
     assert_eq!(
@@ -1240,6 +1275,25 @@ fn c_matches_gcc_function_pointers() {
         "int add(int a,int b){ return a + b; } int sub(int a,int b){ return a - b; } \
          int main(){ int (*ops[2])(int,int) = {add, sub}; int s = 0; \
            for (int i=0;i<2;i++) s += ops[i](10, 3); printf(\"%d\\n\", s); return s; }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_goto() {
+    // A hand-rolled state machine driven by goto, validated against native `cc`.
+    assert_matches_gcc(
+        "int main(){ int n=27, steps=0; \
+         start: if(n==1) goto done; \
+           if(n%2==0){ n=n/2; steps++; goto start; } \
+           n=3*n+1; steps++; goto start; \
+         done: printf(\"%d\\n\", steps); return steps; }",
+    );
+    // Forward goto skipping initialization, plus a backward goto retry loop.
+    assert_matches_gcc(
+        "int main(){ int tries=0; \
+         retry: tries++; if(tries<3) goto retry; \
+           int sum=0; for(int i=0;i<5;i++){ if(i==2) goto skip; sum+=i; skip:; } \
+           printf(\"%d %d\\n\", tries, sum); return sum; }",
     );
 }
 

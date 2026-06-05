@@ -51,8 +51,10 @@
 // memory. **Indirect calls** (C function pointers) lower to `call_indirect` through the
 // function table (§3c): a function designator decays to its `ref.func` index (widened to
 // the 8-byte pointer rep), and `fp(args)` wraps it back to the i32 table index and
-// dispatches with the callee's static signature (incl. the leading data-SP). General
-// `goto`/labels remain;
+// dispatches with the callee's static signature (incl. the leading data-SP). **General
+// `goto`/labels** work: each C label maps to an IR block (allocated on first reference, so
+// forward gotos resolve), and a `goto` branches to it threading the data-SP + promoted
+// locals — the same SSA-block mechanism as `break`/`continue` and loops.
 // anything unsupported is a hard error (so we never emit IR we cannot stand behind). This
 // is enough C surface for a capable VM: globals, structs, pointers, loops, recursion,
 // floats, varargs/`printf`, and heap allocation all run on interp and JIT.
@@ -88,6 +90,23 @@ static int case_block_of(Node *n) {
     if (case_node[i] == n)
       return case_blk[i];
   return -1; // unreachable: every case is registered before the body is emitted
+}
+
+// Each C label (and the `goto`s that target it) maps to one IR block, keyed by chibicc's
+// resolved `unique_label`. A block number is allocated on first reference — whether that
+// is the label or a (forward) `goto` — so forward gotos work (svm-text resolves block
+// targets by name, not position). Reset per function.
+static char *label_name[1024];
+static int label_blk[1024];
+static int nlabel;
+static int label_block_of(char *uniq) {
+  for (int i = 0; i < nlabel; i++)
+    if (!strcmp(label_name[i], uniq))
+      return label_blk[i];
+  label_name[nlabel] = uniq;
+  int b = nb++;
+  label_blk[nlabel++] = b;
+  return b;
 }
 
 // The data-stack pointer (frame base) is threaded as the first parameter of every IR
@@ -1154,9 +1173,9 @@ static void gen_stmt(Node *node) {
   switch (node->kind) {
   case ND_BLOCK:
     for (Node *n = node->body; n; n = n->next) {
-      // Drop dead code after a terminator — but a `case`/`default` label reopens a
-      // reachable block, so it is always emitted.
-      if (term && n->kind != ND_CASE)
+      // Drop dead code after a terminator — but a `case`/`default` or a `goto` label
+      // reopens a reachable block, so it is always emitted.
+      if (term && n->kind != ND_CASE && n->kind != ND_LABEL)
         continue;
       gen_stmt(n);
     }
@@ -1185,6 +1204,16 @@ static void gen_stmt(Node *node) {
   case ND_DO:
     gen_do(node);
     return;
+  case ND_LABEL: {
+    // A C label: its block is a `goto`/fall-through target. Fall into it from the
+    // preceding statement (if reachable), open it, then emit the labelled statement.
+    int blk = label_block_of(node->unique_label);
+    if (!term)
+      fprintf(o, "  br block%d(" SP "%s)\n", blk, cvals());
+    open_block(blk);
+    gen_stmt(node->lhs);
+    return;
+  }
   case ND_GOTO: {
     // break/continue: branch to the matching enclosing loop's break/continue block.
     for (int i = loopsp - 1; i >= 0; i--) {
@@ -1201,7 +1230,11 @@ static void gen_stmt(Node *node) {
         return;
       }
     }
-    error_tok(node->tok, "codegen_ir: general goto/labels not supported yet");
+    // A general `goto`: branch to its target label's block (allocated on first reference,
+    // so forward gotos resolve). The data-SP + promoted locals thread through as args.
+    fprintf(o, "  br block%d(" SP "%s)\n", label_block_of(node->unique_label), cvals());
+    term = true;
+    return;
   }
   case ND_RETURN:
     if (node->lhs && is_agg(node->lhs->ty)) {
@@ -1367,6 +1400,7 @@ static void gen_func(Obj *fn) {
     return;
 
   nb = 0;
+  nlabel = 0;
   cur_frame = fn->stack_size;
   cur_scratch = fn->stack_size - SCRATCH_BYTES; // scratch sits at the top of the frame
   spill_top = 0;

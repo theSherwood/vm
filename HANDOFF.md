@@ -79,7 +79,8 @@ cargo test -p svm --test c_frontend
 `int`/`long`/`char`/`short`/`_Bool`/`enum`, `float`/`double`; pointers, arrays,
 structs/unions (`.`/`->`, indexing, initializers); globals + string literals; the full
 operator set incl. short-circuit `&&`/`||`/`?:`; `if`/`else`/`while`/`for`/`do`/`switch`
-with `break`/`continue`; functions, parameters, **recursion**, **function pointers**
+with `break`/`continue` and **general `goto`/labels**; functions, parameters,
+**recursion**, **function pointers**
 (indirect calls via `call_indirect`, dispatch tables, callbacks, fn-ptr struct members),
 **by-value structs/unions** (passed/returned by value, whole-aggregate assignment),
 **varargs**; **`printf`** and `exit` over the powerbox; **`malloc`/`free`/`calloc`** (guest
@@ -98,6 +99,19 @@ slot in the prologue (by-value semantics). **Whole-aggregate assignment** is a
 `v.i = (int)expr`, an aggregate→scalar cast that `gen_convert` lowers as a *load* of the
 member's bytes (only array/function decay returns the address). `irty(TY_FUNC)`/`is_agg`/
 `pass_irty`/`gen_memcpy` are the new helpers.
+
+**General `goto`/labels.** Each C label maps to one IR block keyed by chibicc's resolved
+`unique_label` (`label_block_of`, reset per function); the block number is allocated on
+first reference — label *or* a forward `goto` — which is sound because svm-text resolves
+block targets **by name**, not position (`labels: HashMap<String,u32>` over appearance
+order). `ND_LABEL` falls into its block (if reachable) then `open_block`s it; `ND_GOTO`
+(after the existing break/continue match) branches to the target block, threading the
+data-SP + promoted locals via `cvals()` — identical to loops. The ND_BLOCK dead-code drop
+now also keeps `ND_LABEL` (a goto target reopens a reachable block). *Limitation:* a label
+buried inside a compound statement that is skipped as dead code after a terminator won't be
+emitted (goto-into-nested-block); labels at block/function scope — the cleanup/retry/state-
+machine idioms — work. With this, the **C ABI (§3d) is feature-complete** for the MVP
+subset: indirect calls, by-value aggregates, and goto all land.
 
 **Indirect calls (function pointers).** A function designator decays to its `ref.func`
 index (an i32 funcref, §3c) widened to the 8-byte C pointer rep (`irty(TY_FUNC)`=i64,

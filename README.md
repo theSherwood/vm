@@ -28,7 +28,7 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > `--emit-ir` backend, §3d) compiles a broad C subset — ints/longs/floats, locals,
 > pointers, arrays, structs/unions, globals & string literals, the full operator set
 > incl. short-circuit `&&`/`||`/`?:`, `if`/`while`/`for`/`do`/`switch` with
-> `break`/`continue`, functions and **recursion** (via a threaded data-stack pointer),
+> `break`/`continue` and **general `goto`/labels**, functions and **recursion** (via a threaded data-stack pointer),
 > **function pointers** (a function designator decays to its `ref.func` index; `fp(args)`
 > lowers to `call_indirect` through the function table, I2), **by-value structs/unions**
 > (passed by hidden pointer, returned via `sret`, D39; whole-aggregate assignment),
@@ -41,7 +41,7 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > (unix): an `mmap`'d window with a `PROT_NONE` guard page + a SIGSEGV/SIGBUS handler turns
 > an out-of-window fault into a clean `MemoryFault` (§4/§5 detect-and-kill), and the large
 > reserved-window model is the default; **read-only data segments** (§3a/D40) and a real
-> **Memory capability** (`map`/`unmap`/`protect`) exist. Still ahead: general `goto`,
+> **Memory capability** (`map`/`unmap`/`protect`) exist. Still ahead:
 > narrow-scalar promotion, demand paging, atomics + the rest of the
 > concurrency model (Phase 4), SIMD, and capability extras. This
 > is a research build; "appears to work" is reachable, "is certified secure" is an explicit
