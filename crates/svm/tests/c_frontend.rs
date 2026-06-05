@@ -16,9 +16,10 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_with_host, GuestMem, Host, StreamRole, Trap, Value, WindowMem};
+use svm_interp::{run_with_host, Host, StreamRole, Trap, Value};
 use svm_ir::ValType;
-use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind, EXIT_CODE};
+use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind};
+use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§9)
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -28,53 +29,6 @@ fn to_slot(v: Value) -> i64 {
         Value::I64(x) => x,
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
-    }
-}
-
-/// Bridge the JIT's capability-thunk ABI to the interpreter's `Host` — the host
-/// trampoline a real embedder supplies (§9). Mirrors the one in `jit_diff.rs`, so both
-/// backends share capability semantics.
-///
-/// # Safety
-/// Honours the `CapThunk` contract: `ctx` is a `*mut Host`, the slot/window pointers are
-/// valid for their lengths, and `trap_out` is live.
-unsafe extern "C" fn cap_thunk(
-    ctx: *mut c_void,
-    mem_base: *mut u8,
-    mem_size: u64,
-    type_id: u32,
-    op: u32,
-    handle: i32,
-    args: *const i64,
-    n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    trap_out: *mut i64,
-) {
-    let host = &mut *(ctx as *mut Host);
-    let arg_slots = std::slice::from_raw_parts(args, n_args as usize);
-    let mut empty: [u8; 0] = [];
-    let window: &mut [u8] = if mem_base.is_null() {
-        &mut empty
-    } else {
-        std::slice::from_raw_parts_mut(mem_base, mem_size as usize)
-    };
-    let mut wm = WindowMem::new(window, mem_size);
-    let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
-        None
-    } else {
-        Some(&mut wm)
-    };
-    match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
-        Ok(res) => {
-            let out = std::slice::from_raw_parts_mut(results, n_results as usize);
-            for (o, r) in out.iter_mut().zip(res) {
-                *o = r;
-            }
-            *trap_out = 0;
-        }
-        Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
-        Err(_) => *trap_out = TrapKind::CapFault as i64,
     }
 }
 
