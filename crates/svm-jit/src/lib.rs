@@ -418,7 +418,17 @@ fn run_inner(
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
         .map_err(|e| JitError::Backend(e.to_string()))?;
-    let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    // Allocate code + read-only data (float constants, jump tables) from a single contiguous
+    // arena rather than the default separate `mmap`s. cranelift's x64 `call`/rip-relative
+    // loads use 32-bit PC-relative relocations (`X86CallPCRel4`/`X86PCRel4`); with independent
+    // mmaps, ASLR can place code and rodata > 2 GiB apart, overflowing the i32 offset (a
+    // `compiled_blob.rs` panic) — intermittent, and only on large modules with rodata (e.g.
+    // a whole UI library). A 256 MiB reserved arena (VA only, committed on demand) keeps every
+    // segment in range. Reserve falls back to the default provider if it cannot map.
+    if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
+        builder.memory_provider(Box::new(arena));
+    }
     let mut module = JITModule::new(builder);
 
     // Declare every function (natural ABI) up front so calls can reference any of them.

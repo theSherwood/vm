@@ -1709,10 +1709,21 @@ void codegen_ir(Obj *prog, FILE *out) {
       need_mem = true;
   }
 
-  // A 2^16-byte window is ample for the globals + data stack of the programs we lower
-  // today (the size becomes program-driven once a real data segment / heap land).
-  if (need_mem)
-    fprintf(o, "memory 16\n\n");
+  // Size the window to hold the globals/BSS region (`data_end`) plus a data-stack/heap
+  // reserve. Small programs keep the 2^16-byte (64 KiB) default; a program with a large
+  // static region (e.g. a big arena buffer) grows to the next power of two that fits. The
+  // JIT only backs `mapped = 2^log2` and reserves a huge VA above it (§4), so a larger
+  // window costs only the backed prefix.
+  if (need_mem) {
+    // Reserve stack/heap headroom: a generous flat 48 KiB for small programs (so they stay
+    // at 64 KiB), or an amount equal to the globals for large ones (proportional stack).
+    long reserve = data_end < (16 << 10) ? (48 << 10) : data_end;
+    long need = (long)data_end + reserve;
+    int wlog2 = 16;
+    while (((long)1 << wlog2) < need)
+      wlog2++;
+    fprintf(o, "memory %d\n\n", wlog2);
+  }
 
   // Global initializers become module-level `data` segments (§3a), placed by the runtime.
   emit_data_segments(prog);
