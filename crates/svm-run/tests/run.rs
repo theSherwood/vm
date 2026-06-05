@@ -122,6 +122,61 @@ fn cli_runs_svm_file() {
     assert_eq!(out.stdout, b"hello, sandbox!\n");
 }
 
+/// Compile a demo `.c` with native `cc`, run both it and `svm-run`, and assert identical
+/// stdout — a real-program oracle (the whole stack vs. a real compiler). Skipped (not failed)
+/// when `cc` or the frontend is unavailable.
+fn assert_demo_matches_cc(name: &str) {
+    let c = demo(name);
+    let exe = std::env::temp_dir().join(format!(
+        "svm_demo_{}_{}",
+        std::process::id(),
+        name.replace('.', "_")
+    ));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe).output().expect("run native build");
+    let svm = Command::new(env!("CARGO_BIN_EXE_svm-run"))
+        .arg(&c)
+        .output()
+        .expect("spawn svm-run");
+    if !svm.status.success() {
+        let err = String::from_utf8_lossy(&svm.stderr);
+        if err.contains("chibicc") {
+            eprintln!(
+                "note: skipping {name} (frontend unavailable): {}",
+                err.trim()
+            );
+            return;
+        }
+        panic!("svm-run on {name} failed: {err}");
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&svm.stdout),
+        String::from_utf8_lossy(&native.stdout),
+        "{name}: svm-run vs native cc stdout differ"
+    );
+}
+
+/// A recursive-descent calculator (recursion, a global string table + a global struct-array of
+/// function pointers, indirect dispatch) — sandboxed output must match native `cc`.
+#[test]
+fn demo_calc_matches_native() {
+    assert_demo_matches_cc("calc.c");
+}
+
+/// Exact-rational arithmetic (by-value struct args/returns through direct *and* indirect calls,
+/// recursion) — sandboxed output must match native `cc`. The program that surfaced the
+/// sret-from-a-non-entry-block bug.
+#[test]
+fn demo_rational_matches_native() {
+    assert_demo_matches_cc("rational.c");
+}
+
 /// If the chibicc frontend is buildable, the CLI compiles and runs the C demo too — the same
 /// greeting from C source. Skipped (not failed) when the toolchain is unavailable.
 #[test]

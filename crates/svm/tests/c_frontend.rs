@@ -1311,6 +1311,17 @@ fn c_matches_gcc_global_relocations() {
 
 #[test]
 fn c_matches_gcc_aggregates() {
+    // Regression (demos/rational.c): a struct returned from a **non-entry block** — inside a
+    // loop, and after it. The sret pointer is a parameter that only lives in the entry block,
+    // so it is stashed to a frame slot and reloaded on return; earlier it was read from the
+    // block's rebound parameter (the loop counter), emitting IR that failed verification.
+    assert_matches_gcc(
+        "struct P { int x, y; }; \
+         struct P pick(int n){ struct P r; \
+           for (int i=0;i<100;i++) if (i==n) { r.x=i; r.y=i*i; return r; } \
+           r.x=-1; r.y=-1; return r; } \
+         int main(){ struct P p = pick(7); printf(\"%d,%d\\n\", p.x, p.y); return p.x + p.y; }",
+    );
     // Structs by value through args and returns (the sret ABI), with printf output,
     // validated against native `cc`.
     assert_matches_gcc(

@@ -91,9 +91,15 @@ guest's code:
 ```sh
 cargo run -p svm-run -- crates/svm-run/demos/hello.svm   # text IR → "hello, sandbox!"
 cargo run -p svm-run -- crates/svm-run/demos/hello.c     # C source (via the chibicc frontend)
+cargo run -p svm-run -- crates/svm-run/demos/calc.c      # a recursive-descent calculator
+cargo run -p svm-run -- crates/svm-run/demos/rational.c  # exact-rational arithmetic
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
+
+`calc.c` (recursion + a function-pointer dispatch table) and `rational.c` (by-value
+struct args/returns through direct and indirect calls) are larger real programs; each is
+checked byte-for-byte against a native `cc` build in `svm-run`'s tests.
 
 Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
 located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —

@@ -99,6 +99,17 @@ slot in the prologue (by-value semantics). **Whole-aggregate assignment** is a
 `v.i = (int)expr`, an aggregate→scalar cast that `gen_convert` lowers as a *load* of the
 member's bytes (only array/function decay returns the address). `irty(TY_FUNC)`/`is_agg`/
 `pass_irty`/`gen_memcpy` are the new helpers.
+- **sret pointer is stashed to a frame slot, not threaded (bug fix, surfaced by
+  `demos/rational.c`).** The sret pointer is a function parameter, so it only lives as `v1`
+  in the **entry block** — but a `return <aggregate>` can be in *any* block (inside a loop,
+  after an `if`), where `v1` is rebound (e.g. to a loop counter). The original code did
+  `gen_memcpy(sret_param, …)` with a fixed value index → it wrote through the wrong value and
+  emitted IR that failed verification. Fix: `prepare_func` reserves a hidden 8-byte slot just
+  below the spill scratch (`sret_slot = stack_size − SCRATCH_BYTES − 16`); the entry block
+  stashes the incoming sret pointer there (like the varargs pointer), and an aggregate
+  `return` reloads it from `sp + sret_slot` (the data-SP `v0` is threaded everywhere, so this
+  works in any block). Regression-tested (`c_matches_gcc_aggregates`: struct return from a
+  loop/after-`if`).
 
 **General `goto`/labels.** Each C label maps to one IR block keyed by chibicc's resolved
 `unique_label` (`label_block_of`, reset per function); the block number is allocated on

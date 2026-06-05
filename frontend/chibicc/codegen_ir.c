@@ -69,6 +69,8 @@ static int nv;    // next SSA value index in the *current block* (resets per blo
                   // values crossing a block are its parameters — the data-SP + promoted locals)
 static int nb;        // next block label number in the current function
 static int sret_param; // v-index of the hidden struct-return pointer (§3d sret), or -1
+static int sret_slot;  // frame offset where the sret pointer is stashed (reloadable in any
+                       // block, since it can't reliably ride a block parameter), or -1
 static bool term;     // is the current block already terminated?
 static int cur_frame; // the current function's data-stack frame size (bytes)
 
@@ -1242,9 +1244,16 @@ static void gen_stmt(Node *node) {
   case ND_RETURN:
     if (node->lhs && is_agg(node->lhs->ty)) {
       // struct/union return: copy the result into the caller's sret buffer (§3d), then
-      // return no value (the IR function is `-> ()`).
+      // return no value (the IR function is `-> ()`). Reload the sret pointer from its frame
+      // slot — `sret_param` is only valid in the entry block, but a return can be in any.
       int src = gen_expr(node->lhs); // an aggregate yields its address (by_address)
-      gen_memcpy(sret_param, src, node->lhs->ty->size);
+      int so = nv++;
+      fprintf(o, "  v%d = i64.const %d\n", so, sret_slot);
+      int sa = nv++;
+      fprintf(o, "  v%d = i64.add " SP " v%d\n", sa, so);
+      int sret = nv++;
+      fprintf(o, "  v%d = i64.load v%d\n", sret, sa);
+      gen_memcpy(sret, src, node->lhs->ty->size);
       fprintf(o, "  return\n");
     } else if (node->lhs) {
       int v = gen_expr(node->lhs);
@@ -1393,8 +1402,13 @@ static void prepare_func(Obj *fn) {
       off += v->ty->size;
     }
   }
-  // Reserve the spill scratch region at the top of the frame (see SCRATCH_BYTES).
-  off = align_to(off, 16) + SCRATCH_BYTES;
+  // Reserve, just below the spill scratch, a hidden 8-byte slot (16-padded) for the sret
+  // pointer of a struct/union-returning function — so a `return <aggregate>` from any block
+  // can reload it. Then the spill scratch region at the top of the frame (see SCRATCH_BYTES).
+  off = align_to(off, 16);
+  if (is_agg(fn->ty->return_ty))
+    off += 16;
+  off += SCRATCH_BYTES;
   fn->stack_size = align_to(off, 16);
 }
 
@@ -1440,8 +1454,10 @@ static void gen_func(Obj *fn) {
   fprintf(o, "block%d(" SP ": i64", nb++);
   int np = 1;
   sret_param = -1;
+  sret_slot = -1;
   if (is_agg(ret)) {
     sret_param = np;
+    sret_slot = fn->stack_size - SCRATCH_BYTES - 16; // the slot reserved by prepare_func
     fprintf(o, ", v%d: i64", np++);
   }
   for (Obj *p = fn->params; p; p = p->next)
@@ -1481,6 +1497,15 @@ static void gen_func(Obj *fn) {
     int addr = nv++;
     fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
     fprintf(o, "  i64.store v%d v%d\n", addr, va_param);
+  }
+  // Stash the hidden sret pointer into its frame slot, so a `return <aggregate>` from any
+  // block (not just the entry, where `sret_param` is the live parameter) can reload it.
+  if (sret_slot >= 0) {
+    int off = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", off, sret_slot);
+    int addr = nv++;
+    fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
+    fprintf(o, "  i64.store v%d v%d\n", addr, sret_param);
   }
   // A promoted non-parameter local starts defined (zero) so it is a valid SSA value on
   // every path before its first assignment (and this subsumes its ND_MEMZERO).
