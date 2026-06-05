@@ -854,6 +854,108 @@ fn c_varargs_end_to_end() {
 }
 
 #[test]
+fn c_function_pointers_end_to_end() {
+    // A function pointer is a funcref index (§3c): assign a function, call through it.
+    assert_eq!(
+        i32_of(
+            "int add(int a, int b){ return a + b; } \
+             int main(){ int (*fp)(int,int) = add; return fp(3, 4); }"
+        ),
+        7
+    );
+    // Indirect call selected at runtime from an array of function pointers (a dispatch
+    // table) — the common C idiom the function table exists for.
+    assert_eq!(
+        i32_of(
+            "int add(int a,int b){return a+b;} int sub(int a,int b){return a-b;} \
+             int mul(int a,int b){return a*b;} \
+             int main(){ int (*ops[3])(int,int) = {add, sub, mul}; \
+               int s = 0; for (int i=0;i<3;i++) s += ops[i](6, 2); return s; }"
+        ),
+        (6 + 2) + (6 - 2) + (6 * 2)
+    );
+    // A callback passed to another function (qsort-shaped: a fn taking a fn pointer),
+    // and a nested indirect call.
+    assert_eq!(
+        i32_of(
+            "int apply(int (*f)(int), int x){ return f(f(x)); } \
+             int inc(int n){ return n + 1; } \
+             int main(){ return apply(inc, 40); }"
+        ),
+        42
+    );
+    // A function pointer stored in a struct and called via `->`.
+    assert_eq!(
+        i32_of(
+            "struct Op { int (*f)(int,int); int x, y; }; \
+             int add(int a,int b){ return a + b; } \
+             int main(){ struct Op o; o.f = add; o.x = 19; o.y = 23; \
+               struct Op *p = &o; return p->f(p->x, p->y); }"
+        ),
+        42
+    );
+    // The explicit `(*fp)(...)` deref-call form, and a *void* function pointer whose only
+    // effect is through a global.
+    assert_eq!(
+        i32_of(
+            "int g; void set(int v){ g = v; } \
+             int main(){ void (*fp)(int) = set; (*fp)(42); return g; }"
+        ),
+        42
+    );
+}
+
+/// I2 (§2a/§3c): an indirect call re-checks the selected function's signature at the use
+/// site, so a function pointer cast to the wrong type — here a no-arg `int(*)(void)` aimed
+/// at a 2-arg function — **traps** (the function-table type-id check), identically on both
+/// backends, rather than calling with a mismatched frame. A type-confused index is inert,
+/// never an escape.
+#[test]
+fn c_function_pointer_signature_mismatch_traps() {
+    let src = "int two(int a, int b){ return a + b; } \
+               int main(){ int (*w)(void) = (int(*)(void))two; return w(); }";
+    let ir = c_to_ir(src);
+    assert!(
+        ir.contains("call_indirect"),
+        "expected an indirect call:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let grant = |h: &mut Host| {
+        [
+            Value::I32(h.grant_stream(StreamRole::Out)),
+            Value::I32(h.grant_stream(StreamRole::In)),
+            Value::I32(h.grant_exit()),
+        ]
+    };
+    let args = grant(&mut hi);
+    grant(&mut hj);
+    let mut fuel = 50_000_000u64;
+    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let jit = compile_and_run_with_host(
+        &m,
+        0,
+        &slots,
+        cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+    assert_eq!(
+        interp,
+        Err(Trap::IndirectCallType),
+        "interp must trap on the signature mismatch\n{ir}"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Trapped(TrapKind::IndirectCallType)),
+        "JIT must trap on the signature mismatch, got {jit:?}\n{ir}"
+    );
+}
+
+#[test]
 fn c_printf_end_to_end() {
     assert_eq!(
         stdout_of("int main() { printf(\"hello, world\\n\"); return 0; }"),
@@ -1062,6 +1164,28 @@ fn c_matches_gcc_functions_and_recursion() {
     );
     assert_matches_gcc(
         "int ack(int m,int n){ if(m==0)return n+1; if(n==0)return ack(m-1,1); return ack(m-1, ack(m,n-1)); } int main(){ return ack(2,3); }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_function_pointers() {
+    // A comparator-driven selection sort (qsort-shaped) plus printf output, validated
+    // against native `cc` — function pointers through a real algorithm, both orderings.
+    assert_matches_gcc(
+        "int asc(int a,int b){ return a - b; } int desc(int a,int b){ return b - a; } \
+         void sort(int *v, int n, int (*cmp)(int,int)){ \
+           for (int i=0;i<n;i++) for (int j=i+1;j<n;j++) \
+             if (cmp(v[j], v[i]) < 0){ int t=v[i]; v[i]=v[j]; v[j]=t; } } \
+         int main(){ int a[5] = {5,3,1,4,2}; \
+           sort(a, 5, asc);  for (int i=0;i<5;i++) printf(\"%d \", a[i]); printf(\"\\n\"); \
+           sort(a, 5, desc); for (int i=0;i<5;i++) printf(\"%d \", a[i]); printf(\"\\n\"); \
+           return a[0]; }",
+    );
+    // A runtime-indexed dispatch table.
+    assert_matches_gcc(
+        "int add(int a,int b){ return a + b; } int sub(int a,int b){ return a - b; } \
+         int main(){ int (*ops[2])(int,int) = {add, sub}; int s = 0; \
+           for (int i=0;i<2;i++) s += ops[i](10, 3); printf(\"%d\\n\", s); return s; }",
     );
 }
 

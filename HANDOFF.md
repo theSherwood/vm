@@ -79,9 +79,21 @@ cargo test -p svm --test c_frontend
 `int`/`long`/`char`/`short`/`_Bool`/`enum`, `float`/`double`; pointers, arrays,
 structs/unions (`.`/`->`, indexing, initializers); globals + string literals; the full
 operator set incl. short-circuit `&&`/`||`/`?:`; `if`/`else`/`while`/`for`/`do`/`switch`
-with `break`/`continue`; functions, parameters, **recursion**, **varargs**; **`printf`**
-and `exit` over the powerbox; **`malloc`/`free`/`calloc`** (guest bump allocator). All
-verify and run identically on interp + JIT, and match native `cc`.
+with `break`/`continue`; functions, parameters, **recursion**, **function pointers**
+(indirect calls via `call_indirect`, dispatch tables, callbacks, fn-ptr struct members),
+**varargs**; **`printf`** and `exit` over the powerbox; **`malloc`/`free`/`calloc`** (guest
+bump allocator). All verify and run identically on interp + JIT, and match native `cc`.
+
+**Indirect calls (function pointers).** A function designator decays to its `ref.func`
+index (an i32 funcref, §3c) widened to the 8-byte C pointer rep (`irty(TY_FUNC)`=i64,
+`by_address` true so a "load" is a no-op returning the funcref). A call through a value
+lowers to `call_indirect (i64 sp, params…[, i64 va]) -> (ret) <i32-wrapped idx>(csp,
+args…)`; the signature **must include the leading data-SP `i64`** so the runtime type-id
+check (`table_lookup`) matches the target. A type-confused/forged index is inert — it
+traps `IndirectCallType` on both backends (I2; see `c_function_pointer_signature_mismatch_traps`).
+The JIT lowers `RefFunc` to an `iconst.i32` and was extended in `ensure_supported`.
+(Coverage gap noted: the generative `jit_fuzz` exercises `call_indirect` but not `ref.func`,
+which is why this JIT gap surfaced only via the C tests — worth adding to the fuzzer.)
 
 Anything unsupported is a **hard `error_tok`** (with the AST node kind), by design — we
 never emit IR we can't stand behind. The frontend is outside the escape-TCB (§2a): the

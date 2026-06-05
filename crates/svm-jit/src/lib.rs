@@ -603,6 +603,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Call { .. }
                 | Inst::CallIndirect { .. }
                 | Inst::CapCall { .. }
+                | Inst::RefFunc { .. }
                 | Inst::IntBin { .. }
                 | Inst::Convert { .. } => {}
                 Inst::IntUn { op, .. } => match op {
@@ -969,6 +970,9 @@ fn lower_block(
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
+            // A funcref is just the function index as plain i32 data (§3c) — the same
+            // value the interpreter materializes; `call_indirect` masks it into the table.
+            Inst::RefFunc { func } => b.ins().iconst(I32, *func as i64),
             _ => return Err(JitError::Unsupported("instruction")),
         };
         // Single-result instruction: record its value and a sound upper bound in lockstep.

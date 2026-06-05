@@ -46,7 +46,11 @@
 // desugaring (`tmp = &A, *tmp = *tmp op B`) is un-desugared for plain-variable targets so
 // loop counters/accumulators promote; address-taken locals, narrow types (char/short/
 // _Bool, whose store truncation we keep in memory), aggregates, and `_Atomic` stay in
-// memory. Indirect calls, by-value aggregate args/returns, and general `goto` remain;
+// memory. **Indirect calls** (C function pointers) lower to `call_indirect` through the
+// function table (§3c): a function designator decays to its `ref.func` index (widened to
+// the 8-byte pointer rep), and `fp(args)` wraps it back to the i32 table index and
+// dispatches with the callee's static signature (incl. the leading data-SP). By-value
+// aggregate args/returns and general `goto` remain;
 // anything unsupported is a hard error (so we never emit IR we cannot stand behind). This
 // is enough C surface for a capable VM: globals, structs, pointers, loops, recursion,
 // floats, varargs/`printf`, and heap allocation all run on interp and JIT.
@@ -206,6 +210,7 @@ static char *irty(Type *ty) {
   case TY_LONG:
   case TY_PTR:
   case TY_ARRAY: // an array decays to its address (a pointer) in value context
+  case TY_FUNC:  // a function decays to its funcref index, widened to the 8-byte ptr rep
     return "i64";
   case TY_FLOAT:
     return "f32";
@@ -289,10 +294,12 @@ static void eval2(Node *a, Node *b, int *va, int *vb) {
   }
 }
 
-// True if a value of type `ty` is held *by address* (arrays/aggregates): reading the
-// lvalue yields its address, not a loaded scalar.
+// True if a value of type `ty` is held *by address* (arrays/aggregates, and functions):
+// reading the lvalue yields its address, not a loaded scalar. A function designator
+// decays to its funcref index (§3c) — its "value" is its address — exactly like an array.
 static bool by_address(Type *ty) {
-  return ty->kind == TY_ARRAY || ty->kind == TY_STRUCT || ty->kind == TY_UNION;
+  return ty->kind == TY_ARRAY || ty->kind == TY_STRUCT || ty->kind == TY_UNION ||
+         ty->kind == TY_FUNC;
 }
 
 // Load the C value of type `ty` from address `addr` (an SSA i64); return its SSA index.
@@ -366,6 +373,16 @@ static void gen_store(Type *ty, int addr, int val) {
 static int gen_addr(Node *node) {
   switch (node->kind) {
   case ND_VAR: {
+    if (node->var->is_function) {
+      // A function designator decays to its funcref index (§3c): `ref.func` yields the
+      // i32 function-table index; widen it to the 8-byte C pointer representation
+      // (function pointers are stored as integers in memory, §3d).
+      int rf = nv++;
+      fprintf(o, "  v%d = ref.func %d\n", rf, func_index(node->var));
+      int r = nv++;
+      fprintf(o, "  v%d = i64.extend_i32_u v%d\n", r, rf);
+      return r;
+    }
     if (node->var->is_local) {
       if (is_promoted(node->var))
         error_tok(node->tok, "codegen_ir: internal — address of a promoted local");
@@ -699,28 +716,41 @@ static int gen_expr(Node *node) {
   case ND_ADDR:
     return gen_addr(node->lhs);
   case ND_FUNCALL: {
-    if (node->lhs->kind != ND_VAR || !node->lhs->var->is_function)
-      error_tok(node->tok, "codegen_ir: only direct calls are supported yet");
+    // A call is direct when the callee is a named function; otherwise it is an indirect
+    // call through a function-pointer *value* (a funcref index, §3c).
+    bool direct = node->lhs->kind == ND_VAR && node->lhs->var->is_function;
     // Intercept the stdio builtins (powerbox §3e) before treating it as a guest call.
-    char *fname = node->lhs->var->name;
-    if (fname) {
-      if (!strcmp(fname, "write"))
-        return gen_builtin_stream(node, STDOUT_SLOT, 1);
-      if (!strcmp(fname, "read"))
-        return gen_builtin_stream(node, STDIN_SLOT, 0);
-      if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
-        return gen_builtin_exit(node);
+    if (direct) {
+      char *fname = node->lhs->var->name;
+      if (fname) {
+        if (!strcmp(fname, "write"))
+          return gen_builtin_stream(node, STDOUT_SLOT, 1);
+        if (!strcmp(fname, "read"))
+          return gen_builtin_stream(node, STDIN_SLOT, 0);
+        if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
+          return gen_builtin_exit(node);
+      }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the
-    // parser). Keep their types too, for marshalling variadic args. If any argument opens
-    // a block, spill each across the rest so all values land in the final block.
+    // parser). Keep their types too, for marshalling variadic args. If any argument — or,
+    // for an indirect call, the callee expression — opens a block, spill each live value
+    // across the rest so they all land in the final block.
     int argv[64];
     Type *argt[64];
     int n = 0;
     bool argbranch = false;
+    if (!direct)
+      argbranch |= has_branch(node->lhs);
     for (Node *a = node->args; a; a = a->next)
       argbranch |= has_branch(a);
     int spillsave = spill_top;
+    // The indirect callee (a funcref) is evaluated first and kept live across the args.
+    int fnval = 0, fnslot = 0;
+    if (!direct) {
+      fnval = gen_expr(node->lhs);
+      if (argbranch)
+        fnslot = spill(fnval, "i64");
+    }
     int spillslot[64];
     for (Node *a = node->args; a; a = a->next) {
       if (n == 64)
@@ -732,6 +762,8 @@ static int gen_expr(Node *node) {
       n++;
     }
     if (argbranch) {
+      if (!direct)
+        fnval = reload(fnslot, "i64");
       for (int i = 0; i < n; i++)
         argv[i] = reload(spillslot[i], irty(argt[i]));
       spill_top = spillsave;
@@ -784,13 +816,37 @@ static int gen_expr(Node *node) {
     int csp = nv++;
     fprintf(o, "  v%d = i64.add " SP " v%d\n", csp, fs);
 
-    int idx = func_index(node->lhs->var);
     bool is_void = node->ty->kind == TY_VOID;
+    // For an indirect call, wrap the 8-byte funcref down to the i32 table index *before*
+    // allocating the result index, so block-local value numbering stays monotonic (the
+    // call's operands must all be strictly-earlier indices).
+    int idx32 = -1;
+    if (!direct) {
+      idx32 = nv++;
+      fprintf(o, "  v%d = i32.wrap_i64 v%d\n", idx32, fnval);
+    }
     int r = is_void ? 0 : nv++;
-    if (is_void)
-      fprintf(o, "  call %d (v%d", idx, csp);
-    else
-      fprintf(o, "  v%d = call %d (v%d", r, idx, csp);
+    if (direct) {
+      int idx = func_index(node->lhs->var);
+      if (is_void)
+        fprintf(o, "  call %d (v%d", idx, csp);
+      else
+        fprintf(o, "  v%d = call %d (v%d", r, idx, csp);
+    } else {
+      // Indirect dispatch through the function table (§3c): call with the callee's static
+      // signature, which must match the target's exactly — including the leading data-SP
+      // i64 and the trailing varargs pointer — or the runtime type-id check traps (a
+      // forged or mismatched index is inert).
+      if (is_void)
+        fprintf(o, "  call_indirect (i64");
+      else
+        fprintf(o, "  v%d = call_indirect (i64", r);
+      for (Type *pt = node->func_ty->params; pt; pt = pt->next)
+        fprintf(o, ", %s", irty(pt));
+      if (variadic)
+        fprintf(o, ", i64"); // the hidden varargs-buffer pointer
+      fprintf(o, ") -> (%s) v%d(v%d", is_void ? "" : irty(node->ty), idx32, csp);
+    }
     for (int i = 0; i < nfixed; i++)
       fprintf(o, ", v%d", argv[i]);
     if (variadic)
