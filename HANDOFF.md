@@ -1,6 +1,6 @@
 # Handoff — C frontend (chibicc → SVM IR) + differential fuzzing
 
-Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-04**.
+Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-05**.
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
@@ -162,7 +162,7 @@ dispatches to `codegen_ir` (see `cc1()` in `main.c`, where the wiring lives). Bu
 `make -C frontend/chibicc` (needs `make` + a C compiler; both present in CI). Build
 artifacts (`*.o`, the `chibicc` binary) are git-ignored.
 
-### Test harness (`crates/svm/tests/c_frontend.rs`, 33 tests, two tiers)
+### Test harness (`crates/svm/tests/c_frontend.rs`, 48 tests, two tiers)
 `make`s the fork once, compiles each C snippet to IR, **verifies it**, then:
 - **Tier 1 (all tests):** runs `main` (function 0 = `_start`) on **both the interpreter
   and the JIT** under identical mock powerboxes and asserts they agree on result, trap,
@@ -371,12 +371,13 @@ real SSA value threaded as a block parameter of every block, exactly like the da
 
 ---
 
-## 5. C-frontend roadmap — items 1–7 all DONE (the agreed stopping point)
+## 5. C-frontend roadmap — items 1–8 all DONE (the agreed stopping point)
 
-The frontend was taken as far as needed for "a capable VM"; items 1–7 below are complete.
-Only item 8 (a perf pass) and the inline "Still TODO" notes (by-value aggregate `sret`,
-general `goto`, a real RO data segment, `fd`→stream mapping) remain, and none block "C
-runs." History order:
+The frontend was taken as far as needed for "a capable VM"; items 1–8 below are complete.
+The once-"Still TODO" items have since landed too — by-value aggregate `sret` (D39), general
+`goto`/labels, and a real read-only data segment (D40) — leaving only minor inline notes
+(`fd`→stream mapping, `%`-width/precision in the mini-printf, narrow-scalar promotion), none of
+which block "C runs." History order:
 
 1. ~~**Short-circuit `&&` / `||` and ternary `?:`**~~ — **DONE** (commit after `0f03686`).
    Lowered with option (b): the merge block carries the result as a second block param
@@ -470,7 +471,7 @@ make -C frontend/chibicc
 printf 'int fib(int n){if(n<2)return n;return fib(n-1)+fib(n-2);} int main(){return fib(10);}\n' > /tmp/t.c
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input /tmp/t.c -cc1-output /tmp/t.svm /tmp/t.c
 cat /tmp/t.svm            # func 0 = _start, func 1 = main calling func 2 = fib; n promotes to v1
-cargo test -p svm --test c_frontend   # 34 tests, all green (interp == JIT, and == cc)
+cargo test -p svm --test c_frontend   # 48 tests, all green (interp == JIT, and == cc)
 cargo test -p svm --test jit_fuzz     # 4000 generated modules, interp == JIT
 ```
 If those pass, you're oriented.
@@ -525,10 +526,14 @@ incompleteness not contradiction:
   address-taken/aggregate locals stay in memory), flat-buffer varargs, guest `malloc` over
   the window, LP64 + pinned `char`/`long double`. The promotion split (SSA value vs
   data-stack slot) is exactly the §3d "local classification" — minus the data-SP being
-  register-pinned in `vmctx`, which is still a plain threaded value. **Deferred SETTLED
-  features (not contradictions):** by-value aggregate args/returns by hidden pointer (D39),
-  const→RO data segment via `protect` (D40), a real IR data section (we use `_start`
-  byte-stores), and narrow-scalar promotion.
+  register-pinned in `vmctx`, which is still a plain threaded value. **Since the early
+  drafts, several once-deferred §3d features have landed:** by-value aggregate args/returns
+  by hidden pointer (D39, the `sret` work — §2), a real IR `data` section with const/string
+  globals as read-only segments via `protect` (D40 — §10), and general `goto`/labels. **Genuine
+  remaining deferrals (incompleteness, not contradictions):** narrow-scalar (`char`/`short`/
+  `_Bool`) promotion (they stay in memory for store-truncation), `malloc`/`free` backed by the
+  `map` capability (today a guest bump allocator over a window heap), and the data-SP being a
+  threaded value rather than register-pinned in `vmctx`.
 - **De-risking moves from §18 now in place:** interpreter-as-oracle differential fuzzing
   (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend, **the verifier escape-oracle**
   (verified ⇒ in-window final memory, §8/§10), **and guard-page/signal detect-and-kill**
@@ -581,7 +586,7 @@ this is the index.)
   `unmap`/`protect` impls + `check_prot`), and the JIT side uses real `libc::mprotect` on the
   window pages, differentially fuzzed. `malloc` is still a guest bump allocator, not backed by
   `map`. **Still left** (so this stays unchecked): **demand paging** on fault, **growth**
-  into the reserved tail (sparse address space, §98), and surfacing the Memory cap in the
+  into the reserved tail (sparse address space, §4), and surfacing the Memory cap in the
   *main* irgen fuzzer. The guard-page + signal foundation above is what demand paging builds on.
 - [x] **Verifier escape-oracle fuzzer** — *done*: the differential now byte-compares the
   final guest window across interp + JIT (verified ⇒ in-window), in the 4000 stable seeds
@@ -816,7 +821,7 @@ regressions one commit old"):
    snapshot). **(b)** the JIT passed `mem_size = reserved` (the mask domain, 2^40) to the cap thunk
    instead of the backed `mapped` extent, so buffer borrows / Memory-cap ops bounded against the
    wrong size → now threads `mapped` into `Lower` and passes it. **Deferred (increment 4+):** growth
-   (`map` into the reserved tail = sparse address space, §98); demand paging on fault; surfacing the
+   (`map` into the reserved tail = sparse address space, §4); demand paging on fault; surfacing the
    Memory cap in the *main* irgen fuzzer (capture path needs restore_rw, now in place) — **next is
    (1): a guest consumer**, D40 const→read-only data segment via `protect` at `_start`.
 
