@@ -365,8 +365,17 @@ static int gen_load(Type *ty, int addr) {
     fprintf(o, "  v%d = i32.load16_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
     break;
   case TY_INT:
-  case TY_ENUM:
     fprintf(o, "  v%d = i32.load v%d\n", r, addr);
+    break;
+  case TY_ENUM:
+    // A packed enum (`enum __attribute__((packed))`, parse.c) is 1/2/4 bytes; load at its
+    // actual width, then it is an ordinary i32 value. A plain enum is `int`.
+    if (ty->size == 1)
+      fprintf(o, "  v%d = i32.load8_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+    else if (ty->size == 2)
+      fprintf(o, "  v%d = i32.load16_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+    else
+      fprintf(o, "  v%d = i32.load v%d\n", r, addr);
     break;
   case TY_LONG:
   case TY_PTR:
@@ -397,8 +406,16 @@ static void gen_store(Type *ty, int addr, int val) {
     fprintf(o, "  i32.store16 v%d v%d\n", addr, val);
     break;
   case TY_INT:
-  case TY_ENUM:
     fprintf(o, "  i32.store v%d v%d\n", addr, val);
+    break;
+  case TY_ENUM:
+    // Store a packed enum at its actual width (1/2/4 bytes); a plain enum is `int`.
+    if (ty->size == 1)
+      fprintf(o, "  i32.store8 v%d v%d\n", addr, val);
+    else if (ty->size == 2)
+      fprintf(o, "  i32.store16 v%d v%d\n", addr, val);
+    else
+      fprintf(o, "  i32.store v%d v%d\n", addr, val);
     break;
   case TY_LONG:
   case TY_PTR:

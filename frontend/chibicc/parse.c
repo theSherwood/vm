@@ -110,6 +110,7 @@ static bool is_typename(Token *tok);
 static Type *declspec(Token **rest, Token *tok, VarAttr *attr);
 static Type *typename(Token **rest, Token *tok);
 static Type *enum_specifier(Token **rest, Token *tok);
+static Token *attribute_list(Token *tok, Type *ty);
 static Type *typeof_specifier(Token **rest, Token *tok);
 static Type *type_suffix(Token **rest, Token *tok, Type *ty);
 static Type *declarator(Token **rest, Token *tok, Type *ty);
@@ -751,6 +752,10 @@ static bool consume_end(Token **rest, Token *tok) {
 static Type *enum_specifier(Token **rest, Token *tok) {
   Type *ty = enum_type();
 
+  // Optional attributes between `enum` and the tag/body, e.g. `enum __attribute__((packed))`
+  // — gcc sizes such an enum to the smallest integer type holding its values (applied below).
+  tok = attribute_list(tok, ty);
+
   // Read a struct tag.
   Token *tag = NULL;
   if (tok->kind == TK_IDENT) {
@@ -770,9 +775,10 @@ static Type *enum_specifier(Token **rest, Token *tok) {
 
   tok = skip(tok, "{");
 
-  // Read an enum-list.
+  // Read an enum-list (tracking the value range, for a packed enum's storage size).
   int i = 0;
   int val = 0;
+  int64_t lo = 0, hi = 0;
   while (!consume_end(rest, tok)) {
     if (i++ > 0)
       tok = skip(tok, ",");
@@ -783,9 +789,30 @@ static Type *enum_specifier(Token **rest, Token *tok) {
     if (equal(tok, "="))
       val = const_expr(&tok, tok->next);
 
+    if (val < lo)
+      lo = val;
+    if (val > hi)
+      hi = val;
+
     VarScope *sc = push_scope(name);
     sc->enum_ty = ty;
     sc->enum_val = val++;
+  }
+
+  // `enum __attribute__((packed))`: storage is the smallest integer type holding all values
+  // (gcc semantics). Only the layout size/align change; enum constants stay `int` in
+  // expressions. Without this, the enum is `int` (4 bytes) and structs containing it grow.
+  if (ty->is_packed) {
+    if (lo >= 0) {
+      ty->size = hi <= 0xff ? 1 : hi <= 0xffff ? 2 : hi <= 0xffffffffLL ? 4 : 8;
+      ty->is_unsigned = true; // all-nonnegative packed enum → unsigned storage (gcc)
+    } else {
+      ty->size = (lo >= -128 && hi <= 127)         ? 1
+                 : (lo >= -32768 && hi <= 32767)   ? 2
+                 : (lo >= -2147483648LL && hi <= 2147483647LL) ? 4
+                                                   : 8;
+    }
+    ty->align = ty->size;
   }
 
   if (tag)
@@ -2613,12 +2640,12 @@ static Token *attribute_list(Token *tok, Type *ty) {
         tok = skip(tok, ",");
       first = false;
 
-      if (consume(&tok, tok, "packed")) {
+      if (consume(&tok, tok, "packed") || consume(&tok, tok, "__packed__")) {
         ty->is_packed = true;
         continue;
       }
 
-      if (consume(&tok, tok, "aligned")) {
+      if (consume(&tok, tok, "aligned") || consume(&tok, tok, "__aligned__")) {
         tok = skip(tok, "(");
         ty->align = const_expr(&tok, tok);
         tok = skip(tok, ")");

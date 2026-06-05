@@ -85,12 +85,21 @@ producing the same render commands as a native `cc` build (`svm-run` test
   overflowing cranelift's 32-bit PC-relative relocations (an intermittent ~1/6
   `compiled_blob.rs` panic on large modules) — now 25/25 clean.
 
-All but the two `parse.c` edits live in our own crates / `codegen_ir.c`. **Known minor
-discrepancy (not a correctness bug):** `Clay_MinMemorySize()` reports ~254 KB on the VM vs
-~246 KB native (≈32 bytes/element over 256 elements) — a struct *size-estimate* difference
-(some internal array's element is padded differently in our layout); the computed layout
-(render commands) is byte-identical, so it's a conservative over-estimate, not a layout bug.
-Worth a look if struct-layout parity matters later (§3d pins x86-64-SysV layout).
+**Struct-layout parity with gcc (fixed).** Initially every Clay struct holding a small enum
+was bigger on the VM (`Clay_MinMemorySize` ~254 KB vs ~246 KB native) — chibicc sized **every
+`enum` as `int` (4 bytes)**, while gcc honours Clay's `enum __attribute__((packed))` (1 byte).
+This matters for host↔guest data exchange (a host writing structured data into the window must
+agree on layout; §3d pins x86-64-SysV). Two-part fix:
+- `enum_specifier` (parse.c) now parses `__attribute__((packed))`/`__packed__` and sizes the
+  enum to the smallest integer type holding its values (1/2/4/8 bytes), and `gen_load`/
+  `gen_store` access a packed enum at that width (it was always an i32 load → it read adjacent
+  bytes; caught by `c_matches_gcc_packed_enums`).
+- ship a minimal `frontend/chibicc/include/stdint.h`. Without it, `#include <stdint.h>` pulled
+  the system `<sys/cdefs.h>`, which — because chibicc isn't `__GNUC__` — `#define`s
+  `__attribute__(x)` to nothing, **silently stripping the attribute** before the parser saw it.
+After both, **all 80 Clay struct sizes and `Clay_MinMemorySize` match gcc exactly**, and Clay
+still renders identically. All edits except the three `parse.c` ones + `stdint.h` live in our
+own crates / `codegen_ir.c`.
 
 ### Invocation
 ```

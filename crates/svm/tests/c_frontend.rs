@@ -1310,6 +1310,28 @@ fn c_matches_gcc_global_relocations() {
 }
 
 #[test]
+fn c_matches_gcc_packed_enums() {
+    // `enum __attribute__((packed))` sizes to the smallest integer type holding its values
+    // (gcc semantics), so a struct containing small enums has the **same layout** as gcc —
+    // which matters for host↔guest data exchange (§3d pins x86-64-SysV layout). chibicc
+    // previously made every enum `int` (4 bytes); found via Clay. `sizeof`/offsets and the
+    // exit code are all compared to native `cc`.
+    assert_matches_gcc(
+        "typedef enum __attribute__((__packed__)) { A, B, C } E; \
+         struct S { E first; int x; E second; char c; }; \
+         int main(){ struct S s = { .first=B, .x=7, .second=C, .c='z' }; \
+           printf(\"%d %d %d %d %d\\n\", (int)sizeof(E), (int)sizeof(struct S), \
+                  s.first, s.second, s.c); \
+           return (int)sizeof(struct S); }",
+    );
+    // A packed enum forced wider by its value range (> 255 → 2 bytes), still matching gcc.
+    assert_matches_gcc(
+        "typedef enum __attribute__((packed)) { LO = 0, HI = 1000 } W; \
+         int main(){ printf(\"%d\\n\", (int)sizeof(W)); return (int)sizeof(W); }",
+    );
+}
+
+#[test]
 fn c_matches_gcc_clay_fixes() {
     // Four frontend/IR fixes surfaced by compiling the Clay layout library, each validated
     // against native `cc`.
