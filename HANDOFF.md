@@ -101,6 +101,15 @@ After both, **all 80 Clay struct sizes and `Clay_MinMemorySize` match gcc exactl
 still renders identically. All edits except the three `parse.c` ones + `stdint.h` live in our
 own crates / `codegen_ir.c`.
 
+**Second real library — jsmn (clean).** The [jsmn](https://github.com/zserge/jsmn) JSON
+tokenizer (`demos/jsmn/`, MIT, vendored) — a deliberately *different* shape from Clay (pure
+char/state-machine string scanning, zero allocations) — compiled and ran **byte-identical to
+native cc on the first try**, including string escapes, `\u` unicode, deep nesting, the
+`-2`/`-3` error codes, and `JSMN_STRICT` mode. No new fixes needed: after the Clay batch the
+frontend is robust enough that a clean library just works. Test `demo_jsmn_matches_native`.
+(Also fixed `assert_demo_matches_cc` to flatten `/` in subdir demo names — it was silently
+skipping the comparison for `jsmn/jsmn_demo.c`.)
+
 ### Invocation
 ```
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.svm a.c

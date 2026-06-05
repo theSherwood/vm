@@ -130,7 +130,7 @@ fn assert_demo_matches_cc(name: &str) {
     let exe = std::env::temp_dir().join(format!(
         "svm_demo_{}_{}",
         std::process::id(),
-        name.replace('.', "_")
+        name.replace(['.', '/'], "_") // flatten subdirs (e.g. `jsmn/jsmn_demo.c`) into one name
     ));
     match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
         Ok(s) if s.success() => {}
@@ -206,6 +206,15 @@ fn demo_clay_layout_runs() {
 #[test]
 fn demo_rational_matches_native() {
     assert_demo_matches_cc("rational.c");
+}
+
+/// The jsmn JSON tokenizer (`demos/jsmn/jsmn.h`, MIT, vendored) — a different shape from Clay:
+/// pure char/state-machine string scanning, zero allocations. Tokenizes a JSON string sandboxed
+/// and prints the token types/spans; output must match a native `cc` build. (It needed no new
+/// fixes — a clean validation that string parsing, escapes, nesting, and error paths work.)
+#[test]
+fn demo_jsmn_matches_native() {
+    assert_demo_matches_cc("jsmn/jsmn_demo.c");
 }
 
 /// If the chibicc frontend is buildable, the CLI compiles and runs the C demo too — the same
