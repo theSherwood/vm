@@ -130,6 +130,18 @@ goto/switch lowering and struct layout hold up under a gnarly real-world state m
 vendoring edit: `miniz_tinfl.c`'s `#include "miniz.h"` → `#include "miniz_tinfl.h"` (so the
 inflate path is self-contained, no deflate/zip headers). Test `demo_tinfl_matches_native`.
 
+**Sixth real library — stb_perlin / the first float shakedown (clean).** Every earlier
+shakedown was integer/pointer/struct shaped, so the IR's **f32 path** had differential-fuzz
+coverage but no *real-program* coverage. [stb_perlin](https://github.com/nothings/stb) (Sean
+Barrett, public domain, `demos/perlin/`, vendored unmodified) is dense f32 arithmetic — gradient
+dot products, the quintic ease polynomial, trilinear lerps, int↔float `fastfloor`, and
+multiply/accumulate chains over octaves (fbm/turbulence/ridge). `perlin_demo.c` provides the one
+libc function the octave variants need (`fabs`, no libm) and prints each value as a **fixed-point
+integer** rather than via float formatting — so any divergence in the actual f32 arithmetic
+between native cc and our JIT would land in the digits. It matched **byte-for-byte with no new
+fixes** — good first evidence the f32 lowering is sound on real code. Test
+`demo_perlin_matches_native`.
+
 ### Invocation
 ```
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.svm a.c

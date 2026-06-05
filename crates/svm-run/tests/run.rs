@@ -244,6 +244,16 @@ fn demo_tinfl_matches_native() {
     assert_demo_matches_cc("tinfl/tinfl_demo.c");
 }
 
+/// stb_perlin (Sean Barrett, public domain, vendored) — the series' first floating-point-heavy
+/// shakedown. Dense f32 arithmetic (gradient dot products, the quintic ease polynomial, trilinear
+/// lerps), int<->float conversion, and multiply/accumulate chains over octaves. The driver prints
+/// each noise value as a fixed-point integer, so any f32 divergence from native `cc` would show in
+/// the digits; output matches byte-for-byte with no new fixes.
+#[test]
+fn demo_perlin_matches_native() {
+    assert_demo_matches_cc("perlin/perlin_demo.c");
+}
+
 /// If the chibicc frontend is buildable, the CLI compiles and runs the C demo too — the same
 /// greeting from C source. Skipped (not failed) when the toolchain is unavailable.
 #[test]

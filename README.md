@@ -98,6 +98,7 @@ cargo run -p svm-run -- crates/svm-run/demos/jsmn/jsmn_demo.c  # the jsmn JSON t
 cargo run -p svm-run -- crates/svm-run/demos/sha256/sha_demo.c # SHA-256 (known test vectors)
 cargo run -p svm-run -- crates/svm-run/demos/xxhash/xxh_demo.c # xxHash (XXH32/XXH64)
 cargo run -p svm-run -- crates/svm-run/demos/tinfl/tinfl_demo.c # miniz tinfl (DEFLATE inflate)
+cargo run -p svm-run -- crates/svm-run/demos/perlin/perlin_demo.c # stb_perlin (3D Perlin noise, floats)
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
@@ -123,6 +124,11 @@ against the standard vectors; it added `_Static_assert` (C11) support to the fro
 *inflate* engine — a coroutine-style state machine (a deeply nested `switch`, bit-buffer shifts,
 Huffman tables, a 32 KiB LZ77 dictionary inside the decompressor struct); it inflates an embedded
 zlib stream byte-identically to a native build, with no new fixes.
+**`perlin/perlin_demo.c`** runs [stb_perlin](https://github.com/nothings/stb) (Sean Barrett's 3D
+Perlin noise) — the first **floating-point-heavy** shakedown (dense f32 gradient dot products, the
+quintic ease polynomial, trilinear lerps, int↔float conversion, octave multiply/accumulate); it
+prints fixed-point-scaled noise so any f32 divergence would show in the digits, and it matches a
+native build byte-for-byte.
 
 Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
 located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —
