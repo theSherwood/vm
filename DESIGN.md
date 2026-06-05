@@ -566,6 +566,26 @@ Consequences:
   the optimization deferred for `call_indirect`. Cross-domain / slow capabilities are
   just a vtable whose entries are trampoline stubs (marshal to supervisor / ring
   submit, §9).
+  - **Devirtualization is deferred, and the cost of doing it is the reason (not just
+    laziness).** Today `cap.call` lowers to one fixed generic host thunk: marshal args
+    into an `i64` slot array, `call_indirect` the thunk, and the **host** does the
+    mask + `type_id` + `generation` resolve — the JIT does *no* authority work, so its
+    role carries no authority-TCB. Devirtualizing pulls binding-resolution and
+    check-elision *into* the escape/authority-TCB codegen, where a miscompile is an
+    authority bug (wrong handler / elided liveness check) — the class AGENTS.md says not
+    to invite without a concrete demand. It also fights the **compile ⊥ instantiate**
+    split (§3a): the binding is set at *instantiation*, after the (parallel/AOT/lazy)
+    JIT runs, so devirtualization must either couple codegen to one instantiation
+    (losing compile-once-instantiate-many + the startup win), guard-and-deopt (eroding
+    the gain), or re-patch at instantiation (complexity). Soundly skipping the
+    `generation` re-check is moreover legal only for a **provably-stable, never-revoked**
+    handle (powerbox imports), so the general case stays generic regardless. And it
+    addresses only *half* the measured cost — the generic `i64`-array arg ABI is separate,
+    and an arbitrary **Rust** handler can't be inlined into CLIF, so the realistic ceiling
+    is "direct call + register args (~parity)," not free. **Measured (`bench/` hostcall):
+    scalar `cap.call` is ~1.24× a wasm import today; the defensible §1a interface win —
+    the zero-copy borrow buffer (`hostbuf`, ~1.8× *faster*) — needs none of this.** Revisit
+    only if a real workload makes scalar host-call latency a measured bottleneck (D45).
 - A forged handle index is **inert**: it traps (wrong type / dead generation /
   OOB-masked-to-wrong-type) or selects one of *this domain's own* granted type-`I`
   capabilities. The guest never supplies `e.methods`/`e.object` (host memory), so it
@@ -1850,7 +1870,7 @@ as open-ended, not a byproduct of the build.
 | D42 | MVP cap ops use a **negative-errno `i64`** result (`≥0` success value, `<0` `-errno`); errors never trap; buffer args are borrow-only `(ptr,len)` validated at the trampoline (`-EFAULT` on overflow) | Settled | Syscall-shaped (§7), 1:1 with the C libc shim; keeps traps reserved for escape/fatal (§3b) |
 | D43 | MVP capability set = `Stream` (stdio via 3 handles), `Exit`, `Clock`, `Memory`; stdio reuses one `Stream` interface (not a bespoke Console) so files/sockets compose later | Settled | First concrete handle-table interfaces (§3c) + C-runtime targets (§3d); orthogonal, one interface to verify (§3e) |
 | D44 | Powerbox = `entry(stdin, stdout, stderr, exit, clock, memory, args_buffer)`; args buffer = `{argc,envc}` + packed NUL-terminated strings | Settled | Concrete instantiation grant + C `main` wrapper contract (§3b/§3d/§3e) |
-| D45 | `cap.call` dispatch is **per-entry** (vtable in the `HandleEntry`), not per-type — generally an indirect call (retpoline/eIBRS), devirtualized to direct/inline when the binding is statically known | Settled | Corrects §3c over-claim; one interface type has many implementations per handle, and §14 virtualization (pass-through vs parent-emulated) needs per-handle dispatch; forgery checks unchanged |
+| D45 | `cap.call` dispatch is **per-entry** (vtable in the `HandleEntry`), not per-type — generally an indirect call (retpoline/eIBRS), devirtualized to direct/inline when the binding is statically known. **Devirtualization is deferred — cost recorded in §3c** (authority-TCB in codegen, fights compile⊥instantiate, sound only for stable handles, only half the measured cost; scalar `cap.call` ~1.24× wasm but the zero-copy buffer win needs none of it) | Settled (devirt deferred) | Corrects §3c over-claim; one interface type has many implementations per handle, and §14 virtualization (pass-through vs parent-emulated) needs per-handle dispatch; forgery checks unchanged. Deferral is a recorded trade, not an oversight — don't relitigate without a measured workload |
 | D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **discovery is static by default**, optional `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; static imports keep no-ambient-authority + the §9 egress-closure analysis intact; registry stays outside the TCB |
 | D47 | Escape-freedom is the **conjunction** `Verified ∧ Correct(JIT) ∧ Correct(runtime) ∧ Correct(host/HW)`, not "verified ⇒ safe"; TCB split into **escape-TCB vs authority-TCB**; decomposed into invariants **I1–I5** (owner + validation each); written as a **structured-prose contract**, not a proof | Settled | Puts risk where it lives (JIT dominates, not the verifier); makes host-extensible caps safe (authority-TCB ≠ escape-TCB); anchors the security work; matches the "as secure as wasm" bar (§2a) |
 | D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
