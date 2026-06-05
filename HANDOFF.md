@@ -578,6 +578,23 @@ Have (✅):
     wins big. Net: §1a's two memory claims both hold — we clearly **beat wasm64**, and the
     **wasm32 gap is now ~1.2–1.36×** (mask elision closed roughly half of it; the residual
     is wasm32's truly-free guard-page access, which needs real guard pages, §5).
+- [x] **Interface / host-call kernels (`hostcall`, `hostbuf`) — the §1a "around-compute" axis.**
+  Each times one guest→host→guest crossing per iteration (own `N_HOST_BIG`): SVM `cap.call`
+  through the bench trampoline thunk vs a **Wasmtime imported host function** (a `Linker`), both
+  via Cranelift, results cross-checked. `Mode::HostCall` on `Resolved` selects the cap-thunk SVM
+  path + import-linked wasm path in `measure`. **Honest findings** (best-of-5, machine-dependent):
+  - `hostcall` (scalar `x→x+1` round-trip): svm **~1.24× slower**. `cap.call` lowers to a
+    *generic* indirect thunk that packs args into an i64 array; the **devirtualize-to-direct-call
+    win (D45) is deferred**, so this is the honest baseline that optimization will move.
+  - `hostbuf` (zero-copy `(ptr,len)` **borrow buffer**, 64 B, host sums in place — the §7 path):
+    svm **~1.8× faster** — *even vs a fair cached-`Memory` wasm baseline* (the wasm host fn caches
+    the exported memory in `Store` data to avoid a per-call `get_export` lookup — I fixed an
+    initial strawman where the naive lookup inflated wasm to a fake ~6×). The real win is
+    structural: SVM hands the host the window base for free; Wasmtime still pays `mem.data(&caller)`
+    per call. **This substantiates §1a's strongest claim.** The *larger* §1a win (vs the component
+    model's lift/lower marshalling, and async rings) is a heavier comparison, **not** attempted.
+  Both are tracked in `baseline.txt` (appended rows, measured on the dev container — a maintainer
+  may re-baseline all rows on a canonical machine for cross-row consistency).
 
 Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
 regressions one commit old"):

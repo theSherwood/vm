@@ -11,6 +11,14 @@
 //!     masks the final address (one `AND`); wasm32 gets the zero-instruction large-guard
 //!     trick (so it wins), while wasm64 must emit an explicit bounds check per access (so a
 //!     mask beats it). The memory kernel is therefore timed against *both* wasm memory types.
+//!   - **interface / host calls → the "around-compute" axis** (§1a, the strongest claimed
+//!     win). `hostcall` times a scalar `cap.call` round-trip vs a Wasmtime imported function;
+//!     `hostbuf` times a zero-copy `(ptr,len)` **borrow buffer** the host reads in place (§7)
+//!     vs a (cached-memory) wasm import doing the same read. Honest current state: scalar
+//!     cap.call is *slower* (a generic arg-packing thunk; the devirtualize-to-direct-call
+//!     win, D45, is deferred), while the zero-copy buffer path is *faster* (the host gets the
+//!     window base for free). The larger §1a claim — vs the component model's lift/lower
+//!     marshalling, and async rings — is a heavier comparison, not attempted here.
 //!
 //! Each kernel is written once in our IR text and once (or twice) in equivalent WAT; we
 //! assert all engines agree on the result before timing (so we never benchmark a miscompile).
@@ -44,11 +52,18 @@
 //! +26%; losing SSA promotion would be far larger). `--check`/`--save-baseline` default to
 //! `--reps 5` (best-of, to stabilise the comparison); plain/`--csv` use one pass for speed.
 
+use std::ffi::c_void;
 use std::hint::black_box;
 use std::time::Instant;
 
-use svm_jit::{compile_and_run, JitOutcome};
-use wasmtime::{Config, Engine, Instance, Module, Store, TypedFunc};
+use svm_jit::{compile_and_run, compile_and_run_with_host, JitOutcome};
+use wasmtime::{Caller, Config, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
+
+/// Wasmtime store state: the host-call buffer benchmark **caches the exported `Memory`** here
+/// (populated after instantiation) so its host fn accesses linear memory without a per-call
+/// `get_export("memory")` string lookup — the fair, perf-conscious wasm baseline. `None` for
+/// compute kernels, which never touch host state.
+type HostState = Option<Memory>;
 
 struct Kernel {
     name: &'static str,
@@ -262,6 +277,10 @@ block3(v24: i64):
 
 const N_SMALL: i64 = 1_000;
 const N_BIG: i64 = 2_000_000;
+// Host-call kernels do real boundary crossings per iteration (≫ a compute op), so they use a
+// smaller iteration span — still large enough that the subtraction isolates per-call cost.
+const N_HOST_SMALL: i64 = 1_000;
+const N_HOST_BIG: i64 = 200_000;
 
 /// Compile + run a kernel's IR entry once and return the single `i64` result. `lead` is the
 /// fixed leading args (e.g. the data-stack pointer chibicc threads as v0); `n` is appended.
@@ -274,6 +293,65 @@ fn svm_call(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
     }
 }
 
+/// A minimal capability host trampoline for the interface benchmark: op 0 is a scalar
+/// round-trip (`x -> x+1`); op 1 sums a `(ptr, len)` **borrow buffer** read in place from the
+/// window (the §7 zero-copy path). It does the least work that still forces the call, so the
+/// timing isolates the boundary-crossing cost rather than the work.
+///
+/// # Safety
+/// Honours the [`svm_jit::CapThunk`] contract: `args`/`results` are valid for their declared
+/// lengths, and for op 1 the kernel passes in-window constants so `[ptr, ptr+len) ⊆ window`.
+unsafe extern "C" fn bench_thunk(
+    _ctx: *mut c_void,
+    mem_base: *mut u8,
+    _mem_size: u64,
+    _type_id: u32,
+    op: u32,
+    _handle: i32,
+    args: *const i64,
+    n_args: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) {
+    let a = std::slice::from_raw_parts(args, n_args as usize);
+    let r: i64 = match op {
+        // op 1: sum the borrow buffer in place (no copy) — the §7 zero-copy I/O path.
+        1 => {
+            let (ptr, len) = (a[0] as usize, a[1] as usize);
+            let buf = std::slice::from_raw_parts(mem_base.add(ptr), len);
+            buf.iter().map(|&b| b as i64).sum()
+        }
+        // op 0: scalar round-trip.
+        _ => a[0].wrapping_add(1),
+    };
+    if n_results > 0 {
+        *results = r;
+    }
+    *trap_out = 0;
+}
+
+/// Like [`svm_call`] but drives the cap.call trampoline ([`bench_thunk`]) — for `HostCall`
+/// kernels. The context pointer is unused (the thunk is stateless), so it is null.
+fn svm_call_host(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
+    let mut args: Vec<i64> = lead.to_vec();
+    args.push(n);
+    match compile_and_run_with_host(m, entry, &args, bench_thunk, std::ptr::null_mut()) {
+        Ok(JitOutcome::Returned(s)) => s[0],
+        other => panic!("svm jit (host-call) produced {other:?}"),
+    }
+}
+
+/// What a kernel measures. `Compute` kernels run an import-less wasm module and the no-cap
+/// SVM JIT (per-iteration *compute*). `HostCall` kernels instead make one host crossing per
+/// iteration — SVM `cap.call` through a trampoline thunk vs a Wasmtime **imported host
+/// function** — so the subtraction isolates the *per-host-call* cost (§1a interface axis).
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Compute,
+    HostCall,
+}
+
 /// A kernel resolved for this run: IR text — hand-written, or generated from C through the
 /// chibicc frontend — plus how to invoke its entry. `svm_call` appends `n` after `lead_args`.
 struct Resolved {
@@ -283,6 +361,7 @@ struct Resolved {
     lead_args: Vec<i64>,
     wat32: String,
     wat64: Option<String>,
+    mode: Mode,
 }
 
 /// The hand-written [`KERNELS`] plus, when the C frontend is buildable, the chibicc-lowered
@@ -297,6 +376,7 @@ fn resolve_kernels() -> Vec<Resolved> {
             lead_args: Vec::new(),
             wat32: k.wat32.to_string(),
             wat64: k.wat64.map(|w| w.to_string()),
+            mode: Mode::Compute,
         })
         .collect();
     for k in [alu_from_c(), locals_from_c()] {
@@ -305,7 +385,118 @@ fn resolve_kernels() -> Vec<Resolved> {
             Err(e) => eprintln!("note: skipping a C-frontend kernel (frontend unavailable): {e}"),
         }
     }
+    // Interface (host-call) kernels — the §1a "around-compute" axis the harness was missing.
+    v.push(hostcall_kernel());
+    v.push(hostbuf_kernel());
     v
+}
+
+/// Interface benchmark — **scalar host round-trip.** Each iteration makes one guest→host→guest
+/// crossing: SVM `cap.call` (op 0) through the trampoline thunk vs a Wasmtime imported function
+/// `host.op`, both `x -> x+1`. The subtraction isolates the per-call boundary cost. (Today SVM's
+/// `cap.call` lowers to a *generic* indirect thunk that packs args into an array — the
+/// devirtualize-to-direct-call optimization, D45, is deferred — so this is the honest baseline a
+/// future inlining win will move.)
+fn hostcall_kernel() -> Resolved {
+    Resolved {
+        name: "hostcall".into(),
+        ir: "\
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i32.const 0
+  v11 = cap.call 0 0 (i64) -> (i64) v10(v9)
+  v12 = i64.add v8 v11
+  v13 = i64.const 1
+  v14 = i64.add v9 v13
+  br block1(v7, v12, v14)
+block3(v15: i64):
+  return v15
+}
+"
+        .into(),
+        entry: 0,
+        lead_args: Vec::new(),
+        wat32: r#"
+(module
+  (import "host" "op" (func $op (param i64) (result i64)))
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc (i64.add (local.get $acc) (call $op (local.get $i))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#
+        .into(),
+        wat64: None,
+        mode: Mode::HostCall,
+    }
+}
+
+/// Interface benchmark — **zero-copy borrow buffer (the strongest §1a claim).** Each iteration
+/// hands the host a `(ptr, len)` buffer the host reads **in place** from the window (§7) and
+/// sums — no marshalling, no copy-out. SVM `cap.call` (op 1) passes the window base to the thunk
+/// directly; the Wasmtime import `host.sum` must fetch the exported `memory` and slice it. Both
+/// are zero-copy in a *core* embedding (the larger §1a win is vs the component model's lift/lower,
+/// not measured here), so this isolates the per-call buffer-access overhead. Buffer is 64 B of
+/// zero-initialized window (the work is the read, not the value; the result is 0 on both).
+fn hostbuf_kernel() -> Resolved {
+    Resolved {
+        name: "hostbuf".into(),
+        ir: "\
+memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i32.const 0
+  v11 = i64.const 0
+  v12 = i64.const 64
+  v13 = cap.call 0 1 (i64, i64) -> (i64) v10(v11, v12)
+  v14 = i64.add v8 v13
+  v15 = i64.const 1
+  v16 = i64.add v9 v15
+  br block1(v7, v14, v16)
+block3(v17: i64):
+  return v17
+}
+"
+        .into(),
+        entry: 0,
+        lead_args: Vec::new(),
+        wat32: r#"
+(module
+  (import "host" "sum" (func $sum (param i32 i32) (result i64)))
+  (memory (export "memory") 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc (i64.add (local.get $acc) (call $sum (i32.const 0) (i32.const 64))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#
+        .into(),
+        wat64: None,
+        mode: Mode::HostCall,
+    }
 }
 
 /// Compile `src` through the chibicc frontend and wrap its `run` as a kernel timed against
@@ -332,6 +523,7 @@ fn c_kernel(name: &str, src: &str, lead: Vec<i64>, wat32: String) -> Result<Reso
         lead_args: lead,
         wat32,
         wat64: None,
+        mode: Mode::Compute,
     })
 }
 
@@ -421,10 +613,48 @@ fn compile_c_to_ir(src: &str) -> Result<String, String> {
 }
 
 /// Compile + instantiate a wasm module and return its `(i64) -> i64` entry, store and all.
-fn wasm_entry(engine: &Engine, wasm: &[u8]) -> (Store<()>, TypedFunc<i64, i64>) {
+fn wasm_entry(engine: &Engine, wasm: &[u8]) -> (Store<HostState>, TypedFunc<i64, i64>) {
     let module = Module::new(engine, wasm).expect("wasmtime compile");
-    let mut store = Store::new(engine, ());
+    let mut store = Store::new(engine, None);
     let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
+    let run = instance
+        .get_typed_func(&mut store, "run")
+        .expect("entry `run`");
+    (store, run)
+}
+
+/// Like [`wasm_entry`] but links the host imports the `HostCall` kernels need — the wasm
+/// counterpart of [`bench_thunk`]: `host.op` (`x -> x+1`) and `host.sum` (sum a `(ptr, len)`
+/// slice read in place from linear memory). The exported `Memory` is **cached in the store**
+/// so `host.sum` skips the per-call export lookup — the perf-conscious wasm baseline, so the
+/// comparison is like-for-like: both engines do the same zero-copy read, only the boundary
+/// mechanism differs.
+fn wasm_entry_host(engine: &Engine, wasm: &[u8]) -> (Store<HostState>, TypedFunc<i64, i64>) {
+    let module = Module::new(engine, wasm).expect("wasmtime compile");
+    let mut linker: Linker<HostState> = Linker::new(engine);
+    linker
+        .func_wrap("host", "op", |x: i64| -> i64 { x.wrapping_add(1) })
+        .expect("define host.op");
+    linker
+        .func_wrap(
+            "host",
+            "sum",
+            |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i64 {
+                let mem = caller.data().expect("memory cached in store"); // Memory is Copy
+                let data = mem.data(&caller);
+                let (p, l) = (ptr as usize, len as usize);
+                data[p..p + l].iter().map(|&b| b as i64).sum()
+            },
+        )
+        .expect("define host.sum");
+    let mut store = Store::new(engine, None);
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate (host-call)");
+    // Cache the exported memory (if any) so `host.sum` avoids a per-call export lookup.
+    if let Some(mem) = instance.get_memory(&mut store, "memory") {
+        *store.data_mut() = Some(mem);
+    }
     let run = instance
         .get_typed_func(&mut store, "run")
         .expect("entry `run`");
@@ -443,15 +673,21 @@ fn per_call(iters: u32, mut f: impl FnMut()) -> f64 {
     t.elapsed().as_secs_f64() / iters as f64
 }
 
-/// Per-iteration steady-state compute (ns) of a compiled wasm entry, via subtraction.
-fn wasm_compute_ns(store: &mut Store<()>, run: &TypedFunc<i64, i64>) -> f64 {
+/// Per-iteration time (ns) of a compiled wasm entry, via subtraction over `[n_small, n_big]`
+/// (steady-state compute for `Compute` kernels; per-host-call for `HostCall` kernels).
+fn wasm_compute_ns(
+    store: &mut Store<HostState>,
+    run: &TypedFunc<i64, i64>,
+    n_big: i64,
+    n_small: i64,
+) -> f64 {
     let big = per_call(100, || {
-        black_box(run.call(&mut *store, N_BIG).unwrap());
+        black_box(run.call(&mut *store, n_big).unwrap());
     });
     let small = per_call(100, || {
-        black_box(run.call(&mut *store, N_SMALL).unwrap());
+        black_box(run.call(&mut *store, n_small).unwrap());
     });
-    (big - small) * 1e9 / (N_BIG - N_SMALL) as f64
+    (big - small) * 1e9 / (n_big - n_small) as f64
 }
 
 /// Raw per-iteration timings for one kernel (ns for compute, ms for cold start), each the
@@ -485,23 +721,37 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
         .wat64
         .as_deref()
         .map(|wat| wat::parse_str(wat).expect("assemble wasm64 WAT"));
-    let svm = |n: i64| svm_call(&m, k.entry, &k.lead_args, n);
+    // `Compute` kernels time the inner loop; `HostCall` kernels make one host crossing per
+    // iteration, so they use the no-cap vs cap-thunk SVM path, the import-linked wasm path, and
+    // a smaller iteration span (a host call ≫ a compute op).
+    let (n_big, n_small) = match k.mode {
+        Mode::Compute => (N_BIG, N_SMALL),
+        Mode::HostCall => (N_HOST_BIG, N_HOST_SMALL),
+    };
+    let svm = |n: i64| match k.mode {
+        Mode::Compute => svm_call(&m, k.entry, &k.lead_args, n),
+        Mode::HostCall => svm_call_host(&m, k.entry, &k.lead_args, n),
+    };
+    let inst = |wasm: &[u8]| match k.mode {
+        Mode::Compute => wasm_entry(engine, wasm),
+        Mode::HostCall => wasm_entry_host(engine, wasm),
+    };
 
     // Cross-check every engine agrees before timing (never benchmark a miscompile).
-    let ours = svm(N_SMALL);
+    let ours = svm(n_small);
     {
-        let (mut s32, run32) = wasm_entry(engine, &wasm32);
+        let (mut s32, run32) = inst(&wasm32);
         assert_eq!(
             ours,
-            run32.call(&mut s32, N_SMALL).unwrap(),
+            run32.call(&mut s32, n_small).unwrap(),
             "kernel `{}`: svm vs wasm32 disagree",
             k.name
         );
         if let Some(w) = &wasm64 {
-            let (mut s64, run64) = wasm_entry(engine, w);
+            let (mut s64, run64) = inst(w);
             assert_eq!(
                 ours,
-                run64.call(&mut s64, N_SMALL).unwrap(),
+                run64.call(&mut s64, n_small).unwrap(),
                 "kernel `{}`: svm vs wasm64 disagree",
                 k.name
             );
@@ -516,23 +766,25 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
         wmt_cold: f64::INFINITY,
     };
     for _ in 0..reps.max(1) {
-        // --- steady-state compute (subtraction isolates the loop body) ---
+        // --- per-iteration time (subtraction isolates the loop body / the host call) ---
         let svm_big = per_call(25, || {
-            black_box(svm(N_BIG));
+            black_box(svm(n_big));
         });
         let svm_small = per_call(25, || {
-            black_box(svm(N_SMALL));
+            black_box(svm(n_small));
         });
         raw.svm_ns = raw
             .svm_ns
-            .min((svm_big - svm_small) * 1e9 / (N_BIG - N_SMALL) as f64);
+            .min((svm_big - svm_small) * 1e9 / (n_big - n_small) as f64);
 
-        let (mut s32, run32) = wasm_entry(engine, &wasm32);
-        raw.w32_ns = raw.w32_ns.min(wasm_compute_ns(&mut s32, &run32));
+        let (mut s32, run32) = inst(&wasm32);
+        raw.w32_ns = raw
+            .w32_ns
+            .min(wasm_compute_ns(&mut s32, &run32, n_big, n_small));
 
         if let Some(w) = &wasm64 {
-            let (mut s64, run64) = wasm_entry(engine, w);
-            let v = wasm_compute_ns(&mut s64, &run64);
+            let (mut s64, run64) = inst(w);
+            let v = wasm_compute_ns(&mut s64, &run64, n_big, n_small);
             raw.w64_ns = Some(raw.w64_ns.unwrap().min(v));
         }
 
@@ -542,7 +794,7 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
         }) * 1e3;
         raw.svm_cold = raw.svm_cold.min(svm_cold);
         let wmt_cold = per_call(60, || {
-            let (mut s, f) = wasm_entry(engine, &wasm32);
+            let (mut s, f) = inst(&wasm32);
             black_box(f.call(&mut s, 0).unwrap());
         }) * 1e3;
         raw.wmt_cold = raw.wmt_cold.min(wmt_cold);
@@ -670,6 +922,11 @@ fn print_table(results: &[(Resolved, Raw)]) {
          Expect: alu compute ≈1×; cold-start <1×.  Memory: wasm32 < svm always (guard\n\
          pages are free); svm < wasm64 once addresses *vary* (scatter) so Wasmtime can't\n\
          CSE the bounds check — memsum (same addr) lets it, so wasm64 looks ~tied there.\n\
+         Interface (host calls, §1a): `hostcall` (scalar cap.call vs a wasm import) is svm-\n\
+         slower today — cap.call is a generic arg-packing thunk; devirtualization (D45) is\n\
+         deferred. `hostbuf` (a zero-copy (ptr,len) borrow buffer the host reads in place)\n\
+         is svm-faster even vs a cached-memory wasm import — the §7 win. Their `ns/it` and\n\
+         `ratio` columns are per *host call* (N_big={N_HOST_BIG}), not per compute iteration.\n\
          N_big={N_BIG} N_small={N_SMALL}\n"
     );
     println!(

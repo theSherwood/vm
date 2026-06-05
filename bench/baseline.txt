@@ -8,3 +8,5 @@ memsum,1.492,1.117,0.334
 scatter,1.444,0.823,0.332
 alu_c,1.026,NA,0.995
 locals_c,2.264,NA,0.998
+hostcall,1.235,NA,0.560
+hostbuf,0.546,NA,0.458
