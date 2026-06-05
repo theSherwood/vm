@@ -1311,6 +1311,20 @@ fn c_matches_gcc_global_relocations() {
 
 #[test]
 fn c_matches_gcc_aggregates() {
+    // Two upstream chibicc parser bugs, found via the Clay layout library and fixed in
+    // `frontend/chibicc/parse.c`, both around designated initializers into **anonymous**
+    // aggregates (pervasive in real C). (1) `struct_designator` only special-cased anonymous
+    // *structs*, so a designator targeting an anonymous *union* member NULL-derefed (segfault).
+    // (2) `struct_initializer2` didn't skip the separator comma when a designated member landed
+    // in a nested anonymous aggregate, so a following designator failed to parse. Validate
+    // both against native `cc`.
+    assert_matches_gcc(
+        "struct S { union { int config; struct { int tc; int data; }; }; int flag; }; \
+         int main(){ struct S a = { .tc = 5, .flag = 1 };      /* fix (1)+(2) */ \
+                     struct S b = { .flag = 9, .config = 7 };  /* anonymous-union member */ \
+                     printf(\"%d %d %d %d\\n\", a.tc, a.flag, b.config, b.flag); \
+                     return a.tc + a.flag; }",
+    );
     // Regression (demos/rational.c): a struct returned from a **non-entry block** — inside a
     // loop, and after it. The sret pointer is a parameter that only lives in the entry block,
     // so it is stashed to a frame slot and reloaded on return; earlier it was read from the

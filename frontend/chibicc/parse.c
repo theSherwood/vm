@@ -1002,8 +1002,11 @@ static Member *struct_designator(Token **rest, Token *tok, Type *ty) {
     error_tok(tok, "expected a field designator");
 
   for (Member *mem = ty->members; mem; mem = mem->next) {
-    // Anonymous struct member
-    if (mem->ty->kind == TY_STRUCT && !mem->name) {
+    // Anonymous struct/union member. (SVM fix: upstream chibicc checked only TY_STRUCT
+    // here, so a designated initializer `.field = …` on a struct containing an anonymous
+    // *union* fell through to the regular branch and dereferenced mem->name (NULL) →
+    // segfault. Match the canonical idiom in get_struct_member, which handles both.)
+    if ((mem->ty->kind == TY_STRUCT || mem->ty->kind == TY_UNION) && !mem->name) {
       if (get_struct_member(mem->ty, tok)) {
         *rest = start;
         return mem;
@@ -1182,14 +1185,16 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
 
 // struct-initializer2 = initializer ("," initializer)*
 static void struct_initializer2(Token **rest, Token *tok, Initializer *init, Member *mem) {
-  bool first = true;
-
   for (; mem && !is_end(tok); mem = mem->next) {
     Token *start = tok;
 
-    if (!first)
+    // Skip the separator comma when one is present. (SVM fix: upstream skipped it only on
+    // non-first members. But this continuation is also entered right after a *designated*
+    // member with `tok` AT the comma — `{ .a = x, .b = y }` where `.a` lands in a nested
+    // anonymous aggregate — so the first member must skip it too. The other caller, struct
+    // brace-elision, enters at a value with no leading comma, so the guard leaves it alone.)
+    if (equal(tok, ","))
       tok = skip(tok, ",");
-    first = false;
 
     if (equal(tok, "[") || equal(tok, ".")) {
       *rest = start;

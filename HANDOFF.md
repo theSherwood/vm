@@ -53,6 +53,24 @@ that walks chibicc's typed AST and emits **our text IR** instead of x86-64 asm, 
 `--emit-ir` flag. Everything else in `frontend/chibicc/` is upstream chibicc (don't
 edit it unless you must; keep the diff small).
 
+**Two upstream `parse.c` fixes** (the only edits outside `codegen_ir.c`), both genuine chibicc
+bugs found by trying to compile the **Clay** layout library, both around designated
+initializers into **anonymous** aggregates (very common in real C), each validated against a
+gcc matrix + the full suite with zero regressions:
+1. `struct_designator` special-cased only anonymous *structs*, so a designator targeting an
+   anonymous *union* member dereferenced a NULL `mem->name` → **segfault**. Now matches the
+   canonical `get_struct_member` idiom (`TY_STRUCT || TY_UNION`).
+2. `struct_initializer2` skipped the separator comma only on non-first members, but it is also
+   entered right after a *designated* member (tok at the comma) when that member lands in a
+   nested anonymous aggregate — so a following designator (`{ .a = x, .b = y }`) failed to
+   parse. Now skips a leading comma when present (handling both callers: designated
+   continuation at a comma, and brace-elision at a value).
+
+With these, Clay parses ~3485/5058 lines (was: instant segfault). The next blocker is a
+*backend* gap — **passing a struct by value through a variadic function** (our varargs
+marshalling calls `irty` per arg, which rejects aggregates) — and Clay also can't *run* under
+the fixed 64 KB window (`memory 16`); full Clay support is a multi-slice effort, not pursued.
+
 ### Invocation
 ```
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.svm a.c
