@@ -113,6 +113,28 @@ emitted (goto-into-nested-block); labels at block/function scope — the cleanup
 machine idioms — work. With this, the **C ABI (§3d) is feature-complete** for the MVP
 subset: indirect calls, by-value aggregates, and goto all land.
 
+**Global pointer initializers / relocations.** A global initialized with a pointer
+(`char *p = "..."`, `&global`, `&arr[k]`, function pointers, and arrays/structs of them)
+carries a chibicc relocation chain (`g->rel`: `{offset, char **label, addend}`).
+`emit_data_segments` now resolves each at compile time — every global's window offset
+(`layout_globals`) and function's funcref index (`funcs[]`) is already assigned — and patches
+the 8-byte little-endian value (`symbol_value(target) + addend`) into the data image, which
+is emitted as an ordinary `data`/`data ro` segment. A function-pointer target resolves to its
+funcref index (§3c), so global dispatch tables compose with `call_indirect`. No runtime
+relocation step; nothing relocation-specific reaches the IR/verifier/JIT (it's just bytes).
+Tests: interp↔JIT differential + native-`cc` oracle (pointer-to-global, array-element
+addend, pointer-to-pointer, struct-with-pointer-member, global fn-ptr tables, string-literal
+`char*`, array-of-`char*`).
+
+**Fuzzing — data segments now generated.** The generative interp↔JIT differential
+(`support/irgen.rs`, shared by the stable `jit_fuzz` test and the libFuzzer `diff` target)
+previously emitted `data: Vec::new()`. It now generates 0–3 in-window `data` segments
+(rarely `readonly`), so interp↔JIT **data-initialization agreement** is fuzzed — caught
+strongly by the existing final-window byte compare — plus the RO-protect fault path (both
+backends protect page-granularly, so they agree). This is exactly the surface globals lower
+onto. `generator_covers_*` gained assertions that non-empty and read-only data segments are
+actually produced (so the coverage can't silently regress).
+
 **Indirect calls (function pointers).** A function designator decays to its `ref.func`
 index (an i32 funcref, §3c) widened to the 8-byte C pointer rep (`irty(TY_FUNC)`=i64,
 `by_address` true so a "load" is a no-op returning the funcref). A call through a value

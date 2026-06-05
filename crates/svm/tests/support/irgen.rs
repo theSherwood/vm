@@ -637,11 +637,43 @@ pub fn gen_module(g: &mut Gen) -> Module {
     let funcs = (0..nfuncs)
         .map(|fi| gen_func(g, fi, &sigs, has_mem))
         .collect();
+    let data = if has_mem {
+        gen_data(g, 1u64 << 16)
+    } else {
+        Vec::new()
+    };
     Module {
         funcs,
         memory,
-        data: Vec::new(),
+        data,
     }
+}
+
+/// Generate initialized data segments (§3a / D40) within the window `[0, size)`. Both
+/// backends copy them over the escape-oracle seed at instantiation and protect the
+/// `readonly` ones page-granularly (the interp rounds to whole pages, matching the JIT's
+/// `mprotect`), so this fuzzes interp↔JIT agreement on **data initialization** — caught
+/// strongly by the final-window byte compare — and exercises the RO-protect fault path.
+/// This is the surface C globals lower onto (`data`/`data ro` segments, incl. pointer
+/// relocations), previously unfuzzed (`data: Vec::new()`).
+fn gen_data(g: &mut Gen, size: u64) -> Vec<Data> {
+    let n = g.below(4); // 0..=3 segments
+    (0..n)
+        .map(|_| {
+            // Modest length so a whole-page RO protection can't blanket the window and
+            // starve value/escape-oracle coverage; offset keeps `[offset, offset+len) ⊆
+            // [0, size)` (the verifier's `DataOutOfWindow` bound).
+            let len = g.below(64) as u64;
+            let offset = g.below((size - len) as u32) as u64;
+            let bytes = (0..len).map(|_| g.byte()).collect();
+            let readonly = g.below(8) == 0; // rare: RO pages fault on store
+            Data {
+                offset,
+                readonly,
+                bytes,
+            }
+        })
+        .collect()
 }
 
 /// Random argument `Value`s matching `params` (for invoking the entry function). Defined

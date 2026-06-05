@@ -27,9 +27,16 @@ fn jit_matches_interp_on_generated_modules() {
 fn generator_covers_loops_indirect_and_cap_calls() {
     use svm_ir::{Inst, Terminator};
     let (mut loops, mut indirect, mut cap) = (0u32, 0u32, 0u32);
+    let (mut data, mut data_ro) = (0u32, 0u32);
     for seed in 0..2000u64 {
         let mut g = Gen::from_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED_5EED);
         let m = irgen::gen_module(&mut g);
+        data += m.data.iter().filter(|d| !d.bytes.is_empty()).count() as u32;
+        data_ro += m
+            .data
+            .iter()
+            .filter(|d| d.readonly && !d.bytes.is_empty())
+            .count() as u32;
         for f in &m.funcs {
             for (bi, blk) in f.blocks.iter().enumerate() {
                 let back = |t: u32| t as usize <= bi; // a back-edge re-enters this/an earlier block
@@ -60,4 +67,6 @@ fn generator_covers_loops_indirect_and_cap_calls() {
     assert!(loops > 0, "generator produced no loop back-edges");
     assert!(indirect > 0, "generator produced no call_indirect");
     assert!(cap > 0, "generator produced no cap.call");
+    assert!(data > 0, "generator produced no (non-empty) data segments");
+    assert!(data_ro > 0, "generator produced no read-only data segments");
 }

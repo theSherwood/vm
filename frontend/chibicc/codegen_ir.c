@@ -22,11 +22,14 @@
 // copies it into its own frame), a struct/union return uses a hidden `sret` pointer the
 // callee writes through (the function is `-> ()`), and whole-aggregate assignment is a
 // byte copy. **Globals + string literals** live at fixed
-// window offsets in a data region below the data stack; a synthetic **`_start`**
-// (function 0) takes the powerbox capability handles, stashes them in a reserved region,
-// writes globals' initializer bytes into the window, then calls `main` with the initial
-// data-SP. (A real read-only data segment per §3a later replaces the byte stores; globals
-// holding pointers/relocations are not handled yet.) **Stdio over the powerbox** (§3e):
+// window offsets in a data region below the data stack, emitted as module-level `data`
+// segments (§3a) the runtime copies in (string literals as `data ro`, D40). **Pointer
+// initializers become relocations** (§3a): `char *p = "..."`, `&global`, `&arr[k]`,
+// function pointers, and arrays/structs of them are resolved at compile time to the
+// target's window offset (or funcref index, §3c) + addend, written little-endian into the
+// data image. A synthetic **`_start`** (function 0) takes the powerbox capability handles,
+// stashes them in a reserved region, then calls `main` with the initial
+// data-SP. **Stdio over the powerbox** (§3e):
 // `write`/`read`/`exit` are recognized builtins lowered to `cap.call` on the stashed
 // Stream/Exit handles — so real C reaches stdout/stdin and terminates with an exit code.
 // **Floats** (`float`=f32, `double`/`long double`=f64) work too: arithmetic, compares,
@@ -1554,18 +1557,39 @@ static bool layout_globals(Obj *prog) {
   return any;
 }
 
+// Resolve a relocation's target symbol to the value stored in the data image: a data
+// global's window offset, or a function's funcref index (§3c — a function pointer in
+// memory is its function-table index). Every global offset (layout_globals) and function
+// index (funcs[]) is assigned before data is emitted, so the value is a compile-time
+// constant — there is no runtime relocation step.
+static long symbol_value(Obj *prog, char *name) {
+  for (Obj *s = prog; s; s = s->next)
+    if (s->name && !strcmp(s->name, name))
+      return s->is_function ? func_index(s) : s->offset;
+  return 0; // unreachable for a well-formed whole-program module (defensive NULL)
+}
+
 // Emit a module-level `data` segment (§3a) for each initialized global: the runtime copies
 // the bytes into the window at instantiation, replacing the old per-byte `_start` init stores.
+// Pointer initializers (`char *p = "..."`, `&global`, `&arr[k]`, function pointers, and
+// arrays/structs of them) become **relocations** (§3a): each writes the 8-byte little-endian
+// window address of its target symbol + addend into the image, computed here since all
+// offsets/indices are known.
 static void emit_data_segments(Obj *prog) {
   for (Obj *g = prog; g; g = g->next) {
     if (g->is_function || !g->init_data)
       continue;
-    if (g->rel)
-      error_tok(g->tok, "codegen_ir: global initialized with a pointer (relocation) "
-                        "not supported yet");
+    int size = g->ty->size;
+    unsigned char *buf = calloc(size ? size : 1, 1);
+    memcpy(buf, g->init_data, size);
+    for (Relocation *r = g->rel; r; r = r->next) {
+      unsigned long val = (unsigned long)(symbol_value(prog, *r->label) + r->addend);
+      for (int i = 0; i < 8 && r->offset + i < size; i++)
+        buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
+    }
     fprintf(o, "data %s%d \"", is_rodata(g) ? "ro " : "", g->offset);
-    for (int i = 0; i < g->ty->size; i++) {
-      unsigned char c = (unsigned char)g->init_data[i];
+    for (int i = 0; i < size; i++) {
+      unsigned char c = buf[i];
       if (c == '\\')
         fprintf(o, "\\\\");
       else if (c == '"')
@@ -1576,6 +1600,7 @@ static void emit_data_segments(Obj *prog) {
         fprintf(o, "\\x%02x", c);
     }
     fprintf(o, "\"\n");
+    free(buf);
   }
 }
 

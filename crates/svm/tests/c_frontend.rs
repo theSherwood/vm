@@ -941,6 +941,44 @@ fn c_goto_end_to_end() {
 }
 
 #[test]
+fn c_global_pointer_relocations_end_to_end() {
+    // A global pointer initialized with the address of another global (a relocation): the
+    // frontend resolves the target's window offset at compile time into the data image.
+    assert_eq!(
+        i32_of("int x = 5; int *p = &x; int main(){ return *p; }"),
+        5
+    );
+    // Pointer into an array element — exercises the relocation addend.
+    assert_eq!(
+        i32_of("int a[3] = {10, 20, 30}; int *p = &a[1]; int main(){ return *p; }"),
+        20
+    );
+    // A pointer to a pointer (chained relocations).
+    assert_eq!(
+        i32_of("int x = 99; int *p = &x; int **pp = &p; int main(){ return **pp; }"),
+        99
+    );
+    // A struct global mixing a pointer member (relocation) with a raw scalar.
+    assert_eq!(
+        i32_of(
+            "struct S { int *p; int n; }; int v = 7; struct S s = {&v, 3}; \
+             int main(){ return *s.p + s.n; }"
+        ),
+        10
+    );
+    // A global function-pointer table: each entry relocates to a funcref index (§3c), and an
+    // indirect call dispatches through it — composes global relocations with part-1 calls.
+    assert_eq!(
+        i32_of(
+            "int f(int x){ return x + 1; } int g(int x){ return x * 2; } \
+             int (*tbl[2])(int) = {f, g}; \
+             int main(){ return tbl[0](10) + tbl[1](10); }"
+        ),
+        11 + 20
+    );
+}
+
+#[test]
 fn c_by_value_aggregates_end_to_end() {
     // Struct passed by value (callee copies the caller's value into its own frame, §3d).
     assert_eq!(
@@ -1294,6 +1332,26 @@ fn c_matches_gcc_goto() {
          retry: tries++; if(tries<3) goto retry; \
            int sum=0; for(int i=0;i<5;i++){ if(i==2) goto skip; sum+=i; skip:; } \
            printf(\"%d %d\\n\", tries, sum); return sum; }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_global_relocations() {
+    // A global char* to a string literal (the relocation targets read-only data), printed.
+    assert_matches_gcc(
+        "char *greeting = \"hello, globals\\n\"; \
+         int main(){ printf(\"%s\", greeting); return 0; }",
+    );
+    // An array of string pointers — a classic relocation-heavy table.
+    assert_matches_gcc(
+        "char *days[3] = {\"Mon\", \"Tue\", \"Wed\"}; \
+         int main(){ for(int i=0;i<3;i++) printf(\"%s \", days[i]); printf(\"\\n\"); return 0; }",
+    );
+    // A global dispatch table of function pointers, called in a loop.
+    assert_matches_gcc(
+        "int add(int a,int b){return a+b;} int mul(int a,int b){return a*b;} \
+         int (*ops[2])(int,int) = {add, mul}; \
+         int main(){ int s=0; for(int i=0;i<2;i++) s+=ops[i](6,7); printf(\"%d\\n\", s); return s; }",
     );
 }
 

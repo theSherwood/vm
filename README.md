@@ -26,7 +26,9 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > **differential-tested against the interpreter** oracle (§18), including trap kinds and
 > host side effects. A **C frontend** (`frontend/chibicc`, a vendored chibicc fork with an
 > `--emit-ir` backend, §3d) compiles a broad C subset — ints/longs/floats, locals,
-> pointers, arrays, structs/unions, globals & string literals, the full operator set
+> pointers, arrays, structs/unions, globals & string literals (incl. **pointer
+> initializers / relocations** — `char *p = "..."`, `&global`, function-pointer tables),
+> the full operator set
 > incl. short-circuit `&&`/`||`/`?:`, `if`/`while`/`for`/`do`/`switch` with
 > `break`/`continue` and **general `goto`/labels**, functions and **recursion** (via a threaded data-stack pointer),
 > **function pointers** (a function designator decays to its `ref.func` index; `fp(args)`
