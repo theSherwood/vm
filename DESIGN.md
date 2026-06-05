@@ -1498,6 +1498,35 @@ cross-domain, supervisor, capability bookkeeping); the *software-isolation half*
 Frameworks like the seL4 Core Platform / Microkit, CAmkES, or Genode would host
 our components.
 
+### Platform abstraction & portability  [OPEN — Linux/macOS first, Windows next]
+
+The escape-critical core is **already portable**: confinement masking (§4) is pure
+arithmetic (`svm-mask` is `no_std`, dependency-free), so the security hinge carries no
+OS-specific code. Portability concentrates in two **non-TCB** layers, isolated behind a thin
+**Platform Abstraction Layer** (PAL) in the runtime/JIT — never in the audited crates:
+
+- **Virtual-memory management** — reserve a large window, commit the backed prefix, guard
+  the tail: `mmap(PROT_NONE)`/`mprotect` (Linux/macOS) ↔ `VirtualAlloc`
+  (`MEM_RESERVE`→`MEM_COMMIT`) + `PAGE_NOACCESS` (Windows).
+- **Trap-catching safety net (§5 detect-and-kill)** — an out-of-window fault → a clean
+  `MemoryFault`: POSIX `SIGSEGV`/`SIGBUS` + `sigsetjmp`/`siglongjmp` (Linux/macOS) ↔ Windows
+  **VEH/SEH** on `EXCEPTION_ACCESS_VIOLATION`. **macOS caveat:** Mach exceptions
+  (`EXC_BAD_ACCESS`) can intercept ahead of BSD signals (the Wasmtime macOS wrinkle).
+- **Futex layer (§12 `wait`/`notify`)** — Linux `futex` ↔ macOS `os_sync`/`__ulock` ↔
+  Windows `WaitOnAddress`.
+
+**Lever:** we share Cranelift (D36), and **Wasmtime has already solved cross-platform trap
+handling + VA management on all three OSes** — same backend, same problem — so the PAL
+borrows a proven design rather than inventing one in §18's riskiest area.
+
+**Tier portability is not uniform:** tier-1 **MPK/PKU is Linux/x86-only**; on macOS and
+Windows tier 1 degrades to tier 0 (masking + MMU) or tier 3 (separate process). Tiers 0 and
+3 are portable. State this so the isolation story is not over-promised off Linux.
+
+**Staging:** Linux + macOS first (the current unix path; the `compile_error!` in `svm-jit`
+is a *temporary* gate, not a permanent stance), Windows VEH/SEH next. Window/mask/interp
+logic is platform-independent; only the PAL is per-OS.
+
 ---
 
 ---
@@ -1542,6 +1571,119 @@ browser — good enough here.
   a driver bug is *contained, not catastrophic*. Side channels (pixel-timing,
   contention) → §9-style covert-channel posture. **DoS is the honest weak spot**
   (coarse GPU preemption) → meter + timeout + context-kill.
+
+---
+
+## 19. Debugging & observability  [DESIGN — new]
+
+Good debugging is a **first-class ergonomics goal**, not an afterthought. The architecture
+yields three debugging pillars cheaply, plus one that is real work — pursue all three cheap
+ones as pillars and stage the expensive one.
+
+1. **Record/replay & time-travel — nearly free, a genuine differentiator.** With no ambient
+   authority (§7), *all* guest nondeterminism enters through capabilities. Logging
+   `cap.call` inputs/outputs and seeding the deterministic mode (§12) yields a fully
+   **replayable** trace — the capability boundary *is* the recording boundary. Time-travel
+   (step backward) follows from deterministic replay to any prior point.
+2. **Trustworthy backtraces even after corruption — free.** The out-of-band control stack
+   (D5/§5) holds return addresses the guest cannot forge or smash, so unwinding yields a
+   reliable stack trace even when the in-window data stack is corrupted — the inverse of
+   native debugging, where a smashed stack destroys the backtrace.
+3. **Reference interpreter as a debug engine — cheap.** Single-step / breakpoint /
+   watchpoint over a masked, contiguous window is straightforward and deterministic with no
+   JIT plumbing; address watchpoints are trivial (the window is one buffer).
+4. **Source-level debugging (the real work, staged).** Preserve source-location +
+   variable-location info **frontend → an IR debug-info side-table (§3a) → Cranelift →
+   DWARF**, so gdb/lldb and VS Code (via **DAP**) set breakpoints and inspect variables in
+   the *source* language. Cranelift already emits DWARF for JIT code (Wasmtime precedent);
+   the new piece is threading debug info through *our* IR.
+
+**Debugger = a host-side capability** (an `Inspector`/`Debugger`, shaped like the §15
+`Monitor`): it *observes* a guest from outside, so it never widens the guest's authority and
+fits the ocap model. Debug info is **tooling, untrusted for escape** (§2a) — strippable, and
+the verifier never trusts it.
+
+**Tension to record (it entangles the §3d perf pass):** SSA promotion gives a promoted local
+**no memory address**, so it is not inspectable as a variable. A debug build therefore either
+**disables promotion** (locals stay in-window, addressable) or emits **Cranelift
+value-location lists** so the debugger finds the register/stack slot — the classic
+`-O0`-vs-optimized-debug trade, here tangled with our headline optimization.
+
+---
+
+## 20. Frontends & language on-ramps  [OPEN — strategy settled, vehicle deferred]
+
+chibicc is the **MVP frontend** (§3d); the goal is to be a target for **many** languages.
+The enabling principle should be explicit:
+
+- **The IR is the stable target/ABI; frontends are plugins; every frontend is
+  untrusted-for-escape (§2a) and re-checked by the verifier.** Adding a language therefore
+  costs **no TCB** — the eBPF lesson, generalized.
+
+Two distinct on-ramps (different bets; the design records both, **priority deferred**):
+
+- **LLVM → our IR (breadth):** buys *every LLVM language* (C, C++, Rust, Swift, Zig…) from
+  one component. The team-tractable form is a **PNaCl-style LLVM-bitcode→IR translator** (the
+  cited NaCl/PNaCl "SSA as a sandbox target" lineage), not a from-scratch TableGen backend.
+  Caveat: LLVM bitcode is not a stable format — pin a frozen subset, as PNaCl did.
+- **wasm → our IR (compat):** the whole wasm ecosystem, cheaply — but inherits wasm's
+  structured/relooped CFG and 32-bit-flavored memory, so it does not showcase our §1a edges.
+
+**Thesis worth stating: we are a strictly better LLVM target than wasm.** Native irreducible
+control flow (D2, no relooper), the 64-bit address space, multi-value returns, and
+first-class tail calls (D6) are exactly what LLVM emits and what wasm forces a frontend to
+contort — a real §1a differentiator.
+
+**Hard parts to name (not hide):** C++ exceptions / unwinding (the §18 unwind-table open
+item), `setjmp`/`longjmp` and EH lowered onto §6 stack-switching, intrinsic coverage, and the
+non-negotiable **two-stack constraint** (§3d) — any frontend must place address-taken objects
+on the in-window data stack, scalars in SSA, control out-of-band, exactly as `codegen_ir.c`
+does. Generalizing that discipline to LLVM is the work.
+
+---
+
+## 21. Host/guest boundary: synchrony & nesting cost  [SETTLED — clarification]
+
+Consolidates what §9/§12/§14 imply but never state in one place: **how synchronous the
+host/guest (and guest/guest-as-host) boundary is.**
+
+- **One call shape, and it is synchronous.** `cap.call` produces a result (§3b); the MVP caps
+  return a synchronous negative-errno `i64` (D42). There is no separate "async instruction."
+  **So host↔guest can be entirely synchronous — that is the default.**
+- **"Async" is a construction *on top*, not a second mechanism.** The §12 async-first ABI
+  applies only to *blocking-capable* ops: such an op returns a **completion handle**
+  synchronously and the runtime parks the fiber (§12 event-parking). Non-blocking caps
+  (compute/codec/GC/`map`/vDSO-read) are plain synchronous calls (§9 paths 1–3); a single-
+  fiber C guest with nothing else to run simply blocks its vCPU, paying nothing.
+- **Synchronous in both directions.** Reentrancy (§12): a host handler may call back into
+  guest code on the *same fiber* (a `qsort` comparator, a GC callback) — synchronous
+  host→guest as well as guest→host.
+- **Nesting (§14):** a child capability resolves at grant time to a **pass-through** (one hop
+  to the ultimate handler, zero added cost at any depth) or the **parent's own handler**
+  (parent virtualizing). A virtualized op runs **synchronously on the child's calling
+  fiber** — child `cap.call` → trampoline → parent handler → return — composing to any depth.
+
+**The governing principle:**
+
+> **Synchrony is interface-guaranteed; cost is host policy the guest cannot observe.**
+
+`cap.call` is always synchronous in *shape*, and the child "cannot tell whether a capability
+is real or parent-emulated" (§14). Only the *realized cost* differs, gated by **isolation
+tier**, not by the interface:
+
+- **Same process (tiers 0/1 — cooperating / nested sub-window):** trampoline + table lookup,
+  **inline-able to ~free, no flush** (§9 path 1). Virtualized hops add one trampoline each;
+  pass-through hops add nothing → the zero-overhead-nesting steady state.
+- **Across distrust (tier 3 — separate process):** the interface stays synchronous in
+  *shape*, but is realized as IPC + (crossing distrust) the Spectre flush tax (§9 path 6).
+  Keep it cheap by **batching via async shared-memory rings** (§13 / §9 path 5) — which is
+  *why* the ABI is async-first: to amortize the **distrust** boundary, not because the cheap
+  one needs it.
+
+**Honest caveat:** a synchronous blocking chain across nesting levels (child blocks →
+parent-as-host blocks on *its* host → …) blocks the vCPU per level (§12 overcommit), and
+parent-virtualized faults are the slow path (§14). Bounded, but it is where synchronous
+nesting bites.
 
 ---
 
@@ -1699,3 +1841,8 @@ as open-ended, not a byproduct of the build.
 | D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
 | D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |
 | D50 | **Accept the mask cost on unbounded-base accesses; do not pursue 32-bit window addressing.** Mask elision (§4 guard-when-bounded) covers *provably-bounded* addresses; for an unbounded base (the threaded data-SP in C locals) we keep the single AND mask (`locals_c` ~2.26× wasm32, still < wasm64) rather than lower window addresses as 32-bit | Settled | The 64-bit address space is a core goal (D36/§1a); the only sound way to elide an unbounded-base access is the wasm32 trick (32-bit address arithmetic, address `< 2^32` by construction so it matches the interp and elides) — masking the i64 data-SP alone is un-elidable or diverges from the interp (an escape). That trick caps the elided window at 4 GiB and reworks the frontend's pointer model for one benchmark; not worth trading the clean 64-bit model. Revisit only if a real workload makes the data-SP mask a measured bottleneck |
+| D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement masking stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
+| D52 | **Capability-boundary record/replay** as the primary debugging differentiator: all nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + deterministic mode (§12) gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5) | Proposed | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary; the control stack survives heap corruption |
+| D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`) | Proposed | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
+| D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset) and wasm→IR bridge (compat) — vehicle priority deferred.** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | Open (strategy settled) | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
+| D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
