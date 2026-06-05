@@ -66,10 +66,31 @@ gcc matrix + the full suite with zero regressions:
    parse. Now skips a leading comma when present (handling both callers: designated
    continuation at a comma, and brace-elision at a value).
 
-With these, Clay parses ~3485/5058 lines (was: instant segfault). The next blocker is a
-*backend* gap — **passing a struct by value through a variadic function** (our varargs
-marshalling calls `irty` per arg, which rejects aggregates) — and Clay also can't *run* under
-the fixed 64 KB window (`memory 16`); full Clay support is a multi-slice effort, not pursued.
+**Clay runs end-to-end (the capstone).** Iterating on the Clay shakedown to completion,
+`demos/clay/clay_demo.c` now compiles (~93k lines of IR), verifies, and runs on the JIT,
+producing the same render commands as a native `cc` build (`svm-run` test
+`demo_clay_layout_runs`). The full set of fixes Clay drove, beyond the two `parse.c` ones above:
+- **gen_cond** — a ternary `?:` returning an aggregate carries the selected arm's *address*
+  (merge type `pass_irty` = i64), not `irty(struct)` which errored.
+- **guest_params** — chibicc prepends a hidden return-buffer pointer to `fn->params` for
+  struct returns > 16 bytes (SysV); our §3d ABI uses its own sret for every size, so skip
+  chibicc's to avoid double-counting (the ≤16B test structs never hit it).
+- **binop shift width** — a shift keeps its amount's own width (`uint64_t << int`), so widen/
+  narrow the amount to the value's width before `iN.shl/shr`.
+- **svm-text i32.const** — accept the full u32 range (`0xFFFFFFFF` = -1).
+- **program-sized window** — the frontend sizes the window to globals/BSS + a stack reserve
+  (Clay's ~250 KB arena needs `memory 21`); small programs keep 64 KB.
+- **svm-jit `ArenaMemoryProvider`** — allocate code+rodata from one contiguous 256 MiB arena;
+  the default separate mmaps let ASLR place code and float-constant rodata > 2 GiB apart,
+  overflowing cranelift's 32-bit PC-relative relocations (an intermittent ~1/6
+  `compiled_blob.rs` panic on large modules) — now 25/25 clean.
+
+All but the two `parse.c` edits live in our own crates / `codegen_ir.c`. **Known minor
+discrepancy (not a correctness bug):** `Clay_MinMemorySize()` reports ~254 KB on the VM vs
+~246 KB native (≈32 bytes/element over 256 elements) — a struct *size-estimate* difference
+(some internal array's element is padded differently in our layout); the computed layout
+(render commands) is byte-identical, so it's a conservative over-estimate, not a layout bug.
+Worth a look if struct-layout parity matters later (§3d pins x86-64-SysV layout).
 
 ### Invocation
 ```

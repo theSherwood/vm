@@ -93,13 +93,20 @@ cargo run -p svm-run -- crates/svm-run/demos/hello.svm   # text IR → "hello, s
 cargo run -p svm-run -- crates/svm-run/demos/hello.c     # C source (via the chibicc frontend)
 cargo run -p svm-run -- crates/svm-run/demos/calc.c      # a recursive-descent calculator
 cargo run -p svm-run -- crates/svm-run/demos/rational.c  # exact-rational arithmetic
+cargo run -p svm-run -- crates/svm-run/demos/clay/clay_demo.c  # the Clay UI layout library!
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
 
 `calc.c` (recursion + a function-pointer dispatch table) and `rational.c` (by-value
-struct args/returns through direct and indirect calls) are larger real programs; each is
-checked byte-for-byte against a native `cc` build in `svm-run`'s tests.
+struct args/returns through direct and indirect calls) are larger real programs, each
+checked byte-for-byte against a native `cc` build in `svm-run`'s tests. **`clay/clay_demo.c`
+runs the real-world [Clay](https://github.com/nicbarker/clay) UI layout library** (a ~5k-line
+third-party C header, vendored) sandboxed: it compiles through the frontend to ~93k lines of
+IR, verifies, and runs on the JIT, producing the same render commands as a native build.
+Getting it to run drove a batch of frontend/IR/JIT fixes (anonymous-aggregate designated
+inits, ternary-returns-struct, >16-byte struct returns, mixed-width shifts, program-sized
+windows, a contiguous JIT code arena) — see `HANDOFF.md`.
 
 Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
 located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —

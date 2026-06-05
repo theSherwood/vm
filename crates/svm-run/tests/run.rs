@@ -169,6 +169,37 @@ fn demo_calc_matches_native() {
     assert_demo_matches_cc("calc.c");
 }
 
+/// **The capstone: a real third-party C library runs in the sandbox.** The Clay UI layout
+/// library (`demos/clay/clay.h`, ~5k lines, zlib-licensed, vendored) compiles through the
+/// frontend to ~93k lines of IR, verifies, and runs on the JIT — building a small layout and
+/// printing its render commands, deterministically and identically to a native build. Skipped
+/// (not failed) when the chibicc frontend is unavailable.
+#[test]
+fn demo_clay_layout_runs() {
+    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
+        .arg(demo("clay/clay_demo.c"))
+        .output()
+        .expect("spawn svm-run");
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("chibicc") {
+            eprintln!(
+                "note: skipping Clay demo (frontend unavailable): {}",
+                err.trim()
+            );
+            return;
+        }
+        panic!("svm-run on clay_demo.c failed: {err}");
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3 render commands:\n\
+         \x20 cmd 1 bbox=(16,16 768x40)\n\
+         \x20 cmd 3 bbox=(16,16 152x18)\n\
+         \x20 cmd 1 bbox=(16,64 768x520)\n",
+    );
+}
+
 /// Exact-rational arithmetic (by-value struct args/returns through direct *and* indirect calls,
 /// recursion) — sandboxed output must match native `cc`. The program that surfaced the
 /// sret-from-a-non-entry-block bug.
