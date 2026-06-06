@@ -305,6 +305,7 @@ unsafe extern "C" fn bench_thunk(
     _ctx: *mut c_void,
     mem_base: *mut u8,
     _mem_size: u64,
+    _mem_reserved: u64,
     _type_id: u32,
     op: u32,
     _handle: i32,

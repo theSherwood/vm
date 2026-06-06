@@ -879,6 +879,7 @@ block0(v0: i64, v1: f64):
 use core::ffi::c_void;
 use svm_interp::{run_with_host, GuestMem, Host, StreamRole};
 use svm_jit::{compile_and_run_with_host, EXIT_CODE};
+use svm_run::MprotectWindow;
 
 /// Bridge the JIT's `CapThunk` ABI to the interpreter's `Host::cap_dispatch_slots`.
 /// This is the host "trampoline" (§9) a real embedder supplies; here it drives the same
@@ -891,6 +892,7 @@ unsafe extern "C" fn cap_thunk(
     ctx: *mut c_void,
     mem_base: *mut u8,
     mem_size: u64,
+    mem_reserved: u64,
     type_id: u32,
     op: u32,
     handle: i32,
@@ -902,13 +904,10 @@ unsafe extern "C" fn cap_thunk(
 ) {
     let host = &mut *(ctx as *mut Host);
     let arg_slots = std::slice::from_raw_parts(args, n_args as usize);
-    // The JIT-side guest window, with `map`/`unmap`/`protect` backed by real `mprotect` on the
-    // window pages — the mirror of the interpreter's page-protection map, so the Memory cap
-    // behaves identically on both backends (a store to a protected page faults into the guard).
-    let mut wm = MprotectWindow {
-        base: mem_base,
-        size: mem_size,
-    };
+    // The production JIT-side guest window: `map`/`unmap`/`protect` backed by real `mprotect`
+    // (incl. growth into the reserved tail), mirrored by a software page map so the Memory cap is
+    // bit-identical to the interpreter's paged `Mem` — exactly what this differential checks.
+    let mut wm = MprotectWindow::new(mem_base, mem_size, mem_reserved);
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
     } else {
@@ -926,95 +925,6 @@ unsafe extern "C" fn cap_thunk(
         Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
         // CapFault (forged/wrong-type/closed) and anything else map to a CapFault trap.
         Err(_) => *trap_out = TrapKind::CapFault as i64,
-    }
-}
-
-/// A [`GuestMem`] over the JIT's flat guest window whose `map`/`unmap`/`protect` are backed by
-/// real `mprotect` on the window pages — the JIT-side mirror of the interpreter's page-protection
-/// map, so the Memory capability behaves identically on both backends (a store to a protected
-/// page faults into the guard region → detect-and-kill). `read_bytes`/`write_bytes` behave like
-/// `svm_interp::WindowMem`. Unix-only, like the JIT's guard itself.
-struct MprotectWindow {
-    base: *mut u8,
-    size: u64,
-}
-
-impl MprotectWindow {
-    /// `mprotect [offset, offset+len)` to cap `prot_bits` (`READ`=1, `WRITE`=2). Page-aligned
-    /// offset + in-range required (else `-EINVAL`), matching the interpreter's `prot_pages`.
-    fn mprotect_range(&self, offset: u64, len: u64, prot_bits: i32) -> i64 {
-        const EINVAL: i64 = -22;
-        // SAFETY: sysconf is always safe to call; `_SC_PAGESIZE` is positive.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-        let Some(end) = offset.checked_add(len) else {
-            return EINVAL;
-        };
-        if len == 0 || page == 0 || !offset.is_multiple_of(page) || end > self.size {
-            return EINVAL;
-        }
-        let prot = if prot_bits & 2 != 0 {
-            libc::PROT_READ | libc::PROT_WRITE
-        } else if prot_bits & 1 != 0 {
-            libc::PROT_READ
-        } else {
-            libc::PROT_NONE
-        };
-        let last = end - 1;
-        let rlen = ((last / page) - (offset / page) + 1) * page; // round up to whole pages
-                                                                 // SAFETY: `[base+offset, +rlen)` is within the window's reserved mapping (offset+len ≤
-                                                                 // size ≤ mapped, page-rounded), owned by the JIT for the duration of the call.
-        let rc = unsafe {
-            libc::mprotect(
-                self.base.add(offset as usize) as *mut c_void,
-                rlen as usize,
-                prot,
-            )
-        };
-        if rc == 0 {
-            0
-        } else {
-            EINVAL
-        }
-    }
-}
-
-impl GuestMem for MprotectWindow {
-    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
-        let end = ptr.checked_add(len)?;
-        if end > self.size {
-            return None;
-        }
-        // SAFETY: `[base, base+size)` is the live guest window for the call's duration.
-        let w = unsafe { std::slice::from_raw_parts(self.base, self.size as usize) };
-        Some(w[ptr as usize..end as usize].to_vec())
-    }
-    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
-        let end = ptr.checked_add(data.len() as u64)?;
-        if end > self.size {
-            return None;
-        }
-        // SAFETY: as above; `&mut self` gives exclusive access for the write.
-        let w = unsafe { std::slice::from_raw_parts_mut(self.base, self.size as usize) };
-        w[ptr as usize..end as usize].copy_from_slice(data);
-        Some(())
-    }
-    fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
-        // Re-commit: zero the range (matching the interpreter's fresh-page semantics on a
-        // (re)map), then apply the requested protection. mprotect to RW first so a previously
-        // unmapped/RO range is writable for the zero-fill.
-        let rw = self.mprotect_range(offset, len, 2 /* WRITE ⇒ RW */);
-        if rw != 0 {
-            return rw;
-        }
-        // SAFETY: `[base+offset, +len)` is in-range (mprotect_range validated it) and now RW.
-        unsafe { std::ptr::write_bytes(self.base.add(offset as usize), 0, len as usize) };
-        self.mprotect_range(offset, len, prot)
-    }
-    fn unmap(&mut self, offset: u64, len: u64) -> i64 {
-        self.mprotect_range(offset, len, 0) // PROT_NONE ⇒ any access faults
-    }
-    fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
-        self.mprotect_range(offset, len, prot)
     }
 }
 

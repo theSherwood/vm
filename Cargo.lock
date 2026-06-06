@@ -474,6 +474,7 @@ version = "0.0.0"
 name = "svm-run"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "svm-encode",
  "svm-interp",
  "svm-ir",

@@ -206,12 +206,15 @@ impl TrapKind {
 ///
 /// # Safety
 /// `ctx` is the caller's host pointer; `args`/`results` point at `n_args`/`n_results`
-/// `i64` slots; `[mem_base, mem_base+mem_size)` is the guest window (`mem_base` null if
-/// none); `trap_out` points at the live trap cell. All must outlive the call.
+/// `i64` slots; `[mem_base, mem_base+mem_size)` is the guest window's backed prefix
+/// (`mem_base` null if none) and `mem_reserved` is the full reserved mask domain
+/// (`>= mem_size`) the guest may `map`-grow into via the Memory cap (§3e/§4); `trap_out`
+/// points at the live trap cell. All must outlive the call.
 pub type CapThunk = unsafe extern "C" fn(
     ctx: *mut core::ffi::c_void,
     mem_base: *mut u8,
     mem_size: u64,
+    mem_reserved: u64,
     type_id: u32,
     op: u32,
     handle: i32,
@@ -228,6 +231,7 @@ unsafe extern "C" fn empty_cap_thunk(
     _ctx: *mut core::ffi::c_void,
     _mem_base: *mut u8,
     _mem_size: u64,
+    _mem_reserved: u64,
     _type_id: u32,
     _op: u32,
     _handle: i32,
@@ -1193,6 +1197,9 @@ fn lower_cap_call(
     let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);
     let mem_base = b.use_var(lower.mem_var);
     let mem_size = b.ins().iconst(I64, lower.mapped as i64);
+    // The reserved mask domain (`mask + 1`) the guest may `map`-grow into; 0 when no memory.
+    let reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
+    let mem_reserved = b.ins().iconst(I64, reserved as i64);
     let tid = b.ins().iconst(I32, type_id as i64);
     let opc = b.ins().iconst(I32, op as i64);
     let h = get(vals, handle)?;
@@ -1202,12 +1209,23 @@ fn lower_cap_call(
     let thunk = b.ins().iconst(I64, lower.cap.thunk_addr);
 
     let mut tsig = module.make_signature(); // host C ABI (matches `extern "C"`)
-    for t in [I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64] {
+    for t in [I64, I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64] {
         tsig.params.push(AbiParam::new(t));
     }
     let tsigref = b.import_signature(tsig);
     let call_args = [
-        ctx, mem_base, mem_size, tid, opc, h, args_ptr, na, res_ptr, nr, trap_out,
+        ctx,
+        mem_base,
+        mem_size,
+        mem_reserved,
+        tid,
+        opc,
+        h,
+        args_ptr,
+        na,
+        res_ptr,
+        nr,
+        trap_out,
     ];
     b.ins().call_indirect(tsigref, thunk, &call_args);
 

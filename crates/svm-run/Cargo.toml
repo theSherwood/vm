@@ -26,3 +26,9 @@ svm-encode.workspace = true
 svm-verify.workspace = true
 svm-interp.workspace = true
 svm-jit.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Real `map`/`unmap`/`protect` for the Memory capability (§3e): `mprotect` on the JIT window
+# pages, mirrored by a software page-state map (so cap-buffer borrows fail closed rather than
+# faulting the host). Unix-only, like the JIT's guard page itself (`svm-jit` is unix-only).
+libc = "0.2"
