@@ -43,9 +43,13 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > (unix): an `mmap`'d window with a `PROT_NONE` guard page + a SIGSEGV/SIGBUS handler turns
 > an out-of-window fault into a clean `MemoryFault` (§4/§5 detect-and-kill), and the large
 > reserved-window model is the default; **read-only data segments** (§3a/D40) and a real
-> **Memory capability** (`map`/`unmap`/`protect`) exist. Still ahead:
-> narrow-scalar promotion, demand paging, atomics + the rest of the
-> concurrency model (Phase 4), SIMD, and capability extras. This
+> **Memory capability** (`map`/`unmap`/`protect`) exist — including **guest-controlled growth**
+> into the reserved tail (the §1a sparse-address-space / lazy-page-supply differentiator: a guest
+> `map`s pages anywhere in its large reserved window, the kernel demand-pages them, and an
+> uncommitted access faults), backed by real `mprotect` and differentially fuzzed against the
+> interpreter. Still ahead:
+> narrow-scalar promotion, fault-driven page supply + shared-region aliasing (Phase 4), atomics +
+> the rest of the concurrency model (Phase 4), SIMD, and capability extras. This
 > is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
 

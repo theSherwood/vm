@@ -514,9 +514,11 @@ float-module memory coverage (NaN bits aren't pinned across backends).
 Largely compliant; simplifications are the ones the design *sanctions*, deferrals are
 incompleteness not contradiction:
 - **Phase 2 complete** (real C on interp + JIT). Solidly into **Phase 3** (JIT + masked
-  window + caps + **guard-page/signal detect-and-kill** done). Phase-3 remainder = the §4
-  *large* reserved window + demand paging (still the "fixed-size window, eager mapping" MVP
-  today), which the new guard-page/signal foundation is built to extend.
+  window + caps + **guard-page/signal detect-and-kill** done; the §4 *large* reserved window is
+  the default and the **Memory cap now supports guest-controlled growth** into the reserved tail,
+  with the kernel providing physical demand paging for free). Phase-3 remainder is small: `malloc`
+  over `map`, and the Phase-4 virtual-memory extras (fault-driven content supply, `SharedRegion`
+  aliasing) which the guard-page/signal + sparse-commit foundation is built to extend.
 - **§2a escape-TCB intact:** the frontend is untrusted; all its output is re-verified;
   every memory access is masked, so even a buggy/hostile data-SP cannot escape (the
   data-SP is a plain value, not trusted). Making it an explicit value rather than a
@@ -578,16 +580,26 @@ this is the index.)
   4000 fuzz seeds green (the handler is exercised by width-overruns). **Not yet:** the
   *perf*-unlocking guard-when-bounded (needs a large window — below); div/rem/trunc still use
   explicit in-code trap checks (correct; converting them to #DE faults is optional).
-- [ ] **Real window / Memory capability** — pin page size + masking constant + the *large*
-  reserved window; make `map`/`unmap`/`protect` real. **Largely done now** (see suggested
-  pickups #1 and #3): the large reserved-window model is the default (`DEFAULT_RESERVED_LOG2
-  = 40`, masking constant `reserved - 1`), and `map`/`unmap`/`protect` are **real**, not
-  stubs — the interp `Mem` enforces a per-page protection map (`svm-interp`, the `map`/
-  `unmap`/`protect` impls + `check_prot`), and the JIT side uses real `libc::mprotect` on the
-  window pages, differentially fuzzed. `malloc` is still a guest bump allocator, not backed by
-  `map`. **Still left** (so this stays unchecked): **demand paging** on fault, **growth**
-  into the reserved tail (sparse address space, §4), and surfacing the Memory cap in the
-  *main* irgen fuzzer. The guard-page + signal foundation above is what demand paging builds on.
+- [x] **Real window / Memory capability + growth** — *done*: pin page size (4096, §4), the
+  *large* reserved window (`DEFAULT_RESERVED_LOG2 = 40`, mask `reserved - 1`), and real
+  `map`/`unmap`/`protect` **including guest-controlled growth into the reserved tail** — the §1a
+  "sparse address space / lazy page supply" capability. The interp `Mem` (reference) commits pages
+  sparsely across all of `[0, reserved)`: confinement masks the final address into `[0, reserved)`
+  while per-page committed-ness (the page map) is the functional bound, so a `map` past the initial
+  prefix grows the window and an uncommitted access faults. The JIT side is a production
+  `svm_run::MprotectWindow` — real `libc::mprotect` across the reserved range + `MADV_DONTNEED` on
+  `unmap`, mirrored by a software page map so §7 cap-buffer borrows fail closed (`-EFAULT`) instead
+  of faulting the host — wired into the production `cap_thunk` (was a no-op `WindowMem`) and driven
+  by `jit_diff` (the cap-thunk ABI gained `mem_reserved`). Differentially fuzzed across the
+  prefix+tail (`jit_cap_memory_protect_map_unmap_differential`, 800 seeds) with a concrete guest
+  consumer (`jit_cap_memory_growth_round_trips`: map at 1 MiB, store/load round-trip,
+  unmap→fault). **Physical demand paging is already free** (the JIT reserves `PROT_NONE` +
+  `MAP_NORESERVE`; the kernel lazily zero-fills touched RW pages), so no fault-driven commit
+  machinery was needed. **Still left (Phase 4, not MVP blockers):** fault-driven *content* supply
+  (a guest/parent as pager — `userfaultfd`/§14), `SharedRegion` aliasing (the same backing at two
+  offsets — the magic-ring-buffer trick, §13; the interp `PageProt` has a forward-compat hook for
+  it), surfacing the Memory cap in the *main* irgen fuzzer + extending the escape-oracle snapshot
+  to grown tail pages, and `malloc` backed by `map` (today a guest bump allocator).
 - [x] **Verifier escape-oracle fuzzer** — *done*: the differential now byte-compares the
   final guest window across interp + JIT (verified ⇒ in-window), in the 4000 stable seeds
   (every push) and the `diff` libFuzzer target. See Fuzzing below.
@@ -797,9 +809,10 @@ regressions one commit old"):
 2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
    `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
    win end-to-end at ≈parity — see Benchmarking gaps); a non-gating nightly CI `bench` job runs `--check`.
-3. **Real Memory capability** (`map`/`unmap`/`protect` beyond no-op stubs) — guest-visible
-   virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`. Now in
-   progress (unblocked by the reservation work). **Increment 1 ✅ (interp spec):** `Mem` carries a
+3. ~~**Real Memory capability + growth**~~ — **DONE** (`map`/`unmap`/`protect` + guest-controlled
+   growth into the reserved tail = the §1a sparse-address-space differentiator). Increments 1–3
+   below + the growth increments A–C (see the "Real window / Memory capability + growth" checkbox
+   above). **Increment 1 ✅ (interp spec):** `Mem` carries a
    per-page protection map (`PageProt::Ro`/`Unmapped`, absent ⇒ rw); `load`/`store` enforce it
    (`check_prot`); `GuestMem` gained `map`/`unmap`/`protect` (default no-op; interp `Mem`
    implements them within `[0, mapped)` — `protect`→RO for D40, `unmap`→fault, `map`→re-commit
@@ -820,10 +833,19 @@ regressions one commit old"):
    crash the host → fixed with `GuestWindow::restore_rw()` (mprotect the backed region RW before the
    snapshot). **(b)** the JIT passed `mem_size = reserved` (the mask domain, 2^40) to the cap thunk
    instead of the backed `mapped` extent, so buffer borrows / Memory-cap ops bounded against the
-   wrong size → now threads `mapped` into `Lower` and passes it. **Deferred (increment 4+):** growth
-   (`map` into the reserved tail = sparse address space, §4); demand paging on fault; surfacing the
-   Memory cap in the *main* irgen fuzzer (capture path needs restore_rw, now in place) — **next is
-   (1): a guest consumer**, D40 const→read-only data segment via `protect` at `_start`.
+   wrong size → now threads `mapped` into `Lower` and passes it. **Growth — increments A–C ✅:**
+   (A) the interp model decouples confinement (mask into `[0, reserved)`) from committed-ness (a
+   sparse per-page set over all of `[0, reserved)`), so `map`/`unmap`/`protect` work past the
+   prefix and an uncommitted access faults; (B) a production `svm_run::MprotectWindow` (real
+   `mprotect` across the reserved range + `MADV_DONTNEED` on `unmap`, a software page mirror so §7
+   borrows fail closed) replaces the no-op `WindowMem` in the production `cap_thunk`, and the
+   cap-thunk ABI gained `mem_reserved`; (C) the differential fuzzer spans prefix+tail (800 seeds)
+   plus a concrete guest-consumer round-trip. Physical demand paging is free (kernel lazy-zero of
+   `MAP_NORESERVE` pages). **Deferred (Phase 4):** fault-driven *content* supply (guest/parent as
+   pager, `userfaultfd`/§14); `SharedRegion` aliasing — same backing at two offsets, the
+   magic-ring-buffer trick (§13; `PageProt` has the forward-compat hook); surfacing the Memory cap
+   in the *main* irgen fuzzer + extending the escape-oracle snapshot to grown pages; `malloc` over
+   `map`.
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
@@ -832,4 +854,9 @@ loops + indirect calls in the generative fuzzer; guard pages + signal-handler de
 ratio baseline, + an `alu_c` chibicc-compiled kernel tracking the SSA-promotion win end-to-end;
 a non-gating nightly CI `bench` job running `--check`); **a structural SSA-promotion guard**
 (`c_frontend` asserts zero loop-body memory ops on
-promotable loops, so the promotion win can't silently regress).)*
+promotable loops, so the promotion win can't silently regress); **guest-controlled memory growth
+into the reserved tail** (the §1a sparse-address-space capability: interp sparse-commit model +
+production `mprotect`-backed `MprotectWindow` wired into `cap_thunk` + `mem_reserved` in the
+cap-thunk ABI + prefix/tail differential fuzz + a guest-consumer round-trip); plus a batch of
+real-library shakedowns — Clay, jsmn, SHA-256, xxHash, tinfl, stb_perlin (first float), tiny-regex-c
+(backtracking) — each vendored as a `demos/` + cc-oracle test.)*
