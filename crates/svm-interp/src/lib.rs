@@ -683,11 +683,46 @@ const EINVAL: i64 = -22; // bad op / argument
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 
-/// A §13 `SharedRegion`'s backing bytes — a host-owned buffer that can be aliased into a window at
-/// one or more offsets (cloning the `Rc` shares the *same* bytes, so two mappings alias). This is
-/// the reference (interpreter) representation; a flat-window backend (JIT) will key its own shared
-/// mapping (memfd / file mapping) off the region id and ignore this handle.
-pub type RegionBacking = Rc<RefCell<Vec<u8>>>;
+/// A §13 `SharedRegion`'s backing — a host-owned shared object aliased into a window at one or more
+/// offsets. The reference (interpreter) backing is a plain Rust buffer ([`VecBacking`]); a flat-window
+/// backend (the JIT) supplies one wrapping a real OS shared-memory object (memfd / file mapping) whose
+/// [`SharedBacking::os_fd`] it `mmap`s for true hardware aliasing. Cloning the `Rc` shares the *same*
+/// object, so two mappings of it alias.
+pub trait SharedBacking {
+    /// Region size in bytes.
+    fn size(&self) -> u64;
+    /// Read one region-relative byte (out of range ⇒ 0).
+    fn read_byte(&self, off: u64) -> u8;
+    /// Write one region-relative byte (out of range ⇒ ignored). Interior-mutable: a region is shared
+    /// (`Rc`), so writes go through `&self`.
+    fn write_byte(&self, off: u64, b: u8);
+    /// An OS shared-memory handle a flat-window backend can `mmap` for real aliasing; `None` for the
+    /// pure-Rust reference backing (the interpreter models aliasing in software instead).
+    fn os_fd(&self) -> Option<i32> {
+        None
+    }
+}
+
+/// A reference to a shared region backing (see [`SharedBacking`]); cloning shares the same object.
+pub type RegionBacking = Rc<dyn SharedBacking>;
+
+/// The reference [`SharedBacking`]: a plain in-process buffer. The interpreter models aliasing by
+/// reading/writing this shared buffer through several `Backed` pages.
+struct VecBacking(RefCell<Vec<u8>>);
+
+impl SharedBacking for VecBacking {
+    fn size(&self) -> u64 {
+        self.0.borrow().len() as u64
+    }
+    fn read_byte(&self, off: u64) -> u8 {
+        self.0.borrow().get(off as usize).copied().unwrap_or(0)
+    }
+    fn write_byte(&self, off: u64, b: u8) {
+        if let Some(s) = self.0.borrow_mut().get_mut(off as usize) {
+            *s = b;
+        }
+    }
+}
 
 /// The guest window a capability handler borrows `(ptr, len)` buffers from (§7). Both
 /// the interpreter's lazily-paged [`Mem`] and a JIT's flat window implement this, so a
@@ -883,8 +918,15 @@ impl Host {
     /// access the shared bytes as ordinary masked loads/stores. (Guest-minted regions and
     /// cross-domain `grant` are a §14 follow-up; this models the host↔guest data plane.)
     pub fn grant_shared_region(&mut self, len: usize) -> i32 {
+        self.grant_shared_region_backed(Rc::new(VecBacking(RefCell::new(vec![0u8; len]))))
+    }
+
+    /// Grant a §13 `SharedRegion` over a caller-supplied [`SharedBacking`] — how a flat-window
+    /// backend installs a region whose `os_fd` it can `mmap` for real hardware aliasing (the JIT
+    /// side of the §13 differential). The pure-Rust [`grant_shared_region`] is the common case.
+    pub fn grant_shared_region_backed(&mut self, backing: RegionBacking) -> i32 {
         let id = self.regions.len() as u32;
-        self.regions.push(Rc::new(RefCell::new(vec![0u8; len])));
+        self.regions.push(backing);
         self.grant(iface::SHARED_REGION, Binding::SharedRegion(id))
     }
 
@@ -981,7 +1023,7 @@ impl Host {
                         let len = *args.get(1).unwrap_or(&0) as u64;
                         mem.unmap(win_off, len)
                     }
-                    2 => backing.borrow().len() as i64,
+                    2 => backing.size() as i64,
                     3 => mem.page_size(),
                     _ => EINVAL,
                 }])
@@ -1316,8 +1358,7 @@ impl Mem {
             return self
                 .regions
                 .get(region)
-                .and_then(|r| r.borrow().get(*region_off as usize + idx).copied())
-                .unwrap_or(0);
+                .map_or(0, |r| r.read_byte(*region_off + idx as u64));
         }
         self.pages.get(&(off / self.page)).map_or(0, |p| p[idx])
     }
@@ -1331,11 +1372,7 @@ impl Mem {
         {
             // §13 aliased page: write through to the shared region backing.
             if let Some(r) = self.regions.get(region) {
-                let mut r = r.borrow_mut();
-                let at = *region_off as usize + idx;
-                if at < r.len() {
-                    r[at] = b;
-                }
+                r.write_byte(*region_off + idx as u64, b);
             }
             return;
         }
@@ -1391,9 +1428,8 @@ impl Mem {
             }
             let n = (self.page as usize).min(snap - start);
             if let Some(r) = self.regions.get(region) {
-                let r = r.borrow();
                 for k in 0..n {
-                    out[start + k] = r.get(*region_off as usize + k).copied().unwrap_or(0);
+                    out[start + k] = r.read_byte(*region_off + k as u64);
                 }
             }
         }
@@ -1493,7 +1529,7 @@ impl GuestMem for Mem {
             return EINVAL;
         }
         match region_off.checked_add(len) {
-            Some(end) if end <= backing.borrow().len() as u64 => {}
+            Some(end) if end <= backing.size() => {}
             _ => return EINVAL,
         }
         let writable = prot & PROT_WRITE != 0;
@@ -1937,7 +1973,10 @@ mod prot_tests {
 
     /// A §13 `SharedRegion` backing of `pages` whole host pages, zero-filled.
     fn region(pages: u64) -> RegionBacking {
-        Rc::new(RefCell::new(vec![0u8; (pages * page()) as usize]))
+        Rc::new(VecBacking(RefCell::new(vec![
+            0u8;
+            (pages * page()) as usize
+        ])))
     }
 
     #[test]
