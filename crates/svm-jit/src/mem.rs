@@ -111,6 +111,27 @@ impl GuestWindow {
         unsafe { pal::protect(self.base, rw, Prot::Rw) };
     }
 
+    /// Commit + read the low `snap` bytes of the window for the escape-oracle snapshot — including
+    /// reserved-**tail** pages the guest grew (or left `unmap`-ed / RO) via the Memory cap. `commit_rw`
+    /// makes an uncommitted reserved page readable-as-zero and re-asserts RW on a `NOACCESS`/RO page,
+    /// so the host read can't fault outside the guarded call. `snap` is clamped to the reservation
+    /// (excluding the trailing guard page). Used only by the `_with_host` capture; the common path
+    /// reads `[0, mapped)` directly.
+    pub(crate) fn read_low(&self, snap: usize) -> Vec<u8> {
+        if self.mapped == 0 || snap == 0 {
+            return Vec::new();
+        }
+        let max = self.total - pal::page_size(); // everything but the trailing guard page
+        let snap = snap.min(max);
+        let commit = round_up(snap, pal::page_size()).min(max);
+        // SAFETY: `[base, base+commit)` lies in the reservation (≤ total − guard); `commit_rw` makes
+        // it committed + RW, so the subsequent `[0, snap)` read is in-bounds and cannot fault.
+        unsafe {
+            pal::commit_rw(self.base, commit);
+            std::slice::from_raw_parts(self.base, snap).to_vec()
+        }
+    }
+
     /// Map the whole pages touched by `[offset, offset+len)` **read-only** — the D40 const data
     /// segment (§3a/§4): a later guest write to them faults into the guarded range. The data must
     /// already be written (this only changes protection). A producer keeps RO data on its own

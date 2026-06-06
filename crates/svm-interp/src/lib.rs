@@ -158,6 +158,11 @@ pub fn run_capture_reserved(
 /// [`svm_jit::compile_and_run_capture_reserved_with_host`]: running both lets the §3e Memory
 /// capability's `map`/`unmap`/`protect` effects be byte-compared across backends, not just their
 /// return values — a real generative escape-oracle for the capability path.
+/// Escape-oracle snapshot span (the `_with_host` capture): byte-compare the low `SNAP_CAP` bytes of
+/// the window — *including* reserved-tail pages the guest grew via the Memory cap, not just the
+/// backed prefix. **Must match `svm_jit`'s `SNAP_CAP`** so both backends snapshot the same span.
+const SNAP_CAP: usize = 1 << 18; // 256 KiB
+
 pub fn run_capture_reserved_with_host(
     m: &Module,
     func: FuncIdx,
@@ -178,9 +183,12 @@ pub fn run_capture_reserved_with_host(
         mm
     });
     let r = run_func(f, args, fuel, &mut mem, &m.funcs, host, 0);
+    // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
+    // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
+    // them too.
     let snap = mem
         .as_ref()
-        .map(|mm| mm.snapshot(init_mem.len() as u64))
+        .map(|mm| mm.snapshot_window(SNAP_CAP))
         .unwrap_or_default();
     (r, snap)
 }
@@ -1231,6 +1239,27 @@ impl Mem {
     fn snapshot(&self, n: u64) -> Vec<u8> {
         let n = n.min(self.window.mapped());
         (0..n).map(|i| self.byte(i)).collect()
+    }
+
+    /// Snapshot the low `min(reserved, max(mapped, snap_cap))` bytes for the escape-oracle —
+    /// **including grown reserved-tail pages** (a page absent from the map reads zero, matching the
+    /// JIT's freshly-committed tail). Page-wise (one map lookup per committed page, not per byte) so
+    /// widening past the backed prefix stays cheap.
+    fn snapshot_window(&self, snap_cap: usize) -> Vec<u8> {
+        let snap = self
+            .window
+            .reserved()
+            .min(self.window.mapped().max(snap_cap as u64)) as usize;
+        let mut out = vec![0u8; snap];
+        for (&idx, page) in &self.pages {
+            let start = (idx * self.page) as usize;
+            if start >= snap {
+                continue;
+            }
+            let n = (self.page as usize).min(snap - start);
+            out[start..start + n].copy_from_slice(&page[..n]);
+        }
+        out
     }
 }
 

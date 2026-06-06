@@ -422,14 +422,17 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
             }
             19 if has_mem => {
                 // A *valid* Memory `cap.call` (§3e) on the granted handle: `map`/`unmap`/`protect`
-                // one whole page in the 64 KiB backed prefix, with page-aligned in-range args, so
-                // it takes the **success** path on both backends (interp page-map + JIT real
-                // `mprotect`) — exercising cap.call result marshalling and the cap's window effects
-                // interleaved with the generated CFG, under the escape-oracle. Pages 0..15 are
-                // in-range for every reservation pass, so the op succeeds (a later access to an
-                // `unmap`ped/`protect`ed page then faults identically on both — checked too).
+                // one whole page, page-aligned, so it takes the **success** path on both backends
+                // (interp page-map + JIT real `mprotect`/`VirtualProtect`) — exercising cap.call
+                // result marshalling and the cap's window effects interleaved with the generated CFG,
+                // under the escape-oracle. The page index spans **0..47** (up to 192 KiB): in the
+                // fully-mapped pass only 0..15 are in-range (the 64 KiB prefix; 16.. ⇒ EINVAL on both),
+                // while in the sparse pass 16..47 **grow into the reserved tail** — the §1a growth
+                // path, now byte-compared because the `_with_host` snapshot covers the low 256 KiB
+                // (`SNAP_CAP`), tail included. A later access to a grown/`unmap`ed/`protect`ed page
+                // then faults or reads identically on both.
                 let handle = bb.push(Inst::ConstI32(MEMORY_HANDLE), ValType::I32);
-                let page = bb.g.below(16);
+                let page = bb.g.below(48);
                 let off = bb.push(Inst::ConstI64((page * 4096) as i64), ValType::I64);
                 let len = bb.push(Inst::ConstI64(4096), ValType::I64);
                 let results = vec![ValType::I64];

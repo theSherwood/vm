@@ -85,6 +85,12 @@ const MAX_JIT_WINDOW_LOG2: u8 = 26; // 64 MiB (the backed `mapped` extent)
 /// can't ask for an absurd reservation.
 const MAX_JIT_RESERVED_LOG2: u8 = 40; // 1 TiB of reserved VA (lazy)
 
+/// Escape-oracle snapshot span (the `_with_host` capture): byte-compare the low `SNAP_CAP` bytes of
+/// the window across interp + JIT, *including* reserved-tail pages the guest grew via the Memory cap
+/// (not just the backed prefix). Bounds the per-seed snapshot cost while covering a generous growth
+/// region. **Must match `svm_interp`'s `SNAP_CAP`** so both backends snapshot the same span.
+const SNAP_CAP: usize = 1 << 18; // 256 KiB
+
 /// A function-table entry (§3c `FnEntry`): host-owned, guest-unwritable. `type_id`
 /// identifies the signature (distinct-`FuncType` index); `code` is the finalized
 /// function address. `call_indirect` masks the guest index into the table, checks
@@ -306,6 +312,7 @@ pub fn compile_and_run_with_host(
         cap_ctx,
         None,
         DEFAULT_RESERVED_LOG2,
+        None,
     )?
     .0)
 }
@@ -347,6 +354,7 @@ pub fn compile_and_run_capture_reserved(
         core::ptr::null_mut(),
         Some(init_mem),
         reserved_log2,
+        None,
     )
 }
 
@@ -375,9 +383,13 @@ pub fn compile_and_run_capture_reserved_with_host(
         cap_ctx,
         Some(init_mem),
         reserved_log2,
+        // Escape-oracle over the §1a growth path: snapshot the low `SNAP_CAP` bytes (not just the
+        // backed prefix) so guest-grown / `unmap`-ed reserved-tail pages are byte-compared too.
+        Some(SNAP_CAP),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     m: &IrModule,
     func: FuncIdx,
@@ -386,6 +398,7 @@ fn run_inner(
     cap_ctx: *mut core::ffi::c_void,
     init_mem: Option<&[u8]>,
     reserved_log2: u8,
+    snapshot_cap: Option<usize>,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // Calls can reach any function, so every function must be lowerable.
@@ -574,7 +587,18 @@ fn run_inner(
     // via the Memory cap (unmap/protect), so restore RW first — else this read faults outside the
     // guarded call and crashes the host.
     window.restore_rw();
-    let final_mem = window.rw_mut()[..win_size].to_vec();
+    // `snapshot_cap` (the `_with_host` capture) widens the snapshot past the backed prefix to also
+    // cover reserved-tail pages the guest grew/`unmap`-ed (§1a growth path), `commit`-ing them so the
+    // read sees zero/their content instead of faulting. `read_low` clamps to the reservation.
+    let snap = match snapshot_cap {
+        Some(cap) if win_size > 0 => cap.min((mask + 1) as usize).max(win_size),
+        _ => win_size,
+    };
+    let final_mem = if snap > win_size {
+        window.read_low(snap)
+    } else {
+        window.rw_mut()[..win_size].to_vec()
+    };
     drop(window);
     drop(fn_table);
     drop(module); // frees the executable memory after the call has returned

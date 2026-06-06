@@ -874,12 +874,97 @@ block0(v0: i64, v1: f64):
     );
 }
 
+/// Escape-oracle over the **§1a growth path**, deterministic and cross-platform: grow a *reserved-
+/// tail* page (above the backed prefix) via the Memory cap, store a known marker into it, and assert
+/// both backends leave a byte-identical window whose tail page actually holds the marker. The
+/// `_with_host` capture now snapshots the low 256 KiB (`SNAP_CAP`), tail included, so a grown page
+/// that the JIT mis-grew / mis-masked / failed to commit-for-snapshot would diverge here. Unlike the
+/// random `gen_memory_program` (whose completing runs rarely leave non-zero *tail* content — so its
+/// tail comparison is largely vacuous), this pins the path non-vacuously, on unix **and** windows
+/// (the JIT + Memory cap exist on both). `OFF` is a multiple of 16 KiB, so the single mapped page is
+/// page-aligned on 4 KiB and 16 KiB hosts alike.
+#[cfg(any(unix, windows))]
+#[test]
+fn jit_cap_memory_escape_oracle_grown_tail() {
+    use core::ffi::c_void;
+    use svm_interp::{run_capture_reserved_with_host, Host, Value};
+    use svm_jit::compile_and_run_capture_reserved_with_host;
+
+    const OFF: u64 = 80 * 1024; // 81920 = 5 * 16 KiB: in the tail (prefix is 64 KiB), page-aligned
+    const MARKER: i64 = 0x0123_4567_89ab_cdefu64 as i64;
+    let src = format!(
+        "memory 16\n\
+         func (i32) -> (i64) {{\n\
+         block0(v0: i32):\n\
+         \x20 v1 = i64.const {OFF}\n\
+         \x20 v2 = i64.const 4096\n\
+         \x20 v3 = i32.const 3\n\
+         \x20 v4 = cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)\n\
+         \x20 v5 = i64.const {OFF}\n\
+         \x20 v6 = i64.const {MARKER}\n\
+         \x20 i64.store v5 v6\n\
+         \x20 v7 = i64.load v5\n\
+         \x20 return v7\n\
+         }}\n"
+    );
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let mi = hi.grant_memory();
+    let mj = hj.grant_memory();
+    assert_eq!(mi, mj, "grants are deterministic");
+    let init = vec![0u8; 1 << 16]; // 64 KiB prefix seed; the tail marker is what this test pins
+    let mut fuel = 1_000_000u64;
+    // reserved_log2 = 18 (256 KiB) ⇒ a reserved tail above the 64 KiB prefix; OFF is in it.
+    let (interp, imem) =
+        run_capture_reserved_with_host(&m, 0, &[Value::I32(mi)], &mut fuel, &init, 18, &mut hi);
+    let (jit, jmem) = compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[mj as i64],
+        &init,
+        18,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+
+    // Both grow the page and load the marker back.
+    assert_eq!(
+        interp.expect("interp run"),
+        vec![Value::I64(MARKER)],
+        "interp must load the marker from the grown tail page"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Returned(ref s) if s == &[MARKER]),
+        "jit must load the marker from the grown tail page: {jit:?}"
+    );
+    // The windows must agree, the snapshot must reach the tail, and it must hold the marker there.
+    assert_eq!(imem.len(), jmem.len(), "snapshot length differs");
+    assert!(
+        imem.len() as u64 >= OFF + 8,
+        "snapshot ({}) must cover the grown tail page at {OFF}",
+        imem.len()
+    );
+    assert_eq!(
+        imem, jmem,
+        "escape-oracle: interp/JIT grown-tail windows diverge"
+    );
+    assert_eq!(
+        &imem[OFF as usize..OFF as usize + 8],
+        &MARKER.to_le_bytes(),
+        "grown tail page must hold the stored marker (non-vacuous)"
+    );
+}
+
 // ---- cap.call: the JIT dispatches through a host thunk to the interpreter's Host ----
 //
-// Unix-only: these drive `svm_run::MprotectWindow` (real `mprotect`, cfg(unix)); the windows
-// Memory-cap port is a Phase-3.5 follow-up. The portable cap.call lowering is covered on every OS
-// by `jit_fuzz` (the forged + valid-Memory cap.call arms) and the `c_frontend` powerbox tests.
-// Gated as a module so windows CI still compiles + runs the rest of the suite.
+// This module's broad Memory-cap differential is still unix-gated; the cross-platform `_with_host`
+// capture path (incl. the windows `VirtualProtect` Memory cap) is covered by `jit_fuzz` and by
+// `jit_cap_memory_escape_oracle_grown_tail` above. Re-gating the whole module to windows is a
+// follow-up. Gated as a module so windows CI still compiles + runs the rest of the suite.
 #[cfg(unix)]
 mod cap {
     use super::*;

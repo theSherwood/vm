@@ -660,11 +660,17 @@ this is the index.)
   consumer (`jit_cap_memory_growth_round_trips`: map at 1 MiB, store/load round-trip,
   unmap→fault). **Physical demand paging is already free** (the JIT reserves `PROT_NONE` +
   `MAP_NORESERVE`; the kernel lazily zero-fills touched RW pages), so no fault-driven commit
-  machinery was needed. **Still left (Phase 4, not MVP blockers):** fault-driven *content* supply
-  (a guest/parent as pager — `userfaultfd`/§14), `SharedRegion` aliasing (the same backing at two
-  offsets — the magic-ring-buffer trick, §13; the interp `PageProt` has a forward-compat hook for
-  it), and surfacing the Memory cap in the *main* irgen fuzzer + extending the escape-oracle
-  snapshot to grown tail pages. **`malloc` over `map` is the default guest libc** — the powerbox
+  machinery was needed. The Memory cap is surfaced in the *main* irgen fuzzer (arm 19, now spanning
+  prefix **and** reserved tail), and the `_with_host` escape-oracle snapshot was **extended to grown
+  tail pages** (the low `SNAP_CAP` = 256 KiB, not just the backed prefix; both backends `commit` the
+  span so a grown/`unmap`-ed page reads back instead of faulting). Because a *random* completing run
+  rarely leaves non-zero tail content (verified: a corrupt-a-tail-byte probe didn't fire in 4000
+  seeds), the non-vacuous pin is the deterministic, cross-platform
+  `jit_diff::jit_cap_memory_escape_oracle_grown_tail` (grow a tail page, store a marker, assert both
+  windows agree *and* hold the marker). **Still left (Phase 4, not MVP blockers):** fault-driven
+  *content* supply (a guest/parent as pager — `userfaultfd`/§14), and `SharedRegion` aliasing (the
+  same backing at two offsets — the magic-ring-buffer trick, §13; the interp `PageProt` has a
+  forward-compat hook for it). **`malloc` over `map` is the default guest libc** — the powerbox
   grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect` builtins expose it
   (codegen_ir.c), and the shipped `frontend/chibicc/include/stdlib.h` provides a map-growing
   `malloc`/`free`/`calloc`/`realloc` to any program that `#include <stdlib.h>`; `demos/heapgrow`
@@ -923,11 +929,12 @@ regressions one commit old"):
    borrows fail closed) replaces the no-op `WindowMem` in the production `cap_thunk`, and the
    cap-thunk ABI gained `mem_reserved`; (C) the differential fuzzer spans prefix+tail (800 seeds)
    plus a concrete guest-consumer round-trip. Physical demand paging is free (kernel lazy-zero of
-   `MAP_NORESERVE` pages). **Deferred (Phase 4):** fault-driven *content* supply (guest/parent as
-   pager, `userfaultfd`/§14); `SharedRegion` aliasing — same backing at two offsets, the
-   magic-ring-buffer trick (§13; `PageProt` has the forward-compat hook); surfacing the Memory cap
-   in the *main* irgen fuzzer + extending the escape-oracle snapshot to grown pages; `malloc` over
-   `map`.
+   `MAP_NORESERVE` pages). The Memory cap is surfaced in the *main* irgen fuzzer (arm 19, prefix +
+   tail) and the `_with_host` escape-oracle snapshot now covers grown tail pages (low 256 KiB),
+   pinned non-vacuously by `jit_cap_memory_escape_oracle_grown_tail`. **Deferred (Phase 4):**
+   fault-driven *content* supply (guest/parent as pager, `userfaultfd`/§14); `SharedRegion` aliasing
+   — same backing at two offsets, the magic-ring-buffer trick (§13; `PageProt` has the forward-compat
+   hook).
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
