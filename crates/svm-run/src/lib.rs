@@ -240,39 +240,47 @@ impl GuestMem for MprotectWindow {
         w[ptr as usize..ptr as usize + data.len()].copy_from_slice(data);
         Some(())
     }
-    /// §3e op 0 `map`: (re)commit `[offset,offset+len)` with `prot`, zero-filled — including
-    /// **growth** into the reserved tail. Mirrors `svm_interp::Mem::map`.
+    /// §3e op 0 `map`: (re)commit the **whole pages** covering `[offset,offset+len)` with `prot`,
+    /// zero-filled — including **growth** into the reserved tail. The commit/zero/protect span the
+    /// page range, not the raw `[offset, len)`, so the zeroing is page-granular and matches the
+    /// interpreter's per-page `Mem::map` on any host page size (on a 16 KiB host, `len` may be a
+    /// fraction of a page).
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
+        let start = *pages.start() * self.page;
+        let plen = (*pages.end() + 1 - *pages.start()) * self.page;
         // Make the pages RW so the zero-fill lands, then apply the requested protection.
-        self.hw_protect(offset, len, 2 /* WRITE */);
-        // SAFETY: the pages are now RW and within the reserved mapping (validated).
-        unsafe { std::ptr::write_bytes(self.base.add(offset as usize), 0, len as usize) };
+        self.hw_protect(start, plen, 2 /* WRITE */);
+        // SAFETY: the page range is RW and within the reserved mapping (validated).
+        unsafe { std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize) };
         for page in pages {
             self.set_prot(page, prot);
         }
-        self.hw_protect(offset, len, prot);
+        self.hw_protect(start, plen, prot);
         0
     }
-    /// §3e op 1 `unmap`: decommit — any access faults, the physical pages are released
-    /// (`MADV_DONTNEED`), so a re-`map` reads zero. Mirrors `svm_interp::Mem::unmap`.
+    /// §3e op 1 `unmap`: decommit the **whole pages** covering `[offset,offset+len)` — any access
+    /// faults, the physical pages are released (`MADV_DONTNEED`), so a re-`map` reads zero. Operates
+    /// on the page range (page-granular `MADV_DONTNEED` needs whole pages) to match `Mem::unmap`.
     fn unmap(&mut self, offset: u64, len: u64) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        // SAFETY: validated in-range; drop the physical backing then protect PROT_NONE.
+        let start = *pages.start() * self.page;
+        let plen = (*pages.end() + 1 - *pages.start()) * self.page;
+        // SAFETY: the page range is in the reserved mapping; drop the backing then protect NONE.
         unsafe {
             libc::madvise(
-                self.base.add(offset as usize) as *mut c_void,
-                len as usize,
+                self.base.add(start as usize) as *mut c_void,
+                plen as usize,
                 libc::MADV_DONTNEED,
             );
         }
-        self.hw_protect(offset, len, 0 /* PROT_NONE */);
+        self.hw_protect(start, plen, 0 /* PROT_NONE */);
         for page in pages {
             self.prot.insert(page, PageState::Unmapped);
         }
