@@ -584,6 +584,26 @@ this is the index.)
   the Memory-cap / `malloc`-over-`map` tests pass on windows too. Tier-1 MPK stays Linux-only
   (degrades to tier 0/3 elsewhere). Start point recorded: JIT no longer `compile_error!`s for
   windows; it does for other non-unix/non-windows targets.
+  - **CI matrix is live** (the maintainer applied the workflow — needs the `workflows` token scope):
+    the gating ubuntu job now also runs the windows cross-`check`+clippy, and a non-gating `cross-os`
+    job builds+tests on `windows-latest` + `macos-latest`. First runs surfaced + drove two fixes:
+    (a) `cc` was a `cfg(unix)` *build*-dep — that cfg matches the **host**, so a windows host never
+    got the crate and `build.rs` failed to compile (the linux cross-check can't catch a host-only
+    issue); made it an unconditional `[build-dependencies]` (the C shim compile stays target-gated on
+    `CARGO_CFG_UNIX`). (b) `c_frontend` needs a unix C toolchain (`make`+`cc`) → `#![cfg(unix)]`.
+  - **macOS is BLOCKED on the 4 KiB page-size pin (the real Phase-3.5 blocker).** `macos-latest` is
+    **ARM64 with 16 KiB pages**, but the whole stack pins **4096**: `protect_ro` (svm-jit) rounds RO
+    data-segment protection up to the host page (16 KiB) → over-protects adjacent RW globals → writes
+    fault; the interp's `Mem` hardcodes `PAGE = 4096` → the two **diverge**; and the Memory cap
+    (`MprotectWindow`/interp `prot_pages`/guest `malloc`) all use 4096-aligned offsets that `mprotect`
+    rejects on a 16 KiB host. Net: any RO-data path (`c_frontend` — 49/51 fail, the 2 passing are the
+    trap-expecting ones; and `jit_fuzz`'s `data ro` segments) breaks. This is DESIGN §4 "pin page
+    size" surfacing: **guest page granularity (4096, the Memory-cap API) must be disentangled from
+    host MMU granularity (runtime), and `protect_ro` must protect only host-pages fully within a
+    segment.** A real sub-project; can't be verified from a 4 KiB host, so it needs a 16 KiB CI runner
+    to iterate against. **Interim:** validate the POSIX PAL on **x86_64** by switching the macOS
+    runner to `macos-13` (4 KiB pages) — a one-line workflow edit. Windows is x86_64/4 KiB so it is
+    unaffected and is the near-term green target (it validates the VEH guard).
 - [ ] **Phase 4 — post-MVP:** deferred (below), developed against the parity matrix.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
