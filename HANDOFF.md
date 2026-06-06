@@ -566,11 +566,12 @@ this is the index.)
   test --workspace` passes on `ubuntu-latest` (x86-64 / 4 KiB), `macos-latest` (ARM64 / 16 KiB), and
   `windows-latest` (x86-64 / 4 KiB) in CI. Confinement masking is portable (§16/D51); only the
   non-TCB PAL differs, and all three PALs now reserve/commit/protect + recover from a guard fault.
-  Remaining polish (not blockers): drop `continue-on-error` from the now-green `cross-os` matrix
-  legs and fold them into gating (maintainer-applied workflow edit); port svm-run's `MprotectWindow`
-  Memory-cap thunk to Windows (`VirtualProtect`-backed map/unmap/protect) so guest `malloc`-over-
-  `map` works there too — today Windows uses a portable `WindowMem` (read/write borrows; map/unmap/
-  protect are success no-ops), enough for stdio + the cap-buffer borrow but not guest-driven growth.
+  The svm-run `MprotectWindow` Memory-cap backend (`map`/`unmap`/`protect`/`page_size`) is now
+  **cross-platform** — `mprotect`/`madvise` on unix, `VirtualAlloc(MEM_COMMIT)`/`VirtualProtect` on
+  windows, sharing one software page-state map; the 4000-seed interp/JIT differential grants the
+  Memory cap on every runner, so guest-driven growth + RO isolation are exercised on Windows too.
+  Remaining polish (not a blocker): drop `continue-on-error` from the now-green `cross-os` matrix
+  legs and fold them into gating (a one-line, maintainer-applied workflow edit).
   - **macOS (ARM64 / 16 KiB pages) is GREEN** — `macos-latest` runs the **whole** `cargo test
     --workspace` clean, including the re-enabled `c_frontend` differential suite (interp == JIT ==
     native `cc`) and the `escape_oracle`/`jit_diff` parity oracles. This closed out DESIGN §4 "pin
@@ -600,8 +601,11 @@ this is the index.)
     (it embeds XMM `M128A` state stored with aligned `movaps`); a bare stack local landed 8-mod-16
     and faulted — fixed with a `#[repr(C, align(16))]` wrapper. (b) stdio produced **empty output**
     because `cap_thunk` passed `gm = None` on non-unix, so a `Stream` write had no view of the guest
-    window — fixed by backing the §7 cap-buffer borrow with the portable `WindowMem`. Tier-1 MPK
-    stays Linux-only (degrades to tier 0/3 elsewhere).
+    window — first fixed with a portable `WindowMem`, since **superseded** by the full Windows
+    Memory-cap backend (`VirtualAlloc(MEM_COMMIT)`/`VirtualProtect`, sharing the unix path's
+    software page map), so guest-driven `map`/`unmap`/`protect`/growth + RO isolation now work on
+    Windows and are covered by the interp/JIT differential. Tier-1 MPK stays Linux-only (degrades to
+    tier 0/3 elsewhere).
   - **CI matrix is live** (the maintainer applied the workflow — needs the `workflows` token scope):
     the gating ubuntu job also runs the windows cross-`check`+clippy, and a `cross-os` job
     builds+tests on `windows-latest` + `macos-latest` (still `continue-on-error` — now safe to make
