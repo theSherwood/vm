@@ -12,6 +12,8 @@
 
 use core::ffi::c_void;
 
+#[cfg(not(unix))]
+use svm_interp::WindowMem;
 use svm_interp::{GuestMem, Host, StreamRole, Trap};
 use svm_ir::{Module, ValType};
 
@@ -59,11 +61,27 @@ pub unsafe extern "C" fn cap_thunk(
     } else {
         Some(&mut wm)
     };
+    // Windows (and any non-unix): the `mprotect`-backed Memory capability isn't ported yet, but the
+    // §7 cap-buffer borrow (e.g. a `Stream` write reading the bytes to emit, or a `read` filling the
+    // window) must still work — without it stdio produces nothing. A portable [`WindowMem`] over the
+    // committed window gives read/write borrows (bounds-checked, fail-closed past `mem_size`); its
+    // `map`/`unmap`/`protect` are the trait's default success no-ops (full growth/RO is the unix
+    // `MprotectWindow`'s job — a windows port is the follow-up).
     #[cfg(not(unix))]
-    let gm: Option<&mut dyn GuestMem> = {
-        let _ = (mem_base, mem_size, mem_reserved);
+    let _ = mem_reserved;
+    #[cfg(not(unix))]
+    let mut wm = if mem_base.is_null() {
         None
+    } else {
+        // SAFETY: per the cap_thunk contract `[mem_base, mem_base+mem_size)` is the committed RW
+        // guest window, live for this call.
+        Some(WindowMem::new(
+            std::slice::from_raw_parts_mut(mem_base, mem_size as usize),
+            mem_size,
+        ))
     };
+    #[cfg(not(unix))]
+    let gm: Option<&mut dyn GuestMem> = wm.as_mut().map(|w| w as &mut dyn GuestMem);
     match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
         Ok(res) => {
             if n_results != 0 {
