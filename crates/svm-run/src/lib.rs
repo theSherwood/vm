@@ -42,7 +42,13 @@ pub unsafe extern "C" fn cap_thunk(
     trap_out: *mut i64,
 ) {
     let host = &mut *(ctx as *mut Host);
-    let arg_slots = std::slice::from_raw_parts(args, n_args as usize);
+    // The JIT passes a null args/results pointer when the count is 0; `from_raw_parts` requires a
+    // non-null (aligned) pointer even for an empty slice, so use `&[]` in that case (UB otherwise).
+    let arg_slots = if n_args == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(args, n_args as usize)
+    };
     // The guest window with a real `mprotect`-backed Memory capability (`map`/`unmap`/`protect`,
     // incl. growth into the reserved tail). Unix-only — like the JIT itself.
     #[cfg(unix)]
@@ -60,9 +66,11 @@ pub unsafe extern "C" fn cap_thunk(
     };
     match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
         Ok(res) => {
-            let out = std::slice::from_raw_parts_mut(results, n_results as usize);
-            for (o, r) in out.iter_mut().zip(res) {
-                *o = r;
+            if n_results != 0 {
+                let out = std::slice::from_raw_parts_mut(results, n_results as usize);
+                for (o, r) in out.iter_mut().zip(res) {
+                    *o = r;
+                }
             }
             *trap_out = 0;
         }

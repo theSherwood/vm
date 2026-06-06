@@ -903,7 +903,12 @@ unsafe extern "C" fn cap_thunk(
     trap_out: *mut i64,
 ) {
     let host = &mut *(ctx as *mut Host);
-    let arg_slots = std::slice::from_raw_parts(args, n_args as usize);
+    // Null args pointer when there are 0 args; `from_raw_parts` needs non-null even for len 0.
+    let arg_slots = if n_args == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(args, n_args as usize)
+    };
     // The production JIT-side guest window: `map`/`unmap`/`protect` backed by real `mprotect`
     // (incl. growth into the reserved tail), mirrored by a software page map so the Memory cap is
     // bit-identical to the interpreter's paged `Mem` — exactly what this differential checks.
@@ -916,9 +921,11 @@ unsafe extern "C" fn cap_thunk(
 
     match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
         Ok(res) => {
-            let out = std::slice::from_raw_parts_mut(results, n_results as usize);
-            for (o, r) in out.iter_mut().zip(res) {
-                *o = r;
+            if n_results != 0 {
+                let out = std::slice::from_raw_parts_mut(results, n_results as usize);
+                for (o, r) in out.iter_mut().zip(res) {
+                    *o = r;
+                }
             }
             *trap_out = 0;
         }
