@@ -25,6 +25,24 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
       - run: cargo test --workspace
+      - run: rustup target add x86_64-pc-windows-gnu
+      - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+      - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+  cross-os:
+    name: build · test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # continue-on-error: true   # <- uncomment for the FIRST run (the windows guard is unverified);
+    #                                 drop it to make parity gating once it's green.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
   fuzz:
     name: cargo-fuzz (escape-TCB targets)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
