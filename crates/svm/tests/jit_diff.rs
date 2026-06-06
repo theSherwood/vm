@@ -1442,6 +1442,74 @@ block0(v0: i32):
         }
     }
 
+    /// §13 SharedRegion differential: one region mapped at *two* window offsets must alias on **both**
+    /// backends — the interpreter (`VecBacking`, software aliasing) and the JIT (a real `memfd`
+    /// `MAP_SHARED | MAP_FIXED` mapped at both offsets). A store at offset 0 is read back at
+    /// `page_size` (the second mapping), and the final windows are byte-identical. The guest queries
+    /// `page_size`, so it is host-page-agnostic. Linux-only until the macOS/windows shared mappings
+    /// land (slice 3); the interpreter reference runs everywhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn jit_cap_shared_region_aliases_differential() {
+        let src = format!(
+            "memory 16\n\
+             func (i32) -> (i64) {{\n\
+             block0(v0: i32):\n\
+             \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
+             \x20 v2 = i64.const 0\n\
+             \x20 v3 = i32.const 3\n\
+             \x20 v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
+             \x20 v5 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v1, v2, v1, v3)\n\
+             \x20 v6 = i64.const {marker}\n\
+             \x20 i64.store v2 v6\n\
+             \x20 v7 = i64.load v1\n\
+             \x20 return v7\n\
+             }}\n",
+            marker = 0x0123_4567_89ab_cdef_i64,
+        );
+        let m = parse_module(&src).expect("parse");
+        verify_module(&m).expect("verify");
+
+        let region_len = 1usize << 16;
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        let ri = hi.grant_shared_region(region_len); // interp: pure-Rust VecBacking
+        let rj = hj.grant_shared_region_backed(svm_run::new_shared_region(region_len)); // JIT: memfd
+        assert_eq!(ri, rj, "grants are deterministic");
+
+        let init = vec![0u8; 1 << 16];
+        let mut fuel = 1_000_000u64;
+        let (interp, imem) =
+            run_capture_reserved_with_host(&m, 0, &[Value::I32(ri)], &mut fuel, &init, 0, &mut hi);
+        let (jit, jmem) = compile_and_run_capture_reserved_with_host(
+            &m,
+            0,
+            &[rj as i64],
+            &init,
+            0,
+            cap_thunk,
+            &mut hj as *mut Host as *mut c_void,
+        )
+        .expect("jit compiles");
+
+        let want = 0x0123_4567_89ab_cdef_i64;
+        assert_eq!(
+            interp.expect("interp runs"),
+            vec![Value::I64(want)],
+            "interp: store at 0 must be visible at the page_size alias"
+        );
+        assert!(
+            matches!(jit, JitOutcome::Returned(ref s) if s == &[want]),
+            "jit: store at 0 must be visible at the page_size alias: {jit:?}"
+        );
+        assert_eq!(imem, jmem, "interp/JIT shared-region windows diverge");
+        assert_eq!(
+            &imem[0..8],
+            &want.to_le_bytes(),
+            "the marker must be present at window offset 0 (non-vacuous)"
+        );
+    }
+
     #[test]
     fn jit_cap_forged_handle_is_capfault() {
         // A forged handle index must be inert in the JIT too (CapFault), matching interp.
