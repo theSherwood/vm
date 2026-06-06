@@ -433,8 +433,26 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 let off = bb.push(Inst::ConstI64((page * 4096) as i64), ValType::I64);
                 let len = bb.push(Inst::ConstI64(4096), ValType::I64);
                 let results = vec![ValType::I64];
-                let op = bb.g.below(3); // 0 = map, 1 = unmap, 2 = protect
-                if op == 1 {
+                let op = bb.g.below(4); // 0 = map, 1 = unmap, 2 = protect, 3 = page_size
+                if op == 3 {
+                    // page_size() -> i64: a pure query — no args, no window effect — so both
+                    // backends report the same host page and it always agrees. Exercises the
+                    // 0-arg / 1-result cap.call marshalling for the Memory cap.
+                    let sig = FuncType {
+                        params: vec![],
+                        results: results.clone(),
+                    };
+                    bb.push_multi(
+                        Inst::CapCall {
+                            type_id: 3,
+                            op,
+                            sig,
+                            handle,
+                            args: vec![],
+                        },
+                        &results,
+                    );
+                } else if op == 1 {
                     let sig = FuncType {
                         params: vec![ValType::I64, ValType::I64],
                         results: results.clone(),

@@ -763,6 +763,19 @@ static int gen_builtin_memory(Node *node, int op, int want) {
   return r;
 }
 
+// `__vm_page_size()` (§3e/§4): query the host MMU page granularity the window is managed in —
+// `cap.call 3 3 () -> (i64)` on the stashed Memory handle (Memory op 3, no args). The guest libc
+// caches it so `malloc` aligns its growth to the *real* host page (4 KiB / 16 KiB / …) instead of
+// assuming a fixed size — the host-page-default surfaced to the guest so it can adapt.
+static int gen_builtin_page_size(Node *node) {
+  if (node->args)
+    error_tok(node->tok, "codegen_ir: __vm_page_size takes no arguments");
+  int h = load_handle(MEMORY_SLOT);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 3 3 () -> (i64) v%d ()\n", r, h);
+  return r;
+}
+
 static int gen_expr(Node *node) {
   switch (node->kind) {
   case ND_NUM: {
@@ -880,6 +893,8 @@ static int gen_expr(Node *node) {
           return gen_builtin_memory(node, 1, 2);
         if (!strcmp(fname, "__vm_protect"))
           return gen_builtin_memory(node, 2, 3);
+        if (!strcmp(fname, "__vm_page_size"))
+          return gen_builtin_page_size(node);
       }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the

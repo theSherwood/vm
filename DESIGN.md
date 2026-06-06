@@ -886,7 +886,11 @@ zero** the range — `MADV_DONTNEED` releases anonymous backing on Linux but is 
 advisory on Darwin; (2) the chibicc frontend emits portable IR and can't know the
 host page, so it pins its compile-time layout constants (RO-data isolation,
 heap-growth granularity) to the **largest common host page (16 KiB)** — a multiple
-of 4 KiB, harmless on 4 KiB hosts, correct on 16 KiB. Pinning a *deterministic*
+of 4 KiB, harmless on 4 KiB hosts, correct on 16 KiB. The guest can also **query**
+the page it is being given at runtime — `Memory` capability op 3 `page_size() ->
+i64` (the `__vm_page_size` frontend builtin) — so a guest allocator can align to the
+*actual* host page and adapt instead of assuming a fixed size; the shipped
+`<stdlib.h>` `malloc` caches it for its growth granularity. Pinning a *deterministic*
 guest-visible page (decoupled from the host page) for reproducible cross-host
 execution is a later refinement.
 

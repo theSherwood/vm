@@ -325,6 +325,12 @@ impl GuestMem for MprotectWindow {
         self.hw_protect(offset, len, prot);
         0
     }
+    /// §3e op 3 `page_size`: the `mprotect` granularity (`self.page` = `sysconf(_SC_PAGESIZE)`) —
+    /// the unit `map`/`unmap`/`protect` round to, matching the interpreter's `Mem::page_size` on the
+    /// same host so the two backends agree.
+    fn page_size(&self) -> i64 {
+        self.page as i64
+    }
 }
 
 /// How a guest program ended: its entry returned values, or it invoked `Exit(code)` (§3e).

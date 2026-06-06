@@ -650,7 +650,8 @@ pub mod iface {
     pub const EXIT: u32 = 1;
     /// `Clock` — op 0 `now(clock_id) -> i64` nanoseconds.
     pub const CLOCK: u32 = 2;
-    /// `Memory` — op 0 `map`, 1 `unmap`, 2 `protect` (§3e; real page protection — see `Mem`).
+    /// `Memory` — op 0 `map`, 1 `unmap`, 2 `protect`, 3 `page_size` (§3e; real page protection —
+    /// see `Mem`).
     pub const MEMORY: u32 = 3;
 }
 
@@ -685,6 +686,15 @@ pub trait GuestMem {
     }
     fn protect(&mut self, _offset: u64, _len: u64, _prot: i32) -> i64 {
         0
+    }
+
+    /// `Memory` op 3 `page_size() -> i64`: the host MMU page granularity this window is managed in —
+    /// the unit `map`/`unmap`/`protect` round to. A guest queries it to align its own allocator to
+    /// the real page (4 KiB / 16 KiB / …) and adapt, instead of assuming a fixed size. The default
+    /// reports the host page; the paged [`Mem`] and the JIT's `MprotectWindow` override it with the
+    /// exact value they round to, so the two backends stay in differential lockstep.
+    fn page_size(&self) -> i64 {
+        host_page_size() as i64
     }
 }
 
@@ -887,6 +897,7 @@ impl Host {
                     0 => mem.map(off, len, prot),
                     1 => mem.unmap(off, len),
                     2 => mem.protect(off, len, prot),
+                    3 => mem.page_size(),
                     _ => EINVAL,
                 }])
             }
@@ -1271,6 +1282,13 @@ impl GuestMem for Mem {
             self.set_prot(page, prot);
         }
         0
+    }
+
+    /// §3e op 3 `page_size`: the backing-store page granularity (`self.page`, the host page) — the
+    /// unit `map`/`unmap`/`protect` round to. The JIT's `MprotectWindow` reports the same host page,
+    /// so the two backends agree.
+    fn page_size(&self) -> i64 {
+        self.page as i64
     }
 }
 

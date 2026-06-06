@@ -274,6 +274,27 @@ int main() {
     assert_eq!(run_c(src), vec![Value::I32(43982)]);
 }
 
+/// The guest can **query the host page size** it is being given — Memory cap op 3, the
+/// `__vm_page_size` builtin — so its own allocator can align to the real MMU granularity
+/// (4 KiB / 16 KiB / …) and adapt, instead of assuming a fixed size. The value must be a positive
+/// power of two ≥ 4 KiB; interp and JIT both report the host page they actually round to, so they
+/// must agree (which `run_c` asserts internally).
+#[test]
+fn c_guest_queries_page_size() {
+    let src = r#"
+long __vm_page_size(void);
+int main() {
+  long p = __vm_page_size();
+  return (p >= 4096 && (p & (p - 1)) == 0) ? (int)p : -1; /* the page, or -1 if implausible */
+}
+"#;
+    let p = i32_of(src);
+    assert!(
+        p >= 4096 && (p & (p - 1)) == 0,
+        "guest-queried page size is not a sane power of two: {p}"
+    );
+}
+
 /// The shipped `<stdlib.h>` is a real guest libc: `malloc`/`calloc`/`realloc`/`free` that **grow
 /// the window via the Memory cap** — available to any program that just `#include <stdlib.h>`, no
 /// prelude. Allocates 400 KiB (well past the 64 KiB initial window, forcing growth), checks

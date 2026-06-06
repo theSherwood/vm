@@ -23,9 +23,12 @@
 // `exit` is a powerbox builtin (§3e), intercepted by name; declaring it here is enough.
 void exit(int code);
 
-// The Memory-capability builtin (§3e/§4): commit `[off, off+len)` with `prot` (READ|WRITE = 3),
-// returning 0 or a negative errno. Lowered to `cap.call` on the granted Memory handle.
+// The Memory-capability builtins (§3e/§4), lowered to `cap.call` on the granted Memory handle.
+// `__vm_map` commits `[off, off+len)` with `prot` (READ|WRITE = 3), returning 0 or a negative errno.
+// `__vm_page_size` returns the host MMU page granularity the window is managed in (the unit `map`
+// rounds to), so the guest can align to the *real* page instead of assuming a fixed size.
 long __vm_map(long off, long len, int prot);
+long __vm_page_size(void);
 
 static void abort(void) {
   exit(134); // 128 + SIGABRT, the conventional code
@@ -33,17 +36,24 @@ static void abort(void) {
 
 // --- the map-growing heap -------------------------------------------------------------------
 #define __SVM_HEAP_BASE 268435456L // 256 MiB: above the (<= 64 MiB) backed prefix, in the tail
-// Heap-growth granularity. The runtime's `map` commits and **zero-fills the whole host page(s)**
-// covering the request (host-page default: 4 KiB on x86-64, 16 KiB on Apple Silicon, …). If the
-// guest grew in 4 KiB steps on a 16 KiB host, a later step would re-`map` (and so re-zero) the
-// 16 KiB page already holding live allocations. We grow in 16 KiB units — the largest common host
-// page, a multiple of 4 KiB — so each growth covers fresh page(s) on any host; `__SVM_HEAP_BASE`
-// is 16 KiB-aligned, so growth stays page-aligned.
-#define __SVM_PAGE 16384L
 #define __SVM_HDR 16L // per-allocation header (holds the payload size; keeps 16-byte alignment)
 
 static long __svm_brk = __SVM_HEAP_BASE;       // next free byte
 static long __svm_committed = __SVM_HEAP_BASE; // first byte past the committed region
+static long __svm_page = 0;                    // cached host page granularity (0 = not yet queried)
+
+// Heap-growth granularity = the **host page**, queried once and cached. The runtime's `map` commits
+// and zero-fills the whole host page(s) covering a request (host-page default: 4 KiB on x86-64,
+// 16 KiB on Apple Silicon, …); growing in that unit means each growth covers fresh page(s) on any
+// host (a smaller step could re-`map` — and so re-zero — a page already holding live allocations).
+// `__SVM_HEAP_BASE` (256 MiB) is a multiple of every realistic page, so growth stays page-aligned.
+static long __svm_pagesize(void) {
+  if (__svm_page == 0) {
+    long p = __vm_page_size();
+    __svm_page = p > 0 ? p : 4096L; // defensive floor if the query is unavailable
+  }
+  return __svm_page;
+}
 
 static void *malloc(size_t n) {
   n = (n + 15UL) & ~15UL; // 16-byte align the payload
@@ -51,8 +61,9 @@ static void *malloc(size_t n) {
   long payload = hdr + __SVM_HDR;
   long end = payload + (long)n;
   if (end > __svm_committed) {
-    // Grow: commit whole pages covering the shortfall, read-write (READ|WRITE = 3).
-    long need = (end - __svm_committed + (__SVM_PAGE - 1)) & ~(__SVM_PAGE - 1);
+    // Grow: commit whole host pages covering the shortfall, read-write (READ|WRITE = 3).
+    long pg = __svm_pagesize();
+    long need = (end - __svm_committed + (pg - 1)) & ~(pg - 1);
     if (__vm_map(__svm_committed, need, 3) != 0)
       return NULL; // out of memory
     __svm_committed += need;

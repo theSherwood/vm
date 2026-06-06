@@ -625,9 +625,23 @@ this is the index.)
   4000 fuzz seeds green (the handler is exercised by width-overruns). **Not yet:** the
   *perf*-unlocking guard-when-bounded (needs a large window — below); div/rem/trunc still use
   explicit in-code trap checks (correct; converting them to #DE faults is optional).
+  - **Fixed — software-trap propagation across calls (found by the differential fuzzer):** a
+    *software* trap (the host trap cell — `cap.call` CapFault/`Exit`, div-by-zero, int-overflow,
+    bad float→int, `unreachable`, indirect-call type mismatch) sets the cell and `return`s zeros
+    from *its* clif function. The caller did **not** re-check the cell after a `call`/`call_indirect`,
+    so a trap raised in a **callee** was swallowed: the caller ran on with bogus zero results, and a
+    later *successful* `cap.call` (which resets the cell to 0) could erase it — the JIT then returned
+    where the interpreter stays trapped. Net: a guest could neutralize any trap (even `exit`) by
+    wrapping it in a function call. Fix: `emit_trap_propagate` after every `call`/`call_indirect`
+    (mirroring `cap.call`), so a callee trap unwinds the whole guest stack immediately. Pinned by
+    `jit_diff::cap::jit_trap_in_callee_propagates_through_caller` + the 4000-seed differential (the
+    generator now also emits the `page_size` query, which is what surfaced the cell-reset).
 - [x] **Real window / Memory capability + growth** — *done*: page size is the **host MMU
   granularity** (§4 "pin page size" → host-page default; all backends query it so they agree
-  page-for-page on 4 KiB / 16 KiB hosts), the
+  page-for-page on 4 KiB / 16 KiB hosts), and the guest can **read it at runtime** — `Memory` op 3
+  `page_size() -> i64` (the `__vm_page_size` builtin); the shipped `<stdlib.h>` `malloc` caches it
+  for its growth granularity instead of a hardcoded constant, so a guest adapts to the real page.
+  The
   *large* reserved window (`DEFAULT_RESERVED_LOG2 = 40`, mask `reserved - 1`), and real
   `map`/`unmap`/`protect` **including guest-controlled growth into the reserved tail** — the §1a
   "sparse address space / lazy page supply" capability. The interp `Mem` (reference) commits pages
