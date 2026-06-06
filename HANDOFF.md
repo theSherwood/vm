@@ -681,15 +681,10 @@ this is the index.)
   `svm_run::new_shared_region` over an anonymous fd — `memfd_create` on Linux, an `shm_unlink`ed
   `shm_open` object on macOS (`ShmBacking`); installed via `Host::grant_shared_region_backed`. The
   interp↔JIT differential `jit_diff::jit_cap_shared_region_aliases_differential` (cfg unix) pins it
-  non-vacuously. **Remaining §13 increment — windows (tracked: issue #1):** needs placeholder
-  reservations (`VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` + `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`),
-  a change to svm-jit's window allocator; currently → `-EINVAL` on windows, *pinned* by the
-  `#[cfg(windows)]` test in `svm/tests/shared_region.rs` (so the gap is tested + fails loudly when
-  wired). Plan: develop on a branch, validate via PR CI (`cross-os` runs the full suite on
-  `windows-latest` MSVC on every PR; main stays green), cross-compile locally to `windows-msvc`
-  (`cargo-xwin`) to catch compile/link errors fast — current local cross-check is `windows-gnu`,
-  which may not even expose `VirtualAlloc2`/`MapViewOfFile3`. Two PRs: (1) placeholder allocator with
-  existing Memory-cap tests green; (2) `map_region` + un-gate the differential.
+  non-vacuously. **Remaining §13 increment — windows (tracked: issue #1):** → `-EINVAL` on windows,
+  *pinned* by the `#[cfg(windows)]` test in `svm/tests/shared_region.rs` (so the gap is tested + fails
+  loudly when wired). The full playbook for the next session is in **"§13 Windows — next-session
+  playbook"** below.
   **Still left (Phase 4, not MVP blockers):** fault-driven *content* supply (a guest/parent as pager —
   `userfaultfd`/§14), and cross-domain `SharedRegion` `create`/`grant` (guest-minted regions — needs
   the §14 Instantiator). **`malloc` over `map` is the default guest libc** — the powerbox
@@ -698,6 +693,79 @@ this is the index.)
   `malloc`/`free`/`calloc`/`realloc` to any program that `#include <stdlib.h>`; `demos/heapgrow`
   grows a guest heap megabytes past the initial window cc-identically
   (`demo_heapgrow_matches_native`).
+
+### §13 Windows — next-session playbook (issue #1)
+
+**Goal:** wire the JIT zero-overhead `SharedRegion` mapping on Windows so
+`MprotectWindow::map_region` aliases (today it returns `-EINVAL` there). Then un-gate
+`jit_diff::jit_cap_shared_region_aliases_differential` (`#[cfg(unix)]` → `#[cfg(any(unix, windows))]`)
+and delete the `#[cfg(windows)]` `-EINVAL` pin in `svm/tests/shared_region.rs`. The interp reference
++ all-unix JIT path are already done and green; this is the last platform leg.
+
+**Why it stalled here (toolchain), and the agreed fix.** Windows needs **placeholder reservations**
+(you cannot map a fixed-address view into a plain `VirtualAlloc(MEM_RESERVE)` range). That is runtime
+behavior — compile-success ≠ correctness — and this environment has **no local Windows runtime**:
+`cargo-xwin` (local `x86_64-pc-windows-msvc`) is **blocked by the network policy (HTTP 403 fetching
+the MS SDK)**, and `windows-gnu` only compiles/links (no run). **Plan: do this work in an environment
+with network access for `cargo-xwin`** (the user is provisioning one). There, `cargo xwin build/test
+--target x86_64-pc-windows-msvc` gives a real local MSVC compile (and, with a Windows runner or
+wine-msvc, possibly run); the gating runtime check remains the `cross-os` `windows-latest` (MSVC) CI
+job, which runs the **full suite on every `pull_request`** — so develop on a branch and iterate via
+PR CI with main untouched.
+
+**APIs are available now.** `windows-sys 0.59` already declares `VirtualAlloc2`, `MapViewOfFile3`,
+`UnmapViewOfFile2`, `CreateFileMappingW`, and the `MEM_{RESERVE,REPLACE,PRESERVE}_PLACEHOLDER` /
+`MEM_COALESCE_PLACEHOLDERS` consts. Add the **`Win32_System_SystemServices`** feature (for
+`MEM_COALESCE_PLACEHOLDERS`) to `crates/svm-jit/Cargo.toml` and `crates/svm-run/Cargo.toml`;
+`Win32_System_Memory` (already present) covers the rest. `windows-sys` bundles import libs, so even
+`windows-gnu` links these — local compile/link is checkable without msvc.
+
+**The hard part — cross-layer placeholder state.** Two layers operate on the *same* window and both
+must speak "placeholder":
+- `crates/svm-jit/src/mem.rs` (`mod pal`, `#[cfg(windows)]`): `reserve` (currently
+  `VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS)`), `commit_rw`, `protect`, `release`, plus the guard page
+  and the snapshot `restore_rw`/`read_low`.
+- `crates/svm-run/src/lib.rs` (`MprotectWindow`, `#[cfg(any(unix, windows))]`): `map`/`unmap`/
+  `protect` (hardware via `VirtualAlloc`/`VirtualProtect`) and the new `map_region`.
+
+**Suggested two-PR split (each green on `windows-latest` before merge):**
+1. **Placeholder allocator (no SharedRegion yet).** Change svm-jit's Windows `reserve` to
+   `VirtualAlloc2(NULL, NULL, total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0)`.
+   Make `commit_rw` materialize private committed RW *inside* the placeholder — split to the exact
+   sub-range with `VirtualFree(addr, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)` then
+   `VirtualAlloc2(addr, size, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+   NULL, 0)` — and on the unmap/decommit path restore the placeholder (`VirtualFree(MEM_RELEASE |
+   MEM_PRESERVE_PLACEHOLDER)`) and coalesce adjacent placeholders
+   (`VirtualFree(MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)`). `release` stays
+   `VirtualFree(base, 0, MEM_RELEASE)`. **Success = the existing Windows Memory-cap tests
+   (`jit_diff` cap module, `jit_fuzz`, growth) stay green** — proving the rework is transparent to
+   non-shared paths. This PR is the real de-risk; expect to iterate the split/replace/coalesce
+   granularity (placeholders split/coalesce in *whole pages*, and `MEM_REPLACE_PLACEHOLDER` requires
+   the target be a placeholder of *exactly* the requested range).
+2. **`map_region` + region backing.** In `MprotectWindow::map_region` (Windows branch), split the
+   target placeholder and `MapViewOfFile3(hSection, GetCurrentProcess()?/NULL, base+win_off,
+   region_off, plen, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE|PAGE_READONLY, NULL, 0)`. Add a Windows
+   `SharedBacking` (alongside unix `ShmBacking`) over `CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+   PAGE_READWRITE, sizehigh, sizelow, NULL)` (a pagefile-backed section); `os_fd`'s `i32` return is
+   unix-shaped, so either widen the trait to carry an OS handle (e.g. `os_section(&self) ->
+   Option<*mut c_void>` returning the `HANDLE`) or add a Windows-specific accessor — **prefer a small
+   trait tweak** so `map_region` stays platform-clean. `read_byte`/`write_byte` map the section once
+   via `MapViewOfFile`. Wire `new_shared_region` for Windows. Then un-gate the differential + drop the
+   pin test.
+
+**Debuggability (no debugger on CI):** thread `GetLastError()` into distinct return codes / panic
+messages (e.g. `EINVAL - (err as i64)` or a logged step id) so a red `windows-latest` run names the
+failing call + error code in the test output.
+
+**Gotchas to expect:** `MapViewOfFile3`/`VirtualAlloc2` live in `api-ms-win-core-memory-l1-1-6.dll`
+(Win10+; fine on `windows-latest`); offset/len must be page-granular (already true via `prot_pages`);
+the section must be ≥ `region_off + plen` (size the `CreateFileMapping` page-rounded, mirroring unix
+`ShmBacking`'s `cap`); on teardown the window's single `VirtualFree(MEM_RELEASE)` must still unwind
+views + placeholders cleanly (may need explicit `UnmapViewOfFile2(.., MEM_PRESERVE_PLACEHOLDER)` per
+mapped region before releasing — verify on CI). Also handle the latent **`unmap`-of-region** case
+(unix has it too): unmapping a region-mapped page should restore an anonymous/placeholder page, not
+leave a shared view — add a unix test for this alongside the Windows work.
+
 - [x] **Verifier escape-oracle fuzzer** — *done*: the differential now byte-compares the
   final guest window across interp + JIT (verified ⇒ in-window), in the 4000 stable seeds
   (every push) and the `diff` libFuzzer target. See Fuzzing below.
@@ -953,10 +1021,14 @@ regressions one commit old"):
    plus a concrete guest-consumer round-trip. Physical demand paging is free (kernel lazy-zero of
    `MAP_NORESERVE` pages). The Memory cap is surfaced in the *main* irgen fuzzer (arm 19, prefix +
    tail) and the `_with_host` escape-oracle snapshot now covers grown tail pages (low 256 KiB),
-   pinned non-vacuously by `jit_cap_memory_escape_oracle_grown_tail`. **§13 SharedRegion slice 1
-   (interp reference) landed:** `iface::SHARED_REGION = 4`, `PageProt::Backed` aliasing, host-granted
-   regions, white-box + end-to-end tests (`svm/tests/shared_region.rs`); next is the JIT
-   `MprotectWindow` shared-mapping match + differential, then windows. **Deferred (Phase 4):**
+   pinned non-vacuously by `jit_cap_memory_escape_oracle_grown_tail`. **§13 SharedRegion landed on all
+   unix + spec-complete everywhere:** `iface::SHARED_REGION = 4`, `PageProt::Backed` aliasing
+   (interp reference, every platform); the JIT match via real shared mappings (`MprotectWindow::
+   map_region`, `mmap(MAP_SHARED|MAP_FIXED)` of a `memfd`/`shm` `ShmBacking`); interp↔JIT differential
+   `jit_cap_shared_region_aliases_differential` (cfg unix). **Windows JIT path is the one gap** —
+   tracked in **issue #1**, pinned by a `#[cfg(windows)]` `-EINVAL` test, with a full **"§13 Windows —
+   next-session playbook"** above (needs placeholder reservations; do it in an env with `cargo-xwin`
+   network access, validate via `windows-latest` PR CI). **Deferred (Phase 4):**
    fault-driven *content* supply (guest/parent as pager, `userfaultfd`/§14); cross-domain region
    `create`/`grant` (guest-minted regions, needs the §14 Instantiator).
 
