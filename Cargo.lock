@@ -493,6 +493,7 @@ dependencies = [
  "svm-jit",
  "svm-text",
  "svm-verify",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

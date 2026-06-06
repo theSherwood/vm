@@ -32,3 +32,13 @@ svm-jit.workspace = true
 # pages, mirrored by a software page-state map (so cap-buffer borrows fail closed rather than
 # faulting the host). Unix-only, like the JIT's guard page itself (`svm-jit` is unix-only).
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# The windows Memory-cap backend (§3e): `VirtualAlloc(MEM_COMMIT)` / `VirtualProtect` on the JIT
+# window pages — the same software-page-map model as the unix `mprotect` path, only the syscalls
+# differ. `GetSystemInfo` supplies the host page size.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+] }

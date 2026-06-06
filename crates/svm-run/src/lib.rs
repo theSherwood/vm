@@ -12,8 +12,6 @@
 
 use core::ffi::c_void;
 
-#[cfg(not(unix))]
-use svm_interp::WindowMem;
 use svm_interp::{GuestMem, Host, StreamRole, Trap};
 use svm_ir::{Module, ValType};
 
@@ -51,37 +49,23 @@ pub unsafe extern "C" fn cap_thunk(
     } else {
         std::slice::from_raw_parts(args, n_args as usize)
     };
-    // The guest window with a real `mprotect`-backed Memory capability (`map`/`unmap`/`protect`,
-    // incl. growth into the reserved tail). Unix-only — like the JIT itself.
-    #[cfg(unix)]
+    // The guest window with a real hardware-protected Memory capability (`map`/`unmap`/`protect`,
+    // incl. growth into the reserved tail): `mprotect` on unix, `VirtualProtect`/`VirtualAlloc` on
+    // windows — the same software-page-map model, only the syscalls differ.
+    #[cfg(any(unix, windows))]
     let mut wm = MprotectWindow::new(mem_base, mem_size, mem_reserved);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
     } else {
         Some(&mut wm)
     };
-    // Windows (and any non-unix): the `mprotect`-backed Memory capability isn't ported yet, but the
-    // §7 cap-buffer borrow (e.g. a `Stream` write reading the bytes to emit, or a `read` filling the
-    // window) must still work — without it stdio produces nothing. A portable [`WindowMem`] over the
-    // committed window gives read/write borrows (bounds-checked, fail-closed past `mem_size`); its
-    // `map`/`unmap`/`protect` are the trait's default success no-ops (full growth/RO is the unix
-    // `MprotectWindow`'s job — a windows port is the follow-up).
-    #[cfg(not(unix))]
-    let _ = mem_reserved;
-    #[cfg(not(unix))]
-    let mut wm = if mem_base.is_null() {
+    // Any other target has no window backend (the JIT, `svm-jit`, does not build there anyway).
+    #[cfg(not(any(unix, windows)))]
+    let gm: Option<&mut dyn GuestMem> = {
+        let _ = (mem_base, mem_size, mem_reserved);
         None
-    } else {
-        // SAFETY: per the cap_thunk contract `[mem_base, mem_base+mem_size)` is the committed RW
-        // guest window, live for this call.
-        Some(WindowMem::new(
-            std::slice::from_raw_parts_mut(mem_base, mem_size as usize),
-            mem_size,
-        ))
     };
-    #[cfg(not(unix))]
-    let gm: Option<&mut dyn GuestMem> = wm.as_mut().map(|w| w as &mut dyn GuestMem);
     match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
         Ok(res) => {
             if n_results != 0 {
@@ -97,9 +81,10 @@ pub unsafe extern "C" fn cap_thunk(
     }
 }
 
-/// The **host** page size (`sysconf(_SC_PAGESIZE)`): the protection granularity for `map`/`unmap`/
-/// `protect`, matching the interpreter (`svm_interp`) and the JIT (`svm-jit`'s `mprotect`) on the
-/// same host so all three agree page-for-page (§4 "pin page size", host-page default).
+/// The **host** page size: the protection granularity for `map`/`unmap`/`protect`, matching the
+/// interpreter (`svm_interp`) and the JIT (`svm-jit`) on the same host so all three agree
+/// page-for-page (§4 "pin page size", host-page default). `sysconf(_SC_PAGESIZE)` on unix,
+/// `GetSystemInfo` on windows.
 #[cfg(unix)]
 fn host_page_size() -> u64 {
     // SAFETY: sysconf is always safe; _SC_PAGESIZE is positive.
@@ -108,18 +93,31 @@ fn host_page_size() -> u64 {
         _ => 4096,
     }
 }
+#[cfg(windows)]
+fn host_page_size() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    // SAFETY: GetSystemInfo only writes its out-param; always safe.
+    let mut si: SYSTEM_INFO = unsafe { core::mem::zeroed() };
+    unsafe { GetSystemInfo(&mut si) };
+    match si.dwPageSize as u64 {
+        0 => 4096,
+        p => p,
+    }
+}
 
 /// A [`GuestMem`] over the JIT's guest window whose `map`/`unmap`/`protect` (the Memory capability,
-/// §3e) are backed by **real `mprotect`** on the window pages, mirrored by a software page-state
-/// map. The mirror lets cap-buffer borrows (§7) **fail closed** (`-EFAULT`) on an unmapped/RO page
-/// instead of faulting the host outside the guarded call, and bounds growth to the reserved mask
-/// domain — keeping this backend bit-identical to the interpreter's paged `Mem` (the §18 oracle,
-/// enforced by `jit_diff`'s differential). Unix-only, like the JIT's guard page itself.
+/// §3e) are backed by **real hardware page protection** on the window pages (`mprotect` on unix,
+/// `VirtualAlloc`/`VirtualProtect` on windows), mirrored by a software page-state map. The mirror
+/// lets cap-buffer borrows (§7) **fail closed** (`-EFAULT`) on an unmapped/RO page instead of
+/// faulting the host outside the guarded call, and bounds growth to the reserved mask domain —
+/// keeping this backend bit-identical to the interpreter's paged `Mem` (the §18 oracle, enforced by
+/// `jit_diff`'s differential). The page-map model is portable; only the three hardware primitives
+/// (`hw_commit_rw`/`hw_apply`/`hw_release_hint`) differ per OS.
 ///
 /// # Safety
 /// `base` must point at the JIT guest window: `[base, base+mapped)` initially RW and the whole
-/// `[base, base+reserved)` a live `PROT_NONE`/RW reservation owned for the call's duration.
-#[cfg(unix)]
+/// `[base, base+reserved)` a live inaccessible/RW reservation owned for the call's duration.
+#[cfg(any(unix, windows))]
 pub struct MprotectWindow {
     base: *mut u8,
     mapped: u64,
@@ -131,7 +129,7 @@ pub struct MprotectWindow {
     prot: std::collections::BTreeMap<u64, PageState>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PageState {
     Rw,
@@ -139,7 +137,7 @@ enum PageState {
     Unmapped,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl MprotectWindow {
     /// Wrap the JIT window `[base, base+mapped)` (backed) inside a `reserved` mask domain.
     pub fn new(base: *mut u8, mapped: u64, reserved: u64) -> MprotectWindow {
@@ -212,9 +210,45 @@ impl MprotectWindow {
         }
     }
 
-    /// `mprotect [offset, offset+len)` (page-rounded) to cap `prot` bits. The caller has already
-    /// validated the range, so this only translates + applies.
-    fn hw_protect(&self, offset: u64, len: u64, prot: i32) {
+    // ---- the three hardware primitives (the only per-OS part) -----------------------------------
+    // All take a **page-aligned** `[off, off+len)` already validated `⊆ reserved` by `prot_pages`.
+
+    /// Make `[off, off+len)` **committed and read-write** (so a following zero-fill / protection
+    /// change lands). On unix the reservation is `MAP_NORESERVE`, so `mprotect(RW)` suffices and the
+    /// kernel demand-zeroes; on windows the tail is reserved-but-uncommitted, so `VirtualAlloc(
+    /// MEM_COMMIT)` is required (it zero-fills only *newly* committed pages — callers zero explicitly
+    /// when they need it).
+    #[cfg(unix)]
+    fn hw_commit_rw(&self, off: u64, len: u64) {
+        // SAFETY: `[base+off, +len)` is within the reserved mapping (validated), owned for the call.
+        unsafe {
+            libc::mprotect(
+                self.base.add(off as usize) as *mut c_void,
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
+        }
+    }
+    #[cfg(windows)]
+    fn hw_commit_rw(&self, off: u64, len: u64) {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+        // SAFETY: `[base+off, +len)` is within the reservation (validated); committing an already-
+        // committed page is a no-op that re-asserts RW without zeroing live contents.
+        unsafe {
+            VirtualAlloc(
+                self.base.add(off as usize) as *const c_void,
+                len as usize,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            );
+        }
+    }
+
+    /// Apply cap `prot` bits (`0` none / `1` read / `3` read-write) to the committed `[off, off+len)`
+    /// without touching its contents — `mprotect` on unix, `VirtualProtect` on windows. `none` maps
+    /// to `PROT_NONE`/`PAGE_NOACCESS` (the page stays committed but faults on access).
+    #[cfg(unix)]
+    fn hw_apply(&self, off: u64, len: u64, prot: i32) {
         const PROT_READ: i32 = 1;
         const PROT_WRITE: i32 = 2;
         let hw = if prot & PROT_WRITE != 0 {
@@ -224,22 +258,58 @@ impl MprotectWindow {
         } else {
             libc::PROT_NONE
         };
-        let start = (offset / self.page) * self.page;
-        let end = offset + len;
-        let rlen = (end.div_ceil(self.page) * self.page) - start;
-        // SAFETY: `[base+start, +rlen)` is within the window's reserved mapping (validated:
-        // end ≤ reserved), owned by the JIT for the call's duration.
+        // SAFETY: `[base+off, +len)` is within the reserved mapping (validated), owned for the call.
         unsafe {
-            libc::mprotect(
-                self.base.add(start as usize) as *mut c_void,
-                rlen as usize,
-                hw,
+            libc::mprotect(self.base.add(off as usize) as *mut c_void, len as usize, hw);
+        }
+    }
+    #[cfg(windows)]
+    fn hw_apply(&self, off: u64, len: u64, prot: i32) {
+        use windows_sys::Win32::System::Memory::{
+            VirtualProtect, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
+        };
+        const PROT_READ: i32 = 1;
+        const PROT_WRITE: i32 = 2;
+        let flags: PAGE_PROTECTION_FLAGS = if prot & PROT_WRITE != 0 {
+            PAGE_READWRITE
+        } else if prot & PROT_READ != 0 {
+            PAGE_READONLY
+        } else {
+            PAGE_NOACCESS
+        };
+        let mut old: PAGE_PROTECTION_FLAGS = 0;
+        // SAFETY: `[base+off, +len)` is committed (callers `hw_commit_rw` first) and in-reservation.
+        unsafe {
+            VirtualProtect(
+                self.base.add(off as usize) as *const c_void,
+                len as usize,
+                flags,
+                &mut old,
             );
         }
     }
+
+    /// Hint the OS to drop the physical backing of the now-inaccessible `[off, off+len)` (a pure
+    /// memory-footprint optimization, *after* the range has been zeroed + protected `none`). `unmap`
+    /// semantics ("re-`map` reads zero") are already guaranteed by the explicit zero, so this need
+    /// not be exact: `MADV_DONTNEED` on unix; a no-op on windows (the pages stay committed-but-
+    /// `NOACCESS`, which keeps the snapshot's `restore_rw` able to read the backed prefix).
+    #[cfg(unix)]
+    fn hw_release_hint(&self, off: u64, len: u64) {
+        // SAFETY: `[base+off, +len)` is within the reserved mapping (validated), owned for the call.
+        unsafe {
+            libc::madvise(
+                self.base.add(off as usize) as *mut c_void,
+                len as usize,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+    #[cfg(windows)]
+    fn hw_release_hint(&self, _off: u64, _len: u64) {}
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl GuestMem for MprotectWindow {
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         if !self.range_committed(ptr, len, false) {
@@ -270,25 +340,25 @@ impl GuestMem for MprotectWindow {
         };
         let start = *pages.start() * self.page;
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
-        // Make the pages RW so the zero-fill lands, then apply the requested protection.
-        self.hw_protect(start, plen, 2 /* WRITE */);
+        // Commit + make RW so the zero-fill lands, zero (a fresh commit reads zero), then apply the
+        // requested protection.
+        self.hw_commit_rw(start, plen);
         // SAFETY: the page range is RW and within the reserved mapping (validated).
         unsafe { std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize) };
         for page in pages {
             self.set_prot(page, prot);
         }
-        self.hw_protect(start, plen, prot);
+        self.hw_apply(start, plen, prot);
         0
     }
     /// §3e op 1 `unmap`: decommit the **whole pages** covering `[offset,offset+len)` — any access
     /// faults, and a re-`map` reads zero. Operates on the page range (page-granular work needs whole
     /// pages) to match `Mem::unmap`.
     ///
-    /// We **explicitly zero** the range before decommitting: `MADV_DONTNEED` releases the backing on
-    /// Linux (next fault returns a fresh zero page), but on Darwin it is only advisory and leaves the
-    /// old bytes in place — so without the zero the JIT would keep stale contents while the interpreter
-    /// model reads zero, diverging on a 16 KiB host. The explicit zero makes both platforms agree; the
-    /// subsequent `MADV_DONTNEED` is then a pure memory-footprint hint (a no-op for correctness).
+    /// We **explicitly zero** the range so a later re-`map` reads zero on every platform: on Linux
+    /// `MADV_DONTNEED` alone would suffice (next fault returns a fresh zero page), but Darwin treats
+    /// it as advisory (stale bytes survive) and windows keeps the page committed — so the zero is what
+    /// makes them all agree, and `hw_release_hint` is then a pure footprint optimization.
     fn unmap(&mut self, offset: u64, len: u64) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
@@ -296,36 +366,37 @@ impl GuestMem for MprotectWindow {
         };
         let start = *pages.start() * self.page;
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
-        // SAFETY: the page range is in the reserved mapping; make it RW, zero it, hint the kernel to
-        // drop the backing, then protect NONE so any later access faults.
-        self.hw_protect(start, plen, 2 /* WRITE */);
-        unsafe {
-            std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize);
-            libc::madvise(
-                self.base.add(start as usize) as *mut c_void,
-                plen as usize,
-                libc::MADV_DONTNEED,
-            );
-        }
-        self.hw_protect(start, plen, 0 /* PROT_NONE */);
+        // Commit + make RW, zero it, hint the OS to drop the backing, then protect NONE so any later
+        // access faults (detect-and-kill).
+        self.hw_commit_rw(start, plen);
+        // SAFETY: the page range is RW and within the reserved mapping (validated).
+        unsafe { std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize) };
+        self.hw_release_hint(start, plen);
+        self.hw_apply(start, plen, 0 /* none */);
         for page in pages {
             self.prot.insert(page, PageState::Unmapped);
         }
         0
     }
-    /// §3e op 2 `protect`: change protection without touching backing (the D40 RO mechanism).
+    /// §3e op 2 `protect`: change protection without touching backing (the D40 RO mechanism). The
+    /// page is committed first (a no-op on already-committed pages; on windows it makes a never-mapped
+    /// reserved tail page addressable, matching the interpreter's "absent page reads zero" model)
+    /// **without** zeroing live contents, then the protection is applied.
     fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
+        let start = *pages.start() * self.page;
+        let plen = (*pages.end() + 1 - *pages.start()) * self.page;
+        self.hw_commit_rw(start, plen);
         for page in pages {
             self.set_prot(page, prot);
         }
-        self.hw_protect(offset, len, prot);
+        self.hw_apply(start, plen, prot);
         0
     }
-    /// §3e op 3 `page_size`: the `mprotect` granularity (`self.page` = `sysconf(_SC_PAGESIZE)`) —
+    /// §3e op 3 `page_size`: the hardware protection granularity (`self.page` = the host page) —
     /// the unit `map`/`unmap`/`protect` round to, matching the interpreter's `Mem::page_size` on the
     /// same host so the two backends agree.
     fn page_size(&self) -> i64 {
