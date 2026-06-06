@@ -363,6 +363,15 @@ mod pal {
     }
 
     // ---- the guard: AddVectoredExceptionHandler + RtlCaptureContext (longjmp-equivalent) --------
+    // `CONTEXT` must be **16-byte aligned** on x86-64: it embeds XMM (`M128A`) save area that
+    // `RtlCaptureContext` writes with *aligned* SSE stores (`movaps`). The real Win32 header declares
+    // it `__declspec(align(16))`, but windows-sys types it `#[repr(C)]` only — so a bare stack local
+    // is merely 8-byte aligned, and when it lands at an 8-mod-16 address `RtlCaptureContext` faults
+    // (`STATUS_ACCESS_VIOLATION`) *inside the capture itself*, before the guest runs. Wrap it to
+    // restore the ABI-required alignment.
+    #[repr(C, align(16))]
+    struct AlignedContext(CONTEXT);
+
     #[derive(Clone, Copy)]
     struct Frame {
         ctx: *const CONTEXT, // captured recovery context (a stack local of `run_guarded`)
@@ -420,17 +429,17 @@ mod pal {
         lo: usize,
         hi: usize,
     ) -> bool {
-        let mut saved: CONTEXT = core::mem::zeroed();
+        let mut saved = AlignedContext(core::mem::zeroed());
         // Capture the recovery point. On a guard fault the VEH copies `saved` over the fault context,
         // so execution resumes *here* with TRIPPED set — the longjmp-equivalent return.
-        RtlCaptureContext(&mut saved);
+        RtlCaptureContext(&mut saved.0);
         if TRIPPED.with(|x| x.replace(false)) {
             GUARD.with(|g| g.set(None));
             return true;
         }
         GUARD.with(|g| {
             g.set(Some(Frame {
-                ctx: &saved,
+                ctx: &saved.0,
                 lo,
                 hi,
             }))
