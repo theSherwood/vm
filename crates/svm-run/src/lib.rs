@@ -290,13 +290,15 @@ pub struct Run {
     pub stderr: Vec<u8>,
 }
 
-/// The frontend's `_start(stdout, stdin, exit)` powerbox entry shape — three `i32` capability
-/// handles (function 0). A module whose entry matches this is a runnable *program*; anything
-/// else is a bare kernel (run with [`run_kernel`]).
+/// The frontend's powerbox entry shape (function 0): the three `i32` handles
+/// `_start(stdout, stdin, exit)`, or four `_start(stdout, stdin, exit, memory)` once the program
+/// uses the Memory capability (a guest heap that grows via `map`, §3e/§4). A module whose entry
+/// matches either is a runnable *program*; anything else is a bare kernel (run with [`run_kernel`]).
 pub fn is_powerbox_entry(module: &Module) -> bool {
     matches!(
         module.funcs.first().map(|f| f.params.as_slice()),
         Some([ValType::I32, ValType::I32, ValType::I32])
+            | Some([ValType::I32, ValType::I32, ValType::I32, ValType::I32])
     )
 }
 
@@ -317,12 +319,20 @@ fn typed(t: ValType, v: i64) -> Value {
 pub fn run_powerbox(module: &Module, stdin: &[u8]) -> Result<Run, String> {
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
-    // Grant in the powerbox's declared import order: stdout, stdin, exit (§3e / D44).
-    let slots = [
+    // Grant in the powerbox's declared import order: stdout, stdin, exit, then Memory if the
+    // entry takes a 4th handle (§3e / D44) — so a `map`-growing guest heap has a handle to call.
+    let wants_memory = matches!(
+        module.funcs.first().map(|f| f.params.len()),
+        Some(n) if n >= 4
+    );
+    let mut slots = vec![
         host.grant_stream(StreamRole::Out) as i64,
         host.grant_stream(StreamRole::In) as i64,
         host.grant_exit() as i64,
     ];
+    if wants_memory {
+        slots.push(host.grant_memory() as i64);
+    }
     let jit = compile_and_run_with_host(
         module,
         0,

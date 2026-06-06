@@ -119,7 +119,7 @@ fn run_c_full(src: &str) -> CRun {
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
 
-    // `_start(stdout, stdin, exit)` takes the powerbox handles. Grant them identically on
+    // `_start(stdout, stdin, exit, memory)` takes the powerbox handles. Grant them identically on
     // both hosts (grants are deterministic, so the handle values match).
     let mut hi = Host::new();
     let mut hj = Host::new();
@@ -128,6 +128,7 @@ fn run_c_full(src: &str) -> CRun {
             Value::I32(h.grant_stream(StreamRole::Out)),
             Value::I32(h.grant_stream(StreamRole::In)),
             Value::I32(h.grant_exit()),
+            Value::I32(h.grant_memory()),
         ]
     };
     let args = grant(&mut hi);
@@ -218,6 +219,7 @@ fn c_write_to_string_literal_faults() {
             Value::I32(h.grant_stream(StreamRole::Out)),
             Value::I32(h.grant_stream(StreamRole::In)),
             Value::I32(h.grant_exit()),
+            Value::I32(h.grant_memory()),
         ]
     };
     let args = grant(&mut hi);
@@ -242,6 +244,69 @@ fn c_write_to_string_literal_faults() {
     assert!(
         matches!(jit, JitOutcome::Trapped(TrapKind::MemoryFault)),
         "jit: write to a string literal must detect-and-kill, got {jit:?}\n{ir}"
+    );
+}
+
+/// The guest **grows its own window** through the Memory capability: `__vm_map` (a frontend
+/// builtin → `cap.call` on the granted Memory handle) commits a page at 256 MiB — deep in the
+/// reserved tail, far above the backed prefix — then a store/load round-trips through it. Proves
+/// the Memory cap is granted to compiled C programs and the builtin lowers correctly, on both
+/// backends (interp page map + JIT real `mprotect`). The §1a sparse-address-space path from C.
+#[test]
+fn c_memory_cap_grows_into_reserved_tail() {
+    let src = r#"
+long __vm_map(long off, long len, int prot);
+int main() {
+  long base = 268435456;                        /* 256 MiB, in the reserved tail */
+  if (__vm_map(base, 4096, 3) != 0) return -1;  /* commit one RW page (READ|WRITE) */
+  int *p = (int *)base;
+  p[0] = 43981;                                 /* 0xABCD */
+  p[1] = p[0] + 1;
+  return p[1];
+}
+"#;
+    assert_eq!(run_c(src), vec![Value::I32(43982)]);
+}
+
+/// An access to an **un-grown** tail page faults (detect-and-kill) on both backends: the guest
+/// must `map` before it can touch the reserved tail. The negative of the test above.
+#[test]
+fn c_ungrown_tail_access_faults() {
+    let src = "int main() { int *p = (int *)268435456; return p[0]; }";
+    let ir = c_to_ir(src);
+    let m = parse_module(&ir).expect("parse");
+    verify_module(&m).expect("verify");
+    let grant = |h: &mut Host| {
+        [
+            Value::I32(h.grant_stream(StreamRole::Out)),
+            Value::I32(h.grant_stream(StreamRole::In)),
+            Value::I32(h.grant_exit()),
+            Value::I32(h.grant_memory()),
+        ]
+    };
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let args = grant(&mut hi);
+    grant(&mut hj);
+    let mut fuel = 50_000_000u64;
+    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let jit = compile_and_run_with_host(
+        &m,
+        0,
+        &slots,
+        cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+    assert_eq!(
+        interp,
+        Err(Trap::MemoryFault),
+        "interp: ungrown tail must fault"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Trapped(TrapKind::MemoryFault)),
+        "jit: ungrown tail must detect-and-kill, got {jit:?}"
     );
 }
 
@@ -1010,6 +1075,7 @@ fn c_function_pointer_signature_mismatch_traps() {
             Value::I32(h.grant_stream(StreamRole::Out)),
             Value::I32(h.grant_stream(StreamRole::In)),
             Value::I32(h.grant_exit()),
+            Value::I32(h.grant_memory()),
         ]
     };
     let args = grant(&mut hi);

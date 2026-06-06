@@ -135,10 +135,12 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 static int data_end = 16;
 
 // Capability handles the runtime hands `_start` (§3c/§3e) are stashed in the reserved
-// region; the stdio builtins load them from here. Layout: stdout@0, stdin@4, exit@8.
+// region; the builtins load them from here. Layout: stdout@0, stdin@4, exit@8, memory@12
+// (the four fit the reserved low-16 region, so no global/local address is 0 = C NULL).
 #define STDOUT_SLOT 0
 #define STDIN_SLOT 4
 #define EXIT_SLOT 8
+#define MEMORY_SLOT 12
 
 static int func_index(Obj *fn) {
   for (int i = 0; i < nfuncs; i++)
@@ -735,6 +737,32 @@ static int gen_builtin_exit(Node *node) {
   return 0;
 }
 
+// Memory capability builtins (§3e/§4): `__vm_map(off,len,prot)` / `__vm_unmap(off,len)` /
+// `__vm_protect(off,len,prot)` lower to `cap.call` on the stashed Memory handle (type 3,
+// ops 0/1/2). This is how guest libc (`malloc`) commits/decommits window pages and **grows
+// the heap into the reserved tail** (the §1a sparse-address-space path). Each returns the
+// cap's `i64` (0 / negative-errno). The args are simple expressions in our own libc, so they
+// are evaluated sequentially (no cross-block spill); a caller must not pass branching args.
+static int gen_builtin_memory(Node *node, int op, int want) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != want)
+    error_tok(node->tok, "codegen_ir: __vm_* builtin argument count mismatch");
+  Node *a = node->args;
+  int off = widen_i64(gen_expr(a), a->ty);
+  int len = widen_i64(gen_expr(a->next), a->next->ty);
+  int prot = (want == 3) ? gen_expr(a->next->next) : 0;
+  int h = load_handle(MEMORY_SLOT);
+  int r = nv++;
+  if (want == 3)
+    fprintf(o, "  v%d = cap.call 3 %d (i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d)\n", r, op, h,
+            off, len, prot);
+  else
+    fprintf(o, "  v%d = cap.call 3 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, off, len);
+  return r;
+}
+
 static int gen_expr(Node *node) {
   switch (node->kind) {
   case ND_NUM: {
@@ -846,6 +874,12 @@ static int gen_expr(Node *node) {
           return gen_builtin_stream(node, STDIN_SLOT, 0);
         if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
           return gen_builtin_exit(node);
+        if (!strcmp(fname, "__vm_map"))
+          return gen_builtin_memory(node, 0, 3);
+        if (!strcmp(fname, "__vm_unmap"))
+          return gen_builtin_memory(node, 1, 2);
+        if (!strcmp(fname, "__vm_protect"))
+          return gen_builtin_memory(node, 2, 3);
       }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the
@@ -1680,12 +1714,12 @@ static void emit_start(Obj *main_fn) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
-  fprintf(o, "func (i32, i32, i32) -> (%s) {\n", is_void ? "" : irty(mret));
-  fprintf(o, "block0(v0: i32, v1: i32, v2: i32):\n"); // stdout, stdin, exit
-  nv = 3;
-  // Stash each handle in its reserved slot so the stdio builtins can load it.
-  int slots[3] = {STDOUT_SLOT, STDIN_SLOT, EXIT_SLOT};
-  for (int i = 0; i < 3; i++) {
+  fprintf(o, "func (i32, i32, i32, i32) -> (%s) {\n", is_void ? "" : irty(mret));
+  fprintf(o, "block0(v0: i32, v1: i32, v2: i32, v3: i32):\n"); // stdout, stdin, exit, memory
+  nv = 4;
+  // Stash each handle in its reserved slot so the builtins can load it.
+  int slots[4] = {STDOUT_SLOT, STDIN_SLOT, EXIT_SLOT, MEMORY_SLOT};
+  for (int i = 0; i < 4; i++) {
     int a = nv++;
     fprintf(o, "  v%d = i64.const %d\n", a, slots[i]);
     fprintf(o, "  i32.store v%d v%d\n", a, i);
