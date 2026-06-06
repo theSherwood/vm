@@ -8,7 +8,9 @@
 //! flow is bounded by `fuel` (a stand-in for §5 metering), so it always terminates.
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use svm_ir::{
     BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx,
@@ -661,6 +663,14 @@ pub mod iface {
     /// `Memory` — op 0 `map`, 1 `unmap`, 2 `protect`, 3 `page_size` (§3e; real page protection —
     /// see `Mem`).
     pub const MEMORY: u32 = 3;
+    /// `SharedRegion` — a host-backed memory object aliased into the window (§13). op 0
+    /// `map(window_offset, region_offset, len, prot)` aliases the region's pages into the window
+    /// (the same backing may be mapped at *multiple* window offsets → zero-overhead aliasing, the
+    /// magic-ring-buffer primitive); op 1 `unmap(window_offset, len)` drops the alias; op 2
+    /// `len() -> i64` reports the region size; op 3 `page_size() -> i64`. Granting the handle is how
+    /// two domains come to share memory; `create`/`grant` (guest-minted regions, cross-domain) are a
+    /// §14 follow-up — today regions are host-granted, like `Memory`.
+    pub const SHARED_REGION: u32 = 4;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -672,6 +682,12 @@ const EINVAL: i64 = -22; // bad op / argument
 /// argument. There is no `EXEC` bit — guest data is never executed as code (§3c).
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
+
+/// A §13 `SharedRegion`'s backing bytes — a host-owned buffer that can be aliased into a window at
+/// one or more offsets (cloning the `Rc` shares the *same* bytes, so two mappings alias). This is
+/// the reference (interpreter) representation; a flat-window backend (JIT) will key its own shared
+/// mapping (memfd / file mapping) off the region id and ignore this handle.
+pub type RegionBacking = Rc<RefCell<Vec<u8>>>;
 
 /// The guest window a capability handler borrows `(ptr, len)` buffers from (§7). Both
 /// the interpreter's lazily-paged [`Mem`] and a JIT's flat window implement this, so a
@@ -694,6 +710,23 @@ pub trait GuestMem {
     }
     fn protect(&mut self, _offset: u64, _len: u64, _prot: i32) -> i64 {
         0
+    }
+
+    /// `SharedRegion` op 0 `map` (§13): alias `backing`'s `[region_off, region_off+len)` pages into
+    /// the window at `[win_off, win_off+len)` with `prot`. The same `region`/`backing` mapped at two
+    /// window offsets makes both ranges name the *same* bytes (zero-overhead aliasing). `0` or a
+    /// negative errno. The default rejects it (`-EINVAL`): only the reference paged [`Mem`] models
+    /// aliasing today; a flat-window backend wires its own shared mapping (§13 slice 2).
+    fn map_region(
+        &mut self,
+        _win_off: u64,
+        _region_off: u64,
+        _len: u64,
+        _prot: i32,
+        _region: u32,
+        _backing: RegionBacking,
+    ) -> i64 {
+        EINVAL
     }
 
     /// `Memory` op 3 `page_size() -> i64`: the host MMU page granularity this window is managed in —
@@ -755,6 +788,9 @@ enum Binding {
     Exit,
     Clock,
     Memory,
+    /// A §13 `SharedRegion` handle, carrying the index of its backing in [`Host::regions`]. The
+    /// backing (not the index) is the shared object; mapping it at several window offsets aliases.
+    SharedRegion(u32),
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -787,6 +823,9 @@ pub struct Host {
     /// Monotonic nanosecond counter; each `Clock.now` returns it then advances by one,
     /// so reads are deterministic and strictly increasing.
     pub clock_ns: i64,
+    /// §13 `SharedRegion` backings, indexed by the id a [`Binding::SharedRegion`] carries. Each is a
+    /// shared host buffer; aliasing a region into several window offsets clones this `Rc`.
+    regions: Vec<RegionBacking>,
 }
 
 impl Default for Host {
@@ -804,6 +843,7 @@ impl Host {
             stdout: Vec::new(),
             stderr: Vec::new(),
             clock_ns: 0,
+            regions: Vec::new(),
         }
     }
 
@@ -836,6 +876,16 @@ impl Host {
     }
     pub fn grant_memory(&mut self) -> i32 {
         self.grant(iface::MEMORY, Binding::Memory)
+    }
+
+    /// Grant a §13 `SharedRegion` capability backed by a fresh `len`-byte zero-filled host buffer,
+    /// returning its handle. The guest `map`s it into its window (op 0) — at one or more offsets — to
+    /// access the shared bytes as ordinary masked loads/stores. (Guest-minted regions and
+    /// cross-domain `grant` are a §14 follow-up; this models the host↔guest data plane.)
+    pub fn grant_shared_region(&mut self, len: usize) -> i32 {
+        let id = self.regions.len() as u32;
+        self.regions.push(Rc::new(RefCell::new(vec![0u8; len])));
+        self.grant(iface::SHARED_REGION, Binding::SharedRegion(id))
     }
 
     /// Close a handle (§3c): free the slot but keep its generation, so the old handle
@@ -905,6 +955,33 @@ impl Host {
                     0 => mem.map(off, len, prot),
                     1 => mem.unmap(off, len),
                     2 => mem.protect(off, len, prot),
+                    3 => mem.page_size(),
+                    _ => EINVAL,
+                }])
+            }
+            Binding::SharedRegion(region) => {
+                // §13: alias the host-backed region into the window. `map` (op 0) at several offsets
+                // aliases the same bytes; loads/stores then go through the ordinary masked path.
+                let Some(backing) = self.regions.get(region as usize).cloned() else {
+                    return Ok(vec![EINVAL]);
+                };
+                let Some(mem) = mem else {
+                    return Ok(vec![EINVAL]);
+                };
+                Ok(vec![match op {
+                    0 => {
+                        let win_off = *args.first().unwrap_or(&0) as u64;
+                        let region_off = *args.get(1).unwrap_or(&0) as u64;
+                        let len = *args.get(2).unwrap_or(&0) as u64;
+                        let prot = *args.get(3).unwrap_or(&0) as i32;
+                        mem.map_region(win_off, region_off, len, prot, region, backing)
+                    }
+                    1 => {
+                        let win_off = *args.first().unwrap_or(&0) as u64;
+                        let len = *args.get(1).unwrap_or(&0) as u64;
+                        mem.unmap(win_off, len)
+                    }
+                    2 => backing.borrow().len() as i64,
                     3 => mem.page_size(),
                     _ => EINVAL,
                 }])
@@ -995,10 +1072,11 @@ fn host_page_size() -> u64 {
 /// "sparse address space / lazy page supply" capability), in lockstep with the JIT's real page
 /// tables (an uncommitted page is `PROT_NONE` there and faults identically).
 ///
-/// *Forward-compat (not built):* a committed page is anonymous (zero-filled) today. A future
-/// `Backed { region, offset }` variant would let a §13 `SharedRegion`'s pages be aliased into the
-/// window at one or more offsets — the primitive behind the magic-ring-buffer trick — without
-/// changing the access path below; the variant simply redirects where a page's bytes live.
+/// A committed *anonymous* page is zero-filled and lives in [`Mem::pages`]; a [`PageProt::Backed`]
+/// page's bytes instead live in a §13 `SharedRegion` buffer (keyed in [`Mem::regions`]) — the
+/// primitive behind aliasing / the magic-ring-buffer trick. Crucially the access path
+/// ([`Mem::byte`]/[`Mem::set_byte`]) just redirects where a page's bytes live; loads/stores stay
+/// ordinary masked accesses (zero overhead), exactly as §13 specifies.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PageProt {
     /// Explicitly `map`ped read-write — committed even in the reserved tail (where *absent* would
@@ -1009,6 +1087,15 @@ enum PageProt {
     Ro,
     /// `unmap`ped: any access faults.
     Unmapped,
+    /// §13 aliased page: its bytes live at `region_off` in the `SharedRegion` `region`
+    /// ([`Mem::regions`]), not in an anonymous [`Mem::pages`] entry. `writable` mirrors the map
+    /// `prot` (a store to a read-only alias faults). Two pages with the same `region` (mapped at
+    /// different window offsets) name the same backing → aliasing.
+    Backed {
+        region: u32,
+        region_off: u64,
+        writable: bool,
+    },
 }
 
 /// A guest linear-memory window. Confinement itself lives in [`svm_mask::Window`]
@@ -1027,6 +1114,10 @@ struct Mem {
     /// reserved tail `[mapped, reserved)`. Entries appear for `protect`ed (`Ro`), `unmap`ped
     /// (`Unmapped`), and grown/re-committed tail (`Rw`) pages — anywhere in `[0, reserved)`.
     prot: BTreeMap<u64, PageProt>,
+    /// §13 `SharedRegion` backings this window has aliased in, keyed by region id (the bytes a
+    /// [`PageProt::Backed`] page redirects to). A clone of the `Host`'s `Rc`, so two windows — or
+    /// two offsets in one window — that map the same region share the *same* bytes.
+    regions: BTreeMap<u32, RegionBacking>,
 }
 
 impl Mem {
@@ -1042,6 +1133,7 @@ impl Mem {
             page: host_page_size(),
             pages: BTreeMap::new(),
             prot: BTreeMap::new(),
+            regions: BTreeMap::new(),
         }
     }
 
@@ -1052,6 +1144,7 @@ impl Mem {
         match self.prot.get(&page) {
             Some(PageProt::Rw) => Some(true),
             Some(PageProt::Ro) => Some(false),
+            Some(PageProt::Backed { writable, .. }) => Some(*writable),
             Some(PageProt::Unmapped) => None,
             None => (page * self.page < self.window.mapped()).then_some(true),
         }
@@ -1212,15 +1305,40 @@ impl Mem {
         }
     }
 
-    /// Read one byte; unwritten pages read as zero.
+    /// Read one byte; unwritten anonymous pages read as zero. A [`PageProt::Backed`] page redirects
+    /// to its §13 region buffer (so an aliased page reads whatever the shared backing holds).
     fn byte(&self, off: u64) -> u8 {
         let idx = (off % self.page) as usize;
+        if let Some(PageProt::Backed {
+            region, region_off, ..
+        }) = self.prot.get(&(off / self.page))
+        {
+            return self
+                .regions
+                .get(region)
+                .and_then(|r| r.borrow().get(*region_off as usize + idx).copied())
+                .unwrap_or(0);
+        }
         self.pages.get(&(off / self.page)).map_or(0, |p| p[idx])
     }
 
     fn set_byte(&mut self, off: u64, b: u8) {
         let idx = (off % self.page) as usize;
         let page = self.page;
+        if let Some(PageProt::Backed {
+            region, region_off, ..
+        }) = self.prot.get(&(off / page))
+        {
+            // §13 aliased page: write through to the shared region backing.
+            if let Some(r) = self.regions.get(region) {
+                let mut r = r.borrow_mut();
+                let at = *region_off as usize + idx;
+                if at < r.len() {
+                    r[at] = b;
+                }
+            }
+            return;
+        }
         self.pages
             .entry(off / page)
             .or_insert_with(|| vec![0u8; page as usize])[idx] = b;
@@ -1258,6 +1376,26 @@ impl Mem {
             }
             let n = (self.page as usize).min(snap - start);
             out[start..start + n].copy_from_slice(&page[..n]);
+        }
+        // §13 aliased pages live in their region backing, not in `pages` — fill them from there.
+        for (&idx, p) in &self.prot {
+            let PageProt::Backed {
+                region, region_off, ..
+            } = p
+            else {
+                continue;
+            };
+            let start = (idx * self.page) as usize;
+            if start >= snap {
+                continue;
+            }
+            let n = (self.page as usize).min(snap - start);
+            if let Some(r) = self.regions.get(region) {
+                let r = r.borrow();
+                for k in 0..n {
+                    out[start + k] = r.get(*region_off as usize + k).copied().unwrap_or(0);
+                }
+            }
         }
         out
     }
@@ -1301,14 +1439,75 @@ impl GuestMem for Mem {
     }
 
     /// §3e op 2 `protect`: change the protection of mapped pages without touching their backing
-    /// (the D40 read-only const-segment mechanism: `protect(READ)` ⇒ later stores fault).
+    /// (the D40 read-only const-segment mechanism: `protect(READ)` ⇒ later stores fault). A §13
+    /// aliased page stays aliased — only its writability changes (or it `unmap`s if neither R nor W),
+    /// so the shared bytes survive a `protect(READ)`.
     fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
         for page in pages {
-            self.set_prot(page, prot);
+            if let Some(PageProt::Backed {
+                region, region_off, ..
+            }) = self.prot.get(&page).copied()
+            {
+                if prot & (PROT_READ | PROT_WRITE) == 0 {
+                    self.prot.insert(page, PageProt::Unmapped);
+                } else {
+                    self.prot.insert(
+                        page,
+                        PageProt::Backed {
+                            region,
+                            region_off,
+                            writable: prot & PROT_WRITE != 0,
+                        },
+                    );
+                }
+            } else {
+                self.set_prot(page, prot);
+            }
+        }
+        0
+    }
+
+    /// §13 op 0 `map`: alias `backing`'s `[region_off, region_off+len)` into the window at
+    /// `[win_off, win_off+len)`. Both window offsets and the region offset round to whole pages; the
+    /// region span must fit the backing; the mapping must be at least readable. The aliased pages'
+    /// bytes then live in the region (a prior anonymous page there is dropped), so a store at one
+    /// alias is visible at every other mapping of the same region.
+    fn map_region(
+        &mut self,
+        win_off: u64,
+        region_off: u64,
+        len: u64,
+        prot: i32,
+        region: u32,
+        backing: RegionBacking,
+    ) -> i64 {
+        let pages = match self.prot_pages(win_off, len) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if !region_off.is_multiple_of(self.page) || prot & PROT_READ == 0 {
+            return EINVAL;
+        }
+        match region_off.checked_add(len) {
+            Some(end) if end <= backing.borrow().len() as u64 => {}
+            _ => return EINVAL,
+        }
+        let writable = prot & PROT_WRITE != 0;
+        self.regions.insert(region, backing);
+        for (i, page) in pages.enumerate() {
+            self.prot.insert(
+                page,
+                PageProt::Backed {
+                    region,
+                    region_off: region_off + i as u64 * self.page,
+                    writable,
+                },
+            );
+            self.pages.remove(&page); // bytes live in the region now, not an anonymous page
         }
         0
     }
@@ -1732,5 +1931,121 @@ mod prot_tests {
             assert!(m.store(off, 0, StoreOp::I64, Value::I64(0x55)).is_ok());
             assert_eq!(m.load(off, 0, LoadOp::I64), Ok(Value::I64(0x55)));
         }
+    }
+
+    // ---- §13 SharedRegion: host-backed memory aliased into the window ----
+
+    /// A §13 `SharedRegion` backing of `pages` whole host pages, zero-filled.
+    fn region(pages: u64) -> RegionBacking {
+        Rc::new(RefCell::new(vec![0u8; (pages * page()) as usize]))
+    }
+
+    #[test]
+    fn shared_region_aliases_two_window_offsets() {
+        // One region mapped at two window offsets names the *same* bytes: a store at one alias is
+        // visible at the other (and vice versa) — the §13 zero-overhead aliasing primitive.
+        let mut m = mem64k();
+        let r = region(1);
+        let (a, b) = (0, page());
+        assert_eq!(
+            m.map_region(a, 0, page(), PROT_READ | PROT_WRITE, 0, r.clone()),
+            0
+        );
+        assert_eq!(m.map_region(b, 0, page(), PROT_READ | PROT_WRITE, 0, r), 0);
+        let v = Value::I64(0x0123_4567_89ab_cdefu64 as i64);
+        assert!(m.store(a, 0, StoreOp::I64, v).is_ok());
+        assert_eq!(m.load(b, 0, LoadOp::I64), Ok(v), "A→B alias");
+        let w = Value::I64(0x7777);
+        assert!(m.store(b + 16, 0, StoreOp::I64, w).is_ok());
+        assert_eq!(m.load(a + 16, 0, LoadOp::I64), Ok(w), "B→A alias");
+    }
+
+    #[test]
+    fn shared_region_offsets_are_region_relative() {
+        // Pointers are region-relative (§13): the same *region* offset at two window offsets aliases;
+        // different region offsets are independent.
+        let mut m = mem64k();
+        let r = region(2);
+        // window pages 0,1 ⇒ region pages 0,1.
+        assert_eq!(
+            m.map_region(0, 0, 2 * page(), PROT_READ | PROT_WRITE, 0, r.clone()),
+            0
+        );
+        // a second mapping of *region page 1* at window page 2.
+        assert_eq!(
+            m.map_region(2 * page(), page(), page(), PROT_READ | PROT_WRITE, 0, r),
+            0
+        );
+        let v = Value::I64(0xdead_beef);
+        assert!(m.store(page(), 0, StoreOp::I64, v).is_ok()); // write region page 1 via window page 1
+        assert_eq!(m.load(2 * page(), 0, LoadOp::I64), Ok(v)); // observe via window page 2
+        assert_eq!(m.load(0, 0, LoadOp::I64), Ok(Value::I64(0))); // region page 0 independent
+    }
+
+    #[test]
+    fn shared_region_read_only_alias_shares_reads_faults_stores() {
+        let mut m = mem64k();
+        let r = region(1);
+        assert_eq!(
+            m.map_region(0, 0, page(), PROT_READ | PROT_WRITE, 0, r.clone()),
+            0
+        );
+        assert_eq!(m.map_region(page(), 0, page(), PROT_READ, 0, r), 0); // RO alias of same region
+        let v = Value::I64(0x5151_5151);
+        assert!(m.store(0, 0, StoreOp::I64, v).is_ok());
+        assert_eq!(
+            m.load(page(), 0, LoadOp::I64),
+            Ok(v),
+            "RO alias sees the write"
+        );
+        assert_eq!(
+            m.store(page(), 0, StoreOp::I64, Value::I64(1)),
+            Err(Trap::MemoryFault),
+            "store to RO alias faults"
+        );
+        // protect(READ) on the RW alias keeps it aliased (shared bytes survive), now store-faulting.
+        assert_eq!(m.protect(0, page(), PROT_READ), 0);
+        assert_eq!(m.load(0, 0, LoadOp::I64), Ok(v));
+        assert_eq!(
+            m.store(0, 0, StoreOp::I64, Value::I64(2)),
+            Err(Trap::MemoryFault)
+        );
+    }
+
+    #[test]
+    fn shared_region_unmap_drops_alias_and_map_replaces_anonymous() {
+        let mut m = mem64k();
+        // Aliasing over an already-written anonymous page redirects to the region (old bytes gone).
+        assert!(m.store(0, 0, StoreOp::I64, Value::I64(0x4242)).is_ok());
+        let r = region(1);
+        assert_eq!(m.map_region(0, 0, page(), PROT_READ | PROT_WRITE, 0, r), 0);
+        assert_eq!(
+            m.load(0, 0, LoadOp::I64),
+            Ok(Value::I64(0)),
+            "region zero-fill"
+        );
+        assert!(m.store(0, 0, StoreOp::I64, Value::I64(9)).is_ok());
+        // unmap drops the alias → faults.
+        assert_eq!(m.unmap(0, page()), 0);
+        assert_eq!(m.load(0, 0, LoadOp::I64), Err(Trap::MemoryFault));
+    }
+
+    #[test]
+    fn shared_region_bad_args_einval() {
+        let mut m = mem64k();
+        let r = region(1); // one page
+        assert_eq!(m.map_region(1, 0, page(), PROT_READ, 0, r.clone()), EINVAL); // misaligned window
+        assert_eq!(m.map_region(0, 0, 0, PROT_READ, 0, r.clone()), EINVAL); // zero len
+        assert_eq!(m.map_region(0, 1, page(), PROT_READ, 0, r.clone()), EINVAL); // misaligned region
+        assert_eq!(
+            m.map_region(0, page(), page(), PROT_READ, 0, r.clone()),
+            EINVAL
+        ); // region OOB
+        assert_eq!(
+            m.map_region(0, 0, 2 * page(), PROT_READ, 0, r.clone()),
+            EINVAL
+        ); // span > backing
+        assert_eq!(m.map_region(0, 0, page(), PROT_WRITE, 0, r.clone()), EINVAL); // not readable
+        assert_eq!(m.map_region(65536, 0, page(), PROT_READ, 0, r), EINVAL); // window past reserved
     }
 }

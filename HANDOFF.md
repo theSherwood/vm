@@ -667,10 +667,18 @@ this is the index.)
   rarely leaves non-zero tail content (verified: a corrupt-a-tail-byte probe didn't fire in 4000
   seeds), the non-vacuous pin is the deterministic, cross-platform
   `jit_diff::jit_cap_memory_escape_oracle_grown_tail` (grow a tail page, store a marker, assert both
-  windows agree *and* hold the marker). **Still left (Phase 4, not MVP blockers):** fault-driven
-  *content* supply (a guest/parent as pager — `userfaultfd`/§14), and `SharedRegion` aliasing (the
-  same backing at two offsets — the magic-ring-buffer trick, §13; the interp `PageProt` has a
-  forward-compat hook for it). **`malloc` over `map` is the default guest libc** — the powerbox
+  windows agree *and* hold the marker). **§13 SharedRegion — interp reference landed (slice 1):** a
+  host-granted `SharedRegion` capability (`iface::SHARED_REGION = 4`; op 0 `map(win_off, region_off,
+  len, prot)`, 1 `unmap`, 2 `len`, 3 `page_size`) aliases a shared host buffer into the window via a
+  new `PageProt::Backed { region, region_off, writable }` — the access path is unchanged (loads/stores
+  redirect where a page's bytes live, zero overhead), so the same region mapped at two window offsets
+  names the same bytes (the magic-ring-buffer primitive). White-box tests in `prot_tests` +
+  end-to-end `svm/tests/shared_region.rs` (with a non-vacuous control). **Next §13 increments:** (2)
+  real shared backing in `MprotectWindow` (memfd + `MAP_FIXED` aliasing) + interp↔JIT differential
+  (unix-first); (3) windows (`CreateFileMapping`/`MapViewOfFileEx`) + un-gate. **Still left (Phase 4,
+  not MVP blockers):** fault-driven *content* supply (a guest/parent as pager — `userfaultfd`/§14),
+  and cross-domain `SharedRegion` `create`/`grant` (guest-minted regions — needs the §14
+  Instantiator). **`malloc` over `map` is the default guest libc** — the powerbox
   grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect` builtins expose it
   (codegen_ir.c), and the shipped `frontend/chibicc/include/stdlib.h` provides a map-growing
   `malloc`/`free`/`calloc`/`realloc` to any program that `#include <stdlib.h>`; `demos/heapgrow`
@@ -931,10 +939,12 @@ regressions one commit old"):
    plus a concrete guest-consumer round-trip. Physical demand paging is free (kernel lazy-zero of
    `MAP_NORESERVE` pages). The Memory cap is surfaced in the *main* irgen fuzzer (arm 19, prefix +
    tail) and the `_with_host` escape-oracle snapshot now covers grown tail pages (low 256 KiB),
-   pinned non-vacuously by `jit_cap_memory_escape_oracle_grown_tail`. **Deferred (Phase 4):**
-   fault-driven *content* supply (guest/parent as pager, `userfaultfd`/§14); `SharedRegion` aliasing
-   — same backing at two offsets, the magic-ring-buffer trick (§13; `PageProt` has the forward-compat
-   hook).
+   pinned non-vacuously by `jit_cap_memory_escape_oracle_grown_tail`. **§13 SharedRegion slice 1
+   (interp reference) landed:** `iface::SHARED_REGION = 4`, `PageProt::Backed` aliasing, host-granted
+   regions, white-box + end-to-end tests (`svm/tests/shared_region.rs`); next is the JIT
+   `MprotectWindow` shared-mapping match + differential, then windows. **Deferred (Phase 4):**
+   fault-driven *content* supply (guest/parent as pager, `userfaultfd`/§14); cross-domain region
+   `create`/`grant` (guest-minted regions, needs the §14 Instantiator).
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
