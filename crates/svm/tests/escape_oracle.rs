@@ -9,6 +9,17 @@
 use svm_interp::{run_capture, run_capture_reserved, Value};
 use svm_jit::{compile_and_run_capture, compile_and_run_capture_reserved, JitOutcome};
 
+/// True on a 4 KiB-page host. A couple of `reserved_*` cases below hardcode the mapped/tail
+/// boundary at address 4096 (`memory 12`); on a 16 KiB-page host (macOS ARM) the JIT rounds the
+/// 4 KiB `mapped` up to one 16 KiB host page, so that address is still backed and the "tail
+/// access faults" premise no longer holds. Those cases skip there; the guard itself is covered on
+/// 16 KiB by the `svm-jit` PAL conformance test (64 KiB / 1 MiB windows, host-page-aligned).
+#[cfg(unix)]
+fn host_4k() -> bool {
+    // SAFETY: sysconf is always safe; _SC_PAGESIZE is positive.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) == 4096 }
+}
+
 /// Parse + verify a module, then run it on both backends with `init` seeding the window;
 /// return both final-window snapshots (asserting both ran to completion and agree on the
 /// result). These cases test **wrap-confinement** (an out-of-window address aliasing back in),
@@ -167,6 +178,9 @@ fn both_reserved(
 #[cfg(unix)]
 #[test]
 fn reserved_tail_access_faults_identically() {
+    if !host_4k() {
+        return; // hardcodes the 4 KiB mapped/tail boundary (address 4096); see `host_4k`.
+    }
     // memory 12 = 4 KiB backed (exactly one page). Store one byte at address 4096 — the first
     // byte *past* the mapped window (and well within a 2^24 reserved mask domain).
     let src = "\

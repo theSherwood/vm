@@ -7,12 +7,14 @@
 //! second tier (`c_matches_gcc_*`) compiles the *same* C with native `cc` and compares
 //! exit code + stdout, validating C semantics against a real compiler.
 //!
-//! Requires a unix C toolchain (`make` + `cc`) to build the chibicc fork, so this suite is
-//! **unix-only** (`#![cfg(unix)]`); windows has no such toolchain and the frontend's portability
-//! is a separate effort (Phase 3.5). The frontend is outside the escape-TCB (§2a): whatever IR it
-//! emits still goes through the verifier before it runs — and the JIT/PAL it exercises is validated
+//! Requires a unix C toolchain (`make` + `cc`) to build the chibicc fork, and the frontend bakes
+//! a **4 KiB** RO-data page-isolation at compile time — so this suite is **Linux-only for now**
+//! (`#![cfg(target_os = "linux")]`). Windows lacks the toolchain; macOS-ARM (16 KiB pages) needs
+//! the frontend RO-isolation pin + guest page-size exposure (Phase 3.5 part 2) before its programs
+//! run without spurious RO over-protection faults. The frontend is outside the escape-TCB (§2a):
+//! whatever IR it emits still goes through the verifier, and the JIT/PAL it exercises is validated
 //! cross-platform by `jit_fuzz`/`escape_oracle` + the `svm-jit` PAL conformance test instead.
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
