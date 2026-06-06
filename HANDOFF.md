@@ -562,14 +562,28 @@ this is the index.)
 - [x] **Phase 2 — compilability proof:** chibicc→IR; real C on interp + JIT, two-tier
   tested (interp == JIT == native `cc`); SSA promotion landed (§5 item 8, §3).
 - [ ] **Phase 3 — Solid MVP (in progress):** the MVP remainder below.
-- [ ] **Phase 3.5 — Cross-platform parity:** port to **Windows** (PAL:
+- [~] **Phase 3.5 — Cross-platform parity (in progress):** port to **Windows** (PAL:
   `VirtualAlloc`/`VirtualProtect` + **VEH/SEH** detect-and-kill) and validate
   **macOS** (Mach-exception path, which can intercept ahead of BSD signals); stand
   up a gating **Linux/Windows/macOS CI matrix** so parity holds from here on.
   Confinement masking is already portable (§16/D51); only the non-TCB PAL differs.
-  Starting point: the JIT `compile_error!`s off unix, the guard/detect-and-kill
-  path is `cfg(unix)`, and CI is `ubuntu-latest` only — this phase makes all three
-  OSes first-class. Tier-1 MPK stays Linux-only (degrades to tier 0/3 elsewhere).
+  **Done so far:** `svm-jit/src/mem.rs` is refactored into a portable window model over a small
+  **PAL** seam (reserve/commit/protect/release + install_guard/run_guarded), with the existing unix
+  impl behind it (no behavior change) and a **platform-agnostic guard conformance test** (drives the
+  window+guard directly, no JIT). The **windows PAL** is implemented in pure Rust via `windows-sys`
+  (`VirtualAlloc`/`VirtualProtect`/`VirtualFree` + a Vectored Exception Handler with
+  `RtlCaptureContext` for the longjmp-equivalent recovery — no C shim, so it stays check-able from
+  Linux). `cargo check --target x86_64-pc-windows-gnu` is **green** for the whole workspace, and
+  clippy is clean for both host and the windows target. **Blocked on CI:** the windows guard's
+  *runtime* behaviour (VEH context-restore, fault boundaries) can't be exercised on the Linux dev
+  host (no Windows/Wine) — it's marked `CI-UNVERIFIED` in-source and needs a `windows-latest` CI run
+  of the interp↔JIT differential + the PAL conformance test to validate. **Next:** add the
+  `windows-latest`/`macos-latest` CI jobs + a Linux-hosted cross-`check` step (YAML drafted, see the
+  cross-platform note below — needs the `workflows` permission to land); then port **svm-run's
+  `MprotectWindow`** (the Memory-cap thunk, currently `cfg(unix)` with a no-op windows fallback) so
+  the Memory-cap / `malloc`-over-`map` tests pass on windows too. Tier-1 MPK stays Linux-only
+  (degrades to tier 0/3 elsewhere). Start point recorded: JIT no longer `compile_error!`s for
+  windows; it does for other non-unix/non-windows targets.
 - [ ] **Phase 4 — post-MVP:** deferred (below), developed against the parity matrix.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
