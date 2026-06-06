@@ -883,14 +883,24 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
     // production thunk — the cap's `map`/`unmap`/`protect` window effects then ride the
     // escape-oracle. A forged-handle cap.call (arm 18) still resolves to nothing ⇒ CapFault on
     // both. The thunk is dormant for modules with no cap.call, so non-cap seeds are unaffected.
+    //
+    // Phase 3.5 (TEMPORARY): only grant on unix. `svm_run::cap_thunk`'s `MprotectWindow` is still
+    // `cfg(unix)` (no windows Memory cap yet), so granting on windows would let the interp run a
+    // `map` the JIT can't, diverging. With no grant, every generated Memory cap.call is ungranted ⇒
+    // `CapFault` on *both* backends (agreeing) — so windows CI still validates the core (masking,
+    // the guard via tail faults, the escape-oracle) cleanly. Remove this gate when svm-run's
+    // `MprotectWindow` is ported to windows (then the success path runs on windows too).
     let mut hi = Host::new();
     let mut hj = Host::new();
-    assert_eq!(
-        hi.grant_memory(),
-        MEMORY_HANDLE,
-        "Host grant encoding changed"
-    );
-    assert_eq!(hj.grant_memory(), MEMORY_HANDLE);
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            hi.grant_memory(),
+            MEMORY_HANDLE,
+            "Host grant encoding changed"
+        );
+        assert_eq!(hj.grant_memory(), MEMORY_HANDLE);
+    }
     let (interp, imem) =
         run_capture_reserved_with_host(m, 0, args, &mut fuel, init, reserved_log2, &mut hi);
     let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();

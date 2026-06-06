@@ -142,6 +142,8 @@ block0(v0: i64):
 /// disposition *and* the final memory (the escape-oracle under the decoupled `reserved`/`mapped`
 /// model, §4). `n` is the entry arg (an `i64`); `init` must be `1 << size_log2` bytes (the JIT
 /// snapshots the whole backed window, so the seed length sets the compared extent).
+#[cfg(unix)] // only the `cfg(unix)` reserved-tail tests use it (windows runs them once svm-run's
+             // Memory-cap path is ported — Phase 3.5); avoids a dead-code warning on windows.
 fn both_reserved(
     src: &str,
     init: &[u8],
