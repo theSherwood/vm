@@ -31,7 +31,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Kernel",
 ] }
 
-[target.'cfg(unix)'.build-dependencies]
-# Compiles src/trap_shim.c (the setjmp/siglongjmp recovery — a macro that needs the C
-# compiler's returns_twice handling, so it can't be sound raw FFI).
+[build-dependencies]
+# `build.rs` compiles src/trap_shim.c (the setjmp/siglongjmp recovery — a macro that needs the C
+# compiler's returns_twice handling, so it can't be sound raw FFI). The crate must be present on
+# *every* host (build scripts run on the host), but the shim is only compiled for **unix targets**
+# — `build.rs` gates the actual `cc::Build` call on `CARGO_CFG_UNIX`, so a windows build pulls `cc`
+# but never invokes a C compiler. (Gating the dep itself on `cfg(unix)` matches the *host*, which
+# breaks building on a windows host — the cross-check from a unix host can't catch that.)
 cc = "1"

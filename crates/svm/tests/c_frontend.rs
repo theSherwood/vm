@@ -7,9 +7,12 @@
 //! second tier (`c_matches_gcc_*`) compiles the *same* C with native `cc` and compares
 //! exit code + stdout, validating C semantics against a real compiler.
 //!
-//! Requires a C toolchain (`make` + `cc`) to build the frontend; skipped-by-build only
-//! if those are absent. The frontend is outside the escape-TCB (§2a): whatever IR it
-//! emits still goes through the verifier before it runs.
+//! Requires a unix C toolchain (`make` + `cc`) to build the chibicc fork, so this suite is
+//! **unix-only** (`#![cfg(unix)]`); windows has no such toolchain and the frontend's portability
+//! is a separate effort (Phase 3.5). The frontend is outside the escape-TCB (§2a): whatever IR it
+//! emits still goes through the verifier before it runs — and the JIT/PAL it exercises is validated
+//! cross-platform by `jit_fuzz`/`escape_oracle` + the `svm-jit` PAL conformance test instead.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
