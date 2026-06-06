@@ -13,8 +13,8 @@
 use core::ffi::c_void;
 
 use svm_interp::{GuestMem, Host, RegionBacking, StreamRole, Trap};
-// `SharedBacking`'s methods + its `MemfdBacking` impl are only used by the Linux shared-mapping path.
-#[cfg(target_os = "linux")]
+// `SharedBacking`'s methods + its `ShmBacking` impl are only used by the unix shared-mapping path.
+#[cfg(unix)]
 use svm_interp::SharedBacking;
 use svm_ir::{Module, ValType};
 
@@ -423,7 +423,7 @@ impl GuestMem for MprotectWindow {
         backing: RegionBacking,
     ) -> i64 {
         const EINVAL: i64 = -22;
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             const PROT_READ: i32 = 1;
             const PROT_WRITE: i32 = 2;
@@ -479,8 +479,8 @@ impl GuestMem for MprotectWindow {
             }
             0
         }
-        // macOS (`shm_open`) / windows (`CreateFileMapping`) shared mappings are a follow-up.
-        #[cfg(not(target_os = "linux"))]
+        // windows (`CreateFileMapping`/placeholder reservations) shared mappings are a follow-up.
+        #[cfg(not(unix))]
         {
             let _ = (win_off, region_off, len, prot, backing);
             EINVAL
@@ -488,51 +488,85 @@ impl GuestMem for MprotectWindow {
     }
 }
 
-/// A §13 `SharedRegion` backing over a real OS shared-memory object (an anonymous `memfd`), whose
-/// `os_fd` a window `mmap`s `MAP_SHARED` for true hardware aliasing. The fd is also mapped once into
-/// the host process so `read_byte`/`write_byte` work (e.g. if an interpreter `Mem` uses this backing);
-/// in the JIT differential the guest's loads/stores go straight through the window's shared mapping.
-/// Linux-only for now (`memfd_create`); macOS (`shm_open`) / windows (`CreateFileMapping`) follow.
-#[cfg(target_os = "linux")]
-struct MemfdBacking {
+/// Create a fresh anonymous, `cap`-byte OS shared-memory fd: `memfd_create` on Linux, an immediately-
+/// `shm_unlink`ed POSIX `shm_open` object on other unix (macOS). The fd keeps the (unlinked) object
+/// alive; closing it reclaims the memory. Sized with `ftruncate` so a window `mmap` of whole pages
+/// never faults past EOF.
+#[cfg(unix)]
+fn create_region_fd(cap: usize) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    #[cfg(target_os = "linux")]
+    // SAFETY: a valid NUL-terminated name; returns a fresh owned fd or -1.
+    let raw = unsafe { libc::memfd_create(c"svm_region".as_ptr(), libc::MFD_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let raw = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        // A short unique name (POSIX shm names are length-capped): "/svm<pid·seq in hex>".
+        let uniq = ((std::process::id() as u64) << 24) ^ SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = format!("/svm{uniq:x}\0");
+        // SAFETY: a valid NUL-terminated name; O_EXCL so we own a fresh object, or -1.
+        let raw = unsafe {
+            libc::shm_open(
+                name.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                0o600 as libc::c_int,
+            )
+        };
+        if raw >= 0 {
+            // Unlink now: the open fd keeps the object usable; it's anonymous + auto-reclaimed on close.
+            // SAFETY: `name` is the just-created object's NUL-terminated name.
+            unsafe { libc::shm_unlink(name.as_ptr() as *const libc::c_char) };
+        }
+        raw
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh owned fd.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: sizing the just-created object (before any mmap), per the once-only ftruncate rule.
+    if unsafe { libc::ftruncate(raw, cap as libc::off_t) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// A §13 `SharedRegion` backing over a real OS shared-memory object (`memfd`/`shm`), whose `os_fd` a
+/// window `mmap`s `MAP_SHARED` for true hardware aliasing. The fd is also mapped once into the host
+/// process so `read_byte`/`write_byte` work (e.g. if an interpreter `Mem` uses this backing); in the
+/// JIT differential the guest's loads/stores go straight through the window's shared mapping. Unix
+/// only; windows (`CreateFileMapping` + placeholder reservations) is a follow-up.
+#[cfg(unix)]
+struct ShmBacking {
     fd: std::os::fd::OwnedFd,
     ptr: *mut u8,
     cap: usize, // page-rounded mapping length (the fd size)
     len: usize, // logical region size the guest sees
 }
 
-#[cfg(target_os = "linux")]
-impl MemfdBacking {
-    fn new(len: usize) -> std::io::Result<MemfdBacking> {
-        use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(unix)]
+impl ShmBacking {
+    fn new(len: usize) -> std::io::Result<ShmBacking> {
+        use std::os::fd::AsRawFd;
         let page = host_page_size() as usize;
         let cap = len.max(1).div_ceil(page) * page;
-        // SAFETY: a valid NUL-terminated name; returns a fresh owned fd or -1.
-        let raw = unsafe { libc::memfd_create(c"svm_region".as_ptr(), libc::MFD_CLOEXEC) };
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `raw` is a fresh owned fd from `memfd_create`.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        // SAFETY: sizing the just-created memfd.
-        if unsafe { libc::ftruncate(raw, cap as libc::off_t) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: map the whole memfd shared into the host (for `read_byte`/`write_byte`).
+        let fd = create_region_fd(cap)?;
+        // SAFETY: map the whole object shared into the host (for `read_byte`/`write_byte`).
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 cap,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                raw,
+                fd.as_raw_fd(),
                 0,
             )
         };
         if p == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(MemfdBacking {
+        Ok(ShmBacking {
             fd,
             ptr: p as *mut u8,
             cap,
@@ -541,8 +575,8 @@ impl MemfdBacking {
     }
 }
 
-#[cfg(target_os = "linux")]
-impl SharedBacking for MemfdBacking {
+#[cfg(unix)]
+impl SharedBacking for ShmBacking {
     fn size(&self) -> u64 {
         self.len as u64
     }
@@ -566,8 +600,8 @@ impl SharedBacking for MemfdBacking {
     }
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for MemfdBacking {
+#[cfg(unix)]
+impl Drop for ShmBacking {
     fn drop(&mut self) {
         // SAFETY: `ptr`/`cap` are the host mapping from `new`; the fd is closed by `OwnedFd`.
         unsafe { libc::munmap(self.ptr as *mut c_void, self.cap) };
@@ -576,9 +610,9 @@ impl Drop for MemfdBacking {
 
 /// Create a §13 `SharedRegion` backing over a fresh `len`-byte OS shared-memory object — install it
 /// with [`svm_interp::Host::grant_shared_region_backed`] so the JIT can `mmap` it for real aliasing.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn new_shared_region(len: usize) -> RegionBacking {
-    std::rc::Rc::new(MemfdBacking::new(len).expect("create shared region"))
+    std::rc::Rc::new(ShmBacking::new(len).expect("create shared region"))
 }
 
 /// How a guest program ended: its entry returned values, or it invoked `Exit(code)` (§3e).

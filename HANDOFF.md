@@ -673,12 +673,20 @@ this is the index.)
   new `PageProt::Backed { region, region_off, writable }` — the access path is unchanged (loads/stores
   redirect where a page's bytes live, zero overhead), so the same region mapped at two window offsets
   names the same bytes (the magic-ring-buffer primitive). White-box tests in `prot_tests` +
-  end-to-end `svm/tests/shared_region.rs` (with a non-vacuous control). **Next §13 increments:** (2)
-  real shared backing in `MprotectWindow` (memfd + `MAP_FIXED` aliasing) + interp↔JIT differential
-  (unix-first); (3) windows (`CreateFileMapping`/`MapViewOfFileEx`) + un-gate. **Still left (Phase 4,
-  not MVP blockers):** fault-driven *content* supply (a guest/parent as pager — `userfaultfd`/§14),
-  and cross-domain `SharedRegion` `create`/`grant` (guest-minted regions — needs the §14
-  Instantiator). **`malloc` over `map` is the default guest libc** — the powerbox
+  end-to-end `svm/tests/shared_region.rs` (with a non-vacuous control). **Slices 2–3a (JIT + unix)
+  landed:** `MprotectWindow::map_region` aliases via a **real shared mapping** — `mmap(MAP_SHARED |
+  MAP_FIXED)` of the region's `os_fd` over the window range, so two mappings name the same physical
+  pages (true hardware aliasing; the mapping persists across `cap.call`s — the per-call window is
+  rebuilt but the OS mapping + the region fd held by the `Host` backing are not). The backing is
+  `svm_run::new_shared_region` over an anonymous fd — `memfd_create` on Linux, an `shm_unlink`ed
+  `shm_open` object on macOS (`ShmBacking`); installed via `Host::grant_shared_region_backed`. The
+  interp↔JIT differential `jit_diff::jit_cap_shared_region_aliases_differential` (cfg unix) pins it
+  non-vacuously. **Remaining §13 increment:** (3b) **windows** — needs placeholder reservations
+  (`VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` + `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`), a change to
+  svm-jit's window allocator; currently → `-EINVAL` on windows (so no SharedRegion test runs there).
+  **Still left (Phase 4, not MVP blockers):** fault-driven *content* supply (a guest/parent as pager —
+  `userfaultfd`/§14), and cross-domain `SharedRegion` `create`/`grant` (guest-minted regions — needs
+  the §14 Instantiator). **`malloc` over `map` is the default guest libc** — the powerbox
   grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect` builtins expose it
   (codegen_ir.c), and the shipped `frontend/chibicc/include/stdlib.h` provides a map-growing
   `malloc`/`free`/`calloc`/`realloc` to any program that `#include <stdlib.h>`; `demos/heapgrow`

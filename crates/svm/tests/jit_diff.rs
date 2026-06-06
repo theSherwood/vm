@@ -1446,9 +1446,9 @@ block0(v0: i32):
     /// backends — the interpreter (`VecBacking`, software aliasing) and the JIT (a real `memfd`
     /// `MAP_SHARED | MAP_FIXED` mapped at both offsets). A store at offset 0 is read back at
     /// `page_size` (the second mapping), and the final windows are byte-identical. The guest queries
-    /// `page_size`, so it is host-page-agnostic. Linux-only until the macOS/windows shared mappings
-    /// land (slice 3); the interpreter reference runs everywhere.
-    #[cfg(target_os = "linux")]
+    /// `page_size`, so it is host-page-agnostic. Unix (Linux `memfd` / macOS `shm`); windows shared
+    /// mappings are a follow-up. The interpreter reference runs everywhere.
+    #[cfg(unix)]
     #[test]
     fn jit_cap_shared_region_aliases_differential() {
         let src = format!(
