@@ -501,11 +501,13 @@ non-zero). When the interpreter — the §4 masking reference — runs to comple
 access it made was in-window, so the JIT lowering the same masking must leave an identical
 window; a mismatch is an access that escaped or was mis-masked. Pinned by
 `tests/escape_oracle.rs` and verified non-vacuous (corrupting the JIT mask makes it fail).
-Loops/back-edges, `call_indirect`, and `cap.call` (inert/ungranted ⇒ both-`CapFault`) are now
+Loops/back-edges, `call_indirect`, and `cap.call` — **both** inert/ungranted (⇒ both-`CapFault`)
+**and** the success path (a granted Memory cap, valid `map`/`unmap`/`protect`, via the capture+host
+wrappers over `svm_run::cap_thunk`, so the cap's window effects ride the escape-oracle) — are now
 generated (the trap-kind is no longer asserted when both backends trap — see §10); out-of-
 allocation accesses now fault into the guard page and are caught as `MemoryFault` (§4/§5).
-Remaining: the cap.call *success* path (a mock powerbox granted to both backends) and
-float-module memory coverage (NaN bits aren't pinned across backends).
+Remaining: float-module memory coverage is **deliberately excluded** (NaN bits aren't pinned across
+backends → arch-specific; the oracle is about addresses, which integer modules cover — see §10).
 
 ---
 
@@ -668,19 +670,31 @@ Have (✅ continuously, except where noted):
   different ones among several reachable traps — e.g. a dead trapping float→int convert).
 
 Gaps (priority order):
-- [~] **`cap.call` — *inert (fault) path generated*, success path not; loops still one shape.**
-  The generator now emits `cap.call` with an **ungranted** handle (`gen_inst` arm 18): the fuzzer
-  grants no caps, so it is inert on both backends (interp empty `Host` / JIT `empty_cap_thunk` ⇒
-  both `CapFault`, agreeing under the both-trap rule) — the I2 check for capabilities (§3c, "a
-  forged handle is inert") and the first generative exercise of the JIT's cap.call lowering
-  (handle marshalling + thunk ABI + trap plumbing). A coverage-guard test asserts it's produced.
-  **Still TODO:** the *success* path needs a deterministic **mock powerbox** granted identically
-  to both backends (a `run_capture`-with-host on interp + a `compile_and_run_capture`-with-thunk
-  on JIT, both already nearly present) so a returning cap.call is differentially tested too.
-  Loops are still a single counted shape (no nested/irreducible loops, no data-dependent trip
-  counts); richer loop shapes need a JIT step-cap/fuel to stay terminating.
-- [ ] **Escape-oracle excludes float modules** (NaN-payload nondeterminism). A canonical-NaN
-  normalization, or comparing only integer-store bytes, would extend coverage to them.
+- [x] **`cap.call` — both the inert (fault) *and* success paths are generated.** Arm 18 emits a
+  forged-handle cap.call (inert ⇒ `CapFault` on both, the I2 check). Arm 19 (gated on `has_mem`)
+  emits a **valid Memory cap.call** — granted handle (`MEMORY_HANDLE = 1<<8`, the first grant),
+  page-aligned in-range `map`/`unmap`/`protect` — so the **success path** runs on both backends:
+  the harness grants a Memory cap to interp + JIT via new capture+host run wrappers
+  (`run_capture_reserved_with_host` / `compile_and_run_capture_reserved_with_host`) over the
+  production `svm_run::cap_thunk`, so the cap's window effects ride the **escape-oracle**, not just
+  outcome agreement, interleaved with the random CFG/loops. A coverage guard
+  (`generator_covers_*`) asserts a `type_id==3` cap.call is produced; the dedicated
+  `jit_cap_memory_escape_oracle_differential` (jit_diff) adds a focused full-window pass. The
+  integration **caught two real bugs**: (a) `cap_thunk` did `slice::from_raw_parts(args, 0)` on the
+  JIT's null pointer for a 0-arg/0-result cap.call (UB) — now guarded; (b) the differential's
+  `(Err, Returned)` arm rejected *any* modelled interp trap while the JIT returned, but a
+  **droppable** pure-op trap (div/rem-by-zero, int-overflow, bad float→int convert) whose result is
+  dead may be DCE'd by the JIT — relaxed via `droppable_trap` (effectful/control traps stay strict).
+  Loops are still a single counted shape (no nested/irreducible/data-dependent) — richer shapes need
+  a JIT step-cap to stay terminating.
+- [x] **Escape-oracle on float modules — evaluated, deliberately *not* enabled.** Including float
+  modules in the final-window byte-compare **passes on x86-64** today (interp + JIT lower float ops
+  to the same hardware, so NaN bits agree), but that agreement is **arch-specific**: a Phase-3.5
+  aarch64/Windows port could legitimately produce a different NaN payload, turning the oracle into a
+  false-positive escape. The escape-oracle is about **addresses** (integer modules exercise the
+  masking fully), so the float gain is ~zero; the NaN-insensitive value-compare + the float-free
+  memory oracle stay. (Re-enable only with a sound canonical-NaN/integer-store-only scheme if a real
+  need appears.)
 - [x] **Guard-page fault detection (unix)** — beyond the final-memory divergence check, a
   gross out-of-window access now faults into the `PROT_NONE` guard page and is caught as a
   clean `MemoryFault` (detect-and-kill, see the trap-catching item above) rather than relying
@@ -867,4 +881,8 @@ into the reserved tail** (the §1a sparse-address-space capability: interp spars
 production `mprotect`-backed `MprotectWindow` wired into `cap_thunk` + `mem_reserved` in the
 cap-thunk ABI + prefix/tail differential fuzz + a guest-consumer round-trip); plus a batch of
 real-library shakedowns — Clay, jsmn, SHA-256, xxHash, tinfl, stb_perlin (first float), tiny-regex-c
-(backtracking) — each vendored as a `demos/` + cc-oracle test.)*
+(backtracking) — each vendored as a `demos/` + cc-oracle test; **map-growing `malloc` promoted to
+the default `<stdlib.h>`** (`demos/heapgrow`); and **fuzzer hardening** — the Memory cap's success
+path now rides the escape-oracle in both the dedicated `jit_cap_memory_escape_oracle_differential`
+and the main 4000-seed differential (granted cap + valid `map`/`unmap`/`protect`), which caught two
+real bugs (a null-pointer `from_raw_parts` in `cap_thunk`; an over-strict droppable-trap arm).)*
