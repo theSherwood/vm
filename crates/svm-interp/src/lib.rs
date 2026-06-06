@@ -152,6 +152,39 @@ pub fn run_capture_reserved(
     (r, snap)
 }
 
+/// Like [`run_capture_reserved`], but with a caller-provided [`Host`] (the powerbox), so a
+/// `cap.call` to a *granted* handle takes its **success** path while the final-window snapshot
+/// still feeds the escape-oracle (§18). Pairs with the JIT's
+/// [`svm_jit::compile_and_run_capture_reserved_with_host`]: running both lets the §3e Memory
+/// capability's `map`/`unmap`/`protect` effects be byte-compared across backends, not just their
+/// return values — a real generative escape-oracle for the capability path.
+pub fn run_capture_reserved_with_host(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    reserved_log2: u8,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+    let f = match m.funcs.get(func as usize) {
+        Some(f) => f,
+        None => return (Err(Trap::Malformed), Vec::new()),
+    };
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        mm.seed(init_mem);
+        mm.init_data(&m.data);
+        mm
+    });
+    let r = run_func(f, args, fuel, &mut mem, &m.funcs, host, 0);
+    let snap = mem
+        .as_ref()
+        .map(|mm| mm.snapshot(init_mem.len() as u64))
+        .unwrap_or_default();
+    (r, snap)
+}
+
 fn run_func<'a>(
     mut f: &'a Func,
     args: &[Value],

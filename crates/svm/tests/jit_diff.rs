@@ -877,8 +877,8 @@ block0(v0: i64, v1: f64):
 // ---- cap.call: the JIT dispatches through a host thunk to the interpreter's Host ----
 
 use core::ffi::c_void;
-use svm_interp::{run_with_host, GuestMem, Host, StreamRole};
-use svm_jit::{compile_and_run_with_host, EXIT_CODE};
+use svm_interp::{run_capture_reserved_with_host, run_with_host, GuestMem, Host, StreamRole};
+use svm_jit::{compile_and_run_capture_reserved_with_host, compile_and_run_with_host, EXIT_CODE};
 use svm_run::MprotectWindow;
 
 /// Bridge the JIT's `CapThunk` ABI to the interpreter's `Host::cap_dispatch_slots`.
@@ -1231,6 +1231,60 @@ block0(v0: i32):
     let mj2 = hj2.grant_memory();
     assert_eq!(mi2, mj2);
     assert_cap_agrees(grow_then_unmap, &[Value::I32(mi2)], &mut hi2, &mut hj2);
+}
+
+/// **Escape-oracle for the Memory capability** (§18): run the same generated `map`/`unmap`/
+/// `protect` + store/load programs through the *capture + host* path and byte-compare the final
+/// guest window across the interpreter (page-protection map) and the JIT (real `mprotect` +
+/// guard). The outcome differential above checks return values / traps; this also checks the
+/// **window itself** is identical after the cap's success-path effects — a JIT store/protect/unmap
+/// landing on the wrong page (an escape) would diverge here, as would a snapshot/`restore_rw` bug.
+/// Fully-mapped (`reserved == mapped`, `reserved_log2 = 0` is raised to `size_log2`), so the whole
+/// 64 KiB window is comparable; the generator's tail ops/addresses become in-range no-ops/wraps,
+/// agreeing on both sides.
+#[cfg(unix)]
+#[test]
+fn jit_cap_memory_escape_oracle_differential() {
+    // 300 seeds (each a JIT compile + a 64 KiB window snapshot/compare) keeps the stable suite
+    // snappy; the 800-seed outcome differential above already covers the same generator cheaply.
+    for seed in 0..300u64 {
+        let src = gen_memory_program(seed);
+        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse seed {seed}: {e:?}\n{src}"));
+        verify_module(&m).unwrap_or_else(|e| panic!("verify seed {seed}: {e:?}\n{src}"));
+        let results_ty = m.funcs[0].results.clone();
+        // A varied non-zero window seed, so a divergent (e.g. mis-masked) *read* also shows up.
+        let init: Vec<u8> = (0..1usize << 16)
+            .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+            .collect();
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        let mi = hi.grant_memory();
+        let mj = hj.grant_memory();
+        assert_eq!(mi, mj, "grants are deterministic");
+        let args = [Value::I32(mi)];
+        let mut fuel = 10_000_000u64;
+        let (interp, imem) =
+            run_capture_reserved_with_host(&m, 0, &args, &mut fuel, &init, 0, &mut hi);
+        let (jit, jmem) = compile_and_run_capture_reserved_with_host(
+            &m,
+            0,
+            &[mi as i64],
+            &init,
+            0,
+            cap_thunk,
+            &mut hj as *mut Host as *mut c_void,
+        )
+        .expect("jit compiles");
+        compare_outcome(interp, jit, &results_ty, &src, &args);
+        assert_eq!(imem.len(), jmem.len(), "window length differ (seed {seed})");
+        if let Some(i) = imem.iter().zip(&jmem).position(|(a, b)| a != b) {
+            panic!(
+                "escape-oracle: interp/JIT final window differ at byte {i} \
+                 (interp={:#04x} jit={:#04x}) on seed {seed}\n{src}",
+                imem[i], jmem[i]
+            );
+        }
+    }
 }
 
 #[test]

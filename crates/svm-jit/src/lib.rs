@@ -350,6 +350,34 @@ pub fn compile_and_run_capture_reserved(
     )
 }
 
+/// [`compile_and_run_capture_reserved`] + a live powerbox: `cap.call`s dispatch through
+/// `cap_thunk`/`cap_ctx` (so a granted handle takes its **success** path) *and* the final window
+/// is captured for the escape-oracle. Pairs with the interpreter's
+/// [`svm_interp::run_capture_reserved_with_host`] to byte-compare the effects of the §3e Memory
+/// capability (`map`/`unmap`/`protect`) across both backends.
+///
+/// # Safety
+/// `cap_thunk`/`cap_ctx` must stay valid for the call and honour the [`CapThunk`] contract.
+pub fn compile_and_run_capture_reserved_with_host(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        Some(init_mem),
+        reserved_log2,
+    )
+}
+
 fn run_inner(
     m: &IrModule,
     func: FuncIdx,
