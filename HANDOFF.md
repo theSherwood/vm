@@ -562,53 +562,53 @@ this is the index.)
 - [x] **Phase 2 — compilability proof:** chibicc→IR; real C on interp + JIT, two-tier
   tested (interp == JIT == native `cc`); SSA promotion landed (§5 item 8, §3).
 - [ ] **Phase 3 — Solid MVP (in progress):** the MVP remainder below.
-- [~] **Phase 3.5 — Cross-platform parity (in progress):** port to **Windows** (PAL:
-  `VirtualAlloc`/`VirtualProtect` + **VEH/SEH** detect-and-kill) and validate
-  **macOS** (Mach-exception path, which can intercept ahead of BSD signals); stand
-  up a gating **Linux/Windows/macOS CI matrix** so parity holds from here on.
+- [~] **Phase 3.5 — Cross-platform parity (Linux + macOS done; Windows blocked):** port to
+  **Windows** (PAL: `VirtualAlloc`/`VirtualProtect` + **VEH/SEH** detect-and-kill) and validate
+  **macOS**; stand up a gating **Linux/Windows/macOS CI matrix** so parity holds from here on.
   Confinement masking is already portable (§16/D51); only the non-TCB PAL differs.
-  **Done so far:** `svm-jit/src/mem.rs` is refactored into a portable window model over a small
-  **PAL** seam (reserve/commit/protect/release + install_guard/run_guarded), with the existing unix
-  impl behind it (no behavior change) and a **platform-agnostic guard conformance test** (drives the
-  window+guard directly, no JIT). The **windows PAL** is implemented in pure Rust via `windows-sys`
-  (`VirtualAlloc`/`VirtualProtect`/`VirtualFree` + a Vectored Exception Handler with
-  `RtlCaptureContext` for the longjmp-equivalent recovery — no C shim, so it stays check-able from
-  Linux). `cargo check --target x86_64-pc-windows-gnu` is **green** for the whole workspace, and
-  clippy is clean for both host and the windows target. **Windows now BUILDS + RUNS on CI** (after
-  the `cc` build-dep fix), but the **VEH guard FAILS at runtime** — `cargo test` crashes in
-  `escape_oracle` with `STATUS_ACCESS_VIOLATION (0xc0000005)`: an out-of-window access faults and the
-  Vectored Exception Handler does **not** catch + unwind it, so the AV kills the process. So the JIT
-  + masking compile and run on windows, but the `RtlCaptureContext`-based detect-and-kill recovery
-  (`pal::run_guarded`/`veh` in `mem.rs`) has a bug. **This is the blocker:** debugging a windows
-  exception-handler's context-restore needs a **windows dev/debug environment** — it can't be run or
-  debugged from the Linux host, and the proven alternative (a C `setjmp`/`longjmp` + VEH shim, like
-  the unix `trap_shim.c` / Wasmtime's windows path) can't even be *compile-checked* here (no windows
-  C compiler), so it'd be 100% blind. The `RtlCaptureContext` approach is likely too fragile;
-  switching to a C shim is the recommended fix, to be done with a windows environment or careful
-  CI iteration. **Also next:** port **svm-run's `MprotectWindow`** (the Memory-cap thunk, currently
-  `cfg(unix)` with a no-op windows fallback) so the Memory-cap / `malloc`-over-`map` tests pass on
-  windows too. Tier-1 MPK stays Linux-only (degrades to tier 0/3 elsewhere). Start point recorded:
-  JIT no longer `compile_error!`s for windows; it does for other non-unix/non-windows targets.
+  - **macOS (ARM64 / 16 KiB pages) is GREEN** — `macos-latest` runs the **whole** `cargo test
+    --workspace` clean, including the re-enabled `c_frontend` differential suite (interp == JIT ==
+    native `cc`) and the `escape_oracle`/`jit_diff` parity oracles. This closed out DESIGN §4 "pin
+    page size" via the **host-page-default**: backends query the host MMU granularity at runtime so
+    they agree page-for-page on any host (4 KiB / 16 KiB / …):
+    - `svm-jit/src/mem.rs` is a portable window model over a small **PAL** seam
+      (reserve/commit/protect/release + install_guard/run_guarded); the unix impl queries the host
+      page; a platform-agnostic guard conformance test drives the window+guard directly (no JIT).
+    - `svm-interp`'s `Mem` replaced `const PAGE = 4096` with the host page via the *safe* `page_size`
+      crate (keeps `#![forbid(unsafe_code)]`); `svm-run`'s `MprotectWindow` queries `sysconf` and
+      operates on whole host-page ranges in `map`/`unmap`/`protect`.
+    - `unmap` now **explicitly zeroes** the page range before `MADV_DONTNEED`: that syscall releases
+      anonymous backing on Linux (re-read = 0) but is only advisory on Darwin (stale bytes survive),
+      which diverged the escape-oracle on 16 KiB. The zero makes both platforms agree; the advise is
+      then a pure footprint hint.
+    - The chibicc frontend emits portable IR and can't know the host page, so it **pins its
+      RO-isolation boundary (`DATA_PAGE`) and heap-growth granularity (`__SVM_PAGE`) to the largest
+      common host page (16 KiB)** — a multiple of 4 KiB, so 4 KiB hosts are unaffected (just coarser)
+      while on 16 KiB the RO segment never shares a host page with writable data (no over-protection
+      fault) and `malloc` growth never re-zeroes a live 16 KiB page.
+  - **Windows (x86_64 / 4 KiB) is the remaining BLOCKER.** It **builds + runs** on CI (after the `cc`
+    build-dep fix) and the whole stack compiles, but `cargo test` crashes in `escape_oracle` with
+    `STATUS_ACCESS_VIOLATION (0xc0000005)`: an out-of-window access faults and the Vectored Exception
+    Handler does **not** catch + unwind it, so the AV kills the process. The JIT + masking are fine;
+    the bug is the `RtlCaptureContext`-based detect-and-kill recovery (`pal::run_guarded`/`veh` in
+    `mem.rs`). The pure-Rust `RtlCaptureContext`/`RtlRestoreContext` longjmp-emulation is fragile and
+    **can't be debugged from the Linux host** (no windows runtime). The proven alternative — a C
+    `setjmp`/`longjmp` (SEH `__try/__except`) + VEH shim like the unix `trap_shim.c` / Wasmtime's
+    windows path — is canonical but (a) needs cl.exe (MSVC) so it can't be compile-checked from the
+    Linux `x86_64-pc-windows-gnu` cross-check (mingw gcc lacks `__try/__except`, and isn't installed
+    on the host anyway) and (b) would be iterated 100% blind via CI. **Needs a maintainer decision /
+    windows debug environment** (see the end-of-session note). svm-run's `MprotectWindow` Memory-cap
+    thunk is still `cfg(unix)` (no-op windows fallback) — port it once the guard works. Tier-1 MPK
+    stays Linux-only (degrades to tier 0/3 elsewhere).
   - **CI matrix is live** (the maintainer applied the workflow — needs the `workflows` token scope):
-    the gating ubuntu job now also runs the windows cross-`check`+clippy, and a non-gating `cross-os`
-    job builds+tests on `windows-latest` + `macos-latest`. First runs surfaced + drove two fixes:
-    (a) `cc` was a `cfg(unix)` *build*-dep — that cfg matches the **host**, so a windows host never
-    got the crate and `build.rs` failed to compile (the linux cross-check can't catch a host-only
-    issue); made it an unconditional `[build-dependencies]` (the C shim compile stays target-gated on
-    `CARGO_CFG_UNIX`). (b) `c_frontend` needs a unix C toolchain (`make`+`cc`) → `#![cfg(unix)]`.
-  - **macOS is BLOCKED on the 4 KiB page-size pin (the real Phase-3.5 blocker).** `macos-latest` is
-    **ARM64 with 16 KiB pages**, but the whole stack pins **4096**: `protect_ro` (svm-jit) rounds RO
-    data-segment protection up to the host page (16 KiB) → over-protects adjacent RW globals → writes
-    fault; the interp's `Mem` hardcodes `PAGE = 4096` → the two **diverge**; and the Memory cap
-    (`MprotectWindow`/interp `prot_pages`/guest `malloc`) all use 4096-aligned offsets that `mprotect`
-    rejects on a 16 KiB host. Net: any RO-data path (`c_frontend` — 49/51 fail, the 2 passing are the
-    trap-expecting ones; and `jit_fuzz`'s `data ro` segments) breaks. This is DESIGN §4 "pin page
-    size" surfacing: **guest page granularity (4096, the Memory-cap API) must be disentangled from
-    host MMU granularity (runtime), and `protect_ro` must protect only host-pages fully within a
-    segment.** A real sub-project; can't be verified from a 4 KiB host, so it needs a 16 KiB CI runner
-    to iterate against. **Interim:** validate the POSIX PAL on **x86_64** by switching the macOS
-    runner to `macos-13` (4 KiB pages) — a one-line workflow edit. Windows is x86_64/4 KiB so it is
-    unaffected and is the near-term green target (it validates the VEH guard).
+    the gating ubuntu job also runs the windows cross-`check`+clippy, and a non-gating `cross-os` job
+    builds+tests on `windows-latest` + `macos-latest`. Drop `continue-on-error` from the macOS leg
+    now that it's green (a one-line workflow edit, maintainer-applied); keep it on windows until the
+    guard is fixed. Fixes it drove: (a) `cc` was a `cfg(unix)` *build*-dep — that cfg matches the
+    **host**, so a windows host never got the crate and `build.rs` failed (the linux cross-check
+    can't catch a host-only issue); made it an unconditional `[build-dependencies]` (the C shim
+    compile stays target-gated on `CARGO_CFG_UNIX`). (b) `c_frontend` needs a unix C toolchain
+    (`make`+`cc`) → `#![cfg(unix)]`.
 - [ ] **Phase 4 — post-MVP:** deferred (below), developed against the parity matrix.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
@@ -624,7 +624,9 @@ this is the index.)
   4000 fuzz seeds green (the handler is exercised by width-overruns). **Not yet:** the
   *perf*-unlocking guard-when-bounded (needs a large window — below); div/rem/trunc still use
   explicit in-code trap checks (correct; converting them to #DE faults is optional).
-- [x] **Real window / Memory capability + growth** — *done*: pin page size (4096, §4), the
+- [x] **Real window / Memory capability + growth** — *done*: page size is the **host MMU
+  granularity** (§4 "pin page size" → host-page default; all backends query it so they agree
+  page-for-page on 4 KiB / 16 KiB hosts), the
   *large* reserved window (`DEFAULT_RESERVED_LOG2 = 40`, mask `reserved - 1`), and real
   `map`/`unmap`/`protect` **including guest-controlled growth into the reserved tail** — the §1a
   "sparse address space / lazy page supply" capability. The interp `Mem` (reference) commits pages

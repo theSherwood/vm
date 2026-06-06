@@ -848,21 +848,42 @@ they trust:
 host's. The guest gets genuine paging semantics with zero software translation,
 and the bounded window makes escape impossible without per-access checks.
 
-### Platform support  [unix only, for now]
+### Platform support  [Linux + macOS done; Windows in progress]
 
-Confinement's guard region + fault recovery are implemented on **unix** (`mmap` +
-`mprotect(PROT_NONE)` + a SIGSEGV/SIGBUS handler — see `crates/svm-jit/src/mem.rs`
-and `trap_shim.c`). On **Windows / non-unix** the equivalent —
-`VirtualAlloc(MEM_RESERVE/COMMIT)` + `VirtualProtect(PAGE_NOACCESS)` + a Vectored
-Exception Handler (and `userfaultfd` → `PAGE_GUARD`/VEH for demand paging) — is
-**not built yet**. Until it lands we **refuse to build/run there** (`svm-jit`
-emits a `compile_error!` on non-unix targets) rather than run with a weaker
-guarantee: without the guard we cannot make the same escape guarantee, and
-guard-relying elision (above) would be real host-memory UB. The conservative,
-provably-in-window elision needs no guard and is sound everywhere, but the
-guard-relying win stays gated on the guard. **Goal: run *identically* on Windows
-once the guard path lands** — same confinement, same detect-and-kill, same
-elision. (TODO: implement the Windows backend.)
+Confinement itself is portable arithmetic (the masking pass, §16/D51); only the
+**non-TCB PAL** — VA reserve/commit/protect/release + guard-fault→trap recovery —
+differs per OS. `crates/svm-jit/src/mem.rs` is a portable window model over a small
+PAL seam, cfg-selected per target:
+- **unix (Linux + macOS): done.** `mmap(PROT_NONE, MAP_NORESERVE)` + `mprotect` +
+  a SIGSEGV/SIGBUS handler via the `cc`-built `trap_shim.c` (`sigsetjmp`/
+  `siglongjmp`). The full test suite — confinement, detect-and-kill, the Memory
+  cap, the C frontend, and the interp↔JIT escape oracles — runs green on both
+  `ubuntu-latest` (x86-64 / 4 KiB) and `macos-latest` (ARM64 / 16 KiB) in CI.
+- **Windows: builds + runs, guard not yet recovering.** The PAL is
+  `VirtualAlloc(MEM_RESERVE/COMMIT)` + `VirtualProtect(PAGE_NOACCESS)` + a Vectored
+  Exception Handler. The stack compiles and executes, but the VEH detect-and-kill
+  recovery does not yet catch + unwind an out-of-window fault (the process AVs).
+  The recommended fix is a C `setjmp`/`longjmp` (SEH) + VEH shim mirroring the unix
+  `trap_shim.c`. Until it lands, guard-relying elision would be real host-memory
+  UB on Windows; the conservative, provably-in-window elision needs no guard and is
+  sound everywhere. **Goal: run *identically* on Windows once the guard recovers** —
+  same confinement, same detect-and-kill, same elision.
+
+**Page size — host-page default (the "pin page size" resolution).** Page
+granularity is the **host MMU page**, queried at runtime, *not* a hardcoded 4 KiB:
+x86-64 is 4 KiB, Apple Silicon is a fixed 16 KiB (no 4 KiB granule exists
+natively), other arm64 vary. All backends agree by querying the same value — the
+JIT/`svm-run` via `sysconf`, the `#![forbid(unsafe_code)]` interpreter via the safe
+`page_size` crate — so protection, zeroing, and the page map line up page-for-page
+on any host, and the interp↔JIT differential is page-size-agnostic. Two
+host-specific subtleties the parity work surfaced: (1) `unmap` must **explicitly
+zero** the range — `MADV_DONTNEED` releases anonymous backing on Linux but is only
+advisory on Darwin; (2) the chibicc frontend emits portable IR and can't know the
+host page, so it pins its compile-time layout constants (RO-data isolation,
+heap-growth granularity) to the **largest common host page (16 KiB)** — a multiple
+of 4 KiB, harmless on 4 KiB hosts, correct on 16 KiB. Pinning a *deterministic*
+guest-visible page (decoupled from the host page) for reproducible cross-host
+execution is a later refinement.
 
 A window may itself be a power-of-two-aligned **sub-region of a parent window**
 (see §14); confinement is then `base + (offset & (size−1))` with `base`/`size`
