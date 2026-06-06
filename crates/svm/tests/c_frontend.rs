@@ -268,6 +268,34 @@ int main() {
     assert_eq!(run_c(src), vec![Value::I32(43982)]);
 }
 
+/// The shipped `<stdlib.h>` is a real guest libc: `malloc`/`calloc`/`realloc`/`free` that **grow
+/// the window via the Memory cap** — available to any program that just `#include <stdlib.h>`, no
+/// prelude. Allocates 400 KiB (well past the 64 KiB initial window, forcing growth), checks
+/// `calloc` zeroes and `realloc` preserves contents, on both backends.
+#[test]
+fn c_default_stdlib_malloc_grows() {
+    let src = r#"
+#include <stdlib.h>
+int main() {
+  int n = 50000;                              /* 2 x 200 KiB > the 64 KiB initial window */
+  int *a = (int *)malloc(n * sizeof(int));
+  int *b = (int *)calloc(n, sizeof(int));     /* must be zero-filled */
+  if (!a || !b) return -1;
+  for (int i = 0; i < n; i++) a[i] = 1;
+  long s = 0;
+  for (int i = 0; i < n; i++) s += a[i] + b[i];   /* = n (a=1, b=0) */
+  free(a); free(b);
+  int *c = (int *)malloc(8 * sizeof(int));
+  for (int i = 0; i < 8; i++) c[i] = i;
+  c = (int *)realloc(c, 16 * sizeof(int));    /* preserves c[0..8] */
+  long rs = 0;
+  for (int i = 0; i < 8; i++) rs += c[i];     /* = 28 */
+  return (int)(s + rs);                       /* 50000 + 28 */
+}
+"#;
+    assert_eq!(run_c(src), vec![Value::I32(50028)]);
+}
+
 /// An access to an **un-grown** tail page faults (detect-and-kill) on both backends: the guest
 /// must `map` before it can touch the reserved tail. The negative of the test above.
 #[test]

@@ -35,7 +35,8 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > lowers to `call_indirect` through the function table, I2), **by-value structs/unions**
 > (passed by hidden pointer, returned via `sret`, D39; whole-aggregate assignment),
 > **varargs + a guest-C `printf`** over the powerbox, and **`malloc`/`free`** (a guest
-> bump allocator) — all of which **verify and run identically on the interpreter and the
+> allocator that grows the window via the Memory capability — the shipped `<stdlib.h>`) — all of
+> which **verify and run identically on the interpreter and the
 > JIT**, hello-world and a heap-allocated linked list included (the §18 Phase-2 "it works"
 > milestone). The §3d **SSA-promotion pass** lifts non-address-taken scalar locals out of
 > memory into SSA values (threaded as block params), so the JIT register-allocates them — a
@@ -47,9 +48,10 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > into the reserved tail (the §1a sparse-address-space / lazy-page-supply differentiator: a guest
 > `map`s pages anywhere in its large reserved window, the kernel demand-pages them, and an
 > uncommitted access faults), backed by real `mprotect` and differentially fuzzed against the
-> interpreter — and **consumed by a guest `malloc`** (`demos/heapgrow`) that grows its heap megabytes
-> past the initial window through the Memory capability (`__vm_map`), byte-identically to native
-> `cc`. Still ahead:
+> interpreter — and exposed to C as the **default guest `malloc`** (the shipped `<stdlib.h>`): any
+> program that `#include <stdlib.h>` gets a `malloc`/`free`/`calloc`/`realloc` whose heap grows
+> megabytes past the initial window through the Memory capability, byte-identically to native `cc`
+> (`demos/heapgrow`). Still ahead:
 > narrow-scalar promotion, fault-driven page supply + shared-region aliasing (Phase 4), atomics +
 > the rest of the concurrency model (Phase 4), SIMD, and capability extras. This
 > is a research build; "appears to work" is reachable, "is certified secure" is an explicit
@@ -142,10 +144,11 @@ Rob-Pike-style **backtracking** matcher (`re_match` recurses through
 `matchpattern`/`matchstar`/`matchplus`, retrying on failure), a new control-flow shape that
 exercises data-stack threading and goto/branch lowering; it matches a native build with no new
 fixes.
-**`heapgrow/heapgrow.c`** is the first demo to **consume the Memory capability**: a guest `malloc`
-(`vm_malloc.h`) whose heap grows into the reserved tail on demand via the `__vm_map` builtin
-(`cap.call` on the granted Memory handle). It allocates 1 MiB — ~16× its initial window — and runs
-byte-identically to a native build, demonstrating the §1a "large/sparse programs" path from C.
+**`heapgrow/heapgrow.c`** **consumes the Memory capability** through plain `#include <stdlib.h>`:
+the shipped guest libc's `malloc` grows its heap into the reserved tail on demand via the
+`__vm_map` builtin (`cap.call` on the granted Memory handle). It allocates 1 MiB — ~16× its initial
+window — and runs byte-identically to a native build, demonstrating the §1a "large/sparse programs"
+path from portable C (nothing in the source is SVM-specific).
 
 Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
 located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —

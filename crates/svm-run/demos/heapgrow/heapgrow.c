@@ -7,11 +7,7 @@
  * The program allocates eight 128 KiB int blocks (1 MiB total — ~16× the 64 KiB initial window),
  * fills each with a deterministic pattern, sums it, frees it, and prints the running totals. */
 
-#ifdef __chibicc__
-#include "vm_malloc.h" /* guest malloc over __vm_map (grows the window) */
-#else
-#include <stdlib.h> /* native oracle: the real malloc */
-#endif
+#include <stdlib.h> /* sandbox: the map-growing guest malloc; native: the real one */
 
 int write(int fd, char *buf, long n); /* sandbox: powerbox builtin; native: libc */
 

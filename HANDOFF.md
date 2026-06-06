@@ -534,11 +534,11 @@ incompleteness not contradiction:
   globals as read-only segments via `protect` (D40 — §10), and general `goto`/labels. **Genuine
   remaining deferrals (incompleteness, not contradictions):** narrow-scalar (`char`/`short`/
   `_Bool`) promotion (they stay in memory for store-truncation), and the data-SP being a threaded
-  value rather than register-pinned in `vmctx`. (`malloc` over the `map` cap now **exists** — the
-  powerbox grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect` frontend builtins
-  expose it, and `demos/heapgrow`'s `vm_malloc.h` grows a guest heap into the reserved tail,
-  cc-identically; promoting it from an opt-in header to the standard guest libc is the remaining
-  bit.)
+  value rather than register-pinned in `vmctx`. (`malloc` over the `map` cap is now the **default
+  guest libc**: the powerbox grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect`
+  frontend builtins expose it, and the shipped `frontend/chibicc/include/stdlib.h` provides a
+  `malloc`/`free`/`calloc`/`realloc` that grows the heap into the reserved tail — any program that
+  `#include <stdlib.h>` gets it, cc-identically; `demos/heapgrow` is the showcase.)
 - **De-risking moves from §18 now in place:** interpreter-as-oracle differential fuzzing
   (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend, **the verifier escape-oracle**
   (verified ⇒ in-window final memory, §8/§10), **and guard-page/signal detect-and-kill**
@@ -602,11 +602,12 @@ this is the index.)
   (a guest/parent as pager — `userfaultfd`/§14), `SharedRegion` aliasing (the same backing at two
   offsets — the magic-ring-buffer trick, §13; the interp `PageProt` has a forward-compat hook for
   it), and surfacing the Memory cap in the *main* irgen fuzzer + extending the escape-oracle
-  snapshot to grown tail pages. **`malloc` over `map` now exists** — the powerbox grants the Memory
-  handle, the `__vm_map`/`__vm_unmap`/`__vm_protect` builtins expose it (codegen_ir.c), and
-  `demos/heapgrow` grows a guest heap megabytes past the initial window cc-identically
-  (`demo_heapgrow_matches_native`); making it the *default* guest libc (vs an opt-in `vm_malloc.h`)
-  is the remaining bit.
+  snapshot to grown tail pages. **`malloc` over `map` is the default guest libc** — the powerbox
+  grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect` builtins expose it
+  (codegen_ir.c), and the shipped `frontend/chibicc/include/stdlib.h` provides a map-growing
+  `malloc`/`free`/`calloc`/`realloc` to any program that `#include <stdlib.h>`; `demos/heapgrow`
+  grows a guest heap megabytes past the initial window cc-identically
+  (`demo_heapgrow_matches_native`).
 - [x] **Verifier escape-oracle fuzzer** — *done*: the differential now byte-compares the
   final guest window across interp + JIT (verified ⇒ in-window), in the 4000 stable seeds
   (every push) and the `diff` libFuzzer target. See Fuzzing below.
