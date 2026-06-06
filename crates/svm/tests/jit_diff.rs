@@ -1078,6 +1078,53 @@ block0(v0: i32):
         assert_cap_agrees(src, &[Value::I32(mi)], &mut hi, &mut hj);
     }
 
+    /// Regression (trap propagation across calls): a trap raised in a **callee** must unwind the
+    /// whole guest stack, not just the callee's own frame. A helper here `cap.call`s with a wrong
+    /// `type_id` on the granted Memory handle (→ `CapFault`); the entry then makes a *successful*
+    /// `page_size` `cap.call`, which resets the host trap cell. Before the JIT re-checked the cell
+    /// after a `call`, the callee's trap merely returned zeros, the entry ran on, `page_size` reset
+    /// the cell, and the JIT **returned** where the interpreter (correctly) stays trapped — which
+    /// would let a guest neutralize *any* trap (even `exit`) by wrapping it in a function call. Both
+    /// backends must detect-and-kill.
+    #[cfg(unix)]
+    #[test]
+    fn jit_trap_in_callee_propagates_through_caller() {
+        let src = r#"
+memory 16
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = call 1(v0)
+  v2 = cap.call 3 3 () -> (i64) v0 ()
+  return v1
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = cap.call 99 0 () -> (i64) v0 ()
+  v2 = i32.wrap_i64 v1
+  return v2
+}
+"#;
+        // Non-vacuous: the interpreter (the spec) stays trapped *through* the caller.
+        let m = parse_module(src).expect("parse");
+        verify_module(&m).expect("verify");
+        let mut h = Host::new();
+        let mh = h.grant_memory();
+        let mut fuel = 1_000_000u64;
+        assert_eq!(
+            run_with_host(&m, 0, &[Value::I32(mh)], &mut fuel, &mut h),
+            Err(Trap::CapFault),
+            "interp: a callee's CapFault must propagate through the caller"
+        );
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        let mi = hi.grant_memory();
+        let mj = hj.grant_memory();
+        assert_eq!(mi, mj, "grants are deterministic");
+        assert_cap_agrees(src, &[Value::I32(mi)], &mut hi, &mut hj);
+    }
+
     /// Generate a random straight-line program that drives the `Memory` capability (handle in `v0`):
     /// a mix of `protect`/`unmap`/`map` on whole pages, interleaved with 8-byte stores and loads
     /// (loads accumulate into the returned sum). Page selectors span **0..32** while the window's

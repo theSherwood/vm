@@ -859,6 +859,10 @@ fn lower_block(
                 cargs.push(get(&vals, *a)?);
             }
             let call = b.ins().call(callee, &cargs);
+            // A trap raised inside the callee leaves the trap cell set and returns zeros; propagate
+            // it here so it unwinds immediately (else the caller would run on with bogus results,
+            // and a later successful `cap.call` could reset the cell, masking the trap).
+            emit_trap_propagate(b, lower);
             vals.extend_from_slice(b.inst_results(call));
             ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
@@ -871,6 +875,8 @@ fn lower_block(
                 cargs.push(get(&vals, *a)?);
             }
             let call = b.ins().call_indirect(sig, code, &cargs);
+            // Propagate a callee trap immediately (see the direct-call case above).
+            emit_trap_propagate(b, lower);
             vals.extend_from_slice(b.inst_results(call));
             ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
@@ -1170,6 +1176,27 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     b.ins().load(I64, MemFlags::trusted(), entry_addr, 8)
 }
 
+/// Emit "if the host trap cell is non-zero, propagate the trap now": branch to an early
+/// `return` of zero-valued results (the trap kind / exit code already sits in the cell, which the
+/// entry trampoline reads to decide `Trapped`/`Exited`). Used after **every** `cap.call` *and*
+/// every `call`/`call_indirect`, so a trap raised deep in a callee unwinds the whole guest stack
+/// immediately — before any later op can observe bogus zero results or overwrite the cell (a
+/// *successful* `cap.call` resets it to 0, which would otherwise mask a callee's trap).
+fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
+    let trap_out = b.use_var(lower.trap_var);
+    let tc = b.ins().load(I64, MemFlags::trusted(), trap_out, 0);
+    let trapped = b.ins().icmp_imm(IntCC::NotEqual, tc, 0);
+    let trapret = b.create_block();
+    let cont = b.create_block();
+    b.ins().brif(trapped, trapret, &[], cont, &[]);
+    b.switch_to_block(trapret);
+    b.seal_block(trapret);
+    let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
+    b.ins().return_(&zeros);
+    b.switch_to_block(cont);
+    b.seal_block(cont);
+}
+
 /// Lower a `cap.call` (§3c/§9): marshal the arg slots into a stack buffer, call the host
 /// thunk (a baked-in constant address) with the cap immediates + the guest window, and
 /// — unless it set the trap cell — read the result slots back. A trap from the thunk
@@ -1259,17 +1286,7 @@ fn lower_cap_call(
 
     // If the thunk set the trap cell, propagate (return early; the cell already holds
     // the kind / exit code).
-    let tc = b.ins().load(I64, MemFlags::trusted(), trap_out, 0);
-    let trapped = b.ins().icmp_imm(IntCC::NotEqual, tc, 0);
-    let trapret = b.create_block();
-    let cont = b.create_block();
-    b.ins().brif(trapped, trapret, &[], cont, &[]);
-    b.switch_to_block(trapret);
-    b.seal_block(trapret);
-    let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
-    b.ins().return_(&zeros);
-    b.switch_to_block(cont);
-    b.seal_block(cont);
+    emit_trap_propagate(b, lower);
 
     // Read the result slots back.
     if let Some(ss) = res_ss {
