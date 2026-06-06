@@ -47,7 +47,9 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > into the reserved tail (the §1a sparse-address-space / lazy-page-supply differentiator: a guest
 > `map`s pages anywhere in its large reserved window, the kernel demand-pages them, and an
 > uncommitted access faults), backed by real `mprotect` and differentially fuzzed against the
-> interpreter. Still ahead:
+> interpreter — and **consumed by a guest `malloc`** (`demos/heapgrow`) that grows its heap megabytes
+> past the initial window through the Memory capability (`__vm_map`), byte-identically to native
+> `cc`. Still ahead:
 > narrow-scalar promotion, fault-driven page supply + shared-region aliasing (Phase 4), atomics +
 > the rest of the concurrency model (Phase 4), SIMD, and capability extras. This
 > is a research build; "appears to work" is reachable, "is certified secure" is an explicit
@@ -104,6 +106,7 @@ cargo run -p svm-run -- crates/svm-run/demos/xxhash/xxh_demo.c # xxHash (XXH32/X
 cargo run -p svm-run -- crates/svm-run/demos/tinfl/tinfl_demo.c # miniz tinfl (DEFLATE inflate)
 cargo run -p svm-run -- crates/svm-run/demos/perlin/perlin_demo.c # stb_perlin (3D Perlin noise, floats)
 cargo run -p svm-run -- crates/svm-run/demos/regex/regex_demo.c   # tiny-regex-c (backtracking matcher)
+cargo run -p svm-run -- crates/svm-run/demos/heapgrow/heapgrow.c  # a guest heap that grows via the Memory cap
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```
@@ -139,6 +142,10 @@ Rob-Pike-style **backtracking** matcher (`re_match` recurses through
 `matchpattern`/`matchstar`/`matchplus`, retrying on failure), a new control-flow shape that
 exercises data-stack threading and goto/branch lowering; it matches a native build with no new
 fixes.
+**`heapgrow/heapgrow.c`** is the first demo to **consume the Memory capability**: a guest `malloc`
+(`vm_malloc.h`) whose heap grows into the reserved tail on demand via the `__vm_map` builtin
+(`cap.call` on the granted Memory handle). It allocates 1 MiB — ~16× its initial window — and runs
+byte-identically to a native build, demonstrating the §1a "large/sparse programs" path from C.
 
 Accepts `.svm` (text IR), `.svmb` (binary), or `.c` (compiled through `frontend/chibicc`,
 located via `$SVM_CHIBICC` or the in-repo build). Embedders can call the same path directly —

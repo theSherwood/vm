@@ -264,6 +264,16 @@ fn demo_regex_matches_native() {
     assert_demo_matches_cc("regex/regex_demo.c");
 }
 
+/// heapgrow — the first demo to **consume the Memory capability**: a guest `malloc` (`vm_malloc.h`)
+/// that grows the window into the reserved tail via `__vm_map` on demand. Allocates 1 MiB (~16× the
+/// initial window) in eight blocks, sums them, and prints the totals — byte-identical to a native
+/// `cc` build (which uses the real `malloc`). Exercises the powerbox Memory grant → `__vm_map`
+/// builtin → `cap.call` → `mprotect` growth → masked tail access, the §1a sparse-address-space win.
+#[test]
+fn demo_heapgrow_matches_native() {
+    assert_demo_matches_cc("heapgrow/heapgrow.c");
+}
+
 /// If the chibicc frontend is buildable, the CLI compiles and runs the C demo too — the same
 /// greeting from C source. Skipped (not failed) when the toolchain is unavailable.
 #[test]
