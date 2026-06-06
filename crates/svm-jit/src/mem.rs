@@ -283,20 +283,178 @@ mod pal {
 }
 
 // ============================ PAL: unsupported targets ========================================
+// `VirtualAlloc` reservation + `VirtualProtect` (PAGE_NOACCESS tail/guard) + a **Vectored Exception
+// Handler** that, on an in-window access violation, restores a captured context to unwind out of the
+// fault — the windows analogue of unix's signal + siglongjmp. Pure Rust via `windows-sys` (no C
+// shim), so the path stays `cargo check --target *-windows-*`-able on a non-windows host.
+//
+// CI-UNVERIFIED: this cannot be exercised on the Linux dev host (no Windows / Wine). It is
+// typecheck-gated locally and **must be validated by the windows CI run** of the interp↔JIT
+// differential + the PAL conformance test before it is trusted (Phase 3.5).
+#[cfg(windows)]
+mod pal {
+    use super::{Entry, Prot};
+    use core::cell::Cell;
+    use core::ffi::c_void;
+    use std::sync::Once;
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, RtlCaptureContext, CONTEXT, EXCEPTION_POINTERS,
+    };
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+        PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    // VEH return codes + the access-violation status (kept local to avoid version-specific paths).
+    const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
+
+    pub(super) fn page_size() -> usize {
+        // SAFETY: GetSystemInfo only writes the out-param; always safe.
+        let mut si: SYSTEM_INFO = unsafe { core::mem::zeroed() };
+        unsafe { GetSystemInfo(&mut si) };
+        let p = si.dwPageSize as usize;
+        if p == 0 {
+            4096
+        } else {
+            p
+        }
+    }
+
+    /// Reserve `total` bytes of inaccessible VA (`MEM_RESERVE` + `PAGE_NOACCESS`; commit is
+    /// per-region in [`commit_rw`]). A reservation costs only address space until committed.
+    ///
+    /// # Safety
+    /// Returns a fresh reservation owned by the caller until [`release`].
+    pub(super) unsafe fn reserve(total: usize) -> *mut u8 {
+        VirtualAlloc(core::ptr::null(), total, MEM_RESERVE, PAGE_NOACCESS) as *mut u8
+    }
+
+    /// Commit `[base, base+len)` read/write.
+    ///
+    /// # Safety
+    /// `[base, base+len)` must lie within a reservation from [`reserve`].
+    pub(super) unsafe fn commit_rw(base: *mut u8, len: usize) {
+        let p = VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE);
+        assert!(!p.is_null(), "svm-jit: window commit failed");
+    }
+
+    /// Set the protection of a committed range `[base, base+len)`.
+    ///
+    /// # Safety
+    /// `[base, base+len)` must be a committed sub-range of a window reservation.
+    pub(super) unsafe fn protect(base: *mut u8, len: usize, prot: Prot) {
+        let flags: PAGE_PROTECTION_FLAGS = match prot {
+            Prot::Rw => PAGE_READWRITE,
+            Prot::Ro => PAGE_READONLY,
+        };
+        let mut old: PAGE_PROTECTION_FLAGS = 0;
+        VirtualProtect(base as *const c_void, len, flags, &mut old);
+    }
+
+    /// Release a whole reservation from [`reserve`] (`MEM_RELEASE` requires size 0 + the base).
+    ///
+    /// # Safety
+    /// `base` must be exactly a reservation returned by [`reserve`].
+    pub(super) unsafe fn release(base: *mut u8, _total: usize) {
+        VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+    }
+
+    // ---- the guard: AddVectoredExceptionHandler + RtlCaptureContext (longjmp-equivalent) --------
+    #[derive(Clone, Copy)]
+    struct Frame {
+        ctx: *const CONTEXT, // captured recovery context (a stack local of `run_guarded`)
+        lo: usize,
+        hi: usize,
+    }
+    thread_local! {
+        // The active guarded call's window range + recovery context (None ⇒ no guarded call).
+        static GUARD: Cell<Option<Frame>> = const { Cell::new(None) };
+        // Set by the VEH before it restores the context, read after RtlCaptureContext returns.
+        static TRIPPED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    unsafe extern "system" fn veh(ep: *mut EXCEPTION_POINTERS) -> i32 {
+        let ep = &*ep;
+        let rec = &*ep.ExceptionRecord;
+        if rec.ExceptionCode == STATUS_ACCESS_VIOLATION {
+            // ExceptionInformation[1] is the faulting address for an access violation.
+            let addr = rec.ExceptionInformation[1];
+            if let Some(f) = GUARD.with(|g| g.get()) {
+                if addr >= f.lo && addr < f.hi {
+                    TRIPPED.with(|t| t.set(true));
+                    // Restore the captured context → resume right after RtlCaptureContext in
+                    // `run_guarded` (the unix siglongjmp analogue). The abandoned JIT frames hold no
+                    // Rust destructors.
+                    core::ptr::copy_nonoverlapping(f.ctx, ep.ContextRecord, 1);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    static INSTALL: Once = Once::new();
+    pub(super) fn install_guard() {
+        INSTALL.call_once(|| {
+            // first = 1 → our handler runs before any previously-registered one.
+            let h = unsafe { AddVectoredExceptionHandler(1, Some(veh)) };
+            assert!(!h.is_null(), "svm-jit: AddVectoredExceptionHandler failed");
+        });
+    }
+
+    /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.
+    ///
+    /// # Safety
+    /// `f` and its pointer args must honour the [`Entry`] contract for the call.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn run_guarded(
+        f: Entry,
+        a: *const i64,
+        r: *mut i64,
+        m: *mut u8,
+        t: *const c_void,
+        tc: *mut i64,
+        lo: usize,
+        hi: usize,
+    ) -> bool {
+        let mut saved: CONTEXT = core::mem::zeroed();
+        // Capture the recovery point. On a guard fault the VEH copies `saved` over the fault context,
+        // so execution resumes *here* with TRIPPED set — the longjmp-equivalent return.
+        RtlCaptureContext(&mut saved);
+        if TRIPPED.with(|x| x.replace(false)) {
+            GUARD.with(|g| g.set(None));
+            return true;
+        }
+        GUARD.with(|g| {
+            g.set(Some(Frame {
+                ctx: &saved,
+                lo,
+                hi,
+            }))
+        });
+        f(a, r, m, t, tc);
+        GUARD.with(|g| g.set(None));
+        false
+    }
+}
+
+// ============================ PAL: unsupported targets ========================================
 // The escape guarantee (and the guard the §4 elision leans on) needs a guard-page + fault-recovery
-// PAL. unix has one (above); **windows** (`VirtualAlloc` + `VirtualProtect(PAGE_NOACCESS)` + a
-// Vectored Exception Handler) is the Phase-3.5 leg. Any *other* target (no-MMU / wasm) is
-// unsupported and refuses to build rather than weaken the guarantee.
-#[cfg(not(unix))]
+// PAL. unix and windows have one (above); any *other* target (no-MMU / wasm) is unsupported and
+// refuses to build rather than weaken the guarantee.
+#[cfg(not(any(unix, windows)))]
 mod pal {
     use super::{Entry, Prot};
     use core::ffi::c_void;
 
     compile_error!(
-        "svm-jit needs a guard-page Platform Abstraction Layer: unix (mmap + mprotect(PROT_NONE) \
-         + a SIGSEGV/SIGBUS handler) exists; windows (VirtualAlloc + VirtualProtect(PAGE_NOACCESS) \
-         + a Vectored Exception Handler) is the Phase-3.5 leg and not built yet; other targets \
-         (no-MMU / wasm) are unsupported. See DESIGN.md §4 \"Platform support\"."
+        "svm-jit needs a guard-page Platform Abstraction Layer: unix (mmap + mprotect(PROT_NONE) + \
+         a SIGSEGV/SIGBUS handler) and windows (VirtualAlloc + VirtualProtect + a Vectored \
+         Exception Handler) exist; other targets (no-MMU / wasm) are unsupported. See DESIGN.md §4 \
+         \"Platform support\"."
     );
 
     // Stubs so the portable code's references resolve to that single, clear error rather than a
