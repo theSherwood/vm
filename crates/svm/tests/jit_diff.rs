@@ -1058,10 +1058,13 @@ block0(v0: i32):
 }
 
 /// Generate a random straight-line program that drives the `Memory` capability (handle in `v0`):
-/// a mix of `protect`/`unmap`/`map` on whole pages of a 64 KiB window, interleaved with
-/// 8-byte stores and loads (loads accumulate into the returned sum). Page-aligned, in-range
-/// args, so the ops succeed (or fault deterministically) identically on both backends. Returns
-/// IR text. Deterministic in `seed` (SplitMix64).
+/// a mix of `protect`/`unmap`/`map` on whole pages, interleaved with 8-byte stores and loads
+/// (loads accumulate into the returned sum). Page selectors span **0..32** while the window's
+/// backed prefix is only 16 pages (`memory 16`, 64 KiB) inside the large `DEFAULT_RESERVED_LOG2`
+/// reservation — so pages 16..32 are the **reserved tail**: a store/load there faults until a
+/// `map` *grows* into it, and an `unmap` decommits it again. Page-aligned, in-range args, so every
+/// op succeeds or faults deterministically and identically on both backends (the §1a growth path).
+/// Returns IR text. Deterministic in `seed` (SplitMix64).
 #[cfg(unix)]
 fn gen_memory_program(seed: u64) -> String {
     let mut state = seed;
@@ -1080,6 +1083,10 @@ fn gen_memory_program(seed: u64) -> String {
         body.push_str(&format!("  v{v} = {line}\n"));
         v
     };
+    // Pages 0..16 are the backed prefix (`memory 16`); 16..32 are the reserved tail reachable
+    // only after a `map` grows into them. Addresses span both so the tail's fault/grow path runs.
+    const PAGES: u64 = 32;
+    const SPAN: u64 = PAGES * 4096;
     let acc0 = fresh(&mut body, "i64.const 0".into()); // running sum of loads
     let mut acc = acc0;
     let nops = 3 + next() % 8; // 3..=10 ops
@@ -1087,7 +1094,7 @@ fn gen_memory_program(seed: u64) -> String {
         match next() % 5 {
             0 | 1 => {
                 // protect(page, prot) — prot 0 (none/unmapped), 1 (RO), 3 (RW)
-                let page = next() % 16;
+                let page = next() % PAGES;
                 let prot = [0i32, 1, 3][(next() % 3) as usize];
                 let off = fresh(&mut body, format!("i64.const {}", page * 4096));
                 let len = fresh(&mut body, "i64.const 4096".into());
@@ -1099,7 +1106,7 @@ fn gen_memory_program(seed: u64) -> String {
             }
             2 => {
                 // unmap(page)
-                let page = next() % 16;
+                let page = next() % PAGES;
                 let off = fresh(&mut body, format!("i64.const {}", page * 4096));
                 let len = fresh(&mut body, "i64.const 4096".into());
                 fresh(
@@ -1108,8 +1115,8 @@ fn gen_memory_program(seed: u64) -> String {
                 );
             }
             3 => {
-                // map(page, prot) — re-commit readable (RO or RW)
-                let page = next() % 16;
+                // map(page, prot) — (re)commit readable (RO or RW); grows the tail when page ≥ 16
+                let page = next() % PAGES;
                 let prot = [1i32, 3][(next() % 2) as usize];
                 let off = fresh(&mut body, format!("i64.const {}", page * 4096));
                 let len = fresh(&mut body, "i64.const 4096".into());
@@ -1120,8 +1127,8 @@ fn gen_memory_program(seed: u64) -> String {
                 );
             }
             4 => {
-                // store an 8-byte value at an aligned in-window address
-                let addr = (next() % 65536) & !7;
+                // store an 8-byte value at an aligned address (may land in the unmapped tail)
+                let addr = (next() % SPAN) & !7;
                 let val = next() as i64;
                 let a = fresh(&mut body, format!("i64.const {addr}"));
                 let v = fresh(&mut body, format!("i64.const {val}"));
@@ -1129,7 +1136,7 @@ fn gen_memory_program(seed: u64) -> String {
             }
             _ => {
                 // load + accumulate
-                let addr = (next() % 65536) & !7;
+                let addr = (next() % SPAN) & !7;
                 let a = fresh(&mut body, format!("i64.const {addr}"));
                 let ld = fresh(&mut body, format!("i64.load v{a}"));
                 acc = fresh(&mut body, format!("i64.add v{acc} v{ld}"));
@@ -1139,14 +1146,16 @@ fn gen_memory_program(seed: u64) -> String {
     format!("memory 16\nfunc (i32) -> (i64) {{\nblock0(v0: i32):\n{body}  return v{acc}\n}}\n")
 }
 
-/// Generative differential coverage of the `Memory` capability: random `map`/`unmap`/`protect`
-/// sequences interleaved with stores/loads must produce the **same** result/trap on the
-/// interpreter (page-protection map) and the JIT (real `mprotect`, faults caught by the guard).
-/// A protected/unmapped page makes a store or load fault on both; a re-`map` zero-fills on both.
+/// Generative differential coverage of the `Memory` capability **including growth**: random
+/// `map`/`unmap`/`protect` sequences interleaved with stores/loads, with page selectors spanning
+/// the backed prefix *and* the reserved tail (see `gen_memory_program`), must produce the **same**
+/// result/trap on the interpreter (page-protection map) and the JIT (real `mprotect`, faults
+/// caught by the guard). A protected/unmapped/never-grown page makes a store or load fault on
+/// both; a `map` that grows into the tail makes it accessible on both; a re-`map` zero-fills.
 #[cfg(unix)]
 #[test]
 fn jit_cap_memory_protect_map_unmap_differential() {
-    for seed in 0..500u64 {
+    for seed in 0..800u64 {
         let src = gen_memory_program(seed);
         let m = parse_module(&src).unwrap_or_else(|e| panic!("parse seed {seed}: {e:?}\n{src}"));
         verify_module(&m).unwrap_or_else(|e| panic!("verify seed {seed}: {e:?}\n{src}"));
@@ -1157,6 +1166,71 @@ fn jit_cap_memory_protect_map_unmap_differential() {
         assert_eq!(mi, mj);
         assert_cap_agrees(&src, &[Value::I32(mi)], &mut hi, &mut hj);
     }
+}
+
+/// A concrete guest consumer of **growth** (§1a sparse address space): a `memory 16` program
+/// (64 KiB backed) `map`s a page deep in the reserved tail at offset 1 MiB, stores a value there,
+/// reads it back, and returns it — then a second variant `unmap`s it and faults on the next load.
+/// Both the value round-trip and the post-`unmap` fault must agree on interp + JIT, proving the
+/// reserved tail is genuinely reachable after a grow and genuinely gone after a decommit. This is
+/// the end-to-end "a guest grows its own address space" path, not just a unit of the page map.
+#[cfg(unix)]
+#[test]
+fn jit_cap_memory_growth_round_trips() {
+    // map(0x100000, 4096, RW); store 0xABCD at 0x100000; load it back; return it.
+    let grow_and_read = r#"
+memory 16
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1048576
+  v2 = i64.const 4096
+  v3 = i32.const 3
+  v4 = cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v5 = i64.const 1048576
+  v6 = i64.const 43981
+  i64.store v5 v6
+  v7 = i64.load v5
+  return v7
+}
+"#;
+    // Non-vacuous: the interpreter (the spec) returns the grown-page value, not a fault.
+    let m = parse_module(grow_and_read).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut hcheck = Host::new();
+    let mc = hcheck.grant_memory();
+    let mut fuel = 1_000_000u64;
+    assert_eq!(
+        run_with_host(&m, 0, &[Value::I32(mc)], &mut fuel, &mut hcheck),
+        Ok(vec![Value::I64(43981)]),
+        "interp: a load from a freshly-grown tail page must read back the stored value"
+    );
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let mi = hi.grant_memory();
+    let mj = hj.grant_memory();
+    assert_eq!(mi, mj);
+    assert_cap_agrees(grow_and_read, &[Value::I32(mi)], &mut hi, &mut hj);
+
+    // map then unmap the tail page, then load it → MemoryFault on both backends.
+    let grow_then_unmap = r#"
+memory 16
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1048576
+  v2 = i64.const 4096
+  v3 = i32.const 3
+  v4 = cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v5 = cap.call 3 1 (i64, i64) -> (i64) v0 (v1, v2)
+  v6 = i64.load v1
+  return v6
+}
+"#;
+    let mut hi2 = Host::new();
+    let mut hj2 = Host::new();
+    let mi2 = hi2.grant_memory();
+    let mj2 = hj2.grant_memory();
+    assert_eq!(mi2, mj2);
+    assert_cap_agrees(grow_then_unmap, &[Value::I32(mi2)], &mut hi2, &mut hj2);
 }
 
 #[test]
