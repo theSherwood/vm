@@ -23,6 +23,9 @@ path = "src/bin/bench.rs"
 # out of the umbrella crate's normal build and the auditable dependency-free core.
 [dev-dependencies]
 svm-jit.workspace = true
+# The embedding runtime — its `cap_thunk` (JIT CapThunk → reference-Host bridge) is shared by
+# the C-frontend differential tests instead of a copy-pasted local one.
+svm-run = { path = "../svm-run" }
 # For the JIT-side `mprotect`-backed Memory-capability test harness (real page protection on
 # the guest window, mirroring the interpreter's page-protection model). Unix-only test.
 libc = "0.2"

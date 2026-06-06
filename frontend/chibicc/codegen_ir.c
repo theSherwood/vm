@@ -17,14 +17,19 @@
 // the result as a second block parameter (alongside the data-SP). **Arrays and
 // structs/unions** work too: indexing is chibicc's `*(base + i*size)` (an array decays
 // to its i64 address in value context), and `s.field` / `p->field` add the member offset
-// (`ND_MEMBER`); initializers lower to per-element/-member scalar stores. By-value
-// aggregate *arguments/returns* (sret, §3d D39) and whole-struct assignment are not done
-// yet — pointers to aggregates are fine. **Globals + string literals** live at fixed
-// window offsets in a data region below the data stack; a synthetic **`_start`**
-// (function 0) takes the powerbox capability handles, stashes them in a reserved region,
-// writes globals' initializer bytes into the window, then calls `main` with the initial
-// data-SP. (A real read-only data segment per §3a later replaces the byte stores; globals
-// holding pointers/relocations are not handled yet.) **Stdio over the powerbox** (§3e):
+// (`ND_MEMBER`); initializers lower to per-element/-member scalar stores. **By-value
+// aggregates** (sret, §3d D39) work: a struct/union passes by hidden pointer (the callee
+// copies it into its own frame), a struct/union return uses a hidden `sret` pointer the
+// callee writes through (the function is `-> ()`), and whole-aggregate assignment is a
+// byte copy. **Globals + string literals** live at fixed
+// window offsets in a data region below the data stack, emitted as module-level `data`
+// segments (§3a) the runtime copies in (string literals as `data ro`, D40). **Pointer
+// initializers become relocations** (§3a): `char *p = "..."`, `&global`, `&arr[k]`,
+// function pointers, and arrays/structs of them are resolved at compile time to the
+// target's window offset (or funcref index, §3c) + addend, written little-endian into the
+// data image. A synthetic **`_start`** (function 0) takes the powerbox capability handles,
+// stashes them in a reserved region, then calls `main` with the initial
+// data-SP. **Stdio over the powerbox** (§3e):
 // `write`/`read`/`exit` are recognized builtins lowered to `cap.call` on the stashed
 // Stream/Exit handles — so real C reaches stdout/stdin and terminates with an exit code.
 // **Floats** (`float`=f32, `double`/`long double`=f64) work too: arithmetic, compares,
@@ -46,7 +51,13 @@
 // desugaring (`tmp = &A, *tmp = *tmp op B`) is un-desugared for plain-variable targets so
 // loop counters/accumulators promote; address-taken locals, narrow types (char/short/
 // _Bool, whose store truncation we keep in memory), aggregates, and `_Atomic` stay in
-// memory. Indirect calls, by-value aggregate args/returns, and general `goto` remain;
+// memory. **Indirect calls** (C function pointers) lower to `call_indirect` through the
+// function table (§3c): a function designator decays to its `ref.func` index (widened to
+// the 8-byte pointer rep), and `fp(args)` wraps it back to the i32 table index and
+// dispatches with the callee's static signature (incl. the leading data-SP). **General
+// `goto`/labels** work: each C label maps to an IR block (allocated on first reference, so
+// forward gotos resolve), and a `goto` branches to it threading the data-SP + promoted
+// locals — the same SSA-block mechanism as `break`/`continue` and loops.
 // anything unsupported is a hard error (so we never emit IR we cannot stand behind). This
 // is enough C surface for a capable VM: globals, structs, pointers, loops, recursion,
 // floats, varargs/`printf`, and heap allocation all run on interp and JIT.
@@ -57,6 +68,9 @@ static FILE *o;
 static int nv;    // next SSA value index in the *current block* (resets per block; the only
                   // values crossing a block are its parameters — the data-SP + promoted locals)
 static int nb;        // next block label number in the current function
+static int sret_param; // v-index of the hidden struct-return pointer (§3d sret), or -1
+static int sret_slot;  // frame offset where the sret pointer is stashed (reloadable in any
+                       // block, since it can't reliably ride a block parameter), or -1
 static bool term;     // is the current block already terminated?
 static int cur_frame; // the current function's data-stack frame size (bytes)
 
@@ -83,6 +97,23 @@ static int case_block_of(Node *n) {
   return -1; // unreachable: every case is registered before the body is emitted
 }
 
+// Each C label (and the `goto`s that target it) maps to one IR block, keyed by chibicc's
+// resolved `unique_label`. A block number is allocated on first reference — whether that
+// is the label or a (forward) `goto` — so forward gotos work (svm-text resolves block
+// targets by name, not position). Reset per function.
+static char *label_name[1024];
+static int label_blk[1024];
+static int nlabel;
+static int label_block_of(char *uniq) {
+  for (int i = 0; i < nlabel; i++)
+    if (!strcmp(label_name[i], uniq))
+      return label_blk[i];
+  label_name[nlabel] = uniq;
+  int b = nb++;
+  label_blk[nlabel++] = b;
+  return b;
+}
+
 // The data-stack pointer (frame base) is threaded as the first parameter of every IR
 // function and every IR block — `v0` in each block (§3d). A local at frame offset N
 // lives at `sp + N`; a call gives the callee a fresh frame at `sp + cur_frame`, so
@@ -104,16 +135,23 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 static int data_end = 16;
 
 // Capability handles the runtime hands `_start` (§3c/§3e) are stashed in the reserved
-// region; the stdio builtins load them from here. Layout: stdout@0, stdin@4, exit@8.
+// region; the builtins load them from here. Layout: stdout@0, stdin@4, exit@8, memory@12
+// (the four fit the reserved low-16 region, so no global/local address is 0 = C NULL).
 #define STDOUT_SLOT 0
 #define STDIN_SLOT 4
 #define EXIT_SLOT 8
+#define MEMORY_SLOT 12
 
 static int func_index(Obj *fn) {
   for (int i = 0; i < nfuncs; i++)
     if (funcs[i] == fn)
       return start_off + i;
-  error_tok(fn->tok, "codegen_ir: call to a function with no definition (no linker yet)");
+  // Called/referenced a declared-but-undefined function (e.g. a libc function with no body in
+  // this whole-program TU). A library declaration has no source token, so report by name —
+  // `error_tok(NULL, …)` would dereference a null token and crash.
+  if (fn->tok)
+    error_tok(fn->tok, "codegen_ir: call to '%s' with no definition (no linker yet)", fn->name);
+  error("codegen_ir: call to '%s' with no definition (no linker yet)", fn->name);
 }
 
 // --- SSA promotion (DESIGN §3d "the pass that matters for speed") ----------------------
@@ -206,6 +244,7 @@ static char *irty(Type *ty) {
   case TY_LONG:
   case TY_PTR:
   case TY_ARRAY: // an array decays to its address (a pointer) in value context
+  case TY_FUNC:  // a function decays to its funcref index, widened to the 8-byte ptr rep
     return "i64";
   case TY_FLOAT:
     return "f32";
@@ -228,6 +267,7 @@ static bool is_flt(Type *ty) {
 
 static int gen_expr(Node *node); // emits the IR, returns the result's SSA index
 static int gen_addr(Node *node); // emits the IR, returns the SSA index of an lvalue's address
+static int gen_convert(int a, Type *from, Type *to); // int/float width + signedness conversion
 
 // Per-function scratch region (last SCRATCH_BYTES of the frame) for spilling SSA values
 // across expression-level control flow (&&/||/?:), which opens new blocks. Such a branch
@@ -289,10 +329,31 @@ static void eval2(Node *a, Node *b, int *va, int *vb) {
   }
 }
 
-// True if a value of type `ty` is held *by address* (arrays/aggregates): reading the
-// lvalue yields its address, not a loaded scalar.
+// True if a value of type `ty` is held *by address* (arrays/aggregates, and functions):
+// reading the lvalue yields its address, not a loaded scalar. A function designator
+// decays to its funcref index (§3c) — its "value" is its address — exactly like an array.
 static bool by_address(Type *ty) {
-  return ty->kind == TY_ARRAY || ty->kind == TY_STRUCT || ty->kind == TY_UNION;
+  return ty->kind == TY_ARRAY || ty->kind == TY_STRUCT || ty->kind == TY_UNION ||
+         ty->kind == TY_FUNC;
+}
+
+// A by-value aggregate (struct/union): passed/returned via a hidden pointer (§3d D39).
+static bool is_agg(Type *ty) { return ty->kind == TY_STRUCT || ty->kind == TY_UNION; }
+
+// The IR type of a C parameter/argument *as passed*: a by-value aggregate goes by hidden
+// pointer (i64); everything else is its ordinary value type (an array already decays).
+static char *pass_irty(Type *ty) { return is_agg(ty) ? "i64" : irty(ty); }
+
+// chibicc prepends a hidden return-buffer pointer to `fn->params` for struct/union returns
+// **larger than 16 bytes** (its SysV ABI, parse.c). Our §3d ABI returns *every* by-value
+// aggregate through our own sret pointer regardless of size, so skip chibicc's hidden param —
+// otherwise we emit it *and* our sret, double-counting (the function then has one param too
+// many vs. the call site). Returns the first *guest-visible* parameter.
+static Obj *guest_params(Obj *fn) {
+  Type *r = fn->ty->return_ty;
+  if (is_agg(r) && r->size > 16 && fn->params)
+    return fn->params->next;
+  return fn->params;
 }
 
 // Load the C value of type `ty` from address `addr` (an SSA i64); return its SSA index.
@@ -311,8 +372,17 @@ static int gen_load(Type *ty, int addr) {
     fprintf(o, "  v%d = i32.load16_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
     break;
   case TY_INT:
-  case TY_ENUM:
     fprintf(o, "  v%d = i32.load v%d\n", r, addr);
+    break;
+  case TY_ENUM:
+    // A packed enum (`enum __attribute__((packed))`, parse.c) is 1/2/4 bytes; load at its
+    // actual width, then it is an ordinary i32 value. A plain enum is `int`.
+    if (ty->size == 1)
+      fprintf(o, "  v%d = i32.load8_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+    else if (ty->size == 2)
+      fprintf(o, "  v%d = i32.load16_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+    else
+      fprintf(o, "  v%d = i32.load v%d\n", r, addr);
     break;
   case TY_LONG:
   case TY_PTR:
@@ -343,8 +413,16 @@ static void gen_store(Type *ty, int addr, int val) {
     fprintf(o, "  i32.store16 v%d v%d\n", addr, val);
     break;
   case TY_INT:
-  case TY_ENUM:
     fprintf(o, "  i32.store v%d v%d\n", addr, val);
+    break;
+  case TY_ENUM:
+    // Store a packed enum at its actual width (1/2/4 bytes); a plain enum is `int`.
+    if (ty->size == 1)
+      fprintf(o, "  i32.store8 v%d v%d\n", addr, val);
+    else if (ty->size == 2)
+      fprintf(o, "  i32.store16 v%d v%d\n", addr, val);
+    else
+      fprintf(o, "  i32.store v%d v%d\n", addr, val);
     break;
   case TY_LONG:
   case TY_PTR:
@@ -362,10 +440,48 @@ static void gen_store(Type *ty, int addr, int val) {
   }
 }
 
+// Copy `size` bytes from address `src` to address `dst` (both SSA i64), greedily in
+// 8/4/2/1-byte chunks. Used for by-value aggregate copies (§3d D39): struct args/returns
+// and whole-struct assignment. `dst`/`src` must not overlap (distinct objects), except a
+// self-copy `dst == src`, which is a harmless identity.
+static void gen_memcpy(int dst, int src, int size) {
+  for (int i = 0; i < size;) {
+    int chunk = (size - i >= 8) ? 8 : (size - i >= 4) ? 4 : (size - i >= 2) ? 2 : 1;
+    char *ld = chunk == 8   ? "i64.load"
+               : chunk == 4 ? "i32.load"
+               : chunk == 2 ? "i32.load16_u"
+                            : "i32.load8_u";
+    char *st = chunk == 8   ? "i64.store"
+               : chunk == 4 ? "i32.store"
+               : chunk == 2 ? "i32.store16"
+                            : "i32.store8";
+    int off = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", off, i);
+    int sa = nv++;
+    fprintf(o, "  v%d = i64.add v%d v%d\n", sa, src, off);
+    int val = nv++;
+    fprintf(o, "  v%d = %s v%d\n", val, ld, sa);
+    int da = nv++;
+    fprintf(o, "  v%d = i64.add v%d v%d\n", da, dst, off);
+    fprintf(o, "  %s v%d v%d\n", st, da, val);
+    i += chunk;
+  }
+}
+
 // The address of an lvalue, as an SSA i64.
 static int gen_addr(Node *node) {
   switch (node->kind) {
   case ND_VAR: {
+    if (node->var->is_function) {
+      // A function designator decays to its funcref index (§3c): `ref.func` yields the
+      // i32 function-table index; widen it to the 8-byte C pointer representation
+      // (function pointers are stored as integers in memory, §3d).
+      int rf = nv++;
+      fprintf(o, "  v%d = ref.func %d\n", rf, func_index(node->var));
+      int r = nv++;
+      fprintf(o, "  v%d = i64.extend_i32_u v%d\n", r, rf);
+      return r;
+    }
     if (node->var->is_local) {
       if (is_promoted(node->var))
         error_tok(node->tok, "codegen_ir: internal — address of a promoted local");
@@ -384,6 +500,9 @@ static int gen_addr(Node *node) {
   }
   case ND_DEREF:
     return gen_expr(node->lhs); // the pointer value *is* the address
+  case ND_FUNCALL:
+    // A struct/union-returning call: its lvalue is the sret buffer gen_expr writes to.
+    return gen_expr(node);
   case ND_COMMA:
     gen_expr(node->lhs);
     return gen_addr(node->rhs);
@@ -405,6 +524,12 @@ static int gen_addr(Node *node) {
 static int binop(Node *node, char *op) {
   int a, b;
   eval2(node->lhs, node->rhs, &a, &b);
+  // Shifts don't undergo the usual arithmetic conversions: the shift amount keeps its own
+  // (promoted) width, which may differ from the value's (e.g. `uint64_t << int`). Our
+  // `iN.shl/shr` require both operands at width N, so widen/narrow the amount to match.
+  bool shift = !strcmp(op, "shl") || !strcmp(op, "shr_s") || !strcmp(op, "shr_u");
+  if (shift && is64(node->lhs->ty) != is64(node->rhs->ty))
+    b = gen_convert(b, node->rhs->ty, node->lhs->ty);
   int r = nv++;
   fprintf(o, "  v%d = %s.%s v%d v%d\n", r, irty(node->lhs->ty), op, a, b);
   return r;
@@ -429,6 +554,15 @@ static int cmpop(Node *node, char *base, bool sign) {
 // int (extend/wrap), float<->float (promote/demote), and int<->float. float->int is
 // **saturating** (`trunc_sat`) so an out-of-range conversion is total, not a trap (§3b).
 static int gen_convert(int a, Type *from, Type *to) {
+  // An aggregate (struct/union) value is an *address*; casting one to a scalar reinterprets
+  // its bytes — chibicc emits this when it initializes a union via its first member
+  // (`v.i = (int)expr`) — so load the scalar through the address.
+  if (is_agg(from) && !by_address(to))
+    return gen_load(to, a);
+  // Otherwise anything held by address (array/function decay, or an aggregate→aggregate
+  // copy handled elsewhere by memcpy) converts with no value change.
+  if (by_address(from) || by_address(to))
+    return a;
   bool ff = is_flt(from), tf = is_flt(to);
   if (is64(from) == is64(to) && ff == tf)
     return a; // same IR type — no-op
@@ -544,7 +678,9 @@ static int gen_cond(Node *node) {
   open_block(el);
   int ve = gen_expr_as(node->els, node->ty);
   fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), ve);
-  open_merge(merge, irty(node->ty));
+  // An aggregate-typed `?:` carries the selected arm's *address* (by-address, §3d), so the
+  // merge value is an i64 pointer; `pass_irty` maps a struct/union to i64, scalars to their type.
+  open_merge(merge, pass_irty(node->ty));
   return MERGE_VAL;
 }
 
@@ -599,6 +735,32 @@ static int gen_builtin_exit(Node *node) {
   fprintf(o, "  unreachable\n"); // Exit is noreturn (§3e)
   term = true;
   return 0;
+}
+
+// Memory capability builtins (§3e/§4): `__vm_map(off,len,prot)` / `__vm_unmap(off,len)` /
+// `__vm_protect(off,len,prot)` lower to `cap.call` on the stashed Memory handle (type 3,
+// ops 0/1/2). This is how guest libc (`malloc`) commits/decommits window pages and **grows
+// the heap into the reserved tail** (the §1a sparse-address-space path). Each returns the
+// cap's `i64` (0 / negative-errno). The args are simple expressions in our own libc, so they
+// are evaluated sequentially (no cross-block spill); a caller must not pass branching args.
+static int gen_builtin_memory(Node *node, int op, int want) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != want)
+    error_tok(node->tok, "codegen_ir: __vm_* builtin argument count mismatch");
+  Node *a = node->args;
+  int off = widen_i64(gen_expr(a), a->ty);
+  int len = widen_i64(gen_expr(a->next), a->next->ty);
+  int prot = (want == 3) ? gen_expr(a->next->next) : 0;
+  int h = load_handle(MEMORY_SLOT);
+  int r = nv++;
+  if (want == 3)
+    fprintf(o, "  v%d = cap.call 3 %d (i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d)\n", r, op, h,
+            off, len, prot);
+  else
+    fprintf(o, "  v%d = cap.call 3 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, off, len);
+  return r;
 }
 
 static int gen_expr(Node *node) {
@@ -699,41 +861,62 @@ static int gen_expr(Node *node) {
   case ND_ADDR:
     return gen_addr(node->lhs);
   case ND_FUNCALL: {
-    if (node->lhs->kind != ND_VAR || !node->lhs->var->is_function)
-      error_tok(node->tok, "codegen_ir: only direct calls are supported yet");
+    // A call is direct when the callee is a named function; otherwise it is an indirect
+    // call through a function-pointer *value* (a funcref index, §3c).
+    bool direct = node->lhs->kind == ND_VAR && node->lhs->var->is_function;
     // Intercept the stdio builtins (powerbox §3e) before treating it as a guest call.
-    char *fname = node->lhs->var->name;
-    if (fname) {
-      if (!strcmp(fname, "write"))
-        return gen_builtin_stream(node, STDOUT_SLOT, 1);
-      if (!strcmp(fname, "read"))
-        return gen_builtin_stream(node, STDIN_SLOT, 0);
-      if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
-        return gen_builtin_exit(node);
+    if (direct) {
+      char *fname = node->lhs->var->name;
+      if (fname) {
+        if (!strcmp(fname, "write"))
+          return gen_builtin_stream(node, STDOUT_SLOT, 1);
+        if (!strcmp(fname, "read"))
+          return gen_builtin_stream(node, STDIN_SLOT, 0);
+        if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
+          return gen_builtin_exit(node);
+        if (!strcmp(fname, "__vm_map"))
+          return gen_builtin_memory(node, 0, 3);
+        if (!strcmp(fname, "__vm_unmap"))
+          return gen_builtin_memory(node, 1, 2);
+        if (!strcmp(fname, "__vm_protect"))
+          return gen_builtin_memory(node, 2, 3);
+      }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the
-    // parser). Keep their types too, for marshalling variadic args. If any argument opens
-    // a block, spill each across the rest so all values land in the final block.
+    // parser). Keep their types too, for marshalling variadic args. If any argument — or,
+    // for an indirect call, the callee expression — opens a block, spill each live value
+    // across the rest so they all land in the final block.
     int argv[64];
     Type *argt[64];
     int n = 0;
     bool argbranch = false;
+    if (!direct)
+      argbranch |= has_branch(node->lhs);
     for (Node *a = node->args; a; a = a->next)
       argbranch |= has_branch(a);
     int spillsave = spill_top;
+    // The indirect callee (a funcref) is evaluated first and kept live across the args.
+    int fnval = 0, fnslot = 0;
+    if (!direct) {
+      fnval = gen_expr(node->lhs);
+      if (argbranch)
+        fnslot = spill(fnval, "i64");
+    }
     int spillslot[64];
     for (Node *a = node->args; a; a = a->next) {
       if (n == 64)
         error_tok(node->tok, "codegen_ir: too many call arguments");
       argt[n] = a->ty;
-      argv[n] = gen_expr(a);
+      argv[n] = gen_expr(a); // a by-value aggregate yields its address (passed by pointer)
       if (argbranch)
-        spillslot[n] = spill(argv[n], irty(a->ty));
+        spillslot[n] = spill(argv[n], pass_irty(a->ty));
       n++;
     }
     if (argbranch) {
+      if (!direct)
+        fnval = reload(fnslot, "i64");
       for (int i = 0; i < n; i++)
-        argv[i] = reload(spillslot[i], irty(argt[i]));
+        argv[i] = reload(spillslot[i], pass_irty(argt[i]));
       spill_top = spillsave;
     }
 
@@ -784,19 +967,61 @@ static int gen_expr(Node *node) {
     int csp = nv++;
     fprintf(o, "  v%d = i64.add " SP " v%d\n", csp, fs);
 
-    int idx = func_index(node->lhs->var);
     bool is_void = node->ty->kind == TY_VOID;
-    int r = is_void ? 0 : nv++;
-    if (is_void)
-      fprintf(o, "  call %d (v%d", idx, csp);
-    else
-      fprintf(o, "  v%d = call %d (v%d", r, idx, csp);
+    // A struct/union return uses the §3d sret ABI: the caller passes the address of its
+    // return buffer as a hidden first argument (right after the data-SP), the callee writes
+    // the result through it, and the IR call yields no value.
+    bool agg_ret = is_agg(node->ty);
+    // For an indirect call, wrap the 8-byte funcref down to the i32 table index, and (for a
+    // struct return) materialize the sret buffer address — both *before* allocating the
+    // result index, so block-local value numbering stays monotonic (operands precede it).
+    int idx32 = -1;
+    if (!direct) {
+      idx32 = nv++;
+      fprintf(o, "  v%d = i32.wrap_i64 v%d\n", idx32, fnval);
+    }
+    int sret_addr = 0;
+    if (agg_ret) {
+      int so = nv++;
+      fprintf(o, "  v%d = i64.const %d\n", so, node->ret_buffer->offset);
+      sret_addr = nv++;
+      fprintf(o, "  v%d = i64.add " SP " v%d\n", sret_addr, so); // buffer in the caller frame
+    }
+    bool ir_void = is_void || agg_ret; // a struct-returning call is void at the IR level
+    int r = ir_void ? 0 : nv++;
+    if (direct) {
+      int idx = func_index(node->lhs->var);
+      if (ir_void)
+        fprintf(o, "  call %d (v%d", idx, csp);
+      else
+        fprintf(o, "  v%d = call %d (v%d", r, idx, csp);
+    } else {
+      // Indirect dispatch through the function table (§3c): call with the callee's static
+      // signature, which must match the target's exactly — leading data-SP i64, then the
+      // hidden sret pointer (struct return), the params, and the trailing varargs pointer —
+      // or the runtime type-id check traps (a forged or mismatched index is inert).
+      if (ir_void)
+        fprintf(o, "  call_indirect (i64");
+      else
+        fprintf(o, "  v%d = call_indirect (i64", r);
+      if (agg_ret)
+        fprintf(o, ", i64"); // the hidden sret pointer
+      for (Type *pt = node->func_ty->params; pt; pt = pt->next)
+        fprintf(o, ", %s", pass_irty(pt));
+      if (variadic)
+        fprintf(o, ", i64"); // the hidden varargs-buffer pointer
+      fprintf(o, ") -> (%s) v%d(v%d", ir_void ? "" : irty(node->ty), idx32, csp);
+    }
+    if (agg_ret)
+      fprintf(o, ", v%d", sret_addr); // the hidden sret arg, right after the data-SP
     for (int i = 0; i < nfixed; i++)
       fprintf(o, ", v%d", argv[i]);
     if (variadic)
       fprintf(o, ", v%d", vbuf); // the hidden varargs-buffer pointer
     fprintf(o, ")\n");
-    return r; // for a void call the value is discarded
+    // The call's value: a struct return is the sret buffer address; a void call's result is
+    // discarded; otherwise the IR result.
+    return agg_ret ? sret_addr : r;
   }
   case ND_ASSIGN: {
     // Assigning a promoted local just rebinds its current SSA value — no store. The rhs
@@ -806,6 +1031,22 @@ static int gen_expr(Node *node) {
       int val = gen_expr(node->rhs);
       curval[slot_of(node->lhs->var)] = val;
       return val;
+    }
+    // Whole-struct/union assignment is a byte copy (§3d D39): the rhs yields its address.
+    if (is_agg(node->ty)) {
+      int dst = gen_addr(node->lhs);
+      int src;
+      if (has_branch(node->rhs)) {
+        int save = spill_top;
+        int idx = spill(dst, "i64");
+        src = gen_expr(node->rhs);
+        dst = reload(idx, "i64");
+        spill_top = save;
+      } else {
+        src = gen_expr(node->rhs);
+      }
+      gen_memcpy(dst, src, node->ty->size);
+      return dst; // the assignment's value is the aggregate, used by address
     }
     int addr = gen_addr(node->lhs);
     int val;
@@ -1014,9 +1255,9 @@ static void gen_stmt(Node *node) {
   switch (node->kind) {
   case ND_BLOCK:
     for (Node *n = node->body; n; n = n->next) {
-      // Drop dead code after a terminator — but a `case`/`default` label reopens a
-      // reachable block, so it is always emitted.
-      if (term && n->kind != ND_CASE)
+      // Drop dead code after a terminator — but a `case`/`default` or a `goto` label
+      // reopens a reachable block, so it is always emitted.
+      if (term && n->kind != ND_CASE && n->kind != ND_LABEL)
         continue;
       gen_stmt(n);
     }
@@ -1045,6 +1286,16 @@ static void gen_stmt(Node *node) {
   case ND_DO:
     gen_do(node);
     return;
+  case ND_LABEL: {
+    // A C label: its block is a `goto`/fall-through target. Fall into it from the
+    // preceding statement (if reachable), open it, then emit the labelled statement.
+    int blk = label_block_of(node->unique_label);
+    if (!term)
+      fprintf(o, "  br block%d(" SP "%s)\n", blk, cvals());
+    open_block(blk);
+    gen_stmt(node->lhs);
+    return;
+  }
   case ND_GOTO: {
     // break/continue: branch to the matching enclosing loop's break/continue block.
     for (int i = loopsp - 1; i >= 0; i--) {
@@ -1061,10 +1312,27 @@ static void gen_stmt(Node *node) {
         return;
       }
     }
-    error_tok(node->tok, "codegen_ir: general goto/labels not supported yet");
+    // A general `goto`: branch to its target label's block (allocated on first reference,
+    // so forward gotos resolve). The data-SP + promoted locals thread through as args.
+    fprintf(o, "  br block%d(" SP "%s)\n", label_block_of(node->unique_label), cvals());
+    term = true;
+    return;
   }
   case ND_RETURN:
-    if (node->lhs) {
+    if (node->lhs && is_agg(node->lhs->ty)) {
+      // struct/union return: copy the result into the caller's sret buffer (§3d), then
+      // return no value (the IR function is `-> ()`). Reload the sret pointer from its frame
+      // slot — `sret_param` is only valid in the entry block, but a return can be in any.
+      int src = gen_expr(node->lhs); // an aggregate yields its address (by_address)
+      int so = nv++;
+      fprintf(o, "  v%d = i64.const %d\n", so, sret_slot);
+      int sa = nv++;
+      fprintf(o, "  v%d = i64.add " SP " v%d\n", sa, so);
+      int sret = nv++;
+      fprintf(o, "  v%d = i64.load v%d\n", sret, sa);
+      gen_memcpy(sret, src, node->lhs->ty->size);
+      fprintf(o, "  return\n");
+    } else if (node->lhs) {
       int v = gen_expr(node->lhs);
       fprintf(o, "  return v%d\n", v);
     } else {
@@ -1211,8 +1479,13 @@ static void prepare_func(Obj *fn) {
       off += v->ty->size;
     }
   }
-  // Reserve the spill scratch region at the top of the frame (see SCRATCH_BYTES).
-  off = align_to(off, 16) + SCRATCH_BYTES;
+  // Reserve, just below the spill scratch, a hidden 8-byte slot (16-padded) for the sret
+  // pointer of a struct/union-returning function — so a `return <aggregate>` from any block
+  // can reload it. Then the spill scratch region at the top of the frame (see SCRATCH_BYTES).
+  off = align_to(off, 16);
+  if (is_agg(fn->ty->return_ty))
+    off += 16;
+  off += SCRATCH_BYTES;
   fn->stack_size = align_to(off, 16);
 }
 
@@ -1221,6 +1494,7 @@ static void gen_func(Obj *fn) {
     return;
 
   nb = 0;
+  nlabel = 0;
   cur_frame = fn->stack_size;
   cur_scratch = fn->stack_size - SCRATCH_BYTES; // scratch sits at the top of the frame
   spill_top = 0;
@@ -1237,23 +1511,34 @@ static void gen_func(Obj *fn) {
         npromo = s + 1;
     }
 
-  // Signature: `func (i64 sp, <param tys> [, i64 va_ptr]) -> (<ret ty>)`. v0 is the
-  // data-SP; a variadic function takes a trailing pointer to the marshalled args (§3d).
+  // Signature: `func (i64 sp [, i64 sret], <param tys> [, i64 va_ptr]) -> (<ret ty>)`. v0
+  // is the data-SP; a struct/union-returning function takes a hidden sret pointer right
+  // after it and returns `()` (§3d D39); a variadic function takes a trailing pointer to
+  // the marshalled args (§3d). A by-value aggregate parameter is passed by pointer (i64).
   fprintf(o, "func (i64");
-  for (Obj *p = fn->params; p; p = p->next)
-    fprintf(o, ", %s", irty(p->ty));
+  if (is_agg(ret))
+    fprintf(o, ", i64"); // the hidden sret pointer
+  for (Obj *p = guest_params(fn); p; p = p->next)
+    fprintf(o, ", %s", pass_irty(p->ty));
   if (variadic)
     fprintf(o, ", i64");
-  if (ret->kind == TY_VOID)
+  if (ret->kind == TY_VOID || is_agg(ret))
     fprintf(o, ") -> () {\n");
   else
     fprintf(o, ") -> (%s) {\n", irty(ret));
 
-  // Entry block: params are `sp` (v0), the C params (v1..vN), then the va pointer.
+  // Entry block: params are `sp` (v0), [the sret pointer], the C params, then the va ptr.
   fprintf(o, "block%d(" SP ": i64", nb++);
   int np = 1;
-  for (Obj *p = fn->params; p; p = p->next)
-    fprintf(o, ", v%d: %s", np++, irty(p->ty));
+  sret_param = -1;
+  sret_slot = -1;
+  if (is_agg(ret)) {
+    sret_param = np;
+    sret_slot = fn->stack_size - SCRATCH_BYTES - 16; // the slot reserved by prepare_func
+    fprintf(o, ", v%d: i64", np++);
+  }
+  for (Obj *p = guest_params(fn); p; p = p->next)
+    fprintf(o, ", v%d: %s", np++, pass_irty(p->ty));
   int va_param = np;
   if (variadic)
     fprintf(o, ", v%d: i64", np++);
@@ -1261,10 +1546,11 @@ static void gen_func(Obj *fn) {
   nv = np;
   term = false;
   // Each C parameter: a promoted param's current value *is* its incoming SSA value (no
-  // store); a memory param is spilled to its frame slot as before.
+  // store); a memory param is spilled to its frame slot (an aggregate param is a pointer
+  // to the caller's value, so the callee copies it into its own frame — by-value, §3d).
   bool param_slot[MAXPROMO] = {false};
-  int pi = 1;
-  for (Obj *p = fn->params; p; p = p->next) {
+  int pi = (sret_param < 0) ? 1 : 2; // incoming param values follow sp (and sret, if any)
+  for (Obj *p = guest_params(fn); p; p = p->next) {
     if (is_promoted(p)) {
       int s = slot_of(p);
       curval[s] = pi;
@@ -1274,7 +1560,10 @@ static void gen_func(Obj *fn) {
       fprintf(o, "  v%d = i64.const %d\n", off, p->offset);
       int addr = nv++;
       fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
-      gen_store(p->ty, addr, pi);
+      if (is_agg(p->ty))
+        gen_memcpy(addr, pi, p->ty->size); // copy the caller's aggregate into our frame
+      else
+        gen_store(p->ty, addr, pi);
     }
     pi++;
   }
@@ -1285,6 +1574,15 @@ static void gen_func(Obj *fn) {
     int addr = nv++;
     fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
     fprintf(o, "  i64.store v%d v%d\n", addr, va_param);
+  }
+  // Stash the hidden sret pointer into its frame slot, so a `return <aggregate>` from any
+  // block (not just the entry, where `sret_param` is the live parameter) can reload it.
+  if (sret_slot >= 0) {
+    int off = nv++;
+    fprintf(o, "  v%d = i64.const %d\n", off, sret_slot);
+    int addr = nv++;
+    fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
+    fprintf(o, "  i64.store v%d v%d\n", addr, sret_param);
   }
   // A promoted non-parameter local starts defined (zero) so it is a valid SSA value on
   // every path before its first assignment (and this subsumes its ND_MEMZERO).
@@ -1300,8 +1598,8 @@ static void gen_func(Obj *fn) {
   // Falling off the end: C `main` returns 0; for other paths it is UB, and returning a
   // zero is a safe, defined value. Every block needs a terminator (§3b).
   if (!term) {
-    if (ret->kind == TY_VOID) {
-      fprintf(o, "  return\n");
+    if (ret->kind == TY_VOID || is_agg(ret)) {
+      fprintf(o, "  return\n"); // void, or a struct-returning func that wrote via sret
     } else {
       int z = nv++;
       fprintf(o, "  v%d = %s.const 0\n  return v%d\n", z, irty(ret), z);
@@ -1361,18 +1659,39 @@ static bool layout_globals(Obj *prog) {
   return any;
 }
 
+// Resolve a relocation's target symbol to the value stored in the data image: a data
+// global's window offset, or a function's funcref index (§3c — a function pointer in
+// memory is its function-table index). Every global offset (layout_globals) and function
+// index (funcs[]) is assigned before data is emitted, so the value is a compile-time
+// constant — there is no runtime relocation step.
+static long symbol_value(Obj *prog, char *name) {
+  for (Obj *s = prog; s; s = s->next)
+    if (s->name && !strcmp(s->name, name))
+      return s->is_function ? func_index(s) : s->offset;
+  return 0; // unreachable for a well-formed whole-program module (defensive NULL)
+}
+
 // Emit a module-level `data` segment (§3a) for each initialized global: the runtime copies
 // the bytes into the window at instantiation, replacing the old per-byte `_start` init stores.
+// Pointer initializers (`char *p = "..."`, `&global`, `&arr[k]`, function pointers, and
+// arrays/structs of them) become **relocations** (§3a): each writes the 8-byte little-endian
+// window address of its target symbol + addend into the image, computed here since all
+// offsets/indices are known.
 static void emit_data_segments(Obj *prog) {
   for (Obj *g = prog; g; g = g->next) {
     if (g->is_function || !g->init_data)
       continue;
-    if (g->rel)
-      error_tok(g->tok, "codegen_ir: global initialized with a pointer (relocation) "
-                        "not supported yet");
+    int size = g->ty->size;
+    unsigned char *buf = calloc(size ? size : 1, 1);
+    memcpy(buf, g->init_data, size);
+    for (Relocation *r = g->rel; r; r = r->next) {
+      unsigned long val = (unsigned long)(symbol_value(prog, *r->label) + r->addend);
+      for (int i = 0; i < 8 && r->offset + i < size; i++)
+        buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
+    }
     fprintf(o, "data %s%d \"", is_rodata(g) ? "ro " : "", g->offset);
-    for (int i = 0; i < g->ty->size; i++) {
-      unsigned char c = (unsigned char)g->init_data[i];
+    for (int i = 0; i < size; i++) {
+      unsigned char c = buf[i];
       if (c == '\\')
         fprintf(o, "\\\\");
       else if (c == '"')
@@ -1383,6 +1702,7 @@ static void emit_data_segments(Obj *prog) {
         fprintf(o, "\\x%02x", c);
     }
     fprintf(o, "\"\n");
+    free(buf);
   }
 }
 
@@ -1394,12 +1714,12 @@ static void emit_start(Obj *main_fn) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
-  fprintf(o, "func (i32, i32, i32) -> (%s) {\n", is_void ? "" : irty(mret));
-  fprintf(o, "block0(v0: i32, v1: i32, v2: i32):\n"); // stdout, stdin, exit
-  nv = 3;
-  // Stash each handle in its reserved slot so the stdio builtins can load it.
-  int slots[3] = {STDOUT_SLOT, STDIN_SLOT, EXIT_SLOT};
-  for (int i = 0; i < 3; i++) {
+  fprintf(o, "func (i32, i32, i32, i32) -> (%s) {\n", is_void ? "" : irty(mret));
+  fprintf(o, "block0(v0: i32, v1: i32, v2: i32, v3: i32):\n"); // stdout, stdin, exit, memory
+  nv = 4;
+  // Stash each handle in its reserved slot so the builtins can load it.
+  int slots[4] = {STDOUT_SLOT, STDIN_SLOT, EXIT_SLOT, MEMORY_SLOT};
+  for (int i = 0; i < 4; i++) {
     int a = nv++;
     fprintf(o, "  v%d = i64.const %d\n", a, slots[i]);
     fprintf(o, "  i32.store v%d v%d\n", a, i);
@@ -1445,10 +1765,21 @@ void codegen_ir(Obj *prog, FILE *out) {
       need_mem = true;
   }
 
-  // A 2^16-byte window is ample for the globals + data stack of the programs we lower
-  // today (the size becomes program-driven once a real data segment / heap land).
-  if (need_mem)
-    fprintf(o, "memory 16\n\n");
+  // Size the window to hold the globals/BSS region (`data_end`) plus a data-stack/heap
+  // reserve. Small programs keep the 2^16-byte (64 KiB) default; a program with a large
+  // static region (e.g. a big arena buffer) grows to the next power of two that fits. The
+  // JIT only backs `mapped = 2^log2` and reserves a huge VA above it (§4), so a larger
+  // window costs only the backed prefix.
+  if (need_mem) {
+    // Reserve stack/heap headroom: a generous flat 48 KiB for small programs (so they stay
+    // at 64 KiB), or an amount equal to the globals for large ones (proportional stack).
+    long reserve = data_end < (16 << 10) ? (48 << 10) : data_end;
+    long need = (long)data_end + reserve;
+    int wlog2 = 16;
+    while (((long)1 << wlog2) < need)
+      wlog2++;
+    fprintf(o, "memory %d\n\n", wlog2);
+  }
 
   // Global initializers become module-level `data` segments (§3a), placed by the runtime.
   emit_data_segments(prog);

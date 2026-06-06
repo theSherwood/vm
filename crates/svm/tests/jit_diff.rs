@@ -875,172 +875,103 @@ block0(v0: i64, v1: f64):
 }
 
 // ---- cap.call: the JIT dispatches through a host thunk to the interpreter's Host ----
-
-use core::ffi::c_void;
-use svm_interp::{run_with_host, GuestMem, Host, StreamRole};
-use svm_jit::{compile_and_run_with_host, EXIT_CODE};
-
-/// Bridge the JIT's `CapThunk` ABI to the interpreter's `Host::cap_dispatch_slots`.
-/// This is the host "trampoline" (§9) a real embedder supplies; here it drives the same
-/// mock Host the interpreter uses, so the two backends share capability semantics.
-///
-/// # Safety
-/// Honours the `CapThunk` contract: `ctx` is a `*mut Host`, the slot/window pointers are
-/// valid for their lengths, and `trap_out` is live.
-unsafe extern "C" fn cap_thunk(
-    ctx: *mut c_void,
-    mem_base: *mut u8,
-    mem_size: u64,
-    type_id: u32,
-    op: u32,
-    handle: i32,
-    args: *const i64,
-    n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    trap_out: *mut i64,
-) {
-    let host = &mut *(ctx as *mut Host);
-    let arg_slots = std::slice::from_raw_parts(args, n_args as usize);
-    // The JIT-side guest window, with `map`/`unmap`/`protect` backed by real `mprotect` on the
-    // window pages — the mirror of the interpreter's page-protection map, so the Memory cap
-    // behaves identically on both backends (a store to a protected page faults into the guard).
-    let mut wm = MprotectWindow {
-        base: mem_base,
-        size: mem_size,
+//
+// Unix-only: these drive `svm_run::MprotectWindow` (real `mprotect`, cfg(unix)); the windows
+// Memory-cap port is a Phase-3.5 follow-up. The portable cap.call lowering is covered on every OS
+// by `jit_fuzz` (the forged + valid-Memory cap.call arms) and the `c_frontend` powerbox tests.
+// Gated as a module so windows CI still compiles + runs the rest of the suite.
+#[cfg(unix)]
+mod cap {
+    use super::*;
+    use core::ffi::c_void;
+    use svm_interp::{
+        run_capture_reserved_with_host, run_with_host, GuestMem, Host, StreamRole, Trap, Value,
     };
-    let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
-        None
-    } else {
-        Some(&mut wm)
+    use svm_jit::{
+        compile_and_run_capture_reserved_with_host, compile_and_run_with_host, TrapKind, EXIT_CODE,
     };
+    use svm_run::MprotectWindow;
+    use svm_text::parse_module;
+    use svm_verify::verify_module;
 
-    match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
-        Ok(res) => {
-            let out = std::slice::from_raw_parts_mut(results, n_results as usize);
-            for (o, r) in out.iter_mut().zip(res) {
-                *o = r;
+    /// Bridge the JIT's `CapThunk` ABI to the interpreter's `Host::cap_dispatch_slots`.
+    /// This is the host "trampoline" (§9) a real embedder supplies; here it drives the same
+    /// mock Host the interpreter uses, so the two backends share capability semantics.
+    ///
+    /// # Safety
+    /// Honours the `CapThunk` contract: `ctx` is a `*mut Host`, the slot/window pointers are
+    /// valid for their lengths, and `trap_out` is live.
+    unsafe extern "C" fn cap_thunk(
+        ctx: *mut c_void,
+        mem_base: *mut u8,
+        mem_size: u64,
+        mem_reserved: u64,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: *const i64,
+        n_args: u64,
+        results: *mut i64,
+        n_results: u64,
+        trap_out: *mut i64,
+    ) {
+        let host = &mut *(ctx as *mut Host);
+        // Null args pointer when there are 0 args; `from_raw_parts` needs non-null even for len 0.
+        let arg_slots = if n_args == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(args, n_args as usize)
+        };
+        // The production JIT-side guest window: `map`/`unmap`/`protect` backed by real `mprotect`
+        // (incl. growth into the reserved tail), mirrored by a software page map so the Memory cap is
+        // bit-identical to the interpreter's paged `Mem` — exactly what this differential checks.
+        let mut wm = MprotectWindow::new(mem_base, mem_size, mem_reserved);
+        let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
+            None
+        } else {
+            Some(&mut wm)
+        };
+
+        match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
+            Ok(res) => {
+                if n_results != 0 {
+                    let out = std::slice::from_raw_parts_mut(results, n_results as usize);
+                    for (o, r) in out.iter_mut().zip(res) {
+                        *o = r;
+                    }
+                }
+                *trap_out = 0;
             }
-            *trap_out = 0;
-        }
-        Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
-        // CapFault (forged/wrong-type/closed) and anything else map to a CapFault trap.
-        Err(_) => *trap_out = TrapKind::CapFault as i64,
-    }
-}
-
-/// A [`GuestMem`] over the JIT's flat guest window whose `map`/`unmap`/`protect` are backed by
-/// real `mprotect` on the window pages — the JIT-side mirror of the interpreter's page-protection
-/// map, so the Memory capability behaves identically on both backends (a store to a protected
-/// page faults into the guard region → detect-and-kill). `read_bytes`/`write_bytes` behave like
-/// `svm_interp::WindowMem`. Unix-only, like the JIT's guard itself.
-struct MprotectWindow {
-    base: *mut u8,
-    size: u64,
-}
-
-impl MprotectWindow {
-    /// `mprotect [offset, offset+len)` to cap `prot_bits` (`READ`=1, `WRITE`=2). Page-aligned
-    /// offset + in-range required (else `-EINVAL`), matching the interpreter's `prot_pages`.
-    fn mprotect_range(&self, offset: u64, len: u64, prot_bits: i32) -> i64 {
-        const EINVAL: i64 = -22;
-        // SAFETY: sysconf is always safe to call; `_SC_PAGESIZE` is positive.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-        let Some(end) = offset.checked_add(len) else {
-            return EINVAL;
-        };
-        if len == 0 || page == 0 || !offset.is_multiple_of(page) || end > self.size {
-            return EINVAL;
-        }
-        let prot = if prot_bits & 2 != 0 {
-            libc::PROT_READ | libc::PROT_WRITE
-        } else if prot_bits & 1 != 0 {
-            libc::PROT_READ
-        } else {
-            libc::PROT_NONE
-        };
-        let last = end - 1;
-        let rlen = ((last / page) - (offset / page) + 1) * page; // round up to whole pages
-                                                                 // SAFETY: `[base+offset, +rlen)` is within the window's reserved mapping (offset+len ≤
-                                                                 // size ≤ mapped, page-rounded), owned by the JIT for the duration of the call.
-        let rc = unsafe {
-            libc::mprotect(
-                self.base.add(offset as usize) as *mut c_void,
-                rlen as usize,
-                prot,
-            )
-        };
-        if rc == 0 {
-            0
-        } else {
-            EINVAL
+            Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
+            // CapFault (forged/wrong-type/closed) and anything else map to a CapFault trap.
+            Err(_) => *trap_out = TrapKind::CapFault as i64,
         }
     }
-}
 
-impl GuestMem for MprotectWindow {
-    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
-        let end = ptr.checked_add(len)?;
-        if end > self.size {
-            return None;
-        }
-        // SAFETY: `[base, base+size)` is the live guest window for the call's duration.
-        let w = unsafe { std::slice::from_raw_parts(self.base, self.size as usize) };
-        Some(w[ptr as usize..end as usize].to_vec())
-    }
-    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
-        let end = ptr.checked_add(data.len() as u64)?;
-        if end > self.size {
-            return None;
-        }
-        // SAFETY: as above; `&mut self` gives exclusive access for the write.
-        let w = unsafe { std::slice::from_raw_parts_mut(self.base, self.size as usize) };
-        w[ptr as usize..end as usize].copy_from_slice(data);
-        Some(())
-    }
-    fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
-        // Re-commit: zero the range (matching the interpreter's fresh-page semantics on a
-        // (re)map), then apply the requested protection. mprotect to RW first so a previously
-        // unmapped/RO range is writable for the zero-fill.
-        let rw = self.mprotect_range(offset, len, 2 /* WRITE ⇒ RW */);
-        if rw != 0 {
-            return rw;
-        }
-        // SAFETY: `[base+offset, +len)` is in-range (mprotect_range validated it) and now RW.
-        unsafe { std::ptr::write_bytes(self.base.add(offset as usize), 0, len as usize) };
-        self.mprotect_range(offset, len, prot)
-    }
-    fn unmap(&mut self, offset: u64, len: u64) -> i64 {
-        self.mprotect_range(offset, len, 0) // PROT_NONE ⇒ any access faults
-    }
-    fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
-        self.mprotect_range(offset, len, prot)
-    }
-}
+    /// Drive `src(args)` through the interpreter (on `hi`) and the JIT (on `hj`) and assert
+    /// they agree on the result/trap/exit *and* on the observable host effects. `hi` and `hj`
+    /// must be set up identically by the caller (grants are deterministic, so handle indices
+    /// match).
+    fn assert_cap_agrees(src: &str, args: &[Value], hi: &mut Host, hj: &mut Host) {
+        let m = parse_module(src).expect("parse");
+        verify_module(&m).expect("verify");
+        let results_ty = m.funcs[0].results.clone();
 
-/// Drive `src(args)` through the interpreter (on `hi`) and the JIT (on `hj`) and assert
-/// they agree on the result/trap/exit *and* on the observable host effects. `hi` and `hj`
-/// must be set up identically by the caller (grants are deterministic, so handle indices
-/// match).
-fn assert_cap_agrees(src: &str, args: &[Value], hi: &mut Host, hj: &mut Host) {
-    let m = parse_module(src).expect("parse");
-    verify_module(&m).expect("verify");
-    let results_ty = m.funcs[0].results.clone();
+        let mut fuel = 10_000_000u64;
+        let interp = run_with_host(&m, 0, args, &mut fuel, hi);
+        let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+        let jit =
+            compile_and_run_with_host(&m, 0, &slots, cap_thunk, hj as *mut Host as *mut c_void)
+                .expect("jit compiles");
 
-    let mut fuel = 10_000_000u64;
-    let interp = run_with_host(&m, 0, args, &mut fuel, hi);
-    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let jit = compile_and_run_with_host(&m, 0, &slots, cap_thunk, hj as *mut Host as *mut c_void)
-        .expect("jit compiles");
+        compare_outcome(interp, jit, &results_ty, src, args);
+        assert_eq!(hi.stdout, hj.stdout, "stdout differs on {src:?}");
+        assert_eq!(hi.stderr, hj.stderr, "stderr differs on {src:?}");
+    }
 
-    compare_outcome(interp, jit, &results_ty, src, args);
-    assert_eq!(hi.stdout, hj.stdout, "stdout differs on {src:?}");
-    assert_eq!(hi.stderr, hj.stderr, "stderr differs on {src:?}");
-}
-
-#[test]
-fn jit_cap_clock_now() {
-    let src = r#"
+    #[test]
+    fn jit_cap_clock_now() {
+        let src = r#"
 func (i32) -> (i64) {
 block0(v0: i32):
   v1 = i32.const 0
@@ -1048,19 +979,19 @@ block0(v0: i32):
   return v2
 }
 "#;
-    let mut hi = Host::new();
-    let mut hj = Host::new();
-    let ci = hi.grant_clock();
-    let cj = hj.grant_clock();
-    assert_eq!(ci, cj, "grants are deterministic");
-    assert_cap_agrees(src, &[Value::I32(ci)], &mut hi, &mut hj);
-}
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        let ci = hi.grant_clock();
+        let cj = hj.grant_clock();
+        assert_eq!(ci, cj, "grants are deterministic");
+        assert_cap_agrees(src, &[Value::I32(ci)], &mut hi, &mut hj);
+    }
 
-#[test]
-fn jit_cap_stream_write_captures_output() {
-    // Store "Hi" into the window, then Stream.write(ptr=0, len=2) — exercises a buffer
-    // arg through the §7 window borrow in the JIT thunk.
-    let src = r#"
+    #[test]
+    fn jit_cap_stream_write_captures_output() {
+        // Store "Hi" into the window, then Stream.write(ptr=0, len=2) — exercises a buffer
+        // arg through the §7 window borrow in the JIT thunk.
+        let src = r#"
 memory 16
 
 func (i32) -> (i64) {
@@ -1077,18 +1008,18 @@ block0(v0: i32):
   return v7
 }
 "#;
-    let mut hi = Host::new();
-    let mut hj = Host::new();
-    let oi = hi.grant_stream(StreamRole::Out);
-    let oj = hj.grant_stream(StreamRole::Out);
-    assert_eq!(oi, oj);
-    assert_cap_agrees(src, &[Value::I32(oi)], &mut hi, &mut hj);
-    assert_eq!(hj.stdout, b"Hi", "JIT captured the written bytes");
-}
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        let oi = hi.grant_stream(StreamRole::Out);
+        let oj = hj.grant_stream(StreamRole::Out);
+        assert_eq!(oi, oj);
+        assert_cap_agrees(src, &[Value::I32(oi)], &mut hi, &mut hj);
+        assert_eq!(hj.stdout, b"Hi", "JIT captured the written bytes");
+    }
 
-#[test]
-fn jit_cap_exit_propagates_code() {
-    let src = r#"
+    #[test]
+    fn jit_cap_exit_propagates_code() {
+        let src = r#"
 func (i32) -> () {
 block0(v0: i32):
   v1 = i32.const 7
@@ -1096,21 +1027,21 @@ block0(v0: i32):
   unreachable
 }
 "#;
-    let mut hi = Host::new();
-    let mut hj = Host::new();
-    let ei = hi.grant_exit();
-    let ej = hj.grant_exit();
-    assert_eq!(ei, ej);
-    assert_cap_agrees(src, &[Value::I32(ei)], &mut hi, &mut hj);
-}
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        let ei = hi.grant_exit();
+        let ej = hj.grant_exit();
+        assert_eq!(ei, ej);
+        assert_cap_agrees(src, &[Value::I32(ei)], &mut hi, &mut hj);
+    }
 
-/// §3e Memory cap `protect`: make a page read-only, then store to it — must fault on **both**
-/// backends (interp page-protection map; JIT real `mprotect` caught by the guard page). This is
-/// the D40 read-only-const mechanism and the first end-to-end exercise of the Memory cap.
-#[cfg(unix)]
-#[test]
-fn jit_cap_memory_protect_read_only_faults_store() {
-    let src = r#"
+    /// §3e Memory cap `protect`: make a page read-only, then store to it — must fault on **both**
+    /// backends (interp page-protection map; JIT real `mprotect` caught by the guard page). This is
+    /// the D40 read-only-const mechanism and the first end-to-end exercise of the Memory cap.
+    #[cfg(unix)]
+    #[test]
+    fn jit_cap_memory_protect_read_only_faults_store() {
+        let src = r#"
 memory 16
 
 func (i32) -> (i32) {
@@ -1126,133 +1057,263 @@ block0(v0: i32):
   return v7
 }
 "#;
-    // Non-vacuous: the interpreter (the spec) must actually fault on the post-`protect` store.
-    let m = parse_module(src).expect("parse");
-    verify_module(&m).expect("verify");
-    let mut h = Host::new();
-    let mh = h.grant_memory();
-    let mut fuel = 1_000_000u64;
-    assert_eq!(
-        run_with_host(&m, 0, &[Value::I32(mh)], &mut fuel, &mut h),
-        Err(Trap::MemoryFault),
-        "interp: a store to a protect(READ) page must fault"
-    );
-    // And the JIT agrees (mprotect + guard ⇒ MemoryFault). A no-op JIT `protect` would let the
-    // store succeed and diverge here, so this also pins that the JIT side is real.
-    let mut hi = Host::new();
-    let mut hj = Host::new();
-    let mi = hi.grant_memory();
-    let mj = hj.grant_memory();
-    assert_eq!(mi, mj, "grants are deterministic");
-    assert_cap_agrees(src, &[Value::I32(mi)], &mut hi, &mut hj);
-}
+        // Non-vacuous: the interpreter (the spec) must actually fault on the post-`protect` store.
+        let m = parse_module(src).expect("parse");
+        verify_module(&m).expect("verify");
+        let mut h = Host::new();
+        let mh = h.grant_memory();
+        let mut fuel = 1_000_000u64;
+        assert_eq!(
+            run_with_host(&m, 0, &[Value::I32(mh)], &mut fuel, &mut h),
+            Err(Trap::MemoryFault),
+            "interp: a store to a protect(READ) page must fault"
+        );
+        // And the JIT agrees (mprotect + guard ⇒ MemoryFault). A no-op JIT `protect` would let the
+        // store succeed and diverge here, so this also pins that the JIT side is real.
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        let mi = hi.grant_memory();
+        let mj = hj.grant_memory();
+        assert_eq!(mi, mj, "grants are deterministic");
+        assert_cap_agrees(src, &[Value::I32(mi)], &mut hi, &mut hj);
+    }
 
-/// Generate a random straight-line program that drives the `Memory` capability (handle in `v0`):
-/// a mix of `protect`/`unmap`/`map` on whole pages of a 64 KiB window, interleaved with
-/// 8-byte stores and loads (loads accumulate into the returned sum). Page-aligned, in-range
-/// args, so the ops succeed (or fault deterministically) identically on both backends. Returns
-/// IR text. Deterministic in `seed` (SplitMix64).
-#[cfg(unix)]
-fn gen_memory_program(seed: u64) -> String {
-    let mut state = seed;
-    let mut next = move || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    let mut body = String::new();
-    let mut nv = 1u32; // v0 is the Memory handle (entry param); defined values start at v1
-    let mut fresh = |body: &mut String, line: String| {
-        let v = nv;
-        nv += 1;
-        body.push_str(&format!("  v{v} = {line}\n"));
-        v
-    };
-    let acc0 = fresh(&mut body, "i64.const 0".into()); // running sum of loads
-    let mut acc = acc0;
-    let nops = 3 + next() % 8; // 3..=10 ops
-    for _ in 0..nops {
-        match next() % 5 {
-            0 | 1 => {
-                // protect(page, prot) — prot 0 (none/unmapped), 1 (RO), 3 (RW)
-                let page = next() % 16;
-                let prot = [0i32, 1, 3][(next() % 3) as usize];
-                let off = fresh(&mut body, format!("i64.const {}", page * 4096));
-                let len = fresh(&mut body, "i64.const 4096".into());
-                let pr = fresh(&mut body, format!("i32.const {prot}"));
-                fresh(
-                    &mut body,
-                    format!("cap.call 3 2 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
-                );
-            }
-            2 => {
-                // unmap(page)
-                let page = next() % 16;
-                let off = fresh(&mut body, format!("i64.const {}", page * 4096));
-                let len = fresh(&mut body, "i64.const 4096".into());
-                fresh(
-                    &mut body,
-                    format!("cap.call 3 1 (i64, i64) -> (i64) v0 (v{off}, v{len})"),
-                );
-            }
-            3 => {
-                // map(page, prot) — re-commit readable (RO or RW)
-                let page = next() % 16;
-                let prot = [1i32, 3][(next() % 2) as usize];
-                let off = fresh(&mut body, format!("i64.const {}", page * 4096));
-                let len = fresh(&mut body, "i64.const 4096".into());
-                let pr = fresh(&mut body, format!("i32.const {prot}"));
-                fresh(
-                    &mut body,
-                    format!("cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
-                );
-            }
-            4 => {
-                // store an 8-byte value at an aligned in-window address
-                let addr = (next() % 65536) & !7;
-                let val = next() as i64;
-                let a = fresh(&mut body, format!("i64.const {addr}"));
-                let v = fresh(&mut body, format!("i64.const {val}"));
-                body.push_str(&format!("  i64.store v{a} v{v}\n"));
-            }
-            _ => {
-                // load + accumulate
-                let addr = (next() % 65536) & !7;
-                let a = fresh(&mut body, format!("i64.const {addr}"));
-                let ld = fresh(&mut body, format!("i64.load v{a}"));
-                acc = fresh(&mut body, format!("i64.add v{acc} v{ld}"));
+    /// Generate a random straight-line program that drives the `Memory` capability (handle in `v0`):
+    /// a mix of `protect`/`unmap`/`map` on whole pages, interleaved with 8-byte stores and loads
+    /// (loads accumulate into the returned sum). Page selectors span **0..32** while the window's
+    /// backed prefix is only 16 pages (`memory 16`, 64 KiB) inside the large `DEFAULT_RESERVED_LOG2`
+    /// reservation — so pages 16..32 are the **reserved tail**: a store/load there faults until a
+    /// `map` *grows* into it, and an `unmap` decommits it again. Page-aligned, in-range args, so every
+    /// op succeeds or faults deterministically and identically on both backends (the §1a growth path).
+    /// Returns IR text. Deterministic in `seed` (SplitMix64).
+    #[cfg(unix)]
+    fn gen_memory_program(seed: u64) -> String {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut body = String::new();
+        let mut nv = 1u32; // v0 is the Memory handle (entry param); defined values start at v1
+        let mut fresh = |body: &mut String, line: String| {
+            let v = nv;
+            nv += 1;
+            body.push_str(&format!("  v{v} = {line}\n"));
+            v
+        };
+        // Pages 0..16 are the backed prefix (`memory 16`); 16..32 are the reserved tail reachable
+        // only after a `map` grows into them. Addresses span both so the tail's fault/grow path runs.
+        const PAGES: u64 = 32;
+        const SPAN: u64 = PAGES * 4096;
+        let acc0 = fresh(&mut body, "i64.const 0".into()); // running sum of loads
+        let mut acc = acc0;
+        let nops = 3 + next() % 8; // 3..=10 ops
+        for _ in 0..nops {
+            match next() % 5 {
+                0 | 1 => {
+                    // protect(page, prot) — prot 0 (none/unmapped), 1 (RO), 3 (RW)
+                    let page = next() % PAGES;
+                    let prot = [0i32, 1, 3][(next() % 3) as usize];
+                    let off = fresh(&mut body, format!("i64.const {}", page * 4096));
+                    let len = fresh(&mut body, "i64.const 4096".into());
+                    let pr = fresh(&mut body, format!("i32.const {prot}"));
+                    fresh(
+                        &mut body,
+                        format!("cap.call 3 2 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
+                    );
+                }
+                2 => {
+                    // unmap(page)
+                    let page = next() % PAGES;
+                    let off = fresh(&mut body, format!("i64.const {}", page * 4096));
+                    let len = fresh(&mut body, "i64.const 4096".into());
+                    fresh(
+                        &mut body,
+                        format!("cap.call 3 1 (i64, i64) -> (i64) v0 (v{off}, v{len})"),
+                    );
+                }
+                3 => {
+                    // map(page, prot) — (re)commit readable (RO or RW); grows the tail when page ≥ 16
+                    let page = next() % PAGES;
+                    let prot = [1i32, 3][(next() % 2) as usize];
+                    let off = fresh(&mut body, format!("i64.const {}", page * 4096));
+                    let len = fresh(&mut body, "i64.const 4096".into());
+                    let pr = fresh(&mut body, format!("i32.const {prot}"));
+                    fresh(
+                        &mut body,
+                        format!("cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
+                    );
+                }
+                4 => {
+                    // store an 8-byte value at an aligned address (may land in the unmapped tail)
+                    let addr = (next() % SPAN) & !7;
+                    let val = next() as i64;
+                    let a = fresh(&mut body, format!("i64.const {addr}"));
+                    let v = fresh(&mut body, format!("i64.const {val}"));
+                    body.push_str(&format!("  i64.store v{a} v{v}\n"));
+                }
+                _ => {
+                    // load + accumulate
+                    let addr = (next() % SPAN) & !7;
+                    let a = fresh(&mut body, format!("i64.const {addr}"));
+                    let ld = fresh(&mut body, format!("i64.load v{a}"));
+                    acc = fresh(&mut body, format!("i64.add v{acc} v{ld}"));
+                }
             }
         }
+        format!("memory 16\nfunc (i32) -> (i64) {{\nblock0(v0: i32):\n{body}  return v{acc}\n}}\n")
     }
-    format!("memory 16\nfunc (i32) -> (i64) {{\nblock0(v0: i32):\n{body}  return v{acc}\n}}\n")
-}
 
-/// Generative differential coverage of the `Memory` capability: random `map`/`unmap`/`protect`
-/// sequences interleaved with stores/loads must produce the **same** result/trap on the
-/// interpreter (page-protection map) and the JIT (real `mprotect`, faults caught by the guard).
-/// A protected/unmapped page makes a store or load fault on both; a re-`map` zero-fills on both.
-#[cfg(unix)]
-#[test]
-fn jit_cap_memory_protect_map_unmap_differential() {
-    for seed in 0..500u64 {
-        let src = gen_memory_program(seed);
-        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse seed {seed}: {e:?}\n{src}"));
-        verify_module(&m).unwrap_or_else(|e| panic!("verify seed {seed}: {e:?}\n{src}"));
+    /// Generative differential coverage of the `Memory` capability **including growth**: random
+    /// `map`/`unmap`/`protect` sequences interleaved with stores/loads, with page selectors spanning
+    /// the backed prefix *and* the reserved tail (see `gen_memory_program`), must produce the **same**
+    /// result/trap on the interpreter (page-protection map) and the JIT (real `mprotect`, faults
+    /// caught by the guard). A protected/unmapped/never-grown page makes a store or load fault on
+    /// both; a `map` that grows into the tail makes it accessible on both; a re-`map` zero-fills.
+    #[cfg(unix)]
+    #[test]
+    fn jit_cap_memory_protect_map_unmap_differential() {
+        for seed in 0..800u64 {
+            let src = gen_memory_program(seed);
+            let m =
+                parse_module(&src).unwrap_or_else(|e| panic!("parse seed {seed}: {e:?}\n{src}"));
+            verify_module(&m).unwrap_or_else(|e| panic!("verify seed {seed}: {e:?}\n{src}"));
+            let mut hi = Host::new();
+            let mut hj = Host::new();
+            let mi = hi.grant_memory();
+            let mj = hj.grant_memory();
+            assert_eq!(mi, mj);
+            assert_cap_agrees(&src, &[Value::I32(mi)], &mut hi, &mut hj);
+        }
+    }
+
+    /// A concrete guest consumer of **growth** (§1a sparse address space): a `memory 16` program
+    /// (64 KiB backed) `map`s a page deep in the reserved tail at offset 1 MiB, stores a value there,
+    /// reads it back, and returns it — then a second variant `unmap`s it and faults on the next load.
+    /// Both the value round-trip and the post-`unmap` fault must agree on interp + JIT, proving the
+    /// reserved tail is genuinely reachable after a grow and genuinely gone after a decommit. This is
+    /// the end-to-end "a guest grows its own address space" path, not just a unit of the page map.
+    #[cfg(unix)]
+    #[test]
+    fn jit_cap_memory_growth_round_trips() {
+        // map(0x100000, 4096, RW); store 0xABCD at 0x100000; load it back; return it.
+        let grow_and_read = r#"
+memory 16
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1048576
+  v2 = i64.const 4096
+  v3 = i32.const 3
+  v4 = cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v5 = i64.const 1048576
+  v6 = i64.const 43981
+  i64.store v5 v6
+  v7 = i64.load v5
+  return v7
+}
+"#;
+        // Non-vacuous: the interpreter (the spec) returns the grown-page value, not a fault.
+        let m = parse_module(grow_and_read).expect("parse");
+        verify_module(&m).expect("verify");
+        let mut hcheck = Host::new();
+        let mc = hcheck.grant_memory();
+        let mut fuel = 1_000_000u64;
+        assert_eq!(
+            run_with_host(&m, 0, &[Value::I32(mc)], &mut fuel, &mut hcheck),
+            Ok(vec![Value::I64(43981)]),
+            "interp: a load from a freshly-grown tail page must read back the stored value"
+        );
         let mut hi = Host::new();
         let mut hj = Host::new();
         let mi = hi.grant_memory();
         let mj = hj.grant_memory();
         assert_eq!(mi, mj);
-        assert_cap_agrees(&src, &[Value::I32(mi)], &mut hi, &mut hj);
-    }
-}
+        assert_cap_agrees(grow_and_read, &[Value::I32(mi)], &mut hi, &mut hj);
 
-#[test]
-fn jit_cap_forged_handle_is_capfault() {
-    // A forged handle index must be inert in the JIT too (CapFault), matching interp.
-    let src = r#"
+        // map then unmap the tail page, then load it → MemoryFault on both backends.
+        let grow_then_unmap = r#"
+memory 16
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1048576
+  v2 = i64.const 4096
+  v3 = i32.const 3
+  v4 = cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v5 = cap.call 3 1 (i64, i64) -> (i64) v0 (v1, v2)
+  v6 = i64.load v1
+  return v6
+}
+"#;
+        let mut hi2 = Host::new();
+        let mut hj2 = Host::new();
+        let mi2 = hi2.grant_memory();
+        let mj2 = hj2.grant_memory();
+        assert_eq!(mi2, mj2);
+        assert_cap_agrees(grow_then_unmap, &[Value::I32(mi2)], &mut hi2, &mut hj2);
+    }
+
+    /// **Escape-oracle for the Memory capability** (§18): run the same generated `map`/`unmap`/
+    /// `protect` + store/load programs through the *capture + host* path and byte-compare the final
+    /// guest window across the interpreter (page-protection map) and the JIT (real `mprotect` +
+    /// guard). The outcome differential above checks return values / traps; this also checks the
+    /// **window itself** is identical after the cap's success-path effects — a JIT store/protect/unmap
+    /// landing on the wrong page (an escape) would diverge here, as would a snapshot/`restore_rw` bug.
+    /// Fully-mapped (`reserved == mapped`, `reserved_log2 = 0` is raised to `size_log2`), so the whole
+    /// 64 KiB window is comparable; the generator's tail ops/addresses become in-range no-ops/wraps,
+    /// agreeing on both sides.
+    #[cfg(unix)]
+    #[test]
+    fn jit_cap_memory_escape_oracle_differential() {
+        // 300 seeds (each a JIT compile + a 64 KiB window snapshot/compare) keeps the stable suite
+        // snappy; the 800-seed outcome differential above already covers the same generator cheaply.
+        for seed in 0..300u64 {
+            let src = gen_memory_program(seed);
+            let m =
+                parse_module(&src).unwrap_or_else(|e| panic!("parse seed {seed}: {e:?}\n{src}"));
+            verify_module(&m).unwrap_or_else(|e| panic!("verify seed {seed}: {e:?}\n{src}"));
+            let results_ty = m.funcs[0].results.clone();
+            // A varied non-zero window seed, so a divergent (e.g. mis-masked) *read* also shows up.
+            let init: Vec<u8> = (0..1usize << 16)
+                .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+                .collect();
+            let mut hi = Host::new();
+            let mut hj = Host::new();
+            let mi = hi.grant_memory();
+            let mj = hj.grant_memory();
+            assert_eq!(mi, mj, "grants are deterministic");
+            let args = [Value::I32(mi)];
+            let mut fuel = 10_000_000u64;
+            let (interp, imem) =
+                run_capture_reserved_with_host(&m, 0, &args, &mut fuel, &init, 0, &mut hi);
+            let (jit, jmem) = compile_and_run_capture_reserved_with_host(
+                &m,
+                0,
+                &[mi as i64],
+                &init,
+                0,
+                cap_thunk,
+                &mut hj as *mut Host as *mut c_void,
+            )
+            .expect("jit compiles");
+            compare_outcome(interp, jit, &results_ty, &src, &args);
+            assert_eq!(imem.len(), jmem.len(), "window length differ (seed {seed})");
+            if let Some(i) = imem.iter().zip(&jmem).position(|(a, b)| a != b) {
+                panic!(
+                    "escape-oracle: interp/JIT final window differ at byte {i} \
+                 (interp={:#04x} jit={:#04x}) on seed {seed}\n{src}",
+                    imem[i], jmem[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jit_cap_forged_handle_is_capfault() {
+        // A forged handle index must be inert in the JIT too (CapFault), matching interp.
+        let src = r#"
 func (i32) -> (i64) {
 block0(v0: i32):
   v1 = i32.const 0
@@ -1260,16 +1321,17 @@ block0(v0: i32):
   return v2
 }
 "#;
-    let mut hi = Host::new();
-    let mut hj = Host::new();
-    // No grants: any handle is forged. Also test a wrong-type handle (a Stream called
-    // as a Clock) in a second pass.
-    assert_cap_agrees(src, &[Value::I32(0x7fff)], &mut hi, &mut hj);
+        let mut hi = Host::new();
+        let mut hj = Host::new();
+        // No grants: any handle is forged. Also test a wrong-type handle (a Stream called
+        // as a Clock) in a second pass.
+        assert_cap_agrees(src, &[Value::I32(0x7fff)], &mut hi, &mut hj);
 
-    let mut hi2 = Host::new();
-    let mut hj2 = Host::new();
-    let si = hi2.grant_stream(StreamRole::Out);
-    let sj = hj2.grant_stream(StreamRole::Out);
-    assert_eq!(si, sj);
-    assert_cap_agrees(src, &[Value::I32(si)], &mut hi2, &mut hj2);
+        let mut hi2 = Host::new();
+        let mut hj2 = Host::new();
+        let si = hi2.grant_stream(StreamRole::Out);
+        let sj = hj2.grant_stream(StreamRole::Out);
+        assert_eq!(si, sj);
+        assert_cap_agrees(src, &[Value::I32(si)], &mut hi2, &mut hj2);
+    }
 }

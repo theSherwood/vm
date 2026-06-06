@@ -206,12 +206,15 @@ impl TrapKind {
 ///
 /// # Safety
 /// `ctx` is the caller's host pointer; `args`/`results` point at `n_args`/`n_results`
-/// `i64` slots; `[mem_base, mem_base+mem_size)` is the guest window (`mem_base` null if
-/// none); `trap_out` points at the live trap cell. All must outlive the call.
+/// `i64` slots; `[mem_base, mem_base+mem_size)` is the guest window's backed prefix
+/// (`mem_base` null if none) and `mem_reserved` is the full reserved mask domain
+/// (`>= mem_size`) the guest may `map`-grow into via the Memory cap (§3e/§4); `trap_out`
+/// points at the live trap cell. All must outlive the call.
 pub type CapThunk = unsafe extern "C" fn(
     ctx: *mut core::ffi::c_void,
     mem_base: *mut u8,
     mem_size: u64,
+    mem_reserved: u64,
     type_id: u32,
     op: u32,
     handle: i32,
@@ -228,6 +231,7 @@ unsafe extern "C" fn empty_cap_thunk(
     _ctx: *mut core::ffi::c_void,
     _mem_base: *mut u8,
     _mem_size: u64,
+    _mem_reserved: u64,
     _type_id: u32,
     _op: u32,
     _handle: i32,
@@ -346,6 +350,34 @@ pub fn compile_and_run_capture_reserved(
     )
 }
 
+/// [`compile_and_run_capture_reserved`] + a live powerbox: `cap.call`s dispatch through
+/// `cap_thunk`/`cap_ctx` (so a granted handle takes its **success** path) *and* the final window
+/// is captured for the escape-oracle. Pairs with the interpreter's
+/// [`svm_interp::run_capture_reserved_with_host`] to byte-compare the effects of the §3e Memory
+/// capability (`map`/`unmap`/`protect`) across both backends.
+///
+/// # Safety
+/// `cap_thunk`/`cap_ctx` must stay valid for the call and honour the [`CapThunk`] contract.
+pub fn compile_and_run_capture_reserved_with_host(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        Some(init_mem),
+        reserved_log2,
+    )
+}
+
 fn run_inner(
     m: &IrModule,
     func: FuncIdx,
@@ -418,7 +450,17 @@ fn run_inner(
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
         .map_err(|e| JitError::Backend(e.to_string()))?;
-    let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    // Allocate code + read-only data (float constants, jump tables) from a single contiguous
+    // arena rather than the default separate `mmap`s. cranelift's x64 `call`/rip-relative
+    // loads use 32-bit PC-relative relocations (`X86CallPCRel4`/`X86PCRel4`); with independent
+    // mmaps, ASLR can place code and rodata > 2 GiB apart, overflowing the i32 offset (a
+    // `compiled_blob.rs` panic) — intermittent, and only on large modules with rodata (e.g.
+    // a whole UI library). A 256 MiB reserved arena (VA only, committed on demand) keeps every
+    // segment in range. Reserve falls back to the default provider if it cannot map.
+    if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
+        builder.memory_provider(Box::new(arena));
+    }
     let mut module = JITModule::new(builder);
 
     // Declare every function (natural ABI) up front so calls can reference any of them.
@@ -603,6 +645,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Call { .. }
                 | Inst::CallIndirect { .. }
                 | Inst::CapCall { .. }
+                | Inst::RefFunc { .. }
                 | Inst::IntBin { .. }
                 | Inst::Convert { .. } => {}
                 Inst::IntUn { op, .. } => match op {
@@ -969,6 +1012,9 @@ fn lower_block(
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
+            // A funcref is just the function index as plain i32 data (§3c) — the same
+            // value the interpreter materializes; `call_indirect` masks it into the table.
+            Inst::RefFunc { func } => b.ins().iconst(I32, *func as i64),
             _ => return Err(JitError::Unsupported("instruction")),
         };
         // Single-result instruction: record its value and a sound upper bound in lockstep.
@@ -1179,6 +1225,9 @@ fn lower_cap_call(
     let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);
     let mem_base = b.use_var(lower.mem_var);
     let mem_size = b.ins().iconst(I64, lower.mapped as i64);
+    // The reserved mask domain (`mask + 1`) the guest may `map`-grow into; 0 when no memory.
+    let reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
+    let mem_reserved = b.ins().iconst(I64, reserved as i64);
     let tid = b.ins().iconst(I32, type_id as i64);
     let opc = b.ins().iconst(I32, op as i64);
     let h = get(vals, handle)?;
@@ -1188,12 +1237,23 @@ fn lower_cap_call(
     let thunk = b.ins().iconst(I64, lower.cap.thunk_addr);
 
     let mut tsig = module.make_signature(); // host C ABI (matches `extern "C"`)
-    for t in [I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64] {
+    for t in [I64, I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64] {
         tsig.params.push(AbiParam::new(t));
     }
     let tsigref = b.import_signature(tsig);
     let call_args = [
-        ctx, mem_base, mem_size, tid, opc, h, args_ptr, na, res_ptr, nr, trap_out,
+        ctx,
+        mem_base,
+        mem_size,
+        mem_reserved,
+        tid,
+        opc,
+        h,
+        args_ptr,
+        na,
+        res_ptr,
+        nr,
+        trap_out,
     ];
     b.ins().call_indirect(tsigref, thunk, &call_args);
 

@@ -1,6 +1,6 @@
 # Handoff — C frontend (chibicc → SVM IR) + differential fuzzing
 
-Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-04**.
+Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-05**.
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
@@ -53,6 +53,106 @@ that walks chibicc's typed AST and emits **our text IR** instead of x86-64 asm, 
 `--emit-ir` flag. Everything else in `frontend/chibicc/` is upstream chibicc (don't
 edit it unless you must; keep the diff small).
 
+**Two upstream `parse.c` fixes** (the only edits outside `codegen_ir.c`), both genuine chibicc
+bugs found by trying to compile the **Clay** layout library, both around designated
+initializers into **anonymous** aggregates (very common in real C), each validated against a
+gcc matrix + the full suite with zero regressions:
+1. `struct_designator` special-cased only anonymous *structs*, so a designator targeting an
+   anonymous *union* member dereferenced a NULL `mem->name` → **segfault**. Now matches the
+   canonical `get_struct_member` idiom (`TY_STRUCT || TY_UNION`).
+2. `struct_initializer2` skipped the separator comma only on non-first members, but it is also
+   entered right after a *designated* member (tok at the comma) when that member lands in a
+   nested anonymous aggregate — so a following designator (`{ .a = x, .b = y }`) failed to
+   parse. Now skips a leading comma when present (handling both callers: designated
+   continuation at a comma, and brace-elision at a value).
+
+**Clay runs end-to-end (the capstone).** Iterating on the Clay shakedown to completion,
+`demos/clay/clay_demo.c` now compiles (~93k lines of IR), verifies, and runs on the JIT,
+producing the same render commands as a native `cc` build (`svm-run` test
+`demo_clay_layout_runs`). The full set of fixes Clay drove, beyond the two `parse.c` ones above:
+- **gen_cond** — a ternary `?:` returning an aggregate carries the selected arm's *address*
+  (merge type `pass_irty` = i64), not `irty(struct)` which errored.
+- **guest_params** — chibicc prepends a hidden return-buffer pointer to `fn->params` for
+  struct returns > 16 bytes (SysV); our §3d ABI uses its own sret for every size, so skip
+  chibicc's to avoid double-counting (the ≤16B test structs never hit it).
+- **binop shift width** — a shift keeps its amount's own width (`uint64_t << int`), so widen/
+  narrow the amount to the value's width before `iN.shl/shr`.
+- **svm-text i32.const** — accept the full u32 range (`0xFFFFFFFF` = -1).
+- **program-sized window** — the frontend sizes the window to globals/BSS + a stack reserve
+  (Clay's ~250 KB arena needs `memory 21`); small programs keep 64 KB.
+- **svm-jit `ArenaMemoryProvider`** — allocate code+rodata from one contiguous 256 MiB arena;
+  the default separate mmaps let ASLR place code and float-constant rodata > 2 GiB apart,
+  overflowing cranelift's 32-bit PC-relative relocations (an intermittent ~1/6
+  `compiled_blob.rs` panic on large modules) — now 25/25 clean.
+
+**Struct-layout parity with gcc (fixed).** Initially every Clay struct holding a small enum
+was bigger on the VM (`Clay_MinMemorySize` ~254 KB vs ~246 KB native) — chibicc sized **every
+`enum` as `int` (4 bytes)**, while gcc honours Clay's `enum __attribute__((packed))` (1 byte).
+This matters for host↔guest data exchange (a host writing structured data into the window must
+agree on layout; §3d pins x86-64-SysV). Two-part fix:
+- `enum_specifier` (parse.c) now parses `__attribute__((packed))`/`__packed__` and sizes the
+  enum to the smallest integer type holding its values (1/2/4/8 bytes), and `gen_load`/
+  `gen_store` access a packed enum at that width (it was always an i32 load → it read adjacent
+  bytes; caught by `c_matches_gcc_packed_enums`).
+- ship a minimal `frontend/chibicc/include/stdint.h`. Without it, `#include <stdint.h>` pulled
+  the system `<sys/cdefs.h>`, which — because chibicc isn't `__GNUC__` — `#define`s
+  `__attribute__(x)` to nothing, **silently stripping the attribute** before the parser saw it.
+After both, **all 80 Clay struct sizes and `Clay_MinMemorySize` match gcc exactly**, and Clay
+still renders identically. All edits except the three `parse.c` ones + `stdint.h` live in our
+own crates / `codegen_ir.c`.
+
+**Second real library — jsmn (clean).** The [jsmn](https://github.com/zserge/jsmn) JSON
+tokenizer (`demos/jsmn/`, MIT, vendored) — a deliberately *different* shape from Clay (pure
+char/state-machine string scanning, zero allocations) — compiled and ran **byte-identical to
+native cc on the first try**, including string escapes, `\u` unicode, deep nesting, the
+`-2`/`-3` error codes, and `JSMN_STRICT` mode. No new fixes needed: after the Clay batch the
+frontend is robust enough that a clean library just works. Test `demo_jsmn_matches_native`.
+(Also fixed `assert_demo_matches_cc` to flatten `/` in subdir demo names — it was silently
+skipping the comparison for `jsmn/jsmn_demo.c`.)
+
+**Hash libraries — SHA-256 and xxHash (one fix each).** Two integer/bit-shape shakedowns:
+B-Con's public-domain **SHA-256** (`demos/sha256/`) and Cyan4973's **xxHash** XXH32/XXH64
+(`demos/xxhash/`, scalar: `XXH_INLINE_ALL` + `XXH_NO_XXH3` + `XXH_NO_STREAM`). Both match native
+cc + the standard test vectors; each demo provides the one or two `mem*` functions its library
+uses (no libc). Fixes they drove: (1) `func_index` no longer segfaults reporting an
+undefined-function call (a libc declaration has no source token) — clean error now; (2) chibicc
+now supports **`_Static_assert`** (C11) / `static_assert` (C23) at file and block scope
+(`static_assertion` in parse.c) — it was parsed as a function call. Tests `demo_sha256_*` /
+`demo_xxhash_*` and `c_matches_gcc_static_assert`.
+
+**Fifth real library — tinfl / miniz inflate (clean).** miniz's standalone DEFLATE/zlib
+*inflate* engine (`demos/tinfl/`, MIT, vendored) — a fresh shape: a coroutine-style state
+machine (a deeply nested `switch` driven by `TINFL_CR_*` macros + a saved program counter),
+bit-buffer shifts, Huffman fast/slow lookup tables, and a 32 KiB LZ77 dictionary carried inside
+the `tinfl_decompressor` struct. `tinfl_demo.c` inflates an embedded zlib stream (`blob.inc`) and
+writes the result; it ran **byte-identical to native cc with no new fixes** — good evidence the
+goto/switch lowering and struct layout hold up under a gnarly real-world state machine. The one
+vendoring edit: `miniz_tinfl.c`'s `#include "miniz.h"` → `#include "miniz_tinfl.h"` (so the
+inflate path is self-contained, no deflate/zip headers). Test `demo_tinfl_matches_native`.
+
+**Sixth real library — stb_perlin / the first float shakedown (clean).** Every earlier
+shakedown was integer/pointer/struct shaped, so the IR's **f32 path** had differential-fuzz
+coverage but no *real-program* coverage. [stb_perlin](https://github.com/nothings/stb) (Sean
+Barrett, public domain, `demos/perlin/`, vendored unmodified) is dense f32 arithmetic — gradient
+dot products, the quintic ease polynomial, trilinear lerps, int↔float `fastfloor`, and
+multiply/accumulate chains over octaves (fbm/turbulence/ridge). `perlin_demo.c` provides the one
+libc function the octave variants need (`fabs`, no libm) and prints each value as a **fixed-point
+integer** rather than via float formatting — so any divergence in the actual f32 arithmetic
+between native cc and our JIT would land in the digits. It matched **byte-for-byte with no new
+fixes** — good first evidence the f32 lowering is sound on real code. Test
+`demo_perlin_matches_native`.
+
+**Seventh real library — tiny-regex-c / backtracking recursion (clean).**
+[tiny-regex-c](https://github.com/kokke/tiny-regex-c) (kokke, public domain, `demos/regex/`) is a
+Rob-Pike-style matcher whose `re_match` recurses through
+`matchpattern` → `matchstar`/`matchplus`/`matchquestion` → `matchpattern`, **backtracking** on
+failure — a new control-flow shape (a workout for the threaded data-stack pointer and general
+goto/branch lowering). Vendored with one minimal edit: the libc `<stdio.h>`/`<ctype.h>` includes
+and the printf-only `re_print` debug helper (not in `re.h`'s API) are guarded behind
+`#ifndef RE_FREESTANDING`; the driver defines it and supplies `isdigit`/`isalpha`/`isspace`. A
+table of (pattern, text) cases prints match index/length and matches native cc **byte-for-byte,
+no new fixes**. Test `demo_regex_matches_native`.
+
 ### Invocation
 ```
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input a.c -cc1-output a.svm a.c
@@ -62,7 +162,7 @@ dispatches to `codegen_ir` (see `cc1()` in `main.c`, where the wiring lives). Bu
 `make -C frontend/chibicc` (needs `make` + a C compiler; both present in CI). Build
 artifacts (`*.o`, the `chibicc` binary) are git-ignored.
 
-### Test harness (`crates/svm/tests/c_frontend.rs`, 33 tests, two tiers)
+### Test harness (`crates/svm/tests/c_frontend.rs`, 48 tests, two tiers)
 `make`s the fork once, compiles each C snippet to IR, **verifies it**, then:
 - **Tier 1 (all tests):** runs `main` (function 0 = `_start`) on **both the interpreter
   and the JIT** under identical mock powerboxes and asserts they agree on result, trap,
@@ -79,9 +179,83 @@ cargo test -p svm --test c_frontend
 `int`/`long`/`char`/`short`/`_Bool`/`enum`, `float`/`double`; pointers, arrays,
 structs/unions (`.`/`->`, indexing, initializers); globals + string literals; the full
 operator set incl. short-circuit `&&`/`||`/`?:`; `if`/`else`/`while`/`for`/`do`/`switch`
-with `break`/`continue`; functions, parameters, **recursion**, **varargs**; **`printf`**
-and `exit` over the powerbox; **`malloc`/`free`/`calloc`** (guest bump allocator). All
-verify and run identically on interp + JIT, and match native `cc`.
+with `break`/`continue` and **general `goto`/labels**; functions, parameters,
+**recursion**, **function pointers**
+(indirect calls via `call_indirect`, dispatch tables, callbacks, fn-ptr struct members),
+**by-value structs/unions** (passed/returned by value, whole-aggregate assignment),
+**varargs**; **`printf`** and `exit` over the powerbox; **`malloc`/`free`/`calloc`** (guest
+bump allocator). All verify and run identically on interp + JIT, and match native `cc`.
+
+**By-value aggregates (sret, §3d D39).** Every by-value struct/union goes by hidden
+pointer (no SysV register classification). A **struct/union return** makes the IR function
+`(i64 sp, i64 sret, params…) -> ()`: the caller passes the address of chibicc's
+`ret_buffer` (an lvar in the caller frame) as a hidden first arg, the callee writes the
+result through it, and the call's value is that buffer address (so `f(x).field` and `s =
+f(x)` work — `gen_addr(ND_FUNCALL)` returns it). A **by-value struct/union arg** is passed
+as the lvalue address (`pass_irty`=i64); the callee `gen_memcpy`s it into its own frame
+slot in the prologue (by-value semantics). **Whole-aggregate assignment** is a
+`gen_memcpy`. Two chibicc quirks handled: a same-type aggregate cast on an assignment rhs
+(`gen_convert` no-ops when held by-address), and **union first-member init** — chibicc emits
+`v.i = (int)expr`, an aggregate→scalar cast that `gen_convert` lowers as a *load* of the
+member's bytes (only array/function decay returns the address). `irty(TY_FUNC)`/`is_agg`/
+`pass_irty`/`gen_memcpy` are the new helpers.
+- **sret pointer is stashed to a frame slot, not threaded (bug fix, surfaced by
+  `demos/rational.c`).** The sret pointer is a function parameter, so it only lives as `v1`
+  in the **entry block** — but a `return <aggregate>` can be in *any* block (inside a loop,
+  after an `if`), where `v1` is rebound (e.g. to a loop counter). The original code did
+  `gen_memcpy(sret_param, …)` with a fixed value index → it wrote through the wrong value and
+  emitted IR that failed verification. Fix: `prepare_func` reserves a hidden 8-byte slot just
+  below the spill scratch (`sret_slot = stack_size − SCRATCH_BYTES − 16`); the entry block
+  stashes the incoming sret pointer there (like the varargs pointer), and an aggregate
+  `return` reloads it from `sp + sret_slot` (the data-SP `v0` is threaded everywhere, so this
+  works in any block). Regression-tested (`c_matches_gcc_aggregates`: struct return from a
+  loop/after-`if`).
+
+**General `goto`/labels.** Each C label maps to one IR block keyed by chibicc's resolved
+`unique_label` (`label_block_of`, reset per function); the block number is allocated on
+first reference — label *or* a forward `goto` — which is sound because svm-text resolves
+block targets **by name**, not position (`labels: HashMap<String,u32>` over appearance
+order). `ND_LABEL` falls into its block (if reachable) then `open_block`s it; `ND_GOTO`
+(after the existing break/continue match) branches to the target block, threading the
+data-SP + promoted locals via `cvals()` — identical to loops. The ND_BLOCK dead-code drop
+now also keeps `ND_LABEL` (a goto target reopens a reachable block). *Limitation:* a label
+buried inside a compound statement that is skipped as dead code after a terminator won't be
+emitted (goto-into-nested-block); labels at block/function scope — the cleanup/retry/state-
+machine idioms — work. With this, the **C ABI (§3d) is feature-complete** for the MVP
+subset: indirect calls, by-value aggregates, and goto all land.
+
+**Global pointer initializers / relocations.** A global initialized with a pointer
+(`char *p = "..."`, `&global`, `&arr[k]`, function pointers, and arrays/structs of them)
+carries a chibicc relocation chain (`g->rel`: `{offset, char **label, addend}`).
+`emit_data_segments` now resolves each at compile time — every global's window offset
+(`layout_globals`) and function's funcref index (`funcs[]`) is already assigned — and patches
+the 8-byte little-endian value (`symbol_value(target) + addend`) into the data image, which
+is emitted as an ordinary `data`/`data ro` segment. A function-pointer target resolves to its
+funcref index (§3c), so global dispatch tables compose with `call_indirect`. No runtime
+relocation step; nothing relocation-specific reaches the IR/verifier/JIT (it's just bytes).
+Tests: interp↔JIT differential + native-`cc` oracle (pointer-to-global, array-element
+addend, pointer-to-pointer, struct-with-pointer-member, global fn-ptr tables, string-literal
+`char*`, array-of-`char*`).
+
+**Fuzzing — data segments now generated.** The generative interp↔JIT differential
+(`support/irgen.rs`, shared by the stable `jit_fuzz` test and the libFuzzer `diff` target)
+previously emitted `data: Vec::new()`. It now generates 0–3 in-window `data` segments
+(rarely `readonly`), so interp↔JIT **data-initialization agreement** is fuzzed — caught
+strongly by the existing final-window byte compare — plus the RO-protect fault path (both
+backends protect page-granularly, so they agree). This is exactly the surface globals lower
+onto. `generator_covers_*` gained assertions that non-empty and read-only data segments are
+actually produced (so the coverage can't silently regress).
+
+**Indirect calls (function pointers).** A function designator decays to its `ref.func`
+index (an i32 funcref, §3c) widened to the 8-byte C pointer rep (`irty(TY_FUNC)`=i64,
+`by_address` true so a "load" is a no-op returning the funcref). A call through a value
+lowers to `call_indirect (i64 sp, params…[, i64 va]) -> (ret) <i32-wrapped idx>(csp,
+args…)`; the signature **must include the leading data-SP `i64`** so the runtime type-id
+check (`table_lookup`) matches the target. A type-confused/forged index is inert — it
+traps `IndirectCallType` on both backends (I2; see `c_function_pointer_signature_mismatch_traps`).
+The JIT lowers `RefFunc` to an `iconst.i32` and was extended in `ensure_supported`.
+(Coverage gap noted: the generative `jit_fuzz` exercises `call_indirect` but not `ref.func`,
+which is why this JIT gap surfaced only via the C tests — worth adding to the fuzzer.)
 
 Anything unsupported is a **hard `error_tok`** (with the AST node kind), by design — we
 never emit IR we can't stand behind. The frontend is outside the escape-TCB (§2a): the
@@ -197,12 +371,13 @@ real SSA value threaded as a block parameter of every block, exactly like the da
 
 ---
 
-## 5. C-frontend roadmap — items 1–7 all DONE (the agreed stopping point)
+## 5. C-frontend roadmap — items 1–8 all DONE (the agreed stopping point)
 
-The frontend was taken as far as needed for "a capable VM"; items 1–7 below are complete.
-Only item 8 (a perf pass) and the inline "Still TODO" notes (by-value aggregate `sret`,
-general `goto`, a real RO data segment, `fd`→stream mapping) remain, and none block "C
-runs." History order:
+The frontend was taken as far as needed for "a capable VM"; items 1–8 below are complete.
+The once-"Still TODO" items have since landed too — by-value aggregate `sret` (D39), general
+`goto`/labels, and a real read-only data segment (D40) — leaving only minor inline notes
+(`fd`→stream mapping, `%`-width/precision in the mini-printf, narrow-scalar promotion), none of
+which block "C runs." History order:
 
 1. ~~**Short-circuit `&&` / `||` and ternary `?:`**~~ — **DONE** (commit after `0f03686`).
    Lowered with option (b): the merge block carries the result as a second block param
@@ -296,7 +471,7 @@ make -C frontend/chibicc
 printf 'int fib(int n){if(n<2)return n;return fib(n-1)+fib(n-2);} int main(){return fib(10);}\n' > /tmp/t.c
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input /tmp/t.c -cc1-output /tmp/t.svm /tmp/t.c
 cat /tmp/t.svm            # func 0 = _start, func 1 = main calling func 2 = fib; n promotes to v1
-cargo test -p svm --test c_frontend   # 34 tests, all green (interp == JIT, and == cc)
+cargo test -p svm --test c_frontend   # 48 tests, all green (interp == JIT, and == cc)
 cargo test -p svm --test jit_fuzz     # 4000 generated modules, interp == JIT
 ```
 If those pass, you're oriented.
@@ -326,11 +501,13 @@ non-zero). When the interpreter — the §4 masking reference — runs to comple
 access it made was in-window, so the JIT lowering the same masking must leave an identical
 window; a mismatch is an access that escaped or was mis-masked. Pinned by
 `tests/escape_oracle.rs` and verified non-vacuous (corrupting the JIT mask makes it fail).
-Loops/back-edges, `call_indirect`, and `cap.call` (inert/ungranted ⇒ both-`CapFault`) are now
+Loops/back-edges, `call_indirect`, and `cap.call` — **both** inert/ungranted (⇒ both-`CapFault`)
+**and** the success path (a granted Memory cap, valid `map`/`unmap`/`protect`, via the capture+host
+wrappers over `svm_run::cap_thunk`, so the cap's window effects ride the escape-oracle) — are now
 generated (the trap-kind is no longer asserted when both backends trap — see §10); out-of-
 allocation accesses now fault into the guard page and are caught as `MemoryFault` (§4/§5).
-Remaining: the cap.call *success* path (a mock powerbox granted to both backends) and
-float-module memory coverage (NaN bits aren't pinned across backends).
+Remaining: float-module memory coverage is **deliberately excluded** (NaN bits aren't pinned across
+backends → arch-specific; the oracle is about addresses, which integer modules cover — see §10).
 
 ---
 
@@ -339,9 +516,11 @@ float-module memory coverage (NaN bits aren't pinned across backends).
 Largely compliant; simplifications are the ones the design *sanctions*, deferrals are
 incompleteness not contradiction:
 - **Phase 2 complete** (real C on interp + JIT). Solidly into **Phase 3** (JIT + masked
-  window + caps + **guard-page/signal detect-and-kill** done). Phase-3 remainder = the §4
-  *large* reserved window + demand paging (still the "fixed-size window, eager mapping" MVP
-  today), which the new guard-page/signal foundation is built to extend.
+  window + caps + **guard-page/signal detect-and-kill** done; the §4 *large* reserved window is
+  the default and the **Memory cap now supports guest-controlled growth** into the reserved tail,
+  with the kernel providing physical demand paging for free). Phase-3 remainder is small: `malloc`
+  over `map`, and the Phase-4 virtual-memory extras (fault-driven content supply, `SharedRegion`
+  aliasing) which the guard-page/signal + sparse-commit foundation is built to extend.
 - **§2a escape-TCB intact:** the frontend is untrusted; all its output is re-verified;
   every memory access is masked, so even a buggy/hostile data-SP cannot escape (the
   data-SP is a plain value, not trusted). Making it an explicit value rather than a
@@ -351,10 +530,17 @@ incompleteness not contradiction:
   address-taken/aggregate locals stay in memory), flat-buffer varargs, guest `malloc` over
   the window, LP64 + pinned `char`/`long double`. The promotion split (SSA value vs
   data-stack slot) is exactly the §3d "local classification" — minus the data-SP being
-  register-pinned in `vmctx`, which is still a plain threaded value. **Deferred SETTLED
-  features (not contradictions):** by-value aggregate args/returns by hidden pointer (D39),
-  const→RO data segment via `protect` (D40), a real IR data section (we use `_start`
-  byte-stores), and narrow-scalar promotion.
+  register-pinned in `vmctx`, which is still a plain threaded value. **Since the early
+  drafts, several once-deferred §3d features have landed:** by-value aggregate args/returns
+  by hidden pointer (D39, the `sret` work — §2), a real IR `data` section with const/string
+  globals as read-only segments via `protect` (D40 — §10), and general `goto`/labels. **Genuine
+  remaining deferrals (incompleteness, not contradictions):** narrow-scalar (`char`/`short`/
+  `_Bool`) promotion (they stay in memory for store-truncation), and the data-SP being a threaded
+  value rather than register-pinned in `vmctx`. (`malloc` over the `map` cap is now the **default
+  guest libc**: the powerbox grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect`
+  frontend builtins expose it, and the shipped `frontend/chibicc/include/stdlib.h` provides a
+  `malloc`/`free`/`calloc`/`realloc` that grows the heap into the reserved tail — any program that
+  `#include <stdlib.h>` gets it, cc-identically; `demos/heapgrow` is the showcase.)
 - **De-risking moves from §18 now in place:** interpreter-as-oracle differential fuzzing
   (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend, **the verifier escape-oracle**
   (verified ⇒ in-window final memory, §8/§10), **and guard-page/signal detect-and-kill**
@@ -376,14 +562,28 @@ this is the index.)
 - [x] **Phase 2 — compilability proof:** chibicc→IR; real C on interp + JIT, two-tier
   tested (interp == JIT == native `cc`); SSA promotion landed (§5 item 8, §3).
 - [ ] **Phase 3 — Solid MVP (in progress):** the MVP remainder below.
-- [ ] **Phase 3.5 — Cross-platform parity:** port to **Windows** (PAL:
+- [~] **Phase 3.5 — Cross-platform parity (in progress):** port to **Windows** (PAL:
   `VirtualAlloc`/`VirtualProtect` + **VEH/SEH** detect-and-kill) and validate
   **macOS** (Mach-exception path, which can intercept ahead of BSD signals); stand
   up a gating **Linux/Windows/macOS CI matrix** so parity holds from here on.
   Confinement masking is already portable (§16/D51); only the non-TCB PAL differs.
-  Starting point: the JIT `compile_error!`s off unix, the guard/detect-and-kill
-  path is `cfg(unix)`, and CI is `ubuntu-latest` only — this phase makes all three
-  OSes first-class. Tier-1 MPK stays Linux-only (degrades to tier 0/3 elsewhere).
+  **Done so far:** `svm-jit/src/mem.rs` is refactored into a portable window model over a small
+  **PAL** seam (reserve/commit/protect/release + install_guard/run_guarded), with the existing unix
+  impl behind it (no behavior change) and a **platform-agnostic guard conformance test** (drives the
+  window+guard directly, no JIT). The **windows PAL** is implemented in pure Rust via `windows-sys`
+  (`VirtualAlloc`/`VirtualProtect`/`VirtualFree` + a Vectored Exception Handler with
+  `RtlCaptureContext` for the longjmp-equivalent recovery — no C shim, so it stays check-able from
+  Linux). `cargo check --target x86_64-pc-windows-gnu` is **green** for the whole workspace, and
+  clippy is clean for both host and the windows target. **Blocked on CI:** the windows guard's
+  *runtime* behaviour (VEH context-restore, fault boundaries) can't be exercised on the Linux dev
+  host (no Windows/Wine) — it's marked `CI-UNVERIFIED` in-source and needs a `windows-latest` CI run
+  of the interp↔JIT differential + the PAL conformance test to validate. **Next:** add the
+  `windows-latest`/`macos-latest` CI jobs + a Linux-hosted cross-`check` step (YAML drafted, see the
+  cross-platform note below — needs the `workflows` permission to land); then port **svm-run's
+  `MprotectWindow`** (the Memory-cap thunk, currently `cfg(unix)` with a no-op windows fallback) so
+  the Memory-cap / `malloc`-over-`map` tests pass on windows too. Tier-1 MPK stays Linux-only
+  (degrades to tier 0/3 elsewhere). Start point recorded: JIT no longer `compile_error!`s for
+  windows; it does for other non-unix/non-windows targets.
 - [ ] **Phase 4 — post-MVP:** deferred (below), developed against the parity matrix.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
@@ -399,16 +599,31 @@ this is the index.)
   4000 fuzz seeds green (the handler is exercised by width-overruns). **Not yet:** the
   *perf*-unlocking guard-when-bounded (needs a large window — below); div/rem/trunc still use
   explicit in-code trap checks (correct; converting them to #DE faults is optional).
-- [ ] **Real window / Memory capability** — pin page size + masking constant + the *large*
-  reserved window; make `map`/`unmap`/`protect` real. **Largely done now** (see suggested
-  pickups #1 and #3): the large reserved-window model is the default (`DEFAULT_RESERVED_LOG2
-  = 40`, masking constant `reserved - 1`), and `map`/`unmap`/`protect` are **real**, not
-  stubs — the interp `Mem` enforces a per-page protection map (`svm-interp`, the `map`/
-  `unmap`/`protect` impls + `check_prot`), and the JIT side uses real `libc::mprotect` on the
-  window pages, differentially fuzzed. `malloc` is still a guest bump allocator, not backed by
-  `map`. **Still left** (so this stays unchecked): **demand paging** on fault, **growth**
-  into the reserved tail (sparse address space, §98), and surfacing the Memory cap in the
-  *main* irgen fuzzer. The guard-page + signal foundation above is what demand paging builds on.
+- [x] **Real window / Memory capability + growth** — *done*: pin page size (4096, §4), the
+  *large* reserved window (`DEFAULT_RESERVED_LOG2 = 40`, mask `reserved - 1`), and real
+  `map`/`unmap`/`protect` **including guest-controlled growth into the reserved tail** — the §1a
+  "sparse address space / lazy page supply" capability. The interp `Mem` (reference) commits pages
+  sparsely across all of `[0, reserved)`: confinement masks the final address into `[0, reserved)`
+  while per-page committed-ness (the page map) is the functional bound, so a `map` past the initial
+  prefix grows the window and an uncommitted access faults. The JIT side is a production
+  `svm_run::MprotectWindow` — real `libc::mprotect` across the reserved range + `MADV_DONTNEED` on
+  `unmap`, mirrored by a software page map so §7 cap-buffer borrows fail closed (`-EFAULT`) instead
+  of faulting the host — wired into the production `cap_thunk` (was a no-op `WindowMem`) and driven
+  by `jit_diff` (the cap-thunk ABI gained `mem_reserved`). Differentially fuzzed across the
+  prefix+tail (`jit_cap_memory_protect_map_unmap_differential`, 800 seeds) with a concrete guest
+  consumer (`jit_cap_memory_growth_round_trips`: map at 1 MiB, store/load round-trip,
+  unmap→fault). **Physical demand paging is already free** (the JIT reserves `PROT_NONE` +
+  `MAP_NORESERVE`; the kernel lazily zero-fills touched RW pages), so no fault-driven commit
+  machinery was needed. **Still left (Phase 4, not MVP blockers):** fault-driven *content* supply
+  (a guest/parent as pager — `userfaultfd`/§14), `SharedRegion` aliasing (the same backing at two
+  offsets — the magic-ring-buffer trick, §13; the interp `PageProt` has a forward-compat hook for
+  it), and surfacing the Memory cap in the *main* irgen fuzzer + extending the escape-oracle
+  snapshot to grown tail pages. **`malloc` over `map` is the default guest libc** — the powerbox
+  grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect` builtins expose it
+  (codegen_ir.c), and the shipped `frontend/chibicc/include/stdlib.h` provides a map-growing
+  `malloc`/`free`/`calloc`/`realloc` to any program that `#include <stdlib.h>`; `demos/heapgrow`
+  grows a guest heap megabytes past the initial window cc-identically
+  (`demo_heapgrow_matches_native`).
 - [x] **Verifier escape-oracle fuzzer** — *done*: the differential now byte-compares the
   final guest window across interp + JIT (verified ⇒ in-window), in the 4000 stable seeds
   (every push) and the `diff` libFuzzer target. See Fuzzing below.
@@ -469,19 +684,31 @@ Have (✅ continuously, except where noted):
   different ones among several reachable traps — e.g. a dead trapping float→int convert).
 
 Gaps (priority order):
-- [~] **`cap.call` — *inert (fault) path generated*, success path not; loops still one shape.**
-  The generator now emits `cap.call` with an **ungranted** handle (`gen_inst` arm 18): the fuzzer
-  grants no caps, so it is inert on both backends (interp empty `Host` / JIT `empty_cap_thunk` ⇒
-  both `CapFault`, agreeing under the both-trap rule) — the I2 check for capabilities (§3c, "a
-  forged handle is inert") and the first generative exercise of the JIT's cap.call lowering
-  (handle marshalling + thunk ABI + trap plumbing). A coverage-guard test asserts it's produced.
-  **Still TODO:** the *success* path needs a deterministic **mock powerbox** granted identically
-  to both backends (a `run_capture`-with-host on interp + a `compile_and_run_capture`-with-thunk
-  on JIT, both already nearly present) so a returning cap.call is differentially tested too.
-  Loops are still a single counted shape (no nested/irreducible loops, no data-dependent trip
-  counts); richer loop shapes need a JIT step-cap/fuel to stay terminating.
-- [ ] **Escape-oracle excludes float modules** (NaN-payload nondeterminism). A canonical-NaN
-  normalization, or comparing only integer-store bytes, would extend coverage to them.
+- [x] **`cap.call` — both the inert (fault) *and* success paths are generated.** Arm 18 emits a
+  forged-handle cap.call (inert ⇒ `CapFault` on both, the I2 check). Arm 19 (gated on `has_mem`)
+  emits a **valid Memory cap.call** — granted handle (`MEMORY_HANDLE = 1<<8`, the first grant),
+  page-aligned in-range `map`/`unmap`/`protect` — so the **success path** runs on both backends:
+  the harness grants a Memory cap to interp + JIT via new capture+host run wrappers
+  (`run_capture_reserved_with_host` / `compile_and_run_capture_reserved_with_host`) over the
+  production `svm_run::cap_thunk`, so the cap's window effects ride the **escape-oracle**, not just
+  outcome agreement, interleaved with the random CFG/loops. A coverage guard
+  (`generator_covers_*`) asserts a `type_id==3` cap.call is produced; the dedicated
+  `jit_cap_memory_escape_oracle_differential` (jit_diff) adds a focused full-window pass. The
+  integration **caught two real bugs**: (a) `cap_thunk` did `slice::from_raw_parts(args, 0)` on the
+  JIT's null pointer for a 0-arg/0-result cap.call (UB) — now guarded; (b) the differential's
+  `(Err, Returned)` arm rejected *any* modelled interp trap while the JIT returned, but a
+  **droppable** pure-op trap (div/rem-by-zero, int-overflow, bad float→int convert) whose result is
+  dead may be DCE'd by the JIT — relaxed via `droppable_trap` (effectful/control traps stay strict).
+  Loops are still a single counted shape (no nested/irreducible/data-dependent) — richer shapes need
+  a JIT step-cap to stay terminating.
+- [x] **Escape-oracle on float modules — evaluated, deliberately *not* enabled.** Including float
+  modules in the final-window byte-compare **passes on x86-64** today (interp + JIT lower float ops
+  to the same hardware, so NaN bits agree), but that agreement is **arch-specific**: a Phase-3.5
+  aarch64/Windows port could legitimately produce a different NaN payload, turning the oracle into a
+  false-positive escape. The escape-oracle is about **addresses** (integer modules exercise the
+  masking fully), so the float gain is ~zero; the NaN-insensitive value-compare + the float-free
+  memory oracle stay. (Re-enable only with a sound canonical-NaN/integer-store-only scheme if a real
+  need appears.)
 - [x] **Guard-page fault detection (unix)** — beyond the final-memory divergence check, a
   gross out-of-window access now faults into the `PROT_NONE` guard page and is caught as a
   clean `MemoryFault` (detect-and-kill, see the trap-catching item above) rather than relying
@@ -515,6 +742,23 @@ Have (✅):
     wins big. Net: §1a's two memory claims both hold — we clearly **beat wasm64**, and the
     **wasm32 gap is now ~1.2–1.36×** (mask elision closed roughly half of it; the residual
     is wasm32's truly-free guard-page access, which needs real guard pages, §5).
+- [x] **Interface / host-call kernels (`hostcall`, `hostbuf`) — the §1a "around-compute" axis.**
+  Each times one guest→host→guest crossing per iteration (own `N_HOST_BIG`): SVM `cap.call`
+  through the bench trampoline thunk vs a **Wasmtime imported host function** (a `Linker`), both
+  via Cranelift, results cross-checked. `Mode::HostCall` on `Resolved` selects the cap-thunk SVM
+  path + import-linked wasm path in `measure`. **Honest findings** (best-of-5, machine-dependent):
+  - `hostcall` (scalar `x→x+1` round-trip): svm **~1.24× slower**. `cap.call` lowers to a
+    *generic* indirect thunk that packs args into an i64 array; the **devirtualize-to-direct-call
+    win (D45) is deferred**, so this is the honest baseline that optimization will move.
+  - `hostbuf` (zero-copy `(ptr,len)` **borrow buffer**, 64 B, host sums in place — the §7 path):
+    svm **~1.8× faster** — *even vs a fair cached-`Memory` wasm baseline* (the wasm host fn caches
+    the exported memory in `Store` data to avoid a per-call `get_export` lookup — I fixed an
+    initial strawman where the naive lookup inflated wasm to a fake ~6×). The real win is
+    structural: SVM hands the host the window base for free; Wasmtime still pays `mem.data(&caller)`
+    per call. **This substantiates §1a's strongest claim.** The *larger* §1a win (vs the component
+    model's lift/lower marshalling, and async rings) is a heavier comparison, **not** attempted.
+  Both are tracked in `baseline.txt` (appended rows, measured on the dev container — a maintainer
+  may re-baseline all rows on a canonical machine for cross-row consistency).
 
 Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
 regressions one commit old"):
@@ -601,9 +845,10 @@ regressions one commit old"):
 2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
    `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
    win end-to-end at ≈parity — see Benchmarking gaps); a non-gating nightly CI `bench` job runs `--check`.
-3. **Real Memory capability** (`map`/`unmap`/`protect` beyond no-op stubs) — guest-visible
-   virtual memory (§1a differentiator); also lets the fuzzer generate `cap.call`. Now in
-   progress (unblocked by the reservation work). **Increment 1 ✅ (interp spec):** `Mem` carries a
+3. ~~**Real Memory capability + growth**~~ — **DONE** (`map`/`unmap`/`protect` + guest-controlled
+   growth into the reserved tail = the §1a sparse-address-space differentiator). Increments 1–3
+   below + the growth increments A–C (see the "Real window / Memory capability + growth" checkbox
+   above). **Increment 1 ✅ (interp spec):** `Mem` carries a
    per-page protection map (`PageProt::Ro`/`Unmapped`, absent ⇒ rw); `load`/`store` enforce it
    (`check_prot`); `GuestMem` gained `map`/`unmap`/`protect` (default no-op; interp `Mem`
    implements them within `[0, mapped)` — `protect`→RO for D40, `unmap`→fault, `map`→re-commit
@@ -624,10 +869,19 @@ regressions one commit old"):
    crash the host → fixed with `GuestWindow::restore_rw()` (mprotect the backed region RW before the
    snapshot). **(b)** the JIT passed `mem_size = reserved` (the mask domain, 2^40) to the cap thunk
    instead of the backed `mapped` extent, so buffer borrows / Memory-cap ops bounded against the
-   wrong size → now threads `mapped` into `Lower` and passes it. **Deferred (increment 4+):** growth
-   (`map` into the reserved tail = sparse address space, §98); demand paging on fault; surfacing the
-   Memory cap in the *main* irgen fuzzer (capture path needs restore_rw, now in place) — **next is
-   (1): a guest consumer**, D40 const→read-only data segment via `protect` at `_start`.
+   wrong size → now threads `mapped` into `Lower` and passes it. **Growth — increments A–C ✅:**
+   (A) the interp model decouples confinement (mask into `[0, reserved)`) from committed-ness (a
+   sparse per-page set over all of `[0, reserved)`), so `map`/`unmap`/`protect` work past the
+   prefix and an uncommitted access faults; (B) a production `svm_run::MprotectWindow` (real
+   `mprotect` across the reserved range + `MADV_DONTNEED` on `unmap`, a software page mirror so §7
+   borrows fail closed) replaces the no-op `WindowMem` in the production `cap_thunk`, and the
+   cap-thunk ABI gained `mem_reserved`; (C) the differential fuzzer spans prefix+tail (800 seeds)
+   plus a concrete guest-consumer round-trip. Physical demand paging is free (kernel lazy-zero of
+   `MAP_NORESERVE` pages). **Deferred (Phase 4):** fault-driven *content* supply (guest/parent as
+   pager, `userfaultfd`/§14); `SharedRegion` aliasing — same backing at two offsets, the
+   magic-ring-buffer trick (§13; `PageProt` has the forward-compat hook); surfacing the Memory cap
+   in the *main* irgen fuzzer + extending the escape-oracle snapshot to grown pages; `malloc` over
+   `map`.
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
@@ -636,4 +890,13 @@ loops + indirect calls in the generative fuzzer; guard pages + signal-handler de
 ratio baseline, + an `alu_c` chibicc-compiled kernel tracking the SSA-promotion win end-to-end;
 a non-gating nightly CI `bench` job running `--check`); **a structural SSA-promotion guard**
 (`c_frontend` asserts zero loop-body memory ops on
-promotable loops, so the promotion win can't silently regress).)*
+promotable loops, so the promotion win can't silently regress); **guest-controlled memory growth
+into the reserved tail** (the §1a sparse-address-space capability: interp sparse-commit model +
+production `mprotect`-backed `MprotectWindow` wired into `cap_thunk` + `mem_reserved` in the
+cap-thunk ABI + prefix/tail differential fuzz + a guest-consumer round-trip); plus a batch of
+real-library shakedowns — Clay, jsmn, SHA-256, xxHash, tinfl, stb_perlin (first float), tiny-regex-c
+(backtracking) — each vendored as a `demos/` + cc-oracle test; **map-growing `malloc` promoted to
+the default `<stdlib.h>`** (`demos/heapgrow`); and **fuzzer hardening** — the Memory cap's success
+path now rides the escape-oracle in both the dedicated `jit_cap_memory_escape_oracle_differential`
+and the main 4000-seed differential (granted cap + valid `map`/`unmap`/`protect`), which caught two
+real bugs (a null-pointer `from_raw_parts` in `cap_thunk`; an over-strict droppable-trap arm).)*

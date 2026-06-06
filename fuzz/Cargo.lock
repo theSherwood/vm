@@ -488,6 +488,7 @@ dependencies = [
  "svm-ir",
  "svm-jit",
  "svm-mask",
+ "svm-run",
  "svm-text",
  "svm-verify",
 ]
@@ -521,6 +522,19 @@ dependencies = [
 [[package]]
 name = "svm-mask"
 version = "0.0.0"
+
+[[package]]
+name = "svm-run"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "svm-encode",
+ "svm-interp",
+ "svm-ir",
+ "svm-jit",
+ "svm-text",
+ "svm-verify",
+]
 
 [[package]]
 name = "svm-text"

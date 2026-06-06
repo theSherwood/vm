@@ -152,6 +152,39 @@ pub fn run_capture_reserved(
     (r, snap)
 }
 
+/// Like [`run_capture_reserved`], but with a caller-provided [`Host`] (the powerbox), so a
+/// `cap.call` to a *granted* handle takes its **success** path while the final-window snapshot
+/// still feeds the escape-oracle (§18). Pairs with the JIT's
+/// [`svm_jit::compile_and_run_capture_reserved_with_host`]: running both lets the §3e Memory
+/// capability's `map`/`unmap`/`protect` effects be byte-compared across backends, not just their
+/// return values — a real generative escape-oracle for the capability path.
+pub fn run_capture_reserved_with_host(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    reserved_log2: u8,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+    let f = match m.funcs.get(func as usize) {
+        Some(f) => f,
+        None => return (Err(Trap::Malformed), Vec::new()),
+    };
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        mm.seed(init_mem);
+        mm.init_data(&m.data);
+        mm
+    });
+    let r = run_func(f, args, fuel, &mut mem, &m.funcs, host, 0);
+    let snap = mem
+        .as_ref()
+        .map(|mm| mm.snapshot(init_mem.len() as u64))
+        .unwrap_or_default();
+    (r, snap)
+}
+
 fn run_func<'a>(
     mut f: &'a Func,
     args: &[Value],
@@ -926,11 +959,25 @@ impl Host {
 /// window (e.g. `size_log2 = 63`) never eagerly allocates — safe to fuzz.
 const PAGE: u64 = 4096;
 
-/// Non-default protection of a backed page (absent ⇒ the default, read+write). This is the
-/// guest-visible `protect`/`unmap` state (§3e Memory cap / §4): a page in `[0, mapped)` is
-/// readable+writable unless the guest has `protect`ed it read-only or `unmap`ped it.
+/// Explicit per-page state in the guest-visible address space (§3e Memory cap / §4).
+///
+/// A page absent from the map takes the **default for its region**: read+write inside the
+/// initial backed prefix `[0, mapped)`, and *unmapped* in the reserved tail `[mapped, reserved)`
+/// — so growth into the tail must be made explicit by a `map` (a [`PageProt::Rw`] entry). This is
+/// what lets the guest `map`/`unmap`/`protect` sparsely across the whole reserved window (the §1a
+/// "sparse address space / lazy page supply" capability), in lockstep with the JIT's real page
+/// tables (an uncommitted page is `PROT_NONE` there and faults identically).
+///
+/// *Forward-compat (not built):* a committed page is anonymous (zero-filled) today. A future
+/// `Backed { region, offset }` variant would let a §13 `SharedRegion`'s pages be aliased into the
+/// window at one or more offsets — the primitive behind the magic-ring-buffer trick — without
+/// changing the access path below; the variant simply redirects where a page's bytes live.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PageProt {
+    /// Explicitly `map`ped read-write — committed even in the reserved tail (where *absent* would
+    /// mean unmapped). Within the initial prefix, plain read-write is left *absent* (the default),
+    /// so this entry only appears for grown/re-committed pages.
+    Rw,
     /// `protect`ed read-only: reads succeed, a store faults (the D40 const-segment mechanism).
     Ro,
     /// `unmap`ped: any access faults.
@@ -945,8 +992,10 @@ enum PageProt {
 struct Mem {
     window: Window,
     pages: BTreeMap<u64, Vec<u8>>,
-    /// Page index (`offset / PAGE`) ⇒ non-default protection. A page absent from the map is
-    /// the default (read+write, within `[0, mapped)`). Only pages in `[0, mapped)` appear.
+    /// Page index (`offset / PAGE`) ⇒ explicit page state. A page absent from the map takes its
+    /// region default: read+write inside the initial prefix `[0, mapped)`, unmapped in the
+    /// reserved tail `[mapped, reserved)`. Entries appear for `protect`ed (`Ro`), `unmap`ped
+    /// (`Unmapped`), and grown/re-committed tail (`Rw`) pages — anywhere in `[0, reserved)`.
     prot: BTreeMap<u64, PageProt>,
 }
 
@@ -965,31 +1014,52 @@ impl Mem {
         }
     }
 
-    /// Enforce the page protection map for a `width`-byte access at confined offset `base`:
-    /// a store to a read-only page, or any access to an unmapped page, faults (§4/§5). No-op
-    /// when the map is empty (the common case), so unprotected windows pay nothing.
+    /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed. A page
+    /// absent from the map takes its region default — read+write in the initial prefix
+    /// `[0, mapped)`, unmapped in the reserved tail (growth must be an explicit `map`).
+    fn page_access(&self, page: u64) -> Option<bool> {
+        match self.prot.get(&page) {
+            Some(PageProt::Rw) => Some(true),
+            Some(PageProt::Ro) => Some(false),
+            Some(PageProt::Unmapped) => None,
+            None => (page * PAGE < self.window.mapped()).then_some(true),
+        }
+    }
+
+    /// Enforce the page state for a `width`-byte access at confined offset `base`: any access to an
+    /// unmapped page, or a store to a read-only page, faults (§4/§5). Fast-pathed when the access
+    /// lies wholly in the committed prefix and no page has been re-protected (the common case), so
+    /// unprotected windows pay nothing.
     fn check_prot(&self, base: u64, width: u32, write: bool) -> Result<(), Trap> {
-        if self.prot.is_empty() {
+        let last = base + width as u64 - 1;
+        if self.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
         }
-        let last = base + width as u64 - 1;
         for page in (base / PAGE)..=(last / PAGE) {
-            match self.prot.get(&page) {
-                Some(PageProt::Unmapped) => return Err(Trap::MemoryFault),
-                Some(PageProt::Ro) if write => return Err(Trap::MemoryFault),
+            match self.page_access(page) {
+                None => return Err(Trap::MemoryFault), // unmapped
+                Some(false) if write => return Err(Trap::MemoryFault), // read-only store
                 _ => {}
             }
         }
         Ok(())
     }
 
+    /// Confine the final effective address into `[0, reserved)` (the masking security op, §4) and
+    /// reject a `width`-byte access that would overrun the reserved domain. Per-page committed-ness
+    /// is enforced separately by [`Mem::check_prot`] (the functional bound), so a masked-but-
+    /// uncommitted page faults there — matching the JIT's `PROT_NONE` page tables.
+    fn confine_checked(&self, addr: u64, offset: u64, width: u32) -> Result<u64, Trap> {
+        let base = self.window.confine(addr, offset);
+        match base.checked_add(width as u64) {
+            Some(end) if end <= self.window.reserved() => Ok(base),
+            _ => Err(Trap::MemoryFault),
+        }
+    }
+
     fn load(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Value, Trap> {
         let (_, rty, width, signed) = op.info();
-        // Confine the access (mask + guard check); a window-crossing access faults.
-        let base = self
-            .window
-            .checked(addr, offset, width)
-            .ok_or(Trap::MemoryFault)?;
+        let base = self.confine_checked(addr, offset, width)?;
         self.check_prot(base, width, false)?;
         let raw = self.read_le(base, width);
         Ok(decode_loaded(rty, width, signed, raw))
@@ -997,10 +1067,7 @@ impl Mem {
 
     fn store(&mut self, addr: u64, offset: u64, op: StoreOp, v: Value) -> Result<(), Trap> {
         let (_, _, width) = op.info();
-        let base = self
-            .window
-            .checked(addr, offset, width)
-            .ok_or(Trap::MemoryFault)?;
+        let base = self.confine_checked(addr, offset, width)?;
         self.check_prot(base, width, true)?;
         // `write_le` keeps only the low `width` bytes, so narrow stores truncate.
         self.write_le(base, width, store_bits(v));
@@ -1008,25 +1075,31 @@ impl Mem {
     }
 
     /// Validate a `map`/`unmap`/`protect` range (§3e): the offset must be page-aligned and the
-    /// whole `[offset, offset+len)` must lie within the backed `[0, mapped)` (growth into the
-    /// reserved tail is deferred in the fixed-window MVP). Returns the inclusive page-index range
-    /// it covers, or `Err(EINVAL)`.
+    /// whole `[offset, offset+len)` must lie within the **reserved** window `[0, reserved)` — the
+    /// guest may now grow into the reserved tail `[mapped, reserved)`, not just the initial backed
+    /// prefix. Returns the inclusive page-index range it covers, or `Err(EINVAL)`.
     fn prot_pages(&self, offset: u64, len: u64) -> Result<core::ops::RangeInclusive<u64>, i64> {
         if len == 0 || !offset.is_multiple_of(PAGE) {
             return Err(EINVAL);
         }
         let end = offset.checked_add(len).ok_or(EINVAL)?;
-        if end > self.window.mapped() {
+        if end > self.window.reserved() {
             return Err(EINVAL);
         }
         Ok((offset / PAGE)..=((end - 1) / PAGE)) // len need not be a page multiple; round up
     }
 
-    /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ default read+write (absent from
-    /// the map), `READ` only ⇒ read-only, neither ⇒ unmapped.
+    /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ read+write, `READ` only ⇒
+    /// read-only, neither ⇒ unmapped. A read-write page in the initial prefix is left *absent*
+    /// (its default); in the reserved tail it needs an explicit [`PageProt::Rw`] entry, since
+    /// *absent* there means unmapped.
     fn set_prot(&mut self, page: u64, prot: i32) {
         if prot & PROT_WRITE != 0 {
-            self.prot.remove(&page); // read+write is the default (no entry)
+            if page * PAGE < self.window.mapped() {
+                self.prot.remove(&page); // read+write is the prefix default (no entry)
+            } else {
+                self.prot.insert(page, PageProt::Rw); // explicit commit in the reserved tail
+            }
         } else if prot & PROT_READ != 0 {
             self.prot.insert(page, PageProt::Ro);
         } else {
@@ -1054,22 +1127,38 @@ impl Mem {
         }
     }
 
-    /// Borrow-validate and read a `(ptr, len)` capability buffer (§7): `[ptr, ptr+len)`
-    /// must lie fully within the window. Returns the bytes, or `None` (→ `-EFAULT`).
+    /// Every page touched by `[ptr, ptr+len)` is committed (and writable, when `write`), and the
+    /// range stays within `[0, reserved)`. The §7 borrow check: a buffer straddling an unmapped or
+    /// (for writes) read-only page is rejected (`-EFAULT`), and grown tail pages are accepted.
+    fn range_committed(&self, ptr: u64, len: u64, write: bool) -> bool {
+        let Some(end) = ptr.checked_add(len) else {
+            return false;
+        };
+        if end > self.window.reserved() {
+            return false;
+        }
+        if len == 0 {
+            return true;
+        }
+        (ptr / PAGE..=(end - 1) / PAGE)
+            .all(|page| matches!(self.page_access(page), Some(w) if w || !write))
+    }
+
+    /// Borrow-validate and read a `(ptr, len)` capability buffer (§7): every page of
+    /// `[ptr, ptr+len)` must be committed. Returns the bytes, or `None` (→ `-EFAULT`).
     /// Confinement holds regardless; this explicit check is the recoverable guest-bug
     /// path, not a safety boundary.
     fn read_bytes_impl(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
-        let end = ptr.checked_add(len)?;
-        if end > self.window.mapped() {
+        if !self.range_committed(ptr, len, false) {
             return None;
         }
         Some((0..len).map(|k| self.byte(ptr + k)).collect())
     }
 
-    /// Borrow-validate and write a `(ptr, len)` capability buffer (§7). `None` → `-EFAULT`.
+    /// Borrow-validate and write a `(ptr, len)` capability buffer (§7): every page must be
+    /// committed and writable. `None` → `-EFAULT`.
     fn write_bytes_impl(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
-        let end = ptr.checked_add(data.len() as u64)?;
-        if end > self.window.mapped() {
+        if !self.range_committed(ptr, data.len() as u64, true) {
             return None;
         }
         for (k, b) in data.iter().enumerate() {
@@ -1129,9 +1218,10 @@ impl GuestMem for Mem {
         self.write_bytes_impl(ptr, data)
     }
 
-    /// §3e op 0 `map`: (re)commit pages with `prot`, zero-filling them (a fresh commit). The
-    /// fixed-window MVP only re-maps pages within `[0, mapped)` (growth into the reserved tail
-    /// is deferred); out-of-range / misaligned → `-EINVAL`.
+    /// §3e op 0 `map`: (re)commit pages with `prot`, zero-filling them (a fresh commit). Works
+    /// anywhere in the reserved window `[0, reserved)` — including **growth** into the reserved
+    /// tail `[mapped, reserved)`, the §1a sparse-address-space capability. Out-of-range /
+    /// misaligned → `-EINVAL`.
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
@@ -1468,8 +1558,88 @@ mod prot_tests {
         let mut m = mem64k();
         assert_eq!(m.protect(1, PAGE, PROT_READ), EINVAL); // misaligned offset
         assert_eq!(m.protect(0, 0, PROT_READ), EINVAL); // zero length
-        assert_eq!(m.unmap(65536, PAGE), EINVAL); // offset == mapped ⇒ out of range
-        assert_eq!(m.map(0, 1 << 20, PROT_WRITE), EINVAL); // len past mapped
+                                                        // mem64k is fully mapped (reserved == mapped == 64 KiB), so its tail is empty: a range
+                                                        // at/past the reserved top is still out of range.
+        assert_eq!(m.unmap(65536, PAGE), EINVAL); // offset == reserved ⇒ out of range
+        assert_eq!(m.map(0, 1 << 20, PROT_WRITE), EINVAL); // len past reserved
+    }
+
+    /// A window whose reserved mask domain (`1 MiB`) is larger than the initial backed prefix
+    /// (`64 KiB`): the tail `[64 KiB, 1 MiB)` is reserved-but-unmapped and the guest can grow into
+    /// it. `Mem::with_reservation(reserved_log2=20, mapped_log2=16)`.
+    fn mem_growable() -> Mem {
+        Mem::with_reservation(20, 16)
+    }
+
+    #[test]
+    fn tail_access_faults_until_mapped() {
+        let mut m = mem_growable();
+        let tail = 1u64 << 16; // first byte of the reserved tail (64 KiB)
+                               // Untouched tail faults (any access) — it is reserved-but-unmapped.
+        assert_eq!(m.load(tail, 0, LoadOp::I64), Err(Trap::MemoryFault));
+        assert_eq!(
+            m.store(tail, 0, StoreOp::I64, Value::I64(1)),
+            Err(Trap::MemoryFault)
+        );
+        // Grow one page into the tail; now it is committed, zeroed, read-write.
+        assert_eq!(m.map(tail, PAGE, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(m.load(tail, 0, LoadOp::I64), Ok(Value::I64(0)));
+        assert!(m.store(tail, 0, StoreOp::I64, Value::I64(0x99)).is_ok());
+        assert_eq!(m.load(tail, 0, LoadOp::I64), Ok(Value::I64(0x99)));
+        // The next page up is still unmapped.
+        assert_eq!(m.load(tail + PAGE, 0, LoadOp::I64), Err(Trap::MemoryFault));
+    }
+
+    #[test]
+    fn grow_then_unmap_faults_again() {
+        let mut m = mem_growable();
+        let tail = 1u64 << 16;
+        assert_eq!(m.map(tail, PAGE, PROT_READ | PROT_WRITE), 0);
+        assert!(m.store(tail, 0, StoreOp::I64, Value::I64(7)).is_ok());
+        assert_eq!(m.unmap(tail, PAGE), 0);
+        assert_eq!(m.load(tail, 0, LoadOp::I64), Err(Trap::MemoryFault));
+        // Re-mapping zero-fills (the old contents are gone).
+        assert_eq!(m.map(tail, PAGE, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(m.load(tail, 0, LoadOp::I64), Ok(Value::I64(0)));
+    }
+
+    #[test]
+    fn grow_read_only_then_store_faults() {
+        let mut m = mem_growable();
+        let tail = 1u64 << 16;
+        // Map a tail page read-only: reads of the (zeroed) page succeed, a store faults.
+        assert_eq!(m.map(tail, PAGE, PROT_READ), 0);
+        assert_eq!(m.load(tail, 0, LoadOp::I64), Ok(Value::I64(0)));
+        assert_eq!(
+            m.store(tail, 0, StoreOp::I64, Value::I64(1)),
+            Err(Trap::MemoryFault)
+        );
+    }
+
+    #[test]
+    fn growth_bounds_are_reserved_not_mapped() {
+        let mut m = mem_growable();
+        let reserved = 1u64 << 20;
+        // Mapping anywhere in the reserved tail is allowed now (was EINVAL pre-growth).
+        assert_eq!(m.map(1 << 16, PAGE, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(m.map(reserved - PAGE, PAGE, PROT_READ | PROT_WRITE), 0);
+        // At/past the reserved top is still out of range.
+        assert_eq!(m.map(reserved, PAGE, PROT_WRITE), EINVAL);
+        assert_eq!(m.unmap(reserved - PAGE, 2 * PAGE), EINVAL);
+    }
+
+    #[test]
+    fn grown_tail_buffer_borrow_round_trips() {
+        // A cap buffer (§7 borrow) in a grown tail region validates and round-trips; one in the
+        // unmapped tail is rejected (-EFAULT ⇒ None).
+        let mut m = mem_growable();
+        let tail = 1u64 << 16;
+        assert!(m.write_bytes_impl(tail, &[1, 2, 3, 4]).is_none()); // unmapped ⇒ EFAULT
+        assert_eq!(m.map(tail, PAGE, PROT_READ | PROT_WRITE), 0);
+        assert!(m.write_bytes_impl(tail, &[1, 2, 3, 4]).is_some());
+        assert_eq!(m.read_bytes_impl(tail, 4), Some(vec![1, 2, 3, 4]));
+        // A borrow straddling the committed/uncommitted page boundary is rejected.
+        assert!(m.read_bytes_impl(tail + PAGE - 2, 4).is_none());
     }
 
     #[test]

@@ -19,6 +19,18 @@ svm-ir.workspace = true
 # other targets fall back to a plain heap window with no hardware guard.
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# The windows PAL (§4 "Platform support", Phase 3.5): VirtualAlloc/VirtualProtect/VirtualFree for
+# the reserved guard-paged window, and a Vectored Exception Handler + RtlCaptureContext for
+# detect-and-kill. Pure Rust (no C shim), so the path stays `cargo check --target *-windows-*`-able.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemInformation",
+    "Win32_System_Kernel",
+] }
+
 [target.'cfg(unix)'.build-dependencies]
 # Compiles src/trap_shim.c (the setjmp/siglongjmp recovery — a macro that needs the C
 # compiler's returns_twice handling, so it can't be sound raw FFI).

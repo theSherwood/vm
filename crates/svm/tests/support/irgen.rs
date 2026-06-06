@@ -227,7 +227,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
     let nfuncs = sigs.len();
     let can_call = fi + 1 < nfuncs;
     loop {
-        match bb.g.below(19) {
+        match bb.g.below(20) {
             0 => {
                 let ty = bb.g.inttype();
                 let op = BinOp::from_index(bb.g.below(15) as u8).unwrap();
@@ -419,6 +419,55 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     },
                     &results,
                 );
+            }
+            19 if has_mem => {
+                // A *valid* Memory `cap.call` (§3e) on the granted handle: `map`/`unmap`/`protect`
+                // one whole page in the 64 KiB backed prefix, with page-aligned in-range args, so
+                // it takes the **success** path on both backends (interp page-map + JIT real
+                // `mprotect`) — exercising cap.call result marshalling and the cap's window effects
+                // interleaved with the generated CFG, under the escape-oracle. Pages 0..15 are
+                // in-range for every reservation pass, so the op succeeds (a later access to an
+                // `unmap`ped/`protect`ed page then faults identically on both — checked too).
+                let handle = bb.push(Inst::ConstI32(MEMORY_HANDLE), ValType::I32);
+                let page = bb.g.below(16);
+                let off = bb.push(Inst::ConstI64((page * 4096) as i64), ValType::I64);
+                let len = bb.push(Inst::ConstI64(4096), ValType::I64);
+                let results = vec![ValType::I64];
+                let op = bb.g.below(3); // 0 = map, 1 = unmap, 2 = protect
+                if op == 1 {
+                    let sig = FuncType {
+                        params: vec![ValType::I64, ValType::I64],
+                        results: results.clone(),
+                    };
+                    bb.push_multi(
+                        Inst::CapCall {
+                            type_id: 3,
+                            op,
+                            sig,
+                            handle,
+                            args: vec![off, len],
+                        },
+                        &results,
+                    );
+                } else {
+                    // map / protect take a prot arg; READ-only (1) or READ|WRITE (3).
+                    let prot_val = if bb.g.boolean() { 3 } else { 1 };
+                    let prot = bb.push(Inst::ConstI32(prot_val), ValType::I32);
+                    let sig = FuncType {
+                        params: vec![ValType::I64, ValType::I64, ValType::I32],
+                        results: results.clone(),
+                    };
+                    bb.push_multi(
+                        Inst::CapCall {
+                            type_id: 3,
+                            op,
+                            sig,
+                            handle,
+                            args: vec![off, len, prot],
+                        },
+                        &results,
+                    );
+                }
             }
             _ => continue, // a mem/call kind that isn't available here — re-roll
         }
@@ -637,11 +686,43 @@ pub fn gen_module(g: &mut Gen) -> Module {
     let funcs = (0..nfuncs)
         .map(|fi| gen_func(g, fi, &sigs, has_mem))
         .collect();
+    let data = if has_mem {
+        gen_data(g, 1u64 << 16)
+    } else {
+        Vec::new()
+    };
     Module {
         funcs,
         memory,
-        data: Vec::new(),
+        data,
     }
+}
+
+/// Generate initialized data segments (§3a / D40) within the window `[0, size)`. Both
+/// backends copy them over the escape-oracle seed at instantiation and protect the
+/// `readonly` ones page-granularly (the interp rounds to whole pages, matching the JIT's
+/// `mprotect`), so this fuzzes interp↔JIT agreement on **data initialization** — caught
+/// strongly by the final-window byte compare — and exercises the RO-protect fault path.
+/// This is the surface C globals lower onto (`data`/`data ro` segments, incl. pointer
+/// relocations), previously unfuzzed (`data: Vec::new()`).
+fn gen_data(g: &mut Gen, size: u64) -> Vec<Data> {
+    let n = g.below(4); // 0..=3 segments
+    (0..n)
+        .map(|_| {
+            // Modest length so a whole-page RO protection can't blanket the window and
+            // starve value/escape-oracle coverage; offset keeps `[offset, offset+len) ⊆
+            // [0, size)` (the verifier's `DataOutOfWindow` bound).
+            let len = g.below(64) as u64;
+            let offset = g.below((size - len) as u32) as u64;
+            let bytes = (0..len).map(|_| g.byte()).collect();
+            let readonly = g.below(8) == 0; // rare: RO pages fault on store
+            Data {
+                offset,
+                readonly,
+                bytes,
+            }
+        })
+        .collect()
 }
 
 /// Random argument `Value`s matching `params` (for invoking the entry function). Defined
@@ -661,9 +742,15 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<svm_interp::Value> {
 
 // ---- shared differential check (used by jit_fuzz.rs and the libFuzzer `diff` target) ----
 
-use svm_interp::{run_capture_reserved, Trap, Value};
-use svm_jit::{compile_and_run_capture_reserved, JitError, JitOutcome, TrapKind};
+use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use svm_jit::{compile_and_run_capture_reserved_with_host, JitError, JitOutcome, TrapKind};
 use svm_verify::verify_module;
+
+/// The handle value of the **first** `grant_memory` on a fresh `Host`: the encoding is
+/// `(generation << CAP_LOG2) | slot` with the generation bumped to 1 on the first grant and slot
+/// 0, i.e. `1 << 8`. The generator emits valid Memory `cap.call`s against this constant, and the
+/// harness asserts the grant actually yields it (so a change to the encoding fails loudly here).
+const MEMORY_HANDLE: i32 = 1 << 8;
 
 fn to_slot(v: Value) -> i64 {
     match v {
@@ -689,6 +776,14 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         _ => a == b,
     }
 }
+/// A trap from a **pure** op (no effect) whose result the optimizing JIT may dead-code-eliminate,
+/// so a dead one need not trap on the JIT side even though the eager interpreter takes it. Used to
+/// keep the differential from false-positiving on a dead trapping op (see the `(Err, Returned)`
+/// arm). Effectful/control traps (Unreachable, CapFault, IndirectCallType) are *not* droppable.
+fn droppable_trap(t: &Trap) -> bool {
+    matches!(t, Trap::DivByZero | Trap::IntOverflow | Trap::BadConversion)
+}
+
 /// Trap kinds the scalar JIT models (others — fuel/stack/guard — it need not).
 fn interp_trap_kind(t: &Trap) -> Option<TrapKind> {
     match t {
@@ -783,9 +878,41 @@ pub fn run_differential(m: &Module, args: &[Value]) {
 fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, reserved_log2: u8) {
     let results = m.funcs[0].results.clone();
     let mut fuel = 5_000_000u64;
-    let (interp, imem) = run_capture_reserved(m, 0, args, &mut fuel, init, reserved_log2);
+    // Grant a Memory capability identically to both backends (handle `MEMORY_HANDLE`), so the
+    // generator's valid Memory `cap.call`s (arm 19) take their *success* path through the
+    // production thunk — the cap's `map`/`unmap`/`protect` window effects then ride the
+    // escape-oracle. A forged-handle cap.call (arm 18) still resolves to nothing ⇒ CapFault on
+    // both. The thunk is dormant for modules with no cap.call, so non-cap seeds are unaffected.
+    //
+    // Phase 3.5 (TEMPORARY): only grant on unix. `svm_run::cap_thunk`'s `MprotectWindow` is still
+    // `cfg(unix)` (no windows Memory cap yet), so granting on windows would let the interp run a
+    // `map` the JIT can't, diverging. With no grant, every generated Memory cap.call is ungranted ⇒
+    // `CapFault` on *both* backends (agreeing) — so windows CI still validates the core (masking,
+    // the guard via tail faults, the escape-oracle) cleanly. Remove this gate when svm-run's
+    // `MprotectWindow` is ported to windows (then the success path runs on windows too).
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            hi.grant_memory(),
+            MEMORY_HANDLE,
+            "Host grant encoding changed"
+        );
+        assert_eq!(hj.grant_memory(), MEMORY_HANDLE);
+    }
+    let (interp, imem) =
+        run_capture_reserved_with_host(m, 0, args, &mut fuel, init, reserved_log2, &mut hi);
     let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let (jit, jmem) = match compile_and_run_capture_reserved(m, 0, &slots, init, reserved_log2) {
+    let (jit, jmem) = match compile_and_run_capture_reserved_with_host(
+        m,
+        0,
+        &slots,
+        init,
+        reserved_log2,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut core::ffi::c_void,
+    ) {
         Ok(o) => o,
         Err(JitError::Unsupported(_)) => return, // generator only emits lowered ops; be safe
         Err(e) => panic!("JIT failed to compile a verified module: {e:?}\n{m:#?}"),
@@ -831,7 +958,14 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
             // *return a value* (next arm).
         }
         (Err(trap), JitOutcome::Returned(_)) => assert!(
-            interp_trap_kind(&trap).is_none(),
+            // A *droppable* trap comes from a pure op (div/rem-by-zero, int-overflow, bad
+            // float→int convert) whose result the optimizing JIT may dead-code-eliminate, so it
+            // returns where the eager interpreter traps — the IR does not mandate eager trapping
+            // of dead ops (the same stance as the both-trap arm above; live trapping ops feed a
+            // result/memory effect and so make the JIT trap too). Non-droppable modelled traps
+            // (Unreachable, CapFault, IndirectCallType — effects/control, never DCE'd) must still
+            // never let the JIT return a value.
+            droppable_trap(&trap) || interp_trap_kind(&trap).is_none(),
             "interp trapped {trap:?} but JIT returned\n{m:#?}"
         ),
         (i, j) => panic!("outcome mismatch: {i:?} vs {j:?}\n{m:#?}"),

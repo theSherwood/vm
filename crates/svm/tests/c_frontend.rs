@@ -16,9 +16,10 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_with_host, GuestMem, Host, StreamRole, Trap, Value, WindowMem};
+use svm_interp::{run_with_host, Host, StreamRole, Trap, Value};
 use svm_ir::ValType;
-use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind, EXIT_CODE};
+use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind};
+use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§9)
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -28,53 +29,6 @@ fn to_slot(v: Value) -> i64 {
         Value::I64(x) => x,
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
-    }
-}
-
-/// Bridge the JIT's capability-thunk ABI to the interpreter's `Host` — the host
-/// trampoline a real embedder supplies (§9). Mirrors the one in `jit_diff.rs`, so both
-/// backends share capability semantics.
-///
-/// # Safety
-/// Honours the `CapThunk` contract: `ctx` is a `*mut Host`, the slot/window pointers are
-/// valid for their lengths, and `trap_out` is live.
-unsafe extern "C" fn cap_thunk(
-    ctx: *mut c_void,
-    mem_base: *mut u8,
-    mem_size: u64,
-    type_id: u32,
-    op: u32,
-    handle: i32,
-    args: *const i64,
-    n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    trap_out: *mut i64,
-) {
-    let host = &mut *(ctx as *mut Host);
-    let arg_slots = std::slice::from_raw_parts(args, n_args as usize);
-    let mut empty: [u8; 0] = [];
-    let window: &mut [u8] = if mem_base.is_null() {
-        &mut empty
-    } else {
-        std::slice::from_raw_parts_mut(mem_base, mem_size as usize)
-    };
-    let mut wm = WindowMem::new(window, mem_size);
-    let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
-        None
-    } else {
-        Some(&mut wm)
-    };
-    match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
-        Ok(res) => {
-            let out = std::slice::from_raw_parts_mut(results, n_results as usize);
-            for (o, r) in out.iter_mut().zip(res) {
-                *o = r;
-            }
-            *trap_out = 0;
-        }
-        Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
-        Err(_) => *trap_out = TrapKind::CapFault as i64,
     }
 }
 
@@ -165,7 +119,7 @@ fn run_c_full(src: &str) -> CRun {
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
 
-    // `_start(stdout, stdin, exit)` takes the powerbox handles. Grant them identically on
+    // `_start(stdout, stdin, exit, memory)` takes the powerbox handles. Grant them identically on
     // both hosts (grants are deterministic, so the handle values match).
     let mut hi = Host::new();
     let mut hj = Host::new();
@@ -174,6 +128,7 @@ fn run_c_full(src: &str) -> CRun {
             Value::I32(h.grant_stream(StreamRole::Out)),
             Value::I32(h.grant_stream(StreamRole::In)),
             Value::I32(h.grant_exit()),
+            Value::I32(h.grant_memory()),
         ]
     };
     let args = grant(&mut hi);
@@ -264,6 +219,7 @@ fn c_write_to_string_literal_faults() {
             Value::I32(h.grant_stream(StreamRole::Out)),
             Value::I32(h.grant_stream(StreamRole::In)),
             Value::I32(h.grant_exit()),
+            Value::I32(h.grant_memory()),
         ]
     };
     let args = grant(&mut hi);
@@ -288,6 +244,97 @@ fn c_write_to_string_literal_faults() {
     assert!(
         matches!(jit, JitOutcome::Trapped(TrapKind::MemoryFault)),
         "jit: write to a string literal must detect-and-kill, got {jit:?}\n{ir}"
+    );
+}
+
+/// The guest **grows its own window** through the Memory capability: `__vm_map` (a frontend
+/// builtin → `cap.call` on the granted Memory handle) commits a page at 256 MiB — deep in the
+/// reserved tail, far above the backed prefix — then a store/load round-trips through it. Proves
+/// the Memory cap is granted to compiled C programs and the builtin lowers correctly, on both
+/// backends (interp page map + JIT real `mprotect`). The §1a sparse-address-space path from C.
+#[test]
+fn c_memory_cap_grows_into_reserved_tail() {
+    let src = r#"
+long __vm_map(long off, long len, int prot);
+int main() {
+  long base = 268435456;                        /* 256 MiB, in the reserved tail */
+  if (__vm_map(base, 4096, 3) != 0) return -1;  /* commit one RW page (READ|WRITE) */
+  int *p = (int *)base;
+  p[0] = 43981;                                 /* 0xABCD */
+  p[1] = p[0] + 1;
+  return p[1];
+}
+"#;
+    assert_eq!(run_c(src), vec![Value::I32(43982)]);
+}
+
+/// The shipped `<stdlib.h>` is a real guest libc: `malloc`/`calloc`/`realloc`/`free` that **grow
+/// the window via the Memory cap** — available to any program that just `#include <stdlib.h>`, no
+/// prelude. Allocates 400 KiB (well past the 64 KiB initial window, forcing growth), checks
+/// `calloc` zeroes and `realloc` preserves contents, on both backends.
+#[test]
+fn c_default_stdlib_malloc_grows() {
+    let src = r#"
+#include <stdlib.h>
+int main() {
+  int n = 50000;                              /* 2 x 200 KiB > the 64 KiB initial window */
+  int *a = (int *)malloc(n * sizeof(int));
+  int *b = (int *)calloc(n, sizeof(int));     /* must be zero-filled */
+  if (!a || !b) return -1;
+  for (int i = 0; i < n; i++) a[i] = 1;
+  long s = 0;
+  for (int i = 0; i < n; i++) s += a[i] + b[i];   /* = n (a=1, b=0) */
+  free(a); free(b);
+  int *c = (int *)malloc(8 * sizeof(int));
+  for (int i = 0; i < 8; i++) c[i] = i;
+  c = (int *)realloc(c, 16 * sizeof(int));    /* preserves c[0..8] */
+  long rs = 0;
+  for (int i = 0; i < 8; i++) rs += c[i];     /* = 28 */
+  return (int)(s + rs);                       /* 50000 + 28 */
+}
+"#;
+    assert_eq!(run_c(src), vec![Value::I32(50028)]);
+}
+
+/// An access to an **un-grown** tail page faults (detect-and-kill) on both backends: the guest
+/// must `map` before it can touch the reserved tail. The negative of the test above.
+#[test]
+fn c_ungrown_tail_access_faults() {
+    let src = "int main() { int *p = (int *)268435456; return p[0]; }";
+    let ir = c_to_ir(src);
+    let m = parse_module(&ir).expect("parse");
+    verify_module(&m).expect("verify");
+    let grant = |h: &mut Host| {
+        [
+            Value::I32(h.grant_stream(StreamRole::Out)),
+            Value::I32(h.grant_stream(StreamRole::In)),
+            Value::I32(h.grant_exit()),
+            Value::I32(h.grant_memory()),
+        ]
+    };
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let args = grant(&mut hi);
+    grant(&mut hj);
+    let mut fuel = 50_000_000u64;
+    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let jit = compile_and_run_with_host(
+        &m,
+        0,
+        &slots,
+        cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+    assert_eq!(
+        interp,
+        Err(Trap::MemoryFault),
+        "interp: ungrown tail must fault"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Trapped(TrapKind::MemoryFault)),
+        "jit: ungrown tail must detect-and-kill, got {jit:?}"
     );
 }
 
@@ -854,6 +901,236 @@ fn c_varargs_end_to_end() {
 }
 
 #[test]
+fn c_function_pointers_end_to_end() {
+    // A function pointer is a funcref index (§3c): assign a function, call through it.
+    assert_eq!(
+        i32_of(
+            "int add(int a, int b){ return a + b; } \
+             int main(){ int (*fp)(int,int) = add; return fp(3, 4); }"
+        ),
+        7
+    );
+    // Indirect call selected at runtime from an array of function pointers (a dispatch
+    // table) — the common C idiom the function table exists for.
+    assert_eq!(
+        i32_of(
+            "int add(int a,int b){return a+b;} int sub(int a,int b){return a-b;} \
+             int mul(int a,int b){return a*b;} \
+             int main(){ int (*ops[3])(int,int) = {add, sub, mul}; \
+               int s = 0; for (int i=0;i<3;i++) s += ops[i](6, 2); return s; }"
+        ),
+        (6 + 2) + (6 - 2) + (6 * 2)
+    );
+    // A callback passed to another function (qsort-shaped: a fn taking a fn pointer),
+    // and a nested indirect call.
+    assert_eq!(
+        i32_of(
+            "int apply(int (*f)(int), int x){ return f(f(x)); } \
+             int inc(int n){ return n + 1; } \
+             int main(){ return apply(inc, 40); }"
+        ),
+        42
+    );
+    // A function pointer stored in a struct and called via `->`.
+    assert_eq!(
+        i32_of(
+            "struct Op { int (*f)(int,int); int x, y; }; \
+             int add(int a,int b){ return a + b; } \
+             int main(){ struct Op o; o.f = add; o.x = 19; o.y = 23; \
+               struct Op *p = &o; return p->f(p->x, p->y); }"
+        ),
+        42
+    );
+    // The explicit `(*fp)(...)` deref-call form, and a *void* function pointer whose only
+    // effect is through a global.
+    assert_eq!(
+        i32_of(
+            "int g; void set(int v){ g = v; } \
+             int main(){ void (*fp)(int) = set; (*fp)(42); return g; }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn c_goto_end_to_end() {
+    // Forward goto: jump past the rest of a loop body to a label after it.
+    assert_eq!(
+        i32_of(
+            "int main(){ int s=0; for(int i=0;i<5;i++){ if(i==3) goto done; s+=i; } \
+                done: return s; }"
+        ),
+        1 + 2 // i = 0,1,2 before the goto at i==3
+    );
+    // Backward goto building a loop by hand (the label precedes the goto).
+    assert_eq!(
+        i32_of("int main(){ int i=0,s=0; loop: if(i<5){ s+=i; i++; goto loop; } return s; }"),
+        1 + 2 + 3 + 4 // i = 0..4
+    );
+    // Multi-level loop exit — the classic reason goto survives in C.
+    assert_eq!(
+        i32_of(
+            "int main(){ int s=0; for(int i=0;i<4;i++) for(int j=0;j<4;j++){ \
+                if(i*j>=6) goto out; s++; } out: return s; }"
+        ),
+        // counts (i,j) pairs until i*j>=6: (0,*)4 (1,*)4 (2,0..2)3 → 11, then 2*3=6 stops
+        11
+    );
+    // A `cleanup:` label reached by an early `goto` (the error-handling idiom), with a
+    // promoted local threaded across the jump.
+    assert_eq!(
+        i32_of(
+            "int main(){ int rc=0; int *p=0; if(!p){ rc=42; goto cleanup; } rc=1; \
+                cleanup: return rc; }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn c_global_pointer_relocations_end_to_end() {
+    // A global pointer initialized with the address of another global (a relocation): the
+    // frontend resolves the target's window offset at compile time into the data image.
+    assert_eq!(
+        i32_of("int x = 5; int *p = &x; int main(){ return *p; }"),
+        5
+    );
+    // Pointer into an array element — exercises the relocation addend.
+    assert_eq!(
+        i32_of("int a[3] = {10, 20, 30}; int *p = &a[1]; int main(){ return *p; }"),
+        20
+    );
+    // A pointer to a pointer (chained relocations).
+    assert_eq!(
+        i32_of("int x = 99; int *p = &x; int **pp = &p; int main(){ return **pp; }"),
+        99
+    );
+    // A struct global mixing a pointer member (relocation) with a raw scalar.
+    assert_eq!(
+        i32_of(
+            "struct S { int *p; int n; }; int v = 7; struct S s = {&v, 3}; \
+             int main(){ return *s.p + s.n; }"
+        ),
+        10
+    );
+    // A global function-pointer table: each entry relocates to a funcref index (§3c), and an
+    // indirect call dispatches through it — composes global relocations with part-1 calls.
+    assert_eq!(
+        i32_of(
+            "int f(int x){ return x + 1; } int g(int x){ return x * 2; } \
+             int (*tbl[2])(int) = {f, g}; \
+             int main(){ return tbl[0](10) + tbl[1](10); }"
+        ),
+        11 + 20
+    );
+}
+
+#[test]
+fn c_by_value_aggregates_end_to_end() {
+    // Struct passed by value (callee copies the caller's value into its own frame, §3d).
+    assert_eq!(
+        i32_of(
+            "struct P { int x, y; }; \
+             int sum(struct P p){ return p.x + p.y; } \
+             int main(){ struct P p; p.x = 19; p.y = 23; return sum(p); }"
+        ),
+        42
+    );
+    // Struct *returned* by value (the sret ABI), then read back, assigned, and re-used.
+    assert_eq!(
+        i32_of(
+            "struct P { int x, y; }; \
+             struct P mk(int a, int b){ struct P p; p.x = a; p.y = b; return p; } \
+             int main(){ struct P p = mk(30, 12); struct P q = p; /* whole-struct copy */ \
+               return q.x + q.y; }"
+        ),
+        42
+    );
+    // A function taking *and* returning structs by value, plus a member of a call result.
+    assert_eq!(
+        i32_of(
+            "struct P { int x, y; }; \
+             struct P add(struct P a, struct P b){ struct P r; r.x=a.x+b.x; r.y=a.y+b.y; return r; } \
+             struct P mk(int a,int b){ struct P p; p.x=a; p.y=b; return p; } \
+             int main(){ struct P s = add(mk(1,2), mk(3,4)); return s.x*10 + s.y + mk(0,26).y; }"
+        ),
+        // s = (4, 6); 4*10 + 6 + 26 = 72
+        72
+    );
+    // An odd-sized struct (13 bytes: int + char + int) exercises the 4/2/1 memcpy chunks,
+    // and a struct >16 bytes (no register classification — always by pointer, §3d).
+    assert_eq!(
+        i32_of(
+            "struct Q { int a; char b; int c; }; \
+             struct Q bump(struct Q q){ q.a++; q.b++; q.c++; return q; } \
+             int main(){ struct Q q; q.a=10; q.b=20; q.c=30; struct Q r = bump(q); \
+               return r.a + r.b + r.c; }"
+        ),
+        63
+    );
+    // A union by value round-trips its active member.
+    assert_eq!(
+        i32_of(
+            "union U { int i; char c[4]; }; \
+             union U pass(union U u){ return u; } \
+             int main(){ union U u; u.i = 0x41424344; union U v = pass(u); return v.c[0]; }"
+        ),
+        0x44
+    );
+}
+
+/// I2 (§2a/§3c): an indirect call re-checks the selected function's signature at the use
+/// site, so a function pointer cast to the wrong type — here a no-arg `int(*)(void)` aimed
+/// at a 2-arg function — **traps** (the function-table type-id check), identically on both
+/// backends, rather than calling with a mismatched frame. A type-confused index is inert,
+/// never an escape.
+#[test]
+fn c_function_pointer_signature_mismatch_traps() {
+    let src = "int two(int a, int b){ return a + b; } \
+               int main(){ int (*w)(void) = (int(*)(void))two; return w(); }";
+    let ir = c_to_ir(src);
+    assert!(
+        ir.contains("call_indirect"),
+        "expected an indirect call:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let grant = |h: &mut Host| {
+        [
+            Value::I32(h.grant_stream(StreamRole::Out)),
+            Value::I32(h.grant_stream(StreamRole::In)),
+            Value::I32(h.grant_exit()),
+            Value::I32(h.grant_memory()),
+        ]
+    };
+    let args = grant(&mut hi);
+    grant(&mut hj);
+    let mut fuel = 50_000_000u64;
+    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let jit = compile_and_run_with_host(
+        &m,
+        0,
+        &slots,
+        cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+    assert_eq!(
+        interp,
+        Err(Trap::IndirectCallType),
+        "interp must trap on the signature mismatch\n{ir}"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Trapped(TrapKind::IndirectCallType)),
+        "JIT must trap on the signature mismatch, got {jit:?}\n{ir}"
+    );
+}
+
+#[test]
 fn c_printf_end_to_end() {
     assert_eq!(
         stdout_of("int main() { printf(\"hello, world\\n\"); return 0; }"),
@@ -1062,6 +1339,181 @@ fn c_matches_gcc_functions_and_recursion() {
     );
     assert_matches_gcc(
         "int ack(int m,int n){ if(m==0)return n+1; if(n==0)return ack(m-1,1); return ack(m-1, ack(m,n-1)); } int main(){ return ack(2,3); }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_function_pointers() {
+    // A comparator-driven selection sort (qsort-shaped) plus printf output, validated
+    // against native `cc` — function pointers through a real algorithm, both orderings.
+    assert_matches_gcc(
+        "int asc(int a,int b){ return a - b; } int desc(int a,int b){ return b - a; } \
+         void sort(int *v, int n, int (*cmp)(int,int)){ \
+           for (int i=0;i<n;i++) for (int j=i+1;j<n;j++) \
+             if (cmp(v[j], v[i]) < 0){ int t=v[i]; v[i]=v[j]; v[j]=t; } } \
+         int main(){ int a[5] = {5,3,1,4,2}; \
+           sort(a, 5, asc);  for (int i=0;i<5;i++) printf(\"%d \", a[i]); printf(\"\\n\"); \
+           sort(a, 5, desc); for (int i=0;i<5;i++) printf(\"%d \", a[i]); printf(\"\\n\"); \
+           return a[0]; }",
+    );
+    // A runtime-indexed dispatch table.
+    assert_matches_gcc(
+        "int add(int a,int b){ return a + b; } int sub(int a,int b){ return a - b; } \
+         int main(){ int (*ops[2])(int,int) = {add, sub}; int s = 0; \
+           for (int i=0;i<2;i++) s += ops[i](10, 3); printf(\"%d\\n\", s); return s; }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_goto() {
+    // A hand-rolled state machine driven by goto, validated against native `cc`.
+    assert_matches_gcc(
+        "int main(){ int n=27, steps=0; \
+         start: if(n==1) goto done; \
+           if(n%2==0){ n=n/2; steps++; goto start; } \
+           n=3*n+1; steps++; goto start; \
+         done: printf(\"%d\\n\", steps); return steps; }",
+    );
+    // Forward goto skipping initialization, plus a backward goto retry loop.
+    assert_matches_gcc(
+        "int main(){ int tries=0; \
+         retry: tries++; if(tries<3) goto retry; \
+           int sum=0; for(int i=0;i<5;i++){ if(i==2) goto skip; sum+=i; skip:; } \
+           printf(\"%d %d\\n\", tries, sum); return sum; }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_global_relocations() {
+    // A global char* to a string literal (the relocation targets read-only data), printed.
+    assert_matches_gcc(
+        "char *greeting = \"hello, globals\\n\"; \
+         int main(){ printf(\"%s\", greeting); return 0; }",
+    );
+    // An array of string pointers — a classic relocation-heavy table.
+    assert_matches_gcc(
+        "char *days[3] = {\"Mon\", \"Tue\", \"Wed\"}; \
+         int main(){ for(int i=0;i<3;i++) printf(\"%s \", days[i]); printf(\"\\n\"); return 0; }",
+    );
+    // A global dispatch table of function pointers, called in a loop.
+    assert_matches_gcc(
+        "int add(int a,int b){return a+b;} int mul(int a,int b){return a*b;} \
+         int (*ops[2])(int,int) = {add, mul}; \
+         int main(){ int s=0; for(int i=0;i<2;i++) s+=ops[i](6,7); printf(\"%d\\n\", s); return s; }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_static_assert() {
+    // C11 `_Static_assert(const-expr, msg);` — a compile-time check that emits nothing when the
+    // expression is non-zero, at file *and* block scope. chibicc previously treated it as a
+    // function call (`implicit declaration`). Found via xxHash. (Only the `_Static_assert`
+    // keyword is exercised here — the C23 `static_assert` spelling needs <assert.h>/C23 on gcc.)
+    assert_matches_gcc(
+        "_Static_assert(sizeof(int) == 4, \"int is 4 bytes\"); \
+         _Static_assert(sizeof(long) == 8, \"LP64 long\"); \
+         int main(){ _Static_assert(1 + 1 == 2, \"arithmetic\"); \
+           int n = 0; for (int i = 0; i < 5; i++) { _Static_assert(2 * 3 == 6, \"loop\"); n += i; } \
+           printf(\"%d %d %d\\n\", (int)sizeof(int), (int)sizeof(long), n); return n; }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_packed_enums() {
+    // `enum __attribute__((packed))` sizes to the smallest integer type holding its values
+    // (gcc semantics), so a struct containing small enums has the **same layout** as gcc —
+    // which matters for host↔guest data exchange (§3d pins x86-64-SysV layout). chibicc
+    // previously made every enum `int` (4 bytes); found via Clay. `sizeof`/offsets and the
+    // exit code are all compared to native `cc`.
+    assert_matches_gcc(
+        "typedef enum __attribute__((__packed__)) { A, B, C } E; \
+         struct S { E first; int x; E second; char c; }; \
+         int main(){ struct S s = { .first=B, .x=7, .second=C, .c='z' }; \
+           printf(\"%d %d %d %d %d\\n\", (int)sizeof(E), (int)sizeof(struct S), \
+                  s.first, s.second, s.c); \
+           return (int)sizeof(struct S); }",
+    );
+    // A packed enum forced wider by its value range (> 255 → 2 bytes), still matching gcc.
+    assert_matches_gcc(
+        "typedef enum __attribute__((packed)) { LO = 0, HI = 1000 } W; \
+         int main(){ printf(\"%d\\n\", (int)sizeof(W)); return (int)sizeof(W); }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_clay_fixes() {
+    // Four frontend/IR fixes surfaced by compiling the Clay layout library, each validated
+    // against native `cc`.
+    // (a) ternary `?:` returning a struct by value (gen_cond aggregate result → i64 address):
+    assert_matches_gcc(
+        "struct P{int x,y;}; struct P pick(int c){ struct P a={1,2},b={3,4}; return c?a:b; } \
+         int main(){ struct P p=pick(1); printf(\"%d %d\\n\",p.x,p.y); return p.x+p.y; }",
+    );
+    // (b) struct return > 16 bytes (chibicc prepends a hidden return-buffer param; no longer
+    //     double-counted against our own sret):
+    assert_matches_gcc(
+        "struct Big{int a,b,c,d,e;}; struct Big mk(int x){ struct Big b={x,x+1,x+2,x+3,x+4}; return b; } \
+         int main(){ struct Big b=mk(10); printf(\"%d\\n\", b.a+b.e); return b.a+b.e; }",
+    );
+    // (c) mixed-width shift `uint64_t << int` (shift amount widened to the value's width):
+    assert_matches_gcc(
+        "int main(){ unsigned long h=12345; h+=(h<<10); h^=(h>>6); printf(\"%lu\\n\",h); return (int)(h&255); }",
+    );
+    // (d) an unsigned 32-bit constant 0xFFFFFFFF (`i32.const` accepts the full u32 range):
+    assert_matches_gcc(
+        "int main(){ unsigned int m=0xFFFFFFFFu; printf(\"%u\\n\", m); return (int)(m & 7); }",
+    );
+}
+
+#[test]
+fn c_matches_gcc_aggregates() {
+    // Two upstream chibicc parser bugs, found via the Clay layout library and fixed in
+    // `frontend/chibicc/parse.c`, both around designated initializers into **anonymous**
+    // aggregates (pervasive in real C). (1) `struct_designator` only special-cased anonymous
+    // *structs*, so a designator targeting an anonymous *union* member NULL-derefed (segfault).
+    // (2) `struct_initializer2` didn't skip the separator comma when a designated member landed
+    // in a nested anonymous aggregate, so a following designator failed to parse. Validate
+    // both against native `cc`.
+    assert_matches_gcc(
+        "struct S { union { int config; struct { int tc; int data; }; }; int flag; }; \
+         int main(){ struct S a = { .tc = 5, .flag = 1 };      /* fix (1)+(2) */ \
+                     struct S b = { .flag = 9, .config = 7 };  /* anonymous-union member */ \
+                     printf(\"%d %d %d %d\\n\", a.tc, a.flag, b.config, b.flag); \
+                     return a.tc + a.flag; }",
+    );
+    // Regression (demos/rational.c): a struct returned from a **non-entry block** — inside a
+    // loop, and after it. The sret pointer is a parameter that only lives in the entry block,
+    // so it is stashed to a frame slot and reloaded on return; earlier it was read from the
+    // block's rebound parameter (the loop counter), emitting IR that failed verification.
+    assert_matches_gcc(
+        "struct P { int x, y; }; \
+         struct P pick(int n){ struct P r; \
+           for (int i=0;i<100;i++) if (i==n) { r.x=i; r.y=i*i; return r; } \
+           r.x=-1; r.y=-1; return r; } \
+         int main(){ struct P p = pick(7); printf(\"%d,%d\\n\", p.x, p.y); return p.x + p.y; }",
+    );
+    // Structs by value through args and returns (the sret ABI), with printf output,
+    // validated against native `cc`.
+    assert_matches_gcc(
+        "struct V { int x, y, z; }; \
+         struct V add(struct V a, struct V b){ \
+           struct V r; r.x=a.x+b.x; r.y=a.y+b.y; r.z=a.z+b.z; return r; } \
+         int dot(struct V a, struct V b){ return a.x*b.x + a.y*b.y + a.z*b.z; } \
+         int main(){ struct V a = {1,2,3}, b = {4,5,6}; \
+           struct V s = add(a, b); \
+           printf(\"%d %d %d\\n\", s.x, s.y, s.z); \
+           printf(\"%d\\n\", dot(a, b)); \
+           return s.x + s.y + s.z; }",
+    );
+    // A struct returned from one call fed straight into another, plus a function pointer
+    // whose signature passes/returns a struct by value (composes increment 1 + 2).
+    assert_matches_gcc(
+        "struct P { int x, y; }; \
+         struct P mk(int a, int b){ struct P p; p.x=a; p.y=b; return p; } \
+         struct P swap(struct P p){ struct P r; r.x=p.y; r.y=p.x; return r; } \
+         int main(){ struct P (*f)(struct P) = swap; \
+           struct P p = f(mk(7, 9)); \
+           printf(\"%d,%d\\n\", p.x, p.y); return p.x - p.y; }",
     );
 }
 

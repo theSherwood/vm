@@ -110,6 +110,7 @@ static bool is_typename(Token *tok);
 static Type *declspec(Token **rest, Token *tok, VarAttr *attr);
 static Type *typename(Token **rest, Token *tok);
 static Type *enum_specifier(Token **rest, Token *tok);
+static Token *attribute_list(Token *tok, Type *ty);
 static Type *typeof_specifier(Token **rest, Token *tok);
 static Type *type_suffix(Token **rest, Token *tok, Type *ty);
 static Type *declarator(Token **rest, Token *tok, Type *ty);
@@ -751,6 +752,10 @@ static bool consume_end(Token **rest, Token *tok) {
 static Type *enum_specifier(Token **rest, Token *tok) {
   Type *ty = enum_type();
 
+  // Optional attributes between `enum` and the tag/body, e.g. `enum __attribute__((packed))`
+  // — gcc sizes such an enum to the smallest integer type holding its values (applied below).
+  tok = attribute_list(tok, ty);
+
   // Read a struct tag.
   Token *tag = NULL;
   if (tok->kind == TK_IDENT) {
@@ -770,9 +775,10 @@ static Type *enum_specifier(Token **rest, Token *tok) {
 
   tok = skip(tok, "{");
 
-  // Read an enum-list.
+  // Read an enum-list (tracking the value range, for a packed enum's storage size).
   int i = 0;
   int val = 0;
+  int64_t lo = 0, hi = 0;
   while (!consume_end(rest, tok)) {
     if (i++ > 0)
       tok = skip(tok, ",");
@@ -783,9 +789,30 @@ static Type *enum_specifier(Token **rest, Token *tok) {
     if (equal(tok, "="))
       val = const_expr(&tok, tok->next);
 
+    if (val < lo)
+      lo = val;
+    if (val > hi)
+      hi = val;
+
     VarScope *sc = push_scope(name);
     sc->enum_ty = ty;
     sc->enum_val = val++;
+  }
+
+  // `enum __attribute__((packed))`: storage is the smallest integer type holding all values
+  // (gcc semantics). Only the layout size/align change; enum constants stay `int` in
+  // expressions. Without this, the enum is `int` (4 bytes) and structs containing it grow.
+  if (ty->is_packed) {
+    if (lo >= 0) {
+      ty->size = hi <= 0xff ? 1 : hi <= 0xffff ? 2 : hi <= 0xffffffffLL ? 4 : 8;
+      ty->is_unsigned = true; // all-nonnegative packed enum → unsigned storage (gcc)
+    } else {
+      ty->size = (lo >= -128 && hi <= 127)         ? 1
+                 : (lo >= -32768 && hi <= 32767)   ? 2
+                 : (lo >= -2147483648LL && hi <= 2147483647LL) ? 4
+                                                   : 8;
+    }
+    ty->align = ty->size;
   }
 
   if (tag)
@@ -1002,8 +1029,11 @@ static Member *struct_designator(Token **rest, Token *tok, Type *ty) {
     error_tok(tok, "expected a field designator");
 
   for (Member *mem = ty->members; mem; mem = mem->next) {
-    // Anonymous struct member
-    if (mem->ty->kind == TY_STRUCT && !mem->name) {
+    // Anonymous struct/union member. (SVM fix: upstream chibicc checked only TY_STRUCT
+    // here, so a designated initializer `.field = …` on a struct containing an anonymous
+    // *union* fell through to the regular branch and dereferenced mem->name (NULL) →
+    // segfault. Match the canonical idiom in get_struct_member, which handles both.)
+    if ((mem->ty->kind == TY_STRUCT || mem->ty->kind == TY_UNION) && !mem->name) {
       if (get_struct_member(mem->ty, tok)) {
         *rest = start;
         return mem;
@@ -1182,14 +1212,16 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
 
 // struct-initializer2 = initializer ("," initializer)*
 static void struct_initializer2(Token **rest, Token *tok, Initializer *init, Member *mem) {
-  bool first = true;
-
   for (; mem && !is_end(tok); mem = mem->next) {
     Token *start = tok;
 
-    if (!first)
+    // Skip the separator comma when one is present. (SVM fix: upstream skipped it only on
+    // non-first members. But this continuation is also entered right after a *designated*
+    // member with `tok` AT the comma — `{ .a = x, .b = y }` where `.a` lands in a nested
+    // anonymous aggregate — so the first member must skip it too. The other caller, struct
+    // brace-elision, enters at a value with no leading comma, so the guard leaves it alone.)
+    if (equal(tok, ","))
       tok = skip(tok, ",");
-    first = false;
 
     if (equal(tok, "[") || equal(tok, ".")) {
       *rest = start;
@@ -1759,6 +1791,22 @@ static Node *stmt(Token **rest, Token *tok) {
   return expr_stmt(rest, tok);
 }
 
+// static_assert = ("_Static_assert" | "static_assert") "(" const-expr ("," string)? ")" ";"
+// (C11 `_Static_assert` / C23 `static_assert`, the latter with an optional message). A
+// compile-time check: if the constant expression is zero, error; otherwise it emits nothing.
+static Token *static_assertion(Token **rest, Token *tok) {
+  tok = skip(tok->next, "(");
+  Token *start = tok;
+  int64_t result = const_expr(&tok, tok);
+  if (consume(&tok, tok, ",") && tok->kind == TK_STR)
+    tok = tok->next; // skip the message string literal
+  tok = skip(tok, ")");
+  *rest = skip(tok, ";");
+  if (result == 0)
+    error_tok(start, "static assertion failed");
+  return *rest;
+}
+
 // compound-stmt = (typedef | declaration | stmt)* "}"
 static Node *compound_stmt(Token **rest, Token *tok) {
   Node *node = new_node(ND_BLOCK, tok);
@@ -1768,6 +1816,10 @@ static Node *compound_stmt(Token **rest, Token *tok) {
   enter_scope();
 
   while (!equal(tok, "}")) {
+    if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
+      tok = static_assertion(&tok, tok);
+      continue;
+    }
     if (is_typename(tok) && !equal(tok->next, ":")) {
       VarAttr attr = {};
       Type *basety = declspec(&tok, tok, &attr);
@@ -2608,12 +2660,12 @@ static Token *attribute_list(Token *tok, Type *ty) {
         tok = skip(tok, ",");
       first = false;
 
-      if (consume(&tok, tok, "packed")) {
+      if (consume(&tok, tok, "packed") || consume(&tok, tok, "__packed__")) {
         ty->is_packed = true;
         continue;
       }
 
-      if (consume(&tok, tok, "aligned")) {
+      if (consume(&tok, tok, "aligned") || consume(&tok, tok, "__aligned__")) {
         tok = skip(tok, "(");
         ty->align = const_expr(&tok, tok);
         tok = skip(tok, ")");
@@ -3341,6 +3393,11 @@ Obj *parse(Token *tok) {
   globals = NULL;
 
   while (tok->kind != TK_EOF) {
+    if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
+      tok = static_assertion(&tok, tok);
+      continue;
+    }
+
     VarAttr attr = {};
     Type *basety = declspec(&tok, tok, &attr);
 

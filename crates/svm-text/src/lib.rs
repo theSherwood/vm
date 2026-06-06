@@ -987,8 +987,12 @@ impl<'a> Parser<'a> {
         if suffix == "const" {
             let v = self.parse_int()?;
             return Ok(match ty {
+                // An `i32.const` is a 32-bit pattern: accept both the signed-`i32` range and the
+                // unsigned-`u32` range (e.g. `4294967295` = `0xFFFFFFFF` = `-1`), as a C frontend
+                // emits unsigned constants like `0xFFFFFFFF`/`UINT32_MAX` by value.
                 IntTy::I32 => Inst::ConstI32(
                     i32::try_from(v)
+                        .or_else(|_| u32::try_from(v).map(|u| u as i32))
                         .map_err(|_| ParseError(format!("i32 const out of range: {v}")))?,
                 ),
                 IntTy::I64 => Inst::ConstI64(v),
