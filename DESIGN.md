@@ -848,26 +848,31 @@ they trust:
 host's. The guest gets genuine paging semantics with zero software translation,
 and the bounded window makes escape impossible without per-access checks.
 
-### Platform support  [Linux + macOS done; Windows in progress]
+### Platform support  [Linux + macOS + Windows green]
 
 Confinement itself is portable arithmetic (the masking pass, §16/D51); only the
 **non-TCB PAL** — VA reserve/commit/protect/release + guard-fault→trap recovery —
 differs per OS. `crates/svm-jit/src/mem.rs` is a portable window model over a small
-PAL seam, cfg-selected per target:
-- **unix (Linux + macOS): done.** `mmap(PROT_NONE, MAP_NORESERVE)` + `mprotect` +
-  a SIGSEGV/SIGBUS handler via the `cc`-built `trap_shim.c` (`sigsetjmp`/
-  `siglongjmp`). The full test suite — confinement, detect-and-kill, the Memory
-  cap, the C frontend, and the interp↔JIT escape oracles — runs green on both
-  `ubuntu-latest` (x86-64 / 4 KiB) and `macos-latest` (ARM64 / 16 KiB) in CI.
-- **Windows: builds + runs, guard not yet recovering.** The PAL is
-  `VirtualAlloc(MEM_RESERVE/COMMIT)` + `VirtualProtect(PAGE_NOACCESS)` + a Vectored
-  Exception Handler. The stack compiles and executes, but the VEH detect-and-kill
-  recovery does not yet catch + unwind an out-of-window fault (the process AVs).
-  The recommended fix is a C `setjmp`/`longjmp` (SEH) + VEH shim mirroring the unix
-  `trap_shim.c`. Until it lands, guard-relying elision would be real host-memory
-  UB on Windows; the conservative, provably-in-window elision needs no guard and is
-  sound everywhere. **Goal: run *identically* on Windows once the guard recovers** —
-  same confinement, same detect-and-kill, same elision.
+PAL seam, cfg-selected per target. The full test suite — confinement,
+detect-and-kill, the Memory cap, the interp↔JIT escape oracles, and (on unix) the
+C frontend — runs green on `ubuntu-latest` (x86-64 / 4 KiB), `macos-latest`
+(ARM64 / 16 KiB), and `windows-latest` (x86-64 / 4 KiB) in CI.
+- **unix (Linux + macOS):** `mmap(PROT_NONE, MAP_NORESERVE)` + `mprotect` + a
+  SIGSEGV/SIGBUS handler via the `cc`-built `trap_shim.c` (`sigsetjmp`/
+  `siglongjmp`).
+- **Windows:** pure-Rust `windows-sys` — `VirtualAlloc(MEM_RESERVE/COMMIT)` +
+  `VirtualProtect(PAGE_NOACCESS)` + an `AddVectoredExceptionHandler` guard with
+  `RtlCaptureContext` as the longjmp-equivalent recovery (no C shim, so it stays
+  cross-`check`-able from Linux). Two gotchas the bring-up surfaced: the x86-64
+  `CONTEXT` must be **16-byte aligned** (it holds XMM state stored with aligned
+  moves; windows-sys types it `#[repr(C)]` only, so it needs a `repr(align(16))`
+  wrapper), and the cap-buffer borrow needs a guest-window view on non-unix too
+  (a portable `WindowMem`, else stdio is silent). Guest-driven Memory-cap growth
+  (`map`/`unmap` backed by `VirtualProtect`) is the one remaining Windows follow-up.
+
+The guarantee is identical across targets: same confinement, same detect-and-kill,
+same elision. (Guard-relying elision is sound only where the guard region exists —
+it does on all three.)
 
 **Page size — host-page default (the "pin page size" resolution).** Page
 granularity is the **host MMU page**, queried at runtime, *not* a hardcoded 4 KiB:

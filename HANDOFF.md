@@ -562,10 +562,15 @@ this is the index.)
 - [x] **Phase 2 — compilability proof:** chibicc→IR; real C on interp + JIT, two-tier
   tested (interp == JIT == native `cc`); SSA promotion landed (§5 item 8, §3).
 - [ ] **Phase 3 — Solid MVP (in progress):** the MVP remainder below.
-- [~] **Phase 3.5 — Cross-platform parity (Linux + macOS done; Windows blocked):** port to
-  **Windows** (PAL: `VirtualAlloc`/`VirtualProtect` + **VEH/SEH** detect-and-kill) and validate
-  **macOS**; stand up a gating **Linux/Windows/macOS CI matrix** so parity holds from here on.
-  Confinement masking is already portable (§16/D51); only the non-TCB PAL differs.
+- [x] **Phase 3.5 — Cross-platform parity (Linux + macOS + Windows all GREEN):** the full `cargo
+  test --workspace` passes on `ubuntu-latest` (x86-64 / 4 KiB), `macos-latest` (ARM64 / 16 KiB), and
+  `windows-latest` (x86-64 / 4 KiB) in CI. Confinement masking is portable (§16/D51); only the
+  non-TCB PAL differs, and all three PALs now reserve/commit/protect + recover from a guard fault.
+  Remaining polish (not blockers): drop `continue-on-error` from the now-green `cross-os` matrix
+  legs and fold them into gating (maintainer-applied workflow edit); port svm-run's `MprotectWindow`
+  Memory-cap thunk to Windows (`VirtualProtect`-backed map/unmap/protect) so guest `malloc`-over-
+  `map` works there too — today Windows uses a portable `WindowMem` (read/write borrows; map/unmap/
+  protect are success no-ops), enough for stdio + the cap-buffer borrow but not guest-driven growth.
   - **macOS (ARM64 / 16 KiB pages) is GREEN** — `macos-latest` runs the **whole** `cargo test
     --workspace` clean, including the re-enabled `c_frontend` differential suite (interp == JIT ==
     native `cc`) and the `escape_oracle`/`jit_diff` parity oracles. This closed out DESIGN §4 "pin
@@ -586,29 +591,25 @@ this is the index.)
       common host page (16 KiB)** — a multiple of 4 KiB, so 4 KiB hosts are unaffected (just coarser)
       while on 16 KiB the RO segment never shares a host page with writable data (no over-protection
       fault) and `malloc` growth never re-zeroes a live 16 KiB page.
-  - **Windows (x86_64 / 4 KiB) is the remaining BLOCKER.** It **builds + runs** on CI (after the `cc`
-    build-dep fix) and the whole stack compiles, but `cargo test` crashes in `escape_oracle` with
-    `STATUS_ACCESS_VIOLATION (0xc0000005)`: an out-of-window access faults and the Vectored Exception
-    Handler does **not** catch + unwind it, so the AV kills the process. The JIT + masking are fine;
-    the bug is the `RtlCaptureContext`-based detect-and-kill recovery (`pal::run_guarded`/`veh` in
-    `mem.rs`). The pure-Rust `RtlCaptureContext`/`RtlRestoreContext` longjmp-emulation is fragile and
-    **can't be debugged from the Linux host** (no windows runtime). The proven alternative — a C
-    `setjmp`/`longjmp` (SEH `__try/__except`) + VEH shim like the unix `trap_shim.c` / Wasmtime's
-    windows path — is canonical but (a) needs cl.exe (MSVC) so it can't be compile-checked from the
-    Linux `x86_64-pc-windows-gnu` cross-check (mingw gcc lacks `__try/__except`, and isn't installed
-    on the host anyway) and (b) would be iterated 100% blind via CI. **Needs a maintainer decision /
-    windows debug environment** (see the end-of-session note). svm-run's `MprotectWindow` Memory-cap
-    thunk is still `cfg(unix)` (no-op windows fallback) — port it once the guard works. Tier-1 MPK
+  - **Windows (x86_64 / 4 KiB) is GREEN.** The PAL is pure Rust via `windows-sys`
+    (`VirtualAlloc(MEM_RESERVE/COMMIT)` + `VirtualProtect(PAGE_NOACCESS)` + an `AddVectored­Exception­
+    Handler` guard with `RtlCaptureContext` as the longjmp-equivalent recovery — no C shim, so it
+    stays check-able from Linux via `cargo check --target x86_64-pc-windows-gnu`). Two runtime bugs
+    were found + fixed from CI alone: (a) the guard AV'd **inside `RtlCaptureContext`** because
+    windows-sys types `CONTEXT` `#[repr(C)]` only, but x86-64 `CONTEXT` must be **16-byte aligned**
+    (it embeds XMM `M128A` state stored with aligned `movaps`); a bare stack local landed 8-mod-16
+    and faulted — fixed with a `#[repr(C, align(16))]` wrapper. (b) stdio produced **empty output**
+    because `cap_thunk` passed `gm = None` on non-unix, so a `Stream` write had no view of the guest
+    window — fixed by backing the §7 cap-buffer borrow with the portable `WindowMem`. Tier-1 MPK
     stays Linux-only (degrades to tier 0/3 elsewhere).
   - **CI matrix is live** (the maintainer applied the workflow — needs the `workflows` token scope):
-    the gating ubuntu job also runs the windows cross-`check`+clippy, and a non-gating `cross-os` job
-    builds+tests on `windows-latest` + `macos-latest`. Drop `continue-on-error` from the macOS leg
-    now that it's green (a one-line workflow edit, maintainer-applied); keep it on windows until the
-    guard is fixed. Fixes it drove: (a) `cc` was a `cfg(unix)` *build*-dep — that cfg matches the
-    **host**, so a windows host never got the crate and `build.rs` failed (the linux cross-check
-    can't catch a host-only issue); made it an unconditional `[build-dependencies]` (the C shim
-    compile stays target-gated on `CARGO_CFG_UNIX`). (b) `c_frontend` needs a unix C toolchain
-    (`make`+`cc`) → `#![cfg(unix)]`.
+    the gating ubuntu job also runs the windows cross-`check`+clippy, and a `cross-os` job
+    builds+tests on `windows-latest` + `macos-latest` (still `continue-on-error` — now safe to make
+    gating since both are green). Fixes it drove along the way: (a) `cc` was a `cfg(unix)` *build*-dep
+    — that cfg matches the **host**, so a windows host never got the crate and `build.rs` failed (the
+    linux cross-check can't catch a host-only issue); made it an unconditional `[build-dependencies]`
+    (the C shim compile stays target-gated on `CARGO_CFG_UNIX`). (b) `c_frontend` needs a unix C
+    toolchain (`make`+`cc`) → `#![cfg(unix)]` (runs on Linux + macOS; skipped on Windows).
 - [ ] **Phase 4 — post-MVP:** deferred (below), developed against the parity matrix.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
