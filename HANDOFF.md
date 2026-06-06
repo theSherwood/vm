@@ -574,16 +574,21 @@ this is the index.)
   (`VirtualAlloc`/`VirtualProtect`/`VirtualFree` + a Vectored Exception Handler with
   `RtlCaptureContext` for the longjmp-equivalent recovery — no C shim, so it stays check-able from
   Linux). `cargo check --target x86_64-pc-windows-gnu` is **green** for the whole workspace, and
-  clippy is clean for both host and the windows target. **Blocked on CI:** the windows guard's
-  *runtime* behaviour (VEH context-restore, fault boundaries) can't be exercised on the Linux dev
-  host (no Windows/Wine) — it's marked `CI-UNVERIFIED` in-source and needs a `windows-latest` CI run
-  of the interp↔JIT differential + the PAL conformance test to validate. **Next:** add the
-  `windows-latest`/`macos-latest` CI jobs + a Linux-hosted cross-`check` step (YAML drafted, see the
-  cross-platform note below — needs the `workflows` permission to land); then port **svm-run's
-  `MprotectWindow`** (the Memory-cap thunk, currently `cfg(unix)` with a no-op windows fallback) so
-  the Memory-cap / `malloc`-over-`map` tests pass on windows too. Tier-1 MPK stays Linux-only
-  (degrades to tier 0/3 elsewhere). Start point recorded: JIT no longer `compile_error!`s for
-  windows; it does for other non-unix/non-windows targets.
+  clippy is clean for both host and the windows target. **Windows now BUILDS + RUNS on CI** (after
+  the `cc` build-dep fix), but the **VEH guard FAILS at runtime** — `cargo test` crashes in
+  `escape_oracle` with `STATUS_ACCESS_VIOLATION (0xc0000005)`: an out-of-window access faults and the
+  Vectored Exception Handler does **not** catch + unwind it, so the AV kills the process. So the JIT
+  + masking compile and run on windows, but the `RtlCaptureContext`-based detect-and-kill recovery
+  (`pal::run_guarded`/`veh` in `mem.rs`) has a bug. **This is the blocker:** debugging a windows
+  exception-handler's context-restore needs a **windows dev/debug environment** — it can't be run or
+  debugged from the Linux host, and the proven alternative (a C `setjmp`/`longjmp` + VEH shim, like
+  the unix `trap_shim.c` / Wasmtime's windows path) can't even be *compile-checked* here (no windows
+  C compiler), so it'd be 100% blind. The `RtlCaptureContext` approach is likely too fragile;
+  switching to a C shim is the recommended fix, to be done with a windows environment or careful
+  CI iteration. **Also next:** port **svm-run's `MprotectWindow`** (the Memory-cap thunk, currently
+  `cfg(unix)` with a no-op windows fallback) so the Memory-cap / `malloc`-over-`map` tests pass on
+  windows too. Tier-1 MPK stays Linux-only (degrades to tier 0/3 elsewhere). Start point recorded:
+  JIT no longer `compile_error!`s for windows; it does for other non-unix/non-windows targets.
   - **CI matrix is live** (the maintainer applied the workflow — needs the `workflows` token scope):
     the gating ubuntu job now also runs the windows cross-`check`+clippy, and a non-gating `cross-os`
     job builds+tests on `windows-latest` + `macos-latest`. First runs surfaced + drove two fixes:
