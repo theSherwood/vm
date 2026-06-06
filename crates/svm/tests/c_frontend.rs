@@ -7,14 +7,15 @@
 //! second tier (`c_matches_gcc_*`) compiles the *same* C with native `cc` and compares
 //! exit code + stdout, validating C semantics against a real compiler.
 //!
-//! Requires a unix C toolchain (`make` + `cc`) to build the chibicc fork, and the frontend bakes
-//! a **4 KiB** RO-data page-isolation at compile time — so this suite is **Linux-only for now**
-//! (`#![cfg(target_os = "linux")]`). Windows lacks the toolchain; macOS-ARM (16 KiB pages) needs
-//! the frontend RO-isolation pin + guest page-size exposure (Phase 3.5 part 2) before its programs
-//! run without spurious RO over-protection faults. The frontend is outside the escape-TCB (§2a):
-//! whatever IR it emits still goes through the verifier, and the JIT/PAL it exercises is validated
-//! cross-platform by `jit_fuzz`/`escape_oracle` + the `svm-jit` PAL conformance test instead.
-#![cfg(target_os = "linux")]
+//! Requires a unix C toolchain (`make` + `cc`) to build the chibicc fork, so this suite is gated to
+//! `#![cfg(unix)]` — Windows lacks the toolchain. It runs on **both** Linux (4 KiB pages) and
+//! macOS-ARM (16 KiB pages): the frontend now pins its RO-data isolation and heap-growth granularity
+//! to the largest common host page (16 KiB, a multiple of 4 KiB), so a guest's read-only segment
+//! never shares a host page with writable data and its writes don't trip a spurious RO
+//! over-protection fault on a 16 KiB host (Phase 3.5 §16). The frontend is outside the escape-TCB
+//! (§2a): whatever IR it emits still goes through the verifier, and the JIT/PAL it exercises is
+//! validated cross-platform by `jit_fuzz`/`escape_oracle` + the `svm-jit` PAL conformance test.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
