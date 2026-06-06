@@ -31,7 +31,7 @@ jobs:
   cross-os:
     name: build · test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: true # TODO: drop once green to make parity gating (the windows guard is unverified)
+    # continue-on-error: true # TODO: drop once green to make parity gating (the windows guard is unverified)
     strategy:
       fail-fast: false
       matrix:
