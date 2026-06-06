@@ -85,3 +85,44 @@ fn shared_region_without_second_mapping_is_not_aliased() {
         "an un-aliased window page must read zero, not the marker"
     );
 }
+
+/// Anti-rot pin for the Windows §13 gap (tracking issue #1): the JIT's shared mapping is not yet
+/// wired on Windows (it needs placeholder reservations — see the `MprotectWindow::map_region` TODO),
+/// so `map` over a `SharedRegion` returns `-EINVAL` (-22) there. This test asserts that contract so
+/// the gap stays *tested and intentional* — it will fail loudly the moment Windows support lands,
+/// at which point flip it to the real `jit_diff` differential.
+#[cfg(windows)]
+#[test]
+fn shared_region_map_is_einval_on_windows_until_placeholders() {
+    use core::ffi::c_void;
+    use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
+
+    let src = "memory 16\n\
+         func (i32) -> (i64) {\n\
+         block0(v0: i32):\n\
+         \x20 v1 = cap.call 4 3 () -> (i64) v0 ()\n\
+         \x20 v2 = i64.const 0\n\
+         \x20 v3 = i32.const 3\n\
+         \x20 v4 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v0 (v2, v2, v1, v3)\n\
+         \x20 return v4\n\
+         }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let mut host = Host::new();
+    let h = host.grant_shared_region(1 << 16); // pure-Rust backing (no os_fd on Windows)
+    let (jit, _mem) = compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[h as i64],
+        &[],
+        0,
+        svm_run::cap_thunk,
+        &mut host as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+    assert!(
+        matches!(jit, JitOutcome::Returned(ref s) if s == &[-22]),
+        "Windows JIT map_region must return -EINVAL until placeholder mappings land (issue #1): {jit:?}"
+    );
+}

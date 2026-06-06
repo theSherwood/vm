@@ -479,7 +479,10 @@ impl GuestMem for MprotectWindow {
             }
             0
         }
-        // windows (`CreateFileMapping`/placeholder reservations) shared mappings are a follow-up.
+        // TODO(§13 windows, issue #1): wire real shared mappings via placeholder reservations
+        // (`VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` + `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`).
+        // Until then SharedRegion `map` is unsupported on windows; pinned by the `#[cfg(windows)]`
+        // test in `svm/tests/shared_region.rs`.
         #[cfg(not(unix))]
         {
             let _ = (win_off, region_off, len, prot, backing);
