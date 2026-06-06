@@ -79,10 +79,17 @@ pub unsafe extern "C" fn cap_thunk(
     }
 }
 
-/// The pinned guest page size (§4 "pin page size"); the model granularity for `map`/`unmap`/
-/// `protect`, matching the interpreter's reference `PAGE` so the two backends agree.
+/// The **host** page size (`sysconf(_SC_PAGESIZE)`): the protection granularity for `map`/`unmap`/
+/// `protect`, matching the interpreter (`svm_interp`) and the JIT (`svm-jit`'s `mprotect`) on the
+/// same host so all three agree page-for-page (§4 "pin page size", host-page default).
 #[cfg(unix)]
-const PAGE: u64 = 4096;
+fn host_page_size() -> u64 {
+    // SAFETY: sysconf is always safe; _SC_PAGESIZE is positive.
+    match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        p if p > 0 => p as u64,
+        _ => 4096,
+    }
+}
 
 /// A [`GuestMem`] over the JIT's guest window whose `map`/`unmap`/`protect` (the Memory capability,
 /// §3e) are backed by **real `mprotect`** on the window pages, mirrored by a software page-state
@@ -99,6 +106,8 @@ pub struct MprotectWindow {
     base: *mut u8,
     mapped: u64,
     reserved: u64,
+    /// Host page size (`host_page_size()`), the protection granularity (matches `svm_interp`).
+    page: u64,
     /// Page index ⇒ explicit state; absent ⇒ region default (rw in `[0, mapped)`, unmapped in the
     /// reserved tail). Mirrors `svm_interp`'s page map so the two backends agree page-for-page.
     prot: std::collections::BTreeMap<u64, PageState>,
@@ -120,6 +129,7 @@ impl MprotectWindow {
             base,
             mapped,
             reserved: reserved.max(mapped),
+            page: host_page_size(),
             prot: std::collections::BTreeMap::new(),
         }
     }
@@ -131,7 +141,7 @@ impl MprotectWindow {
             Some(PageState::Rw) => Some(true),
             Some(PageState::Ro) => Some(false),
             Some(PageState::Unmapped) => None,
-            None => (page * PAGE < self.mapped).then_some(true),
+            None => (page * self.page < self.mapped).then_some(true),
         }
     }
 
@@ -147,7 +157,7 @@ impl MprotectWindow {
         if len == 0 {
             return true;
         }
-        (ptr / PAGE..=(end - 1) / PAGE)
+        (ptr / self.page..=(end - 1) / self.page)
             .all(|p| matches!(self.page_access(p), Some(w) if w || !write))
     }
 
@@ -156,14 +166,14 @@ impl MprotectWindow {
     /// interpreter's `prot_pages` (growth into the reserved tail is allowed).
     fn prot_pages(&self, offset: u64, len: u64) -> Result<std::ops::RangeInclusive<u64>, i64> {
         const EINVAL: i64 = -22;
-        if len == 0 || !offset.is_multiple_of(PAGE) {
+        if len == 0 || !offset.is_multiple_of(self.page) {
             return Err(EINVAL);
         }
         let end = offset.checked_add(len).ok_or(EINVAL)?;
         if end > self.reserved {
             return Err(EINVAL);
         }
-        Ok((offset / PAGE)..=((end - 1) / PAGE))
+        Ok((offset / self.page)..=((end - 1) / self.page))
     }
 
     /// Update one page's software state from cap `prot` bits, mirroring `svm_interp::set_prot`:
@@ -172,7 +182,7 @@ impl MprotectWindow {
         const PROT_READ: i32 = 1;
         const PROT_WRITE: i32 = 2;
         if prot & PROT_WRITE != 0 {
-            if page * PAGE < self.mapped {
+            if page * self.page < self.mapped {
                 self.prot.remove(&page);
             } else {
                 self.prot.insert(page, PageState::Rw);
@@ -196,9 +206,9 @@ impl MprotectWindow {
         } else {
             libc::PROT_NONE
         };
-        let start = (offset / PAGE) * PAGE;
+        let start = (offset / self.page) * self.page;
         let end = offset + len;
-        let rlen = (end.div_ceil(PAGE) * PAGE) - start;
+        let rlen = (end.div_ceil(self.page) * self.page) - start;
         // SAFETY: `[base+start, +rlen)` is within the window's reserved mapping (validated:
         // end ≤ reserved), owned by the JIT for the call's duration.
         unsafe {

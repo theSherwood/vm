@@ -9,3 +9,8 @@ publish = false
 [dependencies]
 svm-ir.workspace = true
 svm-mask.workspace = true
+# Host page size for the protection model — a tiny *safe* wrapper (keeps `#![forbid(unsafe_code)]`),
+# so the interpreter's RO/unmap granularity matches the JIT's real `mprotect` on the same host
+# (§4 "pin page size" → host-page default; both backends query the same value, so they agree
+# page-for-page on any platform: 4 KiB / 16 KiB / …).
+page_size = "0.6"
