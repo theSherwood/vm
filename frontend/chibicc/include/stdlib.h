@@ -33,7 +33,13 @@ static void abort(void) {
 
 // --- the map-growing heap -------------------------------------------------------------------
 #define __SVM_HEAP_BASE 268435456L // 256 MiB: above the (<= 64 MiB) backed prefix, in the tail
-#define __SVM_PAGE 4096L
+// Heap-growth granularity. The runtime's `map` commits and **zero-fills the whole host page(s)**
+// covering the request (host-page default: 4 KiB on x86-64, 16 KiB on Apple Silicon, …). If the
+// guest grew in 4 KiB steps on a 16 KiB host, a later step would re-`map` (and so re-zero) the
+// 16 KiB page already holding live allocations. We grow in 16 KiB units — the largest common host
+// page, a multiple of 4 KiB — so each growth covers fresh page(s) on any host; `__SVM_HEAP_BASE`
+// is 16 KiB-aligned, so growth stays page-aligned.
+#define __SVM_PAGE 16384L
 #define __SVM_HDR 16L // per-allocation header (holds the payload size; keeps 16-byte alignment)
 
 static long __svm_brk = __SVM_HEAP_BASE;       // next free byte

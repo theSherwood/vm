@@ -1608,10 +1608,15 @@ static void gen_func(Obj *fn) {
   fprintf(o, "}\n\n");
 }
 
-// Window page size, matching the runtime (`svm-interp`/`svm-jit` use 4 KiB). Read-only data is
-// laid out on its own page(s) so a `data ro` segment can be protected without touching writable
-// data (protection is page-granular).
-#define DATA_PAGE 4096
+// Read-only data is laid out on its own page(s) so a `data ro` segment can be protected without
+// touching writable data (protection is page-granular). The runtime protects at the *host* MMU
+// granularity (§4 "pin page size" → host-page default: 4 KiB on x86-64, 16 KiB on Apple Silicon,
+// …). Since the frontend emits portable IR and can't know the host page, we pin this isolation
+// boundary to the **largest common host page (16 KiB)**: a multiple of 4 KiB, so on a 4 KiB host
+// it is merely coarser, while on a 16 KiB host the RO region shares no host page with writable
+// data (otherwise the RO protection would over-protect adjacent writable globals → a spurious
+// MemoryFault on the guest's own writes).
+#define DATA_PAGE 16384
 
 // A read-only data global (§3a / D40): a string literal — an anonymous (`.L..`) char array with
 // initializer bytes (this includes `__func__`/`__FUNCTION__`). chibicc tracks no `const`, and
