@@ -263,8 +263,14 @@ impl GuestMem for MprotectWindow {
         0
     }
     /// §3e op 1 `unmap`: decommit the **whole pages** covering `[offset,offset+len)` — any access
-    /// faults, the physical pages are released (`MADV_DONTNEED`), so a re-`map` reads zero. Operates
-    /// on the page range (page-granular `MADV_DONTNEED` needs whole pages) to match `Mem::unmap`.
+    /// faults, and a re-`map` reads zero. Operates on the page range (page-granular work needs whole
+    /// pages) to match `Mem::unmap`.
+    ///
+    /// We **explicitly zero** the range before decommitting: `MADV_DONTNEED` releases the backing on
+    /// Linux (next fault returns a fresh zero page), but on Darwin it is only advisory and leaves the
+    /// old bytes in place — so without the zero the JIT would keep stale contents while the interpreter
+    /// model reads zero, diverging on a 16 KiB host. The explicit zero makes both platforms agree; the
+    /// subsequent `MADV_DONTNEED` is then a pure memory-footprint hint (a no-op for correctness).
     fn unmap(&mut self, offset: u64, len: u64) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
@@ -272,8 +278,11 @@ impl GuestMem for MprotectWindow {
         };
         let start = *pages.start() * self.page;
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
-        // SAFETY: the page range is in the reserved mapping; drop the backing then protect NONE.
+        // SAFETY: the page range is in the reserved mapping; make it RW, zero it, hint the kernel to
+        // drop the backing, then protect NONE so any later access faults.
+        self.hw_protect(start, plen, 2 /* WRITE */);
         unsafe {
+            std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize);
             libc::madvise(
                 self.base.add(start as usize) as *mut c_void,
                 plen as usize,
