@@ -110,6 +110,11 @@ impl Gen {
             FloatTy::F32
         }
     }
+    /// Pick one of the given memory orderings (§12). Callers pass only the orderings valid for the
+    /// op, so the generated module always verifies.
+    fn order_from(&mut self, opts: &[Ordering]) -> Ordering {
+        opts[self.below(opts.len() as u32) as usize]
+    }
     fn i32c(&mut self) -> i32 {
         match self.below(8) {
             0 => 0,
@@ -227,7 +232,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
     let nfuncs = sigs.len();
     let can_call = fi + 1 < nfuncs;
     loop {
-        match bb.g.below(20) {
+        match bb.g.below(24) {
             0 => {
                 let ty = bb.g.inttype();
                 let op = BinOp::from_index(bb.g.below(15) as u8).unwrap();
@@ -490,10 +495,115 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     );
                 }
             }
+            // §12 atomics — naturally-aligned (else they would just trap; aligning exercises the
+            // real atomic path, and in the sparse pass an in-tail aligned address still trap-agrees).
+            // Both backends execute seq-cst, so the `order` is carried but doesn't change results.
+            20 if has_mem => {
+                let ty = bb.g.inttype();
+                let order =
+                    bb.g.order_from(&[Ordering::Relaxed, Ordering::Acquire, Ordering::SeqCst]);
+                let addr = atomic_addr(bb, ty);
+                let offset = aligned_offset(bb, ty);
+                bb.push(
+                    Inst::AtomicLoad {
+                        ty,
+                        addr,
+                        offset,
+                        order,
+                    },
+                    ty.val(),
+                );
+            }
+            21 if has_mem => {
+                let ty = bb.g.inttype();
+                let order =
+                    bb.g.order_from(&[Ordering::Relaxed, Ordering::Release, Ordering::SeqCst]);
+                let addr = atomic_addr(bb, ty);
+                let value = bb.want(ty.val());
+                let offset = aligned_offset(bb, ty);
+                bb.push0(Inst::AtomicStore {
+                    ty,
+                    addr,
+                    value,
+                    offset,
+                    order,
+                });
+            }
+            22 if has_mem => {
+                let ty = bb.g.inttype();
+                let order = bb.g.order_from(&Ordering::ALL);
+                let addr = atomic_addr(bb, ty);
+                let offset = aligned_offset(bb, ty);
+                if bb.g.boolean() {
+                    let op = AtomicRmwOp::from_index(bb.g.below(6) as u8).unwrap();
+                    let value = bb.want(ty.val());
+                    bb.push(
+                        Inst::AtomicRmw {
+                            ty,
+                            op,
+                            addr,
+                            value,
+                            offset,
+                            order,
+                        },
+                        ty.val(),
+                    );
+                } else {
+                    let expected = bb.want(ty.val());
+                    let replacement = bb.want(ty.val());
+                    bb.push(
+                        Inst::AtomicCmpxchg {
+                            ty,
+                            addr,
+                            expected,
+                            replacement,
+                            offset,
+                            order,
+                        },
+                        ty.val(),
+                    );
+                }
+            }
+            23 => {
+                // A standalone fence needs no memory. (Both backends emit a seq-cst barrier.)
+                let order = bb.g.order_from(&Ordering::ALL);
+                bb.push0(Inst::AtomicFence { order });
+            }
             _ => continue, // a mem/call kind that isn't available here — re-roll
         }
         break;
     }
+}
+
+/// An atomic's access width in bytes (its natural alignment).
+fn atomic_w(ty: IntTy) -> u64 {
+    match ty {
+        IntTy::I32 => 4,
+        IntTy::I64 => 8,
+    }
+}
+
+/// Generate a `ty`-aligned i64 address: take an arbitrary value and clear its low alignment bits.
+/// (Confinement masks into a power-of-two window ≥ the width, which preserves the low bits, so the
+/// effective address stays aligned and the atomic takes its real — non-trapping — path when mapped.)
+fn atomic_addr(bb: &mut BB, ty: IntTy) -> ValIdx {
+    let width = atomic_w(ty) as i64;
+    let raw = bb.want(ValType::I64);
+    let maskc = bb.push(Inst::ConstI64(!(width - 1)), ValType::I64);
+    bb.push(
+        Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::And,
+            a: raw,
+            b: maskc,
+        },
+        ValType::I64,
+    )
+}
+
+/// A width-aligned `offset` immediate, so `addr + offset` stays naturally aligned.
+fn aligned_offset(bb: &mut BB, ty: IntTy) -> u64 {
+    (bb.g.below(16) as u64) * atomic_w(ty)
 }
 
 fn gen_term(

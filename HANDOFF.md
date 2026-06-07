@@ -838,10 +838,12 @@ leave a shared view — add a unix test for this alongside the Windows work.
   a software `guard_atomic_align` before the hardware atomic, so it's portable, not the guard page).
   Differentially tested in `jit_diff` (rmw ×6 × i32/i64, cmpxchg hit/miss, atomic↔plain aliasing,
   unaligned-traps-both; non-vacuous — corrupting the JIT rmw map fails it) + a parse/print/encode/
-  decode round-trip in `pipeline`. **Still to come (§12):** the actual *ordering* (only checkable
-  once threads exist — single-threaded the value semantics equal the non-atomic op), narrow widths
-  (8/16/32), fibers/vCPUs/M:N scheduling, real threads + the C11 memory model. The atomics are not
-  yet emitted by the `irgen` fuzzer or the chibicc frontend (focused tests cover them).
+  decode round-trip in `pipeline`. **Still to come (§12):** narrow widths
+  (8/16/32), fibers/vCPUs/M:N scheduling. The atomics (with orderings) + `atomic.fence` **are now
+  emitted by the `irgen` differential fuzzer** — naturally-aligned addresses so they exercise the real
+  atomic path, generated across the interp↔JIT differential (4000 modules) + the escape-oracle, with a
+  coverage guard asserting they appear; still not emitted by the chibicc frontend (focused tests cover
+  that).
   **Parallel threads — Phase 1 DONE (shared-memory substrate + real interp atomics):** new escape-TCB
   crate **`svm-mem`** owns the guest anonymous-page backing as a `Region` — on unix one demand-zeroed,
   page-aligned anonymous `mmap` of the window's *reserved* extent (the shareable substrate multi-vCPU
