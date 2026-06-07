@@ -11,16 +11,33 @@
 //! reference oracle. So all the `unsafe` lives *here*, behind a safe API, and is audited/fuzzed in
 //! isolation — exactly the role [`svm_mask`] plays for masking.
 //!
+//! ## Sharing across vCPUs
+//!
+//! A `Region` is [`Send`] + [`Sync`]: several vCPU threads hold `&Region` and run over the *one*
+//! guest memory image — that shared image is what makes them threads of one guest rather than
+//! isolated programs. Every accessor therefore takes `&self`. `Region` itself adds **no** locking or
+//! ordering policy beyond what each op needs to be language-level sound; the concurrency *semantics*
+//! (the memory model, scheduling, `wait`/`notify`) live above it. What each op guarantees:
+//! - **atomic ops** (`atomic_*`) — real seq-cst hardware atomics; the sound primitive for concurrent
+//!   access to a *shared* location.
+//! - **single-byte plain ops** (`byte`/`set_byte`) — relaxed atomics, so even a same-byte race is
+//!   *defined* (no UB), just unordered (the guest's responsibility, per the §12 C11-style model).
+//! - **bulk ops** (`zero`/`read_into`) — control-plane (`map`/`unmap`/snapshot); they assume no
+//!   concurrent access to *their own range*, which holds for steady-state guest execution.
+//!
+//! Beyond that, a guest data race corrupts only the guest's own confined memory and can never escape
+//! the window (§12) — masking + bounds still gate every access.
+//!
 //! Two backings:
 //! - **`Mapped`** (unix): one anonymous `mmap` of the reserved size (lazy: pages cost nothing until
 //!   touched, then the kernel zero-fills). Page-aligned, so **real** `AtomicU32`/`AtomicU64` ops
 //!   (the §12 hardware atomics the JIT already emits) are sound on it. The substrate parallel
 //!   execution runs on.
-//! - **`Paged`** (non-unix, or a reservation too large to `mmap`): a `BTreeMap` of zeroed pages.
-//!   Single-threaded-only — `Vec<u8>` pages aren't width-aligned, so its "atomics" are plain
-//!   value-correct ops, identical to the non-atomic op under a single thread.
+//! - **`Paged`** (non-unix, or a reservation too large to `mmap`): a `BTreeMap` of zeroed pages
+//!   behind a `Mutex`. Correct but serialized — the portable fallback, not the parallel substrate.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 /// The six read-modify-write operations (§12), mirrored from `svm_ir::AtomicRmwOp` without taking a
 /// dependency on the IR crate (this crate sits below it). Each returns the **old** value.
@@ -34,12 +51,13 @@ pub enum RmwOp {
     Xchg,
 }
 
-/// A guest window's anonymous-page backing store. See the crate docs for the two variants.
+/// A guest window's anonymous-page backing store. See the crate docs for the two variants and the
+/// sharing contract. All accessors take `&self`: a `Region` is shared by reference across vCPUs.
 pub enum Region {
     /// Unix: one demand-zeroed anonymous `mmap` of `[0, len)` (page-rounded). Real atomics.
     #[cfg(unix)]
     Mapped(Mapped),
-    /// Portable fallback: zeroed pages in a map. Single-threaded; "atomics" are plain ops.
+    /// Portable fallback: zeroed pages in a `Mutex`-guarded map (serialized, not the parallel path).
     Paged(Paged),
 }
 
@@ -88,7 +106,7 @@ impl Region {
     }
 
     /// Write one byte. Out-of-range writes are dropped (the caller confines first).
-    pub fn set_byte(&mut self, off: u64, b: u8) {
+    pub fn set_byte(&self, off: u64, b: u8) {
         if off >= self.len() {
             return;
         }
@@ -100,8 +118,8 @@ impl Region {
     }
 
     /// Reset `[off, off+len)` to zero (the `map`/`unmap` "fresh page" semantics). Range is clamped
-    /// to `[0, size)`.
-    pub fn zero(&mut self, off: u64, len: u64) {
+    /// to `[0, size)`. Control-plane: assumes no concurrent access to the range.
+    pub fn zero(&self, off: u64, len: u64) {
         let len = clamp_len(off, len, self.len());
         if len == 0 {
             return;
@@ -120,11 +138,7 @@ impl Region {
         match self {
             #[cfg(unix)]
             Region::Mapped(m) => m.read_into(off, out),
-            Region::Paged(p) => {
-                for (k, slot) in out.iter_mut().enumerate() {
-                    *slot = p.byte(off + k as u64);
-                }
-            }
+            Region::Paged(p) => p.read_into(off, out),
         }
     }
 
@@ -134,42 +148,41 @@ impl Region {
         match self {
             #[cfg(unix)]
             Region::Mapped(m) => m.atomic_load(off, width),
-            Region::Paged(p) => p.plain_load(off, width),
+            Region::Paged(p) => p.atomic_load(off, width),
         }
     }
 
     /// `width`-byte seq-cst atomic store.
-    pub fn atomic_store(&mut self, off: u64, width: u32, val: u64) {
+    pub fn atomic_store(&self, off: u64, width: u32, val: u64) {
         match self {
             #[cfg(unix)]
             Region::Mapped(m) => m.atomic_store(off, width, val),
-            Region::Paged(p) => p.plain_store(off, width, val),
+            Region::Paged(p) => p.atomic_store(off, width, val),
         }
     }
 
     /// `width`-byte seq-cst read-modify-write; returns the **old** value.
-    pub fn atomic_rmw(&mut self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
+    pub fn atomic_rmw(&self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
         match self {
             #[cfg(unix)]
             Region::Mapped(m) => m.atomic_rmw(off, width, op, val),
-            Region::Paged(p) => p.plain_rmw(off, width, op, val),
+            Region::Paged(p) => p.atomic_rmw(off, width, op, val),
         }
     }
 
     /// `width`-byte seq-cst compare-exchange: store `replacement` iff the current value equals
     /// `expected`; always return the **old** value.
-    pub fn atomic_cmpxchg(&mut self, off: u64, width: u32, expected: u64, replacement: u64) -> u64 {
+    pub fn atomic_cmpxchg(&self, off: u64, width: u32, expected: u64, replacement: u64) -> u64 {
         match self {
             #[cfg(unix)]
             Region::Mapped(m) => m.atomic_cmpxchg(off, width, expected, replacement),
-            Region::Paged(p) => p.plain_cmpxchg(off, width, expected, replacement),
+            Region::Paged(p) => p.atomic_cmpxchg(off, width, expected, replacement),
         }
     }
 }
 
-/// Apply an [`RmwOp`] to `(old, v)` truncated to `width` bytes — the value math shared by both
-/// backings (the `Mapped` path uses it only for `Paged`-parity in tests; live `Mapped` RMWs use the
-/// hardware `fetch_*`).
+/// Apply an [`RmwOp`] to `(old, v)` truncated to `width` bytes — the value math the `Paged` backing
+/// uses (the `Mapped` path uses the hardware `fetch_*` instead).
 fn rmw_apply(op: RmwOp, old: u64, v: u64, width: u32) -> u64 {
     let m = width_mask(width);
     let r = match op {
@@ -208,7 +221,10 @@ pub use mapped::Mapped;
 #[cfg(unix)]
 mod mapped {
     use super::RmwOp;
-    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+    use core::sync::atomic::{
+        AtomicU32, AtomicU64, AtomicU8,
+        Ordering::{Relaxed, SeqCst},
+    };
 
     /// One anonymous `mmap` of `[0, size)` (rounded up to `map_len`). The base is page-aligned, so
     /// any naturally-aligned 4/8-byte access is hardware-atomic-able.
@@ -217,6 +233,19 @@ mod mapped {
         pub(super) size: u64,
         map_len: usize,
     }
+
+    // SAFETY: `Mapped` is the only non-`Send`/`Sync`-by-default piece of `Region` (it holds a raw
+    // `*mut u8`). Sharing it across vCPU threads is sound under the contract documented on the crate:
+    //   * the mmap is a process-wide reservation owned by this value (freed once on `Drop`), so
+    //     moving it between threads (`Send`) transfers nothing thread-local;
+    //   * concurrent access through `&Mapped` (`Sync`) is either a real hardware atomic (`atomic_*`,
+    //     seq-cst) or a relaxed-atomic single byte (`byte`/`set_byte`) — both *defined* under races,
+    //     never UB. Bulk `zero`/`read_into` are control-plane and not raced against live access.
+    // Every offset is bounds-checked by `Region` before reaching here, and masking (§4) confines the
+    // address upstream, so no access can leave `[0, size)` — a guest race can corrupt only the
+    // guest's own memory, never escape the window (§12).
+    unsafe impl Send for Mapped {}
+    unsafe impl Sync for Mapped {}
 
     impl Mapped {
         pub(super) fn new(size: u64, page: u64) -> Option<Mapped> {
@@ -252,17 +281,19 @@ mod mapped {
         }
 
         pub(super) fn byte(&self, off: u64) -> u8 {
-            // SAFETY: `off < size`; the page is mapped RW (lazily zero-filled on first touch).
-            unsafe { self.ptr(off).read() }
+            // Relaxed atomic so a concurrent same-byte write is defined, not UB. On x86 this is a
+            // plain `mov`. SAFETY: `off < size`; a `*mut u8` is trivially 1-aligned for `AtomicU8`.
+            unsafe { AtomicU8::from_ptr(self.ptr(off)).load(Relaxed) }
         }
 
-        pub(super) fn set_byte(&mut self, off: u64, b: u8) {
-            // SAFETY: as `byte`; `&mut self` rules out concurrent access this turn.
-            unsafe { self.ptr(off).write(b) }
+        pub(super) fn set_byte(&self, off: u64, b: u8) {
+            // SAFETY: as `byte`.
+            unsafe { AtomicU8::from_ptr(self.ptr(off)).store(b, Relaxed) }
         }
 
-        pub(super) fn zero(&mut self, off: u64, len: u64) {
-            // SAFETY: `[off, off+len)` is within `[0, size)` (clamped by the caller).
+        pub(super) fn zero(&self, off: u64, len: u64) {
+            // SAFETY: `[off, off+len)` is within `[0, size)` (clamped by the caller). Control-plane:
+            // not concurrent with live access to the range.
             unsafe { core::ptr::write_bytes(self.ptr(off), 0, len as usize) }
         }
 
@@ -289,7 +320,7 @@ mod mapped {
             }
         }
 
-        pub(super) fn atomic_store(&mut self, off: u64, width: u32, val: u64) {
+        pub(super) fn atomic_store(&self, off: u64, width: u32, val: u64) {
             // SAFETY: aligned + in-bounds as in `atomic_load`.
             unsafe {
                 match width {
@@ -299,7 +330,7 @@ mod mapped {
             }
         }
 
-        pub(super) fn atomic_rmw(&mut self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
+        pub(super) fn atomic_rmw(&self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
             // SAFETY: aligned + in-bounds as in `atomic_load`.
             unsafe {
                 match width {
@@ -332,7 +363,7 @@ mod mapped {
         }
 
         pub(super) fn atomic_cmpxchg(
-            &mut self,
+            &self,
             off: u64,
             width: u32,
             expected: u64,
@@ -344,12 +375,8 @@ mod mapped {
                 match width {
                     4 => {
                         let a = AtomicU32::from_ptr(self.ptr(off) as *mut u32);
-                        match a.compare_exchange(
-                            expected as u32,
-                            replacement as u32,
-                            SeqCst,
-                            SeqCst,
-                        ) {
+                        match a.compare_exchange(expected as u32, replacement as u32, SeqCst, SeqCst)
+                        {
                             Ok(old) | Err(old) => old as u64,
                         }
                     }
@@ -378,16 +405,15 @@ mod mapped {
     }
 }
 
-// ========================= portable fallback: paged, single-threaded =========================
+// ========================= portable fallback: paged, Mutex-serialized =========================
 
-/// The portable backing: zeroed `page`-sized chunks in a `BTreeMap`, committed on first write. Used
-/// on non-unix targets and for reservations too large to `mmap`. Single-threaded only — its pages
-/// aren't width-aligned, so its "atomics" are plain value-correct ops (equal to the non-atomic op
-/// under one thread; the JIT/`Mapped` path provides true atomicity once threads exist).
+/// The portable backing: zeroed `page`-sized chunks in a `BTreeMap`, committed on first write, all
+/// behind a `Mutex`. Used on non-unix targets and for reservations too large to `mmap`. Correct
+/// under sharing but fully serialized — the fallback, not the parallel substrate (which is `Mapped`).
 pub struct Paged {
     size: u64,
     page: u64,
-    pages: BTreeMap<u64, Vec<u8>>,
+    pages: Mutex<BTreeMap<u64, Vec<u8>>>,
 }
 
 impl Paged {
@@ -395,69 +421,107 @@ impl Paged {
         Paged {
             size,
             page: page.max(1),
-            pages: BTreeMap::new(),
+            pages: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Lock the page map, recovering from a poisoned lock (our ops never panic while holding it, so
+    /// the data is always consistent) rather than propagating the panic.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Vec<u8>>> {
+        self.pages.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn byte(&self, off: u64) -> u8 {
         let idx = (off % self.page) as usize;
-        self.pages.get(&(off / self.page)).map_or(0, |p| p[idx])
+        self.lock().get(&(off / self.page)).map_or(0, |p| p[idx])
     }
 
-    fn set_byte(&mut self, off: u64, b: u8) {
-        let idx = (off % self.page) as usize;
+    fn set_byte(&self, off: u64, b: u8) {
         let page = self.page as usize;
-        self.pages
-            .entry(off / self.page)
-            .or_insert_with(|| vec![0u8; page])[idx] = b;
+        let idx = (off % self.page) as usize;
+        let key = off / self.page;
+        self.lock().entry(key).or_insert_with(|| vec![0u8; page])[idx] = b;
     }
 
-    fn zero(&mut self, off: u64, len: u64) {
+    fn zero(&self, off: u64, len: u64) {
+        let mut map = self.lock();
         // Whole pages of the range are dropped (an absent page reads zero); partial edges are
         // overwritten byte-wise.
         let mut o = off;
         let end = off + len;
+        let page_sz = self.page as usize;
         while o < end {
-            let page = o / self.page;
-            let page_start = page * self.page;
+            let key = o / self.page;
+            let page_start = key * self.page;
             let page_end = page_start + self.page;
             if o == page_start && end >= page_end {
-                self.pages.remove(&page);
+                map.remove(&key);
                 o = page_end;
             } else {
                 let stop = end.min(page_end);
+                let p = map.entry(key).or_insert_with(|| vec![0u8; page_sz]);
                 for b in o..stop {
-                    self.set_byte(b, 0);
+                    p[(b % self.page) as usize] = 0;
                 }
                 o = stop;
             }
         }
     }
 
-    fn plain_load(&self, off: u64, width: u32) -> u64 {
+    fn read_into(&self, off: u64, out: &mut [u8]) {
+        let map = self.lock();
+        for (k, slot) in out.iter_mut().enumerate() {
+            let o = off + k as u64;
+            if o >= self.size {
+                break;
+            }
+            let idx = (o % self.page) as usize;
+            *slot = map.get(&(o / self.page)).map_or(0, |p| p[idx]);
+        }
+    }
+
+    // The atomic ops hold the lock across the whole read-modify-write, so they are atomic with
+    // respect to one another (true atomicity vs. other backings comes from `Mapped`).
+    fn load_locked(map: &BTreeMap<u64, Vec<u8>>, page: u64, off: u64, width: u32) -> u64 {
         let mut raw = 0u64;
         for k in 0..width as u64 {
-            raw |= (self.byte(off + k) as u64) << (8 * k);
+            let o = off + k;
+            let idx = (o % page) as usize;
+            let b = map.get(&(o / page)).map_or(0, |p| p[idx]);
+            raw |= (b as u64) << (8 * k);
         }
         raw
     }
 
-    fn plain_store(&mut self, off: u64, width: u32, val: u64) {
+    fn store_locked(map: &mut BTreeMap<u64, Vec<u8>>, page: u64, off: u64, width: u32, val: u64) {
+        let page_sz = page as usize;
         for k in 0..width as u64 {
-            self.set_byte(off + k, (val >> (8 * k)) as u8);
+            let o = off + k;
+            let idx = (o % page) as usize;
+            map.entry(o / page).or_insert_with(|| vec![0u8; page_sz])[idx] = (val >> (8 * k)) as u8;
         }
     }
 
-    fn plain_rmw(&mut self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
-        let old = self.plain_load(off, width);
-        self.plain_store(off, width, rmw_apply(op, old, val, width));
+    fn atomic_load(&self, off: u64, width: u32) -> u64 {
+        Self::load_locked(&self.lock(), self.page, off, width)
+    }
+
+    fn atomic_store(&self, off: u64, width: u32, val: u64) {
+        Self::store_locked(&mut self.lock(), self.page, off, width, val);
+    }
+
+    fn atomic_rmw(&self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
+        let mut map = self.lock();
+        let old = Self::load_locked(&map, self.page, off, width);
+        Self::store_locked(&mut map, self.page, off, width, rmw_apply(op, old, val, width));
         old
     }
 
-    fn plain_cmpxchg(&mut self, off: u64, width: u32, expected: u64, replacement: u64) -> u64 {
-        let old = self.plain_load(off, width);
+    fn atomic_cmpxchg(&self, off: u64, width: u32, expected: u64, replacement: u64) -> u64 {
+        let mut map = self.lock();
+        let old = Self::load_locked(&map, self.page, off, width);
         if old == (expected & width_mask(width)) {
-            self.plain_store(off, width, replacement);
+            Self::store_locked(&mut map, self.page, off, width, replacement);
         }
         old
     }
@@ -474,7 +538,7 @@ mod tests {
 
     #[test]
     fn byte_rw_and_zero_default() {
-        each_region(1 << 16, 4096, |mut r| {
+        each_region(1 << 16, 4096, |r| {
             assert_eq!(r.byte(10), 0);
             r.set_byte(10, 0xAB);
             assert_eq!(r.byte(10), 0xAB);
@@ -485,14 +549,14 @@ mod tests {
 
     #[test]
     fn out_of_range_is_inert() {
-        let mut r = Region::new(4096, 4096);
+        let r = Region::new(4096, 4096);
         r.set_byte(1 << 20, 1); // ignored
         assert_eq!(r.byte(1 << 20), 0);
     }
 
     #[test]
     fn atomics_value_semantics() {
-        each_region(1 << 16, 4096, |mut r| {
+        each_region(1 << 16, 4096, |r| {
             r.atomic_store(8, 8, 0x1122_3344_5566_7788);
             assert_eq!(r.atomic_load(8, 8), 0x1122_3344_5566_7788);
             assert_eq!(r.atomic_rmw(8, 8, RmwOp::Add, 1), 0x1122_3344_5566_7788);
@@ -514,12 +578,63 @@ mod tests {
 
     #[test]
     fn read_into_spans_pages() {
-        each_region(1 << 16, 4096, |mut r| {
+        each_region(1 << 16, 4096, |r| {
             r.set_byte(4095, 1);
             r.set_byte(4096, 2);
             let mut out = [0u8; 4];
             r.read_into(4094, &mut out);
             assert_eq!(out, [0, 1, 2, 0]);
         });
+    }
+
+    #[test]
+    fn region_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Region>();
+    }
+
+    /// The headline Phase-2 capability: many OS threads sharing `&Region` and racing on one atomic
+    /// counter still land on the exact total — i.e. the atomic RMWs are genuinely atomic across
+    /// threads over the shared substrate, not just value-correct single-threaded.
+    #[test]
+    fn shared_atomic_counter_across_threads() {
+        const THREADS: u64 = 8;
+        const ITERS: u64 = 20_000;
+        let r = Region::new(1 << 16, 4096);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    for _ in 0..ITERS {
+                        r.atomic_rmw(0, 8, RmwOp::Add, 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(r.atomic_load(0, 8), THREADS * ITERS);
+    }
+
+    /// Non-atomic sharing too: threads writing *disjoint* byte ranges through one `&Region` all land
+    /// (no data race — distinct addresses), proving the shared image is one backing, not per-thread.
+    #[test]
+    fn shared_disjoint_plain_writes() {
+        const THREADS: u64 = 8;
+        const SPAN: u64 = 1024;
+        let r = Region::new(1 << 16, 4096);
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let r = &r;
+                s.spawn(move || {
+                    let v = (t as u8).wrapping_add(1);
+                    for i in 0..SPAN {
+                        r.set_byte(t * SPAN + i, v);
+                    }
+                });
+            }
+        });
+        for t in 0..THREADS {
+            let v = (t as u8).wrapping_add(1);
+            assert_eq!(r.byte(t * SPAN), v);
+            assert_eq!(r.byte(t * SPAN + SPAN - 1), v);
+        }
     }
 }

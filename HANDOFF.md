@@ -854,8 +854,21 @@ leave a shared view — add a unix test for this alongside the Windows work.
   path). **Behaviour-preserving** (the 46 `jit_diff` differential cases, 7 escape-oracle snapshots,
   §13 `shared_region`, and the C-frontend suite all unchanged; clippy `-D warnings` + windows-gnu
   green). Single-threaded the atomic *values* are identical; the win is the substrate + genuine atomic
-  instructions, ready for **Phase 2** (vCPUs = OS threads over a shared `Region`, a runtime scheduler,
-  `wait`/`notify`, and the `Send`/`Sync` + concurrency-soundness story).
+  instructions, ready for **Phase 2**.
+  **Parallel threads — Phase 2 step 1 DONE (`Region` is soundly shareable):** the substrate is now
+  `Send + Sync`, so multiple OS-thread vCPUs can hold `&Region` and run over the *one* guest memory
+  image. Every accessor takes `&self`; the `unsafe impl Send/Sync` sits on `Mapped` (the only
+  raw-pointer holder) with a documented contract — `atomic_*` are real seq-cst hardware atomics
+  (the sound shared primitive); single-byte `byte`/`set_byte` use **relaxed atomics** so even a
+  same-byte race is *defined*, not UB (a plain `mov` on x86); bulk `zero`/`read_into` are control-plane
+  (map/unmap/snapshot, not raced against live access). The `Paged` fallback moved behind a `Mutex`
+  (correct-but-serialized; not the parallel path). **Validated under ThreadSanitizer** (`-Zsanitizer=
+  thread`): the headline test — 8 threads × 20 000 `fetch_add` on one shared counter landing on the
+  exact total — plus a disjoint-plain-write test report **zero data races**. `Region` adds no
+  ordering/scheduling policy; that lives above it. **Phase 2 still to come:** vCPU = OS-thread spawn +
+  per-thread/shared state split, fibers→real-threads scheduler (M:N), `wait`/`notify`, the
+  memory-ordering parameter on the atomic IR ops + fences (today all seq-cst), and the
+  differential-oracle-under-nondeterminism story.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a
