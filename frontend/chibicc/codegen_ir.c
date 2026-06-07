@@ -776,6 +776,55 @@ static int gen_builtin_page_size(Node *node) {
   return r;
 }
 
+// §12 fiber builtins (stack switching). A fiber is a first-class suspendable computation
+// whose continuation is its own call stack (DESIGN §6/§12). Real C reaches them through
+// three intercepted calls (declared, never defined — like the stdio builtins):
+//
+//   int  __vm_fiber_new(fiber_fn f, void *stack);  // f : long(*)(long); -> handle
+//   long __vm_fiber_resume(int k, long arg, int *done);  // -> yielded/returned value
+//   long __vm_fiber_suspend(long value);                 // -> next resume's arg
+//
+// The fiber body is an ordinary C function `long f(long)`, which lowers to the IR entry
+// signature `(i64 sp, i64 arg) -> (i64)` — `cont.new` records the funcref plus the
+// caller-provided data-stack base (a fiber owns its own data stack, §3d), so the guest
+// allocates each fiber a distinct stack (e.g. `malloc`). The first resume calls
+// `f(stack, arg)`; later resumes deliver `arg` as the result of the body's `suspend`.
+static int gen_builtin_fiber_new(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_fiber_new(fn, stack) expects 2 arguments");
+  int fnv = gen_expr(a);             // function pointer: i64 funcref (zero-extended)
+  int sp = widen_i64(gen_expr(a->next), a->next->ty); // data-stack base (i64)
+  int fn32 = nv++;
+  fprintf(o, "  v%d = i32.wrap_i64 v%d\n", fn32, fnv); // cont.new wants the i32 funcref
+  int r = nv++;
+  fprintf(o, "  v%d = cont.new v%d v%d\n", r, fn32, sp);
+  return r; // i32 fiber handle
+}
+
+static int gen_builtin_fiber_resume(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || a->next->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_fiber_resume(k, arg, done) expects 3 arguments");
+  int k = gen_expr(a);                                   // handle (i32)
+  int arg = widen_i64(gen_expr(a->next), a->next->ty);   // resume value (i64)
+  int done = gen_expr(a->next->next);                    // int* — where to store the status
+  int status = nv++;
+  int value = nv++;
+  fprintf(o, "  v%d, v%d = cont.resume v%d v%d\n", status, value, k, arg);
+  fprintf(o, "  i32.store v%d v%d\n", done, status); // *done = 0 suspended / 1 returned
+  return value;                                       // the yielded/returned i64
+}
+
+static int gen_builtin_fiber_suspend(Node *node) {
+  if (!node->args || node->args->next)
+    error_tok(node->tok, "codegen_ir: __vm_fiber_suspend(value) expects 1 argument");
+  int v = widen_i64(gen_expr(node->args), node->args->ty);
+  int r = nv++;
+  fprintf(o, "  v%d = suspend v%d\n", r, v);
+  return r; // the next resume's arg
+}
+
 static int gen_expr(Node *node) {
   switch (node->kind) {
   case ND_NUM: {
@@ -895,6 +944,12 @@ static int gen_expr(Node *node) {
           return gen_builtin_memory(node, 2, 3);
         if (!strcmp(fname, "__vm_page_size"))
           return gen_builtin_page_size(node);
+        if (!strcmp(fname, "__vm_fiber_new"))
+          return gen_builtin_fiber_new(node);
+        if (!strcmp(fname, "__vm_fiber_resume"))
+          return gen_builtin_fiber_resume(node);
+        if (!strcmp(fname, "__vm_fiber_suspend"))
+          return gen_builtin_fiber_suspend(node);
       }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the

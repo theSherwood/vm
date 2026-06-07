@@ -744,17 +744,18 @@ fn jit_bails_unsupported_on_fiber_ops() {
         "func () -> (i64) {\n\
          block0():\n\
          \x20 v0 = ref.func 1\n\
-         \x20 v1 = cont.new v0\n\
-         \x20 v2 = i64.const 0\n\
-         \x20 v3, v4 = cont.resume v1 v2\n\
-         \x20 return v4\n\
+         \x20 v1 = i64.const 4096\n\
+         \x20 v2 = cont.new v0 v1\n\
+         \x20 v3 = i64.const 0\n\
+         \x20 v4, v5 = cont.resume v2 v3\n\
+         \x20 return v5\n\
          }\n\
-         func (i64) -> (i64) {\nblock0(v0: i64):\n  return v0\n}\n",
+         func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n  return v1\n}\n",
         // suspend
-        "func (i64) -> (i64) {\n\
-         block0(v0: i64):\n\
-         \x20 v1 = suspend v0\n\
-         \x20 return v1\n\
+        "func (i64, i64) -> (i64) {\n\
+         block0(v0: i64, v1: i64):\n\
+         \x20 v2 = suspend v1\n\
+         \x20 return v2\n\
          }\n",
     ];
     for src in srcs {

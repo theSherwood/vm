@@ -413,8 +413,9 @@ fn check_inst(
         // §12 fibers. `cont.new` takes an i32 funcref, yields an i32 handle; `suspend`
         // takes an i64, yields the i64 of the next resume. (`cont.resume` is multi-result
         // and handled in the main loop.)
-        Inst::ContNew { func } => {
+        Inst::ContNew { func, sp } => {
             cx.expect(*func, ValType::I32)?;
+            cx.expect(*sp, ValType::I64)?; // the fiber's data-stack base
             ValType::I32
         }
         Inst::Suspend { value } => {

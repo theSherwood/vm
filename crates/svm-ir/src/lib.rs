@@ -961,14 +961,18 @@ pub enum Inst {
         args: Vec<ValIdx>,
     },
     /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
-    /// function referenced by `func` — an `i32` funcref, resolved through the function
-    /// table with signature `(i64) -> i64` at first resume (a bad ref traps there, like
-    /// [`Inst::CallIndirect`]). Yields an `i32` **fiber handle**: a forgeable index into
-    /// the runtime-owned fiber table, masked + generation-checked at use like a capability
-    /// handle (§3c), so a forged handle is inert (it traps or selects one of this domain's
-    /// own fibers, never host state). The fiber does not run yet.
+    /// function referenced by `func` on the data stack based at `sp`. `func` is an `i32`
+    /// funcref, resolved through the function table with signature `(i64 sp, i64 arg) ->
+    /// i64` at first resume (a bad ref traps there, like [`Inst::CallIndirect`]); `sp`
+    /// (`i64`) is the fiber's own data-stack base — a fiber owns a **stack pair** (§3d): its
+    /// in-window data stack (based here) plus the out-of-band control stack the runtime
+    /// allocates. Yields an `i32` **fiber handle**: a forgeable index into the runtime-owned
+    /// fiber table, masked + generation-checked at use like a capability handle (§3c), so a
+    /// forged handle is inert (it traps or selects one of this domain's own fibers, never
+    /// host state). The fiber does not run yet; the first resume calls `func(sp, arg)`.
     ContNew {
         func: ValIdx,
+        sp: ValIdx,
     },
     /// §12 fiber resume (`cont.resume`): switch to fiber `k` (an `i32` handle), delivering
     /// `arg` (`i64`) — the argument to the fiber's function on the first resume, or the

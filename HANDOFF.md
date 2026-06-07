@@ -4,12 +4,16 @@ Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
-**Latest (2026-06-07):** §12 **fibers — step 2** landed: the stack-switch IR ops
-(`cont.new`/`cont.resume`/`suspend`, opcodes `0xCA..=0xCC`) now exist across IR/text/binary/verify
-with a **real reference-interpreter** implementation (asymmetric stackful coroutines: a fiber's
-continuation *is* its reified `Vec<Frame>`, switched via a fiber table + resume chain in `run_func`;
-forgeable i32 handles, masked + inert on forge → `Trap::FiberFault`). JIT cleanly bails `Unsupported`
-(the machine switch is step 4). See the §12 fibers entry under Phase 4 for the full design. Before
+**Latest (2026-06-07):** §12 **fibers now reach real C**. The stack-switch IR ops
+(`cont.new(funcref, sp)`/`cont.resume`/`suspend`, opcodes `0xCA..=0xCC`) exist across
+IR/text/binary/verify with a **real reference-interpreter** implementation (asymmetric stackful
+coroutines: a fiber's continuation *is* its reified `Vec<Frame>`, switched via a fiber table + resume
+chain in `run_func`; forgeable i32 handles, masked + inert on forge → `Trap::FiberFault`; each fiber
+owns its data stack via the `sp` operand, §3d two-stack split). chibicc lowers
+`__vm_fiber_new`/`__vm_fiber_resume`/`__vm_fiber_suspend` builtins to them, so ordinary C
+(`long f(long)` bodies) creates/resumes/suspends fibers and runs on the interpreter (interp-only — the
+JIT bails `Unsupported`; the machine switch is step 4). Hardened by `fiber_fuzz.rs` (structured: never
+panics, deterministic). See the §12 fibers entry under Phase 4 for the full design. Before
 that: §13 `SharedRegion` aliasing is now wired on **Windows** (issue #1,
 PR #2, merged) — `MapViewOfFile3` over a `VirtualAlloc2` placeholder reservation — so the
 feature is complete on all three OS legs (Linux/macOS/Windows), green on `windows-latest` CI.
@@ -853,31 +857,44 @@ leave a shared view — add a unix test for this alongside the Windows work.
   reference interpreter** — but **no JIT** (the machine-level switch is step 4, so the JIT cleanly
   *bails* `Unsupported`; `jit_bails_unsupported_on_fiber_ops` asserts this, and the differential
   harness skips fiber modules). Model: a fiber is a first-class suspendable computation whose
-  continuation **is** its `Vec<Frame>`; `cont.new(funcref)` makes a `Pending` fiber (started lazily,
-  the funcref resolved through the table as `(i64) -> (i64)` at first resume, like `call_indirect`),
-  `cont.resume(k, arg)` switches into it (delivering `arg`), `suspend(value)` switches back out
-  (yielding `value`, `status` 0=suspended / 1=returned). The `run_func` driver now holds a **fiber
-  table** + a **resume chain** (root = `fibers[0]`; the running fiber's frames live in a local `frames`,
-  its slot held `Running`); the single-stack/no-fiber path is byte-identical to step 1 (same depth
-  bound, now summed across the chain). A fiber **handle is a forgeable i32**, masked into the table +
-  chain/state-checked at resume so a forged/dead/in-chain handle is **inert** (`Trap::FiberFault`,
-  new) — never an escape; `MAX_FIBERS` bounds a fiber-bomb. Tests in `pipeline.rs`
-  (`fiber_*`: value-threading, a generator loop, a 3-level nested resume chain, resume-after-return
-  traps, suspend-at-root traps, forged-handle inert) + parse/print/encode/decode round-trip; whole
-  suite + clippy green. **Still to come:** the *host scheduler* sugar (a deterministic cooperative
-  driver multiplexing N fibers — the primitive is in place, this is policy on top) and the JIT switch.
+  continuation **is** its `Vec<Frame>`; **`cont.new(funcref, sp)`** makes a `Pending` fiber (started
+  lazily; the funcref resolved through the table as **`(i64 sp, i64 arg) -> (i64)`** at first resume,
+  like `call_indirect`), where `sp` is the fiber's **own data-stack base** — a fiber owns a *stack
+  pair* (§3d): its in-window data stack plus the out-of-band control stack (the `Vec<Frame>`). The
+  guest allocates each fiber a distinct data stack (e.g. `malloc`/a static buffer). `cont.resume(k,
+  arg)` switches in (first entry calls `func(sp, arg)`; later resumes deliver `arg` as the body's
+  `suspend` result), `suspend(value)` switches back out (yielding `value`, `status` 0=suspended /
+  1=returned). The `run_func` driver holds a **fiber table** + a **resume chain** (root = `fibers[0]`;
+  the running fiber's frames live in a local `frames`, its slot held `Running`); the single-stack/no-
+  fiber path is byte-identical to step 1 (same depth bound, now summed across the chain). A fiber
+  **handle is a forgeable i32**, masked into the table + chain/state-checked at resume so a
+  forged/dead/in-chain handle is **inert** (`Trap::FiberFault`, new) — never an escape; `MAX_FIBERS`
+  bounds a fiber-bomb. Tested at three levels: focused interp tests in `pipeline.rs` (`fiber_*`:
+  value-threading, generator loop, 3-level nested resume chain, resume-after-return / suspend-at-root /
+  forged-handle all trap) + round-trip; a **structured robustness fuzzer** (`fiber_fuzz.rs`: random
+  multi-function fiber programs never panic the interp + are deterministic); and **real C** (below).
+  **Fibers — step 6 (partial) DONE: real C reaches fibers.** chibicc (`codegen_ir.c`) now intercepts
+  three builtins — `int __vm_fiber_new(long(*)(long), void *stack)`, `long __vm_fiber_resume(int k,
+  long arg, int *done)`, `long __vm_fiber_suspend(long value)` — lowering them to `cont.new` (funcptr
+  wrapped to the i32 funcref + the guest stack), `cont.resume` (status stored through `done`, value
+  returned), and `suspend`. A fiber body is an ordinary `long f(long)` (IR `(i64 sp, i64 arg)->(i64)`
+  by the existing data-SP ABI — *that's why the entry sig carries `sp`*). Interp-only C tests in
+  `c_frontend.rs` (`c_fiber_*`: a generator, two-way resume-arg round-trip, two independent fibers on
+  distinct stacks interleaving without clobbering — the data-stack-per-fiber property) via a new
+  `run_c_interp` helper (the differential `run_c_full` can't drive fibers since the JIT bails). Whole
+  suite + clippy + fmt green.
   **Plan for C threading on the fibers/vCPU model** (no architectural blocker — the determinism vs.
   threading tension is resolved by running fibers cooperatively on a *single* vCPU in the differential
   oracle; true multi-vCPU parallelism is a separate, non-bit-deterministic mode validated by other
-  means). Remaining steps, in order: (3) an optional host-side cooperative *scheduler* over the
-  step-2 primitive (run-until-suspend is already what `cont.resume` gives; a scheduler just picks the
-  next runnable fiber); (4) the JIT's machine-level control-stack
+  means). Remaining steps: (4) the JIT's machine-level control-stack
   switch (asm SP swap — the riskiest, escape-TCB-adjacent piece) so compiled fibers suspend mid-callstack;
-  (5) `wait`/`notify` (futex over the window) as cooperative park/unpark; (6) C frontend: real
-  `_Atomic`/`<stdatomic.h>` lowering (today stubbed → silently races), a `<pthread.h>`/`<threads.h>`
-  shim onto fiber-spawn + futex, and `_Thread_local` → fiber-local storage. The data-stack half of the
-  two-stack split is already built (chibicc lowers address-taken locals to an in-window data stack via
-  data-SP `v0`), so only the control-stack half is new work.
+  (5) `wait`/`notify` (futex over the window) as cooperative park/unpark, which needs a symmetric
+  scheduler (a runnable queue) — today's model is asymmetric (explicit resume/suspend); (6, rest) the
+  remaining C threading surface: real `_Atomic`/`<stdatomic.h>` lowering (today stubbed → silently
+  races), a `<pthread.h>`/`<threads.h>` shim onto the fiber builtins + futex, and `_Thread_local` →
+  fiber-local storage. The data-stack half of the two-stack split is already built (chibicc lowers
+  address-taken locals to an in-window data stack via data-SP `v0`), so only the control-stack half is
+  new work.
 - [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
   virtual memory** — *most of the §1a differentiators live here.*
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.

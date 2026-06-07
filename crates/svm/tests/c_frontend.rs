@@ -203,6 +203,45 @@ fn i32_of(src: &str) -> i32 {
     }
 }
 
+/// Like [`run_c_full`] but **interpreter-only** — for programs using §12 fibers, which the
+/// JIT does not yet lower (it bails `Unsupported`, step 4), so the differential `run_c_full`
+/// cannot drive them. The frontend → verifier → reference-interpreter path is the full story
+/// for fibers today. Returns the outcome and captured stdout.
+fn run_c_interp(src: &str) -> CRun {
+    let ir = c_to_ir(src);
+    let m =
+        parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    let mut h = Host::new();
+    let args = [
+        Value::I32(h.grant_stream(StreamRole::Out)),
+        Value::I32(h.grant_stream(StreamRole::In)),
+        Value::I32(h.grant_exit()),
+        Value::I32(h.grant_memory()),
+    ];
+    let mut fuel = 50_000_000u64;
+    let outcome = match run_with_host(&m, 0, &args, &mut fuel, &mut h) {
+        Ok(v) => Outcome::Returned(v),
+        Err(Trap::Exit(c)) => Outcome::Exited(c),
+        Err(e) => panic!("interp trapped: {e:?}\n{src}\n{ir}"),
+    };
+    CRun {
+        outcome,
+        stdout: h.stdout,
+    }
+}
+
+/// Run a normally-returning fiber program (interpreter-only) and return its single i32.
+fn fiber_i32(src: &str) -> i32 {
+    match run_c_interp(src).outcome {
+        Outcome::Returned(v) => match v.as_slice() {
+            [Value::I32(x)] => *x,
+            other => panic!("expected one i32 result, got {other:?}"),
+        },
+        Outcome::Exited(c) => panic!("expected a normal return, but the program exited({c})"),
+    }
+}
+
 /// D40 (§3a/§4): a string literal lives in a **read-only** data segment, so writing through a
 /// pointer to it (UB in C) detect-and-kills on both backends instead of silently corrupting the
 /// literal. The first real C consumer of the read-only data section.
@@ -1654,4 +1693,99 @@ fn c_ssa_promotion_eliminates_loop_body_memory_ops() {
         loop_region_mem_ops(&ir) > 0,
         "an address-taken accumulator must keep loop-body memory ops (else the guard is blind):\n{ir}"
     );
+}
+
+// ---- §12 fibers through real C (interpreter-only; the JIT bails Unsupported) ----
+
+// Prototypes for the three intercepted fiber builtins, shared by the C tests below. A fiber
+// body is an ordinary `long f(long)`; the guest hands each fiber its own data stack.
+const FIBER_DECLS: &str = "\
+int  __vm_fiber_new(long (*f)(long), void *stack);\n\
+long __vm_fiber_resume(int k, long arg, int *done);\n\
+long __vm_fiber_suspend(long value);\n";
+
+#[cfg(unix)]
+#[test]
+fn c_fiber_generator_yields_then_returns() {
+    // `counter` yields start+1 and start+2 via suspend, then returns start+3. `main` drives
+    // it: the first resume passes 100 (the body's arg), later resumes pass 0; it sums every
+    // yielded value plus the final return. 101 + 102 + 103 = 306.
+    let src = format!(
+        "{FIBER_DECLS}\
+        static char stack0[8192];\n\
+        long counter(long start) {{\n\
+        \x20 __vm_fiber_suspend(start + 1);\n\
+        \x20 __vm_fiber_suspend(start + 2);\n\
+        \x20 return start + 3;\n\
+        }}\n\
+        int main() {{\n\
+        \x20 int k = __vm_fiber_new(counter, stack0);\n\
+        \x20 int done = 0;\n\
+        \x20 long sum = 0;\n\
+        \x20 long v = __vm_fiber_resume(k, 100, &done);\n\
+        \x20 while (!done) {{ sum += v; v = __vm_fiber_resume(k, 0, &done); }}\n\
+        \x20 sum += v;\n\
+        \x20 return (int)sum;\n\
+        }}\n"
+    );
+    assert_eq!(fiber_i32(&src), 306);
+}
+
+#[cfg(unix)]
+#[test]
+fn c_fiber_round_trips_resume_arguments() {
+    // The value passed to resume is delivered as the *result* of the body's `suspend`, so a
+    // fiber can be a two-way channel. `echo` yields 0 once, then returns whatever it was
+    // resumed with — proving the resume arg threads back into the suspended body. main feeds
+    // 77 on the second resume and returns it.
+    let src = format!(
+        "{FIBER_DECLS}\
+        static char st[4096];\n\
+        long echo(long start) {{\n\
+        \x20 (void)start;\n\
+        \x20 long got = __vm_fiber_suspend(0);\n\
+        \x20 return got * 2;\n\
+        }}\n\
+        int main() {{\n\
+        \x20 int k = __vm_fiber_new(echo, st);\n\
+        \x20 int done = 0;\n\
+        \x20 __vm_fiber_resume(k, 0, &done);\n\
+        \x20 long r = __vm_fiber_resume(k, 77, &done);\n\
+        \x20 return (int)(done * 1000 + r);\n\
+        }}\n"
+    );
+    // done = 1 (RETURNED) after the second resume; r = 77 * 2 = 154 -> 1154.
+    assert_eq!(fiber_i32(&src), 1154);
+}
+
+#[cfg(unix)]
+#[test]
+fn c_two_fibers_are_independent() {
+    // Two live fibers on distinct stacks interleave without clobbering each other's locals —
+    // the data-stack-per-fiber property (§3d). Each keeps its own running counter across
+    // suspends; main ping-pongs between them and sums their yields.
+    let src = format!(
+        "{FIBER_DECLS}\
+        static char sa[4096];\n\
+        static char sb[4096];\n\
+        long acc(long step) {{\n\
+        \x20 long total = 0;\n\
+        \x20 for (;;) {{ total += step; __vm_fiber_suspend(total); }}\n\
+        \x20 return 0;\n\
+        }}\n\
+        int main() {{\n\
+        \x20 int da = 0, db = 0;\n\
+        \x20 int a = __vm_fiber_new(acc, sa);\n\
+        \x20 int b = __vm_fiber_new(acc, sb);\n\
+        \x20 long s = 0;\n\
+        \x20 s += __vm_fiber_resume(a, 10, &da);\n\
+        \x20 s += __vm_fiber_resume(b, 3, &db);\n\
+        \x20 s += __vm_fiber_resume(a, 0, &da);\n\
+        \x20 s += __vm_fiber_resume(b, 0, &db);\n\
+        \x20 s += __vm_fiber_resume(a, 0, &da);\n\
+        \x20 return (int)s;\n\
+        }}\n"
+    );
+    // a yields 10, 20, 30; b yields 3, 6. Sum = 10+3+20+6+30 = 69.
+    assert_eq!(fiber_i32(&src), 69);
 }

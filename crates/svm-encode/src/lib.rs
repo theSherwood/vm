@@ -111,7 +111,7 @@ mod op {
     pub const ATOMIC_CMPXCHG: u8 = 0xC9; // ty, addr, expected, replacement, offset
 
     // §12 fibers (stack switching).
-    pub const CONT_NEW: u8 = 0xCA; // func (funcref idx)
+    pub const CONT_NEW: u8 = 0xCA; // func (funcref idx), sp (data-stack base)
     pub const CONT_RESUME: u8 = 0xCB; // k, arg
     pub const SUSPEND: u8 = 0xCC; // value
     pub const FTOI: u8 = 0xD0; // saturating trunc_sat: + FToI index (0..=7)
@@ -400,9 +400,10 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *handle as u64);
             write_idxs(out, args);
         }
-        Inst::ContNew { func } => {
+        Inst::ContNew { func, sp } => {
             out.push(op::CONT_NEW);
             write_uleb(out, *func as u64);
+            write_uleb(out, *sp as u64);
         }
         Inst::ContResume { k, arg } => {
             out.push(op::CONT_RESUME);
@@ -789,7 +790,10 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             offset: c.uleb()?,
         },
 
-        op::CONT_NEW => Inst::ContNew { func: c.idx()? },
+        op::CONT_NEW => Inst::ContNew {
+            func: c.idx()?,
+            sp: c.idx()?,
+        },
         op::CONT_RESUME => Inst::ContResume {
             k: c.idx()?,
             arg: c.idx()?,

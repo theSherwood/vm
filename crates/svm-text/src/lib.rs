@@ -222,7 +222,7 @@ fn print_inst(inst: &Inst) -> String {
             arglist(args)
         ),
         // §12 fibers (stack switching).
-        Inst::ContNew { func } => format!("cont.new v{func}"),
+        Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
         Inst::Suspend { value } => format!("suspend v{value}"),
     }
@@ -1027,9 +1027,9 @@ impl<'a> Parser<'a> {
         }
         // §12 fibers (stack switching).
         if op == "cont.new" {
-            return Ok(Inst::ContNew {
-                func: self.value(names)?,
-            });
+            let func = self.value(names)?;
+            let sp = self.value(names)?;
+            return Ok(Inst::ContNew { func, sp });
         }
         if op == "cont.resume" {
             let k = self.value(names)?;

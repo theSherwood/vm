@@ -232,8 +232,9 @@ const FIBER_RETURNED: i32 = 1;
 /// `suspend` switches back out, parking it (`Live`).
 enum Fiber<'a> {
     /// Created by `cont.new`, not yet started: holds the `i32` funcref to launch on the
-    /// first resume (resolved then through the function table as `(i64) -> i64`).
-    Pending(i32),
+    /// first resume (resolved then through the function table as `(i64 sp, i64 arg) ->
+    /// i64`) and the `i64` data-stack base `sp` to run it on.
+    Pending { func: i32, sp: i64 },
     /// Started and currently **parked** — suspended at a `suspend`, or an ancestor in the
     /// resume chain — holding its reified call stack, ready to continue.
     Live(Vec<Frame<'a>>),
@@ -245,12 +246,14 @@ enum Fiber<'a> {
     Done,
 }
 
-/// The fixed fiber entry signature (§12): a fiber runs a function of type `(i64) -> i64`.
-/// The single `i64` carries the first-resume argument in and the final return value out
-/// (a pointer into the window can carry richer payloads).
+/// The fixed fiber entry signature (§12): a fiber runs a function of type `(i64 sp, i64
+/// arg) -> i64`. `sp` is the fiber's data-stack base (the §3d two-stack split — every
+/// frontend-emitted function already takes the data-SP as its first param); `arg` carries
+/// the first-resume value in and the final value out (a window pointer can carry richer
+/// payloads).
 fn fiber_sig() -> FuncType {
     FuncType {
-        params: vec![ValType::I64],
+        params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
     }
 }
@@ -280,7 +283,7 @@ fn resolve_fiber(fibers: &[Fiber], chain: &[usize], handle: i32) -> Result<usize
         return Err(Trap::FiberFault);
     }
     match &fibers[slot] {
-        Fiber::Pending(_) | Fiber::Live(_) => Ok(slot),
+        Fiber::Pending { .. } | Fiber::Live(_) => Ok(slot),
         Fiber::Running | Fiber::Done => Err(Trap::FiberFault),
     }
 }
@@ -397,13 +400,17 @@ fn run_func<'a>(
                     }
                 }
                 // §12 fiber create: record a `Pending` fiber, yield its handle. No switch.
-                Inst::ContNew { func } => {
+                Inst::ContNew { func, sp } => {
                     let funcref = as_i32(get(&frames[top].vals, *func)?)?;
+                    let stack_base = as_i64(get(&frames[top].vals, *sp)?)?;
                     if fibers.len() >= MAX_FIBERS {
                         return Err(Trap::FiberFault);
                     }
                     let handle = fibers.len() as i32;
-                    fibers.push(Fiber::Pending(funcref));
+                    fibers.push(Fiber::Pending {
+                        func: funcref,
+                        sp: stack_base,
+                    });
                     frames[top].vals.push(Value::I32(handle));
                 }
                 // §12 fiber resume: switch into fiber `k`, delivering `arg`. The two results
@@ -416,13 +423,14 @@ fn run_func<'a>(
                     // Materialize the target's frames: start a `Pending` fiber, or continue a
                     // parked one (delivering `arg` as the result of its `suspend`).
                     let new_frames = match std::mem::replace(&mut fibers[target], Fiber::Running) {
-                        Fiber::Pending(funcref) => {
+                        Fiber::Pending { func: funcref, sp } => {
                             let callee = table_lookup(funcs, funcref, &fiber_sig())?;
+                            // First entry: call `func(sp, arg)` on the fiber's data stack.
                             vec![Frame {
                                 f: callee,
                                 block: 0,
                                 inst: 0,
-                                vals: vec![Value::I64(av)],
+                                vals: vec![Value::I64(sp), Value::I64(av)],
                             }]
                         }
                         Fiber::Live(mut f) => {

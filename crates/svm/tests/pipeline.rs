@@ -189,23 +189,24 @@ fn atomics_parse_roundtrip_and_verify() {
 
 #[test]
 fn fibers_parse_roundtrip_and_verify() {
-    // §12 stack switching: `cont.new` (funcref -> handle), `cont.resume` (handle, i64 ->
+    // §12 stack switching: `cont.new` (funcref, sp -> handle), `cont.resume` (handle, i64 ->
     // status, value), and `suspend` (i64 -> i64). Parse, verify, then assert text and
     // binary serializations round-trip to the identical IR. Func 1 is a fiber body
-    // `(i64) -> (i64)` that suspends once then returns; func 0 drives it.
+    // `(i64 sp, i64 arg) -> (i64)` that suspends once then returns; func 0 drives it.
     let src = "func (i64) -> (i64) {\n\
         block0(v0: i64):\n\
         \x20 v1 = ref.func 1\n\
-        \x20 v2 = cont.new v1\n\
-        \x20 v3 = i64.const 10\n\
-        \x20 v4, v5 = cont.resume v2 v3\n\
-        \x20 v6, v7 = cont.resume v2 v5\n\
-        \x20 return v7\n\
+        \x20 v2 = i64.const 4096\n\
+        \x20 v3 = cont.new v1 v2\n\
+        \x20 v4 = i64.const 10\n\
+        \x20 v5, v6 = cont.resume v3 v4\n\
+        \x20 v7, v8 = cont.resume v3 v6\n\
+        \x20 return v8\n\
         }\n\
-        func (i64) -> (i64) {\n\
-        block0(v0: i64):\n\
-        \x20 v1 = suspend v0\n\
-        \x20 return v1\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = suspend v1\n\
+        \x20 return v2\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -297,25 +298,26 @@ fn add_wraps_two_complement() {
 
 #[test]
 fn fiber_suspend_then_resume_threads_values() {
-    // Func 1 is a fiber `(i64) -> (i64)`: it `suspend`s its arg (yielding it to the
-    // resumer), then on the next resume adds 100 to the delivered value and returns it.
+    // Func 1 is a fiber `(i64 sp, i64 arg) -> (i64)`: it `suspend`s its arg (yielding it to
+    // the resumer), then on the next resume adds 100 to the delivered value and returns it.
     // The root drives it: resume(10) -> (SUSPENDED, 10); resume(7) -> (RETURNED, 107).
     let src = "func () -> (i32, i64, i32, i64) {\n\
         block0():\n\
         \x20 v0 = ref.func 1\n\
-        \x20 v1 = cont.new v0\n\
-        \x20 v2 = i64.const 10\n\
-        \x20 v3, v4 = cont.resume v1 v2\n\
-        \x20 v5 = i64.const 7\n\
-        \x20 v6, v7 = cont.resume v1 v5\n\
-        \x20 return v3 v4 v6 v7\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 10\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.const 7\n\
+        \x20 v7, v8 = cont.resume v2 v6\n\
+        \x20 return v4 v5 v7 v8\n\
         }\n\
-        func (i64) -> (i64) {\n\
-        block0(v0: i64):\n\
-        \x20 v1 = suspend v0\n\
-        \x20 v2 = i64.const 100\n\
-        \x20 v3 = i64.add v1 v2\n\
-        \x20 return v3\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = suspend v1\n\
+        \x20 v3 = i64.const 100\n\
+        \x20 v4 = i64.add v2 v3\n\
+        \x20 return v4\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -341,27 +343,28 @@ fn fiber_generator_loop_sums_a_sequence() {
     let src = "func () -> (i64) {\n\
         block0():\n\
         \x20 v0 = ref.func 1\n\
-        \x20 v1 = cont.new v0\n\
-        \x20 v2 = i64.const 0\n\
-        \x20 br block1(v1, v2)\n\
-        block1(v3: i32, v4: i64):\n\
-        \x20 v5 = i64.const 0\n\
-        \x20 v6, v7 = cont.resume v3 v5\n\
-        \x20 v8 = i64.add v4 v7\n\
-        \x20 br_if v6 block2(v8) block1(v3, v8)\n\
-        block2(v9: i64):\n\
-        \x20 return v9\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 br block1(v2, v3)\n\
+        block1(v4: i32, v5: i64):\n\
+        \x20 v6 = i64.const 0\n\
+        \x20 v7, v8 = cont.resume v4 v6\n\
+        \x20 v9 = i64.add v5 v8\n\
+        \x20 br_if v7 block2(v9) block1(v4, v9)\n\
+        block2(v10: i64):\n\
+        \x20 return v10\n\
         }\n\
-        func (i64) -> (i64) {\n\
-        block0(v0: i64):\n\
-        \x20 v1 = i64.const 1\n\
-        \x20 v2 = suspend v1\n\
-        \x20 v3 = i64.const 2\n\
-        \x20 v4 = suspend v3\n\
-        \x20 v5 = i64.const 3\n\
-        \x20 v6 = suspend v5\n\
-        \x20 v7 = i64.const 4\n\
-        \x20 return v7\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 1\n\
+        \x20 v3 = suspend v2\n\
+        \x20 v4 = i64.const 2\n\
+        \x20 v5 = suspend v4\n\
+        \x20 v6 = i64.const 3\n\
+        \x20 v7 = suspend v6\n\
+        \x20 v8 = i64.const 4\n\
+        \x20 return v8\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -379,28 +382,30 @@ fn fiber_nested_resume_chain() {
     let src = "func () -> (i64, i64) {\n\
         block0():\n\
         \x20 v0 = ref.func 1\n\
-        \x20 v1 = cont.new v0\n\
-        \x20 v2 = i64.const 0\n\
-        \x20 v3, v4 = cont.resume v1 v2\n\
-        \x20 v5, v6 = cont.resume v1 v2\n\
-        \x20 return v4 v6\n\
-        }\n\
-        func (i64) -> (i64) {\n\
-        block0(v0: i64):\n\
-        \x20 v1 = ref.func 2\n\
-        \x20 v2 = cont.new v1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 0\n\
         \x20 v4, v5 = cont.resume v2 v3\n\
-        \x20 v6 = suspend v5\n\
-        \x20 v7, v8 = cont.resume v2 v3\n\
-        \x20 return v8\n\
+        \x20 v6, v7 = cont.resume v2 v3\n\
+        \x20 return v5 v7\n\
         }\n\
-        func (i64) -> (i64) {\n\
-        block0(v0: i64):\n\
-        \x20 v1 = i64.const 11\n\
-        \x20 v2 = suspend v1\n\
-        \x20 v3 = i64.const 22\n\
-        \x20 return v3\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = ref.func 2\n\
+        \x20 v3 = i64.const 8192\n\
+        \x20 v4 = cont.new v2 v3\n\
+        \x20 v5 = i64.const 0\n\
+        \x20 v6, v7 = cont.resume v4 v5\n\
+        \x20 v8 = suspend v7\n\
+        \x20 v9, v10 = cont.resume v4 v5\n\
+        \x20 return v10\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 11\n\
+        \x20 v3 = suspend v2\n\
+        \x20 v4 = i64.const 22\n\
+        \x20 return v4\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
@@ -418,15 +423,16 @@ fn fiber_resume_after_return_traps() {
     let src = "func () -> (i64) {\n\
         block0():\n\
         \x20 v0 = ref.func 1\n\
-        \x20 v1 = cont.new v0\n\
-        \x20 v2 = i64.const 1\n\
-        \x20 v3, v4 = cont.resume v1 v2\n\
-        \x20 v5, v6 = cont.resume v1 v2\n\
-        \x20 return v6\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 1\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6, v7 = cont.resume v2 v3\n\
+        \x20 return v7\n\
         }\n\
-        func (i64) -> (i64) {\n\
-        block0(v0: i64):\n\
-        \x20 return v0\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 return v1\n\
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");

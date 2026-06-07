@@ -42,15 +42,16 @@ impl Rng {
     }
 }
 
-/// Build one verifier-valid function body. Every function has type `(i64) -> (i64)` so any
-/// one may serve as a fiber body, a callee, or the entry, and a fiber's `(i64) -> (i64)`
-/// resume signature is always satisfiable. A single straight-line block keeps the module
-/// trivially well-typed (operands reference strictly-earlier values) while still letting
-/// `cont.new`/`resume`/`suspend`/`call` interleave arbitrarily.
+/// Build one verifier-valid function body. Every function has type `(i64 sp, i64 arg) ->
+/// (i64)` — the fiber entry signature (§12) — so any one may serve as a fiber body, a
+/// callee, or the entry, and a `cont.resume` always finds a signature-matching target. A
+/// single straight-line block keeps the module trivially well-typed (operands reference
+/// strictly-earlier values) while letting `cont.new`/`resume`/`suspend`/`call` interleave.
 fn gen_func(g: &mut Rng, nfuncs: usize) -> Func {
-    // Index 0 is the param `v0: i64`. Track which produced indices hold each value type.
-    let mut next: u32 = 1;
-    let mut i64s: Vec<u32> = vec![0];
+    // Indices 0,1 are the params `v0: i64` (data-SP) and `v1: i64` (arg). Track which
+    // produced indices hold each value type.
+    let mut next: u32 = 2;
+    let mut i64s: Vec<u32> = vec![0, 1];
     let mut i32s: Vec<u32> = Vec::new();
     let mut insts: Vec<Inst> = Vec::new();
 
@@ -96,10 +97,12 @@ fn gen_func(g: &mut Rng, nfuncs: usize) -> Func {
                 next += 1;
             }
             3 => {
-                // cont.new(funcref) -> i32 handle. The funcref is any i32 in scope (a
-                // forgeable index, masked into the func table at first resume).
+                // cont.new(funcref, sp) -> i32 handle. The funcref is any i32 in scope (a
+                // forgeable index, masked into the func table at first resume); sp is any
+                // i64 (the fiber's data-stack base).
                 let func = any_i32!();
-                insts.push(Inst::ContNew { func });
+                let sp = any_i64!();
+                insts.push(Inst::ContNew { func, sp });
                 i32s.push(next);
                 next += 1;
             }
@@ -120,11 +123,12 @@ fn gen_func(g: &mut Rng, nfuncs: usize) -> Func {
                 next += 1;
             }
             _ => {
-                // call a random function (all are `(i64) -> (i64)`).
-                let arg = any_i64!();
+                // call a random function (all are `(i64, i64) -> (i64)`).
+                let a0 = any_i64!();
+                let a1 = any_i64!();
                 insts.push(Inst::Call {
                     func: g.range(nfuncs) as u32,
-                    args: vec![arg],
+                    args: vec![a0, a1],
                 });
                 i64s.push(next);
                 next += 1;
@@ -132,13 +136,13 @@ fn gen_func(g: &mut Rng, nfuncs: usize) -> Func {
         }
     }
 
-    // Return an in-scope i64 (always at least the param).
+    // Return an in-scope i64 (always at least the params).
     let ret = i64s[g.range(i64s.len())];
     Func {
-        params: vec![ValType::I64],
+        params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
-            params: vec![ValType::I64],
+            params: vec![ValType::I64, ValType::I64],
             insts,
             term: Terminator::Return(vec![ret]),
         }],
@@ -177,7 +181,7 @@ fn generated_fiber_programs_never_panic_and_are_deterministic() {
 
         // Interpret every function: never panics, and is deterministic across two runs.
         for fi in 0..m.funcs.len() as u32 {
-            let args = [svm_interp::Value::I64(1)];
+            let args = [svm_interp::Value::I64(4096), svm_interp::Value::I64(1)];
             let mut fuel_a = 8_000u64;
             let mut fuel_b = 8_000u64;
             let a = run(&m, fi, &args, &mut fuel_a);
