@@ -9,7 +9,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
@@ -1722,13 +1723,30 @@ struct Mem {
     /// (`thread.spawn`) shares the *same* bytes — `Region`'s accessors are all `&self`, so the `Arc`
     /// derefs transparently.
     back: Arc<Region>,
+    /// The guest-visible **address space** — page-protection map + §13 region backings — behind a
+    /// shared `RwLock` so all vCPUs of a run see one another's `map`/`unmap`/`protect` live (§12). A
+    /// spawned vCPU ([`Mem::fork_for_thread`]) clones this `Arc`, sharing the same address space; the
+    /// `RwLock` lets the many readers (every protection check) run concurrently while `map`/`unmap`
+    /// take the brief write lock.
+    space: Arc<RwLock<AddrSpace>>,
+    /// Fast-path flag: set once any §13 region is aliased in (monotonic). While clear — the
+    /// overwhelmingly common case — the per-byte path skips the address-space lock entirely and goes
+    /// straight to `back`, since no page can be `Backed`. Shared with forked vCPUs.
+    has_regions: Arc<AtomicBool>,
+}
+
+/// The shared, synchronized guest address space (§12): the page-protection map plus the §13 region
+/// backings, mutated by `map`/`unmap`/`protect` and read by every access check. Lives behind
+/// `Mem::space`'s `RwLock`; all vCPUs of a run share one.
+#[derive(Default)]
+struct AddrSpace {
     /// Page index (`offset / page`) ⇒ explicit page state. A page absent from the map takes its
     /// region default: read+write inside the initial prefix `[0, mapped)`, unmapped in the
     /// reserved tail `[mapped, reserved)`. Entries appear for `protect`ed (`Ro`), `unmap`ped
     /// (`Unmapped`), and grown/re-committed tail (`Rw`) pages — anywhere in `[0, reserved)`.
     prot: BTreeMap<u64, PageProt>,
     /// §13 `SharedRegion` backings this window has aliased in, keyed by region id (the bytes a
-    /// [`PageProt::Backed`] page redirects to). A clone of the `Host`'s `Rc`, so two windows — or
+    /// [`PageProt::Backed`] page redirects to). A clone of the `Host`'s `Arc`, so two windows — or
     /// two offsets in one window — that map the same region share the *same* bytes.
     regions: BTreeMap<u32, RegionBacking>,
 }
@@ -1747,32 +1765,39 @@ impl Mem {
             back: Arc::new(Region::new(window.reserved(), page)),
             window,
             page,
-            prot: BTreeMap::new(),
-            regions: BTreeMap::new(),
+            space: Arc::new(RwLock::new(AddrSpace::default())),
+            has_regions: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Build the memory view a spawned vCPU (`thread.spawn`) starts with (§12): the **same** shared
-    /// bytes (`Arc<Region>` clone) and the **same** §13 region backings (`Arc` clones, so a `Backed`
-    /// alias names identical bytes across threads), plus a *snapshot* of the page-protection map.
-    /// Confinement (`window`/`page`) is copied. Mapping changes either thread makes *after* the spawn
-    /// are therefore private to that thread — a documented step-2 limitation; lifting it to a shared,
-    /// synchronized address space is a later step.
+    /// Read/write the shared address space, recovering from a poisoned lock (the interpreter never
+    /// panics while holding it) rather than propagating the panic.
+    fn space_read(&self) -> std::sync::RwLockReadGuard<'_, AddrSpace> {
+        self.space.read().unwrap_or_else(|e| e.into_inner())
+    }
+    fn space_write(&self) -> std::sync::RwLockWriteGuard<'_, AddrSpace> {
+        self.space.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Build the memory view a spawned vCPU (`thread.spawn`) starts with (§12): it shares the **same**
+    /// everything — the `Arc<Region>` bytes *and* the `Arc<RwLock<AddrSpace>>` address space — so a
+    /// `map`/`unmap`/`protect` (or §13 alias) by any vCPU is immediately visible to the others.
+    /// Confinement (`window`/`page`) is copied (identical for every vCPU of the run).
     fn fork_for_thread(&self) -> Mem {
         Mem {
             window: self.window,
             page: self.page,
             back: Arc::clone(&self.back),
-            prot: self.prot.clone(),
-            regions: self.regions.clone(),
+            space: Arc::clone(&self.space),
+            has_regions: Arc::clone(&self.has_regions),
         }
     }
 
     /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed. A page
     /// absent from the map takes its region default — read+write in the initial prefix
     /// `[0, mapped)`, unmapped in the reserved tail (growth must be an explicit `map`).
-    fn page_access(&self, page: u64) -> Option<bool> {
-        match self.prot.get(&page) {
+    fn page_access(&self, prot: &BTreeMap<u64, PageProt>, page: u64) -> Option<bool> {
+        match prot.get(&page) {
             Some(PageProt::Rw) => Some(true),
             Some(PageProt::Ro) => Some(false),
             Some(PageProt::Backed { writable, .. }) => Some(*writable),
@@ -1787,11 +1812,12 @@ impl Mem {
     /// unprotected windows pay nothing.
     fn check_prot(&self, base: u64, width: u32, write: bool) -> Result<(), Trap> {
         let last = base + width as u64 - 1;
-        if self.prot.is_empty() && last < self.window.mapped() {
+        let space = self.space_read();
+        if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
         }
         for page in (base / self.page)..=(last / self.page) {
-            match self.page_access(page) {
+            match self.page_access(&space.prot, page) {
                 None => return Err(Trap::MemoryFault), // unmapped
                 Some(false) if write => return Err(Trap::MemoryFault), // read-only store
                 _ => {}
@@ -1848,10 +1874,11 @@ impl Mem {
     /// value-correct `read_le`/`write_le` path (their bytes live in an `Rc` region, not `back`);
     /// anonymous pages get `back`'s real hardware atomics (§12).
     fn is_backed(&self, base: u64) -> bool {
-        matches!(
-            self.prot.get(&(base / self.page)),
-            Some(PageProt::Backed { .. })
-        )
+        self.has_regions.load(Ordering::Relaxed)
+            && matches!(
+                self.space_read().prot.get(&(base / self.page)),
+                Some(PageProt::Backed { .. })
+            )
     }
 
     /// Validate a `<ty>.atomic.wait` address: confine it, require natural alignment, and require the
@@ -1976,17 +2003,19 @@ impl Mem {
     /// read-only, neither ⇒ unmapped. A read-write page in the initial prefix is left *absent*
     /// (its default); in the reserved tail it needs an explicit [`PageProt::Rw`] entry, since
     /// *absent* there means unmapped.
-    fn set_prot(&mut self, page: u64, prot: i32) {
-        if prot & PROT_WRITE != 0 {
+    /// Apply a `map`/`protect` protection to one page in the given prot map (the caller holds the
+    /// address-space write lock). Uses `self`'s immutable `window`/`page` only.
+    fn set_prot(&self, prot: &mut BTreeMap<u64, PageProt>, page: u64, flags: i32) {
+        if flags & PROT_WRITE != 0 {
             if page * self.page < self.window.mapped() {
-                self.prot.remove(&page); // read+write is the prefix default (no entry)
+                prot.remove(&page); // read+write is the prefix default (no entry)
             } else {
-                self.prot.insert(page, PageProt::Rw); // explicit commit in the reserved tail
+                prot.insert(page, PageProt::Rw); // explicit commit in the reserved tail
             }
-        } else if prot & PROT_READ != 0 {
-            self.prot.insert(page, PageProt::Ro);
+        } else if flags & PROT_READ != 0 {
+            prot.insert(page, PageProt::Ro);
         } else {
-            self.prot.insert(page, PageProt::Unmapped);
+            prot.insert(page, PageProt::Unmapped);
         }
     }
 
@@ -1995,16 +2024,19 @@ impl Mem {
     /// don't fault). RO protection is page-granular, so a producer keeps RO data on its own pages
     /// (the verifier already bounds each segment to `[0, size)`).
     fn init_data(&mut self, data: &[Data]) {
+        // Byte writes first (no §13 regions exist at init ⇒ `set_byte` is lock-free)...
         for d in data {
             for (i, &b) in d.bytes.iter().enumerate() {
                 self.set_byte(d.offset + i as u64, b);
             }
         }
+        // ...then the read-only protections, under one address-space write lock.
+        let mut space = self.space_write();
         for d in data {
             if d.readonly && !d.bytes.is_empty() {
                 let last = d.offset + d.bytes.len() as u64 - 1;
                 for page in (d.offset / self.page)..=(last / self.page) {
-                    self.prot.insert(page, PageProt::Ro);
+                    space.prot.insert(page, PageProt::Ro);
                 }
             }
         }
@@ -2023,8 +2055,9 @@ impl Mem {
         if len == 0 {
             return true;
         }
+        let space = self.space_read();
         (ptr / self.page..=(end - 1) / self.page)
-            .all(|page| matches!(self.page_access(page), Some(w) if w || !write))
+            .all(|page| matches!(self.page_access(&space.prot, page), Some(w) if w || !write))
     }
 
     /// Borrow-validate and read a `(ptr, len)` capability buffer (§7): every page of
@@ -2067,12 +2100,18 @@ impl Mem {
     /// Read one byte; unwritten anonymous pages read as zero. A [`PageProt::Backed`] page redirects
     /// to its §13 region buffer (so an aliased page reads whatever the shared backing holds).
     fn byte(&self, off: u64) -> u8 {
+        // Fast path: no §13 region is mapped, so no page can be `Backed` — go straight to `back`
+        // without touching the address-space lock (the hot, overwhelmingly common case).
+        if !self.has_regions.load(Ordering::Relaxed) {
+            return self.back.byte(off);
+        }
         let idx = (off % self.page) as usize;
+        let space = self.space_read();
         if let Some(PageProt::Backed {
             region, region_off, ..
-        }) = self.prot.get(&(off / self.page))
+        }) = space.prot.get(&(off / self.page))
         {
-            return self
+            return space
                 .regions
                 .get(region)
                 .map_or(0, |r| r.read_byte(*region_off + idx as u64));
@@ -2080,15 +2119,19 @@ impl Mem {
         self.back.byte(off)
     }
 
-    fn set_byte(&mut self, off: u64, b: u8) {
+    fn set_byte(&self, off: u64, b: u8) {
+        if !self.has_regions.load(Ordering::Relaxed) {
+            self.back.set_byte(off, b);
+            return;
+        }
         let idx = (off % self.page) as usize;
-        let page = self.page;
+        let space = self.space_read();
         if let Some(PageProt::Backed {
             region, region_off, ..
-        }) = self.prot.get(&(off / page))
+        }) = space.prot.get(&(off / self.page))
         {
             // §13 aliased page: write through to the shared region backing.
-            if let Some(r) = self.regions.get(region) {
+            if let Some(r) = space.regions.get(region) {
                 r.write_byte(*region_off + idx as u64, b);
             }
             return;
@@ -2123,7 +2166,8 @@ impl Mem {
         let mut out = vec![0u8; snap];
         self.back.read_into(0, &mut out); // anonymous bytes (untouched / grown-tail read as zero)
                                           // §13 aliased pages live in their region backing, not in `back` — fill them from there.
-        for (&idx, p) in &self.prot {
+        let space = self.space_read();
+        for (&idx, p) in &space.prot {
             let PageProt::Backed {
                 region, region_off, ..
             } = p
@@ -2135,7 +2179,7 @@ impl Mem {
                 continue;
             }
             let n = (self.page as usize).min(snap - start);
-            if let Some(r) = self.regions.get(region) {
+            if let Some(r) = space.regions.get(region) {
                 for k in 0..n {
                     out[start + k] = r.read_byte(*region_off + k as u64);
                 }
@@ -2162,8 +2206,13 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
+        {
+            let mut space = self.space_write();
+            for page in pages.clone() {
+                self.set_prot(&mut space.prot, page, prot);
+            }
+        }
         for page in pages {
-            self.set_prot(page, prot);
             self.back.zero(page * self.page, self.page); // commit ⇒ fresh zeroed page
         }
         0
@@ -2175,8 +2224,13 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
+        {
+            let mut space = self.space_write();
+            for page in pages.clone() {
+                space.prot.insert(page, PageProt::Unmapped);
+            }
+        }
         for page in pages {
-            self.prot.insert(page, PageProt::Unmapped);
             self.back.zero(page * self.page, self.page);
         }
         0
@@ -2191,15 +2245,16 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
+        let mut space = self.space_write();
         for page in pages {
             if let Some(PageProt::Backed {
                 region, region_off, ..
-            }) = self.prot.get(&page).copied()
+            }) = space.prot.get(&page).copied()
             {
                 if prot & (PROT_READ | PROT_WRITE) == 0 {
-                    self.prot.insert(page, PageProt::Unmapped);
+                    space.prot.insert(page, PageProt::Unmapped);
                 } else {
-                    self.prot.insert(
+                    space.prot.insert(
                         page,
                         PageProt::Backed {
                             region,
@@ -2209,7 +2264,7 @@ impl GuestMem for Mem {
                     );
                 }
             } else {
-                self.set_prot(page, prot);
+                self.set_prot(&mut space.prot, page, prot);
             }
         }
         0
@@ -2229,8 +2284,8 @@ impl GuestMem for Mem {
         region: u32,
         backing: RegionBacking,
     ) -> i64 {
-        let pages = match self.prot_pages(win_off, len) {
-            Ok(p) => p,
+        let pages: Vec<u64> = match self.prot_pages(win_off, len) {
+            Ok(p) => p.collect(),
             Err(e) => return e,
         };
         if !region_off.is_multiple_of(self.page) || prot & PROT_READ == 0 {
@@ -2241,17 +2296,24 @@ impl GuestMem for Mem {
             _ => return EINVAL,
         }
         let writable = prot & PROT_WRITE != 0;
-        self.regions.insert(region, backing);
-        for (i, page) in pages.enumerate() {
-            self.prot.insert(
-                page,
-                PageProt::Backed {
-                    region,
-                    region_off: region_off + i as u64 * self.page,
-                    writable,
-                },
-            );
-            self.back.zero(page * self.page, self.page); // bytes live in the region now, not an anonymous page
+        // A §13 alias now exists ⇒ the per-byte path must consult the address space from here on.
+        self.has_regions.store(true, Ordering::Relaxed);
+        {
+            let mut space = self.space_write();
+            space.regions.insert(region, backing);
+            for (i, &page) in pages.iter().enumerate() {
+                space.prot.insert(
+                    page,
+                    PageProt::Backed {
+                        region,
+                        region_off: region_off + i as u64 * self.page,
+                        writable,
+                    },
+                );
+            }
+        }
+        for &page in &pages {
+            self.back.zero(page * self.page, self.page); // bytes live in the region now, not anonymous
         }
         0
     }
@@ -2624,6 +2686,28 @@ mod prot_tests {
         assert_eq!(m.map(0, page(), PROT_READ | PROT_WRITE), 0);
         assert_eq!(m.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
         assert!(m.store(0, 0, StoreOp::I64, Value::I64(1)).is_ok());
+    }
+
+    /// §12 shared synchronized address space: a forked vCPU view (`thread.spawn`) sees `map`/`unmap`
+    /// made by another vCPU *after* the fork — the address space is shared, not snapshotted.
+    #[test]
+    fn forked_vcpu_sees_post_fork_mappings() {
+        // 128 KiB reserved, 64 KiB mapped ⇒ the page at 64 KiB starts in the unmapped tail.
+        let mut parent = Mem::with_reservation(17, 16);
+        let child = parent.fork_for_thread();
+        let tail = 1u64 << 16;
+        // Both views fault on the tail initially (unmapped).
+        assert_eq!(child.load(tail, 0, LoadOp::I64), Err(Trap::MemoryFault));
+        // Parent maps + writes the tail *after* the fork.
+        assert_eq!(parent.map(tail, page(), PROT_READ | PROT_WRITE), 0);
+        assert!(parent
+            .store(tail, 0, StoreOp::I64, Value::I64(0xCAFE))
+            .is_ok());
+        // The child now sees both the mapping (shared prot) and the bytes (shared region).
+        assert_eq!(child.load(tail, 0, LoadOp::I64), Ok(Value::I64(0xCAFE)));
+        // An unmap by the parent is likewise visible to the child.
+        assert_eq!(parent.unmap(tail, page()), 0);
+        assert_eq!(child.load(tail, 0, LoadOp::I64), Err(Trap::MemoryFault));
     }
 
     #[test]

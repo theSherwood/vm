@@ -899,10 +899,22 @@ leave a shared view — add a unix test for this alongside the Windows work.
   and wakes up to `count` waiters. Tests in `crates/svm/tests/threads.rs` (now ×14): not-equal,
   timeout, **cross-thread notify wakeup** (a worker parks, main vCPU notifies — woken status drives a
   100 result), round-trip, verify-needs-memory — all green under ThreadSanitizer + clippy + windows.
-  **Phase 2 still to come:** a shared *synchronized* address space (live cross-thread `map`/`unmap`),
-  fibers→real-threads scheduler (M:N), the memory-ordering parameter on the atomic IR ops + fences
-  (today all seq-cst), per-thread capability grants, and the differential-oracle-under-nondeterminism
-  story.
+  **Parallel threads — Phase 2 step 4 DONE (shared *synchronized* address space):** lifts the step-2
+  limitation — `map`/`unmap`/`protect` (and §13 aliases) by one vCPU are now live-visible to all the
+  others. The page-protection map + §13 region table moved out of `Mem` into a shared
+  `Arc<RwLock<AddrSpace>>`; `fork_for_thread` clones that `Arc` (was: snapshotted the maps), so every
+  vCPU reads/writes one address space. Many readers (every `check_prot`) run concurrently under the
+  read lock; `map`/`unmap`/`protect`/`map_region` take the brief write lock (mutate the maps, then
+  zero pages after releasing). The per-byte hot path stays lock-free via a monotonic
+  `Arc<AtomicBool> has_regions`: until a §13 region is aliased (the common case), `byte`/`set_byte` go
+  straight to `back` without touching the lock. Lock order is always parking→space (never the
+  reverse), so wait/notify + map can't deadlock. White-box test `forked_vcpu_sees_post_fork_mappings`
+  (a forked view sees a post-fork `map` then `unmap`); whole suite (incl. §13 `shared_region`,
+  `jit_diff`, `c_frontend`) unchanged, TSan-clean (the 4-thread atomic test now hammers the shared
+  `RwLock` `check_prot`), clippy + windows-gnu green.
+  **Phase 2 still to come:** fibers→real-threads scheduler (M:N), the memory-ordering parameter on the
+  atomic IR ops + fences (today all seq-cst), per-thread capability grants (spawned vCPUs still start
+  with an empty powerbox), and the differential-oracle-under-nondeterminism story.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a
