@@ -882,7 +882,12 @@ leave a shared view — add a unix test for this alongside the Windows work.
   `c_frontend.rs` (`c_fiber_*`: a generator, two-way resume-arg round-trip, two independent fibers on
   distinct stacks interleaving without clobbering — the data-stack-per-fiber property) via a new
   `run_c_interp` helper (the differential `run_c_full` can't drive fibers since the JIT bails). Whole
-  suite + clippy + fmt green.
+  suite + clippy + fmt green. **Cooperative C *multithreading* already works on this** with **no new
+  VM primitive** (`c_cooperative_threads_round_robin`): a round-robin scheduler written in plain guest
+  C interleaves three worker "threads" (each yields via `__vm_fiber_suspend` mid-loop) to completion —
+  DESIGN §12's model, where scheduling is runtime/guest policy. What's *not* there: preemption +
+  parallelism (need fuel-yield points + vCPUs/the JIT), a `<pthread.h>`/`<threads.h>` shim wrapping
+  this pattern, and real `_Atomic` (still plain ops → would race under true concurrency).
   **Plan for C threading on the fibers/vCPU model** (no architectural blocker — the determinism vs.
   threading tension is resolved by running fibers cooperatively on a *single* vCPU in the differential
   oracle; true multi-vCPU parallelism is a separate, non-bit-deterministic mode validated by other
