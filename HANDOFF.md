@@ -885,10 +885,24 @@ leave a shared view — add a unix test for this alongside the Windows work.
   shared-memory visibility, 4-way concurrent `atomic.rmw.add` summing exactly, forge/double-join
   inert, child-trap propagation, capture reflects thread writes, verify-rejects-bad-sig, binary+text
   round-trip), **all green under ThreadSanitizer** (`-Zsanitizer=thread`, zero data races) + clippy
-  `-D warnings` + windows-gnu. **Phase 2 still to come:** a shared *synchronized* address space (live
-  cross-thread `map`/`unmap`), fibers→real-threads scheduler (M:N), `wait`/`notify`, the
-  memory-ordering parameter on the atomic IR ops + fences (today all seq-cst), per-thread capability
-  grants, and the differential-oracle-under-nondeterminism story.
+  `-D warnings` + windows-gnu.
+  **Parallel threads — Phase 2 step 3 DONE (`wait`/`notify` futex):** first-class blocking sync, so a
+  vCPU parks instead of busy-spinning. Ops: `Inst::MemoryWait { ty, addr, expected, timeout }` → i32
+  status (`0` woken / `1` value-not-equal / `2` timed-out), `Inst::MemoryNotify { addr, count }` →
+  i32 woken. Text `<ty>.atomic.wait vaddr vexp vtimeout` / `atomic.notify vaddr vcount`; opcodes
+  `0xCF` (+ty byte) / `0xE8`; verify requires declared memory + types the operands; JIT
+  auto-`Unsupported`. Runtime: a per-run **parking lot** (`Parking` = one mutex + condvar, generation
+  + waiter-count maps keyed by confined address), passed by `&` to every vCPU like the thread budget.
+  `wait` confines/aligns/prot-checks the address, then **under the parking lock** compares `*addr` to
+  `expected` (atomic with `notify` — no lost wakeup) and blocks on the condvar until the address's
+  generation moves or the (host-capped `MAX_WAIT=10s`) timeout fires; `notify` bumps the generation
+  and wakes up to `count` waiters. Tests in `crates/svm/tests/threads.rs` (now ×14): not-equal,
+  timeout, **cross-thread notify wakeup** (a worker parks, main vCPU notifies — woken status drives a
+  100 result), round-trip, verify-needs-memory — all green under ThreadSanitizer + clippy + windows.
+  **Phase 2 still to come:** a shared *synchronized* address space (live cross-thread `map`/`unmap`),
+  fibers→real-threads scheduler (M:N), the memory-ordering parameter on the atomic IR ops + fences
+  (today all seq-cst), per-thread capability grants, and the differential-oracle-under-nondeterminism
+  story.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a

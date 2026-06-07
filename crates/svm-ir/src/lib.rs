@@ -1009,6 +1009,24 @@ pub enum Inst {
     ThreadJoin {
         handle: ValIdx,
     },
+    /// §12 futex wait (`<ty>.atomic.wait`): if the `ty`-wide value at the confined, naturally-aligned
+    /// address `addr` still equals `expected`, block this vCPU until a [`Inst::MemoryNotify`] on the
+    /// same address wakes it or `timeout` nanoseconds (`i64`) elapse. Yields an `i32` status: `0` =
+    /// woken by a notify, `1` = the value did not equal `expected` (no wait), `2` = timed out. A
+    /// misaligned address **traps** (like the other atomics).
+    MemoryWait {
+        ty: IntTy,
+        addr: ValIdx,
+        expected: ValIdx,
+        timeout: ValIdx,
+    },
+    /// §12 futex notify (`atomic.notify`): wake up to `count` (`i32`) vCPUs waiting on the confined
+    /// address `addr`. Yields an `i32`: the number of waiters woken (capped at `count`). Accesses no
+    /// memory, so it never faults on protection — only the address is confined.
+    MemoryNotify {
+        addr: ValIdx,
+        count: ValIdx,
+    },
 }
 
 impl Inst {

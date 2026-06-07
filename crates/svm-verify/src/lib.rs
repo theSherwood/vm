@@ -457,6 +457,36 @@ fn check_inst(
             cx.expect(*handle, ValType::I32)?;
             ValType::I64
         }
+        // §12 futex wait: i64 addr, `ty` expected value, i64 timeout ⇒ i32 status. Touches memory.
+        Inst::MemoryWait {
+            ty,
+            addr,
+            expected,
+            timeout,
+        } => {
+            if !has_memory {
+                return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*addr, ValType::I64)?;
+            cx.expect(*expected, ty.val())?;
+            cx.expect(*timeout, ValType::I64)?;
+            ValType::I32
+        }
+        // §12 futex notify: i64 addr, i32 count ⇒ i32 woken. Requires declared memory.
+        Inst::MemoryNotify { addr, count } => {
+            if !has_memory {
+                return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*addr, ValType::I64)?;
+            cx.expect(*count, ValType::I32)?;
+            ValType::I32
+        }
         // Handled before/around the match; listed for exhaustiveness (no panic).
         Inst::Store { .. }
         | Inst::AtomicStore { .. }

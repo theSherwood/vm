@@ -228,6 +228,14 @@ fn print_inst(inst: &Inst) -> String {
         // §12 real threads (OS-thread vCPUs over shared memory).
         Inst::ThreadSpawn { func, arg } => format!("thread.spawn {func} v{arg}"),
         Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
+        // §12 futex wait/notify.
+        Inst::MemoryWait {
+            ty,
+            addr,
+            expected,
+            timeout,
+        } => format!("{}.atomic.wait v{addr} v{expected} v{timeout}", ty.prefix()),
+        Inst::MemoryNotify { addr, count } => format!("atomic.notify v{addr} v{count}"),
     }
 }
 
@@ -908,6 +916,18 @@ impl<'a> Parser<'a> {
                 let (offset, _) = self.parse_memarg()?;
                 Ok(Inst::AtomicLoad { ty, addr, offset })
             }
+            // §12 futex wait: `<ty>.atomic.wait addr expected timeout` (no memarg).
+            "wait" => {
+                let addr = self.value(names)?;
+                let expected = self.value(names)?;
+                let timeout = self.value(names)?;
+                Ok(Inst::MemoryWait {
+                    ty,
+                    addr,
+                    expected,
+                    timeout,
+                })
+            }
             "store" => {
                 let addr = self.value(names)?;
                 let value = self.value(names)?;
@@ -1056,6 +1076,11 @@ impl<'a> Parser<'a> {
             return Ok(Inst::ThreadJoin {
                 handle: self.value(names)?,
             });
+        }
+        if op == "atomic.notify" {
+            let addr = self.value(names)?;
+            let count = self.value(names)?;
+            return Ok(Inst::MemoryNotify { addr, count });
         }
         if op == "ptr.from_int" || op == "ptr.to_int" {
             return Ok(Inst::PtrCast {

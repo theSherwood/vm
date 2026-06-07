@@ -114,7 +114,12 @@ pub fn run_with_host(
     // still be a real OS thread; the scope joins any stragglers at run end. `budget` caps total
     // spawned threads (§12). No `thread.spawn` ⇒ no thread is ever created (negligible overhead).
     let budget = std::sync::atomic::AtomicU32::new(MAX_THREADS);
-    std::thread::scope(|s| run_func(f, args, fuel, &mut mem, &m.funcs, host, 0, s, &budget))
+    let parking = Parking::default();
+    std::thread::scope(|s| {
+        run_func(
+            f, args, fuel, &mut mem, &m.funcs, host, 0, s, &budget, &parking,
+        )
+    })
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -161,8 +166,11 @@ pub fn run_capture_reserved(
         mm
     });
     let budget = std::sync::atomic::AtomicU32::new(MAX_THREADS);
+    let parking = Parking::default();
     let r = std::thread::scope(|s| {
-        run_func(f, args, fuel, &mut mem, &m.funcs, &mut host, 0, s, &budget)
+        run_func(
+            f, args, fuel, &mut mem, &m.funcs, &mut host, 0, s, &budget, &parking,
+        )
     });
     let snap = mem
         .as_ref()
@@ -202,8 +210,12 @@ pub fn run_capture_reserved_with_host(
         mm
     });
     let budget = std::sync::atomic::AtomicU32::new(MAX_THREADS);
-    let r =
-        std::thread::scope(|s| run_func(f, args, fuel, &mut mem, &m.funcs, host, 0, s, &budget));
+    let parking = Parking::default();
+    let r = std::thread::scope(|s| {
+        run_func(
+            f, args, fuel, &mut mem, &m.funcs, host, 0, s, &budget, &parking,
+        )
+    });
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -245,6 +257,90 @@ const MAX_THREADS: u32 = 64;
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
 const FIBER_RETURNED: i32 = 1;
+
+/// `<ty>.atomic.wait` status results (§12), matching wasm: woken by a notify / value mismatch / timed
+/// out.
+const WAIT_WOKEN: i32 = 0;
+const WAIT_NOT_EQUAL: i32 = 1;
+const WAIT_TIMED_OUT: i32 = 2;
+
+/// Upper bound on how long a `<ty>.atomic.wait` will actually block, regardless of the guest's
+/// requested timeout (and what a negative — "infinite" — timeout is clamped to). A vCPU blocking
+/// forever would never let the run's thread `scope` join; capping keeps the host live (a guest can
+/// stall *itself* but not wedge the process). Legitimate waits return immediately on the notify, so
+/// the cap only bounds the missed-notify fallback.
+const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The run's **parking lot** (§12 futex): a notify generation per confined address plus a live waiter
+/// count, behind one mutex + condvar. Shared across all vCPUs (passed by `&` like the thread budget).
+/// A waiter records the current generation under the lock and blocks until it changes (a notify bumps
+/// it) or the timeout fires; `notify` bumps the generation and wakes everyone, who re-check their own
+/// address (a coarse but correct futex — spurious wakeups are allowed by the model).
+#[derive(Default)]
+struct Parking {
+    state: Mutex<ParkState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct ParkState {
+    /// Confined address ⇒ notify generation (bumped by each `notify`).
+    gen: BTreeMap<u64, u64>,
+    /// Confined address ⇒ number of vCPUs currently parked on it.
+    waiters: BTreeMap<u64, u32>,
+}
+
+impl Parking {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ParkState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Park on `key` until notified or timed out. `value_matches` is evaluated **under the lock**
+    /// (the futex compare-and-block atomicity): if it is already false, return [`WAIT_NOT_EQUAL`]
+    /// without blocking; otherwise block until the generation moves ([`WAIT_WOKEN`]) or the
+    /// `MAX_WAIT`-clamped `timeout_ns` elapses ([`WAIT_TIMED_OUT`]).
+    fn wait(&self, key: u64, timeout_ns: i64, value_matches: impl Fn() -> bool) -> i32 {
+        let st = self.lock();
+        if !value_matches() {
+            return WAIT_NOT_EQUAL;
+        }
+        let gen0 = st.gen.get(&key).copied().unwrap_or(0);
+        {
+            let mut st = st;
+            *st.waiters.entry(key).or_insert(0) += 1;
+            let dur = if timeout_ns < 0 {
+                MAX_WAIT
+            } else {
+                std::time::Duration::from_nanos(timeout_ns as u64).min(MAX_WAIT)
+            };
+            let (mut st, res) = self
+                .cv
+                .wait_timeout_while(st, dur, |s| s.gen.get(&key).copied().unwrap_or(0) == gen0)
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(w) = st.waiters.get_mut(&key) {
+                *w = w.saturating_sub(1);
+            }
+            if res.timed_out() {
+                WAIT_TIMED_OUT
+            } else {
+                WAIT_WOKEN
+            }
+        }
+    }
+
+    /// Wake up to `count` vCPUs parked on `key`; return how many were woken (capped at the live
+    /// waiter count). Bumps the generation so parked waiters fall out of their wait loop.
+    fn notify(&self, key: u64, count: u32) -> u32 {
+        let mut st = self.lock();
+        let waiting = st.waiters.get(&key).copied().unwrap_or(0);
+        if waiting == 0 {
+            return 0;
+        }
+        *st.gen.entry(key).or_insert(0) += 1;
+        self.cv.notify_all();
+        count.min(waiting)
+    }
+}
 
 /// A §12 fiber: a first-class suspendable computation whose continuation is exactly its
 /// reified call stack. `cont.new` makes one (`Pending`); `cont.resume` switches into it;
@@ -341,6 +437,7 @@ fn run_func<'a, 'scope, 'env>(
     depth: u32,
     scope: &'scope std::thread::Scope<'scope, 'env>,
     budget: &'env std::sync::atomic::AtomicU32,
+    parking: &'env Parking,
 ) -> Result<Vec<Value>, Trap>
 where
     'a: 'env,
@@ -541,6 +638,7 @@ where
                             0,
                             scope,
                             budget,
+                            parking,
                         )
                     });
                     threads.push(Some(jh));
@@ -558,6 +656,34 @@ where
                     frames[top]
                         .vals
                         .push(vals.first().copied().unwrap_or(Value::I64(0)));
+                }
+                // §12 futex wait: validate the address (confine/align/prot), then — atomically with
+                // respect to `notify` — compare `*addr` to `expected` under the parking lock and
+                // block on a mismatch-free address until notified or timed out.
+                Inst::MemoryWait {
+                    ty,
+                    addr,
+                    expected,
+                    timeout,
+                } => {
+                    let width = atomic_width(*ty);
+                    let a = as_i64(get(&frames[top].vals, *addr)?)? as u64;
+                    let exp = store_bits(get(&frames[top].vals, *expected)?) & width_mask(width);
+                    let to_ns = as_i64(get(&frames[top].vals, *timeout)?)?;
+                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                    let base = m.prepare_wait(a, *ty)?;
+                    let status = parking.wait(base, to_ns, || m.atomic_value(base, width) == exp);
+                    frames[top].vals.push(Value::I32(status));
+                }
+                // §12 futex notify: wake up to `count` waiters on the confined address.
+                Inst::MemoryNotify { addr, count } => {
+                    let a = as_i64(get(&frames[top].vals, *addr)?)? as u64;
+                    let n = as_i32(get(&frames[top].vals, *count)?)?.max(0) as u32;
+                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                    let base = m.confine_for_notify(a)?;
+                    frames[top]
+                        .vals
+                        .push(Value::I32(parking.notify(base, n) as i32));
                 }
                 // Everything else: one value, or none for `Store`/`AtomicStore`.
                 other => {
@@ -809,7 +935,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         | Inst::ContResume { .. }
         | Inst::Suspend { .. }
         | Inst::ThreadSpawn { .. }
-        | Inst::ThreadJoin { .. } => return Ok(None),
+        | Inst::ThreadJoin { .. }
+        | Inst::MemoryWait { .. }
+        | Inst::MemoryNotify { .. } => return Ok(None),
     };
     Ok(Some(v))
 }
@@ -1724,6 +1852,34 @@ impl Mem {
             self.prot.get(&(base / self.page)),
             Some(PageProt::Backed { .. })
         )
+    }
+
+    /// Validate a `<ty>.atomic.wait` address: confine it, require natural alignment, and require the
+    /// page be readable (`map`/`unmap`/`protect` state) — the same gate as a same-width atomic load.
+    /// Returns the confined base (the parking-lot key). (§12 futex)
+    fn prepare_wait(&self, addr: u64, ty: IntTy) -> Result<u64, Trap> {
+        let width = atomic_width(ty);
+        let base = self.confine_checked(addr, 0, width)?;
+        self.check_align(base, width)?;
+        self.check_prot(base, width, false)?;
+        Ok(base)
+    }
+
+    /// The current `width`-byte value at confined `base` (no checks; `prepare_wait` ran them). Used
+    /// for the futex compare under the parking lock — real atomic for anonymous pages, value-correct
+    /// for §13 aliases.
+    fn atomic_value(&self, base: u64, width: u32) -> u64 {
+        if self.is_backed(base) {
+            self.read_le(base, width)
+        } else {
+            self.back.atomic_load(base, width)
+        }
+    }
+
+    /// Confine an `atomic.notify` address to its parking-lot key. `notify` reads no memory, so only
+    /// bounds confinement applies (no alignment or protection check). (§12 futex)
+    fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap> {
+        self.confine_checked(addr, 0, 1)
     }
 
     fn atomic_load(&self, addr: u64, offset: u64, ty: IntTy) -> Result<Value, Trap> {

@@ -273,3 +273,145 @@ block0(v0: i64):
     // Text: print → parse is identity.
     assert_eq!(parse_module(&print_module(&m)).expect("reparse"), m);
 }
+
+// ---- §12 futex: `<ty>.atomic.wait` / `atomic.notify` ----
+
+/// `wait` returns 1 (not-equal) without blocking when the memory value already differs from
+/// `expected` — the compare-and-block is atomic, so a stale wait is cheap.
+#[test]
+fn wait_returns_not_equal() {
+    // mem[0] is 0; wait expecting 7 ⇒ status 1. Return 1 iff status==1.
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i32.const 7
+  v2 = i64.const 1000000
+  v3 = i32.atomic.wait v0 v1 v2
+  v4 = i32.const 1
+  v5 = i32.eq v3 v4
+  v6 = i64.const 1
+  v7 = i64.const 0
+  v8 = select v5 v6 v7
+  return v8
+}
+"#;
+    assert_eq!(run_i64(src), Ok(1));
+}
+
+/// `wait` returns 2 (timed-out) when the value matches but no notify arrives within the timeout.
+#[test]
+fn wait_times_out() {
+    // mem[0]==0 matches expected 0; 1ms timeout, no notifier ⇒ status 2. Return 1 iff status==2.
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i32.const 0
+  v2 = i64.const 1000000
+  v3 = i32.atomic.wait v0 v1 v2
+  v4 = i32.const 2
+  v5 = i32.eq v3 v4
+  v6 = i64.const 1
+  v7 = i64.const 0
+  v8 = select v5 v6 v7
+  return v8
+}
+"#;
+    assert_eq!(run_i64(src), Ok(1));
+}
+
+/// Cross-thread wakeup: a worker vCPU parks in `atomic.wait`; the main vCPU `atomic.notify`s it
+/// (retrying until a waiter is actually parked, so there's no lost-wakeup race) and the worker wakes
+/// with status 0. The worker maps status 0 → 100, so joining it yields 100 — proof a notify on one
+/// vCPU woke a wait on another.
+#[test]
+fn notify_wakes_waiting_thread() {
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = thread.spawn 1 v0
+  br block1(v1)
+block1(v2: i32):
+  v3 = i64.const 8
+  v4 = i64.atomic.load v3
+  v5 = i64.const 1
+  v6 = i64.eq v4 v5
+  br_if v6 block2(v2) block1(v2)
+block2(v7: i32):
+  v8 = i64.const 0
+  v9 = i32.const 1
+  v10 = atomic.notify v8 v9
+  v11 = i32.const 0
+  v12 = i32.ne v10 v11
+  br_if v12 block3(v7) block2(v7)
+block3(v13: i32):
+  v14 = thread.join v13
+  return v14
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 8
+  v2 = i64.const 1
+  i64.atomic.store v1 v2
+  v3 = i64.const 0
+  v4 = i32.const 0
+  v5 = i64.const 100000000
+  v6 = i32.atomic.wait v3 v4 v5
+  v7 = i32.const 0
+  v8 = i32.eq v6 v7
+  v9 = i64.const 100
+  v10 = i64.const 200
+  v11 = select v8 v9 v10
+  return v11
+}
+"#;
+    assert_eq!(run_i64(src), Ok(100));
+}
+
+/// `wait`/`notify` survive both round-trips (text and binary), like the other ops.
+#[test]
+fn wait_notify_round_trip() {
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i32.const 0
+  v2 = i64.const 1000
+  v3 = i32.atomic.wait v0 v1 v2
+  v4 = i32.const 1
+  v5 = atomic.notify v0 v4
+  v6 = i64.atomic.load v0
+  return v6
+}
+"#;
+    let m = module(src);
+    assert_eq!(decode_module(&encode_module(&m)).expect("decode"), m);
+    assert_eq!(parse_module(&print_module(&m)).expect("reparse"), m);
+}
+
+/// `wait`/`notify` without declared memory are rejected by the verifier (they name an address).
+#[test]
+fn verify_rejects_wait_without_memory() {
+    let src = r#"
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i32.const 0
+  v2 = i64.const 0
+  v3 = i32.atomic.wait v0 v1 v2
+  v4 = i64.const 0
+  return v4
+}
+"#;
+    let m = parse_module(src).expect("parse");
+    assert!(matches!(
+        verify_module(&m),
+        Err(svm_verify::VerifyError::MemoryNotDeclared { .. })
+    ));
+}

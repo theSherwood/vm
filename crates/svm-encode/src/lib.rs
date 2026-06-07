@@ -116,12 +116,14 @@ mod op {
     pub const SUSPEND: u8 = 0xCC; // value
     pub const THREAD_SPAWN: u8 = 0xCD; // func (funcidx), arg -> i32 handle
     pub const THREAD_JOIN: u8 = 0xCE; // handle -> i64 result
+    pub const ATOMIC_WAIT: u8 = 0xCF; // ty, addr, expected, timeout -> i32 status
     pub const FTOI: u8 = 0xD0; // saturating trunc_sat: + FToI index (0..=7)
     pub const FTOI_END: u8 = 0xD7;
     pub const FTOI_TRAP: u8 = 0xD8; // trapping trunc: + FToI index (0..=7)
     pub const FTOI_TRAP_END: u8 = 0xDF;
     pub const ITOF: u8 = 0xE0; // + IToF index (0..=7)
     pub const ITOF_END: u8 = 0xE7;
+    pub const ATOMIC_NOTIFY: u8 = 0xE8; // addr, count -> i32 woken
 
     // Terminators (decoded in a separate context from instruction opcodes).
     pub const BR: u8 = 0x80;
@@ -424,6 +426,23 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::ThreadJoin { handle } => {
             out.push(op::THREAD_JOIN);
             write_uleb(out, *handle as u64);
+        }
+        Inst::MemoryWait {
+            ty,
+            addr,
+            expected,
+            timeout,
+        } => {
+            out.push(op::ATOMIC_WAIT);
+            out.push(int_ty_byte(*ty));
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *expected as u64);
+            write_uleb(out, *timeout as u64);
+        }
+        Inst::MemoryNotify { addr, count } => {
+            out.push(op::ATOMIC_NOTIFY);
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *count as u64);
         }
     }
 }
@@ -816,6 +835,16 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             arg: c.idx()?,
         },
         op::THREAD_JOIN => Inst::ThreadJoin { handle: c.idx()? },
+        op::ATOMIC_WAIT => Inst::MemoryWait {
+            ty: int_ty_from(c.byte()?, b)?,
+            addr: c.idx()?,
+            expected: c.idx()?,
+            timeout: c.idx()?,
+        },
+        op::ATOMIC_NOTIFY => Inst::MemoryNotify {
+            addr: c.idx()?,
+            count: c.idx()?,
+        },
 
         other => return Err(DecodeError::BadOpcode(other)),
     })
