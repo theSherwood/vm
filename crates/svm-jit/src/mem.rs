@@ -339,12 +339,14 @@ mod pal {
         AddVectoredExceptionHandler, RtlCaptureContext, CONTEXT, EXCEPTION_POINTERS,
     };
     use windows_sys::Win32::System::Memory::{
-        VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION,
-        MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+        UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery,
+        MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MEM_COMMIT, MEM_MAPPED,
+        MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
         MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
         PAGE_READWRITE,
     };
     use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     /// `GetLastError()` as an `i64`, for thread-into-panic-messages debuggability (CI has no debugger,
     /// so a failing Win32 call names its error code in the test output).
@@ -470,12 +472,54 @@ mod pal {
         VirtualProtect(base as *const c_void, len, flags, &mut old);
     }
 
-    /// Release a whole reservation from [`reserve`] (`MEM_RELEASE` requires size 0 + the base).
+    /// Release a whole reservation from [`reserve`] — **every fragment of it**. After [`commit_rw`]
+    /// (and the §13 `map_region` view path in `svm-run`) have split the original placeholder into
+    /// independent sub-allocations — committed-private regions, leftover placeholders, mapped views —
+    /// a single `VirtualFree(base, 0, MEM_RELEASE)` frees only the *first* fragment and **leaks the
+    /// rest**: grown-tail committed pages accumulate as commit charge across many window teardowns
+    /// until an allocation fails (the intermittent `windows-latest` `jit_fuzz` OOM/fastfail). So walk
+    /// `[base, base+total)` with `VirtualQuery` and tear down each region — unmap shared-section views,
+    /// release placeholders / private commits. Defensive: teardown must never fault, so individual
+    /// Win32 failures are ignored (the address space is reclaimed wholesale at process exit anyway).
     ///
     /// # Safety
-    /// `base` must be exactly a reservation returned by [`reserve`].
-    pub(super) unsafe fn release(base: *mut u8, _total: usize) {
-        VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+    /// `base`/`total` must be exactly a reservation returned by [`reserve`].
+    pub(super) unsafe fn release(base: *mut u8, total: usize) {
+        let end = base as usize + total;
+        let mut addr = base as usize;
+        let proc = GetCurrentProcess();
+        while addr < end {
+            let mut mbi: MEMORY_BASIC_INFORMATION = core::mem::zeroed();
+            if VirtualQuery(
+                addr as *const c_void,
+                &mut mbi,
+                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) == 0
+            {
+                break;
+            }
+            let region_base = mbi.BaseAddress as usize;
+            let next = region_base + mbi.RegionSize;
+            if mbi.Type == MEM_MAPPED {
+                // A §13 shared-section view: unmap it back to a placeholder, then release that.
+                UnmapViewOfFile2(
+                    proc,
+                    MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: region_base as *mut c_void,
+                    },
+                    MEM_PRESERVE_PLACEHOLDER,
+                );
+                VirtualFree(region_base as *mut c_void, 0, MEM_RELEASE);
+            } else if mbi.State == MEM_COMMIT || mbi.State == MEM_RESERVE {
+                // A committed-private region or a leftover placeholder: free the whole fragment.
+                VirtualFree(mbi.AllocationBase, 0, MEM_RELEASE);
+            }
+            addr = if next > addr {
+                next
+            } else {
+                addr + page_size()
+            };
+        }
     }
 
     // ---- the guard: AddVectoredExceptionHandler + RtlCaptureContext (longjmp-equivalent) --------
