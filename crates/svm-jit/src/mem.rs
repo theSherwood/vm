@@ -731,4 +731,76 @@ mod tests {
         assert_eq!(win.rw_mut()[(8 << 10) - 1], 0xCD);
         // dropped here — `release` must not fault.
     }
+
+    // The windows placeholder allocator splits its reservation into independent fragments —
+    // committed-private regions (the prefix and grown-tail pages) and leftover placeholders (plus
+    // shared-section views in `svm-run`'s §13 path). Teardown (`pal::release`) must free **every**
+    // fragment: a single `VirtualFree(base, 0, MEM_RELEASE)` frees only the *first* and leaks the
+    // rest, whose commit charge accumulated across `jit_fuzz`'s teardowns until an allocation failed
+    // (the intermittent `windows-latest` crash). This pins the no-leak contract: fragment a
+    // reservation the way production does, release it, then `VirtualQuery` the original range and
+    // assert not one byte remains mapped/committed/reserved. (Non-vacuous: the pre-fix single-release
+    // leaks all-but-the-first fragment here.)
+    #[cfg(windows)]
+    #[test]
+    fn pal_release_frees_all_placeholder_fragments_no_leak() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_FREE,
+        };
+
+        let page = pal::page_size();
+        let total = 64 * page; // room for several disjoint fragments
+                               // SAFETY: a fresh placeholder reservation, released below.
+        let base = unsafe { pal::reserve(total) };
+        assert!(!base.is_null(), "reserve failed");
+        // Fragment it the way production does: commit the prefix, then two *non-adjacent* tail pages
+        // (each an interior split + replace-commit out of the big placeholder), so the reservation is
+        // now a mix of committed-private regions and leftover placeholders.
+        // SAFETY: every range lies within `[base, base+total)`.
+        unsafe {
+            pal::commit_rw(base, page); // prefix
+            pal::commit_rw(base.add(20 * page), page); // a "grown" tail page
+            pal::commit_rw(base.add(40 * page), page); // another, non-adjacent
+        }
+        // SAFETY: release exactly the reservation created above.
+        unsafe { pal::release(base, total) };
+
+        // Walk the original range: every region must now be `MEM_FREE` (nothing leaked). Nothing
+        // allocates between the release and this walk, so the freed VA is not reused under us.
+        let lo = base as usize;
+        let hi = lo + total;
+        let mut addr = lo;
+        let mut leaked = 0usize;
+        while addr < hi {
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+            // SAFETY: `VirtualQuery` accepts any address and only writes `mbi`.
+            let n = unsafe {
+                VirtualQuery(
+                    addr as *const c_void,
+                    &mut mbi,
+                    core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if n == 0 {
+                break;
+            }
+            let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+            let overlap = region_end
+                .min(hi)
+                .saturating_sub(addr.max(mbi.BaseAddress as usize));
+            if mbi.State != MEM_FREE {
+                leaked += overlap;
+            }
+            addr = if region_end > addr {
+                region_end
+            } else {
+                addr + page
+            };
+        }
+        assert_eq!(
+            leaked, 0,
+            "pal::release leaked {leaked} bytes of the placeholder reservation \
+             (fragments past the first not freed)"
+        );
+    }
 }
