@@ -643,6 +643,14 @@ struct ShmBacking {
     len: usize, // logical region size the guest sees
 }
 
+// SAFETY: `ptr` is a `MAP_SHARED` mapping of `fd` — a process-wide shared object, not thread-local.
+// A §13 region is shared across vCPU threads (§12); `read_byte`/`write_byte` go through that shared
+// mapping, and concurrent access is the guest's own race, confined to the region (never an escape).
+#[cfg(unix)]
+unsafe impl Send for ShmBacking {}
+#[cfg(unix)]
+unsafe impl Sync for ShmBacking {}
+
 #[cfg(unix)]
 impl ShmBacking {
     fn new(len: usize) -> std::io::Result<ShmBacking> {
@@ -710,7 +718,7 @@ impl Drop for ShmBacking {
 /// with [`svm_interp::Host::grant_shared_region_backed`] so the JIT can `mmap` it for real aliasing.
 #[cfg(unix)]
 pub fn new_shared_region(len: usize) -> RegionBacking {
-    std::rc::Rc::new(ShmBacking::new(len).expect("create shared region"))
+    std::sync::Arc::new(ShmBacking::new(len).expect("create shared region"))
 }
 
 /// A §13 `SharedRegion` backing over a Windows **pagefile-backed section** (`CreateFileMappingW` with
@@ -725,6 +733,14 @@ struct WinShmBacking {
     ptr: *mut u8,
     len: usize, // logical region size the guest sees
 }
+
+// SAFETY: `ptr`/`section` name a process-wide file mapping, not thread-local state. A §13 region is
+// shared across vCPU threads (§12); access goes through the shared mapping and a concurrent race is
+// the guest's own, confined to the region (never an escape).
+#[cfg(windows)]
+unsafe impl Send for WinShmBacking {}
+#[cfg(windows)]
+unsafe impl Sync for WinShmBacking {}
 
 #[cfg(windows)]
 impl WinShmBacking {
@@ -808,7 +824,7 @@ impl Drop for WinShmBacking {
 /// [`svm_interp::Host::grant_shared_region_backed`] so the JIT can alias it via `MapViewOfFile3`.
 #[cfg(windows)]
 pub fn new_shared_region(len: usize) -> RegionBacking {
-    std::rc::Rc::new(WinShmBacking::new(len).expect("create shared region"))
+    std::sync::Arc::new(WinShmBacking::new(len).expect("create shared region"))
 }
 
 /// How a guest program ended: its entry returned values, or it invoked `Exit(code)` (§3e).

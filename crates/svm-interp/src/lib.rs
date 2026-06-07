@@ -8,9 +8,8 @@
 //! flow is bounded by `fuel` (a stand-in for §5 metering), so it always terminates.
 #![forbid(unsafe_code)]
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
@@ -61,6 +60,10 @@ pub enum Trap {
     /// fiber handle (inert, like [`Trap::CapFault`]), `suspend` ran at the root (no fiber
     /// to suspend to), or the fiber count exceeded the interpreter's bound. Not an escape.
     FiberFault,
+    /// A §12 thread operation failed: `thread.join` named a forged / out-of-range / already-joined
+    /// thread handle (inert, like [`Trap::CapFault`]), or `thread.spawn` exceeded the run's thread
+    /// budget. Not an escape.
+    ThreadFault,
     /// Structurally invalid in a way a verified module never is (defensive only).
     Malformed,
 }
@@ -107,7 +110,11 @@ pub fn run_with_host(
         mm.init_data(&m.data); // §3a/D40 data segments (copy + RO-protect)
         mm
     });
-    run_func(f, args, fuel, &mut mem, &m.funcs, host, 0)
+    // A `std::thread::scope` so a `thread.spawn` vCPU can borrow the module's functions (`&'a`) yet
+    // still be a real OS thread; the scope joins any stragglers at run end. `budget` caps total
+    // spawned threads (§12). No `thread.spawn` ⇒ no thread is ever created (negligible overhead).
+    let budget = std::sync::atomic::AtomicU32::new(MAX_THREADS);
+    std::thread::scope(|s| run_func(f, args, fuel, &mut mem, &m.funcs, host, 0, s, &budget))
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -153,7 +160,10 @@ pub fn run_capture_reserved(
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
         mm
     });
-    let r = run_func(f, args, fuel, &mut mem, &m.funcs, &mut host, 0);
+    let budget = std::sync::atomic::AtomicU32::new(MAX_THREADS);
+    let r = std::thread::scope(|s| {
+        run_func(f, args, fuel, &mut mem, &m.funcs, &mut host, 0, s, &budget)
+    });
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -191,7 +201,9 @@ pub fn run_capture_reserved_with_host(
         mm.init_data(&m.data);
         mm
     });
-    let r = run_func(f, args, fuel, &mut mem, &m.funcs, host, 0);
+    let budget = std::sync::atomic::AtomicU32::new(MAX_THREADS);
+    let r =
+        std::thread::scope(|s| run_func(f, args, fuel, &mut mem, &m.funcs, host, 0, s, &budget));
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -223,6 +235,12 @@ struct Frame<'a> {
 /// the reference-oracle analogue of the quota that charges out-of-band stacks to the
 /// guest, so a fiber-bomb OOMs *itself*, never the host.
 const MAX_FIBERS: usize = 1 << 16;
+
+/// Maximum number of vCPUs (`thread.spawn`) a single run may create — a hard cap on the OS threads
+/// the run can launch (§12). Unlike fibers (cheap, in-process), each vCPU is a real OS thread, so the
+/// bound is small; a thread-bomb hits a clean [`Trap::ThreadFault`] rather than exhausting the host.
+/// The budget is **total** across the run (like fuel), so it bounds threads regardless of nesting.
+const MAX_THREADS: u32 = 64;
 
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
@@ -289,6 +307,21 @@ fn resolve_fiber(fibers: &[Fiber], chain: &[usize], handle: i32) -> Result<usize
     }
 }
 
+/// Resolve a `thread.join` handle to a table slot (§12). Like [`resolve_fiber`], the handle is
+/// forgeable, so it is **masked** into the power-of-two-padded table, then bounds- and
+/// liveness-checked: out of range or an already-joined (`None`) slot is inert ([`Trap::ThreadFault`]).
+fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> {
+    if threads.is_empty() {
+        return Err(Trap::ThreadFault);
+    }
+    let mask = threads.len().next_power_of_two() - 1;
+    let slot = (handle as u32 as usize) & mask;
+    if slot >= threads.len() || threads[slot].is_none() {
+        return Err(Trap::ThreadFault);
+    }
+    Ok(slot)
+}
+
 /// Take a parked (`Live`) fiber's frames out for execution, marking its slot `Running`.
 fn take_running<'a>(fibers: &mut [Fiber<'a>], i: usize) -> Result<Vec<Frame<'a>>, Trap> {
     match std::mem::replace(&mut fibers[i], Fiber::Running) {
@@ -297,7 +330,8 @@ fn take_running<'a>(fibers: &mut [Fiber<'a>], i: usize) -> Result<Vec<Frame<'a>>
     }
 }
 
-fn run_func<'a>(
+#[allow(clippy::too_many_arguments)]
+fn run_func<'a, 'scope, 'env>(
     f: &'a Func,
     args: &[Value],
     fuel: &mut u64,
@@ -305,7 +339,12 @@ fn run_func<'a>(
     funcs: &'a [Func],
     host: &mut Host,
     depth: u32,
-) -> Result<Vec<Value>, Trap> {
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    budget: &'env std::sync::atomic::AtomicU32,
+) -> Result<Vec<Value>, Trap>
+where
+    'a: 'env,
+{
     // The fiber table for this run (§12). `fibers[0]` is the **root** computation; each
     // `cont.new` appends. A fiber handle (`i32`) is its table index, masked + checked at
     // `cont.resume` like a capability handle (§3c) so a forged handle is inert. The
@@ -314,6 +353,12 @@ fn run_func<'a>(
     // The resume chain: `chain[0]` is always the root, `chain.last()` the running fiber.
     let mut chain: Vec<usize> = vec![0];
     let mut cur = 0usize;
+    // This vCPU's child threads (§12). A `thread.spawn` pushes a scoped join handle; its table
+    // index, masked + checked at `thread.join` like a fiber handle, is the returned thread handle.
+    // A joined slot becomes `None` (a re-join is inert). Stragglers are joined by the enclosing
+    // `scope` at run end.
+    type ThreadHandle<'s> = std::thread::ScopedJoinHandle<'s, Result<Vec<Value>, Trap>>;
+    let mut threads: Vec<Option<ThreadHandle<'scope>>> = Vec::new();
     // The running fiber's reified call stack. The entry block's parameters are the call
     // arguments (verifier-checked; copied defensively).
     let mut frames: Vec<Frame<'a>> = vec![Frame {
@@ -466,6 +511,53 @@ fn run_func<'a>(
                     frames[rtop].vals.push(Value::I32(FIBER_SUSPENDED));
                     frames[rtop].vals.push(Value::I64(v));
                     continue 'frames;
+                }
+                // §12 thread spawn: launch a real OS-thread vCPU running `funcs[func](arg)` over the
+                // *shared* memory (the `Arc<Region>` bytes + §13 `Arc` regions; the child snapshots
+                // the page-protection map). The child starts with an empty powerbox and its own fuel
+                // budget. Yields an i32 thread handle (the table index).
+                Inst::ThreadSpawn { func, arg } => {
+                    let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
+                    let av = as_i64(get(&frames[top].vals, *arg)?)?;
+                    // Charge the run-wide thread budget *before* spawning (a thread-bomb hits this).
+                    if budget.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        budget.fetch_add(1, std::sync::atomic::Ordering::SeqCst); // un-charge
+                        return Err(Trap::ThreadFault);
+                    }
+                    let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
+                    let child_fuel = *fuel; // the child's own metering budget (a copy)
+                    let handle = threads.len() as i32;
+                    let jh = scope.spawn(move || {
+                        let mut cm = child_mem;
+                        let mut cfuel = child_fuel;
+                        let mut chost = Host::new(); // spawned vCPUs start with an empty powerbox
+                        run_func(
+                            callee,
+                            &[Value::I64(av)],
+                            &mut cfuel,
+                            &mut cm,
+                            funcs,
+                            &mut chost,
+                            0,
+                            scope,
+                            budget,
+                        )
+                    });
+                    threads.push(Some(jh));
+                    frames[top].vals.push(Value::I32(handle));
+                }
+                // §12 thread join: block until vCPU `handle` finishes, yield its i64 result. A
+                // forged / out-of-range / already-joined handle is inert (masked + checked like a
+                // fiber handle); a trap in the joined vCPU propagates here.
+                Inst::ThreadJoin { handle } => {
+                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let slot = resolve_thread(&threads, h)?;
+                    let jh = threads[slot].take().ok_or(Trap::ThreadFault)?;
+                    let child = jh.join().map_err(|_| Trap::ThreadFault)?; // a panic ⇒ inert
+                    let vals = child?; // propagate the child's trap, if any
+                    frames[top]
+                        .vals
+                        .push(vals.first().copied().unwrap_or(Value::I64(0)));
                 }
                 // Everything else: one value, or none for `Store`/`AtomicStore`.
                 other => {
@@ -715,7 +807,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         | Inst::CapCall { .. }
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
-        | Inst::Suspend { .. } => return Ok(None),
+        | Inst::Suspend { .. }
+        | Inst::ThreadSpawn { .. }
+        | Inst::ThreadJoin { .. } => return Ok(None),
     };
     Ok(Some(v))
 }
@@ -982,15 +1076,20 @@ const PROT_WRITE: i32 = 2;
 /// A §13 `SharedRegion`'s backing — a host-owned shared object aliased into a window at one or more
 /// offsets. The reference (interpreter) backing is a plain Rust buffer ([`VecBacking`]); a flat-window
 /// backend (the JIT) supplies one wrapping a real OS shared-memory object (memfd / file mapping) whose
-/// [`SharedBacking::os_fd`] it `mmap`s for true hardware aliasing. Cloning the `Rc` shares the *same*
+/// [`SharedBacking::os_fd`] it `mmap`s for true hardware aliasing. Cloning the `Arc` shares the *same*
 /// object, so two mappings of it alias.
-pub trait SharedBacking {
+///
+/// `Send + Sync`: a region is shared across vCPU threads (§12) — a `Backed` page aliased into more
+/// than one thread's window names the same bytes. Concurrent access is the guest's race (§12);
+/// implementors serialize or use atomics as they see fit (the reference [`VecBacking`] uses a
+/// `Mutex`).
+pub trait SharedBacking: Send + Sync {
     /// Region size in bytes.
     fn size(&self) -> u64;
     /// Read one region-relative byte (out of range ⇒ 0).
     fn read_byte(&self, off: u64) -> u8;
     /// Write one region-relative byte (out of range ⇒ ignored). Interior-mutable: a region is shared
-    /// (`Rc`), so writes go through `&self`.
+    /// (`Arc`), so writes go through `&self`.
     fn write_byte(&self, off: u64, b: u8);
     /// An OS shared-memory handle a flat-window backend can `mmap` for real aliasing; `None` for the
     /// pure-Rust reference backing (the interpreter models aliasing in software instead). Unix
@@ -1009,21 +1108,29 @@ pub trait SharedBacking {
 }
 
 /// A reference to a shared region backing (see [`SharedBacking`]); cloning shares the same object.
-pub type RegionBacking = Rc<dyn SharedBacking>;
+pub type RegionBacking = Arc<dyn SharedBacking>;
 
-/// The reference [`SharedBacking`]: a plain in-process buffer. The interpreter models aliasing by
-/// reading/writing this shared buffer through several `Backed` pages.
-struct VecBacking(RefCell<Vec<u8>>);
+/// The reference [`SharedBacking`]: a plain in-process buffer behind a `Mutex` (so it is `Send +
+/// Sync` and safe to alias across vCPU threads). The interpreter models aliasing by reading/writing
+/// this shared buffer through several `Backed` pages.
+struct VecBacking(Mutex<Vec<u8>>);
+
+impl VecBacking {
+    /// Lock, recovering from poisoning rather than panicking (the interpreter never panics, §robust).
+    fn buf(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 impl SharedBacking for VecBacking {
     fn size(&self) -> u64 {
-        self.0.borrow().len() as u64
+        self.buf().len() as u64
     }
     fn read_byte(&self, off: u64) -> u8 {
-        self.0.borrow().get(off as usize).copied().unwrap_or(0)
+        self.buf().get(off as usize).copied().unwrap_or(0)
     }
     fn write_byte(&self, off: u64, b: u8) {
-        if let Some(s) = self.0.borrow_mut().get_mut(off as usize) {
+        if let Some(s) = self.buf().get_mut(off as usize) {
             *s = b;
         }
     }
@@ -1233,7 +1340,7 @@ impl Host {
     /// access the shared bytes as ordinary masked loads/stores. (Guest-minted regions and
     /// cross-domain `grant` are a §14 follow-up; this models the host↔guest data plane.)
     pub fn grant_shared_region(&mut self, len: usize) -> i32 {
-        self.grant_shared_region_backed(Rc::new(VecBacking(RefCell::new(vec![0u8; len]))))
+        self.grant_shared_region_backed(Arc::new(VecBacking(Mutex::new(vec![0u8; len]))))
     }
 
     /// Grant a §13 `SharedRegion` over a caller-supplied [`SharedBacking`] — how a flat-window
@@ -1483,8 +1590,10 @@ struct Mem {
     /// The anonymous-page backing: a [`svm_mem::Region`] (`#![forbid(unsafe_code)]`-friendly) sized
     /// to the window's reserved extent. On unix this is one demand-zeroed `mmap` — the shareable
     /// substrate parallel vCPUs run over with real hardware atomics (§12); elsewhere a paged
-    /// fallback. §13 aliased pages live in `regions`, not here.
-    back: Region,
+    /// fallback. §13 aliased pages live in `regions`, not here. Held in an `Arc` so a spawned vCPU
+    /// (`thread.spawn`) shares the *same* bytes — `Region`'s accessors are all `&self`, so the `Arc`
+    /// derefs transparently.
+    back: Arc<Region>,
     /// Page index (`offset / page`) ⇒ explicit page state. A page absent from the map takes its
     /// region default: read+write inside the initial prefix `[0, mapped)`, unmapped in the
     /// reserved tail `[mapped, reserved)`. Entries appear for `protect`ed (`Ro`), `unmap`ped
@@ -1507,11 +1616,27 @@ impl Mem {
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
         Mem {
-            back: Region::new(window.reserved(), page),
+            back: Arc::new(Region::new(window.reserved(), page)),
             window,
             page,
             prot: BTreeMap::new(),
             regions: BTreeMap::new(),
+        }
+    }
+
+    /// Build the memory view a spawned vCPU (`thread.spawn`) starts with (§12): the **same** shared
+    /// bytes (`Arc<Region>` clone) and the **same** §13 region backings (`Arc` clones, so a `Backed`
+    /// alias names identical bytes across threads), plus a *snapshot* of the page-protection map.
+    /// Confinement (`window`/`page`) is copied. Mapping changes either thread makes *after* the spawn
+    /// are therefore private to that thread — a documented step-2 limitation; lifting it to a shared,
+    /// synchronized address space is a later step.
+    fn fork_for_thread(&self) -> Mem {
+        Mem {
+            window: self.window,
+            page: self.page,
+            back: Arc::clone(&self.back),
+            prot: self.prot.clone(),
+            regions: self.regions.clone(),
         }
     }
 
@@ -2464,10 +2589,7 @@ mod prot_tests {
 
     /// A §13 `SharedRegion` backing of `pages` whole host pages, zero-filled.
     fn region(pages: u64) -> RegionBacking {
-        Rc::new(VecBacking(RefCell::new(vec![
-            0u8;
-            (pages * page()) as usize
-        ])))
+        Arc::new(VecBacking(Mutex::new(vec![0u8; (pages * page()) as usize])))
     }
 
     #[test]

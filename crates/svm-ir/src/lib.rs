@@ -992,6 +992,23 @@ pub enum Inst {
     Suspend {
         value: ValIdx,
     },
+    /// §12 thread spawn (`thread.spawn`): start a new vCPU — a real OS thread — running
+    /// `funcs[func]` with `arg`, over the **same** guest memory. The anonymous `Region` bytes and
+    /// §13 aliases are shared; mapping changes made *after* the spawn are thread-local (a later
+    /// step lifts that). `func` must have type `(i64) -> i64` (verifier-checked). Yields an `i32`
+    /// **thread handle**: a forgeable index into the runtime-owned thread table, masked +
+    /// generation-checked at [`Inst::ThreadJoin`] like a fiber/capability handle (§3c), so a forged
+    /// handle is inert (it traps).
+    ThreadSpawn {
+        func: FuncIdx,
+        arg: ValIdx,
+    },
+    /// §12 thread join (`thread.join`): block until the vCPU named by `handle` (an `i32` thread
+    /// handle) finishes and yield its `i64` result. A forged / out-of-range / already-joined handle
+    /// is inert (**traps**); if the joined vCPU itself trapped, that trap propagates here.
+    ThreadJoin {
+        handle: ValIdx,
+    },
 }
 
 impl Inst {

@@ -375,8 +375,12 @@ mod mapped {
                 match width {
                     4 => {
                         let a = AtomicU32::from_ptr(self.ptr(off) as *mut u32);
-                        match a.compare_exchange(expected as u32, replacement as u32, SeqCst, SeqCst)
-                        {
+                        match a.compare_exchange(
+                            expected as u32,
+                            replacement as u32,
+                            SeqCst,
+                            SeqCst,
+                        ) {
                             Ok(old) | Err(old) => old as u64,
                         }
                     }
@@ -513,7 +517,13 @@ impl Paged {
     fn atomic_rmw(&self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
         let mut map = self.lock();
         let old = Self::load_locked(&map, self.page, off, width);
-        Self::store_locked(&mut map, self.page, off, width, rmw_apply(op, old, val, width));
+        Self::store_locked(
+            &mut map,
+            self.page,
+            off,
+            width,
+            rmw_apply(op, old, val, width),
+        );
         old
     }
 

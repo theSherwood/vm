@@ -225,6 +225,9 @@ fn print_inst(inst: &Inst) -> String {
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
         Inst::Suspend { value } => format!("suspend v{value}"),
+        // §12 real threads (OS-thread vCPUs over shared memory).
+        Inst::ThreadSpawn { func, arg } => format!("thread.spawn {func} v{arg}"),
+        Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
     }
 }
 
@@ -1039,6 +1042,19 @@ impl<'a> Parser<'a> {
         if op == "suspend" {
             return Ok(Inst::Suspend {
                 value: self.value(names)?,
+            });
+        }
+        // §12 real threads.
+        if op == "thread.spawn" {
+            let n = self.parse_int()?;
+            let func = u32::try_from(n)
+                .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
+            let arg = self.value(names)?;
+            return Ok(Inst::ThreadSpawn { func, arg });
+        }
+        if op == "thread.join" {
+            return Ok(Inst::ThreadJoin {
+                handle: self.value(names)?,
             });
         }
         if op == "ptr.from_int" || op == "ptr.to_int" {

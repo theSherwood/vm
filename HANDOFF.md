@@ -865,10 +865,30 @@ leave a shared view — add a unix test for this alongside the Windows work.
   (correct-but-serialized; not the parallel path). **Validated under ThreadSanitizer** (`-Zsanitizer=
   thread`): the headline test — 8 threads × 20 000 `fetch_add` on one shared counter landing on the
   exact total — plus a disjoint-plain-write test report **zero data races**. `Region` adds no
-  ordering/scheduling policy; that lives above it. **Phase 2 still to come:** vCPU = OS-thread spawn +
-  per-thread/shared state split, fibers→real-threads scheduler (M:N), `wait`/`notify`, the
-  memory-ordering parameter on the atomic IR ops + fences (today all seq-cst), and the
-  differential-oracle-under-nondeterminism story.
+  ordering/scheduling policy; that lives above it.
+  **Parallel threads — Phase 2 step 2 DONE (`thread.spawn`/`thread.join`, real OS-thread vCPUs):**
+  first-class IR ops threaded through the whole pipeline (`Inst::ThreadSpawn { func, arg }` → i32
+  handle, `Inst::ThreadJoin { handle }` → i64; text `thread.spawn <funcidx> vN` / `thread.join vN`;
+  opcodes `0xCD`/`0xCE`; verify checks the spawnee is the fixed thread-entry type `(i64)->i64` via new
+  `VerifyError::ThreadEntrySignature`; the JIT auto-reports them `Unsupported` like fibers, so they're
+  interp-only — no differential pairing). The interpreter runs a spawned vCPU on a **real OS thread**
+  inside a per-run `std::thread::scope` (so the child can borrow the module's `&'a` funcs and
+  stragglers are joined at run end); a run-wide `AtomicU32` budget (`MAX_THREADS=64`, total) makes a
+  thread-bomb a clean `Trap::ThreadFault`. The child shares the **same** memory: `Mem.back` is now an
+  `Arc<Region>` and §13 region backings moved `Rc`/`RefCell` → `Arc<dyn SharedBacking + Send + Sync>`
+  / `Mutex` (so `Mem` is `Send`; `SharedBacking` gained the supertrait, svm-run's `ShmBacking`/
+  `WinShmBacking` got justified `unsafe impl Send+Sync`). A spawned vCPU shares anonymous bytes + §13
+  aliases live, **snapshots** the page-protection map (post-spawn `map`/`unmap` is thread-local — a
+  documented step-2 limitation), and starts with an empty powerbox + its own fuel. Thread handles are
+  masked + liveness-checked like fiber/capability handles, so a forged/double `thread.join` is inert
+  (`ThreadFault`); a child trap propagates through `join`. Tests: `crates/svm/tests/threads.rs` (×9 —
+  shared-memory visibility, 4-way concurrent `atomic.rmw.add` summing exactly, forge/double-join
+  inert, child-trap propagation, capture reflects thread writes, verify-rejects-bad-sig, binary+text
+  round-trip), **all green under ThreadSanitizer** (`-Zsanitizer=thread`, zero data races) + clippy
+  `-D warnings` + windows-gnu. **Phase 2 still to come:** a shared *synchronized* address space (live
+  cross-thread `map`/`unmap`), fibers→real-threads scheduler (M:N), `wait`/`notify`, the
+  memory-ordering parameter on the atomic IR ops + fences (today all seq-cst), per-thread capability
+  grants, and the differential-oracle-under-nondeterminism story.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a

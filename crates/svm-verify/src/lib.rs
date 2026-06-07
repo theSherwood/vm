@@ -73,6 +73,9 @@ pub enum VerifyError {
         expected: usize,
         found: usize,
     },
+    /// A `thread.spawn` named a function whose signature is not the fixed thread entry type
+    /// `(i64) -> i64` (§12).
+    ThreadEntrySignature { func: u32, block: u32, callee: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -227,6 +230,32 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 cx.expect(*arg, ValType::I64)?;
                 types.push(ValType::I32); // status
                 types.push(ValType::I64); // value
+                continue;
+            }
+            // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
+            // thread entry type `(i64) -> i64`, so — like `call` — it needs whole-module info.
+            if let Inst::ThreadSpawn { func, arg } = inst {
+                let callee = funcs
+                    .get(*func as usize)
+                    .ok_or(VerifyError::CallFuncOutOfRange {
+                        func: fi,
+                        block: bi,
+                        callee: *func,
+                    })?;
+                if callee.params != [ValType::I64] || callee.results != [ValType::I64] {
+                    return Err(VerifyError::ThreadEntrySignature {
+                        func: fi,
+                        block: bi,
+                        callee: *func,
+                    });
+                }
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*arg, ValType::I64)?;
+                types.push(ValType::I32); // the thread handle
                 continue;
             }
             // A value-producing instruction appends its result type; `Store` does not.
@@ -422,6 +451,12 @@ fn check_inst(
             cx.expect(*value, ValType::I64)?;
             ValType::I64
         }
+        // §12 thread join: an i32 thread handle in, the joined vCPU's i64 result out. (The handle
+        // is forgeable; safety is the runtime use-site check, like a fiber/capability handle.)
+        Inst::ThreadJoin { handle } => {
+            cx.expect(*handle, ValType::I32)?;
+            ValType::I64
+        }
         // Handled before/around the match; listed for exhaustiveness (no panic).
         Inst::Store { .. }
         | Inst::AtomicStore { .. }
@@ -429,7 +464,8 @@ fn check_inst(
         | Inst::RefFunc { .. }
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
-        | Inst::ContResume { .. } => return Ok(None),
+        | Inst::ContResume { .. }
+        | Inst::ThreadSpawn { .. } => return Ok(None),
     };
     Ok(Some(ty))
 }

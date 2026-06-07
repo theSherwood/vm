@@ -114,6 +114,8 @@ mod op {
     pub const CONT_NEW: u8 = 0xCA; // func (funcref idx), sp (data-stack base)
     pub const CONT_RESUME: u8 = 0xCB; // k, arg
     pub const SUSPEND: u8 = 0xCC; // value
+    pub const THREAD_SPAWN: u8 = 0xCD; // func (funcidx), arg -> i32 handle
+    pub const THREAD_JOIN: u8 = 0xCE; // handle -> i64 result
     pub const FTOI: u8 = 0xD0; // saturating trunc_sat: + FToI index (0..=7)
     pub const FTOI_END: u8 = 0xD7;
     pub const FTOI_TRAP: u8 = 0xD8; // trapping trunc: + FToI index (0..=7)
@@ -413,6 +415,15 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::Suspend { value } => {
             out.push(op::SUSPEND);
             write_uleb(out, *value as u64);
+        }
+        Inst::ThreadSpawn { func, arg } => {
+            out.push(op::THREAD_SPAWN);
+            write_uleb(out, *func as u64);
+            write_uleb(out, *arg as u64);
+        }
+        Inst::ThreadJoin { handle } => {
+            out.push(op::THREAD_JOIN);
+            write_uleb(out, *handle as u64);
         }
     }
 }
@@ -799,6 +810,12 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             arg: c.idx()?,
         },
         op::SUSPEND => Inst::Suspend { value: c.idx()? },
+
+        op::THREAD_SPAWN => Inst::ThreadSpawn {
+            func: c.idx()?,
+            arg: c.idx()?,
+        },
+        op::THREAD_JOIN => Inst::ThreadJoin { handle: c.idx()? },
 
         other => return Err(DecodeError::BadOpcode(other)),
     })
