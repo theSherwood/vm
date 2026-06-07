@@ -1,8 +1,14 @@
 # Handoff — C frontend (chibicc → SVM IR) + differential fuzzing
 
-Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-05**.
+Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07**.
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
+
+**Latest (2026-06-07):** §13 `SharedRegion` aliasing is now wired on **Windows** (issue #1,
+PR #2, merged) — `MapViewOfFile3` over a `VirtualAlloc2` placeholder reservation — so the
+feature is complete on all three OS legs (Linux/macOS/Windows), green on `windows-latest` CI.
+A fast local Windows loop exists now: `cargo-xwin` (real MSVC) + **wine** runs the test
+binaries, incl. the placeholder/view + VEH-guard paths (see "§13 Windows — playbook" in §10).
 
 **Status in one line:** Phase 2 ("real C runs") is **complete** — the C frontend is at the
 agreed stopping point (broad subset, two-tier tested) — and we're into Phase 3 (the JIT +
@@ -698,8 +704,9 @@ this is the index.)
   old `#[cfg(windows)]` `-EINVAL` pin is gone. **Validated locally** by cross-compiling to
   `x86_64-pc-windows-msvc` (`cargo-xwin`, MS SDK now fetchable in this environment) and running the
   whole suite under **wine** — escape_oracle, the 4000-seed `jit_fuzz`, the Memory-cap differential,
-  and the §13 alias differential all green; the gating runtime check stays the `cross-os`
-  `windows-latest` CI. The original playbook is preserved below as the design record.
+  and the §13 alias differential all green — **and confirmed on the real `windows-latest` CI** (PR #2,
+  merged: the `build · test (windows-latest)` gate passed, all three OS legs green). The original
+  playbook is preserved below as the design record.
   **Still left (Phase 4, not MVP blockers):** fault-driven *content* supply (a guest/parent as pager —
   `userfaultfd`/§14), and cross-domain `SharedRegion` `create`/`grant` (guest-minted regions — needs
   the §14 Instantiator). **`malloc` over `map` is the default guest libc** — the powerbox
