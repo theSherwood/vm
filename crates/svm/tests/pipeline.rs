@@ -872,6 +872,32 @@ block0(v0: i32):
     );
 }
 
+#[test]
+fn mutual_recursion_traps_not_overflows() {
+    // func0 -> func1 -> func0 -> ... unbounded. The explicit-stack interpreter must keep a
+    // call stack that alternates *between functions* and hit the depth bound as a clean
+    // StackOverflow (never host-stack recursion), well within fuel.
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = call 1(v0)
+  return v1
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = call 0(v0)
+  return v1
+}
+"#;
+    let m = load(&assemble(src).unwrap()).unwrap();
+    let mut fuel = 10_000_000u64;
+    assert_eq!(
+        run(&m, 0, &[Value::I32(0)], &mut fuel),
+        Err(Trap::StackOverflow)
+    );
+}
+
 /// Run a specific function index (the corpus helpers default to func 0).
 fn run1at(src: &str, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
     let m = load(&assemble(src).unwrap()).unwrap();

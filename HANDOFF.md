@@ -832,6 +832,26 @@ leave a shared view — add a unix test for this alongside the Windows work.
   once threads exist — single-threaded the value semantics equal the non-atomic op), narrow widths
   (8/16/32), fibers/vCPUs/M:N scheduling, real threads + the C11 memory model. The atomics are not
   yet emitted by the `irgen` fuzzer or the chibicc frontend (focused tests cover them).
+  **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
+  on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
+  in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a
+  `return` pops and resumes the caller past the call, a tail call replaces the top in place (still
+  O(1) frames). This is a **behaviour-preserving refactor** (identical results/traps/fuel; whole suite
+  + clippy green on linux & windows-gnu; `MAX_CALL_DEPTH=256` boundary unchanged; new
+  `mutual_recursion_traps_not_overflows` test exercises cross-function frames). **Why:** a fiber's
+  continuation is exactly its `Vec<Frame>`, so this is the prerequisite for `suspend`/`resume`.
+  **Plan for C threading on the fibers/vCPU model** (no architectural blocker — the determinism vs.
+  threading tension is resolved by running fibers cooperatively on a *single* vCPU in the differential
+  oracle; true multi-vCPU parallelism is a separate, non-bit-deterministic mode validated by other
+  means). Remaining steps, in order: (2) stack-switch IR ops (`cont.new`/`resume`/`suspend` as
+  call-clobbering control ops) + verify/encode/text; (3) make `run_func` *step-able* (run-until-suspend)
+  + a deterministic cooperative scheduler holding N fibers; (4) the JIT's machine-level control-stack
+  switch (asm SP swap — the riskiest, escape-TCB-adjacent piece) so compiled fibers suspend mid-callstack;
+  (5) `wait`/`notify` (futex over the window) as cooperative park/unpark; (6) C frontend: real
+  `_Atomic`/`<stdatomic.h>` lowering (today stubbed → silently races), a `<pthread.h>`/`<threads.h>`
+  shim onto fiber-spawn + futex, and `_Thread_local` → fiber-local storage. The data-stack half of the
+  two-stack split is already built (chibicc lowers address-taken locals to an in-window data stack via
+  data-SP `v0`), so only the control-stack half is new work.
 - [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
   virtual memory** — *most of the §1a differentiators live here.*
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.

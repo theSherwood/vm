@@ -60,13 +60,15 @@ pub enum Trap {
     Malformed,
 }
 
-/// Maximum nested `call` depth before the interpreter traps. This bounds the host
-/// stack the recursive interpreter consumes, so adversarial (or merely deep) guest
-/// recursion yields a clean `Trap::StackOverflow` instead of crashing the process.
+/// Maximum nested `call` depth before the interpreter traps, bounding the size of the
+/// **explicit** guest call stack (a `Vec<Frame>`, §12) so adversarial (or merely deep)
+/// guest recursion yields a clean `Trap::StackOverflow` rather than unbounded growth.
 ///
-/// Kept conservative because each frame must fit even a small (≈2 MiB) thread stack
-/// — this is a reference-oracle limit, not the production recursion ceiling (the JIT
-/// uses the guest's guard-paged data stack, §5, not host recursion).
+/// The interpreter no longer recurses on the host stack — the guest call stack is
+/// reified (so a fiber's continuation is just its `Vec<Frame>`, suspendable; §12), and
+/// the host stack stays O(1) regardless of guest depth. This is a reference-oracle limit,
+/// not the production recursion ceiling (the JIT uses the guest's guard-paged data stack,
+/// §5).
 const MAX_CALL_DEPTH: u32 = 256;
 
 /// Run `func` with `args`, consuming up to `*fuel` execution steps.
@@ -195,8 +197,25 @@ pub fn run_capture_reserved_with_host(
     (r, snap)
 }
 
+/// One activation record on the **explicit** guest call stack (§12). Reifying the call
+/// stack — rather than recursing on the host stack — is the prerequisite for fibers: a
+/// fiber's continuation is exactly its `Vec<Frame>`, which a future `suspend` can pause
+/// and a `resume` restart. Today the driver still runs each call to completion; nothing
+/// observable changes versus the old recursive interpreter.
+struct Frame<'a> {
+    /// The function this activation is executing.
+    f: &'a Func,
+    /// Index of the block currently executing.
+    block: usize,
+    /// Index of the **next** instruction to execute within that block. Saved across a
+    /// nested call so the caller resumes just past the `call` when the callee returns.
+    inst: usize,
+    /// Block-local SSA values produced so far (entry = the call arguments).
+    vals: Vec<Value>,
+}
+
 fn run_func<'a>(
-    mut f: &'a Func,
+    f: &'a Func,
     args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
@@ -204,108 +223,161 @@ fn run_func<'a>(
     host: &mut Host,
     depth: u32,
 ) -> Result<Vec<Value>, Trap> {
-    if depth > MAX_CALL_DEPTH {
-        return Err(Trap::StackOverflow);
-    }
-    // Entry block parameters are the function arguments (verifier guarantees the
-    // count/types; we still copy defensively).
-    let mut vals: Vec<Value> = args.to_vec();
+    // The reified guest call stack. The entry block's parameters are the function
+    // arguments (verifier-checked; copied defensively). `depth` is the base depth of the
+    // bottom frame (0 at top level) so the bound covers any future resume above a floor.
+    let mut stack: Vec<Frame<'a>> = vec![Frame {
+        f,
+        block: 0,
+        inst: 0,
+        vals: args.to_vec(),
+    }];
 
-    // Outer loop: a *tail* call replaces the current function in place — same host
-    // frame, no depth growth — restarting here with the callee and its args. So
-    // tail-recursive guests run in O(1) host stack (bounded only by fuel).
-    'tail: loop {
-        let mut block_idx: usize = 0;
+    // Drive the top frame. A `call` pushes a new top and restarts here; a `return` pops
+    // and appends results to the caller (which resumes past the call); a tail call
+    // replaces the top in place (no growth) — so deep tail recursion stays O(1) frames.
+    'frames: loop {
+        let top = stack.len() - 1;
+        // `block` borrows `funcs` (lifetime `'a`), *not* `stack`, so the loop body is free
+        // to push/pop/mutate `stack` while holding it.
+        let block = stack[top]
+            .f
+            .blocks
+            .get(stack[top].block)
+            .ok_or(Trap::Malformed)?;
 
-        loop {
-            let block = f.blocks.get(block_idx).ok_or(Trap::Malformed)?;
+        // Execute the remaining instructions of this block.
+        while stack[top].inst < block.insts.len() {
+            let inst = &block.insts[stack[top].inst];
+            step(fuel)?;
+            stack[top].inst += 1; // advance first, so a call-return resumes past this inst
 
-            for inst in &block.insts {
-                step(fuel)?;
-                // Non-tail calls recurse (they append 0..N results and continue);
-                // the rest go through `eval_inst` (one value, or none for `Store`).
-                if let Inst::Call { func, args } = inst {
-                    let argv = collect(&vals, args)?;
+            match inst {
+                // Non-tail calls push a new frame and switch to it; the callee's results
+                // are appended to this frame's `vals` when it returns (see `Return`).
+                Inst::Call { func, args } => {
+                    let argv = collect(&stack[top].vals, args)?;
                     let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
-                    let results = run_func(callee, &argv, fuel, mem, funcs, host, depth + 1)?;
-                    vals.extend(results);
-                } else if let Inst::CallIndirect { ty, idx, args } = inst {
-                    let callee = table_lookup(funcs, as_i32(get(&vals, *idx)?)?, ty)?;
-                    let argv = collect(&vals, args)?;
-                    let results = run_func(callee, &argv, fuel, mem, funcs, host, depth + 1)?;
-                    vals.extend(results);
-                } else if let Inst::CapCall {
+                    if depth as usize + stack.len() > MAX_CALL_DEPTH as usize {
+                        return Err(Trap::StackOverflow);
+                    }
+                    stack.push(Frame {
+                        f: callee,
+                        block: 0,
+                        inst: 0,
+                        vals: argv,
+                    });
+                    continue 'frames;
+                }
+                Inst::CallIndirect { ty, idx, args } => {
+                    let callee = table_lookup(funcs, as_i32(get(&stack[top].vals, *idx)?)?, ty)?;
+                    let argv = collect(&stack[top].vals, args)?;
+                    if depth as usize + stack.len() > MAX_CALL_DEPTH as usize {
+                        return Err(Trap::StackOverflow);
+                    }
+                    stack.push(Frame {
+                        f: callee,
+                        block: 0,
+                        inst: 0,
+                        vals: argv,
+                    });
+                    continue 'frames;
+                }
+                Inst::CapCall {
                     type_id,
                     op,
                     sig,
                     handle,
                     args,
-                } = inst
-                {
+                } => {
                     // Capability call (§3c): resolve the handle in the host-owned table
                     // (mask + type_id/generation check) and dispatch to the mock host.
                     // Args/results cross as i64 slots (the shared host-dispatch ABI).
-                    let h = as_i32(get(&vals, *handle)?)?;
+                    // Synchronous in the reference (the async/submit-complete ABI is §12).
+                    let h = as_i32(get(&stack[top].vals, *handle)?)?;
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
-                        argv.push(val_to_slot(get(&vals, *a)?));
+                        argv.push(val_to_slot(get(&stack[top].vals, *a)?));
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let results = host.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
                     for (s, ty) in results.iter().zip(&sig.results) {
-                        vals.push(slot_to_val(*ty, *s));
+                        stack[top].vals.push(slot_to_val(*ty, *s));
                     }
-                } else if let Some(v) = eval_inst(inst, &vals, mem)? {
-                    vals.push(v);
+                }
+                // Everything else: one value, or none for `Store`/`AtomicStore`.
+                other => {
+                    if let Some(v) = eval_inst(other, &stack[top].vals, mem)? {
+                        stack[top].vals.push(v);
+                    }
                 }
             }
+        }
 
-            step(fuel)?;
-            match &block.term {
-                Terminator::Br { target, args } => {
-                    vals = collect(&vals, args)?;
-                    block_idx = *target as usize;
+        step(fuel)?;
+        match &block.term {
+            Terminator::Br { target, args } => {
+                stack[top].vals = collect(&stack[top].vals, args)?;
+                stack[top].block = *target as usize;
+                stack[top].inst = 0;
+            }
+            Terminator::BrIf {
+                cond,
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+            } => {
+                let (target, edge_args) = if as_i32(get(&stack[top].vals, *cond)?)? != 0 {
+                    (*then_blk, then_args)
+                } else {
+                    (*else_blk, else_args)
+                };
+                stack[top].vals = collect(&stack[top].vals, edge_args)?;
+                stack[top].block = target as usize;
+                stack[top].inst = 0;
+            }
+            Terminator::BrTable {
+                idx,
+                targets,
+                default,
+            } => {
+                let i = as_i32(get(&stack[top].vals, *idx)?)? as u32 as usize;
+                let (target, edge_args) = targets.get(i).unwrap_or(default);
+                stack[top].vals = collect(&stack[top].vals, edge_args)?;
+                stack[top].block = *target as usize;
+                stack[top].inst = 0;
+            }
+            Terminator::Return(out) => {
+                let results = collect(&stack[top].vals, out)?;
+                stack.pop();
+                match stack.last_mut() {
+                    // Caller resumes past the `call` (its `inst` already advanced).
+                    Some(caller) => caller.vals.extend(results),
+                    None => return Ok(results), // bottom frame returned: the run is done
                 }
-                Terminator::BrIf {
-                    cond,
-                    then_blk,
-                    then_args,
-                    else_blk,
-                    else_args,
-                } => {
-                    let (target, edge_args) = if as_i32(get(&vals, *cond)?)? != 0 {
-                        (*then_blk, then_args)
-                    } else {
-                        (*else_blk, else_args)
-                    };
-                    vals = collect(&vals, edge_args)?;
-                    block_idx = target as usize;
-                }
-                Terminator::BrTable {
-                    idx,
-                    targets,
-                    default,
-                } => {
-                    let i = as_i32(get(&vals, *idx)?)? as u32 as usize;
-                    let (target, edge_args) = targets.get(i).unwrap_or(default);
-                    vals = collect(&vals, edge_args)?;
-                    block_idx = *target as usize;
-                }
-                Terminator::Return(out) => return collect(&vals, out),
-                Terminator::Unreachable => return Err(Trap::Unreachable),
-                Terminator::ReturnCall { func, args } => {
-                    let argv = collect(&vals, args)?;
-                    f = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
-                    vals = argv;
-                    continue 'tail;
-                }
-                Terminator::ReturnCallIndirect { ty, idx, args } => {
-                    let callee = table_lookup(funcs, as_i32(get(&vals, *idx)?)?, ty)?;
-                    let argv = collect(&vals, args)?;
-                    f = callee;
-                    vals = argv;
-                    continue 'tail;
-                }
+            }
+            Terminator::Unreachable => return Err(Trap::Unreachable),
+            // Tail calls replace the top frame in place — no depth growth.
+            Terminator::ReturnCall { func, args } => {
+                let argv = collect(&stack[top].vals, args)?;
+                let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
+                stack[top] = Frame {
+                    f: callee,
+                    block: 0,
+                    inst: 0,
+                    vals: argv,
+                };
+            }
+            Terminator::ReturnCallIndirect { ty, idx, args } => {
+                let callee = table_lookup(funcs, as_i32(get(&stack[top].vals, *idx)?)?, ty)?;
+                let argv = collect(&stack[top].vals, args)?;
+                stack[top] = Frame {
+                    f: callee,
+                    block: 0,
+                    inst: 0,
+                    vals: argv,
+                };
             }
         }
     }
