@@ -697,8 +697,17 @@ pub trait SharedBacking {
     /// (`Rc`), so writes go through `&self`.
     fn write_byte(&self, off: u64, b: u8);
     /// An OS shared-memory handle a flat-window backend can `mmap` for real aliasing; `None` for the
-    /// pure-Rust reference backing (the interpreter models aliasing in software instead).
+    /// pure-Rust reference backing (the interpreter models aliasing in software instead). Unix
+    /// (`memfd`/`shm`); the Windows analogue is [`os_section`](SharedBacking::os_section).
     fn os_fd(&self) -> Option<i32> {
+        None
+    }
+
+    /// A Windows section handle (from `CreateFileMapping`) a flat-window backend maps into the window
+    /// via `MapViewOfFile3` for real aliasing — the Windows analogue of [`os_fd`](SharedBacking::os_fd).
+    /// Carried as an `isize` (a `HANDLE` is pointer-sized) to keep this trait platform-clean; `None`
+    /// for the pure-Rust reference backing. Only the Windows JIT path consumes it.
+    fn os_section(&self) -> Option<isize> {
         None
     }
 }
@@ -771,6 +780,16 @@ pub trait GuestMem {
     /// exact value they round to, so the two backends stay in differential lockstep.
     fn page_size(&self) -> i64 {
         host_page_size() as i64
+    }
+
+    /// `SharedRegion` op 3 `page_size() -> i64`: the granularity a `SharedRegion` map aligns to —
+    /// the host page on unix, the **allocation granularity** (64 KiB) on Windows, which
+    /// `MapViewOfFile3` requires. Distinct from [`page_size`](GuestMem::page_size) (the protection
+    /// granularity) so a guest aligns its region maps to a value that works on every backend. The
+    /// default ([`host_region_granularity`]) is correct for both the paged [`Mem`] and the JIT's
+    /// flat window, so the two stay in §13 lockstep without an override.
+    fn region_page_size(&self) -> i64 {
+        host_region_granularity() as i64
     }
 }
 
@@ -1024,7 +1043,7 @@ impl Host {
                         mem.unmap(win_off, len)
                     }
                     2 => backing.size() as i64,
-                    3 => mem.page_size(),
+                    3 => mem.region_page_size(),
                     _ => EINVAL,
                 }])
             }
@@ -1102,6 +1121,21 @@ fn host_page_size() -> u64 {
     match page_size::get() as u64 {
         0 => 4096,
         p => p,
+    }
+}
+
+/// The granularity a `SharedRegion` map (§13) aligns to — distinct from [`host_page_size`] (the
+/// protection granularity) because a *shared mapping* is coarser on Windows. On unix this is the
+/// host page (`mmap(MAP_FIXED)` aliases at page granularity); on Windows it is the **allocation
+/// granularity** (64 KiB), which `MapViewOfFile3` *requires* for both the placement address and the
+/// section offset. Both the interpreter reference and the JIT's flat window report this for
+/// `SharedRegion` op 3 (`region_page_size`), so a guest aligns its region maps to a single value that
+/// works on every backend and the §13 differential stays in lockstep. `page_size::get_granularity`
+/// returns `dwAllocationGranularity` on Windows and the page size on unix.
+pub fn host_region_granularity() -> u64 {
+    match page_size::get_granularity() as u64 {
+        0 => host_page_size(),
+        g => g,
     }
 }
 

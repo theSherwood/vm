@@ -13,8 +13,9 @@
 use core::ffi::c_void;
 
 use svm_interp::{GuestMem, Host, RegionBacking, StreamRole, Trap};
-// `SharedBacking`'s methods + its `ShmBacking` impl are only used by the unix shared-mapping path.
-#[cfg(unix)]
+// `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
+// `WinShmBacking`) the JIT aliases into the window for §13.
+#[cfg(any(unix, windows))]
 use svm_interp::SharedBacking;
 use svm_ir::{Module, ValType};
 
@@ -234,17 +235,12 @@ impl MprotectWindow {
     }
     #[cfg(windows)]
     fn hw_commit_rw(&self, off: u64, len: u64) {
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
-        // SAFETY: `[base+off, +len)` is within the reservation (validated); committing an already-
-        // committed page is a no-op that re-asserts RW without zeroing live contents.
-        unsafe {
-            VirtualAlloc(
-                self.base.add(off as usize) as *const c_void,
-                len as usize,
-                MEM_COMMIT,
-                PAGE_READWRITE,
-            );
-        }
+        // The JIT window is a **placeholder** reservation (`svm-jit`'s `mem::pal`), so a plain
+        // `VirtualAlloc(MEM_COMMIT)` cannot commit a tail page — it must split the placeholder and
+        // replace-commit it. Reuse the JIT's own primitive so the two stay byte-for-byte identical;
+        // it is idempotent (an already-committed page is just re-asserted RW, never re-zeroed).
+        // SAFETY: `[base+off, +len)` is within the reservation that produced `self.base` (validated).
+        unsafe { svm_jit::win_commit_rw(self.base.add(off as usize), len as usize) }
     }
 
     /// Apply cap `prot` bits (`0` none / `1` read / `3` read-write) to the committed `[off, off+len)`
@@ -479,16 +475,115 @@ impl GuestMem for MprotectWindow {
             }
             0
         }
-        // TODO(§13 windows, issue #1): wire real shared mappings via placeholder reservations
-        // (`VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` + `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`).
-        // Until then SharedRegion `map` is unsupported on windows; pinned by the `#[cfg(windows)]`
-        // test in `svm/tests/shared_region.rs`.
-        #[cfg(not(unix))]
+        // §13 windows (issue #1): real shared mappings via **placeholder reservations**. The JIT
+        // window is one `MEM_RESERVE_PLACEHOLDER` reservation (`svm-jit::mem`); to alias a section at
+        // a fixed sub-range we free that sub-range back to a placeholder (`MEM_PRESERVE_PLACEHOLDER`)
+        // — whether it is currently committed (the backed prefix) or an untouched placeholder tail —
+        // then replace it with a view of the section (`MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`). Two
+        // mappings of the same section then name the same physical pages: true hardware aliasing,
+        // zero per-access overhead, persisting across `cap.call`s (the OS view + the section handle
+        // held by the `Host` backing outlive this per-call `MprotectWindow`). Mirrors the unix path,
+        // but at **allocation-granularity** (64 KiB) — what `MapViewOfFile3` requires for the
+        // placement address and the section offset (the guest aligns to `region_page_size`, which
+        // reports this granularity on windows).
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::System::Memory::{
+                MapViewOfFile3, VirtualFree, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+                MEM_REPLACE_PLACEHOLDER, PAGE_READONLY, PAGE_READWRITE,
+            };
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            const PROT_READ: i32 = 1;
+            const PROT_WRITE: i32 = 2;
+            // Validate the window range (page-granular, within `[0, reserved)`) like unix…
+            let pages = match self.prot_pages(win_off, len) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            // …then add the windows-only allocation-granularity constraints `MapViewOfFile3` imposes.
+            let gran = svm_interp::host_region_granularity();
+            if prot & PROT_READ == 0
+                || !win_off.is_multiple_of(gran)
+                || !region_off.is_multiple_of(gran)
+                || !len.is_multiple_of(gran)
+            {
+                return EINVAL;
+            }
+            match region_off.checked_add(len) {
+                Some(end) if end <= backing.size() => {}
+                _ => return EINVAL,
+            }
+            let Some(section) = backing.os_section() else {
+                return EINVAL;
+            };
+            let section = section as HANDLE;
+            let writable = prot & PROT_WRITE != 0;
+            let flags = if writable {
+                PAGE_READWRITE
+            } else {
+                PAGE_READONLY
+            };
+            // SAFETY: GetCurrentProcess returns the current-process pseudo-handle; always safe.
+            let proc = unsafe { GetCurrentProcess() };
+            // Map one allocation granule at a time so each free-to-placeholder targets a single,
+            // self-contained sub-range (committed prefix granule *or* placeholder tail granule).
+            for i in 0..(len / gran) {
+                let addr = unsafe { self.base.add((win_off + i * gran) as usize) };
+                let roff = region_off + i * gran;
+                // SAFETY: `[addr, addr+gran) ⊆` the reserved window (validated by `prot_pages`).
+                // Free-to-placeholder decommits whatever is there (committed or placeholder) leaving
+                // an exact placeholder; `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` then aliases the
+                // section over it. The section (held by the `Host` backing) outlives the run.
+                unsafe {
+                    VirtualFree(
+                        addr as *mut c_void,
+                        gran as usize,
+                        MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                    );
+                    let view = MapViewOfFile3(
+                        section,
+                        proc,
+                        addr as *const c_void,
+                        roff,
+                        gran as usize,
+                        MEM_REPLACE_PLACEHOLDER,
+                        flags,
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                    if view.Value.is_null() {
+                        // Fold GetLastError into the return so a red CI run names the failing call.
+                        return EINVAL - last_error_win();
+                    }
+                }
+            }
+            // Mirror the software page state (committed; RW or RO) for in-call §7 borrow checks.
+            let state = if writable {
+                PageState::Rw
+            } else {
+                PageState::Ro
+            };
+            for page in pages {
+                self.prot.insert(page, state);
+            }
+            0
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (win_off, region_off, len, prot, backing);
             EINVAL
         }
     }
+}
+
+/// `GetLastError()` as a non-negative `i64`, for folding into a `-EINVAL`-shaped return so a failing
+/// Win32 call is identifiable in CI logs (no debugger). Windows-only.
+#[cfg(windows)]
+fn last_error_win() -> i64 {
+    use windows_sys::Win32::Foundation::GetLastError;
+    // SAFETY: GetLastError reads thread-local state; always safe.
+    unsafe { GetLastError() as i64 }
 }
 
 /// Create a fresh anonymous, `cap`-byte OS shared-memory fd: `memfd_create` on Linux, an immediately-
@@ -616,6 +711,104 @@ impl Drop for ShmBacking {
 #[cfg(unix)]
 pub fn new_shared_region(len: usize) -> RegionBacking {
     std::rc::Rc::new(ShmBacking::new(len).expect("create shared region"))
+}
+
+/// A §13 `SharedRegion` backing over a Windows **pagefile-backed section** (`CreateFileMappingW` with
+/// `INVALID_HANDLE_VALUE`), whose section handle a window aliases via `MapViewOfFile3` for true
+/// hardware aliasing. Like the unix `ShmBacking`, the section is also mapped once into the host
+/// process so `read_byte`/`write_byte` work; in the JIT differential the guest's loads/stores go
+/// straight through the window's mapped views. The section is sized to whole allocation granules so a
+/// window view of whole granules never maps past its end.
+#[cfg(windows)]
+struct WinShmBacking {
+    section: windows_sys::Win32::Foundation::HANDLE,
+    ptr: *mut u8,
+    len: usize, // logical region size the guest sees
+}
+
+#[cfg(windows)]
+impl WinShmBacking {
+    fn new(len: usize) -> std::io::Result<WinShmBacking> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
+        };
+        let gran = svm_interp::host_region_granularity() as usize;
+        let cap = len.max(1).div_ceil(gran) * gran;
+        // SAFETY: `INVALID_HANDLE_VALUE` + `PAGE_READWRITE` makes an anonymous pagefile-backed section
+        // of `cap` bytes; NULL attrs/name → an unnamed section owned by the returned handle.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                core::ptr::null(),
+                PAGE_READWRITE,
+                (cap >> 32) as u32,
+                (cap & 0xffff_ffff) as u32,
+                core::ptr::null(),
+            )
+        };
+        if section.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: map the whole section RW into the host for `read_byte`/`write_byte`.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, cap) };
+        if view.Value.is_null() {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: `section` is the just-created handle; close it on the error path.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
+            return Err(e);
+        }
+        Ok(WinShmBacking {
+            section,
+            ptr: view.Value as *mut u8,
+            len,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl SharedBacking for WinShmBacking {
+    fn size(&self) -> u64 {
+        self.len as u64
+    }
+    fn read_byte(&self, off: u64) -> u8 {
+        if (off as usize) < self.len {
+            // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
+            unsafe { *self.ptr.add(off as usize) }
+        } else {
+            0
+        }
+    }
+    fn write_byte(&self, off: u64, b: u8) {
+        if (off as usize) < self.len {
+            // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
+            unsafe { *self.ptr.add(off as usize) = b }
+        }
+    }
+    fn os_section(&self) -> Option<isize> {
+        Some(self.section as isize)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WinShmBacking {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{UnmapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS};
+        // SAFETY: `ptr` is the host mapping from `new`; the section handle is closed after.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.ptr as *mut c_void,
+            });
+            windows_sys::Win32::Foundation::CloseHandle(self.section);
+        }
+    }
+}
+
+/// Create a §13 `SharedRegion` backing over a fresh `len`-byte Windows section — install it with
+/// [`svm_interp::Host::grant_shared_region_backed`] so the JIT can alias it via `MapViewOfFile3`.
+#[cfg(windows)]
+pub fn new_shared_region(len: usize) -> RegionBacking {
+    std::rc::Rc::new(WinShmBacking::new(len).expect("create shared region"))
 }
 
 /// How a guest program ended: its entry returned values, or it invoked `Exit(code)` (§3e).
