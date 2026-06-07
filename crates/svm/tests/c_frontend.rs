@@ -1789,3 +1789,49 @@ fn c_two_fibers_are_independent() {
     // a yields 10, 20, 30; b yields 3, 6. Sum = 10+3+20+6+30 = 69.
     assert_eq!(fiber_i32(&src), 69);
 }
+
+#[cfg(unix)]
+#[test]
+fn c_cooperative_threads_round_robin() {
+    // Cooperative *multithreading* built entirely in guest C on top of the fiber builtins —
+    // no new VM primitive (DESIGN §12: scheduling is runtime policy, "the guest sees a
+    // thread, never an OS thread"). Three worker "threads" each sum 1..n, yielding after
+    // every add; a round-robin scheduler in `main` interleaves them to completion. This is
+    // the cooperative-thread model the pthreads shim will later wrap.
+    let src = format!(
+        "{FIBER_DECLS}\
+        #define NT 3\n\
+        static char stacks[NT][4096];\n\
+        static int  handles[NT];\n\
+        static int  finished[NT];\n\
+        static int  started[NT];\n\
+        static long results[NT];\n\
+        static void co_yield(void) {{ __vm_fiber_suspend(0); }}\n\
+        long worker(long n) {{\n\
+        \x20 long s = 0;\n\
+        \x20 for (long i = 1; i <= n; i++) {{ s += i; co_yield(); }}\n\
+        \x20 return s;\n\
+        }}\n\
+        int main() {{\n\
+        \x20 long ns[NT]; ns[0]=3; ns[1]=4; ns[2]=5;\n\
+        \x20 int remaining = NT;\n\
+        \x20 for (int i = 0; i < NT; i++) {{\n\
+        \x20   handles[i] = __vm_fiber_new(worker, stacks[i]);\n\
+        \x20   finished[i] = 0; started[i] = 0;\n\
+        \x20 }}\n\
+        \x20 while (remaining > 0) {{\n\
+        \x20   for (int i = 0; i < NT; i++) {{\n\
+        \x20     if (finished[i]) continue;\n\
+        \x20     long arg = started[i] ? 0 : ns[i];\n\
+        \x20     started[i] = 1;\n\
+        \x20     int done = 0;\n\
+        \x20     long v = __vm_fiber_resume(handles[i], arg, &done);\n\
+        \x20     if (done) {{ results[i] = v; finished[i] = 1; remaining--; }}\n\
+        \x20   }}\n\
+        \x20 }}\n\
+        \x20 return (int)(results[0] + results[1] + results[2]);\n\
+        }}\n"
+    );
+    // sum(1..3)=6, sum(1..4)=10, sum(1..5)=15  ->  31, regardless of interleaving.
+    assert_eq!(fiber_i32(&src), 31);
+}
