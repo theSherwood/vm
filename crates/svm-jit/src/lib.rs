@@ -73,6 +73,12 @@ use svm_ir::{
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
 
+// The windows placeholder-window commit primitive, reused by `svm-run`'s Memory-cap backend (it
+// commits/grows tail pages of this same window; a plain `VirtualAlloc(MEM_COMMIT)` cannot commit a
+// placeholder reservation). See `mem::win_commit_rw`.
+#[cfg(windows)]
+pub use mem::win_commit_rw;
+
 /// Largest window the reference JIT will back with a host allocation. Real deployments
 /// reserve a huge guard-paged virtual range (§4); for the differential harness we map
 /// `1 << size_log2` bytes (+ a guard page on unix), so cap it.

@@ -602,10 +602,11 @@ this is the index.)
     and faulted — fixed with a `#[repr(C, align(16))]` wrapper. (b) stdio produced **empty output**
     because `cap_thunk` passed `gm = None` on non-unix, so a `Stream` write had no view of the guest
     window — first fixed with a portable `WindowMem`, since **superseded** by the full Windows
-    Memory-cap backend (`VirtualAlloc(MEM_COMMIT)`/`VirtualProtect`, sharing the unix path's
+    Memory-cap backend (placeholder-aware commit / `VirtualProtect`, sharing the unix path's
     software page map), so guest-driven `map`/`unmap`/`protect`/growth + RO isolation now work on
-    Windows and are covered by the interp/JIT differential. Tier-1 MPK stays Linux-only (degrades to
-    tier 0/3 elsewhere).
+    Windows and are covered by the interp/JIT differential. §13 `SharedRegion` aliasing is wired on
+    windows too now (`MapViewOfFile3` over a placeholder reservation — issue #1). Tier-1 MPK stays
+    Linux-only (degrades to tier 0/3 elsewhere).
   - **CI matrix is live** (the maintainer applied the workflow — needs the `workflows` token scope):
     the gating ubuntu job also runs the windows cross-`check`+clippy, and a `cross-os` job
     builds+tests on `windows-latest` + `macos-latest` (still `continue-on-error` — now safe to make
@@ -680,11 +681,25 @@ this is the index.)
   rebuilt but the OS mapping + the region fd held by the `Host` backing are not). The backing is
   `svm_run::new_shared_region` over an anonymous fd — `memfd_create` on Linux, an `shm_unlink`ed
   `shm_open` object on macOS (`ShmBacking`); installed via `Host::grant_shared_region_backed`. The
-  interp↔JIT differential `jit_diff::jit_cap_shared_region_aliases_differential` (cfg unix) pins it
-  non-vacuously. **Remaining §13 increment — windows (tracked: issue #1):** → `-EINVAL` on windows,
-  *pinned* by the `#[cfg(windows)]` test in `svm/tests/shared_region.rs` (so the gap is tested + fails
-  loudly when wired). The full playbook for the next session is in **"§13 Windows — next-session
-  playbook"** below.
+  interp↔JIT differential `jit_diff::jit_cap_shared_region_aliases_differential` pins it
+  non-vacuously. **§13 windows — DONE (issue #1).** `MprotectWindow::map_region` now aliases on
+  windows via **placeholder reservations**: the JIT window is reserved as a `VirtualAlloc2(
+  MEM_RESERVE_PLACEHOLDER)` placeholder (`svm-jit/src/mem.rs`), and `map_region` frees the target
+  sub-range back to a placeholder (`VirtualFree(MEM_PRESERVE_PLACEHOLDER)`, whether it was the
+  committed prefix or an untouched tail) then replaces it with a view of the section
+  (`MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`) — true hardware aliasing, at the **64 KiB allocation
+  granularity** `MapViewOfFile3` requires (the guest aligns to `region_page_size`, op 3, which now
+  reports that granularity on windows). The backing is `svm_run::new_shared_region` over a
+  `CreateFileMapping` section (`WinShmBacking`); the `SharedBacking` trait gained `os_section`. The
+  placeholder rework also touched the **commit path** — a plain `VirtualAlloc(MEM_COMMIT)` cannot
+  commit a placeholder, so `svm-jit::win_commit_rw` does an idempotent `VirtualQuery`-driven split +
+  `MEM_REPLACE_PLACEHOLDER` commit (reused by `svm-run`'s growth path). The differential
+  `jit_diff::jit_cap_shared_region_aliases_differential` is now `#[cfg(any(unix, windows))]` and the
+  old `#[cfg(windows)]` `-EINVAL` pin is gone. **Validated locally** by cross-compiling to
+  `x86_64-pc-windows-msvc` (`cargo-xwin`, MS SDK now fetchable in this environment) and running the
+  whole suite under **wine** — escape_oracle, the 4000-seed `jit_fuzz`, the Memory-cap differential,
+  and the §13 alias differential all green; the gating runtime check stays the `cross-os`
+  `windows-latest` CI. The original playbook is preserved below as the design record.
   **Still left (Phase 4, not MVP blockers):** fault-driven *content* supply (a guest/parent as pager —
   `userfaultfd`/§14), and cross-domain `SharedRegion` `create`/`grant` (guest-minted regions — needs
   the §14 Instantiator). **`malloc` over `map` is the default guest libc** — the powerbox
@@ -694,7 +709,20 @@ this is the index.)
   grows a guest heap megabytes past the initial window cc-identically
   (`demo_heapgrow_matches_native`).
 
-### §13 Windows — next-session playbook (issue #1)
+### §13 Windows — playbook (issue #1) — ✅ DONE (kept as the design record)
+
+> **Done.** Implemented as described below, with one refinement the playbook didn't anticipate:
+> `MapViewOfFile3` requires **64 KiB allocation-granularity** alignment (not the 4 KiB page) for both
+> the placement address and the section offset — so `SharedRegion` op 3 (`region_page_size`) reports
+> the allocation granularity on windows and the guest aligns to it (`memory 17` in the tests so two
+> granules fit). **Local windows test loop (this environment):** `cargo install cargo-xwin`, then
+> `WINEPREFIX=… CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=wine cargo xwin test --target
+> x86_64-pc-windows-msvc -p svm …` cross-compiles under real MSVC and runs the test binaries under
+> **wine** (apt `wine64`). Wine implements `VirtualAlloc2`/`MapViewOfFile3` placeholders *and*
+> delivers access-violations to the VEH guard, so it exercises the real placeholder + view + guard
+> paths — a fast inner loop that made CI a formality rather than the only validator.
+
+
 
 **Goal:** wire the JIT zero-overhead `SharedRegion` mapping on Windows so
 `MprotectWindow::map_region` aliases (today it returns `-EINVAL` there). Then un-gate
@@ -1022,15 +1050,15 @@ regressions one commit old"):
    `MAP_NORESERVE` pages). The Memory cap is surfaced in the *main* irgen fuzzer (arm 19, prefix +
    tail) and the `_with_host` escape-oracle snapshot now covers grown tail pages (low 256 KiB),
    pinned non-vacuously by `jit_cap_memory_escape_oracle_grown_tail`. **§13 SharedRegion landed on all
-   unix + spec-complete everywhere:** `iface::SHARED_REGION = 4`, `PageProt::Backed` aliasing
+   platforms (incl. windows — issue #1 DONE):** `iface::SHARED_REGION = 4`, `PageProt::Backed` aliasing
    (interp reference, every platform); the JIT match via real shared mappings (`MprotectWindow::
-   map_region`, `mmap(MAP_SHARED|MAP_FIXED)` of a `memfd`/`shm` `ShmBacking`); interp↔JIT differential
-   `jit_cap_shared_region_aliases_differential` (cfg unix). **Windows JIT path is the one gap** —
-   tracked in **issue #1**, pinned by a `#[cfg(windows)]` `-EINVAL` test, with a full **"§13 Windows —
-   next-session playbook"** above (needs placeholder reservations; do it in an env with `cargo-xwin`
-   network access, validate via `windows-latest` PR CI). **Deferred (Phase 4):**
-   fault-driven *content* supply (guest/parent as pager, `userfaultfd`/§14); cross-domain region
-   `create`/`grant` (guest-minted regions, needs the §14 Instantiator).
+   map_region`) — `mmap(MAP_SHARED|MAP_FIXED)` of a `memfd`/`shm` `ShmBacking` on unix, and on windows
+   `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` of a `CreateFileMapping` section over a `VirtualAlloc2`
+   **placeholder** window reservation (`WinShmBacking`, `os_section`, the `win_commit_rw` placeholder
+   commit). interp↔JIT differential `jit_cap_shared_region_aliases_differential` is now
+   `#[cfg(any(unix, windows))]`; validated locally via `cargo-xwin` + wine and by `windows-latest` PR
+   CI. **Deferred (Phase 4):** fault-driven *content* supply (guest/parent as pager, `userfaultfd`/§14);
+   cross-domain region `create`/`grant` (guest-minted regions, needs the §14 Instantiator).
 
 *(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
 CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;

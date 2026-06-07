@@ -12,11 +12,11 @@
 //! Everything platform-specific is the small [`pal`] module: reserve / commit / protect / release
 //! virtual address space, and run a call under a guard that converts an in-window fault into a
 //! caught return. The window *model* (page rounding, the `mapped`/`total` bookkeeping, the RW
-//! slice) is portable and shared. Today there is a **unix** PAL (`mmap` + `mprotect(PROT_NONE)` +
-//! a SIGSEGV/SIGBUS handler via `trap_shim.c`); the **windows** PAL (`VirtualAlloc` +
-//! `VirtualProtect(PAGE_NOACCESS)` + a Vectored Exception Handler) is the next leg (§4 "Platform
-//! support", Phase 3.5). The confinement arithmetic is identical on every target, so the
-//! interpreter↔JIT differential (§18) is the cross-platform conformance oracle.
+//! slice) is portable and shared. There is a **unix** PAL (`mmap` + `mprotect(PROT_NONE)` + a
+//! SIGSEGV/SIGBUS handler via `trap_shim.c`) and a **windows** PAL (`VirtualAlloc2` placeholder
+//! reservation + `VirtualProtect(PAGE_NOACCESS)` + a Vectored Exception Handler). The confinement
+//! arithmetic is identical on every target, so the interpreter↔JIT differential (§18) is the
+//! cross-platform conformance oracle.
 
 use crate::TrapKind;
 use core::ffi::c_void;
@@ -193,6 +193,19 @@ pub(crate) unsafe fn run_guarded(
 /// The trap code a caught guard fault reports.
 pub(crate) const FAULT_TRAP: i64 = TrapKind::MemoryFault as i64;
 
+/// Windows-only: make `[base, base+len)` committed read/write across this window's **placeholder**
+/// reservation — idempotent (see the windows `pal::commit_rw`). Exposed so `svm-run`'s production
+/// `MprotectWindow` Memory-cap backend, which operates on this *same* window, can commit/grow tail
+/// pages without re-implementing the placeholder split/replace dance (a plain `VirtualAlloc(
+/// MEM_COMMIT)` fails on a placeholder). On unix the equivalent is a plain `mprotect`, done inline.
+///
+/// # Safety
+/// `[base, base+len)` must lie within the JIT guest-window reservation that produced `base`.
+#[cfg(windows)]
+pub unsafe fn win_commit_rw(base: *mut u8, len: usize) {
+    pal::commit_rw(base, len)
+}
+
 // ================================= PAL: unix ==================================================
 // `mmap` reservation + `mprotect` (PROT_NONE tail/guard) + a SIGSEGV/SIGBUS handler that
 // `siglongjmp`s out of an in-window fault (the C shim `trap_shim.c`, for sound setjmp/longjmp).
@@ -303,29 +316,42 @@ mod pal {
     }
 }
 
-// ============================ PAL: unsupported targets ========================================
-// `VirtualAlloc` reservation + `VirtualProtect` (PAGE_NOACCESS tail/guard) + a **Vectored Exception
-// Handler** that, on an in-window access violation, restores a captured context to unwind out of the
-// fault — the windows analogue of unix's signal + siglongjmp. Pure Rust via `windows-sys` (no C
-// shim), so the path stays `cargo check --target *-windows-*`-able on a non-windows host.
+// ================================= PAL: windows ===============================================
+// `VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` reservation + `VirtualProtect` (PAGE_NOACCESS tail/guard)
+// + a **Vectored Exception Handler** that, on an in-window access violation, restores a captured
+// context to unwind out of the fault — the windows analogue of unix's signal + siglongjmp. A
+// **placeholder** reservation (rather than a plain `MEM_RESERVE`) is what lets `svm-run`'s §13
+// `SharedRegion` path alias a shared section into a fixed window sub-range via
+// `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` (issue #1). Pure Rust via `windows-sys` (no C shim), so
+// the path stays `cargo check/clippy --target *-windows-*`-able on a non-windows host.
 //
-// CI-UNVERIFIED: this cannot be exercised on the Linux dev host (no Windows / Wine). It is
-// typecheck-gated locally and **must be validated by the windows CI run** of the interp↔JIT
-// differential + the PAL conformance test before it is trusted (Phase 3.5).
+// Validated locally by cross-compiling to `x86_64-pc-windows-msvc` (`cargo-xwin`) and running the
+// suite under **wine** (the PAL conformance test + the interp↔JIT differential, incl. §13
+// `SharedRegion` aliasing); the gating runtime check remains the `cross-os` `windows-latest` CI run.
 #[cfg(windows)]
 mod pal {
     use super::{Entry, Prot};
     use core::cell::Cell;
     use core::ffi::c_void;
     use std::sync::Once;
+    use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, RtlCaptureContext, CONTEXT, EXCEPTION_POINTERS,
     };
     use windows_sys::Win32::System::Memory::{
-        VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
-        PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION,
+        MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+        MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
+        PAGE_READWRITE,
     };
     use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    /// `GetLastError()` as an `i64`, for thread-into-panic-messages debuggability (CI has no debugger,
+    /// so a failing Win32 call names its error code in the test output).
+    fn last_error() -> i64 {
+        // SAFETY: GetLastError reads thread-local state; always safe.
+        unsafe { GetLastError() as i64 }
+    }
 
     // VEH return codes + the access-violation status (kept local to avoid version-specific paths).
     const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -344,22 +370,91 @@ mod pal {
         }
     }
 
-    /// Reserve `total` bytes of inaccessible VA (`MEM_RESERVE` + `PAGE_NOACCESS`; commit is
-    /// per-region in [`commit_rw`]). A reservation costs only address space until committed.
+    /// Reserve `total` bytes of inaccessible VA as a **placeholder** (`VirtualAlloc2` with
+    /// `MEM_RESERVE_PLACEHOLDER`). A placeholder — rather than a plain `MEM_RESERVE` — is what lets a
+    /// later `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` alias a shared section into a *fixed* sub-range
+    /// of this window (the §13 `SharedRegion` path in `svm-run`); a plain reservation cannot host a
+    /// fixed-address view. The reservation costs only address space until a sub-range is committed.
     ///
     /// # Safety
     /// Returns a fresh reservation owned by the caller until [`release`].
     pub(super) unsafe fn reserve(total: usize) -> *mut u8 {
-        VirtualAlloc(core::ptr::null(), total, MEM_RESERVE, PAGE_NOACCESS) as *mut u8
+        VirtualAlloc2(
+            0 as HANDLE,
+            core::ptr::null(),
+            total,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            core::ptr::null_mut(),
+            0,
+        ) as *mut u8
     }
 
-    /// Commit `[base, base+len)` read/write.
+    /// Make `[base, base+len)` committed + read/write — **idempotently**, across a placeholder
+    /// reservation. A *placeholder* sub-range is split out (`MEM_PRESERVE_PLACEHOLDER`) to its exact
+    /// bounds and replace-committed (`MEM_REPLACE_PLACEHOLDER`, RW, OS-zero-filled); an already-
+    /// *committed* sub-range (private memory or a mapped §13 view) is merely re-asserted read/write
+    /// with `VirtualProtect`, so its live contents are **never re-zeroed**. Walking the region map
+    /// with `VirtualQuery` is what makes this safe to call on overlapping / growing ranges — the
+    /// snapshot path ([`read_low`](super::GuestWindow::read_low)) re-commits a prefix that is already
+    /// live, and a plain `VirtualAlloc(MEM_COMMIT)` cannot commit a placeholder at all (it fails).
     ///
     /// # Safety
     /// `[base, base+len)` must lie within a reservation from [`reserve`].
     pub(super) unsafe fn commit_rw(base: *mut u8, len: usize) {
-        let p = VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE);
-        assert!(!p.is_null(), "svm-jit: window commit failed");
+        let end = base as usize + len;
+        let mut addr = base as usize;
+        while addr < end {
+            let mut mbi: MEMORY_BASIC_INFORMATION = core::mem::zeroed();
+            let n = VirtualQuery(
+                addr as *const c_void,
+                &mut mbi,
+                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            assert!(
+                n != 0,
+                "svm-jit: VirtualQuery failed (err {})",
+                last_error()
+            );
+            let region_base = mbi.BaseAddress as usize;
+            let region_end = region_base + mbi.RegionSize;
+            let a = addr.max(region_base);
+            let b = end.min(region_end);
+            if mbi.State == MEM_COMMIT {
+                // Already committed (private or a mapped view): re-assert RW, keep contents.
+                let mut old: PAGE_PROTECTION_FLAGS = 0;
+                VirtualProtect((a as *const c_void) as _, b - a, PAGE_READWRITE, &mut old);
+            } else {
+                // Placeholder (`MEM_RESERVE`): carve the exact sub-range, then replace-commit it RW.
+                if a != region_base || b != region_end {
+                    let ok = VirtualFree(
+                        a as *mut c_void,
+                        b - a,
+                        MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                    );
+                    assert!(
+                        ok != 0,
+                        "svm-jit: placeholder split failed (err {})",
+                        last_error()
+                    );
+                }
+                let p = VirtualAlloc2(
+                    0 as HANDLE,
+                    a as *const c_void,
+                    b - a,
+                    MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    core::ptr::null_mut(),
+                    0,
+                );
+                assert!(
+                    !p.is_null(),
+                    "svm-jit: window commit failed (err {})",
+                    last_error()
+                );
+            }
+            addr = b;
+        }
     }
 
     /// Set the protection of a committed range `[base, base+len)`.
