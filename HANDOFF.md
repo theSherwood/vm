@@ -4,7 +4,13 @@ Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
-**Latest (2026-06-07):** §13 `SharedRegion` aliasing is now wired on **Windows** (issue #1,
+**Latest (2026-06-07):** §12 **fibers — step 2** landed: the stack-switch IR ops
+(`cont.new`/`cont.resume`/`suspend`, opcodes `0xCA..=0xCC`) now exist across IR/text/binary/verify
+with a **real reference-interpreter** implementation (asymmetric stackful coroutines: a fiber's
+continuation *is* its reified `Vec<Frame>`, switched via a fiber table + resume chain in `run_func`;
+forgeable i32 handles, masked + inert on forge → `Trap::FiberFault`). JIT cleanly bails `Unsupported`
+(the machine switch is step 4). See the §12 fibers entry under Phase 4 for the full design. Before
+that: §13 `SharedRegion` aliasing is now wired on **Windows** (issue #1,
 PR #2, merged) — `MapViewOfFile3` over a `VirtualAlloc2` placeholder reservation — so the
 feature is complete on all three OS legs (Linux/macOS/Windows), green on `windows-latest` CI.
 A fast local Windows loop exists now: `cargo-xwin` (real MSVC) + **wine** runs the test
@@ -840,12 +846,32 @@ leave a shared view — add a unix test for this alongside the Windows work.
   + clippy green on linux & windows-gnu; `MAX_CALL_DEPTH=256` boundary unchanged; new
   `mutual_recursion_traps_not_overflows` test exercises cross-function frames). **Why:** a fiber's
   continuation is exactly its `Vec<Frame>`, so this is the prerequisite for `suspend`/`resume`.
+  **Fibers — step 2 DONE (stack-switch IR ops + interp semantics, asymmetric stackful coroutines):**
+  three call-clobbering control ops across the whole pipeline — `iface`-free IR
+  (`Inst::ContNew`/`ContResume`/`Suspend`), text (`cont.new v{f}` → handle; `cont.resume v{k} v{arg}`
+  → `(status, value)`; `suspend v{v}` → `value`), binary (opcodes `0xCA..=0xCC`), verify, and a **real
+  reference interpreter** — but **no JIT** (the machine-level switch is step 4, so the JIT cleanly
+  *bails* `Unsupported`; `jit_bails_unsupported_on_fiber_ops` asserts this, and the differential
+  harness skips fiber modules). Model: a fiber is a first-class suspendable computation whose
+  continuation **is** its `Vec<Frame>`; `cont.new(funcref)` makes a `Pending` fiber (started lazily,
+  the funcref resolved through the table as `(i64) -> (i64)` at first resume, like `call_indirect`),
+  `cont.resume(k, arg)` switches into it (delivering `arg`), `suspend(value)` switches back out
+  (yielding `value`, `status` 0=suspended / 1=returned). The `run_func` driver now holds a **fiber
+  table** + a **resume chain** (root = `fibers[0]`; the running fiber's frames live in a local `frames`,
+  its slot held `Running`); the single-stack/no-fiber path is byte-identical to step 1 (same depth
+  bound, now summed across the chain). A fiber **handle is a forgeable i32**, masked into the table +
+  chain/state-checked at resume so a forged/dead/in-chain handle is **inert** (`Trap::FiberFault`,
+  new) — never an escape; `MAX_FIBERS` bounds a fiber-bomb. Tests in `pipeline.rs`
+  (`fiber_*`: value-threading, a generator loop, a 3-level nested resume chain, resume-after-return
+  traps, suspend-at-root traps, forged-handle inert) + parse/print/encode/decode round-trip; whole
+  suite + clippy green. **Still to come:** the *host scheduler* sugar (a deterministic cooperative
+  driver multiplexing N fibers — the primitive is in place, this is policy on top) and the JIT switch.
   **Plan for C threading on the fibers/vCPU model** (no architectural blocker — the determinism vs.
   threading tension is resolved by running fibers cooperatively on a *single* vCPU in the differential
   oracle; true multi-vCPU parallelism is a separate, non-bit-deterministic mode validated by other
-  means). Remaining steps, in order: (2) stack-switch IR ops (`cont.new`/`resume`/`suspend` as
-  call-clobbering control ops) + verify/encode/text; (3) make `run_func` *step-able* (run-until-suspend)
-  + a deterministic cooperative scheduler holding N fibers; (4) the JIT's machine-level control-stack
+  means). Remaining steps, in order: (3) an optional host-side cooperative *scheduler* over the
+  step-2 primitive (run-until-suspend is already what `cont.resume` gives; a scheduler just picks the
+  next runnable fiber); (4) the JIT's machine-level control-stack
   switch (asm SP swap — the riskiest, escape-TCB-adjacent piece) so compiled fibers suspend mid-callstack;
   (5) `wait`/`notify` (futex over the window) as cooperative park/unpark; (6) C frontend: real
   `_Atomic`/`<stdatomic.h>` lowering (today stubbed → silently races), a `<pthread.h>`/`<threads.h>`

@@ -215,6 +215,20 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.extend_from_slice(&sig.results);
                 continue;
             }
+            // §12 `cont.resume` appends two results `(status: i32, value: i64)`, so —
+            // like `call` — it is checked here rather than in `check_inst`.
+            if let Inst::ContResume { k, arg } = inst {
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*k, ValType::I32)?; // forgeable fiber handle
+                cx.expect(*arg, ValType::I64)?;
+                types.push(ValType::I32); // status
+                types.push(ValType::I64); // value
+                continue;
+            }
             // A value-producing instruction appends its result type; `Store` does not.
             if let Some(result) = check_inst(fi, bi, inst, &types, has_memory)? {
                 types.push(result);
@@ -396,13 +410,25 @@ fn check_inst(
             cx.expect(*replacement, ty.val())?;
             ty.val()
         }
+        // §12 fibers. `cont.new` takes an i32 funcref, yields an i32 handle; `suspend`
+        // takes an i64, yields the i64 of the next resume. (`cont.resume` is multi-result
+        // and handled in the main loop.)
+        Inst::ContNew { func } => {
+            cx.expect(*func, ValType::I32)?;
+            ValType::I32
+        }
+        Inst::Suspend { value } => {
+            cx.expect(*value, ValType::I64)?;
+            ValType::I64
+        }
         // Handled before/around the match; listed for exhaustiveness (no panic).
         Inst::Store { .. }
         | Inst::AtomicStore { .. }
         | Inst::Call { .. }
         | Inst::RefFunc { .. }
         | Inst::CallIndirect { .. }
-        | Inst::CapCall { .. } => return Ok(None),
+        | Inst::CapCall { .. }
+        | Inst::ContResume { .. } => return Ok(None),
     };
     Ok(Some(ty))
 }

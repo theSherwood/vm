@@ -188,6 +188,40 @@ fn atomics_parse_roundtrip_and_verify() {
 }
 
 #[test]
+fn fibers_parse_roundtrip_and_verify() {
+    // §12 stack switching: `cont.new` (funcref -> handle), `cont.resume` (handle, i64 ->
+    // status, value), and `suspend` (i64 -> i64). Parse, verify, then assert text and
+    // binary serializations round-trip to the identical IR. Func 1 is a fiber body
+    // `(i64) -> (i64)` that suspends once then returns; func 0 drives it.
+    let src = "func (i64) -> (i64) {\n\
+        block0(v0: i64):\n\
+        \x20 v1 = ref.func 1\n\
+        \x20 v2 = cont.new v1\n\
+        \x20 v3 = i64.const 10\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6, v7 = cont.resume v2 v5\n\
+        \x20 return v7\n\
+        }\n\
+        func (i64) -> (i64) {\n\
+        block0(v0: i64):\n\
+        \x20 v1 = suspend v0\n\
+        \x20 return v1\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse printed"),
+        m,
+        "fibers text round-trip changed the IR"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "fibers binary round-trip changed the IR"
+    );
+}
+
+#[test]
 fn verify_rejects_out_of_window_data() {
     // window = 2^3 = 8 bytes; a 4-byte segment at offset 6 overruns `[0, 8)`.
     let src = "data 6 \"abcd\"\nmemory 3\n\
@@ -257,6 +291,174 @@ fn add_wraps_two_complement() {
     let mut fuel = 100u64;
     let r = run(&m, 0, &[Value::I32(i32::MAX), Value::I32(1)], &mut fuel).unwrap();
     assert_eq!(r, vec![Value::I32(i32::MIN)]);
+}
+
+// ---- §12 fibers: stack switching on the interpreter ----
+
+#[test]
+fn fiber_suspend_then_resume_threads_values() {
+    // Func 1 is a fiber `(i64) -> (i64)`: it `suspend`s its arg (yielding it to the
+    // resumer), then on the next resume adds 100 to the delivered value and returns it.
+    // The root drives it: resume(10) -> (SUSPENDED, 10); resume(7) -> (RETURNED, 107).
+    let src = "func () -> (i32, i64, i32, i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = cont.new v0\n\
+        \x20 v2 = i64.const 10\n\
+        \x20 v3, v4 = cont.resume v1 v2\n\
+        \x20 v5 = i64.const 7\n\
+        \x20 v6, v7 = cont.resume v1 v5\n\
+        \x20 return v3 v4 v6 v7\n\
+        }\n\
+        func (i64) -> (i64) {\n\
+        block0(v0: i64):\n\
+        \x20 v1 = suspend v0\n\
+        \x20 v2 = i64.const 100\n\
+        \x20 v3 = i64.add v1 v2\n\
+        \x20 return v3\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    let r = run(&m, 0, &[], &mut fuel).unwrap();
+    // (status=SUSPENDED=0, yielded=10), (status=RETURNED=1, returned=107).
+    assert_eq!(
+        r,
+        vec![Value::I32(0), Value::I64(10), Value::I32(1), Value::I64(107)]
+    );
+}
+
+#[test]
+fn fiber_generator_loop_sums_a_sequence() {
+    // A generator fiber yields 1, 2, 3 (three `suspend`s) then returns 4. The root loops
+    // resuming it, accumulating every delivered value until the status is RETURNED — a
+    // workout for repeated resume/suspend with the fiber handle threaded as a block param.
+    let src = "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = cont.new v0\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 br block1(v1, v2)\n\
+        block1(v3: i32, v4: i64):\n\
+        \x20 v5 = i64.const 0\n\
+        \x20 v6, v7 = cont.resume v3 v5\n\
+        \x20 v8 = i64.add v4 v7\n\
+        \x20 br_if v6 block2(v8) block1(v3, v8)\n\
+        block2(v9: i64):\n\
+        \x20 return v9\n\
+        }\n\
+        func (i64) -> (i64) {\n\
+        block0(v0: i64):\n\
+        \x20 v1 = i64.const 1\n\
+        \x20 v2 = suspend v1\n\
+        \x20 v3 = i64.const 2\n\
+        \x20 v4 = suspend v3\n\
+        \x20 v5 = i64.const 3\n\
+        \x20 v6 = suspend v5\n\
+        \x20 v7 = i64.const 4\n\
+        \x20 return v7\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    let r = run(&m, 0, &[], &mut fuel).unwrap();
+    assert_eq!(r, vec![Value::I64(1 + 2 + 3 + 4)]);
+}
+
+#[test]
+fn fiber_nested_resume_chain() {
+    // A three-level resume chain: root resumes fiber A (func 1), which itself resumes
+    // fiber B (func 2). B suspends -> control returns to A's resume site; A suspends ->
+    // control returns to root. Then unwinding the other way to completion. Exercises a
+    // resume chain deeper than one and `suspend` returning to the correct resumer.
+    let src = "func () -> (i64, i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = cont.new v0\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 v3, v4 = cont.resume v1 v2\n\
+        \x20 v5, v6 = cont.resume v1 v2\n\
+        \x20 return v4 v6\n\
+        }\n\
+        func (i64) -> (i64) {\n\
+        block0(v0: i64):\n\
+        \x20 v1 = ref.func 2\n\
+        \x20 v2 = cont.new v1\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = suspend v5\n\
+        \x20 v7, v8 = cont.resume v2 v3\n\
+        \x20 return v8\n\
+        }\n\
+        func (i64) -> (i64) {\n\
+        block0(v0: i64):\n\
+        \x20 v1 = i64.const 11\n\
+        \x20 v2 = suspend v1\n\
+        \x20 v3 = i64.const 22\n\
+        \x20 return v3\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    let r = run(&m, 0, &[], &mut fuel).unwrap();
+    // First root resume: A resumes B (B yields 11), A suspends yielding 11 -> root sees 11.
+    // Second root resume: A resumes B again (B returns 22), A returns 22 -> root sees 22.
+    assert_eq!(r, vec![Value::I64(11), Value::I64(22)]);
+}
+
+#[test]
+fn fiber_resume_after_return_traps() {
+    // Func 1 returns immediately (no suspend): the first resume yields (RETURNED, arg).
+    // Resuming the now-`Done` fiber a second time is inert -> `FiberFault`.
+    let src = "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = cont.new v0\n\
+        \x20 v2 = i64.const 1\n\
+        \x20 v3, v4 = cont.resume v1 v2\n\
+        \x20 v5, v6 = cont.resume v1 v2\n\
+        \x20 return v6\n\
+        }\n\
+        func (i64) -> (i64) {\n\
+        block0(v0: i64):\n\
+        \x20 return v0\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    assert_eq!(run(&m, 0, &[], &mut fuel), Err(Trap::FiberFault));
+}
+
+#[test]
+fn fiber_suspend_at_root_traps() {
+    // `suspend` with no resumer (the root computation) traps rather than escaping.
+    let src = "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = i64.const 5\n\
+        \x20 v1 = suspend v0\n\
+        \x20 return v1\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    assert_eq!(run(&m, 0, &[], &mut fuel), Err(Trap::FiberFault));
+}
+
+#[test]
+fn fiber_forged_handle_is_inert() {
+    // A forged handle (no fiber created) is masked into the table and resolves to the
+    // running root, which is in the resume chain -> inert (`FiberFault`), never an escape.
+    let src = "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = i32.const 999\n\
+        \x20 v1 = i64.const 0\n\
+        \x20 v2, v3 = cont.resume v0 v1\n\
+        \x20 return v3\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    assert_eq!(run(&m, 0, &[], &mut fuel), Err(Trap::FiberFault));
 }
 
 // ---- the verifier must reject ill-typed / ill-formed modules (fail-closed) ----

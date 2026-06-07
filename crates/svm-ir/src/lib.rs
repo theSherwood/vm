@@ -960,6 +960,34 @@ pub enum Inst {
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
+    /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
+    /// function referenced by `func` — an `i32` funcref, resolved through the function
+    /// table with signature `(i64) -> i64` at first resume (a bad ref traps there, like
+    /// [`Inst::CallIndirect`]). Yields an `i32` **fiber handle**: a forgeable index into
+    /// the runtime-owned fiber table, masked + generation-checked at use like a capability
+    /// handle (§3c), so a forged handle is inert (it traps or selects one of this domain's
+    /// own fibers, never host state). The fiber does not run yet.
+    ContNew {
+        func: ValIdx,
+    },
+    /// §12 fiber resume (`cont.resume`): switch to fiber `k` (an `i32` handle), delivering
+    /// `arg` (`i64`) — the argument to the fiber's function on the first resume, or the
+    /// result of the fiber's `suspend` on later resumes. Runs the fiber until it suspends
+    /// or returns, then yields `(status: i32, value: i64)`: `status` 0 = **suspended** (the
+    /// fiber stays resumable), 1 = **returned** (the fiber is done; resuming it again
+    /// traps). A **call-clobbering** control op — like a call it switches stacks, but it
+    /// does not end the block.
+    ContResume {
+        k: ValIdx,
+        arg: ValIdx,
+    },
+    /// §12 fiber suspend (`suspend`): from within a running fiber, suspend back to the
+    /// resumer delivering `value` (`i64`); evaluates to the `i64` `arg` of the next resume.
+    /// Suspending when no fiber is running (the root computation) **traps**. Like
+    /// [`Inst::ContResume`] this is a call-clobbering control op.
+    Suspend {
+        value: ValIdx,
+    },
 }
 
 impl Inst {
@@ -971,6 +999,8 @@ impl Inst {
     pub fn result_count(&self, fn_results: &[usize]) -> usize {
         match self {
             Inst::Store { .. } | Inst::AtomicStore { .. } => 0,
+            // `cont.resume` is the one multi-result non-call op: `(status, value)`.
+            Inst::ContResume { .. } => 2,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),

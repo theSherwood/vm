@@ -109,6 +109,10 @@ mod op {
     pub const ATOMIC_STORE: u8 = 0xC7; // ty, addr, value, offset
     pub const ATOMIC_RMW: u8 = 0xC8; // ty, AtomicRmwOp index, addr, value, offset
     pub const ATOMIC_CMPXCHG: u8 = 0xC9; // ty, addr, expected, replacement, offset
+    // §12 fibers (stack switching).
+    pub const CONT_NEW: u8 = 0xCA; // func (funcref idx)
+    pub const CONT_RESUME: u8 = 0xCB; // k, arg
+    pub const SUSPEND: u8 = 0xCC; // value
     pub const FTOI: u8 = 0xD0; // saturating trunc_sat: + FToI index (0..=7)
     pub const FTOI_END: u8 = 0xD7;
     pub const FTOI_TRAP: u8 = 0xD8; // trapping trunc: + FToI index (0..=7)
@@ -394,6 +398,19 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_types(out, &sig.results);
             write_uleb(out, *handle as u64);
             write_idxs(out, args);
+        }
+        Inst::ContNew { func } => {
+            out.push(op::CONT_NEW);
+            write_uleb(out, *func as u64);
+        }
+        Inst::ContResume { k, arg } => {
+            out.push(op::CONT_RESUME);
+            write_uleb(out, *k as u64);
+            write_uleb(out, *arg as u64);
+        }
+        Inst::Suspend { value } => {
+            out.push(op::SUSPEND);
+            write_uleb(out, *value as u64);
         }
     }
 }
@@ -770,6 +787,13 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             replacement: c.idx()?,
             offset: c.uleb()?,
         },
+
+        op::CONT_NEW => Inst::ContNew { func: c.idx()? },
+        op::CONT_RESUME => Inst::ContResume {
+            k: c.idx()?,
+            arg: c.idx()?,
+        },
+        op::SUSPEND => Inst::Suspend { value: c.idx()? },
 
         other => return Err(DecodeError::BadOpcode(other)),
     })

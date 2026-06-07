@@ -56,6 +56,10 @@ pub enum Trap {
     /// The guest invoked the `Exit` capability; carries the requested exit code. Not
     /// an error — the domain asked to terminate (§3e). Propagates like a trap.
     Exit(i32),
+    /// A §12 fiber operation failed: `cont.resume` named a forged/dead/already-running
+    /// fiber handle (inert, like [`Trap::CapFault`]), `suspend` ran at the root (no fiber
+    /// to suspend to), or the fiber count exceeded the interpreter's bound. Not an escape.
+    FiberFault,
     /// Structurally invalid in a way a verified module never is (defensive only).
     Malformed,
 }
@@ -198,10 +202,9 @@ pub fn run_capture_reserved_with_host(
 }
 
 /// One activation record on the **explicit** guest call stack (§12). Reifying the call
-/// stack — rather than recursing on the host stack — is the prerequisite for fibers: a
-/// fiber's continuation is exactly its `Vec<Frame>`, which a future `suspend` can pause
-/// and a `resume` restart. Today the driver still runs each call to completion; nothing
-/// observable changes versus the old recursive interpreter.
+/// stack — rather than recursing on the host stack — is what makes fibers possible: a
+/// fiber's continuation is exactly its `Vec<Frame>`, which `suspend` pauses and
+/// `cont.resume` restarts.
 struct Frame<'a> {
     /// The function this activation is executing.
     f: &'a Func,
@@ -214,6 +217,82 @@ struct Frame<'a> {
     vals: Vec<Value>,
 }
 
+/// Maximum number of fibers a single run may create (§12). Bounds the fiber table so a
+/// fiber-bomb yields a clean [`Trap::FiberFault`] instead of unbounded host allocation —
+/// the reference-oracle analogue of the quota that charges out-of-band stacks to the
+/// guest, so a fiber-bomb OOMs *itself*, never the host.
+const MAX_FIBERS: usize = 1 << 16;
+
+/// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
+const FIBER_SUSPENDED: i32 = 0;
+const FIBER_RETURNED: i32 = 1;
+
+/// A §12 fiber: a first-class suspendable computation whose continuation is exactly its
+/// reified call stack. `cont.new` makes one (`Pending`); `cont.resume` switches into it;
+/// `suspend` switches back out, parking it (`Live`).
+enum Fiber<'a> {
+    /// Created by `cont.new`, not yet started: holds the `i32` funcref to launch on the
+    /// first resume (resolved then through the function table as `(i64) -> i64`).
+    Pending(i32),
+    /// Started and currently **parked** — suspended at a `suspend`, or an ancestor in the
+    /// resume chain — holding its reified call stack, ready to continue.
+    Live(Vec<Frame<'a>>),
+    /// The fiber whose frames are currently *in flight* in the driver's local `frames`.
+    /// A placeholder keeping the table slot addressable (a handle resolving here is in the
+    /// resume chain → inert / traps).
+    Running,
+    /// Returned: resuming it again traps.
+    Done,
+}
+
+/// The fixed fiber entry signature (§12): a fiber runs a function of type `(i64) -> i64`.
+/// The single `i64` carries the first-resume argument in and the final return value out
+/// (a pointer into the window can carry richer payloads).
+fn fiber_sig() -> FuncType {
+    FuncType {
+        params: vec![ValType::I64],
+        results: vec![ValType::I64],
+    }
+}
+
+/// Total live activation records across the resume chain — the running fiber's `frames`
+/// (length `current_len`) plus every parked ancestor's stack. Bounds recursion across
+/// *all* active fibers, not just the current one. With no fibers (`chain == [0]`) this is
+/// just `current_len`, so the depth bound is unchanged from the single-stack case.
+fn live_frames(fibers: &[Fiber], chain: &[usize], current_len: usize) -> usize {
+    let mut total = current_len;
+    for &i in &chain[..chain.len() - 1] {
+        if let Fiber::Live(f) = &fibers[i] {
+            total += f.len();
+        }
+    }
+    total
+}
+
+/// Resolve a `cont.resume` handle to a table slot (§12). The handle is forgeable, so it is
+/// **masked** into the power-of-two-padded table (Spectre-safe, like `call_indirect`), then
+/// the slot is checked: in the resume chain (would alias a running stack), `Running`, or
+/// `Done` ⇒ inert ([`Trap::FiberFault`]); only a `Pending`/`Live` slot is resumable.
+fn resolve_fiber(fibers: &[Fiber], chain: &[usize], handle: i32) -> Result<usize, Trap> {
+    let mask = fibers.len().next_power_of_two() - 1;
+    let slot = (handle as u32 as usize) & mask;
+    if slot >= fibers.len() || chain.contains(&slot) {
+        return Err(Trap::FiberFault);
+    }
+    match &fibers[slot] {
+        Fiber::Pending(_) | Fiber::Live(_) => Ok(slot),
+        Fiber::Running | Fiber::Done => Err(Trap::FiberFault),
+    }
+}
+
+/// Take a parked (`Live`) fiber's frames out for execution, marking its slot `Running`.
+fn take_running<'a>(fibers: &mut [Fiber<'a>], i: usize) -> Result<Vec<Frame<'a>>, Trap> {
+    match std::mem::replace(&mut fibers[i], Fiber::Running) {
+        Fiber::Live(f) => Ok(f),
+        _ => Err(Trap::Malformed),
+    }
+}
+
 fn run_func<'a>(
     f: &'a Func,
     args: &[Value],
@@ -223,45 +302,55 @@ fn run_func<'a>(
     host: &mut Host,
     depth: u32,
 ) -> Result<Vec<Value>, Trap> {
-    // The reified guest call stack. The entry block's parameters are the function
-    // arguments (verifier-checked; copied defensively). `depth` is the base depth of the
-    // bottom frame (0 at top level) so the bound covers any future resume above a floor.
-    let mut stack: Vec<Frame<'a>> = vec![Frame {
+    // The fiber table for this run (§12). `fibers[0]` is the **root** computation; each
+    // `cont.new` appends. A fiber handle (`i32`) is its table index, masked + checked at
+    // `cont.resume` like a capability handle (§3c) so a forged handle is inert. The
+    // *running* fiber's frames live in the local `frames` below — its slot holds `Running`.
+    let mut fibers: Vec<Fiber<'a>> = vec![Fiber::Running];
+    // The resume chain: `chain[0]` is always the root, `chain.last()` the running fiber.
+    let mut chain: Vec<usize> = vec![0];
+    let mut cur = 0usize;
+    // The running fiber's reified call stack. The entry block's parameters are the call
+    // arguments (verifier-checked; copied defensively).
+    let mut frames: Vec<Frame<'a>> = vec![Frame {
         f,
         block: 0,
         inst: 0,
         vals: args.to_vec(),
     }];
 
-    // Drive the top frame. A `call` pushes a new top and restarts here; a `return` pops
-    // and appends results to the caller (which resumes past the call); a tail call
-    // replaces the top in place (no growth) — so deep tail recursion stays O(1) frames.
+    // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
+    // `return` pops and appends results to the caller (which resumes past the call); a tail
+    // call replaces the top in place (O(1) frames). `cont.resume`/`suspend` switch which
+    // fiber's stack is in `frames` — see the comments on those arms.
     'frames: loop {
-        let top = stack.len() - 1;
-        // `block` borrows `funcs` (lifetime `'a`), *not* `stack`, so the loop body is free
-        // to push/pop/mutate `stack` while holding it.
-        let block = stack[top]
+        let top = frames.len() - 1;
+        // `block` borrows `funcs` (lifetime `'a`), *not* `frames`, so the loop body is free
+        // to push/pop/mutate `frames` (and move it on a fiber switch) while holding it.
+        let block = frames[top]
             .f
             .blocks
-            .get(stack[top].block)
+            .get(frames[top].block)
             .ok_or(Trap::Malformed)?;
 
         // Execute the remaining instructions of this block.
-        while stack[top].inst < block.insts.len() {
-            let inst = &block.insts[stack[top].inst];
+        while frames[top].inst < block.insts.len() {
+            let inst = &block.insts[frames[top].inst];
             step(fuel)?;
-            stack[top].inst += 1; // advance first, so a call-return resumes past this inst
+            frames[top].inst += 1; // advance first, so a call-return resumes past this inst
 
             match inst {
                 // Non-tail calls push a new frame and switch to it; the callee's results
                 // are appended to this frame's `vals` when it returns (see `Return`).
                 Inst::Call { func, args } => {
-                    let argv = collect(&stack[top].vals, args)?;
+                    let argv = collect(&frames[top].vals, args)?;
                     let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
-                    if depth as usize + stack.len() > MAX_CALL_DEPTH as usize {
+                    if depth as usize + live_frames(&fibers, &chain, frames.len())
+                        > MAX_CALL_DEPTH as usize
+                    {
                         return Err(Trap::StackOverflow);
                     }
-                    stack.push(Frame {
+                    frames.push(Frame {
                         f: callee,
                         block: 0,
                         inst: 0,
@@ -270,12 +359,14 @@ fn run_func<'a>(
                     continue 'frames;
                 }
                 Inst::CallIndirect { ty, idx, args } => {
-                    let callee = table_lookup(funcs, as_i32(get(&stack[top].vals, *idx)?)?, ty)?;
-                    let argv = collect(&stack[top].vals, args)?;
-                    if depth as usize + stack.len() > MAX_CALL_DEPTH as usize {
+                    let callee = table_lookup(funcs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
+                    let argv = collect(&frames[top].vals, args)?;
+                    if depth as usize + live_frames(&fibers, &chain, frames.len())
+                        > MAX_CALL_DEPTH as usize
+                    {
                         return Err(Trap::StackOverflow);
                     }
-                    stack.push(Frame {
+                    frames.push(Frame {
                         f: callee,
                         block: 0,
                         inst: 0,
@@ -294,21 +385,80 @@ fn run_func<'a>(
                     // (mask + type_id/generation check) and dispatch to the mock host.
                     // Args/results cross as i64 slots (the shared host-dispatch ABI).
                     // Synchronous in the reference (the async/submit-complete ABI is §12).
-                    let h = as_i32(get(&stack[top].vals, *handle)?)?;
+                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
-                        argv.push(val_to_slot(get(&stack[top].vals, *a)?));
+                        argv.push(val_to_slot(get(&frames[top].vals, *a)?));
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let results = host.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
                     for (s, ty) in results.iter().zip(&sig.results) {
-                        stack[top].vals.push(slot_to_val(*ty, *s));
+                        frames[top].vals.push(slot_to_val(*ty, *s));
                     }
+                }
+                // §12 fiber create: record a `Pending` fiber, yield its handle. No switch.
+                Inst::ContNew { func } => {
+                    let funcref = as_i32(get(&frames[top].vals, *func)?)?;
+                    if fibers.len() >= MAX_FIBERS {
+                        return Err(Trap::FiberFault);
+                    }
+                    let handle = fibers.len() as i32;
+                    fibers.push(Fiber::Pending(funcref));
+                    frames[top].vals.push(Value::I32(handle));
+                }
+                // §12 fiber resume: switch into fiber `k`, delivering `arg`. The two results
+                // `(status, value)` are appended to *this* frame later, when `k` suspends or
+                // returns control here (see `Suspend` and `Return`).
+                Inst::ContResume { k, arg } => {
+                    let kh = as_i32(get(&frames[top].vals, *k)?)?;
+                    let av = as_i64(get(&frames[top].vals, *arg)?)?;
+                    let target = resolve_fiber(&fibers, &chain, kh)?;
+                    // Materialize the target's frames: start a `Pending` fiber, or continue a
+                    // parked one (delivering `arg` as the result of its `suspend`).
+                    let new_frames = match std::mem::replace(&mut fibers[target], Fiber::Running) {
+                        Fiber::Pending(funcref) => {
+                            let callee = table_lookup(funcs, funcref, &fiber_sig())?;
+                            vec![Frame {
+                                f: callee,
+                                block: 0,
+                                inst: 0,
+                                vals: vec![Value::I64(av)],
+                            }]
+                        }
+                        Fiber::Live(mut f) => {
+                            f.last_mut().ok_or(Trap::Malformed)?.vals.push(Value::I64(av));
+                            f
+                        }
+                        // `resolve_fiber` already rejected Running/Done.
+                        _ => return Err(Trap::FiberFault),
+                    };
+                    // Park the resumer and switch to the target.
+                    fibers[cur] = Fiber::Live(std::mem::take(&mut frames));
+                    chain.push(target);
+                    cur = target;
+                    frames = new_frames;
+                    continue 'frames;
+                }
+                // §12 fiber suspend: hand `value` back to the resumer with status SUSPENDED;
+                // park this fiber (its `suspend` result pends until the next resume).
+                Inst::Suspend { value } => {
+                    if chain.len() == 1 {
+                        return Err(Trap::FiberFault); // no resumer (the root cannot suspend)
+                    }
+                    let v = as_i64(get(&frames[top].vals, *value)?)?;
+                    fibers[cur] = Fiber::Live(std::mem::take(&mut frames));
+                    chain.pop();
+                    cur = *chain.last().expect("chain keeps the root");
+                    frames = take_running(&mut fibers, cur)?;
+                    let rtop = frames.len() - 1;
+                    frames[rtop].vals.push(Value::I32(FIBER_SUSPENDED));
+                    frames[rtop].vals.push(Value::I64(v));
+                    continue 'frames;
                 }
                 // Everything else: one value, or none for `Store`/`AtomicStore`.
                 other => {
-                    if let Some(v) = eval_inst(other, &stack[top].vals, mem)? {
-                        stack[top].vals.push(v);
+                    if let Some(v) = eval_inst(other, &frames[top].vals, mem)? {
+                        frames[top].vals.push(v);
                     }
                 }
             }
@@ -317,9 +467,9 @@ fn run_func<'a>(
         step(fuel)?;
         match &block.term {
             Terminator::Br { target, args } => {
-                stack[top].vals = collect(&stack[top].vals, args)?;
-                stack[top].block = *target as usize;
-                stack[top].inst = 0;
+                frames[top].vals = collect(&frames[top].vals, args)?;
+                frames[top].block = *target as usize;
+                frames[top].inst = 0;
             }
             Terminator::BrIf {
                 cond,
@@ -328,41 +478,54 @@ fn run_func<'a>(
                 else_blk,
                 else_args,
             } => {
-                let (target, edge_args) = if as_i32(get(&stack[top].vals, *cond)?)? != 0 {
+                let (target, edge_args) = if as_i32(get(&frames[top].vals, *cond)?)? != 0 {
                     (*then_blk, then_args)
                 } else {
                     (*else_blk, else_args)
                 };
-                stack[top].vals = collect(&stack[top].vals, edge_args)?;
-                stack[top].block = target as usize;
-                stack[top].inst = 0;
+                frames[top].vals = collect(&frames[top].vals, edge_args)?;
+                frames[top].block = target as usize;
+                frames[top].inst = 0;
             }
             Terminator::BrTable {
                 idx,
                 targets,
                 default,
             } => {
-                let i = as_i32(get(&stack[top].vals, *idx)?)? as u32 as usize;
+                let i = as_i32(get(&frames[top].vals, *idx)?)? as u32 as usize;
                 let (target, edge_args) = targets.get(i).unwrap_or(default);
-                stack[top].vals = collect(&stack[top].vals, edge_args)?;
-                stack[top].block = *target as usize;
-                stack[top].inst = 0;
+                frames[top].vals = collect(&frames[top].vals, edge_args)?;
+                frames[top].block = *target as usize;
+                frames[top].inst = 0;
             }
             Terminator::Return(out) => {
-                let results = collect(&stack[top].vals, out)?;
-                stack.pop();
-                match stack.last_mut() {
-                    // Caller resumes past the `call` (its `inst` already advanced).
-                    Some(caller) => caller.vals.extend(results),
-                    None => return Ok(results), // bottom frame returned: the run is done
+                let results = collect(&frames[top].vals, out)?;
+                frames.pop();
+                if let Some(caller) = frames.last_mut() {
+                    // Caller in the same fiber resumes past its `call` (`inst` already advanced).
+                    caller.vals.extend(results);
+                } else if cur == 0 {
+                    return Ok(results); // the root returned: the whole run is done
+                } else {
+                    // A fiber's function returned: hand its single `i64` back to the resumer
+                    // with status RETURNED; the fiber is now `Done` (resuming again traps).
+                    fibers[cur] = Fiber::Done;
+                    chain.pop();
+                    cur = *chain.last().expect("chain keeps the root");
+                    frames = take_running(&mut fibers, cur)?;
+                    let rtop = frames.len() - 1;
+                    frames[rtop].vals.push(Value::I32(FIBER_RETURNED));
+                    frames[rtop]
+                        .vals
+                        .push(results.into_iter().next().unwrap_or(Value::I64(0)));
                 }
             }
             Terminator::Unreachable => return Err(Trap::Unreachable),
             // Tail calls replace the top frame in place — no depth growth.
             Terminator::ReturnCall { func, args } => {
-                let argv = collect(&stack[top].vals, args)?;
+                let argv = collect(&frames[top].vals, args)?;
                 let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
-                stack[top] = Frame {
+                frames[top] = Frame {
                     f: callee,
                     block: 0,
                     inst: 0,
@@ -370,9 +533,9 @@ fn run_func<'a>(
                 };
             }
             Terminator::ReturnCallIndirect { ty, idx, args } => {
-                let callee = table_lookup(funcs, as_i32(get(&stack[top].vals, *idx)?)?, ty)?;
-                let argv = collect(&stack[top].vals, args)?;
-                stack[top] = Frame {
+                let callee = table_lookup(funcs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
+                let argv = collect(&frames[top].vals, args)?;
+                frames[top] = Frame {
                     f: callee,
                     block: 0,
                     inst: 0,
@@ -531,12 +694,16 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             let rep = get(vals, *replacement)?;
             m.atomic_cmpxchg(a, *offset, *ty, exp, rep)?
         }
-        // Handled before/around the match; listed for exhaustiveness (no panic).
+        // Handled before/around the match (or in `run_func` for the §12 fiber ops, which
+        // switch stacks); listed for exhaustiveness (no panic).
         Inst::Store { .. }
         | Inst::AtomicStore { .. }
         | Inst::Call { .. }
         | Inst::CallIndirect { .. }
-        | Inst::CapCall { .. } => return Ok(None),
+        | Inst::CapCall { .. }
+        | Inst::ContNew { .. }
+        | Inst::ContResume { .. }
+        | Inst::Suspend { .. } => return Ok(None),
     };
     Ok(Some(v))
 }

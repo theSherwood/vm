@@ -732,6 +732,41 @@ fn assert_jit_matches_interp_at(src: &str, idx: u32, inputs: &[Vec<Value>]) {
     }
 }
 
+/// §12 fibers: the JIT does not yet lower stack switching (the machine-level control-stack
+/// swap is a later, escape-TCB-adjacent slice), so it must cleanly **bail** with
+/// `Unsupported` on each fiber op rather than mis-compile it. This is what lets the
+/// differential harness skip fiber modules (the `Err(Unsupported) => return` above) instead
+/// of diverging from the interpreter — so it is asserted explicitly.
+#[test]
+fn jit_bails_unsupported_on_fiber_ops() {
+    let srcs = [
+        // cont.new + cont.resume
+        "func () -> (i64) {\n\
+         block0():\n\
+         \x20 v0 = ref.func 1\n\
+         \x20 v1 = cont.new v0\n\
+         \x20 v2 = i64.const 0\n\
+         \x20 v3, v4 = cont.resume v1 v2\n\
+         \x20 return v4\n\
+         }\n\
+         func (i64) -> (i64) {\nblock0(v0: i64):\n  return v0\n}\n",
+        // suspend
+        "func (i64) -> (i64) {\n\
+         block0(v0: i64):\n\
+         \x20 v1 = suspend v0\n\
+         \x20 return v1\n\
+         }\n",
+    ];
+    for src in srcs {
+        let m = parse_module(src).expect("parse");
+        verify_module(&m).expect("verify");
+        assert!(
+            matches!(compile_and_run(&m, 0, &[0]), Err(JitError::Unsupported(_))),
+            "JIT should bail Unsupported on fiber ops, not lower them: {src:?}"
+        );
+    }
+}
+
 /// Assert a single interpreter result and JIT outcome agree (value-equal, or the same
 /// trap kind / exit code; traps the JIT doesn't model are not asserted).
 fn compare_outcome(
