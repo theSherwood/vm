@@ -109,6 +109,7 @@ mod op {
     pub const ATOMIC_STORE: u8 = 0xC7; // ty, addr, value, offset
     pub const ATOMIC_RMW: u8 = 0xC8; // ty, AtomicRmwOp index, addr, value, offset
     pub const ATOMIC_CMPXCHG: u8 = 0xC9; // ty, addr, expected, replacement, offset
+
     // §12 fibers (stack switching).
     pub const CONT_NEW: u8 = 0xCA; // func (funcref idx)
     pub const CONT_RESUME: u8 = 0xCB; // k, arg

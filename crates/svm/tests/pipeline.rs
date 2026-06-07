@@ -324,7 +324,12 @@ fn fiber_suspend_then_resume_threads_values() {
     // (status=SUSPENDED=0, yielded=10), (status=RETURNED=1, returned=107).
     assert_eq!(
         r,
-        vec![Value::I32(0), Value::I64(10), Value::I32(1), Value::I64(107)]
+        vec![
+            Value::I32(0),
+            Value::I64(10),
+            Value::I32(1),
+            Value::I64(107)
+        ]
     );
 }
 

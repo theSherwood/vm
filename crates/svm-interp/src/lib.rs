@@ -426,7 +426,10 @@ fn run_func<'a>(
                             }]
                         }
                         Fiber::Live(mut f) => {
-                            f.last_mut().ok_or(Trap::Malformed)?.vals.push(Value::I64(av));
+                            f.last_mut()
+                                .ok_or(Trap::Malformed)?
+                                .vals
+                                .push(Value::I64(av));
                             f
                         }
                         // `resolve_fiber` already rejected Running/Done.
