@@ -152,6 +152,42 @@ fn data_section_parses_roundtrips_and_verifies() {
 }
 
 #[test]
+fn atomics_parse_roundtrip_and_verify() {
+    // §12 atomics across both widths, every RMW op, and the `offset=` memarg: parse, verify, then
+    // assert the text and binary serializations round-trip to the identical IR.
+    let src = "memory 16\n\
+        func (i64) -> (i64) {\n\
+        block0(v0: i64):\n\
+        \x20 v1 = i32.atomic.load v0\n\
+        \x20 v2 = i64.atomic.load v0 offset=8\n\
+        \x20 i32.atomic.store v0 v1\n\
+        \x20 i64.atomic.store v0 v2\n\
+        \x20 v3 = i32.atomic.rmw.add v0 v1\n\
+        \x20 v4 = i32.atomic.rmw.sub v0 v1\n\
+        \x20 v5 = i32.atomic.rmw.and v0 v1\n\
+        \x20 v6 = i32.atomic.rmw.or v0 v1\n\
+        \x20 v7 = i32.atomic.rmw.xor v0 v1\n\
+        \x20 v8 = i32.atomic.rmw.xchg v0 v1\n\
+        \x20 v9 = i64.atomic.rmw.add v0 v2\n\
+        \x20 v10 = i32.atomic.cmpxchg v0 v1 v3\n\
+        \x20 v11 = i64.atomic.cmpxchg v0 v2 v9 offset=16\n\
+        \x20 return v2\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse printed"),
+        m,
+        "atomics text round-trip changed the IR"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "atomics binary round-trip changed the IR"
+    );
+}
+
+#[test]
 fn verify_rejects_out_of_window_data() {
     // window = 2^3 = 8 bytes; a 4-byte segment at offset 6 overruns `[0, 8)`.
     let src = "data 6 \"abcd\"\nmemory 3\n\

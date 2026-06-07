@@ -253,6 +253,21 @@ fn check_inst(
         cx.expect(*value, op.info().1)?;
         return Ok(None);
     }
+    // §12 atomic store — the other no-result memory op.
+    if let Inst::AtomicStore {
+        ty, addr, value, ..
+    } = inst
+    {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*addr, ValType::I64)?;
+        cx.expect(*value, ty.val())?;
+        return Ok(None);
+    }
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
@@ -340,8 +355,50 @@ fn check_inst(
             cx.expect(*addr, ValType::I64)?;
             op.info().1
         }
+        Inst::AtomicLoad { ty, addr, .. } => {
+            if !has_memory {
+                return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*addr, ValType::I64)?;
+            ty.val()
+        }
+        Inst::AtomicRmw {
+            ty, addr, value, ..
+        } => {
+            if !has_memory {
+                return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*addr, ValType::I64)?;
+            cx.expect(*value, ty.val())?;
+            ty.val()
+        }
+        Inst::AtomicCmpxchg {
+            ty,
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
+            if !has_memory {
+                return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*addr, ValType::I64)?;
+            cx.expect(*expected, ty.val())?;
+            cx.expect(*replacement, ty.val())?;
+            ty.val()
+        }
         // Handled before/around the match; listed for exhaustiveness (no panic).
         Inst::Store { .. }
+        | Inst::AtomicStore { .. }
         | Inst::Call { .. }
         | Inst::RefFunc { .. }
         | Inst::CallIndirect { .. }

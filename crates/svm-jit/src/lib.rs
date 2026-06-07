@@ -58,16 +58,16 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F64, I16, I32, I64, I8};
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, BlockCall, Endianness, Function, InstBuilder, JumpTableData, MemFlags,
-    StackSlotData, StackSlotKind, Type, UserFuncName, Value,
+    AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, Endianness, Function, InstBuilder,
+    JumpTableData, MemFlags, StackSlotData, StackSlotKind, Type, UserFuncName, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
-    BinOp, Block, CastOp, ConvOp, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx, FuncType, Inst,
-    IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, ValType,
+    AtomicRmwOp, BinOp, Block, CastOp, ConvOp, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
+    FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, ValType,
     DEFAULT_RESERVED_LOG2,
 };
 
@@ -672,6 +672,10 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Cast { .. }
                 | Inst::Load { .. }
                 | Inst::Store { .. }
+                | Inst::AtomicLoad { .. }
+                | Inst::AtomicStore { .. }
+                | Inst::AtomicRmw { .. }
+                | Inst::AtomicCmpxchg { .. }
                 | Inst::Call { .. }
                 | Inst::CallIndirect { .. }
                 | Inst::CapCall { .. }
@@ -1047,6 +1051,67 @@ fn lower_block(
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
+            }
+            // §12 atomics. Confine like a normal access, then a natural-alignment guard (a misaligned
+            // address traps — `atomic_*` require alignment, and it matches the interpreter), then a
+            // hardware atomic. Elision uses the same upper-bound analysis.
+            Inst::AtomicLoad { ty, addr, offset } => {
+                let w = atomic_width(*ty);
+                let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                guard_atomic_align(b, lower, phys, w);
+                b.ins().atomic_load(int_clif_ty(*ty), atomic_flags(), phys)
+            }
+            Inst::AtomicStore {
+                ty,
+                addr,
+                value,
+                offset,
+            } => {
+                let w = atomic_width(*ty);
+                let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                guard_atomic_align(b, lower, phys, w);
+                b.ins()
+                    .atomic_store(atomic_flags(), get(&vals, *value)?, phys);
+                continue; // atomic store produces no value
+            }
+            Inst::AtomicRmw {
+                ty,
+                op,
+                addr,
+                value,
+                offset,
+            } => {
+                let w = atomic_width(*ty);
+                let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                guard_atomic_align(b, lower, phys, w);
+                b.ins().atomic_rmw(
+                    int_clif_ty(*ty),
+                    atomic_flags(),
+                    clif_rmw_op(*op),
+                    phys,
+                    get(&vals, *value)?,
+                )
+            }
+            Inst::AtomicCmpxchg {
+                ty,
+                addr,
+                expected,
+                replacement,
+                offset,
+            } => {
+                let w = atomic_width(*ty);
+                let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                guard_atomic_align(b, lower, phys, w); // type is inferred from the operands
+                b.ins().atomic_cas(
+                    atomic_flags(),
+                    phys,
+                    get(&vals, *expected)?,
+                    get(&vals, *replacement)?,
+                )
             }
             // A funcref is just the function index as plain i32 data (§3c) — the same
             // value the interpreter materializes; `call_indirect` masks it into the table.
@@ -1470,6 +1535,56 @@ fn lower_store(b: &mut FunctionBuilder, op: StoreOp, phys: Value, value: Value) 
         b.ins().ireduce(store_ty, value)
     };
     b.ins().store(mem_flags(), v, phys, 0);
+}
+
+/// Access width (and natural-alignment requirement) of a §12 atomic `ty`.
+fn atomic_width(ty: IntTy) -> u32 {
+    match ty {
+        IntTy::I32 => 4,
+        IntTy::I64 => 8,
+    }
+}
+
+/// Memory flags for an atomic access: little-endian (the window is LE) and aligned — a preceding
+/// [`guard_atomic_align`] traps a misaligned address, so the hardware atomic only ever sees a
+/// naturally-aligned one.
+fn atomic_flags() -> MemFlags {
+    let mut mf = MemFlags::new();
+    mf.set_endianness(Endianness::Little);
+    mf.set_aligned();
+    mf
+}
+
+/// Map an IR atomic RMW op to Cranelift's.
+fn clif_rmw_op(op: AtomicRmwOp) -> ClifRmwOp {
+    match op {
+        AtomicRmwOp::Add => ClifRmwOp::Add,
+        AtomicRmwOp::Sub => ClifRmwOp::Sub,
+        AtomicRmwOp::And => ClifRmwOp::And,
+        AtomicRmwOp::Or => ClifRmwOp::Or,
+        AtomicRmwOp::Xor => ClifRmwOp::Xor,
+        AtomicRmwOp::Xchg => ClifRmwOp::Xchg,
+    }
+}
+
+/// Trap (`MemoryFault`) if physical address `phys` is not `width`-aligned, else fall through —
+/// mirrors the §12 interpreter's `check_align`. `atomic_*` lowerings require natural alignment
+/// (e.g. aarch64 `LDAXR`/`STLXR` fault otherwise), so this precedes every atomic. Leaves the
+/// builder positioned in the aligned ("ok") block.
+fn guard_atomic_align(b: &mut FunctionBuilder, lower: &Lower, phys: Value, width: u32) {
+    if width <= 1 {
+        return;
+    }
+    let rem = b.ins().band_imm(phys, (width - 1) as i64);
+    let aligned = b.ins().icmp_imm(IntCC::Equal, rem, 0);
+    let ok = b.create_block();
+    let bad = b.create_block();
+    b.ins().brif(aligned, ok, &[], bad, &[]);
+    b.switch_to_block(bad);
+    b.seal_block(bad);
+    emit_trap(b, lower, TrapKind::MemoryFault);
+    b.switch_to_block(ok);
+    b.seal_block(ok);
 }
 
 /// Decode an `i64` calling-convention slot to a value of IR type `ty`.

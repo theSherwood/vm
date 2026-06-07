@@ -22,8 +22,9 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
+    Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator,
+    ValType,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -162,6 +163,43 @@ fn print_inst(inst: &Inst) -> String {
             "{} v{addr} v{value}{}",
             op.info().0,
             memarg(*offset, *align)
+        ),
+        // §12 atomics: `<ty>.atomic.<op>`, naturally aligned (no `align=` suffix, only `offset=`).
+        Inst::AtomicLoad { ty, addr, offset } => {
+            format!("{}.atomic.load v{addr}{}", ty.prefix(), memarg(*offset, 0))
+        }
+        Inst::AtomicStore {
+            ty,
+            addr,
+            value,
+            offset,
+        } => format!(
+            "{}.atomic.store v{addr} v{value}{}",
+            ty.prefix(),
+            memarg(*offset, 0)
+        ),
+        Inst::AtomicRmw {
+            ty,
+            op,
+            addr,
+            value,
+            offset,
+        } => format!(
+            "{}.atomic.rmw.{} v{addr} v{value}{}",
+            ty.prefix(),
+            op.name(),
+            memarg(*offset, 0)
+        ),
+        Inst::AtomicCmpxchg {
+            ty,
+            addr,
+            expected,
+            replacement,
+            offset,
+        } => format!(
+            "{}.atomic.cmpxchg v{addr} v{expected} v{replacement}{}",
+            ty.prefix(),
+            memarg(*offset, 0)
         ),
         Inst::Call { func, args } => format!("call {func}{}", arglist(args)),
         Inst::RefFunc { func } => format!("ref.func {func}"),
@@ -848,6 +886,65 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a §12 atomic op given its `ty` and the mnemonic tail after `<ty>.atomic.`
+    /// (`load` / `store` / `cmpxchg` / `rmw.<op>`). Atomics carry an `offset=` memarg but no
+    /// `align` (the access is naturally aligned by definition).
+    fn parse_atomic(
+        &mut self,
+        ty: IntTy,
+        rest: &str,
+        names: &HashMap<String, u32>,
+    ) -> Result<Inst, ParseError> {
+        match rest {
+            "load" => {
+                let addr = self.value(names)?;
+                let (offset, _) = self.parse_memarg()?;
+                Ok(Inst::AtomicLoad { ty, addr, offset })
+            }
+            "store" => {
+                let addr = self.value(names)?;
+                let value = self.value(names)?;
+                let (offset, _) = self.parse_memarg()?;
+                Ok(Inst::AtomicStore {
+                    ty,
+                    addr,
+                    value,
+                    offset,
+                })
+            }
+            "cmpxchg" => {
+                let addr = self.value(names)?;
+                let expected = self.value(names)?;
+                let replacement = self.value(names)?;
+                let (offset, _) = self.parse_memarg()?;
+                Ok(Inst::AtomicCmpxchg {
+                    ty,
+                    addr,
+                    expected,
+                    replacement,
+                    offset,
+                })
+            }
+            _ => {
+                let opname = rest.strip_prefix("rmw.").ok_or_else(|| {
+                    ParseError(format!("unknown atomic op: {}.atomic.{rest}", ty.prefix()))
+                })?;
+                let op = AtomicRmwOp::from_name(opname)
+                    .ok_or_else(|| ParseError(format!("unknown atomic rmw op: {opname}")))?;
+                let addr = self.value(names)?;
+                let value = self.value(names)?;
+                let (offset, _) = self.parse_memarg()?;
+                Ok(Inst::AtomicRmw {
+                    ty,
+                    op,
+                    addr,
+                    value,
+                    offset,
+                })
+            }
+        }
+    }
+
     fn parse_inst(&mut self, names: &HashMap<String, u32>) -> Result<Inst, ParseError> {
         let op = self.ident()?;
 
@@ -963,6 +1060,13 @@ impl<'a> Parser<'a> {
                 offset,
                 align,
             });
+        }
+        // §12 atomics: `<ty>.atomic.<load|store|cmpxchg|rmw.<op>>`.
+        if let Some(rest) = op.strip_prefix("i32.atomic.") {
+            return self.parse_atomic(IntTy::I32, rest, names);
+        }
+        if let Some(rest) = op.strip_prefix("i64.atomic.") {
+            return self.parse_atomic(IntTy::I64, rest, names);
         }
 
         let (prefix, suffix) = op

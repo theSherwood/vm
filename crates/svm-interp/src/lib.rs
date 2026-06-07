@@ -13,9 +13,9 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use svm_ir::{
-    BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx,
-    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
-    DEFAULT_RESERVED_LOG2,
+    AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
+    FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx,
+    ValType, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 
@@ -327,6 +327,20 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         m.store(a, *offset, *op, v)?;
         return Ok(None);
     }
+    // §12 atomic store — the other no-result memory op.
+    if let Inst::AtomicStore {
+        ty,
+        addr,
+        value,
+        offset,
+    } = inst
+    {
+        let m = mem.as_mut().ok_or(Trap::Malformed)?;
+        let a = as_i64(get(vals, *addr)?)? as u64;
+        let v = get(vals, *value)?;
+        m.atomic_store(a, *offset, *ty, v)?;
+        return Ok(None);
+    }
     let v = match inst {
         Inst::ConstI32(c) => Value::I32(*c),
         Inst::ConstI64(c) => Value::I64(*c),
@@ -415,8 +429,39 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             let a = as_i64(get(vals, *addr)?)? as u64;
             m.load(a, *offset, *op)?
         }
+        Inst::AtomicLoad { ty, addr, offset } => {
+            let m = mem.as_ref().ok_or(Trap::Malformed)?;
+            let a = as_i64(get(vals, *addr)?)? as u64;
+            m.atomic_load(a, *offset, *ty)?
+        }
+        Inst::AtomicRmw {
+            ty,
+            op,
+            addr,
+            value,
+            offset,
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = as_i64(get(vals, *addr)?)? as u64;
+            let v = get(vals, *value)?;
+            m.atomic_rmw(a, *offset, *ty, *op, v)?
+        }
+        Inst::AtomicCmpxchg {
+            ty,
+            addr,
+            expected,
+            replacement,
+            offset,
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = as_i64(get(vals, *addr)?)? as u64;
+            let exp = get(vals, *expected)?;
+            let rep = get(vals, *replacement)?;
+            m.atomic_cmpxchg(a, *offset, *ty, exp, rep)?
+        }
         // Handled before/around the match; listed for exhaustiveness (no panic).
         Inst::Store { .. }
+        | Inst::AtomicStore { .. }
         | Inst::Call { .. }
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. } => return Ok(None),
@@ -1274,6 +1319,76 @@ impl Mem {
         Ok(())
     }
 
+    /// §12 atomics share the confinement + page-protection path with `load`/`store`, and add a
+    /// **natural-alignment** requirement: a misaligned effective address traps (`MemoryFault`). The
+    /// window base and mask domain are width-aligned, so checking the confined address suffices.
+    /// Single-threaded, an atomic's *value* semantics equal the non-atomic op; the JIT lowers these
+    /// to hardware atomics so they stay correct once threads exist (§12). All operate on the full
+    /// `ty` width (`i32`/`i64`).
+    fn check_align(&self, base: u64, width: u32) -> Result<(), Trap> {
+        if base.is_multiple_of(width as u64) {
+            Ok(())
+        } else {
+            Err(Trap::MemoryFault)
+        }
+    }
+
+    fn atomic_load(&self, addr: u64, offset: u64, ty: IntTy) -> Result<Value, Trap> {
+        let width = atomic_width(ty);
+        let base = self.confine_checked(addr, offset, width)?;
+        self.check_align(base, width)?;
+        self.check_prot(base, width, false)?;
+        Ok(atomic_decode(ty, self.read_le(base, width)))
+    }
+
+    fn atomic_store(&mut self, addr: u64, offset: u64, ty: IntTy, v: Value) -> Result<(), Trap> {
+        let width = atomic_width(ty);
+        let base = self.confine_checked(addr, offset, width)?;
+        self.check_align(base, width)?;
+        self.check_prot(base, width, true)?;
+        self.write_le(base, width, store_bits(v));
+        Ok(())
+    }
+
+    /// Read the old value, apply `op` with `v`, write the result back, return the **old** value.
+    fn atomic_rmw(
+        &mut self,
+        addr: u64,
+        offset: u64,
+        ty: IntTy,
+        op: AtomicRmwOp,
+        v: Value,
+    ) -> Result<Value, Trap> {
+        let width = atomic_width(ty);
+        let base = self.confine_checked(addr, offset, width)?;
+        self.check_align(base, width)?;
+        self.check_prot(base, width, true)?;
+        let old = self.read_le(base, width);
+        let new = atomic_rmw_apply(ty, op, old, store_bits(v));
+        self.write_le(base, width, new);
+        Ok(atomic_decode(ty, old))
+    }
+
+    /// If `*addr == expected`, write `replacement`; always return the **old** value.
+    fn atomic_cmpxchg(
+        &mut self,
+        addr: u64,
+        offset: u64,
+        ty: IntTy,
+        expected: Value,
+        replacement: Value,
+    ) -> Result<Value, Trap> {
+        let width = atomic_width(ty);
+        let base = self.confine_checked(addr, offset, width)?;
+        self.check_align(base, width)?;
+        self.check_prot(base, width, true)?;
+        let old = self.read_le(base, width); // already the low `width` bytes, zero-extended
+        if old == (store_bits(expected) & width_mask(width)) {
+            self.write_le(base, width, store_bits(replacement));
+        }
+        Ok(atomic_decode(ty, old))
+    }
+
     /// Validate a `map`/`unmap`/`protect` range (§3e): the offset must be page-aligned and the
     /// whole `[offset, offset+len)` must lie within the **reserved** window `[0, reserved)` — the
     /// guest may now grow into the reserved tail `[mapped, reserved)`, not just the initial backed
@@ -1620,6 +1735,57 @@ fn store_bits(v: Value) -> u64 {
         Value::I64(x) => x as u64,
         Value::F32(x) => x.to_bits() as u64,
         Value::F64(x) => x.to_bits(),
+    }
+}
+
+/// Access width in bytes of an atomic `ty` (§12) — also its natural-alignment requirement.
+fn atomic_width(ty: IntTy) -> u32 {
+    match ty {
+        IntTy::I32 => 4,
+        IntTy::I64 => 8,
+    }
+}
+
+/// Low-`width`-bytes mask (`width` ∈ {4, 8}).
+fn width_mask(width: u32) -> u64 {
+    if width >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width * 8)) - 1
+    }
+}
+
+/// Decode the low `ty`-width bytes (zero-extended, as from [`Mem::read_le`]) into a [`Value`].
+fn atomic_decode(ty: IntTy, raw: u64) -> Value {
+    match ty {
+        IntTy::I32 => Value::I32(raw as i32),
+        IntTy::I64 => Value::I64(raw as i64),
+    }
+}
+
+/// Apply an atomic RMW: `old`/`arg` are the low `ty`-width bytes; returns the new low-`width` value.
+fn atomic_rmw_apply(ty: IntTy, op: AtomicRmwOp, old: u64, arg: u64) -> u64 {
+    match ty {
+        IntTy::I32 => {
+            let (o, a) = (old as u32, arg as u32);
+            let r = match op {
+                AtomicRmwOp::Add => o.wrapping_add(a),
+                AtomicRmwOp::Sub => o.wrapping_sub(a),
+                AtomicRmwOp::And => o & a,
+                AtomicRmwOp::Or => o | a,
+                AtomicRmwOp::Xor => o ^ a,
+                AtomicRmwOp::Xchg => a,
+            };
+            r as u64
+        }
+        IntTy::I64 => match op {
+            AtomicRmwOp::Add => old.wrapping_add(arg),
+            AtomicRmwOp::Sub => old.wrapping_sub(arg),
+            AtomicRmwOp::And => old & arg,
+            AtomicRmwOp::Or => old | arg,
+            AtomicRmwOp::Xor => old ^ arg,
+            AtomicRmwOp::Xchg => arg,
+        },
     }
 }
 

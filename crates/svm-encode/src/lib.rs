@@ -15,10 +15,27 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator, ValIdx,
-    ValType,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
+    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
+    Terminator, ValIdx, ValType,
 };
+
+/// Encode an [`IntTy`] as the atomic `ty` byte (`0` = i32, `1` = i64).
+fn int_ty_byte(ty: IntTy) -> u8 {
+    match ty {
+        IntTy::I32 => 0,
+        IntTy::I64 => 1,
+    }
+}
+
+/// Decode the atomic `ty` byte; any other value is a malformed opcode payload.
+fn int_ty_from(b: u8, op: u8) -> Result<IntTy, DecodeError> {
+    match b {
+        0 => Ok(IntTy::I32),
+        1 => Ok(IntTy::I64),
+        _ => Err(DecodeError::BadOpcode(op)),
+    }
+}
 
 mod op {
     // Value types.
@@ -87,6 +104,11 @@ mod op {
     pub const F64_CMP_END: u8 = 0xBD;
     pub const CAST: u8 = 0xC0; // + CastOp index (0..=5)
     pub const CAST_END: u8 = 0xC5;
+    // §12 atomics. Each is followed by a `ty` byte (0 = i32, 1 = i64), then operand idxs + offset.
+    pub const ATOMIC_LOAD: u8 = 0xC6; // ty, addr, offset
+    pub const ATOMIC_STORE: u8 = 0xC7; // ty, addr, value, offset
+    pub const ATOMIC_RMW: u8 = 0xC8; // ty, AtomicRmwOp index, addr, value, offset
+    pub const ATOMIC_CMPXCHG: u8 = 0xC9; // ty, addr, expected, replacement, offset
     pub const FTOI: u8 = 0xD0; // saturating trunc_sat: + FToI index (0..=7)
     pub const FTOI_END: u8 = 0xD7;
     pub const FTOI_TRAP: u8 = 0xD8; // trapping trunc: + FToI index (0..=7)
@@ -278,6 +300,52 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
             out.push(*align);
+        }
+        Inst::AtomicLoad { ty, addr, offset } => {
+            out.push(op::ATOMIC_LOAD);
+            out.push(int_ty_byte(*ty));
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *offset);
+        }
+        Inst::AtomicStore {
+            ty,
+            addr,
+            value,
+            offset,
+        } => {
+            out.push(op::ATOMIC_STORE);
+            out.push(int_ty_byte(*ty));
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *value as u64);
+            write_uleb(out, *offset);
+        }
+        Inst::AtomicRmw {
+            ty,
+            op: rmw,
+            addr,
+            value,
+            offset,
+        } => {
+            out.push(op::ATOMIC_RMW);
+            out.push(int_ty_byte(*ty));
+            out.push(rmw.index());
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *value as u64);
+            write_uleb(out, *offset);
+        }
+        Inst::AtomicCmpxchg {
+            ty,
+            addr,
+            expected,
+            replacement,
+            offset,
+        } => {
+            out.push(op::ATOMIC_CMPXCHG);
+            out.push(int_ty_byte(*ty));
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *expected as u64);
+            write_uleb(out, *replacement as u64);
+            write_uleb(out, *offset);
         }
         Inst::Call { func, args } => {
             out.push(op::CALL);
@@ -675,6 +743,32 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             value: c.idx()?,
             offset: c.uleb()?,
             align: c.byte()?,
+        },
+
+        op::ATOMIC_LOAD => Inst::AtomicLoad {
+            ty: int_ty_from(c.byte()?, b)?,
+            addr: c.idx()?,
+            offset: c.uleb()?,
+        },
+        op::ATOMIC_STORE => Inst::AtomicStore {
+            ty: int_ty_from(c.byte()?, b)?,
+            addr: c.idx()?,
+            value: c.idx()?,
+            offset: c.uleb()?,
+        },
+        op::ATOMIC_RMW => Inst::AtomicRmw {
+            ty: int_ty_from(c.byte()?, b)?,
+            op: AtomicRmwOp::from_index(c.byte()?).ok_or(DecodeError::BadOpcode(b))?,
+            addr: c.idx()?,
+            value: c.idx()?,
+            offset: c.uleb()?,
+        },
+        op::ATOMIC_CMPXCHG => Inst::AtomicCmpxchg {
+            ty: int_ty_from(c.byte()?, b)?,
+            addr: c.idx()?,
+            expected: c.idx()?,
+            replacement: c.idx()?,
+            offset: c.uleb()?,
         },
 
         other => return Err(DecodeError::BadOpcode(other)),

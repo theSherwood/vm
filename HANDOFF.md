@@ -819,7 +819,19 @@ leave a shared view — add a unix test for this alongside the Windows work.
 
 ### Phase 4 / post-MVP (DESIGN-specified, none built)
 - [ ] Concurrency: fibers / vCPUs / M:N green threads, atomics, the C11 memory model,
-  real threads (§12).
+  real threads (§12). **Atomics — first slice DONE:** linear-memory atomic ops across the whole
+  pipeline — `iface`-free IR (`Inst::AtomicLoad`/`AtomicStore`/`AtomicRmw`/`AtomicCmpxchg`, `ty` ∈
+  {i32, i64}; `AtomicRmwOp` = add/sub/and/or/xor/xchg), text (`<ty>.atomic.<op>` with an `offset=`
+  memarg, no `align`), binary (opcodes `0xC6..=0xC9`), verify, interp reference, and JIT lowering to
+  Cranelift `atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cas`. **Natural alignment is required**
+  — a misaligned effective address traps (`MemoryFault`) on both backends (interp `check_align`; JIT
+  a software `guard_atomic_align` before the hardware atomic, so it's portable, not the guard page).
+  Differentially tested in `jit_diff` (rmw ×6 × i32/i64, cmpxchg hit/miss, atomic↔plain aliasing,
+  unaligned-traps-both; non-vacuous — corrupting the JIT rmw map fails it) + a parse/print/encode/
+  decode round-trip in `pipeline`. **Still to come (§12):** the actual *ordering* (only checkable
+  once threads exist — single-threaded the value semantics equal the non-atomic op), narrow widths
+  (8/16/32), fibers/vCPUs/M:N scheduling, real threads + the C11 memory model. The atomics are not
+  yet emitted by the `irgen` fuzzer or the chibicc frontend (focused tests cover them).
 - [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
   virtual memory** — *most of the §1a differentiators live here.*
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.

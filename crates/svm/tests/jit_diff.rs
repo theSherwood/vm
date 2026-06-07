@@ -251,6 +251,111 @@ block0(v0: i64, v1: i64):
     );
 }
 
+// ---- §12 atomics: interp (reference) == JIT (hardware atomics) ----
+
+#[test]
+fn jit_matches_interp_atomic_rmw() {
+    // Each RMW op at i32 and i64: seed mem[8], rmw it with the arg, return old + new — pinning both
+    // the returned *old* value and the stored *new* value against the interpreter.
+    let mk_i32 = (|x: i64| Value::I32(x as i32)) as fn(i64) -> Value;
+    let mk_i64 = (|x: i64| Value::I64(x)) as fn(i64) -> Value;
+    for (ty, mk) in [("i32", mk_i32), ("i64", mk_i64)] {
+        for op in ["add", "sub", "and", "or", "xor", "xchg"] {
+            let src = format!(
+                "memory 16\n\
+                 func ({ty}, {ty}) -> ({ty}) {{\n\
+                 block0(v0: {ty}, v1: {ty}):\n\
+                 \x20 v2 = i64.const 8\n\
+                 \x20 {ty}.atomic.store v2 v0\n\
+                 \x20 v3 = {ty}.atomic.rmw.{op} v2 v1\n\
+                 \x20 v4 = {ty}.atomic.load v2\n\
+                 \x20 v5 = {ty}.add v3 v4\n\
+                 \x20 return v5\n\
+                 }}\n"
+            );
+            assert_jit_matches_interp(
+                &src,
+                &[
+                    vec![mk(0x12), mk(0x34)],
+                    vec![mk(-1), mk(7)],
+                    vec![mk(0x0F0F_0F0F), mk(0x00FF_00FF)],
+                ],
+            );
+        }
+    }
+}
+
+#[test]
+fn jit_matches_interp_atomic_cmpxchg() {
+    // Compare-exchange: on a match the replacement is stored; on a mismatch memory is unchanged;
+    // either way the *old* value is returned. Return old + new to pin both.
+    let src = "memory 16\n\
+        func (i64, i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64, v2: i64):\n\
+        \x20 v3 = i64.const 16\n\
+        \x20 i64.atomic.store v3 v0\n\
+        \x20 v4 = i64.atomic.cmpxchg v3 v1 v2\n\
+        \x20 v5 = i64.atomic.load v3\n\
+        \x20 v6 = i64.add v4 v5\n\
+        \x20 return v6\n\
+        }\n";
+    assert_jit_matches_interp(
+        src,
+        &[
+            vec![Value::I64(5), Value::I64(5), Value::I64(99)], // match → writes 99
+            vec![Value::I64(5), Value::I64(6), Value::I64(99)], // mismatch → unchanged
+            vec![Value::I64(-1), Value::I64(-1), Value::I64(0)],
+        ],
+    );
+}
+
+#[test]
+fn jit_matches_interp_atomic_aliases_plain_memory() {
+    // Atomics and plain loads/stores are the *same* linear memory: an atomic store is seen by a
+    // plain load, and an atomic load sees a plain store.
+    let src = "memory 16\n\
+        func (i64) -> (i64) {\n\
+        block0(v0: i64):\n\
+        \x20 v1 = i64.const 24\n\
+        \x20 i64.atomic.store v1 v0\n\
+        \x20 v2 = i64.load v1\n\
+        \x20 i64.store v1 v2\n\
+        \x20 v3 = i64.atomic.load v1\n\
+        \x20 return v3\n\
+        }\n";
+    assert_jit_matches_interp(src, &[vec![Value::I64(0xDEAD_BEEF)], vec![Value::I64(-5)]]);
+}
+
+#[test]
+fn jit_atomic_unaligned_traps_both() {
+    // A misaligned atomic effective address traps (MemoryFault) identically on both backends — the
+    // §12 natural-alignment requirement (offset 4 is 4- but not 8-aligned ⇒ an i64 atomic traps).
+    // The JIT trap is the software alignment guard (not the hardware guard page), so it is portable.
+    let src = "memory 16\n\
+        func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = i64.const 4\n\
+        \x20 v1 = i64.const 1\n\
+        \x20 v2 = i64.atomic.rmw.add v0 v1\n\
+        \x20 return v2\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 100_000u64;
+    assert_eq!(
+        run(&m, 0, &[], &mut fuel),
+        Err(Trap::MemoryFault),
+        "interp: unaligned atomic must trap"
+    );
+    assert!(
+        matches!(
+            compile_and_run(&m, 0, &[]).expect("jit"),
+            JitOutcome::Trapped(TrapKind::MemoryFault)
+        ),
+        "jit: unaligned atomic must detect-and-kill"
+    );
+}
+
 #[test]
 fn jit_matches_interp_mem_narrow_store_load() {
     // store8 keeps the low byte; load8_u zero-extends, load8_s sign-extends.

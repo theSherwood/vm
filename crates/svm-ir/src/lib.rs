@@ -722,6 +722,49 @@ impl StoreOp {
     }
 }
 
+/// §12 atomic read-modify-write operation. Each atomically loads the operand, applies the op with
+/// the argument, stores the result, and yields the **old** value (`Xchg` just swaps the argument in).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AtomicRmwOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Xchg,
+}
+
+impl AtomicRmwOp {
+    pub const ALL: [AtomicRmwOp; 6] = [
+        AtomicRmwOp::Add,
+        AtomicRmwOp::Sub,
+        AtomicRmwOp::And,
+        AtomicRmwOp::Or,
+        AtomicRmwOp::Xor,
+        AtomicRmwOp::Xchg,
+    ];
+    /// The text suffix in `<ty>.atomic.rmw.<suffix>`.
+    pub fn name(self) -> &'static str {
+        match self {
+            AtomicRmwOp::Add => "add",
+            AtomicRmwOp::Sub => "sub",
+            AtomicRmwOp::And => "and",
+            AtomicRmwOp::Or => "or",
+            AtomicRmwOp::Xor => "xor",
+            AtomicRmwOp::Xchg => "xchg",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<AtomicRmwOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<AtomicRmwOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
 /// Non-terminator instructions. Each produces exactly one result — appended at the
 /// next block-local value index — **except `Store`, which produces no value** (see
 /// [`Inst::produces_value`]).
@@ -827,6 +870,41 @@ pub enum Inst {
         offset: u64,
         align: u8,
     },
+    /// §12 atomic load — a naturally-aligned read of `ty` from the confined effective address
+    /// `addr + offset`; a misaligned effective address **traps**. Single-threaded value semantics
+    /// equal a plain [`Inst::Load`]; the distinct op makes the JIT emit a hardware atomic
+    /// (sequentially consistent), so it stays correct once threads exist (§12).
+    AtomicLoad {
+        ty: IntTy,
+        addr: ValIdx,
+        offset: u64,
+    },
+    /// §12 atomic store — a naturally-aligned write of `value` (`ty`) to `addr + offset`; a
+    /// misaligned effective address **traps**. Produces no SSA result (like [`Inst::Store`]).
+    AtomicStore {
+        ty: IntTy,
+        addr: ValIdx,
+        value: ValIdx,
+        offset: u64,
+    },
+    /// §12 atomic read-modify-write: atomically apply `op` with `value` to `*(addr+offset)`
+    /// (`ty`-wide, naturally aligned ⇒ else **traps**) and yield the **old** value.
+    AtomicRmw {
+        ty: IntTy,
+        op: AtomicRmwOp,
+        addr: ValIdx,
+        value: ValIdx,
+        offset: u64,
+    },
+    /// §12 atomic compare-exchange: if `*(addr+offset) == expected`, store `replacement`; always
+    /// yield the **old** value (`ty`-wide, naturally aligned ⇒ else **traps**).
+    AtomicCmpxchg {
+        ty: IntTy,
+        addr: ValIdx,
+        expected: ValIdx,
+        replacement: ValIdx,
+        offset: u64,
+    },
     /// Direct call to a function by index (fully static; the verifier checks the
     /// index and argument types). Appends the callee's result values — **0, 1, or
     /// many** — at the next block-local indices.
@@ -892,7 +970,7 @@ impl Inst {
     /// (indexed by [`FuncIdx`]) to answer; `CallIndirect` carries its own signature.
     pub fn result_count(&self, fn_results: &[usize]) -> usize {
         match self {
-            Inst::Store { .. } => 0,
+            Inst::Store { .. } | Inst::AtomicStore { .. } => 0,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),
