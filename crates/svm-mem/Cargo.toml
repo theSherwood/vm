@@ -1,0 +1,18 @@
+[package]
+name = "svm-mem"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The shared guest-memory substrate (DESIGN §12/§13): a demand-zeroed, raw-addressable region the
+# parallel interpreter (and, later, the JIT) run over. This is an escape-TCB crate — it owns the
+# `unsafe` so the safe reference stack (svm-interp et al.) can stay `#![forbid(unsafe_code)]` while
+# still getting a shareable region + real hardware atomics. Audited/fuzzed in isolation, like
+# svm-mask.
+
+[target.'cfg(unix)'.dependencies]
+# Anonymous lazy `mmap` for the demand-zeroed region. Unix only; other targets (Windows) fall back
+# to the page-table (`BTreeMap`) backing, which is single-threaded-only.
+libc = "0.2"

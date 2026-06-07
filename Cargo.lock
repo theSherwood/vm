@@ -457,6 +457,7 @@ dependencies = [
  "page_size",
  "svm-ir",
  "svm-mask",
+ "svm-mem",
 ]
 
 [[package]]
@@ -481,6 +482,13 @@ dependencies = [
 [[package]]
 name = "svm-mask"
 version = "0.0.0"
+
+[[package]]
+name = "svm-mem"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "svm-run"

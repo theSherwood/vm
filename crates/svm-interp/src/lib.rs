@@ -18,6 +18,7 @@ use svm_ir::{
     ValType, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
+use svm_mem::{Region, RmwOp};
 
 /// A runtime value. Mirrors `ValType`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1479,7 +1480,11 @@ struct Mem {
     /// Host page size (`host_page_size()`): protection + storage-chunk granularity. Cached per
     /// `Mem` so every method shares the one host-queried value (matches the JIT's `mprotect`).
     page: u64,
-    pages: BTreeMap<u64, Vec<u8>>,
+    /// The anonymous-page backing: a [`svm_mem::Region`] (`#![forbid(unsafe_code)]`-friendly) sized
+    /// to the window's reserved extent. On unix this is one demand-zeroed `mmap` — the shareable
+    /// substrate parallel vCPUs run over with real hardware atomics (§12); elsewhere a paged
+    /// fallback. §13 aliased pages live in `regions`, not here.
+    back: Region,
     /// Page index (`offset / page`) ⇒ explicit page state. A page absent from the map takes its
     /// region default: read+write inside the initial prefix `[0, mapped)`, unmapped in the
     /// reserved tail `[mapped, reserved)`. Entries appear for `protect`ed (`Ro`), `unmap`ped
@@ -1499,10 +1504,12 @@ impl Mem {
     /// reservation) never eagerly allocates.
     fn with_reservation(reserved_log2: u8, mapped_log2: u8) -> Mem {
         let reserved_log2 = reserved_log2.max(mapped_log2);
+        let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
+        let page = host_page_size();
         Mem {
-            window: Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63)),
-            page: host_page_size(),
-            pages: BTreeMap::new(),
+            back: Region::new(window.reserved(), page),
+            window,
+            page,
             prot: BTreeMap::new(),
             regions: BTreeMap::new(),
         }
@@ -1583,12 +1590,28 @@ impl Mem {
         }
     }
 
+    /// Whether `base`'s page is a §13 aliased (`Backed`) page. A naturally-aligned ≤8-byte atomic
+    /// lies wholly within one host page, so the single page of `base` decides. Aliased pages keep the
+    /// value-correct `read_le`/`write_le` path (their bytes live in an `Rc` region, not `back`);
+    /// anonymous pages get `back`'s real hardware atomics (§12).
+    fn is_backed(&self, base: u64) -> bool {
+        matches!(
+            self.prot.get(&(base / self.page)),
+            Some(PageProt::Backed { .. })
+        )
+    }
+
     fn atomic_load(&self, addr: u64, offset: u64, ty: IntTy) -> Result<Value, Trap> {
         let width = atomic_width(ty);
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, false)?;
-        Ok(atomic_decode(ty, self.read_le(base, width)))
+        let raw = if self.is_backed(base) {
+            self.read_le(base, width)
+        } else {
+            self.back.atomic_load(base, width)
+        };
+        Ok(atomic_decode(ty, raw))
     }
 
     fn atomic_store(&mut self, addr: u64, offset: u64, ty: IntTy, v: Value) -> Result<(), Trap> {
@@ -1596,7 +1619,11 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
-        self.write_le(base, width, store_bits(v));
+        if self.is_backed(base) {
+            self.write_le(base, width, store_bits(v));
+        } else {
+            self.back.atomic_store(base, width, store_bits(v));
+        }
         Ok(())
     }
 
@@ -1613,9 +1640,13 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
-        let old = self.read_le(base, width);
-        let new = atomic_rmw_apply(ty, op, old, store_bits(v));
-        self.write_le(base, width, new);
+        let old = if self.is_backed(base) {
+            let old = self.read_le(base, width);
+            self.write_le(base, width, atomic_rmw_apply(ty, op, old, store_bits(v)));
+            old
+        } else {
+            self.back.atomic_rmw(base, width, rmw_op(op), store_bits(v))
+        };
         Ok(atomic_decode(ty, old))
     }
 
@@ -1632,10 +1663,16 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
-        let old = self.read_le(base, width); // already the low `width` bytes, zero-extended
-        if old == (store_bits(expected) & width_mask(width)) {
-            self.write_le(base, width, store_bits(replacement));
-        }
+        let old = if self.is_backed(base) {
+            let old = self.read_le(base, width); // already the low `width` bytes, zero-extended
+            if old == (store_bits(expected) & width_mask(width)) {
+                self.write_le(base, width, store_bits(replacement));
+            }
+            old
+        } else {
+            self.back
+                .atomic_cmpxchg(base, width, store_bits(expected), store_bits(replacement))
+        };
         Ok(atomic_decode(ty, old))
     }
 
@@ -1759,7 +1796,7 @@ impl Mem {
                 .get(region)
                 .map_or(0, |r| r.read_byte(*region_off + idx as u64));
         }
-        self.pages.get(&(off / self.page)).map_or(0, |p| p[idx])
+        self.back.byte(off)
     }
 
     fn set_byte(&mut self, off: u64, b: u8) {
@@ -1775,9 +1812,7 @@ impl Mem {
             }
             return;
         }
-        self.pages
-            .entry(off / page)
-            .or_insert_with(|| vec![0u8; page as usize])[idx] = b;
+        self.back.set_byte(off, b);
     }
 
     /// Seed the low bytes of the window from `init` (escape-oracle, §18). Bytes past the
@@ -1805,15 +1840,8 @@ impl Mem {
             .reserved()
             .min(self.window.mapped().max(snap_cap as u64)) as usize;
         let mut out = vec![0u8; snap];
-        for (&idx, page) in &self.pages {
-            let start = (idx * self.page) as usize;
-            if start >= snap {
-                continue;
-            }
-            let n = (self.page as usize).min(snap - start);
-            out[start..start + n].copy_from_slice(&page[..n]);
-        }
-        // §13 aliased pages live in their region backing, not in `pages` — fill them from there.
+        self.back.read_into(0, &mut out); // anonymous bytes (untouched / grown-tail read as zero)
+                                          // §13 aliased pages live in their region backing, not in `back` — fill them from there.
         for (&idx, p) in &self.prot {
             let PageProt::Backed {
                 region, region_off, ..
@@ -1855,7 +1883,7 @@ impl GuestMem for Mem {
         };
         for page in pages {
             self.set_prot(page, prot);
-            self.pages.remove(&page); // commit ⇒ fresh zeroed page
+            self.back.zero(page * self.page, self.page); // commit ⇒ fresh zeroed page
         }
         0
     }
@@ -1868,7 +1896,7 @@ impl GuestMem for Mem {
         };
         for page in pages {
             self.prot.insert(page, PageProt::Unmapped);
-            self.pages.remove(&page);
+            self.back.zero(page * self.page, self.page);
         }
         0
     }
@@ -1942,7 +1970,7 @@ impl GuestMem for Mem {
                     writable,
                 },
             );
-            self.pages.remove(&page); // bytes live in the region now, not an anonymous page
+            self.back.zero(page * self.page, self.page); // bytes live in the region now, not an anonymous page
         }
         0
     }
@@ -1993,6 +2021,19 @@ fn atomic_width(ty: IntTy) -> u32 {
     match ty {
         IntTy::I32 => 4,
         IntTy::I64 => 8,
+    }
+}
+
+/// Map the IR's RMW op onto the memory substrate's (the substrate sits below `svm-ir`, so it carries
+/// its own mirrored enum).
+fn rmw_op(op: AtomicRmwOp) -> RmwOp {
+    match op {
+        AtomicRmwOp::Add => RmwOp::Add,
+        AtomicRmwOp::Sub => RmwOp::Sub,
+        AtomicRmwOp::And => RmwOp::And,
+        AtomicRmwOp::Or => RmwOp::Or,
+        AtomicRmwOp::Xor => RmwOp::Xor,
+        AtomicRmwOp::Xchg => RmwOp::Xchg,
     }
 }
 

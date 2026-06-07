@@ -842,6 +842,20 @@ leave a shared view — add a unix test for this alongside the Windows work.
   once threads exist — single-threaded the value semantics equal the non-atomic op), narrow widths
   (8/16/32), fibers/vCPUs/M:N scheduling, real threads + the C11 memory model. The atomics are not
   yet emitted by the `irgen` fuzzer or the chibicc frontend (focused tests cover them).
+  **Parallel threads — Phase 1 DONE (shared-memory substrate + real interp atomics):** new escape-TCB
+  crate **`svm-mem`** owns the guest anonymous-page backing as a `Region` — on unix one demand-zeroed,
+  page-aligned anonymous `mmap` of the window's *reserved* extent (the shareable substrate multi-vCPU
+  execution will run over), with a portable `BTreeMap`-paged fallback (non-unix / a reservation too
+  large to map; single-threaded-only). All the `unsafe` (mmap + raw-pointer atomics) lives in
+  `svm-mem`, so **`svm-interp` stays `#![forbid(unsafe_code)]`**. The interpreter's `Mem` now holds a
+  `Region` instead of `pages: BTreeMap`; `byte`/`set_byte`/`map`/`unmap`/`map_region`/`snapshot_window`
+  route through it, and the four atomic ops use the region's **real `AtomicU32`/`U64` seq-cst
+  hardware atomics** for anonymous pages (§13 `Backed` pages keep the value-correct `read_le`/`write_le`
+  path). **Behaviour-preserving** (the 46 `jit_diff` differential cases, 7 escape-oracle snapshots,
+  §13 `shared_region`, and the C-frontend suite all unchanged; clippy `-D warnings` + windows-gnu
+  green). Single-threaded the atomic *values* are identical; the win is the substrate + genuine atomic
+  instructions, ready for **Phase 2** (vCPUs = OS threads over a shared `Region`, a runtime scheduler,
+  `wait`/`notify`, and the `Send`/`Sync` + concurrency-soundness story).
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a
