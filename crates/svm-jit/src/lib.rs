@@ -676,6 +676,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::AtomicStore { .. }
                 | Inst::AtomicRmw { .. }
                 | Inst::AtomicCmpxchg { .. }
+                | Inst::AtomicFence { .. }
                 | Inst::Call { .. }
                 | Inst::CallIndirect { .. }
                 | Inst::CapCall { .. }
@@ -1123,6 +1124,12 @@ fn lower_block(
             // A funcref is just the function index as plain i32 data (§3c) — the same
             // value the interpreter materializes; `call_indirect` masks it into the table.
             Inst::RefFunc { func } => b.ins().iconst(I32, *func as i64),
+            // §12 standalone fence. Cranelift emits a full (seq-cst) barrier regardless of the
+            // requested `order` — the same sound strengthening the atomics use.
+            Inst::AtomicFence { .. } => {
+                b.ins().fence();
+                continue; // produces no value
+            }
             _ => return Err(JitError::Unsupported("instruction")),
         };
         // Single-result instruction: record its value and a sound upper bound in lockstep.

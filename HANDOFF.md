@@ -922,12 +922,15 @@ leave a shared view — add a unix test for this alongside the Windows work.
   a sound strengthening that keeps the interp↔JIT oracle exact (Cranelift atomics are seq-cst only) —
   so the `order` is carried+validated but not yet weaker-honored; the one place ordering is observable
   is the fence, which the interpreter issues as a real `std::sync::atomic::fence` (Relaxed = no-op, as
-  `std` panics on it). The JIT does not lower `atomic.fence` (interp-only, like fibers). Tests in
+  `std` panics on it). **The JIT now lowers `atomic.fence`** too (Cranelift `fence`, seq-cst), so
+  fence programs aren't interp-only and get differential coverage. Tests in
   `crates/svm/tests/threads.rs` (now ×18): ordering+fence round-trip (binary+text, seqcst stays
   implicit), verify-rejects-release-load / -acquire-store, and an execute test (release-store /
-  acquire-load / fence / relaxed-rmw, value-correct). Whole suite + clippy + windows-gnu + (the
-  existing) TSan green. **Honoring weaker orderings in execution** awaits a backend that supports them
-  + the concurrent-oracle story.
+  acquire-load / fence / relaxed-rmw, value-correct); plus `jit_diff`'s
+  `jit_matches_interp_orderings_and_fence` confirming the JIT lowers the ordering suffixes + fence
+  identically to the interpreter. Whole suite + clippy + windows-gnu + (the existing) TSan green.
+  **Honoring weaker orderings in execution** awaits a backend that supports them + the
+  concurrent-oracle story.
   **Phase 2 still to come:** fibers→real-threads scheduler (M:N), per-thread capability grants
   (spawned vCPUs still start with an empty powerbox), honoring weak orderings in execution, and the
   differential-oracle-under-nondeterminism story.

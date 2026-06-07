@@ -357,6 +357,31 @@ fn jit_atomic_unaligned_traps_both() {
 }
 
 #[test]
+fn jit_matches_interp_orderings_and_fence() {
+    // The C11 ordering suffixes and `atomic.fence` lower on the JIT (all seq-cst, a sound
+    // strengthening) and match the interpreter exactly — release-store 5, acquire-load it, fence,
+    // relaxed rmw +3, then read 8; returns 5 + 8 = 13.
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i64.const 5
+  i64.atomic.store.release v0 v1
+  v2 = i64.atomic.load.acquire v0
+  atomic.fence
+  atomic.fence.acquire
+  v3 = i64.const 3
+  v4 = i64.atomic.rmw.add.relaxed v0 v3
+  v5 = i64.atomic.load v0
+  v6 = i64.add v2 v5
+  return v6
+}
+"#;
+    assert_jit_matches_interp(src, &[vec![]]);
+}
+
+#[test]
 fn jit_matches_interp_mem_narrow_store_load() {
     // store8 keeps the low byte; load8_u zero-extends, load8_s sign-extends.
     let src = r#"
