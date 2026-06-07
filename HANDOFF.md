@@ -912,9 +912,25 @@ leave a shared view — add a unix test for this alongside the Windows work.
   (a forked view sees a post-fork `map` then `unmap`); whole suite (incl. §13 `shared_region`,
   `jit_diff`, `c_frontend`) unchanged, TSan-clean (the 4-thread atomic test now hammers the shared
   `RwLock` `check_prot`), clippy + windows-gnu green.
-  **Phase 2 still to come:** fibers→real-threads scheduler (M:N), the memory-ordering parameter on the
-  atomic IR ops + fences (today all seq-cst), per-thread capability grants (spawned vCPUs still start
-  with an empty powerbox), and the differential-oracle-under-nondeterminism story.
+  **Parallel threads — Phase 2 step 5 DONE (C11 memory-ordering surface + `atomic.fence`):** the four
+  atomic ops gained an `order: svm_ir::Ordering` field (relaxed / acquire / release / acqrel / seqcst)
+  and there's a new `Inst::AtomicFence { order }`. Text: a `.<order>` suffix on the mnemonic, omitted
+  for the default seqcst so existing atomics round-trip unchanged (`i32.atomic.load.acquire`,
+  `i64.atomic.rmw.add.relaxed`, `atomic.fence`, `atomic.fence.acquire`); binary: an ordering byte per
+  atomic + opcode `0xE9` for fence; verify rejects impossible pairs (a load with release / a store
+  with acquire — `VerifyError::BadAtomicOrdering`). **Both backends execute every atomic seq-cst** —
+  a sound strengthening that keeps the interp↔JIT oracle exact (Cranelift atomics are seq-cst only) —
+  so the `order` is carried+validated but not yet weaker-honored; the one place ordering is observable
+  is the fence, which the interpreter issues as a real `std::sync::atomic::fence` (Relaxed = no-op, as
+  `std` panics on it). The JIT does not lower `atomic.fence` (interp-only, like fibers). Tests in
+  `crates/svm/tests/threads.rs` (now ×18): ordering+fence round-trip (binary+text, seqcst stays
+  implicit), verify-rejects-release-load / -acquire-store, and an execute test (release-store /
+  acquire-load / fence / relaxed-rmw, value-correct). Whole suite + clippy + windows-gnu + (the
+  existing) TSan green. **Honoring weaker orderings in execution** awaits a backend that supports them
+  + the concurrent-oracle story.
+  **Phase 2 still to come:** fibers→real-threads scheduler (M:N), per-thread capability grants
+  (spawned vCPUs still start with an empty powerbox), honoring weak orderings in execution, and the
+  differential-oracle-under-nondeterminism story.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a

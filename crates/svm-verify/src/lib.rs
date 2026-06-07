@@ -76,6 +76,9 @@ pub enum VerifyError {
     /// A `thread.spawn` named a function whose signature is not the fixed thread entry type
     /// `(i64) -> i64` (§12).
     ThreadEntrySignature { func: u32, block: u32, callee: u32 },
+    /// An atomic carried an ordering its op can't have: a load with release semantics, or a store
+    /// with acquire semantics (§12 / C11).
+    BadAtomicOrdering { func: u32, block: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -298,11 +301,21 @@ fn check_inst(
     }
     // §12 atomic store — the other no-result memory op.
     if let Inst::AtomicStore {
-        ty, addr, value, ..
+        ty,
+        addr,
+        value,
+        order,
+        ..
     } = inst
     {
         if !has_memory {
             return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        if !order.valid_for_store() {
+            return Err(VerifyError::BadAtomicOrdering {
                 func: fi,
                 block: bi,
             });
@@ -398,9 +411,17 @@ fn check_inst(
             cx.expect(*addr, ValType::I64)?;
             op.info().1
         }
-        Inst::AtomicLoad { ty, addr, .. } => {
+        Inst::AtomicLoad {
+            ty, addr, order, ..
+        } => {
             if !has_memory {
                 return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            if !order.valid_for_load() {
+                return Err(VerifyError::BadAtomicOrdering {
                     func: fi,
                     block: bi,
                 });
@@ -487,6 +508,9 @@ fn check_inst(
             cx.expect(*count, ValType::I32)?;
             ValType::I32
         }
+        // A standalone fence produces no value and needs no memory or operands (any ordering is
+        // valid for a fence) — accept it directly.
+        Inst::AtomicFence { .. } => return Ok(None),
         // Handled before/around the match; listed for exhaustiveness (no panic).
         Inst::Store { .. }
         | Inst::AtomicStore { .. }

@@ -23,8 +23,8 @@ use std::fmt::Write as _;
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
-    Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator,
-    ValType,
+    Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
+    Terminator, ValType,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -164,18 +164,29 @@ fn print_inst(inst: &Inst) -> String {
             op.info().0,
             memarg(*offset, *align)
         ),
-        // §12 atomics: `<ty>.atomic.<op>`, naturally aligned (no `align=` suffix, only `offset=`).
-        Inst::AtomicLoad { ty, addr, offset } => {
-            format!("{}.atomic.load v{addr}{}", ty.prefix(), memarg(*offset, 0))
-        }
+        // §12 atomics: `<ty>.atomic.<op>[.<order>]`, naturally aligned (no `align=`, only `offset=`).
+        // The default `seqcst` ordering is omitted, so seq-cst atomics round-trip unchanged.
+        Inst::AtomicLoad {
+            ty,
+            addr,
+            offset,
+            order,
+        } => format!(
+            "{}.atomic.load{} v{addr}{}",
+            ty.prefix(),
+            ord_suffix(*order),
+            memarg(*offset, 0)
+        ),
         Inst::AtomicStore {
             ty,
             addr,
             value,
             offset,
+            order,
         } => format!(
-            "{}.atomic.store v{addr} v{value}{}",
+            "{}.atomic.store{} v{addr} v{value}{}",
             ty.prefix(),
+            ord_suffix(*order),
             memarg(*offset, 0)
         ),
         Inst::AtomicRmw {
@@ -184,10 +195,12 @@ fn print_inst(inst: &Inst) -> String {
             addr,
             value,
             offset,
+            order,
         } => format!(
-            "{}.atomic.rmw.{} v{addr} v{value}{}",
+            "{}.atomic.rmw.{}{} v{addr} v{value}{}",
             ty.prefix(),
             op.name(),
+            ord_suffix(*order),
             memarg(*offset, 0)
         ),
         Inst::AtomicCmpxchg {
@@ -196,9 +209,11 @@ fn print_inst(inst: &Inst) -> String {
             expected,
             replacement,
             offset,
+            order,
         } => format!(
-            "{}.atomic.cmpxchg v{addr} v{expected} v{replacement}{}",
+            "{}.atomic.cmpxchg{} v{addr} v{expected} v{replacement}{}",
             ty.prefix(),
+            ord_suffix(*order),
             memarg(*offset, 0)
         ),
         Inst::Call { func, args } => format!("call {func}{}", arglist(args)),
@@ -236,7 +251,34 @@ fn print_inst(inst: &Inst) -> String {
             timeout,
         } => format!("{}.atomic.wait v{addr} v{expected} v{timeout}", ty.prefix()),
         Inst::MemoryNotify { addr, count } => format!("atomic.notify v{addr} v{count}"),
+        Inst::AtomicFence { order } => format!("atomic.fence{}", ord_suffix(*order)),
     }
+}
+
+/// The `.<order>` text suffix for an atomic op, empty for the default `seqcst` (so seq-cst atomics
+/// print exactly as before this surface existed).
+fn ord_suffix(order: Ordering) -> String {
+    match order {
+        Ordering::SeqCst => String::new(),
+        o => format!(".{}", o.name()),
+    }
+}
+
+/// Strip a trailing `.<order>` token off an atomic mnemonic tail, defaulting to `seqcst`. E.g.
+/// `"rmw.add.relaxed"` → `("rmw.add", Relaxed)`, `"load"` → `("load", SeqCst)`. (Ordering names never
+/// collide with op names, so this is unambiguous.)
+fn split_order(rest: &str) -> (&str, Ordering) {
+    for o in Ordering::ALL {
+        if o == Ordering::SeqCst {
+            continue;
+        }
+        if let Some(base) = rest.strip_suffix(o.name()) {
+            if let Some(base) = base.strip_suffix('.') {
+                return (base, o);
+            }
+        }
+    }
+    (rest, Ordering::SeqCst)
 }
 
 /// Render the optional `offset=`/`align=` suffix, omitting zero defaults.
@@ -910,22 +952,28 @@ impl<'a> Parser<'a> {
         rest: &str,
         names: &HashMap<String, u32>,
     ) -> Result<Inst, ParseError> {
-        match rest {
+        // `wait` carries no memory ordering; everything else may end in a `.<order>` suffix.
+        if rest == "wait" {
+            let addr = self.value(names)?;
+            let expected = self.value(names)?;
+            let timeout = self.value(names)?;
+            return Ok(Inst::MemoryWait {
+                ty,
+                addr,
+                expected,
+                timeout,
+            });
+        }
+        let (base, order) = split_order(rest);
+        match base {
             "load" => {
                 let addr = self.value(names)?;
                 let (offset, _) = self.parse_memarg()?;
-                Ok(Inst::AtomicLoad { ty, addr, offset })
-            }
-            // §12 futex wait: `<ty>.atomic.wait addr expected timeout` (no memarg).
-            "wait" => {
-                let addr = self.value(names)?;
-                let expected = self.value(names)?;
-                let timeout = self.value(names)?;
-                Ok(Inst::MemoryWait {
+                Ok(Inst::AtomicLoad {
                     ty,
                     addr,
-                    expected,
-                    timeout,
+                    offset,
+                    order,
                 })
             }
             "store" => {
@@ -937,6 +985,7 @@ impl<'a> Parser<'a> {
                     addr,
                     value,
                     offset,
+                    order,
                 })
             }
             "cmpxchg" => {
@@ -950,10 +999,11 @@ impl<'a> Parser<'a> {
                     expected,
                     replacement,
                     offset,
+                    order,
                 })
             }
             _ => {
-                let opname = rest.strip_prefix("rmw.").ok_or_else(|| {
+                let opname = base.strip_prefix("rmw.").ok_or_else(|| {
                     ParseError(format!("unknown atomic op: {}.atomic.{rest}", ty.prefix()))
                 })?;
                 let op = AtomicRmwOp::from_name(opname)
@@ -964,6 +1014,7 @@ impl<'a> Parser<'a> {
                 Ok(Inst::AtomicRmw {
                     ty,
                     op,
+                    order,
                     addr,
                     value,
                     offset,
@@ -1081,6 +1132,15 @@ impl<'a> Parser<'a> {
             let addr = self.value(names)?;
             let count = self.value(names)?;
             return Ok(Inst::MemoryNotify { addr, count });
+        }
+        if let Some(tail) = op.strip_prefix("atomic.fence") {
+            let order = if tail.is_empty() {
+                Ordering::SeqCst
+            } else {
+                Ordering::from_name(tail.strip_prefix('.').unwrap_or(tail))
+                    .ok_or_else(|| ParseError(format!("unknown fence ordering: {op}")))?
+            };
+            return Ok(Inst::AtomicFence { order });
         }
         if op == "ptr.from_int" || op == "ptr.to_int" {
             return Ok(Inst::PtrCast {

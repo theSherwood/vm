@@ -799,6 +799,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         addr,
         value,
         offset,
+        ..
     } = inst
     {
         let m = mem.as_mut().ok_or(Trap::Malformed)?;
@@ -895,7 +896,10 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             let a = as_i64(get(vals, *addr)?)? as u64;
             m.load(a, *offset, *op)?
         }
-        Inst::AtomicLoad { ty, addr, offset } => {
+        // The `order` is carried but execution is seq-cst (a sound strengthening; see `svm_ir::Ordering`).
+        Inst::AtomicLoad {
+            ty, addr, offset, ..
+        } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
             let a = as_i64(get(vals, *addr)?)? as u64;
             m.atomic_load(a, *offset, *ty)?
@@ -906,6 +910,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             addr,
             value,
             offset,
+            ..
         } => {
             let m = mem.as_mut().ok_or(Trap::Malformed)?;
             let a = as_i64(get(vals, *addr)?)? as u64;
@@ -918,12 +923,27 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             expected,
             replacement,
             offset,
+            ..
         } => {
             let m = mem.as_mut().ok_or(Trap::Malformed)?;
             let a = as_i64(get(vals, *addr)?)? as u64;
             let exp = get(vals, *expected)?;
             let rep = get(vals, *replacement)?;
             m.atomic_cmpxchg(a, *offset, *ty, exp, rep)?
+        }
+        // §12 standalone fence — issue the real hardware fence (a `Relaxed` fence is a no-op; `std`
+        // would panic on it). Both backends are otherwise seq-cst, so this is the one place ordering
+        // is observable.
+        Inst::AtomicFence { order } => {
+            use std::sync::atomic::{fence, Ordering as O};
+            match order {
+                svm_ir::Ordering::Relaxed => {}
+                svm_ir::Ordering::Acquire => fence(O::Acquire),
+                svm_ir::Ordering::Release => fence(O::Release),
+                svm_ir::Ordering::AcqRel => fence(O::AcqRel),
+                svm_ir::Ordering::SeqCst => fence(O::SeqCst),
+            }
+            return Ok(None);
         }
         // Handled before/around the match (or in `run_func` for the §12 fiber ops, which
         // switch stacks); listed for exhaustiveness (no panic).

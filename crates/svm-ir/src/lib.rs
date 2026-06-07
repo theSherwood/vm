@@ -765,6 +765,58 @@ impl AtomicRmwOp {
     }
 }
 
+/// C11/§12 memory ordering for atomic ops and fences. The IR carries the full lattice so a frontend
+/// can express it and the verifier can reject impossible op/ordering pairs; **both backends currently
+/// execute every atomic sequentially-consistent** (a sound strengthening — Cranelift atomics are
+/// seq-cst only, and it keeps the interpreter↔JIT oracle exact). Honoring weaker orderings in
+/// execution awaits a backend that can, and the concurrent-oracle story (§18).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ordering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+impl Ordering {
+    pub const ALL: [Ordering; 5] = [
+        Ordering::Relaxed,
+        Ordering::Acquire,
+        Ordering::Release,
+        Ordering::AcqRel,
+        Ordering::SeqCst,
+    ];
+    /// The text suffix; the default [`Ordering::SeqCst`] is rendered by omitting the suffix entirely
+    /// (so existing `.atomic.` text round-trips unchanged).
+    pub fn name(self) -> &'static str {
+        match self {
+            Ordering::Relaxed => "relaxed",
+            Ordering::Acquire => "acquire",
+            Ordering::Release => "release",
+            Ordering::AcqRel => "acqrel",
+            Ordering::SeqCst => "seqcst",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<Ordering> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<Ordering> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+    /// A load may not carry release semantics (`Release`/`AcqRel`).
+    pub fn valid_for_load(self) -> bool {
+        !matches!(self, Ordering::Release | Ordering::AcqRel)
+    }
+    /// A store may not carry acquire semantics (`Acquire`/`AcqRel`).
+    pub fn valid_for_store(self) -> bool {
+        !matches!(self, Ordering::Acquire | Ordering::AcqRel)
+    }
+}
+
 /// Non-terminator instructions. Each produces exactly one result — appended at the
 /// next block-local value index — **except `Store`, which produces no value** (see
 /// [`Inst::produces_value`]).
@@ -878,6 +930,7 @@ pub enum Inst {
         ty: IntTy,
         addr: ValIdx,
         offset: u64,
+        order: Ordering,
     },
     /// §12 atomic store — a naturally-aligned write of `value` (`ty`) to `addr + offset`; a
     /// misaligned effective address **traps**. Produces no SSA result (like [`Inst::Store`]).
@@ -886,6 +939,7 @@ pub enum Inst {
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
+        order: Ordering,
     },
     /// §12 atomic read-modify-write: atomically apply `op` with `value` to `*(addr+offset)`
     /// (`ty`-wide, naturally aligned ⇒ else **traps**) and yield the **old** value.
@@ -895,6 +949,7 @@ pub enum Inst {
         addr: ValIdx,
         value: ValIdx,
         offset: u64,
+        order: Ordering,
     },
     /// §12 atomic compare-exchange: if `*(addr+offset) == expected`, store `replacement`; always
     /// yield the **old** value (`ty`-wide, naturally aligned ⇒ else **traps**).
@@ -904,6 +959,7 @@ pub enum Inst {
         expected: ValIdx,
         replacement: ValIdx,
         offset: u64,
+        order: Ordering,
     },
     /// Direct call to a function by index (fully static; the verifier checks the
     /// index and argument types). Appends the callee's result values — **0, 1, or
@@ -1027,6 +1083,12 @@ pub enum Inst {
         addr: ValIdx,
         count: ValIdx,
     },
+    /// §12 standalone memory fence (`atomic.fence <order>`): orders this vCPU's accesses without
+    /// touching memory. Produces no SSA result. Honored by the interpreter; the JIT does not yet
+    /// lower it (interp-only, like fibers).
+    AtomicFence {
+        order: Ordering,
+    },
 }
 
 impl Inst {
@@ -1037,7 +1099,7 @@ impl Inst {
     /// (indexed by [`FuncIdx`]) to answer; `CallIndirect` carries its own signature.
     pub fn result_count(&self, fn_results: &[usize]) -> usize {
         match self {
-            Inst::Store { .. } | Inst::AtomicStore { .. } => 0,
+            Inst::Store { .. } | Inst::AtomicStore { .. } | Inst::AtomicFence { .. } => 0,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),

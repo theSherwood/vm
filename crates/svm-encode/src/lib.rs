@@ -16,9 +16,14 @@
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
+    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
     Terminator, ValIdx, ValType,
 };
+
+/// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
+fn ord_from(b: u8, op: u8) -> Result<Ordering, DecodeError> {
+    Ordering::from_index(b).ok_or(DecodeError::BadOpcode(op))
+}
 
 /// Encode an [`IntTy`] as the atomic `ty` byte (`0` = i32, `1` = i64).
 fn int_ty_byte(ty: IntTy) -> u8 {
@@ -124,6 +129,7 @@ mod op {
     pub const ITOF: u8 = 0xE0; // + IToF index (0..=7)
     pub const ITOF_END: u8 = 0xE7;
     pub const ATOMIC_NOTIFY: u8 = 0xE8; // addr, count -> i32 woken
+    pub const ATOMIC_FENCE: u8 = 0xE9; // order byte
 
     // Terminators (decoded in a separate context from instruction opcodes).
     pub const BR: u8 = 0x80;
@@ -310,23 +316,31 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *offset);
             out.push(*align);
         }
-        Inst::AtomicLoad { ty, addr, offset } => {
+        Inst::AtomicLoad {
+            ty,
+            addr,
+            offset,
+            order,
+        } => {
             out.push(op::ATOMIC_LOAD);
             out.push(int_ty_byte(*ty));
             write_uleb(out, *addr as u64);
             write_uleb(out, *offset);
+            out.push(order.index());
         }
         Inst::AtomicStore {
             ty,
             addr,
             value,
             offset,
+            order,
         } => {
             out.push(op::ATOMIC_STORE);
             out.push(int_ty_byte(*ty));
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
+            out.push(order.index());
         }
         Inst::AtomicRmw {
             ty,
@@ -334,6 +348,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             addr,
             value,
             offset,
+            order,
         } => {
             out.push(op::ATOMIC_RMW);
             out.push(int_ty_byte(*ty));
@@ -341,6 +356,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *addr as u64);
             write_uleb(out, *value as u64);
             write_uleb(out, *offset);
+            out.push(order.index());
         }
         Inst::AtomicCmpxchg {
             ty,
@@ -348,6 +364,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             expected,
             replacement,
             offset,
+            order,
         } => {
             out.push(op::ATOMIC_CMPXCHG);
             out.push(int_ty_byte(*ty));
@@ -355,6 +372,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *expected as u64);
             write_uleb(out, *replacement as u64);
             write_uleb(out, *offset);
+            out.push(order.index());
         }
         Inst::Call { func, args } => {
             out.push(op::CALL);
@@ -443,6 +461,10 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(op::ATOMIC_NOTIFY);
             write_uleb(out, *addr as u64);
             write_uleb(out, *count as u64);
+        }
+        Inst::AtomicFence { order } => {
+            out.push(op::ATOMIC_FENCE);
+            out.push(order.index());
         }
     }
 }
@@ -798,12 +820,14 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             ty: int_ty_from(c.byte()?, b)?,
             addr: c.idx()?,
             offset: c.uleb()?,
+            order: ord_from(c.byte()?, b)?,
         },
         op::ATOMIC_STORE => Inst::AtomicStore {
             ty: int_ty_from(c.byte()?, b)?,
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
+            order: ord_from(c.byte()?, b)?,
         },
         op::ATOMIC_RMW => Inst::AtomicRmw {
             ty: int_ty_from(c.byte()?, b)?,
@@ -811,6 +835,7 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             addr: c.idx()?,
             value: c.idx()?,
             offset: c.uleb()?,
+            order: ord_from(c.byte()?, b)?,
         },
         op::ATOMIC_CMPXCHG => Inst::AtomicCmpxchg {
             ty: int_ty_from(c.byte()?, b)?,
@@ -818,6 +843,7 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             expected: c.idx()?,
             replacement: c.idx()?,
             offset: c.uleb()?,
+            order: ord_from(c.byte()?, b)?,
         },
 
         op::CONT_NEW => Inst::ContNew {
@@ -844,6 +870,9 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::ATOMIC_NOTIFY => Inst::MemoryNotify {
             addr: c.idx()?,
             count: c.idx()?,
+        },
+        op::ATOMIC_FENCE => Inst::AtomicFence {
+            order: ord_from(c.byte()?, b)?,
         },
 
         other => return Err(DecodeError::BadOpcode(other)),

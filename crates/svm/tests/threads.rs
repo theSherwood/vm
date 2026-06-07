@@ -395,6 +395,107 @@ block0():
     assert_eq!(parse_module(&print_module(&m)).expect("reparse"), m);
 }
 
+// ---- §12 C11 memory-ordering surface + `atomic.fence` ----
+
+/// Ordered atomics and fences survive both round-trips; the default `seqcst` prints with no suffix
+/// (so it stays canonical), the weaker orderings print/parse their suffix.
+#[test]
+fn ordering_and_fence_round_trip() {
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i32.atomic.load.acquire v0
+  v2 = i32.const 1
+  i32.atomic.store.release v0 v2
+  v3 = i64.const 7
+  v4 = i64.atomic.rmw.add.relaxed v0 v3
+  v5 = i32.const 1
+  v6 = i32.const 2
+  v7 = i32.atomic.cmpxchg.acqrel v0 v5 v6
+  atomic.fence
+  atomic.fence.acquire
+  v8 = i64.atomic.load v0
+  return v8
+}
+"#;
+    let m = module(src);
+    assert_eq!(decode_module(&encode_module(&m)).expect("decode"), m);
+    // Text print→parse is identity, and the printed form keeps seqcst implicit.
+    let printed = print_module(&m);
+    assert!(printed.contains("i32.atomic.load.acquire"));
+    assert!(printed.contains("i64.atomic.rmw.add.relaxed"));
+    assert!(printed.contains("atomic.fence.acquire"));
+    assert!(printed.contains("i64.atomic.load v0\n")); // plain seqcst load — no suffix
+    assert_eq!(parse_module(&printed).expect("reparse"), m);
+}
+
+/// The verifier rejects an ordering its op can't carry: a load with release semantics...
+#[test]
+fn verify_rejects_release_load() {
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i32.atomic.load.release v0
+  v2 = i64.const 0
+  return v2
+}
+"#;
+    let m = parse_module(src).expect("parse");
+    assert!(matches!(
+        verify_module(&m),
+        Err(svm_verify::VerifyError::BadAtomicOrdering { .. })
+    ));
+}
+
+/// ...and a store with acquire semantics.
+#[test]
+fn verify_rejects_acquire_store() {
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i32.const 1
+  i32.atomic.store.acquire v0 v1
+  v2 = i64.const 0
+  return v2
+}
+"#;
+    let m = parse_module(src).expect("parse");
+    assert!(matches!(
+        verify_module(&m),
+        Err(svm_verify::VerifyError::BadAtomicOrdering { .. })
+    ));
+}
+
+/// Ordered atomics + a fence execute (value-correct, seq-cst): release-store 5, acquire-load it,
+/// fence, relaxed rmw.add 3 (yields old 5), and the cell ends at 8.
+#[test]
+fn ordered_atomics_and_fence_execute() {
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i64.const 5
+  i64.atomic.store.release v0 v1
+  v2 = i64.atomic.load.acquire v0
+  atomic.fence.acqrel
+  v3 = i64.const 3
+  v4 = i64.atomic.rmw.add.relaxed v0 v3
+  v5 = i64.atomic.load v0
+  v6 = i64.add v2 v5
+  return v6
+}
+"#;
+    // v2 = 5 (acquire load), v5 = 8 (after +3); returns 5 + 8 = 13.
+    assert_eq!(run_i64(src), Ok(13));
+}
+
 /// `wait`/`notify` without declared memory are rejected by the verifier (they name an address).
 #[test]
 fn verify_rejects_wait_without_memory() {

@@ -1055,7 +1055,11 @@ fn lower_block(
             // §12 atomics. Confine like a normal access, then a natural-alignment guard (a misaligned
             // address traps — `atomic_*` require alignment, and it matches the interpreter), then a
             // hardware atomic. Elision uses the same upper-bound analysis.
-            Inst::AtomicLoad { ty, addr, offset } => {
+            // The `order` is ignored: Cranelift atomics are seq-cst, which soundly implements every
+            // requested ordering and keeps the interpreter↔JIT oracle exact (see `svm_ir::Ordering`).
+            Inst::AtomicLoad {
+                ty, addr, offset, ..
+            } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
@@ -1067,6 +1071,7 @@ fn lower_block(
                 addr,
                 value,
                 offset,
+                ..
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
@@ -1082,6 +1087,7 @@ fn lower_block(
                 addr,
                 value,
                 offset,
+                ..
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
@@ -1101,6 +1107,7 @@ fn lower_block(
                 expected,
                 replacement,
                 offset,
+                ..
             } => {
                 let w = atomic_width(*ty);
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
