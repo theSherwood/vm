@@ -102,7 +102,9 @@ pub fn run_with_host(
     fuel: &mut u64,
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
-    let f = m.funcs.get(func as usize).ok_or(Trap::Malformed)?;
+    if m.funcs.get(func as usize).is_none() {
+        return Err(Trap::Malformed);
+    }
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
     // backed, so an out-of-`mapped` access faults (detect-and-kill) instead of wrapping.
@@ -111,16 +113,40 @@ pub fn run_with_host(
         mm.init_data(&m.data); // §3a/D40 data segments (copy + RO-protect)
         mm
     });
-    // A `std::thread::scope` so a `thread.spawn` vCPU can borrow the module's functions (`&'a`) yet
-    // still be a real OS thread; the scope joins any stragglers at run end. `budget` caps total
-    // spawned threads (§12). No `thread.spawn` ⇒ no thread is ever created (negligible overhead).
-    let budget = std::sync::atomic::AtomicU32::new(MAX_THREADS);
-    let parking = Parking::default();
-    std::thread::scope(|s| {
-        run_func(
-            f, args, fuel, &mut mem, &m.funcs, host, 0, s, &budget, &parking,
-        )
-    })
+    drive(&m.funcs, func, args, fuel, &mut mem, host)
+}
+
+/// Set up the shared concurrency runtime (the `thread.spawn` budget, the `wait`/`notify` parking lot,
+/// and the registry of spawned OS threads), run the entry vCPU, then **join every spawned vCPU**
+/// before returning — so no worker outlives the run and the final memory is stable for a snapshot.
+/// `funcs` is cloned into an `Arc<[Func]>` the vCPUs own, so a spawned vCPU borrows nothing and can
+/// run on a detached thread. With no `thread.spawn`, no thread is ever created (negligible overhead).
+fn drive(
+    funcs: &[Func],
+    entry: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
+    let funcs: Arc<[Func]> = funcs.to_vec().into();
+    let budget = Arc::new(std::sync::atomic::AtomicU32::new(MAX_THREADS));
+    let parking = Arc::new(Parking::default());
+    let registry: Arc<Registry> = Arc::new(Mutex::new(Vec::new()));
+    let r = run_func(
+        funcs,
+        entry,
+        args,
+        fuel,
+        mem,
+        host,
+        0,
+        budget,
+        parking,
+        Arc::clone(&registry),
+    );
+    drain_registry(&registry);
+    r
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -156,23 +182,16 @@ pub fn run_capture_reserved(
     reserved_log2: u8,
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
     let mut host = Host::new();
-    let f = match m.funcs.get(func as usize) {
-        Some(f) => f,
-        None => return (Err(Trap::Malformed), Vec::new()),
-    };
+    if m.funcs.get(func as usize).is_none() {
+        return (Err(Trap::Malformed), Vec::new());
+    }
     let mut mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
         mm
     });
-    let budget = std::sync::atomic::AtomicU32::new(MAX_THREADS);
-    let parking = Parking::default();
-    let r = std::thread::scope(|s| {
-        run_func(
-            f, args, fuel, &mut mem, &m.funcs, &mut host, 0, s, &budget, &parking,
-        )
-    });
+    let r = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -200,23 +219,16 @@ pub fn run_capture_reserved_with_host(
     reserved_log2: u8,
     host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
-    let f = match m.funcs.get(func as usize) {
-        Some(f) => f,
-        None => return (Err(Trap::Malformed), Vec::new()),
-    };
+    if m.funcs.get(func as usize).is_none() {
+        return (Err(Trap::Malformed), Vec::new());
+    }
     let mut mem = m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
         mm
     });
-    let budget = std::sync::atomic::AtomicU32::new(MAX_THREADS);
-    let parking = Parking::default();
-    let r = std::thread::scope(|s| {
-        run_func(
-            f, args, fuel, &mut mem, &m.funcs, host, 0, s, &budget, &parking,
-        )
-    });
+    let r = drive(&m.funcs, func, args, fuel, &mut mem, host);
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -345,6 +357,35 @@ impl Parking {
     }
 }
 
+/// A spawned vCPU's result slot (§12). The worker thread stores its `run_func` outcome here and
+/// signals `cv`; a `thread.join` blocks on it. Decouples join-semantics (this) from thread cleanup
+/// (the [`Registry`]) so the executor can later reuse OS threads / park continuations.
+#[derive(Default)]
+struct TaskState {
+    done: Mutex<Option<Result<Vec<Value>, Trap>>>,
+    cv: std::sync::Condvar,
+}
+
+/// Every spawned vCPU's OS-thread handle, joined once at the end of the top-level run so no worker
+/// outlives it. Shared by `Arc` across all vCPUs (any vCPU may spawn). LIFO drain is correct: a
+/// thread's children are registered before it returns, so joining a thread surfaces its descendants.
+type Registry = Mutex<Vec<std::thread::JoinHandle<()>>>;
+
+/// Join (and clear) every spawned vCPU thread — the run-end cleanup. Repeated pop-then-join until
+/// empty: joining a thread waits for it to finish, by which point any threads it spawned are already
+/// in the registry, so the whole tree is drained.
+fn drain_registry(registry: &Registry) {
+    loop {
+        let jh = registry.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        match jh {
+            Some(h) => {
+                let _ = h.join();
+            }
+            None => break,
+        }
+    }
+}
+
 /// A §12 fiber: a first-class suspendable computation whose continuation is exactly its
 /// reified call stack. `cont.new` makes one (`Pending`); `cont.resume` switches into it;
 /// `suspend` switches back out, parking it (`Live`).
@@ -429,39 +470,41 @@ fn take_running<'a>(fibers: &mut [Fiber<'a>], i: usize) -> Result<Vec<Frame<'a>>
     }
 }
 
+/// Run one vCPU. `funcs` is an `Arc<[Func]>` the vCPU **owns** (a child gets its own cheap clone), so
+/// a spawned vCPU borrows nothing from its parent and can run on a detached OS thread (the seam for a
+/// `'static` worker pool). The shared runtime state — thread `budget`, the `parking` lot, the
+/// `registry` of spawned threads — is `Arc`-shared across all vCPUs.
 #[allow(clippy::too_many_arguments)]
-fn run_func<'a, 'scope, 'env>(
-    f: &'a Func,
+fn run_func(
+    funcs: Arc<[Func]>,
+    entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
-    funcs: &'a [Func],
     host: &mut Host,
     depth: u32,
-    scope: &'scope std::thread::Scope<'scope, 'env>,
-    budget: &'env std::sync::atomic::AtomicU32,
-    parking: &'env Parking,
-) -> Result<Vec<Value>, Trap>
-where
-    'a: 'env,
-{
+    budget: Arc<std::sync::atomic::AtomicU32>,
+    parking: Arc<Parking>,
+    registry: Arc<Registry>,
+) -> Result<Vec<Value>, Trap> {
+    // Borrow the owned function table for this call; frames hold `&Func` into it (it outlives them).
+    let fs: &[Func] = &funcs;
+    let f = fs.get(entry as usize).ok_or(Trap::Malformed)?;
     // The fiber table for this run (§12). `fibers[0]` is the **root** computation; each
     // `cont.new` appends. A fiber handle (`i32`) is its table index, masked + checked at
     // `cont.resume` like a capability handle (§3c) so a forged handle is inert. The
     // *running* fiber's frames live in the local `frames` below — its slot holds `Running`.
-    let mut fibers: Vec<Fiber<'a>> = vec![Fiber::Running];
+    let mut fibers: Vec<Fiber<'_>> = vec![Fiber::Running];
     // The resume chain: `chain[0]` is always the root, `chain.last()` the running fiber.
     let mut chain: Vec<usize> = vec![0];
     let mut cur = 0usize;
-    // This vCPU's child threads (§12). A `thread.spawn` pushes a scoped join handle; its table
-    // index, masked + checked at `thread.join` like a fiber handle, is the returned thread handle.
-    // A joined slot becomes `None` (a re-join is inert). Stragglers are joined by the enclosing
-    // `scope` at run end.
-    type ThreadHandle<'s> = std::thread::ScopedJoinHandle<'s, Result<Vec<Value>, Trap>>;
-    let mut threads: Vec<Option<ThreadHandle<'scope>>> = Vec::new();
+    // This vCPU's child threads (§12). A `thread.spawn` pushes a result slot; its table index, masked
+    // + checked at `thread.join` like a fiber handle, is the returned thread handle. A joined slot
+    // becomes `None` (a re-join is inert). The OS threads themselves are joined via the `registry`.
+    let mut threads: Vec<Option<Arc<TaskState>>> = Vec::new();
     // The running fiber's reified call stack. The entry block's parameters are the call
     // arguments (verifier-checked; copied defensively).
-    let mut frames: Vec<Frame<'a>> = vec![Frame {
+    let mut frames: Vec<Frame<'_>> = vec![Frame {
         f,
         block: 0,
         inst: 0,
@@ -493,7 +536,7 @@ where
                 // are appended to this frame's `vals` when it returns (see `Return`).
                 Inst::Call { func, args } => {
                     let argv = collect(&frames[top].vals, args)?;
-                    let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
+                    let callee = fs.get(*func as usize).ok_or(Trap::Malformed)?;
                     if depth as usize + live_frames(&fibers, &chain, frames.len())
                         > MAX_CALL_DEPTH as usize
                     {
@@ -508,7 +551,7 @@ where
                     continue 'frames;
                 }
                 Inst::CallIndirect { ty, idx, args } => {
-                    let callee = table_lookup(funcs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
+                    let callee = table_lookup(fs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
                     let argv = collect(&frames[top].vals, args)?;
                     if depth as usize + live_frames(&fibers, &chain, frames.len())
                         > MAX_CALL_DEPTH as usize
@@ -570,7 +613,7 @@ where
                     // parked one (delivering `arg` as the result of its `suspend`).
                     let new_frames = match std::mem::replace(&mut fibers[target], Fiber::Running) {
                         Fiber::Pending { func: funcref, sp } => {
-                            let callee = table_lookup(funcs, funcref, &fiber_sig())?;
+                            let callee = table_lookup(fs, funcref, &fiber_sig())?;
                             // First entry: call `func(sp, arg)` on the fiber's data stack.
                             vec![Frame {
                                 f: callee,
@@ -617,7 +660,12 @@ where
                 // the page-protection map). The child starts with an empty powerbox and its own fuel
                 // budget. Yields an i32 thread handle (the table index).
                 Inst::ThreadSpawn { func, arg } => {
-                    let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
+                    // Resolve + validate the entry index now (the child owns its own `funcs` clone, so
+                    // we pass the *index*, not a borrow).
+                    if fs.get(*func as usize).is_none() {
+                        return Err(Trap::Malformed);
+                    }
+                    let entry = *func;
                     let av = as_i64(get(&frames[top].vals, *arg)?)?;
                     // Charge a *concurrent-live* vCPU slot (refunded when the child finishes below),
                     // so the cap bounds simultaneous vCPUs — a thread-bomb hits it — while a guest
@@ -629,29 +677,39 @@ where
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
                     let handle = threads.len() as i32;
-                    let jh = scope.spawn(move || {
+                    let state = Arc::new(TaskState::default());
+                    // Owned clones for the detached child — it borrows nothing from this vCPU.
+                    let (cfuncs, cbudget, cparking, cregistry, cstate) = (
+                        Arc::clone(&funcs),
+                        Arc::clone(&budget),
+                        Arc::clone(&parking),
+                        Arc::clone(&registry),
+                        Arc::clone(&state),
+                    );
+                    let jh = std::thread::spawn(move || {
                         let mut cm = child_mem;
                         let mut cfuel = child_fuel;
                         let mut chost = Host::new(); // spawned vCPUs start with an empty powerbox
                         let r = run_func(
-                            callee,
+                            cfuncs,
+                            entry,
                             &[Value::I64(av)],
                             &mut cfuel,
                             &mut cm,
-                            funcs,
                             &mut chost,
                             0,
-                            scope,
-                            budget,
-                            parking,
+                            Arc::clone(&cbudget),
+                            cparking,
+                            cregistry,
                         );
-                        // Release the concurrent slot on completion — *before* the handle's result
-                        // becomes observable to a `join` (which returns only after this closure
-                        // returns), so a joiner's next spawn sees the slot already free.
-                        budget.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        r
+                        // Release the concurrent slot on completion — *before* publishing the result,
+                        // so a joiner's next spawn sees the slot already free.
+                        cbudget.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        *cstate.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                        cstate.cv.notify_all();
                     });
-                    threads.push(Some(jh));
+                    registry.lock().unwrap_or_else(|e| e.into_inner()).push(jh);
+                    threads.push(Some(state));
                     frames[top].vals.push(Value::I32(handle));
                 }
                 // §12 thread join: block until vCPU `handle` finishes, yield its i64 result. A
@@ -660,9 +718,12 @@ where
                 Inst::ThreadJoin { handle } => {
                     let h = as_i32(get(&frames[top].vals, *handle)?)?;
                     let slot = resolve_thread(&threads, h)?;
-                    let jh = threads[slot].take().ok_or(Trap::ThreadFault)?;
-                    let child = jh.join().map_err(|_| Trap::ThreadFault)?; // a panic ⇒ inert
-                    let vals = child?; // propagate the child's trap, if any
+                    let state = threads[slot].take().ok_or(Trap::ThreadFault)?;
+                    let mut g = state.done.lock().unwrap_or_else(|e| e.into_inner());
+                    while g.is_none() {
+                        g = state.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                    }
+                    let vals = g.take().expect("done set")?; // propagate the child's trap, if any
                     frames[top]
                         .vals
                         .push(vals.first().copied().unwrap_or(Value::I64(0)));
@@ -764,7 +825,7 @@ where
             // Tail calls replace the top frame in place — no depth growth.
             Terminator::ReturnCall { func, args } => {
                 let argv = collect(&frames[top].vals, args)?;
-                let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
+                let callee = fs.get(*func as usize).ok_or(Trap::Malformed)?;
                 frames[top] = Frame {
                     f: callee,
                     block: 0,
@@ -773,7 +834,7 @@ where
                 };
             }
             Terminator::ReturnCallIndirect { ty, idx, args } => {
-                let callee = table_lookup(funcs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
+                let callee = table_lookup(fs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
                 let argv = collect(&frames[top].vals, args)?;
                 frames[top] = Frame {
                     f: callee,
