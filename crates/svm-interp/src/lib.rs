@@ -137,8 +137,11 @@ fn drive(
         .unwrap_or(1)
         .clamp(1, MAX_WORKERS);
     let sched = Arc::new(Scheduler::new(MAX_VCPUS, workers));
-    // The root vCPU owns the run's `mem`/`host`/`fuel`; hand them over, then read them back from its
-    // outcome so the caller can snapshot the window and observe host effects (stdout, grants…).
+    // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
+    // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
+    // each child), then unwrap it back into the caller after every vCPU is gone. The root still owns
+    // the run's `mem`/`fuel`, read back from its outcome.
+    let host_shared = Arc::new(Mutex::new(std::mem::take(host)));
     let root_id = {
         let mut s = sched.lock();
         let id = s.next_task;
@@ -150,7 +153,7 @@ fn drive(
             entry,
             args,
             mem.take(),
-            std::mem::take(host),
+            Arc::clone(&host_shared),
             *fuel,
             0,
             id,
@@ -172,7 +175,12 @@ fn drive(
         .expect("root vCPU finished");
     *fuel = out.fuel;
     *mem = out.mem;
-    *host = out.host;
+    // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is uniquely
+    // owned — unwrap it back into the caller so it observes the run's effects (stdout, grants, clock…).
+    *host = Arc::try_unwrap(host_shared)
+        .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
     out.result
 }
 
@@ -299,7 +307,7 @@ pub fn run_scheduled(
             func,
             args,
             mem,
-            Host::new(),
+            Arc::new(Mutex::new(Host::new())),
             fuel,
             0,
             id,
@@ -465,7 +473,7 @@ fn run_one_schedule(
             func,
             args,
             mem,
-            Host::new(),
+            Arc::new(Mutex::new(Host::new())),
             fuel,
             0,
             id,
@@ -537,12 +545,12 @@ const MAX_WORKERS: usize = 32;
 type TaskId = u64;
 
 /// A finished vCPU's outcome, parked in the scheduler until a `thread.join` claims it (or, for the
-/// root, until [`drive`] reads it). Carries `mem`/`host`/`fuel` so the root's window can be snapshot
-/// and its effects read back after the worker that ran it is gone.
+/// root, until [`drive`] reads it). Carries `mem`/`fuel` so the root's window can be snapshot and its
+/// fuel read back after the worker that ran it is gone. (The powerbox is **shared** across all vCPUs of
+/// the run — `Arc<Mutex<Host>>` — so it isn't carried here; `drive` reads it back by unwrapping the Arc.)
 struct Outcome {
     result: Result<Vec<Value>, Trap>,
     mem: Option<Mem>,
-    host: Host,
     fuel: u64,
 }
 
@@ -763,7 +771,6 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             let outcome = Outcome {
                 result,
                 mem: v.mem.take(),
-                host: std::mem::take(&mut v.host),
                 fuel: v.fuel,
             };
             drop(v);
@@ -1005,7 +1012,6 @@ fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
                 let outcome = Outcome {
                     result,
                     mem: v.mem.take(),
-                    host: std::mem::take(&mut v.host),
                     fuel: v.fuel,
                 };
                 drop(v);
@@ -1153,8 +1159,11 @@ struct VCpu {
     frames: Vec<Frame>,
     /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
     mem: Option<Mem>,
-    /// This vCPU's powerbox (spawned vCPUs start empty).
-    host: Host,
+    /// The domain's powerbox, **shared** by every vCPU of the run (`Arc<Mutex<Host>>`): a spawned
+    /// thread inherits the same capability table + I/O sinks, so a handle granted to the domain works
+    /// in any thread and I/O from any thread reaches the same sink (matching the JIT, whose `cap.call`s
+    /// all hit the one host ctx). Locked briefly per `cap.call`.
+    host: Arc<Mutex<Host>>,
     /// Remaining fuel (metering, §5).
     fuel: u64,
     /// This vCPU's spawned children, by `thread.join` handle (slot) ⇒ child [`TaskId`]; `None` once
@@ -1185,7 +1194,7 @@ impl VCpu {
         entry: FuncIdx,
         args: &[Value],
         mem: Option<Mem>,
-        host: Host,
+        host: Arc<Mutex<Host>>,
         fuel: u64,
         depth: u32,
         id: TaskId,
@@ -1397,7 +1406,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         argv.push(val_to_slot(get(&frames[top].vals, *a)?));
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let results = host.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
+                    // Lock the shared powerbox for the duration of this one cap.call (brief; no nested
+                    // host locking). Threads of a domain serialize their capability calls here.
+                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let results = hg.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(slot_to_val(*ty, *s));
                     }
@@ -1471,8 +1483,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 // §12 thread spawn: enqueue a new vCPU (green thread) running `funcs[func](arg)` over
                 // the *shared* memory (the `Arc<Region>` bytes + §13 `Arc` regions; the child snapshots
-                // the page-protection map). The executor runs it on a pooled worker. The child starts
-                // with an empty powerbox + its own fuel. Yields an i32 thread handle (the table slot).
+                // the page-protection map). The executor runs it on a pooled worker. The child **shares
+                // the domain's powerbox** (the same `Arc<Mutex<Host>>`), so a handle granted to the
+                // domain works in the child and its I/O reaches the same sink; it gets its own fuel.
+                // Yields an i32 thread handle (the table slot).
                 Inst::ThreadSpawn { func, sp, arg } => {
                     if fs.get(*func as usize).is_none() {
                         return Err(Trap::Malformed);
@@ -1481,6 +1495,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let spv = as_i64(get(&frames[top].vals, *sp)?)?; // the thread's data-stack base
                     let av = as_i64(get(&frames[top].vals, *arg)?)?;
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
+                    let child_host = Arc::clone(host); // inherit the domain powerbox
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
                     let cfuncs = Arc::clone(&funcs);
                     let csched = sched.clone();
@@ -1490,7 +1505,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             entry,
                             &[Value::I64(spv), Value::I64(av)], // (sp, arg) — the fiber-style entry
                             child_mem,
-                            Host::new(),
+                            child_host,
                             child_fuel,
                             0,
                             id,

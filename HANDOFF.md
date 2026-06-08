@@ -1313,8 +1313,13 @@ leave a shared view — add a unix test for this alongside the Windows work.
   **Next here:** DPOR (dynamic partial-order reduction) to tame contended-lock trees, per-schedule
   memory reuse (each schedule currently re-`mmap`s a fresh reservation), and driving `explore_all` from
   the `concurrent_fuzz` generator for exhaustive proofs of *generated* small programs.
-  **Phase 2 still to come:** per-thread capability grants (spawned vCPUs still start with an empty
-  powerbox) and honoring weak orderings in execution.
+  **Per-thread capability grants — DONE:** a spawned vCPU now **shares the domain's powerbox** rather
+  than starting empty. The interp's `Host` became a run-wide `Arc<Mutex<Host>>` that every vCPU
+  (root + children) clones (locked briefly per `cap.call`); the JIT already shared it (every `cap.call`
+  hits the one baked `cap_ctx`). So a handle granted to the domain works in any thread and a thread's
+  I/O reaches the same sink — fixing a latent interp↔JIT divergence (interp workers used to CapFault on
+  any `cap.call`). Pinned by `c_frontend::c_thread_shares_powerbox_for_io` (a worker `write`s, interp ==
+  JIT). TSan-clean. **Phase 2 still to come:** honoring weak orderings in execution.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a

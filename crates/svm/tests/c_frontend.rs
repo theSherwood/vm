@@ -1889,6 +1889,26 @@ fn c_threads_atomic_counter_jit() {
     }
 }
 
+/// A spawned thread does **I/O** (`write` → a stream `cap.call`). This exercises the per-thread
+/// powerbox: the worker shares the domain's capabilities, so its `write` reaches the same stdout.
+/// Before that fix the interpreter gave each vCPU an *empty* powerbox, so the worker's `cap.call`
+/// CapFaulted while the JIT (shared ctx) succeeded — a latent divergence `run_c_full` now pins
+/// (interp == JIT, both print the line). Deterministic: `main` joins the worker before doing anything,
+/// so only the worker writes.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_thread_shares_powerbox_for_io() {
+    let src = format!(
+        "{LIBC}\n\
+         int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);\n\
+         long __vm_thread_join(int h);\n\
+         long worker(long arg) {{ write(1, \"hi from a thread\\n\", 17); return 0; }}\n\
+         int main(void) {{ int h = __vm_thread_spawn(worker, (void *)0, 0); __vm_thread_join(h); return 0; }}\n"
+    );
+    let run = run_c_full(&src);
+    assert_eq!(run.stdout, b"hi from a thread\n");
+}
+
 #[test]
 fn c_threads_deterministic_sweep() {
     // Same compiled C run through the seeded explorer (§18): every interleaving yields 2000, and each
