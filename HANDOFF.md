@@ -946,9 +946,22 @@ leave a shared view — add a unix test for this alongside the Windows work.
   lifetime/deadlock/race design (a naive bounded pool deadlocks once blocked tasks exceed workers).
   That's the next, larger step; today's model is 1 OS thread per concurrent vCPU (now with a reusable
   slot budget) plus cooperative fibers within each.
-  **Phase 2 still to come:** the work-stealing M:N executor (continuation parking), per-thread
-  capability grants (spawned vCPUs still start with an empty powerbox), honoring weak orderings in
-  execution, and the differential-oracle-under-nondeterminism story.
+  **Parallel threads — M:N executor, commits 1–2 DONE (foundation):** the substrate is being moved so
+  a vCPU can run on a *pooled* OS thread and **park** its continuation on a blocking op (the payoff is
+  scaling past the 64-vCPU cap — thousands of green threads on few cores). (1) `run_func` no longer
+  uses `thread::scope`: a vCPU owns an `Arc<[Func]>` + `Arc` runtime state (budget, parking lot) and a
+  `thread.spawn` uses a **detached** `std::thread` that publishes its result via `Arc<TaskState>`
+  (`thread.join` blocks on it); a shared `Registry` of handles is joined at run end so nothing
+  outlives the run. (2) `Frame` stores a `FuncIdx` (not a `&Func`), so a vCPU's reified state
+  (`frames`/`fibers`) is **plain owned data** — movable between worker threads, the prerequisite for
+  parking. Behaviour-preserving so far (still 1 OS thread per concurrent vCPU); whole suite + TSan +
+  clippy + windows green. **Still to come (the crux):** lift `run_func`'s locals into a resumable
+  `VCpu` struct whose driver *returns* `Park(join|wait)` instead of OS-blocking, and a bounded
+  worker-pool scheduler (run-queue + per-task waiters + a wait-timeout timer) that resumes parked
+  vCPUs on the awaited event — turning the current 1:1 into true M:N.
+  **Phase 2 still to come:** the M:N scheduler crux above, per-thread capability grants (spawned vCPUs
+  still start with an empty powerbox), honoring weak orderings in execution, and the
+  differential-oracle-under-nondeterminism story.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a
