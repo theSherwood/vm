@@ -133,19 +133,25 @@ fn drive(
     let budget = Arc::new(std::sync::atomic::AtomicU32::new(MAX_THREADS));
     let parking = Arc::new(Parking::default());
     let registry: Arc<Registry> = Arc::new(Mutex::new(Vec::new()));
-    let r = run_func(
+    // The root vCPU owns the run's `mem`/`host`/`fuel`; hand them over, then take them back so the
+    // caller can snapshot the window and read host effects (stdout, grants…).
+    let mut v = VCpu::new(
         funcs,
         entry,
         args,
-        fuel,
-        mem,
-        host,
+        mem.take(),
+        std::mem::take(host),
+        *fuel,
         0,
         budget,
         parking,
         Arc::clone(&registry),
-    );
+    )?;
+    let r = run_vcpu(&mut v);
     drain_registry(&registry);
+    *fuel = v.fuel;
+    *mem = v.mem;
+    *host = v.host;
     r
 }
 
@@ -476,44 +482,100 @@ fn take_running(fibers: &mut [Fiber], i: usize) -> Result<Vec<Frame>, Trap> {
 /// a spawned vCPU borrows nothing from its parent and can run on a detached OS thread (the seam for a
 /// `'static` worker pool). The shared runtime state — thread `budget`, the `parking` lot, the
 /// `registry` of spawned threads — is `Arc`-shared across all vCPUs.
-#[allow(clippy::too_many_arguments)]
-fn run_func(
+///
+/// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
+/// between worker threads and (next) parking its continuation on a blocking op.
+struct VCpu {
+    /// The owned function table; `Frame::func` resolves against it.
     funcs: Arc<[Func]>,
-    entry: FuncIdx,
-    args: &[Value],
-    fuel: &mut u64,
-    mem: &mut Option<Mem>,
-    host: &mut Host,
+    /// The fiber table (§12). `fibers[0]` is the root; `cont.new` appends. The *running* fiber's
+    /// frames live in `frames`; its slot holds `Running`.
+    fibers: Vec<Fiber>,
+    /// The resume chain: `chain[0]` the root, `chain.last()` the running fiber.
+    chain: Vec<usize>,
+    /// Index of the running fiber.
+    cur: usize,
+    /// The running fiber's reified call stack.
+    frames: Vec<Frame>,
+    /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
+    mem: Option<Mem>,
+    /// This vCPU's powerbox (spawned vCPUs start empty).
+    host: Host,
+    /// Remaining fuel (metering, §5).
+    fuel: u64,
+    /// This vCPU's spawned children's result slots (indexed by the `thread.join` handle).
+    threads: Vec<Option<Arc<TaskState>>>,
+    /// Call-depth base for the stack-overflow bound.
     depth: u32,
+    /// Shared concurrency-budget / parking-lot / thread-registry (see [`run_vcpu`]).
     budget: Arc<std::sync::atomic::AtomicU32>,
     parking: Arc<Parking>,
     registry: Arc<Registry>,
-) -> Result<Vec<Value>, Trap> {
-    // The owned function table for this vCPU; frames resolve their `func` index against it.
-    let fs: &[Func] = &funcs;
-    if fs.get(entry as usize).is_none() {
-        return Err(Trap::Malformed);
+}
+
+impl VCpu {
+    /// A fresh vCPU whose root frame is `funcs[entry](args)`.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        funcs: Arc<[Func]>,
+        entry: FuncIdx,
+        args: &[Value],
+        mem: Option<Mem>,
+        host: Host,
+        fuel: u64,
+        depth: u32,
+        budget: Arc<std::sync::atomic::AtomicU32>,
+        parking: Arc<Parking>,
+        registry: Arc<Registry>,
+    ) -> Result<VCpu, Trap> {
+        if funcs.get(entry as usize).is_none() {
+            return Err(Trap::Malformed);
+        }
+        Ok(VCpu {
+            funcs,
+            fibers: vec![Fiber::Running],
+            chain: vec![0],
+            cur: 0,
+            frames: vec![Frame {
+                func: entry,
+                block: 0,
+                inst: 0,
+                vals: args.to_vec(),
+            }],
+            mem,
+            host,
+            fuel,
+            threads: Vec::new(),
+            depth,
+            budget,
+            parking,
+            registry,
+        })
     }
-    // The fiber table for this run (§12). `fibers[0]` is the **root** computation; each
-    // `cont.new` appends. A fiber handle (`i32`) is its table index, masked + checked at
-    // `cont.resume` like a capability handle (§3c) so a forged handle is inert. The
-    // *running* fiber's frames live in the local `frames` below — its slot holds `Running`.
-    let mut fibers: Vec<Fiber> = vec![Fiber::Running];
-    // The resume chain: `chain[0]` is always the root, `chain.last()` the running fiber.
-    let mut chain: Vec<usize> = vec![0];
-    let mut cur = 0usize;
-    // This vCPU's child threads (§12). A `thread.spawn` pushes a result slot; its table index, masked
-    // + checked at `thread.join` like a fiber handle, is the returned thread handle. A joined slot
-    // becomes `None` (a re-join is inert). The OS threads themselves are joined via the `registry`.
-    let mut threads: Vec<Option<Arc<TaskState>>> = Vec::new();
-    // The running fiber's reified call stack. The entry block's parameters are the call
-    // arguments (verifier-checked; copied defensively).
-    let mut frames: Vec<Frame> = vec![Frame {
-        func: entry,
-        block: 0,
-        inst: 0,
-        vals: args.to_vec(),
-    }];
+}
+
+/// Drive a vCPU to completion (or a trap). Currently runs the whole continuation on the calling
+/// thread, blocking on `thread.join`/`atomic.wait`; the field-owned state lets the next step *park*
+/// instead. The owned `funcs` is borrowed locally as `fs` so the loop can mutate the other fields.
+fn run_vcpu(v: &mut VCpu) -> Result<Vec<Value>, Trap> {
+    let funcs = Arc::clone(&v.funcs);
+    let fs: &[Func] = &funcs;
+    let VCpu {
+        fibers,
+        chain,
+        cur,
+        frames,
+        mem,
+        host,
+        fuel,
+        threads,
+        depth,
+        budget,
+        parking,
+        registry,
+        funcs: _,
+    } = v;
+    let depth = *depth;
 
     // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
     // `return` pops and appends results to the caller (which resumes past the call); a tail
@@ -544,7 +606,7 @@ fn run_func(
                     if fs.get(*func as usize).is_none() {
                         return Err(Trap::Malformed);
                     }
-                    if depth as usize + live_frames(&fibers, &chain, frames.len())
+                    if depth as usize + live_frames(&fibers[..], &chain[..], frames.len())
                         > MAX_CALL_DEPTH as usize
                     {
                         return Err(Trap::StackOverflow);
@@ -560,7 +622,7 @@ fn run_func(
                 Inst::CallIndirect { ty, idx, args } => {
                     let callee = table_lookup(fs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
                     let argv = collect(&frames[top].vals, args)?;
-                    if depth as usize + live_frames(&fibers, &chain, frames.len())
+                    if depth as usize + live_frames(&fibers[..], &chain[..], frames.len())
                         > MAX_CALL_DEPTH as usize
                     {
                         return Err(Trap::StackOverflow);
@@ -615,7 +677,7 @@ fn run_func(
                 Inst::ContResume { k, arg } => {
                     let kh = as_i32(get(&frames[top].vals, *k)?)?;
                     let av = as_i64(get(&frames[top].vals, *arg)?)?;
-                    let target = resolve_fiber(&fibers, &chain, kh)?;
+                    let target = resolve_fiber(&fibers[..], &chain[..], kh)?;
                     // Materialize the target's frames: start a `Pending` fiber, or continue a
                     // parked one (delivering `arg` as the result of its `suspend`).
                     let new_frames = match std::mem::replace(&mut fibers[target], Fiber::Running) {
@@ -640,10 +702,10 @@ fn run_func(
                         _ => return Err(Trap::FiberFault),
                     };
                     // Park the resumer and switch to the target.
-                    fibers[cur] = Fiber::Live(std::mem::take(&mut frames));
+                    fibers[*cur] = Fiber::Live(std::mem::take(frames));
                     chain.push(target);
-                    cur = target;
-                    frames = new_frames;
+                    *cur = target;
+                    *frames = new_frames;
                     continue 'frames;
                 }
                 // §12 fiber suspend: hand `value` back to the resumer with status SUSPENDED;
@@ -653,10 +715,10 @@ fn run_func(
                         return Err(Trap::FiberFault); // no resumer (the root cannot suspend)
                     }
                     let v = as_i64(get(&frames[top].vals, *value)?)?;
-                    fibers[cur] = Fiber::Live(std::mem::take(&mut frames));
+                    fibers[*cur] = Fiber::Live(std::mem::take(frames));
                     chain.pop();
-                    cur = *chain.last().expect("chain keeps the root");
-                    frames = take_running(&mut fibers, cur)?;
+                    *cur = *chain.last().expect("chain keeps the root");
+                    *frames = take_running(&mut fibers[..], *cur)?;
                     let rtop = frames.len() - 1;
                     frames[rtop].vals.push(Value::I32(FIBER_SUSPENDED));
                     frames[rtop].vals.push(Value::I64(v));
@@ -688,27 +750,28 @@ fn run_func(
                     // Owned clones for the detached child — it borrows nothing from this vCPU.
                     let (cfuncs, cbudget, cparking, cregistry, cstate) = (
                         Arc::clone(&funcs),
-                        Arc::clone(&budget),
-                        Arc::clone(&parking),
-                        Arc::clone(&registry),
+                        Arc::clone(budget),
+                        Arc::clone(parking),
+                        Arc::clone(registry),
                         Arc::clone(&state),
                     );
                     let jh = std::thread::spawn(move || {
-                        let mut cm = child_mem;
-                        let mut cfuel = child_fuel;
-                        let mut chost = Host::new(); // spawned vCPUs start with an empty powerbox
-                        let r = run_func(
+                        let child = VCpu::new(
                             cfuncs,
                             entry,
                             &[Value::I64(av)],
-                            &mut cfuel,
-                            &mut cm,
-                            &mut chost,
+                            child_mem,
+                            Host::new(), // spawned vCPUs start with an empty powerbox
+                            child_fuel,  // the child's own metering budget
                             0,
                             Arc::clone(&cbudget),
                             cparking,
                             cregistry,
                         );
+                        let r = match child {
+                            Ok(mut c) => run_vcpu(&mut c),
+                            Err(e) => Err(e),
+                        };
                         // Release the concurrent slot on completion — *before* publishing the result,
                         // so a joiner's next spawn sees the slot already free.
                         cbudget.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -724,7 +787,7 @@ fn run_func(
                 // fiber handle); a trap in the joined vCPU propagates here.
                 Inst::ThreadJoin { handle } => {
                     let h = as_i32(get(&frames[top].vals, *handle)?)?;
-                    let slot = resolve_thread(&threads, h)?;
+                    let slot = resolve_thread(threads, h)?;
                     let state = threads[slot].take().ok_or(Trap::ThreadFault)?;
                     let mut g = state.done.lock().unwrap_or_else(|e| e.into_inner());
                     while g.is_none() {
@@ -812,15 +875,15 @@ fn run_func(
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
                     caller.vals.extend(results);
-                } else if cur == 0 {
+                } else if *cur == 0 {
                     return Ok(results); // the root returned: the whole run is done
                 } else {
                     // A fiber's function returned: hand its single `i64` back to the resumer
                     // with status RETURNED; the fiber is now `Done` (resuming again traps).
-                    fibers[cur] = Fiber::Done;
+                    fibers[*cur] = Fiber::Done;
                     chain.pop();
-                    cur = *chain.last().expect("chain keeps the root");
-                    frames = take_running(&mut fibers, cur)?;
+                    *cur = *chain.last().expect("chain keeps the root");
+                    *frames = take_running(&mut fibers[..], *cur)?;
                     let rtop = frames.len() - 1;
                     frames[rtop].vals.push(Value::I32(FIBER_RETURNED));
                     frames[rtop]
