@@ -74,7 +74,7 @@ pub enum VerifyError {
         found: usize,
     },
     /// A `thread.spawn` named a function whose signature is not the fixed thread entry type
-    /// `(i64) -> i64` (§12).
+    /// `(i64 sp, i64 arg) -> i64` (§12).
     ThreadEntrySignature { func: u32, block: u32, callee: u32 },
     /// An atomic carried an ordering its op can't have: a load with release semantics, or a store
     /// with acquire semantics (§12 / C11).
@@ -236,8 +236,9 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 continue;
             }
             // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
-            // thread entry type `(i64) -> i64`, so — like `call` — it needs whole-module info.
-            if let Inst::ThreadSpawn { func, arg } = inst {
+            // thread-entry type `(i64 sp, i64 arg) -> i64`, so — like `call` — it needs whole-module
+            // info.
+            if let Inst::ThreadSpawn { func, sp, arg } = inst {
                 let callee = funcs
                     .get(*func as usize)
                     .ok_or(VerifyError::CallFuncOutOfRange {
@@ -245,7 +246,8 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                         block: bi,
                         callee: *func,
                     })?;
-                if callee.params != [ValType::I64] || callee.results != [ValType::I64] {
+                if callee.params != [ValType::I64, ValType::I64] || callee.results != [ValType::I64]
+                {
                     return Err(VerifyError::ThreadEntrySignature {
                         func: fi,
                         block: bi,
@@ -257,6 +259,7 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                     bi,
                     types: &types,
                 };
+                cx.expect(*sp, ValType::I64)?;
                 cx.expect(*arg, ValType::I64)?;
                 types.push(ValType::I32); // the thread handle
                 continue;

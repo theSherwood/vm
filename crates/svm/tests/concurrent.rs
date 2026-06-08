@@ -73,7 +73,7 @@ block1(v1: i64):
   br_if v3 block2(v1) block3()
 block2(v4: i64):
   v5 = i64.const 100
-  v6 = thread.spawn 1 v5
+  v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
   v9 = i64.const 16
@@ -104,8 +104,8 @@ block6():
   v27 = i64.load v26
   return v27
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   br block1(v0)
 block1(v1: i64):
   v2 = i64.const 0
@@ -151,7 +151,7 @@ block1(v1: i64):
   br_if v3 block2(v1) block3()
 block2(v4: i64):
   v5 = i64.const 500
-  v6 = thread.spawn 1 v5
+  v6 = thread.spawn 1 v5 v5
   v7 = i64.const 4
   v8 = i64.mul v4 v7
   v9 = i64.const 16
@@ -182,8 +182,8 @@ block6():
   v27 = i64.atomic.load v26
   return v27
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   br block1(v0)
 block1(v1: i64):
   v2 = i64.const 0
@@ -215,7 +215,7 @@ block0():
   v1 = i64.const 987654
   i64.atomic.store.release v0 v1
   v2 = i64.const 0
-  v3 = thread.spawn 1 v2
+  v3 = thread.spawn 1 v2 v2
   v4 = i64.const 0
   v5 = i32.const 1
   i32.atomic.store.release v4 v5
@@ -225,8 +225,8 @@ block0():
   v9 = thread.join v3
   return v9
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   v1 = i64.const 0
   v2 = i32.const 0
   v3 = i64.const 1000000000

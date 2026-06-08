@@ -241,7 +241,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
         Inst::Suspend { value } => format!("suspend v{value}"),
         // §12 real threads (OS-thread vCPUs over shared memory).
-        Inst::ThreadSpawn { func, arg } => format!("thread.spawn {func} v{arg}"),
+        Inst::ThreadSpawn { func, sp, arg } => format!("thread.spawn {func} v{sp} v{arg}"),
         Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
         // §12 futex wait/notify.
         Inst::MemoryWait {
@@ -1120,8 +1120,9 @@ impl<'a> Parser<'a> {
             let n = self.parse_int()?;
             let func = u32::try_from(n)
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
+            let sp = self.value(names)?;
             let arg = self.value(names)?;
-            return Ok(Inst::ThreadSpawn { func, arg });
+            return Ok(Inst::ThreadSpawn { func, sp, arg });
         }
         if op == "thread.join" {
             return Ok(Inst::ThreadJoin {

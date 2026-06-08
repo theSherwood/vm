@@ -4,7 +4,18 @@ Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
-**Latest (2026-06-07):** §12 **fibers now reach real C**. The stack-switch IR ops
+**Latest (2026-06-08):** §12 **real multi-threaded C now runs end-to-end**. `thread.spawn` was
+reshaped from `(func, arg)` to `(func: FuncIdx, sp: ValIdx, arg: ValIdx)` with the thread entry
+type changed `(i64) -> i64` → `(i64 sp, i64 arg) -> i64`, **unifying threads with fibers** under
+§3d's universal SP-first calling convention (param 0 of every function is the data-stack pointer).
+The reshape threaded through ir/verify/text/encode/interp + `threads.rs`/`concurrent.rs`. chibicc
+(`codegen_ir.c`) gained `__vm_thread_spawn`/`__vm_thread_join`, `__vm_atomic_add`/`_load`/`_store`/
+`_cas32`, and `__vm_wait32`/`__vm_notify` builtins (intercepted in `ND_FUNCALL`, with a
+`fn_designator`/`func_index` helper to resolve a function operand to its `FuncIdx`). So ordinary C
+that spawns threads + hits atomics compiles → IR → runs on the M:N executor: `c_threads_atomic_counter`
+(4×500 `__vm_atomic_add` → 2000) and `c_threads_deterministic_sweep` (the same program through
+`run_scheduled`, 100 seeds, all 2000). Full suite + clippy + fmt green; threads/concurrent TSan-clean.
+See the §12 entries under Phase 4. Before that: §12 **fibers reached real C**. The stack-switch IR ops
 (`cont.new(funcref, sp)`/`cont.resume`/`suspend`, opcodes `0xCA..=0xCC`) exist across
 IR/text/binary/verify with a **real reference-interpreter** implementation (asymmetric stackful
 coroutines: a fiber's continuation *is* its reified `Vec<Frame>`, switched via a fiber table + resume
@@ -984,9 +995,17 @@ leave a shared view — add a unix test for this alongside the Windows work.
   (8×100 → 800 iff mutual exclusion holds), an **atomic-RMW counter** (8×500 → 4000), and a
   **wait/notify futex handoff** — each run both as real-executor **stress** (×30, OS interleavings,
   TSan-clean) and as a deterministic **seed sweep** (×200, reproducible), plus a reproducibility
-  check. A scheduling/lock bug surfaces as a replayable failing seed. **Next here:** drive the explorer
-  from the `irgen` generator (fuzz concurrent programs against their invariants) and add
-  memory-op-granularity exploration for exhaustive small-program checking.
+  check. A scheduling/lock bug surfaces as a replayable failing seed.
+  **Frontend wiring DONE (real multi-threaded C, 2026-06-08):** `thread.spawn` reshaped to
+  `(func, sp, arg)` / entry `(i64 sp, i64 arg) -> i64` (unified with fibers under the §3d SP-first
+  convention); chibicc lowers `__vm_thread_spawn`/`__vm_thread_join`, `__vm_atomic_add`/`_load`/
+  `_store`/`_cas32`, `__vm_wait32`/`__vm_notify` (a `fn_designator`/`func_index` helper resolves a
+  C function operand to its `FuncIdx`). `c_threads_atomic_counter` (4 threads × 500 atomic adds → 2000)
+  runs on the M:N executor; `c_threads_deterministic_sweep` runs that same C program through the
+  deterministic explorer for seeds 0..100 (all 2000). So concurrent C is now verified by both the
+  real-executor path *and* the seeded explorer.
+  **Next here:** drive the explorer from the `irgen` generator (fuzz concurrent programs against their
+  invariants) and add memory-op-granularity exploration for exhaustive small-program checking.
   **Phase 2 still to come:** per-thread capability grants (spawned vCPUs still start with an empty
   powerbox) and honoring weak orderings in execution.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses

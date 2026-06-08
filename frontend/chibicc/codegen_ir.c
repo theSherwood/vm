@@ -825,6 +825,117 @@ static int gen_builtin_fiber_suspend(Node *node) {
   return r; // the next resume's arg
 }
 
+// §12 real-threads + atomics builtins. A guest reaches the M:N executor and the C11-style atomics
+// through intercepted calls (declared, never defined — like the stdio/fiber builtins). The thread
+// body is an ordinary C `long f(long)`, lowering to the fixed thread-entry IR signature
+// `(i64) -> (i64)`:
+//
+//   int  __vm_thread_spawn(long (*fn)(long), long arg);  // -> i32 handle (fn must be a direct name)
+//   long __vm_thread_join(int handle);                   // -> the thread's result
+//   long __vm_atomic_add  (void *p, long v);             // fetch-add, returns the old value
+//   long __vm_atomic_load (void *p);
+//   void __vm_atomic_store(void *p, long v);
+//   int  __vm_atomic_cas32(void *p, int expected, int desired);  // -> old (i32) — locks
+//   int  __vm_wait32(void *p, int expected, long timeout_ns);    // -> 0 woken / 1 != / 2 timeout
+//   int  __vm_notify(void *p, int count);                        // -> number woken
+
+// Peel casts/address-of to find a direct function designator (for the static `thread.spawn` funcidx).
+static Obj *fn_designator(Node *n) {
+  while (n->kind == ND_CAST || n->kind == ND_ADDR)
+    n = n->lhs;
+  if (n->kind == ND_VAR && n->var && n->var->is_function)
+    return n->var;
+  return NULL;
+}
+
+static int gen_builtin_thread_spawn(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || a->next->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_thread_spawn(fn, stack, arg) expects 3 arguments");
+  Obj *fn = fn_designator(a);
+  if (!fn)
+    error_tok(a->tok, "codegen_ir: __vm_thread_spawn's first argument must be a function name");
+  int sp = widen_i64(gen_expr(a->next), a->next->ty);          // the thread's data-stack base
+  int arg = widen_i64(gen_expr(a->next->next), a->next->next->ty); // the thread's i64 argument
+  int r = nv++;
+  fprintf(o, "  v%d = thread.spawn %d v%d v%d\n", r, func_index(fn), sp, arg);
+  return r; // i32 thread handle
+}
+
+static int gen_builtin_thread_join(Node *node) {
+  if (!node->args || node->args->next)
+    error_tok(node->tok, "codegen_ir: __vm_thread_join(handle) expects 1 argument");
+  int h = gen_expr(node->args); // i32 handle
+  int r = nv++;
+  fprintf(o, "  v%d = thread.join v%d\n", r, h);
+  return r; // i64 result
+}
+
+static int gen_builtin_atomic_add(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_atomic_add(ptr, val) expects 2 arguments");
+  int p = widen_i64(gen_expr(a), a->ty);
+  int v = widen_i64(gen_expr(a->next), a->next->ty);
+  int r = nv++;
+  fprintf(o, "  v%d = i64.atomic.rmw.add v%d v%d\n", r, p, v);
+  return r; // old value
+}
+
+static int gen_builtin_atomic_load(Node *node) {
+  if (!node->args || node->args->next)
+    error_tok(node->tok, "codegen_ir: __vm_atomic_load(ptr) expects 1 argument");
+  int p = widen_i64(gen_expr(node->args), node->args->ty);
+  int r = nv++;
+  fprintf(o, "  v%d = i64.atomic.load v%d\n", r, p);
+  return r;
+}
+
+static int gen_builtin_atomic_store(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_atomic_store(ptr, val) expects 2 arguments");
+  int p = widen_i64(gen_expr(a), a->ty);
+  int v = widen_i64(gen_expr(a->next), a->next->ty);
+  fprintf(o, "  i64.atomic.store v%d v%d\n", p, v);
+  return 0; // void
+}
+
+static int gen_builtin_atomic_cas32(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || a->next->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_atomic_cas32(ptr, expected, desired) expects 3 arguments");
+  int p = widen_i64(gen_expr(a), a->ty);
+  int exp = gen_expr(a->next);       // i32
+  int des = gen_expr(a->next->next); // i32
+  int r = nv++;
+  fprintf(o, "  v%d = i32.atomic.cmpxchg v%d v%d v%d\n", r, p, exp, des);
+  return r; // old (i32)
+}
+
+static int gen_builtin_wait32(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || a->next->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_wait32(ptr, expected, timeout_ns) expects 3 arguments");
+  int p = widen_i64(gen_expr(a), a->ty);
+  int exp = gen_expr(a->next); // i32
+  int to = widen_i64(gen_expr(a->next->next), a->next->next->ty); // i64 ns
+  int r = nv++;
+  fprintf(o, "  v%d = i32.atomic.wait v%d v%d v%d\n", r, p, exp, to);
+  return r; // 0 woken / 1 not-equal / 2 timed-out
+}
+
+static int gen_builtin_notify(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_notify(ptr, count) expects 2 arguments");
+  int p = widen_i64(gen_expr(a), a->ty);
+  int c = gen_expr(a->next); // i32
+  int r = nv++;
+  fprintf(o, "  v%d = atomic.notify v%d v%d\n", r, p, c);
+  return r; // number woken
+}
+
 static int gen_expr(Node *node) {
   switch (node->kind) {
   case ND_NUM: {
@@ -950,6 +1061,22 @@ static int gen_expr(Node *node) {
           return gen_builtin_fiber_resume(node);
         if (!strcmp(fname, "__vm_fiber_suspend"))
           return gen_builtin_fiber_suspend(node);
+        if (!strcmp(fname, "__vm_thread_spawn"))
+          return gen_builtin_thread_spawn(node);
+        if (!strcmp(fname, "__vm_thread_join"))
+          return gen_builtin_thread_join(node);
+        if (!strcmp(fname, "__vm_atomic_add"))
+          return gen_builtin_atomic_add(node);
+        if (!strcmp(fname, "__vm_atomic_load"))
+          return gen_builtin_atomic_load(node);
+        if (!strcmp(fname, "__vm_atomic_store"))
+          return gen_builtin_atomic_store(node);
+        if (!strcmp(fname, "__vm_atomic_cas32"))
+          return gen_builtin_atomic_cas32(node);
+        if (!strcmp(fname, "__vm_wait32"))
+          return gen_builtin_wait32(node);
+        if (!strcmp(fname, "__vm_notify"))
+          return gen_builtin_notify(node);
       }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the

@@ -22,7 +22,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_with_host, Host, StreamRole, Trap, Value};
+use svm_interp::{run_scheduled, run_with_host, Host, StreamRole, Trap, Value};
 use svm_ir::ValType;
 use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind};
 use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§9)
@@ -1834,4 +1834,60 @@ fn c_cooperative_threads_round_robin() {
     );
     // sum(1..3)=6, sum(1..4)=10, sum(1..5)=15  ->  31, regardless of interleaving.
     assert_eq!(fiber_i32(&src), 31);
+}
+
+// ---- §12 real threads + atomics from C (the `__vm_thread_*` / `__vm_atomic_*` builtins) ----
+
+/// End-to-end multi-threaded C: four threads each atomically bump a shared counter 500×; the total
+/// is 2000 on every interleaving. The thread body's loop counter is SSA-promoted (not address-taken),
+/// so the worker uses no data stack and a 0 stack base is fine. Interpreter-only (the JIT doesn't
+/// lower thread ops yet, step 4); ThreadSanitizer-clean via the shared `Region`.
+const C_ATOMIC_COUNTER: &str = r#"
+long counter;
+long __vm_atomic_add(void *p, long v);
+long __vm_atomic_load(void *p);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+
+long worker(long iters) {
+  for (long i = 0; i < iters; i++)
+    __vm_atomic_add(&counter, 1);
+  return 0;
+}
+
+int main(void) {
+  int a = __vm_thread_spawn(worker, (void *)0, 500);
+  int b = __vm_thread_spawn(worker, (void *)0, 500);
+  int c = __vm_thread_spawn(worker, (void *)0, 500);
+  int d = __vm_thread_spawn(worker, (void *)0, 500);
+  __vm_thread_join(a);
+  __vm_thread_join(b);
+  __vm_thread_join(c);
+  __vm_thread_join(d);
+  return (int)__vm_atomic_load(&counter);
+}
+"#;
+
+#[test]
+fn c_threads_atomic_counter() {
+    // Real M:N executor: the headline — C source → IR → threads → exactly 2000.
+    match run_c_interp(C_ATOMIC_COUNTER).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(2000)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
+#[test]
+fn c_threads_deterministic_sweep() {
+    // Same compiled C run through the seeded explorer (§18): every interleaving yields 2000, and each
+    // is reproducible from its seed. The program makes no cap.calls, so dummy powerbox handles + the
+    // explorer's empty host suffice.
+    let ir = c_to_ir(C_ATOMIC_COUNTER);
+    let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse: {e:?}\n{ir}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{ir}"));
+    let args = [Value::I32(0), Value::I32(0), Value::I32(0), Value::I32(0)];
+    for seed in 0..100u64 {
+        let r = run_scheduled(&m, 0, &args, 50_000_000, seed);
+        assert_eq!(r, Ok(vec![Value::I32(2000)]), "explorer seed {seed}");
+    }
 }

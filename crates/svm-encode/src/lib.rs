@@ -436,9 +436,10 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(op::SUSPEND);
             write_uleb(out, *value as u64);
         }
-        Inst::ThreadSpawn { func, arg } => {
+        Inst::ThreadSpawn { func, sp, arg } => {
             out.push(op::THREAD_SPAWN);
             write_uleb(out, *func as u64);
+            write_uleb(out, *sp as u64);
             write_uleb(out, *arg as u64);
         }
         Inst::ThreadJoin { handle } => {
@@ -858,6 +859,7 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
 
         op::THREAD_SPAWN => Inst::ThreadSpawn {
             func: c.idx()?,
+            sp: c.idx()?,
             arg: c.idx()?,
         },
         op::THREAD_JOIN => Inst::ThreadJoin { handle: c.idx()? },

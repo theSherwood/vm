@@ -1251,11 +1251,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // the *shared* memory (the `Arc<Region>` bytes + §13 `Arc` regions; the child snapshots
                 // the page-protection map). The executor runs it on a pooled worker. The child starts
                 // with an empty powerbox + its own fuel. Yields an i32 thread handle (the table slot).
-                Inst::ThreadSpawn { func, arg } => {
+                Inst::ThreadSpawn { func, sp, arg } => {
                     if fs.get(*func as usize).is_none() {
                         return Err(Trap::Malformed);
                     }
                     let entry = *func;
+                    let spv = as_i64(get(&frames[top].vals, *sp)?)?; // the thread's data-stack base
                     let av = as_i64(get(&frames[top].vals, *arg)?)?;
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
@@ -1265,7 +1266,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Box::new(VCpu::new(
                             cfuncs,
                             entry,
-                            &[Value::I64(av)],
+                            &[Value::I64(spv), Value::I64(av)], // (sp, arg) — the fiber-style entry
                             child_mem,
                             Host::new(),
                             child_fuel,

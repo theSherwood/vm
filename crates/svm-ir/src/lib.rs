@@ -1048,15 +1048,18 @@ pub enum Inst {
     Suspend {
         value: ValIdx,
     },
-    /// §12 thread spawn (`thread.spawn`): start a new vCPU — a real OS thread — running
-    /// `funcs[func]` with `arg`, over the **same** guest memory. The anonymous `Region` bytes and
-    /// §13 aliases are shared; mapping changes made *after* the spawn are thread-local (a later
-    /// step lifts that). `func` must have type `(i64) -> i64` (verifier-checked). Yields an `i32`
-    /// **thread handle**: a forgeable index into the runtime-owned thread table, masked +
-    /// generation-checked at [`Inst::ThreadJoin`] like a fiber/capability handle (§3c), so a forged
-    /// handle is inert (it traps).
+    /// §12 thread spawn (`thread.spawn`): start a new vCPU — a green thread on the M:N executor —
+    /// running `funcs[func]` on the data stack based at `sp` (the §3d two-stack split — every
+    /// vCPU owns its own in-window data stack, exactly like a fiber) with `arg`, over the **same**
+    /// guest memory (anonymous `Region` bytes and §13 aliases are shared; post-spawn mapping changes
+    /// are thread-local for now). `func` must have the fixed thread-entry type `(i64 sp, i64 arg) ->
+    /// i64` (verifier-checked) — the same signature as a fiber, so a frontend function works as-is.
+    /// Yields an `i32` **thread handle**: a forgeable index into the runtime-owned thread table,
+    /// masked + generation-checked at [`Inst::ThreadJoin`] like a fiber/capability handle (§3c), so a
+    /// forged handle is inert (it traps).
     ThreadSpawn {
         func: FuncIdx,
+        sp: ValIdx,
         arg: ValIdx,
     },
     /// §12 thread join (`thread.join`): block until the vCPU named by `handle` (an `i32` thread

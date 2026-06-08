@@ -40,14 +40,14 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 43981
-  v1 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   v3 = i64.const 0
   v4 = i64.atomic.load v3
   return v4
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   v1 = i64.const 0
   i64.atomic.store v1 v0
   return v0
@@ -66,12 +66,12 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 7
-  v1 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   v1 = i64.const 3
   v2 = i64.mul v0 v1
   return v2
@@ -92,10 +92,10 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 1000
-  v1 = thread.spawn 1 v0
-  v2 = thread.spawn 1 v0
-  v3 = thread.spawn 1 v0
-  v4 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
+  v2 = thread.spawn 1 v0 v0
+  v3 = thread.spawn 1 v0 v0
+  v4 = thread.spawn 1 v0 v0
   v5 = thread.join v1
   v6 = thread.join v2
   v7 = thread.join v3
@@ -104,8 +104,8 @@ block0():
   v10 = i64.atomic.load v9
   return v10
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   br block1(v0)
 block1(v1: i64):
   v2 = i64.const 0
@@ -134,14 +134,14 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 99
-  v1 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   v3 = i32.const 1234567
   v4 = thread.join v3
   return v2
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   return v0
 }
 "#;
@@ -161,7 +161,7 @@ block0():
   v1 = i64.const 0
   br block1(v0, v1)
 block1(v2: i64, v3: i64):
-  v4 = thread.spawn 1 v3
+  v4 = thread.spawn 1 v3 v3
   v5 = thread.join v4
   v6 = i64.add v2 v5
   v7 = i64.const 1
@@ -172,8 +172,8 @@ block1(v2: i64, v3: i64):
 block2(v11: i64):
   return v11
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   return v0
 }
 "#;
@@ -193,7 +193,7 @@ block0():
   v0 = i64.const 0
   br block1(v0)
 block1(v1: i64):
-  v2 = thread.spawn 1 v1
+  v2 = thread.spawn 1 v1 v1
   v3 = i64.const 1
   v4 = i64.add v1 v3
   v5 = i64.const 1000
@@ -210,8 +210,8 @@ block3():
   v12 = i64.atomic.load v11
   return v12
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   v1 = i64.const 0
   v2 = i64.const 1
   v3 = i64.atomic.rmw.add v1 v2
@@ -231,13 +231,13 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 5
-  v1 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   v3 = thread.join v1
   return v2
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   return v0
 }
 "#;
@@ -254,12 +254,12 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 0
-  v1 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   v1 = i64.const 1
   i64.atomic.store v1 v0
   return v0
@@ -277,12 +277,12 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 255
-  v1 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   v1 = i64.const 8
   i64.atomic.store v1 v0
   return v0
@@ -306,7 +306,7 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 1
-  v1 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
 }
@@ -332,12 +332,12 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 1
-  v1 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
   v2 = thread.join v1
   return v2
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   return v0
 }
 "#;
@@ -408,7 +408,7 @@ memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 0
-  v1 = thread.spawn 1 v0
+  v1 = thread.spawn 1 v0 v0
   br block1(v1)
 block1(v2: i32):
   v3 = i64.const 8
@@ -427,8 +427,8 @@ block3(v13: i32):
   v14 = thread.join v13
   return v14
 }
-func (i64) -> (i64) {
-block0(v0: i64):
+func (i64, i64) -> (i64) {
+block0(vsp: i64, v0: i64):
   v1 = i64.const 8
   v2 = i64.const 1
   i64.atomic.store v1 v2
