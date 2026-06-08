@@ -18,8 +18,14 @@
 //! fiber crosses it), and short field borrows derived from the raw `*mut Sched` end before the switch.
 //! Single OS thread, so the `Vec`s are never touched concurrently.
 
+use crate::fiber_rt::FiberCallTramp;
+use crate::{FnEntry, TrapKind};
 use std::collections::VecDeque;
 use svm_fiber::{Fiber, State, Yielder};
+
+/// Max concurrently-live vCPUs per run (matches the interpreter's `MAX_VCPUS`): an anti-bomb ceiling
+/// so a thread-bomb traps (`ThreadFault`) instead of exhausting host memory.
+const MAX_VCPUS: usize = 1 << 16;
 
 /// A guest thread body: receives a [`Ctx`] (its scheduler handle, for nested spawn/join) and returns
 /// the thread's `i64` result. `'static` so it can live in the heap-allocated fiber.
@@ -55,6 +61,12 @@ pub(crate) struct Sched {
     block: Option<Block>,
     /// Per-vCPU control-stack size.
     stack: usize,
+    /// The generated call-trampoline used to invoke a JITted thread entry (`None` for the unit tests,
+    /// whose vCPU bodies are plain Rust closures). Filled in after the module is finalized.
+    call_tramp: Option<FiberCallTramp>,
+    /// The run's host trap cell: when a vCPU trap sets it, the scheduler stops (the domain is killed).
+    /// `null` in the unit tests (no JITted code → never set).
+    trap_cell: *mut i64,
 }
 
 /// What a vCPU body uses to spawn children and join them (the cooperative-scheduler handle). Wraps the
@@ -90,7 +102,25 @@ impl Sched {
             cur: 0,
             block: None,
             stack,
+            call_tramp: None,
+            trap_cell: std::ptr::null_mut(),
         }
+    }
+
+    /// Record the JITted thread-entry call-trampoline (set before any vCPU runs).
+    pub(crate) fn set_call_tramp(&mut self, t: FiberCallTramp) {
+        self.call_tramp = Some(t);
+    }
+
+    /// Point the scheduler at the run's host trap cell, so it stops as soon as a vCPU traps.
+    pub(crate) fn set_trap_cell(&mut self, tc: *mut i64) {
+        self.trap_cell = tc;
+    }
+
+    /// Whether a vCPU has tripped the trap cell (the domain is being killed).
+    fn trapped(&self) -> bool {
+        // SAFETY: `trap_cell` is null (tests) or the live run trap cell.
+        !self.trap_cell.is_null() && unsafe { *self.trap_cell } != 0
     }
 
     /// Spawn the root vCPU running `body`, drive the schedule to completion, and return the root's
@@ -112,6 +142,10 @@ impl Sched {
             };
             // SAFETY: `fib` is an address-stable boxed fiber; only one vCPU runs at a time.
             let st = unsafe { (*fib).resume(0) };
+            // A vCPU trap kills the whole domain: stop scheduling (remaining fibers are abandoned).
+            if self.trapped() {
+                break;
+            }
             match st {
                 State::Complete(_) => { /* completion bookkeeping ran in the body wrapper */ }
                 State::Yielded(_) => match self.block.take() {
@@ -232,6 +266,74 @@ unsafe fn join(
                 // Phase 2: suspend to the scheduler; resumes when the child completes, then re-check.
                 (*yielder).suspend(0);
             }
+        }
+    }
+}
+
+// ===== JIT-facing thunks (called from JITted guest code; addresses baked in as constants) =====
+
+/// `thread.spawn` thunk: start a new vCPU running JITted `funcs[func_idx](sp, arg)` over the shared
+/// window, and return its `i32` handle. Traps (`ThreadFault`, `-1`) on a thread-bomb. `func` is a
+/// compile-time index, so it indexes the function table directly (no masking).
+///
+/// # Safety
+/// `s` is the run's live scheduler; `fn_table_base`/`trap_out` are the threaded context.
+pub(crate) unsafe extern "C" fn thread_spawn(
+    s: *mut Sched,
+    mem_base: u64,
+    fn_table_base: u64,
+    trap_out: u64,
+    func_idx: u32,
+    sp: u64,
+    arg: u64,
+) -> i32 {
+    let call_tramp = {
+        let s = &mut *s;
+        if s.vcpus.len() >= MAX_VCPUS {
+            *(trap_out as *mut i64) = TrapKind::ThreadFault as i64;
+            return -1;
+        }
+        s.call_tramp
+            .expect("call-trampoline set before any vCPU runs")
+    };
+    // Resolve the entry's code pointer from the function table (func_idx is a valid module index).
+    let entry = (fn_table_base as *const FnEntry).add(func_idx as usize);
+    let code = (*entry).code;
+    let body: Body = Box::new(move |_c: &Ctx| -> i64 {
+        call_tramp(code, mem_base, fn_table_base, trap_out, sp, arg) as i64
+    });
+    spawn(s, body) as i32
+}
+
+/// `thread.join` thunk: block until vCPU `handle` finishes and return its `i64` result. A forged /
+/// out-of-range / already-joined handle traps (`ThreadFault`). The handle is masked into the vCPU
+/// table like a capability handle (§3c), so a forged handle is inert.
+///
+/// # Safety
+/// `s` is the run's live scheduler; `trap_out` is the live trap cell.
+pub(crate) unsafe extern "C" fn thread_join(s: *mut Sched, handle: i32, trap_out: u64) -> i64 {
+    let (cur, yielder, slot, in_range) = {
+        let s = &*s;
+        let n = s.vcpus.len();
+        let mask = if n == 0 { 0 } else { n.next_power_of_two() - 1 };
+        let slot = (handle as u32 as usize) & mask;
+        let yielder = s
+            .vcpus
+            .get(s.cur)
+            .and_then(|v| v.as_ref())
+            .map(|v| v.yielder)
+            .unwrap_or(std::ptr::null());
+        (s.cur, yielder, slot, slot < n)
+    };
+    if !in_range || yielder.is_null() {
+        *(trap_out as *mut i64) = TrapKind::ThreadFault as i64;
+        return 0;
+    }
+    match join(s, cur, yielder, slot) {
+        Ok(v) => v,
+        Err(()) => {
+            *(trap_out as *mut i64) = TrapKind::ThreadFault as i64;
+            0
         }
     }
 }

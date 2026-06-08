@@ -34,10 +34,21 @@ needs a scheduler-as-`Entry` shim (a fault `longjmp`s back, abandoning fiber sta
 is being killed). (b) **Verification limit:** TSan only instruments Rust, *not* JITted machine code, so
 it cannot see JITted guest memory accesses — JIT concurrency is verified by invariant **stress** tests
 + the interp↔JIT **differential** on interleaving-invariant programs (e.g. atomic counters), not TSan.
-**Next (commit 4, part 2):** wire it into codegen — lower `thread.spawn`/`thread.join` to the scheduler
-(thunks like `fiber_rt`), run the entry as root vCPU 0 under a guarded scheduler shim, share the one
-`Arc<Region>`-backed window across vCPUs; verify with an atomic-counter differential/stress test. Then
-part 3: `wait`/`notify` (logical-clock parking), then true multi-core workers.
+**Commit 4, part 2 DONE — the JIT runs threads.** `thread.spawn`/`thread.join` now lower (x86-64 unix)
+to `thread_rt` thunks (`thread_spawn`/`thread_join`, addresses baked in like `fiber_rt`/`CapEnv`),
+threading `mem_base`/`fn_table_base`/`trap_out` from the call site. A threaded module runs under a
+**scheduler shim** (`sched_entry`, shaped as `Entry`) driven by `run_guarded`: the guest entry becomes
+root vCPU 0 (via the buffer-ABI entry trampoline), spawned vCPUs run JITted thread entries through the
+shared fiber call-trampoline, and `join` blocks by suspending back to the scheduler loop. All vCPUs
+share the one `Arc<Region>`-backed window (same `mem_base`) → shared memory + hardware atomics for free.
+A vCPU trap sets the cell and the scheduler stops (domain killed; a fault `longjmp`s out, abandoning
+fiber stacks). `TrapKind::ThreadFault` added; fibers+threads in one module bail `Unsupported` for now
+(needs per-vCPU fiber tables). **Verified by the interp↔JIT differential** (`jit_threads.rs`, 3 tests:
+spawn/join sums results, a 4×100 atomic counter → 400, double-join → `ThreadFault`). Full suite +
+clippy + fmt green. **Next (part 3):** `wait`/`notify` (logical-clock parking in the scheduler). **Then
+part 4:** true multi-core workers (the scheduler is cooperative / single OS thread today — correct
+under every interleaving, just no parallel speedup; TSan still can't see JITted accesses, so that step
+leans on the same invariant/differential oracle).
 
 Earlier — §12 **JIT concurrency commit 1: the `svm-fiber` stack-switch primitive.**
 Starting the unified-M:N-for-the-JIT effort (the agreed full path, not 1:1 OS threads). Because

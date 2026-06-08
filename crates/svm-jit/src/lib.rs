@@ -78,10 +78,10 @@ mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill h
 #[cfg(all(unix, target_arch = "x86_64"))]
 mod fiber_rt;
 
-// Cooperative green-thread scheduler core for `thread.spawn`/`thread.join` (§12), on the same
-// stack-switch substrate. The algorithm is unit-tested standalone here; codegen wiring (lowering the
-// `thread.*` ops + driving the scheduler under the guarded execution path) lands in a follow-on, so
-// the items are not referenced from `lib.rs` yet.
+// Cooperative green-thread scheduler for `thread.spawn`/`thread.join` (§12), on the same stack-switch
+// substrate. Wired into codegen below (the `thread.*` lowering + the guarded scheduler shim). The
+// `Ctx`-closure surface is exercised by this module's standalone unit tests, so `allow(dead_code)`
+// keeps the non-test lib build (where that surface is unused) warning-free.
 #[cfg(all(unix, target_arch = "x86_64"))]
 #[allow(dead_code)]
 mod thread_rt;
@@ -205,6 +205,9 @@ pub enum TrapKind {
     /// Forged / out-of-range / already-running / finished fiber handle, a bad fiber-entry funcref, a
     /// `suspend` with no running fiber, or a fiber-bomb (§12). Matches `Trap::FiberFault`.
     FiberFault = 9,
+    /// Forged / out-of-range / already-joined thread handle, or a thread-bomb (§12). Matches
+    /// `Trap::ThreadFault`.
+    ThreadFault = 10,
 }
 
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
@@ -222,6 +225,7 @@ impl TrapKind {
             6 => TrapKind::CapFault,
             8 => TrapKind::MemoryFault,
             9 => TrapKind::FiberFault,
+            10 => TrapKind::ThreadFault,
             _ => return None,
         })
     }
@@ -529,6 +533,14 @@ fn run_inner(
     #[cfg(all(unix, target_arch = "x86_64"))]
     let uses_fibers = module_uses_fibers(m);
     #[cfg(all(unix, target_arch = "x86_64"))]
+    let uses_threads = module_uses_threads(m);
+    // Mixing fibers and threads in one module needs per-vCPU fiber tables (nested switching), which the
+    // JIT doesn't wire yet — bail so the differential harness skips it (the interpreter still runs it).
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    if uses_fibers && uses_threads {
+        return Err(JitError::Unsupported("fibers + threads in one module"));
+    }
+    #[cfg(all(unix, target_arch = "x86_64"))]
     let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
         Some(Box::new(fiber_rt::FiberRuntime::new(
             type_id_of(&distinct, &fiber_func_type()),
@@ -550,6 +562,27 @@ fn run_inner(
     #[cfg(not(all(unix, target_arch = "x86_64")))]
     let fiber = FiberEnv::null();
 
+    // §12 threads: if the module uses `thread.*`, stand up a host cooperative scheduler (address baked
+    // into the `thread.*` sites). Created now for a stable address; the call-trampoline + trap cell are
+    // wired after finalize.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    let mut sched: Option<Box<thread_rt::Sched>> = if uses_threads {
+        Some(Box::new(thread_rt::Sched::new(1 << 20))) // 1 MiB per-vCPU control stack (guard-paged)
+    } else {
+        None
+    };
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    let thread = match &sched {
+        Some(s) => ThreadEnv {
+            sched_addr: (&**s as *const thread_rt::Sched) as i64,
+            spawn_thunk: thread_rt::thread_spawn as *const () as i64,
+            join_thunk: thread_rt::thread_join as *const () as i64,
+        },
+        None => ThreadEnv::null(),
+    };
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    let thread = ThreadEnv::null();
+
     // Define each function body. `clear_context` after each define resets the cached
     // CFG/domtree so the next function never compiles against a stale CFG.
     let mut ctx = module.make_context();
@@ -560,6 +593,7 @@ fn run_inner(
             &distinct,
             cap,
             fiber,
+            thread,
             &mut ctx.func,
             f,
             mask,
@@ -581,9 +615,10 @@ fn run_inner(
         .map_err(|e| JitError::Backend(e.to_string()))?;
     module.clear_context(&mut ctx);
 
-    // The generic fiber call-trampoline (one per module; calls any `Tail`-ABI fiber entry from Rust).
+    // The generic call-trampoline (one per module; calls any `Tail`-ABI `(sp, arg) -> i64` entry from
+    // Rust). Needed by both the fiber runtime (`cont.*`) and the thread scheduler (vCPU entries).
     #[cfg(all(unix, target_arch = "x86_64"))]
-    let fiber_tramp = if uses_fibers {
+    let fiber_tramp = if uses_fibers || uses_threads {
         build_fiber_call_trampoline(&mut module, &mut ctx.func);
         let id = module
             .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
@@ -601,13 +636,18 @@ fn run_inner(
         .finalize_definitions()
         .map_err(|e| JitError::Backend(e.to_string()))?;
 
-    // Now that code is finalized, hand the fiber runtime its call-trampoline address.
+    // Now that code is finalized, hand the fiber runtime / scheduler their call-trampoline address.
     #[cfg(all(unix, target_arch = "x86_64"))]
-    if let (Some(rt), Some(id)) = (&mut fiber_rt, fiber_tramp) {
+    if let Some(id) = fiber_tramp {
         let addr = module.get_finalized_function(id);
         // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the `FiberCallTramp` ABI.
         let t: fiber_rt::FiberCallTramp = unsafe { std::mem::transmute(addr) };
-        rt.set_call_tramp(t);
+        if let Some(rt) = &mut fiber_rt {
+            rt.set_call_tramp(t);
+        }
+        if let Some(s) = &mut sched {
+            s.set_call_tramp(t);
+        }
     }
 
     // Build the function table (§3c) now that code addresses are known: power-of-two
@@ -640,17 +680,37 @@ fn run_inner(
     // Trap cell: 0 = ok; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit
     // code for an Exit. A trapping path (or the cap thunk) writes it.
     let mut trap_cell: i64 = 0;
-    // SAFETY: `code` is the finalized trampoline with the entry signature
-    // (`build_trampoline` set it). It reads `entry.params.len()` arg slots, writes
-    // `entry.results.len()` result slots, accesses only the guarded window (masking
-    // confines effective addresses; any escape faults into the guard page), reads
-    // `fn_table` (length `table_len`, masked index), and writes `trap_cell`. All buffers
-    // outlive the call; `module` owns the executable page until dropped below.
+
+    // For a threaded module, run the scheduler shim (root vCPU 0 = the entry) under the guard instead
+    // of calling the entry directly; otherwise call the entry trampoline as usual. Both share the
+    // fixed `Entry` ABI, so `run_guarded` is identical — only `code`/`args` differ.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    let (run_code, run_args, _sched_ctx): (*const u8, *const i64, Option<Box<SchedCtx>>) =
+        match &mut sched {
+            Some(s) => {
+                let ctx = Box::new(SchedCtx {
+                    sched: &mut **s as *mut thread_rt::Sched,
+                    entry_code: code,
+                    entry_args: args.as_ptr(),
+                });
+                let cptr = &*ctx as *const SchedCtx as *const i64;
+                (sched_entry as *const () as *const u8, cptr, Some(ctx))
+            }
+            None => (code, args.as_ptr(), None),
+        };
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    let (run_code, run_args) = (code, args.as_ptr());
+
+    // SAFETY: `run_code` is a finalized trampoline (the entry's, or the scheduler shim) honouring the
+    // `Entry` ABI. It reads the arg slots, writes `entry.results.len()` result slots, accesses only the
+    // guarded window (masking confines effective addresses; any escape faults into the guard page),
+    // reads `fn_table` (length `table_len`, masked index), and writes `trap_cell`. All buffers outlive
+    // the call; `module` owns the executable page until dropped below.
     let faulted = unsafe {
         mem::run_guarded(
             &window,
-            code,
-            args.as_ptr(),
+            run_code,
+            run_args,
             results.as_mut_ptr(),
             mem_base,
             fn_table.as_ptr() as *const core::ffi::c_void,
@@ -759,10 +819,14 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                     IntUnOp::Clz | IntUnOp::Ctz | IntUnOp::Popcnt => {}
                     _ => return Err(JitError::Unsupported("int extend ops")),
                 },
-                // §12 fibers: lowered to host fiber-runtime calls, but only where the stack-switch
+                // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
-                Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                Inst::ContNew { .. }
+                | Inst::ContResume { .. }
+                | Inst::Suspend { .. }
+                | Inst::ThreadSpawn { .. }
+                | Inst::ThreadJoin { .. }
                     if cfg!(all(unix, target_arch = "x86_64")) => {}
                 _ => return Err(JitError::Unsupported("instruction")),
             }
@@ -809,6 +873,26 @@ impl FiberEnv {
     }
 }
 
+/// The §12 thread scheduler address + the two thunk addresses, baked into `thread.spawn`/`thread.join`
+/// sites as constants. All `0` when the module uses no threads or the target has no stack-switch
+/// support (in which case `ensure_supported` has already rejected any thread op).
+#[derive(Clone, Copy)]
+struct ThreadEnv {
+    sched_addr: i64,
+    spawn_thunk: i64,
+    join_thunk: i64,
+}
+
+impl ThreadEnv {
+    fn null() -> ThreadEnv {
+        ThreadEnv {
+            sched_addr: 0,
+            spawn_thunk: 0,
+            join_thunk: 0,
+        }
+    }
+}
+
 /// Per-function lowering context shared across blocks.
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
@@ -832,6 +916,8 @@ struct Lower<'a> {
     cap: CapEnv,
     /// The §12 fiber runtime + thunk addresses for `cont.*` lowering.
     fiber: FiberEnv,
+    /// The §12 thread scheduler + thunk addresses for `thread.*` lowering.
+    thread: ThreadEnv,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
     /// Distinct module signatures, for `call_indirect` type ids.
@@ -848,6 +934,7 @@ fn build_clif(
     distinct: &[FuncType],
     cap: CapEnv,
     fiber: FiberEnv,
+    thread: ThreadEnv,
     clif: &mut Function,
     f: &Func,
     mask: u64,
@@ -900,6 +987,7 @@ fn build_clif(
         fn_table_mask: (ids.len().next_power_of_two() as u64) - 1,
         cap,
         fiber,
+        thread,
         ids,
         distinct,
     };
@@ -993,6 +1081,18 @@ fn module_uses_fibers(m: &IrModule) -> bool {
     })
 }
 
+/// Whether `m` contains any thread op, so `run_inner` knows to run under the thread scheduler.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn module_uses_threads(m: &IrModule) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|blk| {
+            blk.insts
+                .iter()
+                .any(|i| matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. }))
+        })
+    })
+}
+
 /// Build the generic fiber **call-trampoline**: `extern "C" fn(code, mem_base, fn_table_base,
 /// trap_out, sp, arg) -> i64` that `call_indirect`s a guest fiber entry under its `Tail` ABI. Rust
 /// cannot call a `Tail`-convention function directly, so the fiber runtime calls this (default C ABI)
@@ -1028,6 +1128,50 @@ fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
     b.ins().return_(&[r]);
     b.seal_all_blocks();
     b.finalize();
+}
+
+/// The buffer-ABI entry trampoline's type (= `mem::Entry`): how the root vCPU calls the guest entry.
+#[cfg(all(unix, target_arch = "x86_64"))]
+type EntryTramp = extern "C" fn(*const i64, *mut i64, *mut u8, *const core::ffi::c_void, *mut i64);
+
+/// Context handed to [`sched_entry`] via the guarded call's `args` slot: everything the scheduler
+/// shim needs that doesn't fit the fixed `Entry` ABI.
+#[cfg(all(unix, target_arch = "x86_64"))]
+struct SchedCtx {
+    sched: *mut thread_rt::Sched,
+    /// The buffer-ABI entry trampoline (the guest `main`), run as root vCPU 0.
+    entry_code: *const u8,
+    /// The guest entry's argument slots.
+    entry_args: *const i64,
+}
+
+/// The scheduler **shim**, shaped as an `Entry` so it can run *under* `run_guarded` (the C
+/// `setjmp`/`siglongjmp` detect-and-kill wrapper). It drives the thread scheduler to completion with
+/// the guest entry as root vCPU 0; a guard fault in any vCPU `longjmp`s back out of the whole schedule
+/// (abandoning fiber stacks — the domain is being killed). `args` is a `*const SchedCtx`; the other
+/// params are the run's real `results`/`mem_base`/`fn_table`/`trap_cell`, forwarded to the root vCPU.
+#[cfg(all(unix, target_arch = "x86_64"))]
+extern "C" fn sched_entry(
+    args: *const i64,
+    results: *mut i64,
+    mem_base: *mut u8,
+    fn_table: *const core::ffi::c_void,
+    trap_cell: *mut i64,
+) {
+    // SAFETY: `args` is the `&SchedCtx` we passed to `run_guarded`; the scheduler + pointers are live
+    // for the call.
+    let ctx = unsafe { &*(args as *const SchedCtx) };
+    let sched = unsafe { &mut *ctx.sched };
+    sched.set_trap_cell(trap_cell);
+    // SAFETY: `entry_code` is the finalized buffer-ABI entry trampoline (`EntryTramp` shape).
+    let entry: EntryTramp = unsafe { std::mem::transmute(ctx.entry_code) };
+    let eargs = ctx.entry_args;
+    // Root vCPU 0: run the guest entry, writing its results into the run's results buffer.
+    let body: thread_rt::Body = Box::new(move |_c: &thread_rt::Ctx| -> i64 {
+        entry(eargs, results, mem_base, fn_table, trap_cell);
+        0
+    });
+    sched.run(body);
 }
 
 /// Lower one IR block's body + terminator into its CLIF block.
@@ -1163,6 +1307,53 @@ fn lower_block(
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.suspend_thunk);
             let call = b.ins().call_indirect(tref, thunk, &[rt, v, trap_out]);
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        // §12 threads: lower `thread.spawn`/`thread.join` to indirect calls to the host scheduler
+        // thunks (addresses baked into `lower.thread`), threading `mem_base`/`fn_table_base`/`trap_out`
+        // like `cap.call`. A thunk that sets the trap cell (forged handle, thread-bomb) propagates here.
+        if let Inst::ThreadSpawn { func, sp, arg } = inst {
+            // thread_spawn(sched, mem_base, fn_table_base, trap_out, func_idx:i32, sp:i64, arg:i64) -> i32
+            let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+            let mem_base = b.use_var(lower.mem_var);
+            let fnt = b.use_var(lower.fn_table_var);
+            let trap_out = b.use_var(lower.trap_var);
+            let func_idx = b.ins().iconst(I32, *func as i64);
+            let spv = get(&vals, *sp)?;
+            let av = get(&vals, *arg)?;
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I64, I64, I32, I64, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.thread.spawn_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[sched, mem_base, fnt, trap_out, func_idx, spv, av],
+            );
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        if let Inst::ThreadJoin { handle } = inst {
+            // thread_join(sched, handle:i32, trap_out:i64) -> result:i64
+            let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+            let h = get(&vals, *handle)?;
+            let trap_out = b.use_var(lower.trap_var);
+            let mut tsig = module.make_signature();
+            for t in [I64, I32, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.thread.join_thunk);
+            let call = b.ins().call_indirect(tref, thunk, &[sched, h, trap_out]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
