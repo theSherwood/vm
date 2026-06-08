@@ -249,10 +249,12 @@ struct Frame<'a> {
 /// guest, so a fiber-bomb OOMs *itself*, never the host.
 const MAX_FIBERS: usize = 1 << 16;
 
-/// Maximum number of vCPUs (`thread.spawn`) a single run may create — a hard cap on the OS threads
-/// the run can launch (§12). Unlike fibers (cheap, in-process), each vCPU is a real OS thread, so the
-/// bound is small; a thread-bomb hits a clean [`Trap::ThreadFault`] rather than exhausting the host.
-/// The budget is **total** across the run (like fuel), so it bounds threads regardless of nesting.
+/// Maximum number of **concurrently live** vCPUs (`thread.spawn`) across a run — a hard cap on the
+/// OS threads alive at once (§12). Each vCPU is a real OS thread, so the bound is modest; a
+/// thread-bomb (spawning without joining) hits a clean [`Trap::ThreadFault`]. The slot is **refunded
+/// when a vCPU finishes**, so a guest that spawns-and-joins in a loop may create unboundedly many
+/// vCPUs over its lifetime — only simultaneous liveness is bounded. The cap is global (the budget is
+/// shared by every vCPU), so nesting can't exceed it.
 const MAX_THREADS: u32 = 64;
 
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
@@ -617,7 +619,9 @@ where
                 Inst::ThreadSpawn { func, arg } => {
                     let callee = funcs.get(*func as usize).ok_or(Trap::Malformed)?;
                     let av = as_i64(get(&frames[top].vals, *arg)?)?;
-                    // Charge the run-wide thread budget *before* spawning (a thread-bomb hits this).
+                    // Charge a *concurrent-live* vCPU slot (refunded when the child finishes below),
+                    // so the cap bounds simultaneous vCPUs — a thread-bomb hits it — while a guest
+                    // that spawns-and-joins in a loop can create unboundedly many vCPUs over its life.
                     if budget.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                         budget.fetch_add(1, std::sync::atomic::Ordering::SeqCst); // un-charge
                         return Err(Trap::ThreadFault);
@@ -629,7 +633,7 @@ where
                         let mut cm = child_mem;
                         let mut cfuel = child_fuel;
                         let mut chost = Host::new(); // spawned vCPUs start with an empty powerbox
-                        run_func(
+                        let r = run_func(
                             callee,
                             &[Value::I64(av)],
                             &mut cfuel,
@@ -640,7 +644,12 @@ where
                             scope,
                             budget,
                             parking,
-                        )
+                        );
+                        // Release the concurrent slot on completion — *before* the handle's result
+                        // becomes observable to a `join` (which returns only after this closure
+                        // returns), so a joiner's next spawn sees the slot already free.
+                        budget.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        r
                     });
                     threads.push(Some(jh));
                     frames[top].vals.push(Value::I32(handle));

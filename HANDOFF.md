@@ -933,9 +933,22 @@ leave a shared view — add a unix test for this alongside the Windows work.
   identically to the interpreter. Whole suite + clippy + windows-gnu + (the existing) TSan green.
   **Honoring weaker orderings in execution** awaits a backend that supports them + the
   concurrent-oracle story.
-  **Phase 2 still to come:** fibers→real-threads scheduler (M:N), per-thread capability grants
-  (spawned vCPUs still start with an empty powerbox), honoring weak orderings in execution, and the
-  differential-oracle-under-nondeterminism story.
+  **Parallel threads — Phase 2 step 6 DONE (concurrent-live vCPU budget):** the `thread.spawn` cap
+  changed from **total-per-run** to **concurrent-live** — the slot is charged at spawn and **refunded
+  when the vCPU finishes** (the refund lands before the handle's result is observable to a `join`, so
+  a joiner's next spawn sees the slot free). A guest that spawns-and-joins in a loop can now create
+  unboundedly many vCPUs over its lifetime (only simultaneous liveness is capped at 64); previously it
+  `ThreadFault`ed at the 65th spawn ever. Test `sequential_spawns_exceed_concurrency_cap` runs 200
+  spawn+join iterations (sum 0..199 = 19900). Whole suite + TSan (19 thread tests, zero races) +
+  clippy + windows-gnu green. **Note on true M:N:** running *many* vCPUs over *few* OS threads (tasks
+  ≫ threads) needs a work-stealing executor that **parks fiber continuations** on every blocking op
+  (`join`/`wait`) — an async runtime over the reified-continuation interpreter, with real
+  lifetime/deadlock/race design (a naive bounded pool deadlocks once blocked tasks exceed workers).
+  That's the next, larger step; today's model is 1 OS thread per concurrent vCPU (now with a reusable
+  slot budget) plus cooperative fibers within each.
+  **Phase 2 still to come:** the work-stealing M:N executor (continuation parking), per-thread
+  capability grants (spawned vCPUs still start with an empty powerbox), honoring weak orderings in
+  execution, and the differential-oracle-under-nondeterminism story.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a

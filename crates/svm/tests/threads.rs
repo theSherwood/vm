@@ -148,6 +148,38 @@ block0(v0: i64):
     assert_eq!(run_i64(src), Err(Trap::ThreadFault));
 }
 
+/// The spawn budget is *concurrent-live*, not total: a guest that spawns-and-joins in a loop creates
+/// far more vCPUs over its lifetime than the concurrency cap (64). Here 200 sequential spawn+join
+/// iterations (each ≤1 live) sum 0..199 = 19900 — which a total cap would `ThreadFault` at the 65th.
+#[test]
+fn sequential_spawns_exceed_concurrency_cap() {
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i64.const 0
+  br block1(v0, v1)
+block1(v2: i64, v3: i64):
+  v4 = thread.spawn 1 v3
+  v5 = thread.join v4
+  v6 = i64.add v2 v5
+  v7 = i64.const 1
+  v8 = i64.add v3 v7
+  v9 = i64.const 200
+  v10 = i64.lt_u v8 v9
+  br_if v10 block1(v6, v8) block2(v6)
+block2(v11: i64):
+  return v11
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  return v0
+}
+"#;
+    assert_eq!(run_i64(src), Ok(19900));
+}
+
 /// Joining the same handle twice is inert on the second join (the slot is consumed) — a re-join
 /// can't observe or double-free another vCPU.
 #[test]
