@@ -32,8 +32,24 @@ verification tradeoff; verify TigerBeetle-style — the interpreter + explorer/`
 deterministic spec (our DST), the parallel JIT is an *optimization that refines it* (checked by
 differential + invariant stress), and the parallel *runtime glue* (pure Rust) is checked by **loom**.
 
-**Part 4 step 2 — the parallel executor (PLANNED, not started; the project's highest-risk component).**
-Build order:
+**Part 4 step 2 — the parallel executor.** `loom` confirmed available under the env network policy
+(`[target.'cfg(loom)'.dependencies] loom = "0.7"`, registered via `[lints.rust] check-cfg`).
+**Step 2a DONE — loom-verified worker-pool protocol (`svm-jit/src/par.rs`).** A `Mutex<Inner>` +
+`Condvar` + N OS-thread workers over an abstract `Task` (`run(resume_val, &Shared) -> Step::{Done,
+Join}`); the **lock discipline** (hold the lock to pick a task and to handle its result, never across
+running it) lets a running task re-enter `spawn`/`join`. Workers take a task out of its slot to run it
+(ownership hand-off → safe migration), park it on `Join` of an unfinished child, and on `Done` store
+the result + move joiners to runnable + `notify_all`; the pool exits when `live == 0`. Verified two
+ways: a real-OS-thread **stress** test (2000+1000 runs, 4 workers, nested children → exact sums) and a
+**loom** model check (`loom_spawn_join_no_lost_wakeup`, `RUSTFLAGS="--cfg loom"`) that exhaustively
+explores the 2-worker queue/wake races with **mock tasks** → no lost task / no lost wakeup. (CI: a loom
+job needs `--cfg loom`; not yet added.) **Next 2b:** wire real `Fiber` tasks + JIT in — each worker
+installs the guard + runs under the `setjmp` shim (per-worker detect-and-kill; a fault sets the shared
+trap cell + shutdown), parked fibers migrate via their slot, all vCPUs share the `Arc<Region>` window;
+add `wait`/`notify` to the parallel protocol + `compile_and_run_parallel`; verify by invariant stress +
+the differential.
+
+Original plan for reference:
 - **2a (loom-testable concurrent protocol).** Factor the scheduler so its *task* is abstract:
   `trait Task { fn step(&mut self, resume_val, &SchedHandle) -> TaskStep }` returning `Yielded(Block)`
   / `Complete(result)` — the fiber impl is `fiber.resume` (block delivered via the reentrant thunks);

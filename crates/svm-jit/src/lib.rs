@@ -86,6 +86,10 @@ mod fiber_rt;
 #[allow(dead_code)]
 mod thread_rt;
 
+// Parallel (multi-core) executor core (§12, part 4): the Mutex+Condvar worker-pool protocol over an
+// abstract task, loom-verified with mock tasks here; the real-fiber/JIT wiring lands in step 2b.
+mod par;
+
 // The windows placeholder-window commit primitive, reused by `svm-run`'s Memory-cap backend (it
 // commits/grows tail pages of this same window; a plain `VirtualAlloc(MEM_COMMIT)` cannot commit a
 // placeholder reservation). See `mem::win_commit_rw`.

@@ -43,3 +43,10 @@ windows-sys = { version = "0.59", features = [
 # but never invokes a C compiler. (Gating the dep itself on `cfg(unix)` matches the *host*, which
 # breaks building on a windows host — the cross-check from a unix host can't catch that.)
 cc = "1"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+# `--cfg loom` is set manually for loom model-checking runs; tell rustc it's expected.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
