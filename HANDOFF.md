@@ -970,9 +970,25 @@ leave a shared view — add a unix test for this alongside the Windows work.
   **1000 green threads on ≤32 workers** (`many_green_threads_on_a_small_pool` — impossible under the
   old 64 cap), all **TSan-clean** (`-Zsanitizer=thread`, zero data races), clippy `-D warnings` +
   windows-gnu green.
+  **Concurrent verification — DONE (the §18 oracle for multi-threaded code).** The interp↔JIT
+  differential can't check threaded runs (thread ops are interp-only; runs are nondeterministic), so
+  concurrent code is verified by **property + interleaving exploration**. (a) A **deterministic,
+  seeded explorer** — `svm_interp::run_scheduled(m, func, args, fuel, seed)` — runs the *same* vCPUs
+  on a single OS thread via `DetSched`/`run_det`, choosing which runnable vCPU to step (and a
+  `1..=MAX_QUANTUM` quantum) from a seeded PRNG and timing out `atomic.wait`s on a **logical** clock.
+  So a run is a pure function of its seed: fully reproducible, and sweeping seeds enumerates distinct
+  interleavings (loom/shuttle-style), with no data races (one thread → each seed is one valid
+  sequential interleaving). Enabled by abstracting a vCPU's executor as `SchedRef::{Real,Det}` and
+  adding `Step::Yield` + a per-run `quantum` to `VCpu::run` (the real pool passes `u64::MAX`). (b)
+  Tests in `crates/svm/tests/concurrent.rs`: a cmpxchg **spinlock guarding a non-atomic counter**
+  (8×100 → 800 iff mutual exclusion holds), an **atomic-RMW counter** (8×500 → 4000), and a
+  **wait/notify futex handoff** — each run both as real-executor **stress** (×30, OS interleavings,
+  TSan-clean) and as a deterministic **seed sweep** (×200, reproducible), plus a reproducibility
+  check. A scheduling/lock bug surfaces as a replayable failing seed. **Next here:** drive the explorer
+  from the `irgen` generator (fuzz concurrent programs against their invariants) and add
+  memory-op-granularity exploration for exhaustive small-program checking.
   **Phase 2 still to come:** per-thread capability grants (spawned vCPUs still start with an empty
-  powerbox), honoring weak orderings in execution, and the differential-oracle-under-nondeterminism
-  story.
+  powerbox) and honoring weak orderings in execution.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a

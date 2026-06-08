@@ -154,7 +154,7 @@ fn drive(
             *fuel,
             0,
             id,
-            Arc::clone(&sched),
+            SchedRef::Real(Arc::clone(&sched)),
         ));
         s.runnable.push_back(root);
         id
@@ -266,6 +266,56 @@ pub fn run_capture_reserved_with_host(
     (r, snap)
 }
 
+/// Run a module under the **deterministic explorer** (§18) with scheduling decisions driven by
+/// `seed`: a single OS thread interleaves the guest's vCPUs (green threads) cooperatively, so the run
+/// is fully reproducible and sweeping seeds enumerates distinct interleavings. This is the
+/// verification driver for concurrent guest code — no wall-clock, no OS-scheduler nondeterminism, so
+/// a failing interleaving is replayable from its seed. Returns the entry vCPU's result (or the trap /
+/// `ThreadFault` on a guest deadlock). Memory is default-reserved + data-initialized; no powerbox.
+pub fn run_scheduled(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    seed: u64,
+) -> Result<Vec<Value>, Trap> {
+    if m.funcs.get(func as usize).is_none() {
+        return Err(Trap::Malformed);
+    }
+    let funcs: Arc<[Func]> = m.funcs.clone().into();
+    let mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        mm.init_data(&m.data);
+        mm
+    });
+    let det = Arc::new(DetSched::new(seed, MAX_VCPUS));
+    let root_id = {
+        let mut s = det.lock();
+        let id = s.next_task;
+        s.next_task += 1;
+        s.live += 1;
+        let root = Box::new(VCpu::new(
+            funcs,
+            func,
+            args,
+            mem,
+            Host::new(),
+            fuel,
+            0,
+            id,
+            SchedRef::Det(Arc::clone(&det)),
+        ));
+        s.runnable.push(root);
+        id
+    };
+    run_det(&det);
+    let out = det.lock().results.remove(&root_id);
+    match out {
+        Some(out) => out.result,
+        None => Err(Trap::ThreadFault), // could not complete (a guest join-deadlock)
+    }
+}
+
 /// One activation record on the **explicit** guest call stack (§12). Reifying the call
 /// stack — rather than recursing on the host stack — is what makes fibers possible: a
 /// fiber's continuation is exactly its `Vec<Frame>`, which `suspend` pauses and
@@ -337,14 +387,15 @@ enum Blocked {
     /// Blocked in `thread.join` on child task `child` (the join handle's table slot is recorded in the
     /// vCPU's `pending`, set before it parks).
     Join { child: TaskId },
-    /// Blocked in `atomic.wait` on confined address `key`, to wake on a matching `notify` or at
-    /// `deadline`. `expected`/`width` let the worker re-check the value under the scheduler lock
-    /// (the futex compare-and-park atomicity).
+    /// Blocked in `atomic.wait` on confined address `key`, to wake on a matching `notify` or after
+    /// `timeout_ns` (already `MAX_WAIT`-clamped). `expected`/`width` let the driver re-check the value
+    /// under its lock (the futex compare-and-park atomicity). The driver turns `timeout_ns` into a
+    /// deadline on *its* clock — wall-clock for the real pool, a logical clock for the explorer.
     Wait {
         key: u64,
         expected: u64,
         width: u32,
-        deadline: Instant,
+        timeout_ns: u64,
     },
 }
 
@@ -360,12 +411,16 @@ enum Pending {
 enum Step {
     Done(Result<Vec<Value>, Trap>),
     Park(Blocked),
+    /// Ran out its scheduling quantum mid-execution (deterministic-explorer preemption); re-enqueue
+    /// and continue later. The real executor uses an unbounded quantum and never yields.
+    Yield,
 }
 
 /// Internal `?`-friendly driver result; [`VCpu::run`] folds an `Err` into `Step::Done(Err)`.
 enum Inner {
     Done(Vec<Value>),
     Park(Blocked),
+    Yield,
 }
 
 /// The **M:N executor** (§12): a bounded pool of worker OS threads runs many vCPUs (green threads)
@@ -538,7 +593,7 @@ fn worker_loop(sched: &Arc<Scheduler>) {
 /// Run one vCPU until it yields, then route the outcome: publish a result (waking a joiner) and
 /// retire the slot, or park it on a join target / wait address.
 fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
-    match v.run() {
+    match v.run(u64::MAX) {
         Step::Done(result) => {
             let id = v.id;
             let outcome = Outcome {
@@ -574,8 +629,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             key,
             expected,
             width,
-            deadline,
+            timeout_ns,
         }) => {
+            let deadline = Instant::now() + Duration::from_nanos(timeout_ns);
             let mut s = sched.lock();
             // Re-read the value **under the lock** so the compare-and-park is atomic vs. `notify`.
             if v.atomic_value(key, width) != expected {
@@ -589,6 +645,225 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 s.wait_waiters.entry(key).or_default().push((wid, v));
                 sched.work.notify_all(); // let idle workers recompute their timer deadline
             }
+        }
+        Step::Yield => {
+            // Unreachable for the real pool (quantum is `u64::MAX`), but re-enqueue for safety.
+            let mut s = sched.lock();
+            s.runnable.push_back(v);
+            sched.work.notify_one();
+        }
+    }
+}
+
+/// A vCPU's executor handle: spawn/notify route to either the real OS-thread pool or the
+/// single-threaded deterministic explorer. `Clone` is a cheap `Arc` bump (the child inherits it).
+#[derive(Clone)]
+enum SchedRef {
+    Real(Arc<Scheduler>),
+    Det(Arc<DetSched>),
+}
+
+impl SchedRef {
+    fn spawn(&self, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
+        match self {
+            SchedRef::Real(s) => s.spawn(make),
+            SchedRef::Det(d) => d.spawn(make),
+        }
+    }
+    fn notify(&self, key: u64, count: u32) -> u32 {
+        match self {
+            SchedRef::Real(s) => s.notify(key, count),
+            SchedRef::Det(d) => d.notify(key, count),
+        }
+    }
+    /// Take a finished child's outcome (for a resuming `thread.join`).
+    fn take_result(&self, id: TaskId) -> Option<Outcome> {
+        match self {
+            SchedRef::Real(s) => s.lock().results.remove(&id),
+            SchedRef::Det(d) => d.lock().results.remove(&id),
+        }
+    }
+}
+
+/// Upper bound on the deterministic explorer's per-step quantum (instructions before a forced
+/// yield). A small bound interleaves vCPUs finely; the actual quantum each turn is seeded in
+/// `1..=MAX_QUANTUM`, so varying the seed varies the interleaving.
+const MAX_QUANTUM: u64 = 8;
+
+/// The **deterministic explorer** (§18): a single-threaded, seed-driven executor for *verifying*
+/// concurrent guest code. It runs the same vCPUs as the real pool but on one OS thread, choosing
+/// which runnable vCPU to step (and for how long) from a seeded PRNG, and timing out `atomic.wait`s
+/// on a **logical** clock. So a run is fully reproducible from its seed, and sweeping seeds explores
+/// distinct interleavings — turning "run many times and hope" into systematic coverage, with any
+/// failure replayable. No data races exist (one thread), so each seed realizes one valid sequential
+/// interleaving of the shared-memory ops.
+struct DetSched {
+    st: Mutex<DetState>,
+}
+
+struct DetWaiter {
+    key: u64,
+    deadline: u64, // logical ns
+    vcpu: Box<VCpu>,
+}
+
+struct DetState {
+    // `Box` (matching the join/wait waiter maps) keeps moving a large vCPU between the runnable set
+    // and the waiter collections a pointer copy.
+    #[allow(clippy::vec_box)]
+    runnable: Vec<Box<VCpu>>,
+    results: BTreeMap<TaskId, Outcome>,
+    join_waiters: BTreeMap<TaskId, Box<VCpu>>,
+    wait_waiters: Vec<DetWaiter>,
+    live: usize,
+    next_task: TaskId,
+    clock: u64, // logical nanoseconds, advanced only to fire a timeout
+    rng: u64,
+    cap: usize,
+}
+
+impl DetState {
+    /// xorshift64* — the seeded source of all scheduling choices (so the whole run is a function of
+    /// the seed).
+    fn rng(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+}
+
+impl DetSched {
+    fn new(seed: u64, cap: usize) -> DetSched {
+        DetSched {
+            st: Mutex::new(DetState {
+                runnable: Vec::new(),
+                results: BTreeMap::new(),
+                join_waiters: BTreeMap::new(),
+                wait_waiters: Vec::new(),
+                live: 0,
+                next_task: 0,
+                clock: 0,
+                rng: seed | 1,
+                cap,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DetState> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn spawn(&self, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
+        let mut s = self.lock();
+        if s.live >= s.cap {
+            return None;
+        }
+        let id = s.next_task;
+        s.next_task += 1;
+        s.live += 1;
+        s.runnable.push(make(id));
+        Some(id)
+    }
+
+    /// Wake up to `count` vCPUs waiting on `key`, in deterministic (insertion) order.
+    fn notify(&self, key: u64, count: u32) -> u32 {
+        let mut s = self.lock();
+        let mut woken = 0u32;
+        let mut i = 0;
+        while woken < count && i < s.wait_waiters.len() {
+            if s.wait_waiters[i].key == key {
+                let mut w = s.wait_waiters.remove(i);
+                w.vcpu.pending = Some(Pending::Wait(WAIT_WOKEN));
+                s.runnable.push(w.vcpu);
+                woken += 1;
+            } else {
+                i += 1;
+            }
+        }
+        woken
+    }
+}
+
+/// Run a deterministic-explorer instance to completion (every vCPU finished, or a genuine deadlock —
+/// nothing runnable and nothing waiting on a timeout). Picks a runnable vCPU and a quantum from the
+/// seeded PRNG; when none is runnable, advances the logical clock to the earliest `wait` deadline and
+/// times that waiter out.
+fn run_det(det: &Arc<DetSched>) {
+    loop {
+        // Choose the next vCPU + quantum under the lock; release it before running (run_inner may
+        // re-enter via `spawn`/`notify`).
+        let (mut v, quantum) = {
+            let mut s = det.lock();
+            if s.runnable.is_empty() {
+                if s.live == 0 {
+                    return; // all done
+                }
+                // No one runnable: fire the earliest timeout (or deadlock if none).
+                let Some(idx) =
+                    (0..s.wait_waiters.len()).min_by_key(|&i| s.wait_waiters[i].deadline)
+                else {
+                    return; // live > 0 but nothing runnable/waiting: a guest join-deadlock
+                };
+                let mut w = s.wait_waiters.remove(idx);
+                s.clock = s.clock.max(w.deadline);
+                w.vcpu.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
+                s.runnable.push(w.vcpu);
+                continue;
+            }
+            let n = s.runnable.len();
+            let pick = (s.rng() as usize) % n;
+            let v = s.runnable.swap_remove(pick);
+            let quantum = 1 + s.rng() % MAX_QUANTUM;
+            (v, quantum)
+        };
+        match v.run(quantum) {
+            Step::Done(result) => {
+                let id = v.id;
+                let outcome = Outcome {
+                    result,
+                    mem: v.mem.take(),
+                    host: std::mem::take(&mut v.host),
+                    fuel: v.fuel,
+                };
+                drop(v);
+                let mut s = det.lock();
+                if let Some(parent) = s.join_waiters.remove(&id) {
+                    s.runnable.push(parent);
+                }
+                s.results.insert(id, outcome);
+                s.live -= 1;
+            }
+            Step::Park(Blocked::Join { child }) => {
+                let mut s = det.lock();
+                if s.results.contains_key(&child) {
+                    s.runnable.push(v); // already done (pending already set)
+                } else {
+                    s.join_waiters.insert(child, v);
+                }
+            }
+            Step::Park(Blocked::Wait {
+                key,
+                expected,
+                width,
+                timeout_ns,
+            }) => {
+                let mut s = det.lock();
+                if v.atomic_value(key, width) != expected {
+                    v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
+                    s.runnable.push(v);
+                } else {
+                    let deadline = s.clock.saturating_add(timeout_ns);
+                    s.wait_waiters.push(DetWaiter {
+                        key,
+                        deadline,
+                        vcpu: v,
+                    });
+                }
+            }
+            Step::Yield => det.lock().runnable.push(v),
         }
     }
 }
@@ -711,8 +986,9 @@ struct VCpu {
     id: TaskId,
     /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
     pending: Option<Pending>,
-    /// The shared M:N executor (spawn enqueues here; notify wakes here).
-    sched: Arc<Scheduler>,
+    /// The executor this vCPU runs under — the real OS-thread [`Scheduler`] or the deterministic
+    /// [`DetSched`] (spawn enqueues here; notify wakes here).
+    sched: SchedRef,
 }
 
 impl VCpu {
@@ -728,7 +1004,7 @@ impl VCpu {
         fuel: u64,
         depth: u32,
         id: TaskId,
-        sched: Arc<Scheduler>,
+        sched: SchedRef,
     ) -> VCpu {
         VCpu {
             funcs,
@@ -758,11 +1034,14 @@ impl VCpu {
         self.mem.as_ref().map_or(0, |m| m.atomic_value(key, width))
     }
 
-    /// Run until this vCPU finishes or parks. Folds a trap into `Step::Done(Err)`.
-    fn run(&mut self) -> Step {
-        match run_inner(self) {
+    /// Run for up to `quantum` instructions, then finish / park / yield. The real executor passes
+    /// `u64::MAX` (run to completion or park); the deterministic explorer passes a small seeded
+    /// quantum to interleave vCPUs finely. Folds a trap into `Step::Done(Err)`.
+    fn run(&mut self, quantum: u64) -> Step {
+        match run_inner(self, quantum) {
             Ok(Inner::Done(v)) => Step::Done(Ok(v)),
             Ok(Inner::Park(b)) => Step::Park(b),
+            Ok(Inner::Yield) => Step::Yield,
             Err(t) => Step::Done(Err(t)),
         }
     }
@@ -771,8 +1050,9 @@ impl VCpu {
 /// Drive a vCPU until it finishes (`Inner::Done`) or parks on a blocking op (`Inner::Park`). On
 /// re-entry it first completes the parked op recorded in `pending`. The owned `funcs` is borrowed
 /// locally as `fs` so the loop can mutate the other fields.
-fn run_inner(v: &mut VCpu) -> Result<Inner, Trap> {
-    // Resuming from a park: finish the op the scheduler woke us for.
+fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
+    let mut budget = quantum; // instructions left before a forced `Yield` (deterministic explorer)
+                              // Resuming from a park: finish the op the scheduler woke us for.
     match v.pending.take() {
         Some(Pending::Join { slot }) => {
             let child = v
@@ -781,12 +1061,7 @@ fn run_inner(v: &mut VCpu) -> Result<Inner, Trap> {
                 .and_then(|x| *x)
                 .ok_or(Trap::ThreadFault)?;
             v.threads[slot] = None; // a handle is joined once
-            let out = v
-                .sched
-                .lock()
-                .results
-                .remove(&child)
-                .ok_or(Trap::Malformed)?;
+            let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
             let vals = out.result?; // a child trap propagates as this vCPU's trap
             let top = v.frames.len() - 1;
             v.frames[top]
@@ -836,6 +1111,12 @@ fn run_inner(v: &mut VCpu) -> Result<Inner, Trap> {
 
         // Execute the remaining instructions of this block.
         while frames[top].inst < block.insts.len() {
+            // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
+            // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`.
+            if budget == 0 {
+                return Ok(Inner::Yield);
+            }
+            budget -= 1;
             let inst = &block.insts[frames[top].inst];
             step(fuel)?;
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
@@ -979,7 +1260,7 @@ fn run_inner(v: &mut VCpu) -> Result<Inner, Trap> {
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
                     let cfuncs = Arc::clone(&funcs);
-                    let csched = Arc::clone(sched);
+                    let csched = sched.clone();
                     let made = sched.spawn(move |id| {
                         Box::new(VCpu::new(
                             cfuncs,
@@ -1037,7 +1318,7 @@ fn run_inner(v: &mut VCpu) -> Result<Inner, Trap> {
                         key: base,
                         expected: exp,
                         width,
-                        deadline: Instant::now() + wait,
+                        timeout_ns: wait.as_nanos() as u64,
                     }));
                 }
                 // §12 futex notify: wake up to `count` vCPUs parked on the confined address.
