@@ -835,6 +835,9 @@ static int gen_builtin_fiber_suspend(Node *node) {
 //   long __vm_atomic_add  (void *p, long v);             // fetch-add, returns the old value
 //   long __vm_atomic_load (void *p);
 //   void __vm_atomic_store(void *p, long v);
+//   int  __vm_atomic_load32 (void *p);                   // 32-bit load  (for futex words)
+//   void __vm_atomic_store32(void *p, int v);            // 32-bit store (for futex words)
+//   int  __vm_atomic_add32  (void *p, int v);            // 32-bit fetch-add, returns old
 //   int  __vm_atomic_cas32(void *p, int expected, int desired);  // -> old (i32) — locks
 //   int  __vm_wait32(void *p, int expected, long timeout_ns);    // -> 0 woken / 1 != / 2 timeout
 //   int  __vm_notify(void *p, int count);                        // -> number woken
@@ -899,6 +902,36 @@ static int gen_builtin_atomic_store(Node *node) {
   int v = widen_i64(gen_expr(a->next), a->next->ty);
   fprintf(o, "  i64.atomic.store v%d v%d\n", p, v);
   return 0; // void
+}
+
+static int gen_builtin_atomic_load32(Node *node) {
+  if (!node->args || node->args->next)
+    error_tok(node->tok, "codegen_ir: __vm_atomic_load32(ptr) expects 1 argument");
+  int p = widen_i64(gen_expr(node->args), node->args->ty);
+  int r = nv++;
+  fprintf(o, "  v%d = i32.atomic.load v%d\n", r, p);
+  return r; // i32
+}
+
+static int gen_builtin_atomic_store32(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_atomic_store32(ptr, val) expects 2 arguments");
+  int p = widen_i64(gen_expr(a), a->ty);
+  int v = gen_expr(a->next); // i32 (a 4-byte store; do not widen)
+  fprintf(o, "  i32.atomic.store v%d v%d\n", p, v);
+  return 0; // void
+}
+
+static int gen_builtin_atomic_add32(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_atomic_add32(ptr, val) expects 2 arguments");
+  int p = widen_i64(gen_expr(a), a->ty);
+  int v = gen_expr(a->next); // i32
+  int r = nv++;
+  fprintf(o, "  v%d = i32.atomic.rmw.add v%d v%d\n", r, p, v);
+  return r; // old (i32)
 }
 
 static int gen_builtin_atomic_cas32(Node *node) {
@@ -1071,6 +1104,12 @@ static int gen_expr(Node *node) {
           return gen_builtin_atomic_load(node);
         if (!strcmp(fname, "__vm_atomic_store"))
           return gen_builtin_atomic_store(node);
+        if (!strcmp(fname, "__vm_atomic_load32"))
+          return gen_builtin_atomic_load32(node);
+        if (!strcmp(fname, "__vm_atomic_store32"))
+          return gen_builtin_atomic_store32(node);
+        if (!strcmp(fname, "__vm_atomic_add32"))
+          return gen_builtin_atomic_add32(node);
         if (!strcmp(fname, "__vm_atomic_cas32"))
           return gen_builtin_atomic_cas32(node);
         if (!strcmp(fname, "__vm_wait32"))

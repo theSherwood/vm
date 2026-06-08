@@ -1923,3 +1923,95 @@ fn c_threads_deterministic_sweep() {
         assert_eq!(r, Ok(vec![Value::I32(2000)]), "explorer seed {seed}");
     }
 }
+
+// ---- §12 the C-compatible pthreads layer (`#include <pthread.h>`, D56) -----------------------
+// Standard C threading over the VM primitives: `pthread_t` = one vCPU = one OS thread (1:1), with
+// mutexes/conds built on the i32 atomics + futex. Differentially checked interp == JIT by `run_c_full`.
+
+/// `pthread_create`/`join` + a futex-backed `pthread_mutex_t`: four threads each take the lock and bump
+/// a *plain* shared `int` 500×. The mutex serialises the non-atomic `counter++`, so the total is
+/// exactly 2000 (a missing lock would lose updates). Real pthreads code, unmodified.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_pthread_mutex_counter() {
+    let src = "#include <pthread.h>\n\
+        static int counter = 0;\n\
+        static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;\n\
+        static void *worker(void *arg) {\n\
+        \x20 (void)arg;\n\
+        \x20 for (int i = 0; i < 500; i++) {\n\
+        \x20   pthread_mutex_lock(&mu);\n\
+        \x20   counter++;\n\
+        \x20   pthread_mutex_unlock(&mu);\n\
+        \x20 }\n\
+        \x20 return 0;\n\
+        }\n\
+        int main(void) {\n\
+        \x20 pthread_t t[4];\n\
+        \x20 for (int i = 0; i < 4; i++) pthread_create(&t[i], 0, worker, 0);\n\
+        \x20 for (int i = 0; i < 4; i++) pthread_join(t[i], 0);\n\
+        \x20 return counter;\n\
+        }\n";
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(2000)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
+/// `pthread_join` delivers the thread's return value: `start_routine` returns `arg*2` (via the
+/// trampoline + `thread.join`), retrieved through the `void **retval` out-param.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_pthread_join_returns_value() {
+    let src = "#include <pthread.h>\n\
+        static void *dbl(void *arg) { return (void *)((long)arg * 2); }\n\
+        int main(void) {\n\
+        \x20 pthread_t t;\n\
+        \x20 pthread_create(&t, 0, dbl, (void *)21);\n\
+        \x20 void *r;\n\
+        \x20 pthread_join(t, &r);\n\
+        \x20 return (int)(long)r;\n\
+        }\n";
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(42)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
+/// `pthread_cond_t` handoff: a consumer waits on the cond under the mutex until `ready`, the producer
+/// (main) publishes a payload, sets the predicate, and signals. Correct whether the consumer parks
+/// first (woken by the signal) or the signal lands first (predicate already true, no wait) — the
+/// result is the payload, 42, on every interleaving.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_pthread_cond_handoff() {
+    let src = "#include <pthread.h>\n\
+        static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;\n\
+        static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;\n\
+        static int ready = 0;\n\
+        static int payload = 0;\n\
+        static void *consumer(void *arg) {\n\
+        \x20 (void)arg;\n\
+        \x20 pthread_mutex_lock(&mu);\n\
+        \x20 while (!ready) pthread_cond_wait(&cv, &mu);\n\
+        \x20 int p = payload;\n\
+        \x20 pthread_mutex_unlock(&mu);\n\
+        \x20 return (void *)(long)p;\n\
+        }\n\
+        int main(void) {\n\
+        \x20 pthread_t t;\n\
+        \x20 pthread_create(&t, 0, consumer, 0);\n\
+        \x20 pthread_mutex_lock(&mu);\n\
+        \x20 payload = 42;\n\
+        \x20 ready = 1;\n\
+        \x20 pthread_cond_signal(&cv);\n\
+        \x20 pthread_mutex_unlock(&mu);\n\
+        \x20 void *r;\n\
+        \x20 pthread_join(t, &r);\n\
+        \x20 return (int)(long)r;\n\
+        }\n";
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(42)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
