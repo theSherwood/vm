@@ -315,6 +315,32 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitO
     compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
 }
 
+/// Like [`compile_and_run`], but a **threaded** module's cooperative scheduler chooses the next
+/// runnable vCPU from a seeded PRNG instead of FIFO — so a run is a reproducible function of `seed`,
+/// and sweeping seeds explores distinct (block-granularity) interleavings (the JIT analogue of
+/// [`svm_interp::run_scheduled`]). For a non-threaded module the seed is inert. This is the
+/// deterministic, replayable backbone for verifying the scheduler (independent of the parallel
+/// executor).
+pub fn compile_and_run_scheduled(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    seed: u64,
+) -> Result<JitOutcome, JitError> {
+    Ok(run_inner(
+        m,
+        func,
+        args,
+        empty_cap_thunk,
+        core::ptr::null_mut(),
+        None,
+        DEFAULT_RESERVED_LOG2,
+        None,
+        Some(seed),
+    )?
+    .0)
+}
+
 /// Like [`compile_and_run`], but `cap.call`s dispatch through `cap_thunk` with the
 /// caller's `cap_ctx` (the powerbox host). The thunk + ctx addresses are baked into the
 /// compiled code as constants — valid because the module is compiled, run once, then
@@ -339,6 +365,7 @@ pub fn compile_and_run_with_host(
         cap_ctx,
         None,
         DEFAULT_RESERVED_LOG2,
+        None,
         None,
     )?
     .0)
@@ -382,6 +409,7 @@ pub fn compile_and_run_capture_reserved(
         Some(init_mem),
         reserved_log2,
         None,
+        None,
     )
 }
 
@@ -413,6 +441,7 @@ pub fn compile_and_run_capture_reserved_with_host(
         // Escape-oracle over the §1a growth path: snapshot the low `SNAP_CAP` bytes (not just the
         // backed prefix) so guest-grown / `unmap`-ed reserved-tail pages are byte-compared too.
         Some(SNAP_CAP),
+        None,
     )
 }
 
@@ -426,6 +455,7 @@ fn run_inner(
     init_mem: Option<&[u8]>,
     reserved_log2: u8,
     snapshot_cap: Option<usize>,
+    sched_seed: Option<u64>,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // Calls can reach any function, so every function must be lowerable.
@@ -571,6 +601,13 @@ fn run_inner(
     } else {
         None
     };
+    // A seeded run picks the next runnable vCPU pseudo-randomly (reproducible per seed); FIFO else.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    if let (Some(s), Some(seed)) = (&mut sched, sched_seed) {
+        s.set_seed(seed);
+    }
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    let _ = sched_seed;
     #[cfg(all(unix, target_arch = "x86_64"))]
     let thread = match &sched {
         Some(s) => ThreadEnv {

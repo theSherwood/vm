@@ -45,6 +45,28 @@ enum Block {
     Wait { key: u64, deadline: u64 },
 }
 
+/// How the scheduler chooses the next runnable vCPU — the injectable scheduling decision. `Fifo` is
+/// the default deterministic order; `Seeded` makes a *reproducible* pseudo-random choice at each
+/// decision point, so a seed sweep explores distinct (block-granularity) interleavings the way the
+/// interpreter's `run_scheduled` does — the deterministic, replayable backbone for verifying the
+/// scheduler before (and independently of) the parallel executor.
+enum Pick {
+    Fifo,
+    Seeded(u64),
+}
+
+impl Pick {
+    /// xorshift64* step for the seeded policy.
+    fn next(rng: &mut u64) -> u64 {
+        let mut x = *rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *rng = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+}
+
 /// One green thread.
 struct VCpu {
     fiber: Box<Fiber>,
@@ -83,6 +105,8 @@ pub(crate) struct Sched {
     /// The run's host trap cell: when a vCPU trap sets it, the scheduler stops (the domain is killed).
     /// `null` in the unit tests (no JITted code → never set).
     trap_cell: *mut i64,
+    /// How to choose the next runnable vCPU (deterministic `Fifo`, or a seeded sweep).
+    pick: Pick,
 }
 
 /// What a vCPU body uses to spawn children and join them (the cooperative-scheduler handle). Wraps the
@@ -135,12 +159,33 @@ impl Sched {
             stack,
             call_tramp: None,
             trap_cell: std::ptr::null_mut(),
+            pick: Pick::Fifo,
         }
     }
 
     /// Record the JITted thread-entry call-trampoline (set before any vCPU runs).
     pub(crate) fn set_call_tramp(&mut self, t: FiberCallTramp) {
         self.call_tramp = Some(t);
+    }
+
+    /// Switch to a seeded scheduling policy (a reproducible interleaving per seed).
+    pub(crate) fn set_seed(&mut self, seed: u64) {
+        self.pick = Pick::Seeded(seed | 1);
+    }
+
+    /// Choose the next runnable vCPU per the [`Pick`] policy (removing it from the queue).
+    fn next_runnable(&mut self) -> Option<usize> {
+        if self.runnable.is_empty() {
+            return None;
+        }
+        match &mut self.pick {
+            Pick::Fifo => self.runnable.pop_front(),
+            Pick::Seeded(rng) => {
+                let n = self.runnable.len();
+                let i = (Pick::next(rng) % n as u64) as usize;
+                self.runnable.remove(i)
+            }
+        }
     }
 
     /// Point the scheduler at the run's host trap cell, so it stops as soon as a vCPU traps.
@@ -161,7 +206,7 @@ impl Sched {
         // SAFETY: single-threaded driver; see the module reentrancy note.
         let root = unsafe { spawn(self_ptr, body) };
         loop {
-            let tid = match self.runnable.pop_front() {
+            let tid = match self.next_runnable() {
                 Some(t) => t,
                 None => {
                     // Nothing runnable: fire the earliest `wait` deadline (timeout), or stop (all done

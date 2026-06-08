@@ -11,9 +11,71 @@
 #![cfg(all(unix, target_arch = "x86_64"))]
 
 use svm_interp::{run, Trap, Value};
-use svm_jit::{compile_and_run, JitOutcome, TrapKind};
+use svm_jit::{compile_and_run, compile_and_run_scheduled, JitOutcome, TrapKind};
 use svm_text::parse_module;
 use svm_verify::verify_module;
+
+/// A 4-thread × 100 atomic-increment counter (→ 400), shared by the differential and seed-sweep tests.
+const ATOMIC4: &str = "memory 16\n\
+    func () -> (i64) {\n\
+    block0():\n\
+    \x20 v0 = i64.const 0\n\
+    \x20 br block1(v0)\n\
+    block1(v1: i64):\n\
+    \x20 v2 = i64.const 4\n\
+    \x20 v3 = i64.lt_u v1 v2\n\
+    \x20 br_if v3 block2(v1) block3()\n\
+    block2(v4: i64):\n\
+    \x20 v5 = i64.const 100\n\
+    \x20 v6 = thread.spawn 1 v5 v5\n\
+    \x20 v7 = i64.const 4\n\
+    \x20 v8 = i64.mul v4 v7\n\
+    \x20 v9 = i64.const 16\n\
+    \x20 v10 = i64.add v9 v8\n\
+    \x20 i32.store v10 v6\n\
+    \x20 v11 = i64.const 1\n\
+    \x20 v12 = i64.add v4 v11\n\
+    \x20 br block1(v12)\n\
+    block3():\n\
+    \x20 v13 = i64.const 0\n\
+    \x20 br block4(v13)\n\
+    block4(v14: i64):\n\
+    \x20 v15 = i64.const 4\n\
+    \x20 v16 = i64.lt_u v14 v15\n\
+    \x20 br_if v16 block5(v14) block6()\n\
+    block5(v17: i64):\n\
+    \x20 v18 = i64.const 4\n\
+    \x20 v19 = i64.mul v17 v18\n\
+    \x20 v20 = i64.const 16\n\
+    \x20 v21 = i64.add v20 v19\n\
+    \x20 v22 = i32.load v21\n\
+    \x20 v23 = thread.join v22\n\
+    \x20 v24 = i64.const 1\n\
+    \x20 v25 = i64.add v17 v24\n\
+    \x20 br block4(v25)\n\
+    block6():\n\
+    \x20 v26 = i64.const 0\n\
+    \x20 v27 = i64.atomic.load v26\n\
+    \x20 return v27\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block0(vsp: i64, v0: i64):\n\
+    \x20 br block1(v0)\n\
+    block1(v1: i64):\n\
+    \x20 v2 = i64.const 0\n\
+    \x20 v3 = i64.eq v1 v2\n\
+    \x20 br_if v3 block2() block3(v1)\n\
+    block3(v4: i64):\n\
+    \x20 v5 = i64.const 0\n\
+    \x20 v6 = i64.const 1\n\
+    \x20 v7 = i64.atomic.rmw.add v5 v6\n\
+    \x20 v8 = i64.const -1\n\
+    \x20 v9 = i64.add v4 v8\n\
+    \x20 br block1(v9)\n\
+    block2():\n\
+    \x20 v10 = i64.const 0\n\
+    \x20 return v10\n\
+    }\n";
 
 fn to_slot(v: &Value) -> i64 {
     match v {
@@ -81,67 +143,27 @@ fn thread_spawn_join_sums_results() {
 /// handle of worker `i`.
 #[test]
 fn thread_atomic_counter() {
-    let src = "memory 16\n\
-        func () -> (i64) {\n\
-        block0():\n\
-        \x20 v0 = i64.const 0\n\
-        \x20 br block1(v0)\n\
-        block1(v1: i64):\n\
-        \x20 v2 = i64.const 4\n\
-        \x20 v3 = i64.lt_u v1 v2\n\
-        \x20 br_if v3 block2(v1) block3()\n\
-        block2(v4: i64):\n\
-        \x20 v5 = i64.const 100\n\
-        \x20 v6 = thread.spawn 1 v5 v5\n\
-        \x20 v7 = i64.const 4\n\
-        \x20 v8 = i64.mul v4 v7\n\
-        \x20 v9 = i64.const 16\n\
-        \x20 v10 = i64.add v9 v8\n\
-        \x20 i32.store v10 v6\n\
-        \x20 v11 = i64.const 1\n\
-        \x20 v12 = i64.add v4 v11\n\
-        \x20 br block1(v12)\n\
-        block3():\n\
-        \x20 v13 = i64.const 0\n\
-        \x20 br block4(v13)\n\
-        block4(v14: i64):\n\
-        \x20 v15 = i64.const 4\n\
-        \x20 v16 = i64.lt_u v14 v15\n\
-        \x20 br_if v16 block5(v14) block6()\n\
-        block5(v17: i64):\n\
-        \x20 v18 = i64.const 4\n\
-        \x20 v19 = i64.mul v17 v18\n\
-        \x20 v20 = i64.const 16\n\
-        \x20 v21 = i64.add v20 v19\n\
-        \x20 v22 = i32.load v21\n\
-        \x20 v23 = thread.join v22\n\
-        \x20 v24 = i64.const 1\n\
-        \x20 v25 = i64.add v17 v24\n\
-        \x20 br block4(v25)\n\
-        block6():\n\
-        \x20 v26 = i64.const 0\n\
-        \x20 v27 = i64.atomic.load v26\n\
-        \x20 return v27\n\
-        }\n\
-        func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, v0: i64):\n\
-        \x20 br block1(v0)\n\
-        block1(v1: i64):\n\
-        \x20 v2 = i64.const 0\n\
-        \x20 v3 = i64.eq v1 v2\n\
-        \x20 br_if v3 block2() block3(v1)\n\
-        block3(v4: i64):\n\
-        \x20 v5 = i64.const 0\n\
-        \x20 v6 = i64.const 1\n\
-        \x20 v7 = i64.atomic.rmw.add v5 v6\n\
-        \x20 v8 = i64.const -1\n\
-        \x20 v9 = i64.add v4 v8\n\
-        \x20 br block1(v9)\n\
-        block2():\n\
-        \x20 v10 = i64.const 0\n\
-        \x20 return v10\n\
-        }\n";
-    assert_jit_matches_interp(src);
+    assert_jit_matches_interp(ATOMIC4);
+}
+
+/// The deterministic seeded scheduler (the verification backbone): every seed yields the invariant
+/// 400, and each seed is *reproducible* (same seed → same result) — the JIT analogue of the
+/// interpreter's `run_scheduled` sweep, so a scheduler bug surfaces as a replayable failing seed.
+#[test]
+fn thread_seed_sweep_is_invariant_and_reproducible() {
+    let m = parse_module(ATOMIC4).expect("parse");
+    verify_module(&m).expect("verify");
+    for seed in 0..24u64 {
+        let a = compile_and_run_scheduled(&m, 0, &[], seed).expect("jit");
+        let b = compile_and_run_scheduled(&m, 0, &[], seed).expect("jit");
+        match (&a, &b) {
+            (JitOutcome::Returned(x), JitOutcome::Returned(y)) => {
+                assert_eq!(x, &[400], "seed {seed}: not the invariant total");
+                assert_eq!(x, y, "seed {seed}: not reproducible");
+            }
+            _ => panic!("seed {seed}: unexpected {a:?} / {b:?}"),
+        }
+    }
 }
 
 /// Futex handoff: the producer writes a payload to `mem[8]`, spawns a consumer that `atomic.wait`s on
