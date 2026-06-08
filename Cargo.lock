@@ -451,6 +451,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-fiber"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "svm-interp"
 version = "0.0.0"
 dependencies = [

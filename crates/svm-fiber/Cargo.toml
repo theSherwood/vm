@@ -1,0 +1,16 @@
+[package]
+name = "svm-fiber"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The stack-switching substrate (§3d/§6/§12): guard-paged out-of-band control stacks plus the native
+# context switch that swaps them. This is the *only* place the JIT's green-thread `unsafe` lives —
+# mirroring how `svm-mem` isolates the memory `unsafe` — so it stays small and auditable.
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+# mmap'd, guard-paged stacks (PROT_NONE overflow guard). Other targets get no real fiber support yet.
+libc = "0.2"

@@ -4,7 +4,19 @@ Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
-**Latest (2026-06-08):** §18 **exhaustive interleaving model checker** (`svm_interp::explore_all`):
+**Latest (2026-06-08):** §12 **JIT concurrency — commit 1: the `svm-fiber` stack-switch primitive.**
+Starting the unified-M:N-for-the-JIT effort (the agreed full path, not 1:1 OS threads). Because
+`svm-interp` is `#![forbid(unsafe_code)]`, the native stack-switching `unsafe` lives in a new dedicated
+crate `svm-fiber` (mirroring how `svm-mem` isolates memory `unsafe`). It implements a `boost.context`
+`fcontext`-style symmetric switch on **x86-64 unix** via stable naked functions: `jump(to, data) ->
+Transfer{fctx, data}` (push the 6 callee-saved, swap `rsp`, pop, `ret`; the two transferred words ride
+in `rax:rdx`), `make(stack_top, entry)` (lay out a fresh stack so the first jump lands in a trampoline
+that calls `entry`), and a guard-paged `Stack` (mmap + `PROT_NONE` overflow guard, §5). 5 tests pass:
+roundtrip accumulation, runs-on-the-fiber-stack, deep recursion (fib(25)), 100k switches stable, two
+independent fibers. Other targets compile but `supported()` is `false` (JIT keeps bailing there).
+**Next (commit 2):** a safe `Fiber`/`Yielder` wrapper over this, then scheduler integration + IR
+lowering of `cont.new`/`resume`/`suspend` and `thread.*` in the JIT.
+Before that — §18 **exhaustive interleaving model checker** (`svm_interp::explore_all`):
 a stateless (CHESS/`shuttle`-style) checker that enumerates *every* schedule of a small concurrent
 program at memory-op granularity and reports the outcome set — turning the seed sweep (sampling) into
 a *proof*. Proves the lock-free atomic counter and the wait/notify handoff are interleaving-invariant,

@@ -8,6 +8,7 @@ members = [
     "crates/svm-encode",
     "crates/svm-verify",
     "crates/svm-interp",
+    "crates/svm-fiber",
     "crates/svm-jit",
     "crates/svm",
     "crates/svm-run",
@@ -32,6 +33,7 @@ svm-text = { path = "crates/svm-text" }
 svm-encode = { path = "crates/svm-encode" }
 svm-verify = { path = "crates/svm-verify" }
 svm-interp = { path = "crates/svm-interp" }
+svm-fiber = { path = "crates/svm-fiber" }
 svm-jit = { path = "crates/svm-jit" }
 
 [profile.release]
