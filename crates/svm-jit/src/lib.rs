@@ -609,30 +609,43 @@ fn run_inner(
     let uses_fibers = module_uses_fibers(m);
     #[cfg(all(unix, target_arch = "x86_64"))]
     let uses_threads = module_uses_threads(m);
-    // Mixing fibers and threads in one module needs per-vCPU fiber tables (nested switching), which the
-    // JIT doesn't wire yet — bail so the differential harness skips it (the interpreter still runs it).
+    // Per-run fiber constants (the §12 fiber entry type id + the function-table mask), used to build
+    // fiber runtimes — one standalone, or one per vCPU when threads use `cont.*`.
     #[cfg(all(unix, target_arch = "x86_64"))]
-    if uses_fibers && uses_threads {
-        return Err(JitError::Unsupported("fibers + threads in one module"));
+    let fiber_type_id = type_id_of(&distinct, &fiber_func_type());
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    let fiber_mask = (m.funcs.len().next_power_of_two() as u64) - 1;
+    // Fibers + threads compose via a **per-vCPU** fiber runtime (the cooperative scheduler builds one
+    // per vCPU and publishes it through a thread-local). The *parallel* pool doesn't carry per-vCPU
+    // fiber runtimes yet, so that one combination still bails (cooperative still runs it; the interp is
+    // the spec).
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    if uses_fibers && uses_threads && parallel.is_some() {
+        return Err(JitError::Unsupported(
+            "fibers + threads on the parallel pool",
+        ));
     }
+    // A *standalone* fiber runtime (fibers without threads). Threaded modules get a per-vCPU runtime
+    // from the scheduler instead, so none is created here.
     #[cfg(all(unix, target_arch = "x86_64"))]
-    let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
+    let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers && !uses_threads {
         Some(Box::new(fiber_rt::FiberRuntime::new(
-            type_id_of(&distinct, &fiber_func_type()),
-            (m.funcs.len().next_power_of_two() as u64) - 1,
+            fiber_type_id,
+            fiber_mask,
         )))
     } else {
         None
     };
+    // The `cont.*` thunk addresses (the runtime itself is found via a thread-local at call time).
     #[cfg(all(unix, target_arch = "x86_64"))]
-    let fiber = match &fiber_rt {
-        Some(rt) => FiberEnv {
-            rt_addr: (&**rt as *const fiber_rt::FiberRuntime) as i64,
+    let fiber = if uses_fibers {
+        FiberEnv {
             new_thunk: fiber_rt::fiber_new as *const () as i64,
             resume_thunk: fiber_rt::fiber_resume as *const () as i64,
             suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
-        },
-        None => FiberEnv::null(),
+        }
+    } else {
+        FiberEnv::null()
     };
     #[cfg(not(all(unix, target_arch = "x86_64")))]
     let fiber = FiberEnv::null();
@@ -649,7 +662,13 @@ fn run_inner(
     };
     #[cfg(all(unix, target_arch = "x86_64"))]
     let mut sched: Option<Box<thread_rt::Sched>> = if uses_threads && parallel.is_none() {
-        Some(Box::new(thread_rt::Sched::new(1 << 20))) // 1 MiB per-vCPU control stack (guard-paged)
+        // Per-vCPU fiber config (so a vCPU can use `cont.*`), when the module mixes the two.
+        let fiber_cfg = if uses_fibers {
+            Some((fiber_type_id, fiber_mask))
+        } else {
+            None
+        };
+        Some(Box::new(thread_rt::Sched::new(1 << 20, fiber_cfg))) // 1 MiB per-vCPU control stack
     } else {
         None
     };
@@ -844,6 +863,14 @@ fn run_inner(
         #[cfg(not(all(unix, target_arch = "x86_64")))]
         let (run_code, run_args) = (code, args.as_ptr());
 
+        // Standalone fibers (no threads): publish the single fiber runtime so the `cont.*` thunks find
+        // it via the thread-local for the duration of the entry. (Threaded runs publish per-vCPU
+        // runtimes from inside the scheduler instead.)
+        #[cfg(all(unix, target_arch = "x86_64"))]
+        let prev_rt = fiber_rt
+            .as_mut()
+            .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime));
+
         // SAFETY: `run_code` is a finalized trampoline (the entry's, or the scheduler shim) honouring
         // the `Entry` ABI. It reads the arg slots, writes the result slots, accesses only the guarded
         // window (any escape faults into the guard page), reads `fn_table`, and writes `trap_cell`.
@@ -859,6 +886,10 @@ fn run_inner(
                 &mut trap_cell,
             )
         };
+        #[cfg(all(unix, target_arch = "x86_64"))]
+        if let Some(p) = prev_rt {
+            fiber_rt::set_current(p);
+        }
     }
     // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host.
     if faulted {
@@ -996,12 +1027,11 @@ struct CapEnv {
     ctx_addr: i64,
 }
 
-/// The §12 fiber runtime address + the three thunk addresses, baked into `cont.new`/`cont.resume`/
-/// `suspend` sites as constants. All `0` (`null`) when the module uses no fibers or the target has no
-/// stack-switch support — in which case `ensure_supported` has already rejected any fiber op.
+/// The three `cont.*` thunk addresses, baked into `cont.new`/`cont.resume`/`suspend` sites as
+/// constants. All `0` (`null`) when the module uses no fibers or the target has no stack-switch
+/// support. The fiber *runtime* itself is found via a thread-local (per vCPU), not baked here.
 #[derive(Clone, Copy)]
 struct FiberEnv {
-    rt_addr: i64,
     new_thunk: i64,
     resume_thunk: i64,
     suspend_thunk: i64,
@@ -1010,7 +1040,6 @@ struct FiberEnv {
 impl FiberEnv {
     fn null() -> FiberEnv {
         FiberEnv {
-            rt_addr: 0,
             new_thunk: 0,
             resume_thunk: 0,
             suspend_thunk: 0,
@@ -1400,40 +1429,39 @@ fn lower_block(
         // `lower.fiber`), threading `mem_base`/`fn_table_base`/`trap_out` like `cap.call`. A thunk that
         // sets the trap cell (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
         if let Inst::ContNew { func, sp } = inst {
-            // fiber_new(rt, mem_base, fn_table_base, trap_out, funcref:i32, sp:i64) -> i32 handle
-            let rt = b.ins().iconst(I64, lower.fiber.rt_addr);
+            // fiber_new(mem_base, fn_table_base, trap_out, funcref:i32, sp:i64) -> i32 handle. The
+            // running vCPU's fiber runtime is read from a thread-local, so threads + fibers compose.
             let mem_base = b.use_var(lower.mem_var);
             let fnt = b.use_var(lower.fn_table_var);
             let trap_out = b.use_var(lower.trap_var);
             let funcref = get(&vals, *func)?;
             let spv = get(&vals, *sp)?;
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I64, I32, I64] {
+            for t in [I64, I64, I64, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.new_thunk);
-            let call =
-                b.ins()
-                    .call_indirect(tref, thunk, &[rt, mem_base, fnt, trap_out, funcref, spv]);
+            let call = b
+                .ins()
+                .call_indirect(tref, thunk, &[mem_base, fnt, trap_out, funcref, spv]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         if let Inst::ContResume { k, arg } = inst {
-            // fiber_resume(rt, handle:i32, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
+            // fiber_resume(handle:i32, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
             // Results are appended (status:i32, value:i64) to match the IR's two-result shape.
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
-            let rt = b.ins().iconst(I64, lower.fiber.rt_addr);
             let kh = get(&vals, *k)?;
             let av = get(&vals, *arg)?;
             let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for t in [I64, I32, I64, I64, I64] {
+            for t in [I32, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64));
@@ -1441,7 +1469,7 @@ fn lower_block(
             let thunk = b.ins().iconst(I64, lower.fiber.resume_thunk);
             let call = b
                 .ins()
-                .call_indirect(tref, thunk, &[rt, kh, av, status_ptr, trap_out]);
+                .call_indirect(tref, thunk, &[kh, av, status_ptr, trap_out]);
             emit_trap_propagate(b, lower);
             let value = b.inst_results(call)[0];
             let status64 = b.ins().stack_load(I64, ss, 0);
@@ -1452,18 +1480,17 @@ fn lower_block(
             continue;
         }
         if let Inst::Suspend { value } = inst {
-            // fiber_suspend(rt, value:i64, trap_out:i64) -> next-resume arg:i64
-            let rt = b.ins().iconst(I64, lower.fiber.rt_addr);
+            // fiber_suspend(value:i64, trap_out:i64) -> next-resume arg:i64
             let v = get(&vals, *value)?;
             let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I64] {
+            for t in [I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64));
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.suspend_thunk);
-            let call = b.ins().call_indirect(tref, thunk, &[rt, v, trap_out]);
+            let call = b.ins().call_indirect(tref, thunk, &[v, trap_out]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);

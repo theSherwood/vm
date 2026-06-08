@@ -17,7 +17,26 @@
 //! `chain` rejects re-entrant resume of an already-running fiber, so each `Fiber`'s `&mut` is exclusive.
 
 use crate::{FnEntry, TrapKind};
+use std::cell::Cell;
 use svm_fiber::{Fiber, State, Yielder};
+
+thread_local! {
+    /// The fiber runtime of the computation currently running on this OS thread — the standalone root,
+    /// or the vCPU a scheduler is resuming. The `cont.*` thunks read it, so **each vCPU has its own
+    /// fiber table** and threads + fibers compose (a threaded module can use `cont.*` per vCPU). Null
+    /// between resumes / when no fiber-capable computation is running.
+    static CURRENT_RT: Cell<*mut FiberRuntime> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Publish the running computation's fiber runtime; returns the previous value to restore afterward.
+/// Set by the standalone entry path and by each scheduler around a vCPU resume.
+pub(crate) fn set_current(rt: *mut FiberRuntime) -> *mut FiberRuntime {
+    CURRENT_RT.with(|c| c.replace(rt))
+}
+
+fn current() -> *mut FiberRuntime {
+    CURRENT_RT.with(|c| c.get())
+}
 
 /// Max concurrently-allocated fibers per run (matches the interpreter's `MAX_FIBERS`): an anti-bomb
 /// ceiling so a fiber-bomb traps (`FiberFault`) instead of exhausting host memory.
@@ -95,16 +114,21 @@ unsafe fn fault(trap_out: u64) {
 /// Returns the fiber handle (table index), or traps (`-1`) on a fiber-bomb.
 ///
 /// # Safety
-/// `rt` is the run's live `FiberRuntime`; `fn_table_base`/`trap_out` are the threaded context. The
-/// funcref is resolved (and type-checked) lazily on first resume, matching the interpreter.
+/// `fn_table_base`/`trap_out` are the threaded context. The running vCPU's fiber runtime is read from
+/// the [`CURRENT_RT`] thread-local. The funcref is resolved (and type-checked) lazily on first resume,
+/// matching the interpreter.
 pub(crate) unsafe extern "C" fn fiber_new(
-    rt: *mut FiberRuntime,
     mem_base: u64,
     fn_table_base: u64,
     trap_out: u64,
     funcref: i32,
     sp: u64,
 ) -> i32 {
+    let rt = current();
+    if rt.is_null() {
+        fault(trap_out);
+        return -1;
+    }
     let (mask, type_id, call_tramp) = {
         let rt = &mut *rt;
         if rt.fibers.len() >= MAX_FIBERS {
@@ -149,14 +173,19 @@ pub(crate) unsafe extern "C" fn fiber_new(
 /// already-running / finished handle traps (`FiberFault`), matching the interpreter.
 ///
 /// # Safety
-/// `rt` is the run's live runtime; `status_out`/`trap_out` are live `*mut i64` cells.
+/// `status_out`/`trap_out` are live `*mut i64` cells. The running vCPU's runtime is [`CURRENT_RT`].
 pub(crate) unsafe extern "C" fn fiber_resume(
-    rt: *mut FiberRuntime,
     handle: i32,
     arg: i64,
     status_out: *mut i64,
     trap_out: u64,
 ) -> i64 {
+    let rt = current();
+    if rt.is_null() {
+        fault(trap_out);
+        *status_out = 1;
+        return 0;
+    }
     // Phase 1: validate + extract a raw fiber pointer, releasing the `&mut *rt` before the switch.
     let fib: *mut Fiber = {
         let rt = &mut *rt;
@@ -207,12 +236,13 @@ pub(crate) unsafe extern "C" fn fiber_resume(
 /// with no running fiber (the root computation) traps (`FiberFault`).
 ///
 /// # Safety
-/// `rt` is the run's live runtime; `trap_out` is the live trap cell.
-pub(crate) unsafe extern "C" fn fiber_suspend(
-    rt: *mut FiberRuntime,
-    value: i64,
-    trap_out: u64,
-) -> i64 {
+/// `trap_out` is the live trap cell. The running vCPU's runtime is read from [`CURRENT_RT`].
+pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 {
+    let rt = current();
+    if rt.is_null() {
+        fault(trap_out);
+        return 0;
+    }
     // pop-before-switch / push-after keeps the yielder stack consistent so a resumer reached by the
     // switch sees *its* yielder on top.
     let y = {

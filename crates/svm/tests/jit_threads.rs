@@ -237,6 +237,40 @@ fn thread_parallel_futex_handoff() {
     }
 }
 
+/// **Fibers + threads in one module** (the closed gap): a worker thread internally drives a generator
+/// fiber. `main` spawns the worker with arg 5; the worker `cont.new`s a generator (func 2), resumes it
+/// (it `suspend`s 42), and returns 42 + 5 = 47; `main` joins → 47. The JIT now gives each vCPU its own
+/// fiber runtime, so this runs (cooperatively) and matches the interpreter rather than bailing.
+#[test]
+fn thread_with_fiber_inside() {
+    let src = "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = i64.const 0\n\
+        \x20 v1 = i64.const 5\n\
+        \x20 v2 = thread.spawn 1 v0 v1\n\
+        \x20 v3 = thread.join v2\n\
+        \x20 return v3\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, varg: i64):\n\
+        \x20 v0 = ref.func 2\n\
+        \x20 v1 = i64.const 0\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.add v5 varg\n\
+        \x20 return v6\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, varg: i64):\n\
+        \x20 v0 = i64.const 42\n\
+        \x20 v1 = suspend v0\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 return v2\n\
+        }\n";
+    assert_jit_matches_interp(src);
+}
+
 /// Joining the same handle twice is inert the second time → `ThreadFault`, on both backends.
 #[test]
 fn thread_double_join_traps() {

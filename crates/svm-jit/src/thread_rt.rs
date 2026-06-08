@@ -18,7 +18,7 @@
 //! fiber crosses it), and short field borrows derived from the raw `*mut Sched` end before the switch.
 //! Single OS thread, so the `Vec`s are never touched concurrently.
 
-use crate::fiber_rt::FiberCallTramp;
+use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime};
 use crate::{FnEntry, TrapKind};
 use std::collections::VecDeque;
 use svm_fiber::{Fiber, State, Yielder};
@@ -80,6 +80,9 @@ struct VCpu {
     /// The value the scheduler delivers on the next resume (a wait status for a woken/timed-out
     /// waiter; `0` otherwise).
     resume_val: u64,
+    /// This vCPU's own fiber runtime (`cont.*` table), when the module mixes fibers and threads — so
+    /// each vCPU has its *own* fibers. Published via the `fiber_rt` thread-local around each resume.
+    fiber_rt: Option<Box<FiberRuntime>>,
 }
 
 /// The cooperative scheduler: a fiber table + runnable queue + join parking.
@@ -107,6 +110,9 @@ pub(crate) struct Sched {
     trap_cell: *mut i64,
     /// How to choose the next runnable vCPU (deterministic `Fifo`, or a seeded sweep).
     pick: Pick,
+    /// `(fiber_type_id, fn_table_mask)` when the module mixes fibers + threads — each vCPU then gets
+    /// its own `FiberRuntime` built from these (+ `call_tramp`). `None` for pure-thread modules.
+    fiber_cfg: Option<(u32, u64)>,
 }
 
 /// What a vCPU body uses to spawn children and join them (the cooperative-scheduler handle). Wraps the
@@ -147,7 +153,7 @@ impl Ctx {
 }
 
 impl Sched {
-    pub(crate) fn new(stack: usize) -> Sched {
+    pub(crate) fn new(stack: usize, fiber_cfg: Option<(u32, u64)>) -> Sched {
         Sched {
             vcpus: Vec::new(),
             runnable: VecDeque::new(),
@@ -160,6 +166,7 @@ impl Sched {
             call_tramp: None,
             trap_cell: std::ptr::null_mut(),
             pick: Pick::Fifo,
+            fiber_cfg,
         }
     }
 
@@ -228,17 +235,25 @@ impl Sched {
             self.cur = tid;
             // The value to deliver on resume (a wait status for a woken/timed-out waiter; else 0).
             let resume_val = self.vcpus[tid].as_ref().map_or(0, |v| v.resume_val);
-            // Extract a raw fiber pointer and release the `vcpus` borrow before the switch, so a
-            // re-entrant `spawn` may grow the table without aliasing the resumed fiber.
-            let fib: *mut Fiber = match &mut self.vcpus[tid] {
+            // Extract a raw fiber pointer (and this vCPU's fiber runtime, if any), releasing the
+            // `vcpus` borrow before the switch, so a re-entrant `spawn` may grow the table without
+            // aliasing the resumed fiber.
+            let (fib, frt): (*mut Fiber, *mut FiberRuntime) = match &mut self.vcpus[tid] {
                 Some(v) if !v.fiber.is_done() => {
                     v.resume_val = 0;
-                    &mut *v.fiber as *mut Fiber
+                    let frt = v
+                        .fiber_rt
+                        .as_mut()
+                        .map_or(std::ptr::null_mut(), |b| &mut **b as *mut FiberRuntime);
+                    (&mut *v.fiber as *mut Fiber, frt)
                 }
                 _ => continue,
             };
+            // Publish this vCPU's fiber runtime so its `cont.*` ops hit its own table; restore after.
+            let prev_rt = fiber_rt::set_current(frt);
             // SAFETY: `fib` is an address-stable boxed fiber; only one vCPU runs at a time.
             let st = unsafe { (*fib).resume(resume_val) };
+            fiber_rt::set_current(prev_rt);
             // A vCPU trap kills the whole domain: stop scheduling (remaining fibers are abandoned).
             if self.trapped() {
                 break;
@@ -301,6 +316,16 @@ unsafe fn spawn(s: *mut Sched, body: Body) -> usize {
     });
     {
         let s = &mut *s;
+        // If this module mixes fibers + threads, give the vCPU its own fiber runtime (its own `cont.*`
+        // table), built from the per-run config + the shared call-trampoline.
+        let fiber_rt = s.fiber_cfg.map(|(type_id, mask)| {
+            let mut rt = FiberRuntime::new(type_id, mask);
+            rt.set_call_tramp(
+                s.call_tramp
+                    .expect("call-trampoline set before any vCPU runs"),
+            );
+            Box::new(rt)
+        });
         s.vcpus[tid] = Some(VCpu {
             fiber: Box::new(fiber),
             yielder: std::ptr::null(),
@@ -308,6 +333,7 @@ unsafe fn spawn(s: *mut Sched, body: Body) -> usize {
             result: 0,
             joined: false,
             resume_val: 0,
+            fiber_rt,
         });
     }
     tid
@@ -556,7 +582,7 @@ mod tests {
     /// block (the children run only after the root yields by joining), and every result must arrive.
     #[test]
     fn spawn_join_sum() {
-        let mut s = Sched::new(STACK);
+        let mut s = Sched::new(STACK, None);
         let r = s.run(Box::new(|ctx: &Ctx| {
             let mut total = 0i64;
             let mut handles = Vec::new();
@@ -575,7 +601,7 @@ mod tests {
     /// child. Exercises spawning + joining from *within* a running vCPU (the reentrant path).
     #[test]
     fn nested_spawn_join() {
-        let mut s = Sched::new(STACK);
+        let mut s = Sched::new(STACK, None);
         let r = s.run(Box::new(|ctx: &Ctx| {
             let child = ctx.spawn(Box::new(|c: &Ctx| {
                 let g = c.spawn(Box::new(|_c: &Ctx| 41));
@@ -590,7 +616,7 @@ mod tests {
     /// child's result — and joining an out-of-range handle is inert (`Err`).
     #[test]
     fn join_blocks_and_forged_handle_is_inert() {
-        let mut s = Sched::new(STACK);
+        let mut s = Sched::new(STACK, None);
         let r = s.run(Box::new(|ctx: &Ctx| {
             assert!(ctx.join(9999).is_err(), "forged handle must be inert");
             let h = ctx.spawn(Box::new(|_c: &Ctx| 7));
@@ -605,7 +631,7 @@ mod tests {
     /// Many children interleave correctly and each returns its own value.
     #[test]
     fn many_children_independent() {
-        let mut s = Sched::new(STACK);
+        let mut s = Sched::new(STACK, None);
         let r = s.run(Box::new(|ctx: &Ctx| {
             let handles: Vec<usize> = (0..16)
                 .map(|k| ctx.spawn(Box::new(move |_c: &Ctx| (k * k) as i64)))
@@ -622,7 +648,7 @@ mod tests {
     /// `WAIT_WOKEN`. (Drives the block→notify path the cooperative JIT can't reach root-first.)
     #[test]
     fn wait_then_notify_wakes() {
-        let mut s = Sched::new(STACK);
+        let mut s = Sched::new(STACK, None);
         let r = s.run(Box::new(|ctx: &Ctx| {
             let waiter = ctx.spawn(Box::new(|c: &Ctx| c.wait(KEY, u64::MAX) as i64));
             let notifier = ctx.spawn(Box::new(|c: &Ctx| c.notify(KEY, 1) as i64));
@@ -637,7 +663,7 @@ mod tests {
     /// logical clock advancing to its deadline.
     #[test]
     fn wait_times_out() {
-        let mut s = Sched::new(STACK);
+        let mut s = Sched::new(STACK, None);
         let r = s.run(Box::new(|ctx: &Ctx| {
             let waiter = ctx.spawn(Box::new(|c: &Ctx| c.wait(KEY, 1_000) as i64));
             ctx.join(waiter).unwrap()

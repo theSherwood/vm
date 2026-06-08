@@ -51,8 +51,13 @@ has the full thread surface: spawn/join/wait/notify + atomics, multi-core.** The
 via `cargo test -p svm-jit --lib loom` with `RUSTFLAGS=--cfg loom` (fast, preemption-bounded). **TODO
 (blocked):** add a gating CI `loom` job — couldn't push the `.github/workflows/ci.yml` edit from this
 session (the OAuth app lacks GitHub `workflow` scope); the job is a copy of `check` with that one
-command + `RUSTFLAGS: "--cfg loom"`. Remaining feature gap: fibers+threads in one module still bail
-(needs per-vCPU fiber tables) — an edge case; real C uses threads *or* fibers. **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
+command + `RUSTFLAGS: "--cfg loom"`. **Fibers+threads gap — option #1 implemented (cooperative):** the
+JIT's fiber runtime is now **per-vCPU**, found via a `fiber_rt::CURRENT_RT` thread-local that the
+standalone entry path and the cooperative scheduler publish around each resume (the `cont.*` thunks
+dropped their baked `rt` arg and read it instead). So a threaded module whose vCPUs use `cont.*` runs
+on the cooperative JIT and matches the interpreter (`jit_threads::thread_with_fiber_inside` → 47).
+**Still bails on the *parallel* pool** (`fibers + threads on the parallel pool`) — the same per-vCPU
+runtime needs wiring into `par_jit`'s `Ctx` (Stage B, next). **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
 deterministic spec; the parallel JIT refines it (differential + invariant stress), and the parallel
 *glue* is loom-checked — TSan can't see JITted accesses, so it's not used for the JIT path.
 
