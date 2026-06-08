@@ -405,9 +405,9 @@ security — UB in a sandbox IR would void the escape guarantee.
   + `store8/16/32` (C char/short). Address operand + immediate offset + alignment
   *hint* (unaligned allowed). Confinement masking is implicit (JIT-inserted).
 - **Atomics** (C11, §12): atomic load/store at orderings; RMW `add sub and or xor
-  exchange cmpxchg` at orderings; `fence`; `wait`/`notify` (futex). *(Specified here for
-  completeness, but **deferred to Phase 4** with the rest of the concurrency model — see
-  §18; the scalar MVP, Phases 1–3, ships without them. Not yet in the IR.)*
+  exchange cmpxchg` at orderings; `fence`; `wait`/`notify` (futex). *(**Implemented**
+  (Phase-4 concurrency, ahead of the original plan): in the IR, interpreter, and JIT,
+  alongside the `cont.*` fiber and `thread.spawn`/`thread.join` primitives — see §12, D56.)*
 - **Calls** (produce results): `call <func>`, `call_indirect <funcref>` (typed;
   static check, runtime check only for dynamic dispatch), `cap.call <handle>
   <op-index>` (handle type + op-index → signature; async/sync per the operation).
@@ -1285,7 +1285,17 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   and allocates a fiber only when it actually blocks. Stackful fibers serve both.
 - *Rejected:* a built-in M:N scheduler — policy lock-in, the double-scheduler
   pathology (guest runtime over VM runtime), trusted complexity. The reason wasm
-  ships none.
+  ships none. *(We briefly built one anyway — a green-thread M:N executor in the
+  JIT — then removed it to honour this line; see **D56**. The lesson is logged so
+  it isn't re-attempted.)*
+- **Implemented (the concrete primitives):** `cont.new`/`cont.resume`/`suspend`
+  (fibers), `thread.spawn`/`thread.join` (a vCPU = **one OS thread**, 1:1), and
+  the `wait`/`notify` futex + C11 atomics — in the IR, interpreter, and JIT
+  (x86-64 unix). A spawned vCPU runs the guest entry under the §5 detect-and-kill
+  guard on its own OS thread; the guest builds any M:N model over these. **No
+  scheduler in the VM** (D56). Deterministic verification of all interleavings is
+  the interpreter oracle (`run_scheduled`/`explore_all`, §18), against which the
+  real-thread JIT is differential-tested; the futex glue is loom-checked.
 
 ### Host-call ABI: async-first
 - Blocking-capable host calls are **submit/complete** (io_uring-shaped). The
@@ -1806,8 +1816,13 @@ team has **no expert safety net**.
   parity is of the *portable* tiers, stated honestly. *~1–2 months, gated on a
   solid Phase-3 MVP.*
 - **Phase 4 — Deferred (post-MVP), developed against the parity matrix** — full
-  concurrency (fibers/vCPUs/M:N), nesting, shared memory, isolation tiers, Spectre
-  hardening, split-host supervisor, monitoring, GPU, SIMD, revocation.
+  concurrency, nesting, shared memory, isolation tiers, Spectre hardening,
+  split-host supervisor, monitoring, GPU, SIMD, revocation. *(**Concurrency
+  primitives have landed early**: fibers `cont.*`, 1:1 `thread.spawn`/`join`, the
+  `wait`/`notify` futex + C11 atomics, in IR/interp/JIT on x86-64 unix — **no VM
+  scheduler**, M:N is guest-built (D56/§12). Still deferred here: guest M:N
+  runtimes as worked examples, the async submit/complete ring (§9/§12), fiber/vCPU
+  quota metering, and the fuel/epoch preemption kill-path for runaway siblings.)*
 
 **The hard ceiling (call it out, don't bury it):** in this configuration
 **"appears to work" is reachable; "is actually secure" is not.** The verifier +
@@ -1911,3 +1926,4 @@ as open-ended, not a byproduct of the build.
 | D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`) | Proposed | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
 | D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset) and wasm→IR bridge (compat) — vehicle priority deferred.** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | Open (strategy settled) | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
 | D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
+| D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |

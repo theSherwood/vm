@@ -1,68 +1,41 @@
 # Handoff — C frontend (chibicc → SVM IR) + differential fuzzing
 
-Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07**.
+Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-08**.
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
-**DECISION (2026-06-08) — concurrency model: keep two primitives, unify the *implementation* (option
-#1), not the IR surface (#3).** Green threads (`thread.spawn` vCPUs, scheduler-owned, parallel,
-nondeterministic) and fibers (`cont.*`, guest-owned, cooperative, deterministic synchronous control
-transfer) are *the same mechanism* (a suspendable stack — a vCPU literally **is** an `svm-fiber`) used
-under two **scheduling disciplines**; `resume` (sequential) vs `spawn` (concurrent) are two ops on one
-continuation. They are **not** redundant: threads give parallelism, fibers give deterministic
-continuations (generators / async / algebraic effects) that threads can't express; and a fiber can't
-run in parallel with its resumer. **Considered three options:** (#1) keep both IR primitives, make them
-*coexist* by giving each vCPU its own fiber runtime; (#2) drop guest `cont.*`, threads-only (Go-style;
-loses deterministic continuations + effect-language hosting); (#3) collapse to one continuation
-primitive (`resume`/`spawn`), most principled, matches Wasm typed-continuations, but a large redesign
-of verify/types/frontend and re-verification of a currently-green system, with a blurrier
-deterministic-verification boundary and loss of the footgun-free `spawn`/`join` contract (which can be
-kept as sugar anyway). **Chose #1** because the combo gap is mostly an *implementation* artifact (today
-`fiber_rt` is one-per-run; the thread schedulers are separate), so a **per-vCPU fiber runtime** makes
-them compose at ~10% of #3's cost/risk, keeps the simple thread contract and the crisp verification
-split, and is a *stepping stone* toward #3 if we ever commit to a continuations-first identity.
-**Tradeoff accepted:** two IR concepts instead of one (slightly more surface to document/maintain);
-revisit #3 only if this VM becomes fundamentally a continuations machine.
+**DECISION (2026-06-08) — concurrency: primitives only, no scheduler in the VM (D56).** §12/D22 say the
+VM ships *mechanism, not a scheduler*. We briefly violated that — built a green-thread **M:N executor**
+in the JIT (cooperative `thread_rt` + a loom-verified `par`/`par_jit` worker pool, "option #1") — then
+**removed it** because it reintroduced D22's exact costs: policy lock-in, the double-scheduler pathology,
+and the project's highest-risk unsafe (fiber migration across OS threads) in the runtime TCB. The VM now
+exposes only **primitives**: `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS
+thread**, 1:1), and the `wait`/`notify` futex + C11 atomics. Any M:N model is the guest runtime's job.
+This is strictly **less** opinionated than wasm on threading. Replacement: `svm-jit/src/os_thread_rt.rs`
+— the root vCPU runs on the caller's thread under the §5 `run_guarded` guard; each `thread.spawn` is a
+real `std::thread` running the guest entry under the per-OS-thread `setjmp`/`siglongjmp` guard; `join`
+blocks on a completion cell (double-join traps); `wait`/`notify` is a condvar futex (per-key generation,
+no lost wakeup, loom-checked). `run_inner` joins every spawned vCPU before freeing the window/code. The
+threaded and non-threaded run paths merged (`sched_entry`/`SchedCtx` gone); `compile_and_run_parallel`/
+`_scheduled` collapsed into `compile_and_run` (threads are 1:1-parallel by default).
 
-**Latest (2026-06-08):** §12 **the JIT runs threads on real multiple cores (part 4 step 2b DONE).**
-`compile_and_run_parallel(m, func, args, workers)` drives a threaded module on the loom-verified `par`
-worker pool: the guest entry is root vCPU 0, spawned vCPUs are fibers multiplexed across `workers` OS
-threads, `join` blocks via fiber suspend, and all vCPUs share the one `Arc<Region>` window → real
-parallel **hardware atomics**. Glue (`svm-jit/src/par_jit.rs`): a fiber-backed `par::Task`, parallel
-`thread_spawn`/`thread_join` thunks, the **current-vCPU `thread_local`** (parallel has many live vCPUs,
-so no single `cur`), and **per-worker detect-and-kill** — each `fiber.resume` runs under the §5
-`setjmp` guard (reusing the existing thread-local shim via an `Entry`-shaped `fiber_resume_entry`), so a
-guest fault on any worker unwinds out and tears the pool down. `run_inner` gained a parallel mode
-(bakes the `par` thunks + `par::Shared` address instead of the cooperative `thread_rt`). **Verified:**
-`thread_parallel_atomic_counter` (40 runs × 4 workers → 400 via contended hardware atomics) + the
-loom protocol check + the cooperative differential/seeded sweep all green; clippy/fmt clean. **Found +
-fixed:** the root body passed a null `fn_table` to the entry trampoline → guest `thread.spawn`
-resolved child code from null → SIGSEGV (now passes the real `fn_table_base`). **Step 2c DONE — `wait`/`notify` in the parallel pool.** `par` gained `Step::Wait { key, deadline }`,
-a `wait_waiters` list, a logical clock, and **quiescence detection** (when every worker is idle and only
-futex-waiters remain, no running thread can notify → fire the earliest deadline as a timeout, so a
-never-notified wait can't hang the pool). `par::notify` wakes waiters → runnable (`WAIT_WOKEN`); the
-worker delivers the wake status via `resume_val`. `par_jit` gained `thread_wait` (confined value-compare
-in the thunk; park on equal; spec-allowed spurious wakeups so a single suspend, no re-check loop) and
-`thread_notify`, wired into the parallel `ThreadEnv`. Verified: `thread_parallel_futex_handoff` (40 × 4
-workers — the consumer genuinely parks then is woken, the real block→notify path) + a second **loom**
-test (`loom_wait_notify_never_hangs`, preemption-bounded) exploring notify-before-park (→ quiescence
-timeout) and notify-after-park (→ woken), both completing with the invariant result. **Parallel JIT now
-has the full thread surface: spawn/join/wait/notify + atomics, multi-core.** The loom model checks run
-via `cargo test -p svm-jit --lib loom` with `RUSTFLAGS=--cfg loom` (fast, preemption-bounded). **TODO
-(blocked):** add a gating CI `loom` job — couldn't push the `.github/workflows/ci.yml` edit from this
-session (the OAuth app lacks GitHub `workflow` scope); the job is a copy of `check` with that one
-command + `RUSTFLAGS: "--cfg loom"`. **Fibers+threads gap — option #1 implemented (cooperative):** the
-JIT's fiber runtime is now **per-vCPU**, found via a `fiber_rt::CURRENT_RT` thread-local that the
-standalone entry path and the cooperative scheduler publish around each resume (the `cont.*` thunks
-dropped their baked `rt` arg and read it instead). So a threaded module whose vCPUs use `cont.*` runs
-on the cooperative JIT and matches the interpreter (`jit_threads::thread_with_fiber_inside` → 47).
-**Stage B DONE — the gap is fully closed, parallel too:** `par_jit`'s `Ctx` now also carries a per-vCPU
-`FiberRuntime` (built from `Env.fiber_cfg` + the call-trampoline), published via `CURRENT_RT` around
-each worker resume, so fibers + threads compose on the **multi-core** pool as well
-(`jit_threads::thread_parallel_with_fibers` → 228 across 4 workers, and matches the interpreter). The
-`uses_fibers && uses_threads` bail is gone entirely. **Option #1 complete.** **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
-deterministic spec; the parallel JIT refines it (differential + invariant stress), and the parallel
-*glue* is loom-checked — TSan can't see JITted accesses, so it's not used for the JIT path.
+**Verification posture (unchanged, and now cleaner):** the **interpreter** is the deterministic oracle —
+`run_scheduled(seed)` / `explore_all` exhaust interleavings at *instruction-quantum* granularity, a
+sound model of preemptive 1:1 OS threads — so removing the JIT scheduler lost nothing (the JIT never
+needed its own deterministic mode). The real-thread JIT is differential-tested against the interp; the
+futex glue is loom-checked (`cargo test -p svm-jit --lib loom`, `RUSTFLAGS=--cfg loom`). TSan can't see
+JITted accesses, so it isn't used for the JIT path; it still covers the interp (`threads`/`concurrent`).
+
+**Still open (deferred):** guest-built M:N runtimes as worked examples; the async submit/complete ring
+(§9/§12); fiber/vCPU quota metering; the fuel/epoch preemption kill-path that stops *sibling* OS threads
+when one vCPU traps (today a trapped domain is torn down at join/run-end, not mid-flight).
+
+> **⚠️ SUPERSEDED (see the D56 decision note above).** Everything from here to the
+> "commit 3: fibers run in the JIT" changelog describes the green-thread **M:N executor**
+> (`thread_rt` + `par`/`par_jit`, the seeded JIT scheduler, the worker pool) that was **built and then
+> removed**. It is kept only as historical record of how we got to `os_thread_rt` (the 1:1 OS-thread
+> primitive). For current behaviour read the top of this file + §12/D56 in DESIGN.md. The fiber runtime
+> (`fiber_rt`) and the futex described below survive; the scheduler does not.
 
 §12 **JIT concurrency (cooperative) is functionally complete** — the JIT runs **fibers
 (`cont.*`), threads (`thread.spawn`/`join`), and the futex (`atomic.wait`/`notify`)** on the
