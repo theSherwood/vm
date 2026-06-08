@@ -43,11 +43,33 @@ the result + move joiners to runnable + `notify_all`; the pool exits when `live 
 ways: a real-OS-thread **stress** test (2000+1000 runs, 4 workers, nested children → exact sums) and a
 **loom** model check (`loom_spawn_join_no_lost_wakeup`, `RUSTFLAGS="--cfg loom"`) that exhaustively
 explores the 2-worker queue/wake races with **mock tasks** → no lost task / no lost wakeup. (CI: a loom
-job needs `--cfg loom`; not yet added.) **Next 2b:** wire real `Fiber` tasks + JIT in — each worker
-installs the guard + runs under the `setjmp` shim (per-worker detect-and-kill; a fault sets the shared
-trap cell + shutdown), parked fibers migrate via their slot, all vCPUs share the `Arc<Region>` window;
-add `wait`/`notify` to the parallel protocol + `compile_and_run_parallel`; verify by invariant stress +
-the differential.
+job needs `--cfg loom`; not yet added.)
+
+**Step 2b — wire real fibers + JIT into the parallel core (PLANNED; the highest-risk integration).**
+Concrete mechanisms worked out:
+- **Mode selection is just which thunks/sched get baked.** The `thread.*` lowering already reads
+  addresses from `lower.thread` (`ThreadEnv`); the lowering is *identical* for cooperative vs parallel.
+  So `run_inner` gains a mode: cooperative-seeded bakes `thread_rt` thunks + `thread_rt::Sched`
+  (today); parallel bakes new `par` thunks + `par::Shared`. Add `compile_and_run_parallel(m, func,
+  args, workers)`.
+- **Fiber-backed `Task`.** A `par` `Task` impl wraps a `Fiber` running the guest entry via the shared
+  call-trampoline; `run` = `fiber.resume`, and the block reason (`Join`/`Wait`) set by a thunk during
+  the resume is read back after the fiber suspends (a per-task block slot).
+- **"Current vCPU" per worker = a `thread_local`.** Unlike the cooperative `Sched.cur`, parallel has
+  many vCPUs live at once, so the running vCPU's context (its tid + `Yielder` + block slot + `Shared`)
+  is a `thread_local` the fiber's closure sets at entry / the worker manages around `resume`; the `par`
+  thunks read it to know who is calling. (This is the standard green-thread runtime pattern.)
+- **Per-worker detect-and-kill.** Each worker `install_guard()`s and runs each `fiber.resume` under the
+  `setjmp`/`siglongjmp` shim; a guard fault `longjmp`s out of that resume, the worker sets the shared
+  trap cell + a `shutdown` flag and exits, and the pool tears down (other fibers abandoned — the domain
+  is being killed). Needs a `run_guarded`-style wrapper around a closure (the current shim wraps a
+  single `Entry` fn; a small generalization or a per-resume shim entry).
+- **`wait`/`notify` in `par`.** Mirror `thread_rt`: a `wait_waiters` list keyed by the futex address +
+  a logical clock fired when no worker has runnable work (parallel timeout needs care: fire only when
+  *all* workers are idle and only waiters remain). `notify` wakes waiters → runnable + `notify_all`.
+- **Verification:** invariant **stress** (atomic counter / futex on N real workers, many runs) + the
+  interp↔JIT **differential** (result must match) + the seeded cooperative sweep still green; extend
+  the loom model with a `wait`/`notify` scenario. TIGER_STYLE assertions on the runnable/waiter sets.
 
 Original plan for reference:
 - **2a (loom-testable concurrent protocol).** Factor the scheduler so its *task* is abstract:
