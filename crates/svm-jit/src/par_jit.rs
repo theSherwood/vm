@@ -12,7 +12,7 @@
 //! vCPU's `Yielder` (to suspend) and block slot. Lock discipline lives in `par`: a thunk locks the
 //! scheduler only briefly and never across the suspend.
 
-use crate::fiber_rt::FiberCallTramp;
+use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime};
 use crate::par::{Shared, Step, Task};
 use crate::{mem, FnEntry, TrapKind};
 use std::cell::Cell;
@@ -41,6 +41,9 @@ struct Env {
     call_tramp: FiberCallTramp,
     fault_lo: usize,
     fault_hi: usize,
+    /// `(fiber_type_id, fn_table_mask)` when the module mixes fibers + threads — each vCPU then gets
+    /// its own `FiberRuntime` for `cont.*`. `None` for pure-thread modules.
+    fiber_cfg: Option<(u32, u64)>,
 }
 
 /// The running vCPU's context, reached by the `thread.*` thunks via [`CURRENT`].
@@ -50,6 +53,9 @@ struct Ctx {
     /// Set by a thunk just before it suspends; read by [`FiberTask::run`] after the fiber yields.
     block: Option<Block>,
     env: Env,
+    /// This vCPU's own fiber runtime (its `cont.*` table), when the module mixes fibers + threads.
+    /// Published via `fiber_rt::CURRENT_RT` around each resume so its `cont.*` ops hit its own table.
+    fiber_rt: Option<Box<FiberRuntime>>,
 }
 
 thread_local! {
@@ -127,7 +133,14 @@ impl Task for FiberTask {
             resume_val: resume_val as u64,
             out: Out::Yield,
         };
-        // Run the resume under this worker's guard, with the running vCPU published in the thread-local.
+        // Run the resume under this worker's guard, with the running vCPU published in the thread-local
+        // (and its own fiber runtime, if any, published for the `cont.*` thunks).
+        let frt = self
+            .ctx
+            .fiber_rt
+            .as_mut()
+            .map_or(std::ptr::null_mut(), |b| &mut **b as *mut FiberRuntime);
+        let prev_frt = fiber_rt::set_current(frt);
         let prev = CURRENT.with(|c| c.replace(ctx_ptr));
         // SAFETY: `fiber_resume_entry` honours the Entry ABI; `rc` outlives the call; a guest fault in
         // `[lo,hi)` unwinds back here (the fiber stack is abandoned — the domain is being killed).
@@ -144,6 +157,7 @@ impl Task for FiberTask {
             )
         };
         CURRENT.with(|c| c.set(prev));
+        fiber_rt::set_current(prev_frt);
 
         if faulted {
             // SAFETY: `trap_out` is the run's live trap cell.
@@ -172,10 +186,17 @@ impl Task for FiberTask {
 /// Build a vCPU fiber for `body` with context `env`. The fiber body publishes its `Yielder` into the
 /// `Ctx` at entry (so thunks can suspend it), then runs the guest code.
 fn make_task(env: Env, body: Body) -> FiberTask {
+    // If the module mixes fibers + threads, this vCPU gets its own fiber runtime for `cont.*`.
+    let fiber_rt = env.fiber_cfg.map(|(type_id, mask)| {
+        let mut rt = FiberRuntime::new(type_id, mask);
+        rt.set_call_tramp(env.call_tramp);
+        Box::new(rt)
+    });
     let mut ctx = Box::new(Ctx {
         yielder: std::ptr::null(),
         block: None,
         env,
+        fiber_rt,
     });
     let ctx_ptr: *mut Ctx = &mut *ctx;
     let fiber = Fiber::new(FIBER_STACK, move |y: &Yielder, _arg: u64| -> u64 {
@@ -232,6 +253,7 @@ pub(crate) unsafe fn run_root(
     trap_out: *mut i64,
     call_tramp: FiberCallTramp,
     fault: (usize, usize),
+    fiber_cfg: Option<(u32, u64)>,
 ) {
     let env = Env {
         mem_base,
@@ -240,6 +262,7 @@ pub(crate) unsafe fn run_root(
         call_tramp,
         fault_lo: fault.0,
         fault_hi: fault.1,
+        fiber_cfg,
     };
     let root = make_task(
         env,

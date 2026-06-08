@@ -56,8 +56,11 @@ JIT's fiber runtime is now **per-vCPU**, found via a `fiber_rt::CURRENT_RT` thre
 standalone entry path and the cooperative scheduler publish around each resume (the `cont.*` thunks
 dropped their baked `rt` arg and read it instead). So a threaded module whose vCPUs use `cont.*` runs
 on the cooperative JIT and matches the interpreter (`jit_threads::thread_with_fiber_inside` → 47).
-**Still bails on the *parallel* pool** (`fibers + threads on the parallel pool`) — the same per-vCPU
-runtime needs wiring into `par_jit`'s `Ctx` (Stage B, next). **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
+**Stage B DONE — the gap is fully closed, parallel too:** `par_jit`'s `Ctx` now also carries a per-vCPU
+`FiberRuntime` (built from `Env.fiber_cfg` + the call-trampoline), published via `CURRENT_RT` around
+each worker resume, so fibers + threads compose on the **multi-core** pool as well
+(`jit_threads::thread_parallel_with_fibers` → 228 across 4 workers, and matches the interpreter). The
+`uses_fibers && uses_threads` bail is gone entirely. **Option #1 complete.** **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
 deterministic spec; the parallel JIT refines it (differential + invariant stress), and the parallel
 *glue* is loom-checked — TSan can't see JITted accesses, so it's not used for the JIT path.
 

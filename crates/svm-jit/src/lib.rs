@@ -615,16 +615,8 @@ fn run_inner(
     let fiber_type_id = type_id_of(&distinct, &fiber_func_type());
     #[cfg(all(unix, target_arch = "x86_64"))]
     let fiber_mask = (m.funcs.len().next_power_of_two() as u64) - 1;
-    // Fibers + threads compose via a **per-vCPU** fiber runtime (the cooperative scheduler builds one
-    // per vCPU and publishes it through a thread-local). The *parallel* pool doesn't carry per-vCPU
-    // fiber runtimes yet, so that one combination still bails (cooperative still runs it; the interp is
-    // the spec).
-    #[cfg(all(unix, target_arch = "x86_64"))]
-    if uses_fibers && uses_threads && parallel.is_some() {
-        return Err(JitError::Unsupported(
-            "fibers + threads on the parallel pool",
-        ));
-    }
+    // Fibers + threads compose via a **per-vCPU** fiber runtime — built per vCPU by whichever scheduler
+    // runs (cooperative `thread_rt` or the parallel `par` pool) and published through a thread-local.
     // A *standalone* fiber runtime (fibers without threads). Threaded modules get a per-vCPU runtime
     // from the scheduler instead, so none is created here.
     #[cfg(all(unix, target_arch = "x86_64"))]
@@ -826,6 +818,11 @@ fn run_inner(
             // `run_root` (it blocks until the pool finishes); a per-worker guard turns a guest fault
             // into a trap-cell write + pool shutdown.
             unsafe {
+                let fiber_cfg = if uses_fibers {
+                    Some((fiber_type_id, fiber_mask))
+                } else {
+                    None
+                };
                 par_jit::run_root(
                     ps,
                     workers,
@@ -837,6 +834,7 @@ fn run_inner(
                     &mut trap_cell,
                     par_call_tramp.expect("call-trampoline set for a threaded module"),
                     fault,
+                    fiber_cfg,
                 );
             }
         }

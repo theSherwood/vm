@@ -271,6 +271,84 @@ fn thread_with_fiber_inside() {
     assert_jit_matches_interp(src);
 }
 
+/// Fibers + threads on the **parallel** pool: four worker threads each drive their own generator fiber
+/// (each returns `iters + 42` where the fiber yields 42) and `main` sums the joins. Each vCPU has its
+/// own fiber runtime, so the per-thread coroutines don't interfere — runs on real cores, exact sum
+/// every time. (`mem[16+4i]` holds worker `i`'s handle; result = Σ (i*10 + 42) for i in 0..4.)
+#[test]
+fn thread_parallel_with_fibers() {
+    let src = "memory 16\n\
+        func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = i64.const 0\n\
+        \x20 br block1(v0)\n\
+        block1(v1: i64):\n\
+        \x20 v2 = i64.const 4\n\
+        \x20 v3 = i64.lt_u v1 v2\n\
+        \x20 br_if v3 block2(v1) block3()\n\
+        block2(v4: i64):\n\
+        \x20 v5 = i64.const 10\n\
+        \x20 v6 = i64.mul v4 v5\n\
+        \x20 v7 = thread.spawn 1 v4 v6\n\
+        \x20 v8 = i64.const 4\n\
+        \x20 v9 = i64.mul v4 v8\n\
+        \x20 v10 = i64.const 16\n\
+        \x20 v11 = i64.add v10 v9\n\
+        \x20 i32.store v11 v7\n\
+        \x20 v12 = i64.const 1\n\
+        \x20 v13 = i64.add v4 v12\n\
+        \x20 br block1(v13)\n\
+        block3():\n\
+        \x20 v14 = i64.const 0\n\
+        \x20 br block4(v14, v14)\n\
+        block4(v15: i64, v16: i64):\n\
+        \x20 v17 = i64.const 4\n\
+        \x20 v18 = i64.lt_u v15 v17\n\
+        \x20 br_if v18 block5(v15, v16) block6(v16)\n\
+        block5(v19: i64, v20: i64):\n\
+        \x20 v21 = i64.const 4\n\
+        \x20 v22 = i64.mul v19 v21\n\
+        \x20 v23 = i64.const 16\n\
+        \x20 v24 = i64.add v23 v22\n\
+        \x20 v25 = i32.load v24\n\
+        \x20 v26 = thread.join v25\n\
+        \x20 v27 = i64.add v20 v26\n\
+        \x20 v28 = i64.const 1\n\
+        \x20 v29 = i64.add v19 v28\n\
+        \x20 br block4(v29, v27)\n\
+        block6(v30: i64):\n\
+        \x20 return v30\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, varg: i64):\n\
+        \x20 v0 = ref.func 2\n\
+        \x20 v1 = i64.const 0\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.add v5 varg\n\
+        \x20 return v6\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, varg: i64):\n\
+        \x20 v0 = i64.const 42\n\
+        \x20 v1 = suspend v0\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 return v2\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    // Σ over i in 0..4 of (i*10 + 42) = (0+10+20+30) + 4*42 = 60 + 168 = 228.
+    for _ in 0..40 {
+        match compile_and_run_parallel(&m, 0, &[], 4).expect("jit") {
+            JitOutcome::Returned(x) => assert_eq!(x, [228], "parallel fiber+thread sum wrong"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // And it matches the interpreter (cooperative).
+    assert_jit_matches_interp(src);
+}
+
 /// Joining the same handle twice is inert the second time → `ThreadFault`, on both backends.
 #[test]
 fn thread_double_join_traps() {
