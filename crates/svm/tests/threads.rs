@@ -180,6 +180,48 @@ block0(v0: i64):
     assert_eq!(run_i64(src), Ok(19900));
 }
 
+/// M:N: 1000 vCPUs live at once — far more than the worker pool (≤32 OS threads) or the old
+/// one-OS-thread-per-vCPU cap (64). Each is a parked/queued green thread the executor multiplexes
+/// onto the pool. The parent fire-and-forgets all 1000 (each atomically bumps a shared counter), then
+/// spins until the counter reads 1000 — which can only happen if every green thread actually ran.
+#[test]
+fn many_green_threads_on_a_small_pool() {
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  br block1(v0)
+block1(v1: i64):
+  v2 = thread.spawn 1 v1
+  v3 = i64.const 1
+  v4 = i64.add v1 v3
+  v5 = i64.const 1000
+  v6 = i64.lt_u v4 v5
+  br_if v6 block1(v4) block2()
+block2():
+  v7 = i64.const 0
+  v8 = i64.atomic.load v7
+  v9 = i64.const 1000
+  v10 = i64.eq v8 v9
+  br_if v10 block3() block2()
+block3():
+  v11 = i64.const 0
+  v12 = i64.atomic.load v11
+  return v12
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 1
+  v3 = i64.atomic.rmw.add v1 v2
+  v4 = i64.const 0
+  return v4
+}
+"#;
+    assert_eq!(run_i64(src), Ok(1000));
+}
+
 /// Joining the same handle twice is inert on the second join (the slot is consumed) — a re-join
 /// can't observe or double-free another vCPU.
 #[test]

@@ -8,9 +8,11 @@
 //! flow is bounded by `fuel` (a stand-in for §5 metering), so it always terminates.
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
@@ -116,11 +118,11 @@ pub fn run_with_host(
     drive(&m.funcs, func, args, fuel, &mut mem, host)
 }
 
-/// Set up the shared concurrency runtime (the `thread.spawn` budget, the `wait`/`notify` parking lot,
-/// and the registry of spawned OS threads), run the entry vCPU, then **join every spawned vCPU**
-/// before returning — so no worker outlives the run and the final memory is stable for a snapshot.
-/// `funcs` is cloned into an `Arc<[Func]>` the vCPUs own, so a spawned vCPU borrows nothing and can
-/// run on a detached thread. With no `thread.spawn`, no thread is ever created (negligible overhead).
+/// Run the entry vCPU on the M:N executor: submit the root, become a worker on the calling thread,
+/// and once every vCPU has finished, join any worker threads the executor spawned and read the root's
+/// outcome back. `funcs` is cloned into an `Arc<[Func]>` the vCPUs own, so a spawned vCPU borrows
+/// nothing and can run on a pooled thread. A single-threaded guest never spawns a worker — the calling
+/// thread runs it to completion — so non-threaded runs pay no pool overhead.
 fn drive(
     funcs: &[Func],
     entry: FuncIdx,
@@ -130,29 +132,48 @@ fn drive(
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
     let funcs: Arc<[Func]> = funcs.to_vec().into();
-    let budget = Arc::new(std::sync::atomic::AtomicU32::new(MAX_THREADS));
-    let parking = Arc::new(Parking::default());
-    let registry: Arc<Registry> = Arc::new(Mutex::new(Vec::new()));
-    // The root vCPU owns the run's `mem`/`host`/`fuel`; hand them over, then take them back so the
-    // caller can snapshot the window and read host effects (stdout, grants…).
-    let mut v = VCpu::new(
-        funcs,
-        entry,
-        args,
-        mem.take(),
-        std::mem::take(host),
-        *fuel,
-        0,
-        budget,
-        parking,
-        Arc::clone(&registry),
-    )?;
-    let r = run_vcpu(&mut v);
-    drain_registry(&registry);
-    *fuel = v.fuel;
-    *mem = v.mem;
-    *host = v.host;
-    r
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_WORKERS);
+    let sched = Arc::new(Scheduler::new(MAX_VCPUS, workers));
+    // The root vCPU owns the run's `mem`/`host`/`fuel`; hand them over, then read them back from its
+    // outcome so the caller can snapshot the window and observe host effects (stdout, grants…).
+    let root_id = {
+        let mut s = sched.lock();
+        let id = s.next_task;
+        s.next_task += 1;
+        s.live += 1;
+        s.workers = 1; // the calling thread acts as worker 0
+        let root = Box::new(VCpu::new(
+            funcs,
+            entry,
+            args,
+            mem.take(),
+            std::mem::take(host),
+            *fuel,
+            0,
+            id,
+            Arc::clone(&sched),
+        ));
+        s.runnable.push_back(root);
+        id
+    };
+    // Run as worker 0 until the run shuts down (every vCPU finished), then join spawned workers.
+    worker_loop(&sched);
+    let handles = std::mem::take(&mut sched.lock().handles);
+    for h in handles {
+        let _ = h.join();
+    }
+    let out = sched
+        .lock()
+        .results
+        .remove(&root_id)
+        .expect("root vCPU finished");
+    *fuel = out.fuel;
+    *mem = out.mem;
+    *host = out.host;
+    out.result
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -269,13 +290,12 @@ struct Frame {
 /// guest, so a fiber-bomb OOMs *itself*, never the host.
 const MAX_FIBERS: usize = 1 << 16;
 
-/// Maximum number of **concurrently live** vCPUs (`thread.spawn`) across a run — a hard cap on the
-/// OS threads alive at once (§12). Each vCPU is a real OS thread, so the bound is modest; a
-/// thread-bomb (spawning without joining) hits a clean [`Trap::ThreadFault`]. The slot is **refunded
-/// when a vCPU finishes**, so a guest that spawns-and-joins in a loop may create unboundedly many
-/// vCPUs over its lifetime — only simultaneous liveness is bounded. The cap is global (the budget is
-/// shared by every vCPU), so nesting can't exceed it.
-const MAX_THREADS: u32 = 64;
+/// Maximum number of **concurrently live** vCPUs (`thread.spawn`) across a run (§12). With the M:N
+/// executor a vCPU is a cheap green thread (a parked one costs only its continuation, not an OS
+/// thread), so this can be large; it's just an anti-bomb ceiling — exceeding it is a clean
+/// [`Trap::ThreadFault`]. A spawned-and-joined loop creates unboundedly many vCPUs over its lifetime;
+/// only simultaneous liveness is bounded.
+const MAX_VCPUS: usize = 1 << 16;
 
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
@@ -294,102 +314,281 @@ const WAIT_TIMED_OUT: i32 = 2;
 /// the cap only bounds the missed-notify fallback.
 const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The run's **parking lot** (§12 futex): a notify generation per confined address plus a live waiter
-/// count, behind one mutex + condvar. Shared across all vCPUs (passed by `&` like the thread budget).
-/// A waiter records the current generation under the lock and blocks until it changes (a notify bumps
-/// it) or the timeout fires; `notify` bumps the generation and wakes everyone, who re-check their own
-/// address (a coarse but correct futex — spurious wakeups are allowed by the model).
-#[derive(Default)]
-struct Parking {
-    state: Mutex<ParkState>,
-    cv: std::sync::Condvar,
+/// Maximum worker OS threads the executor will spawn for one run (the "N" of M:N). Capped at the
+/// host parallelism. Workers are spawned **lazily** — a single-threaded guest never creates any.
+const MAX_WORKERS: usize = 32;
+
+/// A task identifier (a spawned vCPU). Distinct from the per-vCPU join *handle* (an index into the
+/// spawner's child table); the executor keys results/waiters by `TaskId`.
+type TaskId = u64;
+
+/// A finished vCPU's outcome, parked in the scheduler until a `thread.join` claims it (or, for the
+/// root, until [`drive`] reads it). Carries `mem`/`host`/`fuel` so the root's window can be snapshot
+/// and its effects read back after the worker that ran it is gone.
+struct Outcome {
+    result: Result<Vec<Value>, Trap>,
+    mem: Option<Mem>,
+    host: Host,
+    fuel: u64,
+}
+
+/// Why a vCPU yielded its worker (returned by [`VCpu::run`]).
+enum Blocked {
+    /// Blocked in `thread.join` on child task `child` (the join handle's table slot is recorded in the
+    /// vCPU's `pending`, set before it parks).
+    Join { child: TaskId },
+    /// Blocked in `atomic.wait` on confined address `key`, to wake on a matching `notify` or at
+    /// `deadline`. `expected`/`width` let the worker re-check the value under the scheduler lock
+    /// (the futex compare-and-park atomicity).
+    Wait {
+        key: u64,
+        expected: u64,
+        width: u32,
+        deadline: Instant,
+    },
+}
+
+/// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
+enum Pending {
+    /// Finish a `thread.join`: take the child's result from `threads[slot]`.
+    Join { slot: usize },
+    /// Finish an `atomic.wait`, pushing this status (woken / not-equal / timed-out).
+    Wait(i32),
+}
+
+/// One run of a vCPU until it finishes or yields.
+enum Step {
+    Done(Result<Vec<Value>, Trap>),
+    Park(Blocked),
+}
+
+/// Internal `?`-friendly driver result; [`VCpu::run`] folds an `Err` into `Step::Done(Err)`.
+enum Inner {
+    Done(Vec<Value>),
+    Park(Blocked),
+}
+
+/// The **M:N executor** (§12): a bounded pool of worker OS threads runs many vCPUs (green threads)
+/// from a shared run-queue. A vCPU that blocks on `thread.join`/`atomic.wait` **parks** — its owned
+/// continuation ([`VCpu`]) is set aside, freeing the worker — and is re-enqueued when the awaited
+/// event fires (child completion / `notify` / timeout). Thus thousands of vCPUs run on a handful of
+/// threads. One mutex guards all scheduler state: coarse, but obviously race-free (the interpreter is
+/// the reference oracle; the JIT is the performance path). Workers are spawned lazily, so a
+/// single-threaded guest runs entirely on the calling thread with no pool at all.
+struct Scheduler {
+    mx: Mutex<Sched>,
+    /// Workers wait here for runnable vCPUs (woken on new work, shutdown, or a timer deadline).
+    /// `drive` runs as worker 0 and returns when shutdown fires, so no separate idle signal is needed.
+    work: Condvar,
+    /// Max concurrently-live vCPUs (anti-bomb) and max worker threads.
+    cap: usize,
+    max_workers: usize,
 }
 
 #[derive(Default)]
-struct ParkState {
-    /// Confined address ⇒ notify generation (bumped by each `notify`).
-    gen: BTreeMap<u64, u64>,
-    /// Confined address ⇒ number of vCPUs currently parked on it.
-    waiters: BTreeMap<u64, u32>,
+struct Sched {
+    /// vCPUs ready to run.
+    runnable: VecDeque<Box<VCpu>>,
+    /// Finished tasks' outcomes, awaiting `join` (or the root, awaiting `drive`).
+    results: BTreeMap<TaskId, Outcome>,
+    /// A vCPU parked in `join`, keyed by the child it awaits.
+    join_waiters: BTreeMap<TaskId, Box<VCpu>>,
+    /// vCPUs parked in `wait`, keyed by confined address; each tagged with a waiter id.
+    wait_waiters: BTreeMap<u64, Vec<(u64, Box<VCpu>)>>,
+    /// Min-heap of `(deadline, waiter id, address)` for timing out `wait`s.
+    timers: BinaryHeap<Reverse<(Instant, u64, u64)>>,
+    /// OS-thread handles of spawned workers (joined by `drive` at the end).
+    handles: Vec<std::thread::JoinHandle<()>>,
+    /// vCPUs not yet finished (running + queued + parked). The run ends when this hits 0.
+    live: usize,
+    /// Worker threads in existence (incl. the calling thread, counted as 1).
+    workers: usize,
+    next_task: TaskId,
+    next_wid: u64,
+    shutdown: bool,
 }
 
-impl Parking {
-    fn lock(&self) -> std::sync::MutexGuard<'_, ParkState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Park on `key` until notified or timed out. `value_matches` is evaluated **under the lock**
-    /// (the futex compare-and-block atomicity): if it is already false, return [`WAIT_NOT_EQUAL`]
-    /// without blocking; otherwise block until the generation moves ([`WAIT_WOKEN`]) or the
-    /// `MAX_WAIT`-clamped `timeout_ns` elapses ([`WAIT_TIMED_OUT`]).
-    fn wait(&self, key: u64, timeout_ns: i64, value_matches: impl Fn() -> bool) -> i32 {
-        let st = self.lock();
-        if !value_matches() {
-            return WAIT_NOT_EQUAL;
-        }
-        let gen0 = st.gen.get(&key).copied().unwrap_or(0);
-        {
-            let mut st = st;
-            *st.waiters.entry(key).or_insert(0) += 1;
-            let dur = if timeout_ns < 0 {
-                MAX_WAIT
-            } else {
-                std::time::Duration::from_nanos(timeout_ns as u64).min(MAX_WAIT)
-            };
-            let (mut st, res) = self
-                .cv
-                .wait_timeout_while(st, dur, |s| s.gen.get(&key).copied().unwrap_or(0) == gen0)
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(w) = st.waiters.get_mut(&key) {
-                *w = w.saturating_sub(1);
-            }
-            if res.timed_out() {
-                WAIT_TIMED_OUT
-            } else {
-                WAIT_WOKEN
-            }
+impl Scheduler {
+    fn new(cap: usize, max_workers: usize) -> Scheduler {
+        Scheduler {
+            mx: Mutex::new(Sched::default()),
+            work: Condvar::new(),
+            cap,
+            max_workers,
         }
     }
 
-    /// Wake up to `count` vCPUs parked on `key`; return how many were woken (capped at the live
-    /// waiter count). Bumps the generation so parked waiters fall out of their wait loop.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Sched> {
+        self.mx.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Allocate a task id + live slot and enqueue the vCPU built by `make`; spawn another worker if
+    /// demand warrants. `None` if the live cap is hit (a thread-bomb).
+    fn spawn(self: &Arc<Self>, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
+        let mut s = self.lock();
+        if s.live >= self.cap {
+            return None;
+        }
+        let id = s.next_task;
+        s.next_task += 1;
+        s.live += 1;
+        s.runnable.push_back(make(id));
+        self.maybe_spawn_worker(&mut s);
+        self.work.notify_one();
+        Some(id)
+    }
+
+    /// Grow the pool toward `min(live, max_workers)` so parked/queued vCPUs have a thread to run them.
+    fn maybe_spawn_worker(self: &Arc<Self>, s: &mut Sched) {
+        if s.workers < self.max_workers && s.workers < s.live && !s.shutdown {
+            s.workers += 1;
+            let me = Arc::clone(self);
+            s.handles.push(std::thread::spawn(move || worker_loop(&me)));
+        }
+    }
+
+    /// Wake up to `count` vCPUs parked on `key`; return how many were woken.
     fn notify(&self, key: u64, count: u32) -> u32 {
-        let mut st = self.lock();
-        let waiting = st.waiters.get(&key).copied().unwrap_or(0);
-        if waiting == 0 {
-            return 0;
+        let mut s = self.lock();
+        let mut woken: Vec<Box<VCpu>> = Vec::new();
+        if let Some(q) = s.wait_waiters.get_mut(&key) {
+            while (woken.len() as u32) < count {
+                match q.pop() {
+                    Some((_, v)) => woken.push(v),
+                    None => break,
+                }
+            }
+            if q.is_empty() {
+                s.wait_waiters.remove(&key);
+            }
         }
-        *st.gen.entry(key).or_insert(0) += 1;
-        self.cv.notify_all();
-        count.min(waiting)
+        let n = woken.len() as u32;
+        for mut v in woken {
+            v.pending = Some(Pending::Wait(WAIT_WOKEN));
+            s.runnable.push_back(v);
+        }
+        if n > 0 {
+            self.work.notify_all();
+        }
+        n
     }
 }
 
-/// A spawned vCPU's result slot (§12). The worker thread stores its `run_func` outcome here and
-/// signals `cv`; a `thread.join` blocks on it. Decouples join-semantics (this) from thread cleanup
-/// (the [`Registry`]) so the executor can later reuse OS threads / park continuations.
-#[derive(Default)]
-struct TaskState {
-    done: Mutex<Option<Result<Vec<Value>, Trap>>>,
-    cv: std::sync::Condvar,
+/// Move any expired `wait` timers' vCPUs back to the run-queue with a timed-out status. (A waiter
+/// already woken by `notify` is simply absent — its stale timer is skipped.)
+fn process_timers(s: &mut Sched) {
+    let now = Instant::now();
+    while let Some(&Reverse((dl, wid, key))) = s.timers.peek() {
+        if dl > now {
+            break;
+        }
+        s.timers.pop();
+        let mut woken = None;
+        if let Some(q) = s.wait_waiters.get_mut(&key) {
+            if let Some(pos) = q.iter().position(|(id, _)| *id == wid) {
+                woken = Some(q.remove(pos).1);
+            }
+        }
+        if let Some(mut v) = woken {
+            if s.wait_waiters.get(&key).is_some_and(|q| q.is_empty()) {
+                s.wait_waiters.remove(&key);
+            }
+            v.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
+            s.runnable.push_back(v);
+        }
+    }
 }
 
-/// Every spawned vCPU's OS-thread handle, joined once at the end of the top-level run so no worker
-/// outlives it. Shared by `Arc` across all vCPUs (any vCPU may spawn). LIFO drain is correct: a
-/// thread's children are registered before it returns, so joining a thread surfaces its descendants.
-type Registry = Mutex<Vec<std::thread::JoinHandle<()>>>;
-
-/// Join (and clear) every spawned vCPU thread — the run-end cleanup. Repeated pop-then-join until
-/// empty: joining a thread waits for it to finish, by which point any threads it spawned are already
-/// in the registry, so the whole tree is drained.
-fn drain_registry(registry: &Registry) {
+/// A worker: pull a runnable vCPU and dispatch it, sleeping (until work, a timer, or shutdown) when
+/// idle. Returns when the run is shutting down and nothing is left to do.
+fn worker_loop(sched: &Arc<Scheduler>) {
     loop {
-        let jh = registry.lock().unwrap_or_else(|e| e.into_inner()).pop();
-        match jh {
-            Some(h) => {
-                let _ = h.join();
+        let next = {
+            let mut s = sched.lock();
+            loop {
+                process_timers(&mut s);
+                if let Some(v) = s.runnable.pop_front() {
+                    break Some(v);
+                }
+                if s.shutdown {
+                    break None;
+                }
+                match s.timers.peek().map(|Reverse((dl, _, _))| *dl) {
+                    Some(dl) => {
+                        let now = Instant::now();
+                        if dl > now {
+                            let (g, _) = sched
+                                .work
+                                .wait_timeout(s, dl - now)
+                                .unwrap_or_else(|e| e.into_inner());
+                            s = g;
+                        }
+                    }
+                    None => s = sched.work.wait(s).unwrap_or_else(|e| e.into_inner()),
+                }
             }
-            None => break,
+        };
+        match next {
+            Some(v) => dispatch(sched, v),
+            None => return,
+        }
+    }
+}
+
+/// Run one vCPU until it yields, then route the outcome: publish a result (waking a joiner) and
+/// retire the slot, or park it on a join target / wait address.
+fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
+    match v.run() {
+        Step::Done(result) => {
+            let id = v.id;
+            let outcome = Outcome {
+                result,
+                mem: v.mem.take(),
+                host: std::mem::take(&mut v.host),
+                fuel: v.fuel,
+            };
+            drop(v);
+            let mut s = sched.lock();
+            if let Some(parent) = s.join_waiters.remove(&id) {
+                s.runnable.push_back(parent);
+                sched.work.notify_one();
+            }
+            s.results.insert(id, outcome);
+            s.live -= 1;
+            if s.live == 0 {
+                s.shutdown = true;
+                sched.work.notify_all();
+            }
+        }
+        Step::Park(Blocked::Join { child }) => {
+            let mut s = sched.lock();
+            if s.results.contains_key(&child) {
+                // Already finished between the join check and here — resume immediately.
+                s.runnable.push_back(v);
+                sched.work.notify_one();
+            } else {
+                s.join_waiters.insert(child, v);
+            }
+        }
+        Step::Park(Blocked::Wait {
+            key,
+            expected,
+            width,
+            deadline,
+        }) => {
+            let mut s = sched.lock();
+            // Re-read the value **under the lock** so the compare-and-park is atomic vs. `notify`.
+            if v.atomic_value(key, width) != expected {
+                v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
+                s.runnable.push_back(v);
+                sched.work.notify_one();
+            } else {
+                let wid = s.next_wid;
+                s.next_wid += 1;
+                s.timers.push(Reverse((deadline, wid, key)));
+                s.wait_waiters.entry(key).or_default().push((wid, v));
+                sched.work.notify_all(); // let idle workers recompute their timer deadline
+            }
         }
     }
 }
@@ -503,18 +702,22 @@ struct VCpu {
     host: Host,
     /// Remaining fuel (metering, §5).
     fuel: u64,
-    /// This vCPU's spawned children's result slots (indexed by the `thread.join` handle).
-    threads: Vec<Option<Arc<TaskState>>>,
+    /// This vCPU's spawned children, by `thread.join` handle (slot) ⇒ child [`TaskId`]; `None` once
+    /// joined (a re-join is inert).
+    threads: Vec<Option<TaskId>>,
     /// Call-depth base for the stack-overflow bound.
     depth: u32,
-    /// Shared concurrency-budget / parking-lot / thread-registry (see [`run_vcpu`]).
-    budget: Arc<std::sync::atomic::AtomicU32>,
-    parking: Arc<Parking>,
-    registry: Arc<Registry>,
+    /// This task's own id (where its outcome is published on completion).
+    id: TaskId,
+    /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
+    pending: Option<Pending>,
+    /// The shared M:N executor (spawn enqueues here; notify wakes here).
+    sched: Arc<Scheduler>,
 }
 
 impl VCpu {
-    /// A fresh vCPU whose root frame is `funcs[entry](args)`.
+    /// A fresh vCPU whose root frame is `funcs[entry](args)`. A bad `entry` is caught by the driver's
+    /// first block lookup ([`Trap::Malformed`]), so construction is infallible.
     #[allow(clippy::too_many_arguments)]
     fn new(
         funcs: Arc<[Func]>,
@@ -524,14 +727,10 @@ impl VCpu {
         host: Host,
         fuel: u64,
         depth: u32,
-        budget: Arc<std::sync::atomic::AtomicU32>,
-        parking: Arc<Parking>,
-        registry: Arc<Registry>,
-    ) -> Result<VCpu, Trap> {
-        if funcs.get(entry as usize).is_none() {
-            return Err(Trap::Malformed);
-        }
-        Ok(VCpu {
+        id: TaskId,
+        sched: Arc<Scheduler>,
+    ) -> VCpu {
+        VCpu {
             funcs,
             fibers: vec![Fiber::Running],
             chain: vec![0],
@@ -547,17 +746,60 @@ impl VCpu {
             fuel,
             threads: Vec::new(),
             depth,
-            budget,
-            parking,
-            registry,
-        })
+            id,
+            pending: None,
+            sched,
+        }
+    }
+
+    /// The current `width`-byte value at confined `key` (no checks; used by the executor for the
+    /// futex compare under the scheduler lock). Zero if this vCPU has no memory.
+    fn atomic_value(&self, key: u64, width: u32) -> u64 {
+        self.mem.as_ref().map_or(0, |m| m.atomic_value(key, width))
+    }
+
+    /// Run until this vCPU finishes or parks. Folds a trap into `Step::Done(Err)`.
+    fn run(&mut self) -> Step {
+        match run_inner(self) {
+            Ok(Inner::Done(v)) => Step::Done(Ok(v)),
+            Ok(Inner::Park(b)) => Step::Park(b),
+            Err(t) => Step::Done(Err(t)),
+        }
     }
 }
 
-/// Drive a vCPU to completion (or a trap). Currently runs the whole continuation on the calling
-/// thread, blocking on `thread.join`/`atomic.wait`; the field-owned state lets the next step *park*
-/// instead. The owned `funcs` is borrowed locally as `fs` so the loop can mutate the other fields.
-fn run_vcpu(v: &mut VCpu) -> Result<Vec<Value>, Trap> {
+/// Drive a vCPU until it finishes (`Inner::Done`) or parks on a blocking op (`Inner::Park`). On
+/// re-entry it first completes the parked op recorded in `pending`. The owned `funcs` is borrowed
+/// locally as `fs` so the loop can mutate the other fields.
+fn run_inner(v: &mut VCpu) -> Result<Inner, Trap> {
+    // Resuming from a park: finish the op the scheduler woke us for.
+    match v.pending.take() {
+        Some(Pending::Join { slot }) => {
+            let child = v
+                .threads
+                .get(slot)
+                .and_then(|x| *x)
+                .ok_or(Trap::ThreadFault)?;
+            v.threads[slot] = None; // a handle is joined once
+            let out = v
+                .sched
+                .lock()
+                .results
+                .remove(&child)
+                .ok_or(Trap::Malformed)?;
+            let vals = out.result?; // a child trap propagates as this vCPU's trap
+            let top = v.frames.len() - 1;
+            v.frames[top]
+                .vals
+                .push(vals.first().copied().unwrap_or(Value::I64(0)));
+        }
+        Some(Pending::Wait(status)) => {
+            let top = v.frames.len() - 1;
+            v.frames[top].vals.push(Value::I32(status));
+        }
+        None => {}
+    }
+
     let funcs = Arc::clone(&v.funcs);
     let fs: &[Func] = &funcs;
     let VCpu {
@@ -570,10 +812,10 @@ fn run_vcpu(v: &mut VCpu) -> Result<Vec<Value>, Trap> {
         fuel,
         threads,
         depth,
-        budget,
-        parking,
-        registry,
+        pending,
+        sched,
         funcs: _,
+        id: _,
     } = v;
     let depth = *depth;
 
@@ -724,83 +966,56 @@ fn run_vcpu(v: &mut VCpu) -> Result<Vec<Value>, Trap> {
                     frames[rtop].vals.push(Value::I64(v));
                     continue 'frames;
                 }
-                // §12 thread spawn: launch a real OS-thread vCPU running `funcs[func](arg)` over the
-                // *shared* memory (the `Arc<Region>` bytes + §13 `Arc` regions; the child snapshots
-                // the page-protection map). The child starts with an empty powerbox and its own fuel
-                // budget. Yields an i32 thread handle (the table index).
+                // §12 thread spawn: enqueue a new vCPU (green thread) running `funcs[func](arg)` over
+                // the *shared* memory (the `Arc<Region>` bytes + §13 `Arc` regions; the child snapshots
+                // the page-protection map). The executor runs it on a pooled worker. The child starts
+                // with an empty powerbox + its own fuel. Yields an i32 thread handle (the table slot).
                 Inst::ThreadSpawn { func, arg } => {
-                    // Resolve + validate the entry index now (the child owns its own `funcs` clone, so
-                    // we pass the *index*, not a borrow).
                     if fs.get(*func as usize).is_none() {
                         return Err(Trap::Malformed);
                     }
                     let entry = *func;
                     let av = as_i64(get(&frames[top].vals, *arg)?)?;
-                    // Charge a *concurrent-live* vCPU slot (refunded when the child finishes below),
-                    // so the cap bounds simultaneous vCPUs — a thread-bomb hits it — while a guest
-                    // that spawns-and-joins in a loop can create unboundedly many vCPUs over its life.
-                    if budget.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                        budget.fetch_add(1, std::sync::atomic::Ordering::SeqCst); // un-charge
-                        return Err(Trap::ThreadFault);
-                    }
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
-                    let handle = threads.len() as i32;
-                    let state = Arc::new(TaskState::default());
-                    // Owned clones for the detached child — it borrows nothing from this vCPU.
-                    let (cfuncs, cbudget, cparking, cregistry, cstate) = (
-                        Arc::clone(&funcs),
-                        Arc::clone(budget),
-                        Arc::clone(parking),
-                        Arc::clone(registry),
-                        Arc::clone(&state),
-                    );
-                    let jh = std::thread::spawn(move || {
-                        let child = VCpu::new(
+                    let cfuncs = Arc::clone(&funcs);
+                    let csched = Arc::clone(sched);
+                    let made = sched.spawn(move |id| {
+                        Box::new(VCpu::new(
                             cfuncs,
                             entry,
                             &[Value::I64(av)],
                             child_mem,
-                            Host::new(), // spawned vCPUs start with an empty powerbox
-                            child_fuel,  // the child's own metering budget
+                            Host::new(),
+                            child_fuel,
                             0,
-                            Arc::clone(&cbudget),
-                            cparking,
-                            cregistry,
-                        );
-                        let r = match child {
-                            Ok(mut c) => run_vcpu(&mut c),
-                            Err(e) => Err(e),
-                        };
-                        // Release the concurrent slot on completion — *before* publishing the result,
-                        // so a joiner's next spawn sees the slot already free.
-                        cbudget.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        *cstate.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-                        cstate.cv.notify_all();
+                            id,
+                            csched,
+                        ))
                     });
-                    registry.lock().unwrap_or_else(|e| e.into_inner()).push(jh);
-                    threads.push(Some(state));
-                    frames[top].vals.push(Value::I32(handle));
+                    match made {
+                        Some(child_id) => {
+                            threads.push(Some(child_id));
+                            frames[top]
+                                .vals
+                                .push(Value::I32((threads.len() - 1) as i32));
+                        }
+                        None => return Err(Trap::ThreadFault), // live cap (a thread-bomb)
+                    }
                 }
-                // §12 thread join: block until vCPU `handle` finishes, yield its i64 result. A
-                // forged / out-of-range / already-joined handle is inert (masked + checked like a
-                // fiber handle); a trap in the joined vCPU propagates here.
+                // §12 thread join: park until vCPU `handle` finishes, then (on resume) take its i64
+                // result. A forged / out-of-range / already-joined handle is inert (masked + checked
+                // like a fiber handle); a trap in the joined vCPU propagates here (on resume).
                 Inst::ThreadJoin { handle } => {
                     let h = as_i32(get(&frames[top].vals, *handle)?)?;
                     let slot = resolve_thread(threads, h)?;
-                    let state = threads[slot].take().ok_or(Trap::ThreadFault)?;
-                    let mut g = state.done.lock().unwrap_or_else(|e| e.into_inner());
-                    while g.is_none() {
-                        g = state.cv.wait(g).unwrap_or_else(|e| e.into_inner());
-                    }
-                    let vals = g.take().expect("done set")?; // propagate the child's trap, if any
-                    frames[top]
-                        .vals
-                        .push(vals.first().copied().unwrap_or(Value::I64(0)));
+                    let child = threads[slot].ok_or(Trap::ThreadFault)?;
+                    *pending = Some(Pending::Join { slot });
+                    return Ok(Inner::Park(Blocked::Join { child }));
                 }
-                // §12 futex wait: validate the address (confine/align/prot), then — atomically with
-                // respect to `notify` — compare `*addr` to `expected` under the parking lock and
-                // block on a mismatch-free address until notified or timed out.
+                // §12 futex wait: validate the address (confine/align/prot — traps surface here), then
+                // park; the executor re-checks the value under its lock (atomic vs. `notify`) and either
+                // resumes immediately (value changed → status 1) or blocks until notified / timed out.
                 Inst::MemoryWait {
                     ty,
                     addr,
@@ -813,10 +1028,19 @@ fn run_vcpu(v: &mut VCpu) -> Result<Vec<Value>, Trap> {
                     let to_ns = as_i64(get(&frames[top].vals, *timeout)?)?;
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let base = m.prepare_wait(a, *ty)?;
-                    let status = parking.wait(base, to_ns, || m.atomic_value(base, width) == exp);
-                    frames[top].vals.push(Value::I32(status));
+                    let wait = if to_ns < 0 {
+                        MAX_WAIT
+                    } else {
+                        Duration::from_nanos(to_ns as u64).min(MAX_WAIT)
+                    };
+                    return Ok(Inner::Park(Blocked::Wait {
+                        key: base,
+                        expected: exp,
+                        width,
+                        deadline: Instant::now() + wait,
+                    }));
                 }
-                // §12 futex notify: wake up to `count` waiters on the confined address.
+                // §12 futex notify: wake up to `count` vCPUs parked on the confined address.
                 Inst::MemoryNotify { addr, count } => {
                     let a = as_i64(get(&frames[top].vals, *addr)?)? as u64;
                     let n = as_i32(get(&frames[top].vals, *count)?)?.max(0) as u32;
@@ -824,7 +1048,7 @@ fn run_vcpu(v: &mut VCpu) -> Result<Vec<Value>, Trap> {
                     let base = m.confine_for_notify(a)?;
                     frames[top]
                         .vals
-                        .push(Value::I32(parking.notify(base, n) as i32));
+                        .push(Value::I32(sched.notify(base, n) as i32));
                 }
                 // Everything else: one value, or none for `Store`/`AtomicStore`.
                 other => {
@@ -876,7 +1100,7 @@ fn run_vcpu(v: &mut VCpu) -> Result<Vec<Value>, Trap> {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
                     caller.vals.extend(results);
                 } else if *cur == 0 {
-                    return Ok(results); // the root returned: the whole run is done
+                    return Ok(Inner::Done(results)); // the root returned: this vCPU is done
                 } else {
                     // A fiber's function returned: hand its single `i64` back to the resumer
                     // with status RETURNED; the fiber is now `Done` (resuming again traps).

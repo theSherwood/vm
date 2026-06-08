@@ -954,14 +954,25 @@ leave a shared view — add a unix test for this alongside the Windows work.
   (`thread.join` blocks on it); a shared `Registry` of handles is joined at run end so nothing
   outlives the run. (2) `Frame` stores a `FuncIdx` (not a `&Func`), so a vCPU's reified state
   (`frames`/`fibers`) is **plain owned data** — movable between worker threads, the prerequisite for
-  parking. Behaviour-preserving so far (still 1 OS thread per concurrent vCPU); whole suite + TSan +
-  clippy + windows green. **Still to come (the crux):** lift `run_func`'s locals into a resumable
-  `VCpu` struct whose driver *returns* `Park(join|wait)` instead of OS-blocking, and a bounded
-  worker-pool scheduler (run-queue + per-task waiters + a wait-timeout timer) that resumes parked
-  vCPUs on the awaited event — turning the current 1:1 into true M:N.
-  **Phase 2 still to come:** the M:N scheduler crux above, per-thread capability grants (spawned vCPUs
-  still start with an empty powerbox), honoring weak orderings in execution, and the
-  differential-oracle-under-nondeterminism story.
+  parking. (3) `Frame` stores a `FuncIdx` and `run_func`→`run_vcpu(&mut VCpu)` lifts the driver's
+  locals into an owned, movable `VCpu`. **(4–6) DONE — the executor itself.** `VCpu::run` returns
+  `Step::Done | Step::Park(Join|Wait)` instead of OS-blocking: on a `thread.join`/`atomic.wait` whose
+  event isn't ready it records a `Pending` and **parks** (its owned continuation is set aside, freeing
+  the worker); on resume it finishes the op from `pending` (no re-execution). A single-mutex
+  `Scheduler` drives it: a run-queue of `Box<VCpu>`, `results`/`join_waiters` maps (a child's
+  completion re-enqueues its joiner), `wait_waiters` keyed by confined address (`notify` re-enqueues;
+  the value is re-checked **under the scheduler lock** for futex atomicity), and a `timers` min-heap
+  drained by idle workers for `wait` timeouts. Worker threads are spawned **lazily** (the calling
+  thread is worker 0; more added toward `min(live, MAX_WORKERS=32)` only as vCPUs spawn), so a
+  single-threaded guest creates **zero** extra threads. The live-vCPU cap is now `MAX_VCPUS=1<<16`
+  (a parked green thread costs only its continuation, not an OS thread). Validated: the full suite
+  (jit_diff/c_frontend/escape_oracle/pipeline/run…) green on the executor, `threads.rs` ×20 incl.
+  **1000 green threads on ≤32 workers** (`many_green_threads_on_a_small_pool` — impossible under the
+  old 64 cap), all **TSan-clean** (`-Zsanitizer=thread`, zero data races), clippy `-D warnings` +
+  windows-gnu green.
+  **Phase 2 still to come:** per-thread capability grants (spawned vCPUs still start with an empty
+  powerbox), honoring weak orderings in execution, and the differential-oracle-under-nondeterminism
+  story.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
   on the host stack for guest calls — the guest call stack is **reified** as an explicit `Vec<Frame>`
   in `run_func` (`svm-interp`), where `Frame = { f, block, inst, vals }`. A `call` pushes a frame, a
