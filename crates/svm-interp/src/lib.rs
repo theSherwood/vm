@@ -243,9 +243,11 @@ pub fn run_capture_reserved_with_host(
 /// stack — rather than recursing on the host stack — is what makes fibers possible: a
 /// fiber's continuation is exactly its `Vec<Frame>`, which `suspend` pauses and
 /// `cont.resume` restarts.
-struct Frame<'a> {
-    /// The function this activation is executing.
-    f: &'a Func,
+struct Frame {
+    /// The function this activation is executing — stored as an **index** (not a borrow) so a
+    /// `Frame` (hence a whole vCPU continuation) is self-contained and movable between worker
+    /// threads. Resolved against the vCPU's owned `Arc<[Func]>` at each use.
+    func: FuncIdx,
     /// Index of the block currently executing.
     block: usize,
     /// Index of the **next** instruction to execute within that block. Saved across a
@@ -389,14 +391,14 @@ fn drain_registry(registry: &Registry) {
 /// A §12 fiber: a first-class suspendable computation whose continuation is exactly its
 /// reified call stack. `cont.new` makes one (`Pending`); `cont.resume` switches into it;
 /// `suspend` switches back out, parking it (`Live`).
-enum Fiber<'a> {
+enum Fiber {
     /// Created by `cont.new`, not yet started: holds the `i32` funcref to launch on the
     /// first resume (resolved then through the function table as `(i64 sp, i64 arg) ->
     /// i64`) and the `i64` data-stack base `sp` to run it on.
     Pending { func: i32, sp: i64 },
     /// Started and currently **parked** — suspended at a `suspend`, or an ancestor in the
     /// resume chain — holding its reified call stack, ready to continue.
-    Live(Vec<Frame<'a>>),
+    Live(Vec<Frame>),
     /// The fiber whose frames are currently *in flight* in the driver's local `frames`.
     /// A placeholder keeping the table slot addressable (a handle resolving here is in the
     /// resume chain → inert / traps).
@@ -463,7 +465,7 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
 }
 
 /// Take a parked (`Live`) fiber's frames out for execution, marking its slot `Running`.
-fn take_running<'a>(fibers: &mut [Fiber<'a>], i: usize) -> Result<Vec<Frame<'a>>, Trap> {
+fn take_running(fibers: &mut [Fiber], i: usize) -> Result<Vec<Frame>, Trap> {
     match std::mem::replace(&mut fibers[i], Fiber::Running) {
         Fiber::Live(f) => Ok(f),
         _ => Err(Trap::Malformed),
@@ -487,14 +489,16 @@ fn run_func(
     parking: Arc<Parking>,
     registry: Arc<Registry>,
 ) -> Result<Vec<Value>, Trap> {
-    // Borrow the owned function table for this call; frames hold `&Func` into it (it outlives them).
+    // The owned function table for this vCPU; frames resolve their `func` index against it.
     let fs: &[Func] = &funcs;
-    let f = fs.get(entry as usize).ok_or(Trap::Malformed)?;
+    if fs.get(entry as usize).is_none() {
+        return Err(Trap::Malformed);
+    }
     // The fiber table for this run (§12). `fibers[0]` is the **root** computation; each
     // `cont.new` appends. A fiber handle (`i32`) is its table index, masked + checked at
     // `cont.resume` like a capability handle (§3c) so a forged handle is inert. The
     // *running* fiber's frames live in the local `frames` below — its slot holds `Running`.
-    let mut fibers: Vec<Fiber<'_>> = vec![Fiber::Running];
+    let mut fibers: Vec<Fiber> = vec![Fiber::Running];
     // The resume chain: `chain[0]` is always the root, `chain.last()` the running fiber.
     let mut chain: Vec<usize> = vec![0];
     let mut cur = 0usize;
@@ -504,8 +508,8 @@ fn run_func(
     let mut threads: Vec<Option<Arc<TaskState>>> = Vec::new();
     // The running fiber's reified call stack. The entry block's parameters are the call
     // arguments (verifier-checked; copied defensively).
-    let mut frames: Vec<Frame<'_>> = vec![Frame {
-        f,
+    let mut frames: Vec<Frame> = vec![Frame {
+        func: entry,
         block: 0,
         inst: 0,
         vals: args.to_vec(),
@@ -517,10 +521,11 @@ fn run_func(
     // fiber's stack is in `frames` — see the comments on those arms.
     'frames: loop {
         let top = frames.len() - 1;
-        // `block` borrows `funcs` (lifetime `'a`), *not* `frames`, so the loop body is free
+        // `block` borrows `fs` (the owned function table), *not* `frames`, so the loop body is free
         // to push/pop/mutate `frames` (and move it on a fiber switch) while holding it.
-        let block = frames[top]
-            .f
+        let block = fs
+            .get(frames[top].func as usize)
+            .ok_or(Trap::Malformed)?
             .blocks
             .get(frames[top].block)
             .ok_or(Trap::Malformed)?;
@@ -536,14 +541,16 @@ fn run_func(
                 // are appended to this frame's `vals` when it returns (see `Return`).
                 Inst::Call { func, args } => {
                     let argv = collect(&frames[top].vals, args)?;
-                    let callee = fs.get(*func as usize).ok_or(Trap::Malformed)?;
+                    if fs.get(*func as usize).is_none() {
+                        return Err(Trap::Malformed);
+                    }
                     if depth as usize + live_frames(&fibers, &chain, frames.len())
                         > MAX_CALL_DEPTH as usize
                     {
                         return Err(Trap::StackOverflow);
                     }
                     frames.push(Frame {
-                        f: callee,
+                        func: *func,
                         block: 0,
                         inst: 0,
                         vals: argv,
@@ -559,7 +566,7 @@ fn run_func(
                         return Err(Trap::StackOverflow);
                     }
                     frames.push(Frame {
-                        f: callee,
+                        func: callee,
                         block: 0,
                         inst: 0,
                         vals: argv,
@@ -616,7 +623,7 @@ fn run_func(
                             let callee = table_lookup(fs, funcref, &fiber_sig())?;
                             // First entry: call `func(sp, arg)` on the fiber's data stack.
                             vec![Frame {
-                                f: callee,
+                                func: callee,
                                 block: 0,
                                 inst: 0,
                                 vals: vec![Value::I64(sp), Value::I64(av)],
@@ -825,9 +832,11 @@ fn run_func(
             // Tail calls replace the top frame in place — no depth growth.
             Terminator::ReturnCall { func, args } => {
                 let argv = collect(&frames[top].vals, args)?;
-                let callee = fs.get(*func as usize).ok_or(Trap::Malformed)?;
+                if fs.get(*func as usize).is_none() {
+                    return Err(Trap::Malformed);
+                }
                 frames[top] = Frame {
-                    f: callee,
+                    func: *func,
                     block: 0,
                     inst: 0,
                     vals: argv,
@@ -837,7 +846,7 @@ fn run_func(
                 let callee = table_lookup(fs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
                 let argv = collect(&frames[top].vals, args)?;
                 frames[top] = Frame {
-                    f: callee,
+                    func: callee,
                     block: 0,
                     inst: 0,
                     vals: argv,
@@ -1036,11 +1045,11 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
 /// Resolve a `call_indirect`: mask the index into the power-of-two-padded function
 /// table, then check the selected entry's signature against `ty` (the §3c table
 /// type-id check). Masking — not branching — keeps the table load Spectre-v1 safe.
-fn table_lookup<'a>(funcs: &'a [Func], idx: i32, ty: &FuncType) -> Result<&'a Func, Trap> {
+fn table_lookup(funcs: &[Func], idx: i32, ty: &FuncType) -> Result<FuncIdx, Trap> {
     let mask = funcs.len().next_power_of_two() - 1;
     let slot = (idx as u32 as usize) & mask;
     match funcs.get(slot) {
-        Some(c) if c.params == ty.params && c.results == ty.results => Ok(c),
+        Some(c) if c.params == ty.params && c.results == ty.results => Ok(slot as FuncIdx),
         _ => Err(Trap::IndirectCallType),
     }
 }
