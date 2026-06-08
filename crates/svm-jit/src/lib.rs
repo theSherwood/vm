@@ -78,6 +78,14 @@ mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill h
 #[cfg(all(unix, target_arch = "x86_64"))]
 mod fiber_rt;
 
+// Cooperative green-thread scheduler core for `thread.spawn`/`thread.join` (§12), on the same
+// stack-switch substrate. The algorithm is unit-tested standalone here; codegen wiring (lowering the
+// `thread.*` ops + driving the scheduler under the guarded execution path) lands in a follow-on, so
+// the items are not referenced from `lib.rs` yet.
+#[cfg(all(unix, target_arch = "x86_64"))]
+#[allow(dead_code)]
+mod thread_rt;
+
 // The windows placeholder-window commit primitive, reused by `svm-run`'s Memory-cap backend (it
 // commits/grows tail pages of this same window; a plain `VirtualAlloc(MEM_COMMIT)` cannot commit a
 // placeholder reservation). See `mem::win_commit_rw`.

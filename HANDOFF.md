@@ -19,6 +19,26 @@ now platform-gated. Full suite + clippy + fmt green. **Next (commit 4):** the na
 scheduler (`thread.spawn`/`join`/`wait`/`notify`) — extract the shared safe `svm-sched` crate and run
 JIT vCPUs as green threads (`Fiber` per vCPU) under TSan.
 
+**Commit 4, part 1 DONE — cooperative thread-scheduler core (`svm-jit/src/thread_rt.rs`).** The
+algorithm behind `thread.spawn`/`thread.join`, built on `svm-fiber`: a vCPU is a `Fiber`; a `Sched`
+keeps a runnable queue and drives one vCPU at a time (cooperative / single OS thread — true multi-core
+workers are a later step), a vCPU runs until it blocks (`join` on an unfinished child) or finishes,
+blocking suspends its fiber back to the scheduler loop and a child's completion re-enqueues its
+waiters. Same reentrancy discipline as `fiber_rt` (no `&mut Sched` across a switch; only a `*mut Fiber`
+to an address-stable boxed fiber crosses it). Backend-agnostic (a vCPU body is any closure), so it's
+**unit-tested standalone** (4 tests: spawn/join sum, nested spawn, join-blocks + forged/re-join inert,
+16 interleaved children) — the novel scheduling logic is de-risked before codegen wiring. clippy/fmt/
+suite green. **Findings that shape the rest:** (a) detect-and-kill uses a C `setjmp`/`siglongjmp` shim
+wrapped around a single `Entry` call (`mem.rs` `run_guarded`), so driving the scheduler under the guard
+needs a scheduler-as-`Entry` shim (a fault `longjmp`s back, abandoning fiber stacks — fine, the domain
+is being killed). (b) **Verification limit:** TSan only instruments Rust, *not* JITted machine code, so
+it cannot see JITted guest memory accesses — JIT concurrency is verified by invariant **stress** tests
++ the interp↔JIT **differential** on interleaving-invariant programs (e.g. atomic counters), not TSan.
+**Next (commit 4, part 2):** wire it into codegen — lower `thread.spawn`/`thread.join` to the scheduler
+(thunks like `fiber_rt`), run the entry as root vCPU 0 under a guarded scheduler shim, share the one
+`Arc<Region>`-backed window across vCPUs; verify with an atomic-counter differential/stress test. Then
+part 3: `wait`/`notify` (logical-clock parking), then true multi-core workers.
+
 Earlier — §12 **JIT concurrency commit 1: the `svm-fiber` stack-switch primitive.**
 Starting the unified-M:N-for-the-JIT effort (the agreed full path, not 1:1 OS threads). Because
 `svm-interp` is `#![forbid(unsafe_code)]`, the native stack-switching `unsafe` lives in a new dedicated
