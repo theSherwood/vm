@@ -7,21 +7,16 @@
 //! an out-of-band **control stack** the runtime allocates, and a switch is `~ns` (no syscall).
 //!
 //! This crate is the single home for that `unsafe`, kept tiny and auditable (the way `svm-mem` is for
-//! memory). It exposes a *symmetric* `boost.context`-style primitive:
+//! memory). Two layers:
 //!
-//! - [`Stack`] — a guard-paged, mmap'd region for one control stack (a `PROT_NONE` page catches
-//!   overflow as a fault rather than silent corruption, §5).
-//! - [`make`] — lay out a fresh stack so the first [`jump`] into it begins executing an entry
-//!   function.
-//! - [`jump`] — switch to a saved context, handing it a `u64` and receiving back the context we came
-//!   *from* plus its `u64` (a [`Transfer`]).
-//!
-//! Higher layers (a safe `Fiber`/`Yielder` wrapper, then scheduler integration) build on this.
+//! - [`imp`] — the raw `boost.context`-style primitive: [`Stack`] (a guard-paged control stack),
+//!   [`make`] (lay out a fresh stack), and [`jump`] (the register/stack swap, exchanging a [`Transfer`]).
+//! - [`Fiber`] / [`Yielder`] — a safe RAII *asymmetric coroutine*: resume a fiber with a value, the
+//!   fiber body does work and [`Yielder::suspend`]s values back, RAII frees the stack, and a panic
+//!   inside the fiber aborts (unwinding across a stack switch would be UB) rather than corrupting.
 //!
 //! Supported today on **x86-64 unix** only; other targets compile but [`supported`] returns `false`
-//! and the primitive is absent (the JIT keeps bailing `Unsupported` there).
-
-#![cfg_attr(not(test), no_std)]
+//! and the primitives are absent (the JIT keeps bailing `Unsupported` there).
 
 /// Whether real stack switching is available on this target.
 pub const fn supported() -> bool {
@@ -33,3 +28,9 @@ mod imp;
 
 #[cfg(all(unix, target_arch = "x86_64"))]
 pub use imp::{jump, make, Stack, Transfer};
+
+#[cfg(all(unix, target_arch = "x86_64"))]
+mod fiber;
+
+#[cfg(all(unix, target_arch = "x86_64"))]
+pub use fiber::{Fiber, State, Yielder};

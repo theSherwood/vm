@@ -14,8 +14,15 @@ in `rax:rdx`), `make(stack_top, entry)` (lay out a fresh stack so the first jump
 that calls `entry`), and a guard-paged `Stack` (mmap + `PROT_NONE` overflow guard, §5). 5 tests pass:
 roundtrip accumulation, runs-on-the-fiber-stack, deep recursion (fib(25)), 100k switches stable, two
 independent fibers. Other targets compile but `supported()` is `false` (JIT keeps bailing there).
-**Next (commit 2):** a safe `Fiber`/`Yielder` wrapper over this, then scheduler integration + IR
-lowering of `cont.new`/`resume`/`suspend` and `thread.*` in the JIT.
+**Commit 2 DONE:** a safe RAII `Fiber`/`Yielder` *asymmetric coroutine* over the raw primitive —
+`Fiber::new(stack, |y, first| …)` runs a boxed closure on its own stack, `resume(val) -> State::{Yielded,
+Complete}`, `y.suspend(val)` switches back; values ride through a single-threaded `Cell` mailbox
+(`Control`). RAII frees the stack; a never-started fiber's closure is reclaimed on drop; a panic in the
+body is caught and converted to `abort` (unwinding across a stack switch is UB). 10 tests pass (yield/
+complete, env capture, drop-before-start drops the closure, independent state across interleaved fibers).
+**Next (commit 3):** scheduler integration — a native M:N runtime in `svm-jit` (where `unsafe` is allowed)
+whose vCPU continuation is a `Fiber`, sharing the §12 scheduler *structure* + the `Arc<Region>` substrate
++ C11 atomics with the interpreter; then IR lowering of `cont.new`/`resume`/`suspend` and `thread.*`.
 Before that — §18 **exhaustive interleaving model checker** (`svm_interp::explore_all`):
 a stateless (CHESS/`shuttle`-style) checker that enumerates *every* schedule of a small concurrent
 program at memory-op granularity and reports the outcome set — turning the seed sweep (sampling) into
