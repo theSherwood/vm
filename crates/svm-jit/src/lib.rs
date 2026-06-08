@@ -666,8 +666,8 @@ fn run_inner(
             sched_addr: std::sync::Arc::as_ptr(ps) as i64,
             spawn_thunk: par_jit::thread_spawn as *const () as i64,
             join_thunk: par_jit::thread_join as *const () as i64,
-            wait_thunk: 0, // parallel wait/notify lands in step 2c
-            notify_thunk: 0,
+            wait_thunk: par_jit::thread_wait as *const () as i64,
+            notify_thunk: par_jit::thread_notify as *const () as i64,
         }
     } else if let Some(s) = &sched {
         ThreadEnv {

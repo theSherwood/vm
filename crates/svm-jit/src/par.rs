@@ -30,10 +30,12 @@ use std::sync::{Condvar, Mutex};
 #[cfg(not(loom))]
 use std::thread;
 
-/// What running a [`Task`] yields: it finished with a result, or it blocked joining child vCPU `tid`.
+/// What running a [`Task`] yields: it finished, blocked joining a child, or parked on a futex `key`
+/// until a notify wakes it or its logical-clock `deadline` fires (at pool quiescence).
 pub(crate) enum Step {
     Done(i64),
     Join(usize),
+    Wait { key: u64, deadline: u64 },
 }
 
 /// A schedulable green thread. The real backend (step 2b) resumes a `Fiber`; the tests use mocks.
@@ -53,14 +55,27 @@ struct Inner {
     results: Vec<Option<i64>>,
     /// `(child, parent)` — `parent` is parked until `child` finishes.
     join_waiters: Vec<(usize, usize)>,
+    /// `(key, deadline, tid)` futex waiters, parked until a notify on `key` or the `deadline` fires.
+    wait_waiters: Vec<(u64, u64, usize)>,
+    /// Logical clock (ns), advanced only to fire the earliest `wait` deadline at quiescence (all
+    /// workers idle, only futex-waiters left) — so timeouts don't depend on wall-clock racing.
+    clock: u64,
     /// Value delivered to a vCPU on its next run (a wake status; 0 otherwise).
     resume_val: Vec<i64>,
     /// vCPUs not yet finished. When this hits 0 the run is done and idle workers are released.
     live: usize,
+    /// Worker threads currently blocked on the condvar (for quiescence detection).
+    idle: usize,
+    /// Total worker threads (set by `run_pool`); quiescence = `idle == workers`.
+    workers: usize,
     /// Tear the pool down early — a guest trap kills the whole domain (workers stop without finishing
     /// the remaining vCPUs).
     shutdown: bool,
 }
+
+/// `<ty>.atomic.wait` wake statuses (matching the interpreter / wasm), delivered via `resume_val`.
+pub(crate) const WAIT_WOKEN: i64 = 0;
+pub(crate) const WAIT_TIMED_OUT: i64 = 2;
 
 /// The lock guard type (distinct between `loom::sync` and `std::sync`).
 #[cfg(loom)]
@@ -82,8 +97,12 @@ impl Shared {
                 tasks: Vec::new(),
                 results: Vec::new(),
                 join_waiters: Vec::new(),
+                wait_waiters: Vec::new(),
+                clock: 0,
                 resume_val: Vec::new(),
                 live: 0,
+                idle: 0,
+                workers: 0,
                 shutdown: false,
             }),
             cvar: Condvar::new(),
@@ -120,6 +139,29 @@ impl Shared {
         self.lock().tasks.len()
     }
 
+    /// Wake up to `count` vCPUs parked on futex `key` (insertion order); returns how many. Each woken
+    /// waiter is delivered `WAIT_WOKEN` and moved to the runnable queue.
+    pub(crate) fn notify(&self, key: u64, count: u32) -> u32 {
+        let mut g = self.lock();
+        let mut woken = 0u32;
+        let mut i = 0;
+        while woken < count && i < g.wait_waiters.len() {
+            if g.wait_waiters[i].0 == key {
+                let (_, _, tid) = g.wait_waiters.remove(i);
+                g.resume_val[tid] = WAIT_WOKEN;
+                g.runnable.push_back(tid);
+                woken += 1;
+            } else {
+                i += 1;
+            }
+        }
+        drop(g);
+        if woken > 0 {
+            self.cvar.notify_all();
+        }
+        woken
+    }
+
     /// The result of vCPU `tid`, if it has finished.
     pub(crate) fn result_of(&self, tid: usize) -> Option<i64> {
         self.lock().results.get(tid).copied().flatten()
@@ -147,11 +189,31 @@ impl Shared {
                         this.cvar.notify_all();
                         return;
                     }
+                    // Nothing runnable. If *every* worker is now idle and only futex-waiters remain, no
+                    // running thread can ever notify — fire the earliest deadline (a timeout) instead of
+                    // blocking forever (quiescence detection).
+                    if g.idle + 1 == g.workers && !g.wait_waiters.is_empty() {
+                        let i = (0..g.wait_waiters.len())
+                            .min_by_key(|&i| g.wait_waiters[i].1)
+                            .unwrap();
+                        let (_, deadline, w) = g.wait_waiters.remove(i);
+                        g.clock = g.clock.max(deadline);
+                        g.resume_val[w] = WAIT_TIMED_OUT;
+                        g.runnable.push_back(w);
+                        continue;
+                    }
+                    g.idle += 1;
                     g = this.cvar.wait(g).unwrap();
+                    g.idle -= 1;
                 }
             };
 
-            let resume_val = this.lock().resume_val[tid];
+            let resume_val = {
+                let mut g = this.lock();
+                let rv = g.resume_val[tid];
+                g.resume_val[tid] = 0; // consumed
+                rv
+            };
             // ---- run the vCPU with NO lock held (it may re-enter spawn/join, or trap) ----
             let step = task.run(resume_val, &this);
 
@@ -195,6 +257,11 @@ impl Shared {
                         g.join_waiters.push((child, tid));
                     }
                 }
+                Step::Wait { key, deadline } => {
+                    // Park on the futex; a notify on `key` (or the quiescence timeout) re-runs us.
+                    g.tasks[tid] = Some(task);
+                    g.wait_waiters.push((key, deadline, tid));
+                }
             }
         }
     }
@@ -204,8 +271,10 @@ impl Shared {
 /// (so its address can be baked into the JITted `thread.*` thunks before this is called); returns the
 /// root's result (or `None` if the run deadlocked / was torn down by a trap).
 pub(crate) fn run_pool(shared: &Arc<Shared>, workers: usize, root: Box<dyn Task>) -> Option<i64> {
+    let workers = workers.max(1);
+    shared.lock().workers = workers; // for quiescence detection
     let root_id = shared.spawn(root);
-    let handles: Vec<_> = (0..workers.max(1))
+    let handles: Vec<_> = (0..workers)
         .map(|_| {
             let s = Arc::clone(shared);
             thread::spawn(move || Shared::worker(s))
@@ -387,6 +456,78 @@ mod loom_tests {
                 }),
             );
             assert_eq!(got, Some(30));
+        });
+    }
+
+    /// Explore the futex `wait`/`notify` interleavings: a waiter parks on a key; a notifier wakes it.
+    /// loom drives notify-before-park (→ the notify finds no waiter, the waiter then parks and is freed
+    /// by the quiescence timeout) and notify-after-park (→ woken). Either way the run must complete with
+    /// the invariant result — no lost wakeup, no hang. The waiter returns a fixed value regardless of
+    /// *why* it woke (spec-allowed spurious wakeups), mirroring real futex-using guest code.
+    #[test]
+    fn loom_wait_notify_never_hangs() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            // A waiter: park once on KEY, then finish with 7 (however it woke).
+            struct Waiter {
+                parked: bool,
+            }
+            impl Task for Waiter {
+                fn run(&mut self, _rv: i64, _s: &Arc<Shared>) -> Step {
+                    if !self.parked {
+                        self.parked = true;
+                        return Step::Wait {
+                            key: 1,
+                            deadline: 100,
+                        };
+                    }
+                    Step::Done(7)
+                }
+            }
+            // A notifier: wake one waiter on KEY, then finish.
+            struct Notifier;
+            impl Task for Notifier {
+                fn run(&mut self, _rv: i64, s: &Arc<Shared>) -> Step {
+                    s.notify(1, 1);
+                    Step::Done(0)
+                }
+            }
+            struct Root {
+                h: Vec<usize>,
+                acc: i64,
+                next: usize,
+                spawned: bool,
+            }
+            impl Task for Root {
+                fn run(&mut self, _rv: i64, sched: &Arc<Shared>) -> Step {
+                    if !self.spawned {
+                        self.h.push(sched.spawn(Box::new(Waiter { parked: false })));
+                        self.h.push(sched.spawn(Box::new(Notifier)));
+                        self.spawned = true;
+                    }
+                    while self.next < self.h.len() {
+                        match sched.result_of(self.h[self.next]) {
+                            Some(r) => {
+                                self.acc += r;
+                                self.next += 1;
+                            }
+                            None => return Step::Join(self.h[self.next]),
+                        }
+                    }
+                    Step::Done(self.acc)
+                }
+            }
+            let got = run(
+                2,
+                Box::new(Root {
+                    h: Vec::new(),
+                    acc: 0,
+                    next: 0,
+                    spawned: false,
+                }),
+            );
+            assert_eq!(got, Some(7));
         });
     }
 }

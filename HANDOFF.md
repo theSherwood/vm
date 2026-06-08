@@ -17,10 +17,18 @@ guest fault on any worker unwinds out and tears the pool down. `run_inner` gaine
 `thread_parallel_atomic_counter` (40 runs × 4 workers → 400 via contended hardware atomics) + the
 loom protocol check + the cooperative differential/seeded sweep all green; clippy/fmt clean. **Found +
 fixed:** the root body passed a null `fn_table` to the entry trampoline → guest `thread.spawn`
-resolved child code from null → SIGSEGV (now passes the real `fn_table_base`). Remaining: **2c** =
-`wait`/`notify` in the parallel pool (cooperative has it; parallel `thread.spawn`/`join` only so far —
-the `wait`/`notify` thunks are `0` in parallel `ThreadEnv`), and fibers+threads in one module still
-bail. **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
+resolved child code from null → SIGSEGV (now passes the real `fn_table_base`). **Step 2c DONE — `wait`/`notify` in the parallel pool.** `par` gained `Step::Wait { key, deadline }`,
+a `wait_waiters` list, a logical clock, and **quiescence detection** (when every worker is idle and only
+futex-waiters remain, no running thread can notify → fire the earliest deadline as a timeout, so a
+never-notified wait can't hang the pool). `par::notify` wakes waiters → runnable (`WAIT_WOKEN`); the
+worker delivers the wake status via `resume_val`. `par_jit` gained `thread_wait` (confined value-compare
+in the thunk; park on equal; spec-allowed spurious wakeups so a single suspend, no re-check loop) and
+`thread_notify`, wired into the parallel `ThreadEnv`. Verified: `thread_parallel_futex_handoff` (40 × 4
+workers — the consumer genuinely parks then is woken, the real block→notify path) + a second **loom**
+test (`loom_wait_notify_never_hangs`, preemption-bounded) exploring notify-before-park (→ quiescence
+timeout) and notify-after-park (→ woken), both completing with the invariant result. **Parallel JIT now
+has the full thread surface: spawn/join/wait/notify + atomics, multi-core.** Remaining: fibers+threads
+in one module still bail (needs per-vCPU fiber tables). **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
 deterministic spec; the parallel JIT refines it (differential + invariant stress), and the parallel
 *glue* is loom-checked — TSan can't see JITted accesses, so it's not used for the JIT path.
 

@@ -188,36 +188,53 @@ fn thread_seed_sweep_is_invariant_and_reproducible() {
 /// the flag at `mem[0]`, then sets the flag (release) and notifies; the consumer returns the payload
 /// it reads. On every interleaving the result is the written payload — exercising `atomic.wait` /
 /// `atomic.notify` end to end.
+const FUTEX: &str = "memory 16\n\
+    func () -> (i64) {\n\
+    block0():\n\
+    \x20 v0 = i64.const 8\n\
+    \x20 v1 = i64.const 987654\n\
+    \x20 i64.atomic.store.release v0 v1\n\
+    \x20 v2 = i64.const 0\n\
+    \x20 v3 = thread.spawn 1 v2 v2\n\
+    \x20 v4 = i64.const 0\n\
+    \x20 v5 = i32.const 1\n\
+    \x20 i32.atomic.store.release v4 v5\n\
+    \x20 v6 = i64.const 0\n\
+    \x20 v7 = i32.const 1\n\
+    \x20 v8 = atomic.notify v6 v7\n\
+    \x20 v9 = thread.join v3\n\
+    \x20 return v9\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block0(vsp: i64, v0: i64):\n\
+    \x20 v1 = i64.const 0\n\
+    \x20 v2 = i32.const 0\n\
+    \x20 v3 = i64.const 1000000000\n\
+    \x20 v4 = i32.atomic.wait v1 v2 v3\n\
+    \x20 v5 = i64.const 8\n\
+    \x20 v6 = i64.atomic.load.acquire v5\n\
+    \x20 return v6\n\
+    }\n";
+
 #[test]
 fn thread_futex_handoff() {
-    let src = "memory 16\n\
-        func () -> (i64) {\n\
-        block0():\n\
-        \x20 v0 = i64.const 8\n\
-        \x20 v1 = i64.const 987654\n\
-        \x20 i64.atomic.store.release v0 v1\n\
-        \x20 v2 = i64.const 0\n\
-        \x20 v3 = thread.spawn 1 v2 v2\n\
-        \x20 v4 = i64.const 0\n\
-        \x20 v5 = i32.const 1\n\
-        \x20 i32.atomic.store.release v4 v5\n\
-        \x20 v6 = i64.const 0\n\
-        \x20 v7 = i32.const 1\n\
-        \x20 v8 = atomic.notify v6 v7\n\
-        \x20 v9 = thread.join v3\n\
-        \x20 return v9\n\
-        }\n\
-        func (i64, i64) -> (i64) {\n\
-        block0(vsp: i64, v0: i64):\n\
-        \x20 v1 = i64.const 0\n\
-        \x20 v2 = i32.const 0\n\
-        \x20 v3 = i64.const 1000000000\n\
-        \x20 v4 = i32.atomic.wait v1 v2 v3\n\
-        \x20 v5 = i64.const 8\n\
-        \x20 v6 = i64.atomic.load.acquire v5\n\
-        \x20 return v6\n\
-        }\n";
-    assert_jit_matches_interp(src);
+    assert_jit_matches_interp(FUTEX);
+}
+
+/// The futex handoff on the **parallel** pool: the consumer can genuinely park on `atomic.wait` (on a
+/// different worker, before the producer sets the flag) and be woken by the producer's `atomic.notify`
+/// — the real block→notify path the cooperative root-first scheduler never reaches. The result is the
+/// payload (987654) every run.
+#[test]
+fn thread_parallel_futex_handoff() {
+    let m = parse_module(FUTEX).expect("parse");
+    verify_module(&m).expect("verify");
+    for _ in 0..40 {
+        match compile_and_run_parallel(&m, 0, &[], 4).expect("jit") {
+            JitOutcome::Returned(x) => assert_eq!(x, [987654], "parallel futex payload wrong"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }
 
 /// Joining the same handle twice is inert the second time → `ThreadFault`, on both backends.

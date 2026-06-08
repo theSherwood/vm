@@ -25,9 +25,10 @@ const FIBER_STACK: usize = 1 << 20;
 /// Max concurrently-live vCPUs (anti-bomb; matches the interpreter / cooperative scheduler).
 const MAX_VCPUS: usize = 1 << 16;
 
-/// Why a thunk suspended the running fiber back to its worker. (`wait`/`notify` land in step 2c.)
+/// Why a thunk suspended the running fiber back to its worker.
 enum Block {
     Join(usize),
+    Wait { key: u64, deadline: u64 },
 }
 
 /// The per-run constants every vCPU needs to call guest code / spawn children — copied into each
@@ -160,6 +161,7 @@ impl Task for FiberTask {
             Out::Done(v) => Step::Done(v as i64),
             Out::Yield => match self.ctx.block.take() {
                 Some(Block::Join(child)) => Step::Join(child),
+                Some(Block::Wait { key, deadline }) => Step::Wait { key, deadline },
                 // A bare yield with no recorded block shouldn't happen for threads; treat as done(0).
                 None => Step::Done(0),
             },
@@ -322,4 +324,73 @@ pub(crate) unsafe extern "C" fn thread_join(
         (*yielder).suspend(0);
         // Resumed: loop and re-check the result.
     }
+}
+
+/// The low `width`-byte mask (`width` ∈ {1,2,4,8}).
+fn width_mask(width: u32) -> u64 {
+    if width >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width * 8)) - 1
+    }
+}
+
+/// Read the `width`-byte value at physical address `phys` (the lowering's alignment guard ensures it
+/// is aligned).
+///
+/// # Safety
+/// `phys` points at `width` readable bytes in the guest window.
+unsafe fn read_phys(phys: u64, width: u32) -> u64 {
+    match width {
+        1 => *(phys as *const u8) as u64,
+        2 => *(phys as *const u16) as u64,
+        4 => *(phys as *const u32) as u64,
+        _ => *(phys as *const u64),
+    }
+}
+
+/// `<ty>.atomic.wait` thunk (parallel mode): if the `width`-byte value at confined `phys` still equals
+/// `expected`, park the running vCPU on `phys` until a notify or `timeout` ns elapse (`< 0` = forever,
+/// fired only at pool quiescence). Returns the `i32` status (woken / not-equal / timed-out). Spurious
+/// wakeups are spec-allowed, so a single suspend (no internal re-check loop) is correct.
+///
+/// # Safety
+/// `sched` is the run's live `par::Shared`; `phys` points at `width` readable guest bytes.
+pub(crate) unsafe extern "C" fn thread_wait(
+    sched: *const Shared,
+    phys: u64,
+    expected: u64,
+    width: u32,
+    timeout: i64,
+) -> i32 {
+    let mask = width_mask(width);
+    if read_phys(phys, width) & mask != expected & mask {
+        return 1; // WAIT_NOT_EQUAL
+    }
+    let ctx = CURRENT.with(|c| c.get());
+    if ctx.is_null() {
+        return crate::par::WAIT_TIMED_OUT as i32;
+    }
+    let deadline = if timeout < 0 {
+        u64::MAX
+    } else {
+        timeout as u64
+    };
+    (*ctx).block = Some(Block::Wait {
+        key: phys,
+        deadline,
+    });
+    let yielder = (*ctx).yielder;
+    let _ = sched; // (the worker parks us via the `Step::Wait`; `sched` kept for symmetry)
+                   // Suspend; the worker resumes us with the wake status (WAIT_WOKEN / WAIT_TIMED_OUT) as resume_val.
+    (*yielder).suspend(0) as i32
+}
+
+/// `atomic.notify` thunk (parallel mode): wake up to `count` vCPUs parked on confined `phys`; returns
+/// the `i32` count woken.
+///
+/// # Safety
+/// `sched` is the run's live `par::Shared`.
+pub(crate) unsafe extern "C" fn thread_notify(sched: *const Shared, phys: u64, count: i32) -> i32 {
+    (*sched).notify(phys, count.max(0) as u32) as i32
 }
