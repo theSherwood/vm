@@ -4,6 +4,26 @@ Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
+**DECISION (2026-06-08) — concurrency model: keep two primitives, unify the *implementation* (option
+#1), not the IR surface (#3).** Green threads (`thread.spawn` vCPUs, scheduler-owned, parallel,
+nondeterministic) and fibers (`cont.*`, guest-owned, cooperative, deterministic synchronous control
+transfer) are *the same mechanism* (a suspendable stack — a vCPU literally **is** an `svm-fiber`) used
+under two **scheduling disciplines**; `resume` (sequential) vs `spawn` (concurrent) are two ops on one
+continuation. They are **not** redundant: threads give parallelism, fibers give deterministic
+continuations (generators / async / algebraic effects) that threads can't express; and a fiber can't
+run in parallel with its resumer. **Considered three options:** (#1) keep both IR primitives, make them
+*coexist* by giving each vCPU its own fiber runtime; (#2) drop guest `cont.*`, threads-only (Go-style;
+loses deterministic continuations + effect-language hosting); (#3) collapse to one continuation
+primitive (`resume`/`spawn`), most principled, matches Wasm typed-continuations, but a large redesign
+of verify/types/frontend and re-verification of a currently-green system, with a blurrier
+deterministic-verification boundary and loss of the footgun-free `spawn`/`join` contract (which can be
+kept as sugar anyway). **Chose #1** because the combo gap is mostly an *implementation* artifact (today
+`fiber_rt` is one-per-run; the thread schedulers are separate), so a **per-vCPU fiber runtime** makes
+them compose at ~10% of #3's cost/risk, keeps the simple thread contract and the crisp verification
+split, and is a *stepping stone* toward #3 if we ever commit to a continuations-first identity.
+**Tradeoff accepted:** two IR concepts instead of one (slightly more surface to document/maintain);
+revisit #3 only if this VM becomes fundamentally a continuations machine.
+
 **Latest (2026-06-08):** §12 **the JIT runs threads on real multiple cores (part 4 step 2b DONE).**
 `compile_and_run_parallel(m, func, args, workers)` drives a threaded module on the loom-verified `par`
 worker pool: the guest entry is root vCPU 0, spawned vCPUs are fibers multiplexed across `workers` OS
