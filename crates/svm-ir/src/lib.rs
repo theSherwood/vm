@@ -1048,12 +1048,14 @@ pub enum Inst {
     Suspend {
         value: ValIdx,
     },
-    /// §12 thread spawn (`thread.spawn`): start a new vCPU — a green thread on the M:N executor —
-    /// running `funcs[func]` on the data stack based at `sp` (the §3d two-stack split — every
-    /// vCPU owns its own in-window data stack, exactly like a fiber) with `arg`, over the **same**
-    /// guest memory (anonymous `Region` bytes and §13 aliases are shared; post-spawn mapping changes
-    /// are thread-local for now). `func` must have the fixed thread-entry type `(i64 sp, i64 arg) ->
-    /// i64` (verifier-checked) — the same signature as a fiber, so a frontend function works as-is.
+    /// §12 thread spawn (`thread.spawn`): start a new vCPU — **one real OS thread** (1:1; the VM
+    /// provides the thread + futex as *primitives*, not a scheduler — any M:N model is built by the
+    /// guest runtime over `thread.spawn` + `cont.*`, D22) — running `funcs[func]` on the data stack
+    /// based at `sp` (the §3d two-stack split — every vCPU owns its own in-window data stack, exactly
+    /// like a fiber) with `arg`, over the **same** guest memory (anonymous `Region` bytes and §13
+    /// aliases are shared; post-spawn mapping changes are thread-local for now). `func` must have the
+    /// fixed thread-entry type `(i64 sp, i64 arg) -> i64` (verifier-checked) — the same signature as a
+    /// fiber, so a frontend function works as-is.
     /// Yields an `i32` **thread handle**: a forgeable index into the runtime-owned thread table,
     /// masked + generation-checked at [`Inst::ThreadJoin`] like a fiber/capability handle (§3c), so a
     /// forged handle is inert (it traps).

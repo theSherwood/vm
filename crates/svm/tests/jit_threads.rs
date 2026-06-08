@@ -11,9 +11,7 @@
 #![cfg(all(unix, target_arch = "x86_64"))]
 
 use svm_interp::{run, Trap, Value};
-use svm_jit::{
-    compile_and_run, compile_and_run_parallel, compile_and_run_scheduled, JitOutcome, TrapKind,
-};
+use svm_jit::{compile_and_run, JitOutcome, TrapKind};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -148,38 +146,19 @@ fn thread_atomic_counter() {
     assert_jit_matches_interp(ATOMIC4);
 }
 
-/// **Real multi-core execution.** The same counter on a 4-worker parallel pool: vCPUs run on real OS
-/// threads, contending on the shared counter via hardware atomics. The total is exactly 400 every run
-/// (a lost update — a scheduler race or a non-atomic RMW — would drop it). Many runs to shake out
-/// races (the scheduler glue is also loom-verified in `svm-jit`'s `par` module).
+/// **Real multi-core execution.** The same counter with four vCPUs on real OS threads (1:1, the VM's
+/// only thread primitive — no scheduler), contending on the shared counter via hardware atomics. The
+/// total is exactly 400 every run (a lost update — a non-atomic RMW — would drop it). Many runs to
+/// shake out races; the deterministic exhaustive-interleaving check is the interpreter oracle
+/// (`run_scheduled`/`explore_all`), against which this run is differential-tested.
 #[test]
 fn thread_parallel_atomic_counter() {
     let m = parse_module(ATOMIC4).expect("parse");
     verify_module(&m).expect("verify");
     for _ in 0..40 {
-        match compile_and_run_parallel(&m, 0, &[], 4).expect("jit") {
+        match compile_and_run(&m, 0, &[]).expect("jit") {
             JitOutcome::Returned(x) => assert_eq!(x, [400], "parallel total wrong"),
             other => panic!("unexpected {other:?}"),
-        }
-    }
-}
-
-/// The deterministic seeded scheduler (the verification backbone): every seed yields the invariant
-/// 400, and each seed is *reproducible* (same seed → same result) — the JIT analogue of the
-/// interpreter's `run_scheduled` sweep, so a scheduler bug surfaces as a replayable failing seed.
-#[test]
-fn thread_seed_sweep_is_invariant_and_reproducible() {
-    let m = parse_module(ATOMIC4).expect("parse");
-    verify_module(&m).expect("verify");
-    for seed in 0..24u64 {
-        let a = compile_and_run_scheduled(&m, 0, &[], seed).expect("jit");
-        let b = compile_and_run_scheduled(&m, 0, &[], seed).expect("jit");
-        match (&a, &b) {
-            (JitOutcome::Returned(x), JitOutcome::Returned(y)) => {
-                assert_eq!(x, &[400], "seed {seed}: not the invariant total");
-                assert_eq!(x, y, "seed {seed}: not reproducible");
-            }
-            _ => panic!("seed {seed}: unexpected {a:?} / {b:?}"),
         }
     }
 }
@@ -221,16 +200,15 @@ fn thread_futex_handoff() {
     assert_jit_matches_interp(FUTEX);
 }
 
-/// The futex handoff on the **parallel** pool: the consumer can genuinely park on `atomic.wait` (on a
-/// different worker, before the producer sets the flag) and be woken by the producer's `atomic.notify`
-/// — the real block→notify path the cooperative root-first scheduler never reaches. The result is the
-/// payload (987654) every run.
+/// The futex handoff with real parallel vCPUs: the consumer genuinely parks on `atomic.wait` (on its
+/// own OS thread, possibly before the producer sets the flag) and is woken by the producer's
+/// `atomic.notify` — the real block→notify path. The result is the payload (987654) every run.
 #[test]
 fn thread_parallel_futex_handoff() {
     let m = parse_module(FUTEX).expect("parse");
     verify_module(&m).expect("verify");
     for _ in 0..40 {
-        match compile_and_run_parallel(&m, 0, &[], 4).expect("jit") {
+        match compile_and_run(&m, 0, &[]).expect("jit") {
             JitOutcome::Returned(x) => assert_eq!(x, [987654], "parallel futex payload wrong"),
             other => panic!("unexpected {other:?}"),
         }
@@ -340,7 +318,7 @@ fn thread_parallel_with_fibers() {
     verify_module(&m).expect("verify");
     // Σ over i in 0..4 of (i*10 + 42) = (0+10+20+30) + 4*42 = 60 + 168 = 228.
     for _ in 0..40 {
-        match compile_and_run_parallel(&m, 0, &[], 4).expect("jit") {
+        match compile_and_run(&m, 0, &[]).expect("jit") {
             JitOutcome::Returned(x) => assert_eq!(x, [228], "parallel fiber+thread sum wrong"),
             other => panic!("unexpected {other:?}"),
         }

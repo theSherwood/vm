@@ -78,22 +78,12 @@ mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill h
 #[cfg(all(unix, target_arch = "x86_64"))]
 mod fiber_rt;
 
-// Cooperative green-thread scheduler for `thread.spawn`/`thread.join` (§12), on the same stack-switch
-// substrate. Wired into codegen below (the `thread.*` lowering + the guarded scheduler shim). The
-// `Ctx`-closure surface is exercised by this module's standalone unit tests, so `allow(dead_code)`
-// keeps the non-test lib build (where that surface is unused) warning-free.
+// 1:1 OS-thread executor for `thread.spawn`/`thread.join` + the `wait`/`notify` futex (§12): the VM
+// exposes these as *primitives*, not a scheduler — a spawned vCPU is one real OS thread; any M:N model
+// is built by the guest runtime over these + `cont.*` (D22: no built-in scheduler). The futex core is
+// loom-verified. Available where `svm_fiber::supported()` (x86-64 unix).
 #[cfg(all(unix, target_arch = "x86_64"))]
-#[allow(dead_code)]
-mod thread_rt;
-
-// Parallel (multi-core) executor core (§12, part 4): the Mutex+Condvar worker-pool protocol over an
-// abstract task, loom-verified with mock tasks.
-mod par;
-
-// Real-fiber + JIT integration for the parallel executor (§12, part 4 step 2b): a fiber-backed
-// `par::Task`, the parallel `thread.*` thunks, and the current-vCPU thread-local.
-#[cfg(all(unix, target_arch = "x86_64"))]
-mod par_jit;
+mod os_thread_rt;
 
 // The windows placeholder-window commit primitive, reused by `svm-run`'s Memory-cap backend (it
 // commits/grows tail pages of this same window; a plain `VirtualAlloc(MEM_COMMIT)` cannot commit a
@@ -324,62 +314,6 @@ pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitO
     compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
 }
 
-/// Like [`compile_and_run`], but a **threaded** module's cooperative scheduler chooses the next
-/// runnable vCPU from a seeded PRNG instead of FIFO — so a run is a reproducible function of `seed`,
-/// and sweeping seeds explores distinct (block-granularity) interleavings (the JIT analogue of
-/// [`svm_interp::run_scheduled`]). For a non-threaded module the seed is inert. This is the
-/// deterministic, replayable backbone for verifying the scheduler (independent of the parallel
-/// executor).
-pub fn compile_and_run_scheduled(
-    m: &IrModule,
-    func: FuncIdx,
-    args: &[i64],
-    seed: u64,
-) -> Result<JitOutcome, JitError> {
-    Ok(run_inner(
-        m,
-        func,
-        args,
-        empty_cap_thunk,
-        core::ptr::null_mut(),
-        None,
-        DEFAULT_RESERVED_LOG2,
-        None,
-        Some(seed),
-        None,
-    )?
-    .0)
-}
-
-/// Like [`compile_and_run`], but run a **threaded** module on a real multi-core pool of `workers`
-/// OS-thread workers (§12, part 4). vCPUs are green threads (fibers) multiplexed over the workers,
-/// sharing the one guest window (real hardware atomics); a guest fault on any worker is detect-and-
-/// kill. For a non-threaded module this is the same as [`compile_and_run`] on one thread.
-///
-/// Unlike the cooperative [`compile_and_run`]/`_scheduled`, a parallel run is **not** deterministic
-/// (the OS schedules the workers); it's the production execution mode, verified by invariant stress +
-/// the differential against the deterministic backends.
-pub fn compile_and_run_parallel(
-    m: &IrModule,
-    func: FuncIdx,
-    args: &[i64],
-    workers: usize,
-) -> Result<JitOutcome, JitError> {
-    Ok(run_inner(
-        m,
-        func,
-        args,
-        empty_cap_thunk,
-        core::ptr::null_mut(),
-        None,
-        DEFAULT_RESERVED_LOG2,
-        None,
-        None,
-        Some(workers.max(1)),
-    )?
-    .0)
-}
-
 /// Like [`compile_and_run`], but `cap.call`s dispatch through `cap_thunk` with the
 /// caller's `cap_ctx` (the powerbox host). The thunk + ctx addresses are baked into the
 /// compiled code as constants — valid because the module is compiled, run once, then
@@ -404,8 +338,6 @@ pub fn compile_and_run_with_host(
         cap_ctx,
         None,
         DEFAULT_RESERVED_LOG2,
-        None,
-        None,
         None,
     )?
     .0)
@@ -449,8 +381,6 @@ pub fn compile_and_run_capture_reserved(
         Some(init_mem),
         reserved_log2,
         None,
-        None,
-        None,
     )
 }
 
@@ -482,8 +412,6 @@ pub fn compile_and_run_capture_reserved_with_host(
         // Escape-oracle over the §1a growth path: snapshot the low `SNAP_CAP` bytes (not just the
         // backed prefix) so guest-grown / `unmap`-ed reserved-tail pages are byte-compared too.
         Some(SNAP_CAP),
-        None,
-        None,
     )
 }
 
@@ -497,11 +425,7 @@ fn run_inner(
     init_mem: Option<&[u8]>,
     reserved_log2: u8,
     snapshot_cap: Option<usize>,
-    sched_seed: Option<u64>,
-    parallel: Option<usize>,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
-    #[cfg(not(all(unix, target_arch = "x86_64")))]
-    let _ = parallel;
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // Calls can reach any function, so every function must be lowerable.
     for f in &m.funcs {
@@ -615,12 +539,11 @@ fn run_inner(
     let fiber_type_id = type_id_of(&distinct, &fiber_func_type());
     #[cfg(all(unix, target_arch = "x86_64"))]
     let fiber_mask = (m.funcs.len().next_power_of_two() as u64) - 1;
-    // Fibers + threads compose via a **per-vCPU** fiber runtime — built per vCPU by whichever scheduler
-    // runs (cooperative `thread_rt` or the parallel `par` pool) and published through a thread-local.
-    // A *standalone* fiber runtime (fibers without threads). Threaded modules get a per-vCPU runtime
-    // from the scheduler instead, so none is created here.
+    // Fibers + threads compose via a **per-vCPU** fiber runtime, published through a thread-local. This
+    // is the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
+    // builds its own from `fiber_cfg` (`os_thread_rt`). Created whenever the module uses `cont.*`.
     #[cfg(all(unix, target_arch = "x86_64"))]
-    let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers && !uses_threads {
+    let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
         Some(Box::new(fiber_rt::FiberRuntime::new(
             fiber_type_id,
             fiber_mask,
@@ -642,51 +565,24 @@ fn run_inner(
     #[cfg(not(all(unix, target_arch = "x86_64")))]
     let fiber = FiberEnv::null();
 
-    // §12 threads: stand up a scheduler whose address is baked into the `thread.*` sites. Two modes:
-    // `parallel = Some(workers)` uses the multi-core `par` pool (`par_jit` thunks); otherwise the
-    // single-thread cooperative `thread_rt` (optionally seeded). The call-trampoline + trap cell are
-    // wired after finalize. Both present a stable scheduler address now.
+    // §12 threads: stand up the 1:1 OS-thread executor `Domain` whose stable address is baked into the
+    // `thread.*` sites. It owns no scheduling policy — `thread.spawn` launches a real OS thread (the
+    // guest builds any M:N model itself, D22). The per-run `Env` (call-trampoline, window, trap cell)
+    // is supplied after finalize via `set_env`; the address is stable now.
     #[cfg(all(unix, target_arch = "x86_64"))]
-    let par_shared: Option<std::sync::Arc<par::Shared>> = if uses_threads && parallel.is_some() {
-        Some(par::Shared::new())
+    let domain: Option<Box<os_thread_rt::Domain>> = if uses_threads {
+        Some(Box::new(os_thread_rt::Domain::new()))
     } else {
         None
     };
     #[cfg(all(unix, target_arch = "x86_64"))]
-    let mut sched: Option<Box<thread_rt::Sched>> = if uses_threads && parallel.is_none() {
-        // Per-vCPU fiber config (so a vCPU can use `cont.*`), when the module mixes the two.
-        let fiber_cfg = if uses_fibers {
-            Some((fiber_type_id, fiber_mask))
-        } else {
-            None
-        };
-        Some(Box::new(thread_rt::Sched::new(1 << 20, fiber_cfg))) // 1 MiB per-vCPU control stack
-    } else {
-        None
-    };
-    // A seeded run picks the next runnable vCPU pseudo-randomly (reproducible per seed); FIFO else.
-    #[cfg(all(unix, target_arch = "x86_64"))]
-    if let (Some(s), Some(seed)) = (&mut sched, sched_seed) {
-        s.set_seed(seed);
-    }
-    #[cfg(not(all(unix, target_arch = "x86_64")))]
-    let _ = sched_seed;
-    #[cfg(all(unix, target_arch = "x86_64"))]
-    let thread = if let Some(ps) = &par_shared {
+    let thread = if let Some(d) = &domain {
         ThreadEnv {
-            sched_addr: std::sync::Arc::as_ptr(ps) as i64,
-            spawn_thunk: par_jit::thread_spawn as *const () as i64,
-            join_thunk: par_jit::thread_join as *const () as i64,
-            wait_thunk: par_jit::thread_wait as *const () as i64,
-            notify_thunk: par_jit::thread_notify as *const () as i64,
-        }
-    } else if let Some(s) = &sched {
-        ThreadEnv {
-            sched_addr: (&**s as *const thread_rt::Sched) as i64,
-            spawn_thunk: thread_rt::thread_spawn as *const () as i64,
-            join_thunk: thread_rt::thread_join as *const () as i64,
-            wait_thunk: thread_rt::thread_wait as *const () as i64,
-            notify_thunk: thread_rt::thread_notify as *const () as i64,
+            sched_addr: (&**d as *const os_thread_rt::Domain) as i64,
+            spawn_thunk: os_thread_rt::thread_spawn as *const () as i64,
+            join_thunk: os_thread_rt::thread_join as *const () as i64,
+            wait_thunk: os_thread_rt::thread_wait as *const () as i64,
+            notify_thunk: os_thread_rt::thread_notify as *const () as i64,
         }
     } else {
         ThreadEnv::null()
@@ -747,10 +643,10 @@ fn run_inner(
         .finalize_definitions()
         .map_err(|e| JitError::Backend(e.to_string()))?;
 
-    // Now that code is finalized, hand the fiber runtime / scheduler their call-trampoline address
-    // (and keep it for the parallel pool, which takes it as a `run_root` argument).
+    // Now that code is finalized, hand the root fiber runtime its call-trampoline address (and keep it
+    // to seed the thread `Domain`'s `Env`, which spawned vCPUs use to call their entry).
     #[cfg(all(unix, target_arch = "x86_64"))]
-    let mut par_call_tramp: Option<fiber_rt::FiberCallTramp> = None;
+    let mut call_tramp: Option<fiber_rt::FiberCallTramp> = None;
     #[cfg(all(unix, target_arch = "x86_64"))]
     if let Some(id) = fiber_tramp {
         let addr = module.get_finalized_function(id);
@@ -759,10 +655,7 @@ fn run_inner(
         if let Some(rt) = &mut fiber_rt {
             rt.set_call_tramp(t);
         }
-        if let Some(s) = &mut sched {
-            s.set_call_tramp(t);
-        }
-        par_call_tramp = Some(t);
+        call_tramp = Some(t);
     }
 
     // Build the function table (§3c) now that code addresses are known: power-of-two
@@ -796,98 +689,56 @@ fn run_inner(
     // code for an Exit. A trapping path (or the cap thunk) writes it.
     let mut trap_cell: i64 = 0;
 
-    // Three execution shapes share this one entry/result/trap setup:
-    //   * parallel threaded → drive the `par` worker pool (root vCPU 0 = the entry); each worker
-    //     guards its own resumes, so there is no single outer `run_guarded`.
-    //   * cooperative threaded → run the scheduler shim (`sched_entry`) under one `run_guarded`.
-    //   * non-threaded → call the entry trampoline under one `run_guarded`.
-    let mut faulted = false;
+    // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
+    // vCPUs run on their own OS threads via the baked `Domain`. Seed the `Domain`'s per-run `Env` now
+    // that the window / fn-table / trap-cell / call-trampoline are all known.
     #[cfg(all(unix, target_arch = "x86_64"))]
-    let parallel_run = par_shared.is_some();
-    #[cfg(not(all(unix, target_arch = "x86_64")))]
-    let parallel_run = false;
-
-    if parallel_run {
-        #[cfg(all(unix, target_arch = "x86_64"))]
-        {
-            let ps = par_shared.as_ref().expect("parallel scheduler");
-            let workers = parallel.unwrap_or(1).max(1);
-            mem::install_guard();
-            let fault = window.fault_range();
-            // SAFETY: `code` is the finalized entry trampoline; the window/fn_table/buffers all outlive
-            // `run_root` (it blocks until the pool finishes); a per-worker guard turns a guest fault
-            // into a trap-cell write + pool shutdown.
-            unsafe {
-                let fiber_cfg = if uses_fibers {
-                    Some((fiber_type_id, fiber_mask))
-                } else {
-                    None
-                };
-                par_jit::run_root(
-                    ps,
-                    workers,
-                    code,
-                    args.as_ptr(),
-                    results.as_mut_ptr(),
-                    mem_base as u64,
-                    fn_table.as_ptr() as u64,
-                    &mut trap_cell,
-                    par_call_tramp.expect("call-trampoline set for a threaded module"),
-                    fault,
-                    fiber_cfg,
-                );
-            }
-        }
-    } else {
-        // For a cooperative threaded module, run the scheduler shim (root vCPU 0 = the entry) under the
-        // guard; otherwise call the entry trampoline. Both share the fixed `Entry` ABI.
-        #[cfg(all(unix, target_arch = "x86_64"))]
-        let (run_code, run_args, _sched_ctx): (
-            *const u8,
-            *const i64,
-            Option<Box<SchedCtx>>,
-        ) = match &mut sched {
-            Some(s) => {
-                let ctx = Box::new(SchedCtx {
-                    sched: &mut **s as *mut thread_rt::Sched,
-                    entry_code: code,
-                    entry_args: args.as_ptr(),
-                });
-                let cptr = &*ctx as *const SchedCtx as *const i64;
-                (sched_entry as *const () as *const u8, cptr, Some(ctx))
-            }
-            None => (code, args.as_ptr(), None),
+    if let Some(d) = &domain {
+        let fiber_cfg = if uses_fibers {
+            Some((fiber_type_id, fiber_mask))
+        } else {
+            None
         };
-        #[cfg(not(all(unix, target_arch = "x86_64")))]
-        let (run_code, run_args) = (code, args.as_ptr());
+        d.set_env(
+            mem_base as u64,
+            fn_table.as_ptr() as u64,
+            &mut trap_cell,
+            call_tramp.expect("call-trampoline set for a threaded module"),
+            window.fault_range(),
+            fiber_cfg,
+        );
+    }
 
-        // Standalone fibers (no threads): publish the single fiber runtime so the `cont.*` thunks find
-        // it via the thread-local for the duration of the entry. (Threaded runs publish per-vCPU
-        // runtimes from inside the scheduler instead.)
-        #[cfg(all(unix, target_arch = "x86_64"))]
-        let prev_rt = fiber_rt
-            .as_mut()
-            .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime));
+    // Publish the root fiber runtime (when the module uses `cont.*`) so its thunks find it via the
+    // thread-local for the duration of the entry; spawned vCPUs publish their own.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    let prev_rt = fiber_rt
+        .as_mut()
+        .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime));
 
-        // SAFETY: `run_code` is a finalized trampoline (the entry's, or the scheduler shim) honouring
-        // the `Entry` ABI. It reads the arg slots, writes the result slots, accesses only the guarded
-        // window (any escape faults into the guard page), reads `fn_table`, and writes `trap_cell`.
-        // All buffers outlive the call; `module` owns the executable page until dropped below.
-        faulted = unsafe {
-            mem::run_guarded(
-                &window,
-                run_code,
-                run_args,
-                results.as_mut_ptr(),
-                mem_base,
-                fn_table.as_ptr() as *const core::ffi::c_void,
-                &mut trap_cell,
-            )
-        };
-        #[cfg(all(unix, target_arch = "x86_64"))]
-        if let Some(p) = prev_rt {
-            fiber_rt::set_current(p);
-        }
+    // SAFETY: `code` is the finalized entry trampoline honouring the `Entry` ABI. It reads the arg
+    // slots, writes the result slots, accesses only the guarded window (any escape faults into the
+    // guard page), reads `fn_table`, and writes `trap_cell`. All buffers outlive the call; `module`
+    // owns the executable page until dropped below (after every spawned vCPU is joined).
+    let faulted = unsafe {
+        mem::run_guarded(
+            &window,
+            code,
+            args.as_ptr(),
+            results.as_mut_ptr(),
+            mem_base,
+            fn_table.as_ptr() as *const core::ffi::c_void,
+            &mut trap_cell,
+        )
+    };
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    if let Some(p) = prev_rt {
+        fiber_rt::set_current(p);
+    }
+    // Join every spawned vCPU OS thread before freeing the window/code — no vCPU may outlive them.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    if let Some(d) = &domain {
+        d.join_all();
     }
     // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host.
     if faulted {
@@ -1311,51 +1162,6 @@ fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
     b.ins().return_(&[r]);
     b.seal_all_blocks();
     b.finalize();
-}
-
-/// The buffer-ABI entry trampoline's type (= `mem::Entry`): how the root vCPU calls the guest entry.
-#[cfg(all(unix, target_arch = "x86_64"))]
-pub(crate) type EntryTramp =
-    extern "C" fn(*const i64, *mut i64, *mut u8, *const core::ffi::c_void, *mut i64);
-
-/// Context handed to [`sched_entry`] via the guarded call's `args` slot: everything the scheduler
-/// shim needs that doesn't fit the fixed `Entry` ABI.
-#[cfg(all(unix, target_arch = "x86_64"))]
-struct SchedCtx {
-    sched: *mut thread_rt::Sched,
-    /// The buffer-ABI entry trampoline (the guest `main`), run as root vCPU 0.
-    entry_code: *const u8,
-    /// The guest entry's argument slots.
-    entry_args: *const i64,
-}
-
-/// The scheduler **shim**, shaped as an `Entry` so it can run *under* `run_guarded` (the C
-/// `setjmp`/`siglongjmp` detect-and-kill wrapper). It drives the thread scheduler to completion with
-/// the guest entry as root vCPU 0; a guard fault in any vCPU `longjmp`s back out of the whole schedule
-/// (abandoning fiber stacks — the domain is being killed). `args` is a `*const SchedCtx`; the other
-/// params are the run's real `results`/`mem_base`/`fn_table`/`trap_cell`, forwarded to the root vCPU.
-#[cfg(all(unix, target_arch = "x86_64"))]
-extern "C" fn sched_entry(
-    args: *const i64,
-    results: *mut i64,
-    mem_base: *mut u8,
-    fn_table: *const core::ffi::c_void,
-    trap_cell: *mut i64,
-) {
-    // SAFETY: `args` is the `&SchedCtx` we passed to `run_guarded`; the scheduler + pointers are live
-    // for the call.
-    let ctx = unsafe { &*(args as *const SchedCtx) };
-    let sched = unsafe { &mut *ctx.sched };
-    sched.set_trap_cell(trap_cell);
-    // SAFETY: `entry_code` is the finalized buffer-ABI entry trampoline (`EntryTramp` shape).
-    let entry: EntryTramp = unsafe { std::mem::transmute(ctx.entry_code) };
-    let eargs = ctx.entry_args;
-    // Root vCPU 0: run the guest entry, writing its results into the run's results buffer.
-    let body: thread_rt::Body = Box::new(move |_c: &thread_rt::Ctx| -> i64 {
-        entry(eargs, results, mem_base, fn_table, trap_cell);
-        0
-    });
-    sched.run(body);
 }
 
 /// Lower one IR block's body + terminator into its CLIF block.
