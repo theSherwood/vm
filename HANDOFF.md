@@ -4,7 +4,24 @@ Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
-**Latest (2026-06-08):** §12 **JIT concurrency — commit 3: fibers run in the JIT.** `cont.new`/
+**Latest (2026-06-08):** §12 **JIT concurrency is functionally complete** — the JIT now runs **fibers
+(`cont.*`), threads (`thread.spawn`/`join`), and the futex (`atomic.wait`/`notify`)** on the
+`svm-fiber` stack switch (x86-64 unix), all verified against the interpreter by the interp↔JIT
+differential, and **real multi-threaded C runs end-to-end on the JIT** (`c_threads_atomic_counter_jit`:
+4×500 atomic adds → 2000 on both backends). Threads run on a cooperative green-thread scheduler
+(`svm-jit/src/thread_rt.rs`): the guest entry is root vCPU 0 under a guarded scheduler shim, spawned
+vCPUs are fibers, `join`/`wait` block by suspending back to the scheduler, all vCPUs share the one
+`Arc<Region>` window (hardware atomics). Commits 1–4-part-3 below. **The one remaining piece is a
+deliberate decision, not a mechanical next step — part 4: true multi-core workers** (run vCPUs on N OS
+threads in parallel). It is *perf-only* (the cooperative scheduler already runs every concurrent
+program **correctly** — correctness under all interleavings doesn't need parallel execution), it is the
+highest-risk unsafe in the project (a `Mutex`-protected scheduler + fiber migration across OS threads +
+per-worker signal handler/`setjmp`), and it carries a **verification tradeoff**: TSan can't see JITted
+machine code, so multi-core JIT can't be TSan-verified the way the interpreter is — it would lean on
+hardware-atomic correctness + TSan on the *glue* + invariant stress. Worth a human call before
+starting.
+
+§12 **JIT concurrency — commit 3: fibers run in the JIT.** `cont.new`/
 `cont.resume`/`suspend` now lower (x86-64 unix) to a host fiber runtime (`svm-jit/src/fiber_rt.rs`)
 over the `svm-fiber` stack switch: a boxed `FiberRuntime` (address baked in like `CapEnv`) + three
 `extern "C"` thunks the JIT calls via `call_indirect` (threading `mem_base`/`fn_table_base`/`trap_out`
