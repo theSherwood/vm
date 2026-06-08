@@ -4,7 +4,22 @@ Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
-**Latest (2026-06-08):** §12 **JIT concurrency — commit 1: the `svm-fiber` stack-switch primitive.**
+**Latest (2026-06-08):** §12 **JIT concurrency — commit 3: fibers run in the JIT.** `cont.new`/
+`cont.resume`/`suspend` now lower (x86-64 unix) to a host fiber runtime (`svm-jit/src/fiber_rt.rs`)
+over the `svm-fiber` stack switch: a boxed `FiberRuntime` (address baked in like `CapEnv`) + three
+`extern "C"` thunks the JIT calls via `call_indirect` (threading `mem_base`/`fn_table_base`/`trap_out`
+like `cap.call`), plus one generated CLIF call-trampoline that bridges Rust → the guest `Tail` ABI
+(`(i64 sp, i64 arg) -> i64`). A fiber body runs JITted guest code on its own native control stack; a
+`suspend` deep inside switches the whole stack back (the §3d two-stack model). Reentrancy is sound:
+no `&mut FiberRuntime` is held across a switch (only a `*mut Fiber` to an address-stable boxed fiber),
+and a `chain` rejects re-entrant resume. **Verified by the interp↔JIT differential** (`jit_fibers.rs`,
+6 tests incl. a 3-level nested resume chain and a data-stack+memory fiber) — fibers are deterministic,
+so the strongest oracle applies. `TrapKind::FiberFault` added; the old "JIT bails on fibers" test is
+now platform-gated. Full suite + clippy + fmt green. **Next (commit 4):** the native M:N thread
+scheduler (`thread.spawn`/`join`/`wait`/`notify`) — extract the shared safe `svm-sched` crate and run
+JIT vCPUs as green threads (`Fiber` per vCPU) under TSan.
+
+Earlier — §12 **JIT concurrency commit 1: the `svm-fiber` stack-switch primitive.**
 Starting the unified-M:N-for-the-JIT effort (the agreed full path, not 1:1 OS threads). Because
 `svm-interp` is `#![forbid(unsafe_code)]`, the native stack-switching `unsafe` lives in a new dedicated
 crate `svm-fiber` (mirroring how `svm-mem` isolates memory `unsafe`). It implements a `boost.context`

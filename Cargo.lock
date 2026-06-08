@@ -482,6 +482,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "libc",
+ "svm-fiber",
  "svm-ir",
  "windows-sys 0.59.0",
 ]

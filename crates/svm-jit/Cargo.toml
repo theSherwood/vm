@@ -13,6 +13,9 @@ cranelift-jit = "0.132.0"
 cranelift-module = "0.132.0"
 cranelift-native = "0.132.0"
 svm-ir.workspace = true
+# The native stack-switch substrate for JIT fibers/green threads (§12). Real impl on x86-64 unix;
+# elsewhere `supported()` is false and the JIT keeps bailing `Unsupported` on fiber ops.
+svm-fiber.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Guard-paged window + the SIGSEGV/SIGBUS detect-and-kill handler (§4/§5) — unix only;

@@ -73,6 +73,11 @@ use svm_ir::{
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
 
+// JIT fiber runtime (§12): host-side fiber table + `extern "C"` thunks for `cont.new`/`resume`/
+// `suspend`, on top of the `svm-fiber` stack-switch substrate. Available where `svm_fiber::supported()`.
+#[cfg(all(unix, target_arch = "x86_64"))]
+mod fiber_rt;
+
 // The windows placeholder-window commit primitive, reused by `svm-run`'s Memory-cap backend (it
 // commits/grows tail pages of this same window; a plain `VirtualAlloc(MEM_COMMIT)` cannot commit a
 // placeholder reservation). See `mem::win_commit_rw`.
@@ -103,7 +108,7 @@ const SNAP_CAP: usize = 1 << 18; // 256 KiB
 /// `type_id`, then calls `code` — confinement at the use site (invariant I2).
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct FnEntry {
+pub(crate) struct FnEntry {
     type_id: u32,
     _pad: u32,
     code: u64,
@@ -189,6 +194,9 @@ pub enum TrapKind {
     /// every access to `[0, size)`, so in practice this is a width-overrun at the very top
     /// of the window, or (defense-in-depth) a masking/elision bug that the guard caught.
     MemoryFault = 8,
+    /// Forged / out-of-range / already-running / finished fiber handle, a bad fiber-entry funcref, a
+    /// `suspend` with no running fiber, or a fiber-bomb (§12). Matches `Trap::FiberFault`.
+    FiberFault = 9,
 }
 
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
@@ -205,6 +213,7 @@ impl TrapKind {
             5 => TrapKind::IndirectCallType,
             6 => TrapKind::CapFault,
             8 => TrapKind::MemoryFault,
+            9 => TrapKind::FiberFault,
             _ => return None,
         })
     }
@@ -505,6 +514,34 @@ fn run_inner(
         ctx_addr: cap_ctx as usize as i64,
     };
 
+    // §12 fibers: if the module uses `cont.*`, stand up a host fiber runtime (its address baked into
+    // the `cont.*` sites). The `FiberRuntime` box is created now so its address is stable; the
+    // call-trampoline address is filled in after finalize. On targets without stack-switch support,
+    // `ensure_supported` has already rejected the fiber ops, so this stays `null`.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    let uses_fibers = module_uses_fibers(m);
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
+        Some(Box::new(fiber_rt::FiberRuntime::new(
+            type_id_of(&distinct, &fiber_func_type()),
+            (m.funcs.len().next_power_of_two() as u64) - 1,
+        )))
+    } else {
+        None
+    };
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    let fiber = match &fiber_rt {
+        Some(rt) => FiberEnv {
+            rt_addr: (&**rt as *const fiber_rt::FiberRuntime) as i64,
+            new_thunk: fiber_rt::fiber_new as *const () as i64,
+            resume_thunk: fiber_rt::fiber_resume as *const () as i64,
+            suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
+        },
+        None => FiberEnv::null(),
+    };
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    let fiber = FiberEnv::null();
+
     // Define each function body. `clear_context` after each define resets the cached
     // CFG/domtree so the next function never compiles against a stale CFG.
     let mut ctx = module.make_context();
@@ -514,6 +551,7 @@ fn run_inner(
             &ids,
             &distinct,
             cap,
+            fiber,
             &mut ctx.func,
             f,
             mask,
@@ -534,9 +572,35 @@ fn run_inner(
         .define_function(tramp, &mut ctx)
         .map_err(|e| JitError::Backend(e.to_string()))?;
     module.clear_context(&mut ctx);
+
+    // The generic fiber call-trampoline (one per module; calls any `Tail`-ABI fiber entry from Rust).
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    let fiber_tramp = if uses_fibers {
+        build_fiber_call_trampoline(&mut module, &mut ctx.func);
+        let id = module
+            .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module
+            .define_function(id, &mut ctx)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module.clear_context(&mut ctx);
+        Some(id)
+    } else {
+        None
+    };
+
     module
         .finalize_definitions()
         .map_err(|e| JitError::Backend(e.to_string()))?;
+
+    // Now that code is finalized, hand the fiber runtime its call-trampoline address.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    if let (Some(rt), Some(id)) = (&mut fiber_rt, fiber_tramp) {
+        let addr = module.get_finalized_function(id);
+        // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the `FiberCallTramp` ABI.
+        let t: fiber_rt::FiberCallTramp = unsafe { std::mem::transmute(addr) };
+        rt.set_call_tramp(t);
+    }
 
     // Build the function table (§3c) now that code addresses are known: power-of-two
     // padded, AoS, host-owned. `call_indirect` masks the guest index into this.
@@ -687,6 +751,11 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                     IntUnOp::Clz | IntUnOp::Ctz | IntUnOp::Popcnt => {}
                     _ => return Err(JitError::Unsupported("int extend ops")),
                 },
+                // §12 fibers: lowered to host fiber-runtime calls, but only where the stack-switch
+                // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
+                // differential harness skips rather than miscompiles.
+                Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                    if cfg!(all(unix, target_arch = "x86_64")) => {}
                 _ => return Err(JitError::Unsupported("instruction")),
             }
         }
@@ -710,6 +779,28 @@ struct CapEnv {
     ctx_addr: i64,
 }
 
+/// The §12 fiber runtime address + the three thunk addresses, baked into `cont.new`/`cont.resume`/
+/// `suspend` sites as constants. All `0` (`null`) when the module uses no fibers or the target has no
+/// stack-switch support — in which case `ensure_supported` has already rejected any fiber op.
+#[derive(Clone, Copy)]
+struct FiberEnv {
+    rt_addr: i64,
+    new_thunk: i64,
+    resume_thunk: i64,
+    suspend_thunk: i64,
+}
+
+impl FiberEnv {
+    fn null() -> FiberEnv {
+        FiberEnv {
+            rt_addr: 0,
+            new_thunk: 0,
+            resume_thunk: 0,
+            suspend_thunk: 0,
+        }
+    }
+}
+
 /// Per-function lowering context shared across blocks.
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
@@ -731,6 +822,8 @@ struct Lower<'a> {
     fn_table_mask: u64,
     /// The host `cap.call` thunk + ctx (constant addresses).
     cap: CapEnv,
+    /// The §12 fiber runtime + thunk addresses for `cont.*` lowering.
+    fiber: FiberEnv,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
     /// Distinct module signatures, for `call_indirect` type ids.
@@ -746,6 +839,7 @@ fn build_clif(
     ids: &[FuncId],
     distinct: &[FuncType],
     cap: CapEnv,
+    fiber: FiberEnv,
     clif: &mut Function,
     f: &Func,
     mask: u64,
@@ -797,6 +891,7 @@ fn build_clif(
         mapped,
         fn_table_mask: (ids.len().next_power_of_two() as u64) - 1,
         cap,
+        fiber,
         ids,
         distinct,
     };
@@ -865,6 +960,68 @@ fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncI
     b.finalize();
 }
 
+/// The fixed signature of a §12 fiber/thread entry: `(i64 sp, i64 arg) -> i64` (the unified
+/// frontend convention). Its structural id is what a `cont.new` funcref is type-checked against.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn fiber_func_type() -> FuncType {
+    FuncType {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+    }
+}
+
+/// Whether `m` contains any fiber op, so `run_inner` knows to stand up the fiber runtime.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn module_uses_fibers(m: &IrModule) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|blk| {
+            blk.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                )
+            })
+        })
+    })
+}
+
+/// Build the generic fiber **call-trampoline**: `extern "C" fn(code, mem_base, fn_table_base,
+/// trap_out, sp, arg) -> i64` that `call_indirect`s a guest fiber entry under its `Tail` ABI. Rust
+/// cannot call a `Tail`-convention function directly, so the fiber runtime calls this (default C ABI)
+/// instead; one trampoline serves all fibers since every entry is `(i64 sp, i64 arg) -> i64`.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
+    for _ in 0..6 {
+        clif.signature.params.push(AbiParam::new(I64)); // code, mem_base, fn_table_base, trap_out, sp, arg
+    }
+    clif.signature.returns.push(AbiParam::new(I64));
+    clif.name = UserFuncName::user(0, 2);
+
+    let mut fbctx = FunctionBuilderContext::new();
+    let mut b = FunctionBuilder::new(clif, &mut fbctx);
+    let blk = b.create_block();
+    for _ in 0..6 {
+        b.append_block_param(blk, I64);
+    }
+    b.switch_to_block(blk);
+    b.seal_block(blk);
+    let p = b.block_params(blk).to_vec();
+    let (code, mem_base, fn_table_base, trap_out, sp, arg) = (p[0], p[1], p[2], p[3], p[4], p[5]);
+    // The guest entry's natural Tail signature: (mem_base, fn_table_base, trap_out, sp, arg) -> i64.
+    let sig = b.import_signature(sig_from(
+        module,
+        &[ValType::I64, ValType::I64],
+        &[ValType::I64],
+    ));
+    let call = b
+        .ins()
+        .call_indirect(sig, code, &[mem_base, fn_table_base, trap_out, sp, arg]);
+    let r = b.inst_results(call)[0];
+    b.ins().return_(&[r]);
+    b.seal_all_blocks();
+    b.finalize();
+}
+
 /// Lower one IR block's body + terminator into its CLIF block.
 fn lower_block(
     module: &mut JITModule,
@@ -928,6 +1085,79 @@ fn lower_block(
                 module, b, lower, *type_id, *op, sig, *handle, args, &mut vals,
             )?;
             ubs.resize(vals.len(), UB_TOP); // cap-call results are unknown
+            continue;
+        }
+        // §12 fibers: lower `cont.*` to indirect calls to the host fiber thunks (addresses baked into
+        // `lower.fiber`), threading `mem_base`/`fn_table_base`/`trap_out` like `cap.call`. A thunk that
+        // sets the trap cell (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
+        if let Inst::ContNew { func, sp } = inst {
+            // fiber_new(rt, mem_base, fn_table_base, trap_out, funcref:i32, sp:i64) -> i32 handle
+            let rt = b.ins().iconst(I64, lower.fiber.rt_addr);
+            let mem_base = b.use_var(lower.mem_var);
+            let fnt = b.use_var(lower.fn_table_var);
+            let trap_out = b.use_var(lower.trap_var);
+            let funcref = get(&vals, *func)?;
+            let spv = get(&vals, *sp)?;
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I64, I64, I32, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.fiber.new_thunk);
+            let call =
+                b.ins()
+                    .call_indirect(tref, thunk, &[rt, mem_base, fnt, trap_out, funcref, spv]);
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        if let Inst::ContResume { k, arg } = inst {
+            // fiber_resume(rt, handle:i32, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
+            // Results are appended (status:i32, value:i64) to match the IR's two-result shape.
+            let ss =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let status_ptr = b.ins().stack_addr(I64, ss, 0);
+            let rt = b.ins().iconst(I64, lower.fiber.rt_addr);
+            let kh = get(&vals, *k)?;
+            let av = get(&vals, *arg)?;
+            let trap_out = b.use_var(lower.trap_var);
+            let mut tsig = module.make_signature();
+            for t in [I64, I32, I64, I64, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.fiber.resume_thunk);
+            let call = b
+                .ins()
+                .call_indirect(tref, thunk, &[rt, kh, av, status_ptr, trap_out]);
+            emit_trap_propagate(b, lower);
+            let value = b.inst_results(call)[0];
+            let status64 = b.ins().stack_load(I64, ss, 0);
+            let status = b.ins().ireduce(I32, status64);
+            vals.push(status); // result 0: status (i32)
+            vals.push(value); // result 1: value (i64)
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        if let Inst::Suspend { value } = inst {
+            // fiber_suspend(rt, value:i64, trap_out:i64) -> next-resume arg:i64
+            let rt = b.ins().iconst(I64, lower.fiber.rt_addr);
+            let v = get(&vals, *value)?;
+            let trap_out = b.use_var(lower.trap_var);
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.fiber.suspend_thunk);
+            let call = b.ins().call_indirect(tref, thunk, &[rt, v, trap_out]);
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         let v = match inst {

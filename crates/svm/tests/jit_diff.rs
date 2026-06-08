@@ -757,13 +757,13 @@ fn assert_jit_matches_interp_at(src: &str, idx: u32, inputs: &[Vec<Value>]) {
     }
 }
 
-/// §12 fibers: the JIT does not yet lower stack switching (the machine-level control-stack
-/// swap is a later, escape-TCB-adjacent slice), so it must cleanly **bail** with
-/// `Unsupported` on each fiber op rather than mis-compile it. This is what lets the
-/// differential harness skip fiber modules (the `Err(Unsupported) => return` above) instead
-/// of diverging from the interpreter — so it is asserted explicitly.
+/// §12 fibers are **platform-gated** in the JIT: where the `svm-fiber` stack-switch substrate exists
+/// (x86-64 unix) the JIT lowers `cont.*` to its host fiber runtime (the happy path is covered by the
+/// interp↔JIT differential in `jit_fibers.rs`); everywhere else it must cleanly **bail** `Unsupported`
+/// so the differential harness skips fiber modules rather than mis-compiling them.
 #[test]
-fn jit_bails_unsupported_on_fiber_ops() {
+fn jit_fiber_support_is_platform_gated() {
+    let supported = cfg!(all(unix, target_arch = "x86_64"));
     let srcs = [
         // cont.new + cont.resume
         "func () -> (i64) {\n\
@@ -786,9 +786,10 @@ fn jit_bails_unsupported_on_fiber_ops() {
     for src in srcs {
         let m = parse_module(src).expect("parse");
         verify_module(&m).expect("verify");
-        assert!(
-            matches!(compile_and_run(&m, 0, &[0]), Err(JitError::Unsupported(_))),
-            "JIT should bail Unsupported on fiber ops, not lower them: {src:?}"
+        let bailed = matches!(compile_and_run(&m, 0, &[0]), Err(JitError::Unsupported(_)));
+        assert_eq!(
+            bailed, !supported,
+            "fiber lowering gating mismatch (supported={supported}): {src:?}"
         );
     }
 }
