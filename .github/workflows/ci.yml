@@ -78,3 +78,15 @@ jobs:
       - name: bench --check vs committed baseline
         working-directory: bench
         run: cargo run --release -- --check baseline.txt --tol 0.4
+  loom:
+    name: loom (parallel scheduler model check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: loom model check
+        run: cargo test -p svm-jit --lib loom
+        env:
+          RUSTFLAGS: "--cfg loom"
+
