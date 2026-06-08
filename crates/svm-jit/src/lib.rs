@@ -577,6 +577,8 @@ fn run_inner(
             sched_addr: (&**s as *const thread_rt::Sched) as i64,
             spawn_thunk: thread_rt::thread_spawn as *const () as i64,
             join_thunk: thread_rt::thread_join as *const () as i64,
+            wait_thunk: thread_rt::thread_wait as *const () as i64,
+            notify_thunk: thread_rt::thread_notify as *const () as i64,
         },
         None => ThreadEnv::null(),
     };
@@ -827,6 +829,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Suspend { .. }
                 | Inst::ThreadSpawn { .. }
                 | Inst::ThreadJoin { .. }
+                | Inst::MemoryWait { .. }
+                | Inst::MemoryNotify { .. }
                     if cfg!(all(unix, target_arch = "x86_64")) => {}
                 _ => return Err(JitError::Unsupported("instruction")),
             }
@@ -881,6 +885,8 @@ struct ThreadEnv {
     sched_addr: i64,
     spawn_thunk: i64,
     join_thunk: i64,
+    wait_thunk: i64,
+    notify_thunk: i64,
 }
 
 impl ThreadEnv {
@@ -889,6 +895,8 @@ impl ThreadEnv {
             sched_addr: 0,
             spawn_thunk: 0,
             join_thunk: 0,
+            wait_thunk: 0,
+            notify_thunk: 0,
         }
     }
 }
@@ -1081,14 +1089,21 @@ fn module_uses_fibers(m: &IrModule) -> bool {
     })
 }
 
-/// Whether `m` contains any thread op, so `run_inner` knows to run under the thread scheduler.
+/// Whether `m` contains any thread op (spawn/join/wait/notify), so `run_inner` knows to run under the
+/// thread scheduler.
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn module_uses_threads(m: &IrModule) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|blk| {
-            blk.insts
-                .iter()
-                .any(|i| matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. }))
+            blk.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::ThreadSpawn { .. }
+                        | Inst::ThreadJoin { .. }
+                        | Inst::MemoryWait { .. }
+                        | Inst::MemoryNotify { .. }
+                )
+            })
         })
     })
 }
@@ -1355,6 +1370,58 @@ fn lower_block(
             let thunk = b.ins().iconst(I64, lower.thread.join_thunk);
             let call = b.ins().call_indirect(tref, thunk, &[sched, h, trap_out]);
             emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        if let Inst::MemoryWait {
+            ty,
+            addr,
+            expected,
+            timeout,
+        } = inst
+        {
+            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64) -> status:i32
+            let w = atomic_width(*ty);
+            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false);
+            guard_atomic_align(b, lower, phys, w); // misaligned wait traps (like the other atomics)
+            let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+            let exp_raw = get(&vals, *expected)?;
+            let exp = if w < 8 {
+                b.ins().uextend(I64, exp_raw) // compare is bit-equality on the low `w` bytes
+            } else {
+                exp_raw
+            };
+            let width = b.ins().iconst(I32, w as i64);
+            let to = get(&vals, *timeout)?;
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I64, I32, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.thread.wait_thunk);
+            let call = b
+                .ins()
+                .call_indirect(tref, thunk, &[sched, phys, exp, width, to]);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        if let Inst::MemoryNotify { addr, count } = inst {
+            // thread_notify(sched, phys:i64, count:i32) -> woken:i32. Accesses no memory (the address
+            // is only confined, no alignment requirement — matching the interpreter).
+            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false);
+            let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+            let cnt = get(&vals, *count)?;
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I32] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.thread.notify_thunk);
+            let call = b.ins().call_indirect(tref, thunk, &[sched, phys, cnt]);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);
             continue;

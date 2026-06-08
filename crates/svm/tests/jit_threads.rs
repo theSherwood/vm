@@ -144,6 +144,42 @@ fn thread_atomic_counter() {
     assert_jit_matches_interp(src);
 }
 
+/// Futex handoff: the producer writes a payload to `mem[8]`, spawns a consumer that `atomic.wait`s on
+/// the flag at `mem[0]`, then sets the flag (release) and notifies; the consumer returns the payload
+/// it reads. On every interleaving the result is the written payload — exercising `atomic.wait` /
+/// `atomic.notify` end to end.
+#[test]
+fn thread_futex_handoff() {
+    let src = "memory 16\n\
+        func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = i64.const 8\n\
+        \x20 v1 = i64.const 987654\n\
+        \x20 i64.atomic.store.release v0 v1\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 v3 = thread.spawn 1 v2 v2\n\
+        \x20 v4 = i64.const 0\n\
+        \x20 v5 = i32.const 1\n\
+        \x20 i32.atomic.store.release v4 v5\n\
+        \x20 v6 = i64.const 0\n\
+        \x20 v7 = i32.const 1\n\
+        \x20 v8 = atomic.notify v6 v7\n\
+        \x20 v9 = thread.join v3\n\
+        \x20 return v9\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, v0: i64):\n\
+        \x20 v1 = i64.const 0\n\
+        \x20 v2 = i32.const 0\n\
+        \x20 v3 = i64.const 1000000000\n\
+        \x20 v4 = i32.atomic.wait v1 v2 v3\n\
+        \x20 v5 = i64.const 8\n\
+        \x20 v6 = i64.atomic.load.acquire v5\n\
+        \x20 return v6\n\
+        }\n";
+    assert_jit_matches_interp(src);
+}
+
 /// Joining the same handle twice is inert the second time → `ThreadFault`, on both backends.
 #[test]
 fn thread_double_join_traps() {

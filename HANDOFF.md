@@ -45,10 +45,22 @@ A vCPU trap sets the cell and the scheduler stops (domain killed; a fault `longj
 fiber stacks). `TrapKind::ThreadFault` added; fibers+threads in one module bail `Unsupported` for now
 (needs per-vCPU fiber tables). **Verified by the interp↔JIT differential** (`jit_threads.rs`, 3 tests:
 spawn/join sums results, a 4×100 atomic counter → 400, double-join → `ThreadFault`). Full suite +
-clippy + fmt green. **Next (part 3):** `wait`/`notify` (logical-clock parking in the scheduler). **Then
-part 4:** true multi-core workers (the scheduler is cooperative / single OS thread today — correct
-under every interleaving, just no parallel speedup; TSan still can't see JITted accesses, so that step
-leans on the same invariant/differential oracle).
+clippy + fmt green.
+
+**Commit 4, part 3 DONE — `wait`/`notify` in the JIT.** `<ty>.atomic.wait`/`atomic.notify` now lower
+to `thread_rt::thread_wait`/`thread_notify`: a futex over the scheduler. `wait` confines+aligns the
+address (the lowering's `mask_addr` + `guard_atomic_align`), reads the value in the thunk, returns
+`NOT_EQUAL` if it changed, else parks the vCPU on `Block::Wait { key=phys, deadline }` (suspend to the
+scheduler); `notify` wakes up to `count` waiters on the key (insertion order). The scheduler gained a
+`wait_waiters` list + a **logical clock** (advanced only to fire the earliest deadline when nothing is
+runnable → timeouts are schedule-deterministic, like the interpreter's `DetSched`) and delivers the
+wake status (`WOKEN`/`TIMED_OUT`) via a per-vCPU `resume_val`. Unit tests: a waiter blocked then woken
+by a notifier (`WOKEN`), and an un-notified waiter that times out (`TIMED_OUT`). **Differential**
+(`jit_threads.rs`): a futex handoff (producer payload + flag + notify, consumer waits then reads) →
+987654 on both backends. Full suite + clippy + fmt green. **Next (part 4):** true multi-core workers —
+the scheduler is cooperative / single OS thread today (correct under every interleaving, just no
+parallel speedup; TSan can't see JITted accesses, so that step leans on the same invariant/differential
+oracle, not TSan).
 
 Earlier — §12 **JIT concurrency commit 1: the `svm-fiber` stack-switch primitive.**
 Starting the unified-M:N-for-the-JIT effort (the agreed full path, not 1:1 OS threads). Because
