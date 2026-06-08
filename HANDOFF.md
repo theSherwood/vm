@@ -27,8 +27,12 @@ in the thunk; park on equal; spec-allowed spurious wakeups so a single suspend, 
 workers — the consumer genuinely parks then is woken, the real block→notify path) + a second **loom**
 test (`loom_wait_notify_never_hangs`, preemption-bounded) exploring notify-before-park (→ quiescence
 timeout) and notify-after-park (→ woken), both completing with the invariant result. **Parallel JIT now
-has the full thread surface: spawn/join/wait/notify + atomics, multi-core.** Remaining: fibers+threads
-in one module still bail (needs per-vCPU fiber tables). **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
+has the full thread surface: spawn/join/wait/notify + atomics, multi-core.** The loom model checks run
+via `cargo test -p svm-jit --lib loom` with `RUSTFLAGS=--cfg loom` (fast, preemption-bounded). **TODO
+(blocked):** add a gating CI `loom` job — couldn't push the `.github/workflows/ci.yml` edit from this
+session (the OAuth app lacks GitHub `workflow` scope); the job is a copy of `check` with that one
+command + `RUSTFLAGS: "--cfg loom"`. Remaining feature gap: fibers+threads in one module still bail
+(needs per-vCPU fiber tables) — an edge case; real C uses threads *or* fibers. **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
 deterministic spec; the parallel JIT refines it (differential + invariant stress), and the parallel
 *glue* is loom-checked — TSan can't see JITted accesses, so it's not used for the JIT path.
 
