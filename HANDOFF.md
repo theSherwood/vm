@@ -20,9 +20,49 @@ Complete}`, `y.suspend(val)` switches back; values ride through a single-threade
 (`Control`). RAII frees the stack; a never-started fiber's closure is reclaimed on drop; a panic in the
 body is caught and converted to `abort` (unwinding across a stack switch is UB). 10 tests pass (yield/
 complete, env capture, drop-before-start drops the closure, independent state across interleaved fibers).
-**Next (commit 3):** scheduler integration — a native M:N runtime in `svm-jit` (where `unsafe` is allowed)
-whose vCPU continuation is a `Fiber`, sharing the §12 scheduler *structure* + the `Arc<Region>` substrate
-+ C11 atomics with the interpreter; then IR lowering of `cont.new`/`resume`/`suspend` and `thread.*`.
+**Architecture decision (agreed):** the cleanest end state is *one* safe generic M:N scheduler crate
+(`svm-sched`) shared by both backends — the `Fiber` surface is safe, so a worker driving
+`fiber.resume()` is safe code, and both task kinds present the same `run(quantum) -> Step`. The
+deterministic explorer / `explore_all` oracle stays interp-only (it's a single-thread *replay* model).
+That extraction happens at the *thread* scheduler step (commit 4), under full-suite + TSan cover — **not**
+now, since fibers need no scheduler. Order: **fibers first (commit 3), then threads (commit 4+).**
+
+**Commit 3 — JIT lowering of `cont.new`/`cont.resume`/`suspend` (PLANNED, fully mapped, not yet built).**
+Single-threaded cooperative fibers in the JIT, differentially testable vs. the interpreter. Mechanics
+(all sites verified against `crates/svm-jit/src/lib.rs`):
+- **Guest ABI:** `sig_from` (lib.rs:632) makes every guest fn `(mem_base, fn_table_base, trap_out,
+  params…) -> results` with `CallConv::Tail`. A fiber entry is the unified `(i64 sp, i64 arg) -> i64`
+  (§12), i.e. CLIF `(mem_base, fn_table_base, trap_out, sp, arg) -> i64`.
+- **funcref** = i32 fn index (lib.rs:1126); `indirect_dispatch` (lib.rs:1257) masks into the §3c table
+  (`base + (idx&mask)*16`, code ptr at +8) — reuse to resolve a funcref to a code pointer.
+- **Rust can't call `Tail`-conv directly**, so build ONE generic CLIF **call-trampoline** (like
+  `build_trampoline`, lib.rs:825): `extern "C" fn(code, mem_base, fn_table_base, trap_out, sp, arg) ->
+  i64` that `call_indirect`s `code` with the Tail fiber sig. Finalize it; hand its address to the runtime.
+- **`FiberRuntime`** (boxed, address baked as a constant like `CapEnv` lib.rs:707/502): `{ fibers:
+  Vec<Option<svm_fiber::Fiber>>, yielders: Vec<*const Yielder>, call_tramp: extern "C" fn(...)->i64 }`.
+- **Three `extern "C"` thunks** (lowered as `call_indirect` to baked addresses, passing `mem_base`/
+  `fn_table_base`/`trap_out` from `lower.{mem,fn_table,trap}_var`, exactly like `lower_cap_call`
+  lib.rs:1314):
+  - `fiber_new(rt, mem_base, fnt, trap_out, funcref_idx, sp) -> i32`: resolve code via the table, make a
+    `Fiber::new(|y,arg| { rt.yielders.push(&y); let r = (rt.call_tramp)(code, mem_base, fnt, trap_out,
+    sp, arg); rt.yielders.pop(); r })`; return slot handle.
+  - `fiber_resume(rt, handle, val, status_out:*mut i64) -> i64`: `match fibers[h].resume(val) {
+    Yielded(v)=>{*status_out=0; v} Complete(v)=>{*status_out=1; v} }` (forged/finished handle → inert,
+    matching interp).
+  - `fiber_suspend(rt, val) -> i64`: `let y = rt.yielders.pop(); let r = (*y).suspend(val);
+    rt.yielders.push(y); r` — pop-before-switch/push-after keeps the top correct under nested
+    `cont.resume` (resumer must see *its* yielder while the callee is suspended).
+- **Lowering:** add `ContNew/ContResume/Suspend` to `ensure_supported` (lib.rs:655) and arms in the
+  block lowering; `cont.resume` returns `(status, value)` via a stack `status_out` slot + the i64 return.
+- **Wiring:** create the `FiberRuntime` + call-trampoline in `compile_and_run`/`_with_host` before the
+  entry call (lib.rs:565); keep it alive across `run_guarded`; reentrancy on `rt` is single-threaded but
+  overlaps (resume holds `&mut fibers[h]` while guest calls suspend) → use raw-pointer/`UnsafeCell`
+  interior access (OK in svm-jit). **Caveat:** a fiber control-stack overflow hits the svm-fiber guard
+  page, which the JIT's window signal handler won't classify as a clean trap (deep fiber recursion may
+  crash rather than `Trap` — acceptable for v1, revisit with the scheduler).
+- **Test:** a differential interp↔JIT test on a small fiber program (cont.new a worker, resume/suspend a
+  few times, observe values) — the JIT must match the interpreter's fiber semantics exactly.
+
 Before that — §18 **exhaustive interleaving model checker** (`svm_interp::explore_all`):
 a stateless (CHESS/`shuttle`-style) checker that enumerates *every* schedule of a small concurrent
 program at memory-op granularity and reports the outcome set — turning the seed sweep (sampling) into
