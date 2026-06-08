@@ -21,6 +21,43 @@ machine code, so multi-core JIT can't be TSan-verified the way the interpreter i
 hardware-atomic correctness + TSan on the *glue* + invariant stress. Worth a human call before
 starting.
 
+**Part 4 step 1 DONE — deterministic seeded JIT scheduling (the verification backbone).** `thread_rt`
+gained an injectable `Pick` policy (`Fifo` default, `Seeded(rng)` xorshift) chosen at each runnable
+decision point; `compile_and_run_scheduled(m, func, args, seed)` threads a `sched_seed` through
+`run_inner` so a threaded JIT run is a reproducible function of the seed (the JIT analogue of
+`run_scheduled`). Test: a 24-seed sweep of the 4×100 atomic counter — every seed → invariant 400, each
+reproducible. This deterministic, replayable mode verifies the scheduler bookkeeping independently of
+the parallel executor. **DESIGN DECISION (agreed):** add real multi-core parallelism, accepting the
+verification tradeoff; verify TigerBeetle-style — the interpreter + explorer/`explore_all` stay the
+deterministic spec (our DST), the parallel JIT is an *optimization that refines it* (checked by
+differential + invariant stress), and the parallel *runtime glue* (pure Rust) is checked by **loom**.
+
+**Part 4 step 2 — the parallel executor (PLANNED, not started; the project's highest-risk component).**
+Build order:
+- **2a (loom-testable concurrent protocol).** Factor the scheduler so its *task* is abstract:
+  `trait Task { fn step(&mut self, resume_val, &SchedHandle) -> TaskStep }` returning `Yielded(Block)`
+  / `Complete(result)` — the fiber impl is `fiber.resume` (block delivered via the reentrant thunks);
+  a **mock** impl is a state machine. Then a parallel core: `Mutex<Inner>` (runnable `VecDeque`, vCPU
+  slots, join/wait waiters, logical clock, live count, shutdown) + a `Condvar`; N worker threads loop
+  *lock → pick runnable (or `cvar.wait`) → take the task out of its slot → **unlock** → `step` → lock →
+  park (Yielded) / store-result+wake-joiners+`notify` (Complete) → unlock*. **Lock discipline:** never
+  hold the lock across `step` (the running task's thunks re-lock to spawn/join/wait/notify → deadlock
+  otherwise) — same shape as the interpreter's real `Scheduler`. Loom test drives this with **mock
+  tasks** (fibers aren't loom-compatible — loom controls `loom::thread`, not stack switches — so loom
+  explores the *worker/queue/wake* races, the genuinely hard part). Gate loom via
+  `[target.'cfg(loom)'.dependencies] loom` + `#[cfg(loom)] use loom::sync::… else std::sync::…`.
+  **FIRST ACTION: confirm `loom` fetches under the env network policy** (`cargo add --dev` / build with
+  `--cfg loom`); if blocked, that's a real blocker — fall back to TSan + the seeded sweep + invariant
+  stress, and note it.
+- **2b (wire real fibers + JIT).** Plug `Fiber` tasks into the parallel core. Each worker installs the
+  guard (`install_guard`) + runs `step` under the `setjmp`/`siglongjmp` shim (per-worker detect-and-
+  kill); a fault sets the shared trap cell + shutdown so the pool tears down (abandoning fiber stacks).
+  A parked `Fiber` (Send) migrates between workers via its slot. All vCPUs share the one `Arc<Region>`
+  window → real parallel hardware atomics. Add `compile_and_run_parallel(m, func, args, workers)`.
+  Verify: invariant **stress** (atomic counter / futex on N workers, many runs) + the existing
+  differential (result must match the interpreter) + the seeded sweep still green. Reuse the §12 caps
+  (`MAX_VCPUS`) and TIGER_STYLE assertions on the runnable/waiter sets.
+
 §12 **JIT concurrency — commit 3: fibers run in the JIT.** `cont.new`/
 `cont.resume`/`suspend` now lower (x86-64 unix) to a host fiber runtime (`svm-jit/src/fiber_rt.rs`)
 over the `svm-fiber` stack switch: a boxed `FiberRuntime` (address baked in like `CapEnv`) + three
