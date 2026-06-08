@@ -19,13 +19,14 @@
 #![allow(dead_code)] // wired into the JIT execution path in step 2b
 
 use std::collections::VecDeque;
+use std::sync::Arc; // `Arc`'s refcount isn't the race of interest; loom only swaps the rest below.
 
 #[cfg(loom)]
-use loom::sync::{Arc, Condvar, Mutex};
+use loom::sync::{Condvar, Mutex};
 #[cfg(loom)]
 use loom::thread;
 #[cfg(not(loom))]
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex};
 #[cfg(not(loom))]
 use std::thread;
 
@@ -56,6 +57,9 @@ struct Inner {
     resume_val: Vec<i64>,
     /// vCPUs not yet finished. When this hits 0 the run is done and idle workers are released.
     live: usize,
+    /// Tear the pool down early — a guest trap kills the whole domain (workers stop without finishing
+    /// the remaining vCPUs).
+    shutdown: bool,
 }
 
 /// The lock guard type (distinct between `loom::sync` and `std::sync`).
@@ -71,7 +75,7 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    fn new() -> Arc<Shared> {
+    pub(crate) fn new() -> Arc<Shared> {
         Arc::new(Shared {
             inner: Mutex::new(Inner {
                 runnable: VecDeque::new(),
@@ -80,6 +84,7 @@ impl Shared {
                 join_waiters: Vec::new(),
                 resume_val: Vec::new(),
                 live: 0,
+                shutdown: false,
             }),
             cvar: Condvar::new(),
         })
@@ -87,6 +92,12 @@ impl Shared {
 
     fn lock(&self) -> Guard<'_> {
         self.inner.lock().unwrap()
+    }
+
+    /// Tear the pool down (a guest trap): wake every worker so they exit.
+    pub(crate) fn request_shutdown(&self) {
+        self.lock().shutdown = true;
+        self.cvar.notify_all();
     }
 
     /// Spawn a new vCPU running `task`; returns its id. Wakes one idle worker. Callable from a running
@@ -104,6 +115,11 @@ impl Shared {
         tid
     }
 
+    /// Number of vCPUs created so far (for the spawn anti-bomb cap) and the live-bound check.
+    pub(crate) fn task_count(&self) -> usize {
+        self.lock().tasks.len()
+    }
+
     /// The result of vCPU `tid`, if it has finished.
     pub(crate) fn result_of(&self, tid: usize) -> Option<i64> {
         self.lock().results.get(tid).copied().flatten()
@@ -118,6 +134,9 @@ impl Shared {
             let (tid, mut task) = {
                 let mut g = this.lock();
                 loop {
+                    if g.shutdown {
+                        return; // domain killed (a trap); stop.
+                    }
                     if let Some(tid) = g.runnable.pop_front() {
                         // Take the task out of its slot — exclusive ownership while we run it.
                         let task = g.tasks[tid].take().expect("runnable vCPU has its task");
@@ -133,11 +152,18 @@ impl Shared {
             };
 
             let resume_val = this.lock().resume_val[tid];
-            // ---- run the vCPU with NO lock held (it may re-enter spawn/join) ----
+            // ---- run the vCPU with NO lock held (it may re-enter spawn/join, or trap) ----
             let step = task.run(resume_val, &this);
 
             // ---- handle the outcome ----
             let mut g = this.lock();
+            if g.shutdown {
+                // A trap (this task or another) is tearing the pool down; stop (this task's slot is
+                // already empty — it's abandoned, like the rest).
+                drop(g);
+                this.cvar.notify_all();
+                return;
+            }
             match step {
                 Step::Done(r) => {
                     g.results[tid] = Some(r);
@@ -174,14 +200,14 @@ impl Shared {
     }
 }
 
-/// Run `root` (vCPU 0) to completion on `workers` OS-thread workers; returns its result (or `None` if
-/// the run deadlocked — a parked vCPU with nothing to wake it).
-pub(crate) fn run(workers: usize, root: Box<dyn Task>) -> Option<i64> {
-    let shared = Shared::new();
+/// Drive `root` (vCPU 0) to completion on `workers` OS-thread workers over a **pre-created** `shared`
+/// (so its address can be baked into the JITted `thread.*` thunks before this is called); returns the
+/// root's result (or `None` if the run deadlocked / was torn down by a trap).
+pub(crate) fn run_pool(shared: &Arc<Shared>, workers: usize, root: Box<dyn Task>) -> Option<i64> {
     let root_id = shared.spawn(root);
-    let handles: Vec<_> = (0..workers)
+    let handles: Vec<_> = (0..workers.max(1))
         .map(|_| {
-            let s = Arc::clone(&shared);
+            let s = Arc::clone(shared);
             thread::spawn(move || Shared::worker(s))
         })
         .collect();
@@ -190,6 +216,12 @@ pub(crate) fn run(workers: usize, root: Box<dyn Task>) -> Option<i64> {
     }
     let result = shared.lock().results[root_id];
     result
+}
+
+/// Convenience for the tests: create a fresh scheduler and run it.
+#[cfg(test)]
+pub(crate) fn run(workers: usize, root: Box<dyn Task>) -> Option<i64> {
+    run_pool(&Shared::new(), workers, root)
 }
 
 #[cfg(all(test, not(loom)))]
@@ -303,13 +335,17 @@ mod tests {
 mod loom_tests {
     use super::*;
 
-    /// Exhaustively explore the worker/queue/wake interleavings with mock tasks: a root spawns two
-    /// leaf children and joins both on a 2-worker pool. loom drives every schedule of the two worker
-    /// threads (lock order, condvar wait/notify, the complete-vs-join race) and the result must always
-    /// be the exact sum — proving no lost task and no lost wakeup under any interleaving.
+    /// Explore the worker/queue/wake interleavings with mock tasks: a root spawns two leaf children
+    /// and joins both on a 2-worker pool. loom drives the schedules of the two worker threads (lock
+    /// order, condvar wait/notify, the complete-vs-join race) and the result must always be the exact
+    /// sum — proving no lost task and no lost wakeup. A **preemption bound** keeps the condvar-heavy
+    /// worker-pool tractable (loom's recommended practice — finds essentially all real concurrency bugs
+    /// while bounding the state space).
     #[test]
     fn loom_spawn_join_no_lost_wakeup() {
-        loom::model(|| {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
             struct Leaf(i64);
             impl Task for Leaf {
                 fn run(&mut self, _rv: i64, _s: &Arc<Shared>) -> Step {

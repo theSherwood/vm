@@ -11,7 +11,9 @@
 #![cfg(all(unix, target_arch = "x86_64"))]
 
 use svm_interp::{run, Trap, Value};
-use svm_jit::{compile_and_run, compile_and_run_scheduled, JitOutcome, TrapKind};
+use svm_jit::{
+    compile_and_run, compile_and_run_parallel, compile_and_run_scheduled, JitOutcome, TrapKind,
+};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -144,6 +146,22 @@ fn thread_spawn_join_sums_results() {
 #[test]
 fn thread_atomic_counter() {
     assert_jit_matches_interp(ATOMIC4);
+}
+
+/// **Real multi-core execution.** The same counter on a 4-worker parallel pool: vCPUs run on real OS
+/// threads, contending on the shared counter via hardware atomics. The total is exactly 400 every run
+/// (a lost update — a scheduler race or a non-atomic RMW — would drop it). Many runs to shake out
+/// races (the scheduler glue is also loom-verified in `svm-jit`'s `par` module).
+#[test]
+fn thread_parallel_atomic_counter() {
+    let m = parse_module(ATOMIC4).expect("parse");
+    verify_module(&m).expect("verify");
+    for _ in 0..40 {
+        match compile_and_run_parallel(&m, 0, &[], 4).expect("jit") {
+            JitOutcome::Returned(x) => assert_eq!(x, [400], "parallel total wrong"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }
 
 /// The deterministic seeded scheduler (the verification backbone): every seed yields the invariant

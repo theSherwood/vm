@@ -4,7 +4,27 @@ Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
-**Latest (2026-06-08):** §12 **JIT concurrency is functionally complete** — the JIT now runs **fibers
+**Latest (2026-06-08):** §12 **the JIT runs threads on real multiple cores (part 4 step 2b DONE).**
+`compile_and_run_parallel(m, func, args, workers)` drives a threaded module on the loom-verified `par`
+worker pool: the guest entry is root vCPU 0, spawned vCPUs are fibers multiplexed across `workers` OS
+threads, `join` blocks via fiber suspend, and all vCPUs share the one `Arc<Region>` window → real
+parallel **hardware atomics**. Glue (`svm-jit/src/par_jit.rs`): a fiber-backed `par::Task`, parallel
+`thread_spawn`/`thread_join` thunks, the **current-vCPU `thread_local`** (parallel has many live vCPUs,
+so no single `cur`), and **per-worker detect-and-kill** — each `fiber.resume` runs under the §5
+`setjmp` guard (reusing the existing thread-local shim via an `Entry`-shaped `fiber_resume_entry`), so a
+guest fault on any worker unwinds out and tears the pool down. `run_inner` gained a parallel mode
+(bakes the `par` thunks + `par::Shared` address instead of the cooperative `thread_rt`). **Verified:**
+`thread_parallel_atomic_counter` (40 runs × 4 workers → 400 via contended hardware atomics) + the
+loom protocol check + the cooperative differential/seeded sweep all green; clippy/fmt clean. **Found +
+fixed:** the root body passed a null `fn_table` to the entry trampoline → guest `thread.spawn`
+resolved child code from null → SIGSEGV (now passes the real `fn_table_base`). Remaining: **2c** =
+`wait`/`notify` in the parallel pool (cooperative has it; parallel `thread.spawn`/`join` only so far —
+the `wait`/`notify` thunks are `0` in parallel `ThreadEnv`), and fibers+threads in one module still
+bail. **Verification posture (TigerBeetle-style):** the interpreter + explorer/`explore_all` are the
+deterministic spec; the parallel JIT refines it (differential + invariant stress), and the parallel
+*glue* is loom-checked — TSan can't see JITted accesses, so it's not used for the JIT path.
+
+§12 **JIT concurrency (cooperative) is functionally complete** — the JIT runs **fibers
 (`cont.*`), threads (`thread.spawn`/`join`), and the futex (`atomic.wait`/`notify`)** on the
 `svm-fiber` stack switch (x86-64 unix), all verified against the interpreter by the interp↔JIT
 differential, and **real multi-threaded C runs end-to-end on the JIT** (`c_threads_atomic_counter_jit`:

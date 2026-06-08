@@ -151,7 +151,7 @@ impl GuestWindow {
     /// The address range a fault must land in to be attributed to this window (the whole
     /// reservation, so the inaccessible tail + guard page are covered). `(0, 0)` when there is no
     /// window.
-    fn fault_range(&self) -> (usize, usize) {
+    pub(crate) fn fault_range(&self) -> (usize, usize) {
         if self.mapped == 0 {
             (0, 0)
         } else {
@@ -186,6 +186,36 @@ pub(crate) unsafe fn run_guarded(
 ) -> bool {
     pal::install_guard();
     let (lo, hi) = window.fault_range();
+    let f: Entry = std::mem::transmute(code);
+    pal::run_guarded(f, args, results, mem_base, fn_table, trap_cell, lo, hi)
+}
+
+/// Install the guard on the calling (worker) thread. Idempotent; the handler is process-wide but its
+/// recovery state is thread-local, so each worker arms independently.
+#[cfg(all(unix, target_arch = "x86_64"))]
+pub(crate) fn install_guard() {
+    pal::install_guard();
+}
+
+/// Run an `Entry`-shaped `code` with faults in `[lo, hi)` caught (detect-and-kill), for a window
+/// fault range obtained from [`GuestWindow::fault_range`]. Used to run a fiber resume on a worker: a
+/// guest memory fault inside the fiber unwinds back here (the fiber stack is abandoned — the domain is
+/// being killed). Returns `true` if a guarded fault was caught.
+///
+/// # Safety
+/// `code` must honour the [`Entry`] ABI and its pointer args must be valid for the call.
+#[cfg(all(unix, target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn run_guarded_range(
+    code: *const u8,
+    args: *const i64,
+    results: *mut i64,
+    mem_base: *mut u8,
+    fn_table: *const c_void,
+    trap_cell: *mut i64,
+    lo: usize,
+    hi: usize,
+) -> bool {
     let f: Entry = std::mem::transmute(code);
     pal::run_guarded(f, args, results, mem_base, fn_table, trap_cell, lo, hi)
 }
