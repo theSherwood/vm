@@ -11,7 +11,7 @@
 //!   seed-driven explorer — across many seeds. Each seed realizes one *reproducible* interleaving, so
 //!   sweeping is systematic coverage and any failure is replayable from its seed.
 
-use svm_interp::{run, run_scheduled, Trap, Value};
+use svm_interp::{explore_all, run, run_scheduled, Trap, Value};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -274,4 +274,119 @@ fn explorer_is_reproducible() {
         let b = run_scheduled(&m, 0, &[], 50_000_000, seed);
         assert_eq!(one_i64(a), one_i64(b), "seed {seed} not reproducible");
     }
+}
+
+// ---- exhaustive model checking: a *proof* over every interleaving of a small program ----
+//
+// The seed sweep above is sampling: it explores many interleavings but can't certify it saw them all.
+// `explore_all` enumerates the *entire* interleaving tree at memory-op granularity, so for a small
+// enough program asserting `outcomes == [expected]` (with `complete`) proves the invariant holds under
+// **every** schedule. The programs here are deliberately tiny so the tree is fully explorable.
+//
+// This is a *stateless* checker without partial-order reduction beyond memory-op granularity, so it
+// targets bounded-synchronization / lock-free shapes. A **busy-wait spinlock** is the classic
+// pathological case — every failed `cmpxchg` retry is a fresh decision point, so the tree explodes —
+// and stays covered instead by `stress` + `sweep` above (see `SPINLOCK`). The proofs here target the
+// lock-free atomic counter and the wait/notify handoff, plus a *negative* test confirming the checker
+// actually finds a known race.
+
+/// Assert the exhaustive checker fully enumerates `src` and every schedule yields exactly `want`.
+fn prove(src: &str, want: i64, max_schedules: u64) {
+    let m = module(src);
+    let report = explore_all(&m, 0, &[], 50_000_000, max_schedules);
+    assert!(
+        report.complete,
+        "exhaustive exploration was truncated at {} schedules (raise the cap or shrink the program)",
+        report.schedules
+    );
+    assert_eq!(
+        report.outcomes,
+        vec![Ok(vec![Value::I64(want)])],
+        "an interleaving produced an outcome other than {want} (in {} schedules)",
+        report.schedules
+    );
+}
+
+/// Two threads each `atomic.rmw.add 1` to `mem[0]`; main returns the total. Exactly 2 on every
+/// interleaving — a non-atomic RMW (or a dropped/duplicated vCPU) would let it be 1.
+const TINY_ATOMIC: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 1
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.atomic.load vaddr
+  return vr
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vaddr = i64.const 0
+  vrmw = i64.atomic.rmw.add vaddr varg
+  vz = i64.const 0
+  return vz
+}
+"#;
+
+/// **Deliberately racy** counterpart of `TINY_ATOMIC`: each thread does a *non-atomic*
+/// load / add / store on `mem[0]`. The correct serial result is 2, but the interleaving where both
+/// threads load 0 before either stores loses an update and yields 1. Exhaustive exploration is
+/// guaranteed to find that schedule — so this is the negative test proving the checker has teeth.
+const RACY_COUNTER: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 1
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.load vaddr
+  return vr
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vaddr = i64.const 0
+  vc = i64.load vaddr
+  vn = i64.add vc varg
+  i64.store vaddr vn
+  vz = i64.const 0
+  return vz
+}
+"#;
+
+#[test]
+fn exhaustive_tiny_atomic_counter() {
+    prove(TINY_ATOMIC, 2, 200_000);
+}
+
+#[test]
+fn exhaustive_futex_handoff() {
+    prove(FUTEX_HANDOFF, 987654, 200_000);
+}
+
+/// The checker must *find* the lost update: across the fully-enumerated tree of the racy counter, both
+/// the correct total (2) and the raced total (1) appear. (If exploration ever stopped finding the
+/// race, the checker would be silently vacuous.)
+#[test]
+fn exhaustive_finds_known_race() {
+    let m = module(RACY_COUNTER);
+    let report = explore_all(&m, 0, &[], 50_000_000, 200_000);
+    assert!(report.complete, "racy counter tree should be small");
+    assert!(
+        report.outcomes.contains(&Ok(vec![Value::I64(1)])),
+        "exhaustive search failed to find the lost-update interleaving; outcomes={:?}",
+        report.outcomes
+    );
+    assert!(
+        report.outcomes.contains(&Ok(vec![Value::I64(2)])),
+        "exhaustive search failed to find the serial interleaving; outcomes={:?}",
+        report.outcomes
+    );
 }

@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx,
-    ValType, DEFAULT_RESERVED_LOG2,
+    FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator,
+    ValIdx, ValType, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -314,6 +314,170 @@ pub fn run_scheduled(
         Some(out) => out.result,
         None => Err(Trap::ThreadFault), // could not complete (a guest join-deadlock)
     }
+}
+
+/// Drives one run's scheduling choices for the exhaustive model checker, and records enough to walk
+/// the next branch. `plan` is the choice to make at each decision point (a runnable set with >1
+/// member); points past its end default to choice 0. `branches`/`chosen` log this run's actual
+/// fan-out and choices so the caller can backtrack.
+struct Choices {
+    plan: Vec<usize>,
+    branches: Vec<usize>,
+    chosen: Vec<usize>,
+    depth: usize,
+}
+
+impl Choices {
+    fn new(plan: Vec<usize>) -> Choices {
+        Choices {
+            plan,
+            branches: Vec::new(),
+            chosen: Vec::new(),
+            depth: 0,
+        }
+    }
+
+    /// Pick a runnable index given `n` choices. A singleton runnable set is not a real decision (and
+    /// isn't recorded), so the plan stays compact and stable across replays.
+    fn pick(&mut self, n: usize) -> usize {
+        if n == 1 {
+            return 0;
+        }
+        let c = self.plan.get(self.depth).copied().unwrap_or(0).min(n - 1);
+        self.branches.push(n);
+        self.chosen.push(c);
+        self.depth += 1;
+        c
+    }
+}
+
+/// The result of exhaustively exploring a concurrent program's interleavings ([`explore_all`]).
+#[derive(Debug)]
+pub struct Exhaustive {
+    /// Every **distinct** terminal outcome observed across all explored schedules. For a correct
+    /// program with an interleaving-invariant result this is a single element.
+    pub outcomes: Vec<Result<Vec<Value>, Trap>>,
+    /// How many complete schedules were run.
+    pub schedules: u64,
+    /// `true` if the whole interleaving tree was enumerated; `false` if `max_schedules` cut it short
+    /// (so `outcomes` is a sound under-approximation, not a proof over *all* interleavings).
+    pub complete: bool,
+}
+
+/// **Exhaustive interleaving model checker** (§18): enumerate *every* distinct schedule of a
+/// concurrent guest program and report the set of terminal outcomes — turning "sweep random seeds and
+/// hope" into a proof, for programs small enough to explore fully.
+///
+/// It's a *stateless* checker (CHESS / `shuttle`-style): each schedule is one fresh execution replayed
+/// from a planned sequence of scheduling choices, with no VM-state snapshotting. vCPUs run at
+/// **memory-op granularity** (`memop` + `quantum = 1`), so the decision points are exactly the
+/// shared-state / sync operations ([`is_visible`]) — the partial-order reduction that keeps the tree
+/// finite and small. After each run it backtracks to the deepest decision with an unexplored
+/// alternative (depth-first), stopping when the tree is exhausted or `max_schedules` is hit.
+///
+/// Because the single-threaded explorer realizes one valid sequential interleaving per schedule and
+/// covers all of them, *any* outcome a real concurrent run could produce appears here — so asserting
+/// `outcomes == [expected]` (with `complete`) proves the invariant holds under every interleaving.
+pub fn explore_all(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    max_schedules: u64,
+) -> Exhaustive {
+    if m.funcs.get(func as usize).is_none() {
+        return Exhaustive {
+            outcomes: vec![Err(Trap::Malformed)],
+            schedules: 1,
+            complete: true,
+        };
+    }
+    let funcs: Arc<[Func]> = m.funcs.clone().into();
+
+    let mut plan: Vec<usize> = Vec::new();
+    let mut outcomes: Vec<Result<Vec<Value>, Trap>> = Vec::new();
+    let mut schedules = 0u64;
+    let complete;
+
+    loop {
+        let mut choices = Choices::new(plan);
+        let result = run_one_schedule(&funcs, &m.memory, &m.data, func, args, fuel, &mut choices);
+        schedules += 1;
+        if !outcomes.contains(&result) {
+            outcomes.push(result);
+        }
+
+        // Backtrack: bump the deepest decision that has an unexplored sibling, dropping everything
+        // after it (those subtrees are re-explored fresh under the new prefix).
+        let mut next = None;
+        for i in (0..choices.branches.len()).rev() {
+            if choices.chosen[i] + 1 < choices.branches[i] {
+                let mut p = choices.chosen[..i].to_vec();
+                p.push(choices.chosen[i] + 1);
+                next = Some(p);
+                break;
+            }
+        }
+        match next {
+            Some(p) if schedules < max_schedules => plan = p,
+            Some(_) => {
+                complete = false;
+                break;
+            }
+            None => {
+                complete = true;
+                break;
+            }
+        }
+    }
+
+    Exhaustive {
+        outcomes,
+        schedules,
+        complete,
+    }
+}
+
+/// Run a single schedule under the exhaustive checker: a fresh memory image and root vCPU (at
+/// memory-op granularity), driven by `choices`. Returns the root task's outcome.
+fn run_one_schedule(
+    funcs: &Arc<[Func]>,
+    memory: &Option<Memory>,
+    data: &[Data],
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    choices: &mut Choices,
+) -> Result<Vec<Value>, Trap> {
+    let mem = memory.map(|mc| {
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        mm.init_data(data);
+        mm
+    });
+    let det = Arc::new(DetSched::new(0, MAX_VCPUS)); // seed unused under the exhaustive policy
+    let root_id = {
+        let mut s = det.lock();
+        let id = s.next_task;
+        s.next_task += 1;
+        s.live += 1;
+        let mut root = VCpu::new(
+            Arc::clone(funcs),
+            func,
+            args,
+            mem,
+            Host::new(),
+            fuel,
+            0,
+            id,
+            SchedRef::Det(Arc::clone(&det)),
+        );
+        root.memop = true;
+        s.runnable.push(Box::new(root));
+        id
+    };
+    run_with_policy(&det, Policy::Exhaustive(choices));
+    let out = det.lock().results.remove(&root_id);
+    out.map_or(Err(Trap::ThreadFault), |o| o.result)
 }
 
 /// One activation record on the **explicit** guest call stack (§12). Reifying the call
@@ -787,11 +951,24 @@ impl DetSched {
     }
 }
 
+/// How a deterministic-explorer run resolves its two scheduling choices — which runnable vCPU to step
+/// next, and for how long. `Seeded` is the random seed sweep ([`run_scheduled`]); `Exhaustive` is the
+/// stateless model checker ([`explore_all`]), which follows a planned choice sequence and records the
+/// branch factor at each point so the caller can DFS the whole interleaving tree.
+enum Policy<'a> {
+    Seeded,
+    Exhaustive(&'a mut Choices),
+}
+
 /// Run a deterministic-explorer instance to completion (every vCPU finished, or a genuine deadlock —
-/// nothing runnable and nothing waiting on a timeout). Picks a runnable vCPU and a quantum from the
-/// seeded PRNG; when none is runnable, advances the logical clock to the earliest `wait` deadline and
+/// nothing runnable and nothing waiting on a timeout). Picks a runnable vCPU and a quantum per the
+/// [`Policy`]; when none is runnable, advances the logical clock to the earliest `wait` deadline and
 /// times that waiter out.
 fn run_det(det: &Arc<DetSched>) {
+    run_with_policy(det, Policy::Seeded);
+}
+
+fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
     loop {
         // Choose the next vCPU + quantum under the lock; release it before running (run_inner may
         // re-enter via `spawn`/`notify`).
@@ -814,9 +991,12 @@ fn run_det(det: &Arc<DetSched>) {
                 continue;
             }
             let n = s.runnable.len();
-            let pick = (s.rng() as usize) % n;
+            let (pick, quantum) = match &mut policy {
+                Policy::Seeded => ((s.rng() as usize) % n, 1 + s.rng() % MAX_QUANTUM),
+                // One visible op per turn (`memop` vCPUs) so every shared-state access is a decision.
+                Policy::Exhaustive(c) => (c.pick(n), 1),
+            };
             let v = s.runnable.swap_remove(pick);
-            let quantum = 1 + s.rng() % MAX_QUANTUM;
             (v, quantum)
         };
         match v.run(quantum) {
@@ -989,6 +1169,11 @@ struct VCpu {
     /// The executor this vCPU runs under — the real OS-thread [`Scheduler`] or the deterministic
     /// [`DetSched`] (spawn enqueues here; notify wakes here).
     sched: SchedRef,
+    /// When set, the `quantum` budget counts **visible (shared-memory / sync) operations** rather than
+    /// raw instructions, so the vCPU yields at memory-op boundaries. The exhaustive model checker
+    /// ([`explore_all`]) uses `memop = true` + `quantum = 1` to make every shared-state access a
+    /// scheduling point; the real pool and the seeded explorer leave it `false`.
+    memop: bool,
 }
 
 impl VCpu {
@@ -1025,6 +1210,7 @@ impl VCpu {
             id,
             pending: None,
             sched,
+            memop: false,
         }
     }
 
@@ -1045,6 +1231,28 @@ impl VCpu {
             Err(t) => Step::Done(Err(t)),
         }
     }
+}
+
+/// A **visible** instruction — one whose effect another vCPU can observe or that synchronizes with
+/// one: a linear-memory access (atomic or plain) or a thread/futex op. These are the only points at
+/// which interleaving order can change a program's outcome, so they are the scheduling decision
+/// points the exhaustive model checker preempts on (`memop` granularity). Pure thread-local
+/// computation (arithmetic, control flow, calls) is invisible and runs without a yield. `atomic.fence`
+/// is omitted: both backends execute seq-cst, so a fence moves no data and adds no observable order.
+fn is_visible(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::Load { .. }
+            | Inst::Store { .. }
+            | Inst::AtomicLoad { .. }
+            | Inst::AtomicStore { .. }
+            | Inst::AtomicRmw { .. }
+            | Inst::AtomicCmpxchg { .. }
+            | Inst::ThreadSpawn { .. }
+            | Inst::ThreadJoin { .. }
+            | Inst::MemoryWait { .. }
+            | Inst::MemoryNotify { .. }
+    )
 }
 
 /// Drive a vCPU until it finishes (`Inner::Done`) or parks on a blocking op (`Inner::Park`). On
@@ -1091,8 +1299,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         sched,
         funcs: _,
         id: _,
+        memop,
     } = v;
     let depth = *depth;
+    let memop = *memop;
 
     // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
     // `return` pops and appends results to the caller (which resumes past the call); a tail
@@ -1113,10 +1323,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         while frames[top].inst < block.insts.len() {
             // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
             // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`.
-            if budget == 0 {
-                return Ok(Inner::Yield);
+            // In `memop` mode the budget counts only **visible** (shared-state / sync) ops, so
+            // thread-local computation runs to the next memory op before a yield is possible — the
+            // partial-order reduction that keeps exhaustive exploration tractable.
+            if memop {
+                if is_visible(&block.insts[frames[top].inst]) {
+                    if budget == 0 {
+                        return Ok(Inner::Yield);
+                    }
+                    budget -= 1;
+                }
+            } else {
+                if budget == 0 {
+                    return Ok(Inner::Yield);
+                }
+                budget -= 1;
             }
-            budget -= 1;
             let inst = &block.insts[frames[top].inst];
             step(fuel)?;
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
@@ -1263,7 +1485,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let cfuncs = Arc::clone(&funcs);
                     let csched = sched.clone();
                     let made = sched.spawn(move |id| {
-                        Box::new(VCpu::new(
+                        let mut child = VCpu::new(
                             cfuncs,
                             entry,
                             &[Value::I64(spv), Value::I64(av)], // (sp, arg) — the fiber-style entry
@@ -1273,7 +1495,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             0,
                             id,
                             csched,
-                        ))
+                        );
+                        child.memop = memop; // inherit the explorer's memory-op granularity
+                        Box::new(child)
                     });
                     match made {
                         Some(child_id) => {

@@ -4,7 +4,14 @@ Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-07
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
-**Latest (2026-06-08):** §12 **real multi-threaded C now runs end-to-end**. `thread.spawn` was
+**Latest (2026-06-08):** §18 **exhaustive interleaving model checker** (`svm_interp::explore_all`):
+a stateless (CHESS/`shuttle`-style) checker that enumerates *every* schedule of a small concurrent
+program at memory-op granularity and reports the outcome set — turning the seed sweep (sampling) into
+a *proof*. Proves the lock-free atomic counter and the wait/notify handoff are interleaving-invariant,
+with a negative test (a racy non-atomic counter) confirming it finds the lost update. See the §18
+entry under Phase 4. Also this session: a **generator-driven concurrent oracle** (`concurrent_fuzz.rs`,
+256 generated commutative-atomic programs vs. an exact checksum on both the explorer and the real
+executor). Before that: §12 **real multi-threaded C now runs end-to-end**. `thread.spawn` was
 reshaped from `(func, arg)` to `(func: FuncIdx, sp: ValIdx, arg: ValIdx)` with the thread entry
 type changed `(i64) -> i64` → `(i64 sp, i64 arg) -> i64`, **unifying threads with fibers** under
 §3d's universal SP-first calling convention (param 0 of every function is the data-stack pointer).
@@ -1016,9 +1023,27 @@ leave a shared view — add a unix test for this alongside the Windows work.
   (12 scheduler seeds) and the real M:N executor (2 runs); failures are replayable from
   `(program_seed, scheduler_seed)`. Catches lost updates, misrouted stores, and explorer
   interleavings that aren't actually realizable. TSan-clean.
-  **Next here:** add memory-op-granularity exploration (step at each memory op rather than per
-  quantum) for exhaustive small-program checking, and extend the generator with cmpxchg-lock /
-  wait-notify shapes (not just commutative RMW).
+  **Exhaustive model checker DONE (2026-06-08, `svm_interp::explore_all`):** a *stateless* interleaving
+  model checker (CHESS/`shuttle`-style) that enumerates **every** distinct schedule of a small
+  concurrent program and returns the set of terminal outcomes — turning the seed *sweep* (sampling)
+  into a *proof*. Two pieces: (1) **memory-op granularity** — a `memop` flag on `VCpu` makes the
+  `quantum` budget count only *visible* ops (`is_visible`: linear-memory accesses + thread/futex ops;
+  fences excluded since both backends are seq-cst), so the scheduling decision points are exactly the
+  shared-state operations (the partial-order reduction that keeps the tree finite). (2) **stateless
+  DFS** — each schedule is one fresh execution replayed from a planned sequence of scheduling choices
+  (`Choices` records the branch factor at each `n>1` runnable set); after each run it backtracks to the
+  deepest decision with an unexplored sibling. `run_det` was refactored to `run_with_policy(Policy::
+  {Seeded,Exhaustive})` so the checker reuses the whole park/join/wait/timeout machinery. Returns
+  `Exhaustive { outcomes, schedules, complete }`. Tests (`concurrent.rs`): `exhaustive_tiny_atomic_counter`
+  (2 threads × 1 atomic add → proves total is *always* 2, `complete`), `exhaustive_futex_handoff`
+  (wait/notify, all interleavings → payload), and a **negative** `exhaustive_finds_known_race` (a
+  *non-atomic* load/add/store counter — the checker must find both 2 and the lost-update 1, proving it
+  has teeth). **Scope:** stateless + no DPOR beyond memop granularity, so it's for bounded-sync /
+  lock-free shapes; a **busy-wait spinlock** is the classic blow-up case (each failed `cmpxchg` retry
+  is a fresh decision point) and stays covered by `stress`+`sweep` instead.
+  **Next here:** DPOR (dynamic partial-order reduction) to tame contended-lock trees, per-schedule
+  memory reuse (each schedule currently re-`mmap`s a fresh reservation), and driving `explore_all` from
+  the `concurrent_fuzz` generator for exhaustive proofs of *generated* small programs.
   **Phase 2 still to come:** per-thread capability grants (spawned vCPUs still start with an empty
   powerbox) and honoring weak orderings in execution.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
