@@ -10,7 +10,7 @@ The full design lives in [`DESIGN.md`](DESIGN.md); the working agreement (keep i
 simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 [`AGENTS.md`](AGENTS.md).
 
-> Status: **Phase 2 complete, into Phase 3** — the core loop, the Cranelift JIT, and the
+> Status: **Phase 3 + cross-platform parity (3.5) complete, into Phase 4 (concurrency)** — the core loop, the Cranelift JIT, and the
 > C frontend are all in place. The full **scalar IR** (integer /
 > float ops, linear memory with confinement masking, direct / indirect / tail calls +
 > the function table, `select`, `br_table`, `unreachable`) plus **capabilities**
@@ -40,9 +40,10 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > JIT**, hello-world and a heap-allocated linked list included (the §18 Phase-2 "it works"
 > milestone). The §3d **SSA-promotion pass** lifts non-address-taken scalar locals out of
 > memory into SSA values (threaded as block params), so the JIT register-allocates them — a
-> hot loop body drops from ~22 load/store ops to zero. **Production trap-catching** is in
-> (unix): an `mmap`'d window with a `PROT_NONE` guard page + a SIGSEGV/SIGBUS handler turns
-> an out-of-window fault into a clean `MemoryFault` (§4/§5 detect-and-kill), and the large
+> hot loop body drops from ~22 load/store ops to zero. **Production trap-catching** runs across
+> **Linux / macOS / Windows**: a reserved window with a guard page + a fault handler (unix
+> SIGSEGV/SIGBUS + `siglongjmp`; Windows VEH) turns an out-of-window fault into a clean
+> `MemoryFault` (§4/§5 detect-and-kill), and the large
 > reserved-window model is the default; **read-only data segments** (§3a/D40) and a real
 > **Memory capability** (`map`/`unmap`/`protect`) exist — including **guest-controlled growth**
 > into the reserved tail (the §1a sparse-address-space / lazy-page-supply differentiator: a guest
@@ -51,9 +52,14 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > interpreter — and exposed to C as the **default guest `malloc`** (the shipped `<stdlib.h>`): any
 > program that `#include <stdlib.h>` gets a `malloc`/`free`/`calloc`/`realloc` whose heap grows
 > megabytes past the initial window through the Memory capability, byte-identically to native `cc`
-> (`demos/heapgrow`). Still ahead:
-> narrow-scalar promotion, fault-driven page supply + shared-region aliasing (Phase 4), atomics +
-> the rest of the concurrency model (Phase 4), SIMD, and capability extras. This
+> (`demos/heapgrow`). **Concurrency primitives** have landed (x86-64 unix, §12): stackful
+> **fibers** (`cont.*`), **threads** (`thread.spawn`/`join`, **1:1** — one vCPU per OS thread),
+> **C11 atomics**, and a **`wait`/`notify` futex** — the VM ships these as *primitives* with **no
+> built-in scheduler** (D22/D56), and a C-compatible **`<pthread.h>`** (`create`/`join`/`mutex`/
+> `cond`) is built over them in the libc, so multithreaded C runs identically on the interpreter
+> (the deterministic interleaving oracle, `explore_all`) and the JIT (real OS threads). Still ahead:
+> narrow-scalar promotion, shared-region aliasing + the async I/O ring, a guest M:N runtime, SIMD,
+> nesting / isolation tiers, and capability extras. This
 > is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
 
