@@ -1004,8 +1004,21 @@ leave a shared view — add a unix test for this alongside the Windows work.
   runs on the M:N executor; `c_threads_deterministic_sweep` runs that same C program through the
   deterministic explorer for seeds 0..100 (all 2000). So concurrent C is now verified by both the
   real-executor path *and* the seeded explorer.
-  **Next here:** drive the explorer from the `irgen` generator (fuzz concurrent programs against their
-  invariants) and add memory-op-granularity exploration for exhaustive small-program checking.
+  **Generator-driven oracle DONE (2026-06-08, `crates/svm/tests/concurrent_fuzz.rs`):** the explorer
+  is now driven by a **structured program generator**, not just hand-written modules. Each program
+  seed emits N (2..6) worker threads, each doing `iters` `i64.atomic.rmw.add amount` on one of a few
+  shared cells; the worker unpacks its `(cell, amount, iters)` script from the spawn `arg`
+  (`(cell<<32)|(amount<<16)|iters`), so one worker function covers all threads. Because atomic
+  RMW-add is linearizable and integer add is commutative+associative, each cell's final value — and
+  `main`'s weighted checksum `Σ_t (cell_t+1)·amount_t·iters_t` (the `c+1` weight makes a *misrouted*
+  add also perturb the result) — is **interleaving-invariant by construction**, so the host computes
+  the exact expected value. 256 generated programs are each checked on the deterministic explorer
+  (12 scheduler seeds) and the real M:N executor (2 runs); failures are replayable from
+  `(program_seed, scheduler_seed)`. Catches lost updates, misrouted stores, and explorer
+  interleavings that aren't actually realizable. TSan-clean.
+  **Next here:** add memory-op-granularity exploration (step at each memory op rather than per
+  quantum) for exhaustive small-program checking, and extend the generator with cmpxchg-lock /
+  wait-notify shapes (not just commutative RMW).
   **Phase 2 still to come:** per-thread capability grants (spawned vCPUs still start with an empty
   powerbox) and honoring weak orderings in execution.
   **Fibers — step 1 DONE (explicit-stack interpreter):** the reference interpreter no longer recurses
