@@ -1870,8 +1870,20 @@ int main(void) {
 
 #[test]
 fn c_threads_atomic_counter() {
-    // Real M:N executor: the headline — C source → IR → threads → exactly 2000.
+    // The headline — C source → IR → threads → exactly 2000 — on the interpreter's real M:N executor.
     match run_c_interp(C_ATOMIC_COUNTER).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(2000)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_threads_atomic_counter_jit() {
+    // The same multi-threaded C, end to end on the **JIT** (cooperative green threads over the shared
+    // window + hardware atomics), differentially checked against the interpreter by `run_c_full` —
+    // real C with threads compiles and runs natively, not just on the interpreter.
+    match run_c_full(C_ATOMIC_COUNTER).outcome {
         Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(2000)]),
         Outcome::Exited(c) => panic!("unexpected exit({c})"),
     }
