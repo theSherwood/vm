@@ -26,9 +26,18 @@ needed its own deterministic mode). The real-thread JIT is differential-tested a
 futex glue is loom-checked (`cargo test -p svm-jit --lib loom`, `RUSTFLAGS=--cfg loom`). TSan can't see
 JITted accesses, so it isn't used for the JIT path; it still covers the interp (`threads`/`concurrent`).
 
-**Still open (deferred):** guest-built M:N runtimes as worked examples; the async submit/complete ring
-(§9/§12); fiber/vCPU quota metering; the fuel/epoch preemption kill-path that stops *sibling* OS threads
-when one vCPU traps (today a trapped domain is torn down at join/run-end, not mid-flight).
+**C threading: `#include <pthread.h>` (DONE).** A C-compatible 1:1 pthreads layer lives in the libc
+(`frontend/chibicc/include/pthread.h`): `pthread_create`/`join` (each pthread = one OS thread via
+`thread.spawn`, a trampoline reaching the runtime `start_routine` by indirect call + a malloc'd
+per-thread data stack), futex-backed `pthread_mutex_t`, and a seq-counter `pthread_cond_t`. Backed by
+the 32-bit atomic builtins (`__vm_atomic_load32`/`store32`/`add32`, added to `codegen_ir.c` to complete
+the i32 surface). Verified interp == JIT (`c_pthread_mutex_counter` →2000, `_join_returns_value` →42,
+`_cond_handoff` →42). This is the guest-side threading model D56 said belongs in the libc, not the VM.
+
+**Still open (deferred):** guest-built *M:N green-thread* runtimes as worked examples (1:1 pthreads is
+done; M≫N cooperative is not); the async submit/complete ring (§9/§12); fiber/vCPU quota metering; the
+fuel/epoch preemption kill-path that stops *sibling* OS threads when one vCPU traps (today a trapped
+domain is torn down at join/run-end, not mid-flight); `pthread_self`/`exit`/`once`/TLS-keys/rwlocks.
 
 > **⚠️ SUPERSEDED (see the D56 decision note above).** Everything from here to the
 > "commit 3: fibers run in the JIT" changelog describes the green-thread **M:N executor**
