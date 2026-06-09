@@ -2132,6 +2132,15 @@ pub mod iface {
     /// two domains come to share memory; `create`/`grant` (guest-minted regions, cross-domain) are a
     /// §14 follow-up — today regions are host-granted, like `Memory`.
     pub const SHARED_REGION: u32 = 4;
+    /// `AddressSpace` — the §14 memory-management capability, **attenuable to a power-of-two
+    /// window sub-range** `[base, base+size)`. Like `Memory` but every op is confined to the
+    /// holder's sub-range (offsets are sub-range-relative, shifted by `base`): op 0 `map(off,len,prot)`,
+    /// 1 `unmap(off,len)`, 2 `protect(off,len,prot)`, 3 `page_size() -> i64`, and 4
+    /// **`sub(off, size_log2) -> handle`** — the **attenuation** primitive: mint a child `AddressSpace`
+    /// over the power-of-two-aligned sub-range `[base+off, base+off + 2^size_log2)`, which must lie
+    /// within the holder's range (a parent can only sub-allocate what it holds, §14). This is the
+    /// memory half of the `Instantiator`: a guest carves a child's window from its own.
+    pub const ADDRESS_SPACE: u32 = 5;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -2319,6 +2328,13 @@ enum Binding {
     /// A §13 `SharedRegion` handle, carrying the index of its backing in [`Host::regions`]. The
     /// backing (not the index) is the shared object; mapping it at several window offsets aliases.
     SharedRegion(u32),
+    /// A §14 `AddressSpace` handle attenuated to the power-of-two window sub-range `[base, base+size)`
+    /// (both window-absolute bytes). Every op is confined to it; `sub` mints a further-attenuated
+    /// child. The bounds live in the host-owned slot — the guest names only the forgeable handle.
+    AddressSpace {
+        base: u64,
+        size: u64,
+    },
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -2404,6 +2420,15 @@ impl Host {
     }
     pub fn grant_memory(&mut self) -> i32 {
         self.grant(iface::MEMORY, Binding::Memory)
+    }
+
+    /// Grant a §14 `AddressSpace` capability over the window sub-range `[base, base+size)` (§14). The
+    /// root grant is normally the whole window (`base = 0`, `size` the window size); the guest then
+    /// `sub`-attenuates it to carve children. `size` must be a power of two and `base` a multiple of
+    /// it (so the range and every sub-range are power-of-two aligned, §4/D19) — the caller's
+    /// contract, mirroring how the host lays out windows.
+    pub fn grant_address_space(&mut self, base: u64, size: u64) -> i32 {
+        self.grant(iface::ADDRESS_SPACE, Binding::AddressSpace { base, size })
     }
 
     /// Grant a §13 `SharedRegion` capability backed by a fresh `len`-byte zero-filled host buffer,
@@ -2518,6 +2543,52 @@ impl Host {
                     }
                     2 => backing.size() as i64,
                     3 => mem.region_page_size(),
+                    _ => EINVAL,
+                }])
+            }
+            Binding::AddressSpace { base, size } => {
+                // §14: every op is confined to this capability's sub-range `[base, base+size)`. Offsets
+                // are sub-range-relative; the handler bounds them and shifts by `base` into the window,
+                // so a holder can never reach a byte outside its grant — the memory authority a child
+                // gets from the `Instantiator`. `sub` (op 4) is **attenuation**: mint a child range.
+                if op == 4 {
+                    // sub(off, size_log2) -> child handle (attenuation). Mint an AddressSpace over the
+                    // power-of-two-aligned `[base+off, base+off+child)` ⊆ `[base, base+size)`.
+                    let off = *args.first().unwrap_or(&0) as u64;
+                    let size_log2 = *args.get(1).unwrap_or(&-1);
+                    if !(0..64).contains(&size_log2) {
+                        return Ok(vec![EINVAL]);
+                    }
+                    let child = 1u64 << size_log2;
+                    // child fits, `off` is child-aligned (power-of-two sub-window, D19), and the whole
+                    // child range lies within this holder's range — "sub-allocate only what you hold".
+                    let fits = child <= size
+                        && off & (child - 1) == 0
+                        && off.checked_add(child).is_some_and(|end| end <= size);
+                    if !fits {
+                        return Ok(vec![EINVAL]);
+                    }
+                    return Ok(vec![self.grant_address_space(base + off, child) as i64]);
+                }
+                // map/unmap/protect/page_size — same shapes as `Memory`, but bounded to `[0, size)`
+                // and shifted by `base` (a buffer/range straddling the sub-range boundary is -EINVAL).
+                let Some(mem) = mem else {
+                    return Ok(vec![EINVAL]);
+                };
+                if op == 3 {
+                    return Ok(vec![mem.page_size()]);
+                }
+                let off = *args.first().unwrap_or(&0) as u64;
+                let len = *args.get(1).unwrap_or(&0) as u64;
+                let prot = *args.get(2).unwrap_or(&0) as i32;
+                // The decisive confinement check: the range must be wholly within this sub-window.
+                if off.checked_add(len).is_none_or(|end| end > size) {
+                    return Ok(vec![EINVAL]);
+                }
+                Ok(vec![match op {
+                    0 => mem.map(base + off, len, prot),
+                    1 => mem.unmap(base + off, len),
+                    2 => mem.protect(base + off, len, prot),
                     _ => EINVAL,
                 }])
             }

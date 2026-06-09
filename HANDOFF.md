@@ -868,9 +868,12 @@ leave a shared view — add a unix test for this alongside the Windows work.
 
 - [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
   virtual memory** — *most of the §1a differentiators live here.* Sub-window **confinement** is
-  in (the masking unit `Window::sub` + a both-backends run path with an interp↔JIT escape-oracle);
-  the **Instantiator capability** (a guest minting a child: sub-window + attenuated caps + quota) is
-  the remaining work, and it's what unlocks §13 cross-domain `SharedRegion` and the isolation tiers.
+  in (the masking unit `Window::sub` + a both-backends run path with an interp↔JIT escape-oracle),
+  as is the **`AddressSpace` capability + attenuation** (iface 5: a power-of-two window sub-range
+  with `map`/`unmap`/`protect` confined to it + a `sub` op that mints an attenuated child — the
+  memory half of the Instantiator). The **`Instantiator` capability** proper (a guest spawning a
+  child *domain*: sub-window + an attenuated subset of its *own* caps + quota) is the remaining
+  work, and it's what unlocks §13 cross-domain `SharedRegion` and the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
   `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
@@ -1060,8 +1063,15 @@ The current frontier, roughly ranked:
    JIT masking lowering adds `+ base` (`base == 0` elided so top-level codegen is unchanged). It's
    covered by a hand-written + generative interp↔JIT **sub-window escape-oracle** (`escape_oracle.rs`,
    `jit_fuzz` pass 3) that byte-compares the *whole parent* and asserts the child never touched a byte
-   outside its slice. **Remaining:** the Instantiator *capability* itself — a parent guest minting a
-   child (sub-window + attenuated caps + quota) at runtime, vs. today's host-driven setup.
+   outside its slice. *Also landed: the **`AddressSpace` capability + attenuation** (iface 5,
+   `Host::grant_address_space`)* — a power-of-two window sub-range whose `map`/`unmap`/`protect` are
+   confined to it and whose `sub(off,size_log2)` op **mints a further-attenuated child range** (a
+   parent can only sub-allocate what it holds). It runs through the shared `cap_dispatch_slots`, so
+   both backends get it for free; covered by an interp↔JIT differential + authority-confinement tests
+   (`address_space.rs`). This is the **memory half of the Instantiator** and the project's first
+   *attenuation* primitive. **Remaining:** bundle it into the `Instantiator` capability proper — a
+   parent guest spawning a child *domain* (sub-window + an **attenuated subset of its own caps** +
+   quota) at runtime, vs. today's host-driven setup; then cross-domain `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.
