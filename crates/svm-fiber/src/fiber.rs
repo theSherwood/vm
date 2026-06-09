@@ -267,4 +267,67 @@ mod tests {
             );
         }
     }
+
+    /// Fuzz-style property test for the per-ABI switch (`jump`/`make`): many fibers driven in
+    /// **random resume orders** must each keep independent register/stack state across the interleaved
+    /// switches. Each fiber `i` is a folding generator that suspends `k_i` times — yielding its running
+    /// sum — then returns `sum + 99`; a parallel model tracks each fiber's expected sum and every
+    /// resume is checked. A register- or stack-save bug in the hand-written switch corrupts a fiber
+    /// resumed *after* others ran on top of it, surfacing here as a mismatched yield. Deterministic
+    /// (seeded xorshift), so any failure replays exactly.
+    #[test]
+    fn random_resume_orders_keep_fibers_independent() {
+        fn xorshift(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        for _trial in 0..300 {
+            let n = 2 + (xorshift(&mut rng) % 5) as usize; // 2..=6 fibers
+            let k: Vec<u64> = (0..n).map(|_| 1 + xorshift(&mut rng) % 8).collect();
+            let mut fibers: Vec<Fiber> = k
+                .iter()
+                .map(|&ki| {
+                    Fiber::new(64 * 1024, move |y, first| {
+                        let mut a = first;
+                        for _ in 0..ki {
+                            a = a.wrapping_add(y.suspend(a));
+                        }
+                        a.wrapping_add(99)
+                    })
+                })
+                .collect();
+            let mut sum = vec![0u64; n];
+            let mut count = vec![0u64; n];
+            let mut done = vec![false; n];
+            let mut remaining = n;
+            while remaining > 0 {
+                // Pick a random not-yet-finished fiber.
+                let mut i = (xorshift(&mut rng) % n as u64) as usize;
+                while done[i] {
+                    i = (i + 1) % n;
+                }
+                let v = xorshift(&mut rng);
+                sum[i] = sum[i].wrapping_add(v);
+                count[i] += 1;
+                match fibers[i].resume(v) {
+                    State::Yielded(got) => {
+                        assert!(count[i] <= k[i], "fiber {i} yielded past its suspend count");
+                        assert_eq!(
+                            got, sum[i],
+                            "fiber {i} yield mismatch (switch state corruption?)"
+                        );
+                    }
+                    State::Complete(got) => {
+                        assert_eq!(count[i], k[i] + 1, "fiber {i} completed early/late");
+                        assert_eq!(got, sum[i].wrapping_add(99), "fiber {i} final mismatch");
+                        done[i] = true;
+                        remaining -= 1;
+                    }
+                }
+            }
+        }
+    }
 }
