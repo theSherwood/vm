@@ -18,38 +18,59 @@
 //!   a fiber with a value, the body runs and [`Yielder::suspend`]s values back, RAII frees the stack,
 //!   and a panic inside the body aborts (unwinding across a stack switch would be UB).
 //!
-//! Supported on **x86-64 unix** only today; other targets compile but [`supported`] returns `false`
-//! and the primitives are absent (the JIT keeps bailing `Unsupported` there). aarch64 (macOS) and
-//! x86-64 Windows ports are staged behind the `switch`/`stack` seams.
+//! Supported on **x86-64 unix** and **x86-64 Windows** today; other targets compile but
+//! [`supported`] returns `false` and the primitives are absent (the JIT keeps bailing `Unsupported`
+//! there). The aarch64 (macOS) port is staged behind the same `switch`/`stack` seams.
 
 /// Whether real stack switching is available on this target.
 ///
 /// Keep this in lockstep with the `switch`/`stack`/`fiber` module gates below and with the
 /// `fiber_rt` cfg that `svm-jit` derives for the same target set.
 pub const fn supported() -> bool {
-    cfg!(all(unix, target_arch = "x86_64"))
+    cfg!(any(
+        all(unix, target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64"),
+    ))
 }
 
-// Arch-specific register/stack switch (the `unsafe` core: `jump`/`make`/`Transfer`).
+// Arch/OS-specific register/stack switch (the `unsafe` core: `jump`/`make`/`Transfer`).
 #[cfg(all(unix, target_arch = "x86_64"))]
 #[path = "switch_x86_64_sysv.rs"]
+mod switch;
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[path = "switch_x86_64_windows.rs"]
 mod switch;
 
 // OS-specific guard-paged control stack.
 #[cfg(all(unix, target_arch = "x86_64"))]
 #[path = "stack_unix.rs"]
 mod stack;
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[path = "stack_windows.rs"]
+mod stack;
 
 // Safe RAII asymmetric-coroutine wrapper (ABI-agnostic; built on `switch` + `stack`).
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
 mod fiber;
 
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
 pub use fiber::{Fiber, State, Yielder};
 
 // Combined switch + stack integration tests, ABI-agnostic (they drive whichever `switch`/`stack` the
 // target selected), so every supported target runs the same behavioral checks.
-#[cfg(all(test, unix, target_arch = "x86_64"))]
+#[cfg(all(
+    test,
+    any(
+        all(unix, target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64")
+    )
+))]
 mod switch_tests {
     use crate::stack::Stack;
     use crate::switch::{jump, make, Transfer};
@@ -74,7 +95,7 @@ mod switch_tests {
     #[test]
     fn switch_roundtrip_accumulates() {
         let stack = Stack::new(64 * 1024);
-        let mut ctx = unsafe { make(stack.top(), summer) };
+        let mut ctx = unsafe { make(&stack, summer) };
         for (payload, want) in [(5u64, 5u64), (10, 15), (100, 115), (1, 116)] {
             let t = unsafe { jump(ctx, payload) };
             ctx = t.fctx;
@@ -98,7 +119,7 @@ mod switch_tests {
     fn runs_on_the_fiber_stack() {
         let stack = Stack::new(64 * 1024);
         let (lo, hi) = stack.usable_range();
-        let ctx = unsafe { make(stack.top(), report_sp) };
+        let ctx = unsafe { make(&stack, report_sp) };
         let t = unsafe { jump(ctx, 0) };
         let addr = t.data as usize;
         assert!(
@@ -125,7 +146,7 @@ mod switch_tests {
     #[test]
     fn recursion_on_fiber_stack() {
         let stack = Stack::new(256 * 1024);
-        let ctx = unsafe { make(stack.top(), fibber) };
+        let ctx = unsafe { make(&stack, fibber) };
         let t = unsafe { jump(ctx, 25) };
         assert_eq!(t.data, 75025); // fib(25)
     }
@@ -134,7 +155,7 @@ mod switch_tests {
     #[test]
     fn many_switches_are_stable() {
         let stack = Stack::new(64 * 1024);
-        let mut ctx = unsafe { make(stack.top(), summer) };
+        let mut ctx = unsafe { make(&stack, summer) };
         let mut expect = 0u64;
         for i in 0..100_000u64 {
             expect = expect.wrapping_add(i | 1); // never u64::MAX
@@ -149,8 +170,8 @@ mod switch_tests {
     fn two_fibers_independent() {
         let sa = Stack::new(64 * 1024);
         let sb = Stack::new(64 * 1024);
-        let mut a = unsafe { make(sa.top(), summer) };
-        let mut b = unsafe { make(sb.top(), summer) };
+        let mut a = unsafe { make(&sa, summer) };
+        let mut b = unsafe { make(&sb, summer) };
         let ta = unsafe { jump(a, 3) };
         a = ta.fctx;
         let tb = unsafe { jump(b, 7) };

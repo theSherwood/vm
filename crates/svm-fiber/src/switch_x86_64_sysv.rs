@@ -90,10 +90,10 @@ unsafe extern "C" fn trampoline() {
 /// ```
 ///
 /// # Safety
-/// `stack_top` must be the top of a live, writable, suitably sized stack (e.g. `Stack::top`).
-pub unsafe fn make(stack_top: *mut u8, entry: Entry) -> *mut u8 {
+/// `stack` must be a live, writable, suitably sized control stack.
+pub unsafe fn make(stack: &crate::stack::Stack, entry: Entry) -> *mut u8 {
     // 16-align the base, then push the seven 8-byte slots top-down.
-    let mut sp = (stack_top as usize) & !15usize;
+    let mut sp = (stack.top() as usize) & !15usize;
     let mut push = |v: u64| {
         sp -= 8;
         // SAFETY: `sp` stays within the caller-provided stack region.

@@ -128,8 +128,8 @@ impl Fiber {
             closure: Cell::new(Box::into_raw(Box::new(f)) as *mut ()),
             drop_closure: drop_closure_impl::<F>,
         });
-        // SAFETY: fresh, live stack top; `fiber_entry::<F>` matches the boxed closure's type.
-        let ctx = unsafe { make(stack.top(), fiber_entry::<F>) };
+        // SAFETY: fresh, live stack; `fiber_entry::<F>` matches the boxed closure's type.
+        let ctx = unsafe { make(&stack, fiber_entry::<F>) };
         Fiber {
             _stack: stack,
             ctx,

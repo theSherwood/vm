@@ -572,6 +572,7 @@ name = "svm-fiber"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
