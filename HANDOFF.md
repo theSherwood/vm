@@ -1038,121 +1038,25 @@ regressions one commit old"):
 
 ### Suggested next pickups (ranked)
 
-> The ranked list below is **historical — all ✅ DONE**. Since then: Phase-3.5 cross-platform parity,
-> §12 concurrency (primitives + the C frontend), the **cross-platform JIT-concurrency port** (aarch64
-> AAPCS64 + x86-64 Windows MS-x64 switches), and the **concurrency escape-TCB hardening** (the
-> concurrent escape-oracle, the `svm-fiber`/`svm-mem` fuzzers, miri — see the Fuzzing section). The
-> live frontier is the **Phase-4** open items in §10 (nesting/§14, cross-domain `SharedRegion`, weak
-> orderings, the async ring) and the LLVM/wasm on-ramp (§14/D54).
+*(Everything previously ranked here is **done** — Phases 1–3.5, §12 concurrency + its cross-platform
+port, and the concurrency escape-TCB hardening. Git history has the build-log; §10 is the live
+tracker and §9 the honest-compliance view.)*
 
-1. ✅ **Large reserved window → guard-when-bounded** (§4) — **DONE** (Increments 2–4 below; the
-   final SP-elision step was decided *against*, D50). The decoupled `reserved`/`mapped` model is
-   the default: a large reserved range with only `mapped` backed, out-of-`mapped` → detect-and-kill.
-   *Original framing:* a multi-GB reserved window so 32-bit-bounded indices fit under the guard and
-   the JIT can elide the mask without a proof (the wasm32 fast path), closing the residual gap incl.
-   data-SP–relative C
-   locals. **Plan:** (1) ✅ a `bench/` **`locals_c`** kernel (address-taken `volatile` stack array
-   ⇒ per-iter `sp + (i&255)*8`, `sp` an unbounded i64 block param ⇒ masked every access) now
-   measures the case — it starts at **2.26× vs wasm32**, the worst kernel and the target metric
-   (memsum/scatter are already pre-elided, so they don't show it). (2) ✅ decoupled `reserved`
-   (mask domain) from `mapped` (fault bound) in `svm-mask`: `Window::with_mapped(reserved_log2,
-   mapped)` + `reserved()`/`mapped()` accessors; `confine` masks into `[0, reserved)`, `checked`
-   faults outside the backed `[0, mapped)`. `new` stays fully-mapped (`mapped == reserved`) and
-   `size()` aliases `reserved()`, so **no behavior change** and no caller churn; a second property
-   test + the `mask` fuzz target now drive the split (incl. the unmapped-tail fault). (3) ✅ both
-   backends adopt the decoupled model in lockstep: JIT `GuestWindow::new(mapped, reserved)`
-   reserves a **host-configured** large window (§4: "e.g. 2^40, host-configurable" — *not* a fixed
-   2^32; capped at `MAX_JIT_RESERVED_LOG2 = 2^40`) as `PROT_NONE`+`MAP_NORESERVE` (a huge reserve
-   costs only VA) + guard page, maps `mapped` RW; mask const = `reserved-1`; elision threshold →
-   `reserved`. Interp `Mem::with_reservation` mirrors it. Out-of-`mapped` accesses now **fault**
-   instead of wrapping (the I1 change). Reservation is host policy threaded through the `_reserved`
-   capture entries (`run_capture_reserved` / `compile_and_run_capture_reserved`), **not** baked
-   into `svm-mask` (still policy-free); default everywhere is fully-mapped (`reserved == mapped`),
-   so existing callers are unchanged. Tested: `escape_oracle::reserved_tail_access_faults_identically`
-   + `reserved_in_mapped_access_matches` pin the semantics, and the generative fuzzer
-   (`run_differential`) runs a **second `reserved > mapped` pass** so the 4000 seeds + `diff`
-   libFuzzer target exercise the large reservation, mask/elision-to-`reserved`, and interp↔JIT
-   trap-agreement on tail faults. (3b) ✅ **flipped the production default** to the §4 large-reserved
-   model: `svm_ir::DEFAULT_RESERVED_LOG2 = 40` (host policy, shared by both backends so they stay in
-   lockstep), applied by the non-`_reserved` `run`/`compile_and_run` entries. Out-of-`mapped`
-   accesses now **fault by default** (detect-and-kill, demand-paging-ready) — valid programs are
-   unaffected (all c_frontend/jit_diff/pipeline tests pass; only one wrap-asserting test was updated
-   to the fault model: `pipeline::confinement_faults_out_of_window_address`). Bench confirms it's
-   perf-neutral (same instruction sequence; memsum/scatter still pre-elide since their ub `< 2^40`).
-   (4) ❌ **decided NOT to pursue (D50)** — the remaining `locals_c` ~2.26× wasm32 gap (data-SP
-   relative `sp + dyn_offset`, `sp` an unbounded `i64` block param) is an **accepted cost** of the
-   64-bit model. **Key soundness finding (don't reopen the dead ends):** eliding needs the address
-   *provably `< reserved`*. Masking `sp` alone does **not** work — `sp & (reserved-1)` leaves
-   `sp+offset > reserved` (un-elidable), and `sp & (mapped-1)` **diverges from the interp** (which
-   masks the *full* address to `reserved`, then faults outside `mapped`) for any `sp ≥ mapped` → a
-   spec mismatch. The only **sound** elision is the wasm32 trick: compute window addresses in
-   **32-bit arithmetic** so the address is `< 2^32` *by construction* (`ub_of(ExtendI32U)` already
-   handles it) and the interp computes the same 32-bit value ⇒ no divergence. That caps the elided
-   window at 4 GiB and reworks the frontend pointer model (`#define SP` is `i64`) for one benchmark
-   — **not worth trading the clean 64-bit address space** (D50). `locals_c` stays a tracked metric
-   (no further regression), and it still beats wasm64.
-2. ~~**Over-time bench tracking**~~ — **DONE** (`bench/ --save-baseline`/`--check` vs committed
-   `bench/baseline.txt`, ratio-based, non-vacuous; `alu_c` chibicc kernel tracks the SSA-promotion
-   win end-to-end at ≈parity — see Benchmarking gaps); a non-gating nightly CI `bench` job runs `--check`.
-3. ~~**Real Memory capability + growth**~~ — **DONE** (`map`/`unmap`/`protect` + guest-controlled
-   growth into the reserved tail = the §1a sparse-address-space differentiator). Increments 1–3
-   below + the growth increments A–C (see the "Real window / Memory capability + growth" checkbox
-   above). **Increment 1 ✅ (interp spec):** `Mem` carries a
-   per-page protection map (`PageProt::Ro`/`Unmapped`, absent ⇒ rw); `load`/`store` enforce it
-   (`check_prot`); `GuestMem` gained `map`/`unmap`/`protect` (default no-op; interp `Mem`
-   implements them within `[0, mapped)` — `protect`→RO for D40, `unmap`→fault, `map`→re-commit
-   zeroed; misaligned/out-of-range ⇒ `-EINVAL`); `cap_dispatch_slots`' Memory arm calls them.
-   White-box `prot_tests` pin the semantics. **Increment 2 ✅ (JIT side + differential):** the
-   `jit_diff` cap-thunk now wraps the window as `MprotectWindow` (a `GuestMem` whose
-   `map`/`unmap`/`protect` call real `libc::mprotect` on the window pages; `read`/`write` like
-   `WindowMem`) instead of the no-op `WindowMem` — so a `protect`ed page is genuinely RO and a
-   store to it faults into the guard → `MemoryFault`. `jit_cap_memory_protect_read_only_faults_store`
-   pins it: the interp (page-map) and JIT (mprotect+guard) both detect-and-kill on a post-`protect`
-   store, non-vacuously (a no-op JIT `protect` would diverge). Added `libc` as an svm dev-dep.
-   **Increment 3 ✅ (generative fuzzing + 2 bug fixes it surfaced):**
-   `jit_cap_memory_protect_map_unmap_differential` generates 500 random map/unmap/protect + store/
-   load sequences and asserts interp (page-map) == JIT (mprotect+guard) on result/trap. JIT-side
-   `map` now zero-fills (parity with the interp), so map-after-unmap is covered. Two real bugs the
-   fuzzer caught: **(a)** `run_inner` always snapshots `window.rw_mut()[..mapped]` after the run, so
-   a guest-`unmap`ped (`PROT_NONE`) page made the snapshot read fault *outside* the guarded call and
-   crash the host → fixed with `GuestWindow::restore_rw()` (mprotect the backed region RW before the
-   snapshot). **(b)** the JIT passed `mem_size = reserved` (the mask domain, 2^40) to the cap thunk
-   instead of the backed `mapped` extent, so buffer borrows / Memory-cap ops bounded against the
-   wrong size → now threads `mapped` into `Lower` and passes it. **Growth — increments A–C ✅:**
-   (A) the interp model decouples confinement (mask into `[0, reserved)`) from committed-ness (a
-   sparse per-page set over all of `[0, reserved)`), so `map`/`unmap`/`protect` work past the
-   prefix and an uncommitted access faults; (B) a production `svm_run::MprotectWindow` (real
-   `mprotect` across the reserved range + `MADV_DONTNEED` on `unmap`, a software page mirror so §7
-   borrows fail closed) replaces the no-op `WindowMem` in the production `cap_thunk`, and the
-   cap-thunk ABI gained `mem_reserved`; (C) the differential fuzzer spans prefix+tail (800 seeds)
-   plus a concrete guest-consumer round-trip. Physical demand paging is free (kernel lazy-zero of
-   `MAP_NORESERVE` pages). The Memory cap is surfaced in the *main* irgen fuzzer (arm 19, prefix +
-   tail) and the `_with_host` escape-oracle snapshot now covers grown tail pages (low 256 KiB),
-   pinned non-vacuously by `jit_cap_memory_escape_oracle_grown_tail`. **§13 SharedRegion landed on all
-   platforms (incl. windows — issue #1 DONE):** `iface::SHARED_REGION = 4`, `PageProt::Backed` aliasing
-   (interp reference, every platform); the JIT match via real shared mappings (`MprotectWindow::
-   map_region`) — `mmap(MAP_SHARED|MAP_FIXED)` of a `memfd`/`shm` `ShmBacking` on unix, and on windows
-   `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` of a `CreateFileMapping` section over a `VirtualAlloc2`
-   **placeholder** window reservation (`WinShmBacking`, `os_section`, the `win_commit_rw` placeholder
-   commit). interp↔JIT differential `jit_cap_shared_region_aliases_differential` is now
-   `#[cfg(any(unix, windows))]`; validated locally via `cargo-xwin` + wine and by `windows-latest` PR
-   CI. **Deferred (Phase 4):** fault-driven *content* supply (guest/parent as pager, `userfaultfd`/§14);
-   cross-domain region `create`/`grant` (guest-minted regions, needs the §14 Instantiator).
+The current frontier, roughly ranked:
+1. **Apply the nightly `miri` CI job** — a one-line maintainer task (needs the `workflow` token scope;
+   snippet in the session for commit `60d4f3a`). Makes the `svm-mem` provenance/data-race check
+   continuous rather than a one-off local run.
+2. **Honor weak memory orderings in execution** (§12) — both backends run seq-cst today; the C11
+   `order` field is carried + verified but not yet weaker-honored. Needs a backend that supports it
+   and the concurrent-oracle story for it.
+3. **Nesting / the §14 Instantiator** — the big §1a differentiator: power-of-two sub-window grants +
+   attenuated caps + quota, which then unlocks **cross-domain `SharedRegion` `create`/`grant`** (§13)
+   and the isolation tiers. Most of the remaining §1a edges live here.
+4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
+   the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
+   lock-free shapes.
+5. **Language on-ramp** (§14/D54) — the LLVM-bitcode→IR translator (breadth, the differentiator
+   vehicle) and/or an optional wasm→IR bridge (compat).
 
-*(Done this session: SSA-promotion pass; the escape-oracle fuzzer (+ nightly `diff`/`mask`
-CI, merged); the JIT-vs-Wasmtime bench harness; mask elision for provably-bounded accesses;
-loops + indirect calls in the generative fuzzer; guard pages + signal-handler detect-and-kill;
-**over-time bench regression tracking** (`bench/ --save-baseline`/`--check` vs a committed
-ratio baseline, + an `alu_c` chibicc-compiled kernel tracking the SSA-promotion win end-to-end;
-a non-gating nightly CI `bench` job running `--check`); **a structural SSA-promotion guard**
-(`c_frontend` asserts zero loop-body memory ops on
-promotable loops, so the promotion win can't silently regress); **guest-controlled memory growth
-into the reserved tail** (the §1a sparse-address-space capability: interp sparse-commit model +
-production `mprotect`-backed `MprotectWindow` wired into `cap_thunk` + `mem_reserved` in the
-cap-thunk ABI + prefix/tail differential fuzz + a guest-consumer round-trip); plus a batch of
-real-library shakedowns — Clay, jsmn, SHA-256, xxHash, tinfl, stb_perlin (first float), tiny-regex-c
-(backtracking) — each vendored as a `demos/` + cc-oracle test; **map-growing `malloc` promoted to
-the default `<stdlib.h>`** (`demos/heapgrow`); and **fuzzer hardening** — the Memory cap's success
-path now rides the escape-oracle in both the dedicated `jit_cap_memory_escape_oracle_differential`
-and the main 4000-seed differential (granted cap + valid `map`/`unmap`/`protect`), which caught two
-real bugs (a null-pointer `from_raw_parts` in `cap_thunk`; an over-strict droppable-trap arm).)*
+The hard ceiling is unchanged (§2a/§18): *"appears to work"* is well-evidenced; *"is certified
+secure"* remains the separate expert-review/audit workstream — not a byproduct of this build.
