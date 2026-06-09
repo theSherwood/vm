@@ -5,10 +5,11 @@
 //! lowers the fiber ops to its host fiber runtime (native stack switching via `svm-fiber`); for every
 //! program below the JIT must produce exactly what the reference interpreter does.
 //!
-//! Stack switching exists on x86-64 unix + x86-64 Windows today (`svm_fiber::supported()`); elsewhere
-//! the JIT bails `Unsupported`, so these tests are gated to those targets.
+//! Stack switching exists on x86-64 unix, aarch64 unix, and x86-64 Windows today
+//! (`svm_fiber::supported()`); elsewhere the JIT bails `Unsupported`, so these tests are gated to it.
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
     all(windows, target_arch = "x86_64")
 ))]
 

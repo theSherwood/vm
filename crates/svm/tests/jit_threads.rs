@@ -5,10 +5,11 @@
 //! interleaving-invariant (the ones below), the interp↔JIT differential oracle applies directly: the
 //! JIT must produce exactly what the reference interpreter (M:N executor) does.
 //!
-//! The JIT thread/fiber runtime exists on x86-64 unix + x86-64 Windows today (`svm_fiber::supported()`);
-//! elsewhere the JIT bails `Unsupported`, so these tests are gated to those targets.
+//! The JIT thread/fiber runtime exists on x86-64 unix, aarch64 unix, and x86-64 Windows today
+//! (`svm_fiber::supported()`); elsewhere the JIT bails `Unsupported`, so these tests are gated to it.
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
     all(windows, target_arch = "x86_64")
 ))]
 

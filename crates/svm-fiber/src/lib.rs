@@ -18,9 +18,9 @@
 //!   a fiber with a value, the body runs and [`Yielder::suspend`]s values back, RAII frees the stack,
 //!   and a panic inside the body aborts (unwinding across a stack switch would be UB).
 //!
-//! Supported on **x86-64 unix** and **x86-64 Windows** today; other targets compile but
-//! [`supported`] returns `false` and the primitives are absent (the JIT keeps bailing `Unsupported`
-//! there). The aarch64 (macOS) port is staged behind the same `switch`/`stack` seams.
+//! Supported on **x86-64 unix**, **aarch64 unix** (e.g. macOS / Apple Silicon), and **x86-64
+//! Windows** today; other targets compile but [`supported`] returns `false` and the primitives are
+//! absent (the JIT keeps bailing `Unsupported` there).
 
 /// Whether real stack switching is available on this target.
 ///
@@ -29,6 +29,7 @@
 pub const fn supported() -> bool {
     cfg!(any(
         all(unix, target_arch = "x86_64"),
+        all(unix, target_arch = "aarch64"),
         all(windows, target_arch = "x86_64"),
     ))
 }
@@ -37,12 +38,15 @@ pub const fn supported() -> bool {
 #[cfg(all(unix, target_arch = "x86_64"))]
 #[path = "switch_x86_64_sysv.rs"]
 mod switch;
+#[cfg(all(unix, target_arch = "aarch64"))]
+#[path = "switch_aarch64.rs"]
+mod switch;
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[path = "switch_x86_64_windows.rs"]
 mod switch;
 
-// OS-specific guard-paged control stack.
-#[cfg(all(unix, target_arch = "x86_64"))]
+// OS-specific guard-paged control stack (the unix mmap one backs both unix arches).
+#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[path = "stack_unix.rs"]
 mod stack;
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -52,12 +56,14 @@ mod stack;
 // Safe RAII asymmetric-coroutine wrapper (ABI-agnostic; built on `switch` + `stack`).
 #[cfg(any(
     all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
     all(windows, target_arch = "x86_64")
 ))]
 mod fiber;
 
 #[cfg(any(
     all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
     all(windows, target_arch = "x86_64")
 ))]
 pub use fiber::{Fiber, State, Yielder};
@@ -68,6 +74,7 @@ pub use fiber::{Fiber, State, Yielder};
     test,
     any(
         all(unix, target_arch = "x86_64"),
+        all(unix, target_arch = "aarch64"),
         all(windows, target_arch = "x86_64")
     )
 ))]

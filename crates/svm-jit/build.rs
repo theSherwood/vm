@@ -8,7 +8,9 @@ fn main() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let on_unix = std::env::var_os("CARGO_CFG_UNIX").is_some();
     let on_windows = std::env::var_os("CARGO_CFG_WINDOWS").is_some();
-    if arch == "x86_64" && (on_unix || on_windows) {
+    let fiber_rt =
+        (on_unix && (arch == "x86_64" || arch == "aarch64")) || (on_windows && arch == "x86_64");
+    if fiber_rt {
         println!("cargo:rustc-cfg=fiber_rt");
     }
 
