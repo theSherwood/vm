@@ -647,4 +647,111 @@ mod tests {
             assert_eq!(r.byte(t * SPAN + SPAN - 1), v);
         }
     }
+
+    /// **Differential fuzzer**: run the same random op sequence against the platform-default backing
+    /// (`Mapped` — the raw-pointer hardware atomics, the crate's `unsafe`) and the `Paged` reference
+    /// (a `BTreeMap` + explicit value math), asserting every op agrees and the final images are
+    /// byte-identical. This is the §18 interp-as-oracle discipline applied to the memory substrate: the
+    /// `unsafe` backing is checked against the safe model across thousands of randomized accesses —
+    /// mixed atomic / non-atomic, 4- and 8-byte widths, cross-page offsets, and out-of-range bytes
+    /// (which both must confine inertly). Deterministic (seeded xorshift), so a failure replays. On
+    /// non-unix both are `Paged`, so it degenerates to a self-consistency check of the op generator.
+    #[test]
+    fn differential_mapped_vs_paged_fuzz() {
+        fn xs(s: &mut u64) -> u64 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *s = x;
+            x
+        }
+        let size = 3 * 4096; // spans pages; the Paged chunk boundary is exercised
+        let page = 4096;
+        let a = Region::new(size, page); // Mapped on unix
+        let b = Region::Paged(Paged::new(size, page)); // safe reference
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        // Atomic location: a `width`-aligned (4 or 8) in-bounds offset (the caller's contract).
+        let aligned = |s: &mut u64| -> (u64, u32) {
+            let width: u32 = if xs(s) & 1 == 0 { 4 } else { 8 };
+            let slots = size / width as u64;
+            let off = (xs(s) % slots) * width as u64;
+            (off, width)
+        };
+        for _ in 0..20_000 {
+            match xs(&mut s) % 7 {
+                0 => {
+                    // byte read, sometimes out of range (must read 0 / confine on both).
+                    let off = xs(&mut s) % (size + 64);
+                    assert_eq!(a.byte(off), b.byte(off), "byte({off}) diverged");
+                }
+                1 => {
+                    // byte write, sometimes out of range (must drop on both).
+                    let off = xs(&mut s) % (size + 64);
+                    let v = xs(&mut s) as u8;
+                    a.set_byte(off, v);
+                    b.set_byte(off, v);
+                }
+                2 => {
+                    let (off, w) = aligned(&mut s);
+                    assert_eq!(
+                        a.atomic_load(off, w),
+                        b.atomic_load(off, w),
+                        "atomic_load({off},{w}) diverged"
+                    );
+                }
+                3 => {
+                    let (off, w) = aligned(&mut s);
+                    let v = xs(&mut s);
+                    a.atomic_store(off, w, v);
+                    b.atomic_store(off, w, v);
+                }
+                4 => {
+                    let (off, w) = aligned(&mut s);
+                    let op = [
+                        RmwOp::Add,
+                        RmwOp::Sub,
+                        RmwOp::And,
+                        RmwOp::Or,
+                        RmwOp::Xor,
+                        RmwOp::Xchg,
+                    ][(xs(&mut s) % 6) as usize];
+                    let v = xs(&mut s);
+                    assert_eq!(
+                        a.atomic_rmw(off, w, op, v),
+                        b.atomic_rmw(off, w, op, v),
+                        "atomic_rmw({off},{w},{op:?}) diverged"
+                    );
+                }
+                5 => {
+                    let (off, w) = aligned(&mut s);
+                    // Bias `expected` toward a hit half the time by reading the current value first
+                    // (both backings agree on it, so this stays a pure differential).
+                    let expected = if xs(&mut s) & 1 == 0 {
+                        a.atomic_load(off, w)
+                    } else {
+                        xs(&mut s)
+                    };
+                    let rep = xs(&mut s);
+                    assert_eq!(
+                        a.atomic_cmpxchg(off, w, expected, rep),
+                        b.atomic_cmpxchg(off, w, expected, rep),
+                        "atomic_cmpxchg({off},{w}) diverged"
+                    );
+                }
+                _ => {
+                    // zero a random (clamped) range.
+                    let off = xs(&mut s) % size;
+                    let len = xs(&mut s) % (2 * page);
+                    a.zero(off, len);
+                    b.zero(off, len);
+                }
+            }
+        }
+        let mut ai = vec![0u8; size as usize];
+        let mut bi = vec![0u8; size as usize];
+        a.read_into(0, &mut ai);
+        b.read_into(0, &mut bi);
+        assert_eq!(ai, bi, "final region images diverge (Mapped vs Paged)");
+    }
 }
