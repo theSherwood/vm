@@ -703,8 +703,9 @@ IR signatures are typed; Cranelift assigns machine registers. The C-level mappin
 Not a VM primitive. The frontend's mini-libc implements `malloc`/`free`/`calloc`/
 `realloc` as **guest C** managing a window heap region, grown via the **`map`
 capability** (§4), guard-page-bracketed (§5). MVP allocator = simple free-list/bump;
-under the Phase-3 "fixed-size window, eager mapping" simplification it bumps within
-a pre-mapped heap.
+the shipped `<stdlib.h>` allocator now **grows the heap into the reserved-window tail via the
+`map` capability on demand** (the early "fixed-size window" bump-within-a-pre-mapped-heap
+simplification is superseded — see §4 / §3e).
 
 ### Phase-2 C subset (the "compilability proof" target)
 - **In:** `alloca`/VLAs (data-SP bump); computed `goto` (native — irreducible CFG,
@@ -719,7 +720,9 @@ a pre-mapped heap.
 
 The first concrete interfaces the §3c handle table dispatches and the §3d C runtime
 calls (`malloc` over `map`, stdio, `exit`). Resolves the §18 checklist item. Four
-interfaces — `Stream`, `Exit`, `Clock`, `Memory` — plus the powerbox layout.
+interfaces — `Stream`, `Exit`, `Clock`, `Memory` — plus the powerbox layout. (A fifth,
+`SharedRegion` (§13), has since landed as a host-granted interface — *aliasing only*; its
+`create`/`grant` are a §14 follow-up.)
 **These four are not special:** they are ordinary instances of the general,
 host-extensible capability mechanism (§7 "Host-defined capabilities &
 discoverability") — a host adds new capabilities the same way the runtime provides
@@ -772,10 +775,13 @@ window-relative, page-aligned offsets):
 | 0 | `map(offset, len, prot: i32) -> i64` | commit pages; `prot` = `READ\|WRITE` (no `EXEC` — guest data is never executed as code, §3c) |
 | 1 | `unmap(offset, len) -> i64` | decommit |
 | 2 | `protect(offset, len, prot: i32) -> i64` | change perms — backs the D40 read-only const segment |
+| 3 | `page_size() -> i64` | host MMU page granularity (the unit `map`/`unmap`/`protect` round to); lets a guest allocator align to the real host page (§4) |
 
-Out-of-range / misaligned → `-EINVAL`. Under the Phase-3 simplification (fixed-size
-window, **eager mapping**) `map` is barely exercised (`malloc` bumps within a
-pre-mapped heap), but the ops give the allocator and RO-data setup a real target.
+Out-of-range / misaligned → `-EINVAL`. The Phase-3 implementation went **past** the original
+fixed-size / eager-mapping simplification: the window is now a *large* reserved VA range
+(`DEFAULT_RESERVED_LOG2 = 40`) with **guest-controlled growth** into the reserved tail and
+kernel demand paging, so `map`/`unmap` are real (the shipped `<stdlib.h>` `malloc` grows the
+guest heap through them) and `protect` backs the RO-data setup.
 
 ### Powerbox (instantiation grant)
 `entry(h0…h5, args_buffer)`, imports declared in this order (§3b):
@@ -868,7 +874,9 @@ C frontend — runs green on `ubuntu-latest` (x86-64 / 4 KiB), `macos-latest`
   moves; windows-sys types it `#[repr(C)]` only, so it needs a `repr(align(16))`
   wrapper), and the cap-buffer borrow needs a guest-window view on non-unix too
   (a portable `WindowMem`, else stdio is silent). Guest-driven Memory-cap growth
-  (`map`/`unmap` backed by `VirtualProtect`) is the one remaining Windows follow-up.
+  (`map`/`unmap`/`protect` via `VirtualProtect`) and zero-overhead `SharedRegion` aliasing
+  (`MapViewOfFile3` over placeholder reservations) now work on Windows too — so all three
+  platforms are green with no outstanding per-OS follow-up for the MVP memory model.
 
 The guarantee is identical across targets: same confinement, same detect-and-kill,
 same elision. (Guard-relying elision is sound only where the guard region exists —
@@ -1583,11 +1591,11 @@ borrows a proven design rather than inventing one in §18's riskiest area.
 Windows tier 1 degrades to tier 0 (masking + MMU) or tier 3 (separate process). Tiers 0 and
 3 are portable. State this so the isolation story is not over-promised off Linux.
 
-**Staging:** Linux + macOS first (the current unix path; the `compile_error!` in `svm-jit`
-is a *temporary* gate, not a permanent stance), Windows VEH/SEH next. Window/mask/interp
-logic is platform-independent; only the PAL is per-OS. Windows is scheduled as its own
-milestone — **Phase 3.5 (§18)** — after which Linux/Windows/macOS are kept at parity by a
-gating three-OS CI matrix.
+**Staging:** Linux + macOS first (the unix path; the `compile_error!` in `svm-jit`
+gates genuinely-unsupported targets, not a permanent stance), Windows VEH/SEH next — **now
+done**. Window/mask/interp logic is platform-independent; only the PAL is per-OS. Windows
+landed as its own milestone — **Phase 3.5 (§18)** — and Linux/Windows/macOS are now kept at
+parity by a gating three-OS CI matrix.
 
 ---
 
@@ -1809,9 +1817,9 @@ team has **no expert safety net**.
   (`VirtualAlloc`/`VirtualProtect`), the detect-and-kill safety net (Windows
   **VEH/SEH**; macOS **Mach exceptions**, which can intercept ahead of BSD
   signals), and later the futex layer (`WaitOnAddress`, once §12 concurrency
-  lands). Starting point today is honest: the JIT `compile_error!`s off unix and CI
-  is Linux-only. macOS is largely free on the POSIX path; the real work is Windows
-  VEH/SEH and a **three-OS gating CI matrix** that keeps every *later* phase green
+  lands). **Phase 3.5 is now done:** the JIT once `compile_error!`d off unix with
+  Linux-only CI; today it runs on Linux, macOS, and Windows (Windows VEH/SEH was the
+  real work) under a **three-OS gating CI matrix** that keeps every *later* phase green
   on all three. Tier-1 MPK stays Linux-only and degrades to tier 0/3 elsewhere —
   parity is of the *portable* tiers, stated honestly. *~1–2 months, gated on a
   solid Phase-3 MVP.*
@@ -1858,9 +1866,10 @@ as open-ended, not a byproduct of the build.
   LP64 type mapping, struct layout, by-pointer aggregates, varargs, data segments,
   const RO data, `malloc`/`free` over `map`, Phase-2 C subset — **§3d**. Remaining:
   toolchain/linking (MVP = whole-program single module) is trivial under §3d.
-- ⬜ **Concrete window params (Phase 3):** §4 is parked — MVP simplification =
-  fixed-size window, eager mapping, no demand paging; pin page size, masking
-  constant, guard-page placement, minimal map/unmap/protect.
+- ✅ **Concrete window params (Phase 3):** resolved — a *large* reserved window
+  (`2^40`) with guest-controlled growth + kernel demand paging, host-page default
+  (page size queried at runtime, not pinned), final-effective-address masking,
+  guard-page detect-and-kill, and real `map`/`unmap`/`protect`/`page_size` — **§4 / §3e**.
 - ✅ **Minimal MVP capability set:** `Stream` (stdio), `Exit`, `Clock`, `Memory`
   (`map`/`unmap`/`protect`); negative-errno model; powerbox + args-buffer — **§3e**.
 - ✅ **TCB / threat-model writeup:** the honest conjunction contract, escape-TCB vs

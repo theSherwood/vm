@@ -1,6 +1,6 @@
 # Handoff — C frontend (chibicc → SVM IR) + differential fuzzing
 
-Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-08**.
+Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-09**.
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
@@ -295,9 +295,11 @@ windowed memory + capabilities exist; a generative interp↔JIT differential fuz
 guards the JIT). The §3d **SSA-promotion perf pass now exists** (item 8 below): scalar
 locals that are never address-taken are promoted to SSA values threaded as block params, so
 the JIT register-allocates them — a hot loop body went from ~22 load/store ops to **0**.
-Memory **detect-and-kill** now exists too: an `mmap`'d window + `PROT_NONE` guard page + a
-SIGSEGV/SIGBUS handler turn an out-of-window fault into a clean `MemoryFault` (§4/§5, unix).
-The remaining Phase-3 memory work is the *large* reserved window (the §4 perf/VM model). The
+Memory **detect-and-kill** now exists too, **cross-platform** (Linux + macOS + Windows, a non-TCB
+per-OS PAL): a guard-paged window + a fault handler (SIGSEGV/SIGBUS on unix; a vectored-exception
+guard on Windows) turns an out-of-window fault into a clean `MemoryFault` (§4/§5). The once-"remaining"
+Phase-3 memory work — the *large* reserved window, guest-controlled Memory-cap growth, and
+`SharedRegion` aliasing — has since landed (see §10). The
 §18 verifier escape-oracle now exists (the differential byte-compares the final guest window
 across interp + JIT: verified ⇒ in-window) — see §8 / §10.
 
@@ -719,8 +721,9 @@ which block "C runs." History order:
 7b. ~~**`malloc`/`free`**~~ — **DONE**, and it needed **no frontend changes**: it is
    ordinary guest C — a bump allocator over a big BSS-global window heap, `free` a no-op
    (the §3d MVP "fixed-size window" allocator). Lives in the test `LIBC` prelude alongside
-   `printf`; `calloc` too. (Real free-list reclamation / heap growth via the `map`
-   capability is deferred.) Demonstrated with a heap-allocated linked list of structs.
+   `printf`; `calloc` too. (Heap **growth via the `map` capability** has since landed in the
+   shipped `frontend/chibicc/include/stdlib.h` `malloc` — see §10 / `demos/heapgrow`; free-list
+   reclamation is still deferred.) Demonstrated with a heap-allocated linked list of structs.
 8. ~~**(Perf) SSA-promotion pass**~~ — **DONE**. Non-address-taken full-width scalar locals
    are promoted from memory to real SSA values, threaded as block params (see the "SSA
    promotion" subsection in §3). Removes the per-access masked load/store and the redundant

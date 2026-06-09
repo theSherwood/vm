@@ -45,7 +45,7 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > SIGSEGV/SIGBUS + `siglongjmp`; Windows VEH) turns an out-of-window fault into a clean
 > `MemoryFault` (§4/§5 detect-and-kill), and the large
 > reserved-window model is the default; **read-only data segments** (§3a/D40) and a real
-> **Memory capability** (`map`/`unmap`/`protect`) exist — including **guest-controlled growth**
+> **Memory capability** (`map`/`unmap`/`protect`/`page_size`) exist — including **guest-controlled growth**
 > into the reserved tail (the §1a sparse-address-space / lazy-page-supply differentiator: a guest
 > `map`s pages anywhere in its large reserved window, the kernel demand-pages them, and an
 > uncommitted access faults), backed by real `mprotect` and differentially fuzzed against the
@@ -58,7 +58,7 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > built-in scheduler** (D22/D56), and a C-compatible **`<pthread.h>`** (`create`/`join`/`mutex`/
 > `cond`) is built over them in the libc, so multithreaded C runs identically on the interpreter
 > (the deterministic interleaving oracle, `explore_all`) and the JIT (real OS threads). Still ahead:
-> narrow-scalar promotion, shared-region aliasing + the async I/O ring, a guest M:N runtime, SIMD,
+> narrow-scalar promotion, cross-domain `SharedRegion` `create`/`grant` + the async I/O ring, a guest M:N runtime, SIMD,
 > nesting / isolation tiers, and capability extras. This
 > is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
