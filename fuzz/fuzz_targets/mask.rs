@@ -1,11 +1,13 @@
-//! libFuzzer target for the **confinement masking unit** (`DESIGN.md` §4, I1; §18).
+//! libFuzzer target for the **confinement masking unit** (`DESIGN.md` §4, I1; §14; §18).
 //!
 //! The masking unit is the part of escape-freedom the verifier does *not* cover, so
 //! it is fuzzed in isolation against its crisp invariant: for any inputs,
-//! `Window::checked` is total (never panics) and, when it returns `Some(base)`,
-//! `base == confine(addr, offset)` and `[base, base+width) ⊆ [0, mapped) ⊆ [0, reserved)`.
-//! Both the fully-mapped form ([`Window::new`]) and the decoupled reserved/mapped form
-//! ([`Window::with_mapped`], the large-reserved-window + guard model, §4) are driven.
+//! `Window::checked` is total (never panics) and, when it returns `Some(a)`,
+//! `a == confine(addr, offset)` and `[a, a+width) ⊆ [base, base+mapped) ⊆ [base, base+reserved)`.
+//! All three constructors are driven — the fully-mapped form ([`Window::new`]), the decoupled
+//! reserved/mapped form ([`Window::with_mapped`], §4), and the **§14 nested sub-window**
+//! ([`Window::sub`], at an arbitrary `base`) — so the confinement-stays-in-its-(sub-)region property
+//! is fuzzed for nested children too.
 //!
 //! Run: `cargo +nightly fuzz run mask`
 #![no_main]
@@ -13,37 +15,47 @@
 use libfuzzer_sys::fuzz_target;
 use svm_mask::Window;
 
-/// Assert the crisp invariant for one window: `confine` is exactly the mask into
-/// `[0, reserved)`, and `checked` either rejects or returns that masked base within the
-/// backed `[0, mapped)`. Total — never panics.
+/// Assert the crisp invariant for one window (top-level or §14 sub-window): `confine` folds the
+/// effective address into this window's region `[base, base+reserved)` as `base + (x & mask)`, and
+/// `checked` either rejects or returns that confined address within the backed `[base, base+mapped)`.
+/// Total — never panics.
 fn check(w: Window, addr: u64, offset: u64, width: u32) {
+    let base = w.base();
     let reserved = w.reserved();
     let mapped = w.mapped();
     assert!(mapped <= reserved, "mapped must not exceed reserved");
-    let expected = addr.wrapping_add(offset) & (reserved - 1);
+    assert_eq!(base & (reserved - 1), 0, "base must be size-aligned");
+    assert!(
+        base <= u64::MAX - (reserved - 1),
+        "base + (reserved-1) must not overflow"
+    );
 
-    // `confine` is exactly the documented mask, always within the reserved domain.
-    assert_eq!(w.confine(addr, offset), expected);
-    assert!(expected < reserved);
+    let rel = addr.wrapping_add(offset) & (reserved - 1); // child-relative, in [0, reserved)
+    let a = w.confine(addr, offset);
+    assert_eq!(a, base + rel, "confine = base + masked offset");
+    // The decisive property: the confined address stays inside this window's (sub-)region.
+    assert!(a >= base, "confined address fell below its window base");
+    assert!(a - base < reserved, "confined address reached/passed its window top");
 
     match w.checked(addr, offset, width) {
-        Some(base) => {
-            assert_eq!(base, expected, "base must be the masked final address");
+        Some(c) => {
+            assert_eq!(c, a, "checked must return the confined address");
+            assert!(c >= base, "checked address below base");
             assert!(
-                base + width as u64 <= mapped,
-                "confined access escaped the mapped region"
+                (c - base) + width as u64 <= mapped,
+                "confined access escaped the backed [base, base+mapped)"
             );
         }
         None => assert!(
-            expected + width as u64 > mapped,
-            "faulted on a fully-mapped access"
+            rel + width as u64 > mapped,
+            "faulted on an in-mapped access"
         ),
     }
 }
 
 fuzz_target!(|data: &[u8]| {
     // Derive the inputs from the fuzz bytes (pad short inputs with zeros).
-    let mut b = [0u8; 26];
+    let mut b = [0u8; 34];
     let n = data.len().min(b.len());
     b[..n].copy_from_slice(&data[..n]);
 
@@ -52,8 +64,11 @@ fuzz_target!(|data: &[u8]| {
     let width = (b[16] % 8) as u32 + 1; // 1..=8
     let reserved_log2 = b[17]; // any byte, incl. out-of-range (Window clamps)
     let mapped = u64::from_le_bytes(b[18..26].try_into().unwrap()); // clamped to reserved
+    let base = u64::from_le_bytes(b[26..34].try_into().unwrap()); // clamped size-aligned by `sub`
 
-    // Fully-mapped form (mapped == reserved == size) and the decoupled form.
+    // Fully-mapped form (mapped == reserved == size), the decoupled form, and a §14 sub-window at an
+    // arbitrary base — all must keep every access confined to their own (sub-)region.
     check(Window::new(reserved_log2), addr, offset, width);
     check(Window::with_mapped(reserved_log2, mapped), addr, offset, width);
+    check(Window::sub(base, reserved_log2, mapped), addr, offset, width);
 });

@@ -16,17 +16,23 @@
 //!   `[mapped, reserved)` is reserved-but-unmapped (a `PROT_NONE` guard region in
 //!   production), so an access that lands there **faults** rather than touching memory.
 //!
-//! Confinement is the single masking operation
+//! Confinement is the single masking operation (with `base = 0` for a top-level window)
 //! ```text
-//! confine(addr, offset) = (addr + offset) & (reserved - 1)
+//! confine(addr, offset) = base + ((addr + offset) & (reserved - 1))
 //! ```
 //! Masking the **final effective address** (after folding the immediate `offset`)
 //! is load-bearing: masking only the operand and *then* adding a large immediate
 //! could land past the guard region in a neighbouring window. An access whose confined
-//! `[base, base+width)` is not fully within `[0, mapped)` is rejected
-//! ([`Window::checked`] returns `None`), modelling the guard region that backs every
-//! window — both a width-overrun off the top and (once `mapped < reserved`) a landing in
-//! the unmapped tail.
+//! address + width is not fully within the backed region is rejected ([`Window::checked`]
+//! returns `None`), modelling the guard region that backs every window — both a width-overrun
+//! off the top and (once `mapped < reserved`) a landing in the unmapped tail.
+//!
+//! ## Nesting (§14)
+//! A window can be a power-of-two-aligned **sub-region** of an enclosing window — a parent grants a
+//! child the slice `[base, base + reserved)` ([`Window::sub`]). Confinement then folds the child
+//! offset into exactly that slice (`base + (x & (reserved-1))`), so a child access can **never leave
+//! its sub-region** — hence never reach the parent's other regions or escape the parent window, at
+//! identical per-access cost. `base` is `reserved`-aligned, so the add is also `base | (x & mask)`.
 //!
 //! A **fully-mapped** window (`mapped == reserved`, the historical case — [`Window::new`])
 //! collapses both extents to one and behaves exactly as before: `confine` masks to `size`
@@ -48,6 +54,11 @@
 /// decoupled with [`Window::with_mapped`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Window {
+    // Absolute offset of this window's low byte within the enclosing address space (the parent
+    // backing for a §14 sub-window; `0` for a top-level window). Invariant: **size-aligned**
+    // (`base & (reserved-1) == 0`) and `base + reserved <= 2^64`, so `base + (x & mask)` confines
+    // into `[base, base+reserved)` without overflow. Clamped in `sub`.
+    base: u64,
     // Invariant: `<= 63`, so `1u64 << reserved_log2` never overflows. Private + clamped in
     // the constructors so a `Window` can never name a non-representable reserved size.
     reserved_log2: u8,
@@ -65,6 +76,7 @@ impl Window {
     pub fn new(size_log2: u8) -> Window {
         let reserved_log2 = if size_log2 > 63 { 63 } else { size_log2 };
         Window {
+            base: 0,
             reserved_log2,
             mapped: 1u64 << reserved_log2,
         }
@@ -85,9 +97,44 @@ impl Window {
         };
         let reserved = 1u64 << reserved_log2;
         Window {
+            base: 0,
             reserved_log2,
             mapped: if mapped > reserved { reserved } else { mapped },
         }
+    }
+
+    /// A **sub-window** at absolute offset `base` — a power-of-two sub-region of an enclosing
+    /// window (a §14 nested child: the parent grants a `1 << reserved_log2`-byte slice with `mapped`
+    /// backed). Confinement maps a child offset `x` to `base + (x & (reserved-1))`, so every child
+    /// access lands in `[base, base + reserved)` and can therefore **never leave its sub-region** —
+    /// hence never reach the parent's other regions or escape the parent window. `base` is clamped
+    /// **size-aligned** (the power-of-two-aligned sub-region §4/§14 requires) which also makes
+    /// `base + reserved <= 2^64`, so the unit stays total + overflow-free on any input;
+    /// `reserved_log2`/`mapped` are clamped as in [`Window::with_mapped`]. A `base == 0` sub-window
+    /// is exactly a [`Window::with_mapped`] window.
+    #[inline]
+    pub fn sub(base: u64, reserved_log2: u8, mapped: u64) -> Window {
+        let reserved_log2 = if reserved_log2 > 63 {
+            63
+        } else {
+            reserved_log2
+        };
+        let reserved = 1u64 << reserved_log2;
+        // `!mask == 2^64 - reserved` (for `mask = reserved - 1`): `base & !mask` is therefore both
+        // size-aligned *and* `<= 2^64 - reserved`, so `base + reserved` never overflows.
+        let base = base & !(reserved - 1);
+        Window {
+            base,
+            reserved_log2,
+            mapped: if mapped > reserved { reserved } else { mapped },
+        }
+    }
+
+    /// The absolute offset of this window's low byte (`0` for a top-level window; the parent-relative
+    /// base for a §14 sub-window). The confined address is `base() + (masked child offset)`.
+    #[inline]
+    pub fn base(self) -> u64 {
+        self.base
     }
 
     /// The **mask domain** in bytes (`1 << reserved_log2`, always `>= 1`): confinement
@@ -118,29 +165,34 @@ impl Window {
         self.reserved() - 1
     }
 
-    /// Confine the **final effective address** into `[0, reserved)`:
-    /// `(addr + offset) & (reserved - 1)`, with wrapping add. This is the load-bearing
-    /// operation (§4); the result is always within the reserved mask domain (it may still
-    /// land in the unmapped tail — [`Window::checked`] is what enforces the `mapped` bound).
+    /// Confine the **final effective address** into the window `[base, base + reserved)`:
+    /// `base + ((addr + offset) & (reserved - 1))`, with wrapping add. This is the load-bearing
+    /// operation (§4/§14); the result is always within this window's reserved range — for a
+    /// top-level window (`base == 0`) that is `[0, reserved)`, for a sub-window it is the granted
+    /// sub-region, so a child can never name an address outside it. (It may still land in the
+    /// unmapped tail — [`Window::checked`] is what enforces the `mapped` bound.)
     #[inline]
     pub fn confine(self, addr: u64, offset: u64) -> u64 {
-        addr.wrapping_add(offset) & self.mask()
+        self.base
+            .wrapping_add(addr.wrapping_add(offset) & self.mask())
     }
 
     /// Confine, then guard-check a `width`-byte access against the **backed** region.
-    /// Returns the in-window base offset, or `None` if `[base, base+width)` is not fully
-    /// within `[0, mapped)` — i.e. a width-overrun off the top, or (when `mapped < reserved`)
-    /// a landing in the unmapped tail. Both model the guard-region fault.
+    /// Returns the confined absolute address, or `None` if the access is not fully within the
+    /// backed region — i.e. a width-overrun off the top, or (when `mapped < reserved`) a landing in
+    /// the unmapped tail. Both model the guard-region fault.
     ///
-    /// Post-condition (asserted by the property tests / `mask` fuzz target): if this
-    /// returns `Some(base)` then
-    /// `base == confine(addr, offset)` **and** `base + width <= mapped`,
-    /// hence `[base, base + width) ⊆ [0, mapped) ⊆ [0, reserved)`.
+    /// Post-condition (asserted by the property tests / `mask` fuzz target): if this returns
+    /// `Some(a)` then `a == confine(addr, offset)`, the child-relative offset `a - base` satisfies
+    /// `(a - base) + width <= mapped`, and hence
+    /// `[a, a + width) ⊆ [base, base + mapped) ⊆ [base, base + reserved)`.
     #[inline]
     pub fn checked(self, addr: u64, offset: u64, width: u32) -> Option<u64> {
-        let base = self.confine(addr, offset);
-        match base.checked_add(width as u64) {
-            Some(end) if end <= self.mapped => Some(base),
+        // The masked *child-relative* offset, in `[0, reserved)`; the guard check is against the
+        // backed `[0, mapped)`. On success the returned address is absolute (`base + rel`).
+        let rel = addr.wrapping_add(offset) & self.mask();
+        match rel.checked_add(width as u64) {
+            Some(end) if end <= self.mapped => Some(self.base.wrapping_add(rel)),
             _ => None,
         }
     }
@@ -313,5 +365,78 @@ mod tests {
         assert_eq!(w.checked((1u64 << 63) - 1, 0, 2), None);
         // size_log2 over the max is clamped, not a shift-overflow panic.
         assert_eq!(Window::new(200).size(), 1u64 << 63);
+    }
+
+    /// The §14 **nesting** property: a sub-window confines every access into *its own* sub-region
+    /// `[base, base + reserved)` — never below `base`, never at/above the top — for arbitrary inputs,
+    /// and `checked` admits only accesses fully within the backed `[base, base + mapped)`. This is
+    /// exactly what makes a nested child unable to reach the parent's other memory or escape the
+    /// parent window. Total + panic-free on any input (drives the same way the `mask` fuzz target
+    /// does).
+    #[test]
+    fn sub_window_confines_within_subregion() {
+        let mut rng = Rng(0xCAFE_F00D_1234_5678);
+        for _ in 0..2_000_000 {
+            let base_in = rng.next();
+            let addr = rng.next();
+            let offset = rng.next();
+            let width = (rng.next() % 8 + 1) as u32; // 1..=8
+            let reserved_log2 = (rng.next() % 66) as u8; // include out-of-range (clamped)
+            let reserved = 1u64 << reserved_log2.min(63);
+            let mask = reserved - 1;
+            let mapped_in = rng.next() % reserved.saturating_mul(2).max(1);
+
+            let w = Window::sub(base_in, reserved_log2, mapped_in);
+            let base = w.base();
+            // Constructor invariants on any input.
+            assert_eq!(
+                base,
+                base_in & !mask,
+                "base size-aligned to the clamped reserved"
+            );
+            assert_eq!(base & mask, 0, "base must be size-aligned");
+            assert!(
+                base <= u64::MAX - mask,
+                "base + (reserved-1) must not overflow"
+            );
+            assert_eq!(w.reserved(), reserved);
+            assert!(w.mapped() <= reserved);
+
+            let rel = addr.wrapping_add(offset) & mask; // child-relative, in [0, reserved)
+            let a = w.confine(addr, offset);
+            assert_eq!(a, base + rel, "confine = base + masked offset");
+            // The decisive property: the confined address stays inside this sub-window's region.
+            assert!(a >= base, "sub-window access fell below its sub-region");
+            assert!(
+                a - base < reserved,
+                "sub-window access reached/passed its sub-region top"
+            );
+
+            match w.checked(addr, offset, width) {
+                Some(c) => {
+                    assert_eq!(c, a, "checked must return the confined address");
+                    assert!(c >= base, "checked address below base");
+                    assert!(
+                        (c - base) + width as u64 <= w.mapped(),
+                        "checked access left the backed [base, base+mapped)"
+                    );
+                }
+                None => assert!(
+                    rel + width as u64 > w.mapped(),
+                    "faulted on an in-mapped access"
+                ),
+            }
+        }
+
+        // A `base == 0` sub-window is exactly the fully-mapped/decoupled top-level window.
+        assert_eq!(Window::sub(0, 16, 1 << 16), Window::new(16));
+        assert_eq!(Window::sub(0, 16, 256), Window::with_mapped(16, 256));
+        // Concrete child: a 4 KiB window granted at offset 64 KiB in the parent.
+        let child = Window::sub(1 << 16, 12, 1 << 12);
+        assert_eq!(child.base(), 1 << 16);
+        assert_eq!(child.confine(0, 0), 1 << 16); // child offset 0 → absolute 64 KiB
+        assert_eq!(child.confine((1 << 12) + 8, 0), (1 << 16) + 8); // wraps within the child
+        assert_eq!(child.checked(4088, 0, 8), Some((1 << 16) + 4088)); // last backed slot
+        assert_eq!(child.checked(4092, 0, 8), None); // overruns the child's top → fault
     }
 }
