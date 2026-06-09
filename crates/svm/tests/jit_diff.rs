@@ -758,12 +758,13 @@ fn assert_jit_matches_interp_at(src: &str, idx: u32, inputs: &[Vec<Value>]) {
 }
 
 /// §12 fibers are **platform-gated** in the JIT: where the `svm-fiber` stack-switch substrate exists
-/// (x86-64 unix) the JIT lowers `cont.*` to its host fiber runtime (the happy path is covered by the
-/// interp↔JIT differential in `jit_fibers.rs`); everywhere else it must cleanly **bail** `Unsupported`
-/// so the differential harness skips fiber modules rather than mis-compiling them.
+/// the JIT lowers `cont.*` to its host fiber runtime (the happy path is covered by the interp↔JIT
+/// differential in `jit_fibers.rs`); everywhere else it must cleanly **bail** `Unsupported` so the
+/// differential harness skips fiber modules rather than mis-compiling them. The expectation is the JIT's
+/// own `fiber_supported()` (the `fiber_rt` cfg) — the single source of truth, not a re-derived target set.
 #[test]
 fn jit_fiber_support_is_platform_gated() {
-    let supported = cfg!(all(unix, target_arch = "x86_64"));
+    let supported = svm_jit::fiber_supported();
     let srcs = [
         // cont.new + cont.resume
         "func () -> (i64) {\n\

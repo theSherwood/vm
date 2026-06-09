@@ -91,6 +91,15 @@ mod os_thread_rt;
 #[cfg(windows)]
 pub use mem::win_commit_rw;
 
+/// Whether this build's JIT lowers the §12 fiber/thread/futex ops (`cont.*`, `thread.*`,
+/// `atomic.wait`/`notify`) instead of bailing [`JitError::Unsupported`]. True on the targets where
+/// `svm-fiber` provides a real stack switch — the `fiber_rt` cfg derived in `build.rs`, kept in
+/// lockstep with `svm_fiber::supported()`. Exposed so tests can assert the platform gating against the
+/// single source of truth rather than re-deriving the target set.
+pub const fn fiber_supported() -> bool {
+    cfg!(fiber_rt)
+}
+
 /// Largest window the reference JIT will back with a host allocation. Real deployments
 /// reserve a huge guard-paged virtual range (§4); for the differential harness we map
 /// `1 << size_log2` bytes (+ a guard page on unix), so cap it.
