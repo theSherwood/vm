@@ -4,3 +4,4 @@
 /fuzz/artifacts
 /bench/target
 **/*.rs.bk
+rustc-ice-*.txt
