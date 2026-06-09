@@ -251,24 +251,46 @@ mod mapped {
         pub(super) fn new(size: u64, page: u64) -> Option<Mapped> {
             let page = (page as usize).max(1);
             let map_len = round_up(size as usize, page);
-            // SAFETY: a fresh anonymous lazy reservation; `MAP_NORESERVE` so a large `size` costs
-            // only virtual address space until pages are touched (then kernel-zeroed). Null/MAP_FAILED
-            // is handled below (→ caller falls back to the paged backing).
-            let base = unsafe {
-                libc::mmap(
-                    core::ptr::null_mut(),
-                    map_len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                    -1,
-                    0,
-                )
+
+            // Under **miri** (which can't execute the `mmap` FFI), back the region with a heap
+            // allocation so the raw-pointer atomic accessors below run *unchanged* — miri then checks
+            // their provenance and the data-race freedom of the concurrent atomics, complementing
+            // ThreadSanitizer. The production path is the anonymous lazy `mmap`.
+            #[cfg(miri)]
+            let base = {
+                // 8-aligned for the widest (`U64`) atomic; `map_len >= page >= 1` so the layout is
+                // non-zero. Freed with the same layout in `Drop`.
+                let layout = std::alloc::Layout::from_size_align(map_len, 8).ok()?;
+                // SAFETY: non-zero layout.
+                let p = unsafe { std::alloc::alloc_zeroed(layout) };
+                if p.is_null() {
+                    return None;
+                }
+                p
             };
-            if base == libc::MAP_FAILED || base.is_null() {
-                return None;
-            }
+            #[cfg(not(miri))]
+            let base = {
+                // SAFETY: a fresh anonymous lazy reservation; `MAP_NORESERVE` so a large `size` costs
+                // only virtual address space until pages are touched (then kernel-zeroed).
+                // Null/MAP_FAILED → caller falls back to the paged backing.
+                let base = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        map_len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                        -1,
+                        0,
+                    )
+                };
+                if base == libc::MAP_FAILED || base.is_null() {
+                    return None;
+                }
+                base as *mut u8
+            };
+
             Some(Mapped {
-                base: base as *mut u8,
+                base,
                 size,
                 map_len,
             })
@@ -397,6 +419,15 @@ mod mapped {
 
     impl Drop for Mapped {
         fn drop(&mut self) {
+            #[cfg(miri)]
+            // SAFETY: the exact layout `new` allocated under miri (8-aligned, `map_len` bytes).
+            unsafe {
+                std::alloc::dealloc(
+                    self.base,
+                    std::alloc::Layout::from_size_align_unchecked(self.map_len, 8),
+                );
+            }
+            #[cfg(not(miri))]
             // SAFETY: releasing exactly the reservation created in `new`.
             unsafe {
                 libc::munmap(self.base as *mut libc::c_void, self.map_len);
@@ -608,43 +639,43 @@ mod tests {
     /// threads over the shared substrate, not just value-correct single-threaded.
     #[test]
     fn shared_atomic_counter_across_threads() {
-        const THREADS: u64 = 8;
-        const ITERS: u64 = 20_000;
+        let threads: u64 = 8;
+        let iters: u64 = if cfg!(miri) { 200 } else { 20_000 }; // miri's race detector is slow
         let r = Region::new(1 << 16, 4096);
         std::thread::scope(|s| {
-            for _ in 0..THREADS {
+            for _ in 0..threads {
                 s.spawn(|| {
-                    for _ in 0..ITERS {
+                    for _ in 0..iters {
                         r.atomic_rmw(0, 8, RmwOp::Add, 1);
                     }
                 });
             }
         });
-        assert_eq!(r.atomic_load(0, 8), THREADS * ITERS);
+        assert_eq!(r.atomic_load(0, 8), threads * iters);
     }
 
     /// Non-atomic sharing too: threads writing *disjoint* byte ranges through one `&Region` all land
     /// (no data race — distinct addresses), proving the shared image is one backing, not per-thread.
     #[test]
     fn shared_disjoint_plain_writes() {
-        const THREADS: u64 = 8;
-        const SPAN: u64 = 1024;
+        let threads: u64 = 8;
+        let span: u64 = if cfg!(miri) { 128 } else { 1024 };
         let r = Region::new(1 << 16, 4096);
         std::thread::scope(|s| {
-            for t in 0..THREADS {
+            for t in 0..threads {
                 let r = &r;
                 s.spawn(move || {
                     let v = (t as u8).wrapping_add(1);
-                    for i in 0..SPAN {
-                        r.set_byte(t * SPAN + i, v);
+                    for i in 0..span {
+                        r.set_byte(t * span + i, v);
                     }
                 });
             }
         });
-        for t in 0..THREADS {
+        for t in 0..threads {
             let v = (t as u8).wrapping_add(1);
-            assert_eq!(r.byte(t * SPAN), v);
-            assert_eq!(r.byte(t * SPAN + SPAN - 1), v);
+            assert_eq!(r.byte(t * span), v);
+            assert_eq!(r.byte(t * span + span - 1), v);
         }
     }
 
@@ -678,7 +709,9 @@ mod tests {
             let off = (xs(s) % slots) * width as u64;
             (off, width)
         };
-        for _ in 0..20_000 {
+        // miri runs every op through its interpreter + provenance/race checkers, so far fewer there.
+        let ops = if cfg!(miri) { 400 } else { 20_000 };
+        for _ in 0..ops {
             match xs(&mut s) % 7 {
                 0 => {
                     // byte read, sometimes out of range (must read 0 / confine on both).
