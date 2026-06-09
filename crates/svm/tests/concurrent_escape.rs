@@ -160,3 +160,69 @@ block0(vsp: i64, v0: i64):
         "a plain store from a thread escaped its confined slot"
     );
 }
+
+/// **Concurrent tail-fault oracle** (§4 decoupled `reserved`/`mapped`, §5 detect-and-kill, from a
+/// thread). A spawned worker accesses an address in the **reserved-but-unmapped tail** (`1<<20`, well
+/// past the 64 KiB backed window and past any host page so it works on 4 KiB *and* 16 KiB hosts). The
+/// contrast pins the I1 change *and* that it holds off the root vCPU:
+/// - **Fully mapped** (`reserved == mapped`): `1<<20` masks to offset 0 → wraps in → the worker
+///   completes and the run returns.
+/// - **`reserved > mapped`** (2^24): the tail address is in `[mapped, reserved)` → an uncommitted
+///   access that must **detect-and-kill** — the worker faults, the trap propagates through `join`, and
+///   the whole run traps `MemoryFault` on both backends. A thread-context bug that *wrapped* instead
+///   (escaping into the wrong/uncommitted page) would let the run complete here.
+///
+/// Unix only (the reserved-tail fault path; matches the single-threaded `escape_oracle.rs` cases),
+/// but page-size-independent so it runs on both x86-64 and aarch64.
+#[cfg(unix)]
+#[test]
+fn concurrent_tail_access_detect_and_kills_from_thread() {
+    let src = "\
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = thread.spawn 1 v0 v0
+  v2 = thread.join v1
+  v3 = i64.const 0
+  return v3
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v1 = i64.const 1048576
+  v2 = i32.const 123
+  i32.store8 v1 v2
+  v3 = i64.const 0
+  return v3
+}
+";
+    let m = svm::text::parse_module(src).expect("parse");
+    svm::verify::verify_module(&m).expect("verify");
+    let init = vec![0u8; 65536];
+
+    // Fully mapped: the tail address wraps in (1<<20 & 65535 == 0) → the worker completes.
+    let mut fuel = 50_000_000u64;
+    let (ir0, _) = run_capture_reserved(&m, 0, &[], &mut fuel, &init, 0);
+    let (jo0, _) = compile_and_run_capture_reserved(&m, 0, &[], &init, 0).expect("jit");
+    assert!(
+        ir0.is_ok(),
+        "interp should complete under a fully-mapped window: {ir0:?}"
+    );
+    assert!(
+        matches!(jo0, JitOutcome::Returned(_)),
+        "jit should complete under a fully-mapped window: {jo0:?}"
+    );
+
+    // Reserved (2^24) > mapped (2^16): the worker's tail access must detect-and-kill on both backends.
+    let mut fuel = 50_000_000u64;
+    let (ir1, _) = run_capture_reserved(&m, 0, &[], &mut fuel, &init, 24);
+    let (jo1, _) = compile_and_run_capture_reserved(&m, 0, &[], &init, 24).expect("jit");
+    assert!(
+        ir1.is_err(),
+        "interp did not fault on the thread's out-of-mapped tail access: {ir1:?}"
+    );
+    assert!(
+        matches!(jo1, JitOutcome::Trapped(svm_jit::TrapKind::MemoryFault)),
+        "jit did not detect-and-kill the thread's tail access: {jo1:?}"
+    );
+}
