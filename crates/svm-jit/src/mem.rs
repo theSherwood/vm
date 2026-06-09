@@ -385,6 +385,16 @@ mod pal {
         unsafe { GetLastError() as i64 }
     }
 
+    /// `ERROR_COMMITMENT_LIMIT` — the system-wide commit charge (RAM + page file) is momentarily
+    /// exhausted. Unlike unix `mmap` (overcommit), Windows charges every committed page up front, so a
+    /// tight CI page file under churn (e.g. the 4000-window fuzz loop) can transiently hit this. It is
+    /// **transient** (clears as other allocations free / the page file grows), so the commit path
+    /// retries it with backoff rather than failing the run.
+    const ERROR_COMMITMENT_LIMIT: i64 = 1455;
+    /// Bounded retries on a transient commit-limit (backoff 5·2^k ms ⇒ ~0.3 s worst case, then give up
+    /// loudly). Enough to ride out a momentary spike without ever hanging on a genuine exhaustion.
+    const COMMIT_RETRIES: u32 = 6;
+
     // VEH return codes + the access-violation status (kept local to avoid version-specific paths).
     const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
     const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
@@ -470,15 +480,25 @@ mod pal {
                         last_error()
                     );
                 }
-                let p = VirtualAlloc2(
-                    0 as HANDLE,
-                    a as *const c_void,
-                    b - a,
-                    MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-                    PAGE_READWRITE,
-                    core::ptr::null_mut(),
-                    0,
-                );
+                // Replace-commit the placeholder sub-range RW. `MEM_REPLACE_PLACEHOLDER` is atomic
+                // (success → ptr, failure → null leaving the placeholder intact), so retrying a
+                // transient `ERROR_COMMITMENT_LIMIT` is safe.
+                let mut p = core::ptr::null_mut();
+                for attempt in 0..COMMIT_RETRIES {
+                    p = VirtualAlloc2(
+                        0 as HANDLE,
+                        a as *const c_void,
+                        b - a,
+                        MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                        PAGE_READWRITE,
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                    if !p.is_null() || last_error() != ERROR_COMMITMENT_LIMIT {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5u64 << attempt));
+                }
                 assert!(
                     !p.is_null(),
                     "svm-jit: window commit failed (err {})",
