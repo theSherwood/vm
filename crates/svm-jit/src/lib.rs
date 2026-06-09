@@ -348,6 +348,7 @@ pub fn compile_and_run_with_host(
         None,
         DEFAULT_RESERVED_LOG2,
         None,
+        None,
     )?
     .0)
 }
@@ -390,6 +391,37 @@ pub fn compile_and_run_capture_reserved(
         Some(init_mem),
         reserved_log2,
         None,
+        None,
+    )
+}
+
+/// Run the guest confined to a §14 **nested sub-window** `[base, base+size)` of a fully-backed
+/// parent of `parent_bytes` (both seeded from / snapshotted into `init_mem`-sized buffers). The
+/// module's declared memory is the *child* (`size = 1 << size_log2`); `base` must be size-aligned
+/// and `base + size ≤ parent_bytes`. The masking lowering adds `base` to every confined address
+/// (matching [`svm_mask::Window::sub`]), so this is the JIT side of the **sub-window escape-oracle**:
+/// pair it with the interpreter's [`svm_interp::run_capture_sub`] and byte-compare the whole parent —
+/// a verified guest must leave every byte *outside* `[base, base+size)` untouched (confinement) and
+/// the slice itself byte-identical to the interpreter (codegen). `init_mem` seeds the parent's low
+/// bytes; the returned `Vec` is the whole parent window.
+pub fn compile_and_run_capture_sub(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    base: u64,
+    parent_bytes: u64,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    run_inner(
+        m,
+        func,
+        args,
+        empty_cap_thunk,
+        core::ptr::null_mut(),
+        Some(init_mem),
+        0, // fully-mapped child (reserved == size); the parent is fully backed
+        None,
+        Some(SubWindow { base, parent_bytes }),
     )
 }
 
@@ -421,7 +453,19 @@ pub fn compile_and_run_capture_reserved_with_host(
         // Escape-oracle over the §1a growth path: snapshot the low `SNAP_CAP` bytes (not just the
         // backed prefix) so guest-grown / `unmap`-ed reserved-tail pages are byte-compared too.
         Some(SNAP_CAP),
+        None,
     )
+}
+
+/// A §14 **nested sub-window**: run the guest confined to `[base, base+child_size)` of a
+/// parent region of `parent_bytes` (both fully backed). The masking lowering adds `base` to
+/// every confined address (matching [`svm_mask::Window::sub`]); `base == 0` is the ordinary
+/// top-level window (the add is elided). The parent is seeded/snapshotted whole, so the
+/// escape-oracle can assert the child only ever touched its own slice.
+#[derive(Clone, Copy)]
+struct SubWindow {
+    base: u64,
+    parent_bytes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -434,6 +478,7 @@ fn run_inner(
     init_mem: Option<&[u8]>,
     reserved_log2: u8,
     snapshot_cap: Option<usize>,
+    sub: Option<SubWindow>,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // Calls can reach any function, so every function must be lowerable.
@@ -444,8 +489,16 @@ fn run_inner(
     // Allocate the guest window if the module declares memory: `mapped` backed RW bytes inside
     // a host-configured `reserved` virtual range whose unmapped tail + guard page fault (§4).
     // `mask` is the §4 confinement mask (`reserved − 1`, the mask domain); `win_size` is the
-    // backed `mapped` extent (what we seed/snapshot); `mem_base` is null when none.
-    let (mut window, mask, win_size): (mem::GuestWindow, u64, usize) = match m.memory {
+    // seed/snapshot extent (the parent for a sub-window); `cap_mapped` is the child's backed
+    // `mapped` that cap-call buffer borrows bound against; `mem_base` is null when none.
+    // `sub_base` is the §14 sub-window offset the masking lowering adds (0 for a top-level window).
+    let (mut window, mask, win_size, cap_mapped, sub_base): (
+        mem::GuestWindow,
+        u64,
+        usize,
+        u64,
+        u64,
+    ) = match m.memory {
         Some(mc) => {
             if mc.size_log2 > MAX_JIT_WINDOW_LOG2 {
                 return Err(JitError::Unsupported(
@@ -456,14 +509,35 @@ fn run_inner(
             // Host reservation policy: at least `mapped` (fully mapped if `reserved_log2` is
             // smaller, e.g. 0), capped so the reference JIT's reservation stays sane.
             let reserved_log2 = reserved_log2.max(mc.size_log2).min(MAX_JIT_RESERVED_LOG2);
-            let reserved = 1usize << reserved_log2;
-            (
-                mem::GuestWindow::new(mapped, reserved),
-                (1u64 << reserved_log2) - 1,
-                mapped,
-            )
+            match sub {
+                // §14 sub-window: a fully-backed parent of `parent_bytes`, with the child
+                // confined (mask = child `reserved − 1`) into the slice at `base`. The child's
+                // mask domain `[0, reserved)` plus `base` must fit in the parent — the
+                // verifier-bounded child size + host-chosen `base` guarantee it (the
+                // Instantiator will enforce this).
+                Some(sw) => {
+                    let parent = sw.parent_bytes as usize;
+                    (
+                        mem::GuestWindow::new(parent, parent),
+                        (1u64 << reserved_log2) - 1,
+                        parent,
+                        mapped as u64,
+                        sw.base,
+                    )
+                }
+                None => {
+                    let reserved = 1usize << reserved_log2;
+                    (
+                        mem::GuestWindow::new(mapped, reserved),
+                        (1u64 << reserved_log2) - 1,
+                        mapped,
+                        mapped as u64,
+                        0,
+                    )
+                }
+            }
         }
-        None => (mem::GuestWindow::new(0, 0), 0, 0),
+        None => (mem::GuestWindow::new(0, 0), 0, 0, 0, 0),
     };
     // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
     if let Some(init) = init_mem {
@@ -473,19 +547,21 @@ fn run_inner(
 
     // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
     // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
-    // verifier already bounds every segment to `[0, size)`. Done while the window is fully RW.
+    // verifier already bounds every segment to `[0, size)`. Segment offsets are child-relative, so
+    // a §14 sub-window shifts them by `sub_base` into the parent backing. Done while fully RW.
     if let Some(mc) = m.memory {
         let size = 1u64 << mc.size_log2;
         let rw = window.rw_mut();
         for d in &m.data {
-            let end = (d.offset + d.bytes.len() as u64).min(size) as usize;
-            let start = (d.offset as usize).min(end);
+            let lo = sub_base + d.offset.min(size);
+            let hi = sub_base + (d.offset + d.bytes.len() as u64).min(size);
+            let (start, end) = (lo as usize, hi as usize);
             rw[start..end].copy_from_slice(&d.bytes[..end - start]);
         }
     }
     for d in &m.data {
         if d.readonly && !d.bytes.is_empty() {
-            window.protect_ro(d.offset, d.bytes.len() as u64);
+            window.protect_ro(sub_base + d.offset, d.bytes.len() as u64);
         }
     }
 
@@ -613,7 +689,8 @@ fn run_inner(
             &mut ctx.func,
             f,
             mask,
-            win_size as u64,
+            cap_mapped,
+            sub_base,
         )?;
         module
             .define_function(*id, &mut ctx)
@@ -946,6 +1023,10 @@ struct Lower<'a> {
     /// thunk (`[mem_base, mem_base+mapped)`), so buffer borrows and Memory-cap ops bound against
     /// the *backed* region, not the larger reserved mask domain. `0` when the module has no memory.
     mapped: u64,
+    /// The §14 nested sub-window base (`svm_mask::Window::sub`'s `base`): the masking lowering
+    /// adds it to every confined address so the child lands in `[mem_base+base, …+reserved)`.
+    /// `0` for an ordinary top-level window — the add is elided.
+    sub_base: u64,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call_indirect`.
     fn_table_mask: u64,
     /// The host `cap.call` thunk + ctx (constant addresses).
@@ -975,6 +1056,7 @@ fn build_clif(
     f: &Func,
     mask: u64,
     mapped: u64,
+    sub_base: u64,
 ) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
@@ -1020,6 +1102,7 @@ fn build_clif(
         result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
         mapped,
+        sub_base,
         fn_table_mask: (ids.len().next_power_of_two() as u64) - 1,
         cap,
         fiber,
@@ -1890,14 +1973,18 @@ fn get(vals: &[Value], i: u32) -> Result<Value, JitError> {
 }
 
 /// The §4 confinement masking lowering (invariant I1): compute the physical address
-/// `mem_base + ((addr + offset) & mask)`. The `(addr + offset) & mask` is exactly
-/// `svm_mask::Window::confine`, so the JIT and the isolated masking unit agree.
+/// `mem_base + sub_base + ((addr + offset) & mask)`. The `sub_base + ((addr + offset) & mask)`
+/// is exactly `svm_mask::Window::sub(...).confine`, so the JIT and the isolated masking unit
+/// agree — and for a top-level window (`sub_base == 0`) it collapses to the plain
+/// `mem_base + ((addr + offset) & mask)` of [`svm_mask::Window::confine`].
 ///
 /// When `elide` is set the `& mask` is dropped — but **only** the caller's
 /// [`in_window`] proof (the address is provably `< size`) may set it, so the unmasked
 /// `addr + offset` already equals the masked value and stays in `[0, size)`. This is the
 /// "mask-when-not" / elide-when-provably-bounded half of §1a (D36–D38); a wrong proof is a
-/// confinement escape, caught by the escape-oracle (final-memory differential, §18).
+/// confinement escape, caught by the escape-oracle (final-memory differential, §18). The
+/// `+ sub_base` is independent of elision (it shifts the whole `[0, size)` child window into
+/// its parent slice) and is itself elided when `sub_base == 0`.
 fn mask_addr(
     b: &mut FunctionBuilder,
     lower: &Lower,
@@ -1918,6 +2005,14 @@ fn mask_addr(
     } else {
         let m = b.ins().iconst(I64, lower.mask as i64);
         b.ins().band(eff, m)
+    };
+    // §14 sub-window: shift the confined child offset into its parent slice. Elided (no add) for a
+    // top-level window so ordinary codegen is byte-identical to before nesting existed.
+    let confined = if lower.sub_base == 0 {
+        confined
+    } else {
+        let sb = b.ins().iconst(I64, lower.sub_base as i64);
+        b.ins().iadd(confined, sb)
     };
     let base = b.use_var(lower.mem_var);
     b.ins().iadd(base, confined)

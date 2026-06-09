@@ -867,7 +867,10 @@ leave a shared view — add a unix test for this alongside the Windows work.
     scale the exhaustive `explore_all` checker past lock-free shapes.
 
 - [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
-  virtual memory** — *most of the §1a differentiators live here.*
+  virtual memory** — *most of the §1a differentiators live here.* Sub-window **confinement** is
+  in (the masking unit `Window::sub` + a both-backends run path with an interp↔JIT escape-oracle);
+  the **Instantiator capability** (a guest minting a child: sub-window + attenuated caps + quota) is
+  the remaining work, and it's what unlocks §13 cross-domain `SharedRegion` and the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
   `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
@@ -1051,7 +1054,14 @@ The current frontier, roughly ranked:
    and the concurrent-oracle story for it.
 3. **Nesting / the §14 Instantiator** — the big §1a differentiator: power-of-two sub-window grants +
    attenuated caps + quota, which then unlocks **cross-domain `SharedRegion` `create`/`grant`** (§13)
-   and the isolation tiers. Most of the remaining §1a edges live here.
+   and the isolation tiers. Most of the remaining §1a edges live here. *Foundation landed:*
+   `svm_mask::Window::sub` (the masking unit, fuzzed) plus a **fully-confined sub-window run path on
+   both backends** — `svm_interp::run_capture_sub` / `svm_jit::compile_and_run_capture_sub`, where the
+   JIT masking lowering adds `+ base` (`base == 0` elided so top-level codegen is unchanged). It's
+   covered by a hand-written + generative interp↔JIT **sub-window escape-oracle** (`escape_oracle.rs`,
+   `jit_fuzz` pass 3) that byte-compares the *whole parent* and asserts the child never touched a byte
+   outside its slice. **Remaining:** the Instantiator *capability* itself — a parent guest minting a
+   child (sub-window + attenuated caps + quota) at runtime, vs. today's host-driven setup.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.

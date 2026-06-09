@@ -274,6 +274,41 @@ pub fn run_capture_reserved_with_host(
     (r, snap)
 }
 
+/// Run the guest confined to a §14 **nested sub-window** `[base, base+size)` of a fully-backed
+/// parent of `parent_bytes` (the child runs over the parent's `Region`; `size = 1 << size_log2` is
+/// the module's declared memory). The masking unit ([`svm_mask::Window::sub`]) confines every child
+/// access into its slice, so a *verified* guest reaches only `[base, base+size)`. This is the
+/// interpreter side of the **sub-window escape-oracle**: pair it with the JIT's
+/// [`svm_jit::compile_and_run_capture_sub`] and byte-compare the whole parent — every byte outside
+/// the slice must stay as seeded (confinement) and the slice must match the JIT (codegen). `init_mem`
+/// seeds the whole parent; the returned `Vec` is the whole parent window (`parent_bytes` bytes).
+pub fn run_capture_sub(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    base: u64,
+    parent_bytes: u64,
+) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+    let mut host = Host::new();
+    if m.funcs.get(func as usize).is_none() {
+        return (Err(Trap::Malformed), Vec::new());
+    }
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::sub_window(base, mc.size_log2, parent_bytes);
+        mm.seed_parent(init_mem); // seed the whole parent, not just the child slice
+        mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
+        mm
+    });
+    let r = drive(&m.funcs, func, args, fuel, &mut mem, &mut host);
+    let snap = mem
+        .as_ref()
+        .map(|mm| mm.snapshot_parent(parent_bytes))
+        .unwrap_or_default();
+    (r, snap)
+}
+
 /// Run a module under the **deterministic explorer** (§18) with scheduling decisions driven by
 /// `seed`: a single OS thread interleaves the guest's vCPUs (green threads) cooperatively, so the run
 /// is fully reproducible and sweeping seeds enumerates distinct interleavings. This is the
@@ -2684,7 +2719,6 @@ impl Mem {
     /// the parent's other memory or outside the parent window. `base` is size-aligned by `Window::sub`;
     /// the whole slice is backed (no `map`-growth inside a child yet). The backing is sized to hold
     /// `[0, base + size)`.
-    #[cfg_attr(not(test), allow(dead_code))] // wired into a sub-window run entry in a follow-up
     fn sub_window(base: u64, size_log2: u8, parent_bytes: u64) -> Mem {
         let window = Window::sub(base, size_log2, 1u64 << size_log2.min(63));
         let page = host_page_size();
@@ -2961,18 +2995,27 @@ impl Mem {
     /// don't fault). RO protection is page-granular, so a producer keeps RO data on its own pages
     /// (the verifier already bounds each segment to `[0, size)`).
     fn init_data(&mut self, data: &[Data]) {
+        self.init_data_at(data, 0);
+    }
+
+    /// Like [`init_data`], but place each (child-relative) segment at `win_base + offset` — the §14
+    /// sub-window's slice base, so segment bytes and their read-only protections land in the child's
+    /// region of the parent backing (matching the masking, which confines child accesses to
+    /// `[win_base, win_base + size)`). `win_base == 0` is the ordinary top-level window.
+    fn init_data_at(&mut self, data: &[Data], win_base: u64) {
         // Byte writes first (no §13 regions exist at init ⇒ `set_byte` is lock-free)...
         for d in data {
             for (i, &b) in d.bytes.iter().enumerate() {
-                self.set_byte(d.offset + i as u64, b);
+                self.set_byte(win_base + d.offset + i as u64, b);
             }
         }
         // ...then the read-only protections, under one address-space write lock.
         let mut space = self.space_write();
         for d in data {
             if d.readonly && !d.bytes.is_empty() {
-                let last = d.offset + d.bytes.len() as u64 - 1;
-                for page in (d.offset / self.page)..=(last / self.page) {
+                let first = win_base + d.offset;
+                let last = first + d.bytes.len() as u64 - 1;
+                for page in (first / self.page)..=(last / self.page) {
                     space.prot.insert(page, PageProt::Ro);
                 }
             }
@@ -3089,6 +3132,21 @@ impl Mem {
     fn snapshot(&self, n: u64) -> Vec<u8> {
         let n = n.min(self.window.mapped());
         (0..n).map(|i| self.byte(i)).collect()
+    }
+
+    /// Seed the **whole parent backing** of a §14 sub-window (parent-absolute bytes), so the
+    /// escape-oracle starts with non-zero bytes *outside* the child's slice — a child write that
+    /// escaped its `[base, base+size)` slice would then perturb a byte the snapshot catches.
+    fn seed_parent(&self, init: &[u8]) {
+        for (i, &b) in init.iter().enumerate() {
+            self.set_byte(i as u64, b);
+        }
+    }
+
+    /// Snapshot the **whole parent backing** `[0, parent_bytes)` of a §14 sub-window (paired with
+    /// the JIT's `compile_and_run_capture_sub`, which returns the full parent window).
+    fn snapshot_parent(&self, parent_bytes: u64) -> Vec<u8> {
+        (0..parent_bytes).map(|i| self.byte(i)).collect()
     }
 
     /// Snapshot the low `min(reserved, max(mapped, snap_cap))` bytes for the escape-oracle —

@@ -6,8 +6,11 @@
 //! mechanism down: that an **out-of-window address is confined to the same in-window byte**
 //! on both backends, and that the capture path reflects guest stores.
 
-use svm_interp::{run_capture, run_capture_reserved, Value};
-use svm_jit::{compile_and_run_capture, compile_and_run_capture_reserved, JitOutcome};
+use svm_interp::{run_capture, run_capture_reserved, run_capture_sub, Value};
+use svm_jit::{
+    compile_and_run_capture, compile_and_run_capture_reserved, compile_and_run_capture_sub,
+    JitOutcome,
+};
 
 /// True on a 4 KiB-page host. A couple of `reserved_*` cases below hardcode the mapped/tail
 /// boundary at address 4096 (`memory 12`); on a 16 KiB-page host (macOS ARM) the JIT rounds the
@@ -242,6 +245,87 @@ block0(v0: i64):
         let slot = ((n as u64 & 511) * 8) as usize;
         assert_eq!(imem[slot], 99, "store landed at wrong slot for n={n}");
     }
+}
+
+/// Run both backends with the guest confined to a §14 **nested sub-window** `[base, base+size)`
+/// of a fully-backed parent of `parent_bytes` (size = the module's declared `memory`). `init`
+/// seeds the whole parent; the two returned snapshots are the whole parent window. This is the
+/// **sub-window escape-oracle**: the masking lowering now adds `base` (matching
+/// `svm_mask::Window::sub`), so byte-comparing the whole parent proves the child stayed in its
+/// slice on *both* backends — the riskiest claim of §14 nesting #1.
+fn both_sub(src: &str, init: &[u8], base: u64, parent_bytes: u64) -> (Vec<u8>, Vec<u8>) {
+    let m = svm::text::parse_module(src).expect("parse");
+    svm::verify::verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    let (ir, imem) = run_capture_sub(&m, 0, &[Value::I32(0)], &mut fuel, init, base, parent_bytes);
+    let (jo, jmem) =
+        compile_and_run_capture_sub(&m, 0, &[0i64], init, base, parent_bytes).expect("jit");
+    assert!(ir.is_ok(), "interp trapped: {ir:?}");
+    assert!(
+        matches!(jo, JitOutcome::Returned(_)),
+        "jit did not return: {jo:?}"
+    );
+    (imem, jmem)
+}
+
+/// §14 nesting #1: a guest runs over a 4 KiB child window placed at offset 64 KiB inside a 128 KiB
+/// parent. Its stores — including out-of-window addresses that the mask folds back in (261, and
+/// `i64::MAX` → 4095) — must land **only** inside the child's slice `[64 KiB, 64 KiB + 4 KiB)`,
+/// identically on both backends, leaving every other parent byte exactly as seeded. The masking
+/// computes `mem_base + base + ((addr+offset) & (size-1))`; this is the differential that proves
+/// the new `+ base` term is right (and confines) on both the interpreter and the JIT.
+#[test]
+fn sub_window_confines_child_to_its_slice() {
+    const PARENT: u64 = 128 << 10; // 128 KiB
+    const BASE: u64 = 64 << 10; // size-aligned 64 KiB offset
+    const SIZE: u64 = 4096; // memory 12 → a 4 KiB child window
+    let src = "\
+memory 12
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i64.const 261
+  v2 = i32.const 171
+  i32.store8 v1 v2
+  v3 = i64.const 4101
+  v4 = i32.const 200
+  i32.store8 v3 v4
+  v5 = i64.const 9223372036854775807
+  v6 = i32.const 99
+  i32.store8 v5 v6
+  v7 = i32.const 0
+  return v7
+}
+";
+    // Seed the whole parent with a non-zero pattern so an escaped write (or a divergent read)
+    // outside the child's slice is observable, not hidden behind zeros.
+    let init: Vec<u8> = (0..PARENT)
+        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+        .collect();
+    let (imem, jmem) = both_sub(src, &init, BASE, PARENT);
+
+    assert_eq!(imem.len(), PARENT as usize, "snapshot is the whole parent");
+    assert_eq!(
+        imem, jmem,
+        "sub-window escape-oracle: interp/JIT parents diverge"
+    );
+
+    // Every byte outside the child's slice is untouched (the seed survives) — confinement.
+    for i in 0..PARENT {
+        if !(BASE..BASE + SIZE).contains(&i) {
+            assert_eq!(
+                imem[i as usize], init[i as usize],
+                "parent byte {i} escaped"
+            );
+        }
+    }
+    // The three stores landed at their confined child offsets, shifted into the slice by `base`.
+    assert_eq!(imem[(BASE + 261) as usize], 171, "store @261 misplaced"); // 261 & 4095
+    assert_eq!(imem[(BASE + 5) as usize], 200, "store @4101 misplaced"); // 4101 & 4095 = 5
+    assert_eq!(
+        imem[(BASE + 4095) as usize],
+        99,
+        "store @i64::MAX misplaced"
+    ); // & 4095 = 4095
 }
 
 /// Detect-and-kill (§4/§5): a store that overruns the top of the window must fault into the

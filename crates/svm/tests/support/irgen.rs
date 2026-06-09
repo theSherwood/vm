@@ -873,8 +873,11 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<svm_interp::Value> {
 
 // ---- shared differential check (used by jit_fuzz.rs and the libFuzzer `diff` target) ----
 
-use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
-use svm_jit::{compile_and_run_capture_reserved_with_host, JitError, JitOutcome, TrapKind};
+use svm_interp::{run_capture_reserved_with_host, run_capture_sub, Host, Trap, Value};
+use svm_jit::{
+    compile_and_run_capture_reserved_with_host, compile_and_run_capture_sub, JitError, JitOutcome,
+    TrapKind,
+};
 use svm_verify::verify_module;
 
 /// The handle value of the **first** `grant_memory` on a fresh `Host`: the encoding is
@@ -1000,6 +1003,12 @@ pub fn run_differential(m: &Module, args: &[Value]) {
         // bound and the JIT's page-granular guard agree on the fault boundary.
         differential_pass(m, args, &init, mem_oracle, mc.size_log2.saturating_add(8));
     }
+
+    // Pass 3 — a §14 nested sub-window: the same entry confined to a child window inside a parent,
+    // so the JIT's `+ base` masking term is fuzzed across the whole op space (not just the
+    // hand-written `escape_oracle` cases). Allocates a parent only for float-free `mem_oracle`
+    // modules, so non-memory / float seeds are unaffected.
+    differential_pass_sub(m, args, mem_oracle);
 }
 
 /// One differential pass at a given host reservation (`reserved_log2`; `0` ⇒ fully mapped):
@@ -1042,6 +1051,62 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
         Err(JitError::Unsupported(_)) => return, // generator only emits lowered ops; be safe
         Err(e) => panic!("JIT failed to compile a verified module: {e:?}\n{m:#?}"),
     };
+    assert_outcomes_agree(m, &results, interp, &imem, jit, &jmem, mem_oracle);
+}
+
+/// One differential pass over a §14 **nested sub-window**: run the entry confined to a child window
+/// at offset `base = size` inside a `2·size` parent on both backends (no powerbox — a `cap.call`
+/// CapFaults identically), and assert they agree on the result/trap and — on a clean completion —
+/// on the **whole parent** window (the sub-window escape-oracle: the JIT's new `+ base` masking term
+/// must confine every access to `[base, base+size)`, byte-for-byte with the interpreter). Skipped
+/// unless the module is a float-free `mem_oracle` candidate, so `parent` is allocated only then.
+fn differential_pass_sub(m: &Module, args: &[Value], mem_oracle: bool) {
+    let Some(mc) = m.memory.filter(|_| mem_oracle) else {
+        return;
+    };
+    let size = 1u64 << mc.size_log2;
+    let (base, parent) = (size, size * 2); // child sits in the upper half of the parent
+    let init: Vec<u8> = (0..parent)
+        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+        .collect();
+    let results = m.funcs[0].results.clone();
+    let mut fuel = 5_000_000u64;
+    let (interp, imem) = run_capture_sub(m, 0, args, &mut fuel, &init, base, parent);
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let (jit, jmem) = match compile_and_run_capture_sub(m, 0, &slots, &init, base, parent) {
+        Ok(o) => o,
+        Err(JitError::Unsupported(_)) => return,
+        Err(e) => panic!("JIT failed to compile a verified module (sub-window): {e:?}\n{m:#?}"),
+    };
+    // Confinement: every byte *outside* the child's slice must equal the seed on the interpreter
+    // (the masking reference) — a sub-window escape would perturb the parent. The JIT is then held
+    // byte-identical to the interpreter over the whole parent by `assert_outcomes_agree`.
+    if interp.is_ok() {
+        for i in (0..base).chain(base + size..parent) {
+            assert_eq!(
+                imem[i as usize],
+                init[i as usize],
+                "sub-window escape: interp touched parent byte {i} outside [{base},{})\n{m:#?}",
+                base + size
+            );
+        }
+    }
+    assert_outcomes_agree(m, &results, interp, &imem, jit, &jmem, mem_oracle);
+}
+
+/// Assert the interpreter and JIT agree for one pass: result value-equal (or same-modelled trap),
+/// and — when `mem_oracle` and both completed — byte-identical final memory (`imem`/`jmem`, which
+/// is the window for a top-level pass or the whole parent for a sub-window pass). Shared by the
+/// reservation passes and the §14 sub-window pass so the agreement policy lives in one place.
+fn assert_outcomes_agree(
+    m: &Module,
+    results: &[svm_ir::ValType],
+    interp: Result<Vec<Value>, Trap>,
+    imem: &[u8],
+    jit: JitOutcome,
+    jmem: &[u8],
+    mem_oracle: bool,
+) {
     match (interp, jit) {
         (Ok(want), JitOutcome::Returned(s)) => {
             let got: Vec<Value> = results
@@ -1061,7 +1126,7 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
             // same masking arithmetic on the same inputs, must therefore leave an identical
             // window. A mismatch means a JIT access escaped or was mis-masked.
             if mem_oracle {
-                if let Some(i) = imem.iter().zip(&jmem).position(|(a, b)| a != b) {
+                if let Some(i) = imem.iter().zip(jmem).position(|(a, b)| a != b) {
                     panic!(
                         "escape-oracle: interp/JIT final memory differs at byte {i} \
                          (interp={:#04x} jit={:#04x}) — an access not masked into [0,size)\n{m:#?}",
