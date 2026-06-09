@@ -2677,6 +2677,27 @@ impl Mem {
         }
     }
 
+    /// A fully-mapped **§14 sub-window**: a `1 << size_log2`-byte child window at absolute offset
+    /// `base` inside a parent backing of `parent_bytes` bytes (the child runs over the parent's
+    /// `Region`). The masking unit ([`svm_mask::Window::sub`], fuzzed as the escape hinge) confines
+    /// every child access into `[base, base + size)`, so the child can reach **only its slice** — never
+    /// the parent's other memory or outside the parent window. `base` is size-aligned by `Window::sub`;
+    /// the whole slice is backed (no `map`-growth inside a child yet). The backing is sized to hold
+    /// `[0, base + size)`.
+    #[cfg_attr(not(test), allow(dead_code))] // wired into a sub-window run entry in a follow-up
+    fn sub_window(base: u64, size_log2: u8, parent_bytes: u64) -> Mem {
+        let window = Window::sub(base, size_log2, 1u64 << size_log2.min(63));
+        let page = host_page_size();
+        let need = window.base().saturating_add(window.reserved());
+        Mem {
+            back: Arc::new(Region::new(parent_bytes.max(need), page)),
+            window,
+            page,
+            space: Arc::new(RwLock::new(AddrSpace::default())),
+            has_regions: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Read/write the shared address space, recovering from a poisoned lock (the interpreter never
     /// panics while holding it) rather than propagating the panic.
     fn space_read(&self) -> std::sync::RwLockReadGuard<'_, AddrSpace> {
@@ -2718,12 +2739,16 @@ impl Mem {
     /// lies wholly in the committed prefix and no page has been re-protected (the common case), so
     /// unprotected windows pay nothing.
     fn check_prot(&self, base: u64, width: u32, write: bool) -> Result<(), Trap> {
-        let last = base + width as u64 - 1;
+        // `base` is the *absolute* confined address; the page-map and `mapped` bound are
+        // window-relative (`rel == base` for a top-level window; offset by the sub-window base for a
+        // §14 child).
+        let rel = base.wrapping_sub(self.window.base());
+        let last = rel + width as u64 - 1;
         let space = self.space_read();
         if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
         }
-        for page in (base / self.page)..=(last / self.page) {
+        for page in (rel / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
                 None => return Err(Trap::MemoryFault), // unmapped
                 Some(false) if write => return Err(Trap::MemoryFault), // read-only store
@@ -2738,9 +2763,14 @@ impl Mem {
     /// is enforced separately by [`Mem::check_prot`] (the functional bound), so a masked-but-
     /// uncommitted page faults there — matching the JIT's `PROT_NONE` page tables.
     fn confine_checked(&self, addr: u64, offset: u64, width: u32) -> Result<u64, Trap> {
-        let base = self.window.confine(addr, offset);
-        match base.checked_add(width as u64) {
-            Some(end) if end <= self.window.reserved() => Ok(base),
+        // `confine` returns the **absolute** address `base + rel` (`base == 0` for a top-level window,
+        // the sub-window base for a §14 child). The reserved-domain guard is on the window-relative
+        // `rel`; per-page committed-ness is enforced by `check_prot` (also window-relative). The
+        // returned absolute address indexes the (possibly parent-sized) backing.
+        let abs = self.window.confine(addr, offset);
+        let rel = abs.wrapping_sub(self.window.base());
+        match rel.checked_add(width as u64) {
+            Some(end) if end <= self.window.reserved() => Ok(abs),
             _ => Err(Trap::MemoryFault),
         }
     }
@@ -3615,6 +3645,48 @@ mod prot_tests {
         // An unmap by the parent is likewise visible to the child.
         assert_eq!(parent.unmap(tail, page()), 0);
         assert_eq!(child.load(tail, 0, LoadOp::I64), Err(Trap::MemoryFault));
+    }
+
+    /// §14 nesting (interp `Mem` plumbing): a sub-window child confines every access into its own
+    /// slice `[base, base + size)` of the parent backing — far/out-of-child offsets alias back into the
+    /// slice, and every parent byte outside the slice is unreachable (stays zero). This is the
+    /// interpreter half of running a guest in a nested child window.
+    #[test]
+    fn sub_window_child_confined_to_its_slice() {
+        let base = 1u64 << 16; // child at 64 KiB
+        let size_log2 = 12u8; // 4 KiB child
+        let size = 1u64 << size_log2;
+        let parent = 1u64 << 17; // 128 KiB parent backing
+        let mut mem = Mem::sub_window(base, size_log2, parent);
+
+        // A store at child offset 8 lands at absolute base+8; a far offset (size+8) wraps to slot 8.
+        assert!(mem.store(8, 0, StoreOp::I64, Value::I64(0x1111)).is_ok());
+        assert!(mem
+            .store(size + 8, 0, StoreOp::I64, Value::I64(0x2222))
+            .is_ok());
+        assert_eq!(mem.load(8, 0, LoadOp::I64), Ok(Value::I64(0x2222))); // last write wins at slot 8
+        assert_eq!(mem.confine_checked(8, 0, 8), Ok(base + 8)); // confined to the child's slice
+
+        // Every (even wildly out-of-child) address aliases *into* `[base, base+size)` — never below
+        // `base`, never at/above `base+size`.
+        for &a in &[0u64, size, size * 1000, u64::MAX, base, parent] {
+            let abs = mem.confine_checked(a, 0, 1).unwrap();
+            assert!(
+                abs >= base && abs < base + size,
+                "child escaped its slice: {abs:#x}"
+            );
+        }
+
+        // Decisive: every parent byte *outside* the child's slice is untouched (unreachable).
+        for i in 0..parent {
+            if i < base || i >= base + size {
+                assert_eq!(
+                    mem.back.byte(i),
+                    0,
+                    "child wrote outside its slice at {i:#x}"
+                );
+            }
+        }
     }
 
     #[test]
