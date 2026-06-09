@@ -75,14 +75,14 @@ mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill h
 
 // JIT fiber runtime (§12): host-side fiber table + `extern "C"` thunks for `cont.new`/`resume`/
 // `suspend`, on top of the `svm-fiber` stack-switch substrate. Available where `svm_fiber::supported()`.
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(fiber_rt)]
 mod fiber_rt;
 
 // 1:1 OS-thread executor for `thread.spawn`/`thread.join` + the `wait`/`notify` futex (§12): the VM
 // exposes these as *primitives*, not a scheduler — a spawned vCPU is one real OS thread; any M:N model
 // is built by the guest runtime over these + `cont.*` (D22: no built-in scheduler). The futex core is
 // loom-verified. Available where `svm_fiber::supported()` (x86-64 unix).
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(fiber_rt)]
 mod os_thread_rt;
 
 // The windows placeholder-window commit primitive, reused by `svm-run`'s Memory-cap backend (it
@@ -529,20 +529,20 @@ fn run_inner(
     // the `cont.*` sites). The `FiberRuntime` box is created now so its address is stable; the
     // call-trampoline address is filled in after finalize. On targets without stack-switch support,
     // `ensure_supported` has already rejected the fiber ops, so this stays `null`.
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let uses_fibers = module_uses_fibers(m);
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let uses_threads = module_uses_threads(m);
     // Per-run fiber constants (the §12 fiber entry type id + the function-table mask), used to build
     // fiber runtimes — one standalone, or one per vCPU when threads use `cont.*`.
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let fiber_type_id = type_id_of(&distinct, &fiber_func_type());
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let fiber_mask = (m.funcs.len().next_power_of_two() as u64) - 1;
     // Fibers + threads compose via a **per-vCPU** fiber runtime, published through a thread-local. This
     // is the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
     // builds its own from `fiber_cfg` (`os_thread_rt`). Created whenever the module uses `cont.*`.
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
         Some(Box::new(fiber_rt::FiberRuntime::new(
             fiber_type_id,
@@ -552,7 +552,7 @@ fn run_inner(
         None
     };
     // The `cont.*` thunk addresses (the runtime itself is found via a thread-local at call time).
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let fiber = if uses_fibers {
         FiberEnv {
             new_thunk: fiber_rt::fiber_new as *const () as i64,
@@ -562,20 +562,20 @@ fn run_inner(
     } else {
         FiberEnv::null()
     };
-    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    #[cfg(not(fiber_rt))]
     let fiber = FiberEnv::null();
 
     // §12 threads: stand up the 1:1 OS-thread executor `Domain` whose stable address is baked into the
     // `thread.*` sites. It owns no scheduling policy — `thread.spawn` launches a real OS thread (the
     // guest builds any M:N model itself, D22). The per-run `Env` (call-trampoline, window, trap cell)
     // is supplied after finalize via `set_env`; the address is stable now.
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let domain: Option<Box<os_thread_rt::Domain>> = if uses_threads {
         Some(Box::new(os_thread_rt::Domain::new()))
     } else {
         None
     };
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let thread = if let Some(d) = &domain {
         ThreadEnv {
             sched_addr: (&**d as *const os_thread_rt::Domain) as i64,
@@ -587,7 +587,7 @@ fn run_inner(
     } else {
         ThreadEnv::null()
     };
-    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    #[cfg(not(fiber_rt))]
     let thread = ThreadEnv::null();
 
     // Define each function body. `clear_context` after each define resets the cached
@@ -624,7 +624,7 @@ fn run_inner(
 
     // The generic call-trampoline (one per module; calls any `Tail`-ABI `(sp, arg) -> i64` entry from
     // Rust). Needed by both the fiber runtime (`cont.*`) and the thread scheduler (vCPU entries).
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let fiber_tramp = if uses_fibers || uses_threads {
         build_fiber_call_trampoline(&mut module, &mut ctx.func);
         let id = module
@@ -645,9 +645,9 @@ fn run_inner(
 
     // Now that code is finalized, hand the root fiber runtime its call-trampoline address (and keep it
     // to seed the thread `Domain`'s `Env`, which spawned vCPUs use to call their entry).
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let mut call_tramp: Option<fiber_rt::FiberCallTramp> = None;
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     if let Some(id) = fiber_tramp {
         let addr = module.get_finalized_function(id);
         // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the `FiberCallTramp` ABI.
@@ -692,7 +692,7 @@ fn run_inner(
     // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
     // vCPUs run on their own OS threads via the baked `Domain`. Seed the `Domain`'s per-run `Env` now
     // that the window / fn-table / trap-cell / call-trampoline are all known.
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     if let Some(d) = &domain {
         let fiber_cfg = if uses_fibers {
             Some((fiber_type_id, fiber_mask))
@@ -711,7 +711,7 @@ fn run_inner(
 
     // Publish the root fiber runtime (when the module uses `cont.*`) so its thunks find it via the
     // thread-local for the duration of the entry; spawned vCPUs publish their own.
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     let prev_rt = fiber_rt
         .as_mut()
         .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime));
@@ -731,12 +731,12 @@ fn run_inner(
             &mut trap_cell,
         )
     };
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     if let Some(p) = prev_rt {
         fiber_rt::set_current(p);
     }
     // Join every spawned vCPU OS thread before freeing the window/code — no vCPU may outlive them.
-    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[cfg(fiber_rt)]
     if let Some(d) = &domain {
         d.join_all();
     }
@@ -852,7 +852,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::ThreadJoin { .. }
                 | Inst::MemoryWait { .. }
                 | Inst::MemoryNotify { .. }
-                    if cfg!(all(unix, target_arch = "x86_64")) => {}
+                    if cfg!(fiber_rt) => {}
                 _ => return Err(JitError::Unsupported("instruction")),
             }
         }
@@ -1085,7 +1085,7 @@ fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncI
 
 /// The fixed signature of a §12 fiber/thread entry: `(i64 sp, i64 arg) -> i64` (the unified
 /// frontend convention). Its structural id is what a `cont.new` funcref is type-checked against.
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(fiber_rt)]
 fn fiber_func_type() -> FuncType {
     FuncType {
         params: vec![ValType::I64, ValType::I64],
@@ -1094,7 +1094,7 @@ fn fiber_func_type() -> FuncType {
 }
 
 /// Whether `m` contains any fiber op, so `run_inner` knows to stand up the fiber runtime.
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(fiber_rt)]
 fn module_uses_fibers(m: &IrModule) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|blk| {
@@ -1110,7 +1110,7 @@ fn module_uses_fibers(m: &IrModule) -> bool {
 
 /// Whether `m` contains any thread op (spawn/join/wait/notify), so `run_inner` knows to run under the
 /// thread scheduler.
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(fiber_rt)]
 fn module_uses_threads(m: &IrModule) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|blk| {
@@ -1131,7 +1131,7 @@ fn module_uses_threads(m: &IrModule) -> bool {
 /// trap_out, sp, arg) -> i64` that `call_indirect`s a guest fiber entry under its `Tail` ABI. Rust
 /// cannot call a `Tail`-convention function directly, so the fiber runtime calls this (default C ABI)
 /// instead; one trampoline serves all fibers since every entry is `(i64 sp, i64 arg) -> i64`.
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(fiber_rt)]
 fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
     for _ in 0..6 {
         clif.signature.params.push(AbiParam::new(I64)); // code, mem_base, fn_table_base, trap_out, sp, arg

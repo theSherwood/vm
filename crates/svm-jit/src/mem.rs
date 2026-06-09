@@ -192,7 +192,7 @@ pub(crate) unsafe fn run_guarded(
 
 /// Install the guard on the calling (worker) thread. Idempotent; the handler is process-wide but its
 /// recovery state is thread-local, so each worker arms independently.
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(fiber_rt)]
 pub(crate) fn install_guard() {
     pal::install_guard();
 }
@@ -204,7 +204,7 @@ pub(crate) fn install_guard() {
 ///
 /// # Safety
 /// `code` must honour the [`Entry`] ABI and its pointer args must be valid for the call.
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(fiber_rt)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_guarded_range(
     code: *const u8,

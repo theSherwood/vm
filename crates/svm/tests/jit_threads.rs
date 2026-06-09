@@ -1,14 +1,16 @@
 //! Differential interp↔JIT tests for §12 **threads** (`thread.spawn`/`thread.join`).
 //!
-//! The JIT runs threaded modules on a cooperative green-thread scheduler (the entry becomes root vCPU
-//! 0; spawned vCPUs are fibers; `join` blocks by suspending back to the scheduler). It is single OS
-//! thread for now, so a run is deterministic — and for programs whose result is interleaving-invariant
-//! (the ones below), the interp↔JIT differential oracle applies directly: the JIT must produce exactly
-//! what the reference interpreter (true M:N executor) does.
+//! The JIT runs each spawned vCPU as a **real 1:1 OS thread** (`os_thread_rt`), all sharing the one
+//! `Arc<Region>` window (hardware atomics + the condvar futex). For programs whose result is
+//! interleaving-invariant (the ones below), the interp↔JIT differential oracle applies directly: the
+//! JIT must produce exactly what the reference interpreter (M:N executor) does.
 //!
-//! Stack switching exists only on x86-64 unix (`svm_fiber::supported()`); elsewhere the JIT bails
-//! `Unsupported`, so these tests are gated to that target.
-#![cfg(all(unix, target_arch = "x86_64"))]
+//! The JIT thread/fiber runtime exists on x86-64 unix + x86-64 Windows today (`svm_fiber::supported()`);
+//! elsewhere the JIT bails `Unsupported`, so these tests are gated to those targets.
+#![cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
 
 use svm_interp::{run, Trap, Value};
 use svm_jit::{compile_and_run, JitOutcome, TrapKind};
