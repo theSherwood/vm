@@ -21,7 +21,8 @@ This file's single source of truth for status + open work is **§10**; the concu
   **`wait`/`notify` futex**, and a guest **`<pthread.h>`** — through the whole pipeline and **both
   backends**. The **interpreter** is the M:N green-thread executor and the deterministic oracle
   (`run_scheduled` / `explore_all`); the **JIT** runs 1:1 OS-thread vCPUs (`os_thread_rt`) + fibers
-  (`fiber_rt`) over the `svm-fiber` stack switch (**x86-64 unix**). Full breakdown + open items: §10.
+  (`fiber_rt`) over the `svm-fiber` stack switch on **x86-64 unix, aarch64 unix (macOS), and x86-64
+  Windows** — cross-platform parity, all CI-green. Full breakdown + open items: §10.
 
 ---
 
@@ -41,21 +42,25 @@ Workspace crates (`crates/`):
 - `svm-verify` — the verifier (`verify_module`).
 - `svm-interp` — reference interpreter (`run`); also the M:N green-thread executor + the
   deterministic `run_scheduled`/`explore_all` concurrency oracle (§12).
-- `svm-jit` — Cranelift JIT (`compile_and_run`, `JitOutcome`); JIT fibers/threads/futex on
-  x86-64 unix (`fiber_rt.rs`, `os_thread_rt.rs`).
-- `svm-mask` — the isolated masking unit.
+- `svm-jit` — Cranelift JIT (`compile_and_run`, `JitOutcome`); JIT fibers/threads/futex on the three
+  `fiber_rt` targets (x86-64 unix, aarch64 unix, x86-64 Windows) via `fiber_rt.rs`, `os_thread_rt.rs`.
+- `svm-mask` — the isolated masking unit (`fuzz/mask` is its dedicated fuzzer).
 - `svm-mem` — the shared guest-memory substrate (§12/§13); owns the memory `unsafe` so the
-  interpreter stays `forbid(unsafe_code)`.
-- `svm-fiber` — native stack-switch primitive for JIT fibers / green threads (x86-64 unix).
+  interpreter stays `forbid(unsafe_code)`. Differentially fuzzed (raw `Mapped` vs the `Paged` model)
+  and miri-checked (provenance + races) via a `cfg(miri)` heap backing.
+- `svm-fiber` — native stack-switch primitive for JIT fibers / green threads; a per-ABI `switch`
+  (x86-64 SysV, aarch64 AAPCS64, x86-64 Windows MS-x64) + a per-OS guard-paged `stack`. Switch fuzzer
+  in its own tests.
 - `svm` — umbrella crate + integration tests (`crates/svm/tests/`).
 - `fuzz/` — libFuzzer targets (out of workspace; nightly + `cargo-fuzz`).
 
 Two big things exist beyond the core loop: (1) **the C frontend** (most of this doc), and
 (2) **a generative interp↔JIT differential fuzzer** (see §8). Test crates:
 `c_frontend.rs` (C, two tiers), `jit_diff.rs` (hand-written JIT diff), `jit_fuzz.rs`
-(generative diff), `pipeline.rs`, `fuzz_smoke.rs`, plus the §12 concurrency suite
+(generative diff), `escape_oracle.rs`, `pipeline.rs`, `fuzz_smoke.rs`, the §12 concurrency suite
 (`threads.rs`, `concurrent.rs`, `concurrent_fuzz.rs`, `jit_threads.rs`, `jit_fibers.rs`,
-`fiber_fuzz.rs`) and `shared_region.rs` (§13).
+`fiber_fuzz.rs`), the **concurrent escape-oracle** (`concurrent_escape.rs` + `concurrent_escape_fuzz.rs`),
+and `shared_region.rs` (§13).
 
 ---
 
@@ -535,7 +540,8 @@ incompleteness not contradiction:
   detect-and-kill + RO data (Phase 3); cross-platform parity on **Linux + macOS + Windows** (Phase
   3.5). `malloc` over `map` is the default libc and `SharedRegion` aliasing is done on all three
   OSes. **Phase 4 has started:** the concurrency *primitives* (fibers, 1:1 threads, atomics + the
-  C11 ordering surface, futex, a `<pthread.h>`) run on interp + JIT (x86-64 unix) as mechanism with
+  C11 ordering surface, futex, a `<pthread.h>`) run on interp (all platforms) + JIT (x86-64 unix,
+  aarch64 unix, x86-64 Windows) as mechanism with
   **no VM scheduler** (D56/§12). The genuine remainders are Phase-4: fault-driven *content* supply +
   cross-domain `SharedRegion` `create`/`grant`, honoring weak orderings in execution,
   nesting/isolation tiers, Spectre, SIMD, and the language on-ramp.
@@ -849,7 +855,9 @@ leave a shared view — add a unix test for this alongside the Windows work.
   - **JIT** — fibers via `svm-jit/src/fiber_rt.rs` over the `svm-fiber` stack switch, threads via
     `svm-jit/src/os_thread_rt.rs` as **1:1 OS-thread vCPUs** (D56 *removed* an earlier JIT M:N
     executor — `thread_rt`/`par` — as a re-litigation of D22), and the condvar futex (loom-checked).
-    **x86-64 unix only**; other targets bail `Unsupported`. Differentially tested against the interp
+    Runs on **x86-64 unix, aarch64 unix (macOS), and x86-64 Windows** — three hand-written `svm-fiber`
+    switches (SysV / AAPCS64 / MS-x64), all CI-green; other targets bail `Unsupported`. Differentially
+    tested against the interp
     (`jit_threads.rs`, `jit_fibers.rs`) — TSan can't instrument JITted code, so JIT concurrency leans
     on the differential + invariant stress + loom on the glue, not TSan; concurrent C is verified both
     real-executor and seed-swept.
@@ -897,6 +905,24 @@ Have (✅ continuously, except where noted):
   this also relaxed an over-strict harness rule: when **both** backends trap, the trap *kind*
   is no longer asserted (a trap is terminal; an eager interp vs an optimizing JIT may surface
   different ones among several reachable traps — e.g. a dead trapping float→int convert).
+- [x] **Concurrency escape-TCB hardening (§12/§18).** The §18 "fuzz the hinge" discipline now reaches
+  the surface the concurrency work grew (the two new `unsafe` units + the concurrent access path):
+  - **Concurrent escape-oracle** (`concurrent_escape.rs` + `concurrent_escape_fuzz.rs`): a *spawned
+    thread* accessing an **out-of-window** address must confine identically on both backends — hand-
+    written (commutative atomic counter + disjoint plain stores) *and* generative (out-of-window
+    commutative-atomic programs across seeds, byte-comparing the final window), plus a **tail-fault**
+    case (`reserved > mapped` ⇒ a thread's out-of-*mapped* access detect-and-kills, not wraps).
+  - **`svm-fiber` switch fuzzer** (in its own tests): random resume orders over many fibers stress the
+    per-ABI register/stack save-restore (the riskiest unsafe, ×3 ABIs).
+  - **`svm-mem` differential fuzzer**: the raw-atomics `Mapped` backing vs the safe `Paged` model, 20k
+    mixed ops (atomic/plain, 4/8-byte, cross-page, out-of-range) — the interp-as-oracle discipline for
+    the memory substrate.
+  - **miri** on `svm-mem` (a `cfg(miri)` heap backing replaces mmap; weak-memory emulation off — its
+    store buffer ICEs on the intentional mixed-width atomic/byte overlap): provenance + data-race
+    checks on the raw atomics. The **nightly `miri` CI job is pending a maintainer apply** (needs the
+    `workflow` token scope; snippet in the session / commit `60d4f3a`).
+  Validated linux + wine (x86-64 Windows); aarch64 via macOS CI. The fiber/JIT asm + the real mmap
+  path miri can't execute — those stay covered by these fuzzers + the sanitizers (loom/TSan).
 
 Gaps (priority order):
 - [x] **`cap.call` — both the inert (fault) *and* success paths are generated.** Arm 18 emits a
@@ -1011,6 +1037,14 @@ regressions one commit old"):
   to C locals.
 
 ### Suggested next pickups (ranked)
+
+> The ranked list below is **historical — all ✅ DONE**. Since then: Phase-3.5 cross-platform parity,
+> §12 concurrency (primitives + the C frontend), the **cross-platform JIT-concurrency port** (aarch64
+> AAPCS64 + x86-64 Windows MS-x64 switches), and the **concurrency escape-TCB hardening** (the
+> concurrent escape-oracle, the `svm-fiber`/`svm-mem` fuzzers, miri — see the Fuzzing section). The
+> live frontier is the **Phase-4** open items in §10 (nesting/§14, cross-domain `SharedRegion`, weak
+> orderings, the async ring) and the LLVM/wasm on-ramp (§14/D54).
+
 1. ✅ **Large reserved window → guard-when-bounded** (§4) — **DONE** (Increments 2–4 below; the
    final SP-elision step was decided *against*, D50). The decoupled `reserved`/`mapped` model is
    the default: a large reserved range with only `mapped` backed, out-of-`mapped` → detect-and-kill.
