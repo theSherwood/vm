@@ -15,7 +15,14 @@ use irgen::{fuzz_one, Gen};
 
 #[test]
 fn jit_matches_interp_on_generated_modules() {
-    for seed in 0..4000u64 {
+    // Windows charges every committed page against the system commit limit (no overcommit like
+    // unix mmap), and the reference JIT's per-iteration window + cranelift code-arena commits don't
+    // all return to the OS immediately, so a long differential loop gradually exhausts the CI
+    // runner's commit headroom (an intermittent abort). The deep 4000-seed sweep — and the nightly
+    // libFuzzer `diff` target — run on Linux/macOS; on Windows a smaller sweep over the *same* seeds
+    // still validates the JIT lowering cross-platform without the resource pressure.
+    let iters: u64 = if cfg!(windows) { 500 } else { 4000 };
+    for seed in 0..iters {
         let mut g = Gen::from_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1CE_F00D);
         fuzz_one(&mut g);
     }
