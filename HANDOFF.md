@@ -319,16 +319,23 @@ Workspace crates (`crates/`):
 - `svm-text` — text parser/printer (`parse_module`).
 - `svm-encode` — binary format.
 - `svm-verify` — the verifier (`verify_module`).
-- `svm-interp` — reference interpreter (`run`).
-- `svm-jit` — Cranelift JIT (`compile_and_run`, `JitOutcome`).
+- `svm-interp` — reference interpreter (`run`); also the M:N green-thread executor + the
+  deterministic `run_scheduled`/`explore_all` concurrency oracle (§12).
+- `svm-jit` — Cranelift JIT (`compile_and_run`, `JitOutcome`); JIT fibers/threads/futex on
+  x86-64 unix (`fiber_rt.rs`, `os_thread_rt.rs`).
 - `svm-mask` — the isolated masking unit.
+- `svm-mem` — the shared guest-memory substrate (§12/§13); owns the memory `unsafe` so the
+  interpreter stays `forbid(unsafe_code)`.
+- `svm-fiber` — native stack-switch primitive for JIT fibers / green threads (x86-64 unix).
 - `svm` — umbrella crate + integration tests (`crates/svm/tests/`).
 - `fuzz/` — libFuzzer targets (out of workspace; nightly + `cargo-fuzz`).
 
 Two big things exist beyond the core loop: (1) **the C frontend** (most of this doc), and
 (2) **a generative interp↔JIT differential fuzzer** (see §8). Test crates:
 `c_frontend.rs` (C, two tiers), `jit_diff.rs` (hand-written JIT diff), `jit_fuzz.rs`
-(generative diff), `pipeline.rs`, `fuzz_smoke.rs`.
+(generative diff), `pipeline.rs`, `fuzz_smoke.rs`, plus the §12 concurrency suite
+(`threads.rs`, `concurrent.rs`, `concurrent_fuzz.rs`, `jit_threads.rs`, `jit_fibers.rs`,
+`fiber_fuzz.rs`) and `shared_region.rs` (§13).
 
 ---
 
@@ -803,12 +810,15 @@ backends → arch-specific; the oracle is about addresses, which integer modules
 
 Largely compliant; simplifications are the ones the design *sanctions*, deferrals are
 incompleteness not contradiction:
-- **Phase 2 complete** (real C on interp + JIT). Solidly into **Phase 3** (JIT + masked
-  window + caps + **guard-page/signal detect-and-kill** done; the §4 *large* reserved window is
-  the default and the **Memory cap now supports guest-controlled growth** into the reserved tail,
-  with the kernel providing physical demand paging for free). Phase-3 remainder is small: `malloc`
-  over `map`, and the Phase-4 virtual-memory extras (fault-driven content supply, `SharedRegion`
-  aliasing) which the guard-page/signal + sparse-commit foundation is built to extend.
+- **Phases 2, 3, and 3.5 complete; into Phase 4.** Real C on interp + JIT (Phase 2); the §4
+  *large* reserved window + Memory cap + guest-controlled growth + guard-page/signal
+  detect-and-kill + RO data (Phase 3); cross-platform parity on **Linux + macOS + Windows** (Phase
+  3.5). `malloc` over `map` is the default libc and `SharedRegion` aliasing is done on all three
+  OSes. **Phase 4 has started:** the concurrency *primitives* (fibers, 1:1 threads, atomics + the
+  C11 ordering surface, futex, a `<pthread.h>`) run on interp + JIT (x86-64 unix) as mechanism with
+  **no VM scheduler** (D56/§12). The genuine remainders are Phase-4: fault-driven *content* supply +
+  cross-domain `SharedRegion` `create`/`grant`, honoring weak orderings in execution,
+  nesting/isolation tiers, Spectre, SIMD, and the language on-ramp.
 - **§2a escape-TCB intact:** the frontend is untrusted; all its output is re-verified;
   every memory access is masked, so even a buggy/hostile data-SP cannot escape (the
   data-SP is a plain value, not trusted). Making it an explicit value rather than a
@@ -832,7 +842,8 @@ incompleteness not contradiction:
 - **De-risking moves from §18 now in place:** interpreter-as-oracle differential fuzzing
   (§8), masking-unit fuzzing (`fuzz/mask`), Cranelift backend, **the verifier escape-oracle**
   (verified ⇒ in-window final memory, §8/§10), **and guard-page/signal detect-and-kill**
-  (§4/§5, unix) so a gross out-of-window access faults cleanly rather than corrupting the host.
+  (§4/§5, cross-platform — SIGSEGV/SIGBUS on unix, a vectored-exception guard on Windows) so a
+  gross out-of-window access faults cleanly rather than corrupting the host.
 - **The hard ceiling still holds:** "appears to work" is well-supported now (two-tier C
   diff + generative JIT diff); "is certified secure" remains the separate post-MVP
   workstream §2a/§18 describes — unchanged by this work.
@@ -849,7 +860,10 @@ this is the index.)
 - [x] **Phase 1 — core loop:** IR + text/binary + verifier + interpreter.
 - [x] **Phase 2 — compilability proof:** chibicc→IR; real C on interp + JIT, two-tier
   tested (interp == JIT == native `cc`); SSA promotion landed (§5 item 8, §3).
-- [ ] **Phase 3 — Solid MVP (in progress):** the MVP remainder below.
+- [x] **Phase 3 — Solid MVP:** the MVP remainder below all landed — large reserved window +
+  Memory cap + guest-controlled growth, guard-page/signal detect-and-kill, RO data segments, the
+  verifier escape-oracle, by-value aggregates (`sret`) + general `goto`. (README/§9 call Phase 3
+  complete; what follows in the per-item list is the evidence.)
 - [x] **Phase 3.5 — Cross-platform parity (Linux + macOS + Windows all GREEN):** the full `cargo
   test --workspace` passes on `ubuntu-latest` (x86-64 / 4 KiB), `macos-latest` (ARM64 / 16 KiB), and
   `windows-latest` (x86-64 / 4 KiB) in CI. Confinement masking is portable (§16/D51); only the
@@ -903,7 +917,10 @@ this is the index.)
     linux cross-check can't catch a host-only issue); made it an unconditional `[build-dependencies]`
     (the C shim compile stays target-gated on `CARGO_CFG_UNIX`). (b) `c_frontend` needs a unix C
     toolchain (`make`+`cc`) → `#![cfg(unix)]` (runs on Linux + macOS; skipped on Windows).
-- [ ] **Phase 4 — post-MVP:** deferred (below), developed against the parity matrix.
+- [ ] **Phase 4 — post-MVP (started):** the **concurrency primitives** have landed (fibers, 1:1
+  threads, atomics + C11 ordering surface, futex, a `<pthread.h>` libc — interp + JIT on x86-64
+  unix; see below); the rest (nesting, isolation tiers, Spectre, split-host, SIMD, GPU, the
+  language on-ramp) is deferred, developed against the parity matrix.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
 - [x] **Production trap-catching (memory)** — *done (unix)*: the JIT window is now `mmap`'d
@@ -1099,9 +1116,32 @@ leave a shared view — add a unix test for this alongside the Windows work.
 > *"Is certified secure"* is **not** an MVP deliverable; it's a separate, open-ended
 > post-MVP workstream (expert review + audit). Green tests ≠ secure.
 
-### Phase 4 / post-MVP (DESIGN-specified, none built)
-- [ ] Concurrency: fibers / vCPUs / M:N green threads, atomics, the C11 memory model,
-  real threads (§12). **Atomics — first slice DONE:** linear-memory atomic ops across the whole
+### Phase 4 / post-MVP (concurrency primitives landed; the rest deferred)
+- [x] **Concurrency — primitives DONE (mechanism only, no VM scheduler — D56/§12).** Through the
+  whole pipeline (IR / text / binary / verify) and **both backends**: fibers (`cont.new`/`resume`/
+  `suspend`), threads (`thread.spawn`/`join`), linear-memory **atomics** (load/store/rmw×6/cmpxchg,
+  i32/i64) with the full **C11 ordering** surface + `atomic.fence`, and a **`wait`/`notify` futex** —
+  plus a guest **`<pthread.h>`** (create/join/mutex/cond) in the libc, so real multithreaded C runs
+  end-to-end. Two execution models, reconciled by D56:
+  - **Interpreter** — an **M:N green-thread executor** (`Scheduler`, bounded worker pool, parked
+    continuations, `MAX_VCPUS = 1<<16`) that doubles as the **deterministic oracle**: `run_scheduled`
+    (seeded interleaving sweep) + `explore_all` (exhaustive stateless model checker). All platforms.
+  - **JIT** — fibers via `svm-jit/src/fiber_rt.rs` over the `svm-fiber` stack switch, threads via
+    `svm-jit/src/os_thread_rt.rs` as **1:1 OS-thread vCPUs** (D56 *removed* an earlier JIT M:N
+    executor — `thread_rt`/`par` — as a re-litigation of D22), and the condvar futex (loom-checked).
+    **x86-64 unix only**; other targets bail `Unsupported`. Differentially tested against the interp
+    (`jit_threads.rs`, `jit_fibers.rs`); concurrent C verified both real-executor and seed-swept.
+  - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
+    today), the async submit/complete ring (§9/§12), fiber/vCPU quota metering, the mid-flight
+    preemption kill-path for sibling vCPUs, and guest-built M≫N runtimes as worked examples.
+
+  > **Historical build-log below (kept for provenance; current state is the summary above + the D56
+  > note at the top of this file).** The increments were written as the *interpreter* concurrency
+  > landed — *before* the JIT gained fibers/threads/futex and before D56 set the JIT thread model to
+  > 1:1 — so their recurring "JIT bails `Unsupported` / interp-only" asides are **stale for x86-64
+  > unix**. Read them as how we got here, not as current behaviour.
+
+  **Atomics — first slice DONE:** linear-memory atomic ops across the whole
   pipeline — `iface`-free IR (`Inst::AtomicLoad`/`AtomicStore`/`AtomicRmw`/`AtomicCmpxchg`, `ty` ∈
   {i32, i64}; `AtomicRmwOp` = add/sub/and/or/xor/xchg), text (`<ty>.atomic.<op>` with an `offset=`
   memarg, no `align`), binary (opcodes `0xC6..=0xC9`), verify, interp reference, and JIT lowering to
