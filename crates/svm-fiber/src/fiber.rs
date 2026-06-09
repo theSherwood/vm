@@ -9,7 +9,8 @@
 //! Panic safety: unwinding across a stack switch is undefined behavior, so the fiber body runs under
 //! [`catch_unwind`] and a panic is turned into a process [`abort`] at the boundary.
 
-use crate::imp::{jump, make, Stack, Transfer};
+use crate::stack::Stack;
+use crate::switch::{jump, make, Transfer};
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::abort;
