@@ -871,11 +871,12 @@ leave a shared view — add a unix test for this alongside the Windows work.
   in (the masking unit `Window::sub` + a both-backends run path with an interp↔JIT escape-oracle),
   as is the **`AddressSpace` capability + attenuation** (iface 5: a power-of-two window sub-range
   with `map`/`unmap`/`protect` confined to it + a `sub` op that mints an attenuated child), and the
-  **`Instantiator` capability** (iface 6, interp): `instantiate`/`join` spawns a same-module child as
-  a confined vCPU on the §12 executor (sub-window + attenuated `AddressSpace` + fuel quota; join parks
-  only the calling fiber). Remaining nesting work: the **JIT** Instantiator path, **co-fiber
-  resume/suspend** children, and **separate-module** children — which then unlock §13 cross-domain
-  `SharedRegion` and the isolation tiers.
+  **`Instantiator` capability** (iface 6, **both backends**): `instantiate`/`join` spawns a
+  same-module child confined to a sub-window — the interp runs it as a vCPU on the §12 executor
+  (shared backing; join parks only the calling fiber); the JIT re-compiles it over its own re-entrantly
+  guarded window (nesting cost at setup) and copies back — proven equal by an interp↔JIT differential.
+  Remaining nesting work: **co-fiber resume/suspend** children, **separate-module** children, and a
+  non-blocking JIT child — which then unlock §13 cross-domain `SharedRegion` and the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
   `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
@@ -1091,10 +1092,21 @@ The current frontier, roughly ranked:
    handles — `Instantiator`, and optionally `AddressSpace`), and `nested_view` gives each child its
    **own** address-space view (shared bytes, private page protections — a shared map would alias the
    child's pages onto the parent's). Covered by `child_manages_its_own_pages_via_address_space`.
-   **Remaining:** (1) **co-fiber resume/suspend** so a child can yield back mid-run (the §14
-   parent-virtualized-fault / lazy-paging story — now unblocked); (2) the **JIT** path — an
-   `instantiate` there `CapFault`s today (no in-process executor; spawning a child fiber on the JIT
-   runtime is the port); (3) **separate-module children** + richer cap pass-through; then cross-domain
+   *Also landed: the **JIT `Instantiator` path*** (interp/JIT parity) — `instantiate`/`join` lower to a
+   per-run `Nursery` (`instantiator_rt`) baked into the iface-6 cap.call sites; `instantiate`
+   **re-compiles** the child as a top-level guest over its **own** fresh guarded window (DESIGN's
+   "nesting cost paid at setup"; reuses the fully-fuzzed top-level confinement — no new escape-TCB
+   codegen), seeded from / copied back to the parent's sub-region (the §14 superset materialized at
+   join). The detect-and-kill guard (`trap_shim`/VEH) was made **re-entrant** (save/restore the
+   recovery state) so a child runs guarded inside the parent's guarded call; a child width-overrun is
+   caught by its *own* guard page and propagates as the parent's trap. Authority is resolved through
+   the run's `cap.call` thunk (a forged handle is an inert `CapFault`). Covered by `jit_instantiator.rs`
+   (interp↔JIT differential: result + whole-window byte-equality, out-of-range carve → `-EINVAL`,
+   `unreachable` + width-overrun child-trap propagation). **Remaining:** (1) **co-fiber resume/suspend**
+   so a child can yield back mid-run (the §14 parent-virtualized-fault / lazy-paging story — now
+   unblocked); (2) **separate-module children** + richer cap pass-through (the JIT child has an empty
+   powerbox today; a child using fibers/threads is `Unsupported`); (3) make the JIT child non-blocking
+   ("park only the calling fiber" — today it runs synchronously at `instantiate`); then cross-domain
    `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past

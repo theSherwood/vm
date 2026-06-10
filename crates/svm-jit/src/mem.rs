@@ -639,12 +639,16 @@ mod pal {
         lo: usize,
         hi: usize,
     ) -> bool {
+        // Save the caller's (possibly-armed parent) guard frame to restore on exit — re-entrant so a
+        // §14 child guest can run (in its own window) inside the parent's guarded call. A child fault
+        // resumes at the child's `saved` context; the parent's frame is restored afterwards intact.
+        let prev = GUARD.with(|g| g.replace(None));
         let mut saved = AlignedContext(core::mem::zeroed());
         // Capture the recovery point. On a guard fault the VEH copies `saved` over the fault context,
         // so execution resumes *here* with TRIPPED set — the longjmp-equivalent return.
         RtlCaptureContext(&mut saved.0);
         if TRIPPED.with(|x| x.replace(false)) {
-            GUARD.with(|g| g.set(None));
+            GUARD.with(|g| g.set(prev)); // restore the parent's frame; report the caught fault
             return true;
         }
         GUARD.with(|g| {
@@ -655,7 +659,7 @@ mod pal {
             }))
         });
         f(a, r, m, t, tc);
-        GUARD.with(|g| g.set(None));
+        GUARD.with(|g| g.set(prev)); // ran to completion; restore the parent's frame
         false
     }
 }

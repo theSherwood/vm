@@ -60,18 +60,38 @@ void svm_install_trap_handler(void) {
 }
 
 /* Run `fn(a, r, m, t, tc)` (a JIT entry trampoline) with faults in [lo, hi) caught.
- * Returns 0 if it ran to completion, 1 if a guarded fault was caught and unwound. */
+ * Returns 0 if it ran to completion, 1 if a guarded fault was caught and unwound.
+ *
+ * **Re-entrant** (§14 nesting): a guest may run a *child* guest (in its own window) from inside its
+ * own guarded call. The recovery state (buf/lo/hi/armed) is saved on this C stack frame and restored
+ * on exit, so the child's guard nests cleanly and the parent's recovery point is intact afterwards.
+ * A child fault unwinds to *this* (the child's) frame; the parent's frame is untouched. */
 int svm_run_guarded(void (*fn)(const long *, long *, unsigned char *, const void *, long *),
                     const long *a, long *r, unsigned char *m, const void *t, long *tc,
                     uintptr_t lo, uintptr_t hi) {
+    /* Save the caller's (possibly-armed parent) recovery state to restore on the way out. */
+    sigjmp_buf saved_buf;
+    memcpy(&saved_buf, &g_buf, sizeof saved_buf);
+    int saved_armed = g_armed;
+    uintptr_t saved_lo = g_lo;
+    uintptr_t saved_hi = g_hi;
+
     g_lo = lo;
     g_hi = hi;
     if (sigsetjmp(g_buf, 1)) {
-        g_armed = 0;
-        return 1; /* a guarded fault unwound back here */
+        /* A guarded fault unwound back here — restore the parent's recovery state and report it. */
+        memcpy(&g_buf, &saved_buf, sizeof g_buf);
+        g_armed = saved_armed;
+        g_lo = saved_lo;
+        g_hi = saved_hi;
+        return 1;
     }
     g_armed = 1;
     fn(a, r, m, t, tc);
-    g_armed = 0;
+    /* Ran to completion — restore the parent's recovery state (re-arming the parent's range). */
+    memcpy(&g_buf, &saved_buf, sizeof g_buf);
+    g_armed = saved_armed;
+    g_lo = saved_lo;
+    g_hi = saved_hi;
     return 0;
 }

@@ -85,6 +85,12 @@ mod fiber_rt;
 #[cfg(fiber_rt)]
 mod os_thread_rt;
 
+// §14 nesting runtime: the host side of the `Instantiator` capability for the JIT — `instantiate`
+// re-compiles a child confined to a sub-window (nesting cost paid at setup) and runs it over the
+// parent's live window; `join` returns its result. Available where children can run (`fiber_rt`).
+#[cfg(fiber_rt)]
+mod instantiator_rt;
+
 // The windows placeholder-window commit primitive, reused by `svm-run`'s Memory-cap backend (it
 // commits/grows tail pages of this same window; a plain `VirtualAlloc(MEM_COMMIT)` cannot commit a
 // placeholder reservation). See `mem::win_commit_rw`.
@@ -675,6 +681,34 @@ fn run_inner(
     #[cfg(not(fiber_rt))]
     let thread = ThreadEnv::null();
 
+    // §14 nesting: if the module holds an `Instantiator` (a `cap.call` to iface 6), stand up the
+    // per-run `Nursery` whose stable address is baked into those sites. `instantiate` re-compiles a
+    // child confined to a sub-window and runs it over this window (its detect-and-kill fault range is
+    // supplied post-finalize via `set_env`, like the thread `Domain`). A child runs synchronously
+    // today, so the nursery is touched only on the calling thread.
+    #[cfg(fiber_rt)]
+    let nursery: Option<Box<instantiator_rt::Nursery>> = if module_uses_instantiator(m) {
+        Some(Box::new(instantiator_rt::Nursery::new(
+            m.funcs.clone().into(),
+            cap_thunk,
+            cap_ctx,
+        )))
+    } else {
+        None
+    };
+    #[cfg(fiber_rt)]
+    let inst = if let Some(n) = &nursery {
+        InstEnv {
+            nursery_addr: (&**n as *const instantiator_rt::Nursery) as i64,
+            instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
+            join_thunk: instantiator_rt::join as *const () as i64,
+        }
+    } else {
+        InstEnv::null()
+    };
+    #[cfg(not(fiber_rt))]
+    let inst = InstEnv::null();
+
     // Define each function body. `clear_context` after each define resets the cached
     // CFG/domtree so the next function never compiles against a stale CFG.
     let mut ctx = module.make_context();
@@ -686,6 +720,7 @@ fn run_inner(
             cap,
             fiber,
             thread,
+            inst,
             &mut ctx.func,
             f,
             mask,
@@ -795,6 +830,12 @@ fn run_inner(
         );
     }
 
+    // §14: the nesting `Nursery`'s address is baked into the Instantiator cap.call sites; a child runs
+    // over its own window (allocated per `instantiate`), so there is no per-run env to seed here. Keep
+    // it alive until the run completes.
+    #[cfg(fiber_rt)]
+    let _nursery = &nursery;
+
     // Publish the root fiber runtime (when the module uses `cont.*`) so its thunks find it via the
     // thread-local for the duration of the entry; spawned vCPUs publish their own.
     #[cfg(fiber_rt)]
@@ -859,6 +900,216 @@ fn run_inner(
         JitOutcome::Trapped(TrapKind::from_code(code).ok_or(JitError::Malformed)?)
     };
     Ok((outcome, final_mem))
+}
+
+/// Compile `func` (and the module's other functions, which `call`/`call_indirect` may reach) as a
+/// **top-level guest over its own fresh `2^child_size_log2`-byte window**, seeded from the parent's
+/// sub-region `[parent_mem_base + sub_base, … + child_size)` and copied back into it on completion.
+/// This is the JIT side of §14 nesting (the `Instantiator`): "nesting cost is paid at setup, not at
+/// runtime" — the child is compiled once (steady-state per-access cost is the same single AND+ADD as
+/// any guest, the masking already fuzzed by the escape-oracle). Running the child over its **own**
+/// guarded window (rather than the live parent window) means its confinement, width-overrun guard
+/// (detect-and-kill at *its* guard page), and `map`/`unmap` are the ordinary, fully-fuzzed top-level
+/// paths — no new escape-TCB codegen — and the parent sees the child's effect as the copy-back at
+/// `instantiate`-completion (the §14 superset, materialized at join for a synchronous child). The
+/// child runs under a **nested** detect-and-kill guard (`trap_shim`/VEH save+restore the parent's
+/// recovery state), so a child fault is caught at the child and the parent's guard stays intact.
+///
+/// Returns the child's `(result_slot, trap_cell)` — one `i64` result (the Instantiator child returns
+/// one `i64`); the trap cell is `0`, a `TrapKind`, or an `Exit` encoding. The child gets an **empty
+/// powerbox** (an inert `cap.call`) for now; a child using §12 fibers/threads is rejected
+/// (`Unsupported`) — those need per-child runtimes (a follow-up), and null thunks would be unsound.
+///
+/// # Safety
+/// `parent_mem_base` must point at the caller's live guest window with `[sub_base, sub_base +
+/// child_size)` committed (the Instantiator checks `sub_base + child_size ≤ holder size`); it must
+/// outlive the call. A guest window must already be installed on this thread (`install_guard`).
+#[cfg(fiber_rt)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn compile_child_and_run(
+    funcs: &[Func],
+    child_entry: FuncIdx,
+    sub_base: u64,
+    child_size_log2: u8,
+    parent_mem_base: *mut u8,
+    args: &[i64],
+) -> Result<(i64, i64), JitError> {
+    let entry = funcs
+        .get(child_entry as usize)
+        .ok_or(JitError::Malformed)?
+        .clone();
+    for f in funcs {
+        ensure_supported(f)?;
+        // A child using §12 fibers/threads would compile against null fiber/thread thunks (no
+        // per-child runtime yet) — reject rather than emit a call through a null pointer.
+        if func_uses_fibers_or_threads(f) {
+            return Err(JitError::Unsupported(
+                "a §14 JIT child using fibers/threads is not supported yet",
+            ));
+        }
+    }
+    let child_size = 1u64 << child_size_log2.min(MAX_JIT_WINDOW_LOG2);
+    let mask = child_size - 1;
+
+    let mut flags = settings::builder();
+    let _ = flags.set("is_pic", "false");
+    let _ = flags.set("preserve_frame_pointers", "true");
+    let isa = cranelift_native::builder()
+        .map_err(|e| JitError::Backend(e.to_string()))?
+        .finish(settings::Flags::new(flags))
+        .map_err(|e| JitError::Backend(e.to_string()))?;
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
+        builder.memory_provider(Box::new(arena));
+    }
+    let mut module = JITModule::new(builder);
+
+    let ids: Vec<_> = funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let sig = natural_sig(&mut module, f);
+            module
+                .declare_function(&format!("f{i}"), Linkage::Local, &sig)
+                .map_err(|e| JitError::Backend(e.to_string()))
+        })
+        .collect::<Result<_, _>>()?;
+    let distinct = distinct_types(funcs);
+
+    // The child's powerbox is empty (an inert `cap.call` → `CapFault`) and it has no fiber/thread
+    // runtime; it runs over its **own** window, so `sub_base = 0` (ordinary top-level confinement).
+    let cap = CapEnv {
+        thunk_addr: empty_cap_thunk as *const () as i64,
+        ctx_addr: 0,
+    };
+    let mut ctx = module.make_context();
+    for (f, id) in funcs.iter().zip(&ids) {
+        build_clif(
+            &mut module,
+            &ids,
+            &distinct,
+            cap,
+            FiberEnv::null(),
+            ThreadEnv::null(),
+            InstEnv::null(), // a JIT child cannot itself nest yet (its Instantiator cap.call → CapFault)
+            &mut ctx.func,
+            f,
+            mask,
+            child_size, // the child is fully mapped (reserved == mapped == size)
+            0,          // top-level confinement over the child's own window
+        )?;
+        module
+            .define_function(*id, &mut ctx)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module.clear_context(&mut ctx);
+    }
+    build_trampoline(
+        &mut module,
+        &mut ctx.func,
+        ids[child_entry as usize],
+        &entry,
+    );
+    let tramp = module
+        .declare_function("child_trampoline", Linkage::Export, &ctx.func.signature)
+        .map_err(|e| JitError::Backend(e.to_string()))?;
+    module
+        .define_function(tramp, &mut ctx)
+        .map_err(|e| JitError::Backend(e.to_string()))?;
+    module.clear_context(&mut ctx);
+    module
+        .finalize_definitions()
+        .map_err(|e| JitError::Backend(e.to_string()))?;
+
+    let table_len = funcs.len().next_power_of_two();
+    let fn_table: Vec<FnEntry> = (0..table_len)
+        .map(|slot| match funcs.get(slot) {
+            Some(f) => FnEntry {
+                type_id: type_id_of(
+                    &distinct,
+                    &FuncType {
+                        params: f.params.clone(),
+                        results: f.results.clone(),
+                    },
+                ),
+                _pad: 0,
+                code: module.get_finalized_function(ids[slot]) as u64,
+            },
+            None => FnEntry {
+                type_id: PADDING_TYPE_ID,
+                _pad: 0,
+                code: 0,
+            },
+        })
+        .collect();
+
+    let code = module.get_finalized_function(tramp);
+
+    // The child's own fully-mapped window (+ guard page). Seed it from the parent's sub-region so the
+    // child starts from the bytes the parent placed there (the §14 data plane is shared memory).
+    let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
+    let child_base = child_window.base();
+    {
+        // SAFETY: `[parent_mem_base + sub_base, … + child_size)` is committed parent-window memory
+        // (the Instantiator bounded `sub_base + child_size ≤ holder size ≤ parent size`).
+        let src =
+            std::slice::from_raw_parts(parent_mem_base.add(sub_base as usize), child_size as usize);
+        child_window.rw_mut().copy_from_slice(src);
+    }
+
+    let mut results = vec![0i64; entry.results.len()];
+    let mut trap_cell: i64 = 0;
+    // SAFETY: `code` honours the `Entry` ABI; it accesses only its own window `[child_base, …+size)`
+    // (baked masking; a width-overrun hits this window's guard page), reads the child `fn_table`, and
+    // writes its result/trap slots. The guard is re-entrant, so a child fault is caught here and the
+    // parent's recovery state is restored.
+    let faulted = mem::run_guarded(
+        &child_window,
+        code,
+        args.as_ptr(),
+        results.as_mut_ptr(),
+        child_base,
+        fn_table.as_ptr() as *const core::ffi::c_void,
+        &mut trap_cell,
+    );
+    if faulted {
+        trap_cell = mem::FAULT_TRAP;
+    }
+    // Copy the child's final window back into the parent's sub-region — the parent (the superset) now
+    // sees the child's writes (materialized at `instantiate`-completion for a synchronous child). A
+    // guest with no Memory cap leaves every page mapped; `restore_rw` is defensive.
+    child_window.restore_rw();
+    {
+        let dst = std::slice::from_raw_parts_mut(
+            parent_mem_base.add(sub_base as usize),
+            child_size as usize,
+        );
+        dst.copy_from_slice(&child_window.rw_mut()[..child_size as usize]);
+    }
+    drop(child_window);
+    drop(fn_table);
+    drop(module); // frees the child's executable memory now the call has returned
+    Ok((results.first().copied().unwrap_or(0), trap_cell))
+}
+
+/// Whether `f` uses any §12 fiber/thread/futex op — which a §14 JIT child cannot yet run (it would
+/// compile against this run's null fiber/thread thunks). Memory + `cap.call` are fine (the latter is
+/// an inert `CapFault` under the child's empty powerbox).
+#[cfg(fiber_rt)]
+fn func_uses_fibers_or_threads(f: &Func) -> bool {
+    f.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::ContNew { .. }
+                    | Inst::ContResume { .. }
+                    | Inst::Suspend { .. }
+                    | Inst::ThreadSpawn { .. }
+                    | Inst::ThreadJoin { .. }
+                    | Inst::MemoryWait { .. }
+                    | Inst::MemoryNotify { .. }
+            )
+        })
+    })
 }
 
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)
@@ -1006,6 +1257,32 @@ impl ThreadEnv {
     }
 }
 
+/// The §14 nesting runtime address + the `instantiate`/`join` thunk addresses, baked into the
+/// module's `Instantiator` `cap.call` sites. All `0` when the module holds no `Instantiator`, or in a
+/// **child** compilation (a JIT child cannot itself nest yet — its `Instantiator` cap.call falls
+/// through to the ordinary `cap.call` path, i.e. an inert `CapFault`).
+#[derive(Clone, Copy)]
+struct InstEnv {
+    nursery_addr: i64,
+    instantiate_thunk: i64,
+    join_thunk: i64,
+}
+
+impl InstEnv {
+    fn null() -> InstEnv {
+        InstEnv {
+            nursery_addr: 0,
+            instantiate_thunk: 0,
+            join_thunk: 0,
+        }
+    }
+    /// True when this compilation may lower `Instantiator` cap.calls to the nesting runtime (the
+    /// parent compile with a live `Nursery`); `false` ⇒ they take the ordinary `cap.call` path.
+    fn is_active(&self) -> bool {
+        self.nursery_addr != 0
+    }
+}
+
 /// Per-function lowering context shared across blocks.
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
@@ -1035,6 +1312,9 @@ struct Lower<'a> {
     fiber: FiberEnv,
     /// The §12 thread scheduler + thunk addresses for `thread.*` lowering.
     thread: ThreadEnv,
+    /// The §14 nesting runtime + thunk addresses for `Instantiator` `cap.call` lowering (`null` ⇒
+    /// `Instantiator` cap.calls take the ordinary `cap.call` path — an inert `CapFault`).
+    inst: InstEnv,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
     /// Distinct module signatures, for `call_indirect` type ids.
@@ -1052,6 +1332,7 @@ fn build_clif(
     cap: CapEnv,
     fiber: FiberEnv,
     thread: ThreadEnv,
+    inst: InstEnv,
     clif: &mut Function,
     f: &Func,
     mask: u64,
@@ -1107,6 +1388,7 @@ fn build_clif(
         cap,
         fiber,
         thread,
+        inst,
         ids,
         distinct,
     };
@@ -1219,6 +1501,19 @@ fn module_uses_threads(m: &IrModule) -> bool {
     })
 }
 
+/// Whether `m` holds a §14 `Instantiator` — a `cap.call` to iface 6 (`svm_interp::iface::INSTANTIATOR`)
+/// — so `run_inner` knows to stand up the nesting [`instantiator_rt::Nursery`].
+#[cfg(fiber_rt)]
+fn module_uses_instantiator(m: &IrModule) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|blk| {
+            blk.insts
+                .iter()
+                .any(|i| matches!(i, Inst::CapCall { type_id: 6, .. }))
+        })
+    })
+}
+
 /// Build the generic fiber **call-trampoline**: `extern "C" fn(code, mem_base, fn_table_base,
 /// trap_out, sp, arg) -> i64` that `call_indirect`s a guest fiber entry under its `Tail` ABI. Rust
 /// cannot call a `Tail`-convention function directly, so the fiber runtime calls this (default C ABI)
@@ -1315,9 +1610,17 @@ fn lower_block(
             args,
         } = inst
         {
-            lower_cap_call(
-                module, b, lower, *type_id, *op, sig, *handle, args, &mut vals,
-            )?;
+            // §14 `Instantiator` (iface 6): when this (parent) compile has a live `Nursery`, lower
+            // `instantiate`/`join` to its thunks instead of the generic `cap.call` — spawning a child
+            // needs the host compiler, which the flat `cap.call` thunk can't reach. Otherwise (a child
+            // compile, or no nesting runtime) it falls through to the ordinary path (an inert CapFault).
+            if *type_id == 6 && lower.inst.is_active() {
+                lower_instantiator(module, b, lower, *op, *handle, args, &mut vals)?;
+            } else {
+                lower_cap_call(
+                    module, b, lower, *type_id, *op, sig, *handle, args, &mut vals,
+                )?;
+            }
             ubs.resize(vals.len(), UB_TOP); // cap-call results are unknown
             continue;
         }
@@ -1964,6 +2267,70 @@ fn lower_cap_call(
             let slot = b.ins().stack_load(I64, ss, (i * 8) as i32);
             vals.push(decode_slot(b, slot, *rty));
         }
+    }
+    Ok(())
+}
+
+/// Lower a §14 `Instantiator` `cap.call` (iface 6) to the nesting runtime ([`instantiator_rt`]) — only
+/// reached when this (parent) compile has a live `Nursery` (`lower.inst.is_active()`). `op 0`
+/// `instantiate(entry, off, size_log2, fuel) -> child_handle` and `op 1` `join(child_handle) ->
+/// result` call the baked thunks, threading `mem_base` (the live parent window) + `trap_out`; a thunk
+/// that sets the trap cell (forged handle, bad carve, child trap) propagates here like any `cap.call`.
+fn lower_instantiator(
+    module: &mut JITModule,
+    b: &mut FunctionBuilder,
+    lower: &Lower,
+    op: u32,
+    handle: u32,
+    args: &[u32],
+    vals: &mut Vec<Value>,
+) -> Result<(), JitError> {
+    let nursery = b.ins().iconst(I64, lower.inst.nursery_addr);
+    let mem_base = b.use_var(lower.mem_var);
+    let trap_out = b.use_var(lower.trap_var);
+    match op {
+        0 => {
+            // instantiate(nursery, mem_base, handle:i32, entry:i64, off:i64, size_log2:i64,
+            //             fuel:i64, trap_out:i64) -> child_handle:i32
+            let h = get(vals, handle)?; // the Instantiator handle (resolved for authority)
+            let entry = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
+            let off = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
+            let size_log2 = get(vals, *args.get(2).ok_or(JitError::Malformed)?)?;
+            let fuel = get(vals, *args.get(3).ok_or(JitError::Malformed)?)?;
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I32, I64, I64, I64, I64, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.inst.instantiate_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[nursery, mem_base, h, entry, off, size_log2, fuel, trap_out],
+            );
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+        }
+        1 => {
+            // join(nursery, child_handle:i32, trap_out:i64) -> result:i64. The cap.call's handle
+            // operand (the Instantiator) is unused here — the child handle is the first arg, and the
+            // nursery owns the child table for this run.
+            let child = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
+            let mut tsig = module.make_signature();
+            for t in [I64, I32, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.inst.join_thunk);
+            let call = b
+                .ins()
+                .call_indirect(tref, thunk, &[nursery, child, trap_out]);
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+        }
+        _ => return Err(JitError::Unsupported("unknown Instantiator op")),
     }
     Ok(())
 }

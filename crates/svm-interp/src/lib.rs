@@ -2753,10 +2753,16 @@ impl Host {
                     _ => EINVAL,
                 }])
             }
-            // The §14 `Instantiator` is serviced by the interpreter's eval loop (spawning a child vCPU
-            // needs the executor, which the generic dispatch can't reach), so reaching here means a
-            // backend without nesting support (the JIT, today) drove an `instantiate`/`join` — fault.
-            Binding::Instantiator { .. } => Err(Trap::CapFault),
+            // The interpreter services `instantiate`/`join` in its eval loop (spawning a child vCPU
+            // needs the executor the generic dispatch can't reach), so it never routes an Instantiator
+            // here. A flat-window backend (the JIT) *does* — but only to **resolve this handle's
+            // authority**: op 0 returns the carve range `[base, base+size)` so the JIT can compile and
+            // run the child confined to a sub-window of it (the JIT owns the actual spawn). Other ops
+            // are inert here (the JIT routes `join` to its own child table, never to the Host).
+            Binding::Instantiator { base, size } => match op {
+                0 => Ok(vec![base as i64, size as i64]),
+                _ => Err(Trap::CapFault),
+            },
         }
     }
 
