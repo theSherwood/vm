@@ -69,8 +69,11 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > on the interpreter, byte-identical by differential. **Separate-module nested children** are in
 > too: the host grants a **`Module` capability** for a different verified module, and a guest
 > instantiates it as a child domain — the plugin-in-plugin story, its data segments materialized
-> into the carve (lazily, for demand-paged children). Still ahead:
-> narrow-scalar promotion, cross-domain `SharedRegion` `create`/`grant` + the async I/O ring, a
+> into the carve (lazily, for demand-paged children). And **cross-domain `SharedRegion`
+> `create`/`grant`** closes the §13/§14 data plane: a guest mints a shareable region via its
+> `AddressSpace` and grants it into a child domain — parent and child then share bytes zero-copy.
+> Still ahead:
+> narrow-scalar promotion, the async I/O ring, a
 > guest M:N runtime, SIMD, isolation tiers, and capability extras.
 > This is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).

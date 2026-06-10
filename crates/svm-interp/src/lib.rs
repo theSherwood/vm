@@ -1509,6 +1509,40 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     )?)?;
                     return Ok(Inner::CoYield(value));
                 }
+                // §13/§14 cross-domain **`grant`** (SharedRegion op 4): install this region — the
+                // *same* shared backing — into a suspended coroutine child's powerbox, returning the
+                // handle the **child** will use. Serviced here (the generic dispatch can't reach the
+                // coroutine table). The parent delivers the returned handle to the child by existing
+                // means (typically the next `resume`'s value); the child `map`s the region into its
+                // own window — the zero-copy cross-domain data plane (§13). Executor (`instantiate`)
+                // children and the JIT parent are follow-ups; a forged region handle or an
+                // unknown/finished child is an inert `CapFault`.
+                Inst::CapCall {
+                    type_id: iface::SHARED_REGION,
+                    op: 4,
+                    handle,
+                    args,
+                    ..
+                } => {
+                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let backing = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.resolve_region(h)?
+                    };
+                    let ch = as_i32(get(
+                        &frames[top].vals,
+                        *args.first().ok_or(Trap::Malformed)?,
+                    )?)?;
+                    let coro = coroutines
+                        .get_mut(ch as usize)
+                        .and_then(|c| c.as_mut())
+                        .ok_or(Trap::CapFault)?;
+                    let child_handle = {
+                        let mut chh = coro.vcpu.host.lock().unwrap_or_else(|e| e.into_inner());
+                        chh.grant_shared_region_backed(backing)
+                    };
+                    frames[top].vals.push(Value::I64(child_handle as i64));
+                }
                 Inst::CapCall {
                     type_id: iface::INSTANTIATOR,
                     op,
@@ -1601,7 +1635,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             if !ok_entry || !fits || !mod_ok {
                                 frames[top].vals.push(Value::I32(EINVAL as i32));
                             } else {
-                                let abs_base = ibase + off;
+                                // `ibase`/`off` are holder-relative; the backing-absolute base
+                                // adds the holder's own window base (0 for a top-level holder), so
+                                // nesting composes at any depth.
+                                let abs_base =
+                                    mem.as_ref().map_or(0, |m| m.window.base()) + ibase + off;
                                 let child_mem = mem
                                     .as_ref()
                                     .map(|m| m.nested_view(abs_base, size_log2 as u8));
@@ -1628,8 +1666,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // arguments. (Pass-through of the parent's *other* handles is a
                                 // follow-up.)
                                 let mut ch = Host::new();
-                                let cinst = ch.grant_instantiator(abs_base, child_size);
-                                let cas = ch.grant_address_space(abs_base, child_size);
+                                let cinst = ch.grant_instantiator(0, child_size);
+                                let cas = ch.grant_address_space(0, child_size);
                                 let child_host = Arc::new(Mutex::new(ch));
                                 let child_args = if want_as {
                                     vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
@@ -1724,7 +1762,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             if !ok_entry || !fits || !mod_ok {
                                 frames[top].vals.push(Value::I32(EINVAL as i32));
                             } else {
-                                let abs_base = ibase + off;
+                                // `ibase`/`off` are holder-relative; the backing-absolute base
+                                // adds the holder's own window base (0 for a top-level holder), so
+                                // nesting composes at any depth.
+                                let abs_base =
+                                    mem.as_ref().map_or(0, |m| m.window.base()) + ibase + off;
                                 let child_mem = mem.as_ref().map(|m| {
                                     let cm = m.nested_view(abs_base, size_log2 as u8);
                                     if demand {
@@ -2602,6 +2644,11 @@ pub mod iface {
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 
+/// Per-region cap on a **guest-minted** region (`AddressSpace.create_region`, §13/§14): an anti-bomb
+/// ceiling so a single mint can't exhaust the host. Aggregate quota metering is §15 (D48: DoS is
+/// contained by caps + the kill path, not prevented).
+const MAX_MINTED_REGION: i64 = 256 << 20; // 256 MiB
+
 /// Cap ABI `prot` bits for the `Memory` capability (§3e): the low two bits of the `i32`
 /// argument. There is no `EXEC` bit — guest data is never executed as code (§3c).
 const PROT_READ: i32 = 1;
@@ -2672,8 +2719,10 @@ impl SharedBacking for VecBacking {
 
 /// The guest window a capability handler borrows `(ptr, len)` buffers from (§7). Both
 /// the interpreter's lazily-paged [`Mem`] and a JIT's flat window implement this, so a
-/// single host dispatch ([`Host::cap_dispatch`]) serves both backends. The methods
-/// bounds-check `[ptr, ptr+len) ⊆ [0, size)` and return `None` (→ `-EFAULT`) otherwise.
+/// single host dispatch ([`Host::cap_dispatch`]) serves both backends. **All offsets/pointers are
+/// guest-relative** — the zero-based window the guest sees (a §14 child names its own `[0, size)`,
+/// never its position in an ancestor's window); implementations translate to their backing. The
+/// methods bounds-check `[ptr, ptr+len) ⊆ [0, size)` and return `None` (→ `-EFAULT`) otherwise.
 pub trait GuestMem {
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>>;
     fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()>;
@@ -2783,15 +2832,18 @@ enum Binding {
     /// backing (not the index) is the shared object; mapping it at several window offsets aliases.
     SharedRegion(u32),
     /// A §14 `AddressSpace` handle attenuated to the power-of-two window sub-range `[base, base+size)`
-    /// (both window-absolute bytes). Every op is confined to it; `sub` mints a further-attenuated
-    /// child. The bounds live in the host-owned slot — the guest names only the forgeable handle.
+    /// in the **holder's own (guest-relative) coordinates** — a child's full-window grant is
+    /// `[0, its size)` regardless of where its window sits in an ancestor's. Every op is confined to
+    /// it; `sub` mints a further-attenuated child. The bounds live in the host-owned slot — the guest
+    /// names only the forgeable handle.
     AddressSpace {
         base: u64,
         size: u64,
     },
     /// A §14 `Instantiator` handle conferring authority to spawn children confined to the window
-    /// sub-range `[base, base+size)` (window-absolute). The eval loop (not the generic dispatch)
-    /// services it — spawning needs executor access — using these bounds to carve each child.
+    /// sub-range `[base, base+size)` in the **holder's own (guest-relative) coordinates**. The eval
+    /// loop (not the generic dispatch) services it — spawning needs executor access — translating to
+    /// backing-absolute via the holder's window base, so nesting composes at any depth.
     Instantiator {
         base: u64,
         size: u64,
@@ -2844,6 +2896,11 @@ pub struct Host {
     /// not copies). Append-only for the life of the `Host`, so raw views handed to the JIT's nesting
     /// runtime ([`Host::resolve_module_parts`]) stay valid for the whole run.
     modules: Vec<ModuleGrant>,
+    /// The backing factory for **guest-minted** §13/§14 regions (`AddressSpace.create_region`).
+    /// `None` (the default) mints the pure-Rust reference [`VecBacking`]; a flat-window embedder
+    /// installs an OS-shared-memory factory ([`Host::set_region_factory`], e.g.
+    /// `svm_run::new_shared_region`) so a JIT guest can `map` what it mints for real aliasing.
+    region_factory: Option<fn(usize) -> RegionBacking>,
 }
 
 /// One §14 module grant: the verified module's functions, declared window size, and data segments —
@@ -2871,6 +2928,7 @@ impl Host {
             clock_ns: 0,
             regions: Vec::new(),
             modules: Vec::new(),
+            region_factory: None,
         }
     }
 
@@ -3009,6 +3067,26 @@ impl Host {
         self.grant(iface::SHARED_REGION, Binding::SharedRegion(id))
     }
 
+    /// Install the backing factory for **guest-minted** regions (`AddressSpace.create_region`,
+    /// §13/§14). A flat-window embedder passes an OS-shared-memory factory (e.g.
+    /// `svm_run::new_shared_region`) so a JIT guest can `map` what it mints; without one, mints use
+    /// the pure-Rust reference [`VecBacking`] (fine for the interpreter, unmappable by the JIT).
+    pub fn set_region_factory(&mut self, f: fn(usize) -> RegionBacking) {
+        self.region_factory = Some(f);
+    }
+
+    /// Resolve a handle as a §13 `SharedRegion` and return its backing (an `Arc` clone — the same
+    /// shared object). Used by the eval loop's cross-domain `grant` (SharedRegion op 4); a forged /
+    /// closed / wrong-type handle is a `CapFault`.
+    fn resolve_region(&self, handle: i32) -> Result<RegionBacking, Trap> {
+        match self.resolve(handle, iface::SHARED_REGION)? {
+            Binding::SharedRegion(id) => {
+                self.regions.get(id as usize).cloned().ok_or(Trap::CapFault)
+            }
+            _ => Err(Trap::CapFault),
+        }
+    }
+
     /// Close a handle (§3c): free the slot but keep its generation, so the old handle
     /// value is now a dead generation and any later `cap.call` on it traps (D37).
     pub fn close(&mut self, handle: i32) {
@@ -3130,6 +3208,24 @@ impl Host {
                         return Ok(vec![EINVAL]);
                     }
                     return Ok(vec![self.grant_address_space(base + off, child) as i64]);
+                }
+                if op == 5 {
+                    // create_region(len) -> region handle — a **guest-minted** §13/§14 `SharedRegion`
+                    // (the cross-domain data plane's `create`): the memory-management authority mints
+                    // a fresh zero-filled shareable region and gets its handle, to `map` into its own
+                    // window and/or `grant` into a child domain (SharedRegion op 4). Backing comes
+                    // from the embedder's factory (OS shared memory under the JIT) or the reference
+                    // `VecBacking`. Capped per-region (anti-bomb); real quota metering is §15 — DoS
+                    // is contained, not prevented (D48).
+                    let len = *args.first().unwrap_or(&0);
+                    if len <= 0 || len > MAX_MINTED_REGION {
+                        return Ok(vec![EINVAL]);
+                    }
+                    let backing = match self.region_factory {
+                        Some(f) => f(len as usize),
+                        None => Arc::new(VecBacking(Mutex::new(vec![0u8; len as usize]))),
+                    };
+                    return Ok(vec![self.grant_shared_region_backed(backing) as i64]);
                 }
                 // map/unmap/protect/page_size — same shapes as `Memory`, but bounded to `[0, size)`
                 // and shifted by `base` (a buffer/range straddling the sub-range boundary is -EINVAL).
@@ -3694,21 +3790,18 @@ impl Mem {
     /// guest may now grow into the reserved tail `[mapped, reserved)`, not just the initial backed
     /// prefix. Returns the inclusive page-index range it covers, or `Err(EINVAL)`.
     fn prot_pages(&self, offset: u64, len: u64) -> Result<core::ops::RangeInclusive<u64>, i64> {
-        // `offset` is an **absolute** window address (a top-level window has base 0, so it equals the
-        // historical window-relative offset; a §14 sub-window shifts it by its base). The prot map is
-        // keyed by window-**relative** page, matching `check_prot`/`page_access`, so fold the base out
-        // here — an address below this window's base (or misaligned) is out of range (`-EINVAL`).
-        let Some(rel) = offset.checked_sub(self.window.base()) else {
-            return Err(EINVAL);
-        };
-        if len == 0 || !rel.is_multiple_of(self.page) {
+        // `offset` is **guest-relative** — the zero-based window the guest sees (the whole `GuestMem`
+        // surface speaks guest coordinates; a §14 child names its own `[0, size)`, never its position
+        // in the parent). The prot map is keyed by the same relative pages
+        // (`check_prot`/`page_access`); only backing-store accesses add `window.base()`.
+        if len == 0 || !offset.is_multiple_of(self.page) {
             return Err(EINVAL);
         }
-        let end = rel.checked_add(len).ok_or(EINVAL)?;
+        let end = offset.checked_add(len).ok_or(EINVAL)?;
         if end > self.window.reserved() {
             return Err(EINVAL);
         }
-        Ok((rel / self.page)..=((end - 1) / self.page)) // len need not be a page multiple; round up
+        Ok((offset / self.page)..=((end - 1) / self.page)) // len need not be a page multiple; round up
     }
 
     /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ read+write, `READ` only ⇒
@@ -3791,7 +3884,9 @@ impl Mem {
         if !self.range_committed(ptr, len, false) {
             return None;
         }
-        Some((0..len).map(|k| self.byte(ptr + k)).collect())
+        // `ptr` is guest-relative; `byte` indexes the (possibly parent-shared) backing absolutely.
+        let base = self.window.base();
+        Some((0..len).map(|k| self.byte(base + ptr + k)).collect())
     }
 
     /// Borrow-validate and write a `(ptr, len)` capability buffer (§7): every page must be
@@ -3800,8 +3895,9 @@ impl Mem {
         if !self.range_committed(ptr, data.len() as u64, true) {
             return None;
         }
+        let base = self.window.base();
         for (k, b) in data.iter().enumerate() {
-            self.set_byte(ptr + k as u64, *b);
+            self.set_byte(base + ptr + k as u64, *b);
         }
         Some(())
     }
@@ -4517,12 +4613,10 @@ mod prot_tests {
         assert!(mem.store(0, 0, StoreOp::I64, Value::I64(0xABCD)).is_ok());
         assert_eq!(mem.load(0, 0, LoadOp::I64), Ok(Value::I64(0xABCD)));
 
-        // Unmap the child's first page via its **absolute** address (what the cap handler passes).
-        assert_eq!(
-            mem.unmap(base, p),
-            0,
-            "sub-window unmap should succeed (was -EINVAL)"
-        );
+        // Unmap the child's first page via its **guest-relative** offset 0 (the whole `GuestMem`
+        // surface speaks the zero-based window the guest sees; the page lands at `base` in the
+        // shared parent backing).
+        assert_eq!(mem.unmap(0, p), 0, "sub-window unmap should succeed");
         assert_eq!(
             mem.load(0, 0, LoadOp::I64),
             Err(Trap::MemoryFault),
@@ -4531,18 +4625,15 @@ mod prot_tests {
         // A different page still within the child is unaffected.
         assert!(mem.store(p, 0, StoreOp::I64, Value::I64(0x1234)).is_ok());
 
-        // Re-map recommits the page, zeroed.
-        assert_eq!(mem.map(base, p, PROT_WRITE), 0);
+        // Re-map recommits the page, zeroed — and the backing byte that changed is the *parent's*
+        // byte at `base` (the child's slice), not the parent's page 0.
+        assert_eq!(mem.map(0, p, PROT_WRITE), 0);
         assert_eq!(mem.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
 
-        // The child cannot address below its base or past its window top.
+        // The child cannot name anything at/past its own window top — its reserved domain is
+        // `[0, size)`, wherever that sits in an ancestor's window.
         assert_eq!(
-            mem.unmap(0, p),
-            EINVAL,
-            "below the child's base is out of range"
-        );
-        assert_eq!(
-            mem.unmap(base + (1u64 << size_log2), p),
+            mem.unmap(1u64 << size_log2, p),
             EINVAL,
             "at/after the child's window top is out of range"
         );

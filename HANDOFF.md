@@ -546,9 +546,10 @@ incompleteness not contradiction:
   attenuable `AddressSpace`, the `Instantiator` incl. recursion, co-fiber children, and
   fault-driven yield — the parent-as-pager *content* supply, hardware faults on the JIT). The
   **Separate-module children** (the host-granted `Module` capability, the "plugin-in-plugin"
-  story) are in on both backends. The genuine remainders are Phase-4: cross-domain `SharedRegion`
-  `create`/`grant`, honoring weak orderings in execution, isolation tiers, Spectre, SIMD, and the
-  language on-ramp.
+  story) are in on both backends, as is **cross-domain `SharedRegion` `create`/`grant`** (guest-
+  minted regions, granted into coroutine children — the zero-copy data plane). The genuine
+  remainders are Phase-4: honoring weak orderings in execution, isolation tiers, Spectre, SIMD,
+  and the language on-ramp.
 - **§2a escape-TCB intact:** the frontend is untrusted; all its output is re-verified;
   every memory access is masked, so even a buggy/hostile data-SP cannot escape (the
   data-SP is a plain value, not trusted). Making it an explicit value rather than a
@@ -739,10 +740,10 @@ this is the index.)
   and the §13 alias differential all green — **and confirmed on the real `windows-latest` CI** (PR #2,
   merged: the `build · test (windows-latest)` gate passed, all three OS legs green). The original
   playbook is preserved below as the design record.
-  **Still left (Phase 4, not MVP blockers):** cross-domain `SharedRegion` `create`/`grant`
-  (guest-minted regions; the §14 Instantiator it needs now exists). Fault-driven *content* supply
-  (a parent as pager, `userfaultfd`-style/§14) has since **landed** — `spawn_demand_coroutine` +
-  fault-driven yield on both backends. **`malloc` over `map` is the default guest libc** — the powerbox
+  **Still left (Phase 4, not MVP blockers):** *(both since **landed**)* — fault-driven *content*
+  supply (a parent as pager, `userfaultfd`-style/§14): `spawn_demand_coroutine` + fault-driven
+  yield on both backends; and cross-domain `SharedRegion` `create`/`grant`: guest-minted regions
+  (`AddressSpace.create_region`) granted into coroutine children (`SharedRegion.grant`). **`malloc` over `map` is the default guest libc** — the powerbox
   grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect` builtins expose it
   (codegen_ir.c), and the shipped `frontend/chibicc/include/stdlib.h` provides a map-growing
   `malloc`/`free`/`calloc`/`realloc` to any program that `#include <stdlib.h>`; `demos/heapgrow`
@@ -889,9 +890,11 @@ leave a shared view — add a unix test for this alongside the Windows work.
   hardware faults suspended from the SIGSEGV/VEH handler) — the §14 lazy-paging primitive, end to
   end. **Separate-module children** are in too (a host-granted `Module` capability + the
   Instantiator's module ops — the "plugin-in-plugin" story, data segments materialized into the
-  carve, lazily for demand children). Remaining nesting work: richer cap pass-through and a
-  non-blocking JIT `instantiate` child — which then unlock §13 cross-domain `SharedRegion` and the
-  isolation tiers.
+  carve, lazily for demand children), and **cross-domain `SharedRegion` `create`/`grant`** (a guest
+  mints a region via its `AddressSpace` and grants it into a coroutine child — zero-copy shared
+  bytes across the domain boundary, both directions). Remaining nesting work: grant to
+  executor/JIT children, richer cap pass-through, and a non-blocking JIT `instantiate` child;
+  then the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
   `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
@@ -1162,10 +1165,23 @@ The current frontier, roughly ranked:
    generic dispatch on a Module handle is an inert `CapFault`) — and the foreign module is compiled
    at `instantiate` ("nesting cost paid at setup"). Covered by `separate_module.rs` (interp) +
    `jit_separate_module.rs` (differential incl. the lazy-segment fault address byte-exact).
-   **Remaining:** (1) richer cap pass-through (the JIT child's powerbox holds only its Yielder; a JIT
-   child using fibers/threads is `Unsupported`); (2) a non-blocking JIT `instantiate` child ("park
-   only the calling fiber" — today synchronous; coroutines already interleave cooperatively); then
-   cross-domain `SharedRegion` `create`/`grant`.
+   *Also landed: **cross-domain `SharedRegion` `create`/`grant`*** — the zero-copy parent↔child data
+   plane. `create_region(len)` (**`AddressSpace` op 5**) mints a guest-owned region (backing from the
+   embedder's factory — `Host::set_region_factory(svm_run::new_shared_region)` under the JIT, so a
+   JIT guest can `map` what it mints, proven by the minted-region alias differential; 256 MiB
+   per-region anti-bomb cap, §15 quotas later). `grant(coro_child)` (**`SharedRegion` op 4**, eval-loop
+   serviced) installs the *same* backing into a suspended coroutine child's powerbox and returns the
+   child-side handle, which the parent delivers via the next `resume` value; the child `map`s the
+   region into its own window and parent/child share bytes with **no copies** (both directions
+   tested). Landing it forced the right coordinate model: the whole **`GuestMem` surface is
+   guest-relative** (the zero-based window the guest sees; `Mem` translates to its backing) and
+   `AddressSpace`/`Instantiator` bindings record **holder-relative** ranges (translated to
+   backing-absolute via the holder's window base at use) — so every capability now composes at any
+   nesting depth, not just the ones that pre-shifted. Covered by `region_grant.rs`.
+   **Remaining:** (1) `grant` to executor (`instantiate`) children and to **JIT** children (the JIT
+   child's powerbox is a baked thunk holding only its Yielder; a JIT child using fibers/threads is
+   `Unsupported`); (2) richer cap pass-through; (3) a non-blocking JIT `instantiate` child ("park
+   only the calling fiber" — today synchronous; coroutines already interleave cooperatively).
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.
