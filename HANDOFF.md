@@ -181,7 +181,7 @@ dispatches to `codegen_ir` (see `cc1()` in `main.c`, where the wiring lives). Bu
 `make -C frontend/chibicc` (needs `make` + a C compiler; both present in CI). Build
 artifacts (`*.o`, the `chibicc` binary) are git-ignored.
 
-### Test harness (`crates/svm/tests/c_frontend.rs`, 64 tests, two tiers)
+### Test harness (`crates/svm/tests/c_frontend.rs`, 67 tests, two tiers)
 `make`s the fork once, compiles each C snippet to IR, **verifies it**, then:
 - **Tier 1 (all tests):** runs `main` (function 0 = `_start`) on **both the interpreter
   and the JIT** under identical mock powerboxes and asserts they agree on result, trap,
@@ -1106,18 +1106,62 @@ regressions one commit old"):
 
 ### Suggested next pickups (ranked)
 
-*(Everything previously ranked here is **done** — Phases 1–3.5, §12 concurrency + its cross-platform
-port, and the concurrency escape-TCB hardening. Git history has the build-log; §10 is the live
-tracker and §9 the honest-compliance view.)*
+> **▶ START HERE (next session) — current frontier as of the 2026-06-10 batch.** Everything below
+> this block is the **build log** (history of landed work, kept for context); this block is the live
+> "what's next."
+>
+> **How to work** (unchanged): commit straight to `main`; gate every commit with
+> `cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --workspace` (all green),
+> the **windows cross-check** (`cargo check -p svm-jit -p svm-run --target x86_64-pc-windows-gnu`),
+> and — when touching the futex/thread runtime — the **loom** model check
+> (`RUSTFLAGS="--cfg loom" cargo test -p svm-jit --lib loom`). The container can reset mid-session →
+> recover with `git fetch origin main && git reset --hard origin/main`. Push to `main`, keep branch
+> `claude/hopeful-franklin-66kiL` force-synced. **Never** push `.github/workflows/*` (no `workflow`
+> token scope). Key design artifacts: **`AUDIT.md`** (security audit register — all 8 findings closed),
+> **`SCHEDULING.md`** + **DESIGN D56/D57** (the concurrency-primitives decision), **`DESIGN.md`** /
+> **`README.md`**.
+>
+> **Just landed (this batch):** (a) a **security + correctness audit** of the escape-TCB — verdict
+> *sound*; all 8 findings fixed (`AUDIT.md`). (b) The **concurrency-validation track**: D57 +
+> `SCHEDULING.md` (two primitives — vCPU + fiber; "stackless tasks" add none; stackful work-stealing
+> via *migratable fibers* is **Proposed**), plus two guest-built M:N scheduler demos —
+> `demos/mn_sched` (sharded, stackful) and `demos/work_stealing` (work-stealing, stackless) — both
+> differentially proven. (c) **The async I/O ring (B), increment 1** — the `IoRing` capability + batched
+> deferred cap.calls (`io_ring.rs`).
+>
+> **Immediate frontier, ranked:**
+> 1. **Finish the async I/O ring (B)** — *increment 2:* a bounded host **offload pool** that overlaps
+>    submissions on K threads (the §12 "0 blocked OS threads" win; needs a thread-safe async op +
+>    Host-concurrency care — the mock Host isn't built for concurrent dispatch). *increment 3:* wire the
+>    ring into `demos/work_stealing`'s scheduler → the full "submit, park, run another, resume on
+>    completion" async runtime (DESIGN §12). This is the in-flight thread.
+> 2. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
+>    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
+>    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
+>    proves (aggregates via memory; hard-error on vectors/unsupported intrinsics), with a differential
+>    harness running the existing C demos through *stock LLVM* and matching native `clang`.
+> 3. **Migratable-fiber primitive (D57)** — the maintainer's stated ideal (stackful work-stealing).
+>    Feasible (Go is the proof) but re-accepts D56's cross-thread-migration unsafe as a *primitive*
+>    (guest owns the stealing policy; VM enforces single-owner). **Gated on a loom-verified ownership
+>    protocol + expert review.** Design + roadmap in `SCHEDULING.md`. Best done *after* B (which informs
+>    the suspend/wake protocol the fiber must support).
+> 4. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); fiber/vCPU
+>    quota *metering* (§15; the kill path exists, quotas don't); a **thread-safe guest `malloc`** (the
+>    MVP bump allocator races under threads — surfaced by `demos/mn_sched`); DPOR for `explore_all`.
+> 5. **Maintainer one-liners** (need the `workflow` token scope I can't push): apply the nightly **miri**
+>    CI job (snippet at commit `60d4f3a`); drop `continue-on-error` from the now-green `cross-os` matrix.
 
-The current frontier, roughly ranked:
-1. **Apply the nightly `miri` CI job** — a one-line maintainer task (needs the `workflow` token scope;
-   snippet in the session for commit `60d4f3a`). Makes the `svm-mem` provenance/data-race check
-   continuous rather than a one-off local run.
-2. **Honor weak memory orderings in execution** (§12) — both backends run seq-cst today; the C11
-   `order` field is carried + verified but not yet weaker-honored. Needs a backend that supports it
-   and the concurrent-oracle story for it.
-3. **Nesting / the §14 Instantiator** — the big §1a differentiator: power-of-two sub-window grants +
+---
+
+#### Build log (landed) — history & rationale
+
+*(Everything below is **done** — Phases 1–3.5, §12 concurrency + its cross-platform port, the
+concurrency escape-TCB hardening, the §14 nesting cluster, the §5 kill-path, the security audit, the
+M:N demos, and async-ring increment 1. §10 is the live tracker; §9 the honest-compliance view.)*
+
+The build log, roughly in landing order:
+
+**Nesting / the §14 Instantiator** — the big §1a differentiator: power-of-two sub-window grants +
    attenuated caps + quota, which then unlocks **cross-domain `SharedRegion` `create`/`grant`** (§13)
    and the isolation tiers. Most of the remaining §1a edges live here. *Foundation landed:*
    `svm_mask::Window::sub` (the masking unit, fuzzed) plus a **fully-confined sub-window run path on
