@@ -137,9 +137,18 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 #define EXIT_SLOT 8
 #define MEMORY_SLOT 12
 #define ADDRSPACE_SLOT 16
-// The reserved region's size: 5 handle slots, 16-aligned. Globals start here so no data segment
-// ever overlaps a stashed handle (a collision corrupts a global, e.g. a pthread mutex).
+// §9/§12 async I/O ring: the IoRing + Blocking handles, granted only to a program that uses the ring
+// builtins (`__vm_io_*`); `_start` then takes 7 handles instead of 5 (see `emit_start`).
+#define IORING_SLOT 20
+#define BLOCKING_SLOT 24
+// The reserved region's size: up to 7 handle slots (0..28), 16-aligned. Globals start here so no data
+// segment ever overlaps a stashed handle (a collision corrupts a global, e.g. a pthread mutex).
 #define RESERVED_BYTES 32
+
+// Set when the program calls an async-ring builtin (`__vm_io_submit_async`/`__vm_io_reap`/
+// `__vm_blocking_handle`); makes `_start` take the extra IoRing + Blocking powerbox handles, so a
+// program that doesn't use the ring keeps the 5-handle entry (and its harness) unchanged.
+static int uses_io_ring;
 
 // Globals + string literals live at fixed window offsets in the data region [RESERVED_BYTES,
 // data_end); the data stack starts at data_end (main's initial data-SP, baked into `_start`).
@@ -781,6 +790,46 @@ static int gen_builtin_page_size(Node *node) {
   return r;
 }
 
+// §9/§12 async I/O ring builtins (iface 9). `__vm_io_submit_async(sq, n, counter)` lowers to
+// `cap.call 9 1`: kick `n` deferred ops (64-byte SQEs at `sq`, each a `Blocking.work`) onto the host
+// offload pool and **return immediately** with the count submitted. `__vm_io_reap(cq, max)` lowers to
+// `cap.call 9 2`: pop up to `max` ready completions into 32-byte CQEs at `cq`. The guest parks on the
+// in-window completion `counter` (an `i32`) between rounds via `__vm_wait32` — an I/O completion is a
+// futex notify (§12): a pool worker bumps the counter and wakes the parked vCPU. Both are on the
+// stashed IoRing handle.
+static int gen_builtin_io_submit_async(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || a->next->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_io_submit_async(sq, n, counter) expects 3 arguments");
+  int sq = widen_i64(gen_expr(a), a->ty);
+  int n = widen_i64(gen_expr(a->next), a->next->ty);
+  int ctr = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int h = load_handle(IORING_SLOT);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 9 1 (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r, h, sq, n, ctr);
+  return r;
+}
+
+static int gen_builtin_io_reap(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_io_reap(cq, max) expects 2 arguments");
+  int cq = widen_i64(gen_expr(a), a->ty);
+  int mx = widen_i64(gen_expr(a->next), a->next->ty);
+  int h = load_handle(IORING_SLOT);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 9 2 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, cq, mx);
+  return r;
+}
+
+// `__vm_blocking_handle()` returns the stashed Blocking capability handle (an `i32`) so the guest can
+// name it in an SQE's `handle` field when building a `Blocking.work` request.
+static int gen_builtin_blocking_handle(Node *node) {
+  if (node->args)
+    error_tok(node->tok, "codegen_ir: __vm_blocking_handle() takes no arguments");
+  return load_handle(BLOCKING_SLOT);
+}
+
 // §13/§14 SharedRegion builtins — guest-minted shareable memory + multi-offset window
 // aliasing (the magic ring buffer), over the granted AddressSpace/region capabilities:
 //
@@ -1195,6 +1244,12 @@ static int gen_expr(Node *node) {
           return gen_builtin_wait32(node);
         if (!strcmp(fname, "__vm_notify"))
           return gen_builtin_notify(node);
+        if (!strcmp(fname, "__vm_io_submit_async"))
+          return gen_builtin_io_submit_async(node);
+        if (!strcmp(fname, "__vm_io_reap"))
+          return gen_builtin_io_reap(node);
+        if (!strcmp(fname, "__vm_blocking_handle"))
+          return gen_builtin_blocking_handle(node);
       }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the
@@ -2031,17 +2086,44 @@ static void emit_data_segments(Obj *prog) {
 // the initial data-SP (= data_end). Global data is now placed by module-level `data` segments
 // (§3a, see `emit_data_segments`), not written here. The runtime invokes this with the granted
 // handles `(stdout, stdin, exit)` as i32 arguments.
+// Does any node in this subtree call an async-ring builtin? (Walks the AST so `_start` knows whether
+// to take the extra IoRing + Blocking powerbox handles.) Recurses every child link incl. sibling
+// `->next` chains (statement/arg lists); redundant revisits are harmless for a boolean scan.
+static bool node_uses_io_ring(Node *n) {
+  if (!n)
+    return false;
+  if (n->kind == ND_FUNCALL && n->lhs && n->lhs->kind == ND_VAR && n->lhs->var &&
+      n->lhs->var->name &&
+      (!strcmp(n->lhs->var->name, "__vm_io_submit_async") ||
+       !strcmp(n->lhs->var->name, "__vm_io_reap") ||
+       !strcmp(n->lhs->var->name, "__vm_blocking_handle")))
+    return true;
+  return node_uses_io_ring(n->lhs) || node_uses_io_ring(n->rhs) || node_uses_io_ring(n->cond) ||
+         node_uses_io_ring(n->then) || node_uses_io_ring(n->els) || node_uses_io_ring(n->init) ||
+         node_uses_io_ring(n->inc) || node_uses_io_ring(n->body) || node_uses_io_ring(n->args) ||
+         node_uses_io_ring(n->next);
+}
+
 static void emit_start(Obj *main_fn) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
-  fprintf(o, "func (i32, i32, i32, i32, i32) -> (%s) {\n", is_void ? "" : irty(mret));
-  // stdout, stdin, exit, memory, addrspace (§14)
-  fprintf(o, "block0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32):\n");
-  nv = 5;
+  // 5 powerbox handles by default; +2 (IoRing, Blocking) when the program uses the async ring.
+  int nh = uses_io_ring ? 7 : 5;
+  int slots[7] = {STDOUT_SLOT, STDIN_SLOT,   EXIT_SLOT,    MEMORY_SLOT,
+                  ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT};
+  fprintf(o, "func (");
+  for (int i = 0; i < nh; i++)
+    fprintf(o, "%si32", i ? ", " : "");
+  fprintf(o, ") -> (%s) {\n", is_void ? "" : irty(mret));
+  // stdout, stdin, exit, memory, addrspace (§14)[, ioring, blocking (§9/§12)]
+  fprintf(o, "block0(");
+  for (int i = 0; i < nh; i++)
+    fprintf(o, "%sv%d: i32", i ? ", " : "", i);
+  fprintf(o, "):\n");
+  nv = nh;
   // Stash each handle in its reserved slot so the builtins can load it.
-  int slots[5] = {STDOUT_SLOT, STDIN_SLOT, EXIT_SLOT, MEMORY_SLOT, ADDRSPACE_SLOT};
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < nh; i++) {
     int a = nv++;
     fprintf(o, "  v%d = i64.const %d\n", a, slots[i]);
     fprintf(o, "  i32.store v%d v%d\n", a, i);
@@ -2102,6 +2184,12 @@ void codegen_ir(Obj *prog, FILE *out) {
       wlog2++;
     fprintf(o, "memory %d\n\n", wlog2);
   }
+
+  // Detect async-ring use so `_start` grants the extra IoRing + Blocking handles (only then).
+  uses_io_ring = 0;
+  for (int i = 0; i < nfuncs && !uses_io_ring; i++)
+    if (node_uses_io_ring(funcs[i]->body))
+      uses_io_ring = 1;
 
   // Global initializers become module-level `data` segments (§3a), placed by the runtime.
   emit_data_segments(prog);

@@ -2130,3 +2130,88 @@ fn c_guest_work_stealing_demo() {
         "the guest work-stealing scheduler must total 16*16 = 256 on both backends"
     );
 }
+
+/// §9/§12 increment 3c — the async **event-loop runtime** in real C (`demos/async_io`). One vCPU
+/// `submit_async`s a batch of `Blocking` ops onto the host offload pool, then parks on an in-window
+/// completion **counter** (`__vm_wait32`) and reaps completions as the pool delivers them — the
+/// "submit, park, run another, resume on completion" loop, with the parked vCPU woken by a pool
+/// worker's `notify` (an I/O completion is a futex notify, DESIGN §12). The printed total — the sum of
+/// the host's deterministic per-op results — is completion-order-invariant, so the interpreter (its
+/// `Scheduler::notify` wake hook, installed by `drive`) and the JIT (its per-run `Domain` futex, wired
+/// via `svm_run::HostAsyncHooks`) must agree. This exercises the new `codegen_ir.c` ring builtins
+/// (`__vm_io_submit_async`/`__vm_io_reap`/`__vm_blocking_handle`) + the 7-handle powerbox end to end.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_async_io_runtime() {
+    use std::time::Duration;
+    let src = include_str!("../../svm-run/demos/async_io/async_io.c");
+    let ir = c_to_ir(src);
+    let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}\n{ir}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{ir}"));
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+
+    // Each `Blocking.work(i)` returns `mix(i)` after a ~10 ms block, so the batch is genuinely in
+    // flight on the pool when the vCPU parks. `NTASKS = 8` (see the demo) over a 4-thread pool ⇒ two
+    // waves, so the event loop parks/resumes more than once.
+    const NTASKS: i64 = 8;
+    fn mix(arg: i64) -> i64 {
+        arg.wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
+    }
+    let expected_total: u64 = (0..NTASKS).fold(0u64, |a, i| a.wrapping_add(mix(i) as u64));
+    let expected = format!("{expected_total}\n").into_bytes();
+
+    // The async powerbox: the usual 5 handles + IoRing + Blocking, granted in the order `_start`
+    // stashes them. Granted identically on both hosts (deterministic), with a 10 ms block duration.
+    let grant = |h: &mut Host| {
+        h.set_region_factory(svm_run::new_shared_region);
+        [
+            Value::I32(h.grant_stream(StreamRole::Out)),
+            Value::I32(h.grant_stream(StreamRole::In)),
+            Value::I32(h.grant_exit()),
+            Value::I32(h.grant_memory()),
+            Value::I32(h.grant_address_space(0, win)),
+            Value::I32(h.grant_io_ring()),
+            Value::I32(h.grant_blocking(Duration::from_millis(10), None)),
+        ]
+    };
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let args = grant(&mut hi);
+    assert_eq!(args, grant(&mut hj), "grants are deterministic");
+
+    // Interp: `run_with_host` drives the M:N executor (installing the `Scheduler::notify` wake hook).
+    let mut fuel = 200_000_000u64;
+    let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi).expect("interp ran ok");
+    assert_eq!(interp, vec![Value::I32(0)], "demo returns 0");
+
+    // JIT: the async entry installs the run's `Domain` futex as the wake hook via `HostAsyncHooks`.
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let init = vec![0u8; win as usize];
+    // SAFETY: `hj` is the live cap-ctx Host for this run and outlives it.
+    let hooks = unsafe { svm_run::HostAsyncHooks::new(&mut hj as *mut Host) };
+    let (jit, _jmem) = svm_jit::compile_and_run_capture_reserved_with_host_async(
+        &m,
+        0,
+        &slots,
+        &init,
+        0,
+        cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+        &hooks,
+    )
+    .expect("jit ran");
+    assert!(
+        matches!(jit, JitOutcome::Returned(ref s) if s == &[0]),
+        "jit demo returns 0: {jit:?}"
+    );
+
+    assert_eq!(
+        hi.stdout, expected,
+        "interp total must be Σ mix(i) for i in 0..8"
+    );
+    assert_eq!(
+        hj.stdout, expected,
+        "jit total must be Σ mix(i) for i in 0..8"
+    );
+}
