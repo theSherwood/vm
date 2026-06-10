@@ -1192,8 +1192,21 @@ The current frontier, roughly ranked:
    fibers/threads is `Unsupported`); (2) richer cap pass-through; (3) a non-blocking JIT `instantiate`
    child ("park only the calling fiber" — today synchronous; coroutines already interleave
    cooperatively).
+   *Also landed: the §5 **fuel/epoch kill-path on the JIT***. The interpreter has always bounded a
+   runaway guest via its per-step fuel counter; the JIT now matches it — the lowering polls a
+   host-owned interrupt cell (`AtomicU64`) at every loop back-edge **and** function entry (so both
+   infinite loops *and* unbounded tail recursion are caught) and traps `OutOfFuel` the moment the
+   host sets it. It's **opt-in + guest-undisableable**: armed via
+   `compile_and_run_with_host_interruptible` (un-armed compiles are byte-identical — `epoch_addr == 0`
+   ⇒ no checks emitted, so the whole differential is unchanged), the guest can't turn the poll off,
+   and `svm-run` exposes it on the CLI via `SVM_DEADLINE_MS` (a watchdog thread that wakes early when
+   the run finishes, so fast programs aren't delayed). Differentially tested in `jit_killpath.rs`
+   (infinite loop, infinite tail recursion → both backends `OutOfFuel`; armed-finite + unarmed runs
+   complete normally). **Remaining:** thread the *same* interrupt cell to sibling vCPUs so one timer
+   kills a whole multi-threaded domain at once (today each top-level run carries its own), and JIT
+   children (compile with `epoch_addr = 0` for now — the parent bounds them).
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
-   the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
+   extending the kill-path to sibling vCPUs / JIT children, and DPOR to scale `explore_all` past
    lock-free shapes.
 5. **Language on-ramp** (§14/D54) — the LLVM-bitcode→IR translator (breadth, the differentiator
    vehicle) and/or an optional wasm→IR bridge (compat).

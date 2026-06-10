@@ -76,6 +76,11 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > libc exposes `<svm.h>` (`__vm_region_create`/`map`/`unmap`/`page_size`), so a stock C guest mints a
 > region and maps it at two adjacent offsets to build the **magic ring buffer** (a single
 > wrap-around access becomes one contiguous store) — verified end to end on both backends.
+> The §5 **fuel/epoch kill-path** now exists on *both* backends: the interpreter bounds execution
+> with its per-step fuel counter, and the JIT polls a host-owned interrupt cell at loop back-edges
+> and function entries, so a host watchdog stops a **runaway guest** (infinite loop / unbounded
+> recursion) with `OutOfFuel` instead of hanging — guest-undisableable, and exposed on the CLI via
+> `SVM_DEADLINE_MS`.
 > Still ahead:
 > narrow-scalar promotion, the async I/O ring, a
 > guest M:N runtime, SIMD, isolation tiers, and capability extras.

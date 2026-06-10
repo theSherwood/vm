@@ -930,13 +930,45 @@ pub fn run_powerbox(module: &Module, stdin: &[u8]) -> Result<Run, String> {
         let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         slots.push(host.grant_address_space(0, win) as i64);
     }
-    let jit = compile_and_run_with_host(
-        module,
-        0,
-        &slots,
-        cap_thunk,
-        &mut host as *mut Host as *mut c_void,
-    )
+    let ctx = &mut host as *mut Host as *mut c_void;
+    // §5 fuel/epoch kill-path: if `SVM_DEADLINE_MS` is set, arm the JIT's interrupt poll with a
+    // watchdog so a runaway guest (infinite loop / unbounded recursion) is stopped after the
+    // deadline instead of hanging the process. Unset ⇒ the ordinary unbounded run (default
+    // behaviour preserved). The watchdog wakes early when the run finishes, so a fast program is
+    // never delayed.
+    let deadline_ms = std::env::var("SVM_DEADLINE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&ms| ms > 0);
+    let jit = if let Some(ms) = deadline_ms {
+        let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let wd = interrupt.clone();
+        let watchdog = std::thread::spawn(move || {
+            // Timed out (or the run dropped the sender) ⇒ request the kill.
+            if done_rx
+                .recv_timeout(std::time::Duration::from_millis(ms))
+                .is_err()
+            {
+                wd.store(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        // SAFETY: `interrupt` (an `Arc<AtomicU64>`) outlives the run — it is dropped only after the
+        // watchdog is joined below; `cap_thunk`/`ctx` honour the `CapThunk` contract.
+        let r = svm_jit::compile_and_run_with_host_interruptible(
+            module,
+            0,
+            &slots,
+            cap_thunk,
+            ctx,
+            std::sync::Arc::as_ptr(&interrupt),
+        );
+        let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
+        let _ = watchdog.join();
+        r
+    } else {
+        compile_and_run_with_host(module, 0, &slots, cap_thunk, ctx)
+    }
     .map_err(|e| format!("JIT compile failed: {e:?}"))?;
 
     let outcome = match jit {

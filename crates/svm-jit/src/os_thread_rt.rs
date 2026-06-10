@@ -14,8 +14,12 @@
 //!
 //! Detect-and-kill (§5): a guest memory fault on any vCPU `siglongjmp`s out of that thread's guarded
 //! call; the thread records the trap in its completion cell + the shared trap cell, and the joiner
-//! propagates it. (Forcibly preempting *sibling* OS threads on a trap — the runaway-guest kill path —
-//! rides on the future fuel/epoch timer, §12; for now a trapped domain is torn down at join/end.)
+//! propagates it. The **fuel/epoch kill-path** for a *runaway* (non-faulting) guest now exists: the
+//! lowering polls a host-owned interrupt cell at loop back-edges + function entries and traps
+//! `OutOfFuel` when the host sets it (see `compile_and_run_with_host_interruptible` / `emit_epoch_check`).
+//! A single-threaded run is fully covered; threading the same cell to *sibling* vCPUs so one timer
+//! kills the whole domain at once is the remaining follow-up (today each top-level run carries it,
+//! and a trapped domain is still torn down at join/end).
 
 use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime};
 use crate::{mem, FnEntry, TrapKind};

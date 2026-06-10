@@ -55,6 +55,7 @@
 //! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
 //! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
 
+use core::sync::atomic::AtomicU64;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F64, I16, I32, I64, I8};
 use cranelift_codegen::ir::{
@@ -222,6 +223,11 @@ pub enum TrapKind {
     /// Forged / out-of-range / already-joined thread handle, or a thread-bomb (§12). Matches
     /// `Trap::ThreadFault`.
     ThreadFault = 10,
+    /// The host **interrupted** a runaway guest (§5 the fuel/epoch kill-path): a non-terminating
+    /// guest is stopped because the host set the interrupt cell (e.g. a watchdog timer). The
+    /// lowering polls that cell at loop back-edges and function entries and traps here. Matches the
+    /// interpreter's `Trap::OutOfFuel` — both report "the host bounded this run".
+    OutOfFuel = 11,
 }
 
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
@@ -240,6 +246,7 @@ impl TrapKind {
             8 => TrapKind::MemoryFault,
             9 => TrapKind::FiberFault,
             10 => TrapKind::ThreadFault,
+            11 => TrapKind::OutOfFuel,
             _ => return None,
         })
     }
@@ -382,6 +389,42 @@ pub fn compile_and_run_with_host(
         None,
         None,
         None,
+        None, // no kill-path armed (use `_interruptible` to arm one)
+    )?
+    .0)
+}
+
+/// Like [`compile_and_run_with_host`], but **arm the §5 fuel/epoch kill-path**: the lowering polls
+/// `*interrupt` at every loop back-edge and function entry, and traps [`TrapKind::OutOfFuel`] as
+/// soon as the host stores a non-zero value there. This is how a host bounds a *runaway* JIT guest
+/// (an infinite loop / unbounded recursion) — the interpreter has always had this via its fuel
+/// counter; this gives the production backend the matching, **guest-undisableable** kill-path
+/// (DESIGN §5 / preemption). The caller owns `interrupt` (typically an `Arc<AtomicU64>`) and sets it
+/// from a watchdog timer, a cross-domain preemption, a signal handler, etc.
+///
+/// # Safety
+/// `interrupt` must point at a live `AtomicU64` that outlives the call; `cap_thunk`/`cap_ctx` must
+/// stay valid for the call and honour the [`CapThunk`] contract.
+pub fn compile_and_run_with_host_interruptible(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    interrupt: *const AtomicU64,
+) -> Result<JitOutcome, JitError> {
+    Ok(run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        None,
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        Some(interrupt),
     )?
     .0)
 }
@@ -426,6 +469,7 @@ pub fn compile_and_run_capture_reserved(
         None,
         None,
         None,
+        None, // no kill-path armed
     )
 }
 
@@ -457,6 +501,7 @@ pub fn compile_and_run_capture_sub(
         None,
         Some(SubWindow { base, parent_bytes }),
         None,
+        None, // no kill-path armed
     )
 }
 
@@ -521,6 +566,7 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
         Some(SNAP_CAP),
         None,
         resolve_module,
+        None, // no kill-path armed (the differential oracle runs to completion)
     )
 }
 
@@ -547,8 +593,14 @@ fn run_inner(
     snapshot_cap: Option<usize>,
     sub: Option<SubWindow>,
     resolve_module: Option<ModuleResolver>,
+    interrupt: Option<*const AtomicU64>,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
+    // §5 fuel/epoch kill-path: the address of the host-owned interrupt cell the lowering polls at
+    // loop back-edges + function entries. `0` when the caller armed no kill-path (then no checks are
+    // emitted — guest code is byte-identical to before). The cell must outlive the run; the caller
+    // owns it (e.g. an `Arc<AtomicU64>` a watchdog thread sets), so the baked address stays valid.
+    let epoch_addr = interrupt.map_or(0, |p| p as i64);
     // Calls can reach any function, so every function must be lowerable.
     for f in &m.funcs {
         ensure_supported(f)?;
@@ -791,6 +843,7 @@ fn run_inner(
             mask,
             cap_mapped,
             sub_base,
+            epoch_addr,
         )?;
         module
             .define_function(*id, &mut ctx)
@@ -1155,6 +1208,7 @@ fn compile_child(
             mask,
             child_size, // the child is fully mapped (reserved == mapped == size)
             0,          // top-level confinement over the child's own window
+            0, // §5 kill-path not yet wired for JIT children (follow-up; parent bounds them)
         )?;
         module
             .define_function(*id, &mut ctx)
@@ -1436,6 +1490,13 @@ struct Lower<'a> {
     /// The §14 nesting runtime + thunk addresses for `Instantiator` `cap.call` lowering (`null` ⇒
     /// `Instantiator` cap.calls take the ordinary `cap.call` path — an inert `CapFault`).
     inst: InstEnv,
+    /// Address of the host-owned **interrupt cell** (`AtomicU64`) for the §5 fuel/epoch kill-path.
+    /// `0` ⇒ no kill-path is armed for this compile (the checks are not emitted — guest code is
+    /// byte-identical to the un-armed build). When non-zero, the lowering polls `*epoch_addr` at
+    /// loop back-edges and function entries and traps [`TrapKind::OutOfFuel`] if the host has set it
+    /// non-zero, so a non-terminating guest is stopped. The guest cannot disable the poll — only the
+    /// host (who chose to arm it) writes the cell.
+    epoch_addr: i64,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
     /// Distinct module signatures, for `call_indirect` type ids.
@@ -1459,6 +1520,7 @@ fn build_clif(
     mask: u64,
     mapped: u64,
     sub_base: u64,
+    epoch_addr: i64,
 ) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
@@ -1510,16 +1572,20 @@ fn build_clif(
         fiber,
         thread,
         inst,
+        epoch_addr,
         ids,
         distinct,
     };
 
     // Jump into IR block 0 passing the function parameters (entry params after the
-    // three context pointers).
+    // three context pointers). A §5 kill-path check guards the *entry* (caught before any work):
+    // this is what stops unbounded recursion and tail-call loops — each (re-)entry polls the
+    // interrupt cell. Intra-function loops are caught by the per-back-edge check in `lower_block`.
     let entry_args: Vec<BlockArg> = b.block_params(entry)[3..]
         .iter()
         .map(|v| BlockArg::from(*v))
         .collect();
+    emit_epoch_check(&mut b, &lower);
     b.ins().jump(blocks[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
@@ -2127,6 +2193,9 @@ fn lower_block(
         Terminator::Br { target, args } => {
             let ba = map_args(&vals, args)?;
             let t = *blocks.get(*target as usize).ok_or(JitError::Malformed)?;
+            // §5 kill-path: poll the interrupt cell before taking any branch — every loop body ends
+            // in one of these terminators, so this bounds a non-terminating intra-function loop.
+            emit_epoch_check(b, lower);
             b.ins().jump(t, &ba);
         }
         Terminator::BrIf {
@@ -2141,6 +2210,7 @@ fn lower_block(
             let ea = map_args(&vals, else_args)?;
             let tb = *blocks.get(*then_blk as usize).ok_or(JitError::Malformed)?;
             let eb = *blocks.get(*else_blk as usize).ok_or(JitError::Malformed)?;
+            emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
             b.ins().brif(c, tb, &ta, eb, &ea);
         }
         Terminator::BrTable {
@@ -2149,8 +2219,9 @@ fn lower_block(
             default,
         } => {
             let index = get(&vals, *idx)?;
-            // Build a BlockCall (target block + its edge args) for each table entry
-            // and the default; Cranelift masks the index and selects, default on OOB.
+            emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
+                                        // Build a BlockCall (target block + its edge args) for each table entry
+                                        // and the default; Cranelift masks the index and selects, default on OOB.
             let mut entries = Vec::with_capacity(targets.len());
             for (t, args) in targets {
                 let ba = map_args(&vals, args)?;
@@ -2226,6 +2297,33 @@ fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
     b.ins().store(MemFlags::trusted(), code, cell, 0);
     let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
     b.ins().return_(&zeros);
+}
+
+/// Emit the §5 fuel/epoch **kill-path** check: if the host has set the interrupt cell non-zero
+/// (a watchdog timer, a cross-domain preemption, …), trap [`TrapKind::OutOfFuel`]; otherwise fall
+/// through. A no-op when no kill-path is armed (`epoch_addr == 0`) — then the guest code is emitted
+/// exactly as before. Placed at function entry and every loop back-edge, so any non-terminating
+/// guest polls the cell within a bounded number of steps and is stopped — the guest can't disable
+/// the poll (only the host writes the cell). The load is **not** `readonly`, so it is re-evaluated
+/// each iteration (never hoisted out of the loop); it never faults (a host-owned aligned cell).
+///
+/// On return the builder is positioned at a fresh continuation block (the not-interrupted path);
+/// the caller emits the real terminator / jump there.
+fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
+    if lower.epoch_addr == 0 {
+        return; // no kill-path armed for this compile — emit nothing
+    }
+    let cont = b.create_block();
+    let trap_blk = b.create_block();
+    let addr = b.ins().iconst(I64, lower.epoch_addr);
+    // notrap + aligned, but *not* readonly: the host may store into it concurrently, so the value
+    // must be reloaded at every check rather than CSE'd / hoisted.
+    let flag = b.ins().load(I64, MemFlags::trusted(), addr, 0);
+    b.ins().brif(flag, trap_blk, &[], cont, &[]);
+    b.switch_to_block(trap_blk);
+    emit_trap(b, lower, TrapKind::OutOfFuel);
+    b.switch_to_block(cont);
+    // `cont`/`trap_blk` are sealed by the caller's `seal_all_blocks`.
 }
 
 /// A zero constant of CLIF type `t` (for a trapping path's dummy return).
