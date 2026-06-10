@@ -1202,12 +1202,15 @@ The current frontier, roughly ranked:
    and `svm-run` exposes it on the CLI via `SVM_DEADLINE_MS` (a watchdog thread that wakes early when
    the run finishes, so fast programs aren't delayed). Differentially tested in `jit_killpath.rs`
    (infinite loop, infinite tail recursion → both backends `OutOfFuel`; armed-finite + unarmed runs
-   complete normally). **Remaining:** thread the *same* interrupt cell to sibling vCPUs so one timer
-   kills a whole multi-threaded domain at once (today each top-level run carries its own), and JIT
-   children (compile with `epoch_addr = 0` for now — the parent bounds them).
+   complete normally). The kill now covers a **whole multithreaded domain**: every vCPU runs the same
+   finalized code, so a *spinning* sibling polls the one baked cell on its own; a *parked* sibling
+   (blocked in a futex `wait` or `thread.join`) re-checks the cell on a bounded interval
+   (`KILL_RECHECK = 20 ms`, real-build only — the loom futex model is untouched) so it wakes and
+   unwinds too, and `join_all` never hangs on it. Tested in `jit_killpath_threads.rs` (spinning
+   sibling + a sibling parked in an *infinite* futex wait → both killed). **Remaining:** the kill-path
+   for **JIT children** (compiled with `epoch_addr = 0` for now — the parent bounds them).
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
-   extending the kill-path to sibling vCPUs / JIT children, and DPOR to scale `explore_all` past
-   lock-free shapes.
+   the kill-path for JIT children, and DPOR to scale `explore_all` past lock-free shapes.
 5. **Language on-ramp** (§14/D54) — the LLVM-bitcode→IR translator (breadth, the differentiator
    vehicle) and/or an optional wasm→IR bridge (compat).
 

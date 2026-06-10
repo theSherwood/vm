@@ -80,7 +80,8 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > with its per-step fuel counter, and the JIT polls a host-owned interrupt cell at loop back-edges
 > and function entries, so a host watchdog stops a **runaway guest** (infinite loop / unbounded
 > recursion) with `OutOfFuel` instead of hanging — guest-undisableable, and exposed on the CLI via
-> `SVM_DEADLINE_MS`.
+> `SVM_DEADLINE_MS`. It kills a **whole multithreaded domain** from one interrupt: spinning vCPUs
+> poll the shared cell, and a vCPU parked in a futex `wait`/`join` re-checks it and unwinds too.
 > Still ahead:
 > narrow-scalar promotion, the async I/O ring, a
 > guest M:N runtime, SIMD, isolation tiers, and capability extras.

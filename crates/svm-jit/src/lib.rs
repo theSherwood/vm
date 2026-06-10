@@ -945,6 +945,7 @@ fn run_inner(
             call_tramp.expect("call-trampoline set for a threaded module"),
             window.fault_range(),
             fiber_cfg,
+            epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
         );
     }
 

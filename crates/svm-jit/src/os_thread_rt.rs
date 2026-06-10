@@ -14,16 +14,19 @@
 //!
 //! Detect-and-kill (§5): a guest memory fault on any vCPU `siglongjmp`s out of that thread's guarded
 //! call; the thread records the trap in its completion cell + the shared trap cell, and the joiner
-//! propagates it. The **fuel/epoch kill-path** for a *runaway* (non-faulting) guest now exists: the
-//! lowering polls a host-owned interrupt cell at loop back-edges + function entries and traps
-//! `OutOfFuel` when the host sets it (see `compile_and_run_with_host_interruptible` / `emit_epoch_check`).
-//! A single-threaded run is fully covered; threading the same cell to *sibling* vCPUs so one timer
-//! kills the whole domain at once is the remaining follow-up (today each top-level run carries it,
-//! and a trapped domain is still torn down at join/end).
+//! propagates it. The **fuel/epoch kill-path** for a *runaway* (non-faulting) guest works across the
+//! whole domain: the lowering polls a host-owned interrupt cell at loop back-edges + function entries
+//! and traps `OutOfFuel` when the host sets it (see `compile_and_run_with_host_interruptible` /
+//! `emit_epoch_check`). Because every vCPU runs the same finalized code, a *spinning* sibling polls
+//! that one cell on its own; a *parked* sibling (blocked in a futex `wait` or `thread.join`) re-checks
+//! it on a bounded interval (`KILL_RECHECK`, real-build only) so it wakes and unwinds too — so a
+//! single host interrupt stops the entire multithreaded domain, not just its busy threads, and
+//! `join_all` never hangs on a vCPU that would otherwise wait forever.
 
 use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime};
 use crate::{mem, FnEntry, TrapKind};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // loom swaps the synchronization primitives for its model-checked versions; `Arc` and `JoinHandle`
@@ -45,6 +48,23 @@ const WAIT_TIMED_OUT: i32 = 2;
 /// so a thread-bomb traps (`ThreadFault`) instead of exhausting host memory.
 const MAX_VCPUS: usize = 1 << 16;
 
+/// How often a *parked* vCPU (futex `wait` / `thread.join`) re-checks the §5 kill-path interrupt
+/// cell when the kill-path is armed. A spinning vCPU trips near-instantly (the cell is polled at
+/// every back-edge); this only bounds the extra latency for an otherwise-blocked vCPU to unwind
+/// once the host requests a kill. Real-build only (the loom futex model uses no timeouts and never
+/// arms the kill-path).
+#[cfg(not(loom))]
+const KILL_RECHECK: Duration = Duration::from_millis(20);
+
+/// True iff the kill-path is armed (`addr != 0`) **and** the host has set the interrupt cell — i.e.
+/// a parked vCPU should stop waiting and unwind (its next epoch poll in guest code traps `OutOfFuel`).
+fn epoch_fired(addr: usize) -> bool {
+    // SAFETY: a non-zero `addr` is the run's live interrupt cell (an `AtomicU64`); it outlives every
+    // vCPU (joined before `run_inner` frees it). A relaxed load suffices — we only need eventual
+    // visibility of the host's store, and the kill is idempotent.
+    addr != 0 && unsafe { (*(addr as *const AtomicU64)).load(Ordering::Relaxed) != 0 }
+}
+
 /// Per-run constants every vCPU needs to call guest code — constant for the whole run, copied into
 /// each spawned thread.
 #[derive(Clone, Copy)]
@@ -58,6 +78,11 @@ struct Env {
     /// `(fiber_type_id, fn_table_mask)` when the module mixes fibers + threads — each vCPU then gets
     /// its own `FiberRuntime` for `cont.*`. `None` for pure-thread modules.
     fiber_cfg: Option<(u32, u64)>,
+    /// Address of the §5 kill-path interrupt cell (an `AtomicU64`), or `0` when no kill-path is
+    /// armed. *Spinning* vCPUs already poll it (it is baked into the same compiled code every vCPU
+    /// runs); this lets a **parked** vCPU — blocked in a futex `wait` or `thread.join` — re-check it
+    /// and unwind too, so one host interrupt kills the whole domain rather than only its busy threads.
+    epoch_addr: usize,
 }
 
 // SAFETY: `Env`'s raw pointers refer to the run's shared window / trap cell, valid for the whole run.
@@ -113,6 +138,7 @@ impl Domain {
 
     /// Supply the per-run [`Env`] once the call-trampoline / window addresses are known (post-finalize,
     /// before the run). Called only on the setup thread before any vCPU spawns.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_env(
         &self,
         mem_base: u64,
@@ -121,6 +147,7 @@ impl Domain {
         call_tramp: FiberCallTramp,
         fault: (usize, usize),
         fiber_cfg: Option<(u32, u64)>,
+        epoch_addr: usize,
     ) {
         *lock(&self.env) = Some(Env {
             mem_base,
@@ -130,6 +157,7 @@ impl Domain {
             fault_lo: fault.0,
             fault_hi: fault.1,
             fiber_cfg,
+            epoch_addr,
         });
     }
 
@@ -348,6 +376,10 @@ pub(crate) unsafe extern "C" fn thread_join(
         t.joined[slot] = true;
         std::sync::Arc::clone(&t.cells[slot])
     };
+    // §5 kill-path: a joiner blocked on a sibling must also unwind when the host kills the domain
+    // (else `join_all` hangs on a vCPU that will never finish). When armed, re-check the interrupt
+    // cell periodically; on a kill, return so the caller's next epoch poll traps `OutOfFuel`.
+    let epoch_addr = dom.env().epoch_addr;
     let mut st = lock(&done.state);
     loop {
         if let Some((result, trap)) = *st {
@@ -355,6 +387,18 @@ pub(crate) unsafe extern "C" fn thread_join(
                 *(trap_out as *mut i64) = trap;
             }
             return result;
+        }
+        if epoch_fired(epoch_addr) {
+            return 0; // killed — unwind to guest code, which traps OutOfFuel at its next poll
+        }
+        #[cfg(not(loom))]
+        if epoch_addr != 0 {
+            st = done
+                .cv
+                .wait_timeout(st, KILL_RECHECK)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            continue;
         }
         st = done.cv.wait(st).unwrap_or_else(|e| e.into_inner());
     }
@@ -410,6 +454,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
         phys,
         || read_phys(phys, width) & mask == expected & mask,
         deadline,
+        dom.env().epoch_addr,
     )
 }
 
@@ -432,6 +477,7 @@ fn futex_wait(
     key: u64,
     still_eq: impl Fn() -> bool,
     deadline: Option<Instant>,
+    epoch_addr: usize,
 ) -> i32 {
     let mut g = lock(futex);
     if !still_eq() {
@@ -447,8 +493,22 @@ fn futex_wait(
         if cur != start_gen {
             break WAIT_WOKEN;
         }
+        // §5 kill-path: a parked waiter unwinds when the host kills the domain (it returns as if
+        // woken; the guest code after the wait traps `OutOfFuel` at its next epoch poll).
+        if epoch_fired(epoch_addr) {
+            break WAIT_WOKEN;
+        }
         match deadline {
             None => {
+                // Armed (real build): bounded re-check so an *infinite* wait still observes a kill.
+                #[cfg(not(loom))]
+                if epoch_addr != 0 {
+                    g = cv
+                        .wait_timeout(g, KILL_RECHECK)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                    continue;
+                }
                 g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
             }
             // loom's `Condvar` models no timeouts; the loom test only exercises the infinite-wait path
@@ -534,7 +594,14 @@ mod loom_tests {
             // consumer: wait while the word is still 0. Must not hang: either it sees 1 (NOT_EQUAL) or
             // it parks and the notify wakes it (WOKEN). A finite deadline keeps the model bounded, but
             // the invariant is "doesn't time out".
-            let status = futex_wait(&futex, &cv, KEY, || word.load(Ordering::SeqCst) == 0, None);
+            let status = futex_wait(
+                &futex,
+                &cv,
+                KEY,
+                || word.load(Ordering::SeqCst) == 0,
+                None,
+                0,
+            );
             producer.join().unwrap();
             assert!(status == WAIT_WOKEN || status == WAIT_NOT_EQUAL);
         });
