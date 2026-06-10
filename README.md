@@ -72,6 +72,10 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > into the carve (lazily, for demand-paged children). And **cross-domain `SharedRegion`
 > `create`/`grant`** closes the §13/§14 data plane: a guest mints a shareable region via its
 > `AddressSpace` and grants it into a child domain — parent and child then share bytes zero-copy.
+> This reaches **all the way to C**: the powerbox grants `_start` an `AddressSpace` handle, and the
+> libc exposes `<svm.h>` (`__vm_region_create`/`map`/`unmap`/`page_size`), so a stock C guest mints a
+> region and maps it at two adjacent offsets to build the **magic ring buffer** (a single
+> wrap-around access becomes one contiguous store) — verified end to end on both backends.
 > Still ahead:
 > narrow-scalar promotion, the async I/O ring, a
 > guest M:N runtime, SIMD, isolation tiers, and capability extras.

@@ -882,6 +882,13 @@ pub fn is_powerbox_entry(module: &Module) -> bool {
         module.funcs.first().map(|f| f.params.as_slice()),
         Some([ValType::I32, ValType::I32, ValType::I32])
             | Some([ValType::I32, ValType::I32, ValType::I32, ValType::I32])
+            | Some([
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32
+            ])
     )
 }
 
@@ -902,19 +909,26 @@ fn typed(t: ValType, v: i64) -> Value {
 pub fn run_powerbox(module: &Module, stdin: &[u8]) -> Result<Run, String> {
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
+    // Guest-minted §13/§14 regions (`__vm_region_create` → `AddressSpace.create_region`) need an
+    // OS-shared-memory backing so the JIT can `map` them for real aliasing; install the factory
+    // unconditionally (inert if the guest never mints).
+    host.set_region_factory(new_shared_region);
     // Grant in the powerbox's declared import order: stdout, stdin, exit, then Memory if the
-    // entry takes a 4th handle (§3e / D44) — so a `map`-growing guest heap has a handle to call.
-    let wants_memory = matches!(
-        module.funcs.first().map(|f| f.params.len()),
-        Some(n) if n >= 4
-    );
+    // entry takes a 4th handle (§3e / D44) — so a `map`-growing guest heap has a handle to call —
+    // then an AddressSpace over the whole window if it takes a 5th (§14: the memory-management
+    // authority `create_region` mints from; attenuable; the carve source for nesting).
+    let arity = module.funcs.first().map_or(0, |f| f.params.len());
     let mut slots = vec![
         host.grant_stream(StreamRole::Out) as i64,
         host.grant_stream(StreamRole::In) as i64,
         host.grant_exit() as i64,
     ];
-    if wants_memory {
+    if arity >= 4 {
         slots.push(host.grant_memory() as i64);
+    }
+    if arity >= 5 {
+        let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        slots.push(host.grant_address_space(0, win) as i64);
     }
     let jit = compile_and_run_with_host(
         module,

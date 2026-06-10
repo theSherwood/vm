@@ -1178,10 +1178,20 @@ The current frontier, roughly ranked:
    `AddressSpace`/`Instantiator` bindings record **holder-relative** ranges (translated to
    backing-absolute via the holder's window base at use) — so every capability now composes at any
    nesting depth, not just the ones that pre-shifted. Covered by `region_grant.rs`.
-   **Remaining:** (1) `grant` to executor (`instantiate`) children and to **JIT** children (the JIT
-   child's powerbox is a baked thunk holding only its Yielder; a JIT child using fibers/threads is
-   `Unsupported`); (2) richer cap pass-through; (3) a non-blocking JIT `instantiate` child ("park
-   only the calling fiber" — today synchronous; coroutines already interleave cooperatively).
+   *Now reaches **stock C***: the powerbox grants `_start` a 5th handle — an `AddressSpace` over the
+   whole window — and the libc ships `<svm.h>` (`__vm_region_create`/`map`/`unmap`/`page_size`,
+   lowering to `cap.call 5 5` on the AddressSpace and `cap.call 4 {0,1,3}` on the region). `svm-run`'s
+   powerbox installs the OS-shared-memory factory unconditionally, so a stock C guest mints a region
+   and maps it at two adjacent offsets to build the **magic ring buffer** — a single straddling store
+   wraps tail→head as one contiguous access. Verified end to end on both backends
+   (`c_ring_buffer_via_minted_region`), plus the minted-region straddle differential
+   (`jit_minted_ring_buffer_straddle_matches_interp`). NB: growing the reserved handle region from
+   16→32 bytes shifted chibicc's global base (`RESERVED_BYTES`), so all C arg-builders now grant 5
+   handles. **Remaining:** (1) `grant` to executor (`instantiate`) children and to **JIT** children
+   (the JIT child's powerbox is a baked thunk holding only its Yielder; a JIT child using
+   fibers/threads is `Unsupported`); (2) richer cap pass-through; (3) a non-blocking JIT `instantiate`
+   child ("park only the calling fiber" — today synchronous; coroutines already interleave
+   cooperatively).
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.

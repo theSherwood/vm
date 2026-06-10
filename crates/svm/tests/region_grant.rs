@@ -259,3 +259,98 @@ block0(v0: i32):
         "interp/JIT windows diverge over a minted region"
     );
 }
+
+/// The combination the separate component tests leave open: a **guest-minted region used as a
+/// magic ring buffer**, differentially. The guest mints a 64 KiB region via its `AddressSpace`,
+/// maps it at two *adjacent* window offsets `[0, g)` and `[g, 2g)`, then issues one 8-byte store
+/// straddling the seam at `g - 4` — its low half lands at the region tail (mapping 1), its high
+/// half wraps to the region head (mapping 2). The marker is recombined from the *other* mapping's
+/// views (i32 at window 0 = head, at `2g - 4` = tail) plus a straddling round-trip check — equal to
+/// the marker iff the wrap is byte-exact. Pins that `create_region` + multi-offset aliasing compose
+/// into the ring trick identically on both backends (the JIT's one hardware store across the alias
+/// boundary vs. the interpreter's per-byte page-map model).
+#[test]
+fn jit_minted_ring_buffer_straddle_matches_interp() {
+    use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
+
+    const RING_MARKER: i64 = 0x1122_3344_5566_7788;
+    let src = format!(
+        "memory 17
+func (i32) -> (i64) {{
+block0(v0: i32):
+  v1 = i64.const 65536
+  v2 = cap.call 5 5 (i64) -> (i64) v0 (v1)
+  v3 = i32.wrap_i64 v2
+  v4 = cap.call 4 3 () -> (i64) v3 ()
+  v5 = i64.const 0
+  v6 = i32.const 3
+  v7 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v3 (v5, v5, v4, v6)
+  v8 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v3 (v4, v5, v4, v6)
+  v9 = i64.const 4
+  v10 = i64.sub v4 v9
+  v11 = i64.const {RING_MARKER}
+  i64.store v10 v11
+  v12 = i64.load v10
+  v13 = i32.load v5
+  v14 = i64.const 2
+  v15 = i64.mul v4 v14
+  v16 = i64.sub v15 v9
+  v17 = i32.load v16
+  v18 = i64.extend_i32_u v13
+  v19 = i64.const 4294967296
+  v20 = i64.mul v18 v19
+  v21 = i64.extend_i32_u v17
+  v22 = i64.add v20 v21
+  v23 = i64.sub v12 v11
+  v24 = i64.add v22 v23
+  return v24
+}}
+"
+    );
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let mut hi = Host::new();
+    hi.set_region_factory(svm_run::new_shared_region);
+    let ai = hi.grant_address_space(0, 128 << 10);
+    let mut hj = Host::new();
+    hj.set_region_factory(svm_run::new_shared_region);
+    let aj = hj.grant_address_space(0, 128 << 10);
+    assert_eq!(ai, aj, "grants must encode identically");
+
+    let mut fuel = 1_000_000u64;
+    let (ir, imem) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(ai)],
+        &mut fuel,
+        &[0u8; 128 << 10],
+        0,
+        &mut hi,
+    );
+    let (jo, jmem) = compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[aj as i64],
+        &[0u8; 128 << 10],
+        0,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut core::ffi::c_void,
+    )
+    .expect("jit");
+
+    let ival = ir.expect("interp ran ok").pop().expect("one result");
+    assert_eq!(
+        ival,
+        Value::I64(RING_MARKER),
+        "interp: minted-region ring straddle must wrap tail→head"
+    );
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[RING_MARKER]),
+        "jit: {jo:?}"
+    );
+    assert_eq!(
+        imem, jmem,
+        "interp/JIT windows diverge over the minted ring"
+    );
+}

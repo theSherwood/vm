@@ -125,16 +125,21 @@ fn run_c_full(src: &str) -> CRun {
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
 
-    // `_start(stdout, stdin, exit, memory)` takes the powerbox handles. Grant them identically on
-    // both hosts (grants are deterministic, so the handle values match).
+    // `_start(stdout, stdin, exit, memory, addrspace)` takes the powerbox handles. Grant them
+    // identically on both hosts (grants are deterministic, so the handle values match). The
+    // AddressSpace (§14) spans the whole declared window; the region factory backs guest-minted
+    // regions (`__vm_region_create`) with real OS shared memory so the JIT can `map` them.
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut hi = Host::new();
     let mut hj = Host::new();
     let grant = |h: &mut Host| {
+        h.set_region_factory(svm_run::new_shared_region);
         [
             Value::I32(h.grant_stream(StreamRole::Out)),
             Value::I32(h.grant_stream(StreamRole::In)),
             Value::I32(h.grant_exit()),
             Value::I32(h.grant_memory()),
+            Value::I32(h.grant_address_space(0, win)),
         ]
     };
     let args = grant(&mut hi);
@@ -213,11 +218,14 @@ fn run_c_interp(src: &str) -> CRun {
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
     let mut h = Host::new();
+    h.set_region_factory(svm_run::new_shared_region);
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let args = [
         Value::I32(h.grant_stream(StreamRole::Out)),
         Value::I32(h.grant_stream(StreamRole::In)),
         Value::I32(h.grant_exit()),
         Value::I32(h.grant_memory()),
+        Value::I32(h.grant_address_space(0, win)),
     ];
     let mut fuel = 50_000_000u64;
     let outcome = match run_with_host(&m, 0, &args, &mut fuel, &mut h) {
@@ -265,6 +273,9 @@ fn c_write_to_string_literal_faults() {
             Value::I32(h.grant_stream(StreamRole::In)),
             Value::I32(h.grant_exit()),
             Value::I32(h.grant_memory()),
+            // The 5th powerbox handle (§14 AddressSpace); unused by these tests, but `_start`'s
+            // arity now requires it. A generous span — the cap is never exercised here.
+            Value::I32(h.grant_address_space(0, 1 << 20)),
         ]
     };
     let args = grant(&mut hi);
@@ -376,6 +387,9 @@ fn c_ungrown_tail_access_faults() {
             Value::I32(h.grant_stream(StreamRole::In)),
             Value::I32(h.grant_exit()),
             Value::I32(h.grant_memory()),
+            // The 5th powerbox handle (§14 AddressSpace); unused by these tests, but `_start`'s
+            // arity now requires it. A generous span — the cap is never exercised here.
+            Value::I32(h.grant_address_space(0, 1 << 20)),
         ]
     };
     let mut hi = Host::new();
@@ -1170,6 +1184,9 @@ fn c_function_pointer_signature_mismatch_traps() {
             Value::I32(h.grant_stream(StreamRole::In)),
             Value::I32(h.grant_exit()),
             Value::I32(h.grant_memory()),
+            // The 5th powerbox handle (§14 AddressSpace); unused by these tests, but `_start`'s
+            // arity now requires it. A generous span — the cap is never exercised here.
+            Value::I32(h.grant_address_space(0, 1 << 20)),
         ]
     };
     let args = grant(&mut hi);
@@ -1917,7 +1934,13 @@ fn c_threads_deterministic_sweep() {
     let ir = c_to_ir(C_ATOMIC_COUNTER);
     let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse: {e:?}\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{ir}"));
-    let args = [Value::I32(0), Value::I32(0), Value::I32(0), Value::I32(0)];
+    let args = [
+        Value::I32(0),
+        Value::I32(0),
+        Value::I32(0),
+        Value::I32(0),
+        Value::I32(0),
+    ];
     for seed in 0..100u64 {
         let r = run_scheduled(&m, 0, &args, 50_000_000, seed);
         assert_eq!(r, Ok(vec![Value::I32(2000)]), "explorer seed {seed}");
@@ -2014,4 +2037,36 @@ fn c_pthread_cond_handoff() {
         Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(42)]),
         Outcome::Exited(c) => panic!("unexpected exit({c})"),
     }
+}
+
+// §13/§14 the **magic ring buffer in real C**, end to end through the `__vm_region_*` builtins —
+// proving the powerbox wiring (the 5th handle: an AddressSpace the guest mints from) and the
+// builtin lowering, differentially on both backends. A guest mints a region, maps it at two
+// adjacent high window offsets, and a single straddling store wraps tail→head as one contiguous
+// access — the whole point of the layout, now reachable from C with no host hand-holding.
+const C_RING_REGION: &str = "\
+#include <svm.h>\n\
+/* Force a large window (≥512 KiB) so two granule mappings fit well above the data/stack. */\n\
+static char pad[200 * 1024];\n\
+int main(void) {\n\
+  pad[0] = 1; pad[200 * 1024 - 1] = 2; /* keep `pad` live so the window grows */\n\
+  int r = (int)__vm_region_create(1 << 16); /* mint a 64 KiB region */\n\
+  if (r < 0) return -1;\n\
+  long g = __vm_region_page_size(r);        /* host map granularity */\n\
+  long base = 256 * 1024;                    /* aligned, clear of data/stack */\n\
+  if (__vm_region_map(r, base, 0, g, 3) < 0) return -2;       /* mapping 1: [base, base+g) */\n\
+  if (__vm_region_map(r, base + g, 0, g, 3) < 0) return -3;   /* mapping 2: [base+g, base+2g) */\n\
+  /* one 8-byte store straddling the seam: low half → region tail, high half wraps → region head */\n\
+  *(unsigned long *)(base + g - 4) = 0x1122334455667788UL;\n\
+  unsigned int head = *(unsigned int *)(base);            /* region head, via mapping 1 */\n\
+  unsigned int tail = *(unsigned int *)(base + 2 * g - 4); /* region tail, via mapping 2 */\n\
+  unsigned long combined = ((unsigned long)head << 32) | tail;\n\
+  return combined == 0x1122334455667788UL ? 1 : 0;\n\
+}\n";
+
+#[test]
+fn c_ring_buffer_via_minted_region() {
+    // Both backends must agree the wrap is byte-exact (the guest minted, mapped, and straddled
+    // entirely on its own — the host only installed the region factory + granted the AddressSpace).
+    assert_eq!(run_c(C_RING_REGION).as_slice(), [Value::I32(1)]);
 }

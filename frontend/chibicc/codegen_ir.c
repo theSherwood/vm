@@ -128,19 +128,24 @@ static Obj *funcs[1024];
 static int nfuncs;
 static int start_off; // 1 if a `_start` occupies function index 0, else 0
 
-// Globals + string literals live at fixed window offsets in the data region [16,
-// data_end); the data stack starts at data_end (main's initial data-SP, baked into
-// `_start`). The low 16 bytes are a runtime-reserved region: it holds the powerbox
-// capability handles (so no global/local address is 0 = C NULL either).
-static int data_end = 16;
-
 // Capability handles the runtime hands `_start` (§3c/§3e) are stashed in the reserved
-// region; the builtins load them from here. Layout: stdout@0, stdin@4, exit@8, memory@12
-// (the four fit the reserved low-16 region, so no global/local address is 0 = C NULL).
+// region; the builtins load them from here. Layout: stdout@0, stdin@4, exit@8, memory@12,
+// addrspace@16 (§14 — the memory-management authority `__vm_region_create` mints from);
+// the rest of the low-32 region is spare. No global/local address is 0 = C NULL.
 #define STDOUT_SLOT 0
 #define STDIN_SLOT 4
 #define EXIT_SLOT 8
 #define MEMORY_SLOT 12
+#define ADDRSPACE_SLOT 16
+// The reserved region's size: 5 handle slots, 16-aligned. Globals start here so no data segment
+// ever overlaps a stashed handle (a collision corrupts a global, e.g. a pthread mutex).
+#define RESERVED_BYTES 32
+
+// Globals + string literals live at fixed window offsets in the data region [RESERVED_BYTES,
+// data_end); the data stack starts at data_end (main's initial data-SP, baked into `_start`).
+// The low RESERVED_BYTES are the runtime-reserved region holding the powerbox capability handles
+// (so no global/local address is 0 = C NULL either).
+static int data_end = RESERVED_BYTES;
 
 static int func_index(Obj *fn) {
   for (int i = 0; i < nfuncs; i++)
@@ -776,6 +781,72 @@ static int gen_builtin_page_size(Node *node) {
   return r;
 }
 
+// §13/§14 SharedRegion builtins — guest-minted shareable memory + multi-offset window
+// aliasing (the magic ring buffer), over the granted AddressSpace/region capabilities:
+//
+//   long __vm_region_create(long len);             // mint a region (AddressSpace op 5) -> handle
+//   long __vm_region_map(int r, long win_off, long region_off, long len, int prot); // op 0
+//   long __vm_region_unmap(int r, long win_off, long len);                          // op 1
+//   long __vm_region_page_size(int r);             // the map granularity (op 3)
+//
+// `create` lowers to `cap.call 5 5` on the stashed AddressSpace handle (the memory-management
+// authority mints shareable memory); the others to `cap.call 4 <op>` on the *region* handle the
+// guest holds. Mapping the same region at two adjacent window offsets makes a wrap-around access
+// contiguous — the ring-buffer trick — with the bytes shareable into a child domain (§14 grant).
+static int gen_builtin_region_create(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_region_create(len) expects 1 argument");
+  int len = widen_i64(gen_expr(a), a->ty);
+  int h = load_handle(ADDRSPACE_SLOT);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 5 5 (i64) -> (i64) v%d (v%d)\n", r, h, len);
+  return r;
+}
+
+static int gen_builtin_region_map(Node *node) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != 5)
+    error_tok(node->tok, "codegen_ir: __vm_region_map(r, win_off, region_off, len, prot) expects 5 arguments");
+  Node *a = node->args;
+  int rh = gen_expr(a); // the region handle (an int — already i32)
+  int win = widen_i64(gen_expr(a->next), a->next->ty);
+  int roff = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int len = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
+  int prot = gen_expr(a->next->next->next->next);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d, v%d)\n", r,
+          rh, win, roff, len, prot);
+  return r;
+}
+
+static int gen_builtin_region_unmap(Node *node) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != 3)
+    error_tok(node->tok, "codegen_ir: __vm_region_unmap(r, win_off, len) expects 3 arguments");
+  Node *a = node->args;
+  int rh = gen_expr(a);
+  int win = widen_i64(gen_expr(a->next), a->next->ty);
+  int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 4 1 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, win, len);
+  return r;
+}
+
+static int gen_builtin_region_page_size(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_region_page_size(r) expects 1 argument");
+  int rh = gen_expr(a);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 4 3 () -> (i64) v%d ()\n", r, rh);
+  return r;
+}
+
 // §12 fiber builtins (stack switching). A fiber is a first-class suspendable computation
 // whose continuation is its own call stack (DESIGN §6/§12). Real C reaches them through
 // three intercepted calls (declared, never defined — like the stdio builtins):
@@ -1086,6 +1157,14 @@ static int gen_expr(Node *node) {
           return gen_builtin_memory(node, 1, 2);
         if (!strcmp(fname, "__vm_protect"))
           return gen_builtin_memory(node, 2, 3);
+        if (!strcmp(fname, "__vm_region_create"))
+          return gen_builtin_region_create(node);
+        if (!strcmp(fname, "__vm_region_map"))
+          return gen_builtin_region_map(node);
+        if (!strcmp(fname, "__vm_region_unmap"))
+          return gen_builtin_region_unmap(node);
+        if (!strcmp(fname, "__vm_region_page_size"))
+          return gen_builtin_region_page_size(node);
         if (!strcmp(fname, "__vm_page_size"))
           return gen_builtin_page_size(node);
         if (!strcmp(fname, "__vm_fiber_new"))
@@ -1864,13 +1943,14 @@ static bool is_rodata(Obj *g) {
 }
 
 // Lay globals out at fixed window offsets; set `data_end` (the data-stack base). Writable data
-// (and the [0,16) handle slots) goes first from 16, then a page boundary, then read-only string
-// literals on their own page(s), then another page boundary before the data stack — so the
-// `data ro` segments are page-isolated for protection (§3a / D40). Returns true if any global.
+// goes first from `RESERVED_BYTES` (just past the [0,RESERVED_BYTES) handle slots), then a page
+// boundary, then read-only string literals on their own page(s), then another page boundary
+// before the data stack — so the `data ro` segments are page-isolated for protection (§3a / D40).
+// Returns true if any global.
 static bool layout_globals(Obj *prog) {
-  int off = 16;
+  int off = RESERVED_BYTES;
   bool any = false;
-  // Pass 1: writable globals (and BSS) packed from 16.
+  // Pass 1: writable globals (and BSS) packed from `RESERVED_BYTES`.
   for (Obj *g = prog; g; g = g->next) {
     if (g->is_function || is_rodata(g))
       continue;
@@ -1955,12 +2035,13 @@ static void emit_start(Obj *main_fn) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
-  fprintf(o, "func (i32, i32, i32, i32) -> (%s) {\n", is_void ? "" : irty(mret));
-  fprintf(o, "block0(v0: i32, v1: i32, v2: i32, v3: i32):\n"); // stdout, stdin, exit, memory
-  nv = 4;
+  fprintf(o, "func (i32, i32, i32, i32, i32) -> (%s) {\n", is_void ? "" : irty(mret));
+  // stdout, stdin, exit, memory, addrspace (§14)
+  fprintf(o, "block0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32):\n");
+  nv = 5;
   // Stash each handle in its reserved slot so the builtins can load it.
-  int slots[4] = {STDOUT_SLOT, STDIN_SLOT, EXIT_SLOT, MEMORY_SLOT};
-  for (int i = 0; i < 4; i++) {
+  int slots[5] = {STDOUT_SLOT, STDIN_SLOT, EXIT_SLOT, MEMORY_SLOT, ADDRSPACE_SLOT};
+  for (int i = 0; i < 5; i++) {
     int a = nv++;
     fprintf(o, "  v%d = i64.const %d\n", a, slots[i]);
     fprintf(o, "  i32.store v%d v%d\n", a, i);
