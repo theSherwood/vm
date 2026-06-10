@@ -3344,7 +3344,9 @@ impl Mem {
     /// child started this way faults on first access of each page, suspending to the parent, which
     /// supplies the page and resumes. The parent virtualizes the whole sub-window.
     fn demand_page(&self) {
-        let pages = self.window.reserved() / self.page;
+        // `div_ceil` so a child smaller than one host page (e.g. a 4 KiB sub-window on a 16 KiB-page
+        // host) still gets its single covering page marked — masking keeps its accesses in-window.
+        let pages = self.window.reserved().div_ceil(self.page).max(1);
         let mut space = self.space_write();
         for p in 0..pages {
             space.prot.insert(p, PageProt::Unmapped);

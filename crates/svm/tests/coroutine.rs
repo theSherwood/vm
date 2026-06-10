@@ -26,7 +26,7 @@ func (i32) -> (i64) {
 block0(v0: i32):
   v1 = i64.const 1
   v2 = i64.const 65536
-  v3 = i64.const 12
+  v3 = i64.const 16
   v4 = i64.const 0
   v5 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.const 0
@@ -115,7 +115,7 @@ func (i32) -> (i64) {
 block0(v0: i32):
   v1 = i64.const 1
   v2 = i64.const 65536
-  v3 = i64.const 12
+  v3 = i64.const 16
   v4 = i64.const 0
   v5 = cap.call 6 4 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.const 0
@@ -162,7 +162,7 @@ func (i32) -> (i64) {
 block0(v0: i32):
   v1 = i64.const 1
   v2 = i64.const 65536
-  v3 = i64.const 12
+  v3 = i64.const 16
   v4 = i64.const 0
   v5 = cap.call 6 4 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.const 0
@@ -194,7 +194,7 @@ func (i32) -> (i64) {
 block0(v0: i32):
   v1 = i64.const 1
   v2 = i64.const 0
-  v3 = i64.const 12
+  v3 = i64.const 16
   v4 = i64.const 0
   v5 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
   v6 = i64.const 0
