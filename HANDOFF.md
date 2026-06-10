@@ -875,7 +875,9 @@ leave a shared view — add a unix test for this alongside the Windows work.
   same-module child confined to a sub-window — the interp runs it as a vCPU on the §12 executor
   (shared backing; join parks only the calling fiber); the JIT re-compiles it over its own re-entrantly
   guarded window (nesting cost at setup) and copies back — proven equal by an interp↔JIT differential.
-  Remaining nesting work: **co-fiber resume/suspend** children, **separate-module** children, and a
+  **co-fiber resume/suspend** children are in too (interp: the `Yielder` cap + `spawn_coroutine`/
+  `resume` — a child yields back to the parent and is resumed, the lazy-paging primitive). Remaining
+  nesting work: fault-driven yield, the JIT co-fiber path, **separate-module** children, and a
   non-blocking JIT child — which then unlock §13 cross-domain `SharedRegion` and the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
@@ -1102,12 +1104,20 @@ The current frontier, roughly ranked:
    caught by its *own* guard page and propagates as the parent's trap. Authority is resolved through
    the run's `cap.call` thunk (a forged handle is an inert `CapFault`). Covered by `jit_instantiator.rs`
    (interp↔JIT differential: result + whole-window byte-equality, out-of-range carve → `-EINVAL`,
-   `unreachable` + width-overrun child-trap propagation). **Remaining:** (1) **co-fiber resume/suspend**
-   so a child can yield back mid-run (the §14 parent-virtualized-fault / lazy-paging story — now
-   unblocked); (2) **separate-module children** + richer cap pass-through (the JIT child has an empty
-   powerbox today; a child using fibers/threads is `Unsupported`); (3) make the JIT child non-blocking
-   ("park only the calling fiber" — today it runs synchronously at `instantiate`); then cross-domain
-   `SharedRegion` `create`/`grant`.
+   `unreachable` + width-overrun child-trap propagation). *Also landed (interp): **co-fiber
+   resume/suspend*** — the `Yielder` capability (iface 7) + `Instantiator.spawn_coroutine` (op 2) /
+   `resume` (op 3). A guest spawns a child confined to a sub-window as a **suspended continuation**
+   (its own frames/mem/host + a `Yielder` back to the parent) and drives it cooperatively: each
+   `resume(child, v)` runs the child inline until it `yield`s (status SUSPENDED, handing back a value)
+   or returns (RETURNED), delivering `v` as the child's yield result; values round-trip both ways,
+   confinement holds across suspensions, and a child trap propagates to the parent. This is the §14
+   parent-virtualized-fault / lazy-paging primitive (a child parks on a fault the parent services).
+   Covered by `coroutine.rs`. **Remaining:** (1) **fault-driven yield** — a child that faults on an
+   unmapped page in its sub-window suspends to the parent (vs. today's *explicit* `yield`), wiring the
+   actual userfaultfd-style lazy-paging; (2) the **JIT** co-fiber path (interp-only today); (3)
+   **separate-module children** + richer cap pass-through (the JIT child has an empty powerbox; a JIT
+   child using fibers/threads is `Unsupported`); (4) a non-blocking JIT child ("park only the calling
+   fiber" — today synchronous at `instantiate`); then cross-domain `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.

@@ -612,6 +612,9 @@ enum Pending {
     Join { slot: usize },
     /// Finish an `atomic.wait`, pushing this status (woken / not-equal / timed-out).
     Wait(i32),
+    /// Finish a §14 co-fiber `yield`: push the value the parent's `resume` delivered (the result of
+    /// the child's `Yielder` cap.call). Only ever set on a *coroutine* child the parent drives inline.
+    CoResume(i64),
 }
 
 /// One run of a vCPU until it finishes or yields.
@@ -628,6 +631,11 @@ enum Inner {
     Done(Vec<Value>),
     Park(Blocked),
     Yield,
+    /// A §14 **co-fiber** child yielded a value to its instantiator-parent (`Yielder` cap.call). The
+    /// child's continuation (frames/mem/host) is preserved in the `VCpu` so the parent's next `resume`
+    /// continues it. Only produced while a coroutine child is driven inline by `resume`; a normal vCPU
+    /// that reaches it (a `Yielder` with no resumer) is a `FiberFault`.
+    CoYield(i64),
 }
 
 /// The **M:N executor** (§12): a bounded pool of worker OS threads runs many vCPUs (green threads)
@@ -1179,6 +1187,15 @@ fn take_running(fibers: &mut [Fiber], i: usize) -> Result<Vec<Frame>, Trap> {
 /// `registry` of spawned threads — is `Arc`-shared across all vCPUs.
 ///
 /// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
+/// A §14 co-fiber child the parent drives with `resume`: its suspended continuation plus whether it is
+/// **awaiting a resume value** — i.e. parked at a `yield` (so the next `resume` delivers its argument
+/// as the yield's result) vs. freshly spawned at its entry (the first `resume` just starts it, its
+/// argument unused). The child runs *inline* on the parent's thread, never on the executor.
+struct Coro {
+    vcpu: Box<VCpu>,
+    awaiting_resume: bool,
+}
+
 /// between worker threads and (next) parking its continuation on a blocking op.
 struct VCpu {
     /// The owned function table; `Frame::func` resolves against it.
@@ -1204,6 +1221,11 @@ struct VCpu {
     /// This vCPU's spawned children, by `thread.join` handle (slot) ⇒ child [`TaskId`]; `None` once
     /// joined (a re-join is inert).
     threads: Vec<Option<TaskId>>,
+    /// This vCPU's §14 **co-fiber** children (`Instantiator.spawn_coroutine`): suspended continuations
+    /// (their own frames/mem/host) driven *inline* by `resume`, by handle (slot). `None` once the
+    /// coroutine has run to completion (a later `resume` is inert). Distinct from `threads` — a
+    /// coroutine is cooperative (parent and child never run concurrently), not an executor vCPU.
+    coroutines: Vec<Option<Coro>>,
     /// Call-depth base for the stack-overflow bound.
     depth: u32,
     /// This task's own id (where its outcome is published on completion).
@@ -1250,6 +1272,7 @@ impl VCpu {
             host,
             fuel,
             threads: Vec::new(),
+            coroutines: Vec::new(),
             depth,
             id,
             pending: None,
@@ -1272,6 +1295,9 @@ impl VCpu {
             Ok(Inner::Done(v)) => Step::Done(Ok(v)),
             Ok(Inner::Park(b)) => Step::Park(b),
             Ok(Inner::Yield) => Step::Yield,
+            // A `Yielder` cap.call on a vCPU the *executor* runs has no resumer to yield to (a
+            // coroutine child is driven inline by `resume`, never enqueued here) — inert FiberFault.
+            Ok(Inner::CoYield(_)) => Step::Done(Err(Trap::FiberFault)),
             Err(t) => Step::Done(Err(t)),
         }
     }
@@ -1324,6 +1350,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             let top = v.frames.len() - 1;
             v.frames[top].vals.push(Value::I32(status));
         }
+        Some(Pending::CoResume(value)) => {
+            // The parent's `resume` delivered `value` — push it as the child `Yielder` cap.call's
+            // result so the coroutine continues past its `yield`.
+            let top = v.frames.len() - 1;
+            v.frames[top].vals.push(Value::I64(value));
+        }
         None => {}
     }
 
@@ -1338,6 +1370,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         host,
         fuel,
         threads,
+        coroutines,
         depth,
         pending,
         sched,
@@ -1428,6 +1461,32 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // `instantiate` spawns a child vCPU and `join` parks — both need the executor. The
                 // handle still gates authority (resolve as Instantiator → its carve range `[base,
                 // base+size)`); a forged/wrong-type handle is an inert `CapFault`.
+                // §14 co-fiber `yield` (iface 7): suspend this (coroutine) child, handing `value` to
+                // the instantiator-parent's `resume`. Serviced here — it must yield the running
+                // continuation, which the generic dispatch can't. The cap.call's result (the resumed
+                // value) is delivered on the next `resume` via `Pending::CoResume`; the inst pointer is
+                // already advanced, so we return `CoYield` without pushing a result.
+                Inst::CapCall {
+                    type_id: iface::YIELDER,
+                    op,
+                    handle,
+                    args,
+                    ..
+                } => {
+                    if *op != 0 {
+                        return Err(Trap::CapFault);
+                    }
+                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.resolve_yielder(h)?; // authority: a forged/wrong handle is inert
+                    }
+                    let value = as_i64(get(
+                        &frames[top].vals,
+                        *args.first().ok_or(Trap::Malformed)?,
+                    )?)?;
+                    return Ok(Inner::CoYield(value));
+                }
                 Inst::CapCall {
                     type_id: iface::INSTANTIATOR,
                     op,
@@ -1545,6 +1604,108 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
                             *pending = Some(Pending::Join { slot });
                             return Ok(Inner::Park(Blocked::Join { child }));
+                        }
+                        // spawn_coroutine(entry, off, size_log2, fuel) -> child handle (or -EINVAL).
+                        // Like instantiate, but the child is a **suspended coroutine** (its own
+                        // confined window + a `Yielder` handle back to us, its single entry arg),
+                        // driven cooperatively by `resume` — not run on the executor. The §14
+                        // parent-virtualized-fault / lazy-paging primitive.
+                        2 => {
+                            let argn = |i: usize| -> Result<i64, Trap> {
+                                as_i64(get(
+                                    &frames[top].vals,
+                                    *args.get(i).ok_or(Trap::Malformed)?,
+                                )?)
+                            };
+                            let entry = argn(0)? as u64;
+                            let off = argn(1)? as u64;
+                            let size_log2 = argn(2)?;
+                            let _quota = argn(3)?; // (per-coroutine fuel metering is a follow-up)
+                                                   // A coroutine child entry is a fixed `(i64 yielder) -> (i64)`.
+                            let ok_entry = fs.get(entry as usize).is_some_and(|f| {
+                                f.params == [ValType::I64] && f.results == [ValType::I64]
+                            });
+                            let child_size = if (0..64).contains(&size_log2) {
+                                1u64 << size_log2
+                            } else {
+                                0
+                            };
+                            let fits = child_size != 0
+                                && child_size <= isize
+                                && off & (child_size - 1) == 0
+                                && off.checked_add(child_size).is_some_and(|e| e <= isize);
+                            if !ok_entry || !fits {
+                                frames[top].vals.push(Value::I32(EINVAL as i32));
+                            } else {
+                                let abs_base = ibase + off;
+                                let child_mem = mem
+                                    .as_ref()
+                                    .map(|m| m.nested_view(abs_base, size_log2 as u8));
+                                let mut ch = Host::new();
+                                let cy = ch.grant_yielder(); // the child's handle to suspend back to us
+                                let child_host = Arc::new(Mutex::new(ch));
+                                let child = VCpu::new(
+                                    Arc::clone(&funcs),
+                                    entry as u32,
+                                    &[Value::I64(cy as i64)],
+                                    child_mem,
+                                    child_host,
+                                    *fuel,
+                                    depth + 1,
+                                    0, // unused: a coroutine is driven inline, never via the executor
+                                    sched.clone(),
+                                );
+                                coroutines.push(Some(Coro {
+                                    vcpu: Box::new(child),
+                                    awaiting_resume: false,
+                                }));
+                                frames[top]
+                                    .vals
+                                    .push(Value::I32((coroutines.len() - 1) as i32));
+                            }
+                        }
+                        // resume(child, value) -> (status: i32, value: i64): drive the coroutine
+                        // **inline** until it `yield`s (SUSPENDED) or returns (RETURNED). The first
+                        // resume starts it (its `value` arg unused); later resumes deliver `value` as
+                        // the child's `yield` result. A child trap propagates to us.
+                        3 => {
+                            let ch = as_i32(get(
+                                &frames[top].vals,
+                                *args.first().ok_or(Trap::Malformed)?,
+                            )?)?;
+                            let value = as_i64(get(
+                                &frames[top].vals,
+                                *args.get(1).ok_or(Trap::Malformed)?,
+                            )?)?;
+                            let slot = ch as usize;
+                            let mut coro = match coroutines.get_mut(slot).and_then(|c| c.take()) {
+                                Some(c) => c,
+                                None => return Err(Trap::CapFault), // forged or already-finished
+                            };
+                            if coro.awaiting_resume {
+                                coro.vcpu.pending = Some(Pending::CoResume(value));
+                            }
+                            match run_inner(&mut coro.vcpu, u64::MAX) {
+                                Ok(Inner::CoYield(yv)) => {
+                                    coro.awaiting_resume = true;
+                                    coroutines[slot] = Some(coro);
+                                    frames[top].vals.push(Value::I32(FIBER_SUSPENDED));
+                                    frames[top].vals.push(Value::I64(yv));
+                                }
+                                Ok(Inner::Done(result)) => {
+                                    // Finished — `coroutines[slot]` stays `None` (a later resume inert).
+                                    frames[top].vals.push(Value::I32(FIBER_RETURNED));
+                                    frames[top]
+                                        .vals
+                                        .push(result.first().copied().unwrap_or(Value::I64(0)));
+                                }
+                                // A coroutine that parks/yields used a blocking concurrency op (it has
+                                // no executor driving it) — unsupported; surface as a fault.
+                                Ok(Inner::Park(_)) | Ok(Inner::Yield) => {
+                                    return Err(Trap::FiberFault)
+                                }
+                                Err(t) => return Err(t), // a child trap propagates to the parent
+                            }
                         }
                         _ => return Err(Trap::CapFault),
                     }
@@ -2278,6 +2439,13 @@ pub mod iface {
     /// the child rides the same §12 executor). Holding the handle is the authority to nest (D19: a
     /// child can only get what the parent sub-allocates).
     pub const INSTANTIATOR: u32 = 6;
+    /// `Yielder` — a §14 **co-fiber** child's handle back to its instantiator-parent. op 0
+    /// `yield(value: i64) -> resumed: i64` suspends the child, handing `value` to the parent's
+    /// `resume` (which returns it as the yield's status/value), and on the next `resume` returns the
+    /// value the parent passed. The cooperative-coroutine primitive the §14 parent-virtualized-fault /
+    /// lazy-paging model builds on (a child parks on a fault it cannot service; the parent supplies the
+    /// page and resumes it). Granted to a coroutine child (`Instantiator.spawn_coroutine`) only.
+    pub const YIELDER: u32 = 7;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -2479,6 +2647,10 @@ enum Binding {
         base: u64,
         size: u64,
     },
+    /// A §14 `Yielder` handle a co-fiber child holds to suspend back to its instantiator-parent. The
+    /// eval loop services it (it must yield the running coroutine's continuation, which the generic
+    /// dispatch can't); a forged/wrong handle resolves nowhere and is an inert `CapFault`.
+    Yielder,
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -2588,6 +2760,21 @@ impl Host {
     fn resolve_instantiator(&self, handle: i32) -> Result<(u64, u64), Trap> {
         match self.resolve(handle, iface::INSTANTIATOR)? {
             Binding::Instantiator { base, size } => Ok((base, size)),
+            _ => Err(Trap::CapFault),
+        }
+    }
+
+    /// Grant a §14 `Yielder` capability (the co-fiber child's handle back to its parent). Used by the
+    /// eval loop when standing up a coroutine child; not a powerbox-level grant.
+    fn grant_yielder(&mut self) -> i32 {
+        self.grant(iface::YIELDER, Binding::Yielder)
+    }
+
+    /// Confirm a handle resolves to *this* domain's `Yielder` (§14 co-fiber); a forged/wrong handle is
+    /// a `CapFault`. The eval loop calls this before yielding the running coroutine's continuation.
+    fn resolve_yielder(&self, handle: i32) -> Result<(), Trap> {
+        match self.resolve(handle, iface::YIELDER)? {
+            Binding::Yielder => Ok(()),
             _ => Err(Trap::CapFault),
         }
     }
@@ -2763,6 +2950,11 @@ impl Host {
                 0 => Ok(vec![base as i64, size as i64]),
                 _ => Err(Trap::CapFault),
             },
+            // The §14 `Yielder` (co-fiber `yield`) is serviced by the eval loop (it suspends the
+            // running coroutine's continuation, which the generic dispatch can't); reaching here means
+            // a `Yielder` cap.call slipped through (e.g. the JIT, which has no coroutine runtime) —
+            // inert `CapFault`.
+            Binding::Yielder => Err(Trap::CapFault),
         }
     }
 
