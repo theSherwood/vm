@@ -2641,6 +2641,10 @@ pub mod iface {
     /// — the "plugin-in-plugin" story: a guest can only instantiate modules it was given (no ambient
     /// authority). It has no directly callable ops (`cap.call` on it is an inert `CapFault`).
     pub const MODULE: u32 = 8;
+    /// §9/§12 `IoRing` — the submit/complete ring. `op 0 submit(sq_ptr, n, cq_ptr)` runs `n`
+    /// deferred `cap.call`s (each a 64-byte SQE in the window) and writes their results as 32-byte
+    /// CQEs, amortizing the boundary crossing (and, later, overlapping them on a host offload pool).
+    pub const IO_RING: u32 = 9;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -2648,6 +2652,23 @@ pub mod iface {
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
+
+/// A `Trap` → small status code for an `IoRing` CQE, numbered to match the JIT's `TrapKind` codes
+/// (so the whole system speaks one trap-code vocabulary). `0` is reserved for success in the CQE.
+fn trap_status(t: &Trap) -> i64 {
+    match t {
+        Trap::DivByZero => 1,
+        Trap::IntOverflow => 2,
+        Trap::BadConversion => 3,
+        Trap::Unreachable => 4,
+        Trap::IndirectCallType => 5,
+        Trap::CapFault | Trap::Malformed | Trap::Exit(_) => 6, // bad/unsupported async request
+        Trap::MemoryFault | Trap::StackOverflow => 8,
+        Trap::FiberFault => 9,
+        Trap::ThreadFault => 10,
+        Trap::OutOfFuel => 11,
+    }
+}
 
 /// Per-region cap on a **guest-minted** region (`AddressSpace.create_region`, §13/§14): an anti-bomb
 /// ceiling so a single mint can't exhaust the host. Aggregate quota metering is §15 (D48: DoS is
@@ -2861,6 +2882,10 @@ enum Binding {
     /// authority to instantiate (the Instantiator's module ops, serviced by the eval loop / nesting
     /// runtime); the generic dispatch treats any `cap.call` on it as an inert `CapFault`.
     Module(u32),
+    /// A §9/§12 `IoRing` handle: authority to `submit` a batch of deferred `cap.call`s
+    /// (io_uring-shaped). Carries no host state in the synchronous MVP — the ring buffers (SQ/CQ)
+    /// live in the guest window; `submit` gets their pointers as args.
+    IoRing,
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -2977,6 +3002,10 @@ impl Host {
     }
     pub fn grant_memory(&mut self) -> i32 {
         self.grant(iface::MEMORY, Binding::Memory)
+    }
+    /// Grant a §9/§12 `IoRing` capability — authority to `submit` batched/deferred `cap.call`s.
+    pub fn grant_io_ring(&mut self) -> i32 {
+        self.grant(iface::IO_RING, Binding::IoRing)
     }
 
     /// Grant a §14 `AddressSpace` capability over the window sub-range `[base, base+size)` (§14). The
@@ -3310,7 +3339,86 @@ impl Host {
             // module ops); it has no callable ops — and crucially, the generic dispatch never exposes
             // the grant's host-side data, so no host pointer is guest-reachable.
             Binding::Module(_) => Err(Trap::CapFault),
+            // §9/§12 IoRing: `op 0 submit(sq_ptr, n, cq_ptr) -> completed`. Runs `n` deferred
+            // cap.calls from the window's submission queue and writes their completions.
+            Binding::IoRing => match op {
+                0 => self.io_ring_submit(args, mem),
+                _ => Ok(vec![EINVAL]),
+            },
         }
+    }
+
+    /// §9/§12 the **submit/complete ring** (io_uring-shaped). `submit(sq_ptr, n, cq_ptr)` reads `n`
+    /// 64-byte SQEs from `[sq_ptr, …)` (each a *deferred `cap.call`*), runs each through the normal
+    /// capability dispatch, and writes a 32-byte CQE to `[cq_ptr, …)` per entry; returns the count
+    /// completed. One boundary crossing for `n` ops (the §1a interface-amortization win; the host
+    /// offload pool that *overlaps* them is the next increment). Synchronous + in-order ⇒ the result
+    /// is deterministic, so both backends agree (the §18 oracle).
+    ///
+    /// SQE (64 B, little-endian): `u32 type_id | u32 op | i32 handle | u32 n_args | i64 args[4] |
+    /// i64 user_data | i64 pad`. CQE (32 B): `i64 user_data | i64 result | i64 status (0=ok, else a
+    /// TrapKind code) | i64 pad`. A nested `IoRing` op, or an op the synchronous dispatch can't service
+    /// (Instantiator/Yielder/Module → `CapFault`), simply lands as a CQE with a non-zero `status` —
+    /// never a host panic and never unbounded recursion.
+    fn io_ring_submit(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        const SQE: u64 = 64;
+        const CQE: u64 = 32;
+        const MAX_SQ_ARGS: usize = 4;
+        // A ring with no window is inert (`-EFAULT`); otherwise borrow the window once and reborrow it
+        // (`&mut *m`) for each SQE's read, recursive dispatch, and CQE write.
+        let m = match mem {
+            Some(m) => m,
+            None => return Ok(vec![EFAULT]),
+        };
+        let sq_ptr = *args.first().unwrap_or(&0) as u64;
+        let n = (*args.get(1).unwrap_or(&0)).max(0) as u64;
+        let cq_ptr = *args.get(2).unwrap_or(&0) as u64;
+        for i in 0..n {
+            // Read SQE i (a borrow-checked window read; out-of-window ⇒ -EFAULT completion).
+            let raw = match m.read_bytes(sq_ptr + i * SQE, SQE) {
+                Some(r) => r,
+                None => {
+                    Self::write_cqe(&mut *m, cq_ptr + i * CQE, 0, 0, -EFAULT);
+                    continue;
+                }
+            };
+            let type_id = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+            let op = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+            let handle = i32::from_le_bytes(raw[8..12].try_into().unwrap());
+            let n_args =
+                (u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize).min(MAX_SQ_ARGS);
+            let mut opargs = [0i64; MAX_SQ_ARGS];
+            for (a, slot) in opargs.iter_mut().enumerate().take(n_args) {
+                *slot = i64::from_le_bytes(raw[16 + a * 8..24 + a * 8].try_into().unwrap());
+            }
+            let user_data = i64::from_le_bytes(raw[48..56].try_into().unwrap());
+            // A ring submitting to a ring would recurse without bound — reject it as an inert error.
+            let (result, status) = if type_id == iface::IO_RING {
+                (0, trap_status(&Trap::CapFault))
+            } else {
+                match self.cap_dispatch_slots(type_id, op, handle, &opargs[..n_args], Some(&mut *m))
+                {
+                    Ok(res) => (res.first().copied().unwrap_or(0), 0),
+                    Err(t) => (0, trap_status(&t)),
+                }
+            };
+            Self::write_cqe(&mut *m, cq_ptr + i * CQE, user_data, result, status);
+        }
+        Ok(vec![n as i64])
+    }
+
+    /// Write one 32-byte CQE (little-endian) at `at`. A bad address is dropped (the guest's bug; the
+    /// `completed` count still reflects the SQEs the host ran).
+    fn write_cqe(m: &mut dyn GuestMem, at: u64, user_data: i64, result: i64, status: i64) {
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&user_data.to_le_bytes());
+        b[8..16].copy_from_slice(&result.to_le_bytes());
+        b[16..24].copy_from_slice(&status.to_le_bytes());
+        let _ = m.write_bytes(at, &b);
     }
 
     /// `Stream` ops (§3e D43): 0 `read`, 1 `write`, 2 `close`. Buffers are `(ptr,len)`,

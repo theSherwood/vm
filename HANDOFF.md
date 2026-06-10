@@ -900,8 +900,18 @@ leave a shared view — add a unix test for this alongside the Windows work.
       thread-safe** — concurrent `malloc` from worker threads corrupts the heap. The demo pre-allocates
       fiber stacks on the main thread to sidestep it; a **thread-safe guest `malloc`** (mutex/atomic
       bump, or per-thread arenas) is a libc follow-up (guest-side, not a VM concern).
+  - **Async submit/complete ring (§9/§12) — increment 1 DONE.** An `IoRing` capability (iface 9,
+    `Host::grant_io_ring`); `op 0 submit(sq_ptr, n, cq_ptr)` runs `n` **deferred `cap.call`s** (each a
+    64-byte SQE in the window) through the *same* capability dispatch and writes 32-byte CQEs — so the
+    JIT gets it for free (a generic `cap.call` through the thunk; `io_ring_submit` recursively dispatches
+    via `cap_dispatch_slots`). One boundary crossing for `n` ops (the §1a amortization). Synchronous +
+    in-order ⇒ deterministic ⇒ differentially tested (`io_ring.rs`: 8 batched `Clock.now` total 28 on
+    both backends; the `completed` count). **Remaining increments:** (2) a bounded host **offload pool**
+    that *overlaps* submissions on K threads (the §12 "0 blocked OS threads" win; needs a thread-safe
+    async op + Host-concurrency care); (3) wire the ring into a guest scheduler (Demo 2) for the full
+    "submit, park, run another, resume on completion" async runtime.
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
-    today), the async submit/complete ring (§9/§12), fiber/vCPU quota metering (the kill path exists;
+    today), the async-ring increments 2–3 above, fiber/vCPU quota metering (the kill path exists;
     *metering*/quotas don't yet), the D57 migratable-fiber primitive (stackful work-stealing), a
     thread-safe guest `malloc`, and DPOR to scale the exhaustive `explore_all` checker past lock-free
     shapes.
