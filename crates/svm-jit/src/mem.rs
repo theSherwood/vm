@@ -223,6 +223,85 @@ pub(crate) unsafe fn run_guarded_range(
 /// The trap code a caught guard fault reports.
 pub(crate) const FAULT_TRAP: i64 = TrapKind::MemoryFault as i64;
 
+/// A snapshot of this thread's **detect-and-kill recovery state** (the armed window range + recovery
+/// point), for §14 co-fibers: a coroutine child arms its own guard on its own fiber stack, and a
+/// suspend switches away mid-call — so the parent swaps the whole recovery state around every switch
+/// (save the child's at suspend-return, restore its own; reinstall the child's at the next resume).
+/// A fresh snapshot is *disarmed*. Same-thread only: the captured recovery point (sigjmp_buf /
+/// CONTEXT pointer) is only meaningful on the thread that captured it — the §14 nesting runtime
+/// enforces same-thread resume.
+#[cfg(fiber_rt)]
+pub(crate) struct GuardState(guard_imp::State);
+
+#[cfg(fiber_rt)]
+impl GuardState {
+    /// A fresh, disarmed state (restoring it disables fault recovery until something re-arms).
+    pub(crate) fn new() -> GuardState {
+        GuardState(guard_imp::new())
+    }
+}
+
+/// Capture this thread's current recovery state into `s`.
+#[cfg(fiber_rt)]
+pub(crate) fn guard_save(s: &mut GuardState) {
+    guard_imp::save(&mut s.0)
+}
+
+/// Install `s` as this thread's recovery state.
+#[cfg(fiber_rt)]
+pub(crate) fn guard_restore(s: &GuardState) {
+    guard_imp::restore(&s.0)
+}
+
+// unix: the state lives in the C shim (sigjmp_buf has C-side size/alignment), as an opaque
+// calloc'd blob (all-zero ⇒ disarmed).
+#[cfg(all(unix, fiber_rt))]
+mod guard_imp {
+    use core::ffi::c_void;
+    extern "C" {
+        fn svm_guard_box() -> *mut c_void;
+        fn svm_guard_unbox(p: *mut c_void);
+        fn svm_guard_save(p: *mut c_void);
+        fn svm_guard_restore(p: *const c_void);
+    }
+    pub(super) struct State(*mut c_void);
+    pub(super) fn new() -> State {
+        // SAFETY: allocates a zeroed C blob; checked non-null.
+        let p = unsafe { svm_guard_box() };
+        assert!(!p.is_null(), "svm-jit: guard-state allocation failed");
+        State(p)
+    }
+    pub(super) fn save(s: &mut State) {
+        // SAFETY: `s.0` is a live blob from `svm_guard_box`.
+        unsafe { svm_guard_save(s.0) }
+    }
+    pub(super) fn restore(s: &State) {
+        // SAFETY: as above; restoring only writes this thread's recovery thread-locals.
+        unsafe { svm_guard_restore(s.0) }
+    }
+    impl Drop for State {
+        fn drop(&mut self) {
+            // SAFETY: exactly the blob `svm_guard_box` returned, freed once.
+            unsafe { svm_guard_unbox(self.0) }
+        }
+    }
+}
+
+// windows: the state is the thread-local VEH guard frame (the recovery CONTEXT pointer + range).
+#[cfg(all(windows, fiber_rt))]
+mod guard_imp {
+    pub(super) struct State(super::pal::GuardSnap);
+    pub(super) fn new() -> State {
+        State(super::pal::GuardSnap::disarmed())
+    }
+    pub(super) fn save(s: &mut State) {
+        s.0 = super::pal::guard_snapshot();
+    }
+    pub(super) fn restore(s: &State) {
+        super::pal::guard_install(&s.0)
+    }
+}
+
 /// Windows-only: make `[base, base+len)` committed read/write across this window's **placeholder**
 /// reservation — idempotent (see the windows `pal::commit_rw`). Exposed so `svm-run`'s production
 /// `MprotectWindow` Memory-cap backend, which operates on this *same* window, can commit/grow tail
@@ -613,6 +692,27 @@ mod pal {
             }
         }
         EXCEPTION_CONTINUE_SEARCH
+    }
+
+    /// A snapshot of the thread's guard frame (§14 co-fibers): the parent swaps this around every
+    /// fiber switch so the child's armed frame survives a suspend and the parent's is reinstated.
+    /// The captured `Frame::ctx` points into a `run_guarded` stack frame — on a *fiber* stack for a
+    /// child, which stays live while the fiber is suspended.
+    #[cfg(fiber_rt)]
+    pub(super) struct GuardSnap(Option<Frame>);
+    #[cfg(fiber_rt)]
+    impl GuardSnap {
+        pub(super) fn disarmed() -> GuardSnap {
+            GuardSnap(None)
+        }
+    }
+    #[cfg(fiber_rt)]
+    pub(super) fn guard_snapshot() -> GuardSnap {
+        GuardSnap(GUARD.with(|g| g.get()))
+    }
+    #[cfg(fiber_rt)]
+    pub(super) fn guard_install(s: &GuardSnap) {
+        GUARD.with(|g| g.set(s.0))
     }
 
     static INSTALL: Once = Once::new();

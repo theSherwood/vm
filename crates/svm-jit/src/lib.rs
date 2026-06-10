@@ -702,6 +702,8 @@ fn run_inner(
             nursery_addr: (&**n as *const instantiator_rt::Nursery) as i64,
             instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
             join_thunk: instantiator_rt::join as *const () as i64,
+            coro_spawn_thunk: instantiator_rt::coro_spawn as *const () as i64,
+            coro_resume_thunk: instantiator_rt::coro_resume as *const () as i64,
         }
     } else {
         InstEnv::null()
@@ -925,7 +927,6 @@ fn run_inner(
 /// child_size)` committed (the Instantiator checks `sub_base + child_size ≤ holder size`); it must
 /// outlive the call. A guest window must already be installed on this thread (`install_guard`).
 #[cfg(fiber_rt)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn compile_child_and_run(
     funcs: &[Func],
     child_entry: FuncIdx,
@@ -934,6 +935,102 @@ pub(crate) unsafe fn compile_child_and_run(
     parent_mem_base: *mut u8,
     args: &[i64],
 ) -> Result<(i64, i64), JitError> {
+    // The synchronous child's powerbox is empty (an inert `cap.call` → `CapFault`).
+    let child = compile_child(
+        funcs,
+        child_entry,
+        child_size_log2,
+        empty_cap_thunk,
+        core::ptr::null_mut(),
+    )?;
+    let child_size = 1u64 << child_size_log2.min(MAX_JIT_WINDOW_LOG2);
+    let n_results = funcs[child_entry as usize].results.len();
+    let code = child.code;
+    let fn_table_ptr = child.fn_table.as_ptr();
+
+    // The child's own fully-mapped window (+ guard page). Seed it from the parent's sub-region so the
+    // child starts from the bytes the parent placed there (the §14 data plane is shared memory).
+    let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
+    let child_base = child_window.base();
+    {
+        // SAFETY: `[parent_mem_base + sub_base, … + child_size)` is committed parent-window memory
+        // (the Instantiator bounded `sub_base + child_size ≤ holder size ≤ parent size`).
+        let src =
+            std::slice::from_raw_parts(parent_mem_base.add(sub_base as usize), child_size as usize);
+        child_window.rw_mut().copy_from_slice(src);
+    }
+
+    let mut results = vec![0i64; n_results];
+    let mut trap_cell: i64 = 0;
+    // SAFETY: `code` honours the `Entry` ABI; it accesses only its own window `[child_base, …+size)`
+    // (baked masking; a width-overrun hits this window's guard page), reads the child `fn_table`, and
+    // writes its result/trap slots. The guard is re-entrant, so a child fault is caught here and the
+    // parent's recovery state is restored.
+    let faulted = mem::run_guarded(
+        &child_window,
+        code,
+        args.as_ptr(),
+        results.as_mut_ptr(),
+        child_base,
+        fn_table_ptr as *const core::ffi::c_void,
+        &mut trap_cell,
+    );
+    if faulted {
+        trap_cell = mem::FAULT_TRAP;
+    }
+    // Copy the child's final window back into the parent's sub-region — the parent (the superset) now
+    // sees the child's writes (materialized at `instantiate`-completion for a synchronous child). A
+    // guest with no Memory cap leaves every page mapped; `restore_rw` is defensive.
+    child_window.restore_rw();
+    {
+        let dst = std::slice::from_raw_parts_mut(
+            parent_mem_base.add(sub_base as usize),
+            child_size as usize,
+        );
+        dst.copy_from_slice(&child_window.rw_mut()[..child_size as usize]);
+    }
+    drop(child_window);
+    drop(child); // frees the child's executable memory now the call has returned
+    Ok((results.first().copied().unwrap_or(0), trap_cell))
+}
+
+/// A compiled §14 child: the owning [`JITModule`] (executable memory lives until drop), its
+/// power-of-two-padded function table, and the entry's buffer-ABI trampoline. Produced by
+/// [`compile_child`]; the synchronous Instantiator child runs it once and drops it, a co-fiber
+/// child keeps it alive across suspends (the [`instantiator_rt`] coroutine owns it).
+#[cfg(fiber_rt)]
+pub(crate) struct ChildCode {
+    /// The padded function table `call_indirect` dispatches through; its address is baked into the
+    /// running code, so it must not move while the child can run (it is boxed and owned here).
+    pub(crate) fn_table: Box<[FnEntry]>,
+    /// The entry trampoline (buffer ABI, [`mem::run_guarded`]-compatible).
+    pub(crate) code: *const u8,
+    /// Owns the executable memory; dropped last.
+    module: JITModule,
+}
+
+#[cfg(fiber_rt)]
+impl Drop for ChildCode {
+    fn drop(&mut self) {
+        // `JITModule` frees its executable memory on drop; nothing extra to do — this impl exists to
+        // document that `code`/`fn_table` die with the struct (no use may outlive it).
+        let _ = &self.module;
+    }
+}
+
+/// Compile a §14 child module: every function confined (top-level masking) to a fresh
+/// `2^child_size_log2`-byte window, `cap.call`s baked to `cap_thunk`/`cap_ctx`, and the entry
+/// wrapped in a buffer-ABI trampoline. "Nesting cost is paid at setup" (§14): this is the setup.
+/// A child using §12 fibers/threads is rejected (`Unsupported`) — those need per-child runtimes,
+/// and compiling them against null thunks would be unsound.
+#[cfg(fiber_rt)]
+fn compile_child(
+    funcs: &[Func],
+    child_entry: FuncIdx,
+    child_size_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<ChildCode, JitError> {
     let entry = funcs
         .get(child_entry as usize)
         .ok_or(JitError::Malformed)?
@@ -976,11 +1073,9 @@ pub(crate) unsafe fn compile_child_and_run(
         .collect::<Result<_, _>>()?;
     let distinct = distinct_types(funcs);
 
-    // The child's powerbox is empty (an inert `cap.call` → `CapFault`) and it has no fiber/thread
-    // runtime; it runs over its **own** window, so `sub_base = 0` (ordinary top-level confinement).
     let cap = CapEnv {
-        thunk_addr: empty_cap_thunk as *const () as i64,
-        ctx_addr: 0,
+        thunk_addr: cap_thunk as *const () as i64,
+        ctx_addr: cap_ctx as i64,
     };
     let mut ctx = module.make_context();
     for (f, id) in funcs.iter().zip(&ids) {
@@ -1021,7 +1116,7 @@ pub(crate) unsafe fn compile_child_and_run(
         .map_err(|e| JitError::Backend(e.to_string()))?;
 
     let table_len = funcs.len().next_power_of_two();
-    let fn_table: Vec<FnEntry> = (0..table_len)
+    let fn_table: Box<[FnEntry]> = (0..table_len)
         .map(|slot| match funcs.get(slot) {
             Some(f) => FnEntry {
                 type_id: type_id_of(
@@ -1043,52 +1138,11 @@ pub(crate) unsafe fn compile_child_and_run(
         .collect();
 
     let code = module.get_finalized_function(tramp);
-
-    // The child's own fully-mapped window (+ guard page). Seed it from the parent's sub-region so the
-    // child starts from the bytes the parent placed there (the §14 data plane is shared memory).
-    let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
-    let child_base = child_window.base();
-    {
-        // SAFETY: `[parent_mem_base + sub_base, … + child_size)` is committed parent-window memory
-        // (the Instantiator bounded `sub_base + child_size ≤ holder size ≤ parent size`).
-        let src =
-            std::slice::from_raw_parts(parent_mem_base.add(sub_base as usize), child_size as usize);
-        child_window.rw_mut().copy_from_slice(src);
-    }
-
-    let mut results = vec![0i64; entry.results.len()];
-    let mut trap_cell: i64 = 0;
-    // SAFETY: `code` honours the `Entry` ABI; it accesses only its own window `[child_base, …+size)`
-    // (baked masking; a width-overrun hits this window's guard page), reads the child `fn_table`, and
-    // writes its result/trap slots. The guard is re-entrant, so a child fault is caught here and the
-    // parent's recovery state is restored.
-    let faulted = mem::run_guarded(
-        &child_window,
+    Ok(ChildCode {
+        fn_table,
         code,
-        args.as_ptr(),
-        results.as_mut_ptr(),
-        child_base,
-        fn_table.as_ptr() as *const core::ffi::c_void,
-        &mut trap_cell,
-    );
-    if faulted {
-        trap_cell = mem::FAULT_TRAP;
-    }
-    // Copy the child's final window back into the parent's sub-region — the parent (the superset) now
-    // sees the child's writes (materialized at `instantiate`-completion for a synchronous child). A
-    // guest with no Memory cap leaves every page mapped; `restore_rw` is defensive.
-    child_window.restore_rw();
-    {
-        let dst = std::slice::from_raw_parts_mut(
-            parent_mem_base.add(sub_base as usize),
-            child_size as usize,
-        );
-        dst.copy_from_slice(&child_window.rw_mut()[..child_size as usize]);
-    }
-    drop(child_window);
-    drop(fn_table);
-    drop(module); // frees the child's executable memory now the call has returned
-    Ok((results.first().copied().unwrap_or(0), trap_cell))
+        module,
+    })
 }
 
 /// Whether `f` uses any §12 fiber/thread/futex op — which a §14 JIT child cannot yet run (it would
@@ -1266,6 +1320,8 @@ struct InstEnv {
     nursery_addr: i64,
     instantiate_thunk: i64,
     join_thunk: i64,
+    coro_spawn_thunk: i64,
+    coro_resume_thunk: i64,
 }
 
 impl InstEnv {
@@ -1274,6 +1330,8 @@ impl InstEnv {
             nursery_addr: 0,
             instantiate_thunk: 0,
             join_thunk: 0,
+            coro_spawn_thunk: 0,
+            coro_resume_thunk: 0,
         }
     }
     /// True when this compilation may lower `Instantiator` cap.calls to the nesting runtime (the
@@ -2329,6 +2387,62 @@ fn lower_instantiator(
                 .call_indirect(tref, thunk, &[nursery, child, trap_out]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
+        }
+        2 | 4 => {
+            // coro_spawn(nursery, mem_base, handle:i32, entry:i64, off:i64, size_log2:i64, fuel:i64,
+            //            demand:i32, trap_out:i64) -> child_handle:i32 — §14 co-fiber spawn (op 4
+            // additionally demand-pages the child's window for fault-driven yield).
+            let h = get(vals, handle)?;
+            let entry = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
+            let off = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
+            let size_log2 = get(vals, *args.get(2).ok_or(JitError::Malformed)?)?;
+            let fuel = get(vals, *args.get(3).ok_or(JitError::Malformed)?)?;
+            let demand = b.ins().iconst(I32, if op == 4 { 1 } else { 0 });
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I32, I64, I64, I64, I64, I32, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.inst.coro_spawn_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[
+                    nursery, mem_base, h, entry, off, size_log2, fuel, demand, trap_out,
+                ],
+            );
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+        }
+        3 => {
+            // coro_resume(nursery, mem_base, handle:i32, child:i32, value:i64, status_out:*i64,
+            //             trap_out:i64) -> value:i64. Results are appended `(status:i32, value:i64)`
+            // to match the op's two-result shape (like `cont.resume`).
+            let ss =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let status_ptr = b.ins().stack_addr(I64, ss, 0);
+            let h = get(vals, handle)?;
+            let child = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
+            let value = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I32, I32, I64, I64, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.inst.coro_resume_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[nursery, mem_base, h, child, value, status_ptr, trap_out],
+            );
+            emit_trap_propagate(b, lower);
+            let value_out = b.inst_results(call)[0];
+            let status64 = b.ins().stack_load(I64, ss, 0);
+            let status = b.ins().ireduce(I32, status64);
+            vals.push(status);
+            vals.push(value_out);
         }
         _ => return Err(JitError::Unsupported("unknown Instantiator op")),
     }

@@ -15,6 +15,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 static _Thread_local sigjmp_buf g_buf;
@@ -94,4 +95,40 @@ int svm_run_guarded(void (*fn)(const long *, long *, unsigned char *, const void
     g_lo = saved_lo;
     g_hi = saved_hi;
     return 0;
+}
+
+/* ---- Guard-state snapshots (§14 co-fibers) -------------------------------------------------
+ *
+ * A coroutine child runs its own guarded call on a *separate fiber stack*; a suspend switches
+ * stacks from inside that call, leaving the thread-local recovery state armed for the child while
+ * the parent runs. The parent therefore swaps the whole recovery state (jmp_buf + armed + range)
+ * around every switch: save the child's state at suspend-return, restore the parent's; reinstall
+ * the child's at the next resume. The state is an opaque heap blob (C-side, for sigjmp_buf size
+ * and alignment); a freshly boxed state is all-zero = disarmed. Same-thread only: a sigjmp_buf
+ * must be longjmp'd on the thread that captured it.
+ */
+typedef struct {
+    sigjmp_buf buf;
+    int armed;
+    uintptr_t lo, hi;
+} svm_guard_state;
+
+void *svm_guard_box(void) { return calloc(1, sizeof(svm_guard_state)); }
+
+void svm_guard_unbox(void *p) { free(p); }
+
+void svm_guard_save(void *p) {
+    svm_guard_state *s = (svm_guard_state *)p;
+    memcpy(&s->buf, &g_buf, sizeof s->buf);
+    s->armed = g_armed;
+    s->lo = g_lo;
+    s->hi = g_hi;
+}
+
+void svm_guard_restore(const void *p) {
+    const svm_guard_state *s = (const svm_guard_state *)p;
+    memcpy(&g_buf, &s->buf, sizeof g_buf);
+    g_armed = s->armed;
+    g_lo = s->lo;
+    g_hi = s->hi;
 }

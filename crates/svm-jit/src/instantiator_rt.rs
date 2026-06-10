@@ -13,12 +13,30 @@
 //! child gets an **empty powerbox** for now (an inert `cap.call`); attenuated child caps + recursion +
 //! "park only the calling fiber" (vs. today's synchronous run-at-`instantiate`) are follow-ups.
 
-use crate::{CapThunk, TrapKind};
+use crate::{mem, CapThunk, TrapKind};
+use std::cell::{Cell, UnsafeCell};
 use std::sync::Mutex;
-use svm_ir::{Func, FuncIdx};
+use svm_ir::{Func, FuncIdx, ValType};
 
 /// Negative-errno an out-of-range carve returns (matches the interpreter's `EINVAL`, §3e D42).
 const EINVAL: i64 = -22;
+
+/// Coroutine `resume` statuses, in lockstep with the interpreter's (`FIBER_SUSPENDED` /
+/// `FIBER_RETURNED` / `CORO_FAULTED`): the child suspended at an explicit `yield`, returned, or
+/// suspended on a demand-page fault (fault-driven yield; value = the fault address).
+const SUSPENDED: i64 = 0;
+const RETURNED: i64 = 1;
+
+/// The handle a coroutine child's `Yielder` capability is minted as — its single entry argument.
+/// In lockstep with the reference `Host`'s **first grant** encoding (`(generation 1 << 8) | slot 0`,
+/// see `svm_interp::Host::grant`): the interpreter's coroutine child gets its `Yielder` as the first
+/// grant of a fresh powerbox, so both backends hand the child the *same* handle value (pinned by the
+/// cross-backend differential — the handle is guest-visible data).
+const YIELDER_HANDLE: i32 = 256;
+
+/// Per-coroutine control stack (matches `fiber_rt::FIBER_STACK`): 1 MiB of reserved VA, committed on
+/// demand, guard-paged by `svm-fiber`.
+const CORO_STACK: usize = 1 << 20;
 
 /// One spawned child's outcome: its `i64` result and trap cell (`0` = clean), plus whether it has
 /// been `join`ed (a second join is inert — `ThreadFault`, matching the interpreter).
@@ -39,6 +57,49 @@ pub(crate) struct Nursery {
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     children: Mutex<Vec<Child>>,
+    /// §14 co-fiber children (`spawn_coroutine`): suspended native continuations driven inline by
+    /// `resume`, by handle (slot). `None` once finished (a later resume is an inert `CapFault`). The
+    /// `Box` is taken out for the duration of a switch (so a re-entrant/concurrent resume of the same
+    /// child sees `None` → `CapFault`), then reinserted if the child suspended.
+    coros: Mutex<Vec<Option<Box<Coro>>>>,
+}
+
+/// The slice of a coroutine's state its **child-side** thunks need (`coro_cap_thunk` — the `Yielder`),
+/// boxed separately from [`Coro`] so its stable heap address can be baked into the child's compiled
+/// code as the `cap.call` ctx *before* the [`Coro`] (which owns this box) is assembled. All access is
+/// single-threaded (the child runs inline on the parent's thread), so `Cell`s suffice.
+struct CoroShared {
+    /// The running fiber's switch-back handle, set on fiber entry, null when the child isn't live on
+    /// its stack — a `Yielder` cap.call outside that window is an inert `CapFault`.
+    yielder: Cell<*const svm_fiber::Yielder>,
+    /// The value the child handed to `yield`, read by the parent side after the switch.
+    yield_value: Cell<i64>,
+    /// The child's trap cell (`0` = clean); a child trap propagates to the parent at `resume`.
+    trap: UnsafeCell<i64>,
+}
+
+/// One §14 co-fiber child: its suspended native continuation (the fiber), its own guarded window,
+/// its compiled code, and the guard-state snapshot swapped around every switch. Field order is drop
+/// order: the fiber (stack) first, then the window, then the code (executable memory) — nothing on
+/// an abandoned fiber stack holds a Rust destructor, so a mid-suspend teardown leaks nothing.
+struct Coro {
+    fiber: svm_fiber::Fiber,
+    window: mem::GuestWindow,
+    /// Keep-alive only: the fiber executes raw pointers into this compilation (extracted at spawn),
+    /// so it must live exactly as long as the fiber can run.
+    #[allow(dead_code)]
+    code: crate::ChildCode,
+    shared: Box<CoroShared>,
+    /// The child's detect-and-kill recovery state while it is *suspended* (its guard is armed on its
+    /// fiber stack); the parent swaps this with its own around every switch.
+    guard: mem::GuardState,
+    /// The carve's parent-window-absolute base + size — the slice synced with the child window at
+    /// every switch boundary (the cooperative equivalent of the interpreter's live shared backing).
+    sub_abs: u64,
+    size: usize,
+    /// The spawning thread: a suspended continuation's recovery state (sigjmp_buf / CONTEXT) is only
+    /// valid on the thread that captured it, so a cross-thread `resume` is rejected (`CapFault`).
+    thread: std::thread::ThreadId,
 }
 
 // SAFETY: the raw `cap_ctx` is the run's host pointer, valid for the whole run; the `Nursery` is
@@ -59,6 +120,7 @@ impl Nursery {
             cap_thunk,
             cap_ctx,
             children: Mutex::new(Vec::new()),
+            coros: Mutex::new(Vec::new()),
         }
     }
 
@@ -199,6 +261,281 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
         _ => {
             *trap_out = TrapKind::CapFault as i64; // forged or already-joined handle
             0
+        }
+    }
+}
+
+/// The `Yielder` interface id (iface 7), in lockstep with `svm_interp::iface::YIELDER`.
+#[inline]
+fn svm_ir_iface_yielder() -> u32 {
+    7
+}
+
+/// The §14 coroutine child's baked `cap.call` thunk: its powerbox holds exactly one capability — the
+/// `Yielder` (iface 7, op 0 `yield(value) -> resumed`, handle [`YIELDER_HANDLE`]), which **suspends
+/// the child's native stack** back to the parent's `resume`, handing over `value`; the next `resume`'s
+/// value comes back as the cap.call's result. Anything else (wrong iface/op/handle, or a `Yielder`
+/// call when the child is not live on its fiber) is an inert `CapFault`, matching the interpreter's
+/// single-binding child powerbox.
+///
+/// # Safety
+/// `ctx` is the child's baked [`CoroShared`]; `args`/`results` are the call-site slot buffers and
+/// `trap_out` the child's trap cell — all valid for the call (the `cap.call` lowering guarantees it).
+unsafe extern "C" fn coro_cap_thunk(
+    ctx: *mut core::ffi::c_void,
+    _mem_base: *mut u8,
+    _mem_size: u64,
+    _mem_reserved: u64,
+    type_id: u32,
+    op: u32,
+    handle: i32,
+    args: *const i64,
+    n_args: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) {
+    let sh = &*(ctx as *const CoroShared);
+    if type_id == svm_ir_iface_yielder() && op == 0 && handle == YIELDER_HANDLE {
+        let y = sh.yielder.get();
+        if y.is_null() {
+            *trap_out = TrapKind::CapFault as i64;
+            return;
+        }
+        let value = if n_args >= 1 { *args } else { 0 };
+        sh.yield_value.set(value);
+        // Switch back to the parent's `resume` (which reads `yield_value`); when the parent resumes
+        // us again, `suspend` returns the value it passed — the yield's result.
+        let resumed = (*y).suspend(0);
+        if n_results >= 1 {
+            *results = resumed as i64;
+        }
+        *trap_out = 0;
+    } else {
+        *trap_out = TrapKind::CapFault as i64; // the child's powerbox holds only the Yielder
+    }
+}
+
+/// `spawn_coroutine(handle, entry, off, size_log2, fuel)` (Instantiator op 2; op 4 sets `demand`) —
+/// compile the child confined to its own `2^size_log2` window and park it as a **suspended native
+/// continuation** (a fiber that has not yet run), to be driven by [`coro_resume`]. Validation matches
+/// the interpreter: the carve must be a power-of-two-aligned sub-window of the holder's range and the
+/// entry a `(i64) -> (i64)` function (its argument is its `Yielder` handle) — else `-EINVAL`. A child
+/// that cannot be compiled (it uses §12 fibers/threads) is a `CapFault`. Demand-paged spawn (op 4) is
+/// not wired on the JIT yet — `CapFault`.
+///
+/// # Safety
+/// As [`instantiate`]: `rt`/`mem_base`/`trap_out` are the baked nursery, live parent window base, and
+/// run trap cell, all valid for the call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn coro_spawn(
+    rt: *const Nursery,
+    mem_base: u64,
+    handle: i32,
+    entry: i64,
+    off: i64,
+    size_log2: i64,
+    _fuel: i64,
+    demand: i32,
+    trap_out: *mut i64,
+) -> i32 {
+    let rt = &*rt;
+    let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
+        return 0; // `*trap_out` already holds the CapFault
+    };
+    if demand != 0 {
+        // Fault-driven yield (demand paging) on the JIT is a follow-up; refuse rather than mis-run.
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    }
+
+    let entry = entry as u64;
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    let off = off as u64;
+    // A coroutine child entry is a fixed `(i64 yielder) -> (i64)`, matching the interpreter.
+    let ok_entry = rt
+        .funcs
+        .get(entry as usize)
+        .is_some_and(|f| f.params == [ValType::I64] && f.results == [ValType::I64]);
+    let fits = child_size != 0
+        && child_size <= size
+        && off & (child_size - 1) == 0
+        && off.checked_add(child_size).is_some_and(|e| e <= size);
+    if !ok_entry || !fits {
+        return EINVAL as i32;
+    }
+
+    // The child's own fully-mapped guarded window. Its bytes are synced with the parent's slice at
+    // every switch boundary (see `coro_resume`), so no seeding is needed here.
+    let window = mem::GuestWindow::new(child_size as usize, child_size as usize);
+    let shared = Box::new(CoroShared {
+        yielder: Cell::new(core::ptr::null()),
+        yield_value: Cell::new(0),
+        trap: UnsafeCell::new(0),
+    });
+    // Bake the child's code against its `Yielder` thunk + the stable `CoroShared` address.
+    let code = match crate::compile_child(
+        &rt.funcs,
+        entry as FuncIdx,
+        size_log2 as u8,
+        coro_cap_thunk,
+        &*shared as *const CoroShared as *mut core::ffi::c_void,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            *trap_out = TrapKind::CapFault as i64; // un-compilable child (fibers/threads/backend)
+            return 0;
+        }
+    };
+
+    // The suspended continuation: a fiber that, on first resume, runs the child's entry trampoline
+    // under the child's own (re-entrantly nested) detect-and-kill guard. Captures only `Copy` raw
+    // pointers — the `Coro` owns everything droppable, so a mid-suspend teardown leaks nothing.
+    let sh_ptr: *const CoroShared = &*shared;
+    let code_ptr = code.code;
+    let fnt_ptr = code.fn_table.as_ptr() as *const core::ffi::c_void;
+    let child_base = window.base();
+    let (lo, hi) = window.fault_range();
+    let fiber = svm_fiber::Fiber::new(CORO_STACK, move |y, _first| {
+        // SAFETY: the fiber only runs inside `coro_resume` while the owning `Coro` (and so `sh_ptr`,
+        // the code, and the window) is alive; all access is on the resuming thread.
+        unsafe {
+            (*sh_ptr).yielder.set(y as *const svm_fiber::Yielder);
+            let args = [YIELDER_HANDLE as i64];
+            let mut results = [0i64];
+            let tc = (*sh_ptr).trap.get();
+            let faulted = mem::run_guarded_range(
+                code_ptr,
+                args.as_ptr(),
+                results.as_mut_ptr(),
+                child_base,
+                fnt_ptr,
+                tc,
+                lo,
+                hi,
+            );
+            if faulted {
+                *tc = mem::FAULT_TRAP;
+            }
+            (*sh_ptr).yielder.set(core::ptr::null());
+            results[0] as u64
+        }
+    });
+
+    let coro = Box::new(Coro {
+        fiber,
+        window,
+        code,
+        shared,
+        guard: mem::GuardState::new(), // disarmed until the child's first run arms it
+        sub_abs: base + off,
+        size: child_size as usize,
+        thread: std::thread::current().id(),
+    });
+    let mut coros = rt.coros.lock().unwrap_or_else(|e| e.into_inner());
+    coros.push(Some(coro));
+    (coros.len() - 1) as i32
+}
+
+/// `resume(child, value) -> (status, value)` (Instantiator op 3) — drive the coroutine **inline** on
+/// this thread until it `yield`s (SUSPENDED, the yielded value) or returns (RETURNED, its result; a
+/// child trap propagates as the parent's). Around the switch the parent (a) syncs its window slice
+/// with the child's window — the cooperative equivalent of the interpreter's live shared backing,
+/// exact because the two never run concurrently — and (b) swaps the thread's detect-and-kill
+/// recovery state, so the child's armed guard survives its suspension and the parent's is back in
+/// force afterwards. A forged Instantiator handle, unknown/finished child handle, re-entrant resume
+/// of a running child, or cross-thread resume is an inert `CapFault`.
+///
+/// # Safety
+/// As [`instantiate`]; `status_out` is the call site's status slot, valid for the call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn coro_resume(
+    rt: *const Nursery,
+    mem_base: u64,
+    handle: i32,
+    child: i32,
+    value: i64,
+    status_out: *mut i64,
+    trap_out: *mut i64,
+) -> i64 {
+    let rt = &*rt;
+    *status_out = RETURNED;
+    if rt.resolve(mem_base, handle, trap_out).is_none() {
+        return 0; // forged Instantiator handle (`*trap_out` holds the CapFault)
+    }
+    // Take the child out of the table for the switch: a re-entrant resume of the same child (from
+    // code the child itself reaches, or another vCPU) then sees `None` → CapFault, like the
+    // interpreter's taken slot.
+    let mut coro = {
+        let mut coros = rt.coros.lock().unwrap_or_else(|e| e.into_inner());
+        match coros.get_mut(child as usize).and_then(|c| c.take()) {
+            Some(c) => c,
+            None => {
+                *trap_out = TrapKind::CapFault as i64;
+                return 0;
+            }
+        }
+    };
+    if coro.thread != std::thread::current().id() {
+        // A suspended continuation's recovery state is thread-affine (sigjmp_buf/CONTEXT); put the
+        // child back for its rightful thread and fault this resume.
+        rt.coros.lock().unwrap_or_else(|e| e.into_inner())[child as usize] = Some(coro);
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    }
+
+    // Sync in: the parent's slice → the child's window (the parent may have written bytes for the
+    // child since the last switch — e.g. supplying data it yielded for).
+    {
+        // SAFETY: `[mem_base+sub_abs, …+size)` is committed parent-window memory (bounded by the
+        // Instantiator at spawn); the child window is fully mapped. Both live for the call.
+        let src =
+            std::slice::from_raw_parts((mem_base as *mut u8).add(coro.sub_abs as usize), coro.size);
+        std::slice::from_raw_parts_mut(coro.window.base(), coro.size).copy_from_slice(src);
+    }
+
+    // The switch, bracketed by the guard-state swap: install the child's recovery state (disarmed on
+    // first resume — its own guarded call arms it), and capture it back (still armed if suspended)
+    // before reinstating the parent's.
+    let mut parent_guard = mem::GuardState::new();
+    mem::guard_save(&mut parent_guard);
+    mem::guard_restore(&coro.guard);
+    let st = coro.fiber.resume(value as u64);
+    mem::guard_save(&mut coro.guard);
+    mem::guard_restore(&parent_guard);
+
+    // Sync out: the child's window → the parent's slice (the parent sees the child's writes — the
+    // §14 superset, materialized at every switch).
+    {
+        // SAFETY: as the sync-in above.
+        let dst = std::slice::from_raw_parts_mut(
+            (mem_base as *mut u8).add(coro.sub_abs as usize),
+            coro.size,
+        );
+        dst.copy_from_slice(std::slice::from_raw_parts(coro.window.base(), coro.size));
+    }
+
+    match st {
+        svm_fiber::State::Yielded(_) => {
+            let v = coro.shared.yield_value.get();
+            rt.coros.lock().unwrap_or_else(|e| e.into_inner())[child as usize] = Some(coro);
+            *status_out = SUSPENDED;
+            v
+        }
+        svm_fiber::State::Complete(v) => {
+            // Finished — the slot stays `None` (a later resume is an inert CapFault). A child trap
+            // propagates to the parent, exactly like the synchronous child's `join`.
+            let trap = *coro.shared.trap.get();
+            if trap != 0 {
+                *trap_out = trap;
+                0
+            } else {
+                v as i64
+            }
         }
     }
 }
