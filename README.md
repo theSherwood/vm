@@ -52,15 +52,24 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > interpreter — and exposed to C as the **default guest `malloc`** (the shipped `<stdlib.h>`): any
 > program that `#include <stdlib.h>` gets a `malloc`/`free`/`calloc`/`realloc` whose heap grows
 > megabytes past the initial window through the Memory capability, byte-identically to native `cc`
-> (`demos/heapgrow`). **Concurrency primitives** have landed (x86-64 unix, §12): stackful
+> (`demos/heapgrow`). **Concurrency primitives** have landed (§12; x86-64 + aarch64 unix and
+> x86-64 Windows): stackful
 > **fibers** (`cont.*`), **threads** (`thread.spawn`/`join`, **1:1** — one vCPU per OS thread),
 > **C11 atomics**, and a **`wait`/`notify` futex** — the VM ships these as *primitives* with **no
 > built-in scheduler** (D22/D56), and a C-compatible **`<pthread.h>`** (`create`/`join`/`mutex`/
 > `cond`) is built over them in the libc, so multithreaded C runs identically on the interpreter
-> (the deterministic interleaving oracle, `explore_all`) and the JIT (real OS threads). Still ahead:
-> narrow-scalar promotion, cross-domain `SharedRegion` `create`/`grant` + the async I/O ring, a guest M:N runtime, SIMD,
-> nesting / isolation tiers, and capability extras. This
-> is a research build; "appears to work" is reachable, "is certified secure" is an explicit
+> (the deterministic interleaving oracle, `explore_all`) and the JIT (real OS threads).
+> **§14 nesting (VM-in-VM) has landed on both backends**: a guest holding an **`Instantiator`**
+> capability carves a power-of-two **sub-window** and spawns a child domain there — confinement
+> composes recursively at depth-independent cost, an attenuable **`AddressSpace`** capability
+> manages pages, and **co-fiber** children (`spawn_coroutine`/`resume`/`yield`) cooperate with
+> their parent, including **fault-driven yield** (`spawn_demand_coroutine`): a demand-paged child's
+> first touch of a page suspends it to its parent, which supplies the page and resumes — real
+> hardware lazy paging on the JIT (the fault handler suspends the child's fiber), prot-map faults
+> on the interpreter, byte-identical by differential. Still ahead:
+> narrow-scalar promotion, cross-domain `SharedRegion` `create`/`grant` + the async I/O ring, a
+> guest M:N runtime, SIMD, separate-module nested children, isolation tiers, and capability extras.
+> This is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
 
 ## Layout
@@ -73,7 +82,7 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 | `svm-encode` | Binary encode + **decode** (untrusted-input-facing) (§3a) | escape-TCB |
 | `svm-verify` | The verifier — single linear pass, fail-closed (§2a I2/I3/I4; §3b) | escape-TCB |
 | `svm-interp` | Reference interpreter — the differential oracle (§18) | — |
-| `svm-fiber` | Native stack-switch primitive for fibers / green threads (§3d/§6/§12); the lone home for that `unsafe`, tiny and auditable (x86-64 unix only) | escape-TCB |
+| `svm-fiber` | Native stack-switch primitive for fibers / green threads (§3d/§6/§12); the lone home for that `unsafe`, tiny and auditable (x86-64 + aarch64 unix, x86-64 Windows) | escape-TCB |
 | `svm-jit` | Cranelift JIT — CLIF lowering + the §4 masking lowering + guard page/signal (§9) | escape-TCB† |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
 | `svm` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |

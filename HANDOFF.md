@@ -542,9 +542,12 @@ incompleteness not contradiction:
   OSes. **Phase 4 has started:** the concurrency *primitives* (fibers, 1:1 threads, atomics + the
   C11 ordering surface, futex, a `<pthread.h>`) run on interp (all platforms) + JIT (x86-64 unix,
   aarch64 unix, x86-64 Windows) as mechanism with
-  **no VM scheduler** (D56/§12). The genuine remainders are Phase-4: fault-driven *content* supply +
-  cross-domain `SharedRegion` `create`/`grant`, honoring weak orderings in execution,
-  nesting/isolation tiers, Spectre, SIMD, and the language on-ramp.
+  **no VM scheduler** (D56/§12). **§14 nesting has landed on both backends** (sub-windows, the
+  attenuable `AddressSpace`, the `Instantiator` incl. recursion, co-fiber children, and
+  fault-driven yield — the parent-as-pager *content* supply, hardware faults on the JIT). The
+  genuine remainders are Phase-4: cross-domain `SharedRegion` `create`/`grant` + separate-module
+  nested children, honoring weak orderings in execution, isolation tiers, Spectre, SIMD, and the
+  language on-ramp.
 - **§2a escape-TCB intact:** the frontend is untrusted; all its output is re-verified;
   every memory access is masked, so even a buggy/hostile data-SP cannot escape (the
   data-SP is a plain value, not trusted). Making it an explicit value rather than a
@@ -644,9 +647,11 @@ this is the index.)
     (the C shim compile stays target-gated on `CARGO_CFG_UNIX`). (b) `c_frontend` needs a unix C
     toolchain (`make`+`cc`) → `#![cfg(unix)]` (runs on Linux + macOS; skipped on Windows).
 - [ ] **Phase 4 — post-MVP (started):** the **concurrency primitives** have landed (fibers, 1:1
-  threads, atomics + C11 ordering surface, futex, a `<pthread.h>` libc — interp + JIT on x86-64
-  unix; see below); the rest (nesting, isolation tiers, Spectre, split-host, SIMD, GPU, the
-  language on-ramp) is deferred, developed against the parity matrix.
+  threads, atomics + C11 ordering surface, futex, a `<pthread.h>` libc — interp on all platforms,
+  JIT on x86-64/aarch64 unix + x86-64 Windows; see below), and **§14 nesting** has landed on both
+  backends (sub-windows, `AddressSpace` + attenuation, the `Instantiator` incl. recursion,
+  co-fibers, fault-driven yield; see §10). The rest (isolation tiers, Spectre, split-host, SIMD,
+  GPU, the language on-ramp) is deferred, developed against the parity matrix.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
 - [x] **Production trap-catching (memory)** — *done (unix)*: the JIT window is now `mmap`'d
@@ -656,7 +661,8 @@ this is the index.)
   `TrapKind::MemoryFault` — §5 **detect-and-kill**, host survives — instead of corrupting it.
   Confinement is still the masking lowering; the guard is the safety net (width-overrun at
   the top now faults cleanly, and a masking/elision bug faults locally instead of corrupting
-  the host). `cfg(unix)`; other targets fall back to the old heap window (no guard).
+  the host). `cfg(unix)` at the time; *since ported* — Windows has the same model via a
+  `VirtualAlloc2` placeholder reservation + a Vectored Exception Handler (Phase 3.5 below).
   Verified non-vacuous by `escape_oracle::guard_page_fault_is_detect_and_kill`; whole suite +
   4000 fuzz seeds green (the handler is exercised by width-overruns). **Not yet:** the
   *perf*-unlocking guard-when-bounded (needs a large window — below); div/rem/trunc still use
@@ -732,9 +738,10 @@ this is the index.)
   and the §13 alias differential all green — **and confirmed on the real `windows-latest` CI** (PR #2,
   merged: the `build · test (windows-latest)` gate passed, all three OS legs green). The original
   playbook is preserved below as the design record.
-  **Still left (Phase 4, not MVP blockers):** fault-driven *content* supply (a guest/parent as pager —
-  `userfaultfd`/§14), and cross-domain `SharedRegion` `create`/`grant` (guest-minted regions — needs
-  the §14 Instantiator). **`malloc` over `map` is the default guest libc** — the powerbox
+  **Still left (Phase 4, not MVP blockers):** cross-domain `SharedRegion` `create`/`grant`
+  (guest-minted regions; the §14 Instantiator it needs now exists). Fault-driven *content* supply
+  (a parent as pager, `userfaultfd`-style/§14) has since **landed** — `spawn_demand_coroutine` +
+  fault-driven yield on both backends. **`malloc` over `map` is the default guest libc** — the powerbox
   grants the Memory handle, the `__vm_map`/`__vm_unmap`/`__vm_protect` builtins expose it
   (codegen_ir.c), and the shipped `frontend/chibicc/include/stdlib.h` provides a map-growing
   `malloc`/`free`/`calloc`/`realloc` to any program that `#include <stdlib.h>`; `demos/heapgrow`
