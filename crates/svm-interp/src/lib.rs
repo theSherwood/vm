@@ -1424,6 +1424,115 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     });
                     continue 'frames;
                 }
+                // §14 `Instantiator` (iface 6): serviced here, not in the generic host dispatch, because
+                // `instantiate` spawns a child vCPU and `join` parks — both need the executor. The
+                // handle still gates authority (resolve as Instantiator → its carve range `[base,
+                // base+size)`); a forged/wrong-type handle is an inert `CapFault`.
+                Inst::CapCall {
+                    type_id: iface::INSTANTIATOR,
+                    op,
+                    handle,
+                    args,
+                    ..
+                } => {
+                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let (ibase, isize) = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.resolve_instantiator(h)?
+                    };
+                    match *op {
+                        // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
+                        // §14 data plane is shared memory: the parent seeds the child's sub-window
+                        // directly (it sees the superset) before/after, so there is no scalar arg.
+                        0 => {
+                            let argn = |i: usize| -> Result<i64, Trap> {
+                                as_i64(get(
+                                    &frames[top].vals,
+                                    *args.get(i).ok_or(Trap::Malformed)?,
+                                )?)
+                            };
+                            let entry = argn(0)? as u64;
+                            let off = argn(1)? as u64;
+                            let size_log2 = argn(2)?;
+                            let quota = argn(3)?;
+                            // The child entry is a fixed `(i64) -> (i64)` (like the §12 fiber/thread
+                            // entry convention); a missing or mistyped entry is rejected, not run.
+                            let ok_entry = fs.get(entry as usize).is_some_and(|f| {
+                                f.params == [ValType::I64] && f.results == [ValType::I64]
+                            });
+                            // The carve must be a power-of-two-aligned sub-window within `[0, isize)`
+                            // — a child can only get what the holder sub-allocates (§14/D19).
+                            let child_size = if (0..64).contains(&size_log2) {
+                                1u64 << size_log2
+                            } else {
+                                0
+                            };
+                            let fits = child_size != 0
+                                && child_size <= isize
+                                && off & (child_size - 1) == 0
+                                && off.checked_add(child_size).is_some_and(|e| e <= isize);
+                            if !ok_entry || !fits {
+                                frames[top].vals.push(Value::I32(EINVAL as i32));
+                            } else {
+                                let abs_base = ibase + off;
+                                let child_mem = mem
+                                    .as_ref()
+                                    .map(|m| m.nested_view(abs_base, size_log2 as u8));
+                                // Attenuated powerbox: the child gets only an `AddressSpace` over its
+                                // own window (a strict subset; pass-through of the parent's other
+                                // handles is a follow-up). Its handle is the child entry's argument.
+                                let mut ch = Host::new();
+                                let cas = ch.grant_address_space(abs_base, child_size);
+                                let child_host = Arc::new(Mutex::new(ch));
+                                // Quota: the child's fuel, sub-allocated from (and capped by) ours.
+                                let child_fuel = if quota <= 0 {
+                                    *fuel
+                                } else {
+                                    (quota as u64).min(*fuel)
+                                };
+                                let cfuncs = Arc::clone(&funcs);
+                                let csched = sched.clone();
+                                let made = sched.spawn(move |id| {
+                                    let mut child = VCpu::new(
+                                        cfuncs,
+                                        entry as u32,
+                                        &[Value::I64(cas as i64)], // the child's own AddressSpace handle
+                                        child_mem,
+                                        child_host,
+                                        child_fuel,
+                                        depth + 1,
+                                        id,
+                                        csched,
+                                    );
+                                    child.memop = memop;
+                                    Box::new(child)
+                                });
+                                match made {
+                                    Some(child_id) => {
+                                        threads.push(Some(child_id));
+                                        frames[top]
+                                            .vals
+                                            .push(Value::I32((threads.len() - 1) as i32));
+                                    }
+                                    None => return Err(Trap::ThreadFault),
+                                }
+                            }
+                        }
+                        // join(child) -> result: park only this fiber until the child finishes (its
+                        // result/trap is delivered on resume via `Pending::Join`); siblings run on.
+                        1 => {
+                            let ch = as_i32(get(
+                                &frames[top].vals,
+                                *args.first().ok_or(Trap::Malformed)?,
+                            )?)?;
+                            let slot = resolve_thread(threads, ch)?;
+                            let child = threads[slot].ok_or(Trap::ThreadFault)?;
+                            *pending = Some(Pending::Join { slot });
+                            return Ok(Inner::Park(Blocked::Join { child }));
+                        }
+                        _ => return Err(Trap::CapFault),
+                    }
+                }
                 Inst::CapCall {
                     type_id,
                     op,
@@ -2141,6 +2250,16 @@ pub mod iface {
     /// within the holder's range (a parent can only sub-allocate what it holds, §14). This is the
     /// memory half of the `Instantiator`: a guest carves a child's window from its own.
     pub const ADDRESS_SPACE: u32 = 5;
+    /// `Instantiator` — the §14 nesting primitive: spawn a **child domain** confined to a
+    /// power-of-two sub-window `[base, base+size)` of the holder's window (VM-in-VM). op 0
+    /// `instantiate(entry, off, size_log2, arg, fuel) -> child_handle` enqueues a child vCPU running
+    /// the same module's `entry` (a fixed `(i64) -> (i64)`) confined to `[base+off, base+off+2^size_log2)`
+    /// with an **attenuated** powerbox (today: a child `AddressSpace` over its own window) and a fuel
+    /// quota — returning immediately (non-blocking). op 1 `join(child_handle) -> result` parks **only
+    /// the calling fiber** until that child finishes, then yields its result (siblings keep running —
+    /// the child rides the same §12 executor). Holding the handle is the authority to nest (D19: a
+    /// child can only get what the parent sub-allocates).
+    pub const INSTANTIATOR: u32 = 6;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -2335,6 +2454,13 @@ enum Binding {
         base: u64,
         size: u64,
     },
+    /// A §14 `Instantiator` handle conferring authority to spawn children confined to the window
+    /// sub-range `[base, base+size)` (window-absolute). The eval loop (not the generic dispatch)
+    /// services it — spawning needs executor access — using these bounds to carve each child.
+    Instantiator {
+        base: u64,
+        size: u64,
+    },
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -2429,6 +2555,23 @@ impl Host {
     /// contract, mirroring how the host lays out windows.
     pub fn grant_address_space(&mut self, base: u64, size: u64) -> i32 {
         self.grant(iface::ADDRESS_SPACE, Binding::AddressSpace { base, size })
+    }
+
+    /// Grant a §14 `Instantiator` capability over the window sub-range `[base, base+size)` — the
+    /// authority to spawn children (`instantiate`/`join`) confined to power-of-two sub-windows of it
+    /// (§14). Like `grant_address_space`, `size` must be a power of two and `base` a multiple of it.
+    pub fn grant_instantiator(&mut self, base: u64, size: u64) -> i32 {
+        self.grant(iface::INSTANTIATOR, Binding::Instantiator { base, size })
+    }
+
+    /// Resolve a handle as an `Instantiator` (§14) and return its `(base, size)` sub-range, or a
+    /// `CapFault` for a forged / closed / wrong-type handle. Used by the eval loop, which services
+    /// `instantiate`/`join` itself (the generic dispatch can't reach the executor).
+    fn resolve_instantiator(&self, handle: i32) -> Result<(u64, u64), Trap> {
+        match self.resolve(handle, iface::INSTANTIATOR)? {
+            Binding::Instantiator { base, size } => Ok((base, size)),
+            _ => Err(Trap::CapFault),
+        }
     }
 
     /// Grant a §13 `SharedRegion` capability backed by a fresh `len`-byte zero-filled host buffer,
@@ -2592,6 +2735,10 @@ impl Host {
                     _ => EINVAL,
                 }])
             }
+            // The §14 `Instantiator` is serviced by the interpreter's eval loop (spawning a child vCPU
+            // needs the executor, which the generic dispatch can't reach), so reaching here means a
+            // backend without nesting support (the JIT, today) drove an `instantiate`/`join` — fault.
+            Binding::Instantiator { .. } => Err(Trap::CapFault),
         }
     }
 
@@ -2819,6 +2966,22 @@ impl Mem {
     fn fork_for_thread(&self) -> Mem {
         Mem {
             window: self.window,
+            page: self.page,
+            back: Arc::clone(&self.back),
+            space: Arc::clone(&self.space),
+            has_regions: Arc::clone(&self.has_regions),
+        }
+    }
+
+    /// Build the memory view a **§14 nested child** runs over: it shares this (parent's) `Arc<Region>`
+    /// bytes and `Arc<RwLock<AddrSpace>>` — so the parent intrinsically sees all of the child's memory
+    /// (the superset, §14) and a child `map`/`unmap` is visible to the parent — but **confines** the
+    /// child to the fully-mapped sub-window `[abs_base, abs_base + 2^size_log2)` (window-absolute, in
+    /// the shared backing's coordinates). The child sees a zero-based `[0, size)` and cannot learn it
+    /// is nested; masking ([`Window::sub`]) does the base+mask in one step at each access.
+    fn nested_view(&self, abs_base: u64, size_log2: u8) -> Mem {
+        Mem {
+            window: Window::sub(abs_base, size_log2, 1u64 << size_log2.min(63)),
             page: self.page,
             back: Arc::clone(&self.back),
             space: Arc::clone(&self.space),

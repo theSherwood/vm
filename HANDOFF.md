@@ -870,10 +870,12 @@ leave a shared view — add a unix test for this alongside the Windows work.
   virtual memory** — *most of the §1a differentiators live here.* Sub-window **confinement** is
   in (the masking unit `Window::sub` + a both-backends run path with an interp↔JIT escape-oracle),
   as is the **`AddressSpace` capability + attenuation** (iface 5: a power-of-two window sub-range
-  with `map`/`unmap`/`protect` confined to it + a `sub` op that mints an attenuated child — the
-  memory half of the Instantiator). The **`Instantiator` capability** proper (a guest spawning a
-  child *domain*: sub-window + an attenuated subset of its *own* caps + quota) is the remaining
-  work, and it's what unlocks §13 cross-domain `SharedRegion` and the isolation tiers.
+  with `map`/`unmap`/`protect` confined to it + a `sub` op that mints an attenuated child), and the
+  **`Instantiator` capability** (iface 6, interp): `instantiate`/`join` spawns a same-module child as
+  a confined vCPU on the §12 executor (sub-window + attenuated `AddressSpace` + fuel quota; join parks
+  only the calling fiber). Remaining nesting work: the **JIT** Instantiator path, **co-fiber
+  resume/suspend** children, and **separate-module** children — which then unlock §13 cross-domain
+  `SharedRegion` and the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
   `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
@@ -1069,9 +1071,20 @@ The current frontier, roughly ranked:
    parent can only sub-allocate what it holds). It runs through the shared `cap_dispatch_slots`, so
    both backends get it for free; covered by an interp↔JIT differential + authority-confinement tests
    (`address_space.rs`). This is the **memory half of the Instantiator** and the project's first
-   *attenuation* primitive. **Remaining:** bundle it into the `Instantiator` capability proper — a
-   parent guest spawning a child *domain* (sub-window + an **attenuated subset of its own caps** +
-   quota) at runtime, vs. today's host-driven setup; then cross-domain `SharedRegion` `create`/`grant`.
+   *attenuation* primitive. *Also landed (interp): the **`Instantiator` capability** itself (iface 6,
+   `Host::grant_instantiator`)* — `instantiate(entry, off, size_log2, fuel) -> child_handle` spawns a
+   child as a vCPU on the §12 M:N executor confined to a power-of-two sub-window (`Mem::nested_view`
+   shares the parent's backing, so the parent sees the child's bytes; masking confines the child to
+   its slice), with an attenuated powerbox (its own `AddressSpace`) + a fuel quota; `join(child)`
+   parks **only the calling fiber** (siblings run) and delivers the child's result/trap. Covered by
+   `instantiator.rs` (confinement, out-of-range carve → `-EINVAL`, child-trap propagation). This is
+   the chosen first cut: **spawn + explicit join, same-module child, interp-first**. **Remaining:**
+   (1) the **JIT** path — an `instantiate` there `CapFault`s today (no in-process executor; spawning a
+   child fiber on the JIT runtime is the port); (2) **co-fiber resume/suspend** so a child can yield
+   back mid-run (enables the §14 parent-virtualized-fault / lazy-paging story, and needs the rel-vs-
+   absolute page-protection coordinate reconciliation when a child `map`/`unmap` composes across the
+   sub-window boundary); (3) **separate-module children** + richer cap pass-through; then cross-domain
+   `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.
