@@ -26,6 +26,13 @@ const EINVAL: i64 = -22;
 /// suspended on a demand-page fault (fault-driven yield; value = the fault address).
 const SUSPENDED: i64 = 0;
 const RETURNED: i64 = 1;
+const FAULTED: i64 = 2;
+
+/// Suspend-payload discriminants (the `u64` a fiber switch carries): an explicit `yield` (the value
+/// is in [`CoroShared::yield_value`]) vs. a demand-page fault (the address in
+/// [`CoroShared::fault_addr`], suspended from inside the fault handler).
+const SUSP_YIELD: u64 = 0;
+const SUSP_FAULT: u64 = 1;
 
 /// The handle a coroutine child's `Yielder` capability is minted as — its single entry argument.
 /// In lockstep with the reference `Host`'s **first grant** encoding (`(generation 1 << 8) | slot 0`,
@@ -74,6 +81,9 @@ struct CoroShared {
     yielder: Cell<*const svm_fiber::Yielder>,
     /// The value the child handed to `yield`, read by the parent side after the switch.
     yield_value: Cell<i64>,
+    /// The child-window VA of a pending demand fault ([`demand_cb`] sets it before suspending
+    /// `SUSP_FAULT` from the fault handler; the parent side reads it after the switch).
+    fault_addr: Cell<usize>,
     /// The child's trap cell (`0` = clean); a child trap propagates to the parent at `resume`.
     trap: UnsafeCell<i64>,
 }
@@ -97,9 +107,69 @@ struct Coro {
     /// every switch boundary (the cooperative equivalent of the interpreter's live shared backing).
     sub_abs: u64,
     size: usize,
+    /// Host page size — the demand-paging granularity and the sync-copy chunk.
+    page: usize,
+    /// Per-page committed flags. A demand-paged child (`spawn_demand_coroutine`) starts all-false
+    /// (every first touch faults to the parent); a plain coroutine starts all-true. Sync copies (and
+    /// nothing else) touch only committed pages — an uncommitted child page would fault the *host*.
+    committed: Vec<bool>,
+    /// Whether the child is demand-paged: its window range is registered as this thread's
+    /// recoverable demand range around every switch into it.
+    demand: bool,
+    /// A demand fault awaiting supply: the child-window byte offset whose page the next `resume`
+    /// commits (the parent has meanwhile written the bytes into its own slice) before re-running the
+    /// rewound access.
+    pending_fault: Option<usize>,
     /// The spawning thread: a suspended continuation's recovery state (sigjmp_buf / CONTEXT) is only
     /// valid on the thread that captured it, so a cross-thread `resume` is rejected (`CapFault`).
     thread: std::thread::ThreadId,
+}
+
+/// Sync the committed pages between the parent's window slice and the child's window —
+/// `into_child` picks the direction. The cooperative-coroutine equivalent of the interpreter's live
+/// shared backing: exact, because parent and child never run concurrently, so each side sees the
+/// other's writes at every switch boundary. Uncommitted (never-supplied) pages are skipped — their
+/// parent bytes are untouched by the child by construction (it faults instead of reaching them).
+///
+/// # Safety
+/// `parent_base` is the live parent window; `[sub_abs, sub_abs+size)` is committed parent memory
+/// and the child window's committed pages are mapped RW. Caller holds the only reference to `coro`.
+unsafe fn sync_committed(coro: &Coro, parent_base: *mut u8, into_child: bool) {
+    for (i, &committed) in coro.committed.iter().enumerate() {
+        if !committed {
+            continue;
+        }
+        let off = i * coro.page;
+        let len = coro.page.min(coro.size - off);
+        let parent = parent_base.add(coro.sub_abs as usize + off);
+        let child = coro.window.base().add(off);
+        if into_child {
+            core::ptr::copy_nonoverlapping(parent, child, len);
+        } else {
+            core::ptr::copy_nonoverlapping(child, parent, len);
+        }
+    }
+}
+
+/// The demand-fault callback (§14 fault-driven yield), called by the fault handler — signal/VEH
+/// context, on the **child's fiber stack** — for a fault in the child's registered demand range.
+/// Records the address and suspends the child to its parent *from the handler frame* (the frame
+/// stays live on the fiber stack across the suspension); when the parent has supplied the page and
+/// resumes, `suspend` returns, we return nonzero, and the handler re-executes the faulting access.
+/// With no live child (defensive; the range is only registered around a resume) returns 0 — the
+/// fault falls through to detect-and-kill.
+///
+/// # Safety
+/// `ctx` is the registered child's [`CoroShared`]; called only by the installed fault handler.
+unsafe extern "C" fn demand_cb(addr: usize, ctx: *mut core::ffi::c_void) -> i32 {
+    let sh = &*(ctx as *const CoroShared);
+    let y = sh.yielder.get();
+    if y.is_null() {
+        return 0;
+    }
+    sh.fault_addr.set(addr);
+    let _ = (*y).suspend(SUSP_FAULT);
+    1
 }
 
 // SAFETY: the raw `cap_ctx` is the run's host pointer, valid for the whole run; the `Nursery` is
@@ -306,7 +376,7 @@ unsafe extern "C" fn coro_cap_thunk(
         sh.yield_value.set(value);
         // Switch back to the parent's `resume` (which reads `yield_value`); when the parent resumes
         // us again, `suspend` returns the value it passed — the yield's result.
-        let resumed = (*y).suspend(0);
+        let resumed = (*y).suspend(SUSP_YIELD);
         if n_results >= 1 {
             *results = resumed as i64;
         }
@@ -343,11 +413,7 @@ pub(crate) unsafe extern "C" fn coro_spawn(
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
-    if demand != 0 {
-        // Fault-driven yield (demand paging) on the JIT is a follow-up; refuse rather than mis-run.
-        *trap_out = TrapKind::CapFault as i64;
-        return 0;
-    }
+    let demand = demand != 0;
 
     let entry = entry as u64;
     let child_size = if (0..64).contains(&size_log2) {
@@ -369,12 +435,21 @@ pub(crate) unsafe extern "C" fn coro_spawn(
         return EINVAL as i32;
     }
 
-    // The child's own fully-mapped guarded window. Its bytes are synced with the parent's slice at
-    // every switch boundary (see `coro_resume`), so no seeding is needed here.
-    let window = mem::GuestWindow::new(child_size as usize, child_size as usize);
+    // The child's own guarded window. Plain spawn: fully mapped, bytes synced with the parent's
+    // slice at every switch (see `coro_resume`). Demand spawn (op 4): every page starts
+    // *inaccessible* — the child's first touch of each page faults to the parent, which supplies it
+    // (§14 fault-driven yield / lazy paging).
+    let window = if demand {
+        mem::GuestWindow::new_uncommitted(child_size as usize)
+    } else {
+        mem::GuestWindow::new(child_size as usize, child_size as usize)
+    };
+    let page = mem::page_size();
+    let npages = (child_size as usize).div_ceil(page).max(1);
     let shared = Box::new(CoroShared {
         yielder: Cell::new(core::ptr::null()),
         yield_value: Cell::new(0),
+        fault_addr: Cell::new(0),
         trap: UnsafeCell::new(0),
     });
     // Bake the child's code against its `Yielder` thunk + the stable `CoroShared` address.
@@ -434,6 +509,10 @@ pub(crate) unsafe extern "C" fn coro_spawn(
         guard: mem::GuardState::new(), // disarmed until the child's first run arms it
         sub_abs: base + off,
         size: child_size as usize,
+        page,
+        committed: vec![!demand; npages], // demand: every page awaits its first-fault supply
+        demand,
+        pending_fault: None,
         thread: std::thread::current().id(),
     });
     let mut coros = rt.coros.lock().unwrap_or_else(|e| e.into_inner());
@@ -488,38 +567,67 @@ pub(crate) unsafe extern "C" fn coro_resume(
         return 0;
     }
 
-    // Sync in: the parent's slice → the child's window (the parent may have written bytes for the
-    // child since the last switch — e.g. supplying data it yielded for).
-    {
-        // SAFETY: `[mem_base+sub_abs, …+size)` is committed parent-window memory (bounded by the
-        // Instantiator at spawn); the child window is fully mapped. Both live for the call.
-        let src =
-            std::slice::from_raw_parts((mem_base as *mut u8).add(coro.sub_abs as usize), coro.size);
-        std::slice::from_raw_parts_mut(coro.window.base(), coro.size).copy_from_slice(src);
+    // A pending demand fault: **supply the page** — commit it (fresh pages read zero), mark it
+    // committed so the sync below copies the parent's bytes (placed there while the child sat
+    // suspended) over it; the interpreter's supply-without-zeroing semantics, in two steps.
+    if let Some(off) = coro.pending_fault.take() {
+        let page_off = (off / coro.page) * coro.page;
+        // SAFETY: `off < size` (the fault was inside the child's confined window), so the page lies
+        // in the reservation.
+        coro.window
+            .commit_range(page_off, coro.page.min(coro.size - page_off).max(1));
+        coro.committed[off / coro.page] = true;
     }
 
-    // The switch, bracketed by the guard-state swap: install the child's recovery state (disarmed on
-    // first resume — its own guarded call arms it), and capture it back (still armed if suspended)
-    // before reinstating the parent's.
+    // Sync in: the parent's slice → the child's window (committed pages only) — the parent may have
+    // written bytes for the child since the last switch (e.g. supplying the faulted page).
+    // SAFETY: see `sync_committed`; the parent slice was bounded by the Instantiator at spawn and
+    // both windows live for the call.
+    sync_committed(&coro, mem_base as *mut u8, true);
+
+    // The switch, bracketed by (a) the demand-range registration, so a demand child's first touch of
+    // an unsupplied page suspends back here instead of detect-and-kill, and (b) the guard-state
+    // swap: install the child's recovery state (disarmed on first resume — its own guarded call arms
+    // it), and capture it back (still armed if suspended) before reinstating the parent's.
     let mut parent_guard = mem::GuardState::new();
     mem::guard_save(&mut parent_guard);
     mem::guard_restore(&coro.guard);
+    if coro.demand {
+        let lo = coro.window.base() as usize;
+        // SAFETY: the registration lives exactly for this switch (cleared below); the `CoroShared`
+        // it points at is owned by `coro`, which we hold.
+        mem::set_demand(
+            lo,
+            lo + coro.size,
+            demand_cb,
+            &*coro.shared as *const CoroShared as *mut core::ffi::c_void,
+        );
+    }
     let st = coro.fiber.resume(value as u64);
+    if coro.demand {
+        mem::clear_demand();
+    }
     mem::guard_save(&mut coro.guard);
     mem::guard_restore(&parent_guard);
 
-    // Sync out: the child's window → the parent's slice (the parent sees the child's writes — the
-    // §14 superset, materialized at every switch).
-    {
-        // SAFETY: as the sync-in above.
-        let dst = std::slice::from_raw_parts_mut(
-            (mem_base as *mut u8).add(coro.sub_abs as usize),
-            coro.size,
-        );
-        dst.copy_from_slice(std::slice::from_raw_parts(coro.window.base(), coro.size));
-    }
+    // Sync out: the child's window → the parent's slice (committed pages only) — the parent sees
+    // the child's writes (the §14 superset, materialized at every switch).
+    // SAFETY: as the sync-in above.
+    sync_committed(&coro, mem_base as *mut u8, false);
 
     match st {
+        svm_fiber::State::Yielded(SUSP_FAULT) => {
+            // Fault-driven yield: report `(FAULTED, the fault address in *parent-window*
+            // coordinates)` and remember the page awaiting supply. The child sits suspended inside
+            // its fault handler; the next resume commits the page, syncs the parent's bytes in, and
+            // returns into the handler — which re-executes the faulting access.
+            let child_off = coro.shared.fault_addr.get() - coro.window.base() as usize;
+            let parent_addr = coro.sub_abs + child_off as u64;
+            coro.pending_fault = Some(child_off);
+            rt.coros.lock().unwrap_or_else(|e| e.into_inner())[child as usize] = Some(coro);
+            *status_out = FAULTED;
+            parent_addr as i64
+        }
         svm_fiber::State::Yielded(_) => {
             let v = coro.shared.yield_value.get();
             rt.coros.lock().unwrap_or_else(|e| e.into_inner())[child as usize] = Some(coro);

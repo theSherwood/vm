@@ -84,6 +84,44 @@ impl GuestWindow {
         }
     }
 
+    /// A `size`-byte window whose pages start **inaccessible** (plus the usual guard page): the §14
+    /// demand-paged child window. Every access faults until [`commit_range`](Self::commit_range)
+    /// supplies the page (fault-driven yield). `mapped` is the logical size, so confinement and
+    /// [`fault_range`](Self::fault_range) see the full window — but `[0, mapped)` is **not**
+    /// committed, so `rw_mut`/whole-window reads must not be used; the §14 nesting runtime tracks
+    /// committed pages and touches only those.
+    #[cfg(fiber_rt)]
+    pub(crate) fn new_uncommitted(size: usize) -> GuestWindow {
+        if size == 0 {
+            return GuestWindow {
+                base: std::ptr::null_mut(),
+                mapped: 0,
+                total: 0,
+            };
+        }
+        let page = pal::page_size();
+        let total = round_up(size, page) + page; // window + one guard page, all inaccessible
+                                                 // SAFETY: a fresh inaccessible reservation; checked non-null below.
+        let base = unsafe { pal::reserve(total) };
+        assert!(!base.is_null(), "svm-jit: window reserve failed");
+        GuestWindow {
+            base,
+            mapped: size,
+            total,
+        }
+    }
+
+    /// Commit `[offset, offset+len)` (page-rounded by the PAL) read/write — the §14 lazy-paging
+    /// page supply. Freshly committed pages read zero; the nesting runtime then copies the parent's
+    /// bytes in. Idempotent on already-committed pages.
+    ///
+    /// # Safety
+    /// `[offset, offset+len)` must lie within the window's reservation (excluding the guard page).
+    #[cfg(fiber_rt)]
+    pub(crate) unsafe fn commit_range(&self, offset: usize, len: usize) {
+        pal::commit_rw(self.base.add(offset), len);
+    }
+
     /// The logical (backed) window `[0, mapped)`, readable/writable (freshly committed pages are
     /// zeroed). Bytes in the reserved-but-inaccessible tail are not part of this slice.
     pub(crate) fn rw_mut(&mut self) -> &mut [u8] {
@@ -223,6 +261,12 @@ pub(crate) unsafe fn run_guarded_range(
 /// The trap code a caught guard fault reports.
 pub(crate) const FAULT_TRAP: i64 = TrapKind::MemoryFault as i64;
 
+/// The host page size — the §14 demand-paging granularity (what one fault supplies).
+#[cfg(fiber_rt)]
+pub(crate) fn page_size() -> usize {
+    pal::page_size()
+}
+
 /// A snapshot of this thread's **detect-and-kill recovery state** (the armed window range + recovery
 /// point), for §14 co-fibers: a coroutine child arms its own guard on its own fiber stack, and a
 /// suspend switches away mid-call — so the parent swaps the whole recovery state around every switch
@@ -299,6 +343,57 @@ mod guard_imp {
     }
     pub(super) fn restore(s: &State) {
         super::pal::guard_install(&s.0)
+    }
+}
+
+/// A §14 **demand-fault** callback: called by the fault handler (signal/VEH context!) for a fault
+/// inside the registered demand range. Return nonzero to re-execute the faulting access (the
+/// callback suspended to the parent, which supplied the page), zero to fall through to
+/// detect-and-kill. Must be async-signal-safe up to the stack switch (touch only the given ctx).
+#[cfg(fiber_rt)]
+pub(crate) type DemandCb = unsafe extern "C" fn(addr: usize, ctx: *mut c_void) -> i32;
+
+/// Register this thread's §14 demand range `[lo, hi)` + callback — the *recoverable* fault window of
+/// the demand-paged coroutine child about to run. One registration per thread (coroutines don't
+/// nest); the caller pairs it with [`clear_demand`] around every switch into the child.
+///
+/// # Safety
+/// `cb`/`ctx` must stay valid until [`clear_demand`]; the handler will call them from fault context.
+#[cfg(fiber_rt)]
+pub(crate) unsafe fn set_demand(lo: usize, hi: usize, cb: DemandCb, ctx: *mut c_void) {
+    demand_imp::set(lo, hi, cb, ctx)
+}
+
+/// Clear this thread's §14 demand registration (faults in the range become detect-and-kill again).
+#[cfg(fiber_rt)]
+pub(crate) fn clear_demand() {
+    demand_imp::clear()
+}
+
+#[cfg(all(unix, fiber_rt))]
+mod demand_imp {
+    use core::ffi::c_void;
+    extern "C" {
+        fn svm_set_demand(lo: usize, hi: usize, cb: super::DemandCb, ctx: *mut c_void);
+        fn svm_clear_demand();
+    }
+    pub(super) unsafe fn set(lo: usize, hi: usize, cb: super::DemandCb, ctx: *mut c_void) {
+        svm_set_demand(lo, hi, cb, ctx)
+    }
+    pub(super) fn clear() {
+        // SAFETY: clears this thread's registration thread-locals; always safe.
+        unsafe { svm_clear_demand() }
+    }
+}
+
+#[cfg(all(windows, fiber_rt))]
+mod demand_imp {
+    use core::ffi::c_void;
+    pub(super) unsafe fn set(lo: usize, hi: usize, cb: super::DemandCb, ctx: *mut c_void) {
+        super::pal::DEMAND.with(|d| d.set(Some((lo, hi, cb, ctx))));
+    }
+    pub(super) fn clear() {
+        super::pal::DEMAND.with(|d| d.set(None));
     }
 }
 
@@ -674,12 +769,32 @@ mod pal {
         static TRIPPED: Cell<bool> = const { Cell::new(false) };
     }
 
+    #[cfg(fiber_rt)]
+    thread_local! {
+        // The §14 demand-fault registration `(lo, hi, callback, ctx)` — the *recoverable* fault
+        // window of the demand-paged coroutine child currently running on this thread (see
+        // `mem::set_demand`). Checked by the VEH before detect-and-kill.
+        pub(super) static DEMAND: Cell<Option<(usize, usize, super::DemandCb, *mut c_void)>> =
+            const { Cell::new(None) };
+    }
+
     unsafe extern "system" fn veh(ep: *mut EXCEPTION_POINTERS) -> i32 {
         let ep = &*ep;
         let rec = &*ep.ExceptionRecord;
         if rec.ExceptionCode == STATUS_ACCESS_VIOLATION {
             // ExceptionInformation[1] is the faulting address for an access violation.
             let addr = rec.ExceptionInformation[1];
+            // §14 fault-driven yield: a fault in the registered demand range is *recoverable* (it
+            // lies inside the armed child window, so this check precedes detect-and-kill). The
+            // callback suspends the child's fiber to its parent from this VEH frame (on the child's
+            // fiber stack, live across the suspension); when the parent resumes, the callback
+            // returns and CONTINUE_EXECUTION re-runs the faulting access on the supplied page.
+            #[cfg(fiber_rt)]
+            if let Some((lo, hi, cb, ctx)) = DEMAND.with(|d| d.get()) {
+                if addr >= lo && addr < hi && cb(addr, ctx) != 0 {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
             if let Some(f) = GUARD.with(|g| g.get()) {
                 if addr >= f.lo && addr < f.hi {
                     TRIPPED.with(|t| t.set(true));

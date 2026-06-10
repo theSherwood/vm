@@ -23,6 +23,30 @@ static _Thread_local volatile int g_armed = 0;
 static _Thread_local volatile uintptr_t g_lo = 0;
 static _Thread_local volatile uintptr_t g_hi = 0;
 
+/* §14 fault-driven yield (demand paging): while a demand-paged coroutine child runs, its window's
+ * committed range is registered here. A fault inside it is *recoverable*: the callback suspends the
+ * child's fiber to its parent (which supplies the page and resumes); when it returns nonzero the
+ * handler simply returns, re-executing the faulting access against the now-mapped page. A zero
+ * return (no live coroutine) falls through to the armed-window detect-and-kill below. */
+static _Thread_local volatile uintptr_t g_demand_lo = 0;
+static _Thread_local volatile uintptr_t g_demand_hi = 0;
+static _Thread_local int (*g_demand_cb)(uintptr_t, void *) = 0;
+static _Thread_local void *g_demand_ctx = 0;
+
+void svm_set_demand(uintptr_t lo, uintptr_t hi, int (*cb)(uintptr_t, void *), void *ctx) {
+    g_demand_lo = lo;
+    g_demand_hi = hi;
+    g_demand_ctx = ctx;
+    g_demand_cb = cb;
+}
+
+void svm_clear_demand(void) {
+    g_demand_cb = 0;
+    g_demand_lo = 0;
+    g_demand_hi = 0;
+    g_demand_ctx = 0;
+}
+
 static struct sigaction g_old_segv;
 static struct sigaction g_old_bus;
 
@@ -42,6 +66,15 @@ static void svm_chain(struct sigaction *old, int sig, siginfo_t *info, void *uc)
 
 static void svm_handler(int sig, siginfo_t *info, void *uc) {
     uintptr_t addr = (uintptr_t)info->si_addr;
+    /* Recoverable demand fault first (the demand range lies inside the armed child window, so this
+     * check must precede detect-and-kill). The callback suspends the child's fiber to its parent
+     * *from this handler frame* (on the child's fiber stack — it stays live across the suspension);
+     * when the parent resumes the child, the callback returns here and the plain return re-executes
+     * the faulting access against the freshly supplied page. */
+    if (g_demand_cb && addr >= g_demand_lo && addr < g_demand_hi) {
+        if (g_demand_cb(addr, g_demand_ctx))
+            return;
+    }
     if (g_armed && addr >= g_lo && addr < g_hi) {
         g_armed = 0;
         siglongjmp(g_buf, 1); /* back to svm_run_guarded; does not return */
@@ -54,7 +87,12 @@ void svm_install_trap_handler(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = svm_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    /* SA_NODEFER: don't block SIGSEGV/SIGBUS while the handler runs. A demand fault suspends to the
+     * parent *from inside this handler*, and the parent must keep its own fault recovery (its guard,
+     * or a further demand fault) while the child sits suspended in its handler frame — a blocked
+     * synchronous signal would kill the process instead. The handler never faults on its own
+     * (it touches only thread-locals), so unblocked re-entry is not a recursion hazard. */
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, &g_old_segv);
     sigaction(SIGBUS, &sa, &g_old_bus);

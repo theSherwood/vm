@@ -875,10 +875,12 @@ leave a shared view — add a unix test for this alongside the Windows work.
   same-module child confined to a sub-window — the interp runs it as a vCPU on the §12 executor
   (shared backing; join parks only the calling fiber); the JIT re-compiles it over its own re-entrantly
   guarded window (nesting cost at setup) and copies back — proven equal by an interp↔JIT differential.
-  **co-fiber resume/suspend** children are in too (interp: the `Yielder` cap + `spawn_coroutine`/
-  `resume` — a child yields back to the parent and is resumed, the lazy-paging primitive). Remaining
-  nesting work: the JIT co-fiber path, **separate-module** children, and a
-  non-blocking JIT child — which then unlock §13 cross-domain `SharedRegion` and the isolation tiers.
+  **co-fiber resume/suspend** children are in too, on **both backends** (the `Yielder` cap +
+  `spawn_coroutine`/`resume`; on the JIT a child is a suspended `svm-fiber` native continuation),
+  including **fault-driven yield** (`spawn_demand_coroutine` — interp: prot-map faults; JIT: real
+  hardware faults suspended from the SIGSEGV/VEH handler) — the §14 lazy-paging primitive, end to
+  end. Remaining nesting work: **separate-module** children and a non-blocking JIT `instantiate`
+  child — which then unlock §13 cross-domain `SharedRegion` and the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
   `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
@@ -1120,10 +1122,24 @@ The current frontier, roughly ranked:
    parent supplies the page (writes its bytes into the shared window, then `resume`s — which
    `supply_page`s it, mapping RW without zeroing) and the rewound access re-executes. An *out-of-window*
    fault still traps (the `last_fault` sentinel distinguishes them). Covered by `coroutine.rs`
-   (`..._faults_then_resumes`, `..._reports_fault_address`). **Remaining:** (1) the **JIT** co-fiber
-   path (interp-only today); (2) **separate-module children** + richer cap pass-through (the JIT child
-   has an empty powerbox; a JIT child using fibers/threads is `Unsupported`); (3) a non-blocking JIT
-   child ("park only the calling fiber" — today synchronous at `instantiate`); then cross-domain
+   (`..._faults_then_resumes`, `..._reports_fault_address`). *Also landed: the **JIT co-fiber path**
+   incl. fault-driven yield* — interp/JIT nesting parity is now complete. A JIT coroutine child is a
+   **suspended native continuation**: an `svm-fiber` stack (the §12 boost.context substrate) running
+   the child's own compilation over its own guarded window, its `Yielder` baked as the child's
+   `cap.call` thunk (handle minted as the reference Host's first-grant encoding — guest-visible
+   lockstep). The detect-and-kill recovery state is **swappable** (`mem::GuardState`, a C-side
+   sigjmp_buf blob / the VEH frame) and the parent swaps it around every switch, so the child's armed
+   guard survives suspension. Fault-driven yield is **hardware**: a demand child's window starts
+   uncommitted (`GuestWindow::new_uncommitted`); the SIGSEGV/VEH handler — now `SA_NODEFER`, with a
+   per-thread registered *demand range* checked before detect-and-kill — suspends the child's fiber
+   *from the handler frame*; the parent supplies the page (`commit_range` + committed-page sync) and
+   the resume returns into the handler, re-executing the faulting access. Parent slice ↔ child window
+   sync at every switch (committed pages) is the cooperative equivalent of the interp's live shared
+   backing. Covered by `jit_coroutine.rs` (5 differential tests incl. hardware demand paging).
+   **Remaining:** (1) **separate-module children** + richer cap pass-through (the JIT child's powerbox
+   holds only its Yielder; a JIT child using fibers/threads is `Unsupported`); (2) a non-blocking JIT
+   `instantiate` child ("park only the calling fiber" — today synchronous; coroutines already
+   interleave cooperatively); then cross-domain
    `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
