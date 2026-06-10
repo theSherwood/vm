@@ -1070,7 +1070,7 @@ pub(crate) unsafe fn compile_child_and_run(
         core::ptr::null_mut(),
         epoch_addr, // §5 kill-path: the child polls the parent's interrupt cell
     )?;
-    let child_size = 1u64 << child_size_log2.min(MAX_JIT_WINDOW_LOG2);
+    let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
     let n_results = funcs[child_entry as usize].results.len();
     let code = child.code;
     let fn_table_ptr = child.fn_table.as_ptr();
@@ -1159,6 +1159,15 @@ fn compile_child(
     cap_ctx: *mut core::ffi::c_void,
     epoch_addr: usize,
 ) -> Result<ChildCode, JitError> {
+    // Audit #3: reject an oversize child window explicitly rather than silently clamping with
+    // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
+    // *validated* (which requires `child ≤ parent ≤ 2^MAX`, so this is unreachable in practice — but
+    // it keeps the invariant local instead of relying on the cross-module parent-size cap).
+    if child_size_log2 > MAX_JIT_WINDOW_LOG2 {
+        return Err(JitError::Unsupported(
+            "child window exceeds the reference JIT's max",
+        ));
+    }
     let entry = funcs
         .get(child_entry as usize)
         .ok_or(JitError::Malformed)?
@@ -1173,7 +1182,7 @@ fn compile_child(
             ));
         }
     }
-    let child_size = 1u64 << child_size_log2.min(MAX_JIT_WINDOW_LOG2);
+    let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
     let mask = child_size - 1;
 
     let mut flags = settings::builder();
@@ -2451,6 +2460,15 @@ fn lower_cap_call(
         Some(ss) => b.ins().stack_addr(I64, ss, 0),
         None => b.ins().iconst(I64, 0),
     };
+    // Audit #4: pre-zero the result slots, so a host op that writes fewer than `n_res` results can't
+    // leave uninitialized stack for the read-back to decode. The verifier pins the sig arity, so a
+    // correct host fills all of them — this guards a buggy host, not a guest (bounded to this slot).
+    if let Some(ss) = res_ss {
+        let z = b.ins().iconst(I64, 0);
+        for i in 0..n_res {
+            b.ins().stack_store(z, ss, (i * 8) as i32);
+        }
+    }
 
     // Assemble the thunk arguments (see `CapThunk`).
     let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);

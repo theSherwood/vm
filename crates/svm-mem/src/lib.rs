@@ -506,7 +506,7 @@ impl Paged {
     fn read_into(&self, off: u64, out: &mut [u8]) {
         let map = self.lock();
         for (k, slot) in out.iter_mut().enumerate() {
-            let o = off + k as u64;
+            let o = off.saturating_add(k as u64); // audit #6: inert past range, no overflow
             if o >= self.size {
                 break;
             }

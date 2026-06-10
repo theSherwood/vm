@@ -14,14 +14,17 @@ confinement. This register tracks every finding to closure.
 
 | # | Sev | Area | Status |
 |---|-----|------|--------|
-| 1 | MED–HIGH | Capability model — guest can abort the host by exhausting the handle table | ✅ **FIXED** (this commit) |
-| 2 | MED (on-paper UB) | Thread runtime — racy non-atomic writes to the shared `trap_out` cell | ✅ **FIXED** (this commit) |
-| 3 | MED (defensive) | JIT nesting — validated child size vs clamped child size can diverge | ☐ open |
-| 4 | LOW | cap.call ABI — result buffer partially uninitialized on a sig/host arity mismatch | ☐ open |
-| 5 | LOW | memory substrate — `Mapped` atomic width dispatch treats any non-4 width as 8 | ☐ open |
-| 6 | LOW | memory substrate — `Paged::read_into`/`zero` can debug-overflow on out-of-range `off` | ☐ open |
-| 7 | LOW | decoder — `Vec::with_capacity(ndata)` ~40× allocation amplification | ☐ open |
-| 8 | LOW | thread runtime — futex `HashMap` entries never pruned | ☐ open |
+| 1 | MED–HIGH | Capability model — guest can abort the host by exhausting the handle table | ✅ **FIXED** (`eadd460`) |
+| 2 | MED (on-paper UB) | Thread runtime — racy non-atomic writes to the shared `trap_out` cell | ✅ **FIXED** (`eadd460`) |
+| 3 | MED (defensive) | JIT nesting — validated child size vs clamped child size can diverge | ✅ **FIXED** (this commit) |
+| 4 | LOW | cap.call ABI — result buffer partially uninitialized on a sig/host arity mismatch | ✅ **FIXED** (this commit) |
+| 5 | LOW | memory substrate — `Mapped` atomic width dispatch treats any non-4 width as 8 | ✅ **FIXED** (this commit) |
+| 6 | LOW | memory substrate — `Paged::read_into` can debug-overflow on out-of-range `off` | ✅ **FIXED** (this commit) |
+| 7 | LOW | decoder — `Vec::with_capacity(ndata)` ~40× allocation amplification | ✅ **FIXED** (this commit) |
+| 8 | LOW | thread runtime — futex `HashMap` entries never pruned | ✅ **FIXED** (this commit) |
+
+**All audit findings are now closed.** Remaining hardening beyond this register (e.g. per-domain
+quota metering, §15) is tracked in HANDOFF/DESIGN, not here.
 
 ---
 
@@ -61,16 +64,18 @@ model, so the Rust-side atomics make the cell race-free. Single-threaded child r
 
 ---
 
-## Open (recommended remediation order)
+## Resolved (#3–8) — fixes applied
 
-### 3 — JIT child-size: validated vs clamped value diverge  *(MED, defensive)*
+Each "Fix:" below describes what was implemented.
+
+### 3 — JIT child-size: validated vs clamped value diverge  *(MED, defensive)* ✅
 `instantiator_rt.rs` validates `child_size = 1 << size_log2` **unclamped** against the parent
 carve, but `lib.rs` builds/seeds/copies-back the child window with `1 << size_log2.min(MAX_JIT_WINDOW_LOG2)`
 (2^26). Not exploitable today — any `size_log2 > 26` fails `child ≤ parent ≤ 2^26` first — but
 the two paths should share **one** clamped value so the invariant is local, not cross-module.
 **Fix:** compute the clamped child size once and use it in both validation and window setup.
 
-### 4 — cap.call result buffer partially uninitialized on arity mismatch  *(LOW)*
+### 4 — cap.call result buffer partially uninitialized on arity mismatch  *(LOW)* ✅
 If a host op returns fewer results than the IR sig declares, the JIT reads back trailing result
 slots that hold stack garbage (`lib.rs` result read-back / `svm-run` `zip`). Bounded to the
 JIT-owned `n_res*8` stack slot (no OOB) and the verifier pins sig↔host arity, so it's a
@@ -78,24 +83,24 @@ differential-correctness corner, not a safety issue.
 **Fix:** zero-fill the result buffer before the thunk call, or `debug_assert!` host arity ==
 sig arity.
 
-### 5 — `Mapped` atomic width dispatch treats any non-4 width as 8  *(LOW)*
+### 5 — `Mapped` atomic width dispatch treats any non-4 width as 8  *(LOW)* ✅
 `crates/svm-mem/src/lib.rs` — `match width { 4 => u32, _ => u64 }`. Only callers pass 4/8
 (`atomic_width`), so unreachable, but a future odd width would silently do an 8-byte access.
 **Fix:** `debug_assert!(width == 4 || width == 8)` at the `Region::atomic_*` entry.
 
-### 6 — `Paged::read_into`/`zero` can debug-overflow on out-of-range `off`  *(LOW)*
+### 6 — `Paged::read_into`/`zero` can debug-overflow on out-of-range `off`  *(LOW)* ✅
 `crates/svm-mem/src/lib.rs` — `off + k` / `off + len` are debug-`+`; a huge `off` would
 overflow-panic before the `o >= size` break, instead of being inert. Unreachable today
 (callers pre-confine), but the public `Region` API documents "out-of-range reads zero."
 **Fix:** early `off >= size` guard or `saturating_add`, matching `byte()`'s inert contract.
 
-### 7 — Decoder `Vec::with_capacity(ndata)` amplification  *(LOW)*
+### 7 — Decoder `Vec::with_capacity(ndata)` amplification  *(LOW)* ✅
 `crates/svm-encode/src/lib.rs` — `ndata` is bounded by remaining bytes (so not a true OOM),
 but `with_capacity` pre-reserves ~40 B/element (~40× the blob). It's the only untrusted-count
 pre-allocation; every other collection grows incrementally.
 **Fix:** reserve incrementally, or cap the pre-reservation.
 
-### 8 — Futex `HashMap` entries never pruned  *(LOW)*
+### 8 — Futex `HashMap` entries never pruned  *(LOW)* ✅
 `crates/svm-jit/src/os_thread_rt.rs` — `futex_wait` does `entry(key).or_default()` and the
 waiter-count decrement never removes a zeroed entry. Bounded by the confined window size (keys
 are confined guest addresses), so not unbounded.

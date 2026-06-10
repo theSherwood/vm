@@ -558,6 +558,12 @@ fn futex_wait(
     };
     if let Some(e) = g.get_mut(&key) {
         e.waiters = e.waiters.saturating_sub(1);
+        // Audit #8: drop a fully-drained entry so the futex map can't accumulate stale keys. Safe
+        // under the held lock — `waiters == 0` means no one is parked, so the per-key generation
+        // has no live observer to preserve; a later waiter on this key starts a fresh entry.
+        if e.waiters == 0 {
+            g.remove(&key);
+        }
     }
     status
 }

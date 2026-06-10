@@ -635,9 +635,11 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         }),
         other => return Err(DecodeError::BadMemoryFlag(other)),
     };
-    // Data segments (§3a / D40), mirroring the encoder.
+    // Data segments (§3a / D40), mirroring the encoder. Grow incrementally rather than
+    // `with_capacity(ndata)` — `ndata` is attacker-influenced, and pre-reserving ~40 B/elem is a
+    // ~40x allocation amplification (audit #7); every other decoder collection grows on demand.
     let ndata = c.count()?;
-    let mut data = Vec::with_capacity(ndata);
+    let mut data = Vec::new();
     for _ in 0..ndata {
         let readonly = match c.byte()? {
             0 => false,
