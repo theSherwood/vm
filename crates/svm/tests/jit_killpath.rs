@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use svm_interp::{run, Trap, Value};
+use svm_interp::{run, Host, Trap, Value};
 use svm_jit::{compile_and_run, compile_and_run_with_host_interruptible, JitOutcome, TrapKind};
 use svm_text::parse_module;
 use svm_verify::verify_module;
@@ -167,4 +167,67 @@ fn jit_unarmed_path_is_unchanged() {
     verify_module(&m).expect("verify");
     let jit = compile_and_run(&m, 0, &[1000i64]).expect("jit");
     assert_eq!(jit, JitOutcome::Returned(vec![0]));
+}
+
+/// A §14 parent that instantiates func 1 as a nested child (64 KiB carve at offset 0) and `join`s it.
+/// The child **spins forever**, so a host kill must reach *into the child* — the child polls the
+/// **parent's** interrupt cell (it is compiled with the same baked address), trips `OutOfFuel`,
+/// `join` propagates it, and the parent unwinds. Without the child polling that cell, the synchronous
+/// `instantiate` never returns and the whole run hangs.
+const PARENT_WITH_RUNAWAY_CHILD: &str = "\
+memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 0
+  v3 = i64.const 16
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  br block1(v0)
+block1(v1: i64):
+  v2 = i64.const 1
+  v3 = i64.add v1 v2
+  br block1(v3)
+}
+";
+
+#[test]
+fn jit_killpath_stops_runaway_child() {
+    if !svm_jit::fiber_supported() {
+        return; // no JIT nesting runtime here — an instantiate is an inert CapFault, not a child run
+    }
+    let m = parse_module(PARENT_WITH_RUNAWAY_CHILD).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let win = 1u64 << 17;
+    let mut host = Host::new();
+    let inst = host.grant_instantiator(0, win); // the parent's nesting authority over the window
+
+    let interrupt = Arc::new(AtomicU64::new(0));
+    let wd = interrupt.clone();
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        wd.store(1, Ordering::SeqCst);
+    });
+    let outcome = compile_and_run_with_host_interruptible(
+        &m,
+        0,
+        &[inst as i64],
+        svm_run::cap_thunk,
+        &mut host as *mut Host as *mut core::ffi::c_void,
+        Arc::as_ptr(&interrupt),
+    )
+    .expect("jit compiles");
+    watchdog.join().unwrap();
+
+    assert_eq!(
+        outcome,
+        JitOutcome::Trapped(TrapKind::OutOfFuel),
+        "a runaway nested JIT child must be killed (and not hang the parent's instantiate)"
+    );
 }

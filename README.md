@@ -81,7 +81,9 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > and function entries, so a host watchdog stops a **runaway guest** (infinite loop / unbounded
 > recursion) with `OutOfFuel` instead of hanging — guest-undisableable, and exposed on the CLI via
 > `SVM_DEADLINE_MS`. It kills a **whole multithreaded domain** from one interrupt: spinning vCPUs
-> poll the shared cell, and a vCPU parked in a futex `wait`/`join` re-checks it and unwinds too.
+> poll the shared cell, a vCPU parked in a futex `wait`/`join` re-checks it and unwinds too, and a
+> runaway **nested §14 child** polls the parent's cell as well — so the kill reaches every JIT
+> execution context (root, sibling vCPUs, nested children).
 > Still ahead:
 > narrow-scalar promotion, the async I/O ring, a
 > guest M:N runtime, SIMD, isolation tiers, and capability extras.

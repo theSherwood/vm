@@ -1207,10 +1207,15 @@ The current frontier, roughly ranked:
    (blocked in a futex `wait` or `thread.join`) re-checks the cell on a bounded interval
    (`KILL_RECHECK = 20 ms`, real-build only — the loom futex model is untouched) so it wakes and
    unwinds too, and `join_all` never hangs on it. Tested in `jit_killpath_threads.rs` (spinning
-   sibling + a sibling parked in an *infinite* futex wait → both killed). **Remaining:** the kill-path
-   for **JIT children** (compiled with `epoch_addr = 0` for now — the parent bounds them).
+   sibling + a sibling parked in an *infinite* futex wait → both killed). And it reaches **nested JIT
+   children**: a child (synchronous `instantiate` or a co-fiber `spawn_coroutine`) is compiled to poll
+   the *parent's* interrupt cell (threaded through the `Nursery`), so a runaway child trips `OutOfFuel`
+   instead of hanging the parent inside the `instantiate`/`resume` call where the parent's own checks
+   can't fire — `join` then propagates the child trap and the parent unwinds (tested:
+   `jit_killpath_stops_runaway_child`). **The kill-path is now closed across every JIT execution
+   context** (root, sibling vCPUs, nested children).
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
-   the kill-path for JIT children, and DPOR to scale `explore_all` past lock-free shapes.
+   and DPOR to scale `explore_all` past lock-free shapes.
 5. **Language on-ramp** (§14/D54) — the LLVM-bitcode→IR translator (breadth, the differentiator
    vehicle) and/or an optional wasm→IR bridge (compat).
 

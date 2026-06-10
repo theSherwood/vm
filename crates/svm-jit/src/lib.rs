@@ -807,6 +807,7 @@ fn run_inner(
             cap_thunk,
             cap_ctx,
             resolve_module,
+            epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
         )))
     } else {
         None
@@ -1051,6 +1052,7 @@ pub(crate) unsafe fn compile_child_and_run(
     child_size_log2: u8,
     parent_mem_base: *mut u8,
     args: &[i64],
+    epoch_addr: usize,
 ) -> Result<(i64, i64), JitError> {
     // The synchronous child's powerbox is empty (an inert `cap.call` → `CapFault`).
     let child = compile_child(
@@ -1059,6 +1061,7 @@ pub(crate) unsafe fn compile_child_and_run(
         child_size_log2,
         empty_cap_thunk,
         core::ptr::null_mut(),
+        epoch_addr, // §5 kill-path: the child polls the parent's interrupt cell
     )?;
     let child_size = 1u64 << child_size_log2.min(MAX_JIT_WINDOW_LOG2);
     let n_results = funcs[child_entry as usize].results.len();
@@ -1147,6 +1150,7 @@ fn compile_child(
     child_size_log2: u8,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
+    epoch_addr: usize,
 ) -> Result<ChildCode, JitError> {
     let entry = funcs
         .get(child_entry as usize)
@@ -1207,9 +1211,9 @@ fn compile_child(
             &mut ctx.func,
             f,
             mask,
-            child_size, // the child is fully mapped (reserved == mapped == size)
-            0,          // top-level confinement over the child's own window
-            0, // §5 kill-path not yet wired for JIT children (follow-up; parent bounds them)
+            child_size,        // the child is fully mapped (reserved == mapped == size)
+            0,                 // top-level confinement over the child's own window
+            epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
         )?;
         module
             .define_function(*id, &mut ctx)

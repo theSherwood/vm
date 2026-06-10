@@ -67,6 +67,11 @@ pub(crate) struct Nursery {
     /// granted module's code/data (`None` ⇒ module ops are an inert `CapFault`). Kept apart from the
     /// `cap.call` thunk so the host pointers it yields are never guest-reachable.
     resolve_module: Option<crate::ModuleResolver>,
+    /// Address of the parent run's §5 kill-path interrupt cell (`0` ⇒ no kill-path armed). A nested
+    /// JIT child is compiled to poll the **same** cell, so one host interrupt stops the parent *and*
+    /// every child it spawned (a runaway child would otherwise hang the parent inside `instantiate` /
+    /// `resume`, where the parent's own epoch checks can't fire).
+    epoch_addr: usize,
     children: Mutex<Vec<Child>>,
     /// §14 co-fiber children (`spawn_coroutine`): suspended native continuations driven inline by
     /// `resume`, by handle (slot). `None` once finished (a later resume is an inert `CapFault`). The
@@ -189,12 +194,14 @@ impl Nursery {
         cap_thunk: CapThunk,
         cap_ctx: *mut core::ffi::c_void,
         resolve_module: Option<crate::ModuleResolver>,
+        epoch_addr: usize,
     ) -> Nursery {
         Nursery {
             funcs,
             cap_thunk,
             cap_ctx,
             resolve_module,
+            epoch_addr,
             children: Mutex::new(Vec::new()),
             coros: Mutex::new(Vec::new()),
         }
@@ -363,6 +370,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         size_log2 as u8,
         mem_base as *mut u8,
         &args,
+        rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
     );
     let (result, trap) = match outcome {
         Ok(rt) => rt,
@@ -545,6 +553,7 @@ pub(crate) unsafe extern "C" fn coro_spawn(
         size_log2 as u8,
         coro_cap_thunk,
         &*shared as *const CoroShared as *mut core::ffi::c_void,
+        rt.epoch_addr, // §5: the co-fiber child polls the parent's kill-path cell
     ) {
         Ok(c) => c,
         Err(_) => {
