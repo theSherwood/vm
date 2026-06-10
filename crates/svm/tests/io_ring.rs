@@ -478,3 +478,211 @@ block0(v0: i32, v1: i32):
     );
     assert_eq!(imem, jmem, "interp/JIT windows must agree on the inert CQE");
 }
+
+// ----- increment 3: async submit + fiber parking (an I/O completion is a futex notify) -----------
+//
+// `submit_async` (op 1) kicks the blocking SQEs onto the pool and returns *without waiting*; the guest
+// parks on an in-window futex completion **counter** (the existing `i32.atomic.wait`), and each pool
+// worker — on completing its blocking op — posts the CQE host-side, atomic-increments the counter, and
+// `notify`s it, waking the parked vCPU (DESIGN §12 "an I/O completion is a futex notify"). The guest
+// then `reap`s (op 2) the ready CQEs on its own thread. Interp-only for now (the JIT wires its own
+// wake in §3b; there `submit_async` returns -EINVAL and a guest falls back to the synchronous submit).
+
+/// Entry `(i32 ioring, i32 blocking) -> (i64)`: build 4 `Blocking` SQEs (arg/user_data = i) at offset
+/// 0, `submit_async` them (counter at offset 1024), then **park** in a wait-loop on the counter until
+/// it reaches 4, `reap` the 4 CQEs at offset 2048, and return the sum of their results. Because the
+/// blocking ops take real time on the pool, the counter is still 0 when the guest reaches `wait`, so it
+/// genuinely parks and is resumed by the pool's `notify` — not by polling. The wait timeout is large
+/// (10 s) so a *broken* wake would fall back to it (and blow the wall-clock budget the test asserts),
+/// while a working notify resumes in ~ms.
+const ASYNC_RING_SRC: &str = "memory 17
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i32, v4: i32, v5: i64):
+  v6 = i64.const 64
+  v7 = i64.mul v5 v6
+  v8 = i32.const 10
+  i32.store v7 v8
+  v9 = i64.const 4
+  v10 = i64.add v7 v9
+  v11 = i32.const 0
+  i32.store v10 v11
+  v12 = i64.const 8
+  v13 = i64.add v7 v12
+  i32.store v13 v4
+  v14 = i64.const 12
+  v15 = i64.add v7 v14
+  v16 = i32.const 1
+  i32.store v15 v16
+  v17 = i64.const 16
+  v18 = i64.add v7 v17
+  i64.store v18 v5
+  v19 = i64.const 48
+  v20 = i64.add v7 v19
+  i64.store v20 v5
+  v21 = i64.const 1
+  v22 = i64.add v5 v21
+  v23 = i64.const 4
+  v24 = i64.lt_u v22 v23
+  br_if v24 block1(v3, v4, v22) block2(v3, v4)
+block2(v25: i32, v26: i32):
+  v27 = i64.const 0
+  v28 = i64.const 4
+  v29 = i64.const 1024
+  v30 = cap.call 9 1 (i64, i64, i64) -> (i64) v25 (v27, v28, v29)
+  br block3(v25)
+block3(v31: i32):
+  v32 = i64.const 1024
+  v33 = i32.atomic.load v32
+  v34 = i32.const 4
+  v35 = i32.lt_u v33 v34
+  br_if v35 block4(v31, v33) block5(v31)
+block4(v36: i32, v37: i32):
+  v38 = i64.const 1024
+  v39 = i64.const 10000000000
+  v40 = i32.atomic.wait v38 v37 v39
+  br block3(v36)
+block5(v41: i32):
+  v42 = i64.const 2048
+  v43 = i64.const 4
+  v44 = cap.call 9 2 (i64, i64) -> (i64) v41 (v42, v43)
+  v45 = i64.const 0
+  v46 = i64.const 0
+  br block6(v45, v46)
+block6(v47: i64, v48: i64):
+  v49 = i64.const 32
+  v50 = i64.mul v47 v49
+  v51 = i64.const 2048
+  v52 = i64.add v51 v50
+  v53 = i64.const 8
+  v54 = i64.add v52 v53
+  v55 = i64.load v54
+  v56 = i64.add v48 v55
+  v57 = i64.const 1
+  v58 = i64.add v47 v57
+  v59 = i64.const 4
+  v60 = i64.lt_u v58 v59
+  br_if v60 block6(v58, v56) block7(v56)
+block7(v61: i64):
+  return v61
+}
+";
+
+/// The core mechanism: a vCPU parks on the futex completion counter, the offload pool runs the 4
+/// blocking ops *concurrently* (proven by `max_active == K`) and wakes the parked vCPU via `notify`,
+/// and the guest reaps `Σ mix(i)`. The run resolves in well under the 10 s wait timeout, proving the
+/// wake was notify-driven (not the timeout fallback).
+#[test]
+fn async_submit_parks_then_pool_notify_wakes_and_reaps() {
+    let n = 4i64;
+    let expected: i64 = (0..n).map(mix).fold(0i64, |a, b| a.wrapping_add(b));
+
+    let m = parse_module(ASYNC_RING_SRC).expect("parse");
+    verify_module(&m).expect("verify");
+    let init = [0u8; 128 << 10];
+
+    let mut h = Host::new();
+    // Each blocking op sleeps ~10 ms, so the counter is still 0 when the guest reaches `wait` ⇒ it
+    // parks; a width-4 rendezvous makes the K-way overlap on the pool deterministic.
+    let (ir, ib) = (
+        h.grant_io_ring(),
+        h.grant_blocking(Duration::from_millis(10), Some(OFFLOAD_POOL_THREADS)),
+    );
+
+    let mut fuel = 50_000_000u64;
+    let start = std::time::Instant::now();
+    let (res, _mem) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(ir), Value::I32(ib)],
+        &mut fuel,
+        &init,
+        0,
+        &mut h,
+    );
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        res.expect("interp ran ok").pop(),
+        Some(Value::I64(expected)),
+        "async reap must sum to Σ mix(i)"
+    );
+    assert_eq!(
+        h.blocking_state(ib).expect("blocking state").max_active(),
+        OFFLOAD_POOL_THREADS,
+        "the pool must overlap the blocking ops while the vCPU is parked"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "resumed in {elapsed:?} — far under the 10s wait timeout, so the pool's notify woke the \
+         parked vCPU (not the timeout fallback)"
+    );
+}
+
+/// `submit_async` returns the count submitted, and a follow-up `reap` with nothing ready yet returns
+/// 0 — the non-blocking contract. Here every SQE is a fast (`block_for = 0`) blocking op, so by the
+/// time the guest reaps they may or may not be ready; this asserts only the immediate `submit_async`
+/// return value (4) via a guest that returns it directly.
+#[test]
+fn async_submit_returns_submitted_count() {
+    let src = "memory 17
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i32, v4: i32, v5: i64):
+  v6 = i64.const 64
+  v7 = i64.mul v5 v6
+  v8 = i32.const 10
+  i32.store v7 v8
+  v9 = i64.const 4
+  v10 = i64.add v7 v9
+  v11 = i32.const 0
+  i32.store v10 v11
+  v12 = i64.const 8
+  v13 = i64.add v7 v12
+  i32.store v13 v4
+  v14 = i64.const 12
+  v15 = i64.add v7 v14
+  v16 = i32.const 1
+  i32.store v15 v16
+  v17 = i64.const 16
+  v18 = i64.add v7 v17
+  i64.store v18 v5
+  v19 = i64.const 1
+  v20 = i64.add v5 v19
+  v21 = i64.const 4
+  v22 = i64.lt_u v20 v21
+  br_if v22 block1(v3, v4, v20) block2(v3)
+block2(v23: i32):
+  v24 = i64.const 0
+  v25 = i64.const 4
+  v26 = i64.const 1024
+  v27 = cap.call 9 1 (i64, i64, i64) -> (i64) v23 (v24, v25, v26)
+  return v27
+}
+";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let init = [0u8; 128 << 10];
+
+    let mut h = Host::new();
+    let (ir, ib) = (h.grant_io_ring(), h.grant_blocking(Duration::ZERO, None));
+    let mut fuel = 10_000_000u64;
+    let (res, _mem) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(ir), Value::I32(ib)],
+        &mut fuel,
+        &init,
+        0,
+        &mut h,
+    );
+    assert_eq!(
+        res.expect("ok").pop(),
+        Some(Value::I64(4)),
+        "submit_async returns the count submitted"
+    );
+}

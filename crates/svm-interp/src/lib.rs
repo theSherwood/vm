@@ -142,6 +142,17 @@ fn drive(
     // each child), then unwrap it back into the caller after every vCPU is gone. The root still owns
     // the run's `mem`/`fuel`, read back from its outcome.
     let host_shared = Arc::new(Mutex::new(std::mem::take(host)));
+    // §9/§12 async ring: wire the completion `notify` hook to this run's M:N scheduler, so an offload
+    // worker waking a vCPU parked in `wait` is a `Scheduler::notify` on the confined counter key.
+    {
+        let sched_for_notify = Arc::clone(&sched);
+        host_shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_async_notify(Arc::new(move |key, count| {
+                sched_for_notify.notify(key, count);
+            }));
+    }
     let root_id = {
         let mut s = sched.lock();
         let id = s.next_task;
@@ -167,6 +178,14 @@ fn drive(
     let handles = std::mem::take(&mut sched.lock().handles);
     for h in handles {
         let _ = h.join();
+    }
+    // Drain any in-flight async-ring offload jobs (they hold the window's `Arc<Region>` and may still
+    // be writing the futex counter) and drop the `notify` hook's `Arc<Scheduler>` before reading the
+    // final window back. Safe to lock: all vCPUs are gone, so the shared host is otherwise idle.
+    {
+        let mut h = host_shared.lock().unwrap_or_else(|e| e.into_inner());
+        h.quiesce_pool();
+        h.clear_async_notify();
     }
     let out = sched
         .lock()
@@ -2809,6 +2828,19 @@ pub trait GuestMem {
     fn region_page_size(&self) -> i64 {
         host_region_granularity() as i64
     }
+
+    /// §9/§12 **async ring** support. Return a `Send + Sync` handle for posting completions to the
+    /// 4-byte futex **completion counter** at `counter_addr` from an offload-pool worker thread, plus
+    /// that address confined to its parking-lot key. A worker atomic-increments the counter through the
+    /// returned [`Region`] (the same path cross-vCPU atomics take) and then `notify`s the key, so a
+    /// vCPU parked in `wait` on the counter wakes race-free (the scheduler's compare-under-lock guard).
+    /// `Some` only for a normal in-window anonymous, naturally-aligned, writable page (not a §13 alias,
+    /// whose atomics route differently). `None` — the default — means the backend can't post async
+    /// completions, so `submit_async` reports `-EINVAL` and the guest falls back to the synchronous
+    /// `submit`. Only the reference paged [`Mem`] overrides it today (the JIT wires its own in §3b).
+    fn async_counter(&self, _counter_addr: u64) -> Option<(Arc<Region>, u64)> {
+        None
+    }
 }
 
 /// A [`GuestMem`] over a flat, contiguous window slice — the JIT's representation. The
@@ -2889,9 +2921,10 @@ enum Binding {
     /// runtime); the generic dispatch treats any `cap.call` on it as an inert `CapFault`.
     Module(u32),
     /// A §9/§12 `IoRing` handle: authority to `submit` a batch of deferred `cap.call`s
-    /// (io_uring-shaped). Carries no host state in the synchronous MVP — the ring buffers (SQ/CQ)
-    /// live in the guest window; `submit` gets their pointers as args.
-    IoRing,
+    /// (io_uring-shaped), carrying the index of its [`RingState`] in [`Host::rings`] (the async-path
+    /// completion buffer; the synchronous `submit` doesn't use it). The SQ/CQ ring buffers live in the
+    /// guest window; the ops get their pointers as args.
+    IoRing(u32),
     /// A §12 `Blocking` handle, carrying the index of its [`AsyncState`] in [`Host::blockings`] — a
     /// mock synchronous-only/blocking op the offload pool can overlap. Out-of-line (an index, not the
     /// `Arc`) so `Binding` stays `Copy`, like [`Binding::SharedRegion`]/[`Binding::Module`].
@@ -2986,6 +3019,11 @@ struct OffloadPool {
     /// Per-worker job channels; a batch is round-robined across them.
     txs: Vec<std::sync::mpsc::Sender<OffloadJob>>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    /// Jobs dispatched but not yet finished — `(count, condvar)`. [`OffloadPool::dispatch`] (the async
+    /// path) returns without waiting, so [`OffloadPool::quiesce`] uses this to drain in-flight work at
+    /// run end before the window's `Arc<Region>` (which a late job may still write) is read back.
+    inflight: Arc<(Mutex<usize>, Condvar)>,
+    next: usize,
 }
 
 impl OffloadPool {
@@ -3001,7 +3039,51 @@ impl OffloadPool {
                 }
             }));
         }
-        OffloadPool { txs, workers }
+        OffloadPool {
+            txs,
+            workers,
+            inflight: Arc::new((Mutex::new(0), Condvar::new())),
+            next: 0,
+        }
+    }
+
+    /// **Async dispatch** (the increment-3 path): round-robin `jobs` to the workers and return
+    /// **immediately**. Each job is wrapped to decrement the in-flight count + notify on completion;
+    /// the job itself posts its own completion (host-side result + futex counter + `notify`). The
+    /// guest's vCPU parks via the futex `wait` rather than blocking here — the whole point of async.
+    fn dispatch(&mut self, jobs: Vec<OffloadJob>) {
+        if jobs.is_empty() {
+            return;
+        }
+        {
+            let (m, _) = &*self.inflight;
+            *m.lock().unwrap() += jobs.len();
+        }
+        for job in jobs {
+            let inflight = Arc::clone(&self.inflight);
+            let wrapped: OffloadJob = Box::new(move || {
+                job();
+                let (m, c) = &*inflight;
+                let mut g = m.lock().unwrap();
+                *g -= 1;
+                if *g == 0 {
+                    c.notify_all();
+                }
+            });
+            let w = self.next % self.txs.len();
+            self.next = self.next.wrapping_add(1);
+            self.txs[w].send(wrapped).expect("offload worker vanished");
+        }
+    }
+
+    /// Block until every dispatched async job has finished. Called at run end so no worker still holds
+    /// (and might still write) the window's `Arc<Region>` after the caller reads the final memory back.
+    fn quiesce(&self) {
+        let (m, c) = &*self.inflight;
+        let mut g = m.lock().unwrap();
+        while *g > 0 {
+            g = c.wait(g).unwrap();
+        }
     }
 
     /// Round-robin `jobs` across the workers and **block until all complete**. Each job writes its
@@ -3046,6 +3128,16 @@ impl Drop for OffloadPool {
     }
 }
 
+/// §9/§12 async-ring per-handle state: completions posted by offload workers (or by inline ops) during
+/// a `submit_async`, awaiting the guest's `reap` to flush them into the window. `Send + Sync` so a pool
+/// worker pushes from its own thread; the guest reaps on its vCPU thread. The futex completion counter
+/// lives in the *window* (so the guest can `wait` on it); this holds only the CQE payloads.
+#[derive(Default)]
+struct RingState {
+    /// Ready completions `(user_data, result, status)`, FIFO — pushed by workers/inline, popped by reap.
+    completed: Mutex<VecDeque<(i64, i64, i64)>>,
+}
+
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -3081,6 +3173,15 @@ pub struct Host {
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
     pool: Option<OffloadPool>,
+    /// §9/§12 async-ring per-handle state, indexed by the id a [`Binding::IoRing`] carries — where a
+    /// `submit_async` posts completions for the guest's `reap`.
+    rings: Vec<Arc<RingState>>,
+    /// §9/§12 the **async-completion `notify`** hook: an offload worker calls this (with the confined
+    /// futex counter key) to wake the vCPU parked in `wait` on that key — i.e. an I/O completion *is* a
+    /// futex notify (DESIGN §12). Installed per run by the executor that owns the wake mechanism
+    /// (`drive` wires it to the M:N `Scheduler::notify`); `None` ⇒ no async support, so `submit_async`
+    /// `-EINVAL`s and the guest falls back to the synchronous `submit`.
+    async_notify: Option<Arc<dyn Fn(u64, u32) + Send + Sync>>,
 }
 
 /// One §14 module grant: the verified module's functions, declared window size, and data segments —
@@ -3111,6 +3212,24 @@ impl Host {
             region_factory: None,
             blockings: Vec::new(),
             pool: None,
+            rings: Vec::new(),
+            async_notify: None,
+        }
+    }
+
+    /// Install the §9/§12 async-completion `notify` hook (the executor that owns the wake mechanism
+    /// wires it at run start; see [`Host::async_notify`]). Cleared at run end to drop the closure's
+    /// `Arc<Scheduler>`.
+    fn set_async_notify(&mut self, f: Arc<dyn Fn(u64, u32) + Send + Sync>) {
+        self.async_notify = Some(f);
+    }
+    fn clear_async_notify(&mut self) {
+        self.async_notify = None;
+    }
+    /// Drain any in-flight offload-pool jobs (run end), so no worker still holds the window backing.
+    fn quiesce_pool(&self) {
+        if let Some(p) = &self.pool {
+            p.quiesce();
         }
     }
 
@@ -3155,9 +3274,12 @@ impl Host {
     pub fn grant_memory(&mut self) -> i32 {
         self.grant(iface::MEMORY, Binding::Memory)
     }
-    /// Grant a §9/§12 `IoRing` capability — authority to `submit` batched/deferred `cap.call`s.
+    /// Grant a §9/§12 `IoRing` capability — authority to `submit` batched/deferred `cap.call`s
+    /// (synchronously via op 0, or asynchronously via op 1 `submit_async` + op 2 `reap`).
     pub fn grant_io_ring(&mut self) -> i32 {
-        self.grant(iface::IO_RING, Binding::IoRing)
+        let idx = self.rings.len() as u32;
+        self.rings.push(Arc::new(RingState::default()));
+        self.grant(iface::IO_RING, Binding::IoRing(idx))
     }
     /// Grant a §12 `Blocking` capability — a mock synchronous/blocking host op the offload pool can
     /// overlap. `block_for` is how long each op blocks (`Duration::ZERO` for a pure compute);
@@ -3514,10 +3636,15 @@ impl Host {
             // module ops); it has no callable ops — and crucially, the generic dispatch never exposes
             // the grant's host-side data, so no host pointer is guest-reachable.
             Binding::Module(_) => Err(Trap::CapFault),
-            // §9/§12 IoRing: `op 0 submit(sq_ptr, n, cq_ptr) -> completed`. Runs `n` deferred
-            // cap.calls from the window's submission queue and writes their completions.
-            Binding::IoRing => match op {
+            // §9/§12 IoRing. op 0 `submit(sq_ptr, n, cq_ptr)` — synchronous batch (increment 1/2). op 1
+            // `submit_async(sq_ptr, n, counter_addr)` — kick the batch onto the pool and return; each
+            // completion posts to the ring's [`RingState`] + bumps the in-window futex counter + wakes
+            // a parked vCPU (increment 3). op 2 `reap(cq_ptr, max)` — flush ready completions to the
+            // window on the vCPU thread.
+            Binding::IoRing(idx) => match op {
                 0 => self.io_ring_submit(args, mem),
+                1 => self.io_ring_submit_async(idx, args, mem),
+                2 => self.io_ring_reap(idx, args, mem),
                 _ => Ok(vec![EINVAL]),
             },
             // §12 Blocking: `op 0 work(arg) -> mix(arg)`. As a *direct* cap.call it runs inline and
@@ -3684,6 +3811,164 @@ impl Host {
             Self::write_cqe(&mut *m, p.at, p.user_data, p.result, p.status);
         }
         Ok(vec![n as i64])
+    }
+
+    /// §9/§12 **async submit** (op 1, increment 3). `submit_async(sq_ptr, n, counter_addr)` reads `n`
+    /// SQEs, kicks the **offloadable** (`Blocking`) ones onto the bounded pool, runs the inline ones
+    /// immediately, and returns the count submitted **without waiting**. Each completion posts its CQE
+    /// to the ring's host-side [`RingState`] and atomic-increments the 4-byte futex **completion
+    /// counter** at `counter_addr`; an offloaded completion additionally `notify`s the counter key to
+    /// wake a vCPU parked in `wait` on it — an I/O completion *is* a futex notify (DESIGN §12). The
+    /// guest then parks on the counter, runs other fibers, and `reap`s once it advances.
+    ///
+    /// Requires the backend to expose the futex counter (`async_counter`) **and** the wake hook
+    /// (`async_notify`); without them — the JIT pre-§3b, or the deterministic explorer — it returns
+    /// `-EINVAL`, and the guest is expected to fall back to the synchronous `submit`. CQEs are written
+    /// only by `reap` on the vCPU thread, so the single counter atomic is the *only* cross-thread
+    /// window write an async ring performs.
+    fn io_ring_submit_async(
+        &mut self,
+        ring_idx: u32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        const SQE: u64 = 64;
+        const MAX_SQ_ARGS: usize = 4;
+        let m = match mem {
+            Some(m) => m,
+            None => return Ok(vec![EFAULT]),
+        };
+        let sq_ptr = *args.first().unwrap_or(&0) as u64;
+        let n = (*args.get(1).unwrap_or(&0)).max(0) as u64;
+        let counter_addr = *args.get(2).unwrap_or(&0) as u64;
+
+        // The backend must expose the futex counter backing + the wake hook, else there is no async
+        // path here (the guest falls back to the synchronous `submit`).
+        let (backing, counter_key) = match m.async_counter(counter_addr) {
+            Some(t) => t,
+            None => return Ok(vec![EINVAL]),
+        };
+        let notify = match &self.async_notify {
+            Some(f) => Arc::clone(f),
+            None => return Ok(vec![EINVAL]),
+        };
+        let ring = Arc::clone(&self.rings[ring_idx as usize]);
+
+        let mut jobs: Vec<OffloadJob> = Vec::new();
+        let mut inline_done: u32 = 0; // completions ready before we return (counter bumped once below)
+        for i in 0..n {
+            let raw = match m.read_bytes(sq_ptr + i * SQE, SQE) {
+                Some(r) => r,
+                None => {
+                    ring.completed.lock().unwrap().push_back((0, 0, -EFAULT));
+                    inline_done += 1;
+                    continue;
+                }
+            };
+            let type_id = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+            let op = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+            let handle = i32::from_le_bytes(raw[8..12].try_into().unwrap());
+            let n_args =
+                (u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize).min(MAX_SQ_ARGS);
+            let mut opargs = [0i64; MAX_SQ_ARGS];
+            for (a, slot) in opargs.iter_mut().enumerate().take(n_args) {
+                *slot = i64::from_le_bytes(raw[16 + a * 8..24 + a * 8].try_into().unwrap());
+            }
+            let user_data = i64::from_le_bytes(raw[48..56].try_into().unwrap());
+
+            if type_id == iface::BLOCKING && op == 0 {
+                if let Ok(Binding::Blocking(bidx)) = self.resolve(handle, iface::BLOCKING) {
+                    // Offload: compute on a pool thread, post the completion, then bump+notify so a
+                    // parked vCPU wakes (the counter write happens-before the notify, so the futex
+                    // compare-under-lock can't lose the wakeup).
+                    let state = Arc::clone(&self.blockings[bidx as usize]);
+                    let arg = opargs[0];
+                    let ring = Arc::clone(&ring);
+                    let backing = Arc::clone(&backing);
+                    let notify = Arc::clone(&notify);
+                    jobs.push(Box::new(move || {
+                        let r = state.run(arg);
+                        ring.completed.lock().unwrap().push_back((user_data, r, 0));
+                        backing.atomic_rmw(counter_key, 4, RmwOp::Add, 1);
+                        notify(counter_key, u32::MAX);
+                    }));
+                    continue;
+                }
+                // forged / wrong-type Blocking handle → inert CapFault completion (the I2 check).
+                ring.completed.lock().unwrap().push_back((
+                    user_data,
+                    0,
+                    trap_status(&Trap::CapFault),
+                ));
+                inline_done += 1;
+            } else if type_id == iface::IO_RING {
+                // A ring submitting to a ring would recurse without bound — inert CapFault.
+                ring.completed.lock().unwrap().push_back((
+                    user_data,
+                    0,
+                    trap_status(&Trap::CapFault),
+                ));
+                inline_done += 1;
+            } else {
+                // Inline: window-/host-touching ops run now on the submit thread.
+                let (result, status) = match self.cap_dispatch_slots(
+                    type_id,
+                    op,
+                    handle,
+                    &opargs[..n_args],
+                    Some(&mut *m),
+                ) {
+                    Ok(res) => (res.first().copied().unwrap_or(0), 0),
+                    Err(t) => (0, trap_status(&t)),
+                };
+                ring.completed
+                    .lock()
+                    .unwrap()
+                    .push_back((user_data, result, status));
+                inline_done += 1;
+            }
+        }
+
+        // Account the inline completions on the counter once (no wake — the guest can't be parked
+        // during its own submit). Offloaded ones bump the counter as they finish.
+        if inline_done > 0 {
+            backing.atomic_rmw(counter_key, 4, RmwOp::Add, inline_done as u64);
+        }
+        if !jobs.is_empty() {
+            let pool = self
+                .pool
+                .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
+            pool.dispatch(jobs);
+        }
+        Ok(vec![n as i64])
+    }
+
+    /// §9/§12 **reap** (op 2). `reap(cq_ptr, max) -> n_reaped` pops up to `max` ready completions from
+    /// the ring's [`RingState`] and writes them as 32-byte CQEs to `[cq_ptr, …)`, on the vCPU thread.
+    fn io_ring_reap(
+        &mut self,
+        ring_idx: u32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        const CQE: u64 = 32;
+        let m = match mem {
+            Some(m) => m,
+            None => return Ok(vec![EFAULT]),
+        };
+        let cq_ptr = *args.first().unwrap_or(&0) as u64;
+        let max = (*args.get(1).unwrap_or(&0)).max(0) as u64;
+        let ring = Arc::clone(&self.rings[ring_idx as usize]);
+        let mut q = ring.completed.lock().unwrap();
+        let mut i = 0u64;
+        while i < max {
+            let Some((ud, result, status)) = q.pop_front() else {
+                break;
+            };
+            Self::write_cqe(&mut *m, cq_ptr + i * CQE, ud, result, status);
+            i += 1;
+        }
+        Ok(vec![i as i64])
     }
 
     /// Write one 32-byte CQE (little-endian) at `at`. A bad address is dropped (the guest's bug; the
@@ -4105,6 +4390,20 @@ impl Mem {
                     .get(&(base.wrapping_sub(self.window.base()) / self.page)),
                 Some(PageProt::Backed { .. })
             )
+    }
+
+    /// §9/§12 async-ring completion counter: confine + validate a 4-byte futex counter address (same
+    /// gate as an `i32` atomic), require a normal anonymous page (a §13 alias's atomics route through
+    /// `read_le`, not `back`, so an offload worker couldn't reach it consistently), and hand back the
+    /// `Arc<Region>` + confined key for a worker to atomic-increment (matching `atomic_value`'s
+    /// non-backed path) before it `notify`s.
+    fn async_counter_impl(&self, counter_addr: u64) -> Option<(Arc<Region>, u64)> {
+        let base = self.confine_checked(counter_addr, 0, 4).ok()?;
+        if base % 4 != 0 || self.is_backed(base) {
+            return None;
+        }
+        self.check_prot(base, 4, true).ok()?;
+        Some((Arc::clone(&self.back), base))
     }
 
     /// Validate a `<ty>.atomic.wait` address: confine it, require natural alignment, and require the
@@ -4591,6 +4890,9 @@ impl GuestMem for Mem {
     /// so the two backends agree.
     fn page_size(&self) -> i64 {
         self.page as i64
+    }
+    fn async_counter(&self, counter_addr: u64) -> Option<(Arc<Region>, u64)> {
+        self.async_counter_impl(counter_addr)
     }
 }
 
