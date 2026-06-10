@@ -2111,3 +2111,22 @@ fn c_guest_mn_scheduler_demo() {
         "the guest M:N scheduler must total 4*8*32 = 1024 on both backends"
     );
 }
+
+/// The §12 work-stealing capstone: a guest-built **work-stealing** M:N scheduler over **stackless**
+/// tasks (`demos/work_stealing`) runs identically on the interpreter (the M:N oracle) and the JIT.
+/// Tasks are state-machine structs (just data), so an idle worker steals one from a busy sibling /
+/// the global injector and resumes it on its own thread — cross-thread task migration with **no VM
+/// change** (the migratable-fiber primitive, D57, is *not* needed for stackless tasks). The total
+/// (16·16 = 256) is interleaving-invariant, so both backends must print it regardless of *which*
+/// worker ran each task. Proves work-stealing M:N composes from the primitives. Interp == JIT is
+/// enforced inside `run_c_full`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_work_stealing_demo() {
+    let src = include_str!("../../svm-run/demos/work_stealing/work_stealing.c");
+    let run = run_c_full(src);
+    assert_eq!(
+        run.stdout, b"256\n",
+        "the guest work-stealing scheduler must total 16*16 = 256 on both backends"
+    );
+}

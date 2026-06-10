@@ -881,22 +881,30 @@ leave a shared view — add a unix test for this alongside the Windows work.
     context** (root vCPU, sibling vCPUs incl. ones *parked* in a futex `wait`/`join`, and nested §14
     children, which poll the parent's cell). Opt-in + guest-undisableable; the CLI arms it via
     `SVM_DEADLINE_MS`. See §10's tracker (next-pickups item 3 tail) for the full write-up.
-  - **Guest-built M:N — first worked example DONE.** `demos/mn_sched` is a guest-built **sharded
-    (thread-per-core) M:N green-thread scheduler**: 4 `thread.spawn` workers, each cooperatively
-    round-robining 8 `cont.*` fibers that yield + increment one shared atomic (total `4·8·32 = 1024`,
-    interleaving-invariant). The *whole scheduler is guest code* over the VM's primitives — proof that
-    D56's "primitives, not policy" composes. Identical on the interp (M:N oracle) and JIT (real OS
-    threads): `c_frontend::c_guest_mn_scheduler_demo` + `run::demo_mn_scheduler_runs`. The design
-    decision (two primitives; "stackless tasks" add none; the two M:N flavors; the *Proposed*
-    migratable-fiber path for stackful work-stealing) is **D57** + `SCHEDULING.md`.
+  - **Guest-built M:N — both flavors DONE (worked examples).** The design decision (two primitives;
+    "stackless tasks" add none; the two M:N flavors; the *Proposed* migratable-fiber path for stackful
+    work-stealing) is **D57** + `SCHEDULING.md`. Both schedulers are *entirely guest code* over the
+    VM's primitives — proof D56's "primitives, not policy" composes — and run identically on the interp
+    (M:N oracle) and JIT (real OS threads):
+    - **Demo 1 — `demos/mn_sched`: sharded (thread-per-core), *stackful*.** 4 `thread.spawn` workers,
+      each round-robining 8 `cont.*` fibers (yield + increment a shared atomic; `4·8·32 = 1024`). Tasks
+      pinned per worker (fibers are thread-affine). `c_frontend::c_guest_mn_scheduler_demo` +
+      `run::demo_mn_scheduler_runs`.
+    - **Demo 2 — `demos/work_stealing`: work-stealing, *stackless*.** tokio-style — a global injector +
+      per-worker deques + stealing; tasks are state-machine structs (just data) that migrate freely
+      between threads (a pointer hand-off, safe by construction — **no VM change**, the D57
+      migratable-fiber primitive is not needed for stackless). `16·16 = 256`, and the exact total
+      proves no task was lost/double-run as they migrated. `c_frontend::c_guest_work_stealing_demo` +
+      `run::demo_work_stealing_runs`.
     - *Finding surfaced by the demo:* the shipped MVP `malloc` (a bump allocator) is **not
       thread-safe** — concurrent `malloc` from worker threads corrupts the heap. The demo pre-allocates
       fiber stacks on the main thread to sidestep it; a **thread-safe guest `malloc`** (mutex/atomic
       bump, or per-thread arenas) is a libc follow-up (guest-side, not a VM concern).
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
     today), the async submit/complete ring (§9/§12), fiber/vCPU quota metering (the kill path exists;
-    *metering*/quotas don't yet), the stackless **work-stealing** M:N demo + the D57 migratable-fiber
-    primitive, and DPOR to scale the exhaustive `explore_all` checker past lock-free shapes.
+    *metering*/quotas don't yet), the D57 migratable-fiber primitive (stackful work-stealing), a
+    thread-safe guest `malloc`, and DPOR to scale the exhaustive `explore_all` checker past lock-free
+    shapes.
 
 - [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
   virtual memory** — *most of the §1a differentiators live here.* Sub-window **confinement** is

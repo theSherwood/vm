@@ -441,3 +441,29 @@ fn demo_mn_scheduler_runs() {
     assert!(out.status.success(), "svm-run on mn_sched failed: {err}");
     assert_eq!(out.stdout, b"1024\n", "guest M:N scheduler total");
 }
+
+/// The guest-built **work-stealing** M:N scheduler demo (`demos/work_stealing`, stackless tasks),
+/// end to end through the `svm-run` binary — must print the interleaving-invariant total `256`. The
+/// interp↔JIT differential lives in `c_frontend::c_guest_work_stealing_demo`; this is the
+/// product-path smoke test. Skipped (not failed) when the frontend is unavailable.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_work_stealing_runs() {
+    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
+        .arg(demo("work_stealing/work_stealing.c"))
+        .output()
+        .expect("spawn svm-run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.contains("chibicc") {
+        eprintln!(
+            "note: skipping work_stealing demo (frontend unavailable): {}",
+            err.trim()
+        );
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "svm-run on work_stealing failed: {err}"
+    );
+    assert_eq!(out.stdout, b"256\n", "guest work-stealing scheduler total");
+}
