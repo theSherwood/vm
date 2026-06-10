@@ -417,3 +417,27 @@ fn cli_deadline_kills_runaway_c_program() {
         "expected an OutOfFuel detect-and-kill on the CLI; stderr: {err}"
     );
 }
+
+/// The guest-built **M:N green-thread scheduler** demo (`demos/mn_sched`), end to end through the
+/// `svm-run` binary: 4 worker threads each cooperatively scheduling 8 fibers over the VM's
+/// primitives — the scheduler is entirely guest code (D56/D57). Must print the interleaving-
+/// invariant total `1024`. The interp↔JIT differential lives in `c_frontend::c_guest_mn_scheduler_demo`;
+/// this is the product-path smoke test. Skipped (not failed) when the frontend is unavailable.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_mn_scheduler_runs() {
+    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
+        .arg(demo("mn_sched/mn_sched.c"))
+        .output()
+        .expect("spawn svm-run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.contains("chibicc") {
+        eprintln!(
+            "note: skipping mn_sched demo (frontend unavailable): {}",
+            err.trim()
+        );
+        return;
+    }
+    assert!(out.status.success(), "svm-run on mn_sched failed: {err}");
+    assert_eq!(out.stdout, b"1024\n", "guest M:N scheduler total");
+}

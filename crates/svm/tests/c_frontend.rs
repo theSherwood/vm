@@ -2093,3 +2093,21 @@ int main(void) {\n\
 fn c_region_unmap_builtin() {
     assert_eq!(run_c(C_REGION_UNMAP).as_slice(), [Value::I32(1)]);
 }
+
+/// The §12 capstone: a **guest-built M:N green-thread scheduler** (`demos/mn_sched`) runs
+/// identically on the interpreter (the M:N deterministic oracle) and the JIT (real OS threads).
+/// 4 worker threads (`thread.spawn`), each cooperatively round-robining 8 fibers (`cont.*`) that
+/// yield and increment one shared atomic — the entire scheduler is *guest code* over the VM's
+/// primitives (D56/D57). The grand total (4·8·32 = 1024) is interleaving-invariant, so both
+/// backends must print exactly it. This proves the abstractions compose into a real M:N runtime
+/// with no scheduler baked into the VM. Interp == JIT is enforced inside `run_c_full`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_mn_scheduler_demo() {
+    let src = include_str!("../../svm-run/demos/mn_sched/mn_sched.c");
+    let run = run_c_full(src);
+    assert_eq!(
+        run.stdout, b"1024\n",
+        "the guest M:N scheduler must total 4*8*32 = 1024 on both backends"
+    );
+}
