@@ -545,8 +545,9 @@ incompleteness not contradiction:
   **no VM scheduler** (D56/§12). **§14 nesting has landed on both backends** (sub-windows, the
   attenuable `AddressSpace`, the `Instantiator` incl. recursion, co-fiber children, and
   fault-driven yield — the parent-as-pager *content* supply, hardware faults on the JIT). The
-  genuine remainders are Phase-4: cross-domain `SharedRegion` `create`/`grant` + separate-module
-  nested children, honoring weak orderings in execution, isolation tiers, Spectre, SIMD, and the
+  **Separate-module children** (the host-granted `Module` capability, the "plugin-in-plugin"
+  story) are in on both backends. The genuine remainders are Phase-4: cross-domain `SharedRegion`
+  `create`/`grant`, honoring weak orderings in execution, isolation tiers, Spectre, SIMD, and the
   language on-ramp.
 - **§2a escape-TCB intact:** the frontend is untrusted; all its output is re-verified;
   every memory access is masked, so even a buggy/hostile data-SP cannot escape (the
@@ -886,8 +887,11 @@ leave a shared view — add a unix test for this alongside the Windows work.
   `spawn_coroutine`/`resume`; on the JIT a child is a suspended `svm-fiber` native continuation),
   including **fault-driven yield** (`spawn_demand_coroutine` — interp: prot-map faults; JIT: real
   hardware faults suspended from the SIGSEGV/VEH handler) — the §14 lazy-paging primitive, end to
-  end. Remaining nesting work: **separate-module** children and a non-blocking JIT `instantiate`
-  child — which then unlock §13 cross-domain `SharedRegion` and the isolation tiers.
+  end. **Separate-module children** are in too (a host-granted `Module` capability + the
+  Instantiator's module ops — the "plugin-in-plugin" story, data segments materialized into the
+  carve, lazily for demand children). Remaining nesting work: richer cap pass-through and a
+  non-blocking JIT `instantiate` child — which then unlock §13 cross-domain `SharedRegion` and the
+  isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
   `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
@@ -1143,11 +1147,25 @@ The current frontier, roughly ranked:
    the resume returns into the handler, re-executing the faulting access. Parent slice ↔ child window
    sync at every switch (committed pages) is the cooperative equivalent of the interp's live shared
    backing. Covered by `jit_coroutine.rs` (5 differential tests incl. hardware demand paging).
-   **Remaining:** (1) **separate-module children** + richer cap pass-through (the JIT child's powerbox
-   holds only its Yielder; a JIT child using fibers/threads is `Unsupported`); (2) a non-blocking JIT
-   `instantiate` child ("park only the calling fiber" — today synchronous; coroutines already
-   interleave cooperatively); then cross-domain
-   `SharedRegion` `create`/`grant`.
+   *Also landed: **separate-module children*** — the "plugin-in-plugin" story, both backends. The host
+   verifies a *different* module and grants a **`Module` capability** (iface 8,
+   `Host::grant_module`); the parent passes it to the Instantiator's **module ops** (5
+   `instantiate_module` / 6 `spawn_coroutine_module` / 7 `spawn_demand_coroutine_module` — same
+   shapes as 0/2/4 with the Module handle prepended; `join`/`resume` unchanged). The child runs the
+   foreign module confined to a carve that must **equal its declared memory** (§14 transparency: the
+   plugin behaves exactly as standalone); its **data segments materialize into the carve at spawn**
+   (so e.g. string literals work — and a demand child gets them **supplied lazily**, page by page);
+   RO-segment protection is skipped for nested children (§1 self-corruption non-goal). On the JIT the
+   module resolves via a dedicated host callback (`svm_jit::ModuleResolver` / `svm_run::
+   module_resolver`, threaded through `compile_and_run_capture_reserved_with_host_ex`) — deliberately
+   **not** the `cap.call` surface, so the host pointers it yields are never guest-reachable (the
+   generic dispatch on a Module handle is an inert `CapFault`) — and the foreign module is compiled
+   at `instantiate` ("nesting cost paid at setup"). Covered by `separate_module.rs` (interp) +
+   `jit_separate_module.rs` (differential incl. the lazy-segment fault address byte-exact).
+   **Remaining:** (1) richer cap pass-through (the JIT child's powerbox holds only its Yielder; a JIT
+   child using fibers/threads is `Unsupported`); (2) a non-blocking JIT `instantiate` child ("park
+   only the calling fiber" — today synchronous; coroutines already interleave cooperatively); then
+   cross-domain `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.

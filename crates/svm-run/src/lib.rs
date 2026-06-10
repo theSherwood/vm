@@ -85,6 +85,36 @@ pub unsafe extern "C" fn cap_thunk(
     }
 }
 
+/// The §14 **module resolver** for the JIT's nesting runtime: resolve a guest's `Module` handle
+/// (granted by [`Host::grant_module`]) to the module's code/data so the runtime can compile and spawn
+/// a **separate-module child** (`instantiate_module` & friends). Pass it (with the same `Host` ctx as
+/// [`cap_thunk`]) to `compile_and_run_capture_reserved_with_host_ex`. Deliberately not routed through
+/// `cap.call` dispatch: it yields host pointers, which must never be guest-reachable.
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the same as the cap thunk's); `out` is a writable
+/// [`svm_jit::ResolvedModule`]. The `Host` must outlive the run (it owns the resolved views).
+pub unsafe extern "C" fn module_resolver(
+    ctx: *mut c_void,
+    handle: i32,
+    out: *mut svm_jit::ResolvedModule,
+) -> i32 {
+    let host = &*(ctx as *const Host);
+    match host.resolve_module_parts(handle) {
+        Some((funcs, n_funcs, memory_log2, data, n_data)) => {
+            *out = svm_jit::ResolvedModule {
+                funcs,
+                n_funcs,
+                memory_log2,
+                data,
+                n_data,
+            };
+            1
+        }
+        None => 0,
+    }
+}
+
 /// The **host** page size: the protection granularity for `map`/`unmap`/`protect`, matching the
 /// interpreter (`svm_interp`) and the JIT (`svm-jit`) on the same host so all three agree
 /// page-for-page (§4 "pin page size", host-page default). `sysconf(_SC_PAGESIZE)` on unix,

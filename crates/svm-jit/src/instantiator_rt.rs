@@ -16,7 +16,7 @@
 use crate::{mem, CapThunk, TrapKind};
 use std::cell::{Cell, UnsafeCell};
 use std::sync::Mutex;
-use svm_ir::{Func, FuncIdx, ValType};
+use svm_ir::{Data, Func, FuncIdx, ValType};
 
 /// Negative-errno an out-of-range carve returns (matches the interpreter's `EINVAL`, §3e D42).
 const EINVAL: i64 = -22;
@@ -63,6 +63,10 @@ pub(crate) struct Nursery {
     funcs: std::sync::Arc<[Func]>,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
+    /// §14 separate-module children: the host callback resolving a guest's `Module` handle to the
+    /// granted module's code/data (`None` ⇒ module ops are an inert `CapFault`). Kept apart from the
+    /// `cap.call` thunk so the host pointers it yields are never guest-reachable.
+    resolve_module: Option<crate::ModuleResolver>,
     children: Mutex<Vec<Child>>,
     /// §14 co-fiber children (`spawn_coroutine`): suspended native continuations driven inline by
     /// `resume`, by handle (slot). `None` once finished (a later resume is an inert `CapFault`). The
@@ -184,14 +188,52 @@ impl Nursery {
         funcs: std::sync::Arc<[Func]>,
         cap_thunk: CapThunk,
         cap_ctx: *mut core::ffi::c_void,
+        resolve_module: Option<crate::ModuleResolver>,
     ) -> Nursery {
         Nursery {
             funcs,
             cap_thunk,
             cap_ctx,
+            resolve_module,
             children: Mutex::new(Vec::new()),
             coros: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Resolve a spawn's child source (§14): `module < 0` ⇒ a **self** child (the parent's own
+    /// functions, no data segments, no declared-memory constraint); otherwise a host-granted
+    /// **`Module` handle** resolved via [`Nursery::resolve_module`] — the child runs *that* verified
+    /// module's code, its data segments materialize into the carve, and the carve must equal its
+    /// declared memory. `None` (with `*trap_out` set to a `CapFault`) for a forged handle or a run
+    /// with no resolver.
+    ///
+    /// # Safety
+    /// `trap_out` is the live trap cell. The returned slices borrow host-owned storage valid for the
+    /// run (the [`ModuleResolver`](crate::ModuleResolver) contract).
+    unsafe fn resolve_child(
+        &self,
+        module: i64,
+        trap_out: *mut i64,
+    ) -> Option<(&[Func], Option<i32>, &[Data])> {
+        if module < 0 {
+            return Some((&self.funcs, None, &[]));
+        }
+        let Some(resolver) = self.resolve_module else {
+            *trap_out = TrapKind::CapFault as i64;
+            return None;
+        };
+        let mut rm = core::mem::MaybeUninit::<crate::ResolvedModule>::zeroed().assume_init();
+        if resolver(self.cap_ctx, module as i32, &mut rm) == 0 || rm.n_funcs == 0 {
+            *trap_out = TrapKind::CapFault as i64;
+            return None;
+        }
+        let funcs = std::slice::from_raw_parts(rm.funcs, rm.n_funcs);
+        let data = if rm.n_data == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(rm.data, rm.n_data)
+        };
+        Some((funcs, Some(rm.memory_log2), data))
     }
 
     /// Resolve `handle` as this domain's `Instantiator` via the run's `cap.call` thunk, returning its
@@ -229,12 +271,35 @@ fn svm_ir_iface_instantiator() -> u32 {
     6
 }
 
-/// `instantiate(handle, entry, off, size_log2, fuel) -> child_handle` — the §14 nesting op. Resolves
-/// the holder's carve range, validates the requested power-of-two sub-window fits within it
-/// (`-EINVAL` otherwise), then **re-compiles** the child entry confined to `[base+off, …+2^size_log2)`
-/// and runs it over the parent's live window (`mem_base`), stashing its outcome for `join`. Returns a
-/// child handle (a table index), or `-EINVAL`. A child that cannot be compiled (e.g. it uses §12
-/// fibers/threads, unsupported for a JIT child today) sets `*trap_out` to a `CapFault`.
+/// Materialize a §14 separate-module child's **data segments** into its carve `[abs_base, …+size)`
+/// of the live parent window — exactly as if the child wrote them (the parent sees them, the §14
+/// superset; the verifier bounded each segment to the child's declared window == the carve, with a
+/// defensive re-check here). RO protection of `readonly` segments is skipped for nested children
+/// (intra-domain self-corruption is a §1 non-goal).
+///
+/// # Safety
+/// `[mem_base+abs_base, …+child_size)` is committed parent-window memory (the Instantiator bounded
+/// the carve to the holder's range), valid for the call.
+unsafe fn write_data_segments(data: &[Data], mem_base: u64, abs_base: u64, child_size: u64) {
+    for d in data {
+        if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+            core::ptr::copy_nonoverlapping(
+                d.bytes.as_ptr(),
+                (mem_base as *mut u8).add((abs_base + d.offset) as usize),
+                d.bytes.len(),
+            );
+        }
+    }
+}
+
+/// `instantiate(handle, [module,] entry, off, size_log2, fuel) -> child_handle` — the §14 nesting op
+/// (`module < 0` ⇒ a self child, op 0; a `Module` handle ⇒ a **separate-module child**, op 5 — the
+/// "plugin"). Resolves the holder's carve range, validates the requested power-of-two sub-window fits
+/// within it (`-EINVAL` otherwise; a module child's carve must **equal its declared memory** — §14
+/// transparency), materializes a module child's data segments into the carve, then **re-compiles**
+/// the child entry confined to its own window and runs it (seeded from / copied back to the carve),
+/// stashing its outcome for `join`. Returns a child handle (a table index), or `-EINVAL`. A child
+/// that cannot be compiled (it uses §12 fibers/threads) or a forged module handle is a `CapFault`.
 ///
 /// # Safety
 /// Called from JIT'd code with `rt` the baked [`Nursery`], `mem_base` the live parent window base, and
@@ -244,6 +309,7 @@ pub(crate) unsafe extern "C" fn instantiate(
     rt: *const Nursery,
     mem_base: u64,
     handle: i32,
+    module: i64,
     entry: i64,
     off: i64,
     size_log2: i64,
@@ -254,9 +320,13 @@ pub(crate) unsafe extern "C" fn instantiate(
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
+    let Some((child_funcs, mod_mem, child_data)) = rt.resolve_child(module, trap_out) else {
+        return 0; // forged Module handle / no resolver — CapFault set
+    };
 
     // The carve must be a power-of-two-aligned sub-window within `[0, size)` — a child can only get
-    // what the holder sub-allocates (§14/D19). Bad entry index / size / alignment ⇒ `-EINVAL`.
+    // what the holder sub-allocates (§14/D19) — and a module child's carve must equal its declared
+    // memory. Bad entry index / size / alignment ⇒ `-EINVAL`.
     let entry = entry as u64;
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
@@ -264,24 +334,30 @@ pub(crate) unsafe extern "C" fn instantiate(
         0
     };
     let off = off as u64;
+    let mod_ok = mod_mem.is_none_or(|ml| ml == size_log2 as i32);
     let fits = child_size != 0
         && child_size <= size
         && off & (child_size - 1) == 0
         && off.checked_add(child_size).is_some_and(|e| e <= size)
-        && (entry as usize) < rt.funcs.len();
-    if !fits {
+        && (entry as usize) < child_funcs.len();
+    if !fits || !mod_ok {
         return EINVAL as i32;
     }
 
+    // A module child's data segments materialize into the carve now — `compile_child_and_run` seeds
+    // the child's window from the carve, so they arrive exactly like the interpreter's shared-backing
+    // writes at spawn.
+    write_data_segments(child_data, mem_base, base + off, child_size);
+
     // The child entry takes its starter caps as `i64` args; with an empty powerbox today they are
     // unused, so pass zeros of the right arity (the entry is a fixed `(i64[, i64]) -> i64`).
-    let nargs = rt.funcs[entry as usize].params.len();
+    let nargs = child_funcs[entry as usize].params.len();
     let args = vec![0i64; nargs];
 
     // Re-compile the child as a top-level guest over its own window, seeded from the parent's
     // sub-region `[base+off, … + child_size)` and copied back on completion (the §14 superset).
     let outcome = crate::compile_child_and_run(
-        &rt.funcs,
+        child_funcs,
         entry as FuncIdx,
         base + off,
         size_log2 as u8,
@@ -402,6 +478,7 @@ pub(crate) unsafe extern "C" fn coro_spawn(
     rt: *const Nursery,
     mem_base: u64,
     handle: i32,
+    module: i64,
     entry: i64,
     off: i64,
     size_log2: i64,
@@ -413,6 +490,9 @@ pub(crate) unsafe extern "C" fn coro_spawn(
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
+    let Some((child_funcs, mod_mem, child_data)) = rt.resolve_child(module, trap_out) else {
+        return 0; // forged Module handle / no resolver — CapFault set
+    };
     let demand = demand != 0;
 
     let entry = entry as u64;
@@ -422,18 +502,24 @@ pub(crate) unsafe extern "C" fn coro_spawn(
         0
     };
     let off = off as u64;
-    // A coroutine child entry is a fixed `(i64 yielder) -> (i64)`, matching the interpreter.
-    let ok_entry = rt
-        .funcs
+    // A coroutine child entry is a fixed `(i64 yielder) -> (i64)`, matching the interpreter; a
+    // module child's carve must equal its declared memory (§14 transparency).
+    let ok_entry = child_funcs
         .get(entry as usize)
         .is_some_and(|f| f.params == [ValType::I64] && f.results == [ValType::I64]);
+    let mod_ok = mod_mem.is_none_or(|ml| ml == size_log2 as i32);
     let fits = child_size != 0
         && child_size <= size
         && off & (child_size - 1) == 0
         && off.checked_add(child_size).is_some_and(|e| e <= size);
-    if !ok_entry || !fits {
+    if !ok_entry || !fits || !mod_ok {
         return EINVAL as i32;
     }
+
+    // A module child's data segments materialize into the **carve** now: a plain coroutine's first
+    // sync-in copies them into its window; a demand coroutine's pages stay unmapped, so its segments
+    // are *supplied lazily*, page by page, as it first touches them (the §14 parent-as-pager model).
+    write_data_segments(child_data, mem_base, base + off, child_size);
 
     // The child's own guarded window. Plain spawn: fully mapped, bytes synced with the parent's
     // slice at every switch (see `coro_resume`). Demand spawn (op 4): every page starts
@@ -454,7 +540,7 @@ pub(crate) unsafe extern "C" fn coro_spawn(
     });
     // Bake the child's code against its `Yielder` thunk + the stable `CoroShared` address.
     let code = match crate::compile_child(
-        &rt.funcs,
+        child_funcs,
         entry as FuncIdx,
         size_log2 as u8,
         coro_cap_thunk,

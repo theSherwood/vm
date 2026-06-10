@@ -66,7 +66,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, ConvOp, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
+    AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, ValType,
     DEFAULT_RESERVED_LOG2,
 };
@@ -272,6 +272,32 @@ pub type CapThunk = unsafe extern "C" fn(
     trap_out: *mut i64,
 );
 
+/// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
+/// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the
+/// host's table is append-only and the host outlives the run — the same lifetime contract as the
+/// `cap.call` ctx). `memory_log2 < 0` means the module declares no memory.
+#[repr(C)]
+pub struct ResolvedModule {
+    pub funcs: *const Func,
+    pub n_funcs: usize,
+    pub memory_log2: i32,
+    pub data: *const Data,
+    pub n_data: usize,
+}
+
+/// The host callback the §14 nesting runtime uses to resolve a guest's **`Module` handle** to the
+/// granted module's code/data (so a guest can only instantiate modules it was given). Returns
+/// nonzero and fills `out` on success, `0` for a forged/closed/wrong handle. Deliberately a
+/// *separate* callback from [`CapThunk`]: module resolution yields host pointers, which must never
+/// be reachable from a guest-issued `cap.call` (the generic dispatch on a Module handle is an inert
+/// `CapFault`) — only the host-side nesting runtime calls this.
+///
+/// # Safety
+/// `ctx` is the same host pointer as the run's `cap_ctx`; `out` points at a writable
+/// [`ResolvedModule`]. The filled views must outlive the run (see [`ResolvedModule`]).
+pub type ModuleResolver =
+    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, handle: i32, out: *mut ResolvedModule) -> i32;
+
 /// The default thunk for [`compile_and_run`] (no host): an empty powerbox, so every
 /// `cap.call` is inert — a `CapFault` — exactly like the interpreter's `run`.
 unsafe extern "C" fn empty_cap_thunk(
@@ -355,6 +381,7 @@ pub fn compile_and_run_with_host(
         DEFAULT_RESERVED_LOG2,
         None,
         None,
+        None,
     )?
     .0)
 }
@@ -398,6 +425,7 @@ pub fn compile_and_run_capture_reserved(
         reserved_log2,
         None,
         None,
+        None,
     )
 }
 
@@ -428,6 +456,7 @@ pub fn compile_and_run_capture_sub(
         0, // fully-mapped child (reserved == size); the parent is fully backed
         None,
         Some(SubWindow { base, parent_bytes }),
+        None,
     )
 }
 
@@ -448,6 +477,37 @@ pub fn compile_and_run_capture_reserved_with_host(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    compile_and_run_capture_reserved_with_host_ex(
+        m,
+        func,
+        args,
+        init_mem,
+        reserved_log2,
+        cap_thunk,
+        cap_ctx,
+        None,
+    )
+}
+
+/// [`compile_and_run_capture_reserved_with_host`] + a §14 **module resolver**: the host callback the
+/// nesting runtime uses to resolve a guest's `Module` handle when it `instantiate`s a
+/// **separate-module child** (the Instantiator's module ops). `None` ⇒ module ops are an inert
+/// `CapFault` (same as a host that granted no modules).
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host`]; `resolve_module` (with `cap_ctx`) must honour
+/// the [`ModuleResolver`] contract — in particular the resolved views must outlive the run.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_ex(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    resolve_module: Option<ModuleResolver>,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
     run_inner(
         m,
         func,
@@ -460,6 +520,7 @@ pub fn compile_and_run_capture_reserved_with_host(
         // backed prefix) so guest-grown / `unmap`-ed reserved-tail pages are byte-compared too.
         Some(SNAP_CAP),
         None,
+        resolve_module,
     )
 }
 
@@ -485,6 +546,7 @@ fn run_inner(
     reserved_log2: u8,
     snapshot_cap: Option<usize>,
     sub: Option<SubWindow>,
+    resolve_module: Option<ModuleResolver>,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // Calls can reach any function, so every function must be lowerable.
@@ -692,6 +754,7 @@ fn run_inner(
             m.funcs.clone().into(),
             cap_thunk,
             cap_ctx,
+            resolve_module,
         )))
     } else {
         None
@@ -2347,16 +2410,23 @@ fn lower_instantiator(
     let mem_base = b.use_var(lower.mem_var);
     let trap_out = b.use_var(lower.trap_var);
     match op {
-        0 => {
-            // instantiate(nursery, mem_base, handle:i32, entry:i64, off:i64, size_log2:i64,
-            //             fuel:i64, trap_out:i64) -> child_handle:i32
+        0 | 5 => {
+            // instantiate(nursery, mem_base, handle:i32, module:i64, entry:i64, off:i64,
+            //             size_log2:i64, fuel:i64, trap_out:i64) -> child_handle:i32. op 0 is a
+            // **self** child (module = -1); op 5 (`instantiate_module`, §14 separate-module child)
+            // passes a host-granted `Module` handle as its first arg and shifts the rest by one.
             let h = get(vals, handle)?; // the Instantiator handle (resolved for authority)
-            let entry = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
-            let off = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
-            let size_log2 = get(vals, *args.get(2).ok_or(JitError::Malformed)?)?;
-            let fuel = get(vals, *args.get(3).ok_or(JitError::Malformed)?)?;
+            let (modh, a0) = if op == 5 {
+                (get(vals, *args.first().ok_or(JitError::Malformed)?)?, 1)
+            } else {
+                (b.ins().iconst(I64, -1), 0)
+            };
+            let entry = get(vals, *args.get(a0).ok_or(JitError::Malformed)?)?;
+            let off = get(vals, *args.get(a0 + 1).ok_or(JitError::Malformed)?)?;
+            let size_log2 = get(vals, *args.get(a0 + 2).ok_or(JitError::Malformed)?)?;
+            let fuel = get(vals, *args.get(a0 + 3).ok_or(JitError::Malformed)?)?;
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I64, I64, I64, I64, I64] {
+            for t in [I64, I64, I32, I64, I64, I64, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -2365,7 +2435,9 @@ fn lower_instantiator(
             let call = b.ins().call_indirect(
                 tref,
                 thunk,
-                &[nursery, mem_base, h, entry, off, size_log2, fuel, trap_out],
+                &[
+                    nursery, mem_base, h, modh, entry, off, size_log2, fuel, trap_out,
+                ],
             );
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
@@ -2388,18 +2460,25 @@ fn lower_instantiator(
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
         }
-        2 | 4 => {
-            // coro_spawn(nursery, mem_base, handle:i32, entry:i64, off:i64, size_log2:i64, fuel:i64,
-            //            demand:i32, trap_out:i64) -> child_handle:i32 — §14 co-fiber spawn (op 4
-            // additionally demand-pages the child's window for fault-driven yield).
+        2 | 4 | 6 | 7 => {
+            // coro_spawn(nursery, mem_base, handle:i32, module:i64, entry:i64, off:i64,
+            //            size_log2:i64, fuel:i64, demand:i32, trap_out:i64) -> child_handle:i32 —
+            // §14 co-fiber spawn. ops 2/4 are **self** children (module = -1); ops 6/7
+            // (`spawn[_demand]_coroutine_module`) pass a `Module` handle first and shift the rest.
+            // ops 4/7 demand-page the child's window for fault-driven yield.
             let h = get(vals, handle)?;
-            let entry = get(vals, *args.first().ok_or(JitError::Malformed)?)?;
-            let off = get(vals, *args.get(1).ok_or(JitError::Malformed)?)?;
-            let size_log2 = get(vals, *args.get(2).ok_or(JitError::Malformed)?)?;
-            let fuel = get(vals, *args.get(3).ok_or(JitError::Malformed)?)?;
-            let demand = b.ins().iconst(I32, if op == 4 { 1 } else { 0 });
+            let (modh, a0) = if op >= 6 {
+                (get(vals, *args.first().ok_or(JitError::Malformed)?)?, 1)
+            } else {
+                (b.ins().iconst(I64, -1), 0)
+            };
+            let entry = get(vals, *args.get(a0).ok_or(JitError::Malformed)?)?;
+            let off = get(vals, *args.get(a0 + 1).ok_or(JitError::Malformed)?)?;
+            let size_log2 = get(vals, *args.get(a0 + 2).ok_or(JitError::Malformed)?)?;
+            let fuel = get(vals, *args.get(a0 + 3).ok_or(JitError::Malformed)?)?;
+            let demand = b.ins().iconst(I32, if op == 4 || op == 7 { 1 } else { 0 });
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I64, I64, I64, I64, I32, I64] {
+            for t in [I64, I64, I32, I64, I64, I64, I64, I64, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -2409,7 +2488,7 @@ fn lower_instantiator(
                 tref,
                 thunk,
                 &[
-                    nursery, mem_base, h, entry, off, size_log2, fuel, demand, trap_out,
+                    nursery, mem_base, h, modh, entry, off, size_log2, fuel, demand, trap_out,
                 ],
             );
             emit_trap_propagate(b, lower);

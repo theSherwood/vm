@@ -66,9 +66,12 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > their parent, including **fault-driven yield** (`spawn_demand_coroutine`): a demand-paged child's
 > first touch of a page suspends it to its parent, which supplies the page and resumes — real
 > hardware lazy paging on the JIT (the fault handler suspends the child's fiber), prot-map faults
-> on the interpreter, byte-identical by differential. Still ahead:
+> on the interpreter, byte-identical by differential. **Separate-module nested children** are in
+> too: the host grants a **`Module` capability** for a different verified module, and a guest
+> instantiates it as a child domain — the plugin-in-plugin story, its data segments materialized
+> into the carve (lazily, for demand-paged children). Still ahead:
 > narrow-scalar promotion, cross-domain `SharedRegion` `create`/`grant` + the async I/O ring, a
-> guest M:N runtime, SIMD, separate-module nested children, isolation tiers, and capability extras.
+> guest M:N runtime, SIMD, isolation tiers, and capability extras.
 > This is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
 

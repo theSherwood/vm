@@ -1195,6 +1195,10 @@ fn take_running(fibers: &mut [Fiber], i: usize) -> Result<Vec<Frame>, Trap> {
 /// `registry` of spawned threads — is `Arc`-shared across all vCPUs.
 ///
 /// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
+/// A resolved §14 `Module` grant's pieces, as the eval loop carries them: the child module's
+/// functions, declared window size, and data segments (`Arc`s — spawning shares, never copies).
+type ModArc = (Arc<[Func]>, Option<u8>, Arc<[Data]>);
+
 /// A §14 co-fiber child the parent drives with `resume`: its suspended continuation plus whether it is
 /// **awaiting a resume value** — i.e. parked at a `yield` (so the next `resume` delivers its argument
 /// as the yield's result) vs. freshly spawned at its entry (the first `resume` just starts it, its
@@ -1517,7 +1521,40 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.resolve_instantiator(h)?
                     };
-                    match *op {
+                    // §14 **separate-module children** (ops 5/6/7 = `instantiate_module` /
+                    // `spawn_coroutine_module` / `spawn_demand_coroutine_module`): exactly ops 0/2/4,
+                    // except the first arg is a host-granted `Module` handle (iface 8) and the child
+                    // domain runs *that* verified module — the "plugin-in-plugin" story (a guest can
+                    // only instantiate modules it was given). Resolve the grant here, shift the
+                    // remaining args by one, and fold into the shared op logic below; `join`/`resume`
+                    // (ops 1/3) serve both kinds unchanged. A forged module handle is a `CapFault`.
+                    let (op, child_mod, askip): (u32, Option<ModArc>, usize) = match *op {
+                        mop @ 5..=7 => {
+                            // The module handle crosses as an i64 arg (the slot ABI); low 32 bits.
+                            let mh = as_i64(get(
+                                &frames[top].vals,
+                                *args.first().ok_or(Trap::Malformed)?,
+                            )?)? as i32;
+                            let g = {
+                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let g = hg.resolve_module(mh)?;
+                                (g.funcs.clone(), g.memory_log2, g.data.clone())
+                            };
+                            (
+                                match mop {
+                                    5 => 0, // instantiate_module → instantiate
+                                    6 => 2, // spawn_coroutine_module → spawn_coroutine
+                                    _ => 4, // spawn_demand_coroutine_module → spawn_demand_coroutine
+                                },
+                                Some(g),
+                                1,
+                            )
+                        }
+                        o => (o, None, 0),
+                    };
+                    // The function table the child's `entry` indexes — its own module's, or ours.
+                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |(f, _, _)| f);
+                    match op {
                         // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
                         // §14 data plane is shared memory: the parent seeds the child's sub-window
                         // directly (it sees the superset) before/after, so there is no scalar arg.
@@ -1525,7 +1562,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let argn = |i: usize| -> Result<i64, Trap> {
                                 as_i64(get(
                                     &frames[top].vals,
-                                    *args.get(i).ok_or(Trap::Malformed)?,
+                                    *args.get(i + askip).ok_or(Trap::Malformed)?,
                                 )?)
                             };
                             let entry = argn(0)? as u64;
@@ -1536,32 +1573,54 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // `Instantiator`) or two (its `Instantiator`, its `AddressSpace`) — its
                             // starter capabilities, both over its own window. A missing/mistyped entry
                             // is rejected, not run.
-                            let want_as = fs
+                            let want_as = cfs
                                 .get(entry as usize)
                                 .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
-                            let ok_entry = fs.get(entry as usize).is_some_and(|f| {
+                            let ok_entry = cfs.get(entry as usize).is_some_and(|f| {
                                 f.results == [ValType::I64]
                                     && (f.params == [ValType::I64]
                                         || f.params == [ValType::I64, ValType::I64])
                             });
                             // The carve must be a power-of-two-aligned sub-window within `[0, isize)`
-                            // — a child can only get what the holder sub-allocates (§14/D19).
+                            // — a child can only get what the holder sub-allocates (§14/D19). A
+                            // separate-module child's carve must **equal its declared memory** (§14
+                            // transparency: the plugin runs exactly as it would standalone — same
+                            // window size, same wrap behaviour; a module with no memory can't nest).
                             let child_size = if (0..64).contains(&size_log2) {
                                 1u64 << size_log2
                             } else {
                                 0
                             };
+                            let mod_ok = child_mod
+                                .as_ref()
+                                .is_none_or(|(_, ml, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
-                            if !ok_entry || !fits {
+                            if !ok_entry || !fits || !mod_ok {
                                 frames[top].vals.push(Value::I32(EINVAL as i32));
                             } else {
                                 let abs_base = ibase + off;
                                 let child_mem = mem
                                     .as_ref()
                                     .map(|m| m.nested_view(abs_base, size_log2 as u8));
+                                // A separate-module child's **data segments** materialize into the
+                                // carve at spawn (exactly as if the child wrote them; the verifier
+                                // bounded them to its declared window == the carve). RO protection of
+                                // `readonly` segments is skipped for nested children (documented —
+                                // intra-domain self-corruption is a §1 non-goal).
+                                if let (Some((_, _, data)), Some(m)) = (&child_mod, mem.as_ref()) {
+                                    for d in data.iter() {
+                                        if d.offset.saturating_add(d.bytes.len() as u64)
+                                            <= child_size
+                                        {
+                                            for (k, &b) in d.bytes.iter().enumerate() {
+                                                m.set_byte(abs_base + d.offset + k as u64, b);
+                                            }
+                                        }
+                                    }
+                                }
                                 // Attenuated powerbox: the child gets, over its *own* window (a strict
                                 // subset of the parent's authority), an `Instantiator` (so it can
                                 // itself nest — confinement composes to any depth) and an
@@ -1583,7 +1642,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 } else {
                                     (quota as u64).min(*fuel)
                                 };
-                                let cfuncs = Arc::clone(&funcs);
+                                let cfuncs = child_mod
+                                    .as_ref()
+                                    .map_or_else(|| Arc::clone(&funcs), |(f, _, _)| Arc::clone(f));
                                 let csched = sched.clone();
                                 let made = sched.spawn(move |id| {
                                     let mut child = VCpu::new(
@@ -1631,11 +1692,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // page starts unmapped), so the child faults on first access and we supply the
                         // page — the §14 parent-virtualized-fault / userfaultfd-style lazy-paging model.
                         2 | 4 => {
-                            let demand = *op == 4;
+                            let demand = op == 4;
                             let argn = |i: usize| -> Result<i64, Trap> {
                                 as_i64(get(
                                     &frames[top].vals,
-                                    *args.get(i).ok_or(Trap::Malformed)?,
+                                    *args.get(i + askip).ok_or(Trap::Malformed)?,
                                 )?)
                             };
                             let entry = argn(0)? as u64;
@@ -1643,7 +1704,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let size_log2 = argn(2)?;
                             let _quota = argn(3)?; // (per-coroutine fuel metering is a follow-up)
                                                    // A coroutine child entry is a fixed `(i64 yielder) -> (i64)`.
-                            let ok_entry = fs.get(entry as usize).is_some_and(|f| {
+                            let ok_entry = cfs.get(entry as usize).is_some_and(|f| {
                                 f.params == [ValType::I64] && f.results == [ValType::I64]
                             });
                             let child_size = if (0..64).contains(&size_log2) {
@@ -1651,11 +1712,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             } else {
                                 0
                             };
+                            // A separate-module child's carve must equal its declared memory (§14
+                            // transparency), exactly as for `instantiate_module`.
+                            let mod_ok = child_mod
+                                .as_ref()
+                                .is_none_or(|(_, ml, _)| *ml == Some(size_log2 as u8));
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
-                            if !ok_entry || !fits {
+                            if !ok_entry || !fits || !mod_ok {
                                 frames[top].vals.push(Value::I32(EINVAL as i32));
                             } else {
                                 let abs_base = ibase + off;
@@ -1666,11 +1732,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     }
                                     cm
                                 });
+                                // A separate-module child's data segments materialize into the carve
+                                // at spawn (see `instantiate`). For a **demand** coroutine they land
+                                // in the parent's backing while the child's pages start unmapped — so
+                                // a plugin's data segments are *supplied lazily*, page by page, as it
+                                // first touches them (the §14 parent-as-pager model, for free).
+                                if let (Some((_, _, data)), Some(m)) = (&child_mod, mem.as_ref()) {
+                                    for d in data.iter() {
+                                        if d.offset.saturating_add(d.bytes.len() as u64)
+                                            <= child_size
+                                        {
+                                            for (k, &b) in d.bytes.iter().enumerate() {
+                                                m.set_byte(abs_base + d.offset + k as u64, b);
+                                            }
+                                        }
+                                    }
+                                }
                                 let mut ch = Host::new();
                                 let cy = ch.grant_yielder(); // the child's handle to suspend back to us
                                 let child_host = Arc::new(Mutex::new(ch));
+                                let cfuncs = child_mod
+                                    .as_ref()
+                                    .map_or_else(|| Arc::clone(&funcs), |(f, _, _)| Arc::clone(f));
                                 let mut child = VCpu::new(
-                                    Arc::clone(&funcs),
+                                    cfuncs,
                                     entry as u32,
                                     &[Value::I64(cy as i64)],
                                     child_mem,
@@ -2503,6 +2588,13 @@ pub mod iface {
     /// lazy-paging model builds on (a child parks on a fault it cannot service; the parent supplies the
     /// page and resumes it). Granted to a coroutine child (`Instantiator.spawn_coroutine`) only.
     pub const YIELDER: u32 = 7;
+    /// `Module` — a host-granted, host-**verified** module a guest may instantiate (§14). The handle
+    /// confers only the authority to pass it to the `Instantiator`'s module ops (5/6/7 —
+    /// `instantiate_module` / `spawn_coroutine_module` / `spawn_demand_coroutine_module`), which
+    /// spawn a child domain running *that* module's code confined to a carve of the holder's window
+    /// — the "plugin-in-plugin" story: a guest can only instantiate modules it was given (no ambient
+    /// authority). It has no directly callable ops (`cap.call` on it is an inert `CapFault`).
+    pub const MODULE: u32 = 8;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -2708,6 +2800,10 @@ enum Binding {
     /// eval loop services it (it must yield the running coroutine's continuation, which the generic
     /// dispatch can't); a forged/wrong handle resolves nowhere and is an inert `CapFault`.
     Yielder,
+    /// A §14 `Module` handle, carrying the index of its grant in [`Host::modules`]. Confers only the
+    /// authority to instantiate (the Instantiator's module ops, serviced by the eval loop / nesting
+    /// runtime); the generic dispatch treats any `cap.call` on it as an inert `CapFault`.
+    Module(u32),
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -2743,6 +2839,19 @@ pub struct Host {
     /// §13 `SharedRegion` backings, indexed by the id a [`Binding::SharedRegion`] carries. Each is a
     /// shared host buffer; aliasing a region into several window offsets clones this `Rc`.
     regions: Vec<RegionBacking>,
+    /// §14 instantiable **modules**, indexed by the id a [`Binding::Module`] carries — host-verified
+    /// code a guest holding the handle may spawn as a child domain (`Arc`s so a spawned child shares,
+    /// not copies). Append-only for the life of the `Host`, so raw views handed to the JIT's nesting
+    /// runtime ([`Host::resolve_module_parts`]) stay valid for the whole run.
+    modules: Vec<ModuleGrant>,
+}
+
+/// One §14 module grant: the verified module's functions, declared window size, and data segments —
+/// what spawning a child domain of it needs.
+struct ModuleGrant {
+    funcs: Arc<[Func]>,
+    memory_log2: Option<u8>,
+    data: Arc<[Data]>,
 }
 
 impl Default for Host {
@@ -2761,6 +2870,7 @@ impl Host {
             stderr: Vec::new(),
             clock_ns: 0,
             regions: Vec::new(),
+            modules: Vec::new(),
         }
     }
 
@@ -2834,6 +2944,52 @@ impl Host {
             Binding::Yielder => Ok(()),
             _ => Err(Trap::CapFault),
         }
+    }
+
+    /// Grant a §14 **`Module` capability** over `m` — the authority to instantiate it as a child
+    /// domain via the `Instantiator`'s module ops (the "plugin" grant). **`m` must already be
+    /// verified** (`svm_verify::verify_module`): like every run entry, the host is trusted to grant
+    /// only verifier-passing modules — a guest can never inject code, only spawn what it was given.
+    pub fn grant_module(&mut self, m: &Module) -> i32 {
+        let id = self.modules.len() as u32;
+        self.modules.push(ModuleGrant {
+            funcs: m.funcs.clone().into(),
+            memory_log2: m.memory.map(|mc| mc.size_log2),
+            data: m.data.clone().into(),
+        });
+        self.grant(iface::MODULE, Binding::Module(id))
+    }
+
+    /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's
+    /// module ops. A forged / closed / wrong-type handle is a `CapFault`.
+    fn resolve_module(&self, handle: i32) -> Result<&ModuleGrant, Trap> {
+        match self.resolve(handle, iface::MODULE)? {
+            Binding::Module(id) => self.modules.get(id as usize).ok_or(Trap::CapFault),
+            _ => Err(Trap::CapFault),
+        }
+    }
+
+    /// Resolve a §14 `Module` handle to **raw views** of its grant — the bridge the JIT's nesting
+    /// runtime uses (via `svm-run`'s `module_resolver` callback; `svm-jit` cannot name `Host`).
+    /// `None` for a forged/closed/wrong-type handle. The returned pointers borrow [`Host::modules`]
+    /// (append-only), so they stay valid for as long as this `Host` lives — which outlives the run,
+    /// the same lifetime contract as the `cap.call` ctx itself. `memory_log2` is `-1` when the
+    /// module declares no memory. Host-side callers only; never reachable from a guest `cap.call`
+    /// (the generic dispatch on a `Module` handle is an inert `CapFault`), so no host address ever
+    /// leaks into a guest-readable value.
+    #[allow(clippy::type_complexity)]
+    pub fn resolve_module_parts(
+        &self,
+        handle: i32,
+    ) -> Option<(*const Func, usize, i32, *const Data, usize)> {
+        let g = self.resolve_module(handle).ok()?;
+        Some((
+            g.funcs.as_ptr(),
+            g.funcs.len(),
+            g.memory_log2.map_or(-1, |l| l as i32),
+            g.data.as_ptr(),
+            g.data.len(),
+        ))
     }
 
     /// Grant a §13 `SharedRegion` capability backed by a fresh `len`-byte zero-filled host buffer,
@@ -3012,6 +3168,10 @@ impl Host {
             // a `Yielder` cap.call slipped through (e.g. the JIT, which has no coroutine runtime) —
             // inert `CapFault`.
             Binding::Yielder => Err(Trap::CapFault),
+            // A §14 `Module` handle confers instantiation authority only (through the Instantiator's
+            // module ops); it has no callable ops — and crucially, the generic dispatch never exposes
+            // the grant's host-side data, so no host pointer is guest-reachable.
+            Binding::Module(_) => Err(Trap::CapFault),
         }
     }
 
