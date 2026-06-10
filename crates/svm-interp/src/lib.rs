@@ -1478,11 +1478,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_mem = mem
                                     .as_ref()
                                     .map(|m| m.nested_view(abs_base, size_log2 as u8));
-                                // Attenuated powerbox: the child gets only an `AddressSpace` over its
-                                // own window (a strict subset; pass-through of the parent's other
-                                // handles is a follow-up). Its handle is the child entry's argument.
+                                // Attenuated powerbox: the child gets an `Instantiator` over its *own*
+                                // window (a strict subset of the parent's authority), so it can itself
+                                // nest — confinement composes to any depth at depth-independent cost
+                                // (§14). Its handle is the child entry's single argument. (Pass-through
+                                // of the parent's other handles, and a usable child `AddressSpace`, are
+                                // follow-ups — the latter waits on the nested page-protection
+                                // coordinate fix.)
                                 let mut ch = Host::new();
-                                let cas = ch.grant_address_space(abs_base, child_size);
+                                let cinst = ch.grant_instantiator(abs_base, child_size);
                                 let child_host = Arc::new(Mutex::new(ch));
                                 // Quota: the child's fuel, sub-allocated from (and capped by) ours.
                                 let child_fuel = if quota <= 0 {
@@ -1496,7 +1500,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let mut child = VCpu::new(
                                         cfuncs,
                                         entry as u32,
-                                        &[Value::I64(cas as i64)], // the child's own AddressSpace handle
+                                        &[Value::I64(cinst as i64)], // an Instantiator over the child's window
                                         child_mem,
                                         child_host,
                                         child_fuel,
@@ -2252,10 +2256,11 @@ pub mod iface {
     pub const ADDRESS_SPACE: u32 = 5;
     /// `Instantiator` — the §14 nesting primitive: spawn a **child domain** confined to a
     /// power-of-two sub-window `[base, base+size)` of the holder's window (VM-in-VM). op 0
-    /// `instantiate(entry, off, size_log2, arg, fuel) -> child_handle` enqueues a child vCPU running
+    /// `instantiate(entry, off, size_log2, fuel) -> child_handle` enqueues a child vCPU running
     /// the same module's `entry` (a fixed `(i64) -> (i64)`) confined to `[base+off, base+off+2^size_log2)`
-    /// with an **attenuated** powerbox (today: a child `AddressSpace` over its own window) and a fuel
-    /// quota — returning immediately (non-blocking). op 1 `join(child_handle) -> result` parks **only
+    /// with an **attenuated** powerbox (today: an `Instantiator` over the child's own window, so it can
+    /// recurse — confinement composes to any depth) and a fuel quota — returning immediately
+    /// (non-blocking). op 1 `join(child_handle) -> result` parks **only
     /// the calling fiber** until that child finishes, then yields its result (siblings keep running —
     /// the child rides the same §12 executor). Holding the handle is the authority to nest (D19: a
     /// child can only get what the parent sub-allocates).

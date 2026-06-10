@@ -1075,16 +1075,20 @@ The current frontier, roughly ranked:
    `Host::grant_instantiator`)* — `instantiate(entry, off, size_log2, fuel) -> child_handle` spawns a
    child as a vCPU on the §12 M:N executor confined to a power-of-two sub-window (`Mem::nested_view`
    shares the parent's backing, so the parent sees the child's bytes; masking confines the child to
-   its slice), with an attenuated powerbox (its own `AddressSpace`) + a fuel quota; `join(child)`
-   parks **only the calling fiber** (siblings run) and delivers the child's result/trap. Covered by
-   `instantiator.rs` (confinement, out-of-range carve → `-EINVAL`, child-trap propagation). This is
-   the chosen first cut: **spawn + explicit join, same-module child, interp-first**. **Remaining:**
-   (1) the **JIT** path — an `instantiate` there `CapFault`s today (no in-process executor; spawning a
-   child fiber on the JIT runtime is the port); (2) **co-fiber resume/suspend** so a child can yield
-   back mid-run (enables the §14 parent-virtualized-fault / lazy-paging story, and needs the rel-vs-
-   absolute page-protection coordinate reconciliation when a child `map`/`unmap` composes across the
-   sub-window boundary); (3) **separate-module children** + richer cap pass-through; then cross-domain
-   `SharedRegion` `create`/`grant`.
+   its slice), with an attenuated powerbox (an `Instantiator` over the child's **own** window, so it
+   can recurse — **confinement composes to any depth**, verified to depth 2) + a fuel quota;
+   `join(child)` parks **only the calling fiber** (siblings run) and delivers the child's result/trap.
+   Covered by `instantiator.rs` (confinement, depth-2 nesting, out-of-range carve → `-EINVAL`,
+   child-trap propagation). This is the chosen first cut: **spawn + explicit join, same-module child,
+   interp-first**. **Remaining:** (1) the **page-protection coordinate reconciliation** — `Mem`'s prot
+   map / `prot_pages` bound / `check_prot` are window-relative in some places and window-absolute in
+   others (identical for a top-level window, but divergent for a §14 child), so a child's granted
+   `AddressSpace` `map`/`unmap` does not yet work on a nested `Mem` (the child holds an `Instantiator`
+   today, which rides the executor and *does* work). This is the prerequisite for (2); (2) **co-fiber
+   resume/suspend** so a child can yield back mid-run (the §14 parent-virtualized-fault / lazy-paging
+   story); (3) the **JIT** path — an `instantiate` there `CapFault`s today (no in-process executor;
+   spawning a child fiber on the JIT runtime is the port); (4) **separate-module children** + richer
+   cap pass-through; then cross-domain `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.

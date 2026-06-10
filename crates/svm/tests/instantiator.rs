@@ -2,10 +2,11 @@
 //! guest holding an `Instantiator` capability `instantiate`s a child confined to a power-of-two
 //! sub-window of its own window, then `join`s it (parking only the calling fiber). The child runs
 //! the same module's entry on the same M:N executor, confined by masking to its slice, with an
-//! attenuated powerbox (its own `AddressSpace`) and a fuel quota. These tests pin: the child runs
-//! and its result returns through `join`; its writes land **only** in its sub-window of the shared
-//! parent backing (confinement — the parent sees the superset); an out-of-range carve is rejected;
-//! and a child trap propagates to the parent on `join`.
+//! attenuated powerbox (an `Instantiator` over its own window, so it can recurse) and a fuel quota.
+//! These tests pin: the child runs and its result returns through `join`; its writes land **only**
+//! in its sub-window of the shared parent backing (confinement — the parent sees the superset);
+//! nesting **composes to depth 2** (a grandchild is confined to a sub-window of the child's window);
+//! an out-of-range carve is rejected; and a child trap propagates to the parent on `join`.
 //!
 //! The JIT path is deferred (it has no in-process executor to spawn a child vCPU into) — an
 //! `instantiate` there resolves to a `CapFault`, like any unsupported capability.
@@ -93,6 +94,81 @@ fn instantiate_child_runs_confined_and_joins() {
             assert_eq!(
                 mem[i as usize], init[i as usize],
                 "child escaped to parent byte {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nesting_composes_to_depth_two() {
+    // Depth-2 VM-in-VM, the headline §14 property — confinement composes at depth-independent cost.
+    // func 0 (parent) instantiates func 1 (child) in a 4 KiB window at 64 KiB; the child — handed an
+    // `Instantiator` over *its* window — instantiates func 2 (grandchild) in a 1 KiB window at child
+    // offset 2 KiB (→ window 64 KiB + 2 KiB). Each level writes a marker into its own slice; the
+    // parent (the superset) sees all of them, and a far store at each level folds back into that
+    // level's window — proving the grandchild is masked to its 1 KiB, nested two deep.
+    let src = "memory 17\n\
+         func (i32) -> (i64) {\n\
+         block0(v0: i32):\n\
+         \x20 v1 = i64.const 1\n\
+         \x20 v2 = i64.const 65536\n\
+         \x20 v3 = i64.const 12\n\
+         \x20 v4 = i64.const 0\n\
+         \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
+         \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+         \x20 return v6\n\
+         }\n\
+         func (i64) -> (i64) {\n\
+         block0(v0: i64):\n\
+         \x20 v1 = i32.wrap_i64 v0\n\
+         \x20 v2 = i64.const 0\n\
+         \x20 v3 = i32.const 171\n\
+         \x20 i32.store8 v2 v3\n\
+         \x20 v4 = i64.const 2\n\
+         \x20 v5 = i64.const 2048\n\
+         \x20 v6 = i64.const 10\n\
+         \x20 v7 = i64.const 0\n\
+         \x20 v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)\n\
+         \x20 v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)\n\
+         \x20 return v9\n\
+         }\n\
+         func (i64) -> (i64) {\n\
+         block0(v0: i64):\n\
+         \x20 v1 = i64.const 0\n\
+         \x20 v2 = i32.const 200\n\
+         \x20 i32.store8 v1 v2\n\
+         \x20 v3 = i64.const 99999\n\
+         \x20 v4 = i32.const 222\n\
+         \x20 i32.store8 v3 v4\n\
+         \x20 v5 = i64.const 77\n\
+         \x20 return v5\n\
+         }\n";
+    let (res, mem) = run_nested(src, 17);
+    assert_eq!(
+        res.expect("run ok"),
+        vec![Value::I64(77)],
+        "grandchild result via two joins"
+    );
+
+    let init: Vec<u8> = (0..(128u64 << 10))
+        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+        .collect();
+    const CHILD: u64 = 64 << 10; // child window [64 KiB, 68 KiB)
+    const GRAND: u64 = CHILD + 2048; // grandchild window [66 KiB, 67 KiB)
+    assert_eq!(mem[CHILD as usize], 171, "child marker missing");
+    assert_eq!(mem[GRAND as usize], 200, "grandchild marker missing");
+    // The grandchild's far store (99999 & 1023 = 671) folds into its 1 KiB window, not the child's.
+    assert_eq!(
+        mem[(GRAND + 671) as usize],
+        222,
+        "grandchild far store escaped its 1 KiB slice"
+    );
+    // Confinement: every byte outside the child's 4 KiB window is exactly as the parent seeded it.
+    for i in 0..(128u64 << 10) {
+        if !(CHILD..CHILD + 4096).contains(&i) {
+            assert_eq!(
+                mem[i as usize], init[i as usize],
+                "depth-2 nest escaped to byte {i}"
             );
         }
     }
