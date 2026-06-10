@@ -12,6 +12,7 @@ use svm_verify::verify_module;
 
 const SUSPENDED: i32 = 0;
 const RETURNED: i32 = 1;
+const FAULTED: i32 = 2;
 
 /// func 0 (parent) spawns func 1 as a coroutine in a 4 KiB window at 64 KiB, then resumes it three
 /// times — delivering 0, then 10, then 20 — collecting the value the child yields/returns each time,
@@ -99,6 +100,89 @@ fn coroutine_resume_suspend_round_trips_values() {
             );
         }
     }
+}
+
+/// §14 **fault-driven yield** (userfaultfd-style lazy paging): `spawn_demand_coroutine` (op 4) starts
+/// the child with its whole window **unmapped**, so its first access faults and suspends to the parent
+/// (status FAULTED, value = the fault address) instead of trapping. The parent supplies the page —
+/// writing the byte into the shared window and resuming — and the child's rewound load re-executes and
+/// reads it. Pins: the first resume reports FAULTED at the child's page (window offset 64 KiB), and
+/// after the parent supplies `123` there, the second resume RETURNs that byte.
+#[test]
+fn coroutine_demand_paging_faults_then_resumes() {
+    let src = "memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 4 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.const 0
+  v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
+  v9 = i32.const 123
+  i32.store8 v8 v9
+  v10 = i64.const 0
+  v11, v12 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v10)
+  v13 = i64.extend_i32_s v7
+  v14 = i64.const 1000000
+  v15 = i64.mul v13 v14
+  v16 = i64.extend_i32_s v11
+  v17 = i64.const 1000
+  v18 = i64.mul v16 v17
+  v19 = i64.add v12 v15
+  v20 = i64.add v19 v18
+  return v20
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load8_u v1
+  v3 = i64.extend_i32_u v2
+  return v3
+}
+";
+    let (res, _mem) = run(src);
+    // status1 = FAULTED (2) at the child's page, status2 = RETURNED (1), value2 = the supplied 123.
+    let want = 123 + (FAULTED as i64) * 1_000_000 + (RETURNED as i64) * 1000;
+    assert_eq!(
+        res.expect("run ok"),
+        vec![Value::I64(want)],
+        "demand-paged coroutine: fault → parent supplies page → resume reads it"
+    );
+}
+
+/// The fault address handed to the parent is the child's page in the *parent's* window coordinates
+/// (so the parent can supply it with an ordinary store). Pin it: the child faults at window offset
+/// 64 KiB (its sub-window base), which the parent returns directly.
+#[test]
+fn coroutine_demand_paging_reports_fault_address() {
+    let src = "memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 4 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.const 0
+  v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
+  return v8
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i32.load8_u v1
+  v3 = i64.extend_i32_u v2
+  return v3
+}
+";
+    let (res, _mem) = run(src);
+    assert_eq!(
+        res.expect("run ok"),
+        vec![Value::I64(65536)],
+        "the fault address is the child's page in the parent's window"
+    );
 }
 
 /// The first resume's status is SUSPENDED (the child yields before returning) — pin it directly, so

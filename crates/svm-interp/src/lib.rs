@@ -10,7 +10,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -557,6 +557,9 @@ const MAX_VCPUS: usize = 1 << 16;
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
 const FIBER_RETURNED: i32 = 1;
+/// Extra §14 coroutine-`resume` status: the child suspended on a **page fault** (its `(status, value)`
+/// is `(2, fault_addr)`) — the parent supplies the page and resumes (fault-driven yield / lazy paging).
+const CORO_FAULTED: i32 = 2;
 
 /// `<ty>.atomic.wait` status results (§12), matching wasm: woken by a notify / value mismatch / timed
 /// out.
@@ -636,6 +639,11 @@ enum Inner {
     /// continues it. Only produced while a coroutine child is driven inline by `resume`; a normal vCPU
     /// that reaches it (a `Yielder` with no resumer) is a `FiberFault`.
     CoYield(i64),
+    /// A §14 **fault-driven yield**: a coroutine child (`fault_yields`) hit a recoverable page fault
+    /// (an access to an unmapped page in its window) at this confined address. The faulting access has
+    /// been rewound; the parent's `resume` supplies the page and re-runs it (userfaultfd-style lazy
+    /// paging). Like `CoYield`, only produced for an inline-driven coroutine.
+    CoFault(u64),
 }
 
 /// The **M:N executor** (§12): a bounded pool of worker OS threads runs many vCPUs (green threads)
@@ -1194,6 +1202,9 @@ fn take_running(fibers: &mut [Fiber], i: usize) -> Result<Vec<Frame>, Trap> {
 struct Coro {
     vcpu: Box<VCpu>,
     awaiting_resume: bool,
+    /// When set, the child is suspended at a **fault-driven yield** awaiting this (confined) page: the
+    /// next `resume` supplies it (maps it read-write) before re-running the rewound faulting access.
+    faulted_page: Option<u64>,
 }
 
 /// between worker threads and (next) parking its continuation on a blocking op.
@@ -1226,6 +1237,10 @@ struct VCpu {
     /// coroutine has run to completion (a later `resume` is inert). Distinct from `threads` — a
     /// coroutine is cooperative (parent and child never run concurrently), not an executor vCPU.
     coroutines: Vec<Option<Coro>>,
+    /// §14: this vCPU is a coroutine whose recoverable page faults **suspend to its parent** (fault-
+    /// driven yield / lazy paging) instead of trapping. Set for `Instantiator.spawn_coroutine`
+    /// children; `false` for every ordinary vCPU (a page fault is detect-and-kill).
+    fault_yields: bool,
     /// Call-depth base for the stack-overflow bound.
     depth: u32,
     /// This task's own id (where its outcome is published on completion).
@@ -1273,6 +1288,7 @@ impl VCpu {
             fuel,
             threads: Vec::new(),
             coroutines: Vec::new(),
+            fault_yields: false,
             depth,
             id,
             pending: None,
@@ -1295,9 +1311,9 @@ impl VCpu {
             Ok(Inner::Done(v)) => Step::Done(Ok(v)),
             Ok(Inner::Park(b)) => Step::Park(b),
             Ok(Inner::Yield) => Step::Yield,
-            // A `Yielder` cap.call on a vCPU the *executor* runs has no resumer to yield to (a
-            // coroutine child is driven inline by `resume`, never enqueued here) — inert FiberFault.
-            Ok(Inner::CoYield(_)) => Step::Done(Err(Trap::FiberFault)),
+            // A `Yielder` cap.call / fault-driven yield on a vCPU the *executor* runs has no resumer to
+            // yield to (a coroutine child is driven inline by `resume`, never enqueued here) — inert.
+            Ok(Inner::CoYield(_)) | Ok(Inner::CoFault(_)) => Step::Done(Err(Trap::FiberFault)),
             Err(t) => Step::Done(Err(t)),
         }
     }
@@ -1371,6 +1387,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         fuel,
         threads,
         coroutines,
+        fault_yields,
         depth,
         pending,
         sched,
@@ -1380,6 +1397,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     } = v;
     let depth = *depth;
     let memop = *memop;
+    let fault_yields = *fault_yields;
 
     // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
     // `return` pops and appends results to the caller (which resumes past the call); a tail
@@ -1605,12 +1623,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             *pending = Some(Pending::Join { slot });
                             return Ok(Inner::Park(Blocked::Join { child }));
                         }
-                        // spawn_coroutine(entry, off, size_log2, fuel) -> child handle (or -EINVAL).
-                        // Like instantiate, but the child is a **suspended coroutine** (its own
-                        // confined window + a `Yielder` handle back to us, its single entry arg),
-                        // driven cooperatively by `resume` — not run on the executor. The §14
-                        // parent-virtualized-fault / lazy-paging primitive.
-                        2 => {
+                        // spawn_coroutine (op 2) / spawn_demand_coroutine (op 4) (entry, off,
+                        // size_log2, fuel) -> child handle (or -EINVAL). Like instantiate, but the child
+                        // is a **suspended coroutine** (its own confined window + a `Yielder` handle
+                        // back to us, its single entry arg), driven cooperatively by `resume` — not run
+                        // on the executor. op 4 additionally **demand-pages** the child's window (every
+                        // page starts unmapped), so the child faults on first access and we supply the
+                        // page — the §14 parent-virtualized-fault / userfaultfd-style lazy-paging model.
+                        2 | 4 => {
+                            let demand = *op == 4;
                             let argn = |i: usize| -> Result<i64, Trap> {
                                 as_i64(get(
                                     &frames[top].vals,
@@ -1638,13 +1659,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 frames[top].vals.push(Value::I32(EINVAL as i32));
                             } else {
                                 let abs_base = ibase + off;
-                                let child_mem = mem
-                                    .as_ref()
-                                    .map(|m| m.nested_view(abs_base, size_log2 as u8));
+                                let child_mem = mem.as_ref().map(|m| {
+                                    let cm = m.nested_view(abs_base, size_log2 as u8);
+                                    if demand {
+                                        cm.demand_page(); // every page starts unmapped (lazy paging)
+                                    }
+                                    cm
+                                });
                                 let mut ch = Host::new();
                                 let cy = ch.grant_yielder(); // the child's handle to suspend back to us
                                 let child_host = Arc::new(Mutex::new(ch));
-                                let child = VCpu::new(
+                                let mut child = VCpu::new(
                                     Arc::clone(&funcs),
                                     entry as u32,
                                     &[Value::I64(cy as i64)],
@@ -1655,9 +1680,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     0, // unused: a coroutine is driven inline, never via the executor
                                     sched.clone(),
                                 );
+                                child.fault_yields = true; // its page faults suspend to us, not trap
                                 coroutines.push(Some(Coro {
                                     vcpu: Box::new(child),
                                     awaiting_resume: false,
+                                    faulted_page: None,
                                 }));
                                 frames[top]
                                     .vals
@@ -1665,9 +1692,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                         // resume(child, value) -> (status: i32, value: i64): drive the coroutine
-                        // **inline** until it `yield`s (SUSPENDED) or returns (RETURNED). The first
-                        // resume starts it (its `value` arg unused); later resumes deliver `value` as
-                        // the child's `yield` result. A child trap propagates to us.
+                        // **inline** until it `yield`s (SUSPENDED), faults on an unmapped page (FAULTED,
+                        // value = fault address), or returns (RETURNED). The first resume starts it (its
+                        // `value` arg unused); a resume after an explicit yield delivers `value` as the
+                        // yield's result; a resume after a fault first **supplies** the faulted page
+                        // (the parent has placed its bytes in the shared window) and re-runs the access.
+                        // A child trap propagates to us.
                         3 => {
                             let ch = as_i32(get(
                                 &frames[top].vals,
@@ -1682,7 +1712,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 Some(c) => c,
                                 None => return Err(Trap::CapFault), // forged or already-finished
                             };
-                            if coro.awaiting_resume {
+                            if let Some(addr) = coro.faulted_page.take() {
+                                // Supply the faulted page (map it RW, keeping the parent's bytes), then
+                                // re-run the rewound access.
+                                if let Some(m) = &coro.vcpu.mem {
+                                    m.supply_page(addr);
+                                }
+                            } else if coro.awaiting_resume {
                                 coro.vcpu.pending = Some(Pending::CoResume(value));
                             }
                             match run_inner(&mut coro.vcpu, u64::MAX) {
@@ -1692,6 +1728,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     frames[top].vals.push(Value::I32(FIBER_SUSPENDED));
                                     frames[top].vals.push(Value::I64(yv));
                                 }
+                                Ok(Inner::CoFault(addr)) => {
+                                    coro.faulted_page = Some(addr);
+                                    coroutines[slot] = Some(coro);
+                                    frames[top].vals.push(Value::I32(CORO_FAULTED));
+                                    frames[top].vals.push(Value::I64(addr as i64));
+                                }
                                 Ok(Inner::Done(result)) => {
                                     // Finished — `coroutines[slot]` stays `None` (a later resume inert).
                                     frames[top].vals.push(Value::I32(FIBER_RETURNED));
@@ -1699,8 +1741,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         .vals
                                         .push(result.first().copied().unwrap_or(Value::I64(0)));
                                 }
-                                // A coroutine that parks/yields used a blocking concurrency op (it has
-                                // no executor driving it) — unsupported; surface as a fault.
+                                // A coroutine that parks used a blocking concurrency op (it has no
+                                // executor driving it) — unsupported; surface as a fault.
                                 Ok(Inner::Park(_)) | Ok(Inner::Yield) => {
                                     return Err(Trap::FiberFault)
                                 }
@@ -1894,8 +1936,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 // Everything else: one value, or none for `Store`/`AtomicStore`.
                 other => {
-                    if let Some(v) = eval_inst(other, &frames[top].vals, mem)? {
-                        frames[top].vals.push(v);
+                    match eval_inst(other, &frames[top].vals, mem) {
+                        Ok(Some(v)) => frames[top].vals.push(v),
+                        Ok(None) => {}
+                        // §14 fault-driven yield: a coroutine child's access to an unmapped page in its
+                        // window suspends to the parent (which supplies the page) instead of trapping.
+                        // `take_fault` is `Some` only for a *recoverable* in-window page fault (not an
+                        // out-of-window fault, which traps). Rewind to re-execute the access on resume.
+                        Err(Trap::MemoryFault) if fault_yields => {
+                            match mem.as_ref().and_then(|m| m.take_fault()) {
+                                Some(addr) => {
+                                    frames[top].inst -= 1;
+                                    return Ok(Inner::CoFault(addr));
+                                }
+                                None => return Err(Trap::MemoryFault),
+                            }
+                        }
+                        Err(t) => return Err(t),
                     }
                 }
             }
@@ -3109,7 +3166,18 @@ struct Mem {
     /// overwhelmingly common case — the per-byte path skips the address-space lock entirely and goes
     /// straight to `back`, since no page can be `Backed`. Shared with forked vCPUs.
     has_regions: Arc<AtomicBool>,
+    /// §14 fault-driven-yield side-channel: the confined address of the most recent **recoverable**
+    /// page fault (an in-window access to an unmapped/read-only page — `check_prot` sets it,
+    /// `confine_checked` clears it to [`NO_FAULT`]). A coroutine child with `fault_yields` reads it
+    /// after a `MemoryFault` to distinguish a recoverable page fault (suspend to the parent, which
+    /// supplies the page) from an out-of-window fault (a real trap). Per-`Mem` (each vCPU owns its
+    /// own), written/read only by the owning thread; `AtomicU64` keeps `Mem: Sync` for the futex path.
+    last_fault: AtomicU64,
 }
+
+/// Sentinel for [`Mem::last_fault`] meaning "no recoverable fault pending" — never a valid confined
+/// address (every access is bounded to `< reserved ≤ 2^MAX_JIT_WINDOW_LOG2`).
+const NO_FAULT: u64 = u64::MAX;
 
 /// The shared, synchronized guest address space (§12): the page-protection map plus the §13 region
 /// backings, mutated by `map`/`unmap`/`protect` and read by every access check. Lives behind
@@ -3143,6 +3211,7 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            last_fault: AtomicU64::new(NO_FAULT),
         }
     }
 
@@ -3163,6 +3232,7 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            last_fault: AtomicU64::new(NO_FAULT),
         }
     }
 
@@ -3186,6 +3256,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::clone(&self.space),
             has_regions: Arc::clone(&self.has_regions),
+            last_fault: AtomicU64::new(NO_FAULT),
         }
     }
 
@@ -3208,6 +3279,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            last_fault: AtomicU64::new(NO_FAULT),
         }
     }
 
@@ -3240,12 +3312,51 @@ impl Mem {
         }
         for page in (rel / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
-                None => return Err(Trap::MemoryFault), // unmapped
-                Some(false) if write => return Err(Trap::MemoryFault), // read-only store
+                // A **recoverable** in-window page fault: record the confined address so a §14
+                // coroutine child can suspend to its parent (fault-driven yield) instead of trapping.
+                None => return Err(self.page_fault(base)), // unmapped
+                Some(false) if write => return Err(self.page_fault(base)), // read-only store
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// Record `base` as the pending recoverable page fault (for §14 fault-driven yield) and return the
+    /// `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a coroutine
+    /// child reads the recorded address and suspends to its parent instead.
+    fn page_fault(&self, base: u64) -> Trap {
+        self.last_fault.store(base, Ordering::Relaxed);
+        Trap::MemoryFault
+    }
+
+    /// Take the pending recoverable page-fault address (set by [`check_prot`], cleared by
+    /// [`confine_checked`]), clearing it. `None` if the last `MemoryFault` was an out-of-window fault
+    /// (a real trap), not a recoverable page fault.
+    fn take_fault(&self) -> Option<u64> {
+        match self.last_fault.swap(NO_FAULT, Ordering::Relaxed) {
+            NO_FAULT => None,
+            addr => Some(addr),
+        }
+    }
+
+    /// Mark **every** page of this window unmapped — demand-paging it (§14 lazy paging): a coroutine
+    /// child started this way faults on first access of each page, suspending to the parent, which
+    /// supplies the page and resumes. The parent virtualizes the whole sub-window.
+    fn demand_page(&self) {
+        let pages = self.window.reserved() / self.page;
+        let mut space = self.space_write();
+        for p in 0..pages {
+            space.prot.insert(p, PageProt::Unmapped);
+        }
+    }
+
+    /// Supply the page containing the confined `abs_addr` (§14 lazy paging): mark it read-write
+    /// **without zeroing**, so the bytes the parent placed in the shared backing survive — the
+    /// faulting access then re-executes and reads them. Used by `resume` after a fault-driven yield.
+    fn supply_page(&self, abs_addr: u64) {
+        let page = abs_addr.wrapping_sub(self.window.base()) / self.page;
+        self.space_write().prot.insert(page, PageProt::Rw);
     }
 
     /// Confine the final effective address into `[0, reserved)` (the masking security op, §4) and
@@ -3257,9 +3368,12 @@ impl Mem {
         // the sub-window base for a §14 child). The reserved-domain guard is on the window-relative
         // `rel`; per-page committed-ness is enforced by `check_prot` (also window-relative). The
         // returned absolute address indexes the (possibly parent-sized) backing.
+        self.last_fault.store(NO_FAULT, Ordering::Relaxed); // fresh: clear any prior page fault
         let abs = self.window.confine(addr, offset);
         let rel = abs.wrapping_sub(self.window.base());
         match rel.checked_add(width as u64) {
+            // An out-of-window fault is a real trap (not a recoverable page fault) — leave `last_fault`
+            // cleared so `take_fault` returns `None` and the coroutine path propagates the trap.
             Some(end) if end <= self.window.reserved() => Ok(abs),
             _ => Err(Trap::MemoryFault),
         }

@@ -877,7 +877,7 @@ leave a shared view — add a unix test for this alongside the Windows work.
   guarded window (nesting cost at setup) and copies back — proven equal by an interp↔JIT differential.
   **co-fiber resume/suspend** children are in too (interp: the `Yielder` cap + `spawn_coroutine`/
   `resume` — a child yields back to the parent and is resumed, the lazy-paging primitive). Remaining
-  nesting work: fault-driven yield, the JIT co-fiber path, **separate-module** children, and a
+  nesting work: the JIT co-fiber path, **separate-module** children, and a
   non-blocking JIT child — which then unlock §13 cross-domain `SharedRegion` and the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
@@ -1112,12 +1112,19 @@ The current frontier, roughly ranked:
    or returns (RETURNED), delivering `v` as the child's yield result; values round-trip both ways,
    confinement holds across suspensions, and a child trap propagates to the parent. This is the §14
    parent-virtualized-fault / lazy-paging primitive (a child parks on a fault the parent services).
-   Covered by `coroutine.rs`. **Remaining:** (1) **fault-driven yield** — a child that faults on an
-   unmapped page in its sub-window suspends to the parent (vs. today's *explicit* `yield`), wiring the
-   actual userfaultfd-style lazy-paging; (2) the **JIT** co-fiber path (interp-only today); (3)
-   **separate-module children** + richer cap pass-through (the JIT child has an empty powerbox; a JIT
-   child using fibers/threads is `Unsupported`); (4) a non-blocking JIT child ("park only the calling
-   fiber" — today synchronous at `instantiate`); then cross-domain `SharedRegion` `create`/`grant`.
+   Covered by `coroutine.rs`. *Also landed (interp): **fault-driven yield*** — the actual
+   userfaultfd-style lazy-paging. `spawn_demand_coroutine` (Instantiator op 4) starts the child with
+   its window **unmapped**; a recoverable in-window page fault (`check_prot`) on a coroutine
+   (`fault_yields`) records the confined address (`Mem::last_fault`), rewinds the access, and suspends
+   to the parent (`Inner::CoFault`, status FAULTED, value = fault address) instead of trapping. The
+   parent supplies the page (writes its bytes into the shared window, then `resume`s — which
+   `supply_page`s it, mapping RW without zeroing) and the rewound access re-executes. An *out-of-window*
+   fault still traps (the `last_fault` sentinel distinguishes them). Covered by `coroutine.rs`
+   (`..._faults_then_resumes`, `..._reports_fault_address`). **Remaining:** (1) the **JIT** co-fiber
+   path (interp-only today); (2) **separate-module children** + richer cap pass-through (the JIT child
+   has an empty powerbox; a JIT child using fibers/threads is `Unsupported`); (3) a non-blocking JIT
+   child ("park only the calling fiber" — today synchronous at `instantiate`); then cross-domain
+   `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.
