@@ -26,7 +26,7 @@
 use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime};
 use crate::{mem, FnEntry, TrapKind};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // loom swaps the synchronization primitives for its model-checked versions; `Arc` and `JoinHandle`
@@ -55,6 +55,26 @@ const MAX_VCPUS: usize = 1 << 16;
 /// arms the kill-path).
 #[cfg(not(loom))]
 const KILL_RECHECK: Duration = Duration::from_millis(20);
+
+/// Atomically store a trap code into the run's shared trap cell (audit #2). The cell is one `i64`
+/// shared by every vCPU; multiple dying vCPUs (and the root) can store to it concurrently, so the
+/// **Rust** accesses must be atomic to avoid a data race. `p` points at the run's `AtomicI64` storage
+/// (`run_inner`); the JIT writes the same cell via an aligned `i64` store in its emitted code (a
+/// hardware-atomic store, foreign to Rust's abstract machine). Relaxed suffices: any trap value is
+/// terminal and the final read (post-`join_all`, a synchronization point) sees the last store.
+///
+/// # Safety
+/// `p` is the run's live trap-cell address (an `AtomicI64`'s storage), valid for the whole run.
+unsafe fn store_trap(p: *mut i64, v: i64) {
+    (*(p as *const AtomicI64)).store(v, Ordering::Relaxed);
+}
+/// Atomically load the run's shared trap cell (audit #2; see [`store_trap`]).
+///
+/// # Safety
+/// As [`store_trap`].
+unsafe fn load_trap(p: *mut i64) -> i64 {
+    (*(p as *const AtomicI64)).load(Ordering::Relaxed)
+}
 
 /// True iff the kill-path is armed (`addr != 0`) **and** the host has set the interrupt cell — i.e.
 /// a parked vCPU should stop waiting and unwind (its next epoch poll in guest code traps `OutOfFuel`).
@@ -277,13 +297,13 @@ fn run_child(a: SpawnArgs) {
     }
 
     let (result, trap) = if faulted {
-        // SAFETY: `trap_out` is the run's live trap cell.
-        unsafe { *env.trap_out = TrapKind::MemoryFault as i64 };
+        // SAFETY: `trap_out` is the run's live trap cell (an `AtomicI64`'s storage).
+        unsafe { store_trap(env.trap_out, TrapKind::MemoryFault as i64) };
         (0, TrapKind::MemoryFault as i64)
     } else {
         // A non-memory trap (DivByZero, ThreadFault, …) set the shared cell from inside the run.
         // SAFETY: live trap cell.
-        let t = unsafe { *env.trap_out };
+        let t = unsafe { load_trap(env.trap_out) };
         (call.ret, t)
     };
     let mut st = lock(&a.done.state);
@@ -319,7 +339,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     let handle = {
         let mut t = lock(&dom.threads);
         if t.cells.len() >= MAX_VCPUS {
-            *(trap_out as *mut i64) = TrapKind::ThreadFault as i64;
+            store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
             return -1;
         }
         let idx = t.cells.len();
@@ -343,7 +363,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             Err(_) => {
                 // Out of OS threads: pop the cell we reserved and trap.
                 t.cells.pop();
-                *(trap_out as *mut i64) = TrapKind::ThreadFault as i64;
+                store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
                 -1
             }
         }
@@ -370,7 +390,7 @@ pub(crate) unsafe extern "C" fn thread_join(
         let slot = (handle as u32 as usize) & mask;
         // Out-of-range or already-joined handles are inert (trap), like a forged capability index.
         if slot >= n || t.joined[slot] {
-            *(trap_out as *mut i64) = TrapKind::ThreadFault as i64;
+            store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
             return 0;
         }
         t.joined[slot] = true;
@@ -384,7 +404,7 @@ pub(crate) unsafe extern "C" fn thread_join(
     loop {
         if let Some((result, trap)) = *st {
             if trap != 0 {
-                *(trap_out as *mut i64) = trap;
+                store_trap(trap_out as *mut i64, trap);
             }
             return result;
         }

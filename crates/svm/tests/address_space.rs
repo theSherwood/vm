@@ -187,3 +187,46 @@ fn sub_rejects_ranges_outside_the_holder() {
         "a 2 KiB grandchild within the child is fine"
     );
 }
+
+/// Audit #1 — a guest must not be able to crash the host by exhausting the 256-slot handle table.
+/// `AddressSpace.sub` mints a handle each call; this loops it 300 times (past `CAP = 256`). Once the
+/// table fills, `sub` must return **-EMFILE** (-24), and the run must complete normally on **both**
+/// backends — in particular the JIT path routes `cap.call` through the `extern "C"` thunk, where a
+/// panic (the pre-fix `.expect("handle table full")`) would unwind across the FFI boundary and
+/// **abort the host process**. Reaching `block2` with -24 proves the table-full path is a clean
+/// errno, not a crash.
+#[test]
+fn minting_past_table_capacity_returns_emfile_not_panic() {
+    const EMFILE: i64 = -24;
+    let src = "\
+memory 17
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 300
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i32, v4: i64, v5: i64):
+  v6 = i64.const 0
+  v7 = i64.const 12
+  v8 = cap.call 5 4 (i64, i64) -> (i32) v3 (v6, v7)
+  v9 = i64.extend_i32_s v8
+  v10 = i64.const -1
+  v11 = i64.add v4 v10
+  v12 = i64.const 0
+  v13 = i64.gt_s v11 v12
+  br_if v13 block1(v3, v11, v9) block2(v9)
+block2(v14: i64):
+  return v14
+}
+";
+    let (ival, _imem, jo, _jmem) = both(src, 17, &seed_128k());
+    assert_eq!(
+        ival,
+        Value::I64(EMFILE),
+        "interp: an over-capacity mint must return -EMFILE"
+    );
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[EMFILE]),
+        "jit: an over-capacity mint must return -EMFILE (not abort across the cap thunk): {jo:?}"
+    );
+}

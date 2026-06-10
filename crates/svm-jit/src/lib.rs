@@ -55,7 +55,7 @@
 //! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
 //! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
 
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F64, I16, I32, I64, I8};
 use cranelift_codegen::ir::{
@@ -926,8 +926,11 @@ fn run_inner(
     let mem_base = window.base();
     let mut results = vec![0i64; entry.results.len()];
     // Trap cell: 0 = ok; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit
-    // code for an Exit. A trapping path (or the cap thunk) writes it.
-    let mut trap_cell: i64 = 0;
+    // code for an Exit. A trapping path (or the cap thunk) writes it. It is **shared across vCPU
+    // threads** (every spawned vCPU gets its address via `set_env`), so the Rust accesses are atomic
+    // (audit #2): the JIT writes it via an aligned `i64` store in emitted code (hardware-atomic,
+    // foreign to Rust's model); concurrent Rust writers (dying vCPUs) and this reader must not race.
+    let trap_cell = AtomicI64::new(0);
 
     // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
     // vCPUs run on their own OS threads via the baked `Domain`. Seed the `Domain`'s per-run `Env` now
@@ -942,7 +945,7 @@ fn run_inner(
         d.set_env(
             mem_base as u64,
             fn_table.as_ptr() as u64,
-            &mut trap_cell,
+            trap_cell.as_ptr(),
             call_tramp.expect("call-trampoline set for a threaded module"),
             window.fault_range(),
             fiber_cfg,
@@ -975,7 +978,7 @@ fn run_inner(
             results.as_mut_ptr(),
             mem_base,
             fn_table.as_ptr() as *const core::ffi::c_void,
-            &mut trap_cell,
+            trap_cell.as_ptr(),
         )
     };
     #[cfg(fiber_rt)]
@@ -987,9 +990,10 @@ fn run_inner(
     if let Some(d) = &domain {
         d.join_all();
     }
-    // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host.
+    // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host. All vCPUs are
+    // joined by now (`join_all` above), so this store no longer races; Relaxed is fine.
     if faulted {
-        trap_cell = mem::FAULT_TRAP;
+        trap_cell.store(mem::FAULT_TRAP, Ordering::Relaxed);
     }
     // Snapshot the in-window bytes (escape-oracle). The guest may have made pages non-readable
     // via the Memory cap (unmap/protect), so restore RW first — else this read faults outside the
@@ -1011,11 +1015,14 @@ fn run_inner(
     drop(fn_table);
     drop(module); // frees the executable memory after the call has returned
 
-    let code = trap_cell as u32;
+    // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
+    // synchronization point); Relaxed suffices.
+    let cell = trap_cell.load(Ordering::Relaxed);
+    let code = cell as u32;
     let outcome = if code == 0 {
         JitOutcome::Returned(results)
     } else if code == EXIT_CODE {
-        JitOutcome::Exited((trap_cell >> 32) as i32)
+        JitOutcome::Exited((cell >> 32) as i32)
     } else {
         JitOutcome::Trapped(TrapKind::from_code(code).ok_or(JitError::Malformed)?)
     };

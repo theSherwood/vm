@@ -1537,11 +1537,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .get_mut(ch as usize)
                         .and_then(|c| c.as_mut())
                         .ok_or(Trap::CapFault)?;
+                    // Install the region into the child's powerbox. Guest-minting into the *child*
+                    // table, so a full table yields -EMFILE rather than panicking (§3c / audit #1).
                     let child_handle = {
                         let mut chh = coro.vcpu.host.lock().unwrap_or_else(|e| e.into_inner());
-                        chh.grant_shared_region_backed(backing)
+                        chh.try_grant_shared_region_backed(backing)
                     };
-                    frames[top].vals.push(Value::I64(child_handle as i64));
+                    frames[top]
+                        .vals
+                        .push(Value::I64(child_handle.map_or(EMFILE, |h| h as i64)));
                 }
                 Inst::CapCall {
                     type_id: iface::INSTANTIATOR,
@@ -2643,6 +2647,7 @@ pub mod iface {
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal.
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
+const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
 
 /// Per-region cap on a **guest-minted** region (`AddressSpace.create_region`, §13/§14): an anti-bomb
 /// ceiling so a single mint can't exhaust the host. Aggregate quota metering is §15 (D48: DoS is
@@ -2936,17 +2941,28 @@ impl Host {
     /// `i32` index encoding `(generation, slot)`. This is how the powerbox (and, later,
     /// attenuation) hands authority to the guest (§3c). Panics only if the table is
     /// full (a host bug, not reachable from guest code).
-    fn grant(&mut self, type_id: u32, binding: Binding) -> i32 {
-        let slot = self
-            .table
-            .iter()
-            .position(|s| s.entry.is_none())
-            .expect("handle table full");
+    /// Fallible grant: claim a free handle-table slot for `binding`, or `None` if the table is full
+    /// (all `CAP` slots live). **Guest-minting** ops (`AddressSpace.sub`, `create_region`, the
+    /// cross-domain `SharedRegion.grant`) must use this and surface `None` as `-EMFILE` — a guest can
+    /// call them in a loop, and a panic here would unwind across the JIT's `extern "C"` cap thunk and
+    /// abort the host (a guest must never crash the host; §5). Host-side powerbox setup uses the
+    /// infallible [`Host::grant`] (it grants a bounded few into a fresh table at instantiation).
+    fn try_grant(&mut self, type_id: u32, binding: Binding) -> Option<i32> {
+        let slot = self.table.iter().position(|s| s.entry.is_none())?;
         let s = &mut self.table[slot];
         s.generation = s.generation.wrapping_add(1); // advance per (re)grant (ABA-safe)
         s.entry = Some(binding);
         s.type_id = type_id;
-        ((s.generation << CAP_LOG2) | slot as u32) as i32
+        Some(((s.generation << CAP_LOG2) | slot as u32) as i32)
+    }
+
+    /// Infallible grant for **host-controlled** powerbox setup (`grant_stream`/`grant_memory`/… and
+    /// the `grant_*` embedder APIs): the host grants a bounded handful into a fresh `CAP`-slot table,
+    /// so the table cannot be full. Never call this on a **guest-reachable** path — use
+    /// [`Host::try_grant`] there (a guest can exhaust the table; see its docs).
+    fn grant(&mut self, type_id: u32, binding: Binding) -> i32 {
+        self.try_grant(type_id, binding)
+            .expect("handle table full during host powerbox setup (bounded by construction)")
     }
 
     /// Grant a `Stream` capability bound to `role` (a powerbox stdio grant, §3e).
@@ -3065,6 +3081,19 @@ impl Host {
         let id = self.regions.len() as u32;
         self.regions.push(backing);
         self.grant(iface::SHARED_REGION, Binding::SharedRegion(id))
+    }
+
+    /// Fallible [`grant_shared_region_backed`] for **guest-minting** paths (`create_region`, the
+    /// cross-domain `grant`): `None` when the handle table is full (so the caller can return
+    /// `-EMFILE` instead of panicking). Checks for a free slot **before** registering the backing, so
+    /// a full table leaves `regions` untouched (no leaked backing).
+    pub fn try_grant_shared_region_backed(&mut self, backing: RegionBacking) -> Option<i32> {
+        if self.table.iter().all(|s| s.entry.is_some()) {
+            return None; // table full — don't register a backing we can't hand out
+        }
+        let id = self.regions.len() as u32;
+        self.regions.push(backing);
+        self.try_grant(iface::SHARED_REGION, Binding::SharedRegion(id))
     }
 
     /// Install the backing factory for **guest-minted** regions (`AddressSpace.create_region`,
@@ -3207,7 +3236,17 @@ impl Host {
                     if !fits {
                         return Ok(vec![EINVAL]);
                     }
-                    return Ok(vec![self.grant_address_space(base + off, child) as i64]);
+                    // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit #1).
+                    return Ok(vec![match self.try_grant(
+                        iface::ADDRESS_SPACE,
+                        Binding::AddressSpace {
+                            base: base + off,
+                            size: child,
+                        },
+                    ) {
+                        Some(h) => h as i64,
+                        None => EMFILE,
+                    }]);
                 }
                 if op == 5 {
                     // create_region(len) -> region handle — a **guest-minted** §13/§14 `SharedRegion`
@@ -3225,7 +3264,10 @@ impl Host {
                         Some(f) => f(len as usize),
                         None => Arc::new(VecBacking(Mutex::new(vec![0u8; len as usize]))),
                     };
-                    return Ok(vec![self.grant_shared_region_backed(backing) as i64]);
+                    // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit #1).
+                    return Ok(vec![self
+                        .try_grant_shared_region_backed(backing)
+                        .map_or(EMFILE, |h| h as i64)]);
                 }
                 // map/unmap/protect/page_size — same shapes as `Memory`, but bounded to `[0, size)`
                 // and shifted by `base` (a buffer/range straddling the sub-range boundary is -EINVAL).
