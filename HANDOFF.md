@@ -1206,7 +1206,12 @@ The current frontier, roughly ranked:
    `compile_and_run_with_host_interruptible` (un-armed compiles are byte-identical — `epoch_addr == 0`
    ⇒ no checks emitted, so the whole differential is unchanged), the guest can't turn the poll off,
    and `svm-run` exposes it on the CLI via `SVM_DEADLINE_MS` (a watchdog thread that wakes early when
-   the run finishes, so fast programs aren't delayed). Differentially tested in `jit_killpath.rs`
+   the run finishes, so fast programs aren't delayed). The embedding deadline is now an explicit
+   `run_powerbox_with_deadline(module, stdin, Option<Duration>)` arg (the CLI reads the env var and
+   passes it — env-reading is CLI policy, not library behaviour); pinned end to end in
+   `svm-run/tests/run.rs`: a runaway powerbox guest is killed at the deadline, a fast guest isn't
+   delayed, and the **`svm-run` binary** detect-and-kills a C `for(;;){}` (frontend → JIT → watchdog
+   → non-zero exit). Differentially tested in `jit_killpath.rs`
    (infinite loop, infinite tail recursion → both backends `OutOfFuel`; armed-finite + unarmed runs
    complete normally). The kill now covers a **whole multithreaded domain**: every vCPU runs the same
    finalized code, so a *spinning* sibling polls the one baked cell on its own; a *parked* sibling

@@ -4,9 +4,12 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use svm_ir::Module;
-use svm_run::{is_powerbox_entry, run_kernel, run_powerbox, Outcome, Value};
+use svm_run::{
+    is_powerbox_entry, run_kernel, run_powerbox, run_powerbox_with_deadline, Outcome, Value,
+};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -294,4 +297,123 @@ fn cli_compiles_and_runs_c() {
         panic!("svm-run on hello.c failed: {err}");
     }
     assert_eq!(out.stdout, b"hello, sandbox!\n");
+}
+
+// ── §5 kill-path through the embedding entry (`run_powerbox_with_deadline`) ────────────────────
+
+/// A runaway powerbox guest (ignores its handles, loops forever) is **detect-and-killed** at the
+/// deadline rather than hanging the process — the CLI's `SVM_DEADLINE_MS` is this, end to end.
+#[test]
+fn deadline_kills_runaway_powerbox_guest() {
+    let m = load(
+        "func (i32, i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32, v2: i32):\n\
+         \x20 v3 = i32.const 0\n\
+         \x20 br block1(v3)\n\
+         block1(v4: i32):\n\
+         \x20 v5 = i32.const 1\n\
+         \x20 v6 = i32.add v4 v5\n\
+         \x20 br block1(v6)\n\
+         }\n",
+    );
+    let err = run_powerbox_with_deadline(&m, b"", Some(Duration::from_millis(100)))
+        .expect_err("a runaway guest must be killed, not returned");
+    assert!(
+        err.contains("OutOfFuel"),
+        "expected an OutOfFuel detect-and-kill, got: {err}"
+    );
+}
+
+/// Arming the kill-path must not penalize a well-behaved guest: a fast program finishes normally —
+/// and *quickly* — because the watchdog wakes the instant the run completes (it never blocks the
+/// full deadline).
+#[test]
+fn deadline_does_not_delay_fast_guest() {
+    let m = load(
+        "memory 16\n\
+         data 16 \"hi\\n\"\n\
+         func (i32, i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32, v2: i32):\n\
+         \x20 v3 = i64.const 16\n\
+         \x20 v4 = i64.const 3\n\
+         \x20 v5 = cap.call 0 1 (i64, i64) -> (i64) v0(v3, v4)\n\
+         \x20 v6 = i32.const 7\n\
+         \x20 return v6\n\
+         }\n",
+    );
+    let t0 = Instant::now();
+    let run = run_powerbox_with_deadline(&m, b"", Some(Duration::from_secs(30))).expect("run");
+    let elapsed = t0.elapsed();
+    assert_eq!(run.stdout, b"hi\n");
+    assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(7)]));
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the watchdog must not delay a fast run (took {elapsed:?} of a 30s deadline)"
+    );
+}
+
+// ── §13/§14 region minting through the powerbox (the 5-handle grant + region factory) ──────────
+
+/// A powerbox guest that takes the **5th** handle (an `AddressSpace`, §14) mints a `SharedRegion`,
+/// maps it at two window offsets, and aliases through it — pinning that `run_powerbox` grants the
+/// AddressSpace *and* installs the OS-shared-memory factory so a stock embedded guest can build the
+/// zero-copy data plane (the same capability `<svm.h>` exposes to C). Host-granularity-agnostic: it
+/// queries `region_page_size` (op 3) and works in whole granules.
+#[test]
+fn powerbox_region_minting_round_trips() {
+    let m = load(
+        "memory 17\n\
+         func (i32, i32, i32, i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32):\n\
+         \x20 v5 = i64.const 65536\n\
+         \x20 v6 = cap.call 5 5 (i64) -> (i64) v4(v5)\n\
+         \x20 v7 = i32.wrap_i64 v6\n\
+         \x20 v8 = cap.call 4 3 () -> (i64) v7()\n\
+         \x20 v9 = i64.const 0\n\
+         \x20 v10 = i32.const 3\n\
+         \x20 v11 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v7(v9, v9, v8, v10)\n\
+         \x20 v12 = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v7(v8, v9, v8, v10)\n\
+         \x20 v13 = i32.const 123\n\
+         \x20 i32.store8 v9 v13\n\
+         \x20 v14 = i32.load8_u v8\n\
+         \x20 return v14\n\
+         }\n",
+    );
+    // The 5-param entry is still a recognized powerbox shape.
+    assert!(is_powerbox_entry(&m));
+    let run = run_powerbox(&m, b"").expect("run");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(123)]),
+        "the value stored through one mapping must read back through the alias"
+    );
+}
+
+/// The capstone for the §5 kill-path: drive the **`svm-run` binary** on a C `for(;;){}` compiled by
+/// the frontend, with `SVM_DEADLINE_MS` set — it must be detect-and-killed (non-zero exit, an
+/// `OutOfFuel` message) instead of hanging the process. The real end-to-end product path: C source →
+/// frontend → JIT → watchdog → CLI exit. Skipped (not failed) when the frontend is unavailable.
+#[test]
+fn cli_deadline_kills_runaway_c_program() {
+    let cfile = std::env::temp_dir().join(format!("svm_runaway_{}.c", std::process::id()));
+    std::fs::write(&cfile, "int main(void){ for(;;){} return 0; }\n").expect("write temp C");
+    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
+        .arg(&cfile)
+        .env("SVM_DEADLINE_MS", "200")
+        .output()
+        .expect("spawn svm-run");
+    let _ = std::fs::remove_file(&cfile);
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.contains("chibicc") {
+        eprintln!("note: skipping (frontend unavailable): {}", err.trim());
+        return;
+    }
+    assert!(
+        !out.status.success(),
+        "a detect-and-killed guest must exit non-zero; stderr: {err}"
+    );
+    assert!(
+        err.contains("OutOfFuel"),
+        "expected an OutOfFuel detect-and-kill on the CLI; stderr: {err}"
+    );
 }

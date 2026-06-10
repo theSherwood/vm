@@ -17,7 +17,7 @@ use std::process::Command;
 use std::{env, fs, process};
 
 use svm_ir::Module;
-use svm_run::{is_powerbox_entry, run_kernel, run_powerbox, Outcome, Value};
+use svm_run::{is_powerbox_entry, run_kernel, run_powerbox_with_deadline, Outcome, Value};
 use svm_verify::verify_module;
 
 fn main() {
@@ -64,7 +64,14 @@ fn try_main() -> Result<(), String> {
     verify_module(&module).map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
 
     if is_powerbox_entry(&module) {
-        let run = run_powerbox(&module, &stdin)?;
+        // §5 kill-path: `SVM_DEADLINE_MS` (CLI policy) bounds a possibly-runaway guest so it is
+        // detect-and-killed after the deadline instead of hanging the process; unset ⇒ unbounded.
+        let deadline = std::env::var("SVM_DEADLINE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(std::time::Duration::from_millis);
+        let run = run_powerbox_with_deadline(&module, &stdin, deadline)?;
         // Flush captured output to the real streams (process::exit skips destructors, so flush
         // explicitly), then terminate with the guest's exit code.
         let mut out = std::io::stdout().lock();

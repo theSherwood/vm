@@ -905,8 +905,23 @@ fn typed(t: ValType, v: i64) -> Value {
 /// `stdout`, a readable `stdin` seeded from `stdin`, and `Exit` — the three handles the
 /// frontend's `_start` expects, granted in declared order. Returns the outcome and captured
 /// output. `Err` if the (already-verified) module fails to JIT-compile, or if the guest
-/// **traps** (detect-and-kill, §5) — the guest can never corrupt the host.
+/// **traps** (detect-and-kill, §5) — the guest can never corrupt the host. Unbounded execution
+/// (no §5 kill-path); use [`run_powerbox_with_deadline`] to bound a possibly-runaway guest.
 pub fn run_powerbox(module: &Module, stdin: &[u8]) -> Result<Run, String> {
+    run_powerbox_with_deadline(module, stdin, None)
+}
+
+/// Like [`run_powerbox`], but arm the §5 fuel/epoch kill-path with `deadline`: a watchdog thread
+/// stops a **runaway** guest (infinite loop / unbounded recursion) `deadline` after it starts,
+/// surfacing as an `Err` (detect-and-kill) instead of hanging the process. `None` ⇒ the ordinary
+/// unbounded run. The watchdog wakes early the moment the run finishes, so a fast program is never
+/// delayed. The `svm-run` CLI reads `SVM_DEADLINE_MS` and passes it here; an embedder supplies its
+/// own policy (reading process env vars is the CLI's job, not the library's).
+pub fn run_powerbox_with_deadline(
+    module: &Module,
+    stdin: &[u8],
+    deadline: Option<std::time::Duration>,
+) -> Result<Run, String> {
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     // Guest-minted §13/§14 regions (`__vm_region_create` → `AddressSpace.create_region`) need an
@@ -931,25 +946,17 @@ pub fn run_powerbox(module: &Module, stdin: &[u8]) -> Result<Run, String> {
         slots.push(host.grant_address_space(0, win) as i64);
     }
     let ctx = &mut host as *mut Host as *mut c_void;
-    // §5 fuel/epoch kill-path: if `SVM_DEADLINE_MS` is set, arm the JIT's interrupt poll with a
-    // watchdog so a runaway guest (infinite loop / unbounded recursion) is stopped after the
-    // deadline instead of hanging the process. Unset ⇒ the ordinary unbounded run (default
-    // behaviour preserved). The watchdog wakes early when the run finishes, so a fast program is
-    // never delayed.
-    let deadline_ms = std::env::var("SVM_DEADLINE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&ms| ms > 0);
-    let jit = if let Some(ms) = deadline_ms {
+    // §5 fuel/epoch kill-path: when a `deadline` is given, arm the JIT's interrupt poll with a
+    // watchdog so a runaway guest is stopped after the deadline instead of hanging the process.
+    // `None` ⇒ the ordinary unbounded run. The watchdog wakes early when the run finishes, so a
+    // fast program is never delayed.
+    let jit = if let Some(d) = deadline.filter(|d| !d.is_zero()) {
         let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let wd = interrupt.clone();
         let watchdog = std::thread::spawn(move || {
             // Timed out (or the run dropped the sender) ⇒ request the kill.
-            if done_rx
-                .recv_timeout(std::time::Duration::from_millis(ms))
-                .is_err()
-            {
+            if done_rx.recv_timeout(d).is_err() {
                 wd.store(1, std::sync::atomic::Ordering::SeqCst);
             }
         });
