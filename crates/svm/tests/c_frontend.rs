@@ -2070,3 +2070,26 @@ fn c_ring_buffer_via_minted_region() {
     // entirely on its own — the host only installed the region factory + granted the AddressSpace).
     assert_eq!(run_c(C_RING_REGION).as_slice(), [Value::I32(1)]);
 }
+
+// The `__vm_region_unmap` builtin (`<svm.h>`, op 1) — the one region builtin the ring-buffer test
+// doesn't exercise. Mint a region, map it, write through it, then unmap that window range: the
+// builtin must lower (`cap.call 4 1`) and the unmap succeed (return 0), identically on both backends.
+const C_REGION_UNMAP: &str = "\
+#include <svm.h>\n\
+static char pad[200 * 1024];\n\
+int main(void) {\n\
+  pad[0] = 1; pad[200 * 1024 - 1] = 2;\n\
+  int r = (int)__vm_region_create(1 << 16);\n\
+  if (r < 0) return -1;\n\
+  long g = __vm_region_page_size(r);\n\
+  long base = 256 * 1024;\n\
+  if (__vm_region_map(r, base, 0, g, 3) < 0) return -2;\n\
+  *(unsigned int *)base = 77;                 /* write through the mapping */\n\
+  long u = __vm_region_unmap(r, base, g);     /* the builtin under test */\n\
+  return u == 0 ? 1 : 0;                       /* unmap must succeed */\n\
+}\n";
+
+#[test]
+fn c_region_unmap_builtin() {
+    assert_eq!(run_c(C_REGION_UNMAP).as_slice(), [Value::I32(1)]);
+}

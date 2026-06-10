@@ -232,7 +232,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
     let nfuncs = sigs.len();
     let can_call = fi + 1 < nfuncs;
     loop {
-        match bb.g.below(24) {
+        match bb.g.below(25) {
             0 => {
                 let ty = bb.g.inttype();
                 let op = BinOp::from_index(bb.g.below(15) as u8).unwrap();
@@ -568,6 +568,17 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 // A standalone fence needs no memory. (Both backends emit a seq-cst barrier.)
                 let order = bb.g.order_from(&Ordering::ALL);
                 bb.push0(Inst::AtomicFence { order });
+            }
+            24 => {
+                // `ref.func k` — a funcref (an i32 function index, §3c) for *any* function. Both
+                // backends lower it to the same constant (`iconst.i32 k`), so it pins RefFunc on the
+                // JIT, which once had a lowering gap that surfaced only via the C tests, not this
+                // fuzzer (HANDOFF §2). The result flows as a plain i32 value; `call_indirect` mints
+                // its **own** forward `ConstI32` index (arm 17) and never reads the pool, so a
+                // RefFunc value can't become a backward call target — the halting-by-construction
+                // forward-only call DAG is untouched.
+                let k = bb.g.below(nfuncs as u32);
+                bb.push(Inst::RefFunc { func: k as FuncIdx }, ValType::I32);
             }
             _ => continue, // a mem/call kind that isn't available here — re-roll
         }

@@ -273,8 +273,13 @@ args…)`; the signature **must include the leading data-SP `i64`** so the runti
 check (`table_lookup`) matches the target. A type-confused/forged index is inert — it
 traps `IndirectCallType` on both backends (I2; see `c_function_pointer_signature_mismatch_traps`).
 The JIT lowers `RefFunc` to an `iconst.i32` and was extended in `ensure_supported`.
-(Coverage gap noted: the generative `jit_fuzz` exercises `call_indirect` but not `ref.func`,
-which is why this JIT gap surfaced only via the C tests — worth adding to the fuzzer.)
+(Former coverage gap — *now closed*: the generative `jit_fuzz` exercises `call_indirect` but
+historically not `ref.func`, which is why this JIT gap once surfaced only via the C tests. `irgen`
+now emits `ref.func k` (arm 24; any function index — the result is a plain i32 that never feeds
+`call_indirect`, so the halting-by-construction forward-only call DAG is untouched), and
+`generator_covers_*` asserts it is produced, so `ref.func` rides the 4000-seed interp↔JIT
+differential. The deterministic pin `jit_diff::jit_matches_interp_ref_func_indirect` and the C-level
+`__vm_region_unmap` builtin (`c_region_unmap_builtin`) round out the coverage.)
 
 Anything unsupported is a **hard `error_tok`** (with the AST node kind), by design — we
 never emit IR we can't stand behind. The frontend is outside the escape-TCB (§2a): the

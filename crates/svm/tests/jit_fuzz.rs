@@ -35,7 +35,7 @@ fn generator_covers_loops_indirect_and_cap_calls() {
     use svm_ir::{Inst, Terminator};
     let (mut loops, mut indirect, mut cap) = (0u32, 0u32, 0u32);
     let (mut data, mut data_ro, mut mem_cap) = (0u32, 0u32, 0u32);
-    let (mut atomics, mut fences) = (0u32, 0u32);
+    let (mut atomics, mut fences, mut reffuncs) = (0u32, 0u32, 0u32);
     for seed in 0..2000u64 {
         let mut g = Gen::from_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED_5EED);
         let m = irgen::gen_module(&mut g);
@@ -94,11 +94,17 @@ fn generator_covers_loops_indirect_and_cap_calls() {
                     .iter()
                     .filter(|i| matches!(i, Inst::AtomicFence { .. }))
                     .count() as u32;
+                reffuncs += blk
+                    .insts
+                    .iter()
+                    .filter(|i| matches!(i, Inst::RefFunc { .. }))
+                    .count() as u32;
             }
         }
     }
     assert!(atomics > 0, "generator produced no atomic ops");
     assert!(fences > 0, "generator produced no fences");
+    assert!(reffuncs > 0, "generator produced no ref.func");
     assert!(loops > 0, "generator produced no loop back-edges");
     assert!(indirect > 0, "generator produced no call_indirect");
     assert!(cap > 0, "generator produced no cap.call");
