@@ -2829,18 +2829,29 @@ pub trait GuestMem {
         host_region_granularity() as i64
     }
 
-    /// §9/§12 **async ring** support. Return a `Send + Sync` handle for posting completions to the
-    /// 4-byte futex **completion counter** at `counter_addr` from an offload-pool worker thread, plus
-    /// that address confined to its parking-lot key. A worker atomic-increments the counter through the
-    /// returned [`Region`] (the same path cross-vCPU atomics take) and then `notify`s the key, so a
-    /// vCPU parked in `wait` on the counter wakes race-free (the scheduler's compare-under-lock guard).
-    /// `Some` only for a normal in-window anonymous, naturally-aligned, writable page (not a §13 alias,
-    /// whose atomics route differently). `None` — the default — means the backend can't post async
-    /// completions, so `submit_async` reports `-EINVAL` and the guest falls back to the synchronous
-    /// `submit`. Only the reference paged [`Mem`] overrides it today (the JIT wires its own in §3b).
-    fn async_counter(&self, _counter_addr: u64) -> Option<(Arc<Region>, u64)> {
+    /// §9/§12 **async ring** support. Return a backend-neutral [`AsyncCounter`] for the 4-byte futex
+    /// **completion counter** at `counter_addr`: an offload-pool worker atomic-increments it (the same
+    /// path the backend's `wait`/`notify` value-check reads) and `notify`s its [`AsyncCounter::key`], so
+    /// a vCPU parked in `wait` on the counter wakes race-free (the compare-under-lock guard). `Some`
+    /// only for a normal in-window, naturally-aligned, writable page. `None` — the default — means the
+    /// backend can't post async completions, so `submit_async` reports `-EINVAL` and the guest falls
+    /// back to the synchronous `submit`. The reference paged [`Mem`] and the JIT's flat window both
+    /// override it (each keyed to its own `wait`/`notify`: a window offset vs. an absolute address).
+    fn async_counter(&self, _counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
         None
     }
+}
+
+/// A `Send + Sync` handle an offload-pool worker uses to post an async-ring completion to the futex
+/// **completion counter** (§9/§12). `increment` atomic-adds to the in-window counter through the same
+/// path the backend's atomics take (a [`Region`] on the interpreter, a raw window write on the JIT);
+/// `key` is the parking-lot key to hand the [`Host`]'s wake hook — a window offset on the interpreter
+/// (the `Scheduler` key), an absolute window address on the JIT (the futex key) — each consistent with
+/// that backend's `wait`/`notify`, so the worker's increment targets exactly what the parked vCPU's
+/// value-check reads.
+pub trait AsyncCounter: Send + Sync {
+    fn increment(&self, delta: u64);
+    fn key(&self) -> u64;
 }
 
 /// A [`GuestMem`] over a flat, contiguous window slice — the JIT's representation. The
@@ -3138,6 +3149,23 @@ struct RingState {
     completed: Mutex<VecDeque<(i64, i64, i64)>>,
 }
 
+/// The interpreter's [`AsyncCounter`]: the futex completion counter is a normal anonymous window page,
+/// so a worker increments it via the shared [`Region`] (the same real-atomic path cross-vCPU atomics
+/// take) and the parking key is the window-relative offset (the `Scheduler`'s parking-lot key).
+struct RegionCounter {
+    region: Arc<Region>,
+    off: u64,
+}
+
+impl AsyncCounter for RegionCounter {
+    fn increment(&self, delta: u64) {
+        self.region.atomic_rmw(self.off, 4, RmwOp::Add, delta);
+    }
+    fn key(&self) -> u64 {
+        self.off
+    }
+}
+
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -3218,16 +3246,18 @@ impl Host {
     }
 
     /// Install the §9/§12 async-completion `notify` hook (the executor that owns the wake mechanism
-    /// wires it at run start; see [`Host::async_notify`]). Cleared at run end to drop the closure's
-    /// `Arc<Scheduler>`.
-    fn set_async_notify(&mut self, f: Arc<dyn Fn(u64, u32) + Send + Sync>) {
+    /// wires it at run start; see [`Host::async_notify`]). The interp's `drive` calls this with the M:N
+    /// `Scheduler::notify`; the JIT wires its futex via the same seam (`svm_jit::AsyncHostHooks`).
+    /// Cleared at run end to drop the closure's executor reference.
+    pub fn set_async_notify(&mut self, f: Arc<dyn Fn(u64, u32) + Send + Sync>) {
         self.async_notify = Some(f);
     }
-    fn clear_async_notify(&mut self) {
+    pub fn clear_async_notify(&mut self) {
         self.async_notify = None;
     }
-    /// Drain any in-flight offload-pool jobs (run end), so no worker still holds the window backing.
-    fn quiesce_pool(&self) {
+    /// Drain any in-flight offload-pool jobs (run end), so no worker still holds the window backing (or
+    /// the JIT's window/`Domain` pointers) when the caller frees them.
+    pub fn quiesce_pool(&self) {
         if let Some(p) = &self.pool {
             p.quiesce();
         }
@@ -3842,10 +3872,10 @@ impl Host {
         let n = (*args.get(1).unwrap_or(&0)).max(0) as u64;
         let counter_addr = *args.get(2).unwrap_or(&0) as u64;
 
-        // The backend must expose the futex counter backing + the wake hook, else there is no async
+        // The backend must expose the futex counter handle + the wake hook, else there is no async
         // path here (the guest falls back to the synchronous `submit`).
-        let (backing, counter_key) = match m.async_counter(counter_addr) {
-            Some(t) => t,
+        let counter = match m.async_counter(counter_addr) {
+            Some(c) => c,
             None => return Ok(vec![EINVAL]),
         };
         let notify = match &self.async_notify {
@@ -3884,13 +3914,13 @@ impl Host {
                     let state = Arc::clone(&self.blockings[bidx as usize]);
                     let arg = opargs[0];
                     let ring = Arc::clone(&ring);
-                    let backing = Arc::clone(&backing);
+                    let counter = Arc::clone(&counter);
                     let notify = Arc::clone(&notify);
                     jobs.push(Box::new(move || {
                         let r = state.run(arg);
                         ring.completed.lock().unwrap().push_back((user_data, r, 0));
-                        backing.atomic_rmw(counter_key, 4, RmwOp::Add, 1);
-                        notify(counter_key, u32::MAX);
+                        counter.increment(1);
+                        notify(counter.key(), u32::MAX);
                     }));
                     continue;
                 }
@@ -3932,7 +3962,7 @@ impl Host {
         // Account the inline completions on the counter once (no wake — the guest can't be parked
         // during its own submit). Offloaded ones bump the counter as they finish.
         if inline_done > 0 {
-            backing.atomic_rmw(counter_key, 4, RmwOp::Add, inline_done as u64);
+            counter.increment(inline_done as u64);
         }
         if !jobs.is_empty() {
             let pool = self
@@ -4397,13 +4427,16 @@ impl Mem {
     /// `read_le`, not `back`, so an offload worker couldn't reach it consistently), and hand back the
     /// `Arc<Region>` + confined key for a worker to atomic-increment (matching `atomic_value`'s
     /// non-backed path) before it `notify`s.
-    fn async_counter_impl(&self, counter_addr: u64) -> Option<(Arc<Region>, u64)> {
+    fn async_counter_impl(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
         let base = self.confine_checked(counter_addr, 0, 4).ok()?;
-        if base % 4 != 0 || self.is_backed(base) {
+        if !base.is_multiple_of(4) || self.is_backed(base) {
             return None;
         }
         self.check_prot(base, 4, true).ok()?;
-        Some((Arc::clone(&self.back), base))
+        Some(Arc::new(RegionCounter {
+            region: Arc::clone(&self.back),
+            off: base,
+        }))
     }
 
     /// Validate a `<ty>.atomic.wait` address: confine it, require natural alignment, and require the
@@ -4891,7 +4924,7 @@ impl GuestMem for Mem {
     fn page_size(&self) -> i64 {
         self.page as i64
     }
-    fn async_counter(&self, counter_addr: u64) -> Option<(Arc<Region>, u64)> {
+    fn async_counter(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
         self.async_counter_impl(counter_addr)
     }
 }

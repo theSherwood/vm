@@ -12,7 +12,8 @@
 
 use core::ffi::c_void;
 
-use svm_interp::{GuestMem, Host, RegionBacking, StreamRole, Trap};
+use std::sync::Arc;
+use svm_interp::{AsyncCounter, GuestMem, Host, RegionBacking, StreamRole, Trap};
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
@@ -432,6 +433,20 @@ impl GuestMem for MprotectWindow {
         self.page as i64
     }
 
+    /// §9/§12 async-ring completion counter. The JIT's `atomic.wait` parks on the confined **physical**
+    /// address `phys = base + (addr & mask)`; an offload worker bumps the counter and `notify`s that
+    /// same `phys`, so the handle keys on it (vs. the interpreter's window-relative offset). `Some` only
+    /// for a 4-byte-aligned, committed, writable in-window address — the same gate as a guest atomic.
+    fn async_counter(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
+        let off = counter_addr & (self.reserved - 1); // the §4 mask domain, matching the JIT lowering
+        if !off.is_multiple_of(4) || !self.range_committed(off, 4, true) {
+            return None;
+        }
+        Some(Arc::new(PhysCounter {
+            phys: self.base as u64 + off,
+        }))
+    }
+
     /// §13 op 0 `map`: alias a `SharedRegion` into the window with a **real shared mapping** —
     /// `mmap(MAP_SHARED | MAP_FIXED)` of the region's `os_fd` over `[win_off, win_off+len)`, so two
     /// mappings of the same region (here, or in another window) name the *same* physical pages: true
@@ -603,6 +618,66 @@ impl GuestMem for MprotectWindow {
         {
             let _ = (win_off, region_off, len, prot, backing);
             EINVAL
+        }
+    }
+}
+
+/// §9/§12 the JIT's [`AsyncCounter`]: the futex completion counter is a raw window address `phys`, so
+/// an offload worker bumps it with a real atomic — the same `phys` the JIT's `atomic.wait` value-check
+/// reads and the futex `notify` keys on. The run is quiesced before the window is freed
+/// ([`HostAsyncHooks::finish`]), so `phys` is live whenever a worker calls this.
+#[cfg(any(unix, windows))]
+struct PhysCounter {
+    phys: u64,
+}
+// SAFETY: `phys` is a stable, validated, committed window address; it is only ever atomic-accessed,
+// and the offload pool is drained before the window is unmapped (no use-after-free).
+#[cfg(any(unix, windows))]
+unsafe impl Send for PhysCounter {}
+#[cfg(any(unix, windows))]
+unsafe impl Sync for PhysCounter {}
+
+#[cfg(any(unix, windows))]
+impl AsyncCounter for PhysCounter {
+    fn increment(&self, delta: u64) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // SAFETY: `phys` points at a 4-byte-aligned committed window word (validated in
+        // `async_counter`); the run drains the pool before freeing the window, so it stays live.
+        let a = unsafe { &*(self.phys as *const AtomicU32) };
+        a.fetch_add(delta as u32, Ordering::SeqCst);
+    }
+    fn key(&self) -> u64 {
+        self.phys
+    }
+}
+
+/// §9/§12 the `Host`-backed [`svm_jit::AsyncHostHooks`] for the asynchronous `IoRing.submit_async`:
+/// installs this JIT run's futex `notify` into the `Host` (which owns the offload pool) so a worker can
+/// wake a vCPU parked on a completion counter, and drains the pool at teardown. Construct it over the
+/// **same** `Host` whose pointer is the run's `cap_ctx`, and pass it to
+/// [`svm_jit::compile_and_run_capture_reserved_with_host_async`].
+pub struct HostAsyncHooks {
+    host: *mut Host,
+}
+
+impl HostAsyncHooks {
+    /// # Safety
+    /// `host` must point at the live `Host` used as the run's `cap_ctx`, and outlive the run.
+    pub unsafe fn new(host: *mut Host) -> HostAsyncHooks {
+        HostAsyncHooks { host }
+    }
+}
+
+impl svm_jit::AsyncHostHooks for HostAsyncHooks {
+    fn install_notify(&self, notify: Arc<dyn Fn(u64, u32) + Send + Sync>) {
+        // SAFETY: `host` is the live cap-ctx `Host`; install runs on the run thread before any vCPU.
+        unsafe { (*self.host).set_async_notify(notify) };
+    }
+    fn finish(&self) {
+        // SAFETY: same `Host`; called on the run thread after every vCPU has joined.
+        unsafe {
+            (*self.host).quiesce_pool();
+            (*self.host).clear_async_notify();
         }
     }
 }

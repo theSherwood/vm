@@ -305,6 +305,23 @@ pub struct ResolvedModule {
 pub type ModuleResolver =
     unsafe extern "C" fn(ctx: *mut core::ffi::c_void, handle: i32, out: *mut ResolvedModule) -> i32;
 
+/// §9/§12 async-ring host seam. The asynchronous `IoRing.submit_async` parks a vCPU on an in-window
+/// futex completion **counter** and an offload-pool worker wakes it — but the pool lives in the
+/// embedder's `Host` while the futex lives in the JIT's per-run `Domain`. This trait bridges them: the
+/// run publishes its futex-`notify` into the `Host` (so a worker can wake the parked vCPU), and drains
+/// the pool before the window/`Domain` are freed. `svm_run` supplies the `Host`-backed impl; a run
+/// with no async ring passes `None` (then `submit_async` is an inert `-EINVAL` and the guest falls back
+/// to the synchronous `submit`).
+pub trait AsyncHostHooks {
+    /// Install the futex wake hook — `notify(key, count)` wakes up to `count` vCPUs parked on the
+    /// confined counter address `key`. Called once, after the thread `Domain` is up, before the guest
+    /// runs.
+    fn install_notify(&self, notify: std::sync::Arc<dyn Fn(u64, u32) + Send + Sync>);
+    /// Drain the offload pool and drop the wake hook. Called after every vCPU is joined and before the
+    /// window / `Domain` are freed, so no worker still holds those pointers.
+    fn finish(&self);
+}
+
 /// The default thunk for [`compile_and_run`] (no host): an empty powerbox, so every
 /// `cap.call` is inert — a `CapFault` — exactly like the interpreter's `run`.
 unsafe extern "C" fn empty_cap_thunk(
@@ -390,6 +407,7 @@ pub fn compile_and_run_with_host(
         None,
         None,
         None, // no kill-path armed (use `_interruptible` to arm one)
+        None, // no async ring
     )?
     .0)
 }
@@ -425,6 +443,7 @@ pub fn compile_and_run_with_host_interruptible(
         None,
         None,
         Some(interrupt),
+        None, // no async ring
     )?
     .0)
 }
@@ -470,6 +489,7 @@ pub fn compile_and_run_capture_reserved(
         None,
         None,
         None, // no kill-path armed
+        None, // no async ring
     )
 }
 
@@ -502,6 +522,7 @@ pub fn compile_and_run_capture_sub(
         Some(SubWindow { base, parent_bytes }),
         None,
         None, // no kill-path armed
+        None, // no async ring
     )
 }
 
@@ -567,6 +588,43 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
         None,
         resolve_module,
         None, // no kill-path armed (the differential oracle runs to completion)
+        None, // no async ring
+    )
+}
+
+/// [`compile_and_run_capture_reserved_with_host`] + the §9/§12 **async-ring host seam**
+/// ([`AsyncHostHooks`]): wires this run's futex-`notify` into the embedder's `Host` so an offload-pool
+/// worker can wake a vCPU parked in `IoRing.submit_async`, and drains the pool before teardown. Use it
+/// (with `svm_run::HostAsyncHooks`) when the guest exercises the asynchronous ring; otherwise the plain
+/// entry point leaves `submit_async` an inert `-EINVAL`.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host`]; `hooks` must outlive the run and its `Host` must
+/// be the same one `cap_ctx` points at.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_async(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    hooks: &dyn AsyncHostHooks,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        Some(init_mem),
+        reserved_log2,
+        Some(SNAP_CAP),
+        None,
+        None,
+        None, // no kill-path armed
+        Some(hooks),
     )
 }
 
@@ -594,6 +652,7 @@ fn run_inner(
     sub: Option<SubWindow>,
     resolve_module: Option<ModuleResolver>,
     interrupt: Option<*const AtomicU64>,
+    async_hooks: Option<&dyn AsyncHostHooks>,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // §5 fuel/epoch kill-path: the address of the host-owned interrupt cell the lowering polls at
@@ -953,6 +1012,27 @@ fn run_inner(
         );
     }
 
+    // §9/§12 async ring: publish this run's futex-`notify` into the embedder's `Host` so an offload
+    // worker can wake a vCPU parked in `submit_async` on a completion counter (the futex `phys` is the
+    // parking key). Needs the thread `Domain` (a module that parks on a counter uses `atomic.wait`, so
+    // `uses_threads` holds). With no `Domain`/hooks, `submit_async` stays an inert `-EINVAL`.
+    #[cfg(fiber_rt)]
+    if let (Some(hooks), Some(d)) = (async_hooks, &domain) {
+        // The `Domain` pointer as a `usize` so the hook closure is `Send + Sync` (a raw pointer is not,
+        // and Rust-2021 disjoint capture would otherwise grab the bare pointer field).
+        let dom_addr = (&**d as *const os_thread_rt::Domain) as usize;
+        hooks.install_notify(std::sync::Arc::new(move |key: u64, count: u32| {
+            let n = count.min(i32::MAX as u32) as i32;
+            // SAFETY: the `Domain` outlives the run; the hook is dropped by `hooks.finish()` after
+            // `join_all`, before the `Domain` is freed, so the pointer is valid whenever a worker
+            // calls this. `thread_notify` is sound from any thread (it locks the domain futex), like a
+            // guest `atomic.notify`.
+            unsafe { os_thread_rt::thread_notify(dom_addr as *const os_thread_rt::Domain, key, n) };
+        }));
+    }
+    #[cfg(not(fiber_rt))]
+    let _ = &async_hooks;
+
     // §14: the nesting `Nursery`'s address is baked into the Instantiator cap.call sites; a child runs
     // over its own window (allocated per `instantiate`), so there is no per-run env to seed here. Keep
     // it alive until the run completes.
@@ -989,6 +1069,13 @@ fn run_inner(
     #[cfg(fiber_rt)]
     if let Some(d) = &domain {
         d.join_all();
+    }
+    // §9/§12 async ring: now that every vCPU is joined, drain the offload pool and drop the futex hook
+    // (which holds the `Domain` pointer) before the window / `Domain` are freed below — so no worker
+    // can still write the window counter or call into a dead `Domain`.
+    #[cfg(fiber_rt)]
+    if let Some(hooks) = async_hooks {
+        hooks.finish();
     }
     // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host. All vCPUs are
     // joined by now (`join_all` above), so this store no longer races; Relaxed is fine.

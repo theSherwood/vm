@@ -8,7 +8,10 @@
 
 use std::time::Duration;
 use svm_interp::{run_capture_reserved_with_host, Host, Value, OFFLOAD_POOL_THREADS};
-use svm_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
+use svm_jit::{
+    compile_and_run_capture_reserved_with_host, compile_and_run_capture_reserved_with_host_async,
+    JitOutcome,
+};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -618,6 +621,78 @@ fn async_submit_parks_then_pool_notify_wakes_and_reaps() {
         elapsed < Duration::from_secs(3),
         "resumed in {elapsed:?} — far under the 10s wait timeout, so the pool's notify woke the \
          parked vCPU (not the timeout fallback)"
+    );
+}
+
+/// **Cross-backend parity (3b).** The same async ring — park on the completion counter, get woken by
+/// the offload pool's `notify`, reap — runs on the JIT too: a worker bumps the raw window counter and
+/// calls the JIT `Domain`'s futex `notify` (wired in via `svm_run::HostAsyncHooks`) to wake the parked
+/// OS-thread vCPU. Both backends must return `Σ mix(i)`, leave byte-identical windows, and overlap the
+/// blocking ops on their pools (`max_active == K`).
+#[test]
+fn async_submit_parks_and_reaps_on_both_backends() {
+    let n = 4i64;
+    let expected: i64 = (0..n).map(mix).fold(0i64, |a, b| a.wrapping_add(b));
+    let m = parse_module(ASYNC_RING_SRC).expect("parse");
+    verify_module(&m).expect("verify");
+    let init = [0u8; 128 << 10];
+    let blk = || (Duration::from_millis(10), Some(OFFLOAD_POOL_THREADS));
+
+    // Interp: `drive` installs the M:N `Scheduler::notify` as the wake hook.
+    let mut hi = Host::new();
+    let (b0, b1) = blk();
+    let (iri, ibi) = (hi.grant_io_ring(), hi.grant_blocking(b0, b1));
+    let mut fuel = 50_000_000u64;
+    // Async completion *order* is nondeterministic (whichever pool worker finishes first), so the CQE
+    // region's byte layout is not a cross-backend invariant — unlike the synchronous `submit`. The
+    // order-independent check is the reaped **sum** `Σ mix(i)` (which requires every completion exactly
+    // once) plus the `max_active` overlap, asserted on both backends below.
+    let (ir, _imem) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(iri), Value::I32(ibi)],
+        &mut fuel,
+        &init,
+        0,
+        &mut hi,
+    );
+
+    // JIT: `HostAsyncHooks` installs the run's futex `notify` into the same `Host`.
+    let mut hj = Host::new();
+    let (b0, b1) = blk();
+    let (irj, ibj) = (hj.grant_io_ring(), hj.grant_blocking(b0, b1));
+    // SAFETY: `hj` is the live cap-ctx Host for this run and outlives it.
+    let hooks = unsafe { svm_run::HostAsyncHooks::new(&mut hj as *mut Host) };
+    let (jo, _jmem) = compile_and_run_capture_reserved_with_host_async(
+        &m,
+        0,
+        &[irj as i64, ibj as i64],
+        &init,
+        0,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut core::ffi::c_void,
+        &hooks,
+    )
+    .expect("jit");
+
+    assert_eq!(
+        ir.expect("interp ran ok").pop(),
+        Some(Value::I64(expected)),
+        "interp async reap must sum to Σ mix(i)"
+    );
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[expected]),
+        "jit async reap: {jo:?} (want {expected})"
+    );
+    assert_eq!(
+        hi.blocking_state(ibi).unwrap().max_active(),
+        OFFLOAD_POOL_THREADS,
+        "interp pool must overlap the blocking ops while the vCPU is parked"
+    );
+    assert_eq!(
+        hj.blocking_state(ibj).unwrap().max_active(),
+        OFFLOAD_POOL_THREADS,
+        "jit pool must overlap the blocking ops while the vCPU is parked"
     );
 }
 
