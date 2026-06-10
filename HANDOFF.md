@@ -900,7 +900,7 @@ leave a shared view — add a unix test for this alongside the Windows work.
       thread-safe** — concurrent `malloc` from worker threads corrupts the heap. The demo pre-allocates
       fiber stacks on the main thread to sidestep it; a **thread-safe guest `malloc`** (mutex/atomic
       bump, or per-thread arenas) is a libc follow-up (guest-side, not a VM concern).
-  - **Async submit/complete ring (§9/§12) — increments 1–2 + 3a DONE.** An `IoRing` capability (iface 9,
+  - **Async submit/complete ring (§9/§12) — increments 1–2 + 3a–3b DONE (mechanism complete on both backends).** An `IoRing` capability (iface 9,
     `Host::grant_io_ring`); `op 0 submit(sq_ptr, n, cq_ptr)` runs `n` **deferred `cap.call`s** (each a
     64-byte SQE in the window) through the *same* capability dispatch and writes 32-byte CQEs — so the
     JIT gets it for free (a generic `cap.call` through the thunk; `io_ring_submit` recursively dispatches
@@ -944,17 +944,41 @@ leave a shared view — add a unix test for this alongside the Windows work.
       guest falls back to the synchronous submit); `Host` gained an `async_notify` hook that `drive`
       installs as `Scheduler::notify` (and clears + quiesces the pool at run end so no worker still holds
       the window backing); `OffloadPool` gained fire-and-return `dispatch` + in-flight tracking +
-      `quiesce`; `Binding::IoRing` now carries its `RingState` index. **Interp-only** (the JIT wires its
-      own wake in **3b**). Tests (`io_ring.rs`):
+      `quiesce`; `Binding::IoRing` now carries its `RingState` index. Tests (`io_ring.rs`):
       `async_submit_parks_then_pool_notify_wakes_and_reaps` (a vCPU parks, the pool overlaps 4 blocking
       ops `max_active == K` and wakes it via `notify`, reaps `Σ mix(i)`, resolving far under the 10 s
       wait timeout ⇒ the wake was notify-driven not the timeout fallback; 0/20 flake runs) and
       `async_submit_returns_submitted_count`.
-    **Remaining increments:** (3b) **JIT parity** — wire the JIT's condvar futex as the `submit_async`
-    wake hook (today `submit_async` `-EINVAL`s on the JIT and falls back to sync), then differentially
-    test. (3c) wire the async ring into `demos/work_stealing`'s scheduler for the full "submit, park,
-    run another, resume on completion" runtime — i.e. the guest C runtime submits, parks the task, runs
-    others, and resumes on completion (DESIGN §12).
+    - **Increment 3b — JIT parity (DONE): true cross-thread fiber wake.** The same fiber-parking on the
+      JIT: an offload worker wakes a JIT **OS-thread vCPU** genuinely parked in `atomic.wait` on the
+      counter. The pool lives in the embedder's `Host`; the JIT futex lives in svm-jit's per-run
+      `Domain`. The new **`svm_jit::AsyncHostHooks`** seam bridges them: 3a's interp-specific return is
+      generalized to a backend-neutral **`svm_interp::AsyncCounter`** (`increment` atomic-bumps the
+      counter; `key` is the parking key — a window offset on the interp via `Region`, the absolute
+      window address `phys` on the JIT via a raw atomic, each what that backend's `wait`/`notify`
+      value-check reads). `run_inner`, after the thread `Domain` is up, calls `hooks.install_notify`
+      with a hook that invokes the `Domain`'s `thread_notify(phys, count)`, and after `join_all` (before
+      the window/`Domain` are freed) calls `hooks.finish` to drain the pool + drop the hook (no
+      use-after-free). svm-run provides `PhysCounter` (`MprotectWindow::async_counter`) + `HostAsyncHooks`
+      (the `Host`-backed seam impl); new entry point
+      `compile_and_run_capture_reserved_with_host_async`. Reuses the JIT futex's existing
+      compare-under-lock guard, so the wake is race-free (worker bumps the counter before it notifies).
+      Test: `async_submit_parks_and_reaps_on_both_backends` (interp + JIT both return `Σ mix(i)` and
+      overlap on their pools `max_active == K`; 0/25 flake; loom + windows cross-check green). The CQE
+      **byte layout is not** cross-backend-compared — async completion *order* is nondeterministic, so
+      only the order-invariant reaped **sum** is an invariant (the synchronous `submit` keeps its
+      full-window compare).
+    **Remaining increment:** (3c) wire the async ring into `crates/svm-run/demos/work_stealing`'s
+    scheduler for the full "submit, park, run another, resume on completion" runtime (DESIGN §12) — the
+    guest C runtime submits an I/O op, parks the *task*, runs others, resumes on completion. **Scope (a
+    C-frontend + demo slice, ~the size of 3a/3b):** add `codegen_ir.c` builtins for `submit_async` +
+    `reap` (lowering to `cap.call 9 1` / `cap.call 9 2`, mirroring how `__vm_map` lowers a Memory
+    cap.call — see the `__vm_*` builtins), thread an `IoRing` + `Blocking` handle into the guest
+    powerbox (`_start`'s cap handles), rewrite the demo so a task submits a `Blocking` op and parks on
+    the completion counter via `__vm_wait` while the scheduler runs siblings, and make the C run harness
+    grant `IoRing`+`Blocking` and use `compile_and_run_capture_reserved_with_host_async` +
+    `svm_run::HostAsyncHooks` for the JIT leg. Differentially test on the order-invariant aggregate (the
+    async total), like the existing `c_guest_work_stealing_demo`.
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
     today), the async-ring increments 3b–3c above, fiber/vCPU quota metering (the kill path exists;
     *metering*/quotas don't yet), the D57 migratable-fiber primitive (stackful work-stealing), a
@@ -1166,28 +1190,33 @@ regressions one commit old"):
 > **`SCHEDULING.md`** + **DESIGN D56/D57** (the concurrency-primitives decision), **`DESIGN.md`** /
 > **`README.md`**.
 >
-> **Just landed (recent batches): the async I/O ring (B), increments 2 + 3a.** Increment 2 — the
-> **bounded blocking-offload pool**: `submit` overlaps `Blocking` SQEs (iface 10) on an
-> `OFFLOAD_POOL_THREADS = 4` pool (waves of K) while inline ops run in SQE order, transparently
-> (interp↔JIT differential preserved; overlap proven via a width-K rendezvous `max_active == K`).
-> Increment 3a — **async submit + fiber parking** (interp): op 1 `submit_async` kicks the batch to the
-> pool and returns; the guest parks on an in-window futex completion **counter** via `i32.atomic.wait`;
-> each pool worker, on completing, posts its CQE host-side + bumps the counter + `notify`s it to **wake
-> the parked vCPU** (an I/O completion is a futex notify — DESIGN §12); op 2 `reap` flushes CQEs on the
-> vCPU thread. Race-free via the scheduler's existing compare-under-lock futex guard. See §10's ring
-> tracker + `crates/svm/tests/io_ring.rs` (8 tests). *(Earlier: the escape-TCB audit (`AUDIT.md`); D57
-> + `SCHEDULING.md`; the `demos/mn_sched` + `demos/work_stealing` guest M:N schedulers; ring increment
-> 1.)*
+> **Just landed (recent batches): the async I/O ring (B), increments 2 + 3a + 3b — the mechanism is now
+> complete on BOTH backends.** Increment 2 — the **bounded blocking-offload pool**: `submit` overlaps
+> `Blocking` SQEs (iface 10) on an `OFFLOAD_POOL_THREADS = 4` pool (waves of K) while inline ops run in
+> SQE order, transparently. Increment 3a/3b — **async submit + true fiber parking on interp *and* JIT**:
+> op 1 `submit_async` kicks the batch to the pool and returns; the guest parks on an in-window futex
+> completion **counter** via `i32.atomic.wait`; each pool worker, on completing, posts its CQE host-side
+> + atomic-bumps the counter + `notify`s it to **wake the genuinely-parked vCPU** (an I/O completion is
+> a futex notify — DESIGN §12); op 2 `reap` flushes CQEs on the vCPU thread. The interp wakes via
+> `Scheduler::notify` (installed in `drive`); the JIT wakes a parked OS-thread vCPU via its per-run
+> `Domain`'s futex, bridged by the `svm_jit::AsyncHostHooks` seam (`svm_run::HostAsyncHooks` +
+> `compile_and_run_capture_reserved_with_host_async`), over a backend-neutral `svm_interp::AsyncCounter`.
+> Race-free via each futex's compare-under-lock guard. See §10's ring tracker +
+> `crates/svm/tests/io_ring.rs` (10 tests, 0/25 flake). *(Earlier: the escape-TCB audit (`AUDIT.md`);
+> D57 + `SCHEDULING.md`; the `demos/mn_sched` + `demos/work_stealing` guest M:N schedulers; ring
+> increment 1.)*
 >
 > **Immediate frontier, ranked:**
-> 1. **Finish the async I/O ring (B) — *increments 3b + 3c* (in flight).** **3b — JIT parity:** wire the
->    JIT's condvar futex (`fiber_rt`) as the `submit_async` wake hook so a JIT guest gets the async path
->    too (today `submit_async` `-EINVAL`s on the JIT and a guest falls back to the synchronous submit) —
->    the interp side (3a) installs `Host::async_notify = Scheduler::notify` in `drive`; the JIT needs the
->    analogous install + a `MprotectWindow::async_counter` impl, then a differential test. **3c — demo:**
->    wire the async ring into `demos/work_stealing`'s scheduler → the full "submit, park, run another,
->    resume on completion" runtime (DESIGN §12): the guest C runtime submits, parks the task, runs others,
->    resumes on completion. This is the in-flight thread.
+> 1. **Finish the async I/O ring (B) — *increment 3c* (the last piece): the demo/runtime.** The VM
+>    mechanism is done on both backends; 3c is the guest-side application of it — wire the async ring
+>    into `crates/svm-run/demos/work_stealing`'s scheduler for the full "submit, park, run another,
+>    resume on completion" runtime (DESIGN §12). It's a **C-frontend + demo** slice (~the size of 3a/3b),
+>    NOT more VM-core work. Scope (full detail in §10's ring tracker): add `codegen_ir.c` builtins for
+>    `submit_async` + `reap` (lower to `cap.call 9 1` / `cap.call 9 2`, mirroring `__vm_map`'s Memory
+>    cap.call), thread `IoRing` + `Blocking` handles into the guest powerbox, rewrite the demo so a task
+>    submits a `Blocking` op and parks on the counter via `__vm_wait` while siblings run, and make the C
+>    run harness grant those caps + use `..._with_host_async` + `HostAsyncHooks` for the JIT leg.
+>    Differentially test on the order-invariant async total (like `c_guest_work_stealing_demo`).
 > 2. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
@@ -1210,7 +1239,7 @@ regressions one commit old"):
 
 *(Everything below is **done** — Phases 1–3.5, §12 concurrency + its cross-platform port, the
 concurrency escape-TCB hardening, the §14 nesting cluster, the §5 kill-path, the security audit, the
-M:N demos, and async-ring increments 1–2. §10 is the live tracker; §9 the honest-compliance view.)*
+M:N demos, and async-ring increments 1–3b. §10 is the live tracker; §9 the honest-compliance view.)*
 
 The build log, roughly in landing order:
 
