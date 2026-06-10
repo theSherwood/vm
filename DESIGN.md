@@ -1827,10 +1827,18 @@ team has **no expert safety net**.
   concurrency, nesting, shared memory, isolation tiers, Spectre hardening,
   split-host supervisor, monitoring, GPU, SIMD, revocation. *(**Concurrency
   primitives have landed early**: fibers `cont.*`, 1:1 `thread.spawn`/`join`, the
-  `wait`/`notify` futex + C11 atomics, in IR/interp/JIT on x86-64 unix — **no VM
-  scheduler**, M:N is guest-built (D56/§12). Still deferred here: guest M:N
-  runtimes as worked examples, the async submit/complete ring (§9/§12), fiber/vCPU
-  quota metering, and the fuel/epoch preemption kill-path for runaway siblings.)*
+  `wait`/`notify` futex + C11 atomics, in IR/interp/JIT across the parity matrix
+  (interp everywhere; JIT on x86-64 unix, aarch64 unix, x86-64 Windows) — **no VM
+  scheduler**, M:N is guest-built (D56/§12). **§14 nesting** has also landed on both
+  backends (sub-windows, the attenuable `AddressSpace`, the `Instantiator` incl.
+  recursion + co-fibers + fault-driven yield, separate-module "plugin" children, and
+  cross-domain `SharedRegion` `create`/`grant`), as has the **§5 fuel/epoch kill-path**
+  (the lowering polls a host-owned interrupt cell, so a watchdog stops a runaway guest
+  with `OutOfFuel` — across the root vCPU, sibling vCPUs incl. parked ones, and nested
+  children; the interpreter has its per-step fuel counter). Still deferred here: guest
+  M:N runtimes as worked examples, the async submit/complete ring (§9/§12), fiber/vCPU
+  quota *metering* (the kill path exists; quotas don't), and honoring *weak* memory
+  orderings.)*
 
 **The hard ceiling (call it out, don't bury it):** in this configuration
 **"appears to work" is reachable; "is actually secure" is not.** The verifier +

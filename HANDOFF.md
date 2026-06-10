@@ -1,6 +1,6 @@
 # Handoff — C frontend (chibicc → SVM IR) + differential fuzzing
 
-Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-09**.
+Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-10**.
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
@@ -181,7 +181,7 @@ dispatches to `codegen_ir` (see `cc1()` in `main.c`, where the wiring lives). Bu
 `make -C frontend/chibicc` (needs `make` + a C compiler; both present in CI). Build
 artifacts (`*.o`, the `chibicc` binary) are git-ignored.
 
-### Test harness (`crates/svm/tests/c_frontend.rs`, 48 tests, two tiers)
+### Test harness (`crates/svm/tests/c_frontend.rs`, 64 tests, two tiers)
 `make`s the fork once, compiles each C snippet to IR, **verifies it**, then:
 - **Tier 1 (all tests):** runs `main` (function 0 = `_start`) on **both the interpreter
   and the JIT** under identical mock powerboxes and asserts they agree on result, trap,
@@ -491,7 +491,7 @@ make -C frontend/chibicc
 printf 'int fib(int n){if(n<2)return n;return fib(n-1)+fib(n-2);} int main(){return fib(10);}\n' > /tmp/t.c
 frontend/chibicc/chibicc -cc1 --emit-ir -cc1-input /tmp/t.c -cc1-output /tmp/t.svm /tmp/t.c
 cat /tmp/t.svm            # func 0 = _start, func 1 = main calling func 2 = fib; n promotes to v1
-cargo test -p svm --test c_frontend   # 48 tests, all green (interp == JIT, and == cc)
+cargo test -p svm --test c_frontend   # 64 tests, all green (interp == JIT, and == cc)
 cargo test -p svm --test jit_fuzz     # 4000 generated modules, interp == JIT
 ```
 If those pass, you're oriented.
@@ -870,10 +870,16 @@ leave a shared view — add a unix test for this alongside the Windows work.
     (`jit_threads.rs`, `jit_fibers.rs`) — TSan can't instrument JITted code, so JIT concurrency leans
     on the differential + invariant stress + loom on the glue, not TSan; concurrent C is verified both
     real-executor and seed-swept.
+  - **The §5 fuel/epoch kill-path is DONE on the JIT** (it was the "mid-flight preemption kill-path"
+    open item): the lowering polls a host-owned interrupt cell at loop back-edges + function entries,
+    so a host watchdog stops a runaway guest with `OutOfFuel` — and it reaches **every JIT execution
+    context** (root vCPU, sibling vCPUs incl. ones *parked* in a futex `wait`/`join`, and nested §14
+    children, which poll the parent's cell). Opt-in + guest-undisableable; the CLI arms it via
+    `SVM_DEADLINE_MS`. See §10's tracker (next-pickups item 3 tail) for the full write-up.
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
-    today), the async submit/complete ring (§9/§12), fiber/vCPU quota metering, the mid-flight
-    preemption kill-path for sibling vCPUs, guest-built M≫N runtimes as worked examples, and DPOR to
-    scale the exhaustive `explore_all` checker past lock-free shapes.
+    today), the async submit/complete ring (§9/§12), fiber/vCPU quota metering (the kill path exists;
+    *metering*/quotas don't yet), guest-built M≫N runtimes as worked examples, and DPOR to scale the
+    exhaustive `explore_all` checker past lock-free shapes.
 
 - [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
   virtual memory** — *most of the §1a differentiators live here.* Sub-window **confinement** is
