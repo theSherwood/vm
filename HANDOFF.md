@@ -1086,12 +1086,15 @@ The current frontier, roughly ranked:
    `back` at the base-shifted absolute offset). Identical for a top-level window (base 0); for a §14
    child it makes a sub-window `map`/`unmap`/`protect` actually work (it `-EINVAL`'d before) and also
    hardens the sub-window escape-oracle (RO data segments now fault consistently across backends).
-   Covered by `sub_window_page_protection_is_window_relative`. **Remaining:** (1) **co-fiber
-   resume/suspend** so a child can yield back mid-run (the §14 parent-virtualized-fault / lazy-paging
-   story — now unblocked); (2) give the child a usable **`AddressSpace`** in its powerbox (the
-   mechanism works now; just needs plumbing a second handle to the child); (3) the **JIT** path — an
+   Covered by `sub_window_page_protection_is_window_relative`. *Also landed: the child now gets a
+   **usable `AddressSpace`*** over its own window in its powerbox (its entry takes one or two starter
+   handles — `Instantiator`, and optionally `AddressSpace`), and `nested_view` gives each child its
+   **own** address-space view (shared bytes, private page protections — a shared map would alias the
+   child's pages onto the parent's). Covered by `child_manages_its_own_pages_via_address_space`.
+   **Remaining:** (1) **co-fiber resume/suspend** so a child can yield back mid-run (the §14
+   parent-virtualized-fault / lazy-paging story — now unblocked); (2) the **JIT** path — an
    `instantiate` there `CapFault`s today (no in-process executor; spawning a child fiber on the JIT
-   runtime is the port); (4) **separate-module children** + richer cap pass-through; then cross-domain
+   runtime is the port); (3) **separate-module children** + richer cap pass-through; then cross-domain
    `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past

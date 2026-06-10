@@ -1455,10 +1455,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let off = argn(1)? as u64;
                             let size_log2 = argn(2)?;
                             let quota = argn(3)?;
-                            // The child entry is a fixed `(i64) -> (i64)` (like the §12 fiber/thread
-                            // entry convention); a missing or mistyped entry is rejected, not run.
+                            // The child entry returns one `i64` and takes either one `i64` (its
+                            // `Instantiator`) or two (its `Instantiator`, its `AddressSpace`) — its
+                            // starter capabilities, both over its own window. A missing/mistyped entry
+                            // is rejected, not run.
+                            let want_as = fs
+                                .get(entry as usize)
+                                .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
                             let ok_entry = fs.get(entry as usize).is_some_and(|f| {
-                                f.params == [ValType::I64] && f.results == [ValType::I64]
+                                f.results == [ValType::I64]
+                                    && (f.params == [ValType::I64]
+                                        || f.params == [ValType::I64, ValType::I64])
                             });
                             // The carve must be a power-of-two-aligned sub-window within `[0, isize)`
                             // — a child can only get what the holder sub-allocates (§14/D19).
@@ -1478,16 +1485,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_mem = mem
                                     .as_ref()
                                     .map(|m| m.nested_view(abs_base, size_log2 as u8));
-                                // Attenuated powerbox: the child gets an `Instantiator` over its *own*
-                                // window (a strict subset of the parent's authority), so it can itself
-                                // nest — confinement composes to any depth at depth-independent cost
-                                // (§14). Its handle is the child entry's single argument. (Pass-through
-                                // of the parent's other handles, and a usable child `AddressSpace`, are
-                                // follow-ups — the latter waits on the nested page-protection
-                                // coordinate fix.)
+                                // Attenuated powerbox: the child gets, over its *own* window (a strict
+                                // subset of the parent's authority), an `Instantiator` (so it can
+                                // itself nest — confinement composes to any depth) and an
+                                // `AddressSpace` (so it can manage its own pages). These are its entry
+                                // arguments. (Pass-through of the parent's *other* handles is a
+                                // follow-up.)
                                 let mut ch = Host::new();
                                 let cinst = ch.grant_instantiator(abs_base, child_size);
+                                let cas = ch.grant_address_space(abs_base, child_size);
                                 let child_host = Arc::new(Mutex::new(ch));
+                                let child_args = if want_as {
+                                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                                } else {
+                                    vec![Value::I64(cinst as i64)]
+                                };
                                 // Quota: the child's fuel, sub-allocated from (and capped by) ours.
                                 let child_fuel = if quota <= 0 {
                                     *fuel
@@ -1500,7 +1512,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let mut child = VCpu::new(
                                         cfuncs,
                                         entry as u32,
-                                        &[Value::I64(cinst as i64)], // an Instantiator over the child's window
+                                        &child_args, // [Instantiator] or [Instantiator, AddressSpace]
                                         child_mem,
                                         child_host,
                                         child_fuel,
@@ -2256,11 +2268,12 @@ pub mod iface {
     pub const ADDRESS_SPACE: u32 = 5;
     /// `Instantiator` — the §14 nesting primitive: spawn a **child domain** confined to a
     /// power-of-two sub-window `[base, base+size)` of the holder's window (VM-in-VM). op 0
-    /// `instantiate(entry, off, size_log2, fuel) -> child_handle` enqueues a child vCPU running
-    /// the same module's `entry` (a fixed `(i64) -> (i64)`) confined to `[base+off, base+off+2^size_log2)`
-    /// with an **attenuated** powerbox (today: an `Instantiator` over the child's own window, so it can
-    /// recurse — confinement composes to any depth) and a fuel quota — returning immediately
-    /// (non-blocking). op 1 `join(child_handle) -> result` parks **only
+    /// `instantiate(entry, off, size_log2, fuel) -> child_handle` enqueues a child vCPU running the
+    /// same module's `entry` (which returns one `i64` and takes one or two — its starter caps)
+    /// confined to `[base+off, base+off+2^size_log2)` with an **attenuated** powerbox over the child's
+    /// own window: an `Instantiator` (so it can recurse — confinement composes to any depth) and an
+    /// `AddressSpace` (so it can manage its own pages), passed as the entry's arguments. A fuel quota
+    /// caps it; returns immediately (non-blocking). op 1 `join(child_handle) -> result` parks **only
     /// the calling fiber** until that child finishes, then yields its result (siblings keep running —
     /// the child rides the same §12 executor). Holding the handle is the authority to nest (D19: a
     /// child can only get what the parent sub-allocates).
@@ -2979,18 +2992,24 @@ impl Mem {
     }
 
     /// Build the memory view a **§14 nested child** runs over: it shares this (parent's) `Arc<Region>`
-    /// bytes and `Arc<RwLock<AddrSpace>>` — so the parent intrinsically sees all of the child's memory
-    /// (the superset, §14) and a child `map`/`unmap` is visible to the parent — but **confines** the
-    /// child to the fully-mapped sub-window `[abs_base, abs_base + 2^size_log2)` (window-absolute, in
-    /// the shared backing's coordinates). The child sees a zero-based `[0, size)` and cannot learn it
-    /// is nested; masking ([`Window::sub`]) does the base+mask in one step at each access.
+    /// bytes — so the parent intrinsically sees all of the child's bytes (the superset, §14) — but
+    /// **confines** the child to the fully-mapped sub-window `[abs_base, abs_base + 2^size_log2)`
+    /// (window-absolute, in the shared backing's coordinates). The child sees a zero-based `[0, size)`
+    /// and cannot learn it is nested; masking ([`Window::sub`]) does the base+mask in one step.
+    ///
+    /// Unlike [`fork_for_thread`](Mem::fork_for_thread), the child gets its **own** address space (a
+    /// fresh, empty page-protection map + §13 region set), *not* the parent's: page protections are a
+    /// per-domain view, and the prot map is keyed window-relative, so a shared map would alias the
+    /// child's pages onto the parent's (a child `unmap` of *its* page 0 would hit the parent's). The
+    /// domains share **bytes**, not page-protection state — cross-domain memory sharing is §13, and
+    /// lazy paging is the parent fielding the child's faults (co-fiber), not a shared map.
     fn nested_view(&self, abs_base: u64, size_log2: u8) -> Mem {
         Mem {
             window: Window::sub(abs_base, size_log2, 1u64 << size_log2.min(63)),
             page: self.page,
             back: Arc::clone(&self.back),
-            space: Arc::clone(&self.space),
-            has_regions: Arc::clone(&self.has_regions),
+            space: Arc::new(RwLock::new(AddrSpace::default())),
+            has_regions: Arc::new(AtomicBool::new(false)),
         }
     }
 

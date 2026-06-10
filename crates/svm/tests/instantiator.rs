@@ -2,11 +2,12 @@
 //! guest holding an `Instantiator` capability `instantiate`s a child confined to a power-of-two
 //! sub-window of its own window, then `join`s it (parking only the calling fiber). The child runs
 //! the same module's entry on the same M:N executor, confined by masking to its slice, with an
-//! attenuated powerbox (an `Instantiator` over its own window, so it can recurse) and a fuel quota.
-//! These tests pin: the child runs and its result returns through `join`; its writes land **only**
-//! in its sub-window of the shared parent backing (confinement — the parent sees the superset);
-//! nesting **composes to depth 2** (a grandchild is confined to a sub-window of the child's window);
-//! an out-of-range carve is rejected; and a child trap propagates to the parent on `join`.
+//! attenuated powerbox over its own window — an `Instantiator` (so it can recurse) and an
+//! `AddressSpace` (so it can manage its own pages) — and a fuel quota. These tests pin: the child
+//! runs and its result returns through `join`; its writes land **only** in its sub-window of the
+//! shared parent backing (confinement — the parent sees the superset); nesting **composes to depth
+//! 2**; a child manages its **own** pages via its `AddressSpace`; an out-of-range carve is rejected;
+//! and a child trap propagates to the parent on `join`.
 //!
 //! The JIT path is deferred (it has no in-process executor to spawn a child vCPU into) — an
 //! `instantiate` there resolves to a `CapFault`, like any unsupported capability.
@@ -169,6 +170,59 @@ fn nesting_composes_to_depth_two() {
             assert_eq!(
                 mem[i as usize], init[i as usize],
                 "depth-2 nest escaped to byte {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn child_manages_its_own_pages_via_address_space() {
+    // A two-arg child receives its starter caps `(Instantiator, AddressSpace)`. It uses the
+    // `AddressSpace` (iface 5) to `unmap` the first 16 KiB of its **own** 64 KiB window — a §14
+    // sub-window page op, which works now that the prot map is keyed window-relative. The unmap
+    // decommits (zeroes) exactly the child's first 16 KiB of the shared parent backing and returns 0;
+    // the rest of the child's window, and the entire parent outside it, stay as the parent seeded.
+    const CHILD: u64 = 64 << 10; // child window [64 KiB, 128 KiB)
+    const SPAN: u64 = 16 << 10; // unmap the child's first 16 KiB (a whole multiple of any host page)
+    let src = "memory 18\n\
+         func (i32) -> (i64) {\n\
+         block0(v0: i32):\n\
+         \x20 v1 = i64.const 1\n\
+         \x20 v2 = i64.const 65536\n\
+         \x20 v3 = i64.const 16\n\
+         \x20 v4 = i64.const 0\n\
+         \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
+         \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
+         \x20 return v6\n\
+         }\n\
+         func (i64, i64) -> (i64) {\n\
+         block0(v0: i64, v1: i64):\n\
+         \x20 v2 = i32.wrap_i64 v1\n\
+         \x20 v3 = i64.const 0\n\
+         \x20 v4 = i64.const 16384\n\
+         \x20 v5 = cap.call 5 1 (i64, i64) -> (i64) v2 (v3, v4)\n\
+         \x20 return v5\n\
+         }\n";
+    let (res, mem) = run_nested(src, 18); // 256 KiB window so a 64 KiB child fits at 64 KiB
+    assert_eq!(
+        res.expect("run ok"),
+        vec![Value::I64(0)],
+        "child unmap should succeed"
+    );
+
+    let init: Vec<u8> = (0..(256u64 << 10))
+        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+        .collect();
+    for i in 0..(256u64 << 10) {
+        if (CHILD..CHILD + SPAN).contains(&i) {
+            assert_eq!(
+                mem[i as usize], 0,
+                "child's unmapped page byte {i} not decommitted"
+            );
+        } else {
+            assert_eq!(
+                mem[i as usize], init[i as usize],
+                "byte {i} outside the child's unmap changed"
             );
         }
     }
