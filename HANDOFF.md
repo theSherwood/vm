@@ -1080,15 +1080,19 @@ The current frontier, roughly ranked:
    `join(child)` parks **only the calling fiber** (siblings run) and delivers the child's result/trap.
    Covered by `instantiator.rs` (confinement, depth-2 nesting, out-of-range carve → `-EINVAL`,
    child-trap propagation). This is the chosen first cut: **spawn + explicit join, same-module child,
-   interp-first**. **Remaining:** (1) the **page-protection coordinate reconciliation** — `Mem`'s prot
-   map / `prot_pages` bound / `check_prot` are window-relative in some places and window-absolute in
-   others (identical for a top-level window, but divergent for a §14 child), so a child's granted
-   `AddressSpace` `map`/`unmap` does not yet work on a nested `Mem` (the child holds an `Instantiator`
-   today, which rides the executor and *does* work). This is the prerequisite for (2); (2) **co-fiber
+   interp-first**. *Also landed: the **page-protection coordinate reconciliation*** — `Mem`'s prot map
+   is now uniformly keyed **window-relative** (`prot_pages`/`byte`/`set_byte`/`is_backed`/`init_data_at`
+   fold the window base out, matching `check_prot`/`page_access`; `map`/`unmap`/`map_region` zero the
+   `back` at the base-shifted absolute offset). Identical for a top-level window (base 0); for a §14
+   child it makes a sub-window `map`/`unmap`/`protect` actually work (it `-EINVAL`'d before) and also
+   hardens the sub-window escape-oracle (RO data segments now fault consistently across backends).
+   Covered by `sub_window_page_protection_is_window_relative`. **Remaining:** (1) **co-fiber
    resume/suspend** so a child can yield back mid-run (the §14 parent-virtualized-fault / lazy-paging
-   story); (3) the **JIT** path — an `instantiate` there `CapFault`s today (no in-process executor;
-   spawning a child fiber on the JIT runtime is the port); (4) **separate-module children** + richer
-   cap pass-through; then cross-domain `SharedRegion` `create`/`grant`.
+   story — now unblocked); (2) give the child a usable **`AddressSpace`** in its powerbox (the
+   mechanism works now; just needs plumbing a second handle to the child); (3) the **JIT** path — an
+   `instantiate` there `CapFault`s today (no in-process executor; spawning a child fiber on the JIT
+   runtime is the port); (4) **separate-module children** + richer cap pass-through; then cross-domain
+   `SharedRegion` `create`/`grant`.
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12), fiber/vCPU quota metering,
    the mid-flight preemption kill-path for sibling vCPUs, and DPOR to scale `explore_all` past
    lock-free shapes.

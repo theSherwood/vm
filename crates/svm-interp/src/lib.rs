@@ -3086,7 +3086,9 @@ impl Mem {
     fn is_backed(&self, base: u64) -> bool {
         self.has_regions.load(Ordering::Relaxed)
             && matches!(
-                self.space_read().prot.get(&(base / self.page)),
+                self.space_read()
+                    .prot
+                    .get(&(base.wrapping_sub(self.window.base()) / self.page)),
                 Some(PageProt::Backed { .. })
             )
     }
@@ -3199,14 +3201,21 @@ impl Mem {
     /// guest may now grow into the reserved tail `[mapped, reserved)`, not just the initial backed
     /// prefix. Returns the inclusive page-index range it covers, or `Err(EINVAL)`.
     fn prot_pages(&self, offset: u64, len: u64) -> Result<core::ops::RangeInclusive<u64>, i64> {
-        if len == 0 || !offset.is_multiple_of(self.page) {
+        // `offset` is an **absolute** window address (a top-level window has base 0, so it equals the
+        // historical window-relative offset; a §14 sub-window shifts it by its base). The prot map is
+        // keyed by window-**relative** page, matching `check_prot`/`page_access`, so fold the base out
+        // here — an address below this window's base (or misaligned) is out of range (`-EINVAL`).
+        let Some(rel) = offset.checked_sub(self.window.base()) else {
+            return Err(EINVAL);
+        };
+        if len == 0 || !rel.is_multiple_of(self.page) {
             return Err(EINVAL);
         }
-        let end = offset.checked_add(len).ok_or(EINVAL)?;
+        let end = rel.checked_add(len).ok_or(EINVAL)?;
         if end > self.window.reserved() {
             return Err(EINVAL);
         }
-        Ok((offset / self.page)..=((end - 1) / self.page)) // len need not be a page multiple; round up
+        Ok((rel / self.page)..=((end - 1) / self.page)) // len need not be a page multiple; round up
     }
 
     /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ read+write, `READ` only ⇒
@@ -3248,11 +3257,13 @@ impl Mem {
                 self.set_byte(win_base + d.offset + i as u64, b);
             }
         }
-        // ...then the read-only protections, under one address-space write lock.
+        // ...then the read-only protections, under one address-space write lock. The prot map is
+        // keyed by window-relative page (the masking confines accesses to this window, and
+        // `check_prot` looks up relative pages), so fold the window base out of the absolute address.
         let mut space = self.space_write();
         for d in data {
             if d.readonly && !d.bytes.is_empty() {
-                let first = win_base + d.offset;
+                let first = (win_base + d.offset).wrapping_sub(self.window.base());
                 let last = first + d.bytes.len() as u64 - 1;
                 for page in (first / self.page)..=(last / self.page) {
                     space.prot.insert(page, PageProt::Ro);
@@ -3326,9 +3337,13 @@ impl Mem {
         }
         let idx = (off % self.page) as usize;
         let space = self.space_read();
+        // The prot map is keyed by window-relative page (base folds out; the within-page `idx` is
+        // unchanged since the base is page-aligned).
         if let Some(PageProt::Backed {
             region, region_off, ..
-        }) = space.prot.get(&(off / self.page))
+        }) = space
+            .prot
+            .get(&(off.wrapping_sub(self.window.base()) / self.page))
         {
             return space
                 .regions
@@ -3347,7 +3362,9 @@ impl Mem {
         let space = self.space_read();
         if let Some(PageProt::Backed {
             region, region_off, ..
-        }) = space.prot.get(&(off / self.page))
+        }) = space
+            .prot
+            .get(&(off.wrapping_sub(self.window.base()) / self.page))
         {
             // §13 aliased page: write through to the shared region backing.
             if let Some(r) = space.regions.get(region) {
@@ -3447,7 +3464,8 @@ impl GuestMem for Mem {
             }
         }
         for page in pages {
-            self.back.zero(page * self.page, self.page); // commit ⇒ fresh zeroed page
+            self.back
+                .zero(self.window.base() + page * self.page, self.page); // commit ⇒ fresh zeroed page
         }
         0
     }
@@ -3465,7 +3483,8 @@ impl GuestMem for Mem {
             }
         }
         for page in pages {
-            self.back.zero(page * self.page, self.page);
+            self.back
+                .zero(self.window.base() + page * self.page, self.page);
         }
         0
     }
@@ -3547,7 +3566,8 @@ impl GuestMem for Mem {
             }
         }
         for &page in &pages {
-            self.back.zero(page * self.page, self.page); // bytes live in the region now, not anonymous
+            self.back
+                .zero(self.window.base() + page * self.page, self.page); // bytes live in the region now, not anonymous
         }
         0
     }
@@ -3984,6 +4004,55 @@ mod prot_tests {
                 );
             }
         }
+    }
+
+    /// §14 nesting: a child's `AddressSpace`-style `map`/`unmap` (page protection) now works on a
+    /// sub-window `Mem`. The prot map is keyed window-relative, so the base folds out consistently —
+    /// before the fix, `unmap` on a sub-window `-EINVAL`'d (its absolute address was bounded against
+    /// the child's window-relative `reserved`). A page unmapped via its **absolute** (§14-shifted)
+    /// address faults a later plain access; re-`map` recommits it zeroed; and an address below the
+    /// child's base or past its top is out of range.
+    #[test]
+    fn sub_window_page_protection_is_window_relative() {
+        let base = 1u64 << 16; // child at 64 KiB
+        let size_log2 = 16u8; // 64 KiB child (≥ one host page, so a whole page fits)
+        let parent = 1u64 << 18; // 256 KiB parent backing
+        let p = page();
+        let mut mem = Mem::sub_window(base, size_log2, parent);
+
+        // Initially fully mapped: a store/load at child offset 0 works.
+        assert!(mem.store(0, 0, StoreOp::I64, Value::I64(0xABCD)).is_ok());
+        assert_eq!(mem.load(0, 0, LoadOp::I64), Ok(Value::I64(0xABCD)));
+
+        // Unmap the child's first page via its **absolute** address (what the cap handler passes).
+        assert_eq!(
+            mem.unmap(base, p),
+            0,
+            "sub-window unmap should succeed (was -EINVAL)"
+        );
+        assert_eq!(
+            mem.load(0, 0, LoadOp::I64),
+            Err(Trap::MemoryFault),
+            "an access to the child's unmapped page must fault"
+        );
+        // A different page still within the child is unaffected.
+        assert!(mem.store(p, 0, StoreOp::I64, Value::I64(0x1234)).is_ok());
+
+        // Re-map recommits the page, zeroed.
+        assert_eq!(mem.map(base, p, PROT_WRITE), 0);
+        assert_eq!(mem.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
+
+        // The child cannot address below its base or past its window top.
+        assert_eq!(
+            mem.unmap(0, p),
+            EINVAL,
+            "below the child's base is out of range"
+        );
+        assert_eq!(
+            mem.unmap(base + (1u64 << size_log2), p),
+            EINVAL,
+            "at/after the child's window top is out of range"
+        );
     }
 
     #[test]
