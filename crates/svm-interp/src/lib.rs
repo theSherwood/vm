@@ -10,8 +10,8 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use svm_ir::{
@@ -2643,8 +2643,14 @@ pub mod iface {
     pub const MODULE: u32 = 8;
     /// §9/§12 `IoRing` — the submit/complete ring. `op 0 submit(sq_ptr, n, cq_ptr)` runs `n`
     /// deferred `cap.call`s (each a 64-byte SQE in the window) and writes their results as 32-byte
-    /// CQEs, amortizing the boundary crossing (and, later, overlapping them on a host offload pool).
+    /// CQEs, amortizing the boundary crossing — and, for *blocking* SQEs, **overlapping** them on a
+    /// bounded host offload pool ([`OFFLOAD_POOL_THREADS`] threads; the §12 increment-2 win).
     pub const IO_RING: u32 = 9;
+    /// §12 `Blocking` — a *mock* synchronous-only / blocking host capability (DNS-/FS-blocking-shaped)
+    /// whose op 0 `work(arg) -> mix(arg)` is **window-independent and `&mut Host`-free**, so a
+    /// `submit` batch can hand it to the offload pool instead of the guest's vCPU thread. Op 0 is also
+    /// a perfectly ordinary synchronous `cap.call` (it then blocks the caller — the degenerate path).
+    pub const BLOCKING: u32 = 10;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -2886,6 +2892,10 @@ enum Binding {
     /// (io_uring-shaped). Carries no host state in the synchronous MVP — the ring buffers (SQ/CQ)
     /// live in the guest window; `submit` gets their pointers as args.
     IoRing,
+    /// A §12 `Blocking` handle, carrying the index of its [`AsyncState`] in [`Host::blockings`] — a
+    /// mock synchronous-only/blocking op the offload pool can overlap. Out-of-line (an index, not the
+    /// `Arc`) so `Binding` stays `Copy`, like [`Binding::SharedRegion`]/[`Binding::Module`].
+    Blocking(u32),
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -2902,6 +2912,139 @@ struct Slot {
 /// `slot = h & (cap-1)`, `generation = h >> CAP_LOG2`.
 const CAP_LOG2: u32 = 8;
 const CAP: usize = 1 << CAP_LOG2;
+
+/// Worker-thread count of the host **bounded blocking-offload pool** (§12 "Keeping cores busy under
+/// blocking", path 2 — the io_uring increment-2 path). At most this many *blocking* SQEs run
+/// concurrently; the `(K+1)`th queues — so the OS-thread cost of a `submit` batch is bounded by `K`,
+/// never by the number of deferred ops. The guest's own vCPU thread is **not** multiplied (it parks
+/// on the one `submit` while the pool absorbs the blocking) — the "0 blocked vCPU threads" win.
+pub const OFFLOAD_POOL_THREADS: usize = 4;
+
+/// Shared, thread-safe state behind a [`iface::BLOCKING`] capability — a *mock* synchronous-only host
+/// op used to exercise the offload pool. Its `run` is **window-independent and `&mut Host`-free** (a
+/// pure function of its argument plus this `Send + Sync` state), which is exactly the property that
+/// lets a `submit` batch run it on the pool instead of the guest's vCPU thread. The result is
+/// deterministic ⇒ both backends agree (the §18 oracle); the `active`/`max_active` counters let a
+/// test *prove* a batch genuinely overlapped on the pool.
+pub struct AsyncState {
+    /// How long each op blocks before returning — the "synchronous blocking" the pool absorbs.
+    /// `Duration::ZERO` in production (a pure compute); a test sets it to make the blocking real.
+    block_for: Duration,
+    /// Optional rendezvous: when set, every concurrent op waits here before completing, so a batch of
+    /// exactly `width` ops on a `≥ width`-thread pool **deterministically** co-resides
+    /// (`max_active == width`) without depending on sleep timing. `None` in production. A *direct*
+    /// (non-batched) `cap.call` on a rendezvous-configured handle would block forever — it is a
+    /// batch-overlap test fixture only.
+    rendezvous: Option<Arc<Barrier>>,
+    /// Ops currently in-flight (bumped on entry, dropped on completion).
+    active: AtomicUsize,
+    /// High-water mark of `active` across this `AsyncState`'s lifetime — the realized concurrency,
+    /// read back via [`AsyncState::max_active`] to confirm a batch overlapped on `K` threads.
+    max_active: AtomicUsize,
+}
+
+impl AsyncState {
+    /// Run one blocking op: account the in-flight concurrency, (optionally) rendezvous + block, then
+    /// return the deterministic transform of `arg`. Called either inline (a direct `cap.call`, on the
+    /// caller's thread) or on an offload-pool worker (a batched `submit`) — same result either way.
+    fn run(&self, arg: i64) -> i64 {
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(now, Ordering::SeqCst);
+        if let Some(b) = &self.rendezvous {
+            b.wait();
+        }
+        if !self.block_for.is_zero() {
+            std::thread::sleep(self.block_for);
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Self::mix(arg)
+    }
+
+    /// A deterministic, non-trivial pure transform (one Knuth LCG step) — identical on every backend
+    /// and thread, so a batch's CQE results are reproducible (and a divergence would show).
+    fn mix(arg: i64) -> i64 {
+        arg.wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
+    }
+
+    /// The peak realized concurrency — a test reads this after a batched `submit` to confirm the pool
+    /// overlapped the blocking ops (`== min(batch, OFFLOAD_POOL_THREADS)`).
+    pub fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
+    }
+}
+
+/// A job handed to the offload pool: a self-contained closure that writes its own result (it captures
+/// the destination), so completion *order* is irrelevant — the data it leaves is deterministic.
+type OffloadJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// The **bounded blocking-offload pool** (§12 path 2): [`OFFLOAD_POOL_THREADS`] long-lived workers
+/// that run window-independent blocking SQEs *off* the guest's vCPU thread. A `submit` of `n` blocking
+/// ops costs `K` OS threads regardless of `n` (waves of `K`). Each worker owns its **own** channel —
+/// a single shared `Mutex<Receiver>` would serialize the blocking `recv`s and defeat the overlap.
+struct OffloadPool {
+    /// Per-worker job channels; a batch is round-robined across them.
+    txs: Vec<std::sync::mpsc::Sender<OffloadJob>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl OffloadPool {
+    fn new(k: usize) -> OffloadPool {
+        let mut txs = Vec::with_capacity(k);
+        let mut workers = Vec::with_capacity(k);
+        for _ in 0..k {
+            let (tx, rx) = std::sync::mpsc::channel::<OffloadJob>();
+            txs.push(tx);
+            workers.push(std::thread::spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            }));
+        }
+        OffloadPool { txs, workers }
+    }
+
+    /// Round-robin `jobs` across the workers and **block until all complete**. Each job writes its
+    /// result through its own captured destination, so the caller reads results back by index after
+    /// this returns. This is the synchronous-submit MVP: one boundary crossing, `K`-way overlap,
+    /// then a single reap (fiber-parking / async resume is increment 3).
+    fn run_batch(&self, jobs: Vec<OffloadJob>) {
+        let n = jobs.len();
+        if n == 0 {
+            return;
+        }
+        let done = Arc::new((Mutex::new(0usize), Condvar::new()));
+        for (i, job) in jobs.into_iter().enumerate() {
+            let done = Arc::clone(&done);
+            let wrapped: OffloadJob = Box::new(move || {
+                job();
+                let (m, c) = &*done;
+                *m.lock().unwrap() += 1;
+                c.notify_all();
+            });
+            // `send` only fails if a worker thread is gone — a host bug, not a guest-reachable path,
+            // and the wait below would then hang, so surface it loudly.
+            self.txs[i % self.txs.len()]
+                .send(wrapped)
+                .expect("offload worker vanished");
+        }
+        let (m, c) = &*done;
+        let mut g = m.lock().unwrap();
+        while *g < n {
+            g = c.wait(g).unwrap();
+        }
+    }
+}
+
+impl Drop for OffloadPool {
+    fn drop(&mut self) {
+        // Dropping the senders closes each worker's channel → its `recv` returns `Err` → it exits.
+        self.txs.clear();
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
 
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
@@ -2931,6 +3074,13 @@ pub struct Host {
     /// installs an OS-shared-memory factory ([`Host::set_region_factory`], e.g.
     /// `svm_run::new_shared_region`) so a JIT guest can `map` what it mints for real aliasing.
     region_factory: Option<fn(usize) -> RegionBacking>,
+    /// §12 `Blocking` capability backings, indexed by the id a [`Binding::Blocking`] carries. Each is
+    /// a `Send + Sync` [`AsyncState`] a `submit` batch can run on the offload pool.
+    blockings: Vec<Arc<AsyncState>>,
+    /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
+    /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
+    /// workers ([`OffloadPool`]'s `Drop`).
+    pool: Option<OffloadPool>,
 }
 
 /// One §14 module grant: the verified module's functions, declared window size, and data segments —
@@ -2959,6 +3109,8 @@ impl Host {
             regions: Vec::new(),
             modules: Vec::new(),
             region_factory: None,
+            blockings: Vec::new(),
+            pool: None,
         }
     }
 
@@ -3006,6 +3158,29 @@ impl Host {
     /// Grant a §9/§12 `IoRing` capability — authority to `submit` batched/deferred `cap.call`s.
     pub fn grant_io_ring(&mut self) -> i32 {
         self.grant(iface::IO_RING, Binding::IoRing)
+    }
+    /// Grant a §12 `Blocking` capability — a mock synchronous/blocking host op the offload pool can
+    /// overlap. `block_for` is how long each op blocks (`Duration::ZERO` for a pure compute);
+    /// `rendezvous` (test-only) installs a width-`w` [`Barrier`] so a batch of exactly `w` ops on a
+    /// `≥ w`-thread pool deterministically co-resides (proving overlap without timing).
+    pub fn grant_blocking(&mut self, block_for: Duration, rendezvous: Option<usize>) -> i32 {
+        let state = Arc::new(AsyncState {
+            block_for,
+            rendezvous: rendezvous.map(|w| Arc::new(Barrier::new(w))),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let idx = self.blockings.len() as u32;
+        self.blockings.push(state);
+        self.grant(iface::BLOCKING, Binding::Blocking(idx))
+    }
+    /// Read back the [`AsyncState`] behind a granted `Blocking` handle (a test inspects `max_active`
+    /// to confirm a batched `submit` overlapped on the pool). `None` if the handle isn't a `Blocking`.
+    pub fn blocking_state(&self, handle: i32) -> Option<Arc<AsyncState>> {
+        match self.resolve(handle, iface::BLOCKING) {
+            Ok(Binding::Blocking(idx)) => self.blockings.get(idx as usize).cloned(),
+            _ => None,
+        }
     }
 
     /// Grant a §14 `AddressSpace` capability over the window sub-range `[base, base+size)` (§14). The
@@ -3345,19 +3520,39 @@ impl Host {
                 0 => self.io_ring_submit(args, mem),
                 _ => Ok(vec![EINVAL]),
             },
+            // §12 Blocking: `op 0 work(arg) -> mix(arg)`. As a *direct* cap.call it runs inline and
+            // blocks the caller (the degenerate single path); a batched `submit` instead overlaps it
+            // on the offload pool. Either way the result is the same deterministic transform.
+            Binding::Blocking(idx) => match op {
+                0 => {
+                    let arg = *args.first().unwrap_or(&0);
+                    Ok(vec![self.blockings[idx as usize].run(arg)])
+                }
+                _ => Ok(vec![EINVAL]),
+            },
         }
     }
 
     /// §9/§12 the **submit/complete ring** (io_uring-shaped). `submit(sq_ptr, n, cq_ptr)` reads `n`
-    /// 64-byte SQEs from `[sq_ptr, …)` (each a *deferred `cap.call`*), runs each through the normal
-    /// capability dispatch, and writes a 32-byte CQE to `[cq_ptr, …)` per entry; returns the count
-    /// completed. One boundary crossing for `n` ops (the §1a interface-amortization win; the host
-    /// offload pool that *overlaps* them is the next increment). Synchronous + in-order ⇒ the result
-    /// is deterministic, so both backends agree (the §18 oracle).
+    /// 64-byte SQEs from `[sq_ptr, …)` (each a *deferred `cap.call`*) and writes a 32-byte CQE to
+    /// `[cq_ptr, …)` per entry; returns the count completed. One boundary crossing for `n` ops (the
+    /// §1a interface-amortization win).
+    ///
+    /// **Two execution classes (increment 2 — the bounded offload pool):**
+    /// - **Inline** — ops that touch the window or `&mut Host` (Clock, Memory, Stream, …) run on the
+    ///   submitting thread through the normal dispatch, in SQE order, exactly as increment 1.
+    /// - **Offloaded** — `Blocking` ops (window-independent, `&mut Host`-free) are handed to the
+    ///   bounded [`OffloadPool`] and run **concurrently** on `K` threads (waves of `K`), so the
+    ///   guest's vCPU thread isn't multiplied by the blocking count (§12 "0 blocked vCPU threads").
+    ///
+    /// Window reads (SQE parse) and writes (CQE) stay on the submit thread; only the offloaded *op
+    /// bodies* overlap, and each `Blocking` result is a deterministic pure transform — so the final
+    /// window is **identical to running every op inline in order**, and both backends still agree (the
+    /// §18 oracle). The submit blocks until the whole batch completes (fiber-parking is increment 3).
     ///
     /// SQE (64 B, little-endian): `u32 type_id | u32 op | i32 handle | u32 n_args | i64 args[4] |
     /// i64 user_data | i64 pad`. CQE (32 B): `i64 user_data | i64 result | i64 status (0=ok, else a
-    /// TrapKind code) | i64 pad`. A nested `IoRing` op, or an op the synchronous dispatch can't service
+    /// TrapKind code) | i64 pad`. A nested `IoRing` op, or an op the dispatch can't service
     /// (Instantiator/Yielder/Module → `CapFault`), simply lands as a CQE with a non-zero `status` —
     /// never a host panic and never unbounded recursion.
     fn io_ring_submit(
@@ -3369,7 +3564,7 @@ impl Host {
         const CQE: u64 = 32;
         const MAX_SQ_ARGS: usize = 4;
         // A ring with no window is inert (`-EFAULT`); otherwise borrow the window once and reborrow it
-        // (`&mut *m`) for each SQE's read, recursive dispatch, and CQE write.
+        // (`&mut *m`) for each SQE's read, inline dispatch, and CQE write.
         let m = match mem {
             Some(m) => m,
             None => return Ok(vec![EFAULT]),
@@ -3377,12 +3572,26 @@ impl Host {
         let sq_ptr = *args.first().unwrap_or(&0) as u64;
         let n = (*args.get(1).unwrap_or(&0)).max(0) as u64;
         let cq_ptr = *args.get(2).unwrap_or(&0) as u64;
+
+        // One pending completion per SQE we managed to read; filled inline now, or by the pool below.
+        // (An unreadable SQE writes its `-EFAULT` CQE immediately and is not tracked here.)
+        struct Pending {
+            at: u64,
+            user_data: i64,
+            result: i64,
+            status: i64,
+        }
+        let mut pending: Vec<Pending> = Vec::with_capacity(n as usize);
+        // Offloadable `Blocking` SQEs: `(index into `pending`, its state, its argument)`.
+        let mut offload: Vec<(usize, Arc<AsyncState>, i64)> = Vec::new();
+
         for i in 0..n {
+            let at = cq_ptr + i * CQE;
             // Read SQE i (a borrow-checked window read; out-of-window ⇒ -EFAULT completion).
             let raw = match m.read_bytes(sq_ptr + i * SQE, SQE) {
                 Some(r) => r,
                 None => {
-                    Self::write_cqe(&mut *m, cq_ptr + i * CQE, 0, 0, -EFAULT);
+                    Self::write_cqe(&mut *m, at, 0, 0, -EFAULT);
                     continue;
                 }
             };
@@ -3396,17 +3605,83 @@ impl Host {
                 *slot = i64::from_le_bytes(raw[16 + a * 8..24 + a * 8].try_into().unwrap());
             }
             let user_data = i64::from_le_bytes(raw[48..56].try_into().unwrap());
-            // A ring submitting to a ring would recurse without bound — reject it as an inert error.
-            let (result, status) = if type_id == iface::IO_RING {
-                (0, trap_status(&Trap::CapFault))
+
+            if type_id == iface::IO_RING {
+                // A ring submitting to a ring would recurse without bound — inert CapFault.
+                pending.push(Pending {
+                    at,
+                    user_data,
+                    result: 0,
+                    status: trap_status(&Trap::CapFault),
+                });
+            } else if type_id == iface::BLOCKING && op == 0 {
+                // Offloadable iff the handle actually resolves to a `Blocking` binding; a forged /
+                // wrong-type handle is an inert CapFault (the I2 check), never queued.
+                match self.resolve(handle, iface::BLOCKING) {
+                    Ok(Binding::Blocking(idx)) => {
+                        let slot = pending.len();
+                        pending.push(Pending {
+                            at,
+                            user_data,
+                            result: 0, // filled from the pool below
+                            status: 0,
+                        });
+                        offload.push((slot, Arc::clone(&self.blockings[idx as usize]), opargs[0]));
+                    }
+                    _ => pending.push(Pending {
+                        at,
+                        user_data,
+                        result: 0,
+                        status: trap_status(&Trap::CapFault),
+                    }),
+                }
             } else {
-                match self.cap_dispatch_slots(type_id, op, handle, &opargs[..n_args], Some(&mut *m))
-                {
+                // Inline: window-/host-touching ops run on the submit thread, in order.
+                let (result, status) = match self.cap_dispatch_slots(
+                    type_id,
+                    op,
+                    handle,
+                    &opargs[..n_args],
+                    Some(&mut *m),
+                ) {
                     Ok(res) => (res.first().copied().unwrap_or(0), 0),
                     Err(t) => (0, trap_status(&t)),
-                }
-            };
-            Self::write_cqe(&mut *m, cq_ptr + i * CQE, user_data, result, status);
+                };
+                pending.push(Pending {
+                    at,
+                    user_data,
+                    result,
+                    status,
+                });
+            }
+        }
+
+        // Run the offloadable blocking ops concurrently on the bounded pool (created lazily so a Host
+        // that never offloads spawns no threads). Each job writes its result by index; the submit
+        // thread parks until the whole batch posts completion, then we copy results back in order.
+        if !offload.is_empty() {
+            let results: Arc<Vec<AtomicI64>> =
+                Arc::new(offload.iter().map(|_| AtomicI64::new(0)).collect());
+            let mut jobs: Vec<OffloadJob> = Vec::with_capacity(offload.len());
+            for (k, (_slot, state, arg)) in offload.iter().enumerate() {
+                let state = Arc::clone(state);
+                let arg = *arg;
+                let results = Arc::clone(&results);
+                jobs.push(Box::new(move || {
+                    results[k].store(state.run(arg), Ordering::SeqCst);
+                }));
+            }
+            let pool = self
+                .pool
+                .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
+            pool.run_batch(jobs);
+            for (k, (slot, _, _)) in offload.iter().enumerate() {
+                pending[*slot].result = results[k].load(Ordering::SeqCst);
+            }
+        }
+
+        for p in &pending {
+            Self::write_cqe(&mut *m, p.at, p.user_data, p.result, p.status);
         }
         Ok(vec![n as i64])
     }

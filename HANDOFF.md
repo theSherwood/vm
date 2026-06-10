@@ -900,18 +900,38 @@ leave a shared view — add a unix test for this alongside the Windows work.
       thread-safe** — concurrent `malloc` from worker threads corrupts the heap. The demo pre-allocates
       fiber stacks on the main thread to sidestep it; a **thread-safe guest `malloc`** (mutex/atomic
       bump, or per-thread arenas) is a libc follow-up (guest-side, not a VM concern).
-  - **Async submit/complete ring (§9/§12) — increment 1 DONE.** An `IoRing` capability (iface 9,
+  - **Async submit/complete ring (§9/§12) — increments 1–2 DONE.** An `IoRing` capability (iface 9,
     `Host::grant_io_ring`); `op 0 submit(sq_ptr, n, cq_ptr)` runs `n` **deferred `cap.call`s** (each a
     64-byte SQE in the window) through the *same* capability dispatch and writes 32-byte CQEs — so the
     JIT gets it for free (a generic `cap.call` through the thunk; `io_ring_submit` recursively dispatches
     via `cap_dispatch_slots`). One boundary crossing for `n` ops (the §1a amortization). Synchronous +
     in-order ⇒ deterministic ⇒ differentially tested (`io_ring.rs`: 8 batched `Clock.now` total 28 on
-    both backends; the `completed` count). **Remaining increments:** (2) a bounded host **offload pool**
-    that *overlaps* submissions on K threads (the §12 "0 blocked OS threads" win; needs a thread-safe
-    async op + Host-concurrency care); (3) wire the ring into a guest scheduler (Demo 2) for the full
-    "submit, park, run another, resume on completion" async runtime.
+    both backends; the `completed` count).
+    - **Increment 2 — the bounded blocking-offload pool (DONE).** `submit` now classifies each SQE:
+      window-/`&mut Host`-touching ops (Clock, Memory, Stream, …) still run **inline** on the submit
+      thread in SQE order, but **`Blocking` SQEs** (a new mock synchronous-only capability, iface 10 =
+      `BLOCKING`, `Host::grant_blocking`; op 0 `work(arg) -> mix(arg)`, window-independent +
+      `&mut Host`-free) are handed to a lazily-created **`OffloadPool`** of `OFFLOAD_POOL_THREADS = 4`
+      long-lived worker threads and run **concurrently** (waves of K) — the §12 path-2 "0 blocked *vCPU*
+      threads" win (the guest's one vCPU parks on the single `submit`; the host pool absorbs the
+      blocking). Window reads (SQE parse) + writes (CQE) stay on the submit thread and each `Blocking`
+      result is a deterministic pure transform, so the final window is **identical to running every op
+      inline** — the interp↔JIT differential (the §18 oracle) is preserved (`io_ring.rs`:
+      `offload_batch_matches_inline_on_both_backends`). Overlap is proven **deterministically** (no
+      timing flakiness) via a width-K rendezvous `Barrier` baked into the mock op: submit exactly K
+      blocking ops and assert each backend's pool reached `max_active == K`
+      (`offload_pool_overlaps_blocking_ops_on_k_threads`). The op is also an ordinary inline `cap.call`
+      (`blocking_direct_cap_call_runs_inline`) and a forged `Blocking` handle is inert on the offload
+      path (`offload_forged_blocking_handle_is_inert`, the I2 check). Pool internals: per-worker
+      channels (a shared `Mutex<Receiver>` would serialize the blocking `recv`s); `Drop` joins the
+      workers. Implementation entirely in `svm-interp` (the shared `Host`), so both backends get it for
+      free through `cap_thunk` — no JIT/`svm-run` change.
+    **Remaining increment:** (3) wire the ring into a guest scheduler (Demo 2) for the full
+    "submit, park, run another, resume on completion" async runtime — i.e. an *async* (non-blocking)
+    submit that parks the calling fiber and reaps completions on a later poll, rather than today's
+    synchronous submit that blocks until the whole batch is done.
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
-    today), the async-ring increments 2–3 above, fiber/vCPU quota metering (the kill path exists;
+    today), the async-ring increment 3 above, fiber/vCPU quota metering (the kill path exists;
     *metering*/quotas don't yet), the D57 migratable-fiber primitive (stackful work-stealing), a
     thread-safe guest `malloc`, and DPOR to scale the exhaustive `explore_all` checker past lock-free
     shapes.
@@ -1121,20 +1141,26 @@ regressions one commit old"):
 > **`SCHEDULING.md`** + **DESIGN D56/D57** (the concurrency-primitives decision), **`DESIGN.md`** /
 > **`README.md`**.
 >
-> **Just landed (this batch):** (a) a **security + correctness audit** of the escape-TCB — verdict
-> *sound*; all 8 findings fixed (`AUDIT.md`). (b) The **concurrency-validation track**: D57 +
-> `SCHEDULING.md` (two primitives — vCPU + fiber; "stackless tasks" add none; stackful work-stealing
-> via *migratable fibers* is **Proposed**), plus two guest-built M:N scheduler demos —
-> `demos/mn_sched` (sharded, stackful) and `demos/work_stealing` (work-stealing, stackless) — both
-> differentially proven. (c) **The async I/O ring (B), increment 1** — the `IoRing` capability + batched
-> deferred cap.calls (`io_ring.rs`).
+> **Just landed (this batch): the async I/O ring (B), increment 2 — the bounded blocking-offload
+> pool.** `submit` now overlaps **`Blocking`** SQEs (a new mock synchronous-only capability, iface 10)
+> on a lazily-created `OffloadPool` of `OFFLOAD_POOL_THREADS = 4` worker threads (waves of K), while
+> window-/`&mut Host`-touching ops still run inline in SQE order — the §12 path-2 "0 blocked *vCPU*
+> threads" win. The overlap is **transparent** (final window identical to inline ⇒ interp↔JIT
+> differential preserved) and **proven deterministically** via a width-K rendezvous (`max_active == K`,
+> no timing flakiness). Entirely in `svm-interp`'s shared `Host`, so both backends get it through
+> `cap_thunk` — no JIT/`svm-run` change. See §10's ring tracker + `crates/svm/tests/io_ring.rs` (6
+> tests). *(Earlier batches: the escape-TCB audit (`AUDIT.md`, 8 findings closed); the
+> concurrency-validation track — D57 + `SCHEDULING.md`, the `demos/mn_sched` + `demos/work_stealing`
+> guest M:N schedulers; ring increment 1.)*
 >
 > **Immediate frontier, ranked:**
-> 1. **Finish the async I/O ring (B)** — *increment 2:* a bounded host **offload pool** that overlaps
->    submissions on K threads (the §12 "0 blocked OS threads" win; needs a thread-safe async op +
->    Host-concurrency care — the mock Host isn't built for concurrent dispatch). *increment 3:* wire the
->    ring into `demos/work_stealing`'s scheduler → the full "submit, park, run another, resume on
->    completion" async runtime (DESIGN §12). This is the in-flight thread.
+> 1. **Finish the async I/O ring (B) — *increment 3* (last increment).** Make `submit` *async*: a
+>    non-blocking submit that parks the calling **fiber** and reaps completions on a later poll (today's
+>    submit is synchronous — it blocks until the whole batch is done, which is increment 2). Then wire
+>    it into `demos/work_stealing`'s scheduler → the full "submit, park, run another, resume on
+>    completion" async runtime (DESIGN §12). The offload pool (increment 2) is the K-thread engine the
+>    parked fibers wait on; this increment is the *fiber-parking / completion-reaping* half. This is the
+>    in-flight thread.
 > 2. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
@@ -1157,7 +1183,7 @@ regressions one commit old"):
 
 *(Everything below is **done** — Phases 1–3.5, §12 concurrency + its cross-platform port, the
 concurrency escape-TCB hardening, the §14 nesting cluster, the §5 kill-path, the security audit, the
-M:N demos, and async-ring increment 1. §10 is the live tracker; §9 the honest-compliance view.)*
+M:N demos, and async-ring increments 1–2. §10 is the live tracker; §9 the honest-compliance view.)*
 
 The build log, roughly in landing order:
 
