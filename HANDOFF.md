@@ -1262,7 +1262,14 @@ regressions one commit old"):
 >    its suspend/wake protocol — the futex park + completion notify — informs the fiber's).
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); fiber/vCPU
 >    quota *metering* (§15; the kill path exists, quotas don't); DPOR for `explore_all`; the async-ring
->    pool could grow more offloadable ops. *(Done this batch: the JIT cap-path page-map persistence
+>    pool could grow more offloadable ops. **Deferred design decision — narrow integer types (the wasm
+>    tradeoff):** `char`/`short`/`_Bool` are `i32` values (no `i8`/`i16` SSA types), so frontends must
+>    lower narrowing casts explicitly and **narrow-width atomics (`_Atomic char/short`) have no IR form**.
+>    Decision + recommendation written up in **DESIGN.md §3b "Narrow integer types"** — keep the model;
+>    if it bites (likely the LLVM on-ramp, or a narrow-atomic workload), prefer completing the existing
+>    `extend8_s`/`extend16_s` ops (in `svm-ir` + interp but **not JIT-lowered** — the frontend uses
+>    shifts) + a guest-libc CAS-loop for narrow atomics, *not* adding `i8`/`i16` (which would widen the
+>    escape-TCB). *(Done this batch: the JIT cap-path page-map persistence
 >    (`Host::cap_window_pages` + `MprotectWindow::new_shared`); the **thread-safe guest `malloc`**; and a
 >    **chibicc narrowing-cast bug** found via the malloc demo — a value-level cast to `char`/`short`/
 >    `_Bool` (which the IR all carry as `i32`) wasn't truncated, so `(char)200`/`(_Bool)200` kept the

@@ -283,7 +283,9 @@ index.** The split is defined by what a forged value can do:
   plain data is **freely forgeable and interconvertible** (int↔ptr↔float-bits,
   pointer arithmetic, tagging) — non-negotiable, because C/Rust do exactly this.
   `i8`/`i16` exist only as memory access *widths*, not SSA value types (tiny
-  lattice → trivial verifier).
+  lattice → trivial verifier) — the wasm tradeoff; its compromises (frontend
+  truncation burden, no narrow-width atomics) + the recommendation are in §3b
+  "Narrow integer types".
 - **Capabilities** — **handles** and **function references**, a **typed-index**
   class: `handle<Interface>`, `funcref<Sig>`. **The unforgeability is *positional*,
   not value-level.** A handle/funcref value is a plain **index into a per-domain
@@ -395,7 +397,9 @@ security — UB in a sandbox IR would void the escape guarantee.
   abs neg ceil floor trunc nearest copysign`.
 - **Float compare** (→ i32): `eq ne lt le gt ge`.
 - **Conversions:** `i64.extend_i32_s/u`, `i32.wrap_i64`, `extend8_s/extend16_s/
-  extend32_s`; `trunc_sat_f→i_s/u` (**saturating default**, deterministic; trapping
+  extend32_s` (the narrow sign-extends — *defined here + in `svm-ir`/the interpreter but **not yet
+  JIT-lowered**; the frontend narrows with shifts instead — see "Narrow integer types" below*);
+  `trunc_sat_f→i_s/u` (**saturating default**, deterministic; trapping
   variant available), `convert_i→f_s/u`, `f32.demote/f64.promote`; `reinterpret`
   (i32↔f32, i64↔f64 — bit-level, for NaN-boxing).
 - **Pointers:** `ptr.from_int` / `ptr.to_int` (free, no-op off-CHERI — the §10/§3a
@@ -419,7 +423,46 @@ security — UB in a sandbox IR would void the escape guarantee.
 - **Deferred to their sections:** SIMD vector ops (§17), stack-switch terminators
   for fibers/continuations (§12 — MVP is single-fiber, so stubbed).
 
-### Trap / numeric / layout semantics
+### Narrow integer types — the wasm tradeoff  [SETTLED for the MVP; revisit at the LLVM on-ramp]
+`char`/`short`/`_Bool` are carried as **`i32` SSA values** (narrow widths exist only on
+*memory* — `load8/16`, `store8/16` — and `IntTy` is `{i32, i64}`). This mirrors wasm. So a
+**value-level narrowing cast must be lowered explicitly**: the frontend emits `(x<<k)>>k`
+(signed), `& 0xFF/0xFFFF` (unsigned), or `x != 0` (`_Bool`) — `gen_convert`/`narrow_to` in
+`codegen_ir.c`. (A *missing* truncation here was a real chibicc bug: a same-IR-width cast was a
+no-op, so an rvalue `(char)200` kept `200` — only the store width truncated, which hid it behind
+`char c = (char)200`. Now fixed + guarded by `c_matches_gcc_narrowing_casts`.)
+
+**Compromises we accept vs. first-class `i8`/`i16` values:**
+1. The **truncation burden lives in each frontend's lowering** — a recurring bug class. Containable
+   by centralizing it (done for chibicc); the **LLVM on-ramp (D54) will need the same discipline**
+   when collapsing LLVM's native `i8`/`i16` to `i32`.
+2. **Narrow-width atomics are not expressible** — `IntTy = {i32, i64}`, so `_Atomic char/short`
+   RMW/cmpxchg have no IR form (a guest must widen to a 4-byte atomic — which touches adjacent
+   bytes — or the libc omits it; today it offers only 32/64-bit atomics). The one genuine
+   *capability* gap (vs. a lowering burden); rare, since most atomics are word-sized.
+3. Minor IR verbosity at narrowing points — Cranelift folds the shift pair back to a sign-extend,
+   so **zero runtime cost**.
+
+**Why not add `i8`/`i16` value types:** it **widens the escape-TCB** — the JIT (the dominant
+escape-TCB component, §2a) would have to lower narrow arithmetic/compares/shifts, against the
+"small, separately-fuzzable codegen surface" thesis — and proliferates ops across the whole
+pipeline (text/encode/verify/interp/JIT/fuzzer), for **marginal benefit**: C integer-promotes
+narrow types to `int`, so narrow *arithmetic* almost never occurs; narrowness matters only at
+load/store/cast/atomic *boundaries*, which the current model already covers (except atomics).
+
+**Recommendation (revisit only if a concrete need appears — likely the LLVM on-ramp or a
+narrow-atomic workload):** keep the `i32`/`i64` model; prefer the cheaper, TCB-preserving fixes
+over adding `i8`/`i16`:
+- **Complete the already-specified `extend8_s`/`extend16_s` ops** so narrowing is one canonical,
+  fuzzable op instead of a shift pair. They exist in `svm-ir` + the interpreter and are *listed in
+  the IR spec above*, but the **JIT does not lower them yet** (its `IntUn` match returns
+  `Unsupported("int extend ops")`) — which is exactly why the frontend emits shifts. This adds *no*
+  narrow-arithmetic surface to the TCB.
+- For any `_Atomic char/short`, emit a **CAS loop over the enclosing aligned word** in the guest
+  libc (the standard lock-free narrow-atomic trick) — zero VM/TCB change — rather than adding
+  `IntTy::I8/I16`.
+
+
 - Traps: integer /0 and signed-overflow div/rem; out-of-window / unmapped /
   wrong-perm access (hardware fault, §4); `trap`/`unreachable`. All traps deliver to
   the host (§5 detect-and-kill); host decides kill vs signal.
