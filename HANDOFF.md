@@ -1173,8 +1173,11 @@ Have (✅):
   Measures steady-state **compute** (per-iteration, isolated by big-vs-small subtraction so
   compile cancels) and **cold start** (source → first result). The memory kernels are timed
   against **both wasm32 and wasm64** (`Config::wasm_memory64`). `cargo run --release` from
-  `bench/`; `--csv` for a line per kernel. **Representative numbers** (ratio = svm ÷ wasm;
-  `<1` = svm faster; machine-dependent — watch the *ratio*, not the absolute ns):
+  `bench/`; `--csv` for a line per kernel. **NB: the representative numbers below predate the
+  `opt_level=speed` switch** (see the "Cranelift `opt_level=speed`" item under *Gaps* — memsum/scatter
+  now *beat* wasm32, locals_c beats wasm64); they're kept for the per-kernel *narrative*, but the
+  current ratios are in that item. **Representative numbers** (ratio = svm ÷ wasm; `<1` = svm faster;
+  machine-dependent — watch the *ratio*, not the absolute ns):
   - `alu` (tight i64 mul/add loop): compute **≈1.0–1.05×** (parity, as designed — shared
     backend); cold start **≈0.3–0.45×** (we're ~2–3× faster — "SSA on the wire, no SSA
     reconstruction", §1a). *Both theses confirmed.*
@@ -1236,12 +1239,30 @@ regressions one commit old"):
   `< size`, closing ~half the wasm32 gap (memsum 1.6→1.36×, scatter 1.53→1.21×) and widening
   the wasm64 lead. Guarded by the escape-oracle (a wrong bound diverges final memory / faults;
   verified non-vacuous). Pinned by `escape_oracle::elided_bounded_address_confines`.
-- [ ] **Residual wasm32 gap (~1.2–1.36×)** needs the *full* guard-when-bounded: real **guard
-  pages** so even addresses we *can't* prove bounded (and the common data-SP–relative C
-  locals, where `sp` is an unbounded block param) get the wasm32 zero-instruction access.
-  That ties into Phase-3 trap-catching (guard pages + signal handler, §5). Also: the elision
-  is per-block (block params = unknown); proving the threaded data-SP bounded would extend it
-  to C locals.
+- [x] **Cranelift `opt_level=speed` — *done* (was the big residual-gap closer).** The JIT had been
+  compiling at the default `opt_level=none` (no GVN/CSE, no constant materialization, no
+  store-to-load forwarding) while Wasmtime runs `speed` — so the comparison was *unfair* and svm left
+  a lot on the table. `locals_c` exposed it: the store/load addresses (identical) were computed twice
+  and the mask/constants were rip-relative pool loads (~13-instruction hot loop). Enabling `speed`
+  (both the top-level and §14 child compiles) is a broad, fair win that **closes the residual wasm32
+  gap**: memsum **1.37→0.91×** and scatter **1.24→0.94×** now *beat* wasm32; locals_c **3.25→1.48×**
+  (wasm32) and **1.84→0.83×** (wasm64, now faster); hostbuf 0.80→0.64×; hostcall 1.24→1.11×. Cold
+  start regresses modestly (alu 0.40→0.48× of Wasmtime) but stays ahead — "SSA on the wire" keeps the
+  lead even with the optimizer on. **Caught + fixed a latent kill-path bug it exposed:**
+  `emit_epoch_check` polled the host-owned interrupt cell with a *plain* load (relying on `none` to not
+  hoist it); under `speed`, Cranelift's alias analysis sees no *guest* store to the cell (the watchdog
+  writes it cross-thread) and hoisted the load out of the loop ⇒ the poll fired once and a runaway was
+  never killed (`jit_killpath` hung). Now an **atomic load** (a sync op the optimizer won't hoist; the
+  cell is a host `AtomicU64`). Verified byte-identical: escape_oracle + jit_diff + 4000-seed jit_fuzz +
+  full workspace green; windows + loom clean. *(`baseline.txt` still holds the pre-`speed` numbers —
+  re-baseline on a canonical machine.)*
+- [ ] **Remaining `locals_c` gap (now ~1.48× wasm32, but it *beats* wasm64).** With the optimizer on,
+  the leftover gap vs wasm32 is the un-elidable `sp`-relative mask (the data-SP is an unbounded block
+  param) plus the threaded-SP add — i.e. the 64-bit-confinement tax, paid where elision can't fire.
+  Closing it needs the verifier to prove the data-SP bounded (the §3d register-pinned-`sp` direction),
+  *not* 32-bit addressing (D50, rejected). Lower priority now that we beat wasm64 everywhere and tie/
+  beat wasm32 on the elided kernels; `locals_c` is also a deliberate worst case (`volatile` +
+  address-taken forces memory residence; normal locals promote to SSA and are free).
 
 ### Suggested next pickups (ranked)
 
