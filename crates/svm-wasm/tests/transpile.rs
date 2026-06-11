@@ -742,13 +742,109 @@ fn memory64_grow_and_size() {
 
 #[test]
 fn unsupported_is_clean_error() {
-    // `memory.fill` (bulk memory) is out of the current subset → a clean Unsupported error, not a panic.
+    // A **non-constant-length** `memory.fill` is out of the current subset (only constant sizes unroll)
+    // → a clean Unsupported error, not a panic. (A SIMD/passive-segment op would do equally.)
     let wat = r#"(module (memory 1)
-      (func (export "f") (memory.fill (i32.const 0) (i32.const 0) (i32.const 1))))"#;
+      (func (export "f") (param $n i32) (memory.fill (i32.const 0) (i32.const 0) (local.get $n))))"#;
     let wasm = wat::parse_str(wat).unwrap();
     match svm_wasm::transpile(&wasm) {
         Err(svm_wasm::Error::Unsupported(_)) => {}
         Err(e) => panic!("expected Unsupported, got error {e:?}"),
         Ok(_) => panic!("expected Unsupported, got Ok"),
+    }
+}
+
+/// Hand-written `memory.copy` over **overlapping** ranges — exercises the memmove semantics (load all
+/// before storing any). `data` seeds 0..8 at offset 0; copy 6 bytes from 0 to 2 (overlap), so
+/// `[2..8] = [0,1,2,3,4,5]`. Reading byte at `idx` proves the overlap-correct result on both backends.
+#[test]
+fn memory_copy_overlap_is_memmove() {
+    let wat = r#"
+(module (memory 1)
+  (data (i32.const 0) "\00\01\02\03\04\05\06\07")
+  (func (export "byte") (param $idx i32) (result i32)
+    (memory.copy (i32.const 2) (i32.const 0) (i32.const 6))   ;; dest=2, src=0, len=6 (overlap)
+    (i32.load8_u (local.get $idx))))"#;
+    // After memmove: bytes = [0,1,0,1,2,3,4,5]. (A naive forward byte loop would give [0,1,0,1,0,1,..].)
+    let expect = [0, 1, 0, 1, 2, 3, 4, 5];
+    for (i, &e) in expect.iter().enumerate() {
+        assert_eq!(run(wat, "byte", &[Value::I32(i as i32)]), e, "byte[{i}]");
+    }
+}
+
+/// Hand-written `memory.fill` — set a run of bytes to a value, read one back. Exercises the broadcast
+/// chunking (8/4/2/1) at a non-byte-multiple length.
+#[test]
+fn memory_fill_sets_bytes() {
+    let wat = r#"
+(module (memory 1)
+  (func (export "byte") (param $idx i32) (result i32)
+    (memory.fill (i32.const 4) (i32.const 0xAB) (i32.const 13))  ;; [4..17) = 0xAB
+    (i32.load8_u (local.get $idx))))"#;
+    assert_eq!(run(wat, "byte", &[Value::I32(3)]), 0); // before the fill
+    for i in 4..17 {
+        assert_eq!(run(wat, "byte", &[Value::I32(i)]), 0xAB, "byte[{i}]");
+    }
+    assert_eq!(run(wat, "byte", &[Value::I32(17)]), 0); // after the fill
+}
+
+/// **Real clang program using bulk memory.** A struct copy by value (clang → `memory.copy`) and a
+/// large zero-init (`int buf[64]={0}` → `memory.fill`), compiled with `-mbulk-memory`, transpiled, and
+/// run on interp + JIT against a hand-computed oracle — the program-first proof that real bulk-memory
+/// wasm runs identically.
+#[cfg(unix)]
+#[test]
+fn real_clang_bulk_memory() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("svm_wasm_bulk_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = dir.join("b.c");
+    let w = dir.join("b.wasm");
+    std::fs::write(
+        &c,
+        "struct Big { int a[24]; };\n\
+         static struct Big g_src;\n\
+         int sum_copy(int n){\n\
+           struct Big x; for(int i=0;i<24;i++) x.a[i]=i*n+1;\n\
+           struct Big y = x; g_src = y;\n\
+           int s=0; for(int i=0;i<24;i++) s+=g_src.a[i]; return s; }\n\
+         int zero_then_set(int n){\n\
+           int buf[64]={0}; buf[n&63]=99;\n\
+           int s=0; for(int i=0;i<64;i++) s+=buf[i]; return s; }\n",
+    )
+    .unwrap();
+    let out = Command::new("clang")
+        .args(["--target=wasm32", "-nostdlib", "-O2", "-mbulk-memory"])
+        .args([
+            "-Wl,--no-entry",
+            "-Wl,--export=sum_copy",
+            "-Wl,--export=zero_then_set",
+        ])
+        .arg(&c)
+        .arg("-o")
+        .arg(&w)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            eprintln!("skipping real_clang_bulk_memory: clang wasm toolchain unavailable");
+            return;
+        }
+    }
+    let wasm = std::fs::read(&w).unwrap();
+    let t = svm_wasm::transpile(&wasm).expect("transpile bulk-memory wasm");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let find = |name: &str| t.exports.iter().find(|(n, _)| n == name).unwrap().1;
+    // sum_copy(n) = Σ_{i=0..23}(i·n+1) = 276·n + 24.
+    for n in [0i32, 1, 2, 5] {
+        assert_eq!(
+            run_idx(&t, find("sum_copy"), &[Value::I32(n)]),
+            (276 * n + 24) as i64,
+            "sum_copy({n})"
+        );
+    }
+    // zero_then_set: one element set to 99, the rest zero ⇒ 99 regardless of n.
+    for n in [0i32, 7, 63, 100] {
+        assert_eq!(run_idx(&t, find("zero_then_set"), &[Value::I32(n)]), 99);
     }
 }

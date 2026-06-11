@@ -554,6 +554,10 @@ struct Lower<'a> {
     local_types: Vec<ValType>,
     /// Operand stack: (value, type).
     stack: Vec<(ValIdx, ValType)>,
+    /// Constant SSA values in the **current block** (set when an `i32.const`/`i64.const` is emitted,
+    /// cleared on block entry). Used to recognise the compile-time `len` of a `memory.copy`/`fill`
+    /// (clang's bulk ops carry a constant size) so it can be unrolled into chunked load/stores.
+    consts: std::collections::HashMap<ValIdx, i64>,
     reachable: bool,
     control: Vec<Frame>,
     types: &'a [(Vec<ValType>, Vec<ValType>)],
@@ -704,7 +708,14 @@ impl Lower<'_> {
             .enumerate()
             .map(|(i, t)| (p + nl + i as ValIdx, *t))
             .collect();
+        self.consts.clear(); // SSA values are block-local; constants don't carry across blocks
         self.reachable = true;
+    }
+
+    /// The compile-time value of `idx` if it was produced by an `i32.const`/`i64.const` in the
+    /// current block (used to recognise a `memory.copy`/`fill`'s constant length).
+    fn const_of(&self, idx: ValIdx) -> Option<i64> {
+        self.consts.get(&idx).copied()
     }
 
     fn set_term(&mut self, t: Terminator) {
@@ -783,6 +794,7 @@ fn lower_func(
         locals: (base..base + nparams).collect(),
         local_types: local_types.clone(),
         stack: Vec::new(),
+        consts: std::collections::HashMap::new(),
         reachable: true,
         control: Vec::new(),
         types,
@@ -1199,6 +1211,155 @@ fn mem_grow_op(lo: &mut Lower) -> Result<(), Error> {
     Ok(())
 }
 
+/// The largest constant byte length we unroll a `memory.copy`/`fill` into chunked load/stores. A
+/// larger (or non-constant) length is a clean `Unsupported` — a dynamic-length runtime loop is a later
+/// slice; clang's bulk ops carry small constant struct/array sizes.
+const MAX_BULK_UNROLL: i64 = 1 << 16; // 64 KiB
+
+/// Split `len` bytes into `(offset, width)` chunks, widest first (8/4/2/1) — the unroll plan a bulk op
+/// lowers to (mirrors the chibicc frontend's `gen_memcpy`).
+fn chunk_plan(len: u64) -> Vec<(u64, u64)> {
+    let mut plan = Vec::new();
+    let mut i = 0u64;
+    while i < len {
+        let rem = len - i;
+        let w = if rem >= 8 {
+            8
+        } else if rem >= 4 {
+            4
+        } else if rem >= 2 {
+            2
+        } else {
+            1
+        };
+        plan.push((i, w));
+        i += w;
+    }
+    plan
+}
+fn load_w(w: u64) -> LoadOp {
+    match w {
+        8 => LoadOp::I64,
+        4 => LoadOp::I32,
+        2 => LoadOp::I32_16U,
+        _ => LoadOp::I32_8U,
+    }
+}
+fn store_w(w: u64) -> StoreOp {
+    match w {
+        8 => StoreOp::I64,
+        4 => StoreOp::I32,
+        2 => StoreOp::I32_16,
+        _ => StoreOp::I32_8,
+    }
+}
+
+/// Pop the constant byte length of a bulk op (clang always emits a constant size); a non-constant or
+/// over-`MAX_BULK_UNROLL` length is unsupported (the dynamic-length loop is a later slice).
+fn pop_bulk_len(lo: &mut Lower, what: &str) -> Result<u64, Error> {
+    let (len_v, _) = lo.pop()?;
+    match lo.const_of(len_v) {
+        Some(n) if (0..=MAX_BULK_UNROLL).contains(&n) => Ok(n as u64),
+        _ => Err(Error::Unsupported(format!(
+            "{what} with a non-constant or too-large length (only constant sizes ≤ {MAX_BULK_UNROLL} \
+             bytes are unrolled)"
+        ))),
+    }
+}
+
+/// `memory.fill(dest, val, len)`: set `len` bytes at `dest` to byte `val`. Constant `len` ⇒ unrolled
+/// chunked stores of the fill byte broadcast to each chunk width.
+fn mem_fill_op(lo: &mut Lower) -> Result<(), Error> {
+    let n = pop_bulk_len(lo, "memory.fill")?;
+    let (val, _) = lo.pop()?; // the fill byte (low 8 bits of an i32)
+    let dest = pop_addr(lo)?; // i64 window address
+    if n == 0 {
+        return Ok(());
+    }
+    // The fill byte broadcast to each width: vb·0x01… (so every byte of the chunk is the fill byte).
+    let m255 = lo.emit(Inst::ConstI32(0xFF));
+    let byte = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::And,
+        a: val,
+        b: m255,
+    });
+    let mul_i32 = |lo: &mut Lower, k: i32| {
+        let m = lo.emit(Inst::ConstI32(k));
+        lo.emit(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Mul,
+            a: byte,
+            b: m,
+        })
+    };
+    let b2 = mul_i32(lo, 0x0001_0101);
+    let b4 = mul_i32(lo, 0x0101_0101);
+    let b8 = {
+        let b64 = lo.emit(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: byte,
+        });
+        let m = lo.emit(Inst::ConstI64(0x0101_0101_0101_0101));
+        lo.emit(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Mul,
+            a: b64,
+            b: m,
+        })
+    };
+    for (off, w) in chunk_plan(n) {
+        let value = match w {
+            8 => b8,
+            4 => b4,
+            2 => b2,
+            _ => byte,
+        };
+        lo.emit_void(Inst::Store {
+            op: store_w(w),
+            addr: dest,
+            value,
+            offset: off,
+            align: 0,
+        });
+    }
+    Ok(())
+}
+
+/// `memory.copy(dest, src, len)`: copy `len` bytes (overlap-safe, like memmove). Constant `len` ⇒
+/// **load every chunk first, then store every chunk** — the reads all complete before any write, so an
+/// overlapping `dest`/`src` is handled correctly without choosing a copy direction.
+fn mem_copy_op(lo: &mut Lower) -> Result<(), Error> {
+    let n = pop_bulk_len(lo, "memory.copy")?;
+    let src = pop_addr(lo)?;
+    let dest = pop_addr(lo)?;
+    if n == 0 {
+        return Ok(());
+    }
+    let plan = chunk_plan(n);
+    let loaded: Vec<ValIdx> = plan
+        .iter()
+        .map(|&(off, w)| {
+            lo.emit(Inst::Load {
+                op: load_w(w),
+                addr: src,
+                offset: off,
+                align: 0,
+            })
+        })
+        .collect();
+    for (&(off, w), &value) in plan.iter().zip(&loaded) {
+        lo.emit_void(Inst::Store {
+            op: store_w(w),
+            addr: dest,
+            value,
+            offset: off,
+            align: 0,
+        });
+    }
+    Ok(())
+}
+
 fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), Error> {
     use Operator as O;
     // Dead code after a branch/return/unreachable: track structure (block depth) but emit nothing
@@ -1214,10 +1375,12 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::Unreachable => lo.set_term(Terminator::Unreachable),
         O::I32Const { value } => {
             let v = lo.emit(Inst::ConstI32(value));
+            lo.consts.insert(v, value as i64);
             lo.push(v, ValType::I32);
         }
         O::I64Const { value } => {
             let v = lo.emit(Inst::ConstI64(value));
+            lo.consts.insert(v, value);
             lo.push(v, ValType::I64);
         }
         O::LocalGet { local_index } => {
@@ -1352,6 +1515,19 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
                 return unsup("memory.grow on a non-zero memory");
             }
             mem_grow_op(lo)?;
+        }
+        // ---- bulk memory: memory.fill / memory.copy (constant length ⇒ unrolled chunks) ----
+        O::MemoryFill { mem } => {
+            if mem != 0 {
+                return unsup("memory.fill on a non-zero memory");
+            }
+            mem_fill_op(lo)?;
+        }
+        O::MemoryCopy { dst_mem, src_mem } => {
+            if dst_mem != 0 || src_mem != 0 {
+                return unsup("memory.copy on a non-zero memory");
+            }
+            mem_copy_op(lo)?;
         }
         // ---- floats: const / arithmetic / unary / compare ----
         O::F32Const { value } => {
