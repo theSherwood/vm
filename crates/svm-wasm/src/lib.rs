@@ -14,14 +14,16 @@
 //! Scope: i32/i64 const · arithmetic/bitwise/shift · comparisons · `eqz` · `clz`/`ctz`/`popcnt` ·
 //! `extend{8,16,32}_s` · `wrap`/`extend_i32` · `local.{get,set,tee}` · `drop` · `select` · `nop` · the
 //! full structured control set `block`/`loop`/`if`/`else`/`br`/`br_if`/`br_table`/`return`/
-//! `unreachable` (with the dead-code / else-resurrection bookkeeping). Anything else (linear memory,
-//! calls, globals, floats, SIMD, reference types) is a clean [`Error::Unsupported`] — added in slices.
+//! `unreachable` (with dead-code / else-resurrection bookkeeping) · **linear memory** load/store
+//! (i32/i64, incl. narrow + `memory64`; the i32 address is zero-extended into our i64 window, which is
+//! sized to the wasm memory's initial pages). Still a clean [`Error::Unsupported`] (added in slices):
+//! calls, globals, floats, `memory.{grow,size}`, data segments, SIMD, reference types.
 
 use svm_ir::{
-    BinOp, Block, CmpOp, ConvOp, Edge, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx,
-    ValType,
+    BinOp, Block, CmpOp, ConvOp, Edge, Func, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp,
+    Terminator, ValIdx, ValType,
 };
-use wasmparser::{BlockType, Operator, Parser, Payload, ValType as W};
+use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
 /// Why a wasm module couldn't be transpiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +79,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut func_type_idx: Vec<u32> = Vec::new();
     let mut bodies: Vec<wasmparser::FunctionBody> = Vec::new();
     let mut exports: Vec<(String, u32)> = Vec::new();
+    let mut mem: Option<wasmparser::MemoryType> = None;
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -104,7 +107,17 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     func_type_idx.push(idx?);
                 }
             }
-            Payload::MemorySection(_) => return unsup("linear memory (next slice)"),
+            Payload::MemorySection(reader) => {
+                for mt in reader {
+                    let mt = mt?;
+                    if mt.shared {
+                        return unsup("shared memory");
+                    }
+                    if mem.replace(mt).is_some() {
+                        return unsup("multi-memory");
+                    }
+                }
+            }
             Payload::GlobalSection(_) => return unsup("globals"),
             Payload::TableSection(_) => return unsup("tables"),
             Payload::ExportSection(reader) => {
@@ -124,16 +137,27 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         return Err(Error::Parse("function/code section length mismatch".into()));
     }
 
+    let mem64 = mem.as_ref().map(|m| m.memory64).unwrap_or(false);
     let mut funcs = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.into_iter().enumerate() {
         let ty = &types[func_type_idx[i] as usize];
-        funcs.push(lower_func(&ty.0, &ty.1, &types, &body)?);
+        funcs.push(lower_func(&ty.0, &ty.1, &types, &body, mem64)?);
     }
+
+    // Our window is a power-of-two byte range (masking confines to it); size it to hold the wasm
+    // memory's initial pages (64 KiB each). NB: wasm bounds-checks-and-traps on out-of-range access
+    // while we mask-and-confine to the (≥) power-of-two window — identical for in-bounds accesses
+    // (what real programs make), looser only for OOB. Data segments / `memory.grow` are later slices.
+    let memory = mem.map(|m| {
+        let bytes = (m.initial.max(1)).saturating_mul(1 << 16);
+        let size_log2 = bytes.next_power_of_two().trailing_zeros().max(16) as u8;
+        svm_ir::Memory { size_log2 }
+    });
 
     Ok(Transpiled {
         module: Module {
             funcs,
-            memory: None,
+            memory,
             data: Vec::new(),
         },
         exports,
@@ -141,10 +165,13 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
 }
 
 /// A block under construction: SSA values are block-local indices — params first (`0..params.len()`),
-/// then each emitted instruction's result. The terminator is filled when the block ends.
+/// then each **value-producing** instruction's result. `next_val` tracks that index (a `store` is an
+/// instruction but produces no value, so it must not consume an index). The terminator is filled when
+/// the block ends.
 struct BlockB {
     params: Vec<ValType>,
     insts: Vec<Inst>,
+    next_val: ValIdx,
     term: Option<Terminator>,
 }
 
@@ -196,24 +223,36 @@ struct Lower<'a> {
     reachable: bool,
     control: Vec<Frame>,
     types: &'a [(Vec<ValType>, Vec<ValType>)],
+    /// 64-bit linear memory (`memory64`): the address operand is already i64; otherwise it's an i32
+    /// that must be zero-extended before our (i64-addressed) `load`/`store`.
+    mem64: bool,
 }
 
 impl Lower<'_> {
     fn new_block(&mut self, params: Vec<ValType>) -> usize {
+        let next_val = params.len() as ValIdx;
         self.blocks.push(BlockB {
             params,
             insts: Vec::new(),
+            next_val,
             term: None,
         });
         self.blocks.len() - 1
     }
 
-    /// Append an instruction to the current block and return its SSA value index.
+    /// Append a **value-producing** instruction and return its SSA value index.
     fn emit(&mut self, inst: Inst) -> ValIdx {
         let b = &mut self.blocks[self.cur];
-        let idx = (b.params.len() + b.insts.len()) as ValIdx;
+        let idx = b.next_val;
+        b.next_val += 1;
         b.insts.push(inst);
         idx
+    }
+
+    /// Append an instruction that produces **no** value (`store`/`atomic.store`): it does not consume
+    /// a value index.
+    fn emit_void(&mut self, inst: Inst) {
+        self.blocks[self.cur].insts.push(inst);
     }
 
     fn push(&mut self, v: ValIdx, t: ValType) {
@@ -301,6 +340,7 @@ fn lower_func(
     results: &[ValType],
     types: &[(Vec<ValType>, Vec<ValType>)],
     body: &wasmparser::FunctionBody,
+    mem64: bool,
 ) -> Result<Func, Error> {
     // Locals = params (with their incoming param values) then declared locals (default 0).
     let mut local_types: Vec<ValType> = params.to_vec();
@@ -315,6 +355,7 @@ fn lower_func(
     let entry = BlockB {
         params: params.to_vec(),
         insts: Vec::new(),
+        next_val: params.len() as ValIdx,
         term: None,
     };
     let mut lo = Lower {
@@ -326,6 +367,7 @@ fn lower_func(
         reachable: true,
         control: Vec::new(),
         types,
+        mem64,
     };
     // Initialize declared locals to zero (params already bound to block params), extending `locals`.
     for t in &local_types[params.len()..] {
@@ -401,6 +443,43 @@ fn int_val(ty: IntTy) -> ValType {
         IntTy::I32 => ValType::I32,
         IntTy::I64 => ValType::I64,
     }
+}
+
+/// Pop the wasm address (an i32 for a 32-bit memory, zero-extended to our i64 address space; an i64 for
+/// `memory64`).
+fn pop_addr(lo: &mut Lower) -> Result<ValIdx, Error> {
+    let (a, _) = lo.pop()?;
+    Ok(if lo.mem64 {
+        a
+    } else {
+        lo.emit(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a,
+        })
+    })
+}
+fn mem_load(lo: &mut Lower, op: LoadOp, m: MemArg) -> Result<(), Error> {
+    let addr = pop_addr(lo)?;
+    let v = lo.emit(Inst::Load {
+        op,
+        addr,
+        offset: m.offset,
+        align: m.align,
+    });
+    lo.push(v, op.info().1); // `info().1` is the result value type (i32/i64)
+    Ok(())
+}
+fn mem_store(lo: &mut Lower, op: StoreOp, m: MemArg) -> Result<(), Error> {
+    let (value, _) = lo.pop()?;
+    let addr = pop_addr(lo)?;
+    lo.emit_void(Inst::Store {
+        op,
+        addr,
+        value,
+        offset: m.offset,
+        align: m.align,
+    });
+    Ok(())
 }
 
 fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), Error> {
@@ -524,6 +603,26 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64ExtendI32S => convert(lo, ConvOp::ExtendI32S, ValType::I64)?,
         O::I64ExtendI32U => convert(lo, ConvOp::ExtendI32U, ValType::I64)?,
         O::I32WrapI64 => convert(lo, ConvOp::WrapI64, ValType::I32)?,
+        // ---- linear memory load / store (i32/i64; floats are a later slice) ----
+        O::I32Load { memarg } => mem_load(lo, LoadOp::I32, memarg)?,
+        O::I64Load { memarg } => mem_load(lo, LoadOp::I64, memarg)?,
+        O::I32Load8S { memarg } => mem_load(lo, LoadOp::I32_8S, memarg)?,
+        O::I32Load8U { memarg } => mem_load(lo, LoadOp::I32_8U, memarg)?,
+        O::I32Load16S { memarg } => mem_load(lo, LoadOp::I32_16S, memarg)?,
+        O::I32Load16U { memarg } => mem_load(lo, LoadOp::I32_16U, memarg)?,
+        O::I64Load8S { memarg } => mem_load(lo, LoadOp::I64_8S, memarg)?,
+        O::I64Load8U { memarg } => mem_load(lo, LoadOp::I64_8U, memarg)?,
+        O::I64Load16S { memarg } => mem_load(lo, LoadOp::I64_16S, memarg)?,
+        O::I64Load16U { memarg } => mem_load(lo, LoadOp::I64_16U, memarg)?,
+        O::I64Load32S { memarg } => mem_load(lo, LoadOp::I64_32S, memarg)?,
+        O::I64Load32U { memarg } => mem_load(lo, LoadOp::I64_32U, memarg)?,
+        O::I32Store { memarg } => mem_store(lo, StoreOp::I32, memarg)?,
+        O::I64Store { memarg } => mem_store(lo, StoreOp::I64, memarg)?,
+        O::I32Store8 { memarg } => mem_store(lo, StoreOp::I32_8, memarg)?,
+        O::I32Store16 { memarg } => mem_store(lo, StoreOp::I32_16, memarg)?,
+        O::I64Store8 { memarg } => mem_store(lo, StoreOp::I64_8, memarg)?,
+        O::I64Store16 { memarg } => mem_store(lo, StoreOp::I64_16, memarg)?,
+        O::I64Store32 { memarg } => mem_store(lo, StoreOp::I64_32, memarg)?,
         // ---- structured control flow ----
         O::Block { blockty } => {
             let (p, r) = block_sig(blockty, lo.types)?;

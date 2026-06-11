@@ -192,6 +192,107 @@ fn collatz_steps() {
 }
 
 #[test]
+fn memory_store_load_roundtrip() {
+    let wat = r#"
+(module (memory 1)
+  (func (export "rw") (param $a i32) (param $v i64) (result i64)
+    (i64.store (local.get $a) (local.get $v))
+    (i64.load (local.get $a))))"#;
+    assert_eq!(
+        run(wat, "rw", &[Value::I32(80), Value::I64(123456789)]),
+        123456789
+    );
+    // narrow store/load truncates like wasm
+    let wat8 = r#"
+(module (memory 1)
+  (func (export "rw8") (param $a i32) (param $v i32) (result i32)
+    (i32.store8 (local.get $a) (local.get $v))
+    (i32.load8_u (local.get $a))))"#;
+    assert_eq!(run(wat8, "rw8", &[Value::I32(16), Value::I32(0x1ff)]), 0xff);
+}
+
+/// The real `memsum` bench kernel (wasm32): store `i` to a windowed slot, read it back, sum. Each slot
+/// is overwritten then read in the same iteration, so the total is `Σ i = n(n-1)/2`.
+#[test]
+fn memsum_kernel_wasm32() {
+    let wat = r#"
+(module (memory 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64) (local $addr i32)
+    (block $done (loop $loop
+      (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+      (local.set $addr (i32.mul (i32.and (i32.wrap_i64 (local.get $i)) (i32.const 1023)) (i32.const 8)))
+      (i64.store (local.get $addr) (local.get $i))
+      (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
+      (local.set $i (i64.add (local.get $i) (i64.const 1)))
+      (br $loop)))
+    (local.get $acc)))"#;
+    for n in [0i64, 1, 10, 100] {
+        assert_eq!(run(wat, "run", &[Value::I64(n)]), n * (n - 1) / 2);
+    }
+}
+
+/// Same kernel over a **64-bit** memory (`memory i64`) — the address is already i64, no extension.
+#[test]
+fn memsum_kernel_wasm64() {
+    let wat = r#"
+(module (memory i64 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64) (local $addr i64)
+    (block $done (loop $loop
+      (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+      (local.set $addr (i64.mul (i64.and (local.get $i) (i64.const 1023)) (i64.const 8)))
+      (i64.store (local.get $addr) (local.get $i))
+      (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
+      (local.set $i (i64.add (local.get $i) (i64.const 1)))
+      (br $loop)))
+    (local.get $acc)))"#;
+    for n in [0i64, 1, 10, 100] {
+        assert_eq!(run(wat, "run", &[Value::I64(n)]), n * (n - 1) / 2);
+    }
+}
+
+/// The `scatter` kernel: store to one hashed slot, load from a different one — addresses that vary per
+/// iteration, with the array persisting across iterations. Checked against a Rust replica.
+#[test]
+fn scatter_kernel() {
+    let wat = r#"
+(module (memory 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done (loop $loop
+      (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+      (i64.store
+        (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2654435761))) (i32.const 1023)) (i32.const 8))
+        (local.get $i))
+      (local.set $acc (i64.add (local.get $acc)
+        (i64.load
+          (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2246822519))) (i32.const 1023)) (i32.const 8)))))
+      (local.set $i (i64.add (local.get $i) (i64.const 1)))
+      (br $loop)))
+    (local.get $acc)))"#;
+    for n in [0i64, 1, 5, 50, 300] {
+        assert_eq!(
+            run(wat, "run", &[Value::I64(n)]),
+            scatter_ref(n),
+            "scatter n={n}"
+        );
+    }
+}
+
+fn scatter_ref(n: i64) -> i64 {
+    let mut mem = [0i64; 1024];
+    let mut acc = 0i64;
+    for i in 0..n {
+        let si = ((i.wrapping_mul(2654435761) as i32) & 1023) as usize;
+        mem[si] = i;
+        let li = ((i.wrapping_mul(2246822519) as i32) & 1023) as usize;
+        acc = acc.wrapping_add(mem[li]);
+    }
+    acc
+}
+
+#[test]
 fn unsupported_is_clean_error() {
     // f32 arithmetic is out of this slice's subset → a clean Unsupported error, not a panic.
     let wat = r#"(module (func (export "g") (result f32) (f32.const 1.0)))"#;
