@@ -126,15 +126,21 @@ pub(crate) struct Domain {
     threads: Mutex<Threads>,
     futex: Mutex<HashMap<u64, FutexEntry>>,
     futex_cv: Condvar,
-    /// §15 spawn quota: max thread cells (`thread.spawn`s) this domain may create (clamped to
-    /// [`MAX_VCPUS`]). Exceeding it is a clean `ThreadFault`. NB the table is **cumulative** (a `join`
-    /// marks a slot used but doesn't free it), so this bounds *total* spawns over the run — stricter
-    /// than the interpreter's *concurrent*-liveness cap, but the DoS-containment guarantee holds.
+    /// §15 spawn quota: max **concurrently-live** vCPUs (incl. the root) this domain may have, clamped
+    /// to [`MAX_VCPUS`]. Exceeding it is a clean `ThreadFault`. Bounds `Threads::live` (concurrent),
+    /// matching the interpreter's `s.live` — a spawn-join loop is fine (a finished vCPU frees its slot).
     max_vcpus: usize,
 }
 
 #[derive(Default)]
 struct Threads {
+    /// §15 **concurrently-live** vCPUs — the root (1) plus every spawned vCPU that hasn't finished.
+    /// Incremented under this lock at a successful `thread.spawn`, decremented when a spawned vCPU's
+    /// computation ends ([`run_child`]). The §15 quota bounds *this* (concurrent liveness, like the
+    /// interpreter's `s.live`), **not** `cells.len()` (the cumulative handle table that never shrinks —
+    /// symmetric with the interpreter's per-vCPU `threads` Vec). Starts at 1 (the root) via
+    /// [`Domain::new`]; `Default` is 0 only for the unused loom path.
+    live: usize,
     /// Completion cells, indexed by thread handle (a masked, generation-free table index, §3c).
     cells: Vec<std::sync::Arc<Done>>,
     /// Per-handle "already joined" flag — a second `thread.join` of the same vCPU is inert (traps),
@@ -155,7 +161,12 @@ impl Domain {
     pub(crate) fn new(max_vcpus: usize) -> Domain {
         Domain {
             env: Mutex::new(None),
-            threads: Mutex::new(Threads::default()),
+            // `live` starts at 1: the root vCPU (the main thread running the entry) counts toward the
+            // §15 quota, like the interpreter's `s.live`.
+            threads: Mutex::new(Threads {
+                live: 1,
+                ..Threads::default()
+            }),
             futex: Mutex::new(HashMap::new()),
             futex_cv: Condvar::new(),
             max_vcpus: max_vcpus.clamp(1, MAX_VCPUS),
@@ -257,6 +268,10 @@ struct SpawnArgs {
     sp: u64,
     arg: u64,
     done: std::sync::Arc<Done>,
+    /// The owning [`Domain`] — so this vCPU can drop its §15 concurrent-live count when it finishes.
+    /// The domain outlives every spawned thread (`run_inner` joins them at run end), so the pointer
+    /// stays valid for the thread's lifetime.
+    dom: *const Domain,
 }
 // SAFETY: same contract as `Env` — the raw pointers are the run's shared window/trap cell, and a fresh
 // OS thread is the sole user of its `SpawnArgs` until it stores into the (synchronized) `Done` cell.
@@ -312,6 +327,14 @@ fn run_child(a: SpawnArgs) {
         let t = unsafe { load_trap(env.trap_out) };
         (call.ret, t)
     };
+    // §15: this vCPU's computation has ended — free its concurrent-live slot *before* publishing the
+    // result, so a `thread.join` that then observes completion already sees the quota slot freed (a
+    // spawn-join loop can't transiently false-trap). The domain outlives all spawned threads, so the
+    // pointer is live. SAFETY: `a.dom` is the run's `Domain` (joined at run end).
+    unsafe {
+        let mut t = lock(&(*a.dom).threads);
+        t.live -= 1;
+    }
     let mut st = lock(&a.done.state);
     *st = Some((result, trap));
     a.done.cv.notify_all();
@@ -344,7 +367,9 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     });
     let handle = {
         let mut t = lock(&dom.threads);
-        if t.cells.len() >= dom.max_vcpus {
+        // §15: bound *concurrent* live vCPUs (root + unfinished spawns), not the cumulative handle
+        // table — so a spawn-join loop never trips, matching the interpreter.
+        if t.live >= dom.max_vcpus {
             store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
             return -1;
         }
@@ -357,6 +382,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             sp,
             arg,
             done,
+            dom: sched,
         };
         let jh = std::thread::Builder::new()
             .name(format!("svm-vcpu-{idx}"))
@@ -364,11 +390,15 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         match jh {
             Ok(jh) => {
                 t.joins.push(jh);
+                // Count the new vCPU as live *before* releasing the lock, so its own completion
+                // decrement (which takes this lock) can't underflow.
+                t.live += 1;
                 idx as i32
             }
             Err(_) => {
-                // Out of OS threads: pop the cell we reserved and trap.
+                // Out of OS threads: pop the cell we reserved and trap (no `live` change).
                 t.cells.pop();
+                t.joined.pop();
                 store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
                 -1
             }

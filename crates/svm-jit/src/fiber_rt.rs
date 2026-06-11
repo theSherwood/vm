@@ -75,8 +75,9 @@ pub(crate) struct FiberRuntime {
     fiber_type_id: u32,
     /// `next_pow2(nfuncs) - 1`, to mask a funcref into the function table.
     fn_table_mask: u64,
-    /// §15 spawn quota: max fibers this run may create (clamped to [`MAX_FIBERS`] at construction).
-    /// Exceeding it is a clean `FiberFault`, matching the interpreter's per-vCPU `Quota::max_fibers`.
+    /// §15 spawn quota: max fibers (incl. the implicit root computation) this vCPU may have, clamped to
+    /// [`MAX_FIBERS`] at construction. Exceeding it is a clean `FiberFault`, matching the interpreter's
+    /// per-vCPU `Quota::max_fibers` (whose table counts the root).
     max_fibers: usize,
 }
 
@@ -135,7 +136,10 @@ pub(crate) unsafe extern "C" fn fiber_new(
     }
     let (mask, type_id, call_tramp) = {
         let rt = &mut *rt;
-        if rt.fibers.len() >= rt.max_fibers {
+        // `+ 1` counts the implicit **root** computation (not a slot in `fibers`, unlike the
+        // interpreter's table which starts with the root) so `max_fibers` means the same total on both
+        // backends. Like the interpreter, the table is cumulative (a finished fiber keeps its slot).
+        if rt.fibers.len() + 1 >= rt.max_fibers {
             fault(trap_out);
             return -1;
         }

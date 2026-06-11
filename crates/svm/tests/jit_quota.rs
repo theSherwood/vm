@@ -3,12 +3,11 @@
 //! quota traps cleanly (`FiberFault`/`ThreadFault`); the default quota = the anti-bomb ceilings, so an
 //! unconfigured run is unchanged.
 //!
-//! Gated to the targets where the JIT fiber/thread runtime exists (`svm_fiber::supported()`).
+//! The JIT now counts the **root** computation toward the quota (like the interpreter) and bounds
+//! **concurrently-live** vCPUs (a finished thread frees its slot), so the same quota value means the
+//! same thing on both backends — these use the same programs/expectations as the interpreter tests.
 //!
-//! NB the JIT's fiber/vCPU tables don't include a *root* entry (the interpreter's do), so the same
-//! quota value admits one more spawn here than on the interpreter — a pre-existing off-by-one; for DoS
-//! *containment* what matters is the bound, not the exact threshold. Each test targets the JIT's own
-//! counting.
+//! Gated to the targets where the JIT fiber/thread runtime exists (`svm_fiber::supported()`).
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
@@ -58,8 +57,8 @@ fn run(src: &str, quota: Quota) -> JitOutcome {
     .expect("jit compile")
 }
 
-/// Three `cont.new`s. The JIT fiber table holds no root, so `max_fibers = 2` admits the first two and
-/// the **third** trips the quota (`FiberFault`); the default admits all three.
+/// Two `cont.new`s. `max_fibers = 2` = the root + one fiber, so the **second** `cont.new` trips the
+/// quota (`FiberFault`) — identical to the interpreter. The default admits both.
 const FIBER_BOMB: &str = r#"
 memory 16
 func () -> (i64) {
@@ -68,9 +67,8 @@ block0():
   v1 = i64.const 1024
   v2 = cont.new v0 v1
   v3 = cont.new v0 v1
-  v4 = cont.new v0 v1
-  v5 = i64.const 0
-  return v5
+  v4 = i64.const 0
+  return v4
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
@@ -100,16 +98,16 @@ fn jit_fiber_quota_default_runs() {
     ));
 }
 
-/// Two `thread.spawn`s (no join). The JIT vCPU table holds no root, so `max_vcpus = 1` admits the
-/// first spawn and the **second** trips the quota (`ThreadFault`); the default admits both.
-const THREAD_BOMB: &str = r#"
+/// One `thread.spawn` + `join`. `max_vcpus = 1` = the root only, so the spawn (which would make a
+/// second live vCPU) traps `ThreadFault` — identical to the interpreter. `max_vcpus = 2` admits it.
+const THREAD_PROG: &str = r#"
 memory 16
 func () -> (i64) {
 block0():
   v0 = i64.const 5
   v1 = thread.spawn 1 v0 v0
-  v2 = thread.spawn 1 v0 v0
-  return v0
+  v2 = thread.join v1
+  return v2
 }
 func (i64, i64) -> (i64) {
 block0(vsp: i64, varg: i64):
@@ -118,23 +116,79 @@ block0(vsp: i64, varg: i64):
 "#;
 
 #[test]
-fn jit_vcpu_quota_traps() {
+fn jit_vcpu_quota_blocks_spawn() {
     match run(
-        THREAD_BOMB,
+        THREAD_PROG,
         Quota {
             max_fibers: 1 << 16,
             max_vcpus: 1,
         },
     ) {
         JitOutcome::Trapped(TrapKind::ThreadFault) => {}
-        other => panic!("expected ThreadFault at the vCPU quota, got {other:?}"),
+        other => panic!("expected ThreadFault when the vCPU quota leaves no room, got {other:?}"),
     }
 }
 
 #[test]
 fn jit_vcpu_quota_default_runs() {
+    match run(THREAD_PROG, Quota::default()) {
+        JitOutcome::Returned(v) => assert_eq!(v[0], 5),
+        other => panic!("expected 5, got {other:?}"),
+    }
+    // A quota of 2 (root + one concurrent child) admits exactly this program.
     assert!(matches!(
-        run(THREAD_BOMB, Quota::default()),
+        run(
+            THREAD_PROG,
+            Quota {
+                max_fibers: 16,
+                max_vcpus: 2,
+            },
+        ),
         JitOutcome::Returned(_)
     ));
+}
+
+/// **The fix for the cumulative-vs-concurrent issue:** spawn **and join** a vCPU 8 times in a loop.
+/// Only one child is ever live, so `max_vcpus = 2` (root + one) must succeed — the previous
+/// cumulative count (the never-shrinking handle table) would have false-trapped on the 3rd iteration.
+const SPAWN_JOIN_LOOP: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  br block1(v0)
+block1(v1: i64):
+  v2 = i64.const 8
+  v3 = i64.lt_u v1 v2
+  br_if v3 block2(v1) block3()
+block2(v4: i64):
+  v5 = i64.const 7
+  v6 = thread.spawn 1 v5 v5
+  v7 = thread.join v6
+  v8 = i64.const 1
+  v9 = i64.add v4 v8
+  br block1(v9)
+block3():
+  v10 = i64.const 42
+  return v10
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  return varg
+}
+"#;
+
+#[test]
+fn jit_vcpu_quota_spawn_join_loop_is_concurrent() {
+    // 8 spawn+join iterations, only one child live at a time ⇒ max_vcpus = 2 must not trap.
+    match run(
+        SPAWN_JOIN_LOOP,
+        Quota {
+            max_fibers: 16,
+            max_vcpus: 2,
+        },
+    ) {
+        JitOutcome::Returned(v) => assert_eq!(v[0], 42, "spawn-join loop completed"),
+        other => panic!("spawn-join loop must not trip a concurrent quota, got {other:?}"),
+    }
 }

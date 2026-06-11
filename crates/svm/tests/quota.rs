@@ -133,6 +133,49 @@ fn vcpu_quota_default_runs() {
     );
 }
 
+/// The vCPU quota bounds **concurrent** liveness, not cumulative spawns: spawn+join 8 times (only one
+/// child ever live), which `max_vcpus = 2` (root + one) must admit. (Pins parity with the JIT, whose
+/// concurrent-live counter was fixed to match this.)
+#[test]
+fn vcpu_quota_spawn_join_loop_is_concurrent() {
+    let src = r#"
+memory 16
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  br block1(v0)
+block1(v1: i64):
+  v2 = i64.const 8
+  v3 = i64.lt_u v1 v2
+  br_if v3 block2(v1) block3()
+block2(v4: i64):
+  v5 = i64.const 7
+  v6 = thread.spawn 1 v5 v5
+  v7 = thread.join v6
+  v8 = i64.const 1
+  v9 = i64.add v4 v8
+  br block1(v9)
+block3():
+  v10 = i64.const 42
+  return v10
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  return varg
+}
+"#;
+    assert_eq!(
+        run_q(
+            src,
+            Some(Quota {
+                max_fibers: 16,
+                max_vcpus: 2,
+            })
+        ),
+        Ok(42)
+    );
+}
+
 /// A quota only *tightens* — `set_quota` clamps each limit to the hard ceiling, so a guest can't raise
 /// it past the anti-bomb bound by asking for more.
 #[test]
