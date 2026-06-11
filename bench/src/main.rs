@@ -57,7 +57,15 @@ use std::ffi::c_void;
 use std::hint::black_box;
 use std::time::Instant;
 
-use svm_jit::{compile_and_run, compile_and_run_with_host, JitOutcome};
+use std::sync::atomic::{AtomicBool, Ordering};
+use svm_jit::{
+    compile_and_run, compile_and_run_with_host, compile_and_run_with_host_fast, JitOutcome,
+};
+
+/// `--fast-cap`: drive `HostCall` kernels through the §9/D45 devirtualized fast path
+/// ([`compile_and_run_with_host_fast`] + [`bench_fast_resolver`]) instead of the generic thunk, to
+/// measure the register-to-register win.
+static FAST_CAP: AtomicBool = AtomicBool::new(false);
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
 /// Wasmtime store state: the host-call buffer benchmark **caches the exported `Memory`** here
@@ -333,12 +341,62 @@ unsafe extern "C" fn bench_thunk(
     *trap_out = 0;
 }
 
+/// The §9/D45 **devirtualized** counterparts of [`bench_thunk`]'s ops: register-to-register host fns
+/// the JIT calls directly when `--fast-cap` is set. `op 0` (`x -> x+1`) and `op 1` (sum a `(ptr,len)`
+/// borrow buffer) — identical results to the generic thunk, but no stack marshalling / runtime
+/// dispatch. The ABI matches [`svm_jit::FastCapResolver`]: `(ctx, mem_base, mem_size, handle, trap_out,
+/// args…)`.
+unsafe extern "C" fn fast_op0(
+    _ctx: *mut c_void,
+    _mem_base: *mut u8,
+    _mem_size: u64,
+    _handle: i32,
+    trap_out: *mut i64,
+    a0: i64,
+) -> i64 {
+    *trap_out = 0;
+    a0.wrapping_add(1)
+}
+unsafe extern "C" fn fast_op1(
+    _ctx: *mut c_void,
+    mem_base: *mut u8,
+    _mem_size: u64,
+    _handle: i32,
+    trap_out: *mut i64,
+    ptr: i64,
+    len: i64,
+) -> i64 {
+    *trap_out = 0;
+    let buf = std::slice::from_raw_parts(mem_base.add(ptr as usize), len as usize);
+    buf.iter().map(|&b| b as i64).sum()
+}
+unsafe extern "C" fn bench_fast_resolver(_type_id: u32, op: u32) -> *const c_void {
+    match op {
+        0 => fast_op0 as *const c_void,
+        1 => fast_op1 as *const c_void,
+        _ => std::ptr::null(),
+    }
+}
+
 /// Like [`svm_call`] but drives the cap.call trampoline ([`bench_thunk`]) — for `HostCall`
-/// kernels. The context pointer is unused (the thunk is stateless), so it is null.
+/// kernels. The context pointer is unused (the thunk is stateless), so it is null. With `--fast-cap`
+/// the call instead takes the §9/D45 devirtualized fast path via [`bench_fast_resolver`].
 fn svm_call_host(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
     let mut args: Vec<i64> = lead.to_vec();
     args.push(n);
-    match compile_and_run_with_host(m, entry, &args, bench_thunk, std::ptr::null_mut()) {
+    let out = if FAST_CAP.load(Ordering::Relaxed) {
+        compile_and_run_with_host_fast(
+            m,
+            entry,
+            &args,
+            bench_thunk,
+            std::ptr::null_mut(),
+            bench_fast_resolver,
+        )
+    } else {
+        compile_and_run_with_host(m, entry, &args, bench_thunk, std::ptr::null_mut())
+    };
+    match out {
         Ok(JitOutcome::Returned(s)) => s[0],
         other => panic!("svm jit (host-call) produced {other:?}"),
     }
@@ -1061,6 +1119,9 @@ fn main() {
     // `--from-wasm`: get each compute kernel's SVM IR by transpiling its WAT (the same bytes Wasmtime
     // runs) instead of using the hand-written IR — the apples-to-apples comparison.
     let from_wasm = args.iter().any(|a| a == "--from-wasm");
+    // `--fast-cap`: route HostCall kernels through the §9/D45 devirtualized fast path (vs the generic
+    // thunk) so the two can be compared head-to-head.
+    FAST_CAP.store(args.iter().any(|a| a == "--fast-cap"), Ordering::Relaxed);
     let save = flag_value(&args, "--save-baseline");
     let check = flag_value(&args, "--check");
     let tol = flag_value(&args, "--tol")
