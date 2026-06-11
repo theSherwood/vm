@@ -136,7 +136,10 @@ fn drive(
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, MAX_WORKERS);
-    let sched = Arc::new(Scheduler::new(MAX_VCPUS, workers));
+    // §15: the domain's spawn quota (already clamped to the hard ceilings by `set_quota`) sizes the
+    // executor's live-vCPU cap and each vCPU's fiber cap. Default = the ceilings (unchanged behavior).
+    let quota = host.quota();
+    let sched = Arc::new(Scheduler::new(quota.max_vcpus, workers));
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
     // each child), then unwrap it back into the caller after every vCPU is gone. The root still owns
@@ -169,6 +172,7 @@ fn drive(
             0,
             id,
             SchedRef::Real(Arc::clone(&sched)),
+            quota,
         ));
         s.runnable.push_back(root);
         id
@@ -366,6 +370,7 @@ pub fn run_scheduled(
             0,
             id,
             SchedRef::Det(Arc::clone(&det)),
+            Quota::default(), // deterministic oracle path: the fixed anti-bomb ceilings
         ));
         s.runnable.push(root);
         id
@@ -866,6 +871,7 @@ fn run_one_schedule(
             0,
             id,
             SchedRef::Det(Arc::clone(&det)),
+            Quota::default(), // exhaustive model-checker path: the fixed anti-bomb ceilings
         );
         root.memop = true;
         s.runnable.push(Box::new(root));
@@ -906,6 +912,37 @@ const MAX_FIBERS: usize = 1 << 16;
 /// [`Trap::ThreadFault`]. A spawned-and-joined loop creates unboundedly many vCPUs over its lifetime;
 /// only simultaneous liveness is bounded.
 const MAX_VCPUS: usize = 1 << 16;
+
+/// §15 **spawn quota** — host-configurable ceilings on how many fibers / concurrently-live vCPUs a run
+/// may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings. The embedder sets it
+/// on the [`Host`] ([`Host::set_quota`]); a guest that exceeds it traps cleanly ([`Trap::FiberFault`] /
+/// [`Trap::ThreadFault`]) — DoS *containment* policy (§15/D48), not just the host-OOM backstop. The
+/// default is the hard ceilings, so an unconfigured run behaves exactly as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quota {
+    /// Max fibers a single vCPU may create (`cont.new`); capped at [`MAX_FIBERS`].
+    pub max_fibers: usize,
+    /// Max concurrently-live vCPUs across the run (`thread.spawn`); capped at [`MAX_VCPUS`].
+    pub max_vcpus: usize,
+}
+impl Default for Quota {
+    fn default() -> Self {
+        Quota {
+            max_fibers: MAX_FIBERS,
+            max_vcpus: MAX_VCPUS,
+        }
+    }
+}
+impl Quota {
+    /// Clamp each limit to its hard anti-bomb ceiling (a quota can only *tighten*, never raise the
+    /// ceiling), and ensure at least 1 (the root vCPU always exists).
+    fn clamped(self) -> Quota {
+        Quota {
+            max_fibers: self.max_fibers.clamp(1, MAX_FIBERS),
+            max_vcpus: self.max_vcpus.clamp(1, MAX_VCPUS),
+        }
+    }
+}
 
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
@@ -1716,6 +1753,8 @@ struct VCpu {
     /// point; `None` if the turn ran no visible op). Read back by the DPOR driver ([`explore_all`]) to
     /// build the schedule trace; unused by the real pool / seeded explorer.
     acc: Option<MemAccess>,
+    /// §15 spawn quota (fiber/vCPU ceilings) — inherited by every vCPU of the run from the root.
+    quota: Quota,
 }
 
 impl VCpu {
@@ -1732,6 +1771,7 @@ impl VCpu {
         depth: u32,
         id: TaskId,
         sched: SchedRef,
+        quota: Quota,
     ) -> VCpu {
         VCpu {
             funcs,
@@ -1756,6 +1796,7 @@ impl VCpu {
             sched,
             memop: false,
             acc: None,
+            quota,
         }
     }
 
@@ -1885,6 +1926,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
 
     let funcs = Arc::clone(&v.funcs);
     let fs: &[Func] = &funcs;
+    let spawn_quota = v.quota; // §15 fiber/vCPU ceilings (distinct from the Instantiator's i64 fuel quota)
     let VCpu {
         fibers,
         chain,
@@ -1903,6 +1945,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         id: _,
         memop,
         acc,
+        quota: _,
     } = v;
     let depth = *depth;
     let memop = *memop;
@@ -2211,6 +2254,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         depth + 1,
                                         id,
                                         csched,
+                                        spawn_quota, // a nested child inherits the domain's spawn quota
                                     );
                                     child.memop = memop;
                                     Box::new(child)
@@ -2322,6 +2366,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     depth + 1,
                                     0, // unused: a coroutine is driven inline, never via the executor
                                     sched.clone(),
+                                    spawn_quota, // co-fiber child inherits the domain's spawn quota
                                 );
                                 child.fault_yields = true; // its page faults suspend to us, not trap
                                 coroutines.push(Some(Coro {
@@ -2424,7 +2469,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::ContNew { func, sp } => {
                     let funcref = as_i32(get(&frames[top].vals, *func)?)?;
                     let stack_base = as_i64(get(&frames[top].vals, *sp)?)?;
-                    if fibers.len() >= MAX_FIBERS {
+                    if fibers.len() >= spawn_quota.max_fibers {
                         return Err(Trap::FiberFault);
                     }
                     let handle = fibers.len() as i32;
@@ -2516,6 +2561,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             0,
                             id,
                             csched,
+                            spawn_quota, // spawned vCPU inherits the domain's spawn quota
                         );
                         child.memop = memop; // inherit the explorer's memory-op granularity
                         Box::new(child)
@@ -3715,6 +3761,10 @@ pub struct Host {
     /// mirrors how the interpreter's `Mem` keeps its page map across calls. Page index → state code
     /// (`svm_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears.
     cap_pages: Option<(usize, CapPageMap)>,
+    /// §15 spawn quota (fiber/vCPU ceilings) the embedder sets for this domain ([`Host::set_quota`]);
+    /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
+    /// size the executor's live-vCPU cap and each vCPU's fiber cap.
+    quota: Quota,
 }
 
 /// One §14 module grant: the verified module's functions, declared window size, and data segments —
@@ -3748,7 +3798,20 @@ impl Host {
             rings: Vec::new(),
             async_notify: None,
             cap_pages: None,
+            quota: Quota::default(),
         }
+    }
+
+    /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
+    /// anti-bomb ceiling ([`MAX_FIBERS`]/[`MAX_VCPUS`]) — a quota can only *tighten* — and to ≥ 1. The
+    /// quota is read at run start ([`run_with_host`]→`drive`); a guest exceeding it traps cleanly
+    /// (`FiberFault`/`ThreadFault`). The JIT enforces the same quota via `svm_jit` (see `svm-run`).
+    pub fn set_quota(&mut self, quota: Quota) {
+        self.quota = quota.clamped();
+    }
+    /// This domain's spawn quota (the clamped value in effect).
+    pub fn quota(&self) -> Quota {
+        self.quota
     }
 
     /// §4/§7 the JIT cap-path window page map (see [`Host::cap_pages`]) for window `base`, persistent
