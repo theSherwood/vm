@@ -1231,9 +1231,25 @@ Have (✅):
   **nested-guest** boundary (a child whose `cap.call` is serviced by its parent, via `coro_cap_thunk`)
   additionally pays a **fiber stack-switch round-trip** (`suspend`→parent→`suspend` back), so it is
   *strictly* more expensive than a native host call; `Instantiator.instantiate`/`join` is heavier
-  still but is a one-shot spawn (re-compiles the child), not a per-call cost. **Still open:** a
-  production `svm_run` fast resolver for the real powerbox ops (the prototype's specialized fns live
-  in the bench); a cheaper cross-domain switch for the nested-guest path (separate axis from D45).
+  still but is a one-shot spawn (re-compiles the child), not a per-call cost.
+  - **Production resolver — DONE.** `svm_run::fast_cap_resolver` claims the **window-independent,
+    authority-checked** hot ops — `Clock.now` and `Blocking.work` — for the real powerbox;
+    `run_powerbox` uses it on both the plain and deadline (kill-path) runs (new
+    `svm_jit::compile_and_run_with_host_interruptible_fast`). Every other op (all *window-touching*
+    ones — Memory/Stream/SharedRegion/IoRing — and any multi-result/arity-mismatched op) returns null
+    ⇒ the generic `cap_thunk` unchanged. **Safety preserved by construction:** the specialized fns
+    delegate to the *same* `Host::cap_dispatch_slots` (`gm = None`), so the I2 authority check (forged
+    handle ⇒ inert `CapFault`) + semantics are byte-identical to the generic path — pinned by
+    `jit_diff::fast_cap_prod` (Clock/Blocking: interp == JIT-generic == JIT-fast; **and
+    `forged_handle_is_inert_on_fast_path`**, the I2 check on the fast path). **Safety hardening to the
+    mechanism:** `FastCapResolver` now also takes `(n_args, n_res)` — the JIT builds the call sig from
+    the IR `cap.call`'s arity, so a specialized fn of a *different* arity would be a C-ABI mismatch (a
+    frontend may emit any sig; the verifier checks only `args.len() == sig.params.len()`). The resolver
+    must claim an op only at its true arity; an odd arity falls back to the slot-based generic path.
+    (Types never mismatch — every arg is an i64 register, the result decoded from i64 — so only arity
+    matters; not an escape either way, but the UB is closed.) **Still open:** fast-pathing
+    *window-touching* ops (needs the page-map/bounds context the generic thunk threads); a cheaper
+    cross-domain switch for the nested-guest path (a separate axis from D45).
 
 Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
 regressions one commit old"):
@@ -1318,8 +1334,13 @@ regressions one commit old"):
 > (~1.5× faster than Wasmtime)**. Also answered the nested-guest question: the guest-side cap.call tax is
 > identical either way (so D45 helps both), but a nested-guest boundary additionally pays a fiber
 > stack-switch round-trip, so it's strictly costlier than a native host call. Full write-up in §10's
-> Benchmarking "D45" item. *Open follow-ups:* a production `svm_run` fast resolver (the prototype's
-> specialized fns are in the bench), and the wasm transpiler's next slice (passive/bulk-memory).
+> Benchmarking "D45" item. **Production resolver — DONE:** `svm_run::fast_cap_resolver` fast-paths the
+> window-independent hot ops (Clock.now, Blocking.work) for the real powerbox; the specialized fns
+> delegate to the *same* `Host::cap_dispatch_slots`, so authority (forged handle ⇒ inert `CapFault`,
+> pinned by `jit_diff::fast_cap_prod`) is identical to the generic path. The resolver was also hardened
+> to gate on arity (`n_args`/`n_res`) so a mismatched-sig `cap.call` can't C-ABI-mismatch the
+> specialized fn. *Open follow-ups:* fast-pathing window-touching ops (needs the page-map context), and
+> the wasm transpiler's next slice (passive/bulk-memory).
 >
 > **(A) wasm transpiler — function imports / the host ABI, then
 > `memory.size`/`memory.grow` (item 0 below).**
