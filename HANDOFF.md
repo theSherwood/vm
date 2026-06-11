@@ -1058,13 +1058,16 @@ leave a shared view — add a unix test for this alongside the Windows work.
     co-fiber/nested children). The JIT mirrors it via `svm_jit::Quota` threaded into
     `fiber_rt::FiberRuntime`/`os_thread_rt::Domain`; `svm_run::run_powerbox` passes `host.quota()` so a
     Host-set quota binds both backends. `cont.new`/`thread.spawn` past the cap trap `FiberFault`/
-    `ThreadFault`. Default = the ceilings ⇒ unconfigured runs unchanged. Tests `svm/tests/quota.rs`
-    (interp) + `jit_quota.rs` (JIT, gated to fiber_rt targets). *Two documented semantic nuances: the
-    JIT tables hold no root entry (interp's do), so the same quota admits one more spawn on the JIT; and
-    the JIT vCPU table is cumulative (a join doesn't free the slot), so `max_vcpus` bounds total spawns
-    there vs concurrent liveness on the interp — both contain DoS. **Follow-ups:** a `run_powerbox`
-    quota arg for embedders (today the powerbox Host carries the default); optionally reconcile the
-    root-count/cumulative nuances across backends.*
+    `ThreadFault`. Default = the ceilings ⇒ unconfigured runs unchanged. **The two backends are now
+    semantically identical:** the JIT counts the **root** computation (`fibers.len()+1`; `Domain.live`
+    seeded at 1) and bounds **concurrent** live vCPUs via a `live` counter (incremented at spawn,
+    decremented in `run_child` before the result is published), so the same quota value admits the same
+    spawns and a spawn-join *loop* doesn't false-trap (the old `cells.len()` cumulative check was a
+    latent bug — it would trap a spawn-join loop at the ceiling and leak). Tests `svm/tests/quota.rs`
+    (interp) + `jit_quota.rs` (JIT, gated to fiber_rt targets) share programs/quotas/expectations and
+    include a spawn-join-loop concurrency test on both. **Follow-up:** a `run_powerbox` quota arg for
+    embedders (today the powerbox Host carries the default; an embedder can already set a quota on a
+    `Host` it drives directly).
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
     today), the D57 migratable-fiber primitive (stackful work-stealing), and the DPOR refinements
     (source sets / wakeup trees for full optimality; multi-op spin-body detection).
