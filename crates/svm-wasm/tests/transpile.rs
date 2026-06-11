@@ -663,10 +663,88 @@ fn call_indirect_type_mismatch_traps() {
     );
 }
 
+/// `memory.size` with no growth is the constant initial page count (no runtime cell needed).
+#[test]
+fn memory_size_constant() {
+    let wat = r#"(module (memory 3) (func (export "sz") (result i32) (memory.size)))"#;
+    assert_eq!(run(wat, "sz", &[]), 3);
+}
+
+/// `memory.grow` returns the previous size, and `memory.size` then reflects the larger memory (the
+/// runtime size cell is read back).
+#[test]
+fn memory_grow_returns_old_and_updates_size() {
+    let old = r#"(module (memory 1) (func (export "g") (result i32) (memory.grow (i32.const 2))))"#;
+    assert_eq!(run(old, "g", &[]), 1); // previous size in pages
+
+    let sz = r#"
+(module (memory 1)
+  (func (export "sz") (result i32)
+    (drop (memory.grow (i32.const 2)))
+    (memory.size)))"#;
+    assert_eq!(run(sz, "sz", &[]), 3); // 1 + 2 pages
+}
+
+/// A `memory.grow` past the cap (unbounded memory's default `DEFAULT_MAX_GROW_PAGES = 256`) returns
+/// `-1` and leaves the size unchanged.
+#[test]
+fn memory_grow_over_cap_fails() {
+    let r =
+        r#"(module (memory 1) (func (export "g") (result i32) (memory.grow (i32.const 1000))))"#;
+    assert_eq!(run(r, "g", &[]), -1);
+
+    let sz = r#"
+(module (memory 1)
+  (func (export "sz") (result i32)
+    (drop (memory.grow (i32.const 1000)))
+    (memory.size)))"#;
+    assert_eq!(run(sz, "sz", &[]), 1); // unchanged
+}
+
+/// A declared `maximum` is honored as the grow cap (rather than the unbounded default): growing to the
+/// max succeeds, one past it fails.
+#[test]
+fn memory_grow_honors_declared_maximum() {
+    let ok =
+        r#"(module (memory 1 4) (func (export "g") (result i32) (memory.grow (i32.const 3))))"#;
+    assert_eq!(run(ok, "g", &[]), 1); // 1 -> 4 (== maximum) succeeds, returns old size
+    let fail =
+        r#"(module (memory 1 4) (func (export "g") (result i32) (memory.grow (i32.const 4))))"#;
+    assert_eq!(run(fail, "g", &[]), -1); // 1 -> 5 (> maximum) fails
+}
+
+/// After growing, the new pages are usable — a store/load to an address in the grown region (past the
+/// initial 64 KiB) round-trips identically on both backends (the window holds the growable span).
+#[test]
+fn grown_memory_is_usable() {
+    let wat = r#"
+(module (memory 1)
+  (func (export "g") (result i64)
+    (drop (memory.grow (i32.const 1)))      ;; 1 -> 2 pages (128 KiB)
+    (i64.store (i32.const 70000) (i64.const 0x0102030405060708))
+    (i64.load (i32.const 70000))))"#;
+    assert_eq!(run(wat, "g", &[]), 0x0102030405060708);
+}
+
+/// `memory64`: `memory.size`/`memory.grow` operate in i64.
+#[test]
+fn memory64_grow_and_size() {
+    let g =
+        r#"(module (memory i64 1) (func (export "g") (result i64) (memory.grow (i64.const 2))))"#;
+    assert_eq!(run(g, "g", &[]), 1);
+    let sz = r#"
+(module (memory i64 1)
+  (func (export "sz") (result i64)
+    (drop (memory.grow (i64.const 2)))
+    (memory.size)))"#;
+    assert_eq!(run(sz, "sz", &[]), 3);
+}
+
 #[test]
 fn unsupported_is_clean_error() {
-    // `memory.grow` is out of the current subset → a clean Unsupported error, not a panic.
-    let wat = r#"(module (memory 1) (func (export "g") (result i32) (memory.grow (i32.const 1))))"#;
+    // `memory.fill` (bulk memory) is out of the current subset → a clean Unsupported error, not a panic.
+    let wat = r#"(module (memory 1)
+      (func (export "f") (memory.fill (i32.const 0) (i32.const 0) (i32.const 1))))"#;
     let wasm = wat::parse_str(wat).unwrap();
     match svm_wasm::transpile(&wasm) {
         Err(svm_wasm::Error::Unsupported(_)) => {}

@@ -15,8 +15,9 @@
 //! `extend{8,16,32}_s` · `wrap`/`extend_i32` · `local.{get,set,tee}` · `drop` · `select` · `nop` · the
 //! full structured control set `block`/`loop`/`if`/`else`/`br`/`br_if`/`br_table`/`return`/
 //! `unreachable` (with dead-code / else-resurrection bookkeeping) · **linear memory** load/store
-//! (i32/i64, incl. narrow + `memory64`; the i32 address is zero-extended into our i64 window, which is
-//! sized to the wasm memory's initial pages) · direct **`call`** (multi-function + recursion) ·
+//! (i32/i64, incl. narrow + `memory64`; the i32 address is zero-extended into our i64 window) ·
+//! **`memory.size`/`memory.grow`** (pages; the window holds the full growable span, a runtime size
+//! cell backs growth — see [`transpile`]) · direct **`call`** (multi-function + recursion) ·
 //! **floats** (f32/f64 const/arith/unary/compare, load/store, and every int↔float conversion incl.
 //! `trunc`/`trunc_sat`/`convert`/`demote`/`promote`/`reinterpret`) · **globals** (`global.get`/`set`
 //! lowered to a reserved window region) · active **data segments** (initialized linear memory) ·
@@ -24,9 +25,9 @@
 //! `call_indirect` loads the entry and feeds it to our `CallIndirect`'s §3c type-id check) ·
 //! **function imports** (a wasm `call` to an import → a `cap.call` on a threaded capability handle;
 //! the host-ABI convention binds each import's `module`/`name` to a capability `type_id`/`op` — see
-//! [`transpile`]). Still a clean [`Error::Unsupported`] (added in slices): `memory.{grow,size}`,
-//! passive data/elements, table/memory/global imports, imports across multiple capability interfaces,
-//! SIMD, reference types.
+//! [`transpile`]). Still a clean [`Error::Unsupported`] (added in slices): bulk memory
+//! (`memory.fill`/`copy`/`init`), passive data/elements, table/memory/global imports, imports across
+//! multiple capability interfaces, SIMD, reference types.
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
@@ -63,6 +64,17 @@ fn unsup<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Unsupported(what.into()))
 }
 
+/// A wasm linear-memory page is 64 KiB.
+const WASM_PAGE: u64 = 1 << 16;
+/// `memory.grow` on an **unbounded** wasm memory may extend up to this many pages. The window must
+/// hold the whole growable span (SVM masks accesses into the window rather than bounds-checking-and-
+/// trapping — the documented confinement difference), so for unbounded memory this is a modest cap
+/// (16 MiB) that keeps the eagerly-committed window small. A declared `maximum` is honored instead.
+const DEFAULT_MAX_GROW_PAGES: u64 = 256;
+/// Hard ceiling on the growable span regardless of a declared `maximum`, so a pathological `maximum`
+/// can't blow up the committed window (256 MiB).
+const MAX_GROW_PAGES: u64 = 4096;
+
 /// The transpiled module plus the wasm `export name → function index` map (the IR carries no export
 /// names, so the caller — e.g. a differential harness — needs this to pick the entry).
 pub struct Transpiled {
@@ -94,6 +106,18 @@ fn val_type(w: W) -> Result<ValType, Error> {
 /// every import must share one `type_id` (methods distinguished by `op`); a non-numeric name, a
 /// table/memory/global import, or imports spanning multiple interfaces is a clean [`Error::Unsupported`]
 /// (real WASI, whose imports are non-numeric, needs a dedicated shim). A no-import module is unchanged.
+///
+/// **Linear-memory growth (`memory.size` / `memory.grow`).** The linear memory sits at window offset 0
+/// (wasm address `a` == window address `a`). When a module uses `memory.grow`, the window reserves the
+/// memory's *full growable span* at the bottom — up to its declared `maximum`, or a modest default
+/// ([`DEFAULT_MAX_GROW_PAGES`], bounded by [`MAX_GROW_PAGES`]) for unbounded memory — and places the
+/// globals/table regions above it, so growth never collides with them. A runtime **size cell** (an
+/// 8-byte window slot just above the linear memory, initialized to the initial page count) holds the
+/// current size: `memory.size` loads it and `memory.grow` updates it branch-free (set to the new size
+/// on success / unchanged on a past-cap failure, returning the old size or `-1`). Because SVM masks
+/// accesses into the window rather than bounds-checking-and-trapping, a grown page is simply reachable;
+/// the size cell only governs the `size`/`grow` *return values*. A module that never grows is
+/// unchanged (no cell, the tight initial-sized window, `memory.size` a constant).
 pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
     let mut func_type_idx: Vec<u32> = Vec::new();
@@ -297,16 +321,57 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
 
     let mem64 = mem.as_ref().map(|m| m.memory64).unwrap_or(false);
 
+    // Does any function use `memory.grow`? Only then must the window reserve room for the linear memory
+    // to expand (and carry a runtime size cell) — so a non-growing module (every existing kernel)
+    // transpiles to byte-identical IR and the same window. (`memory.size` without growth is a constant.)
+    let mut uses_grow = false;
+    'scan: for body in &bodies {
+        for op in body.get_operators_reader()? {
+            if matches!(op?, Operator::MemoryGrow { .. }) {
+                uses_grow = true;
+                break 'scan;
+            }
+        }
+    }
+
+    // Linear-memory layout. The linear memory sits at window offset 0 (so wasm address `a` is window
+    // address `a`); the page count it may occupy is its initial size, or — when `memory.grow` is used —
+    // up to its declared `maximum` (a default cap for unbounded memory, bounded by `MAX_GROW_PAGES`).
+    // The window must hold that whole span because SVM masks accesses into the window rather than
+    // bounds-checking-and-trapping (so a grown page is reachable, an over-grow access just masks).
+    let initial_pages = mem.as_ref().map(|m| m.initial).unwrap_or(0);
+    let max_pages = if uses_grow {
+        mem.as_ref()
+            .and_then(|m| m.maximum)
+            .unwrap_or(DEFAULT_MAX_GROW_PAGES)
+            .clamp(initial_pages.max(1), MAX_GROW_PAGES.max(initial_pages))
+    } else {
+        initial_pages
+    };
+    let mem_span_pages = if mem.is_some() { max_pages.max(1) } else { 0 };
+    let mem_bytes = mem_span_pages.saturating_mul(WASM_PAGE);
+
+    // Runtime current-size cell (pages), an 8-byte slot just above the linear-memory span — present
+    // only when `grow` is used; `memory.size`/`grow` load/store it, initialized to the initial page
+    // count via a `data` segment. (Without growth there is no cell and `memory.size` is a constant.)
+    let size_cell_off = mem_bytes;
+    let after_mem = if uses_grow {
+        data.push(svm_ir::Data {
+            offset: size_cell_off,
+            readonly: false,
+            bytes: initial_pages.to_le_bytes().to_vec(),
+        });
+        size_cell_off + 8
+    } else {
+        mem_bytes
+    };
+
     // wasm globals are module-level mutables our IR has no notion of, so we give them a reserved region
-    // **above** the linear memory and lower `global.get`/`set` to load/store there (8-byte slots, the
-    // standard "globals in memory" lowering). Initializers become `data` segments. A valid guest's
-    // linear-memory accesses stay in `[0, mem_bytes)` and so never reach the globals; only an OOB access
-    // would (which wasm traps and we don't — the documented confinement difference).
-    let mem_bytes = mem
-        .as_ref()
-        .map(|m| (m.initial.max(1)).saturating_mul(1 << 16))
-        .unwrap_or(0);
-    let globals_base = mem_bytes.div_ceil(8) * 8; // 8-byte aligned, just past the linear memory
+    // **above** the linear memory (and the size cell) and lower `global.get`/`set` to load/store there
+    // (8-byte slots, the standard "globals in memory" lowering). Initializers become `data` segments. A
+    // valid guest's linear-memory accesses stay in `[0, mem_bytes)` and so never reach the globals; only
+    // an OOB access would (which wasm traps and we don't — the documented confinement difference).
+    let globals_base = after_mem.div_ceil(8) * 8; // 8-byte aligned, just past the linear memory + cell
     let globals_types: Vec<ValType> = globals.iter().map(|(t, _)| *t).collect();
     for (g, (_, bytes)) in globals.iter().enumerate() {
         data.push(svm_ir::Data {
@@ -359,14 +424,20 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             &body,
             mem64,
             &imports,
+            MemGrow {
+                uses_grow,
+                size_cell_off,
+                max_pages,
+                initial_pages,
+            },
         )?);
     }
 
     // Our window is a power-of-two byte range (masking confines to it); size it to hold the linear
-    // memory **and** the globals + function-table regions. (wasm bounds-checks-and-traps on
-    // out-of-range access while we mask-confine to the ≥ power-of-two window — identical for in-bounds
-    // accesses; `memory.grow` is a later slice.) Globals/table-only modules still need a window.
-    let needed = table_end.max(globals_end).max(mem_bytes);
+    // memory (its full growable span) **and** the size cell + globals + function-table regions. (wasm
+    // bounds-checks-and-traps on out-of-range access while we mask-confine to the ≥ power-of-two
+    // window — identical for in-bounds accesses.) Globals/table-only modules still need a window.
+    let needed = table_end.max(globals_end).max(after_mem).max(mem_bytes);
     let memory = if mem.is_some() || !globals.is_empty() || tsize > 0 {
         let size_log2 = needed.max(1).next_power_of_two().trailing_zeros().max(16) as u8;
         Some(svm_ir::Memory { size_log2 })
@@ -464,6 +535,17 @@ struct IfElse {
     in_else: bool,
 }
 
+/// `memory.size`/`memory.grow` lowering parameters. When `uses_grow` the linear memory may expand and
+/// a runtime **size cell** (an 8-byte window slot at `size_cell_off`, holding the current page count)
+/// backs both ops; otherwise `memory.size` is the constant `initial_pages` and `grow` never appears.
+#[derive(Clone, Copy)]
+struct MemGrow {
+    uses_grow: bool,
+    size_cell_off: u64,
+    max_pages: u64,
+    initial_pages: u64,
+}
+
 struct Lower<'a> {
     blocks: Vec<BlockB>,
     cur: usize,
@@ -488,6 +570,8 @@ struct Lower<'a> {
     /// 64-bit linear memory (`memory64`): the address operand is already i64; otherwise it's an i32
     /// that must be zero-extended before our (i64-addressed) `load`/`store`.
     mem64: bool,
+    /// `memory.size`/`memory.grow` lowering config (size-cell offset, page caps).
+    mg: MemGrow,
     /// The single threaded **capability handle** (`i32`, the forgeable index a `cap.call` takes),
     /// present iff the module has function imports.
     /// Like the data-SP in the chibicc frontend, it is block param 0 of every block and is prepended
@@ -662,6 +746,7 @@ fn lower_func(
     body: &wasmparser::FunctionBody,
     mem64: bool,
     imports: &[(u32, u32, FuncType)],
+    mg: MemGrow,
 ) -> Result<Func, Error> {
     // Locals = params (with their incoming param values) then declared locals (default 0).
     let mut local_types: Vec<ValType> = params.to_vec();
@@ -706,6 +791,7 @@ fn lower_func(
         globals_base,
         table_base,
         mem64,
+        mg,
         handle: has_imports.then_some(0),
         imports,
         n_imp,
@@ -1002,6 +1088,117 @@ fn mem_store(lo: &mut Lower, op: StoreOp, m: MemArg) -> Result<(), Error> {
     Ok(())
 }
 
+/// The wasm memory index/size type: `i64` for `memory64`, else `i32`.
+fn idx_ty(mem64: bool) -> ValType {
+    if mem64 {
+        ValType::I64
+    } else {
+        ValType::I32
+    }
+}
+
+/// `memory.size`: the current size in pages. With growth it's a load of the runtime size cell; without
+/// growth the size is constant (`initial_pages`), so no cell is needed.
+fn mem_size_op(lo: &mut Lower) -> Result<(), Error> {
+    let ty = idx_ty(lo.mem64);
+    let v = if lo.mg.uses_grow {
+        let a = lo.emit(Inst::ConstI64(lo.mg.size_cell_off as i64));
+        let op = if lo.mem64 { LoadOp::I64 } else { LoadOp::I32 };
+        lo.emit(Inst::Load {
+            op,
+            addr: a,
+            offset: 0,
+            align: 3,
+        })
+    } else if lo.mem64 {
+        lo.emit(Inst::ConstI64(lo.mg.initial_pages as i64))
+    } else {
+        lo.emit(Inst::ConstI32(lo.mg.initial_pages as i32))
+    };
+    lo.push(v, ty);
+    Ok(())
+}
+
+/// `memory.grow(delta)`: extend by `delta` pages, returning the previous size (or `-1` if it would
+/// exceed `max_pages`). Lowered **branch-free**: page math in i64 (the grow delta is unsigned), then
+/// the size cell is set to `new` on success / unchanged on failure and the result is `old`/`-1`, each
+/// via `select`. Only emitted when `uses_grow`, so the size cell exists.
+fn mem_grow_op(lo: &mut Lower) -> Result<(), Error> {
+    let ty = idx_ty(lo.mem64);
+    let (delta, _) = lo.pop()?;
+    let (load_op, store_op) = if lo.mem64 {
+        (LoadOp::I64, StoreOp::I64)
+    } else {
+        (LoadOp::I32, StoreOp::I32)
+    };
+    let cell = lo.emit(Inst::ConstI64(lo.mg.size_cell_off as i64));
+    let old = lo.emit(Inst::Load {
+        op: load_op,
+        addr: cell,
+        offset: 0,
+        align: 3,
+    });
+    // Overflow-safe in i64 (a near-`u32::MAX` delta must not wrap past the cap into a "fits").
+    let widen = |lo: &mut Lower, v| {
+        if lo.mem64 {
+            v
+        } else {
+            lo.emit(Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: v,
+            })
+        }
+    };
+    let old64 = widen(lo, old);
+    let delta64 = widen(lo, delta);
+    let new64 = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: old64,
+        b: delta64,
+    });
+    let maxc = lo.emit(Inst::ConstI64(lo.mg.max_pages as i64));
+    let ok = lo.emit(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::LeU,
+        a: new64,
+        b: maxc,
+    });
+    let new_idx = if lo.mem64 {
+        new64
+    } else {
+        lo.emit(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: new64,
+        })
+    };
+    // Store `new` on success, unchanged `old` on failure (a no-op write); reuse `cell` as the address.
+    let stored = lo.emit(Inst::Select {
+        cond: ok,
+        a: new_idx,
+        b: old,
+    });
+    lo.emit_void(Inst::Store {
+        op: store_op,
+        addr: cell,
+        value: stored,
+        offset: 0,
+        align: 3,
+    });
+    let negone = if lo.mem64 {
+        lo.emit(Inst::ConstI64(-1))
+    } else {
+        lo.emit(Inst::ConstI32(-1))
+    };
+    let result = lo.emit(Inst::Select {
+        cond: ok,
+        a: old,
+        b: negone,
+    });
+    lo.push(result, ty);
+    Ok(())
+}
+
 fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), Error> {
     use Operator as O;
     // Dead code after a branch/return/unreachable: track structure (block depth) but emit nothing
@@ -1143,6 +1340,19 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64Store8 { memarg } => mem_store(lo, StoreOp::I64_8, memarg)?,
         O::I64Store16 { memarg } => mem_store(lo, StoreOp::I64_16, memarg)?,
         O::I64Store32 { memarg } => mem_store(lo, StoreOp::I64_32, memarg)?,
+        // ---- memory.size / memory.grow (pages; the window holds the growable span) ----
+        O::MemorySize { mem } => {
+            if mem != 0 {
+                return unsup("memory.size on a non-zero memory");
+            }
+            mem_size_op(lo)?;
+        }
+        O::MemoryGrow { mem } => {
+            if mem != 0 {
+                return unsup("memory.grow on a non-zero memory");
+            }
+            mem_grow_op(lo)?;
+        }
         // ---- floats: const / arithmetic / unary / compare ----
         O::F32Const { value } => {
             let v = lo.emit(Inst::ConstF32(value.bits()));
