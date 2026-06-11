@@ -1050,10 +1050,24 @@ leave a shared view — add a unix test for this alongside the Windows work.
     it catches single-visible-op spin bodies (the `cmpxchg`/flag-load spinlock); a multi-visible-op spin
     body falls back to bounded exploration (still sound). Gated on memop mode (the exhaustive/brute
     explorers); the seeded sweep is fuel-bounded and unaffected.*
+  - **Fiber/vCPU quota metering (§15) — DONE.** Host-configurable spawn ceilings *below* the fixed
+    anti-bomb ceilings (`MAX_FIBERS`/`MAX_VCPUS = 1<<16`): DoS *containment* policy (the §5 fuel
+    kill-path bounds runaway *execution*; the quota bounds runaway *spawning*). `svm_interp::Quota
+    { max_fibers, max_vcpus }` on the `Host` (`Host::set_quota`, clamped — a quota only tightens);
+    `drive` reads it for the executor's live-vCPU cap + each vCPU's fiber cap (inherited by spawned/
+    co-fiber/nested children). The JIT mirrors it via `svm_jit::Quota` threaded into
+    `fiber_rt::FiberRuntime`/`os_thread_rt::Domain`; `svm_run::run_powerbox` passes `host.quota()` so a
+    Host-set quota binds both backends. `cont.new`/`thread.spawn` past the cap trap `FiberFault`/
+    `ThreadFault`. Default = the ceilings ⇒ unconfigured runs unchanged. Tests `svm/tests/quota.rs`
+    (interp) + `jit_quota.rs` (JIT, gated to fiber_rt targets). *Two documented semantic nuances: the
+    JIT tables hold no root entry (interp's do), so the same quota admits one more spawn on the JIT; and
+    the JIT vCPU table is cumulative (a join doesn't free the slot), so `max_vcpus` bounds total spawns
+    there vs concurrent liveness on the interp — both contain DoS. **Follow-ups:** a `run_powerbox`
+    quota arg for embedders (today the powerbox Host carries the default); optionally reconcile the
+    root-count/cumulative nuances across backends.*
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
-    today), fiber/vCPU quota metering (the kill path exists; *metering*/quotas don't yet), the D57
-    migratable-fiber primitive (stackful work-stealing), and the DPOR refinements (source sets /
-    wakeup trees for full optimality; multi-op spin-body detection).
+    today), the D57 migratable-fiber primitive (stackful work-stealing), and the DPOR refinements
+    (source sets / wakeup trees for full optimality; multi-op spin-body detection).
 
 - [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
   virtual memory** — *most of the §1a differentiators live here.* Sub-window **confinement** is
@@ -1522,9 +1536,10 @@ regressions one commit old"):
 >    (guest owns the stealing policy; VM enforces single-owner). **Gated on a loom-verified ownership
 >    protocol + expert review.** Design + roadmap in `SCHEDULING.md`. Now unblocked: B has landed (and
 >    its suspend/wake protocol — the futex park + completion notify — informs the fiber's).
-> 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); fiber/vCPU
->    quota *metering* (§15; the kill path exists, quotas don't); the async-ring
->    pool could grow more offloadable ops. *(Done across recent batches: **DPOR + sleep sets** for
+> 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); the
+>    async-ring pool could grow more offloadable ops. *(Done across recent batches: **fiber/vCPU quota
+>    metering** (§15) — host-configurable spawn ceilings (`Quota` on the `Host`, enforced on both
+>    backends, `FiberFault`/`ThreadFault` on exceed; `quota.rs`/`jit_quota.rs`); **DPOR + sleep sets** for
 >    `explore_all` — prunes independent-op reorderings and the residual cross-cluster redundancy, sound
 >    vs the retained brute-force oracle (`svm/tests/dpor.rs`); and **spin-loop handling** — a busy-wait
 >    spinlock is now exhaustively verifiable (parked-until-written, not re-spun; `svm/tests/spinloop.rs`)
@@ -1703,7 +1718,8 @@ The build log, roughly in landing order:
    `jit_killpath_stops_runaway_child`). **The kill-path is now closed across every JIT execution
    context** (root, sibling vCPUs, nested children).
 4. **Concurrency loose ends** — the async submit/complete ring (§9/§12) *(done)*, fiber/vCPU quota
-   metering, and DPOR to scale `explore_all` past lock-free shapes *(done — `explore_all` is now a
+   metering *(done — host-configurable `Quota`, both backends; `quota.rs`/`jit_quota.rs`)*, and DPOR to
+   scale `explore_all` past lock-free shapes *(done — `explore_all` is now a
    DPOR checker, sound vs the retained `explore_all_bruteforce` oracle; `svm/tests/dpor.rs`)*.
 5. **Language on-ramp** (§14/D54) — the LLVM-bitcode→IR translator (breadth, the differentiator
    vehicle) and/or an optional wasm→IR bridge (compat).
