@@ -369,17 +369,19 @@ struct Resolved {
 /// The hand-written [`KERNELS`] plus, when the C frontend is buildable, the chibicc-lowered
 /// kernels (`alu_c`, `locals_c` — see [`alu_from_c`] / [`locals_from_c`]).
 ///
-/// With `from_wasm`, each **compute** kernel's SVM IR is replaced by transpiling its `wat32` through
-/// `svm-wasm` (the same bytes Wasmtime runs) — the genuine apples-to-apples comparison. Kernels the
-/// transpiler can't handle keep their hand-written IR, with a note saying why.
+/// With `from_wasm`, each kernel's SVM IR is replaced by transpiling its `wat32` through `svm-wasm`
+/// (the same bytes Wasmtime runs) — the genuine apples-to-apples comparison. This now covers the
+/// **`hostcall` / `hostbuf`** interface kernels too: their `host.op` / `host.sum` imports use the
+/// host-ABI convention (`module` = capability type_id, `name` = op), so they transpile to the same
+/// `cap.call` the hand-written IR used. Kernels the transpiler can't handle keep their hand-written
+/// IR, with a note saying why.
 ///
-/// **svm-wasm doesn't transpile (so these are excluded / unchanged under `--from-wasm`):**
-/// - **imports / the host-function ABI** — so the `hostcall` / `hostbuf` interface kernels (which
-///   import `host.op` / `host.sum`) can't come from wasm; they keep their hand-written `cap.call` IR.
-/// - **`memory.grow` / `memory.size`**, **passive** data/element segments, **SIMD (v128)**, and
-///   **reference types** beyond funcref tables. (Supported: i32/i64/f32/f64 numeric + all conversions,
-///   locals, the full structured control set, linear memory, direct + indirect calls, globals, active
-///   data/element segments — enough for every *compute* kernel here.)
+/// **svm-wasm doesn't transpile (so these keep their hand-written IR under `--from-wasm`):**
+/// **`memory.grow` / `memory.size`**, **passive** data/element segments, imports across multiple
+/// capability interfaces, **SIMD (v128)**, and **reference types** beyond funcref tables. (Supported:
+/// i32/i64/f32/f64 numeric + all conversions, locals, the full structured control set, linear memory,
+/// direct + indirect calls, globals, active data/element segments, and **function imports / the host
+/// ABI** — enough for every kernel here.)
 fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
     let mut v: Vec<Resolved> = KERNELS
         .iter()
@@ -405,19 +407,18 @@ fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
 
     if from_wasm {
         for k in &mut v {
-            if k.mode != Mode::Compute {
-                eprintln!(
-                    "note: --from-wasm keeps `{}` hand-written — it imports a host function, \
-                     which svm-wasm doesn't transpile (no import / host-ABI support yet)",
-                    k.name
-                );
-                continue;
-            }
             match transpile_wat_to_ir(&k.wat32) {
                 Ok((ir, entry)) => {
                     k.ir = ir;
                     k.entry = entry;
-                    k.lead_args = Vec::new();
+                    // A `HostCall` kernel's wasm imports a host function, so the transpiled entry takes
+                    // the threaded capability handle as its leading param (the host-ABI convention). The
+                    // stateless `bench_thunk` ignores the handle, so any value works — pass 0.
+                    k.lead_args = if k.mode == Mode::HostCall {
+                        vec![0]
+                    } else {
+                        Vec::new()
+                    };
                 }
                 Err(e) => eprintln!(
                     "note: --from-wasm keeps `{}` hand-written (svm-wasm: {e})",
@@ -478,7 +479,7 @@ block3(v15: i64):
         lead_args: Vec::new(),
         wat32: r#"
 (module
-  (import "host" "op" (func $op (param i64) (result i64)))
+  (import "0" "0" (func $op (param i64) (result i64)))
   (func (export "run") (param $n i64) (result i64)
     (local $acc i64) (local $i i64)
     (block $done
@@ -533,7 +534,7 @@ block3(v17: i64):
         lead_args: Vec::new(),
         wat32: r#"
 (module
-  (import "host" "sum" (func $sum (param i32 i32) (result i64)))
+  (import "0" "1" (func $sum (param i32 i32) (result i64)))
   (memory (export "memory") 1)
   (func (export "run") (param $n i64) (result i64)
     (local $acc i64) (local $i i64)
@@ -719,13 +720,16 @@ fn wasm_entry(engine: &Engine, wasm: &[u8]) -> (Store<HostState>, TypedFunc<i64,
 fn wasm_entry_host(engine: &Engine, wasm: &[u8]) -> (Store<HostState>, TypedFunc<i64, i64>) {
     let module = Module::new(engine, wasm).expect("wasmtime compile");
     let mut linker: Linker<HostState> = Linker::new(engine);
+    // Imports use the svm-wasm host-ABI convention (module = capability type_id, name = op) so the
+    // *same WAT* transpiles to `cap.call <type_id> <op>` under `--from-wasm`: "0"/"0" → op 0 (scalar
+    // x+1), "0"/"1" → op 1 (sum a borrow buffer), matching `bench_thunk`'s op dispatch.
     linker
-        .func_wrap("host", "op", |x: i64| -> i64 { x.wrapping_add(1) })
-        .expect("define host.op");
+        .func_wrap("0", "0", |x: i64| -> i64 { x.wrapping_add(1) })
+        .expect("define host op 0");
     linker
         .func_wrap(
-            "host",
-            "sum",
+            "0",
+            "1",
             |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i64 {
                 let mem = caller.data().expect("memory cached in store"); // Memory is Copy
                 let data = mem.data(&caller);
@@ -733,7 +737,7 @@ fn wasm_entry_host(engine: &Engine, wasm: &[u8]) -> (Store<HostState>, TypedFunc
                 data[p..p + l].iter().map(|&b| b as i64).sum()
             },
         )
-        .expect("define host.sum");
+        .expect("define host op 1");
     let mut store = Store::new(engine, None);
     let instance = linker
         .instantiate(&mut store, &module)
