@@ -21,10 +21,9 @@ int write(int fd, char *buf, long n);
 
 static char *g_blocks[NWORKERS * NALLOC]; /* each worker writes its own disjoint slice */
 
-/* A byte pattern unique to (worker, block, offset) — distinct across blocks so an overlap shows.
- * Kept in 0..127 (one printable-ish range) so the check is a plain low-bit `char` compare. */
+/* A byte pattern unique to (worker, block, offset) — distinct across blocks so an overlap shows. */
 static char pat(long w, int k, int i) {
-  return (char)((w * 31 + k * 7 + i) & 0x7F);
+  return (char)(w * 31 + k * 7 + i);
 }
 
 static void *worker(void *arg) {

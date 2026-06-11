@@ -562,6 +562,30 @@ static int cmpop(Node *node, char *base, bool sign) {
 // Convert SSA value `a` of type `from` to type `to` (the C "usual conversions"): int<->
 // int (extend/wrap), float<->float (promote/demote), and int<->float. float->int is
 // **saturating** (`trunc_sat`) so an out-of-range conversion is total, not a trap (§3b).
+// Reduce an i32 value to a **narrow integer** target's width (char/short/_Bool/packed enum). The IR
+// has no i8/i16 value type — char/short/_Bool are all carried as i32 — so a same-IR-width conversion
+// leaves the full value; a value-level cast must still truncate it (previously only the *store* width
+// did, so an *rvalue* cast like `(char)300`, `(unsigned char)256`, or `(_Bool)200` kept the wrong
+// value). Uses only ops every backend lowers (shift / and / ne), so no verifier/JIT change.
+static int narrow_to(int v, Type *to) {
+  if (to->size != 1 && to->size != 2)
+    return v; // i32/i64-width target (int/long/enum) — already at width
+  if (to->is_unsigned) { // zero-extend the low byte/halfword: v & 0xFF / 0xFFFF
+    int m = nv++;
+    fprintf(o, "  v%d = i32.const %d\n", m, to->size == 1 ? 0xFF : 0xFFFF);
+    int r = nv++;
+    fprintf(o, "  v%d = i32.and v%d v%d\n", r, v, m);
+    return r;
+  }
+  int sh = nv++; // sign-extend the low byte/halfword: (v << k) >> k arithmetic
+  fprintf(o, "  v%d = i32.const %d\n", sh, to->size == 1 ? 24 : 16);
+  int t = nv++;
+  fprintf(o, "  v%d = i32.shl v%d v%d\n", t, v, sh);
+  int r = nv++;
+  fprintf(o, "  v%d = i32.shr_s v%d v%d\n", r, t, sh);
+  return r;
+}
+
 static int gen_convert(int a, Type *from, Type *to) {
   // An aggregate (struct/union) value is an *address*; casting one to a scalar reinterprets
   // its bytes — chibicc emits this when it initializes a union via its first member
@@ -572,25 +596,40 @@ static int gen_convert(int a, Type *from, Type *to) {
   // copy handled elsewhere by memcpy) converts with no value change.
   if (by_address(from) || by_address(to))
     return a;
-  bool ff = is_flt(from), tf = is_flt(to);
-  if (is64(from) == is64(to) && ff == tf)
-    return a; // same IR type — no-op
-  int r = nv++;
-  if (!ff && !tf) {
-    if (is64(to))
-      fprintf(o, "  v%d = i64.extend_i32_%s v%d\n", r, from->is_unsigned ? "u" : "s", a);
-    else
-      fprintf(o, "  v%d = i32.wrap_i64 v%d\n", r, a);
-  } else if (ff && tf) {
-    fprintf(o, "  v%d = %s v%d\n", r, is64(to) ? "f64.promote_f32" : "f32.demote_f64", a);
-  } else if (!ff && tf) {
-    fprintf(o, "  v%d = %s.convert_%s_%s v%d\n", r, irty(to), irty(from),
-            from->is_unsigned ? "u" : "s", a);
-  } else {
-    fprintf(o, "  v%d = %s.trunc_sat_%s_%s v%d\n", r, irty(to), irty(from),
-            to->is_unsigned ? "u" : "s", a);
+  // `(_Bool)x == (x != 0)` (exactly 0/1), tested in `x`'s **own** type — so high bits of a `long`
+  // and a fractional `float` count (testing the width-narrowed value would lose them).
+  if (to->kind == TY_BOOL) {
+    char *fp = irty(from); // i32/i64/f32/f64
+    int z = nv++;
+    fprintf(o, "  v%d = %s.const 0\n", z, fp);
+    int r = nv++;
+    fprintf(o, "  v%d = %s.ne v%d v%d\n", r, fp, a, z);
+    return r;
   }
-  return r;
+  bool ff = is_flt(from), tf = is_flt(to);
+  // First bring the value to `to`'s IR width / float-ness…
+  int v;
+  if (is64(from) == is64(to) && ff == tf) {
+    v = a; // same IR type
+  } else {
+    v = nv++;
+    if (!ff && !tf) {
+      if (is64(to))
+        fprintf(o, "  v%d = i64.extend_i32_%s v%d\n", v, from->is_unsigned ? "u" : "s", a);
+      else
+        fprintf(o, "  v%d = i32.wrap_i64 v%d\n", v, a);
+    } else if (ff && tf) {
+      fprintf(o, "  v%d = %s v%d\n", v, is64(to) ? "f64.promote_f32" : "f32.demote_f64", a);
+    } else if (!ff && tf) {
+      fprintf(o, "  v%d = %s.convert_%s_%s v%d\n", v, irty(to), irty(from),
+              from->is_unsigned ? "u" : "s", a);
+    } else {
+      fprintf(o, "  v%d = %s.trunc_sat_%s_%s v%d\n", v, irty(to), irty(from),
+              to->is_unsigned ? "u" : "s", a);
+    }
+  }
+  // …then, for an integer target narrower than its i32 carrier, reduce to its width.
+  return tf ? v : narrow_to(v, to);
 }
 
 static int gen_cast(Node *node) {

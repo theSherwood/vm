@@ -1262,14 +1262,15 @@ regressions one commit old"):
 >    its suspend/wake protocol — the futex park + completion notify — informs the fiber's).
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); fiber/vCPU
 >    quota *metering* (§15; the kill path exists, quotas don't); DPOR for `explore_all`; the async-ring
->    pool could grow more offloadable ops; and a **chibicc high-bit-`char` bug** found while testing the
->    malloc demo (a `(char)` of a value ≥ 128, or an `(unsigned char)` narrowing cast, doesn't truncate
->    to 8 bits — `(char)200 != (char)200` compares *true* on the VM but false on native `cc`; the demos
->    sidestep it by keeping patterns in 0..127). It's an **untrusted-frontend** bug (re-verified output
->    is still safe), pre-existing and independent of the allocator, but a real interp+JIT-vs-`cc`
->    correctness gap worth a focused fix in `codegen_ir.c`'s cast/load lowering. *(Done this batch: the
->    JIT cap-path page-map persistence — `Host::cap_window_pages` + `MprotectWindow::new_shared` — and the
->    **thread-safe guest `malloc`**.)*
+>    pool could grow more offloadable ops. *(Done this batch: the JIT cap-path page-map persistence
+>    (`Host::cap_window_pages` + `MprotectWindow::new_shared`); the **thread-safe guest `malloc`**; and a
+>    **chibicc narrowing-cast bug** found via the malloc demo — a value-level cast to `char`/`short`/
+>    `_Bool` (which the IR all carry as `i32`) wasn't truncated, so `(char)200`/`(_Bool)200` kept the
+>    wrong value (only the *store* width truncated, so `char c = (char)200` worked but an rvalue cast
+>    didn't). Fixed in `codegen_ir.c`'s `gen_convert` (`narrow_to`: sign-extend low byte/halfword via
+>    shifts, `& 0xFF`/`0xFFFF` for unsigned, `!= 0` for `_Bool` — only ops every backend lowers).
+>    Untrusted-frontend (re-verified output was always safe); guard `c_matches_gcc_narrowing_casts`; the
+>    byte-heavy demos (sha256/xxhash/jsmn/tinfl) still match `cc`.)*
 > 4. **Maintainer one-liners** (need the `workflow` token scope I can't push): apply the nightly **miri**
 >    CI job (snippet at commit `60d4f3a`); drop `continue-on-error` from the now-green `cross-os` matrix.
 

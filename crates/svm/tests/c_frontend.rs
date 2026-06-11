@@ -1385,6 +1385,29 @@ fn c_matches_gcc_arithmetic_and_control_flow() {
     );
 }
 
+/// Narrowing **rvalue casts** to `char`/`short`/`_Bool` must truncate to the target width — the IR
+/// carries all three as `i32`, so `gen_convert` has to reduce the value (sign-extend the low byte/
+/// halfword, mask for unsigned, `!= 0` for `_Bool`), not lean on a store width. Before the fix
+/// `(char)200` kept `200` and these `== expected` checks returned `0` on the VM vs `1` on `cc`
+/// (non-vacuous). Each `main` returns `0`/`1`, so the comparison — not an exit code (which truncates
+/// mod 256 and would hide the bug) — is what's checked.
+#[test]
+fn c_matches_gcc_narrowing_casts() {
+    assert_matches_gcc("int main(){ return (char)200 == -56; }");
+    assert_matches_gcc("int main(){ return (unsigned char)300 == 44; }");
+    assert_matches_gcc("int main(){ return (char)(-200) == 56; }");
+    assert_matches_gcc("int main(){ return (short)100000 == -31072; }");
+    assert_matches_gcc("int main(){ return (unsigned short)0x12345 == 0x2345; }");
+    assert_matches_gcc("int main(){ return (_Bool)200 == 1; }");
+    assert_matches_gcc("int main(){ return (_Bool)0 == 0; }");
+    // `_Bool` tests the *source* value: a long's high bits and a fractional float both count.
+    assert_matches_gcc("int main(){ long x = 0x100000000L; return (_Bool)x == 1; }");
+    assert_matches_gcc("int main(){ double d = 0.5; return (_Bool)d == 1; }");
+    assert_matches_gcc("int main(){ long x = 0xAB; return (char)x == -85; }"); // i64 -> char
+                                                                               // 125+126+127 + (-128)+(-127)+(-126) = -3 (each i past 127 wraps signed).
+    assert_matches_gcc("int main(){ int s=0; for(int i=125;i<131;i++) s+=(char)i; return s==-3; }");
+}
+
 #[test]
 fn c_matches_gcc_functions_and_recursion() {
     assert_matches_gcc(
