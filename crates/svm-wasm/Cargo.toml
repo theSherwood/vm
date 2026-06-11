@@ -1,0 +1,20 @@
+[package]
+name = "svm-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A **frontend**, not part of the escape-TCB: it consumes the core crates (svm-ir/svm-text) to
+# produce a verifier-checked `Module` from core wasm, and is never a dependency of svm-jit/svm-interp.
+# Like the chibicc fork, its output is re-verified, so a transpiler bug is a clean error, not an escape.
+
+[dependencies]
+svm-ir = { path = "../svm-ir" }
+wasmparser = "0.251"
+
+[dev-dependencies]
+svm-text = { path = "../svm-text" }
+svm-verify = { path = "../svm-verify" }
+svm-interp = { path = "../svm-interp" }
+svm-jit = { path = "../svm-jit" }
+wat = "1"
