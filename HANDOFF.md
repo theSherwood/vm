@@ -1065,9 +1065,12 @@ leave a shared view — add a unix test for this alongside the Windows work.
     spawns and a spawn-join *loop* doesn't false-trap (the old `cells.len()` cumulative check was a
     latent bug — it would trap a spawn-join loop at the ceiling and leak). Tests `svm/tests/quota.rs`
     (interp) + `jit_quota.rs` (JIT, gated to fiber_rt targets) share programs/quotas/expectations and
-    include a spawn-join-loop concurrency test on both. **Follow-up:** a `run_powerbox` quota arg for
-    embedders (today the powerbox Host carries the default; an embedder can already set a quota on a
-    `Host` it drives directly).
+    include a spawn-join-loop concurrency test on both. **Embedder + CLI exposed (§15 complete):**
+    `svm_run::run_powerbox_with_deadline_and_quota(module, stdin, deadline, quota)` sets the quota on
+    the powerbox Host (threaded to the JIT); `svm_jit::Quota` re-exported from `svm-run`; the CLI reads
+    `SVM_MAX_FIBERS`/`SVM_MAX_VCPUS` (like `SVM_DEADLINE_MS`). End-to-end test
+    `run.rs::quota_contains_a_powerbox_thread_bomb` (a powerbox guest's spawn is detect-and-killed under
+    `max_vcpus=1`, runs under the default).
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
     today), the D57 migratable-fiber primitive (stackful work-stealing), and the DPOR refinements
     (source sets / wakeup trees for full optimality; multi-op spin-body detection).
