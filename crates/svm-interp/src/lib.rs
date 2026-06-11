@@ -516,37 +516,69 @@ struct SchedEvent {
     access: MemAccess,
 }
 
-/// Drives one schedule under DPOR: follow `plan` (one `TaskId` per decision); past its end pick the
-/// smallest enabled `TaskId` (a deterministic default). Records the executed `trace` for race analysis.
+/// Drives one schedule under DPOR with **sleep sets** (Flanagan–Godefroid). Follow `plan` (one
+/// `TaskId` per decision); past its end pick the smallest enabled `TaskId` that is **not asleep**. As
+/// it descends it carries the current `sleep` set — threads whose exploration from here would be
+/// redundant: a thread sleeps in a subtree once a sibling *independent* with it has been explored, and
+/// wakes the moment a *conflicting* transition runs. `prior[d]` supplies the siblings already explored
+/// at depth `d` (with their accessed objects), so the inherited sleep is reconstructed during replay.
+/// Records the executed `trace` for race analysis; sets `blocked` when every enabled vCPU is asleep
+/// (a redundant prefix whose completions were covered by other schedules — the run stops, contributing
+/// no outcome).
 struct Dpor {
     plan: Vec<TaskId>,
+    prior: Vec<BTreeMap<TaskId, MemAccess>>,
     depth: usize,
+    sleep: BTreeMap<TaskId, MemAccess>,
     trace: Vec<SchedEvent>,
-    /// The `(tid, enabled)` chosen at the current decision, finalized into a [`SchedEvent`] once the
-    /// step's [`MemAccess`] is known (after it runs).
     pending: Option<(TaskId, Vec<TaskId>)>,
+    blocked: bool,
 }
 
 impl Dpor {
-    fn new(plan: Vec<TaskId>) -> Dpor {
+    fn new(plan: Vec<TaskId>, prior: Vec<BTreeMap<TaskId, MemAccess>>) -> Dpor {
         Dpor {
             plan,
+            prior,
             depth: 0,
+            sleep: BTreeMap::new(),
             trace: Vec::new(),
             pending: None,
+            blocked: false,
         }
     }
 
     /// Choose the next vCPU by `TaskId` (not runnable index — the runnable order is reshuffled by
-    /// `swap_remove`, so addressing by id keeps the plan stable across replays). `enabled` is sorted.
-    fn pick(&mut self, enabled: &[TaskId]) -> TaskId {
-        let tid = self.plan.get(self.depth).copied().unwrap_or(enabled[0]);
+    /// `swap_remove`, so addressing by id keeps the plan stable across replays). Returns `None` when
+    /// every enabled vCPU is asleep, so the caller stops this (redundant) run. `enabled` is sorted.
+    fn pick(&mut self, enabled: &[TaskId]) -> Option<TaskId> {
+        let tid = if self.depth < self.plan.len() {
+            // Forced replay (incl. a race-woken thread): the planned choice overrides the sleep set.
+            self.plan[self.depth]
+        } else {
+            // Greedy extension: the smallest enabled thread that is not asleep here.
+            match enabled
+                .iter()
+                .copied()
+                .find(|t| !self.sleep.contains_key(t))
+            {
+                Some(t) => t,
+                None => {
+                    self.blocked = true;
+                    return None;
+                }
+            }
+        };
         debug_assert!(enabled.contains(&tid), "planned tid must be runnable");
         self.pending = Some((tid, enabled.to_vec()));
-        tid
+        Some(tid)
     }
 
-    /// Finalize the current decision into the trace once its `access` is known.
+    /// Finalize the current decision into the trace once its `access` is known, and advance the sleep
+    /// set to the child state: the thread that just ran leaves the set (its old next-transition entry is
+    /// stale); the siblings explored before it (`prior[depth]`) join it; then everything that
+    /// **conflicts** with the transition just taken wakes (is dropped), leaving only the independent
+    /// threads asleep deeper — the FG sleep-set rule `sleep(s.p) = {q ∈ sleep(s) : indep(p, q)}`.
     fn finish(&mut self, access: MemAccess) {
         if let Some((tid, enabled)) = self.pending.take() {
             self.trace.push(SchedEvent {
@@ -554,19 +586,31 @@ impl Dpor {
                 enabled,
                 access,
             });
+            self.sleep.remove(&tid);
+            if let Some(prior) = self.prior.get(self.depth) {
+                for (&q, &qacc) in prior {
+                    self.sleep.entry(q).or_insert(qacc);
+                }
+            }
+            self.sleep.retain(|_, &mut qacc| !access.conflicts(qacc));
             self.depth += 1;
         }
     }
 }
 
-/// One node of the DPOR exploration along the current depth-first path: the vCPU `chosen` here, the
-/// `enabled` set at this point, and the `backtrack`/`done` sets (threads still to explore vs. already
-/// explored from this state) — the classic Flanagan–Godefroid bookkeeping.
+/// One node of the DPOR exploration along the current depth-first path: the vCPU `chosen` here (and the
+/// object `chosen_acc` it touched), the `enabled` set, the `backtrack`/`done` sets (threads still to
+/// explore vs. already explored from this state), each explored thread's access (`done_acc`), and
+/// `prior_acc` — the siblings explored *before* the current `chosen`, which seed the child sleep set
+/// during replay. The Flanagan–Godefroid bookkeeping, plus the access maps sleep sets need.
 struct DporSlot {
     chosen: TaskId,
+    chosen_acc: MemAccess,
     enabled: Vec<TaskId>,
     backtrack: BTreeSet<TaskId>,
     done: BTreeSet<TaskId>,
+    done_acc: BTreeMap<TaskId, MemAccess>,
+    prior_acc: BTreeMap<TaskId, MemAccess>,
 }
 
 /// **Exhaustive interleaving model checker** (§18) with **dynamic partial-order reduction** (DPOR):
@@ -577,14 +621,17 @@ struct DporSlot {
 /// It's a *stateless* checker (CHESS / `shuttle`-style): each schedule is one fresh execution replayed
 /// from a planned sequence of scheduling choices, with no VM-state snapshotting. vCPUs run at
 /// **memory-op granularity** (`memop` + `quantum = 1`), so the decision points are exactly the
-/// shared-state / sync operations ([`is_visible`]). DPOR (Flanagan–Godefroid stateless form) then only
-/// explores *both* orders of two transitions when they actually **conflict** ([`MemAccess::conflicts`]:
-/// same bytes, one a write); independent operations keep one order. After each run it detects races
-/// (for each transition, the latest earlier conflicting transition by a *different* vCPU) and adds the
-/// conflicting vCPU to that earlier decision's `backtrack` set, then DFS-backtracks to the deepest
-/// decision with an unexplored alternative — stopping when the tree is exhausted or `max_schedules` is
-/// hit. The reduction is sound: reordering independent ops cannot change the terminal state, so the set
-/// of reachable outcomes is identical to the unreduced enumeration ([`explore_all_bruteforce`], the
+/// shared-state / sync operations ([`is_visible`]). DPOR (Flanagan–Godefroid stateless form, **with
+/// sleep sets**) then only explores *both* orders of two transitions when they actually **conflict**
+/// ([`MemAccess::conflicts`]: same bytes, one a write); independent operations keep one order. After
+/// each run it detects races (for each transition, the latest earlier conflicting transition by a
+/// *different* vCPU) and adds the conflicting vCPU to that earlier decision's `backtrack` set; **sleep
+/// sets** then prune the residual redundancy (a thread that became redundant after an independent
+/// sibling ran is held asleep down that subtree until a conflict wakes it), so the search visits
+/// essentially one schedule per Mazurkiewicz trace. It DFS-backtracks to the deepest decision with an
+/// unexplored, non-sleeping alternative — stopping when the tree is exhausted or `max_schedules` is hit.
+/// The reduction is sound: reordering independent ops cannot change the terminal state, so the set of
+/// reachable outcomes is identical to the unreduced enumeration ([`explore_all_bruteforce`], the
 /// differential oracle) at a fraction of the schedules.
 ///
 /// Asserting `outcomes == [expected]` (with `complete`) proves the invariant holds under every
@@ -612,8 +659,11 @@ pub fn explore_all(
 
     loop {
         // Replay the current path (`chosen` per depth), extending with the default choice past its end.
+        // `prior` carries each slot's pre-`chosen` siblings so the controller reconstructs sleep sets.
         let plan: Vec<TaskId> = stack.iter().map(|s| s.chosen).collect();
-        let mut dpor = Dpor::new(plan);
+        let prior: Vec<BTreeMap<TaskId, MemAccess>> =
+            stack.iter().map(|s| s.prior_acc.clone()).collect();
+        let mut dpor = Dpor::new(plan, prior);
         let result = run_one_schedule(
             &funcs,
             &m.memory,
@@ -624,14 +674,16 @@ pub fn explore_all(
             Policy::Dpor(&mut dpor),
         );
         schedules += 1;
-        if !outcomes.contains(&result) {
+        // A sleep-blocked run is a redundant prefix (its completions were reached elsewhere): keep its
+        // trace for race/backtrack bookkeeping, but don't record an outcome from its truncated tail.
+        if !dpor.blocked && !outcomes.contains(&result) {
             outcomes.push(result);
         }
         let trace = dpor.trace;
 
         // Sync the path stack with the trace just produced. Slots for the replayed prefix already
         // exist (their `chosen` matches by construction); push fresh slots for newly reached depths;
-        // a forced choice that shortened the run drops the now-stale deeper slots.
+        // a forced/blocked choice that shortened the run drops the now-stale deeper slots.
         if trace.len() < stack.len() {
             stack.truncate(trace.len());
         }
@@ -639,12 +691,18 @@ pub fn explore_all(
             if d < stack.len() {
                 debug_assert_eq!(stack[d].chosen, ev.tid);
                 stack[d].enabled.clone_from(&ev.enabled);
+                stack[d].chosen_acc = ev.access;
+                stack[d].done.insert(ev.tid);
+                stack[d].done_acc.insert(ev.tid, ev.access);
             } else {
                 stack.push(DporSlot {
                     chosen: ev.tid,
+                    chosen_acc: ev.access,
                     enabled: ev.enabled.clone(),
                     backtrack: BTreeSet::from([ev.tid]),
                     done: BTreeSet::from([ev.tid]),
+                    done_acc: BTreeMap::from([(ev.tid, ev.access)]),
+                    prior_acc: BTreeMap::new(),
                 });
             }
         }
@@ -653,7 +711,7 @@ pub fn explore_all(
         // transition `i` by a *different* vCPU that conflicts with it, and ensure the decision at `i`
         // will also try `j`'s vCPU (or, if it wasn't co-enabled there, every enabled vCPU — the
         // conservative "may-be-co-enabled" fallback). The recursion across runs then covers earlier
-        // conflicts.
+        // conflicts. A race-added thread overrides the sleep set (backtrack ∖ done isn't pruned by it).
         for j in 0..trace.len() {
             for i in (0..j).rev() {
                 if trace[i].tid != trace[j].tid && trace[i].access.conflicts(trace[j].access) {
@@ -669,7 +727,8 @@ pub fn explore_all(
             }
         }
 
-        // Backtrack to the deepest decision with an unexplored alternative; force it next run.
+        // Backtrack to the deepest decision with an unexplored alternative; force it next run, recording
+        // the now-explored siblings as its child's sleep seed (`prior_acc`).
         let mut next = None;
         for d in (0..stack.len()).rev() {
             if let Some(&p) = stack[d].backtrack.difference(&stack[d].done).next() {
@@ -679,6 +738,7 @@ pub fn explore_all(
         }
         match next {
             Some((d, p)) if schedules < max_schedules => {
+                stack[d].prior_acc = stack[d].done_acc.clone();
                 stack[d].done.insert(p);
                 stack[d].chosen = p;
                 stack.truncate(d + 1);
@@ -1351,16 +1411,21 @@ fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
                 Policy::Brute(c) => (c.pick(n), 1),
                 Policy::Dpor(d) => {
                     // Address by `TaskId` (the runnable order is reshuffled by `swap_remove`), so the
-                    // plan replays identically. `enabled` sorted ⇒ a stable default (smallest id).
+                    // plan replays identically. `enabled` sorted ⇒ a stable default (smallest id). A
+                    // `None` pick means every runnable vCPU is asleep ⇒ stop this redundant schedule.
                     let mut enabled: Vec<TaskId> = s.runnable.iter().map(|v| v.id).collect();
                     enabled.sort_unstable();
-                    let tid = d.pick(&enabled);
-                    let idx = s
-                        .runnable
-                        .iter()
-                        .position(|v| v.id == tid)
-                        .expect("planned tid is runnable");
-                    (idx, 1)
+                    match d.pick(&enabled) {
+                        Some(tid) => {
+                            let idx = s
+                                .runnable
+                                .iter()
+                                .position(|v| v.id == tid)
+                                .expect("planned tid is runnable");
+                            (idx, 1)
+                        }
+                        None => return,
+                    }
                 }
             };
             let v = s.runnable.swap_remove(pick);

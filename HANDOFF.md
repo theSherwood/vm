@@ -1020,15 +1020,20 @@ leave a shared view — add a unix test for this alongside the Windows work.
     after every schedule the checker detects races (for each transition, the latest earlier
     *conflicting* transition — same bytes, one a write — by a different vCPU) and adds that vCPU to the
     earlier decision's backtrack set, exploring **both** orders only for genuinely dependent ops while
-    keeping one order for independent ones. The reduction is **sound** (reordering independent ops
-    can't change the terminal state), proven non-vacuously by `svm/tests/dpor.rs`: a differential vs the
-    retained unreduced enumerator (`explore_all_bruteforce`, the oracle) shows **identical outcome
-    sets** on racy programs whose outcome *multiplicity* reflects coverage (lost-update counter → {1,2};
-    store-buffering two-var → {1,2,3}) at far fewer schedules — atomic-counter 2 vs 11, racy-counter 4
-    vs 71, store-buffer 6 vs 71, all-independent stores **1 vs 379**. The existing `concurrent.rs`
-    proofs (`exhaustive_*`) still pass (same outcomes, `complete`). *Still bounded by the per-visible-op
-    granularity (a busy-wait spinlock's every-retry-is-a-decision shape is still big), but independent
-    work no longer multiplies the tree.*
+    keeping one order for independent ones — **plus sleep sets** (the full FG algorithm): a thread that
+    became redundant after an independent sibling ran is held *asleep* down that subtree until a
+    conflicting transition wakes it, pruning the residual cross-cluster redundancy that backtrack-only
+    DPOR re-explores (a sleep-blocked prefix just stops and contributes no outcome). The reduction is
+    **sound** (reordering independent ops can't change the terminal state), proven non-vacuously by
+    `svm/tests/dpor.rs`: a differential vs the retained unreduced enumerator (`explore_all_bruteforce`,
+    the oracle) shows **identical outcome sets** on racy programs whose outcome *multiplicity* reflects
+    coverage (lost-update counter → {1,2}; store-buffering two-var → {1,2,3}; two independent racy
+    clusters → {17,18,33,34}) at far fewer schedules — atomic-counter 2 vs 11, racy-counter 4 vs 71,
+    store-buffer 6 vs 71, all-independent stores **1 vs 379**; and on two independent atomic clusters
+    sleep sets cut **8 vs 12** (backtrack-only) **vs 1270** (unreduced). The existing `concurrent.rs`
+    proofs (`exhaustive_*`) still pass (same outcomes, `complete`). *Not full optimal-DPOR (no source
+    sets / wakeup trees), and still bounded by the per-visible-op granularity — a busy-wait spinlock's
+    every-retry-is-a-decision shape is still big — but independent work no longer multiplies the tree.*
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
     today), fiber/vCPU quota metering (the kill path exists; *metering*/quotas don't yet), and the D57
     migratable-fiber primitive (stackful work-stealing).
@@ -1276,9 +1281,11 @@ regressions one commit old"):
 >    its suspend/wake protocol — the futex park + completion notify — informs the fiber's).
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); fiber/vCPU
 >    quota *metering* (§15; the kill path exists, quotas don't); the async-ring
->    pool could grow more offloadable ops. *(Done this batch: **DPOR** for `explore_all` — the exhaustive
->    checker now prunes independent-op reorderings, sound vs the retained brute-force oracle; see §10's
->    concurrency tracker + `svm/tests/dpor.rs`.)* **Deferred design decision — narrow integer types (the wasm
+>    pool could grow more offloadable ops. *(Done this batch: **DPOR + sleep sets** for `explore_all` —
+>    the exhaustive checker prunes independent-op reorderings and the residual cross-cluster redundancy,
+>    sound vs the retained brute-force oracle; see §10's concurrency tracker + `svm/tests/dpor.rs`. A
+>    further refinement — full optimal-DPOR via source sets / wakeup trees — remains open.)* **Deferred
+>    design decision — narrow integer types (the wasm
 >    tradeoff):** `char`/`short`/`_Bool` are `i32` values (no `i8`/`i16` SSA types), so frontends must
 >    lower narrowing casts explicitly and **narrow-width atomics (`_Atomic char/short`) have no IR form**.
 >    Decision + recommendation written up in **DESIGN.md §3b "Narrow integer types"** — keep the model;

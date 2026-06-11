@@ -5,6 +5,11 @@
 //! commute. The brute-force enumerator is the oracle; matching it across the racy programs below
 //! (whose outcome *multiplicity* directly reflects interleaving coverage — a lost update, a store-
 //! buffering read) means DPOR is not silently pruning reachable states.
+//!
+//! The checker uses DPOR **with sleep sets**, so beyond skipping independent reorderings it also
+//! prunes the *residual* redundancy that plain backtrack-set DPOR re-explores when a program has
+//! several independent conflict clusters (`two_clusters_*` below: 8 schedules vs 12 without sleep sets
+//! vs 1270 unreduced).
 
 use svm_interp::{explore_all, explore_all_bruteforce, Exhaustive, Trap, Value};
 use svm_text::parse_module;
@@ -245,5 +250,145 @@ fn dpor_reduces_independent_stores() {
         "DPOR reduction weaker than expected (dpor={}, brute={})",
         dpor.schedules,
         brute.schedules
+    );
+}
+
+/// **Two independent atomic clusters** — the case sleep sets specifically improve. A,B `rmw.add` X;
+/// C,D `rmw.add` Y. The two clusters conflict internally but are independent of each other, so plain
+/// backtrack-set DPOR re-explores their cross-interleavings while **sleep sets** collapse them. The
+/// total is invariant (X=2, Y=2 ⇒ `2*16 + 2 = 34`); the win shows in the schedule count.
+const TWO_CLUSTERS_ATOMIC: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 1
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vh2 = thread.spawn 2 vsp va
+  vh3 = thread.spawn 2 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vj2 = thread.join vh2
+  vj3 = thread.join vh3
+  vx = i64.const 0
+  vrx = i64.atomic.load vx
+  vy = i64.const 8
+  vry = i64.atomic.load vy
+  v16 = i64.const 16
+  vt = i64.mul vrx v16
+  vres = i64.add vt vry
+  return vres
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vx = i64.const 0
+  vr = i64.atomic.rmw.add vx varg
+  vz = i64.const 0
+  return vz
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vy = i64.const 8
+  vr = i64.atomic.rmw.add vy varg
+  vz = i64.const 0
+  return vz
+}
+"#;
+
+/// Racy variant of the two clusters: A,B race on X, C,D race on Y (non-atomic load/add/store). The
+/// clusters are independent, so the outcome is the *product* of each cluster's reachable finals
+/// (X,Y ∈ {1,2}) ⇒ `{1·16+1, 1·16+2, 2·16+1, 2·16+2} = {17,18,33,34}`. A hand-verifiable invariant
+/// (no brute-force oracle here — its tree is ~580k schedules); the assertion that all four appear is a
+/// strong check that sleep-set pruning across independent clusters drops no reachable state.
+const TWO_CLUSTERS_RACY: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 0
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vh2 = thread.spawn 2 vsp va
+  vh3 = thread.spawn 2 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vj2 = thread.join vh2
+  vj3 = thread.join vh3
+  vx = i64.const 0
+  vrx = i64.load vx
+  vy = i64.const 8
+  vry = i64.load vy
+  v16 = i64.const 16
+  vt = i64.mul vrx v16
+  vres = i64.add vt vry
+  return vres
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vx = i64.const 0
+  vc = i64.load vx
+  v1 = i64.const 1
+  vn = i64.add vc v1
+  i64.store vx vn
+  vz = i64.const 0
+  return vz
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vy = i64.const 8
+  vc = i64.load vy
+  v1 = i64.const 1
+  vn = i64.add vc v1
+  i64.store vy vn
+  vz = i64.const 0
+  return vz
+}
+"#;
+
+#[test]
+fn dpor_matches_bruteforce_two_clusters_atomic() {
+    let (dpor, _) = check(TWO_CLUSTERS_ATOMIC);
+    assert_eq!(dpor.outcomes, vec![Ok(vec![Value::I64(34)])]);
+    // Sleep sets cut this to 8 schedules; plain backtrack-set DPOR needs 12 (brute force, 1270). The
+    // bound guards the sleep-set reduction — a regression to backtrack-only would exceed it.
+    assert!(
+        dpor.schedules <= 8,
+        "expected sleep sets to prune cross-cluster interleavings (dpor={}, backtrack-only is 12)",
+        dpor.schedules
+    );
+}
+
+#[test]
+fn dpor_independent_clusters_keep_all_outcomes() {
+    let m = module(TWO_CLUSTERS_RACY);
+    let dpor = explore_all(&m, 0, &[], FUEL, MAX);
+    assert!(
+        dpor.complete,
+        "DPOR truncated at {} schedules",
+        dpor.schedules
+    );
+    let mut got: Vec<i64> = dpor
+        .outcomes
+        .iter()
+        .map(|o| match o {
+            Ok(v) => match v[0] {
+                Value::I64(x) => x,
+                _ => panic!("unexpected value {v:?}"),
+            },
+            Err(e) => panic!("unexpected trap {e:?}"),
+        })
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![17, 18, 33, 34],
+        "sleep-set pruning across independent clusters dropped a reachable outcome"
+    );
+    // Backtrack-only DPOR explores 180 schedules here; sleep sets cut it to 72.
+    assert!(
+        dpor.schedules <= 100,
+        "expected the sleep-set reduction (dpor={}, backtrack-only is 180)",
+        dpor.schedules
     );
 }
