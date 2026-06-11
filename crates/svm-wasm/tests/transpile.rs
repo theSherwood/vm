@@ -293,6 +293,31 @@ fn scatter_ref(n: i64) -> i64 {
 }
 
 #[test]
+fn direct_call_multifunction() {
+    let wat = r#"
+(module
+  (func $sq (param $x i64) (result i64) (i64.mul (local.get $x) (local.get $x)))
+  (func (export "sumsq") (param $a i64) (param $b i64) (result i64)
+    (i64.add (call $sq (local.get $a)) (call $sq (local.get $b)))))"#;
+    assert_eq!(run(wat, "sumsq", &[Value::I64(3), Value::I64(4)]), 25);
+    assert_eq!(run(wat, "sumsq", &[Value::I64(-5), Value::I64(12)]), 169);
+}
+
+/// Recursion through `call` (Fibonacci) — exercises call + if/else + the call stack.
+#[test]
+fn recursive_call_fib() {
+    let wat = r#"
+(module (func $fib (export "fib") (param $n i64) (result i64)
+  (if (result i64) (i64.lt_s (local.get $n) (i64.const 2))
+    (then (local.get $n))
+    (else (i64.add (call $fib (i64.sub (local.get $n) (i64.const 1)))
+                   (call $fib (i64.sub (local.get $n) (i64.const 2))))))))"#;
+    for (n, want) in [(0i64, 0i64), (1, 1), (10, 55), (20, 6765)] {
+        assert_eq!(run(wat, "fib", &[Value::I64(n)]), want, "fib({n})");
+    }
+}
+
+#[test]
 fn unsupported_is_clean_error() {
     // f32 arithmetic is out of this slice's subset → a clean Unsupported error, not a panic.
     let wat = r#"(module (func (export "g") (result f32) (f32.const 1.0)))"#;

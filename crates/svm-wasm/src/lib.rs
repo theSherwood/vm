@@ -16,8 +16,9 @@
 //! full structured control set `block`/`loop`/`if`/`else`/`br`/`br_if`/`br_table`/`return`/
 //! `unreachable` (with dead-code / else-resurrection bookkeeping) · **linear memory** load/store
 //! (i32/i64, incl. narrow + `memory64`; the i32 address is zero-extended into our i64 window, which is
-//! sized to the wasm memory's initial pages). Still a clean [`Error::Unsupported`] (added in slices):
-//! calls, globals, floats, `memory.{grow,size}`, data segments, SIMD, reference types.
+//! sized to the wasm memory's initial pages) · direct **`call`** (multi-function + recursion). Still a
+//! clean [`Error::Unsupported`] (added in slices): `call_indirect`/tables, globals, floats,
+//! `memory.{grow,size}`, data segments, SIMD, reference types.
 
 use svm_ir::{
     BinOp, Block, CmpOp, ConvOp, Edge, Func, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp,
@@ -138,10 +139,14 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     }
 
     let mem64 = mem.as_ref().map(|m| m.memory64).unwrap_or(false);
+    let func_sigs: Vec<(Vec<ValType>, Vec<ValType>)> = func_type_idx
+        .iter()
+        .map(|&ti| types[ti as usize].clone())
+        .collect();
     let mut funcs = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.into_iter().enumerate() {
         let ty = &types[func_type_idx[i] as usize];
-        funcs.push(lower_func(&ty.0, &ty.1, &types, &body, mem64)?);
+        funcs.push(lower_func(&ty.0, &ty.1, &types, &func_sigs, &body, mem64)?);
     }
 
     // Our window is a power-of-two byte range (masking confines to it); size it to hold the wasm
@@ -223,6 +228,9 @@ struct Lower<'a> {
     reachable: bool,
     control: Vec<Frame>,
     types: &'a [(Vec<ValType>, Vec<ValType>)],
+    /// Per-function signatures by function index (for `call`). No imports, so wasm function index =
+    /// our `Module` function index.
+    func_sigs: &'a [(Vec<ValType>, Vec<ValType>)],
     /// 64-bit linear memory (`memory64`): the address operand is already i64; otherwise it's an i32
     /// that must be zero-extended before our (i64-addressed) `load`/`store`.
     mem64: bool,
@@ -253,6 +261,16 @@ impl Lower<'_> {
     /// a value index.
     fn emit_void(&mut self, inst: Inst) {
         self.blocks[self.cur].insts.push(inst);
+    }
+
+    /// Append a `call` producing `n` results (a multi-result call occupies `n` consecutive value
+    /// indices — the callee's results are appended to the caller's value space in order).
+    fn emit_call(&mut self, inst: Inst, n: usize) -> Vec<ValIdx> {
+        let b = &mut self.blocks[self.cur];
+        let start = b.next_val;
+        b.next_val += n as ValIdx;
+        b.insts.push(inst);
+        (start..start + n as ValIdx).collect()
     }
 
     fn push(&mut self, v: ValIdx, t: ValType) {
@@ -335,10 +353,12 @@ fn block_sig(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_func(
     params: &[ValType],
     results: &[ValType],
     types: &[(Vec<ValType>, Vec<ValType>)],
+    func_sigs: &[(Vec<ValType>, Vec<ValType>)],
     body: &wasmparser::FunctionBody,
     mem64: bool,
 ) -> Result<Func, Error> {
@@ -367,6 +387,7 @@ fn lower_func(
         reachable: true,
         control: Vec::new(),
         types,
+        func_sigs,
         mem64,
     };
     // Initialize declared locals to zero (params already bound to block params), extending `locals`.
@@ -469,6 +490,26 @@ fn mem_load(lo: &mut Lower, op: LoadOp, m: MemArg) -> Result<(), Error> {
     lo.push(v, op.info().1); // `info().1` is the result value type (i32/i64)
     Ok(())
 }
+/// `call funcidx`: pop the callee's params (the last is on top), call it, push its results. No
+/// imports, so the wasm function index is our `Module` function index directly.
+fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
+    let (params, results) = lo
+        .func_sigs
+        .get(func as usize)
+        .ok_or_else(|| Error::Parse(format!("call to unknown function {func}")))?
+        .clone();
+    let mut args = Vec::with_capacity(params.len());
+    for _ in 0..params.len() {
+        args.push(lo.pop()?.0);
+    }
+    args.reverse(); // stack top is the last argument
+    let res = lo.emit_call(Inst::Call { func, args }, results.len());
+    for (v, t) in res.into_iter().zip(results.iter()) {
+        lo.push(v, *t);
+    }
+    Ok(())
+}
+
 fn mem_store(lo: &mut Lower, op: StoreOp, m: MemArg) -> Result<(), Error> {
     let (value, _) = lo.pop()?;
     let addr = pop_addr(lo)?;
@@ -623,6 +664,8 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64Store8 { memarg } => mem_store(lo, StoreOp::I64_8, memarg)?,
         O::I64Store16 { memarg } => mem_store(lo, StoreOp::I64_16, memarg)?,
         O::I64Store32 { memarg } => mem_store(lo, StoreOp::I64_32, memarg)?,
+        // ---- direct call (call_indirect needs tables/elements — a later slice) ----
+        O::Call { function_index } => call_op(lo, function_index)?,
         // ---- structured control flow ----
         O::Block { blockty } => {
             let (p, r) = block_sig(blockty, lo.types)?;
