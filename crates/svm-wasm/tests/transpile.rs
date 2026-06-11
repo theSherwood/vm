@@ -447,6 +447,89 @@ fn data_segment_init() {
     assert_eq!(run(wat2, "sum", &[]), 30); // 10 + 20
 }
 
+/// **Capstone: real clang-emitted wasm.** Compile C to wasm with `clang --target=wasm32` (+ `wasm-ld`)
+/// and run the transpiled module — exercising LLVM-optimized control flow, the `__stack_pointer`
+/// mutable global, and data layout that no hand-written WAT here covers. Skipped (not failed) if the
+/// wasm toolchain is unavailable, matching how the C-frontend tests treat a missing `cc`.
+#[cfg(unix)]
+#[test]
+fn real_clang_wasm() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("svm_wasm_clang_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = dir.join("t.c");
+    let w = dir.join("t.wasm");
+    std::fs::write(
+        &c,
+        "int fib(int n){return n<2?n:fib(n-1)+fib(n-2);}\n\
+         int sumto(int n){int s=0;for(int i=1;i<=n;i++)s+=i;return s;}\n\
+         int poly(int x){return 3*x*x - 5*x + 7;}\n",
+    )
+    .unwrap();
+    let out = Command::new("clang")
+        .args(["--target=wasm32", "-nostdlib", "-O2"])
+        .args([
+            "-Wl,--no-entry",
+            "-Wl,--export=fib",
+            "-Wl,--export=sumto",
+            "-Wl,--export=poly",
+        ])
+        .arg(&c)
+        .arg("-o")
+        .arg(&w)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            eprintln!("skipping real_clang_wasm: clang wasm toolchain unavailable");
+            return;
+        }
+    }
+    let wasm = std::fs::read(&w).unwrap();
+    let t = svm_wasm::transpile(&wasm).expect("transpile real clang wasm");
+    svm_verify::verify_module(&t.module).expect("verify real clang wasm");
+    let find = |name: &str| t.exports.iter().find(|(n, _)| n == name).unwrap().1;
+    assert_eq!(run_idx(&t, find("fib"), &[Value::I32(20)]), 6765);
+    assert_eq!(run_idx(&t, find("sumto"), &[Value::I32(100)]), 5050);
+    for x in [0i32, 3, -4, 17] {
+        assert_eq!(
+            run_idx(&t, find("poly"), &[Value::I32(x)]),
+            (3 * x * x - 5 * x + 7) as i64,
+            "poly({x})"
+        );
+    }
+}
+
+/// Run a known function index through interp + JIT, assert they agree, return the (i32/i64) result.
+fn run_idx(t: &svm_wasm::Transpiled, idx: u32, args: &[Value]) -> i64 {
+    let rt = t.module.funcs[idx as usize].results[0];
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&t.module, idx, args, &mut fuel).expect("interp");
+    let jit_args: Vec<i64> = args
+        .iter()
+        .map(|v| match v {
+            Value::I32(x) => *x as i64,
+            Value::I64(x) => *x,
+            _ => panic!(),
+        })
+        .collect();
+    let jit = match svm_jit::compile_and_run(&t.module, idx, &jit_args).unwrap() {
+        svm_jit::JitOutcome::Returned(v) => v,
+        o => panic!("jit: {o:?}"),
+    };
+    match (rt, interp[0]) {
+        (svm_ir::ValType::I32, Value::I32(x)) => {
+            assert_eq!(x as u32, jit[0] as u32, "interp != jit");
+            x as i64
+        }
+        (svm_ir::ValType::I64, Value::I64(x)) => {
+            assert_eq!(x as u64, jit[0] as u64, "interp != jit");
+            x
+        }
+        _ => panic!("unexpected result"),
+    }
+}
+
 /// A mutable global used as accumulator state across get/set (with linear memory present).
 #[test]
 fn mutable_global_counter() {

@@ -1314,18 +1314,22 @@ regressions one commit old"):
 >    (wasm is a stack machine; our IR is SSA) — done by threading all locals + the surviving operand
 >    stack as block params at every control-flow target, the same trick chibicc uses for the data-SP.
 >    **Landed:** i32/i64 numeric + locals; the full structured control set incl. `if`/`else` (with
->    dead-code / else-resurrection handling); **linear memory** load/store (i32/i64, narrow + `memory64`;
->    wasm i32 addr zero-extended into our window, sized to the wasm pages); direct **`call`** (multi-fn +
->    recursion); **floats** (f32/f64 const/arith/unary/compare/load/store + every int↔float conversion).
->    All differentially tested (`svm-wasm/tests/transpile.rs`, 18 tests: WAT → transpile → verify →
->    interp==JIT vs a hand oracle — incl. the real `alu`/`memsum`(32+64)/`scatter` bench kernels, a 4-way
->    br_table, collatz, recursive fib, a harmonic float loop). Two real bugs the differential caught: a
->    `locals` vec not grown for declared locals, and SSA value-numbering that mis-counted `store` (no
->    result) — now `next_val` advances only for value-producing insts (`emit` vs `emit_void`).
->    **Next slices:** `call_indirect` + tables/elements, globals, `memory.{grow,size}` + data segments —
->    then wire it into `bench/` so the comparison runs on transpiled wasm, not hand-paired IR/WAT (the
->    payoff: any wasm benchmark, both engines, same bytes). With memory + calls + floats done, the core
->    subset is now broad enough to transpile most non-table, non-global wasm.
+>    dead-code / else-resurrection handling); **linear memory** load/store (i32/i64, narrow + `memory64`);
+>    direct **`call`** (multi-fn + recursion); **floats** (f32/f64 const/arith/unary/compare/load/store +
+>    every int↔float conversion); active **data segments**; **globals** (`global.get`/`set` lowered to a
+>    reserved window region above the linear memory, 8-byte slots, initialized via data segments).
+>    All differentially tested (`svm-wasm/tests/transpile.rs`, **23 tests**: WAT → transpile → verify →
+>    interp==JIT vs a hand oracle — the real `alu`/`memsum`(32+64)/`scatter` bench kernels, br_table,
+>    collatz, recursive fib, a harmonic float loop, data/global tests) — **plus the capstone
+>    `real_clang_wasm`: compiles C with `clang --target=wasm32` (+`wasm-ld`) and runs the transpiled
+>    module** (fib/sumto/poly), exercising LLVM-optimized control flow + the `__stack_pointer` mutable
+>    global on genuine real-world wasm (skips if the clang/wasm toolchain is absent, like the `cc` tests).
+>    Two bugs the differential caught: a `locals` vec not grown for declared locals; SSA value-numbering
+>    that mis-counted `store` (no result) — now `next_val` advances only for value-producing insts.
+>    **Next slices:** `call_indirect` + tables/elements, `memory.{grow,size}`, passive data / imports
+>    (the host-function ABI) — then wire it into `bench/` so the perf comparison runs on transpiled wasm,
+>    not hand-paired IR/WAT (the payoff: any wasm benchmark, both engines, same bytes). The core subset
+>    already transpiles real clang-emitted wasm end to end.
 > 1. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
