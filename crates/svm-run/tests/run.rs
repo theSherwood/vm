@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use svm_ir::Module;
 use svm_run::{
-    is_powerbox_entry, run_kernel, run_powerbox, run_powerbox_with_deadline, Outcome, Value,
+    is_powerbox_entry, run_kernel, run_powerbox, run_powerbox_with_deadline,
+    run_powerbox_with_deadline_and_quota, Outcome, Quota, Value,
 };
 use svm_text::parse_module;
 use svm_verify::verify_module;
@@ -466,4 +467,50 @@ fn demo_work_stealing_runs() {
         "svm-run on work_stealing failed: {err}"
     );
     assert_eq!(out.stdout, b"256\n", "guest work-stealing scheduler total");
+}
+
+/// §15 the embedder-facing spawn quota (`run_powerbox_with_deadline_and_quota`) is enforced
+/// end-to-end on the JIT: a powerbox guest that spawns a vCPU is **detect-and-killed** under a
+/// `max_vcpus = 1` quota (the root fills it), and runs under the default. Gated to the targets where
+/// the JIT thread runtime exists (elsewhere `thread.spawn` is `Unsupported`, a different `Err`).
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn quota_contains_a_powerbox_thread_bomb() {
+    // A 3-handle powerbox entry (stdout, stdin, exit) that just spawns a vCPU and returns.
+    let src = "memory 16\n\
+        func (i32, i32, i32) -> () {\n\
+        block0(vout: i32, vin: i32, vexit: i32):\n\
+        \x20 v0 = i64.const 5\n\
+        \x20 v1 = thread.spawn 1 v0 v0\n\
+        \x20 v2 = thread.join v1\n\
+        \x20 return\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, varg: i64):\n\
+        \x20 return varg\n\
+        }\n";
+    let m = load(src);
+    assert!(is_powerbox_entry(&m));
+
+    // max_vcpus = 1 ⇒ the root alone fills the quota; the spawn detect-and-kills (Err).
+    let tight = Quota {
+        max_fibers: 1 << 16,
+        max_vcpus: 1,
+    };
+    let r = run_powerbox_with_deadline_and_quota(&m, b"", None, tight);
+    assert!(
+        r.is_err(),
+        "a spawn over the quota must detect-and-kill, got {r:?}"
+    );
+
+    // The default quota admits the spawn+join.
+    let r = run_powerbox_with_deadline_and_quota(&m, b"", None, Quota::default());
+    assert!(
+        r.is_ok(),
+        "the default quota must run the program, got {r:?}"
+    );
 }

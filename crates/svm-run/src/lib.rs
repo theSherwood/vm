@@ -21,8 +21,9 @@ use svm_interp::{AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, Stream
 use svm_interp::SharedBacking;
 use svm_ir::{Module, ValType};
 
-// Re-export the value type so embedders (and the CLI) need not also depend on `svm-interp`.
-pub use svm_interp::Value;
+// Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
+// `svm-interp`.
+pub use svm_interp::{Quota, Value};
 use svm_jit::{
     compile_and_run, compile_and_run_with_host_fast, compile_and_run_with_host_interruptible_fast,
     JitOutcome, TrapKind, EXIT_CODE,
@@ -1150,13 +1151,31 @@ pub fn run_powerbox(module: &Module, stdin: &[u8]) -> Result<Run, String> {
 /// surfacing as an `Err` (detect-and-kill) instead of hanging the process. `None` ⇒ the ordinary
 /// unbounded run. The watchdog wakes early the moment the run finishes, so a fast program is never
 /// delayed. The `svm-run` CLI reads `SVM_DEADLINE_MS` and passes it here; an embedder supplies its
-/// own policy (reading process env vars is the CLI's job, not the library's).
+/// own policy (reading process env vars is the CLI's job, not the library's). Uses the default
+/// (anti-bomb-ceiling) spawn quota — use [`run_powerbox_with_deadline_and_quota`] to tighten it.
 pub fn run_powerbox_with_deadline(
     module: &Module,
     stdin: &[u8],
     deadline: Option<std::time::Duration>,
 ) -> Result<Run, String> {
+    run_powerbox_with_deadline_and_quota(module, stdin, deadline, Quota::default())
+}
+
+/// [`run_powerbox_with_deadline`] + a §15 **spawn quota**: cap how many fibers (`cont.new`) and
+/// concurrently-live vCPUs (`thread.spawn`) the guest may create, *below* the fixed anti-bomb
+/// ceilings — DoS *containment* the embedder configures (the deadline bounds runaway *execution*; the
+/// quota bounds runaway *spawning*). The quota binds **both** backends (here, the JIT; the same
+/// [`Quota`] on a [`Host`] would bind the interpreter). Exceeding it detect-and-kills the guest
+/// (`FiberFault`/`ThreadFault`). [`Quota::default`] = the ceilings (unbounded-ish). The `svm-run` CLI
+/// reads `SVM_MAX_FIBERS`/`SVM_MAX_VCPUS` and passes them here.
+pub fn run_powerbox_with_deadline_and_quota(
+    module: &Module,
+    stdin: &[u8],
+    deadline: Option<std::time::Duration>,
+    quota: Quota,
+) -> Result<Run, String> {
     let mut host = Host::new();
+    host.set_quota(quota);
     host.stdin = stdin.to_vec();
     // Guest-minted §13/§14 regions (`__vm_region_create` → `AddressSpace.create_region`) need an
     // OS-shared-memory backing so the JIT can `map` them for real aliasing; install the factory

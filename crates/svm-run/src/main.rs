@@ -17,7 +17,9 @@ use std::process::Command;
 use std::{env, fs, process};
 
 use svm_ir::Module;
-use svm_run::{is_powerbox_entry, run_kernel, run_powerbox_with_deadline, Outcome, Value};
+use svm_run::{
+    is_powerbox_entry, run_kernel, run_powerbox_with_deadline_and_quota, Outcome, Quota, Value,
+};
 use svm_verify::verify_module;
 
 fn main() {
@@ -34,7 +36,9 @@ fn try_main() -> Result<(), String> {
             "usage: svm-run <file.svm|.svmb|.c> [--stdin FILE]\n\
              \n  Verifies the module, then runs it sandboxed on the JIT under the MVP powerbox\n\
              \n  (stdout/stderr → real streams, exit code = the guest's). `.c` is compiled via\n\
-             \n  the chibicc frontend ($SVM_CHIBICC or the in-repo build)."
+             \n  the chibicc frontend ($SVM_CHIBICC or the in-repo build).\n\
+             \n  env: SVM_DEADLINE_MS (kill a runaway guest after N ms),\n\
+             \n       SVM_MAX_FIBERS / SVM_MAX_VCPUS (§15 spawn quotas — kill a fiber/thread bomb)."
         );
         return Err("no input file".into());
     }
@@ -71,7 +75,21 @@ fn try_main() -> Result<(), String> {
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|&ms| ms > 0)
             .map(std::time::Duration::from_millis);
-        let run = run_powerbox_with_deadline(&module, &stdin, deadline)?;
+        // §15 spawn quota (CLI policy): `SVM_MAX_FIBERS`/`SVM_MAX_VCPUS` cap fiber/vCPU spawning so a
+        // spawn-bomb is detect-and-killed; unset ⇒ the default anti-bomb ceilings.
+        let env_usize = |k: &str, dflt: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(dflt)
+        };
+        let dq = Quota::default();
+        let quota = Quota {
+            max_fibers: env_usize("SVM_MAX_FIBERS", dq.max_fibers),
+            max_vcpus: env_usize("SVM_MAX_VCPUS", dq.max_vcpus),
+        };
+        let run = run_powerbox_with_deadline_and_quota(&module, &stdin, deadline, quota)?;
         // Flush captured output to the real streams (process::exit skips destructors, so flush
         // explicitly), then terminate with the guest's exit code.
         let mut out = std::io::stdout().lock();
