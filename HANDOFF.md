@@ -1363,8 +1363,13 @@ regressions one commit old"):
 > compiling a real clang struct-copy + array-zero-init program): a constant length unrolls to chunked
 > load/stores (overlap-safe), a runtime length lowers to a synthesized byte loop (`memory.copy` is a
 > direction-correct memmove). Two real-clang capstones (static + runtime-length `__builtin_memcpy`) run
-> identically interp == JIT. Full detail in item 0's sub-bullets. **Next:** passive data/element
-> segments + `memory.init`/`data.drop` (the remaining bulk-memory family).
+> identically interp == JIT. **(4) Real-library capstones (program-first):** with bulk memory done, two
+> real C libraries — the **jsmn JSON tokenizer** and **B-Con SHA-256** — compile clang→wasm, transpile,
+> and run **byte-identical to native** (jsmn: 14 tokens + types; sha256: every digest byte = the known
+> `d7a8fbb3…`) with no new transpiler changes. So passive segments (the speculated next gap) are **not**
+> hit by typical clang output; the likely real next gap is **SIMD (v128)** (clang auto-vectorizes at
+> `-O2`). Full detail in item 0's sub-bullets. **Next:** evidence-driven — a `-O3`/math program will
+> probably surface v128 first; passive segments are lower priority than assumed.
 >
 > **Earlier (prior session): the async I/O ring (B) — COMPLETE, increments 2 + 3a + 3b + 3c,
 > mechanism + runtime on BOTH backends.** Increment 2 — the **bounded blocking-offload pool**: `submit`
@@ -1408,14 +1413,18 @@ regressions one commit old"):
 >    `CallIndirect`'s §3c type-id check — a type-confused index traps, the I2 guarantee); **function
 >    imports / the host ABI** (a wasm `call` to an import → a `cap.call` — see the import-ABI note below).
 >    Window layout: `linear-memory | globals | function-table`, all inside the masked power-of-two window.
->    All differentially tested (`svm-wasm/tests/transpile.rs`, **25 tests**: WAT → transpile → verify →
+>    All differentially tested (`svm-wasm/tests/transpile.rs`, **40 tests**: WAT → transpile → verify →
 >    interp==JIT vs a hand oracle — the real `alu`/`memsum`(32+64)/`scatter` bench kernels, br_table,
 >    collatz, recursive fib, harmonic float loop, data/global tests, a 3-way call_indirect dispatch +
->    type-mismatch trap) — **plus the capstone `real_clang_wasm`: compiles C with `clang --target=wasm32`
->    (+`wasm-ld`) and runs the transpiled module** (fib/sumto/poly + a **function-pointer `dispatch`** →
->    real clang call_indirect/tables/elements), exercising LLVM-optimized control flow, the
->    `__stack_pointer` global, and indirect calls on genuine real-world wasm (skips if the clang/wasm
->    toolchain is absent, like the `cc` tests). Two bugs the differential caught: a `locals` vec not grown
+>    type-mismatch trap, bulk-memory overlap) — **plus real-clang capstones** that compile C with
+>    `clang --target=wasm32` (+`wasm-ld`) and run the transpiled module vs a native oracle:
+>    `real_clang_wasm` (fib/sumto/poly + a function-pointer `dispatch` → call_indirect/tables/elements),
+>    `real_clang_bulk_memory` + `real_clang_dynamic_memcpy` (struct copy / array zero-init / runtime
+>    `__builtin_memcpy`), and — the headline — **two real libraries running byte-identical to native:**
+>    `real_clang_jsmn_tokenizer` (the jsmn JSON tokenizer: 14 tokens + per-token types) and
+>    `real_clang_sha256` (B-Con SHA-256: every digest byte = the known `d7a8fbb3…`). These exercise
+>    LLVM-optimized control flow, `__stack_pointer`, indirect calls, string scanning/state machines, and
+>    clang's bulk-memory copies on genuine real-world code (skip if the clang/wasm toolchain is absent). Two bugs the differential caught: a `locals` vec not grown
 >    for declared locals; SSA value-numbering that mis-counted `store` (no result) — now `next_val`
 >    advances only for value-producing insts. **Bench wiring — DONE:** `bench/ --from-wasm` replaces each
 >    compute kernel's hand-written SVM IR with IR *transpiled from its WAT* (the same bytes Wasmtime
@@ -1479,14 +1488,21 @@ regressions one commit old"):
 >      const + dynamic) gives the memmove result, broadcast-chunk fill, and two real-clang capstones
 >      (`real_clang_bulk_memory` = struct copy + array zero-init; `real_clang_dynamic_memcpy` =
 >      `__builtin_memcpy` with a runtime length) run identically on interp + JIT vs a computed oracle.
+>    - **Real libraries already run (program-first finding).** After bulk memory, two real C libraries
+>      compile clang→wasm, transpile, and run **byte-identical to native** on interp + JIT with **no new
+>      transpiler changes** — `real_clang_jsmn_tokenizer` (jsmn JSON tokenizer) and `real_clang_sha256`
+>      (B-Con SHA-256). So the speculated "next gap" (passive segments) is **not** emitted by typical
+>      clang output and is lower priority than assumed.
 >    **Missing wasm features (the explicit note — what svm-wasm does NOT transpile yet):** (1) passive
->    data / element segments + `memory.init`/`data.drop` + the `table.*` bulk ops. (2) imports spanning
->    multiple capability interfaces (one handle is threaded). (3) SIMD (v128). (4) reference types beyond
->    funcref tables; multi-memory / multi-table. **Next slice:** passive data/element segments +
->    `memory.init`/`data.drop` (the remaining bulk-memory family; appears in some clang/wasi-libc
->    output). The subset already transpiles real clang-emitted wasm (control flow, `__stack_pointer`,
->    function pointers, host imports, heap growth, **memcpy/memset incl. runtime length**) end to end and
->    benches at hand-written-IR speed.
+>    data / element segments + `memory.init`/`data.drop` + the `table.*` bulk ops — *confirmed not hit by
+>    typical clang output (jsmn/sha256 don't use them)*. (2) imports spanning multiple capability
+>    interfaces (one handle is threaded). (3) SIMD (v128) — the most likely **real** next gap (clang
+>    auto-vectorizes at `-O2`; add `-mno-simd128` to avoid, or transpile v128). (4) reference types
+>    beyond funcref tables; multi-memory / multi-table. **Next slice (pick by evidence):** keep throwing
+>    real programs at it — a math-heavy / `-O3` program will likely surface **SIMD (v128)** first (the
+>    genuine next gap), not passive segments. The subset already transpiles real clang-emitted wasm
+>    (control flow, `__stack_pointer`, function pointers, host imports, heap growth, **memcpy/memset incl.
+>    runtime length**, and two real libraries) end to end and benches at hand-written-IR speed.
 > 1. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
