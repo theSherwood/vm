@@ -370,10 +370,16 @@ unsafe extern "C" fn fast_op1(
     let buf = std::slice::from_raw_parts(mem_base.add(ptr as usize), len as usize);
     buf.iter().map(|&b| b as i64).sum()
 }
-unsafe extern "C" fn bench_fast_resolver(_type_id: u32, op: u32) -> *const c_void {
-    match op {
-        0 => fast_op0 as *const c_void,
-        1 => fast_op1 as *const c_void,
+unsafe extern "C" fn bench_fast_resolver(
+    _type_id: u32,
+    op: u32,
+    n_args: u32,
+    n_res: u32,
+) -> *const c_void {
+    // Only claim an op when the IR arity matches the specialized fn's (else the generic path).
+    match (op, n_args, n_res) {
+        (0, 1, 1) => fast_op0 as *const c_void, // x -> x+1
+        (1, 2, 1) => fast_op1 as *const c_void, // sum a (ptr,len) buffer
         _ => std::ptr::null(),
     }
 }
