@@ -630,6 +630,19 @@ Consequences:
     scalar `cap.call` is ~1.24× a wasm import today; the defensible §1a interface win —
     the zero-copy borrow buffer (`hostbuf`, ~1.8× *faster*) — needs none of this.** Revisit
     only if a real workload makes scalar host-call latency a measured bottleneck (D45).
+  - **Update — D45 now implemented (opt-in), and it cleared the TCB concern above.** An optional
+    `svm_jit::FastCapResolver` lets the embedder hand the JIT a *specialized* host fn for a
+    statically-known `(type_id, op)`; the JIT emits a register-to-register direct call to it
+    (resolved at compile time, baked), falling back to the generic thunk for any unclaimed op. The
+    authority-TCB worry is sidestepped **by construction**: the specialized fns *delegate to the same
+    `Host::cap_dispatch_slots`* the generic thunk uses, so the I2 `resolve` (mask + `type_id` +
+    `generation`) is unchanged — devirtualization moves only the *boundary* (register args, no
+    runtime `(type_id, op)` dispatch), never the authority check. The resolver is gated on arity
+    (`n_args`/`n_res`) so an odd-signature `cap.call` can't C-ABI-mismatch the fn. The production
+    powerbox (`svm-run`) fast-paths the window-independent hot ops (`Clock.now`, `Blocking.work`).
+    **Measured: hostcall ~1.24×→ ≈0.67× (≈1.5× *faster* than a Wasmtime import)** — the register-ABI
+    win was larger than the "~parity ceiling" predicted, since it also drops the generic `i64`-array
+    marshalling *and* the host-side dispatch. See HANDOFF §10 (Benchmarking "D45") + `jit_diff::fast_cap`.
 - A forged handle index is **inert**: it traps (wrong type / dead generation /
   OOB-masked-to-wrong-type) or selects one of *this domain's own* granted type-`I`
   capabilities. The guest never supplies `e.methods`/`e.object` (host memory), so it

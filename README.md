@@ -84,9 +84,24 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > poll the shared cell, a vCPU parked in a futex `wait`/`join` re-checks it and unwinds too, and a
 > runaway **nested §14 child** polls the parent's cell as well — so the kill reaches every JIT
 > execution context (root, sibling vCPUs, nested children).
+> The **async I/O ring** (§9/§12) has landed: an `IoRing` capability batches deferred `cap.call`s,
+> a bounded host **offload pool** runs blocking ops concurrently, and `submit_async`/`reap` park a
+> vCPU on an in-window futex counter that a pool worker wakes (an I/O completion *is* a futex
+> notify) — driven end-to-end by an **async event-loop runtime in real C**, including an async
+> **work-stealing M:N** scheduler that is *entirely guest code* over the two primitives (D56/D57).
+> A **second frontend, `svm-wasm`**, transpiles **core wasm → IR** (reconstructing SSA from the
+> stack machine) and runs real clang-compiled programs and **real C libraries** — the jsmn JSON
+> tokenizer and B-Con SHA-256 — byte-identically to native, including bulk memory
+> (`memory.copy`/`fill`), `memory.grow`, and **function imports** (a wasm `call` → a `cap.call`); it
+> benches the §1a thesis on the *same bytes* Wasmtime runs. The host-call boundary is now
+> **devirtualized** (D45): a `cap.call` to a statically-known capability op is a register-to-register
+> direct call, taking `hostcall` from ~parity to ~1.5× faster than Wasmtime. And **§15 spawn
+> quotas** — host-configurable fiber/vCPU ceilings enforced identically on both backends (CLI
+> `SVM_MAX_FIBERS`/`SVM_MAX_VCPUS`) — contain a spawn-bomb (`FiberFault`/`ThreadFault`), DoS
+> containment that complements the kill-path's bound on runaway execution.
 > Still ahead:
-> narrow-scalar promotion, the async I/O ring, a
-> guest M:N runtime, SIMD, isolation tiers, and capability extras.
+> narrow-scalar promotion, honoring *weak* memory orderings (both backends seq-cst today), SIMD
+> (v128), isolation tiers, Spectre hardening, and the LLVM-bitcode on-ramp.
 > This is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
 
@@ -103,6 +118,7 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 | `svm-fiber` | Native stack-switch primitive for fibers / green threads (§3d/§6/§12); the lone home for that `unsafe`, tiny and auditable (x86-64 + aarch64 unix, x86-64 Windows) | escape-TCB |
 | `svm-jit` | Cranelift JIT — CLIF lowering + the §4 masking lowering + guard page/signal (§9) | escape-TCB† |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
+| `svm-wasm` | **Core-wasm → IR transpiler** — a second frontend (untrusted, re-verified); stack→SSA reconstruction | — |
 | `svm` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |
 | `svm-run` | Embedding runtime + **`svm-run` CLI**: instantiate with the powerbox, run on the JIT | — |
 | `fuzz/` | cargo-fuzz targets (nightly); mirror the stable smoke fuzz | — |
