@@ -742,10 +742,9 @@ fn memory64_grow_and_size() {
 
 #[test]
 fn unsupported_is_clean_error() {
-    // A **non-constant-length** `memory.fill` is out of the current subset (only constant sizes unroll)
-    // → a clean Unsupported error, not a panic. (A SIMD/passive-segment op would do equally.)
-    let wat = r#"(module (memory 1)
-      (func (export "f") (param $n i32) (memory.fill (i32.const 0) (i32.const 0) (local.get $n))))"#;
+    // A **passive** data segment is out of the current subset → a clean Unsupported error, not a panic.
+    let wat = r#"(module (memory 1) (data "abc")
+      (func (export "f") (result i32) (i32.const 0)))"#;
     let wasm = wat::parse_str(wat).unwrap();
     match svm_wasm::transpile(&wasm) {
         Err(svm_wasm::Error::Unsupported(_)) => {}
@@ -846,5 +845,129 @@ fn real_clang_bulk_memory() {
     // zero_then_set: one element set to 99, the rest zero ⇒ 99 regardless of n.
     for n in [0i32, 7, 63, 100] {
         assert_eq!(run_idx(&t, find("zero_then_set"), &[Value::I32(n)]), 99);
+    }
+}
+
+/// Runtime-length `memory.fill` (a non-constant `len` ⇒ a synthesized byte loop).
+#[test]
+fn memory_fill_dynamic_length() {
+    let wat = r#"
+(module (memory 1)
+  (func (export "byte") (param $n i32) (param $idx i32) (result i32)
+    (memory.fill (i32.const 4) (i32.const 0xCD) (local.get $n))
+    (i32.load8_u (local.get $idx))))"#;
+    // fill 10 bytes [4..14) = 0xCD
+    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(3)]), 0); // before
+    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(4)]), 0xCD);
+    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(13)]), 0xCD);
+    assert_eq!(run(wat, "byte", &[Value::I32(10), Value::I32(14)]), 0); // after
+    assert_eq!(run(wat, "byte", &[Value::I32(0), Value::I32(4)]), 0); // n=0: no write
+}
+
+/// Runtime-length `memory.copy`, **forward** direction (`dest ≤ src`): a non-overlapping copy and an
+/// overlapping `dest < src` copy (forward is the safe direction there).
+#[test]
+fn memory_copy_dynamic_forward() {
+    // non-overlapping: dest=20, src=0, len=n
+    let nonoverlap = r#"
+(module (memory 1)
+  (data (i32.const 0) "\00\01\02\03\04\05\06\07\08\09")
+  (func (export "byte") (param $n i32) (param $idx i32) (result i32)
+    (memory.copy (i32.const 20) (i32.const 0) (local.get $n))
+    (i32.load8_u (local.get $idx))))"#;
+    for i in 0..6 {
+        assert_eq!(
+            run(nonoverlap, "byte", &[Value::I32(6), Value::I32(20 + i)]),
+            i as i64
+        );
+    }
+    // overlapping, dest<src: data 0..7, copy dest=0 src=2 len=6 → [0..6]=[2,3,4,5,6,7]
+    let overlap = r#"
+(module (memory 1)
+  (data (i32.const 0) "\00\01\02\03\04\05\06\07")
+  (func (export "byte") (param $n i32) (param $idx i32) (result i32)
+    (memory.copy (i32.const 0) (i32.const 2) (local.get $n))
+    (i32.load8_u (local.get $idx))))"#;
+    let expect = [2, 3, 4, 5, 6, 7, 6, 7];
+    for (i, &e) in expect.iter().enumerate() {
+        assert_eq!(
+            run(overlap, "byte", &[Value::I32(6), Value::I32(i as i32)]),
+            e,
+            "fwd byte[{i}]"
+        );
+    }
+}
+
+/// Runtime-length `memory.copy`, **backward** direction (`dest > src`, overlapping): must give the
+/// memmove result, which a naive forward loop would corrupt.
+#[test]
+fn memory_copy_dynamic_backward_overlap() {
+    let wat = r#"
+(module (memory 1)
+  (data (i32.const 0) "\00\01\02\03\04\05\06\07")
+  (func (export "byte") (param $n i32) (param $idx i32) (result i32)
+    (memory.copy (i32.const 2) (i32.const 0) (local.get $n))
+    (i32.load8_u (local.get $idx))))"#;
+    // memmove dest=2,src=0,len=6 → bytes = [0,1,0,1,2,3,4,5]
+    let expect = [0, 1, 0, 1, 2, 3, 4, 5];
+    for (i, &e) in expect.iter().enumerate() {
+        assert_eq!(
+            run(wat, "byte", &[Value::I32(6), Value::I32(i as i32)]),
+            e,
+            "bwd byte[{i}]"
+        );
+    }
+}
+
+/// **Real clang `__builtin_memcpy` with a runtime length** (→ `memory.copy` with a dynamic `len`):
+/// transpiles and runs identically on interp + JIT vs a computed oracle.
+#[cfg(unix)]
+#[test]
+fn real_clang_dynamic_memcpy() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("svm_wasm_dyn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = dir.join("d.c");
+    let w = dir.join("d.wasm");
+    std::fs::write(
+        &c,
+        "int copy_prefix(int n){\n\
+           static char src[64]; char dst[64];\n\
+           for(int i=0;i<64;i++) src[i]=(char)(i+1);\n\
+           __builtin_memcpy(dst, src, n & 63);\n\
+           int s=0; for(int i=0;i<(n&63);i++) s+=dst[i]; return s; }\n",
+    )
+    .unwrap();
+    let out = Command::new("clang")
+        .args(["--target=wasm32", "-nostdlib", "-O2", "-mbulk-memory"])
+        .args(["-Wl,--no-entry", "-Wl,--export=copy_prefix"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&w)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            eprintln!("skipping real_clang_dynamic_memcpy: clang wasm toolchain unavailable");
+            return;
+        }
+    }
+    let wasm = std::fs::read(&w).unwrap();
+    let t = svm_wasm::transpile(&wasm).expect("transpile dynamic-memcpy wasm");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let idx = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "copy_prefix")
+        .unwrap()
+        .1;
+    // copy_prefix(n) copies (n&63) bytes of src[i]=i+1, sums dst → Σ_{i=0..m-1}(i+1), m = n&63.
+    for n in [0i32, 1, 5, 63, 130] {
+        let m = (n & 63) as i64;
+        assert_eq!(
+            run_idx(&t, idx, &[Value::I32(n)]),
+            m * (m + 1) / 2,
+            "copy_prefix({n})"
+        );
     }
 }

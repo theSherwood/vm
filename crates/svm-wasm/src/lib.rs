@@ -17,7 +17,9 @@
 //! `unreachable` (with dead-code / else-resurrection bookkeeping) · **linear memory** load/store
 //! (i32/i64, incl. narrow + `memory64`; the i32 address is zero-extended into our i64 window) ·
 //! **`memory.size`/`memory.grow`** (pages; the window holds the full growable span, a runtime size
-//! cell backs growth — see [`transpile`]) · direct **`call`** (multi-function + recursion) ·
+//! cell backs growth — see [`transpile`]) · **`memory.copy`/`memory.fill`** (a constant length is
+//! unrolled into chunked load/stores; a runtime length lowers to a byte loop — `copy` is
+//! direction-correct memmove) · direct **`call`** (multi-function + recursion) ·
 //! **floats** (f32/f64 const/arith/unary/compare, load/store, and every int↔float conversion incl.
 //! `trunc`/`trunc_sat`/`convert`/`demote`/`promote`/`reinterpret`) · **globals** (`global.get`/`set`
 //! lowered to a reserved window region) · active **data segments** (initialized linear memory) ·
@@ -25,8 +27,8 @@
 //! `call_indirect` loads the entry and feeds it to our `CallIndirect`'s §3c type-id check) ·
 //! **function imports** (a wasm `call` to an import → a `cap.call` on a threaded capability handle;
 //! the host-ABI convention binds each import's `module`/`name` to a capability `type_id`/`op` — see
-//! [`transpile`]). Still a clean [`Error::Unsupported`] (added in slices): bulk memory
-//! (`memory.fill`/`copy`/`init`), passive data/elements, table/memory/global imports, imports across
+//! [`transpile`]). Still a clean [`Error::Unsupported`] (added in slices): `memory.init`/`data.drop` +
+//! the `table.*` bulk ops, passive data/element segments, table/memory/global imports, imports across
 //! multiple capability interfaces, SIMD, reference types.
 
 use svm_ir::{
@@ -718,6 +720,52 @@ impl Lower<'_> {
         self.consts.get(&idx).copied()
     }
 
+    // ---- synthesized-block helpers (a transpiler-emitted runtime loop, e.g. a dynamic bulk op) ----
+    // A synthesized block's params are `prefix (handle + locals) ++ below ++ extra`, where `below` is
+    // the operand stack carried through the loop and `extra` are loop-private values (addresses, the
+    // length, the counter). This mirrors the normal block layout (`prefix ++ stack`) with the extra
+    // loop-private values appended after the stack.
+
+    /// Param types for a synthesized block: prefix ++ `below` ++ `extra`.
+    fn synth_sig(&self, below: &[ValType], extra: &[ValType]) -> Vec<ValType> {
+        let mut s = self.prefix_types();
+        s.extend_from_slice(below);
+        s.extend_from_slice(extra);
+        s
+    }
+    /// Branch args to a synthesized block: prefix (of the *current* block) ++ `below_vals` ++ `extra`.
+    fn synth_args(&self, below_vals: &[ValIdx], extra: &[ValIdx]) -> Vec<ValIdx> {
+        let mut a = self.prefix_vals();
+        a.extend_from_slice(below_vals);
+        a.extend_from_slice(extra);
+        a
+    }
+    /// Enter a synthesized block: rebind handle/locals to the prefix and the operand stack to `below`,
+    /// and return the SSA values of the `n_extra` trailing loop-private params (in order).
+    fn enter_synth(&mut self, blk: usize, below: &[ValType], n_extra: usize) -> Vec<ValIdx> {
+        self.cur = blk;
+        let p = self.handle.is_some() as ValIdx;
+        if self.handle.is_some() {
+            self.handle = Some(0);
+        }
+        let nl = self.local_types.len() as ValIdx;
+        self.locals = (p..p + nl).collect();
+        let stack_start = p + nl;
+        self.stack = below
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (stack_start + i as ValIdx, *t))
+            .collect();
+        self.consts.clear();
+        self.reachable = true;
+        let extra_start = stack_start + below.len() as ValIdx;
+        (extra_start..extra_start + n_extra as ValIdx).collect()
+    }
+    /// The current operand-stack values (the `below` carried by a synthesized loop).
+    fn stack_vals(&self) -> Vec<ValIdx> {
+        self.stack.iter().map(|(v, _)| *v).collect()
+    }
+
     fn set_term(&mut self, t: Terminator) {
         self.blocks[self.cur].term = Some(t);
         self.reachable = false;
@@ -1254,25 +1302,41 @@ fn store_w(w: u64) -> StoreOp {
     }
 }
 
-/// Pop the constant byte length of a bulk op (clang always emits a constant size); a non-constant or
-/// over-`MAX_BULK_UNROLL` length is unsupported (the dynamic-length loop is a later slice).
-fn pop_bulk_len(lo: &mut Lower, what: &str) -> Result<u64, Error> {
-    let (len_v, _) = lo.pop()?;
-    match lo.const_of(len_v) {
-        Some(n) if (0..=MAX_BULK_UNROLL).contains(&n) => Ok(n as u64),
-        _ => Err(Error::Unsupported(format!(
-            "{what} with a non-constant or too-large length (only constant sizes ≤ {MAX_BULK_UNROLL} \
-             bytes are unrolled)"
-        ))),
+/// The constant byte length of a bulk op, if it is a constant `≤ MAX_BULK_UNROLL` (then it's unrolled
+/// into chunked load/stores); otherwise `None` ⇒ lower to a runtime byte loop.
+fn const_bulk_len(lo: &Lower, len_v: ValIdx) -> Option<u64> {
+    lo.const_of(len_v)
+        .filter(|&n| (0..=MAX_BULK_UNROLL).contains(&n))
+        .map(|n| n as u64)
+}
+
+/// Zero-extend a wasm memory length/index to the i64 window-address space (a no-op for `memory64`).
+fn widen_to_i64(lo: &mut Lower, v: ValIdx) -> ValIdx {
+    if lo.mem64 {
+        v
+    } else {
+        lo.emit(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: v,
+        })
     }
 }
 
-/// `memory.fill(dest, val, len)`: set `len` bytes at `dest` to byte `val`. Constant `len` ⇒ unrolled
-/// chunked stores of the fill byte broadcast to each chunk width.
+/// `memory.fill(dest, val, len)`: set `len` bytes at `dest` to byte `val`. A constant `len` is
+/// unrolled into chunked stores of the fill byte broadcast to each chunk width; a runtime `len` lowers
+/// to a byte loop.
 fn mem_fill_op(lo: &mut Lower) -> Result<(), Error> {
-    let n = pop_bulk_len(lo, "memory.fill")?;
+    let (len_v, _) = lo.pop()?;
     let (val, _) = lo.pop()?; // the fill byte (low 8 bits of an i32)
     let dest = pop_addr(lo)?; // i64 window address
+    match const_bulk_len(lo, len_v) {
+        Some(n) => fill_unroll(lo, dest, val, n),
+        None => fill_dynamic(lo, dest, val, len_v),
+    }
+}
+
+/// Unrolled constant-length fill: store the fill byte (broadcast per chunk width) at each chunk.
+fn fill_unroll(lo: &mut Lower, dest: ValIdx, val: ValIdx, n: u64) -> Result<(), Error> {
     if n == 0 {
         return Ok(());
     }
@@ -1326,13 +1390,96 @@ fn mem_fill_op(lo: &mut Lower) -> Result<(), Error> {
     Ok(())
 }
 
-/// `memory.copy(dest, src, len)`: copy `len` bytes (overlap-safe, like memmove). Constant `len` ⇒
-/// **load every chunk first, then store every chunk** — the reads all complete before any write, so an
-/// overlapping `dest`/`src` is handled correctly without choosing a copy direction.
+/// Runtime-length fill as a forward byte loop: `for (i = 0; i < n; i++) store8(dest + i, val)`.
+/// Synthesized as header/body/exit blocks threading the prefix + operand stack + the loop-private
+/// `(dest, val, n, i)`.
+fn fill_dynamic(lo: &mut Lower, dest: ValIdx, val: ValIdx, len: ValIdx) -> Result<(), Error> {
+    let below_t: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect();
+    let below_v = lo.stack_vals();
+    let n = widen_to_i64(lo, len);
+    let extra = [ValType::I64, ValType::I32, ValType::I64, ValType::I64]; // dest, val, n, i
+    let hsig = lo.synth_sig(&below_t, &extra);
+    let header = lo.new_block(hsig.clone());
+    let body = lo.new_block(hsig);
+    let exit_sig = lo.synth_sig(&below_t, &[]);
+    let exit = lo.new_block(exit_sig);
+
+    let zero = lo.emit(Inst::ConstI64(0));
+    let args = lo.synth_args(&below_v, &[dest, val, n, zero]);
+    lo.set_term(Terminator::Br {
+        target: header as u32,
+        args,
+    });
+
+    // header: while i < n → body, else → exit.
+    let hx = lo.enter_synth(header, &below_t, 4);
+    let (d, v, nn, i) = (hx[0], hx[1], hx[2], hx[3]);
+    let cond = lo.emit(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::LtU,
+        a: i,
+        b: nn,
+    });
+    let bv = lo.stack_vals();
+    let then_args = lo.synth_args(&bv, &[d, v, nn, i]);
+    let else_args = lo.synth_args(&bv, &[]);
+    lo.set_term(Terminator::BrIf {
+        cond,
+        then_blk: body as u32,
+        then_args,
+        else_blk: exit as u32,
+        else_args,
+    });
+
+    // body: store8(d + i, v); i += 1; back to header.
+    let bx = lo.enter_synth(body, &below_t, 4);
+    let (d, v, nn, i) = (bx[0], bx[1], bx[2], bx[3]);
+    let addr = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: d,
+        b: i,
+    });
+    lo.emit_void(Inst::Store {
+        op: StoreOp::I32_8,
+        addr,
+        value: v,
+        offset: 0,
+        align: 0,
+    });
+    let one = lo.emit(Inst::ConstI64(1));
+    let i1 = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: i,
+        b: one,
+    });
+    let bv = lo.stack_vals();
+    let back = lo.synth_args(&bv, &[d, v, nn, i1]);
+    lo.set_term(Terminator::Br {
+        target: header as u32,
+        args: back,
+    });
+
+    lo.enter(exit, &below_t); // continue with the operand stack restored
+    Ok(())
+}
+
+/// `memory.copy(dest, src, len)`: copy `len` bytes (overlap-safe, like memmove). A constant `len`
+/// loads every chunk before storing any (overlap-safe); a runtime `len` lowers to a direction-correct
+/// byte loop.
 fn mem_copy_op(lo: &mut Lower) -> Result<(), Error> {
-    let n = pop_bulk_len(lo, "memory.copy")?;
+    let (len_v, _) = lo.pop()?;
     let src = pop_addr(lo)?;
     let dest = pop_addr(lo)?;
+    match const_bulk_len(lo, len_v) {
+        Some(n) => copy_unroll(lo, dest, src, n),
+        None => copy_dynamic(lo, dest, src, len_v),
+    }
+}
+
+/// Unrolled constant-length copy: load every chunk, then store every chunk (overlap-safe memmove).
+fn copy_unroll(lo: &mut Lower, dest: ValIdx, src: ValIdx, n: u64) -> Result<(), Error> {
     if n == 0 {
         return Ok(());
     }
@@ -1358,6 +1505,149 @@ fn mem_copy_op(lo: &mut Lower) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+/// Runtime-length copy as a **memmove** byte loop: copy forward when `dest ≤ src`, backward when
+/// `dest > src` (so overlapping ranges are correct). Synthesized as a direction branch into a
+/// forward and a backward header/body, both exiting to one continuation block. All blocks thread the
+/// prefix + operand stack + the loop-private `(dest, src, n, i)`.
+fn copy_dynamic(lo: &mut Lower, dest: ValIdx, src: ValIdx, len: ValIdx) -> Result<(), Error> {
+    let below_t: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect();
+    let below_v = lo.stack_vals();
+    let n = widen_to_i64(lo, len);
+    let extra = [ValType::I64, ValType::I64, ValType::I64, ValType::I64]; // dest, src, n, i
+    let lsig = lo.synth_sig(&below_t, &extra);
+    let fwd_h = lo.new_block(lsig.clone());
+    let fwd_b = lo.new_block(lsig.clone());
+    let bwd_h = lo.new_block(lsig.clone());
+    let bwd_b = lo.new_block(lsig);
+    let exit = {
+        let s = lo.synth_sig(&below_t, &[]);
+        lo.new_block(s)
+    };
+
+    // Direction: backward (start i = n) when dest > src, else forward (start i = 0).
+    let desc = lo.emit(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::GtU,
+        a: dest,
+        b: src,
+    });
+    let zero = lo.emit(Inst::ConstI64(0));
+    let fwd_args = lo.synth_args(&below_v, &[dest, src, n, zero]);
+    let bwd_args = lo.synth_args(&below_v, &[dest, src, n, n]);
+    lo.set_term(Terminator::BrIf {
+        cond: desc,
+        then_blk: bwd_h as u32,
+        then_args: bwd_args,
+        else_blk: fwd_h as u32,
+        else_args: fwd_args,
+    });
+
+    // Forward: while i < n → copy [i], i++.
+    let hx = lo.enter_synth(fwd_h, &below_t, 4);
+    let (d, s, nn, i) = (hx[0], hx[1], hx[2], hx[3]);
+    let cond = lo.emit(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::LtU,
+        a: i,
+        b: nn,
+    });
+    let bv = lo.stack_vals();
+    let ta = lo.synth_args(&bv, &[d, s, nn, i]);
+    let ea = lo.synth_args(&bv, &[]);
+    lo.set_term(Terminator::BrIf {
+        cond,
+        then_blk: fwd_b as u32,
+        then_args: ta,
+        else_blk: exit as u32,
+        else_args: ea,
+    });
+    let bx = lo.enter_synth(fwd_b, &below_t, 4);
+    let (d, s, nn, i) = (bx[0], bx[1], bx[2], bx[3]);
+    copy_one(lo, d, s, i); // store8(d+i, load8(s+i))
+    let one = lo.emit(Inst::ConstI64(1));
+    let i1 = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: i,
+        b: one,
+    });
+    let bv = lo.stack_vals();
+    let back = lo.synth_args(&bv, &[d, s, nn, i1]);
+    lo.set_term(Terminator::Br {
+        target: fwd_h as u32,
+        args: back,
+    });
+
+    // Backward: while i > 0 → i--, copy [i].
+    let hx = lo.enter_synth(bwd_h, &below_t, 4);
+    let (d, s, nn, i) = (hx[0], hx[1], hx[2], hx[3]);
+    let z = lo.emit(Inst::ConstI64(0));
+    let cond = lo.emit(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::Ne,
+        a: i,
+        b: z,
+    });
+    let bv = lo.stack_vals();
+    let ta = lo.synth_args(&bv, &[d, s, nn, i]);
+    let ea = lo.synth_args(&bv, &[]);
+    lo.set_term(Terminator::BrIf {
+        cond,
+        then_blk: bwd_b as u32,
+        then_args: ta,
+        else_blk: exit as u32,
+        else_args: ea,
+    });
+    let bx = lo.enter_synth(bwd_b, &below_t, 4);
+    let (d, s, nn, i) = (bx[0], bx[1], bx[2], bx[3]);
+    let one = lo.emit(Inst::ConstI64(1));
+    let j = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Sub,
+        a: i,
+        b: one,
+    });
+    copy_one(lo, d, s, j); // store8(d+j, load8(s+j))
+    let bv = lo.stack_vals();
+    let back = lo.synth_args(&bv, &[d, s, nn, j]);
+    lo.set_term(Terminator::Br {
+        target: bwd_h as u32,
+        args: back,
+    });
+
+    lo.enter(exit, &below_t);
+    Ok(())
+}
+
+/// Emit `store8(d + idx, load8(s + idx))` (one byte of a runtime-length copy).
+fn copy_one(lo: &mut Lower, d: ValIdx, s: ValIdx, idx: ValIdx) {
+    let sa = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: s,
+        b: idx,
+    });
+    let byte = lo.emit(Inst::Load {
+        op: LoadOp::I32_8U,
+        addr: sa,
+        offset: 0,
+        align: 0,
+    });
+    let da = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: d,
+        b: idx,
+    });
+    lo.emit_void(Inst::Store {
+        op: StoreOp::I32_8,
+        addr: da,
+        value: byte,
+        offset: 0,
+        align: 0,
+    });
 }
 
 fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), Error> {
