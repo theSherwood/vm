@@ -11,10 +11,11 @@
 //! locals. wasm's structured control flow + validation make the stack height/types statically known at
 //! each point, so the carried-value layout is well-defined.
 //!
-//! Scope (first slice): i32/i64 const · arithmetic/bitwise/shift · comparisons · `eqz` · `clz`/`ctz`/
-//! `popcnt` · `extend{8,16,32}_s` · `wrap`/`extend_i32` · `local.{get,set,tee}` · `drop` · `select` ·
-//! `nop` · `block`/`loop`/`br`/`br_if`/`br_table`/`return`/`unreachable`. Anything else (`if`/`else`,
-//! linear memory, calls, globals, floats, SIMD, reference types) is a clean [`Error::Unsupported`].
+//! Scope: i32/i64 const · arithmetic/bitwise/shift · comparisons · `eqz` · `clz`/`ctz`/`popcnt` ·
+//! `extend{8,16,32}_s` · `wrap`/`extend_i32` · `local.{get,set,tee}` · `drop` · `select` · `nop` · the
+//! full structured control set `block`/`loop`/`if`/`else`/`br`/`br_if`/`br_table`/`return`/
+//! `unreachable` (with the dead-code / else-resurrection bookkeeping). Anything else (linear memory,
+//! calls, globals, floats, SIMD, reference types) is a clean [`Error::Unsupported`] — added in slices.
 
 use svm_ir::{
     BinOp, Block, CmpOp, ConvOp, Edge, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx,
@@ -151,17 +152,17 @@ struct BlockB {
 enum Tgt {
     /// The function's implicit outermost label: a branch returns the result values.
     Return,
-    /// A forward `block` label → the merge IR block after it (carries the block's results); the index
-    /// is filled when the merge is first realized.
-    Merge(Option<usize>),
+    /// A forward `block`/`if` label → the merge IR block after it (carries the block's results). The
+    /// block index itself lives in `Frame::end_merge`, realized lazily on the first exit.
+    Merge,
     /// A backward `loop` label → the loop header IR block (carries the loop's params).
     Loop(usize),
 }
 
-/// One entry on the control stack — a wasm `block`/`loop` (or the function frame).
+/// One entry on the control stack — a wasm `block`/`loop`/`if` (or the function frame).
 struct Frame {
     target: Tgt,
-    /// Values a `br` to this label carries (results for block, params for loop, results for fn).
+    /// Values a `br` to this label carries (results for block/if, params for loop, results for fn).
     br_arity: usize,
     /// Operand-stack height *below* the carried values when this frame was entered (the preserved
     /// base): `entry_height - n_params`. `br` keeps the top `br_arity` and unwinds to here.
@@ -169,6 +170,19 @@ struct Frame {
     /// Result types (what falls through the matching `end`), and the `end` merge block (lazy).
     results: Vec<ValType>,
     end_merge: Option<usize>,
+    /// Present for a *live* `if` (not a dead placeholder): the else arm's block, the if's param types
+    /// (for an `if` without `else`, where the inputs pass through as the results), and whether we have
+    /// switched into the else arm yet.
+    if_else: Option<IfElse>,
+    /// `true` if this frame was pushed while control was unreachable (a placeholder that only needs to
+    /// balance the matching `end`; never branched to from live code).
+    dead: bool,
+}
+
+struct IfElse {
+    else_block: usize,
+    params: Vec<ValType>,
+    in_else: bool,
 }
 
 struct Lower<'a> {
@@ -331,6 +345,8 @@ fn lower_func(
         base: 0,
         results: results.to_vec(),
         end_merge: None,
+        if_else: None,
+        dead: false,
     });
 
     for op in body.get_operators_reader()? {
@@ -512,11 +528,13 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::Block { blockty } => {
             let (p, r) = block_sig(blockty, lo.types)?;
             lo.control.push(Frame {
-                target: Tgt::Merge(None),
+                target: Tgt::Merge,
                 br_arity: r.len(),
                 base: lo.stack.len() - p.len(),
                 results: r,
                 end_merge: None,
+                if_else: None,
+                dead: false,
             });
         }
         O::Loop { blockty } => {
@@ -537,9 +555,12 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
                 base,
                 results: r,
                 end_merge: None,
+                if_else: None,
+                dead: false,
             });
         }
-        O::If { .. } | O::Else => return unsup("if/else (next slice)"),
+        O::If { blockty } => if_op(lo, blockty)?,
+        O::Else => else_op(lo)?,
         O::Br { relative_depth } => branch_to(lo, relative_depth as usize)?,
         O::BrIf { relative_depth } => {
             let (cond, _) = lo.pop()?;
@@ -599,18 +620,7 @@ fn resolve_target(lo: &mut Lower, depth: usize) -> Result<usize, Error> {
     let fi = lo.control.len() - 1 - depth;
     match lo.control[fi].target {
         Tgt::Loop(h) => Ok(h),
-        Tgt::Merge(Some(m)) => Ok(m),
-        Tgt::Merge(None) => {
-            // Lazily realize the merge with locals ++ base ++ results.
-            let base = lo.control[fi].base;
-            let results = lo.control[fi].results.clone();
-            let mut carried: Vec<ValType> = lo.stack[..base].iter().map(|(_, t)| *t).collect();
-            carried.extend_from_slice(&results);
-            let m = lo.new_block(lo.sig(&carried));
-            lo.control[fi].target = Tgt::Merge(Some(m));
-            lo.control[fi].end_merge = Some(m);
-            Ok(m)
-        }
+        Tgt::Merge => Ok(realize_merge(lo, fi)),
         Tgt::Return => unsup("internal: return target resolved as block"),
     }
 }
@@ -648,12 +658,88 @@ fn branch_edge(lo: &mut Lower, depth: usize) -> Result<Edge, Error> {
     Ok((blk as u32, args)) // `Edge = (BlockIdx, Vec<ValIdx>)`
 }
 
-/// Handle `end`: close the current frame, branching the fallthrough (if reachable) into the frame's
-/// merge, then continue there.
+/// `if cond`: pop the condition and split into a then/else pair. Both arms start with the same state
+/// (locals + the entry stack, the if's params on top), so they share the carried layout; a BrIf routes
+/// to them. The merge after the if is created lazily on the first arm's exit (`else`/`end`/`br`).
+fn if_op(lo: &mut Lower, blockty: BlockType) -> Result<(), Error> {
+    let (p, r) = block_sig(blockty, lo.types)?;
+    let (cond, _) = lo.pop()?;
+    let base = lo.stack.len() - p.len();
+    let carried: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect(); // base ++ params
+    let then_blk = lo.new_block(lo.sig(&carried));
+    let else_blk = lo.new_block(lo.sig(&carried));
+    let mut args = lo.locals.clone();
+    args.extend(lo.stack.iter().map(|(v, _)| *v));
+    lo.set_term(Terminator::BrIf {
+        cond,
+        then_blk: then_blk as u32,
+        then_args: args.clone(),
+        else_blk: else_blk as u32,
+        else_args: args,
+    });
+    lo.control.push(Frame {
+        target: Tgt::Merge,
+        br_arity: r.len(),
+        base,
+        results: r,
+        end_merge: None,
+        if_else: Some(IfElse {
+            else_block: else_blk,
+            params: p,
+            in_else: false,
+        }),
+        dead: false,
+    });
+    lo.enter(then_blk, &carried);
+    Ok(())
+}
+
+/// `else`: close the then arm (its fallthrough, if reachable, exits to the merge) and switch into the
+/// else arm — which is reachable even if the then arm ended in a `br`. A no-op for a dead `if`.
+fn else_op(lo: &mut Lower) -> Result<(), Error> {
+    let i = lo.control.len() - 1;
+    if lo.control[i].dead || lo.control[i].if_else.is_none() {
+        return Ok(()); // the `else` of an unreachable `if`: nothing to switch into
+    }
+    let (base, arity) = (lo.control[i].base, lo.control[i].results.len());
+    let merge = realize_merge(lo, i);
+    if lo.reachable {
+        let args = lo.branch_args(base, arity);
+        lo.set_term(Terminator::Br {
+            target: merge as u32,
+            args,
+        });
+    }
+    let else_blk = lo.control[i].if_else.as_ref().unwrap().else_block;
+    let st = lo.merge_stack_types(else_blk); // base ++ params
+    lo.enter(else_blk, &st);
+    lo.control[i].if_else.as_mut().unwrap().in_else = true;
+    Ok(())
+}
+
+/// Create a merge block carrying locals ++ the current preserved base ++ `results`.
+fn make_merge(lo: &mut Lower, base: usize, results: &[ValType]) -> usize {
+    let mut carried: Vec<ValType> = lo.stack[..base].iter().map(|(_, t)| *t).collect();
+    carried.extend_from_slice(results);
+    lo.new_block(lo.sig(&carried))
+}
+
+/// Realize (once) the merge block of the frame at index `i`, recording it as the frame's branch
+/// target and `end` merge.
+fn realize_merge(lo: &mut Lower, i: usize) -> usize {
+    if let Some(m) = lo.control[i].end_merge {
+        return m;
+    }
+    let (base, results) = (lo.control[i].base, lo.control[i].results.clone());
+    let m = make_merge(lo, base, &results);
+    lo.control[i].end_merge = Some(m);
+    m
+}
+
+/// Handle `end`: close the current frame and continue in its merge (for the function frame, return).
 fn end_frame(lo: &mut Lower) -> Result<(), Error> {
     let fr = lo.control.pop().expect("control underflow at end");
     if let Tgt::Return = fr.target {
-        // Function `end`: return the results on the stack.
         if lo.reachable {
             let n = fr.results.len();
             let args: Vec<ValIdx> = lo.stack[lo.stack.len() - n..]
@@ -664,61 +750,88 @@ fn end_frame(lo: &mut Lower) -> Result<(), Error> {
         }
         return Ok(());
     }
-    let base = fr.base;
-    let results = fr.results.clone();
-    if lo.reachable {
-        // Realize the merge (a block whose label was never branched to still needs one to continue
-        // into) and branch the fallthrough there: locals ++ base ++ results.
-        let m = match fr.end_merge {
-            Some(m) => m,
-            None => {
-                let mut carried: Vec<ValType> = lo.stack[..base].iter().map(|(_, t)| *t).collect();
-                carried.extend_from_slice(&results);
-                lo.new_block(lo.sig(&carried))
+    if fr.dead {
+        // A placeholder from dead code: only balance. (A live `br` can't reach into a dead region.)
+        if let Some(m) = fr.end_merge {
+            let st = lo.merge_stack_types(m);
+            lo.enter(m, &st);
+        }
+        return Ok(());
+    }
+    let (base, results) = (fr.base, fr.results.clone());
+    if let Some(ie) = fr.if_else {
+        // An `if`: both arms (or the then arm + an implicit pass-through else) exit to one merge.
+        let merge = fr
+            .end_merge
+            .unwrap_or_else(|| make_merge(lo, base, &results));
+        if !ie.in_else {
+            // No `else`: current is the then arm; its fallthrough (if reachable) exits to merge, and
+            // the implicit else forwards the if's inputs (params == results) through.
+            if lo.reachable {
+                let args = lo.branch_args(base, results.len());
+                lo.set_term(Terminator::Br {
+                    target: merge as u32,
+                    args,
+                });
             }
-        };
+            let st = lo.merge_stack_types(ie.else_block); // base ++ params
+            lo.enter(ie.else_block, &st);
+            let args = lo.branch_args(base, ie.params.len());
+            lo.set_term(Terminator::Br {
+                target: merge as u32,
+                args,
+            });
+        } else if lo.reachable {
+            let args = lo.branch_args(base, results.len());
+            lo.set_term(Terminator::Br {
+                target: merge as u32,
+                args,
+            });
+        }
+        let st = lo.merge_stack_types(merge);
+        lo.enter(merge, &st);
+        return Ok(());
+    }
+    // block / loop frame.
+    if lo.reachable {
+        let m = fr
+            .end_merge
+            .unwrap_or_else(|| make_merge(lo, base, &results));
         let args = lo.branch_args(base, results.len());
         lo.set_term(Terminator::Br {
             target: m as u32,
             args,
         });
-        let stack_types = lo.merge_stack_types(m);
-        lo.enter(m, &stack_types);
+        let st = lo.merge_stack_types(m);
+        lo.enter(m, &st);
     } else if let Some(m) = fr.end_merge {
-        // Fallthrough is dead, but a `br` reached the merge — continue there.
-        let stack_types = lo.merge_stack_types(m);
-        lo.enter(m, &stack_types);
+        let st = lo.merge_stack_types(m);
+        lo.enter(m, &st);
     }
-    // else: dead fallthrough and no merge → the region after this `end` stays unreachable.
     Ok(())
 }
 
 /// Track block structure through dead code (after a `br`/`return`/`unreachable`) without emitting.
-/// wasm's polymorphic unreachable stack is approximated: only the control depth matters until the
-/// matching `end` restores reachability via a live `br`'s merge.
+/// wasm's polymorphic unreachable stack is approximated: control depth is tracked until a matching
+/// `end`/`else` restores reachability (a live `if`'s else arm, or a live `br`'s merge).
 fn skip_unreachable(lo: &mut Lower, op: Operator) -> Result<(), Error> {
     use Operator as O;
     match op {
-        O::Block { .. } | O::Loop { .. } => {
+        O::Block { .. } | O::Loop { .. } | O::If { .. } => {
             // A placeholder frame so the matching `end` balances; never branched to from live code.
             lo.control.push(Frame {
-                target: Tgt::Merge(None),
+                target: Tgt::Merge,
                 br_arity: 0,
                 base: 0,
                 results: vec![],
                 end_merge: None,
+                if_else: None,
+                dead: true,
             });
             Ok(())
         }
-        O::If { .. } | O::Else => unsup("if/else (next slice)"),
-        O::End => {
-            let fr = lo.control.pop().expect("control underflow in dead end");
-            if let Some(m) = fr.end_merge {
-                let stack_types = lo.merge_stack_types(m);
-                lo.enter(m, &stack_types);
-            }
-            Ok(())
-        }
+        O::Else => else_op(lo), // a live `if`'s else arm resurrects even when the then arm went dead
+        O::End => end_frame(lo),
         _ => Ok(()), // ignore every other op in dead code
     }
 }

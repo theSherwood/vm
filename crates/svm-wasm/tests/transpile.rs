@@ -132,6 +132,66 @@ fn br_table_dispatch() {
 }
 
 #[test]
+fn if_else_max() {
+    let wat = r#"
+(module (func (export "max") (param $a i32) (param $b i32) (result i32)
+  (if (result i32) (i32.gt_s (local.get $a) (local.get $b))
+    (then (local.get $a)) (else (local.get $b)))))"#;
+    assert_eq!(run(wat, "max", &[Value::I32(7), Value::I32(3)]), 7);
+    assert_eq!(run(wat, "max", &[Value::I32(3), Value::I32(9)]), 9);
+    assert_eq!(run(wat, "max", &[Value::I32(-5), Value::I32(-2)]), -2);
+}
+
+/// `if` without `else` (the inputs/locals pass through): clamp negatives to zero via a side-effecting
+/// then arm. Exercises the implicit pass-through else.
+#[test]
+fn if_no_else_clamp() {
+    let wat = r#"
+(module (func (export "clamp") (param $x i32) (result i32)
+  (local $r i32)
+  (local.set $r (local.get $x))
+  (if (i32.lt_s (local.get $x) (i32.const 0)) (then (local.set $r (i32.const 0))))
+  (local.get $r)))"#;
+    assert_eq!(run(wat, "clamp", &[Value::I32(5)]), 5);
+    assert_eq!(run(wat, "clamp", &[Value::I32(-5)]), 0);
+    assert_eq!(run(wat, "clamp", &[Value::I32(0)]), 0);
+}
+
+/// The then arm `br`s out of an enclosing block (going dead), so the **else arm must still be
+/// reachable** — the dead-then / else-resurrection path.
+#[test]
+fn if_then_br_else_resurrects() {
+    let wat = r#"
+(module (func (export "g") (param $c i32) (result i32)
+  (block $b (result i32)
+    (if (result i32) (local.get $c)
+      (then (br $b (i32.const 1)))
+      (else (i32.const 2))))))"#;
+    assert_eq!(run(wat, "g", &[Value::I32(1)]), 1);
+    assert_eq!(run(wat, "g", &[Value::I32(0)]), 2);
+}
+
+/// Nested if/else inside a loop — collatz step count, exercising if/else + loop + br interplay.
+#[test]
+fn collatz_steps() {
+    let wat = r#"
+(module (func (export "steps") (param $n i64) (result i64)
+  (local $c i64)
+  (block $done (loop $loop
+    (br_if $done (i64.le_s (local.get $n) (i64.const 1)))
+    (if (i64.eqz (i64.rem_u (local.get $n) (i64.const 2)))
+      (then (local.set $n (i64.div_u (local.get $n) (i64.const 2))))
+      (else (local.set $n (i64.add (i64.mul (local.get $n) (i64.const 3)) (i64.const 1)))))
+    (local.set $c (i64.add (local.get $c) (i64.const 1)))
+    (br $loop)))
+  (local.get $c)))"#;
+    // 6 → 3 → 10 → 5 → 16 → 8 → 4 → 2 → 1 : 8 steps
+    assert_eq!(run(wat, "steps", &[Value::I64(6)]), 8);
+    assert_eq!(run(wat, "steps", &[Value::I64(1)]), 0);
+    assert_eq!(run(wat, "steps", &[Value::I64(27)]), 111);
+}
+
+#[test]
 fn unsupported_is_clean_error() {
     // f32 arithmetic is out of this slice's subset → a clean Unsupported error, not a panic.
     let wat = r#"(module (func (export "g") (result f32) (f32.const 1.0)))"#;
