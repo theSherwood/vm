@@ -522,6 +522,9 @@ fn real_clang_wasm() {
 }
 
 /// Run a known function index through interp + JIT, assert they agree, return the (i32/i64) result.
+/// Only used by the `#[cfg(unix)]` `real_clang_wasm` test, so gate it the same way (else it's dead
+/// code on non-unix targets, which CI's `-D warnings` rejects).
+#[cfg(unix)]
 fn run_idx(t: &svm_wasm::Transpiled, idx: u32, args: &[Value]) -> i64 {
     let rt = t.module.funcs[idx as usize].results[0];
     let mut fuel = 100_000_000u64;
