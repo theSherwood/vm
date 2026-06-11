@@ -1330,11 +1330,20 @@ regressions one commit old"):
 >    `__stack_pointer` global, and indirect calls on genuine real-world wasm (skips if the clang/wasm
 >    toolchain is absent, like the `cc` tests). Two bugs the differential caught: a `locals` vec not grown
 >    for declared locals; SSA value-numbering that mis-counted `store` (no result) — now `next_val`
->    advances only for value-producing insts. **Next slices:** `memory.{grow,size}`, passive data, and
->    **imports** (the host-function ABI — the one big remaining gap for arbitrary real wasm) — then wire
->    it into `bench/` so the perf comparison runs on transpiled wasm, not hand-paired IR/WAT (the payoff:
->    any wasm benchmark, both engines, same bytes). The subset already transpiles real clang-emitted wasm
->    end to end, function pointers and all.
+>    advances only for value-producing insts. **Bench wiring — DONE:** `bench/ --from-wasm` replaces each
+>    compute kernel's hand-written SVM IR with IR *transpiled from its WAT* (the same bytes Wasmtime
+>    runs) — the genuine apples-to-apples comparison. Result: transpiled IR ≈ hand-written (alu 1.02×
+>    both, memsum 0.91× both / beats wasm32, scatter 0.94→1.00× — a ~6% transpiler overhead from the
+>    i32→i64 address extend). **Bonus finding:** `locals_c` is 1.43× from chibicc IR but **0.92× from the
+>    transpiled WAT**, confirming that gap is a chibicc `volatile`-array lowering artifact, not the VM.
+>    **Missing wasm features (the explicit note — what svm-wasm does NOT transpile yet):** (1) **imports /
+>    the host-function ABI** — so the `hostcall`/`hostbuf` interface kernels stay hand-written under
+>    `--from-wasm` (with a printed note); this is the one big remaining gap for arbitrary real wasm. (2)
+>    `memory.{grow,size}`. (3) passive data / element segments. (4) SIMD (v128). (5) reference types
+>    beyond funcref tables; multi-memory / multi-table. **Next slices:** imports (host ABI) is the
+>    highest-value remaining piece, then `memory.grow` — the subset already transpiles real clang-emitted
+>    wasm (control flow, `__stack_pointer`, function pointers) end to end and benches at hand-written-IR
+>    speed.
 > 1. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
