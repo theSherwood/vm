@@ -1266,7 +1266,7 @@ regressions one commit old"):
 
 ### Suggested next pickups (ranked)
 
-> **▶ START HERE (next session) — current frontier as of the 2026-06-10 batch.** Everything below
+> **▶ START HERE (next session) — current frontier as of the 2026-06-11 batch.** Everything below
 > this block is the **build log** (history of landed work, kept for context); this block is the live
 > "what's next."
 >
@@ -1281,7 +1281,18 @@ regressions one commit old"):
 > **`SCHEDULING.md`** + **DESIGN D56/D57** (the concurrency-primitives decision), **`DESIGN.md`** /
 > **`README.md`**.
 >
-> **Just landed (this session): the async I/O ring (B) — COMPLETE, increments 2 + 3a + 3b + 3c,
+> **Just landed (this session): wasm transpiler — function imports / the host ABI (item 0 below).** A
+> wasm `(import "<module>" "<name>" (func …))` now lowers to a `cap.call` by the convention `module` =
+> decimal capability `type_id`, `name` = decimal `op`; the transpiler threads one capability handle (an
+> `i32`) as the leading param of every function (the data-SP trick), and the embedder grants the cap +
+> passes its handle as the entry's leading arg. Function-index remapping (imports first), `call_indirect`
+> handle-threading through the §3c type check, and clean errors for non-numeric names / non-func imports /
+> multiple interfaces. 7 differential tests (`crates/svm-wasm/tests/imports.rs`) run import-using modules
+> on **both** backends under one reference `Host` (interp `run_with_host`; JIT `compile_and_run_with_host`
+> over `svm_run::cap_thunk`). No-import modules are unchanged (25 transpile tests green). Full detail in
+> item 0's "Imports / host ABI" sub-bullet. **Next:** `memory.{grow,size}`.
+>
+> **Earlier (prior session): the async I/O ring (B) — COMPLETE, increments 2 + 3a + 3b + 3c,
 > mechanism + runtime on BOTH backends.** Increment 2 — the **bounded blocking-offload pool**: `submit`
 > overlaps `Blocking` SQEs (iface 10) on an `OFFLOAD_POOL_THREADS = 4` pool (waves of K) while inline
 > ops run in SQE order, transparently. Increment 3a/3b — **async submit + true fiber parking on interp
@@ -1307,7 +1318,8 @@ regressions one commit old"):
 > schedulers; ring increment 1.)*
 >
 > **Immediate frontier, ranked** *(the async ring (B) is done — these are the next big rocks):*
-> 0. **wasm → IR transpiler (`crates/svm-wasm`) — IN PROGRESS (numeric + control + if/else + memory).**
+> 0. **wasm → IR transpiler (`crates/svm-wasm`) — IN PROGRESS (numeric + control + if/else + memory +
+>    imports).**
 >    A second frontend after chibicc, chosen *before* the LLVM on-ramp because it's smaller and directly
 >    serves the §1a benchmark thesis: take *any* wasm and run it on SVM vs Wasmtime on the *same bytes*,
 >    instead of hand-writing IR+WAT kernel pairs. The interesting part is the **stack→SSA reconstruction**
@@ -1319,8 +1331,9 @@ regressions one commit old"):
 >    every int↔float conversion); active **data segments**; **globals** (`global.get`/`set` → a reserved
 >    window region above the linear memory, init via data segments); **`call_indirect`** + tables/element
 >    segments (the wasm table → an in-window i32 funcref-index array; the runtime load feeds our
->    `CallIndirect`'s §3c type-id check — a type-confused index traps, the I2 guarantee). Window layout:
->    `linear-memory | globals | function-table`, all inside the masked power-of-two window.
+>    `CallIndirect`'s §3c type-id check — a type-confused index traps, the I2 guarantee); **function
+>    imports / the host ABI** (a wasm `call` to an import → a `cap.call` — see the import-ABI note below).
+>    Window layout: `linear-memory | globals | function-table`, all inside the masked power-of-two window.
 >    All differentially tested (`svm-wasm/tests/transpile.rs`, **25 tests**: WAT → transpile → verify →
 >    interp==JIT vs a hand oracle — the real `alu`/`memsum`(32+64)/`scatter` bench kernels, br_table,
 >    collatz, recursive fib, harmonic float loop, data/global tests, a 3-way call_indirect dispatch +
@@ -1336,14 +1349,36 @@ regressions one commit old"):
 >    both, memsum 0.91× both / beats wasm32, scatter 0.94→1.00× — a ~6% transpiler overhead from the
 >    i32→i64 address extend). **Bonus finding:** `locals_c` is 1.43× from chibicc IR but **0.92× from the
 >    transpiled WAT**, confirming that gap is a chibicc `volatile`-array lowering artifact, not the VM.
->    **Missing wasm features (the explicit note — what svm-wasm does NOT transpile yet):** (1) **imports /
->    the host-function ABI** — so the `hostcall`/`hostbuf` interface kernels stay hand-written under
->    `--from-wasm` (with a printed note); this is the one big remaining gap for arbitrary real wasm. (2)
->    `memory.{grow,size}`. (3) passive data / element segments. (4) SIMD (v128). (5) reference types
->    beyond funcref tables; multi-memory / multi-table. **Next slices:** imports (host ABI) is the
->    highest-value remaining piece, then `memory.grow` — the subset already transpiles real clang-emitted
->    wasm (control flow, `__stack_pointer`, function pointers) end to end and benches at hand-written-IR
->    speed.
+>    - **Imports / host ABI — DONE (this session).** A wasm `(import "<module>" "<name>" (func …))` binds
+>      to an SVM capability by a naming **convention**: `module` = decimal capability **`type_id`**, `name`
+>      = decimal **`op`**. A wasm `call` to an import lowers to `cap.call type_id op sig handle args`; the
+>      transpiler threads **one** capability **handle** (an `i32`, the forgeable index a `cap.call` takes)
+>      as the leading param of every function/block (the data-SP trick), so any function reaches it and the
+>      embedder grants one capability + passes its handle as the entry's leading arg. The transpiler stays
+>      pure mechanism — it never interprets the host semantics. The wasm function-index space puts imports
+>      first, so all `call`/`call_indirect`/element/export indices remap by `−n_imp`; `call_indirect`
+>      prepends the handle to both its args **and** the §3c type-check signature (matching the defined
+>      targets that now carry it); a funcref to an import is a clean error. v1 threads one handle ⇒ all
+>      imports must share one `type_id` (methods by `op`); a non-numeric name, a table/memory/global
+>      import, or imports spanning multiple interfaces is a clean `Unsupported` (real WASI's non-numeric
+>      imports need a dedicated shim). No-import modules are byte-identical to before (all 25 transpile
+>      tests unchanged). This is exactly the `cap.call 0 0` / `cap.call 0 1` shape the bench `hostcall`/
+>      `hostbuf` kernels hand-write. Differentially tested in **`svm-wasm/tests/imports.rs` (7 tests)**:
+>      a `Clock.now` loop-sum (no-arg op), a `Blocking.work` loop-sum (scalar arg + result = the `hostcall`
+>      shape, deterministic `mix`), handle-threading through a defined→defined call and through a
+>      `call_indirect` dispatch table, plus the three clean-error guards — each run on **both** backends
+>      under one reference `Host` (interp `run_with_host`; JIT `compile_and_run_with_host` over the
+>      production `svm_run::cap_thunk`, added as a dev-dep). **Still open on imports:** multiple distinct
+>      capability interfaces (one handle each), and wiring the bench `hostcall`/`hostbuf` kernels to
+>      transpile from WAT under `--from-wasm` (their thunk already dispatches on `(type_id, op)`; the
+>      remaining bit is feeding the threaded leading handle arg).
+>    **Missing wasm features (the explicit note — what svm-wasm does NOT transpile yet):** (1)
+>    `memory.{grow,size}`. (2) passive data / element segments. (3) imports spanning multiple capability
+>    interfaces (one handle is threaded). (4) SIMD (v128). (5) reference types beyond funcref tables;
+>    multi-memory / multi-table. **Next slice:** `memory.{grow,size}` (the remaining piece blocking most
+>    real clang/wasi-libc-emitted wasm) — function imports / the host ABI just landed; the subset already
+>    transpiles real clang-emitted wasm (control flow, `__stack_pointer`, function pointers, host imports)
+>    end to end and benches at hand-written-IR speed.
 > 1. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already

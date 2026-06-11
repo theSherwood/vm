@@ -21,9 +21,12 @@
 //! `trunc`/`trunc_sat`/`convert`/`demote`/`promote`/`reinterpret`) · **globals** (`global.get`/`set`
 //! lowered to a reserved window region) · active **data segments** (initialized linear memory) ·
 //! **`call_indirect`** + tables/element segments (the table → an in-window array of funcref indices;
-//! `call_indirect` loads the entry and feeds it to our `CallIndirect`'s §3c type-id check). Still a
-//! clean [`Error::Unsupported`] (added in slices): `memory.{grow,size}`, passive data/elements,
-//! imports, SIMD, reference types.
+//! `call_indirect` loads the entry and feeds it to our `CallIndirect`'s §3c type-id check) ·
+//! **function imports** (a wasm `call` to an import → a `cap.call` on a threaded capability handle;
+//! the host-ABI convention binds each import's `module`/`name` to a capability `type_id`/`op` — see
+//! [`transpile`]). Still a clean [`Error::Unsupported`] (added in slices): `memory.{grow,size}`,
+//! passive data/elements, table/memory/global imports, imports across multiple capability interfaces,
+//! SIMD, reference types.
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
@@ -80,6 +83,17 @@ fn val_type(w: W) -> Result<ValType, Error> {
 }
 
 /// Transpile a core-wasm binary into a verifier-checkable [`Module`].
+///
+/// **Host-function imports (the host ABI).** A wasm `(import "<module>" "<name>" (func …))` binds to
+/// an SVM capability by a naming convention: `module` is the decimal capability **`type_id`** and
+/// `name` the decimal **`op`**. A wasm `call` to an import then lowers to `cap.call type_id op` on a
+/// single capability **handle** the transpiler threads as the leading `i32` parameter of every
+/// function (the data-SP trick). The embedder grants the matching capability and passes its handle as
+/// the entry function's leading argument; the transpiler stays pure mechanism (it never interprets the
+/// host semantics — `(type_id, op)` just select an interface/method). v1 threads **one** handle, so
+/// every import must share one `type_id` (methods distinguished by `op`); a non-numeric name, a
+/// table/memory/global import, or imports spanning multiple interfaces is a clean [`Error::Unsupported`]
+/// (real WASI, whose imports are non-numeric, needs a dedicated shim). A no-import module is unchanged.
 pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
     let mut func_type_idx: Vec<u32> = Vec::new();
@@ -90,6 +104,10 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut globals: Vec<(ValType, Vec<u8>)> = Vec::new();
     let mut table_size: Option<u64> = None;
     let mut elements: Vec<(u64, Vec<u32>)> = Vec::new(); // (offset, func indices)
+                                                         // Function imports, in import order: each binds to an SVM capability `(type_id, op)` by the naming
+                                                         // convention (`module` = decimal type_id, `name` = decimal op) and lowers to a `cap.call`. The
+                                                         // function index space puts imports first, so a wasm index `< imports.len()` is an import.
+    let mut imports: Vec<(u32, u32, FuncType)> = Vec::new();
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -111,7 +129,60 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     }
                 }
             }
-            Payload::ImportSection(_) => return unsup("imports"),
+            Payload::ImportSection(reader) => {
+                for imp in reader.into_imports() {
+                    let imp = imp?;
+                    let type_idx = match imp.ty {
+                        wasmparser::TypeRef::Func(t) => t,
+                        wasmparser::TypeRef::FuncExact(t) => t,
+                        wasmparser::TypeRef::Table(_) => return unsup("imported table"),
+                        wasmparser::TypeRef::Memory(_) => return unsup("imported memory"),
+                        wasmparser::TypeRef::Global(_) => return unsup("imported global"),
+                        wasmparser::TypeRef::Tag(_) => return unsup("imported tag"),
+                    };
+                    // The binding convention: `module` is the decimal capability type_id and `name`
+                    // the decimal op. This keeps the transpiler pure mechanism — it never interprets
+                    // the host semantics; the embedder grants the matching capability and the
+                    // (type_id, op) just select an interface/method. A non-numeric name is a clear
+                    // error rather than a silent mis-binding.
+                    let type_id: u32 = imp.module.parse().map_err(|_| {
+                        Error::Unsupported(format!(
+                            "import module {:?} is not a decimal capability type_id (the host-ABI \
+                             convention: module = type_id, name = op)",
+                            imp.module
+                        ))
+                    })?;
+                    let op: u32 = imp.name.parse().map_err(|_| {
+                        Error::Unsupported(format!(
+                            "import name {:?} is not a decimal capability op (the host-ABI \
+                             convention: module = type_id, name = op)",
+                            imp.name
+                        ))
+                    })?;
+                    let (p, r) = &types[type_idx as usize];
+                    imports.push((
+                        type_id,
+                        op,
+                        FuncType {
+                            params: p.clone(),
+                            results: r.clone(),
+                        },
+                    ));
+                }
+                // v1 threads a single capability handle, so every import must share one type_id (one
+                // capability interface, methods distinguished by op). Distinct interfaces would need
+                // one handle each — a later slice. (Real WASI, whose imports are non-numeric, hits the
+                // parse error above regardless and needs a dedicated shim.)
+                if let Some((first, _, _)) = imports.first() {
+                    let first = *first;
+                    if imports.iter().any(|(t, _, _)| *t != first) {
+                        return unsup(
+                            "imports spanning multiple capability interfaces (one handle is \
+                             threaded in v1 — give every import the same module/type_id)",
+                        );
+                    }
+                }
+            }
             Payload::FunctionSection(reader) => {
                 for idx in reader {
                     func_type_idx.push(idx?);
@@ -157,7 +228,19 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                             let off = const_offset(offset_expr)?;
                             match el.items {
                                 wasmparser::ElementItems::Functions(fns) => {
-                                    let fs: Vec<u32> = fns.into_iter().collect::<Result<_, _>>()?;
+                                    // Store IR function indices (imports first in the wasm index
+                                    // space; the table holds defined functions). A funcref to an
+                                    // import isn't representable as an IR funcref — reject it.
+                                    let mut fs: Vec<u32> = Vec::new();
+                                    for f in fns {
+                                        let f = f?;
+                                        match f.checked_sub(imports.len() as u32) {
+                                            Some(ir) => fs.push(ir),
+                                            None => {
+                                                return unsup("funcref to an imported function")
+                                            }
+                                        }
+                                    }
                                     elements.push((off, fs));
                                 }
                                 wasmparser::ElementItems::Expressions(..) => {
@@ -173,7 +256,12 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                 for e in reader {
                     let e = e?;
                     if matches!(e.kind, wasmparser::ExternalKind::Func) {
-                        exports.push((e.name.to_string(), e.index));
+                        // wasm function indices put imports first; the IR module holds only defined
+                        // functions (index `wasm_idx - n_imp`). A re-exported import has no IR function,
+                        // so skip it (it isn't a runnable entry).
+                        if let Some(ir_idx) = e.index.checked_sub(imports.len() as u32) {
+                            exports.push((e.name.to_string(), ir_idx));
+                        }
                     }
                 }
             }
@@ -270,6 +358,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             table_base,
             &body,
             mem64,
+            &imports,
         )?);
     }
 
@@ -399,6 +488,19 @@ struct Lower<'a> {
     /// 64-bit linear memory (`memory64`): the address operand is already i64; otherwise it's an i32
     /// that must be zero-extended before our (i64-addressed) `load`/`store`.
     mem64: bool,
+    /// The single threaded **capability handle** (`i32`, the forgeable index a `cap.call` takes),
+    /// present iff the module has function imports.
+    /// Like the data-SP in the chibicc frontend, it is block param 0 of every block and is prepended
+    /// to every branch's args, so every function can reach it and a wasm `call` to an import lowers to
+    /// a `cap.call` on it. The embedder grants one capability and passes its handle as the entry's
+    /// leading argument.
+    handle: Option<ValIdx>,
+    /// Per function-import (by import index): the `(type_id, op, signature)` its `call` lowers to as a
+    /// `cap.call`. Empty when the module has no imports.
+    imports: &'a [(u32, u32, FuncType)],
+    /// Number of imported functions: a wasm function index `< n_imp` is an import (→ `cap.call`), else
+    /// a defined function at IR index `idx - n_imp`.
+    n_imp: usize,
 }
 
 impl Lower<'_> {
@@ -447,18 +549,42 @@ impl Lower<'_> {
             .ok_or_else(|| Error::Parse("operand stack underflow".into()))
     }
 
+    /// Width of the always-threaded prefix every block carries: the capability handle (if any),
+    /// then all locals. The surviving operand stack follows.
+    fn prefix_len(&self) -> usize {
+        self.handle.is_some() as usize + self.local_types.len()
+    }
+    /// The prefix value list (handle ++ locals) every branch threads, in `cur`'s value space.
+    fn prefix_vals(&self) -> Vec<ValIdx> {
+        let mut v = Vec::with_capacity(self.prefix_len());
+        if let Some(h) = self.handle {
+            v.push(h);
+        }
+        v.extend_from_slice(&self.locals);
+        v
+    }
+    /// The prefix types (the i32 capability handle ++ local types).
+    fn prefix_types(&self) -> Vec<ValType> {
+        let mut t = Vec::with_capacity(self.prefix_len());
+        if self.handle.is_some() {
+            t.push(ValType::I32);
+        }
+        t.extend_from_slice(&self.local_types);
+        t
+    }
+
     /// The block-parameter signature for a target carrying `carried` stack types: every IR block
-    /// threads all locals first, then the surviving stack.
+    /// threads the handle + all locals first, then the surviving stack.
     fn sig(&self, carried: &[ValType]) -> Vec<ValType> {
-        let mut s = self.local_types.clone();
+        let mut s = self.prefix_types();
         s.extend_from_slice(carried);
         s
     }
 
-    /// The arguments for a branch to a frame: all current locals, then the preserved base of the
-    /// target and the top `arity` carried values (the middle is unwound away).
+    /// The arguments for a branch to a frame: the threaded prefix (handle + locals), then the
+    /// preserved base of the target and the top `arity` carried values (the middle is unwound away).
     fn branch_args(&self, base: usize, arity: usize) -> Vec<ValIdx> {
-        let mut a = self.locals.clone();
+        let mut a = self.prefix_vals();
         a.extend(self.stack[..base].iter().map(|(v, _)| *v));
         a.extend(
             self.stack[self.stack.len() - arity..]
@@ -478,16 +604,21 @@ impl Lower<'_> {
         t
     }
 
-    /// Make `blk` current and rebind locals + stack to its parameters. `stack_types` is the carried
-    /// stack layout (after the locals) — the values become params `local_types.len()..`.
+    /// Make `blk` current and rebind the handle + locals + stack to its parameters. The prefix (handle
+    /// then locals) occupies params `0..prefix_len()`; `stack_types` is the carried stack layout, whose
+    /// values become the params after it.
     fn enter(&mut self, blk: usize, stack_types: &[ValType]) {
         self.cur = blk;
-        let nl = self.local_types.len();
-        self.locals = (0..nl as ValIdx).collect();
+        let p = self.handle.is_some() as ValIdx;
+        if self.handle.is_some() {
+            self.handle = Some(0);
+        }
+        let nl = self.local_types.len() as ValIdx;
+        self.locals = (p..p + nl).collect();
         self.stack = stack_types
             .iter()
             .enumerate()
-            .map(|(i, t)| ((nl + i) as ValIdx, *t))
+            .map(|(i, t)| (p + nl + i as ValIdx, *t))
             .collect();
         self.reachable = true;
     }
@@ -497,9 +628,10 @@ impl Lower<'_> {
         self.reachable = false;
     }
 
-    /// The carried stack types a merge expects, read back from its params (locals stripped).
+    /// The carried stack types a merge expects, read back from its params (the handle + locals
+    /// prefix stripped).
     fn merge_stack_types(&self, m: usize) -> Vec<ValType> {
-        self.blocks[m].params[self.local_types.len()..].to_vec()
+        self.blocks[m].params[self.prefix_len()..].to_vec()
     }
 }
 
@@ -529,6 +661,7 @@ fn lower_func(
     table_base: u64,
     body: &wasmparser::FunctionBody,
     mem64: bool,
+    imports: &[(u32, u32, FuncType)],
 ) -> Result<Func, Error> {
     // Locals = params (with their incoming param values) then declared locals (default 0).
     let mut local_types: Vec<ValType> = params.to_vec();
@@ -540,16 +673,29 @@ fn lower_func(
         }
     }
 
+    // When the module has imports we thread one capability handle (i32) as the leading param of every
+    // function/block (the data-SP trick): the IR signature is `(i32 handle, wasm-params...) -> results`
+    // and param 0 is the handle. A no-import module is unchanged (no prefix), so its IR is identical.
+    let has_imports = !imports.is_empty();
+    let n_imp = imports.len();
+    let mut entry_params: Vec<ValType> = Vec::with_capacity(has_imports as usize + params.len());
+    if has_imports {
+        entry_params.push(ValType::I32);
+    }
+    entry_params.extend_from_slice(params);
+    let nparams = params.len() as ValIdx;
+    let base = has_imports as ValIdx; // value index of wasm param 0 (after the handle, if present)
+
     let entry = BlockB {
-        params: params.to_vec(),
+        params: entry_params.clone(),
         insts: Vec::new(),
-        next_val: params.len() as ValIdx,
+        next_val: entry_params.len() as ValIdx,
         term: None,
     };
     let mut lo = Lower {
         blocks: vec![entry],
         cur: 0,
-        locals: (0..params.len() as ValIdx).collect(),
+        locals: (base..base + nparams).collect(),
         local_types: local_types.clone(),
         stack: Vec::new(),
         reachable: true,
@@ -560,6 +706,9 @@ fn lower_func(
         globals_base,
         table_base,
         mem64,
+        handle: has_imports.then_some(0),
+        imports,
+        n_imp,
     };
     // Initialize declared locals to zero (params already bound to block params), extending `locals`.
     for t in &local_types[params.len()..] {
@@ -598,7 +747,7 @@ fn lower_func(
         })
         .collect();
     Ok(Func {
-        params: params.to_vec(),
+        params: entry_params,
         results: results.to_vec(),
         blocks,
     })
@@ -731,20 +880,52 @@ fn store_op(ty: ValType) -> StoreOp {
     }
 }
 
-/// `call funcidx`: pop the callee's params (the last is on top), call it, push its results. No
-/// imports, so the wasm function index is our `Module` function index directly.
+/// `call funcidx`: pop the callee's params (the last is on top), call it, push its results.
+///
+/// A wasm function index `< n_imp` is an **import**: lower to a `cap.call` on the threaded capability
+/// handle (the import's `(type_id, op, sig)` from the convention). Otherwise it's a defined function
+/// at IR index `func - n_imp`; prepend the handle (when threaded) to its args so the callee's leading
+/// handle param is supplied.
 fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
+    if (func as usize) < lo.n_imp {
+        let (type_id, op, sig) = lo.imports[func as usize].clone();
+        let mut args = Vec::with_capacity(sig.params.len());
+        for _ in 0..sig.params.len() {
+            args.push(lo.pop()?.0);
+        }
+        args.reverse(); // stack top is the last argument
+        let handle = lo.handle.expect("import call requires a threaded handle");
+        let results = sig.results.clone();
+        let res = lo.emit_call(
+            Inst::CapCall {
+                type_id,
+                op,
+                sig,
+                handle,
+                args,
+            },
+            results.len(),
+        );
+        for (v, t) in res.into_iter().zip(results.iter()) {
+            lo.push(v, *t);
+        }
+        return Ok(());
+    }
+    let ir_idx = func - lo.n_imp as u32;
     let (params, results) = lo
         .func_sigs
-        .get(func as usize)
+        .get(ir_idx as usize)
         .ok_or_else(|| Error::Parse(format!("call to unknown function {func}")))?
         .clone();
-    let mut args = Vec::with_capacity(params.len());
+    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
     for _ in 0..params.len() {
         args.push(lo.pop()?.0);
     }
     args.reverse(); // stack top is the last argument
-    let res = lo.emit_call(Inst::Call { func, args }, results.len());
+    if let Some(h) = lo.handle {
+        args.insert(0, h); // the callee's leading handle param
+    }
+    let res = lo.emit_call(Inst::Call { func: ir_idx, args }, results.len());
     for (v, t) in res.into_iter().zip(results.iter()) {
         lo.push(v, *t);
     }
@@ -778,13 +959,20 @@ fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result
         offset: lo.table_base,
         align: 2,
     });
-    let mut args = Vec::with_capacity(params.len());
+    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
     for _ in 0..params.len() {
         args.push(lo.pop()?.0);
     }
     args.reverse();
+    // Every defined function carries a leading handle param when the module has imports, so the
+    // indirect-call signature (used for the §3c runtime type-id check) and args must include it too.
+    let mut ty_params = params.clone();
+    if let Some(h) = lo.handle {
+        args.insert(0, h);
+        ty_params.insert(0, ValType::I32);
+    }
     let ty = FuncType {
-        params: params.clone(),
+        params: ty_params,
         results: results.clone(),
     };
     let res = lo.emit_call(
@@ -1119,10 +1307,10 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
                 _ => resolve_target(lo, d)?,
             };
             let then_args = lo.branch_args(base, arity);
-            // Cond-false edge: continue in a fresh block carrying locals + the full current stack.
+            // Cond-false edge: continue in a fresh block carrying the prefix + the full current stack.
             let cont_types: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect();
             let cont = lo.new_block(lo.sig(&cont_types));
-            let mut else_args = lo.locals.clone();
+            let mut else_args = lo.prefix_vals();
             else_args.extend(lo.stack.iter().map(|(v, _)| *v));
             lo.set_term(Terminator::BrIf {
                 cond,
@@ -1214,7 +1402,7 @@ fn if_op(lo: &mut Lower, blockty: BlockType) -> Result<(), Error> {
     let carried: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect(); // base ++ params
     let then_blk = lo.new_block(lo.sig(&carried));
     let else_blk = lo.new_block(lo.sig(&carried));
-    let mut args = lo.locals.clone();
+    let mut args = lo.prefix_vals();
     args.extend(lo.stack.iter().map(|(v, _)| *v));
     lo.set_term(Terminator::BrIf {
         cond,

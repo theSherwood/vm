@@ -17,4 +17,8 @@ svm-text = { path = "../svm-text" }
 svm-verify = { path = "../svm-verify" }
 svm-interp = { path = "../svm-interp" }
 svm-jit = { path = "../svm-jit" }
+# The host glue (`cap_thunk`) for the import differential tests: bridges the JIT's `cap.call` ABI to a
+# reference `Host` so a transpiled import runs on both backends. Not a normal dep — the transpiler
+# itself emits only verifier-checked IR and never links the runtime.
+svm-run = { path = "../svm-run" }
 wat = "1"
