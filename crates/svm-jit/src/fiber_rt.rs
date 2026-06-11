@@ -75,10 +75,13 @@ pub(crate) struct FiberRuntime {
     fiber_type_id: u32,
     /// `next_pow2(nfuncs) - 1`, to mask a funcref into the function table.
     fn_table_mask: u64,
+    /// §15 spawn quota: max fibers this run may create (clamped to [`MAX_FIBERS`] at construction).
+    /// Exceeding it is a clean `FiberFault`, matching the interpreter's per-vCPU `Quota::max_fibers`.
+    max_fibers: usize,
 }
 
 impl FiberRuntime {
-    pub(crate) fn new(fiber_type_id: u32, fn_table_mask: u64) -> FiberRuntime {
+    pub(crate) fn new(fiber_type_id: u32, fn_table_mask: u64, max_fibers: usize) -> FiberRuntime {
         FiberRuntime {
             fibers: Vec::new(),
             chain: Vec::new(),
@@ -86,6 +89,7 @@ impl FiberRuntime {
             call_tramp: None,
             fiber_type_id,
             fn_table_mask,
+            max_fibers: max_fibers.clamp(1, MAX_FIBERS),
         }
     }
 
@@ -131,7 +135,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
     }
     let (mask, type_id, call_tramp) = {
         let rt = &mut *rt;
-        if rt.fibers.len() >= MAX_FIBERS {
+        if rt.fibers.len() >= rt.max_fibers {
             fault(trap_out);
             return -1;
         }

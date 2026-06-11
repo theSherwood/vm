@@ -1187,6 +1187,14 @@ pub fn run_powerbox_with_deadline(
     if arity >= 7 {
         slots.push(host.grant_blocking(std::time::Duration::ZERO, None) as i64);
     }
+    // §15: the powerbox's spawn quota (default = the anti-bomb ceilings) — the JIT enforces the same
+    // fiber/vCPU caps as the interpreter would. (An embedder sets it on the `Host`; a `run_powerbox`
+    // quota arg is a follow-up.)
+    let hq = host.quota();
+    let quota = svm_jit::Quota {
+        max_fibers: hq.max_fibers,
+        max_vcpus: hq.max_vcpus,
+    };
     let ctx = &mut host as *mut Host as *mut c_void;
     // §5 fuel/epoch kill-path: when a `deadline` is given, arm the JIT's interrupt poll with a
     // watchdog so a runaway guest is stopped after the deadline instead of hanging the process.
@@ -1212,6 +1220,7 @@ pub fn run_powerbox_with_deadline(
             ctx,
             std::sync::Arc::as_ptr(&interrupt),
             fast_cap_resolver,
+            quota,
         );
         let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
         let _ = watchdog.join();
@@ -1219,7 +1228,7 @@ pub fn run_powerbox_with_deadline(
     } else {
         // The §9/D45 fast path for the hot window-independent ops (Clock/Blocking); everything else
         // falls back to `cap_thunk` inside the resolver, so the run is otherwise identical.
-        compile_and_run_with_host_fast(module, 0, &slots, cap_thunk, ctx, fast_cap_resolver)
+        compile_and_run_with_host_fast(module, 0, &slots, cap_thunk, ctx, fast_cap_resolver, quota)
     }
     .map_err(|e| format!("JIT compile failed: {e:?}"))?;
 

@@ -315,6 +315,28 @@ pub type FastCapResolver = unsafe extern "C" fn(
     n_res: u32,
 ) -> *const core::ffi::c_void;
 
+/// §15 **spawn quota** — host-configurable ceilings on how many fibers (`cont.new`) / vCPUs
+/// (`thread.spawn`) a JIT run may create, below the fixed anti-bomb ceilings. The runtimes clamp each
+/// to their hard ceiling (a quota only *tightens*); exceeding it is a clean `FiberFault`/`ThreadFault`,
+/// matching `svm_interp::Quota`. [`Default`] = the ceilings (an unconfigured run is unchanged). NB the
+/// JIT's vCPU table is **cumulative** (a joined slot isn't freed), so `max_vcpus` bounds *total* spawns
+/// over the run — stricter than the interpreter's concurrent-liveness cap, but containment holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quota {
+    /// Max fibers a run may create (`cont.new`); clamped to the fiber anti-bomb ceiling.
+    pub max_fibers: usize,
+    /// Max thread cells a run may create (`thread.spawn`); clamped to the vCPU anti-bomb ceiling.
+    pub max_vcpus: usize,
+}
+impl Default for Quota {
+    fn default() -> Self {
+        Quota {
+            max_fibers: 1 << 16,
+            max_vcpus: 1 << 16,
+        }
+    }
+}
+
 /// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
 /// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the
 /// host's table is append-only and the host outlives the run — the same lifetime contract as the
@@ -442,9 +464,10 @@ pub fn compile_and_run_with_host(
         None,
         None,
         None,
-        None, // no kill-path armed (use `_interruptible` to arm one)
-        None, // no async ring
-        None, // no fast cap resolver (use `_fast` to supply one)
+        None,             // no kill-path armed (use `_interruptible` to arm one)
+        None,             // no async ring
+        None,             // no fast cap resolver (use `_fast` to supply one)
+        Quota::default(), // no spawn quota (use a powerbox quota via svm-run)
     )?
     .0)
 }
@@ -465,6 +488,7 @@ pub fn compile_and_run_with_host_fast(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     fast_resolver: FastCapResolver,
+    quota: Quota,
 ) -> Result<JitOutcome, JitError> {
     Ok(run_inner(
         m,
@@ -480,6 +504,7 @@ pub fn compile_and_run_with_host_fast(
         None, // no kill-path armed
         None, // no async ring
         Some(fast_resolver),
+        quota,
     )?
     .0)
 }
@@ -517,6 +542,7 @@ pub fn compile_and_run_with_host_interruptible(
         Some(interrupt),
         None, // no async ring
         None, // no fast cap resolver
+        Quota::default(),
     )?
     .0)
 }
@@ -528,6 +554,7 @@ pub fn compile_and_run_with_host_interruptible(
 /// # Safety
 /// As [`compile_and_run_with_host_interruptible`], plus `fast_resolver` (and every fn it returns) must
 /// honour the [`FastCapResolver`] ABI and stay valid for the call.
+#[allow(clippy::too_many_arguments)]
 pub fn compile_and_run_with_host_interruptible_fast(
     m: &IrModule,
     func: FuncIdx,
@@ -536,6 +563,7 @@ pub fn compile_and_run_with_host_interruptible_fast(
     cap_ctx: *mut core::ffi::c_void,
     interrupt: *const AtomicU64,
     fast_resolver: FastCapResolver,
+    quota: Quota,
 ) -> Result<JitOutcome, JitError> {
     Ok(run_inner(
         m,
@@ -551,6 +579,7 @@ pub fn compile_and_run_with_host_interruptible_fast(
         Some(interrupt),
         None, // no async ring
         Some(fast_resolver),
+        quota,
     )?
     .0)
 }
@@ -598,6 +627,7 @@ pub fn compile_and_run_capture_reserved(
         None, // no kill-path armed
         None, // no async ring
         None, // no fast cap resolver
+        Quota::default(),
     )
 }
 
@@ -632,6 +662,7 @@ pub fn compile_and_run_capture_sub(
         None, // no kill-path armed
         None, // no async ring
         None, // no fast cap resolver
+        Quota::default(),
     )
 }
 
@@ -699,6 +730,7 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
         None, // no kill-path armed (the differential oracle runs to completion)
         None, // no async ring
         None, // no fast cap resolver
+        Quota::default(),
     )
 }
 
@@ -736,6 +768,7 @@ pub fn compile_and_run_capture_reserved_with_host_async(
         None, // no kill-path armed
         Some(hooks),
         None, // no fast cap resolver
+        Quota::default(),
     )
 }
 
@@ -765,6 +798,7 @@ fn run_inner(
     interrupt: Option<*const AtomicU64>,
     async_hooks: Option<&dyn AsyncHostHooks>,
     fast_resolver: Option<FastCapResolver>,
+    quota: Quota,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // §5 fuel/epoch kill-path: the address of the host-owned interrupt cell the lowering polls at
@@ -929,6 +963,7 @@ fn run_inner(
         Some(Box::new(fiber_rt::FiberRuntime::new(
             fiber_type_id,
             fiber_mask,
+            quota.max_fibers,
         )))
     } else {
         None
@@ -953,7 +988,7 @@ fn run_inner(
     // is supplied after finalize via `set_env`; the address is stable now.
     #[cfg(fiber_rt)]
     let domain: Option<Box<os_thread_rt::Domain>> = if uses_threads {
-        Some(Box::new(os_thread_rt::Domain::new()))
+        Some(Box::new(os_thread_rt::Domain::new(quota.max_vcpus)))
     } else {
         None
     };
@@ -1115,7 +1150,7 @@ fn run_inner(
     #[cfg(fiber_rt)]
     if let Some(d) = &domain {
         let fiber_cfg = if uses_fibers {
-            Some((fiber_type_id, fiber_mask))
+            Some((fiber_type_id, fiber_mask, quota.max_fibers))
         } else {
             None
         };

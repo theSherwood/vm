@@ -1845,6 +1845,7 @@ mod fast_cap {
             generic_thunk,
             core::ptr::null_mut(),
             resolver,
+            svm_jit::Quota::default(),
         )
         .expect("fast")
         {
@@ -1942,6 +1943,7 @@ mod fast_cap_prod {
             cap_thunk,
             &mut hk as *mut Host as *mut c_void,
             fast_cap_resolver,
+            svm_jit::Quota::default(),
         )
         .expect("jit fast")
         {
@@ -2052,6 +2054,7 @@ block0(v0: i32):
             cap_thunk,
             &mut hk as *mut Host as *mut c_void,
             fast_cap_resolver,
+            svm_jit::Quota::default(),
         )
         .expect("jit fast");
 

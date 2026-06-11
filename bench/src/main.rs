@@ -398,6 +398,7 @@ fn svm_call_host(m: &svm_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
             bench_thunk,
             std::ptr::null_mut(),
             bench_fast_resolver,
+            svm_jit::Quota::default(),
         )
     } else {
         compile_and_run_with_host(m, entry, &args, bench_thunk, std::ptr::null_mut())

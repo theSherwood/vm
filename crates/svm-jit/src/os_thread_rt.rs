@@ -97,7 +97,7 @@ struct Env {
     fault_hi: usize,
     /// `(fiber_type_id, fn_table_mask)` when the module mixes fibers + threads — each vCPU then gets
     /// its own `FiberRuntime` for `cont.*`. `None` for pure-thread modules.
-    fiber_cfg: Option<(u32, u64)>,
+    fiber_cfg: Option<(u32, u64, usize)>,
     /// Address of the §5 kill-path interrupt cell (an `AtomicU64`), or `0` when no kill-path is
     /// armed. *Spinning* vCPUs already poll it (it is baked into the same compiled code every vCPU
     /// runs); this lets a **parked** vCPU — blocked in a futex `wait` or `thread.join` — re-check it
@@ -126,6 +126,11 @@ pub(crate) struct Domain {
     threads: Mutex<Threads>,
     futex: Mutex<HashMap<u64, FutexEntry>>,
     futex_cv: Condvar,
+    /// §15 spawn quota: max thread cells (`thread.spawn`s) this domain may create (clamped to
+    /// [`MAX_VCPUS`]). Exceeding it is a clean `ThreadFault`. NB the table is **cumulative** (a `join`
+    /// marks a slot used but doesn't free it), so this bounds *total* spawns over the run — stricter
+    /// than the interpreter's *concurrent*-liveness cap, but the DoS-containment guarantee holds.
+    max_vcpus: usize,
 }
 
 #[derive(Default)]
@@ -147,12 +152,13 @@ struct FutexEntry {
 }
 
 impl Domain {
-    pub(crate) fn new() -> Domain {
+    pub(crate) fn new(max_vcpus: usize) -> Domain {
         Domain {
             env: Mutex::new(None),
             threads: Mutex::new(Threads::default()),
             futex: Mutex::new(HashMap::new()),
             futex_cv: Condvar::new(),
+            max_vcpus: max_vcpus.clamp(1, MAX_VCPUS),
         }
     }
 
@@ -166,7 +172,7 @@ impl Domain {
         trap_out: *mut i64,
         call_tramp: FiberCallTramp,
         fault: (usize, usize),
-        fiber_cfg: Option<(u32, u64)>,
+        fiber_cfg: Option<(u32, u64, usize)>,
         epoch_addr: usize,
     ) {
         *lock(&self.env) = Some(Env {
@@ -262,8 +268,8 @@ fn run_child(a: SpawnArgs) {
     // thread-local — §5 / `mem::install_guard`).
     mem::install_guard();
     // A vCPU that uses `cont.*` gets its own fiber runtime, published for the duration of its run.
-    let mut frt = env.fiber_cfg.map(|(tid, mask)| {
-        let mut rt = FiberRuntime::new(tid, mask);
+    let mut frt = env.fiber_cfg.map(|(tid, mask, max_fibers)| {
+        let mut rt = FiberRuntime::new(tid, mask, max_fibers);
         rt.set_call_tramp(env.call_tramp);
         Box::new(rt)
     });
@@ -338,7 +344,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     });
     let handle = {
         let mut t = lock(&dom.threads);
-        if t.cells.len() >= MAX_VCPUS {
+        if t.cells.len() >= dom.max_vcpus {
             store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
             return -1;
         }
