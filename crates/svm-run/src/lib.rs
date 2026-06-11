@@ -23,7 +23,10 @@ use svm_ir::{Module, ValType};
 
 // Re-export the value type so embedders (and the CLI) need not also depend on `svm-interp`.
 pub use svm_interp::Value;
-use svm_jit::{compile_and_run, compile_and_run_with_host, JitOutcome, TrapKind, EXIT_CODE};
+use svm_jit::{
+    compile_and_run, compile_and_run_with_host_fast, compile_and_run_with_host_interruptible_fast,
+    JitOutcome, TrapKind, EXIT_CODE,
+};
 
 /// The host trampoline bridging the JIT's [`svm_jit::CapThunk`] ABI (§9) to the reference
 /// [`Host`]'s capability dispatch — the host code a real embedder supplies. One shared copy.
@@ -88,6 +91,102 @@ pub unsafe extern "C" fn cap_thunk(
         }
         Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
         Err(_) => *trap_out = TrapKind::CapFault as i64,
+    }
+}
+
+/// The §9/D45 **devirtualized `cap.call` fast-path resolver** for the production powerbox. It claims
+/// only the **window-independent, authority-checked** hot ops — `Clock.now` and `Blocking.work` — so
+/// they take the register-to-register fast path; every other op (all *window-touching* ones —
+/// `Memory`/`Stream`/`SharedRegion`/`IoRing` — and any multi-result or arity-mismatched op) returns
+/// `null`, so the generic [`cap_thunk`] handles it unchanged.
+///
+/// **Safety / authority is preserved by construction:** the specialized fns delegate to the *same*
+/// [`Host::cap_dispatch_slots`] the generic thunk uses (with `gm = None`, since these ops never touch
+/// the guest window), so the I2 authority check — a forged/closed/wrong-type handle is an inert
+/// `CapFault` — and the op semantics are byte-identical to the generic path. The win is only the
+/// leaner JIT→host boundary (args/result in registers, no stack marshalling, no runtime `(type_id,
+/// op)` dispatch). The arity gate (`n_args`/`n_res`) prevents a C-ABI mismatch if a frontend emits a
+/// `cap.call` to one of these ops with an unexpected signature.
+///
+/// Pass it to [`svm_jit::compile_and_run_with_host_fast`] /
+/// [`svm_jit::compile_and_run_with_host_interruptible_fast`]; [`run_powerbox`] uses it automatically.
+///
+/// # Safety
+/// Honours the [`svm_jit::FastCapResolver`] contract: `ctx` (passed to the returned fns) is a live
+/// `*mut Host`; the returned fns gate on the supplied arity and stay valid for the run.
+pub unsafe extern "C" fn fast_cap_resolver(
+    type_id: u32,
+    op: u32,
+    n_args: u32,
+    n_res: u32,
+) -> *const c_void {
+    use svm_interp::iface;
+    match (type_id, op, n_args, n_res) {
+        (iface::CLOCK, 0, 0, 1) => fast_clock_now as *const c_void,
+        (iface::BLOCKING, 0, 1, 1) => fast_blocking_work as *const c_void,
+        _ => std::ptr::null(),
+    }
+}
+
+/// `Clock.now() -> i64` (iface 2, op 0, no args) on the fast path.
+///
+/// # Safety
+/// `ctx` is a live `*mut Host`; `trap_out` is writable — the [`svm_jit::FastCapResolver`] contract.
+unsafe extern "C" fn fast_clock_now(
+    ctx: *mut c_void,
+    _mem_base: *mut u8,
+    _mem_size: u64,
+    handle: i32,
+    trap_out: *mut i64,
+) -> i64 {
+    fast_dispatch(ctx, svm_interp::iface::CLOCK, 0, handle, &[], trap_out)
+}
+
+/// `Blocking.work(a0) -> i64` (iface 10, op 0, one arg) on the fast path.
+///
+/// # Safety
+/// As [`fast_clock_now`].
+unsafe extern "C" fn fast_blocking_work(
+    ctx: *mut c_void,
+    _mem_base: *mut u8,
+    _mem_size: u64,
+    handle: i32,
+    trap_out: *mut i64,
+    a0: i64,
+) -> i64 {
+    fast_dispatch(ctx, svm_interp::iface::BLOCKING, 0, handle, &[a0], trap_out)
+}
+
+/// Shared body for the fast-path fns: drive the **same** [`Host::cap_dispatch_slots`] the generic
+/// thunk uses (so the authority check + semantics are identical), with no window (`gm = None` — these
+/// ops never touch the guest window). The register args are already collected in `args`; the single
+/// result is returned and the trap cell encoded exactly as [`cap_thunk`].
+///
+/// # Safety
+/// `ctx` is a live `*mut Host`; `trap_out` is writable.
+#[inline]
+unsafe fn fast_dispatch(
+    ctx: *mut c_void,
+    type_id: u32,
+    op: u32,
+    handle: i32,
+    args: &[i64],
+    trap_out: *mut i64,
+) -> i64 {
+    let host = &mut *(ctx as *mut Host);
+    match host.cap_dispatch_slots(type_id, op, handle, args, None) {
+        Ok(res) => {
+            *trap_out = 0;
+            res.first().copied().unwrap_or(0)
+        }
+        Err(Trap::Exit(code)) => {
+            *trap_out = EXIT_CODE as i64 | ((code as i64) << 32);
+            0
+        }
+        Err(_) => {
+            *trap_out = TrapKind::CapFault as i64;
+            0
+        }
     }
 }
 
@@ -1104,20 +1203,23 @@ pub fn run_powerbox_with_deadline(
             }
         });
         // SAFETY: `interrupt` (an `Arc<AtomicU64>`) outlives the run — it is dropped only after the
-        // watchdog is joined below; `cap_thunk`/`ctx` honour the `CapThunk` contract.
-        let r = svm_jit::compile_and_run_with_host_interruptible(
+        // watchdog is joined below; `cap_thunk`/`ctx`/`fast_cap_resolver` honour their contracts.
+        let r = compile_and_run_with_host_interruptible_fast(
             module,
             0,
             &slots,
             cap_thunk,
             ctx,
             std::sync::Arc::as_ptr(&interrupt),
+            fast_cap_resolver,
         );
         let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
         let _ = watchdog.join();
         r
     } else {
-        compile_and_run_with_host(module, 0, &slots, cap_thunk, ctx)
+        // The §9/D45 fast path for the hot window-independent ops (Clock/Blocking); everything else
+        // falls back to `cap_thunk` inside the resolver, so the run is otherwise identical.
+        compile_and_run_with_host_fast(module, 0, &slots, cap_thunk, ctx, fast_cap_resolver)
     }
     .map_err(|e| format!("JIT compile failed: {e:?}"))?;
 

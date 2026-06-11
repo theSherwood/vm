@@ -1818,9 +1818,10 @@ mod fast_cap {
         a0.wrapping_add(1)
     }
 
-    /// Claims only `(42, 0)`; everything else falls back to the generic thunk.
-    unsafe extern "C" fn resolver(type_id: u32, op: u32) -> *const c_void {
-        if type_id == 42 && op == 0 {
+    /// Claims only `(42, 0)` at its `(1 arg, 1 result)` arity; everything else (incl. a mismatched
+    /// arity) falls back to the generic thunk.
+    unsafe extern "C" fn resolver(type_id: u32, op: u32, n_args: u32, n_res: u32) -> *const c_void {
+        if (type_id, op, n_args, n_res) == (42, 0, 1, 1) {
             fast_add1 as *const c_void
         } else {
             core::ptr::null()
@@ -1884,5 +1885,189 @@ block0(v0: i32, v1: i64):
         let (g, f) = run_both(ir, 21);
         assert_eq!(g, f, "unclaimed op must fall back to the generic thunk");
         assert_eq!(g, 42, "op 1 doubles");
+    }
+}
+
+/// §9 / D45 — the **production** `svm_run::fast_cap_resolver` (Clock/Blocking on the devirtualized
+/// path). These pin that it is behaviourally identical to the generic `svm_run::cap_thunk` *and* the
+/// interpreter — including the **I2 safety check** (a forged handle is an inert `CapFault` on the fast
+/// path too, because the specialized fns delegate to the same `Host::cap_dispatch_slots`).
+#[cfg(unix)]
+mod fast_cap_prod {
+    use core::ffi::c_void;
+    use std::time::Duration;
+    use svm_interp::{run_with_host, Host, Value};
+    use svm_jit::{compile_and_run_with_host, compile_and_run_with_host_fast, JitOutcome};
+    use svm_run::{cap_thunk, fast_cap_resolver};
+    use svm_text::parse_module;
+    use svm_verify::verify_module;
+
+    /// Run `ir`'s entry (handle passed as the single i32 arg) three ways — interp, JIT-generic,
+    /// JIT-fast — over a `Host` the closure `grant`s the same way each time, and assert all agree.
+    fn assert_all_agree(ir: &str, grant: impl Fn(&mut Host) -> i32) -> i64 {
+        let m = parse_module(ir).expect("parse");
+        verify_module(&m).expect("verify");
+
+        let mut hi = Host::new();
+        let h = grant(&mut hi);
+        let mut fuel = 100_000_000u64;
+        let interp = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut hi).expect("interp");
+        let iv = match interp[0] {
+            Value::I64(x) => x,
+            Value::I32(x) => x as i64,
+            o => panic!("interp value {o:?}"),
+        };
+
+        let mut hg = Host::new();
+        assert_eq!(grant(&mut hg), h, "handle encoding stable");
+        let g = match compile_and_run_with_host(
+            &m,
+            0,
+            &[h as i64],
+            cap_thunk,
+            &mut hg as *mut Host as *mut c_void,
+        )
+        .expect("jit generic")
+        {
+            JitOutcome::Returned(v) => v[0],
+            o => panic!("generic: {o:?}"),
+        };
+
+        let mut hk = Host::new();
+        assert_eq!(grant(&mut hk), h, "handle encoding stable");
+        let f = match compile_and_run_with_host_fast(
+            &m,
+            0,
+            &[h as i64],
+            cap_thunk,
+            &mut hk as *mut Host as *mut c_void,
+            fast_cap_resolver,
+        )
+        .expect("jit fast")
+        {
+            JitOutcome::Returned(v) => v[0],
+            o => panic!("fast: {o:?}"),
+        };
+
+        assert_eq!(iv, g, "interp vs jit-generic");
+        assert_eq!(g, f, "jit-generic vs jit-fast (D45 must match the thunk)");
+        iv
+    }
+
+    /// `Clock.now` (iface 2 op 0) is fast-pathed: an 8-iteration loop-sum of the deterministic clock
+    /// (0+1+…+7 = 28) agrees across interp, the generic thunk, and the fast path.
+    #[test]
+    fn clock_now_fast_matches_generic_and_interp() {
+        let ir = "\
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i32, v4: i64, v5: i64):
+  v6 = i64.const 8
+  v7 = i64.lt_s v5 v6
+  br_if v7 block2(v3, v4, v5) block3(v4)
+block2(v8: i32, v9: i64, v10: i64):
+  v11 = cap.call 2 0 () -> (i64) v8()
+  v12 = i64.add v9 v11
+  v13 = i64.const 1
+  v14 = i64.add v10 v13
+  br block1(v8, v12, v14)
+block3(v15: i64):
+  return v15
+}
+";
+        let got = assert_all_agree(ir, |h| h.grant_clock());
+        assert_eq!(got, 28);
+    }
+
+    /// `Blocking.work` (iface 10 op 0, one arg) is fast-pathed: a loop-sum of `mix(i)` for i in 0..8
+    /// agrees across all three execution paths (exercises the register-arg path, the `hostcall` shape).
+    #[test]
+    fn blocking_work_fast_matches_generic_and_interp() {
+        let ir = "\
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i32, v4: i64, v5: i64):
+  v6 = i64.const 8
+  v7 = i64.lt_s v5 v6
+  br_if v7 block2(v3, v4, v5) block3(v4)
+block2(v8: i32, v9: i64, v10: i64):
+  v11 = cap.call 10 0 (i64) -> (i64) v8(v10)
+  v12 = i64.add v9 v11
+  v13 = i64.const 1
+  v14 = i64.add v10 v13
+  br block1(v8, v12, v14)
+block3(v15: i64):
+  return v15
+}
+";
+        // mix(arg) = arg*6364136223846793005 + 1442695040888963407 (wrapping) — the Blocking transform.
+        let want: i64 = (0..8i64)
+            .map(|a| {
+                a.wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407)
+            })
+            .fold(0i64, |s, x| s.wrapping_add(x));
+        let got = assert_all_agree(ir, |h| h.grant_blocking(Duration::ZERO, None));
+        assert_eq!(got, want);
+    }
+
+    /// **I2 safety on the fast path:** a `cap.call` with a *forged* handle (nothing granted) must be an
+    /// inert `CapFault` trap on the fast path exactly as on the generic thunk — the specialized fn
+    /// delegates to `Host::cap_dispatch_slots`, whose `resolve` rejects an ungranted handle.
+    #[test]
+    fn forged_handle_is_inert_on_fast_path() {
+        // A Clock cap.call through a handle the host never granted (empty powerbox).
+        let ir = "\
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = cap.call 2 0 () -> (i64) v0()
+  return v1
+}
+";
+        let m = parse_module(ir).expect("parse");
+        verify_module(&m).expect("verify");
+        let forged = 0x4242_4242i32; // never granted
+
+        let mut hg = Host::new();
+        let generic = compile_and_run_with_host(
+            &m,
+            0,
+            &[forged as i64],
+            cap_thunk,
+            &mut hg as *mut Host as *mut c_void,
+        )
+        .expect("jit generic");
+
+        let mut hk = Host::new();
+        let fast = compile_and_run_with_host_fast(
+            &m,
+            0,
+            &[forged as i64],
+            cap_thunk,
+            &mut hk as *mut Host as *mut c_void,
+            fast_cap_resolver,
+        )
+        .expect("jit fast");
+
+        assert!(
+            matches!(generic, JitOutcome::Trapped(_)),
+            "generic: forged handle must trap, got {generic:?}"
+        );
+        assert!(
+            matches!(fast, JitOutcome::Trapped(_)),
+            "fast: forged handle must trap (I2), got {fast:?}"
+        );
+        // And identically (same trap kind).
+        assert_eq!(
+            format!("{generic:?}"),
+            format!("{fast:?}"),
+            "fast path must trap identically to the generic thunk"
+        );
     }
 }

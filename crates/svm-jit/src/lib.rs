@@ -288,8 +288,8 @@ pub type CapThunk = unsafe extern "C" fn(
 /// **compile time** (the JIT calls the resolver during codegen and bakes the returned address); a
 /// `null` return falls back to the generic thunk, so an embedder can fast-path only its hot ops.
 ///
-/// The specialized function's ABI is, for a `cap.call` with `sig.params.len() == N` args and **one**
-/// result (multi-result ops fall back to the generic thunk):
+/// The specialized function's ABI is, for a `cap.call` with `n_args` args and **one** result
+/// (multi-result ops fall back to the generic thunk):
 /// `unsafe extern "C" fn(ctx, mem_base, mem_size, handle: i32, trap_out: *mut i64, a0: i64, …, aN: i64) -> i64`
 /// — `ctx`/`mem_base`/`mem_size`/`trap_out` are exactly as in [`CapThunk`]; the `handle` is the
 /// resolved capability handle (the fn still does the authority check); each `ai` is the i'th argument
@@ -297,9 +297,23 @@ pub type CapThunk = unsafe extern "C" fn(
 /// to the result type. A 0-result op returns an ignored 0. The fn signals a trap via `trap_out`
 /// exactly like the generic thunk.
 ///
+/// **The resolver MUST gate on `(n_args, n_res)`**: the JIT builds the call signature from the IR
+/// `cap.call`'s arity, so a returned fn whose Rust signature has a *different* arity is a C-ABI
+/// mismatch. A frontend may emit a `cap.call` to any `(type_id, op)` with any sig (the verifier checks
+/// only `args.len() == sig.params.len()`, not that it matches the host op), so the resolver must return
+/// a fn **only** when `(n_args, n_res)` equals that fn's own arity — otherwise `null` (the generic
+/// slot-based path handles the odd arity safely). Types never mismatch (every arg is passed as an i64
+/// register, the result decoded from i64), so only arity matters.
+///
 /// # Safety
-/// The resolver and every function it returns must honour the ABI above and stay valid for the run.
-pub type FastCapResolver = unsafe extern "C" fn(type_id: u32, op: u32) -> *const core::ffi::c_void;
+/// The resolver and every function it returns must honour the ABI above (incl. the arity gate) and
+/// stay valid for the run.
+pub type FastCapResolver = unsafe extern "C" fn(
+    type_id: u32,
+    op: u32,
+    n_args: u32,
+    n_res: u32,
+) -> *const core::ffi::c_void;
 
 /// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
 /// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the
@@ -503,6 +517,40 @@ pub fn compile_and_run_with_host_interruptible(
         Some(interrupt),
         None, // no async ring
         None, // no fast cap resolver
+    )?
+    .0)
+}
+
+/// [`compile_and_run_with_host_interruptible`] + the §9/D45 [`FastCapResolver`]: the production run
+/// path — a guest-undisableable kill-path **and** hot `cap.call`s devirtualized. The resolver's
+/// unclaimed ops fall back to `cap_thunk` unchanged.
+///
+/// # Safety
+/// As [`compile_and_run_with_host_interruptible`], plus `fast_resolver` (and every fn it returns) must
+/// honour the [`FastCapResolver`] ABI and stay valid for the call.
+pub fn compile_and_run_with_host_interruptible_fast(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    interrupt: *const AtomicU64,
+    fast_resolver: FastCapResolver,
+) -> Result<JitOutcome, JitError> {
+    Ok(run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        None,
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        Some(interrupt),
+        None, // no async ring
+        Some(fast_resolver),
     )?
     .0)
 }
@@ -2601,8 +2649,17 @@ fn fast_cap_target(lower: &Lower, type_id: u32, op: u32, sig: &FuncType) -> Opti
         return None; // the fast ABI returns a single register; multi-result falls back to the thunk
     }
     // SAFETY: `resolver` honours the `FastCapResolver` contract (caller guarantee); it's a pure
-    // `(type_id, op) -> *const fn` lookup with no side effects, safe to call during codegen.
-    let target = unsafe { resolver(type_id, op) } as i64;
+    // `(type_id, op, n_args, n_res) -> *const fn` lookup with no side effects, safe to call during
+    // codegen. The arity is passed so the resolver only claims an op when its specialized fn's arity
+    // matches the IR `cap.call`'s — else it returns null and the generic slot-based path is used.
+    let target = unsafe {
+        resolver(
+            type_id,
+            op,
+            sig.params.len() as u32,
+            sig.results.len() as u32,
+        )
+    } as i64;
     (target != 0).then_some(target)
 }
 
