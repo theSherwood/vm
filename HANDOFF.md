@@ -1281,19 +1281,25 @@ regressions one commit old"):
 > **`SCHEDULING.md`** + **DESIGN D56/D57** (the concurrency-primitives decision), **`DESIGN.md`** /
 > **`README.md`**.
 >
-> **Just landed (this session): wasm transpiler — function imports / the host ABI (item 0 below).** A
-> wasm `(import "<module>" "<name>" (func …))` now lowers to a `cap.call` by the convention `module` =
-> decimal capability `type_id`, `name` = decimal `op`; the transpiler threads one capability handle (an
-> `i32`) as the leading param of every function (the data-SP trick), and the embedder grants the cap +
-> passes its handle as the entry's leading arg. Function-index remapping (imports first), `call_indirect`
-> handle-threading through the §3c type check, and clean errors for non-numeric names / non-func imports /
-> multiple interfaces. 7 differential tests (`crates/svm-wasm/tests/imports.rs`) run import-using modules
-> on **both** backends under one reference `Host` (interp `run_with_host`; JIT `compile_and_run_with_host`
-> over `svm_run::cap_thunk`). No-import modules are unchanged (25 transpile tests green). **Bench
-> `--from-wasm` now also transpiles the `hostcall`/`hostbuf` interface kernels from their WAT** (numeric
-> import convention; cross-checked identical to Wasmtime) — so the apples-to-apples comparison covers the
-> §1a interface axis, not just compute. Full detail in item 0's "Imports / host ABI" sub-bullet.
-> **Next:** `memory.{grow,size}`.
+> **Just landed (this session): wasm transpiler — function imports / the host ABI, then
+> `memory.size`/`memory.grow` (item 0 below).**
+> **(1) Imports.** A wasm `(import "<module>" "<name>" (func …))` lowers to a `cap.call` by the
+> convention `module` = decimal capability `type_id`, `name` = decimal `op`; the transpiler threads one
+> capability handle (an `i32`) as the leading param of every function (the data-SP trick), and the
+> embedder grants the cap + passes its handle as the entry's leading arg. Function-index remapping
+> (imports first), `call_indirect` handle-threading through the §3c type check, clean errors for
+> non-numeric names / non-func imports / multiple interfaces; 7 differential tests
+> (`crates/svm-wasm/tests/imports.rs`) on **both** backends under one reference `Host`. **Bench
+> `--from-wasm` now also transpiles the `hostcall`/`hostbuf` kernels** (cross-checked identical to
+> Wasmtime) — the apples-to-apples comparison covers the §1a interface axis, not just compute.
+> **(2) Linear-memory growth.** `memory.size`/`memory.grow` (pages, incl. memory64): when a module uses
+> `memory.grow` the window reserves the memory's full growable span at offset 0 (up to its declared
+> `maximum`, else a modest default `DEFAULT_MAX_GROW_PAGES = 256`) and puts globals/table *above* it; a
+> runtime 8-byte **size cell** backs the ops (`grow` updates it branch-free via `select`, returning the
+> old size or `-1`). A pre-scan means a non-growing module is byte-identical to before (tight window, no
+> cell, `memory.size` a constant). 6 new differential tests in `transpile.rs` (31 total). No-import
+> /no-grow modules unchanged. Full detail in item 0's sub-bullets. **Next:** passive data / element
+> segments (then bulk memory `memory.fill`/`copy`/`init`).
 >
 > **Earlier (prior session): the async I/O ring (B) — COMPLETE, increments 2 + 3a + 3b + 3c,
 > mechanism + runtime on BOTH backends.** Increment 2 — the **bounded blocking-offload pool**: `submit`
@@ -1322,7 +1328,7 @@ regressions one commit old"):
 >
 > **Immediate frontier, ranked** *(the async ring (B) is done — these are the next big rocks):*
 > 0. **wasm → IR transpiler (`crates/svm-wasm`) — IN PROGRESS (numeric + control + if/else + memory +
->    imports).**
+>    grow + imports).**
 >    A second frontend after chibicc, chosen *before* the LLVM on-ramp because it's smaller and directly
 >    serves the §1a benchmark thesis: take *any* wasm and run it on SVM vs Wasmtime on the *same bytes*,
 >    instead of hand-writing IR+WAT kernel pairs. The interesting part is the **stack→SSA reconstruction**
@@ -1380,13 +1386,30 @@ regressions one commit old"):
 >      identical results to Wasmtime on the same bytes (hostcall ~1.18×, hostbuf ~0.50× = ~2× faster).
 >      So `--from-wasm` now covers the §1a **interface** axis too, not just compute. **Still open on
 >      imports:** multiple distinct capability interfaces (one handle each).
->    **Missing wasm features (the explicit note — what svm-wasm does NOT transpile yet):** (1)
->    `memory.{grow,size}`. (2) passive data / element segments. (3) imports spanning multiple capability
->    interfaces (one handle is threaded). (4) SIMD (v128). (5) reference types beyond funcref tables;
->    multi-memory / multi-table. **Next slice:** `memory.{grow,size}` (the remaining piece blocking most
->    real clang/wasi-libc-emitted wasm) — function imports / the host ABI just landed; the subset already
->    transpiles real clang-emitted wasm (control flow, `__stack_pointer`, function pointers, host imports)
->    end to end and benches at hand-written-IR speed.
+>    - **`memory.size` / `memory.grow` — DONE (this session).** Pages, incl. `memory64`. The linear
+>      memory is at window offset 0; when a module uses `memory.grow` the window reserves its **full
+>      growable span** at the bottom — up to a declared `maximum`, or `DEFAULT_MAX_GROW_PAGES = 256`
+>      (16 MiB, bounded by `MAX_GROW_PAGES`) for unbounded memory — and puts the globals/table regions
+>      *above* it, so growth never collides. A runtime 8-byte **size cell** just above the linear memory
+>      (initialized to the initial page count via a data segment) holds the current size: `memory.size`
+>      loads it, `memory.grow(delta)` updates it **branch-free** (i64 page math, then `select` to store
+>      `new`/unchanged and return `old`/`-1`). Because SVM masks accesses into the window rather than
+>      bounds-checking-and-trapping, a grown page is just reachable; the cell only governs the return
+>      values (the documented confinement difference). A **pre-scan** for the `memory.grow` opcode means
+>      a non-growing module — every existing kernel — is **byte-identical** to before (tight initial-
+>      sized window, no cell, `memory.size` a constant). 6 differential tests in `transpile.rs` (size
+>      constant; grow returns old + size reflects it; over-cap → `-1` + unchanged; declared `maximum`
+>      honored; grown memory store/load past 64 KiB; the memory64 path). *Limitation: the growable
+>      window is eagerly RW-committed (lazy-physical on Linux via `MAP_NORESERVE`), so the unbounded
+>      default is modest; a program needing a larger heap declares a `maximum` (honored) — a lazy-commit
+>      growable window is a future JIT enhancement.*
+>    **Missing wasm features (the explicit note — what svm-wasm does NOT transpile yet):** (1) passive
+>    data / element segments + **bulk memory** (`memory.fill`/`copy`/`init`, `table.*`). (2) imports
+>    spanning multiple capability interfaces (one handle is threaded). (3) SIMD (v128). (4) reference
+>    types beyond funcref tables; multi-memory / multi-table. **Next slice:** passive data / element
+>    segments + bulk-memory ops (`memory.fill`/`copy`) — common in clang/wasi-libc output. The subset
+>    already transpiles real clang-emitted wasm (control flow, `__stack_pointer`, function pointers,
+>    host imports, heap growth) end to end and benches at hand-written-IR speed.
 > 1. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
