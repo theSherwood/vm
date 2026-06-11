@@ -16,13 +16,15 @@
 //! full structured control set `block`/`loop`/`if`/`else`/`br`/`br_if`/`br_table`/`return`/
 //! `unreachable` (with dead-code / else-resurrection bookkeeping) · **linear memory** load/store
 //! (i32/i64, incl. narrow + `memory64`; the i32 address is zero-extended into our i64 window, which is
-//! sized to the wasm memory's initial pages) · direct **`call`** (multi-function + recursion). Still a
-//! clean [`Error::Unsupported`] (added in slices): `call_indirect`/tables, globals, floats,
-//! `memory.{grow,size}`, data segments, SIMD, reference types.
+//! sized to the wasm memory's initial pages) · direct **`call`** (multi-function + recursion) ·
+//! **floats** (f32/f64 const/arith/unary/compare, load/store, and every int↔float conversion incl.
+//! `trunc`/`trunc_sat`/`convert`/`demote`/`promote`/`reinterpret`). Still a clean
+//! [`Error::Unsupported`] (added in slices): `call_indirect`/tables, globals, `memory.{grow,size}`,
+//! data segments, SIMD, reference types.
 
 use svm_ir::{
-    BinOp, Block, CmpOp, ConvOp, Edge, Func, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp,
-    Terminator, ValIdx, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF,
+    Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -465,6 +467,55 @@ fn int_val(ty: IntTy) -> ValType {
         IntTy::I64 => ValType::I64,
     }
 }
+fn float_val(ty: FloatTy) -> ValType {
+    match ty {
+        FloatTy::F32 => ValType::F32,
+        FloatTy::F64 => ValType::F64,
+    }
+}
+fn fbin(lo: &mut Lower, ty: FloatTy, op: FBinOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::FBin { ty, op, a, b });
+    lo.push(v, float_val(ty));
+    Ok(())
+}
+fn fun(lo: &mut Lower, ty: FloatTy, op: FUnOp) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::FUn { ty, op, a });
+    lo.push(v, float_val(ty));
+    Ok(())
+}
+fn fcmp(lo: &mut Lower, ty: FloatTy, op: FCmpOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::FCmp { ty, op, a, b });
+    lo.push(v, ValType::I32);
+    Ok(())
+}
+/// float → int. wasm `trunc_*` traps on out-of-range/NaN; `trunc_sat_*` saturates.
+fn ftoi(lo: &mut Lower, op: FToI, sat: bool, out: ValType) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(if sat {
+        Inst::FToISat { op, a }
+    } else {
+        Inst::FToITrap { op, a }
+    });
+    lo.push(v, out);
+    Ok(())
+}
+fn itof(lo: &mut Lower, op: IToF, out: ValType) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::IToFConv { op, a });
+    lo.push(v, out);
+    Ok(())
+}
+fn fcast(lo: &mut Lower, op: CastOp, out: ValType) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::Cast { op, a });
+    lo.push(v, out);
+    Ok(())
+}
 
 /// Pop the wasm address (an i32 for a 32-bit memory, zero-extended to our i64 address space; an i64 for
 /// `memory64`).
@@ -664,6 +715,91 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64Store8 { memarg } => mem_store(lo, StoreOp::I64_8, memarg)?,
         O::I64Store16 { memarg } => mem_store(lo, StoreOp::I64_16, memarg)?,
         O::I64Store32 { memarg } => mem_store(lo, StoreOp::I64_32, memarg)?,
+        // ---- floats: const / arithmetic / unary / compare ----
+        O::F32Const { value } => {
+            let v = lo.emit(Inst::ConstF32(value.bits()));
+            lo.push(v, ValType::F32);
+        }
+        O::F64Const { value } => {
+            let v = lo.emit(Inst::ConstF64(value.bits()));
+            lo.push(v, ValType::F64);
+        }
+        O::F32Add => fbin(lo, FloatTy::F32, FBinOp::Add)?,
+        O::F32Sub => fbin(lo, FloatTy::F32, FBinOp::Sub)?,
+        O::F32Mul => fbin(lo, FloatTy::F32, FBinOp::Mul)?,
+        O::F32Div => fbin(lo, FloatTy::F32, FBinOp::Div)?,
+        O::F32Min => fbin(lo, FloatTy::F32, FBinOp::Min)?,
+        O::F32Max => fbin(lo, FloatTy::F32, FBinOp::Max)?,
+        O::F32Copysign => fbin(lo, FloatTy::F32, FBinOp::Copysign)?,
+        O::F64Add => fbin(lo, FloatTy::F64, FBinOp::Add)?,
+        O::F64Sub => fbin(lo, FloatTy::F64, FBinOp::Sub)?,
+        O::F64Mul => fbin(lo, FloatTy::F64, FBinOp::Mul)?,
+        O::F64Div => fbin(lo, FloatTy::F64, FBinOp::Div)?,
+        O::F64Min => fbin(lo, FloatTy::F64, FBinOp::Min)?,
+        O::F64Max => fbin(lo, FloatTy::F64, FBinOp::Max)?,
+        O::F64Copysign => fbin(lo, FloatTy::F64, FBinOp::Copysign)?,
+        O::F32Abs => fun(lo, FloatTy::F32, FUnOp::Abs)?,
+        O::F32Neg => fun(lo, FloatTy::F32, FUnOp::Neg)?,
+        O::F32Sqrt => fun(lo, FloatTy::F32, FUnOp::Sqrt)?,
+        O::F32Ceil => fun(lo, FloatTy::F32, FUnOp::Ceil)?,
+        O::F32Floor => fun(lo, FloatTy::F32, FUnOp::Floor)?,
+        O::F32Trunc => fun(lo, FloatTy::F32, FUnOp::Trunc)?,
+        O::F32Nearest => fun(lo, FloatTy::F32, FUnOp::Nearest)?,
+        O::F64Abs => fun(lo, FloatTy::F64, FUnOp::Abs)?,
+        O::F64Neg => fun(lo, FloatTy::F64, FUnOp::Neg)?,
+        O::F64Sqrt => fun(lo, FloatTy::F64, FUnOp::Sqrt)?,
+        O::F64Ceil => fun(lo, FloatTy::F64, FUnOp::Ceil)?,
+        O::F64Floor => fun(lo, FloatTy::F64, FUnOp::Floor)?,
+        O::F64Trunc => fun(lo, FloatTy::F64, FUnOp::Trunc)?,
+        O::F64Nearest => fun(lo, FloatTy::F64, FUnOp::Nearest)?,
+        O::F32Eq => fcmp(lo, FloatTy::F32, FCmpOp::Eq)?,
+        O::F32Ne => fcmp(lo, FloatTy::F32, FCmpOp::Ne)?,
+        O::F32Lt => fcmp(lo, FloatTy::F32, FCmpOp::Lt)?,
+        O::F32Le => fcmp(lo, FloatTy::F32, FCmpOp::Le)?,
+        O::F32Gt => fcmp(lo, FloatTy::F32, FCmpOp::Gt)?,
+        O::F32Ge => fcmp(lo, FloatTy::F32, FCmpOp::Ge)?,
+        O::F64Eq => fcmp(lo, FloatTy::F64, FCmpOp::Eq)?,
+        O::F64Ne => fcmp(lo, FloatTy::F64, FCmpOp::Ne)?,
+        O::F64Lt => fcmp(lo, FloatTy::F64, FCmpOp::Lt)?,
+        O::F64Le => fcmp(lo, FloatTy::F64, FCmpOp::Le)?,
+        O::F64Gt => fcmp(lo, FloatTy::F64, FCmpOp::Gt)?,
+        O::F64Ge => fcmp(lo, FloatTy::F64, FCmpOp::Ge)?,
+        // ---- float load / store ----
+        O::F32Load { memarg } => mem_load(lo, LoadOp::F32, memarg)?,
+        O::F64Load { memarg } => mem_load(lo, LoadOp::F64, memarg)?,
+        O::F32Store { memarg } => mem_store(lo, StoreOp::F32, memarg)?,
+        O::F64Store { memarg } => mem_store(lo, StoreOp::F64, memarg)?,
+        // ---- float ↔ int conversions (trunc traps; trunc_sat saturates) ----
+        O::I32TruncF32S => ftoi(lo, FToI::F32I32S, false, ValType::I32)?,
+        O::I32TruncF32U => ftoi(lo, FToI::F32I32U, false, ValType::I32)?,
+        O::I32TruncF64S => ftoi(lo, FToI::F64I32S, false, ValType::I32)?,
+        O::I32TruncF64U => ftoi(lo, FToI::F64I32U, false, ValType::I32)?,
+        O::I64TruncF32S => ftoi(lo, FToI::F32I64S, false, ValType::I64)?,
+        O::I64TruncF32U => ftoi(lo, FToI::F32I64U, false, ValType::I64)?,
+        O::I64TruncF64S => ftoi(lo, FToI::F64I64S, false, ValType::I64)?,
+        O::I64TruncF64U => ftoi(lo, FToI::F64I64U, false, ValType::I64)?,
+        O::I32TruncSatF32S => ftoi(lo, FToI::F32I32S, true, ValType::I32)?,
+        O::I32TruncSatF32U => ftoi(lo, FToI::F32I32U, true, ValType::I32)?,
+        O::I32TruncSatF64S => ftoi(lo, FToI::F64I32S, true, ValType::I32)?,
+        O::I32TruncSatF64U => ftoi(lo, FToI::F64I32U, true, ValType::I32)?,
+        O::I64TruncSatF32S => ftoi(lo, FToI::F32I64S, true, ValType::I64)?,
+        O::I64TruncSatF32U => ftoi(lo, FToI::F32I64U, true, ValType::I64)?,
+        O::I64TruncSatF64S => ftoi(lo, FToI::F64I64S, true, ValType::I64)?,
+        O::I64TruncSatF64U => ftoi(lo, FToI::F64I64U, true, ValType::I64)?,
+        O::F32ConvertI32S => itof(lo, IToF::I32F32S, ValType::F32)?,
+        O::F32ConvertI32U => itof(lo, IToF::I32F32U, ValType::F32)?,
+        O::F32ConvertI64S => itof(lo, IToF::I64F32S, ValType::F32)?,
+        O::F32ConvertI64U => itof(lo, IToF::I64F32U, ValType::F32)?,
+        O::F64ConvertI32S => itof(lo, IToF::I32F64S, ValType::F64)?,
+        O::F64ConvertI32U => itof(lo, IToF::I32F64U, ValType::F64)?,
+        O::F64ConvertI64S => itof(lo, IToF::I64F64S, ValType::F64)?,
+        O::F64ConvertI64U => itof(lo, IToF::I64F64U, ValType::F64)?,
+        O::F32DemoteF64 => fcast(lo, CastOp::Demote, ValType::F32)?,
+        O::F64PromoteF32 => fcast(lo, CastOp::Promote, ValType::F64)?,
+        O::I32ReinterpretF32 => fcast(lo, CastOp::ReinterpF32I32, ValType::I32)?,
+        O::F32ReinterpretI32 => fcast(lo, CastOp::ReinterpI32F32, ValType::F32)?,
+        O::I64ReinterpretF64 => fcast(lo, CastOp::ReinterpF64I64, ValType::I64)?,
+        O::F64ReinterpretI64 => fcast(lo, CastOp::ReinterpI64F64, ValType::F64)?,
         // ---- direct call (call_indirect needs tables/elements — a later slice) ----
         O::Call { function_index } => call_op(lo, function_index)?,
         // ---- structured control flow ----

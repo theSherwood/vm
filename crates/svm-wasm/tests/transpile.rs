@@ -50,6 +50,117 @@ fn run(wat: &str, entry: &str, args: &[Value]) -> i64 {
     }
 }
 
+/// Like [`run`] but for any value type (incl. floats): runs interp + JIT, asserts they agree
+/// (float results bit-equal or both NaN), and returns the interp result `Value`.
+fn eval(wat: &str, entry: &str, args: &[Value]) -> Value {
+    let wasm = wat::parse_str(wat).expect("assemble wat");
+    let t = svm_wasm::transpile(&wasm).expect("transpile");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let idx = t.exports.iter().find(|(n, _)| n == entry).unwrap().1;
+    let results = &t.module.funcs[idx as usize].results;
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&t.module, idx, args, &mut fuel).expect("interp");
+    let jit_args: Vec<i64> = args
+        .iter()
+        .map(|v| match v {
+            Value::I32(x) => *x as i64,
+            Value::I64(x) => *x,
+            Value::F32(x) => x.to_bits() as i64,
+            Value::F64(x) => x.to_bits() as i64,
+        })
+        .collect();
+    let jit = match svm_jit::compile_and_run(&t.module, idx, &jit_args).expect("jit") {
+        svm_jit::JitOutcome::Returned(v) => v,
+        other => panic!("jit did not return: {other:?}"),
+    };
+    for (i, rt) in results.iter().enumerate() {
+        let ok = match (rt, interp[i]) {
+            (svm_ir::ValType::I32, Value::I32(x)) => x as u32 as u64 == jit[i] as u32 as u64,
+            (svm_ir::ValType::I64, Value::I64(x)) => x as u64 == jit[i] as u64,
+            (svm_ir::ValType::F32, Value::F32(x)) => {
+                let j = f32::from_bits(jit[i] as u32);
+                x.to_bits() == j.to_bits() || (x.is_nan() && j.is_nan())
+            }
+            (svm_ir::ValType::F64, Value::F64(x)) => {
+                let j = f64::from_bits(jit[i] as u64);
+                x.to_bits() == j.to_bits() || (x.is_nan() && j.is_nan())
+            }
+            _ => panic!("result type/value mismatch"),
+        };
+        assert!(
+            ok,
+            "interp != jit at result {i}: {:?} vs {:#x}",
+            interp[i], jit[i]
+        );
+    }
+    interp[0]
+}
+
+fn as_f64(v: Value) -> f64 {
+    match v {
+        Value::F64(x) => x,
+        other => panic!("expected f64, got {other:?}"),
+    }
+}
+fn as_f32(v: Value) -> f32 {
+    match v {
+        Value::F32(x) => x,
+        other => panic!("expected f32, got {other:?}"),
+    }
+}
+
+#[test]
+fn f64_arithmetic() {
+    let wat = r#"
+(module (func (export "f") (param $a f64) (param $b f64) (result f64)
+  (f64.add (f64.mul (local.get $a) (local.get $a)) (f64.sqrt (local.get $b)))))"#;
+    assert_eq!(
+        as_f64(eval(wat, "f", &[Value::F64(3.0), Value::F64(16.0)])),
+        13.0
+    );
+}
+
+/// A float loop: sum 1/k for k in 1..=n (harmonic), plus int↔float conversion — exercises FBin/FCmp,
+/// the loop, and i64→f64 / f64 compares.
+#[test]
+fn f64_harmonic_loop() {
+    let wat = r#"
+(module (func (export "h") (param $n i64) (result f64)
+  (local $acc f64) (local $k i64)
+  (local.set $k (i64.const 1))
+  (block $done (loop $loop
+    (br_if $done (i64.gt_s (local.get $k) (local.get $n)))
+    (local.set $acc (f64.add (local.get $acc) (f64.div (f64.const 1) (f64.convert_i64_s (local.get $k)))))
+    (local.set $k (i64.add (local.get $k) (i64.const 1)))
+    (br $loop)))
+  (local.get $acc)))"#;
+    let got = as_f64(eval(wat, "h", &[Value::I64(4)]));
+    let want = 1.0 + 0.5 + 1.0 / 3.0 + 0.25;
+    assert!(
+        (got - want).abs() < 1e-12,
+        "harmonic(4) = {got}, want {want}"
+    );
+}
+
+#[test]
+fn f32_and_conversions() {
+    let wat = r#"
+(module (func (export "g") (param $x f32) (result i32)
+  (i32.trunc_f32_s (f32.mul (local.get $x) (f32.const 2.5)))))"#;
+    assert_eq!(eval(wat, "g", &[Value::F32(4.0)]), Value::I32(10));
+    // demote/promote round trip
+    let wat2 = r#"
+(module (func (export "rt") (param $x f64) (result f64)
+  (f64.promote_f32 (f32.demote_f64 (local.get $x)))))"#;
+    let got = as_f32(eval(
+        r#"(module (func (export "d") (param $x f64) (result f32) (f32.demote_f64 (local.get $x))))"#,
+        "d",
+        &[Value::F64(1.5)],
+    ));
+    assert_eq!(got, 1.5f32);
+    assert_eq!(as_f64(eval(wat2, "rt", &[Value::F64(2.25)])), 2.25);
+}
+
 #[test]
 fn straight_line_add() {
     let wat = r#"
@@ -319,8 +430,9 @@ fn recursive_call_fib() {
 
 #[test]
 fn unsupported_is_clean_error() {
-    // f32 arithmetic is out of this slice's subset → a clean Unsupported error, not a panic.
-    let wat = r#"(module (func (export "g") (result f32) (f32.const 1.0)))"#;
+    // A global is out of the current subset → a clean Unsupported error, not a panic.
+    let wat =
+        r#"(module (global i32 (i32.const 5)) (func (export "g") (result i32) (global.get 0)))"#;
     let wasm = wat::parse_str(wat).unwrap();
     match svm_wasm::transpile(&wasm) {
         Err(svm_wasm::Error::Unsupported(_)) => {}
