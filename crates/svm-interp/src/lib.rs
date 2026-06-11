@@ -2854,6 +2854,11 @@ pub trait AsyncCounter: Send + Sync {
     fn key(&self) -> u64;
 }
 
+/// §4/§7 a JIT cap-path window **page map**: page index → state code (the flat-window backend, e.g.
+/// `svm_run`, owns the encoding; absent ⇒ region default). Shared + persistent across a run's
+/// `cap.call`s (see [`Host::cap_window_pages`]) so a guest-grown page stays borrowable.
+pub type CapPageMap = Arc<Mutex<BTreeMap<u64, u8>>>;
+
 /// A [`GuestMem`] over a flat, contiguous window slice — the JIT's representation. The
 /// slice may include trailing guard bytes; `size` is the *logical* window so the §7
 /// bounds check matches the interpreter exactly.
@@ -3210,6 +3215,13 @@ pub struct Host {
     /// (`drive` wires it to the M:N `Scheduler::notify`); `None` ⇒ no async support, so `submit_async`
     /// `-EINVAL`s and the guest falls back to the synchronous `submit`.
     async_notify: Option<Arc<dyn Fn(u64, u32) + Send + Sync>>,
+    /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
+    /// its window view per `cap.call`, so without a persistent home a guest-*grown* heap page (committed
+    /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
+    /// would fail-closed. Persisting it here (the per-run `Host` is the only state `cap_thunk` reaches)
+    /// mirrors how the interpreter's `Mem` keeps its page map across calls. Page index → state code
+    /// (`svm_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears.
+    cap_pages: Option<(usize, CapPageMap)>,
 }
 
 /// One §14 module grant: the verified module's functions, declared window size, and data segments —
@@ -3242,6 +3254,21 @@ impl Host {
             pool: None,
             rings: Vec::new(),
             async_notify: None,
+            cap_pages: None,
+        }
+    }
+
+    /// §4/§7 the JIT cap-path window page map (see [`Host::cap_pages`]) for window `base`, persistent
+    /// across this run's `cap.call`s so a guest-grown heap page stays borrowable. Returns a fresh empty
+    /// map when the base changes (a new window / run reusing this `Host`), else the existing one.
+    pub fn cap_window_pages(&mut self, base: usize) -> CapPageMap {
+        match &self.cap_pages {
+            Some((b, m)) if *b == base => Arc::clone(m),
+            _ => {
+                let m = Arc::new(Mutex::new(BTreeMap::new()));
+                self.cap_pages = Some((base, Arc::clone(&m)));
+                m
+            }
         }
     }
 

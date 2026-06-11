@@ -12,8 +12,9 @@
 
 use core::ffi::c_void;
 
-use std::sync::Arc;
-use svm_interp::{AsyncCounter, GuestMem, Host, RegionBacking, StreamRole, Trap};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use svm_interp::{AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, StreamRole, Trap};
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
@@ -56,9 +57,13 @@ pub unsafe extern "C" fn cap_thunk(
     };
     // The guest window with a real hardware-protected Memory capability (`map`/`unmap`/`protect`,
     // incl. growth into the reserved tail): `mprotect` on unix, `VirtualProtect`/`VirtualAlloc` on
-    // windows — the same software-page-map model, only the syscalls differ.
+    // windows — the same software-page-map model, only the syscalls differ. The page map is the
+    // **per-run** one from the `Host` (keyed by window base), so growth committed in an earlier
+    // `cap.call` is still seen committed here — a borrow of a guest-grown page doesn't fail-closed.
     #[cfg(any(unix, windows))]
-    let mut wm = MprotectWindow::new(mem_base, mem_size, mem_reserved);
+    let pages = host.cap_window_pages(mem_base as usize);
+    #[cfg(any(unix, windows))]
+    let mut wm = MprotectWindow::new_shared(mem_base, mem_size, mem_reserved, pages);
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
@@ -159,9 +164,13 @@ pub struct MprotectWindow {
     reserved: u64,
     /// Host page size (`host_page_size()`), the protection granularity (matches `svm_interp`).
     page: u64,
-    /// Page index ⇒ explicit state; absent ⇒ region default (rw in `[0, mapped)`, unmapped in the
-    /// reserved tail). Mirrors `svm_interp`'s page map so the two backends agree page-for-page.
-    prot: std::collections::BTreeMap<u64, PageState>,
+    /// Page index ⇒ explicit state code (1=Rw, 2=Ro, 3=Unmapped); absent ⇒ region default (rw in
+    /// `[0, mapped)`, unmapped in the reserved tail). Mirrors `svm_interp`'s page map so the two
+    /// backends agree page-for-page. **Shared** ([`Arc<Mutex<…>>`]) so it persists across the run's
+    /// `cap.call`s (the JIT rebuilds the window view per call): guest-grown pages stay borrowable. The
+    /// persistent home is the `Host` ([`Host::cap_window_pages`]); a one-off [`MprotectWindow::new`]
+    /// gets a private fresh map.
+    prot: CapPageMap,
 }
 
 #[cfg(any(unix, windows))]
@@ -173,22 +182,78 @@ enum PageState {
 }
 
 #[cfg(any(unix, windows))]
+impl PageState {
+    fn code(self) -> u8 {
+        match self {
+            PageState::Rw => 1,
+            PageState::Ro => 2,
+            PageState::Unmapped => 3,
+        }
+    }
+    fn from_code(c: u8) -> Option<PageState> {
+        match c {
+            1 => Some(PageState::Rw),
+            2 => Some(PageState::Ro),
+            3 => Some(PageState::Unmapped),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
 impl MprotectWindow {
-    /// Wrap the JIT window `[base, base+mapped)` (backed) inside a `reserved` mask domain.
+    /// Wrap the JIT window `[base, base+mapped)` (backed) inside a `reserved` mask domain with a
+    /// **private** fresh page map — for a one-off view. Most callers want [`MprotectWindow::new_shared`]
+    /// (the `cap_thunk` path) so growth persists across the run's cap.calls.
     pub fn new(base: *mut u8, mapped: u64, reserved: u64) -> MprotectWindow {
+        Self::new_shared(
+            base,
+            mapped,
+            reserved,
+            Arc::new(Mutex::new(BTreeMap::new())),
+        )
+    }
+
+    /// Like [`MprotectWindow::new`], but with a **shared** page map (typically the per-run one from
+    /// [`Host::cap_window_pages`]) so a guest-grown page committed in one `cap.call` is still seen
+    /// committed by a later one — the cap-buffer borrow of grown heap memory no longer fail-closes.
+    pub fn new_shared(
+        base: *mut u8,
+        mapped: u64,
+        reserved: u64,
+        prot: CapPageMap,
+    ) -> MprotectWindow {
         MprotectWindow {
             base,
             mapped,
             reserved: reserved.max(mapped),
             page: host_page_size(),
-            prot: std::collections::BTreeMap::new(),
+            prot,
         }
+    }
+
+    /// Read one page's explicit state from the shared map (locks; `None` ⇒ absent / region default).
+    fn prot_get(&self, page: u64) -> Option<PageState> {
+        self.prot
+            .lock()
+            .unwrap()
+            .get(&page)
+            .copied()
+            .and_then(PageState::from_code)
+    }
+    /// Set one page's explicit state in the shared map.
+    fn prot_set(&self, page: u64, st: PageState) {
+        self.prot.lock().unwrap().insert(page, st.code());
+    }
+    /// Clear one page back to the region default (absent).
+    fn prot_clear(&self, page: u64) {
+        self.prot.lock().unwrap().remove(&page);
     }
 
     /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed — the
     /// same default rule as the interpreter (`svm_interp::Mem::page_access`).
     fn page_access(&self, page: u64) -> Option<bool> {
-        match self.prot.get(&page) {
+        match self.prot_get(page) {
             Some(PageState::Rw) => Some(true),
             Some(PageState::Ro) => Some(false),
             Some(PageState::Unmapped) => None,
@@ -234,14 +299,14 @@ impl MprotectWindow {
         const PROT_WRITE: i32 = 2;
         if prot & PROT_WRITE != 0 {
             if page * self.page < self.mapped {
-                self.prot.remove(&page);
+                self.prot_clear(page);
             } else {
-                self.prot.insert(page, PageState::Rw);
+                self.prot_set(page, PageState::Rw);
             }
         } else if prot & PROT_READ != 0 {
-            self.prot.insert(page, PageState::Ro);
+            self.prot_set(page, PageState::Ro);
         } else {
-            self.prot.insert(page, PageState::Unmapped);
+            self.prot_set(page, PageState::Unmapped);
         }
     }
 
@@ -404,7 +469,7 @@ impl GuestMem for MprotectWindow {
         self.hw_release_hint(start, plen);
         self.hw_apply(start, plen, 0 /* none */);
         for page in pages {
-            self.prot.insert(page, PageState::Unmapped);
+            self.prot_set(page, PageState::Unmapped);
         }
         0
     }
@@ -516,7 +581,7 @@ impl GuestMem for MprotectWindow {
                 PageState::Ro
             };
             for page in pages {
-                self.prot.insert(page, state);
+                self.prot_set(page, state);
             }
             0
         }
@@ -610,7 +675,7 @@ impl GuestMem for MprotectWindow {
                 PageState::Ro
             };
             for page in pages {
-                self.prot.insert(page, state);
+                self.prot_set(page, state);
             }
             0
         }

@@ -994,14 +994,17 @@ leave a shared view — add a unix test for this alongside the Windows work.
         submit/reap `cap.call`s **must be serialized by the guest** (a guest mutex, like a real shared
         io_uring's single-producer SQ) — the JIT `cap_thunk` takes `&mut *host` with no lock (the interp
         serializes via `Arc<Mutex<Host>>`), so concurrent dispatch from multiple vCPUs would race the
-        Host. (2) **cap-buffer ops to a guest-*grown* heap page fail-closed on the JIT** — `cap_thunk`
-        rebuilds `MprotectWindow` per call with a fresh software page map, so it doesn't know the guest
-        grew the heap (the interp's `Mem` persists the map across cap.calls); a `read_bytes`/`write_bytes`
-        to a grown-tail address returns `-EFAULT`/writes nothing. **Safe (fail-closed, no escape), but a
-        real interp/JIT functional divergence.** The demo sidesteps it with **global** (backed-prefix)
-        SQ/CQ buffers (realistic — io_uring rings are fixed shared buffers). *Follow-up:* persist the
-        JIT cap-path page map across cap.calls (e.g. thread it through `cap_thunk`) so grown-heap buffers
-        work on the JIT too.
+        Host. (2) **cap-buffer ops to a guest-*grown* heap page — FIXED.** Previously fail-closed on the
+        JIT: `cap_thunk` rebuilt `MprotectWindow` per call with a fresh software page map, so it didn't
+        know the guest grew the heap (the interp's `Mem` persists the map across cap.calls), and a
+        `read_bytes`/`write_bytes` to a grown-tail address returned `-EFAULT`/wrote nothing. Now the page
+        map is **persisted per run in the `Host`** (`Host::cap_window_pages(base)` → a shared
+        `CapPageMap = Arc<Mutex<BTreeMap<u64,u8>>>`, keyed by window base so it resets for a new window);
+        `cap_thunk` builds the window via `MprotectWindow::new_shared(.., pages)`, so growth committed in
+        one cap.call is seen by later ones — a borrow of grown heap memory works on the JIT exactly like
+        the interp. Regression guard: `c_frontend::c_grown_heap_buffer_is_borrowable` (malloc 128 KiB past
+        the window, `write()` the grown buffer; interp == JIT, was non-vacuously failing before). The demo
+        keeps its global (prefix) SQ/CQ buffers purely for the shared-ring design now, not as a workaround.
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
     today), fiber/vCPU quota metering (the kill path exists;
     *metering*/quotas don't yet), the D57 migratable-fiber primitive (stackful work-stealing), a
@@ -1251,11 +1254,9 @@ regressions one commit old"):
 >    its suspend/wake protocol — the futex park + completion notify — informs the fiber's).
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); fiber/vCPU
 >    quota *metering* (§15; the kill path exists, quotas don't); a **thread-safe guest `malloc`** (the
->    MVP bump allocator races under threads — surfaced by `demos/mn_sched`); DPOR for `explore_all`;
->    **persist the JIT cap-path page map across cap.calls** so cap-buffer ops (`write`/`submit`/`reap`)
->    on a guest-*grown* heap page work on the JIT (today they fail-closed — `cap_thunk` rebuilds
->    `MprotectWindow` per call; the interp's `Mem` persists it — a safe but real interp/JIT divergence
->    surfaced by `demos/async_work_stealing`); and the async-ring pool could grow more offloadable ops.
+>    MVP bump allocator races under threads — surfaced by `demos/mn_sched`); DPOR for `explore_all`; and
+>    the async-ring pool could grow more offloadable ops. *(The JIT cap-path page-map persistence — grown-
+>    heap cap-buffer borrows — is now **DONE**: `Host::cap_window_pages` + `MprotectWindow::new_shared`.)*
 > 4. **Maintainer one-liners** (need the `workflow` token scope I can't push): apply the nightly **miri**
 >    CI job (snippet at commit `60d4f3a`); drop `continue-on-error` from the now-green `cross-os` matrix.
 

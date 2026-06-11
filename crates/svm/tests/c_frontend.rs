@@ -2061,6 +2061,33 @@ fn c_region_unmap_builtin() {
     assert_eq!(run_c(C_REGION_UNMAP).as_slice(), [Value::I32(1)]);
 }
 
+/// §7/§4 — a cap-buffer borrow of a **guest-grown** heap page. The program `malloc`s 128 KiB (past
+/// the 64 KiB initial window, so `malloc` grows the heap into the reserved tail via the Memory cap),
+/// fills it, and `write()`s **that grown buffer** across the §7 trampoline. The interpreter's `Mem`
+/// persists its page map across cap.calls, so it borrows the grown pages fine; the JIT's `cap_thunk`
+/// must persist its page map too (else the borrow fail-closes and the write drops). `run_c_full`
+/// enforces interp == JIT, so this fails if the JIT can't see the growth — the regression guard for
+/// the cap-path page-map persistence.
+#[test]
+fn c_grown_heap_buffer_is_borrowable() {
+    let src = "#include <stdlib.h>\n\
+        int write(int fd, char *buf, long n);\n\
+        int main(void){\n\
+        \x20 long n = 128*1024;\n\
+        \x20 char *buf = (char*)malloc(n);\n\
+        \x20 if(!buf){ write(1,\"OOM\\n\",4); return 1; }\n\
+        \x20 for(long i=0;i<n;i++) buf[i] = (char)('A' + (i%26));\n\
+        \x20 write(1, buf, n);\n\
+        \x20 return 0;\n\
+        }\n";
+    let run = run_c_full(src);
+    let expected: Vec<u8> = (0..128 * 1024).map(|i| b'A' + (i % 26) as u8).collect();
+    assert_eq!(
+        run.stdout, expected,
+        "grown-heap buffer write must reach stdout"
+    );
+}
+
 /// The §12 capstone: a **guest-built M:N green-thread scheduler** (`demos/mn_sched`) runs
 /// identically on the interpreter (the M:N deterministic oracle) and the JIT (real OS threads).
 /// 4 worker threads (`thread.spawn`), each cooperatively round-robining 8 fibers (`cont.*`) that

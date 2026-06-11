@@ -8,12 +8,12 @@
  * is a futex notify, §12). Work-stealing and I/O overlap: while N ops are in flight on the pool, the
  * NWORKERS vCPUs are reaping, not blocked — "OS threads bounded by K, not by I/O concurrency".
  *
- * The SQ/CQ are **global** (fixed shared ring buffers, like real io_uring), not per-worker stack
- * scratch — both so concurrent workers share one ring and so the buffers live in the backed window
- * prefix. (Cap-buffer borrows to a guest-*grown* heap page currently fail-closed on the JIT, whose
- * per-cap.call window view doesn't persist growth state; globals sidestep that.) The shared ring's
- * submit/reap `cap.call`s are serialized by a guest mutex — exactly as a shared io_uring requires
- * single-producer submission; the blocking work still overlaps on the pool, and parking is lock-free.
+ * The SQ/CQ are **global** fixed shared ring buffers, like real io_uring — one ring shared by all
+ * workers, not per-worker scratch. Its submit/reap `cap.call`s are serialized by a guest mutex —
+ * exactly as a shared io_uring requires single-producer submission; the blocking work still overlaps
+ * on the pool, and parking is lock-free. (Grown-heap buffers borrow fine across cap.calls on both
+ * backends — the JIT persists its cap-path page map per run — so the choice here is purely the
+ * shared-ring design, not a workaround.)
  *
  * Everything is guest code over the VM's primitives: vCPUs (`thread.spawn`), C11 atomics, the futex
  * (`__vm_wait32`), and the ring builtins. The printed total — the wrapping sum of the host's
