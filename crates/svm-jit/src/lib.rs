@@ -749,6 +749,11 @@ fn run_inner(
     let _ = flags.set("is_pic", "false");
     // Cranelift's x64 `return_call` (tail calls, §3b) lowering requires frame pointers.
     let _ = flags.set("preserve_frame_pointers", "true");
+    // Run Cranelift's mid-end optimizer (GVN/CSE, constant materialization, store-to-load
+    // forwarding). Wasmtime defaults to this; without it (the prior default `none`) redundant
+    // address computations weren't CSE'd and constants were pool loads. "SSA on the wire" (no SSA
+    // reconstruction) keeps cold start ahead even with the optimizer on.
+    let _ = flags.set("opt_level", "speed");
     let isa = cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
@@ -1275,6 +1280,7 @@ fn compile_child(
     let mut flags = settings::builder();
     let _ = flags.set("is_pic", "false");
     let _ = flags.set("preserve_frame_pointers", "true");
+    let _ = flags.set("opt_level", "speed"); // match the top-level compile (GVN/CSE/const-mat)
     let isa = cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
@@ -2436,9 +2442,12 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
     let cont = b.create_block();
     let trap_blk = b.create_block();
     let addr = b.ins().iconst(I64, lower.epoch_addr);
-    // notrap + aligned, but *not* readonly: the host may store into it concurrently, so the value
-    // must be reloaded at every check rather than CSE'd / hoisted.
-    let flag = b.ins().load(I64, MemFlags::trusted(), addr, 0);
+    // The host stores into this cell **concurrently** (the watchdog thread), so the poll must reload
+    // it every check. An **atomic** load is the reliable way to say so: under `opt_level=speed`
+    // Cranelift's alias analysis sees no *guest* store to the cell and would hoist/CSE a plain load out
+    // of the loop (the poll would fire once and never again — the runaway would never be killed); an
+    // atomic load is a synchronization op the optimizer won't hoist. (The cell is a host `AtomicU64`.)
+    let flag = b.ins().atomic_load(I64, atomic_flags(), addr);
     b.ins().brif(flag, trap_blk, &[], cont, &[]);
     b.switch_to_block(trap_blk);
     emit_trap(b, lower, TrapKind::OutOfFuel);
