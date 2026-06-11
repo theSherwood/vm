@@ -428,6 +428,25 @@ fn recursive_call_fib() {
     }
 }
 
+/// An active data segment initializes linear memory; the guest reads it back.
+#[test]
+fn data_segment_init() {
+    let wat = r#"
+(module (memory 1)
+  (data (i32.const 16) "\01\02\03\04\05\06\07\08")
+  (func (export "g") (result i64) (i64.load (i32.const 16))))"#;
+    // little-endian i64 from bytes 01..08
+    assert_eq!(run(wat, "g", &[]), 0x0807_0605_0403_0201);
+
+    // sum two i32s laid out by a data segment
+    let wat2 = r#"
+(module (memory 1)
+  (data (i32.const 0) "\0a\00\00\00\14\00\00\00")
+  (func (export "sum") (result i32)
+    (i32.add (i32.load (i32.const 0)) (i32.load (i32.const 4)))))"#;
+    assert_eq!(run(wat2, "sum", &[]), 30); // 10 + 20
+}
+
 #[test]
 fn unsupported_is_clean_error() {
     // A global is out of the current subset → a clean Unsupported error, not a panic.

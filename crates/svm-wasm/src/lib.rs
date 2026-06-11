@@ -20,7 +20,7 @@
 //! **floats** (f32/f64 const/arith/unary/compare, load/store, and every int↔float conversion incl.
 //! `trunc`/`trunc_sat`/`convert`/`demote`/`promote`/`reinterpret`). Still a clean
 //! [`Error::Unsupported`] (added in slices): `call_indirect`/tables, globals, `memory.{grow,size}`,
-//! data segments, SIMD, reference types.
+//! SIMD, reference types. Active **data segments** (initialized linear memory) are now handled.
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF,
@@ -83,6 +83,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut bodies: Vec<wasmparser::FunctionBody> = Vec::new();
     let mut exports: Vec<(String, u32)> = Vec::new();
     let mut mem: Option<wasmparser::MemoryType> = None;
+    let mut data: Vec<svm_ir::Data> = Vec::new();
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -132,6 +133,27 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                 }
             }
             Payload::CodeSectionEntry(body) => bodies.push(body),
+            Payload::DataSection(reader) => {
+                for seg in reader {
+                    let seg = seg?;
+                    match seg.kind {
+                        wasmparser::DataKind::Active {
+                            memory_index,
+                            offset_expr,
+                        } => {
+                            if memory_index != 0 {
+                                return unsup("multi-memory data segment");
+                            }
+                            data.push(svm_ir::Data {
+                                offset: const_offset(offset_expr)?,
+                                readonly: false, // wasm linear memory is writable; RO data is a frontend choice
+                                bytes: seg.data.to_vec(),
+                            });
+                        }
+                        wasmparser::DataKind::Passive => return unsup("passive data segment"),
+                    }
+                }
+            }
             _ => {} // version header, custom sections, datacount, ends, etc. — ignore
         }
     }
@@ -165,10 +187,25 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         module: Module {
             funcs,
             memory,
-            data: Vec::new(),
+            data,
         },
         exports,
     })
+}
+
+/// Evaluate an active data segment's offset (a constant expression — `i32.const`/`i64.const`; a
+/// `global.get` initializer needs immutable imported globals, deferred).
+fn const_offset(expr: wasmparser::ConstExpr) -> Result<u64, Error> {
+    let mut off = None;
+    for op in expr.get_operators_reader() {
+        match op? {
+            Operator::I32Const { value } => off = Some(value as u32 as u64),
+            Operator::I64Const { value } => off = Some(value as u64),
+            Operator::End => {}
+            other => return unsup(format!("data offset expression {other:?}")),
+        }
+    }
+    off.ok_or_else(|| Error::Parse("empty data offset expression".into()))
 }
 
 /// A block under construction: SSA values are block-local indices — params first (`0..params.len()`),
