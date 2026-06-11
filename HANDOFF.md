@@ -1359,8 +1359,12 @@ regressions one commit old"):
 > runtime 8-byte **size cell** backs the ops (`grow` updates it branch-free via `select`, returning the
 > old size or `-1`). A pre-scan means a non-growing module is byte-identical to before (tight window, no
 > cell, `memory.size` a constant). 6 new differential tests in `transpile.rs` (31 total). No-import
-> /no-grow modules unchanged. Full detail in item 0's sub-bullets. **Next:** passive data / element
-> segments (then bulk memory `memory.fill`/`copy`/`init`).
+> /no-grow modules unchanged. **(3) Bulk memory `memory.copy`/`memory.fill`** (program-first: found by
+> compiling a real clang struct-copy + array-zero-init program): a constant length unrolls to chunked
+> load/stores (overlap-safe), a runtime length lowers to a synthesized byte loop (`memory.copy` is a
+> direction-correct memmove). Two real-clang capstones (static + runtime-length `__builtin_memcpy`) run
+> identically interp == JIT. Full detail in item 0's sub-bullets. **Next:** passive data/element
+> segments + `memory.init`/`data.drop` (the remaining bulk-memory family).
 >
 > **Earlier (prior session): the async I/O ring (B) — COMPLETE, increments 2 + 3a + 3b + 3c,
 > mechanism + runtime on BOTH backends.** Increment 2 — the **bounded blocking-offload pool**: `submit`
@@ -1389,7 +1393,7 @@ regressions one commit old"):
 >
 > **Immediate frontier, ranked** *(the async ring (B) is done — these are the next big rocks):*
 > 0. **wasm → IR transpiler (`crates/svm-wasm`) — IN PROGRESS (numeric + control + if/else + memory +
->    grow + imports).**
+>    grow + bulk-memory + imports).**
 >    A second frontend after chibicc, chosen *before* the LLVM on-ramp because it's smaller and directly
 >    serves the §1a benchmark thesis: take *any* wasm and run it on SVM vs Wasmtime on the *same bytes*,
 >    instead of hand-writing IR+WAT kernel pairs. The interesting part is the **stack→SSA reconstruction**
@@ -1464,13 +1468,25 @@ regressions one commit old"):
 >      window is eagerly RW-committed (lazy-physical on Linux via `MAP_NORESERVE`), so the unbounded
 >      default is modest; a program needing a larger heap declares a `maximum` (honored) — a lazy-commit
 >      growable window is a future JIT enhancement.*
+>    - **Bulk memory `memory.copy` / `memory.fill` — DONE (program-first).** Found by compiling a real
+>      clang program (struct copy + `int buf[64]={0}`) with `-mbulk-memory`. A **constant** length is
+>      unrolled into chunked load/stores (8/4/2/1; `copy` loads all chunks before storing any, so
+>      overlap is safe); a **runtime** length lowers to a **synthesized byte loop** in IR (header/body/
+>      exit blocks threading the prefix + carried stack + loop-private addresses/length/counter — new
+>      `Lower::{synth_sig,synth_args,enter_synth}` helpers), with `memory.copy` a **direction-correct
+>      memmove** (forward when `dest ≤ src`, backward when `dest > src`). Constant lengths are recognised
+>      by tracking `i32/i64.const` SSA values per block. Tests: hand-written overlap (both directions,
+>      const + dynamic) gives the memmove result, broadcast-chunk fill, and two real-clang capstones
+>      (`real_clang_bulk_memory` = struct copy + array zero-init; `real_clang_dynamic_memcpy` =
+>      `__builtin_memcpy` with a runtime length) run identically on interp + JIT vs a computed oracle.
 >    **Missing wasm features (the explicit note — what svm-wasm does NOT transpile yet):** (1) passive
->    data / element segments + **bulk memory** (`memory.fill`/`copy`/`init`, `table.*`). (2) imports
->    spanning multiple capability interfaces (one handle is threaded). (3) SIMD (v128). (4) reference
->    types beyond funcref tables; multi-memory / multi-table. **Next slice:** passive data / element
->    segments + bulk-memory ops (`memory.fill`/`copy`) — common in clang/wasi-libc output. The subset
->    already transpiles real clang-emitted wasm (control flow, `__stack_pointer`, function pointers,
->    host imports, heap growth) end to end and benches at hand-written-IR speed.
+>    data / element segments + `memory.init`/`data.drop` + the `table.*` bulk ops. (2) imports spanning
+>    multiple capability interfaces (one handle is threaded). (3) SIMD (v128). (4) reference types beyond
+>    funcref tables; multi-memory / multi-table. **Next slice:** passive data/element segments +
+>    `memory.init`/`data.drop` (the remaining bulk-memory family; appears in some clang/wasi-libc
+>    output). The subset already transpiles real clang-emitted wasm (control flow, `__stack_pointer`,
+>    function pointers, host imports, heap growth, **memcpy/memset incl. runtime length**) end to end and
+>    benches at hand-written-IR speed.
 > 1. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
