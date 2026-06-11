@@ -506,7 +506,13 @@ block3(v17: i64):
 /// ordering. `lead` is the args before `n`: `run` threads the data-stack pointer as v0, so it is
 /// the initial SP (0 is safe here — the frame is tiny and self-contained). Returns `Err` (caller
 /// skips the kernel) if the frontend can't be built/run.
-fn c_kernel(name: &str, src: &str, lead: Vec<i64>, wat32: String) -> Result<Resolved, String> {
+fn c_kernel(
+    name: &str,
+    src: &str,
+    lead: Vec<i64>,
+    wat32: String,
+    wat64: Option<String>,
+) -> Result<Resolved, String> {
     let ir = compile_c_to_ir(src)?;
     let m = svm_text::parse_module(&ir).map_err(|e| format!("parse frontend IR: {e:?}"))?;
     let entry = m
@@ -523,7 +529,7 @@ fn c_kernel(name: &str, src: &str, lead: Vec<i64>, wat32: String) -> Result<Reso
         entry,
         lead_args: lead,
         wat32,
-        wat64: None,
+        wat64,
         mode: Mode::Compute,
     })
 }
@@ -537,16 +543,20 @@ fn alu_from_c() -> Result<Resolved, String> {
         for (long i = 0; i < n; i++)\n    \
         acc = acc * 6364136223846793005L + 1442695040888963407L + i;\n  \
         return acc;\n}\nint main(){ return (int)run(0); }\n";
-    c_kernel("alu_c", SRC, vec![0], ALU.wat32.to_string())
+    c_kernel("alu_c", SRC, vec![0], ALU.wat32.to_string(), None)
 }
 
 /// A **data-SP–relative** memory loop from C: an address-taken `volatile` stack array, so each
 /// iteration stores/loads through `sp + (i & 255)*8` — and `sp` is an *unbounded* i64 block
-/// param, so the JIT cannot prove the address in-window and masks every access. This is the
-/// **accepted-cost** case (D50): closing the ~2.26× wasm32 gap would require 32-bit window
-/// addressing, which we deliberately do *not* pursue — we keep the clean 64-bit model and pay
-/// one mask (it still beats wasm64). Kept as a tracked metric so the mask path can't *regress
-/// further*. `memsum`/`scatter` don't exercise it (their indices are provably small ⇒ pre-elided).
+/// param, so the JIT cannot prove the address in-window and masks every access. This is svm's
+/// **weakest** kernel: unlike `memsum`/`scatter` (provably-small indices ⇒ mask pre-elided ⇒ svm
+/// *beats* wasm64), here the mask can't be elided, so svm is slower than **both** wasm32 (~3.3×) and
+/// wasm64 (~1.8×). Measured split: the mask is only ~1/3 of it (force-eliding drops it to ~2.2× wasm32
+/// / ~1.2× wasm64); the rest is structural — the threaded-`sp` add + chibicc-generated IR + the
+/// `volatile` memory-resident pattern, vs hand-written WAT over a pinned heap base. Closing the mask
+/// third needs the verifier to prove the data-SP bounded (the §3d register-pinned-`sp` direction), not
+/// 32-bit addressing (D50, rejected). Kept as a tracked metric so the mask path can't *regress
+/// further*, with both a wasm32 and a (fair, 64-bit) wasm64 oracle.
 fn locals_from_c() -> Result<Resolved, String> {
     const SRC: &str = "long run(long n){\n  volatile long a[256];\n  long acc = 0;\n  \
         for (long i = 0; i < n; i++) { a[i & 255] = i; acc += a[i & 255]; }\n  \
@@ -569,7 +579,32 @@ fn locals_from_c() -> Result<Resolved, String> {
         (br $loop)))
     (local.get $acc)))
 "#;
-    c_kernel("locals_c", SRC, vec![0], WAT32.to_string())
+    // wasm64 oracle (`(memory i64 1)`): the **fair 64-bit comparison** — like SVM, the address is a
+    // 64-bit value, so Wasmtime emits an explicit bounds check per access (it can't lean on a 4 GiB
+    // guard region the way wasm32 does). This is the apples-to-apples row for a 64-bit memory model.
+    const WAT64: &str = r#"
+(module
+  (memory i64 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64) (local $addr i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $addr
+          (i64.mul (i64.and (local.get $i) (i64.const 255)) (i64.const 8)))
+        (i64.store (local.get $addr) (local.get $i))
+        (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#;
+    c_kernel(
+        "locals_c",
+        SRC,
+        vec![0],
+        WAT32.to_string(),
+        Some(WAT64.to_string()),
+    )
 }
 
 /// Build the chibicc fork (idempotent `make`) and compile `src` to our text IR. Returns `Err`
