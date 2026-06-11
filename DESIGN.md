@@ -1317,8 +1317,10 @@ requirement.
   exactly which capabilities are fast-path vs supervisor-brokered.
 - **Substrate / backends** (§16): commodity-OS vs seL4; whether to adopt seL4's
   capability-derivation-tree revocation (would close the §7 revocation item).
-- **SIMD** (§17): fixed-128 baseline vs scalable vectors (GPU now settled —
-  WebGPU via sandboxed broker).
+- **SIMD wider widths** (§17/D58): fixed-128 baseline now SETTLED; `v256`/`v512`
+  IR types (feature-detected, split-to-`v128` fallback) deferred until a kernel
+  demands them. Scalable vectors (SVE/RVV) rejected. (GPU settled — WebGPU via
+  sandboxed broker.)
 
 ---
 
@@ -1661,12 +1663,36 @@ parity by a gating three-OS CI matrix.
 
 ---
 
-## 17. Acceleration  [SIMD OPEN, GPU SETTLED]
+## 17. Acceleration  [SIMD SETTLED (fixed-128), GPU SETTLED]
 
-### SIMD  [OPEN]
-Fixed-width 128-bit baseline (portable, simple, safe — vector ops touch values,
-not memory escape) vs. scalable vectors (SVE/RVV-style, width-agnostic, harder to
-JIT/verify). Lean: fixed-128 baseline + feature-detected wider widths.
+### SIMD  [SETTLED — fixed-128 baseline; wider widths deferred]
+**Decision: a first-class fixed-width `v128` value type with real hardware
+codegen (Cranelift → SSE2/NEON), not scalar expansion.** 128-bit is the
+guaranteed floor — SSE2 is on every x86-64 and NEON on every aarch64, so a
+`v128` op always lowers to one real vector instruction. **Wasm-parity is *not* a
+design goal**; wasm v128 was only the lens that surfaced the gap. The op set is
+designed for real hardware SIMD on its own terms (build/inspect, integer/float
+lane arith, bitwise, shuffle/swizzle), grown **evidence-driven** — an op is added
+only when a real kernel emits it (same program-first discipline as the chibicc
+and wasm-transpiler op sets). The wasm bridge (§17→`svm-wasm`) maps wasm v128 →
+IR v128 and cleanly rejects what it can't map (`Unsupported`), its existing stance.
+
+- **Escape-TCB delta is small and isolated.** Vector arithmetic/lane/shuffle ops
+  are register-to-register and add **zero** escape surface — the verifier just
+  gains total lane-typing rules. The *only* confinement change is the wider masked
+  access: a `v128.load`/`store` masks the **final effective address** so
+  `[addr, addr+16)` stays in-window (the same I1 invariant as scalar, 16 bytes
+  wide), so `svm-mask` + `fuzz/mask` gain 16-byte-width coverage (D38).
+- **Float lanes are NaN-insensitive in the differential.** Per-lane NaN bits
+  aren't pinned across backends, so the interp↔JIT v128 differential is
+  NaN-insensitive per lane and vector-float modules stay excluded from the
+  byte-exact window oracle — the same caveat as scalar floats today.
+- **Wider widths (256/512) are feature-detected, deferred.** MVP ships `v128`
+  only plus a **feature-detection hook** (host reports supported vector width) so
+  guests/frontends can dispatch. Wider-width IR *types* (`v256`/`v512`, lowered to
+  AVX when present, split into 2×/4× `v128` otherwise) are **deferred until a
+  kernel demands them** — see D58. **Scalable vectors (SVE/RVV) are rejected**
+  (width unknown at compile time → harder to verify/JIT, no demand).
 
 ### GPU = WebGPU via a sandboxed broker  [SETTLED]
 The VM does *not* execute GPU code, and the guest never touches the driver. GPU
@@ -2004,4 +2030,5 @@ as open-ended, not a byproduct of the build.
 | D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset) and wasm→IR bridge (compat) — vehicle priority deferred.** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | Open (strategy settled) | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
 | D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
 | D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |
+| D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`svm-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED** — MVP ships `v128` + a feature-detect hook; wider IR types (AVX when present, split-to-`v128` fallback) wait until a kernel demands them. **Scalable vectors (SVE/RVV) rejected** (compile-time-unknown width → harder to verify/JIT, no demand). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback; pricing in `v256` speculatively violates the evidence-driven discipline, so it's recorded here to revisit when a kernel needs it. Vector ops are value-only so the security story barely moves — only the masked access widens |
 | D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful work-stealing over *migratable* fibers is Proposed, not adopted:** it would re-accept D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread*; the guest owns the stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections but **not** its TCB-risk one. Feasible (Go is the existence proof; the voluntarily-suspended set is stealable, fault-suspended fibers stay pinned, and the ownership protocol is loom-verifiable), gated behind that loom-verified protocol + expert review for the asm/signal seam loom can't reach. | Proposed (extends D56) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full reasoning + design + demo roadmap in `SCHEDULING.md` |
