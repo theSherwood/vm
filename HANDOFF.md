@@ -1032,11 +1032,28 @@ leave a shared view — add a unix test for this alongside the Windows work.
     store-buffer 6 vs 71, all-independent stores **1 vs 379**; and on two independent atomic clusters
     sleep sets cut **8 vs 12** (backtrack-only) **vs 1270** (unreduced). The existing `concurrent.rs`
     proofs (`exhaustive_*`) still pass (same outcomes, `complete`). *Not full optimal-DPOR (no source
-    sets / wakeup trees), and still bounded by the per-visible-op granularity — a busy-wait spinlock's
-    every-retry-is-a-decision shape is still big — but independent work no longer multiplies the tree.*
+    sets / wakeup trees), but independent work no longer multiplies the tree.*
+  - **Spin-loop handling — DONE.** The classic pathology — a busy-wait spinlock where every `cmpxchg`
+    retry is a fresh decision point, so the tree is unbounded *and* an unfair schedule starves the
+    holder into a spurious `OutOfFuel` — is now collapsed in the memop explorer. After each turn the
+    scheduler compares a 64-bit fingerprint of the vCPU's local configuration (`VCpu::local_fingerprint`
+    — fibers + reified call stacks, *not* shared memory) against the pre-turn one, alongside a per-`Mem`
+    write counter; a visible op that **changed no memory** and returned the vCPU to the **same
+    configuration** is a pure busy-wait, so the vCPU is **parked** (a `SpinWaiter` keyed by the byte
+    range it read) off the runnable set until another vCPU writes that range (`DetState::wake_spins`) —
+    the exact semantics of the spin, with no redundant decision points and no starvation. Sound (a
+    stuttering thread's future is fixed until shared memory it reads changes), verified in
+    `svm/tests/spinloop.rs`: a 2-worker `cmpxchg`-spinlock counter is now **exhaustively verifiable**
+    (12 schedules, outcome `{2}` — was non-terminating; the parent commit times out >60 s), and an
+    *asymmetric* spinlock (`+1` vs `*3` under the lock) yields exactly `{1,3}`, proving the
+    lock-acquisition-order nondeterminism survives the pruning. *Limitation: detection is intra-turn, so
+    it catches single-visible-op spin bodies (the `cmpxchg`/flag-load spinlock); a multi-visible-op spin
+    body falls back to bounded exploration (still sound). Gated on memop mode (the exhaustive/brute
+    explorers); the seeded sweep is fuel-bounded and unaffected.*
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
-    today), fiber/vCPU quota metering (the kill path exists; *metering*/quotas don't yet), and the D57
-    migratable-fiber primitive (stackful work-stealing).
+    today), fiber/vCPU quota metering (the kill path exists; *metering*/quotas don't yet), the D57
+    migratable-fiber primitive (stackful work-stealing), and the DPOR refinements (source sets /
+    wakeup trees for full optimality; multi-op spin-body detection).
 
 - [ ] **Nesting (§14)** + **shared memory + isolation tiers (§13)** + **real guest-visible
   virtual memory** — *most of the §1a differentiators live here.* Sub-window **confinement** is
@@ -1281,11 +1298,12 @@ regressions one commit old"):
 >    its suspend/wake protocol — the futex park + completion notify — informs the fiber's).
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); fiber/vCPU
 >    quota *metering* (§15; the kill path exists, quotas don't); the async-ring
->    pool could grow more offloadable ops. *(Done this batch: **DPOR + sleep sets** for `explore_all` —
->    the exhaustive checker prunes independent-op reorderings and the residual cross-cluster redundancy,
->    sound vs the retained brute-force oracle; see §10's concurrency tracker + `svm/tests/dpor.rs`. A
->    further refinement — full optimal-DPOR via source sets / wakeup trees — remains open.)* **Deferred
->    design decision — narrow integer types (the wasm
+>    pool could grow more offloadable ops. *(Done across recent batches: **DPOR + sleep sets** for
+>    `explore_all` — prunes independent-op reorderings and the residual cross-cluster redundancy, sound
+>    vs the retained brute-force oracle (`svm/tests/dpor.rs`); and **spin-loop handling** — a busy-wait
+>    spinlock is now exhaustively verifiable (parked-until-written, not re-spun; `svm/tests/spinloop.rs`)
+>    instead of unbounded. Remaining: full optimal-DPOR via source sets / wakeup trees; multi-op spin
+>    bodies.)* **Deferred design decision — narrow integer types (the wasm
 >    tradeoff):** `char`/`short`/`_Bool` are `i32` values (no `i8`/`i16` SSA types), so frontends must
 >    lower narrowing casts explicitly and **narrow-width atomics (`_Atomic char/short`) have no IR form**.
 >    Decision + recommendation written up in **DESIGN.md §3b "Narrow integer types"** — keep the model;

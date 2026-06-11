@@ -283,12 +283,14 @@ fn explorer_is_reproducible() {
 // enough program asserting `outcomes == [expected]` (with `complete`) proves the invariant holds under
 // **every** schedule. The programs here are deliberately tiny so the tree is fully explorable.
 //
-// This is a *stateless* checker without partial-order reduction beyond memory-op granularity, so it
-// targets bounded-synchronization / lock-free shapes. A **busy-wait spinlock** is the classic
-// pathological case — every failed `cmpxchg` retry is a fresh decision point, so the tree explodes —
-// and stays covered instead by `stress` + `sweep` above (see `SPINLOCK`). The proofs here target the
-// lock-free atomic counter and the wait/notify handoff, plus a *negative* test confirming the checker
-// actually finds a known race.
+// This is a *stateless* checker with dynamic partial-order reduction (DPOR + sleep sets) and
+// **spin-loop handling**, so beyond lock-free shapes it now also covers busy-wait spinlocks — the
+// once-pathological case where every failed `cmpxchg` retry was a fresh decision point. A spinning
+// vCPU is parked until another writes what it read, so a *small* spinlock is exhaustively verifiable
+// (see `tests/spinloop.rs`); the big `SPINLOCK` here (8 workers × 100 acquisitions = 800 contended
+// critical sections) is still far too large to *enumerate*, so it stays covered by `stress` + `sweep`.
+// The proofs here target the lock-free atomic counter and the wait/notify handoff, plus a *negative*
+// test confirming the checker actually finds a known race.
 
 /// Assert the exhaustive checker fully enumerates `src` and every schedule yields exactly `want`.
 fn prove(src: &str, want: i64, max_schedules: u64) {

@@ -1282,6 +1282,16 @@ struct DetWaiter {
     vcpu: Box<VCpu>,
 }
 
+/// A vCPU the explorer parked because it was **spinning**: it ran a visible op that changed no memory
+/// and returned it to the same local configuration (a busy-wait retry). It stays parked — not a
+/// scheduling choice, so the spin doesn't multiply the interleaving tree — until another vCPU writes to
+/// the `[base, base+width)` range it was reading, which may have changed the value it spins on.
+struct SpinWaiter {
+    vcpu: Box<VCpu>,
+    base: u64,
+    width: u32,
+}
+
 struct DetState {
     // `Box` (matching the join/wait waiter maps) keeps moving a large vCPU between the runnable set
     // and the waiter collections a pointer copy.
@@ -1290,11 +1300,34 @@ struct DetState {
     results: BTreeMap<TaskId, Outcome>,
     join_waiters: BTreeMap<TaskId, Box<VCpu>>,
     wait_waiters: Vec<DetWaiter>,
+    /// vCPUs parked by spin-loop detection (memop explorer only), woken by a write to their read range.
+    spin_waiters: Vec<SpinWaiter>,
     live: usize,
     next_task: TaskId,
     clock: u64, // logical nanoseconds, advanced only to fire a timeout
     rng: u64,
     cap: usize,
+}
+
+impl DetState {
+    /// Move every spin-parked vCPU whose read range `[base, base+width)` overlaps the just-written
+    /// `[w_base, w_base+w_width)` back to the runnable set — a write there may have changed the value it
+    /// spins on, so it must re-check (it re-parks if still stuck). The interpreter is sequentially
+    /// consistent, so a write is the *only* way a spinner's read can change.
+    fn wake_spins(&mut self, w_base: u64, w_width: u32) {
+        let mut i = 0;
+        while i < self.spin_waiters.len() {
+            let s = &self.spin_waiters[i];
+            let overlap = w_base < s.base.saturating_add(s.width as u64)
+                && s.base < w_base.saturating_add(w_width as u64);
+            if overlap {
+                let w = self.spin_waiters.swap_remove(i);
+                self.runnable.push(w.vcpu);
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 impl DetState {
@@ -1318,6 +1351,7 @@ impl DetSched {
                 results: BTreeMap::new(),
                 join_waiters: BTreeMap::new(),
                 wait_waiters: Vec::new(),
+                spin_waiters: Vec::new(),
                 live: 0,
                 next_task: 0,
                 clock: 0,
@@ -1431,10 +1465,32 @@ fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
             let v = s.runnable.swap_remove(pick);
             (v, quantum)
         };
+        // Spin-loop detection (memop explorer only): snapshot the vCPU's local configuration and its
+        // memory-write count so that, after the turn, a pure busy-wait retry (same config, no memory
+        // changed) is distinguishable from real progress.
+        let spin_capable = v.memop;
+        let pre_fp = if spin_capable {
+            v.local_fingerprint()
+        } else {
+            0
+        };
+        let writes_before = v.mem.as_ref().map_or(0, |m| m.writes);
+
         let step = v.run(quantum);
+
+        let acc = v.acc.take();
         // DPOR: finalize this decision's trace entry now that the step's accessed object is known.
         if let Policy::Dpor(d) = &mut policy {
-            d.finish(v.acc.take().unwrap_or(MemAccess::None));
+            d.finish(acc.unwrap_or(MemAccess::None));
+        }
+        // A turn that actually changed a byte may unblock spinners parked on that address — wake them
+        // to re-check (they re-park if still stuck). Memory change is the only thing that can, under
+        // sequential consistency, alter a parked spinner's read.
+        let mem_changed = v.mem.as_ref().map_or(0, |m| m.writes) != writes_before;
+        if mem_changed {
+            if let Some(MemAccess::Range { base, width, .. }) = acc {
+                det.lock().wake_spins(base, width);
+            }
         }
         match step {
             Step::Done(result) => {
@@ -1479,7 +1535,25 @@ fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
                     });
                 }
             }
-            Step::Yield => det.lock().runnable.push(v),
+            Step::Yield => {
+                // Spin-park: the turn ran one visible op, changed no memory, and returned the vCPU to
+                // the same local configuration — a busy-wait whose only way forward is another vCPU
+                // writing what it just read. Park it off the runnable set (so the spin doesn't multiply
+                // the interleaving tree, and an unfair "spin forever" schedule can't starve the writer)
+                // until such a write wakes it. Anything else re-enqueues normally.
+                if spin_capable && !mem_changed && v.local_fingerprint() == pre_fp {
+                    if let Some(MemAccess::Range { base, width, .. }) = acc {
+                        let mut s = det.lock();
+                        s.spin_waiters.push(SpinWaiter {
+                            vcpu: v,
+                            base,
+                            width,
+                        });
+                        continue;
+                    }
+                }
+                det.lock().runnable.push(v);
+            }
         }
     }
 }
@@ -1683,6 +1757,52 @@ impl VCpu {
             memop: false,
             acc: None,
         }
+    }
+
+    /// A 64-bit fingerprint of this vCPU's **local** execution configuration (its fibers + reified call
+    /// stacks: function / block / instruction / SSA values — everything *except* shared memory). The
+    /// explorer compares it across one turn: a visible op that returns the vCPU to the same fingerprint
+    /// has gone once around a loop with no local progress — a spin (livelock unless shared memory it
+    /// reads changes). Collisions would risk a false spin-park, but two configs of the *same* vCPU one
+    /// op apart colliding is ~2^-64; the values fully determine the hash (floats by bit pattern).
+    fn local_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        fn hash_vals(h: &mut std::collections::hash_map::DefaultHasher, vals: &[Value]) {
+            vals.len().hash(h);
+            for v in vals {
+                match v {
+                    Value::I32(x) => (0u8, *x as i64).hash(h),
+                    Value::I64(x) => (1u8, *x).hash(h),
+                    Value::F32(x) => (2u8, x.to_bits() as u64).hash(h),
+                    Value::F64(x) => (3u8, x.to_bits()).hash(h),
+                }
+            }
+        }
+        fn hash_frames(h: &mut std::collections::hash_map::DefaultHasher, frames: &[Frame]) {
+            frames.len().hash(h);
+            for f in frames {
+                (f.func, f.block, f.inst).hash(h);
+                hash_vals(h, &f.vals);
+            }
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.cur.hash(&mut h);
+        self.chain.hash(&mut h);
+        hash_frames(&mut h, &self.frames);
+        // Parked fibers are part of the configuration (a resume could re-enter them).
+        self.fibers.len().hash(&mut h);
+        for fib in &self.fibers {
+            match fib {
+                Fiber::Pending { func, sp } => (0u8, *func, *sp).hash(&mut h),
+                Fiber::Live(frames) => {
+                    1u8.hash(&mut h);
+                    hash_frames(&mut h, frames);
+                }
+                Fiber::Running => 2u8.hash(&mut h),
+                Fiber::Done => 3u8.hash(&mut h),
+            }
+        }
+        h.finish()
     }
 
     /// The current `width`-byte value at confined `key` (no checks; used by the executor for the
@@ -4569,6 +4689,12 @@ struct Mem {
     /// supplies the page) from an out-of-window fault (a real trap). Per-`Mem` (each vCPU owns its
     /// own), written/read only by the owning thread; `AtomicU64` keeps `Mem: Sync` for the futex path.
     last_fault: AtomicU64,
+    /// Monotonic count of operations that **actually changed** a byte (a `store`/`atomic.store`/
+    /// `atomic.rmw`, or an `atomic.cmpxchg` that *swapped*). The deterministic explorer reads the
+    /// per-turn delta to drive spin-loop detection (a turn that changed no memory and returned the vCPU
+    /// to the same local configuration is a pure spin → park it) and spin wakeups (a change wakes
+    /// spinners parked on the written address). Per-`Mem` (only the running vCPU writes through its own).
+    writes: u64,
 }
 
 /// Sentinel for [`Mem::last_fault`] meaning "no recoverable fault pending" — never a valid confined
@@ -4608,6 +4734,7 @@ impl Mem {
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
+            writes: 0,
         }
     }
 
@@ -4629,6 +4756,7 @@ impl Mem {
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
+            writes: 0,
         }
     }
 
@@ -4653,6 +4781,7 @@ impl Mem {
             space: Arc::clone(&self.space),
             has_regions: Arc::clone(&self.has_regions),
             last_fault: AtomicU64::new(NO_FAULT),
+            writes: 0,
         }
     }
 
@@ -4676,6 +4805,7 @@ impl Mem {
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
+            writes: 0,
         }
     }
 
@@ -4791,6 +4921,7 @@ impl Mem {
         self.check_prot(base, width, true)?;
         // `write_le` keeps only the low `width` bytes, so narrow stores truncate.
         self.write_le(base, width, store_bits(v));
+        self.writes += 1;
         Ok(())
     }
 
@@ -4890,6 +5021,7 @@ impl Mem {
         } else {
             self.back.atomic_store(base, width, store_bits(v));
         }
+        self.writes += 1;
         Ok(())
     }
 
@@ -4913,6 +5045,7 @@ impl Mem {
         } else {
             self.back.atomic_rmw(base, width, rmw_op(op), store_bits(v))
         };
+        self.writes += 1;
         Ok(atomic_decode(ty, old))
     }
 
@@ -4929,9 +5062,10 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
+        let want = store_bits(expected) & width_mask(width);
         let old = if self.is_backed(base) {
             let old = self.read_le(base, width); // already the low `width` bytes, zero-extended
-            if old == (store_bits(expected) & width_mask(width)) {
+            if old == want {
                 self.write_le(base, width, store_bits(replacement));
             }
             old
@@ -4939,6 +5073,11 @@ impl Mem {
             self.back
                 .atomic_cmpxchg(base, width, store_bits(expected), store_bits(replacement))
         };
+        // Count a write only when the compare succeeded (a failed cmpxchg leaves memory unchanged —
+        // the distinction the spin detector needs to tell a spinning retry from a real acquire).
+        if old == want {
+            self.writes += 1;
+        }
         Ok(atomic_decode(ty, old))
     }
 
