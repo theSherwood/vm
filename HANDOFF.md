@@ -1198,9 +1198,11 @@ Have (✅):
   through the bench trampoline thunk vs a **Wasmtime imported host function** (a `Linker`), both
   via Cranelift, results cross-checked. `Mode::HostCall` on `Resolved` selects the cap-thunk SVM
   path + import-linked wasm path in `measure`. **Honest findings** (best-of-5, machine-dependent):
-  - `hostcall` (scalar `x→x+1` round-trip): svm **~1.24× slower**. `cap.call` lowers to a
-    *generic* indirect thunk that packs args into an i64 array; the **devirtualize-to-direct-call
-    win (D45) is deferred**, so this is the honest baseline that optimization will move.
+  - `hostcall` (scalar `x→x+1` round-trip): the generic `cap.call` thunk is ~parity–1.24× slower
+    (it packs args into an i64 stack buffer and the host dispatches on `(type_id, op)` at runtime).
+    **D45 devirtualize-to-direct-call — DONE** (see "D45 fast path" below): with `--fast-cap` the JIT
+    emits a register-to-register direct call to a specialized host fn, dropping the per-call cost
+    **2.83→1.90 ns (~33%)** → **0.67× = ~1.5× *faster* than Wasmtime**.
   - `hostbuf` (zero-copy `(ptr,len)` **borrow buffer**, 64 B, host sums in place — the §7 path):
     svm **~1.8× faster** — *even vs a fair cached-`Memory` wasm baseline* (the wasm host fn caches
     the exported memory in `Store` data to avoid a per-call `get_export` lookup — I fixed an
@@ -1210,6 +1212,28 @@ Have (✅):
     model's lift/lower marshalling, and async rings) is a heavier comparison, **not** attempted.
   Both are tracked in `baseline.txt` (appended rows, measured on the dev container — a maintainer
   may re-baseline all rows on a canonical machine for cross-row consistency).
+- [x] **D45 — devirtualized `cap.call` fast path (DONE).** *Why hostcall was expensive:* every
+  `cap.call` lowers through `lower_cap_call` (`svm-jit/src/lib.rs`) to (a) a **stack buffer** for args +
+  one for results (a memory round-trip that defeats register passing), (b) a **12-arg generic thunk
+  ABI** (8 of them runtime-materialized constants — `mem_size`/`mem_reserved`/`type_id`/`op`/`n_args`/
+  `n_res`/`ctx`/`thunk`), (c) an **indirect call** the host then **dispatches on `(type_id, op)` at
+  runtime**, (d) a trap-cell check. Wasmtime's typed import passes the arg/result **in registers** with
+  a known signature — that register-vs-memory + runtime-dispatch gap is the whole delta. *The fix:* an
+  optional `svm_jit::FastCapResolver` the embedder supplies; for a statically-known `(type_id, op)` it
+  returns a **specialized host fn** the JIT calls **register-to-register** (resolved once at compile
+  time, baked; `null` ⇒ fall back to the generic thunk). New entry `compile_and_run_with_host_fast`;
+  the resolver lives in `CapEnv` (top-level compile only — nested children keep the coroutine thunk).
+  Pinned by `jit_diff::fast_cap` (fast == generic for a claimed op; falls back for an unclaimed one).
+  **Measured:** `bench --fast-cap` → hostcall **2.83→1.90 ns (~33%)**, ratio **1.01×→0.67×** (now
+  ~1.5× *faster* than Wasmtime); hostbuf 11.55→10.44 ns (the 64-B buffer read dominates, so the
+  per-call cut is a smaller share). **Native host vs. nested guest:** the *guest-side* `cap.call` tax
+  is identical regardless of who's on the other side (same lowering) — so D45 helps both — but a
+  **nested-guest** boundary (a child whose `cap.call` is serviced by its parent, via `coro_cap_thunk`)
+  additionally pays a **fiber stack-switch round-trip** (`suspend`→parent→`suspend` back), so it is
+  *strictly* more expensive than a native host call; `Instantiator.instantiate`/`join` is heavier
+  still but is a one-shot spawn (re-compiles the child), not a per-call cost. **Still open:** a
+  production `svm_run` fast resolver for the real powerbox ops (the prototype's specialized fns live
+  in the bench); a cheaper cross-domain switch for the nested-guest path (separate axis from D45).
 
 Gaps (the weakest area vs. AGENTS.md "benchmark early · measured vs. wasm/Wasmtime · catch
 regressions one commit old"):
@@ -1281,7 +1305,23 @@ regressions one commit old"):
 > **`SCHEDULING.md`** + **DESIGN D56/D57** (the concurrency-primitives decision), **`DESIGN.md`** /
 > **`README.md`**.
 >
-> **Just landed (this session): wasm transpiler — function imports / the host ABI, then
+> **Just landed (this session): (A) the wasm transpiler — function imports / host ABI + heap growth;
+> (B) D45 — the devirtualized `cap.call` fast path.**
+>
+> **(B) D45 cap.call fast path** (investigation → fix). Profiled why `hostcall` was slow: the generic
+> `cap.call` lowering marshals args/results through **stack buffers**, passes a **12-arg generic ABI**,
+> and the host **dispatches on `(type_id, op)` at runtime** — register-vs-memory + runtime dispatch is
+> the whole gap vs Wasmtime's typed import. Added an optional `svm_jit::FastCapResolver`: for a known
+> `(type_id, op)` the embedder hands the JIT a specialized host fn it calls **register-to-register**
+> (resolved at compile time; `null` ⇒ generic fallback). New `compile_and_run_with_host_fast`; pinned by
+> `jit_diff::fast_cap`; measured in `bench --fast-cap`: **hostcall 2.83→1.90 ns (~33%), 1.01×→0.67×
+> (~1.5× faster than Wasmtime)**. Also answered the nested-guest question: the guest-side cap.call tax is
+> identical either way (so D45 helps both), but a nested-guest boundary additionally pays a fiber
+> stack-switch round-trip, so it's strictly costlier than a native host call. Full write-up in §10's
+> Benchmarking "D45" item. *Open follow-ups:* a production `svm_run` fast resolver (the prototype's
+> specialized fns are in the bench), and the wasm transpiler's next slice (passive/bulk-memory).
+>
+> **(A) wasm transpiler — function imports / the host ABI, then
 > `memory.size`/`memory.grow` (item 0 below).**
 > **(1) Imports.** A wasm `(import "<module>" "<name>" (func …))` lowers to a `cap.call` by the
 > convention `module` = decimal capability `type_id`, `name` = decimal `op`; the transpiler threads one
