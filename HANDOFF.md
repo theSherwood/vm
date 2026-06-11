@@ -1496,13 +1496,21 @@ regressions one commit old"):
 >    **Missing wasm features (the explicit note — what svm-wasm does NOT transpile yet):** (1) passive
 >    data / element segments + `memory.init`/`data.drop` + the `table.*` bulk ops — *confirmed not hit by
 >    typical clang output (jsmn/sha256 don't use them)*. (2) imports spanning multiple capability
->    interfaces (one handle is threaded). (3) SIMD (v128) — the most likely **real** next gap (clang
->    auto-vectorizes at `-O2`; add `-mno-simd128` to avoid, or transpile v128). (4) reference types
->    beyond funcref tables; multi-memory / multi-table. **Next slice (pick by evidence):** keep throwing
->    real programs at it — a math-heavy / `-O3` program will likely surface **SIMD (v128)** first (the
->    genuine next gap), not passive segments. The subset already transpiles real clang-emitted wasm
->    (control flow, `__stack_pointer`, function pointers, host imports, heap growth, **memcpy/memset incl.
->    runtime length**, and two real libraries) end to end and benches at hand-written-IR speed.
+>    interfaces (one handle is threaded). (3) **SIMD (v128) — confirmed the genuine next gap** (a `-O3`
+>    auto-vectorized saxpy/dot/isum kernel emits `V128{Load,Store,Const}` + `F32x4{Splat,Add,Mul}` +
+>    `I32x4{Add,ExtractLane}` + `I8x16Shuffle`; `-mno-simd128` transpiles + runs the same kernels fine).
+>    (4) reference types beyond funcref tables; multi-memory / multi-table. **On v128 (paused by
+>    decision):** the 9 ops are tractable, but v128 is 128 bits and the IR has no vector/i128 type, so a
+>    v128 must be carried as **two i64 SSA values** — and clang's vectorized loops put v128 in **locals**
+>    and across the **loop back-edge**, so the *core machinery* (operand stack + locals + block-param
+>    threading) would need fat-value (2-slot) support: a ~300-line moderate-risk refactor for a feature
+>    that is (a) explicitly deferred Phase-4 ("SIMD §17"), (b) **correctness-only, not speed** (SVM has no
+>    SIMD codegen, so scalar-expanded v128 is *slower* than plain scalar), and (c) trivially avoided with
+>    `-mno-simd128`. **Recommended stance:** treat `-mno-simd128` as the supported input for SVM (full
+>    scalar speed); only build v128 scalar-expansion if a use case genuinely needs to run SIMD-containing
+>    wasm unchanged. The subset already transpiles real clang-emitted wasm (control flow, `__stack_pointer`,
+>    function pointers, host imports, heap growth, **memcpy/memset incl. runtime length**, and two real
+>    libraries) end to end and benches at hand-written-IR speed.
 > 1. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
