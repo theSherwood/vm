@@ -463,7 +463,12 @@ fn real_clang_wasm() {
         &c,
         "int fib(int n){return n<2?n:fib(n-1)+fib(n-2);}\n\
          int sumto(int n){int s=0;for(int i=1;i<=n;i++)s+=i;return s;}\n\
-         int poly(int x){return 3*x*x - 5*x + 7;}\n",
+         int poly(int x){return 3*x*x - 5*x + 7;}\n\
+         static int add(int a,int b){return a+b;}\n\
+         static int sub(int a,int b){return a-b;}\n\
+         static int mul(int a,int b){return a*b;}\n\
+         int dispatch(int op,int a,int b){\n\
+           int (*tbl[3])(int,int)={add,sub,mul}; return tbl[op](a,b);}\n",
     )
     .unwrap();
     let out = Command::new("clang")
@@ -473,6 +478,7 @@ fn real_clang_wasm() {
             "-Wl,--export=fib",
             "-Wl,--export=sumto",
             "-Wl,--export=poly",
+            "-Wl,--export=dispatch",
         ])
         .arg(&c)
         .arg("-o")
@@ -498,6 +504,21 @@ fn real_clang_wasm() {
             "poly({x})"
         );
     }
+    // `dispatch` is a C function-pointer table — clang lowers it to call_indirect + a table + an
+    // element segment, exercising the whole indirect-call path on real-world wasm.
+    let d = find("dispatch");
+    assert_eq!(
+        run_idx(&t, d, &[Value::I32(0), Value::I32(7), Value::I32(3)]),
+        10
+    );
+    assert_eq!(
+        run_idx(&t, d, &[Value::I32(1), Value::I32(7), Value::I32(3)]),
+        4
+    );
+    assert_eq!(
+        run_idx(&t, d, &[Value::I32(2), Value::I32(7), Value::I32(3)]),
+        21
+    );
 }
 
 /// Run a known function index through interp + JIT, assert they agree, return the (i32/i64) result.
