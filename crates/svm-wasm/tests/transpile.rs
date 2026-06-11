@@ -971,3 +971,149 @@ fn real_clang_dynamic_memcpy() {
         );
     }
 }
+
+/// Compile C `srcs` (relative to `inc_dir`) to a wasm32 module exporting `exports`, with `-mbulk-memory`
+/// and any `extra` flags. Returns `None` (skips) if the clang/wasm toolchain is unavailable. Used by the
+/// real-library capstones below.
+#[cfg(unix)]
+fn clang_wasm(
+    driver: &str,
+    extra_headers: &[(&str, &str)],
+    inc_dir: &str,
+    srcs: &[&str],
+    extra: &[&str],
+    exports: &[&str],
+) -> Option<Vec<u8>> {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!(
+        "svm_wasm_lib_{}_{}",
+        std::process::id(),
+        exports[0]
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let drv = dir.join("driver.c");
+    std::fs::write(&drv, driver).unwrap();
+    for (name, body) in extra_headers {
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+    let w = dir.join("out.wasm");
+    let mut cmd = Command::new("clang");
+    cmd.args(["--target=wasm32", "-nostdlib", "-O2", "-mbulk-memory"])
+        .arg(format!("-I{inc_dir}"))
+        .arg(format!("-I{}", dir.display()))
+        .args(extra)
+        .arg("-Wl,--no-entry");
+    for e in exports {
+        cmd.arg(format!("-Wl,--export={e}"));
+    }
+    cmd.arg(&drv);
+    for s in srcs {
+        cmd.arg(format!("{inc_dir}/{s}"));
+    }
+    cmd.arg("-o").arg(&w);
+    match cmd.output() {
+        Ok(o) if o.status.success() => Some(std::fs::read(&w).unwrap()),
+        _ => {
+            eprintln!(
+                "skipping: clang wasm toolchain unavailable for {}",
+                exports[0]
+            );
+            None
+        }
+    }
+}
+
+/// **Real library — the jsmn JSON tokenizer** (pure C, no libc), compiled to wasm and transpiled. It
+/// parses a fixed JSON and the transpiled module runs identically on interp + JIT vs a native oracle
+/// (14 tokens; the per-token types). Exercises string scanning, a state machine, struct-array writes,
+/// and the bulk-memory copies clang emits — a real-world capstone, not a hand-written kernel.
+#[cfg(unix)]
+#[test]
+fn real_clang_jsmn_tokenizer() {
+    let driver = r#"
+#define JSMN_STATIC
+#include "jsmn.h"
+static const char json[] = "{\"name\":\"svm\",\"nums\":[1,2,3],\"ok\":true,\"nested\":{\"a\":1}}";
+int parse_count(void){ jsmn_parser p; jsmntok_t t[64]; jsmn_init(&p);
+  return jsmn_parse(&p, json, sizeof(json)-1, t, 64); }
+int token_type(int k){ jsmn_parser p; jsmntok_t t[64]; jsmn_init(&p);
+  int n = jsmn_parse(&p, json, sizeof(json)-1, t, 64);
+  if (k < 0 || k >= n) return -1; return (int)t[k].type; }
+"#;
+    let inc = concat!(env!("CARGO_MANIFEST_DIR"), "/../svm-run/demos/jsmn");
+    let Some(wasm) = clang_wasm(driver, &[], inc, &[], &[], &["parse_count", "token_type"]) else {
+        return;
+    };
+    let t = svm_wasm::transpile(&wasm).expect("transpile jsmn");
+    svm_verify::verify_module(&t.module).expect("verify jsmn");
+    let find = |n: &str| t.exports.iter().find(|(e, _)| e == n).unwrap().1;
+    assert_eq!(
+        run_idx(&t, find("parse_count"), &[]),
+        14,
+        "jsmn token count"
+    );
+    // jsmn types: OBJECT=1, ARRAY=2, STRING=4, PRIMITIVE=8 (native oracle).
+    let types = [1, 4, 4, 4, 2, 8, 8, 8, 4, 8, 4, 1, 4, 8];
+    let tt = find("token_type");
+    for (k, &ty) in types.iter().enumerate() {
+        assert_eq!(
+            run_idx(&t, tt, &[Value::I32(k as i32)]),
+            ty,
+            "token {k} type"
+        );
+    }
+}
+
+/// **Real library — B-Con's SHA-256** (`demos/sha256`), compiled to wasm and transpiled. Hashing a
+/// fixed message, every digest byte matches the native oracle (the known SHA-256 of the message) on
+/// interp + JIT. Exercises 64-bit-free bit twiddling, big rotate/shift chains, and the `memset`/`memcpy`
+/// clang lowers to bulk memory (`memory.fill`/`copy`).
+#[cfg(unix)]
+#[test]
+fn real_clang_sha256() {
+    let driver = r#"
+#include "sha256.h"
+static unsigned char digest[32];
+static int done = 0;
+static void compute(void){
+  const unsigned char msg[] = "The quick brown fox jumps over the lazy dog";
+  SHA256_CTX ctx; sha256_init(&ctx); sha256_update(&ctx, msg, sizeof(msg)-1); sha256_final(&ctx, digest);
+  done = 1;
+}
+int digest_byte(int k){ if(!done) compute(); if(k<0||k>=32) return -1; return digest[k]; }
+"#;
+    // sha256.c calls memset/memcpy; declare them so clang lowers (with -mbulk-memory) to memory.fill/copy.
+    let protos =
+        "void *memset(void*,int,unsigned long);\nvoid *memcpy(void*,const void*,unsigned long);\n";
+    let inc = concat!(env!("CARGO_MANIFEST_DIR"), "/../svm-run/demos/sha256");
+    let Some(wasm) = clang_wasm(
+        driver,
+        &[("protos.h", protos)],
+        inc,
+        &["sha256.c"],
+        &["-include", "protos.h"],
+        &["digest_byte"],
+    ) else {
+        return;
+    };
+    let t = svm_wasm::transpile(&wasm).expect("transpile sha256");
+    svm_verify::verify_module(&t.module).expect("verify sha256");
+    let db = t
+        .exports
+        .iter()
+        .find(|(e, _)| e == "digest_byte")
+        .unwrap()
+        .1;
+    // SHA-256("The quick brown fox jumps over the lazy dog") = d7a8fbb3… (native oracle bytes).
+    let digest = [
+        215, 168, 251, 179, 7, 215, 128, 148, 105, 202, 154, 188, 176, 8, 46, 79, 141, 86, 81, 228,
+        109, 60, 219, 118, 45, 2, 208, 191, 55, 201, 229, 146,
+    ];
+    for (k, &b) in digest.iter().enumerate() {
+        assert_eq!(
+            run_idx(&t, db, &[Value::I32(k as i32)]),
+            b,
+            "digest byte {k}"
+        );
+    }
+}
