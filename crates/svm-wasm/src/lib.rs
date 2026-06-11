@@ -18,9 +18,10 @@
 //! (i32/i64, incl. narrow + `memory64`; the i32 address is zero-extended into our i64 window, which is
 //! sized to the wasm memory's initial pages) · direct **`call`** (multi-function + recursion) ·
 //! **floats** (f32/f64 const/arith/unary/compare, load/store, and every int↔float conversion incl.
-//! `trunc`/`trunc_sat`/`convert`/`demote`/`promote`/`reinterpret`). Still a clean
-//! [`Error::Unsupported`] (added in slices): `call_indirect`/tables, globals, `memory.{grow,size}`,
-//! SIMD, reference types. Active **data segments** (initialized linear memory) are now handled.
+//! `trunc`/`trunc_sat`/`convert`/`demote`/`promote`/`reinterpret`) · **globals** (`global.get`/`set`
+//! lowered to a reserved window region) · active **data segments** (initialized linear memory). Still a
+//! clean [`Error::Unsupported`] (added in slices): `call_indirect`/tables, `memory.{grow,size}`,
+//! passive data, imports, SIMD, reference types.
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF,
@@ -84,6 +85,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut exports: Vec<(String, u32)> = Vec::new();
     let mut mem: Option<wasmparser::MemoryType> = None;
     let mut data: Vec<svm_ir::Data> = Vec::new();
+    let mut globals: Vec<(ValType, Vec<u8>)> = Vec::new();
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -122,7 +124,13 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     }
                 }
             }
-            Payload::GlobalSection(_) => return unsup("globals"),
+            Payload::GlobalSection(reader) => {
+                for g in reader {
+                    let g = g?;
+                    let ty = val_type(g.ty.content_type)?;
+                    globals.push((ty, const_bytes(g.init_expr, ty)?));
+                }
+            }
             Payload::TableSection(_) => return unsup("tables"),
             Payload::ExportSection(reader) => {
                 for e in reader {
@@ -163,6 +171,26 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     }
 
     let mem64 = mem.as_ref().map(|m| m.memory64).unwrap_or(false);
+
+    // wasm globals are module-level mutables our IR has no notion of, so we give them a reserved region
+    // **above** the linear memory and lower `global.get`/`set` to load/store there (8-byte slots, the
+    // standard "globals in memory" lowering). Initializers become `data` segments. A valid guest's
+    // linear-memory accesses stay in `[0, mem_bytes)` and so never reach the globals; only an OOB access
+    // would (which wasm traps and we don't — the documented confinement difference).
+    let mem_bytes = mem
+        .as_ref()
+        .map(|m| (m.initial.max(1)).saturating_mul(1 << 16))
+        .unwrap_or(0);
+    let globals_base = mem_bytes.div_ceil(8) * 8; // 8-byte aligned, just past the linear memory
+    let globals_types: Vec<ValType> = globals.iter().map(|(t, _)| *t).collect();
+    for (g, (_, bytes)) in globals.iter().enumerate() {
+        data.push(svm_ir::Data {
+            offset: globals_base + g as u64 * 8,
+            readonly: false,
+            bytes: bytes.clone(),
+        });
+    }
+
     let func_sigs: Vec<(Vec<ValType>, Vec<ValType>)> = func_type_idx
         .iter()
         .map(|&ti| types[ti as usize].clone())
@@ -170,18 +198,29 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut funcs = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.into_iter().enumerate() {
         let ty = &types[func_type_idx[i] as usize];
-        funcs.push(lower_func(&ty.0, &ty.1, &types, &func_sigs, &body, mem64)?);
+        funcs.push(lower_func(
+            &ty.0,
+            &ty.1,
+            &types,
+            &func_sigs,
+            &globals_types,
+            globals_base,
+            &body,
+            mem64,
+        )?);
     }
 
-    // Our window is a power-of-two byte range (masking confines to it); size it to hold the wasm
-    // memory's initial pages (64 KiB each). NB: wasm bounds-checks-and-traps on out-of-range access
-    // while we mask-and-confine to the (≥) power-of-two window — identical for in-bounds accesses
-    // (what real programs make), looser only for OOB. Data segments / `memory.grow` are later slices.
-    let memory = mem.map(|m| {
-        let bytes = (m.initial.max(1)).saturating_mul(1 << 16);
-        let size_log2 = bytes.next_power_of_two().trailing_zeros().max(16) as u8;
-        svm_ir::Memory { size_log2 }
-    });
+    // Our window is a power-of-two byte range (masking confines to it); size it to hold the linear
+    // memory **and** the globals region. (wasm bounds-checks-and-traps on out-of-range access while we
+    // mask-confine to the ≥ power-of-two window — identical for in-bounds accesses; `memory.grow` is a
+    // later slice.) A module with globals but no memory still needs a window for them.
+    let needed = (globals_base + globals.len() as u64 * 8).max(mem_bytes);
+    let memory = if mem.is_some() || !globals.is_empty() {
+        let size_log2 = needed.max(1).next_power_of_two().trailing_zeros().max(16) as u8;
+        Some(svm_ir::Memory { size_log2 })
+    } else {
+        None
+    };
 
     Ok(Transpiled {
         module: Module {
@@ -191,6 +230,23 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         },
         exports,
     })
+}
+
+/// Evaluate a global's constant initializer to its little-endian bytes (4 or 8 wide).
+fn const_bytes(expr: wasmparser::ConstExpr, ty: ValType) -> Result<Vec<u8>, Error> {
+    let mut out = None;
+    for op in expr.get_operators_reader() {
+        match op? {
+            Operator::I32Const { value } => out = Some((value as u32).to_le_bytes().to_vec()),
+            Operator::I64Const { value } => out = Some((value as u64).to_le_bytes().to_vec()),
+            Operator::F32Const { value } => out = Some(value.bits().to_le_bytes().to_vec()),
+            Operator::F64Const { value } => out = Some(value.bits().to_le_bytes().to_vec()),
+            Operator::End => {}
+            other => return unsup(format!("global initializer {other:?}")),
+        }
+    }
+    let _ = ty;
+    out.ok_or_else(|| Error::Parse("empty global initializer".into()))
 }
 
 /// Evaluate an active data segment's offset (a constant expression — `i32.const`/`i64.const`; a
@@ -270,6 +326,10 @@ struct Lower<'a> {
     /// Per-function signatures by function index (for `call`). No imports, so wasm function index =
     /// our `Module` function index.
     func_sigs: &'a [(Vec<ValType>, Vec<ValType>)],
+    /// Global types by index, and the window byte address of global 0 (each global an 8-byte slot).
+    /// `global.get`/`set` lower to a load/store there.
+    global_types: &'a [ValType],
+    globals_base: u64,
     /// 64-bit linear memory (`memory64`): the address operand is already i64; otherwise it's an i32
     /// that must be zero-extended before our (i64-addressed) `load`/`store`.
     mem64: bool,
@@ -398,6 +458,8 @@ fn lower_func(
     results: &[ValType],
     types: &[(Vec<ValType>, Vec<ValType>)],
     func_sigs: &[(Vec<ValType>, Vec<ValType>)],
+    global_types: &[ValType],
+    globals_base: u64,
     body: &wasmparser::FunctionBody,
     mem64: bool,
 ) -> Result<Func, Error> {
@@ -427,6 +489,8 @@ fn lower_func(
         control: Vec::new(),
         types,
         func_sigs,
+        global_types,
+        globals_base,
         mem64,
     };
     // Initialize declared locals to zero (params already bound to block params), extending `locals`.
@@ -578,6 +642,27 @@ fn mem_load(lo: &mut Lower, op: LoadOp, m: MemArg) -> Result<(), Error> {
     lo.push(v, op.info().1); // `info().1` is the result value type (i32/i64)
     Ok(())
 }
+fn global_addr(lo: &Lower, g: u32) -> u64 {
+    lo.globals_base + g as u64 * 8
+}
+/// The full-width load/store op for a value type (globals occupy whole 8-byte slots).
+fn load_op(ty: ValType) -> LoadOp {
+    match ty {
+        ValType::I32 => LoadOp::I32,
+        ValType::I64 => LoadOp::I64,
+        ValType::F32 => LoadOp::F32,
+        ValType::F64 => LoadOp::F64,
+    }
+}
+fn store_op(ty: ValType) -> StoreOp {
+    match ty {
+        ValType::I32 => StoreOp::I32,
+        ValType::I64 => StoreOp::I64,
+        ValType::F32 => StoreOp::F32,
+        ValType::F64 => StoreOp::F64,
+    }
+}
+
 /// `call funcidx`: pop the callee's params (the last is on top), call it, push its results. No
 /// imports, so the wasm function index is our `Module` function index directly.
 fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
@@ -837,6 +922,30 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::F32ReinterpretI32 => fcast(lo, CastOp::ReinterpI32F32, ValType::F32)?,
         O::I64ReinterpretF64 => fcast(lo, CastOp::ReinterpF64I64, ValType::I64)?,
         O::F64ReinterpretI64 => fcast(lo, CastOp::ReinterpI64F64, ValType::F64)?,
+        // ---- globals (lowered to load/store of a reserved window slot) ----
+        O::GlobalGet { global_index } => {
+            let ty = lo.global_types[global_index as usize];
+            let a = lo.emit(Inst::ConstI64(global_addr(lo, global_index) as i64));
+            let v = lo.emit(Inst::Load {
+                op: load_op(ty),
+                addr: a,
+                offset: 0,
+                align: 3,
+            });
+            lo.push(v, ty);
+        }
+        O::GlobalSet { global_index } => {
+            let ty = lo.global_types[global_index as usize];
+            let (value, _) = lo.pop()?;
+            let a = lo.emit(Inst::ConstI64(global_addr(lo, global_index) as i64));
+            lo.emit_void(Inst::Store {
+                op: store_op(ty),
+                addr: a,
+                value,
+                offset: 0,
+                align: 3,
+            });
+        }
         // ---- direct call (call_indirect needs tables/elements — a later slice) ----
         O::Call { function_index } => call_op(lo, function_index)?,
         // ---- structured control flow ----

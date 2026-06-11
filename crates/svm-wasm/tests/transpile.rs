@@ -447,11 +447,51 @@ fn data_segment_init() {
     assert_eq!(run(wat2, "sum", &[]), 30); // 10 + 20
 }
 
+/// A mutable global used as accumulator state across get/set (with linear memory present).
+#[test]
+fn mutable_global_counter() {
+    let wat = r#"
+(module (memory 1)
+  (global $g (mut i32) (i32.const 100))
+  (func (export "f") (param $x i32) (result i32)
+    (global.set $g (i32.add (global.get $g) (local.get $x)))
+    (global.get $g)))"#;
+    // each run re-instantiates (the data segment re-inits the global to 100)
+    assert_eq!(run(wat, "f", &[Value::I32(5)]), 105);
+    assert_eq!(run(wat, "f", &[Value::I32(-30)]), 70);
+}
+
+/// A module with **globals but no linear memory** — the transpiler still gives them a window region.
+#[test]
+fn globals_without_memory() {
+    let wat = r#"
+(module
+  (global $g (mut i64) (i64.const 7))
+  (func (export "acc") (param $x i64) (result i64)
+    (global.set $g (i64.mul (global.get $g) (local.get $x)))
+    (global.get $g)))"#;
+    assert_eq!(run(wat, "acc", &[Value::I64(3)]), 21);
+    assert_eq!(run(wat, "acc", &[Value::I64(6)]), 42);
+}
+
+/// Immutable + float globals.
+#[test]
+fn immutable_and_float_globals() {
+    let wat = r#"
+(module
+  (global $c i32 (i32.const 42))
+  (global $pi f64 (f64.const 3.25))
+  (func (export "c") (result i32) (global.get $c))
+  (func (export "twopi") (result f64) (f64.add (global.get $pi) (global.get $pi))))"#;
+    assert_eq!(run(wat, "c", &[]), 42);
+    assert_eq!(as_f64(eval(wat, "twopi", &[])), 6.5);
+}
+
 #[test]
 fn unsupported_is_clean_error() {
-    // A global is out of the current subset → a clean Unsupported error, not a panic.
-    let wat =
-        r#"(module (global i32 (i32.const 5)) (func (export "g") (result i32) (global.get 0)))"#;
+    // A table / call_indirect is out of the current subset → a clean Unsupported error, not a panic.
+    let wat = r#"(module (table 1 funcref) (type $t (func (result i32)))
+        (func (export "g") (result i32) (call_indirect (type $t) (i32.const 0))))"#;
     let wasm = wat::parse_str(wat).unwrap();
     match svm_wasm::transpile(&wasm) {
         Err(svm_wasm::Error::Unsupported(_)) => {}
