@@ -30,6 +30,15 @@ void exit(int code);
 long __vm_map(long off, long len, int prot);
 long __vm_page_size(void);
 
+// Atomics for the **thread-safe** bump allocator (below). These lower to plain atomic ops, so a
+// single-threaded program pays only an uncontended atomic and never pulls in the thread runtime
+// (only `thread.spawn`/`wait`/`notify` mark a module threaded — not atomics).
+long __vm_atomic_add(void *p, long v);   // fetch-add (i64), returns old
+long __vm_atomic_load(void *p);          // load (i64)
+void __vm_atomic_store(void *p, long v); // store (i64)
+int __vm_atomic_cas32(void *p, int expected, int desired); // CAS (i32), returns old
+void __vm_atomic_store32(void *p, int v);                  // store (i32)
+
 static void abort(void) {
   exit(134); // 128 + SIGABRT, the conventional code
 }
@@ -38,9 +47,10 @@ static void abort(void) {
 #define __SVM_HEAP_BASE 268435456L // 256 MiB: above the (<= 64 MiB) backed prefix, in the tail
 #define __SVM_HDR 16L // per-allocation header (holds the payload size; keeps 16-byte alignment)
 
-static long __svm_brk = __SVM_HEAP_BASE;       // next free byte
+static long __svm_brk = __SVM_HEAP_BASE;       // next free byte (atomic bump pointer)
 static long __svm_committed = __SVM_HEAP_BASE; // first byte past the committed region
 static long __svm_page = 0;                    // cached host page granularity (0 = not yet queried)
+static int __svm_grow_lock = 0;                // spinlock guarding heap *growth* (page commits) only
 
 // Heap-growth granularity = the **host page**, queried once and cached. The runtime's `map` commits
 // and zero-fills the whole host page(s) covering a request (host-page default: 4 KiB on x86-64,
@@ -55,21 +65,36 @@ static long __svm_pagesize(void) {
   return __svm_page;
 }
 
+// **Thread-safe `malloc`.** The fast path is **lock-free**: an atomic fetch-add on the bump pointer
+// claims a unique `[hdr, end)` region, so concurrent callers never overlap. Only **growth** —
+// committing new pages when a claim runs past the committed boundary — is serialized (a brief
+// spinlock around one `__vm_map`), so a page is mapped exactly once (re-mapping would re-zero live
+// allocations). `__svm_committed` is published *after* the pages are mapped, so any caller that
+// observes `committed >= end` sees its region already backed. A single-threaded caller pays only the
+// uncontended atomics; the spinlock never spins. (On OOM the claimed range is leaked — but `free` is a
+// no-op anyway, §3d MVP, so this only forfeits some address space; it never corrupts live data.)
 static void *malloc(size_t n) {
   n = (n + 15UL) & ~15UL; // 16-byte align the payload
-  long hdr = __svm_brk;
+  long total = __SVM_HDR + (long)n;
+  long hdr = __vm_atomic_add(&__svm_brk, total); // atomically claim [hdr, hdr+total)
   long payload = hdr + __SVM_HDR;
-  long end = payload + (long)n;
-  if (end > __svm_committed) {
-    // Grow: commit whole host pages covering the shortfall, read-write (READ|WRITE = 3).
-    long pg = __svm_pagesize();
-    long need = (end - __svm_committed + (pg - 1)) & ~(pg - 1);
-    if (__vm_map(__svm_committed, need, 3) != 0)
-      return NULL; // out of memory
-    __svm_committed += need;
+  long end = hdr + total;
+  if (end > __vm_atomic_load(&__svm_committed)) {
+    while (__vm_atomic_cas32(&__svm_grow_lock, 0, 1) != 0) {
+    } // acquire the growth lock
+    long cur = __vm_atomic_load(&__svm_committed);
+    if (end > cur) { // still short after the lock — another grower may have caught up
+      long pg = __svm_pagesize();
+      long need = (end - cur + (pg - 1)) & ~(pg - 1); // whole host pages covering the shortfall
+      if (__vm_map(cur, need, 3) != 0) {
+        __vm_atomic_store32(&__svm_grow_lock, 0); // release
+        return NULL;                              // out of memory
+      }
+      __vm_atomic_store(&__svm_committed, cur + need); // publish growth *after* it is mapped
+    }
+    __vm_atomic_store32(&__svm_grow_lock, 0); // release
   }
-  __svm_brk = end;
-  *(size_t *)hdr = n; // remember the size for realloc
+  *(size_t *)hdr = n; // remember the size for realloc (disjoint per allocation)
   return (void *)payload;
 }
 

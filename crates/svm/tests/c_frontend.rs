@@ -2125,6 +2125,24 @@ fn c_guest_work_stealing_demo() {
     );
 }
 
+/// The §3d **thread-safe guest `malloc`** (`include/stdlib.h`): 4 vCPUs each `malloc` 64 blocks and
+/// fill them with per-block patterns; main re-checks every byte. If two concurrent allocations had
+/// overlapped (the race the old bump allocator allowed), a fill would have clobbered another block and
+/// the re-check would find corruption. The demo prints the corrupt-block count — `0` on a correct
+/// allocator, on both the interpreter (M:N oracle) and the JIT (real OS threads). The lock-free
+/// atomic-bump claim + spinlock-guarded page growth is what makes concurrent allocation safe (so
+/// threaded guests no longer have to pre-allocate on the main thread).
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_thread_safe_malloc() {
+    let src = include_str!("../../svm-run/demos/malloc_threads/malloc_threads.c");
+    let run = run_c_full(src);
+    assert_eq!(
+        run.stdout, b"0\n",
+        "concurrent malloc must hand out disjoint blocks (0 corrupt) on both backends"
+    );
+}
+
 /// The host's deterministic `Blocking.work(i)` result (mirrors `svm_interp::AsyncState::mix`).
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn async_mix(arg: i64) -> i64 {

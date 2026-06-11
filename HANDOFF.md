@@ -896,10 +896,18 @@ leave a shared view — add a unix test for this alongside the Windows work.
       migratable-fiber primitive is not needed for stackless). `16·16 = 256`, and the exact total
       proves no task was lost/double-run as they migrated. `c_frontend::c_guest_work_stealing_demo` +
       `run::demo_work_stealing_runs`.
-    - *Finding surfaced by the demo:* the shipped MVP `malloc` (a bump allocator) is **not
-      thread-safe** — concurrent `malloc` from worker threads corrupts the heap. The demo pre-allocates
-      fiber stacks on the main thread to sidestep it; a **thread-safe guest `malloc`** (mutex/atomic
-      bump, or per-thread arenas) is a libc follow-up (guest-side, not a VM concern).
+    - *Finding surfaced by the demo (now **FIXED**):* the shipped MVP `malloc` (a bump allocator) was
+      **not thread-safe** — concurrent `malloc` from worker threads corrupted the heap, so the demos
+      pre-allocated on the main thread to sidestep it. `include/stdlib.h`'s `malloc` is now thread-safe:
+      a **lock-free atomic-bump** fast path (`__vm_atomic_add` on the bump pointer claims a unique
+      `[hdr, end)`, so concurrent callers never overlap) with the rare **page growth** serialized by a
+      spinlock (`__vm_atomic_cas32`) — a page is mapped exactly once (re-mapping would re-zero live
+      data) and `__svm_committed` is published only *after* the pages are mapped. A single-threaded
+      caller pays only uncontended atomics and never pulls in the thread runtime (atomics don't mark a
+      module threaded). Demo `crates/svm-run/demos/malloc_threads` (4 vCPUs × 64 allocs, per-block
+      patterns, main re-checks every byte for an overlap clobber) + test
+      `c_frontend::c_guest_thread_safe_malloc` (0 corrupt on both backends; the old racy bump scored 11
+      under the same load — non-vacuous).
   - **Async submit/complete ring (§9/§12) — COMPLETE (increments 1–3c, mechanism + runtime, both backends).** An `IoRing` capability (iface 9,
     `Host::grant_io_ring`); `op 0 submit(sq_ptr, n, cq_ptr)` runs `n` **deferred `cap.call`s** (each a
     64-byte SQE in the window) through the *same* capability dispatch and writes 32-byte CQEs — so the
@@ -1253,10 +1261,15 @@ regressions one commit old"):
 >    protocol + expert review.** Design + roadmap in `SCHEDULING.md`. Now unblocked: B has landed (and
 >    its suspend/wake protocol — the futex park + completion notify — informs the fiber's).
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); fiber/vCPU
->    quota *metering* (§15; the kill path exists, quotas don't); a **thread-safe guest `malloc`** (the
->    MVP bump allocator races under threads — surfaced by `demos/mn_sched`); DPOR for `explore_all`; and
->    the async-ring pool could grow more offloadable ops. *(The JIT cap-path page-map persistence — grown-
->    heap cap-buffer borrows — is now **DONE**: `Host::cap_window_pages` + `MprotectWindow::new_shared`.)*
+>    quota *metering* (§15; the kill path exists, quotas don't); DPOR for `explore_all`; the async-ring
+>    pool could grow more offloadable ops; and a **chibicc high-bit-`char` bug** found while testing the
+>    malloc demo (a `(char)` of a value ≥ 128, or an `(unsigned char)` narrowing cast, doesn't truncate
+>    to 8 bits — `(char)200 != (char)200` compares *true* on the VM but false on native `cc`; the demos
+>    sidestep it by keeping patterns in 0..127). It's an **untrusted-frontend** bug (re-verified output
+>    is still safe), pre-existing and independent of the allocator, but a real interp+JIT-vs-`cc`
+>    correctness gap worth a focused fix in `codegen_ir.c`'s cast/load lowering. *(Done this batch: the
+>    JIT cap-path page-map persistence — `Host::cap_window_pages` + `MprotectWindow::new_shared` — and the
+>    **thread-safe guest `malloc`**.)*
 > 4. **Maintainer one-liners** (need the `workflow` token scope I can't push): apply the nightly **miri**
 >    CI job (snippet at commit `60d4f3a`); drop `continue-on-error` from the now-green `cross-os` matrix.
 
