@@ -1307,11 +1307,23 @@ regressions one commit old"):
 > schedulers; ring increment 1.)*
 >
 > **Immediate frontier, ranked** *(the async ring (B) is done — these are the next big rocks):*
+> 0. **wasm → IR transpiler (`crates/svm-wasm`) — STARTED (slice 1 landed).** A second frontend after
+>    chibicc, chosen *before* the LLVM on-ramp because it's smaller and directly serves the §1a
+>    benchmark thesis: take *any* wasm and run it on SVM vs Wasmtime on the *same bytes*, instead of
+>    hand-writing IR+WAT kernel pairs. The interesting part is the **stack→SSA reconstruction** (wasm is
+>    a stack machine; our IR is SSA) — done by threading all locals + the surviving operand stack as
+>    block params at every control-flow target, the same trick chibicc uses for the data-SP. *Slice 1*
+>    (numeric + locals + `block`/`loop`/`br`/`br_if`/`br_table`/`return` + dead-code bookkeeping) is in
+>    and differentially tested (`svm-wasm/tests/transpile.rs`: WAT → transpile → verify → interp==JIT vs
+>    a hand oracle, incl. the real `alu` LCG kernel + a 4-way br_table). **Next slices:** linear memory
+>    (unlocks memsum/scatter; map wasm i32 addrs → i64 + window), calls/`call_indirect`, `if`/`else`,
+>    floats — then wire it into `bench/` so the comparison runs on transpiled wasm, not hand-paired IR.
 > 1. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
 >    — the translator links libLLVM at build/dev time and is *off the runtime path* (keeps the ~5 MiB
 >    JIT binary lean). MVP: `clang -emit-llvm` → IR for the scalar+memory+call subset chibicc already
 >    proves (aggregates via memory; hard-error on vectors/unsupported intrinsics), with a differential
->    harness running the existing C demos through *stock LLVM* and matching native `clang`.
+>    harness running the existing C demos through *stock LLVM* and matching native `clang`. (LLVM 18 +
+>    `libLLVM.so` confirmed present in the dev container.)
 > 2. **Migratable-fiber primitive (D57)** — the maintainer's stated ideal (stackful work-stealing).
 >    Feasible (Go is the proof) but re-accepts D56's cross-thread-migration unsafe as a *primitive*
 >    (guest owns the stealing policy; VM enforces single-owner). **Gated on a loom-verified ownership
