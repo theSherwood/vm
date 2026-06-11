@@ -1289,8 +1289,11 @@ regressions one commit old"):
 > handle-threading through the §3c type check, and clean errors for non-numeric names / non-func imports /
 > multiple interfaces. 7 differential tests (`crates/svm-wasm/tests/imports.rs`) run import-using modules
 > on **both** backends under one reference `Host` (interp `run_with_host`; JIT `compile_and_run_with_host`
-> over `svm_run::cap_thunk`). No-import modules are unchanged (25 transpile tests green). Full detail in
-> item 0's "Imports / host ABI" sub-bullet. **Next:** `memory.{grow,size}`.
+> over `svm_run::cap_thunk`). No-import modules are unchanged (25 transpile tests green). **Bench
+> `--from-wasm` now also transpiles the `hostcall`/`hostbuf` interface kernels from their WAT** (numeric
+> import convention; cross-checked identical to Wasmtime) — so the apples-to-apples comparison covers the
+> §1a interface axis, not just compute. Full detail in item 0's "Imports / host ABI" sub-bullet.
+> **Next:** `memory.{grow,size}`.
 >
 > **Earlier (prior session): the async I/O ring (B) — COMPLETE, increments 2 + 3a + 3b + 3c,
 > mechanism + runtime on BOTH backends.** Increment 2 — the **bounded blocking-offload pool**: `submit`
@@ -1368,10 +1371,15 @@ regressions one commit old"):
 >      shape, deterministic `mix`), handle-threading through a defined→defined call and through a
 >      `call_indirect` dispatch table, plus the three clean-error guards — each run on **both** backends
 >      under one reference `Host` (interp `run_with_host`; JIT `compile_and_run_with_host` over the
->      production `svm_run::cap_thunk`, added as a dev-dep). **Still open on imports:** multiple distinct
->      capability interfaces (one handle each), and wiring the bench `hostcall`/`hostbuf` kernels to
->      transpile from WAT under `--from-wasm` (their thunk already dispatches on `(type_id, op)`; the
->      remaining bit is feeding the threaded leading handle arg).
+>      production `svm_run::cap_thunk`, added as a dev-dep). **Bench wiring — DONE:** the `hostcall`/
+>      `hostbuf` interface kernels now transpile from their WAT under `--from-wasm` (no longer
+>      hand-written-only) — their imports use the convention (`"0"/"0"` → op 0 scalar `x+1`, `"0"/"1"` →
+>      op 1 borrow-buffer sum) matching `bench_thunk`'s op dispatch and the Wasmtime linker; the
+>      transpiled entry takes the threaded handle as its leading param (the stateless thunk ignores it,
+>      so `lead_args = [0]`). The bench's pre-timing cross-check confirms the transpiled SVM IR returns
+>      identical results to Wasmtime on the same bytes (hostcall ~1.18×, hostbuf ~0.50× = ~2× faster).
+>      So `--from-wasm` now covers the §1a **interface** axis too, not just compute. **Still open on
+>      imports:** multiple distinct capability interfaces (one handle each).
 >    **Missing wasm features (the explicit note — what svm-wasm does NOT transpile yet):** (1)
 >    `memory.{grow,size}`. (2) passive data / element segments. (3) imports spanning multiple capability
 >    interfaces (one handle is threaded). (4) SIMD (v128). (5) reference types beyond funcref tables;
