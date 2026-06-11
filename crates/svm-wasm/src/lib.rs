@@ -19,13 +19,15 @@
 //! sized to the wasm memory's initial pages) · direct **`call`** (multi-function + recursion) ·
 //! **floats** (f32/f64 const/arith/unary/compare, load/store, and every int↔float conversion incl.
 //! `trunc`/`trunc_sat`/`convert`/`demote`/`promote`/`reinterpret`) · **globals** (`global.get`/`set`
-//! lowered to a reserved window region) · active **data segments** (initialized linear memory). Still a
-//! clean [`Error::Unsupported`] (added in slices): `call_indirect`/tables, `memory.{grow,size}`,
-//! passive data, imports, SIMD, reference types.
+//! lowered to a reserved window region) · active **data segments** (initialized linear memory) ·
+//! **`call_indirect`** + tables/element segments (the table → an in-window array of funcref indices;
+//! `call_indirect` loads the entry and feeds it to our `CallIndirect`'s §3c type-id check). Still a
+//! clean [`Error::Unsupported`] (added in slices): `memory.{grow,size}`, passive data/elements,
+//! imports, SIMD, reference types.
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF,
-    Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
+    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -86,6 +88,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut mem: Option<wasmparser::MemoryType> = None;
     let mut data: Vec<svm_ir::Data> = Vec::new();
     let mut globals: Vec<(ValType, Vec<u8>)> = Vec::new();
+    let mut table_size: Option<u64> = None;
+    let mut elements: Vec<(u64, Vec<u32>)> = Vec::new(); // (offset, func indices)
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -131,7 +135,40 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     globals.push((ty, const_bytes(g.init_expr, ty)?));
                 }
             }
-            Payload::TableSection(_) => return unsup("tables"),
+            Payload::TableSection(reader) => {
+                for tb in reader {
+                    let tb = tb?;
+                    if table_size.replace(tb.ty.initial).is_some() {
+                        return unsup("multiple tables");
+                    }
+                }
+            }
+            Payload::ElementSection(reader) => {
+                for el in reader {
+                    let el = el?;
+                    match el.kind {
+                        wasmparser::ElementKind::Active {
+                            table_index,
+                            offset_expr,
+                        } => {
+                            if table_index.unwrap_or(0) != 0 {
+                                return unsup("multi-table element segment");
+                            }
+                            let off = const_offset(offset_expr)?;
+                            match el.items {
+                                wasmparser::ElementItems::Functions(fns) => {
+                                    let fs: Vec<u32> = fns.into_iter().collect::<Result<_, _>>()?;
+                                    elements.push((off, fs));
+                                }
+                                wasmparser::ElementItems::Expressions(..) => {
+                                    return unsup("element segment with const-expr items")
+                                }
+                            }
+                        }
+                        _ => return unsup("passive/declared element segment"),
+                    }
+                }
+            }
             Payload::ExportSection(reader) => {
                 for e in reader {
                     let e = e?;
@@ -190,6 +227,31 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             bytes: bytes.clone(),
         });
     }
+    let globals_end = globals_base + globals.len() as u64 * 8;
+
+    // The wasm function table → an in-window array of i32 function indices (each `funcref` is our
+    // §3c funcref index = the function index). `call_indirect` loads the entry and feeds it to our
+    // `CallIndirect`, whose `table_lookup` does the type-id check. Empty slots get a sentinel that
+    // fails that check (≈ wasm's null-funcref trap). Element segments fill the live slots.
+    let tsize = table_size.unwrap_or(0);
+    let table_base = globals_end.div_ceil(4) * 4;
+    if tsize > 0 {
+        let mut bytes = vec![0xFFu8; tsize as usize * 4]; // sentinel = no/bad funcref
+        for (off, fns) in &elements {
+            for (k, &f) in fns.iter().enumerate() {
+                let slot = (*off as usize + k) * 4;
+                if slot + 4 <= bytes.len() {
+                    bytes[slot..slot + 4].copy_from_slice(&f.to_le_bytes());
+                }
+            }
+        }
+        data.push(svm_ir::Data {
+            offset: table_base,
+            readonly: false,
+            bytes,
+        });
+    }
+    let table_end = table_base + tsize * 4;
 
     let func_sigs: Vec<(Vec<ValType>, Vec<ValType>)> = func_type_idx
         .iter()
@@ -205,17 +267,18 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             &func_sigs,
             &globals_types,
             globals_base,
+            table_base,
             &body,
             mem64,
         )?);
     }
 
     // Our window is a power-of-two byte range (masking confines to it); size it to hold the linear
-    // memory **and** the globals region. (wasm bounds-checks-and-traps on out-of-range access while we
-    // mask-confine to the ≥ power-of-two window — identical for in-bounds accesses; `memory.grow` is a
-    // later slice.) A module with globals but no memory still needs a window for them.
-    let needed = (globals_base + globals.len() as u64 * 8).max(mem_bytes);
-    let memory = if mem.is_some() || !globals.is_empty() {
+    // memory **and** the globals + function-table regions. (wasm bounds-checks-and-traps on
+    // out-of-range access while we mask-confine to the ≥ power-of-two window — identical for in-bounds
+    // accesses; `memory.grow` is a later slice.) Globals/table-only modules still need a window.
+    let needed = table_end.max(globals_end).max(mem_bytes);
+    let memory = if mem.is_some() || !globals.is_empty() || tsize > 0 {
         let size_log2 = needed.max(1).next_power_of_two().trailing_zeros().max(16) as u8;
         Some(svm_ir::Memory { size_log2 })
     } else {
@@ -330,6 +393,9 @@ struct Lower<'a> {
     /// `global.get`/`set` lower to a load/store there.
     global_types: &'a [ValType],
     globals_base: u64,
+    /// Window byte address of function-table slot 0 (each slot an i32 funcref index). `call_indirect`
+    /// loads the slot and feeds it to our `CallIndirect`.
+    table_base: u64,
     /// 64-bit linear memory (`memory64`): the address operand is already i64; otherwise it's an i32
     /// that must be zero-extended before our (i64-addressed) `load`/`store`.
     mem64: bool,
@@ -460,6 +526,7 @@ fn lower_func(
     func_sigs: &[(Vec<ValType>, Vec<ValType>)],
     global_types: &[ValType],
     globals_base: u64,
+    table_base: u64,
     body: &wasmparser::FunctionBody,
     mem64: bool,
 ) -> Result<Func, Error> {
@@ -491,6 +558,7 @@ fn lower_func(
         func_sigs,
         global_types,
         globals_base,
+        table_base,
         mem64,
     };
     // Initialize declared locals to zero (params already bound to block params), extending `locals`.
@@ -677,6 +745,56 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
     }
     args.reverse(); // stack top is the last argument
     let res = lo.emit_call(Inst::Call { func, args }, results.len());
+    for (v, t) in res.into_iter().zip(results.iter()) {
+        lo.push(v, *t);
+    }
+    Ok(())
+}
+
+/// `call_indirect (type $t)`: the stack is `[args.., index]`. Pop the index, load the funcref (a
+/// function index) from `table[index]` in the window, pop the args, and emit our `CallIndirect` (whose
+/// `table_lookup` does the §3c type-id check against `$t`).
+fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result<(), Error> {
+    if table_index != 0 {
+        return unsup("call_indirect on a non-zero table");
+    }
+    let (params, results) = lo.types[type_index as usize].clone();
+    // table[index] → function index, at window byte `table_base + index*4`.
+    let (widx, _) = lo.pop()?;
+    let idx64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: widx,
+    });
+    let four = lo.emit(Inst::ConstI64(4));
+    let byte_off = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a: idx64,
+        b: four,
+    });
+    let funcref = lo.emit(Inst::Load {
+        op: LoadOp::I32,
+        addr: byte_off,
+        offset: lo.table_base,
+        align: 2,
+    });
+    let mut args = Vec::with_capacity(params.len());
+    for _ in 0..params.len() {
+        args.push(lo.pop()?.0);
+    }
+    args.reverse();
+    let ty = FuncType {
+        params: params.clone(),
+        results: results.clone(),
+    };
+    let res = lo.emit_call(
+        Inst::CallIndirect {
+            ty,
+            idx: funcref,
+            args,
+        },
+        results.len(),
+    );
     for (v, t) in res.into_iter().zip(results.iter()) {
         lo.push(v, *t);
     }
@@ -946,8 +1064,12 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
                 align: 3,
             });
         }
-        // ---- direct call (call_indirect needs tables/elements — a later slice) ----
+        // ---- calls ----
         O::Call { function_index } => call_op(lo, function_index)?,
+        O::CallIndirect {
+            type_index,
+            table_index,
+        } => call_indirect_op(lo, type_index, table_index)?,
         // ---- structured control flow ----
         O::Block { blockty } => {
             let (p, r) = block_sig(blockty, lo.types)?;

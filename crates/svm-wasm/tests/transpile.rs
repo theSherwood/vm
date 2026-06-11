@@ -570,11 +570,79 @@ fn immutable_and_float_globals() {
     assert_eq!(as_f64(eval(wat, "twopi", &[])), 6.5);
 }
 
+/// `call_indirect` through a function table populated by an element segment — virtual dispatch.
+#[test]
+fn call_indirect_dispatch() {
+    let wat = r#"
+(module
+  (table 3 funcref)
+  (elem (i32.const 0) $add $sub $mul)
+  (type $binop (func (param i32 i32) (result i32)))
+  (func $add (type $binop) (i32.add (local.get 0) (local.get 1)))
+  (func $sub (type $binop) (i32.sub (local.get 0) (local.get 1)))
+  (func $mul (type $binop) (i32.mul (local.get 0) (local.get 1)))
+  (func (export "dispatch") (param $op i32) (param $a i32) (param $b i32) (result i32)
+    (call_indirect (type $binop) (local.get $a) (local.get $b) (local.get $op))))"#;
+    assert_eq!(
+        run(
+            wat,
+            "dispatch",
+            &[Value::I32(0), Value::I32(7), Value::I32(3)]
+        ),
+        10
+    );
+    assert_eq!(
+        run(
+            wat,
+            "dispatch",
+            &[Value::I32(1), Value::I32(7), Value::I32(3)]
+        ),
+        4
+    );
+    assert_eq!(
+        run(
+            wat,
+            "dispatch",
+            &[Value::I32(2), Value::I32(7), Value::I32(3)]
+        ),
+        21
+    );
+}
+
+/// A `call_indirect` whose declared type doesn't match the table entry's must **trap** (the §3c
+/// type-id check), on both backends — the I2 "forged/confused index is inert" guarantee.
+#[test]
+fn call_indirect_type_mismatch_traps() {
+    let wat = r#"
+(module
+  (table 1 funcref)
+  (elem (i32.const 0) $f)
+  (type $unary (func (param i64) (result i64)))
+  (func $f (param i32 i32) (result i32) (i32.add (local.get 0) (local.get 1)))
+  (func (export "bad") (result i64)
+    (call_indirect (type $unary) (i64.const 5) (i32.const 0))))"#;
+    let wasm = wat::parse_str(wat).unwrap();
+    let t = svm_wasm::transpile(&wasm).expect("transpile");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let idx = t.exports.iter().find(|(n, _)| n == "bad").unwrap().1;
+    let mut fuel = 1_000_000u64;
+    assert!(
+        svm_interp::run(&t.module, idx, &[], &mut fuel).is_err(),
+        "interp must trap"
+    );
+    assert!(
+        matches!(
+            svm_jit::compile_and_run(&t.module, idx, &[]).unwrap(),
+            svm_jit::JitOutcome::Trapped(_)
+        ),
+        "jit must trap"
+    );
+}
+
 #[test]
 fn unsupported_is_clean_error() {
-    // A table / call_indirect is out of the current subset → a clean Unsupported error, not a panic.
-    let wat = r#"(module (table 1 funcref) (type $t (func (result i32)))
-        (func (export "g") (result i32) (call_indirect (type $t) (i32.const 0))))"#;
+    // `memory.grow` is out of the current subset → a clean Unsupported error, not a panic.
+    let wat = r#"(module (memory 1) (func (export "g") (result i32) (memory.grow (i32.const 1))))"#;
     let wasm = wat::parse_str(wat).unwrap();
     match svm_wasm::transpile(&wasm) {
         Err(svm_wasm::Error::Unsupported(_)) => {}
