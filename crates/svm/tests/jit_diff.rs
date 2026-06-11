@@ -1764,3 +1764,125 @@ block0(v0: i32):
         assert_cap_agrees(src, &[Value::I32(si)], &mut hi2, &mut hj2);
     }
 }
+
+/// §9 / D45 — the **devirtualized `cap.call` fast path**. A `cap.call` to a `(type_id, op)` the
+/// embedder's `FastCapResolver` claims is lowered to a register-to-register direct call to a
+/// specialized host fn (no stack marshalling, no runtime dispatch). These pin that the fast path is
+/// *behaviourally identical* to the generic thunk (same result, same fallback when unclaimed).
+mod fast_cap {
+    use core::ffi::c_void;
+    use svm_jit::{compile_and_run_with_host, compile_and_run_with_host_fast, JitOutcome};
+    use svm_text::parse_module;
+    use svm_verify::verify_module;
+
+    /// Generic thunk: op 1 doubles its arg, any other op increments — the fallback semantics.
+    unsafe extern "C" fn generic_thunk(
+        _ctx: *mut c_void,
+        _mem_base: *mut u8,
+        _mem_size: u64,
+        _mem_reserved: u64,
+        _type_id: u32,
+        op: u32,
+        _handle: i32,
+        args: *const i64,
+        n_args: u64,
+        results: *mut i64,
+        n_results: u64,
+        trap_out: *mut i64,
+    ) {
+        let a = if n_args == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(args, n_args as usize)
+        };
+        let r = match op {
+            1 => a[0].wrapping_mul(2),
+            _ => a[0].wrapping_add(1),
+        };
+        if n_results != 0 {
+            *results = r;
+        }
+        *trap_out = 0;
+    }
+
+    /// The specialized (register-ABI) fast fn for `(42, 0)`: `a0 + 1` — must match the generic op-0.
+    unsafe extern "C" fn fast_add1(
+        _ctx: *mut c_void,
+        _mem_base: *mut u8,
+        _mem_size: u64,
+        _handle: i32,
+        trap_out: *mut i64,
+        a0: i64,
+    ) -> i64 {
+        *trap_out = 0;
+        a0.wrapping_add(1)
+    }
+
+    /// Claims only `(42, 0)`; everything else falls back to the generic thunk.
+    unsafe extern "C" fn resolver(type_id: u32, op: u32) -> *const c_void {
+        if type_id == 42 && op == 0 {
+            fast_add1 as *const c_void
+        } else {
+            core::ptr::null()
+        }
+    }
+
+    fn run_both(ir: &str, x: i64) -> (i64, i64) {
+        let m = parse_module(ir).expect("parse");
+        verify_module(&m).expect("verify");
+        let g =
+            match compile_and_run_with_host(&m, 0, &[0, x], generic_thunk, core::ptr::null_mut())
+                .expect("generic")
+            {
+                JitOutcome::Returned(v) => v[0],
+                o => panic!("generic: {o:?}"),
+            };
+        let f = match compile_and_run_with_host_fast(
+            &m,
+            0,
+            &[0, x],
+            generic_thunk,
+            core::ptr::null_mut(),
+            resolver,
+        )
+        .expect("fast")
+        {
+            JitOutcome::Returned(v) => v[0],
+            o => panic!("fast: {o:?}"),
+        };
+        (g, f)
+    }
+
+    /// A claimed op (42,0): the fast path returns the same as the generic thunk, and the right value.
+    #[test]
+    fn fast_path_matches_generic() {
+        let ir = "\
+memory 16
+func (i32, i64) -> (i64) {
+block0(v0: i32, v1: i64):
+  v2 = cap.call 42 0 (i64) -> (i64) v0(v1)
+  return v2
+}
+";
+        let (g, f) = run_both(ir, 41);
+        assert_eq!(g, f, "fast must match generic");
+        assert_eq!(g, 42, "op 0 increments");
+    }
+
+    /// An *unclaimed* op (42,1): the resolver returns null, so the fast-enabled run still uses the
+    /// generic thunk — identical to the plain generic run.
+    #[test]
+    fn unclaimed_op_falls_back_to_generic() {
+        let ir = "\
+memory 16
+func (i32, i64) -> (i64) {
+block0(v0: i32, v1: i64):
+  v2 = cap.call 42 1 (i64) -> (i64) v0(v1)
+  return v2
+}
+";
+        let (g, f) = run_both(ir, 21);
+        assert_eq!(g, f, "unclaimed op must fall back to the generic thunk");
+        assert_eq!(g, 42, "op 1 doubles");
+    }
+}

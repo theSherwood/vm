@@ -279,6 +279,28 @@ pub type CapThunk = unsafe extern "C" fn(
     trap_out: *mut i64,
 );
 
+/// The **devirtualized `cap.call` fast path** (§9 / D45). A `cap.call` to a statically-known
+/// `(type_id, op)` normally goes through the generic [`CapThunk`]: it marshals args through a stack
+/// buffer, passes a 12-wide ABI (incl. `n_args`/`n_res`/`type_id`/`op`), and the host dispatches on
+/// `(type_id, op)` at runtime. A `FastCapResolver` lets an embedder hand the JIT a **specialized**
+/// host function for a given `(type_id, op)`, which the JIT calls **register-to-register** — args and
+/// the result in registers, no stack marshalling, no runtime dispatch. Resolution happens once at
+/// **compile time** (the JIT calls the resolver during codegen and bakes the returned address); a
+/// `null` return falls back to the generic thunk, so an embedder can fast-path only its hot ops.
+///
+/// The specialized function's ABI is, for a `cap.call` with `sig.params.len() == N` args and **one**
+/// result (multi-result ops fall back to the generic thunk):
+/// `unsafe extern "C" fn(ctx, mem_base, mem_size, handle: i32, trap_out: *mut i64, a0: i64, …, aN: i64) -> i64`
+/// — `ctx`/`mem_base`/`mem_size`/`trap_out` are exactly as in [`CapThunk`]; the `handle` is the
+/// resolved capability handle (the fn still does the authority check); each `ai` is the i'th argument
+/// widened to its i64 slot (an i32/f32 in the low bits, an f64 bit-pattern); the i64 return is decoded
+/// to the result type. A 0-result op returns an ignored 0. The fn signals a trap via `trap_out`
+/// exactly like the generic thunk.
+///
+/// # Safety
+/// The resolver and every function it returns must honour the ABI above and stay valid for the run.
+pub type FastCapResolver = unsafe extern "C" fn(type_id: u32, op: u32) -> *const core::ffi::c_void;
+
 /// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
 /// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the
 /// host's table is append-only and the host outlives the run — the same lifetime contract as the
@@ -408,6 +430,42 @@ pub fn compile_and_run_with_host(
         None,
         None, // no kill-path armed (use `_interruptible` to arm one)
         None, // no async ring
+        None, // no fast cap resolver (use `_fast` to supply one)
+    )?
+    .0)
+}
+
+/// Like [`compile_and_run_with_host`], but also supply a [`FastCapResolver`] so hot `cap.call`s to
+/// the resolver's known `(type_id, op)` pairs take the **devirtualized fast path** (register-to-
+/// register, no stack marshalling, no runtime dispatch — §9 / D45). Calls the resolver doesn't claim
+/// fall back to `cap_thunk`. This is the entry an embedder uses once it has specialized host functions
+/// for its hot capabilities (the generic `cap_thunk` stays the correctness fallback).
+///
+/// # Safety
+/// `cap_thunk`/`cap_ctx`/`fast_resolver` (and every function it returns) must stay valid for the call
+/// and honour their respective ABIs.
+pub fn compile_and_run_with_host_fast(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    fast_resolver: FastCapResolver,
+) -> Result<JitOutcome, JitError> {
+    Ok(run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        None,
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None, // no kill-path armed
+        None, // no async ring
+        Some(fast_resolver),
     )?
     .0)
 }
@@ -444,6 +502,7 @@ pub fn compile_and_run_with_host_interruptible(
         None,
         Some(interrupt),
         None, // no async ring
+        None, // no fast cap resolver
     )?
     .0)
 }
@@ -490,6 +549,7 @@ pub fn compile_and_run_capture_reserved(
         None,
         None, // no kill-path armed
         None, // no async ring
+        None, // no fast cap resolver
     )
 }
 
@@ -523,6 +583,7 @@ pub fn compile_and_run_capture_sub(
         None,
         None, // no kill-path armed
         None, // no async ring
+        None, // no fast cap resolver
     )
 }
 
@@ -589,6 +650,7 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
         resolve_module,
         None, // no kill-path armed (the differential oracle runs to completion)
         None, // no async ring
+        None, // no fast cap resolver
     )
 }
 
@@ -625,6 +687,7 @@ pub fn compile_and_run_capture_reserved_with_host_async(
         None,
         None, // no kill-path armed
         Some(hooks),
+        None, // no fast cap resolver
     )
 }
 
@@ -653,6 +716,7 @@ fn run_inner(
     resolve_module: Option<ModuleResolver>,
     interrupt: Option<*const AtomicU64>,
     async_hooks: Option<&dyn AsyncHostHooks>,
+    fast_resolver: Option<FastCapResolver>,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
     // §5 fuel/epoch kill-path: the address of the host-owned interrupt cell the lowering polls at
@@ -792,6 +856,7 @@ fn run_inner(
     let cap = CapEnv {
         thunk_addr: cap_thunk as usize as i64,
         ctx_addr: cap_ctx as usize as i64,
+        fast_resolver,
     };
 
     // §12 fibers: if the module uses `cont.*`, stand up a host fiber runtime (its address baked into
@@ -1306,6 +1371,7 @@ fn compile_child(
     let cap = CapEnv {
         thunk_addr: cap_thunk as *const () as i64,
         ctx_addr: cap_ctx as i64,
+        fast_resolver: None, // nested child: `cap.call`s go to the coroutine thunk, not a fast path
     };
     let mut ctx = module.make_context();
     for (f, id) in funcs.iter().zip(&ids) {
@@ -1493,6 +1559,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
 struct CapEnv {
     thunk_addr: i64,
     ctx_addr: i64,
+    /// The optional D45 devirtualize-to-direct-call resolver (top-level compile only; `None` for
+    /// nested children, whose `cap.call`s go to the coroutine thunk). Invoked at compile time.
+    fast_resolver: Option<FastCapResolver>,
 }
 
 /// The three `cont.*` thunk addresses, baked into `cont.new`/`cont.resume`/`suspend` sites as
@@ -1914,6 +1983,10 @@ fn lower_block(
             // compile, or no nesting runtime) it falls through to the ordinary path (an inert CapFault).
             if *type_id == 6 && lower.inst.is_active() {
                 lower_instantiator(module, b, lower, *op, *handle, args, &mut vals)?;
+            } else if let Some(target) = fast_cap_target(lower, *type_id, *op, sig) {
+                // D45 devirtualized fast path: a register-to-register direct call to the specialized
+                // host fn the resolver claimed for this `(type_id, op)`.
+                lower_cap_call_fast(module, b, lower, target, sig, *handle, args, &mut vals)?;
             } else {
                 lower_cap_call(
                     module, b, lower, *type_id, *op, sig, *handle, args, &mut vals,
@@ -2516,6 +2589,75 @@ fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     b.ins().return_(&zeros);
     b.switch_to_block(cont);
     b.seal_block(cont);
+}
+
+/// Resolve the §9/D45 fast-path target for a `cap.call`, if one applies: there is a [`FastCapResolver`]
+/// (top-level compile), the op has **at most one result** (the register ABI returns a single i64), and
+/// the resolver claims this `(type_id, op)` (returns a non-null specialized fn). Returns the baked
+/// target address. Resolution is a **compile-time** call into the embedder's resolver.
+fn fast_cap_target(lower: &Lower, type_id: u32, op: u32, sig: &FuncType) -> Option<i64> {
+    let resolver = lower.cap.fast_resolver?;
+    if sig.results.len() > 1 {
+        return None; // the fast ABI returns a single register; multi-result falls back to the thunk
+    }
+    // SAFETY: `resolver` honours the `FastCapResolver` contract (caller guarantee); it's a pure
+    // `(type_id, op) -> *const fn` lookup with no side effects, safe to call during codegen.
+    let target = unsafe { resolver(type_id, op) } as i64;
+    (target != 0).then_some(target)
+}
+
+/// Lower a `cap.call` via the **devirtualized fast path** (§9 / D45): a direct register-to-register
+/// call to the specialized host fn at `target`, passing `ctx`/`mem_base`/`mem_size`/`handle`/`trap_out`
+/// then each argument **in a register** (widened to its i64 slot), and reading the single result back
+/// from a register — no stack-slot marshalling, no `n_args`/`n_res`/`type_id`/`op` dispatch. The trap
+/// cell is checked exactly as in [`lower_cap_call`].
+#[allow(clippy::too_many_arguments)]
+fn lower_cap_call_fast(
+    module: &mut JITModule,
+    b: &mut FunctionBuilder,
+    lower: &Lower,
+    target: i64,
+    sig: &FuncType,
+    handle: u32,
+    args: &[u32],
+    vals: &mut Vec<Value>,
+) -> Result<(), JitError> {
+    let n_res = sig.results.len();
+    let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);
+    let mem_base = b.use_var(lower.mem_var);
+    let mem_size = b.ins().iconst(I64, lower.mapped as i64);
+    let h = get(vals, handle)?;
+    let trap_out = b.use_var(lower.trap_var);
+
+    // Signature: (ctx, mem_base, mem_size, handle:i32, trap_out, args…:i64) -> [i64].
+    let mut tsig = module.make_signature();
+    for t in [I64, I64, I64, I32, I64] {
+        tsig.params.push(AbiParam::new(t));
+    }
+    for _ in args {
+        tsig.params.push(AbiParam::new(I64));
+    }
+    if n_res == 1 {
+        tsig.returns.push(AbiParam::new(I64));
+    }
+    let tsigref = b.import_signature(tsig);
+
+    let mut call_args = vec![ctx, mem_base, mem_size, h, trap_out];
+    for a in args {
+        let v = get(vals, *a)?;
+        call_args.push(encode_slot(b, v)); // each arg widened to its i64 register slot
+    }
+    let target_v = b.ins().iconst(I64, target);
+    let call = b.ins().call_indirect(tsigref, target_v, &call_args);
+
+    // If the specialized fn set the trap cell, propagate (the cell already holds the kind / exit code).
+    emit_trap_propagate(b, lower);
+
+    if n_res == 1 {
+        let slot = b.inst_results(call)[0]; // the i64 return register
+        vals.push(decode_slot(b, slot, sig.results[0]));
+    }
+    Ok(())
 }
 
 /// Lower a `cap.call` (§3c/§9): marshal the arg slots into a stack buffer, call the host
