@@ -975,13 +975,33 @@ leave a shared view — add a unix test for this alongside the Windows work.
       completion" loop, with the parked vCPU woken by a pool worker's `notify`. N=8 I/Os in flight cost
       one parked vCPU + K pool threads (the "0 blocked vCPU threads" win). C-frontend (`codegen_ir.c`):
       new builtins `__vm_io_submit_async`/`__vm_io_reap` (→ `cap.call 9 1`/`9 2` on the stashed IoRing
-      handle) + `__vm_blocking_handle` (the Blocking handle for an SQE); the powerbox grows 5→7 handles
-      (+IoRing, +Blocking) **only when the program uses a ring builtin** (a small AST pre-scan sets
-      `uses_io_ring`), so `_start`'s arity + every existing C test/harness are unchanged (zero blast
-      radius); new `IORING_SLOT`/`BLOCKING_SLOT` fit the existing 32-byte reserved region. Test
-      `c_frontend.rs::c_guest_async_io_runtime`: interp (`run_with_host`→`drive`) + JIT
-      (`..._with_host_async` + `HostAsyncHooks`) both print `Σ mix(i)` for i in 0..8 (order-invariant);
-      0/20 flake; full c_frontend suite (68 tests) + workspace + clippy + windows cross-check green.
+      handle) + `__vm_blocking_handle` (the Blocking handle for an SQE). The powerbox is a **fixed
+      7-handle** set (stdout, stdin, exit, memory, addrspace, ioring, blocking) every `_start` imports —
+      one entry shape, mirroring how the frontend already always imports Memory/AddressSpace; a guest
+      that never touches the ring just leaves the two handles stashed and unused. (An earlier draft made
+      the arity conditional on a usage scan — collapsed to a single arity; the c_frontend harnesses
+      share one `powerbox(h, win, block_for)` helper and `svm_run::run` grants by the entry's declared
+      arity, now 6→IoRing/7→Blocking.) Tests (`c_frontend.rs`): **`c_guest_async_io_runtime`** — a
+      single-vCPU event loop (`demos/async_io`, N=8) — and **`c_guest_async_work_stealing`** — the
+      capstone **async work-stealing M:N runtime** (`demos/async_work_stealing`, NWORKERS=4 vCPUs draining
+      NTASKS=16 I/O-bound tasks: a worker `submit_async`s a task's op and moves on, parking on the
+      counter only when nothing is runnable, woken by a pool `notify`; work-stealing + I/O overlap).
+      Both run on interp (`run_with_host`→`drive`) + JIT (`..._with_host_async` + `HostAsyncHooks`,
+      `reserved_log2 = DEFAULT_RESERVED_LOG2` for the malloc growth tail) and print the order-invariant
+      `Σ mix(i)`; 0/30 flake; full c_frontend suite (69 tests) + workspace + clippy + windows
+      cross-check green.
+      - **Two real findings the capstone surfaced (worth knowing):** (1) a **shared** ring's
+        submit/reap `cap.call`s **must be serialized by the guest** (a guest mutex, like a real shared
+        io_uring's single-producer SQ) — the JIT `cap_thunk` takes `&mut *host` with no lock (the interp
+        serializes via `Arc<Mutex<Host>>`), so concurrent dispatch from multiple vCPUs would race the
+        Host. (2) **cap-buffer ops to a guest-*grown* heap page fail-closed on the JIT** — `cap_thunk`
+        rebuilds `MprotectWindow` per call with a fresh software page map, so it doesn't know the guest
+        grew the heap (the interp's `Mem` persists the map across cap.calls); a `read_bytes`/`write_bytes`
+        to a grown-tail address returns `-EFAULT`/writes nothing. **Safe (fail-closed, no escape), but a
+        real interp/JIT functional divergence.** The demo sidesteps it with **global** (backed-prefix)
+        SQ/CQ buffers (realistic — io_uring rings are fixed shared buffers). *Follow-up:* persist the
+        JIT cap-path page map across cap.calls (e.g. thread it through `cap_thunk`) so grown-heap buffers
+        work on the JIT too.
   - **Still open (Phase 4):** honoring *weak* orderings in execution (both backends run seq-cst
     today), fiber/vCPU quota metering (the kill path exists;
     *metering*/quotas don't yet), the D57 migratable-fiber primitive (stackful work-stealing), a
@@ -1205,12 +1225,18 @@ regressions one commit old"):
 > its per-run `Domain`'s futex, bridged by the `svm_jit::AsyncHostHooks` seam (`svm_run::HostAsyncHooks`
 > + `compile_and_run_capture_reserved_with_host_async`), over a backend-neutral
 > `svm_interp::AsyncCounter`. Race-free via each futex's compare-under-lock guard. Increment 3c — the
-> **async event-loop runtime in real C** (`demos/async_io`): one vCPU drives N=8 concurrent I/Os via new
-> `codegen_ir.c` ring builtins (`__vm_io_submit_async`/`__vm_io_reap`/`__vm_blocking_handle`) + a 5→7
-> handle powerbox (granted only when a ring builtin is used). See §10's ring tracker +
-> `crates/svm/tests/io_ring.rs` (10 tests) + `c_frontend.rs::c_guest_async_io_runtime` (0 flake; loom +
-> windows cross-check green). *(Earlier: the escape-TCB audit (`AUDIT.md`); D57 + `SCHEDULING.md`; the
-> `demos/mn_sched` + `demos/work_stealing` guest M:N schedulers; ring increment 1.)*
+> async runtime **in real C**: `demos/async_io` (single-vCPU event loop, N=8) and the capstone
+> `demos/async_work_stealing` (**async work-stealing M:N**, 4 vCPUs draining 16 I/O-bound tasks: submit,
+> park, steal/run another, resume on completion), via new `codegen_ir.c` ring builtins
+> (`__vm_io_submit_async`/`__vm_io_reap`/`__vm_blocking_handle`) + a **fixed 7-handle** powerbox (one
+> `_start` shape). See §10's ring tracker + `crates/svm/tests/io_ring.rs` (10 tests) +
+> `c_frontend.rs::{c_guest_async_io_runtime,c_guest_async_work_stealing}` (0 flake; loom + windows
+> cross-check green). **Two findings the capstone surfaced** (see §10): a shared ring must be guest-
+> serialized (the JIT `cap_thunk` doesn't lock the `Host`), and JIT cap-buffer ops to a guest-*grown*
+> heap page fail-closed (per-cap.call `MprotectWindow` doesn't persist growth) — a safe interp/JIT
+> divergence; the demos use global (prefix) SQ/CQ buffers. *(Earlier: the escape-TCB audit
+> (`AUDIT.md`); D57 + `SCHEDULING.md`; the `demos/mn_sched` + `demos/work_stealing` guest M:N
+> schedulers; ring increment 1.)*
 >
 > **Immediate frontier, ranked** *(the async ring (B) is done — these are the next big rocks):*
 > 1. **Language on-ramp (LLVM-bitcode→IR)** — the big breadth play (D54). **Architecture decided: AOT**
@@ -1225,8 +1251,11 @@ regressions one commit old"):
 >    its suspend/wake protocol — the futex park + completion notify — informs the fiber's).
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); fiber/vCPU
 >    quota *metering* (§15; the kill path exists, quotas don't); a **thread-safe guest `malloc`** (the
->    MVP bump allocator races under threads — surfaced by `demos/mn_sched`); DPOR for `explore_all`; and
->    the **async-ring offload pool** could grow a CQE-ordering option / more offloadable op types.
+>    MVP bump allocator races under threads — surfaced by `demos/mn_sched`); DPOR for `explore_all`;
+>    **persist the JIT cap-path page map across cap.calls** so cap-buffer ops (`write`/`submit`/`reap`)
+>    on a guest-*grown* heap page work on the JIT (today they fail-closed — `cap_thunk` rebuilds
+>    `MprotectWindow` per call; the interp's `Mem` persists it — a safe but real interp/JIT divergence
+>    surfaced by `demos/async_work_stealing`); and the async-ring pool could grow more offloadable ops.
 > 4. **Maintainer one-liners** (need the `workflow` token scope I can't push): apply the nightly **miri**
 >    CI job (snippet at commit `60d4f3a`); drop `continue-on-error` from the now-green `cross-os` matrix.
 

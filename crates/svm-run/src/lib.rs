@@ -953,17 +953,12 @@ pub struct Run {
 /// uses the Memory capability (a guest heap that grows via `map`, §3e/§4). A module whose entry
 /// matches either is a runnable *program*; anything else is a bare kernel (run with [`run_kernel`]).
 pub fn is_powerbox_entry(module: &Module) -> bool {
+    // The powerbox entry imports 3–7 `i32` capability handles (stdout, stdin, exit, [memory],
+    // [addrspace], [ioring], [blocking] — §3e/§9/§12; a chibicc `_start` always imports the full 7).
+    // The runner grants exactly as many as the entry declares (see `run_powerbox_with_deadline`).
     matches!(
         module.funcs.first().map(|f| f.params.as_slice()),
-        Some([ValType::I32, ValType::I32, ValType::I32])
-            | Some([ValType::I32, ValType::I32, ValType::I32, ValType::I32])
-            | Some([
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-                ValType::I32
-            ])
+        Some(p) if (3..=7).contains(&p.len()) && p.iter().all(|t| matches!(t, ValType::I32))
     )
 }
 
@@ -1019,6 +1014,14 @@ pub fn run_powerbox_with_deadline(
     if arity >= 5 {
         let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         slots.push(host.grant_address_space(0, win) as i64);
+    }
+    // §9/§12 the async I/O ring: the IoRing + Blocking handles a chibicc `_start` always imports (the
+    // 6th/7th of the fixed 7-handle powerbox). The mock Blocking op is non-blocking here (`ZERO`).
+    if arity >= 6 {
+        slots.push(host.grant_io_ring() as i64);
+    }
+    if arity >= 7 {
+        slots.push(host.grant_blocking(std::time::Duration::ZERO, None) as i64);
     }
     let ctx = &mut host as *mut Host as *mut c_void;
     // §5 fuel/epoch kill-path: when a `deadline` is given, arm the JIT's interrupt poll with a

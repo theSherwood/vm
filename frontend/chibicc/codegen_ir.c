@@ -137,18 +137,13 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 #define EXIT_SLOT 8
 #define MEMORY_SLOT 12
 #define ADDRSPACE_SLOT 16
-// §9/§12 async I/O ring: the IoRing + Blocking handles, granted only to a program that uses the ring
-// builtins (`__vm_io_*`); `_start` then takes 7 handles instead of 5 (see `emit_start`).
+// §9/§12 async I/O ring: the IoRing + Blocking handles — part of the fixed 7-handle powerbox every
+// entry imports (see `emit_start`).
 #define IORING_SLOT 20
 #define BLOCKING_SLOT 24
-// The reserved region's size: up to 7 handle slots (0..28), 16-aligned. Globals start here so no data
+// The reserved region's size: 7 handle slots (0..28), 16-aligned. Globals start here so no data
 // segment ever overlaps a stashed handle (a collision corrupts a global, e.g. a pthread mutex).
 #define RESERVED_BYTES 32
-
-// Set when the program calls an async-ring builtin (`__vm_io_submit_async`/`__vm_io_reap`/
-// `__vm_blocking_handle`); makes `_start` take the extra IoRing + Blocking powerbox handles, so a
-// program that doesn't use the ring keeps the 5-handle entry (and its harness) unchanged.
-static int uses_io_ring;
 
 // Globals + string literals live at fixed window offsets in the data region [RESERVED_BYTES,
 // data_end); the data stack starts at data_end (main's initial data-SP, baked into `_start`).
@@ -2087,47 +2082,34 @@ static void emit_data_segments(Obj *prog) {
 // (§3a, see `emit_data_segments`), not written here. The runtime invokes this with the granted
 // handles `(stdout, stdin, exit)` as i32 arguments.
 // Does any node in this subtree call an async-ring builtin? (Walks the AST so `_start` knows whether
-// to take the extra IoRing + Blocking powerbox handles.) Recurses every child link incl. sibling
-// `->next` chains (statement/arg lists); redundant revisits are harmless for a boolean scan.
-static bool node_uses_io_ring(Node *n) {
-  if (!n)
-    return false;
-  if (n->kind == ND_FUNCALL && n->lhs && n->lhs->kind == ND_VAR && n->lhs->var &&
-      n->lhs->var->name &&
-      (!strcmp(n->lhs->var->name, "__vm_io_submit_async") ||
-       !strcmp(n->lhs->var->name, "__vm_io_reap") ||
-       !strcmp(n->lhs->var->name, "__vm_blocking_handle")))
-    return true;
-  return node_uses_io_ring(n->lhs) || node_uses_io_ring(n->rhs) || node_uses_io_ring(n->cond) ||
-         node_uses_io_ring(n->then) || node_uses_io_ring(n->els) || node_uses_io_ring(n->init) ||
-         node_uses_io_ring(n->inc) || node_uses_io_ring(n->body) || node_uses_io_ring(n->args) ||
-         node_uses_io_ring(n->next);
-}
-
 static void emit_start(Obj *main_fn) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
-  // 5 powerbox handles by default; +2 (IoRing, Blocking) when the program uses the async ring.
-  int nh = uses_io_ring ? 7 : 5;
-  int slots[7] = {STDOUT_SLOT, STDIN_SLOT,   EXIT_SLOT,    MEMORY_SLOT,
-                  ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT};
+  // A single **fixed** powerbox: every entry imports the same 7 handles regardless of which it uses
+  // (mirroring how the frontend already always imports Memory/AddressSpace). A guest that never
+  // touches the ring just leaves those two handles stashed and unused — one `_start` shape, so every
+  // runner/harness grants the same set.
+#define NHANDLES 7
+  int slots[NHANDLES] = {STDOUT_SLOT,    STDIN_SLOT,  EXIT_SLOT,    MEMORY_SLOT,
+                         ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT};
   fprintf(o, "func (");
-  for (int i = 0; i < nh; i++)
+  for (int i = 0; i < NHANDLES; i++)
     fprintf(o, "%si32", i ? ", " : "");
   fprintf(o, ") -> (%s) {\n", is_void ? "" : irty(mret));
-  // stdout, stdin, exit, memory, addrspace (§14)[, ioring, blocking (§9/§12)]
+  // stdout, stdin, exit, memory, addrspace (§14), ioring, blocking (§9/§12)
   fprintf(o, "block0(");
-  for (int i = 0; i < nh; i++)
+  for (int i = 0; i < NHANDLES; i++)
     fprintf(o, "%sv%d: i32", i ? ", " : "", i);
   fprintf(o, "):\n");
-  nv = nh;
+  nv = NHANDLES;
   // Stash each handle in its reserved slot so the builtins can load it.
-  for (int i = 0; i < nh; i++) {
+  for (int i = 0; i < NHANDLES; i++) {
     int a = nv++;
     fprintf(o, "  v%d = i64.const %d\n", a, slots[i]);
     fprintf(o, "  i32.store v%d v%d\n", a, i);
   }
+#undef NHANDLES
   int sp = nv++;
   fprintf(o, "  v%d = i64.const %d\n", sp, data_end);
   // `int main()` (empty parens) is variadic in chibicc, so it expects the hidden va
@@ -2184,12 +2166,6 @@ void codegen_ir(Obj *prog, FILE *out) {
       wlog2++;
     fprintf(o, "memory %d\n\n", wlog2);
   }
-
-  // Detect async-ring use so `_start` grants the extra IoRing + Blocking handles (only then).
-  uses_io_ring = 0;
-  for (int i = 0; i < nfuncs && !uses_io_ring; i++)
-    if (node_uses_io_ring(funcs[i]->body))
-      uses_io_ring = 1;
 
   // Global initializers become module-level `data` segments (§3a), placed by the runtime.
   emit_data_segments(prog);

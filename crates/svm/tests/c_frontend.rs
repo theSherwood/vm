@@ -38,6 +38,25 @@ fn to_slot(v: Value) -> i64 {
     }
 }
 
+/// The fixed **7-handle powerbox** a chibicc `_start` imports — stdout, stdin, exit, memory,
+/// addrspace (§14), ioring + blocking (§9/§12) — granted in that order so the handle values are
+/// deterministic (and identical across two hosts). Every entry imports the same set (one `_start`
+/// shape); a guest that never touches the ring just leaves those two handles stashed and unused.
+/// `block_for` is the mock Blocking op's duration — `ZERO` for ordinary programs, non-zero for an
+/// async demo that wants its I/O to actually block on the pool.
+fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 7] {
+    h.set_region_factory(svm_run::new_shared_region);
+    [
+        Value::I32(h.grant_stream(StreamRole::Out)),
+        Value::I32(h.grant_stream(StreamRole::In)),
+        Value::I32(h.grant_exit()),
+        Value::I32(h.grant_memory()),
+        Value::I32(h.grant_address_space(0, win)),
+        Value::I32(h.grant_io_ring()),
+        Value::I32(h.grant_blocking(block_for, None)),
+    ]
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -132,16 +151,7 @@ fn run_c_full(src: &str) -> CRun {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut hi = Host::new();
     let mut hj = Host::new();
-    let grant = |h: &mut Host| {
-        h.set_region_factory(svm_run::new_shared_region);
-        [
-            Value::I32(h.grant_stream(StreamRole::Out)),
-            Value::I32(h.grant_stream(StreamRole::In)),
-            Value::I32(h.grant_exit()),
-            Value::I32(h.grant_memory()),
-            Value::I32(h.grant_address_space(0, win)),
-        ]
-    };
+    let grant = |h: &mut Host| powerbox(h, win, std::time::Duration::ZERO);
     let args = grant(&mut hi);
     assert_eq!(args, grant(&mut hj), "grants are deterministic");
 
@@ -218,15 +228,8 @@ fn run_c_interp(src: &str) -> CRun {
         parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
     let mut h = Host::new();
-    h.set_region_factory(svm_run::new_shared_region);
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let args = [
-        Value::I32(h.grant_stream(StreamRole::Out)),
-        Value::I32(h.grant_stream(StreamRole::In)),
-        Value::I32(h.grant_exit()),
-        Value::I32(h.grant_memory()),
-        Value::I32(h.grant_address_space(0, win)),
-    ];
+    let args = powerbox(&mut h, win, std::time::Duration::ZERO);
     let mut fuel = 50_000_000u64;
     let outcome = match run_with_host(&m, 0, &args, &mut fuel, &mut h) {
         Ok(v) => Outcome::Returned(v),
@@ -267,17 +270,7 @@ fn c_write_to_string_literal_faults() {
 
     let mut hi = Host::new();
     let mut hj = Host::new();
-    let grant = |h: &mut Host| {
-        [
-            Value::I32(h.grant_stream(StreamRole::Out)),
-            Value::I32(h.grant_stream(StreamRole::In)),
-            Value::I32(h.grant_exit()),
-            Value::I32(h.grant_memory()),
-            // The 5th powerbox handle (§14 AddressSpace); unused by these tests, but `_start`'s
-            // arity now requires it. A generous span — the cap is never exercised here.
-            Value::I32(h.grant_address_space(0, 1 << 20)),
-        ]
-    };
+    let grant = |h: &mut Host| powerbox(h, 1 << 20, std::time::Duration::ZERO);
     let args = grant(&mut hi);
     grant(&mut hj);
     let mut fuel = 50_000_000u64;
@@ -381,17 +374,7 @@ fn c_ungrown_tail_access_faults() {
     let ir = c_to_ir(src);
     let m = parse_module(&ir).expect("parse");
     verify_module(&m).expect("verify");
-    let grant = |h: &mut Host| {
-        [
-            Value::I32(h.grant_stream(StreamRole::Out)),
-            Value::I32(h.grant_stream(StreamRole::In)),
-            Value::I32(h.grant_exit()),
-            Value::I32(h.grant_memory()),
-            // The 5th powerbox handle (§14 AddressSpace); unused by these tests, but `_start`'s
-            // arity now requires it. A generous span — the cap is never exercised here.
-            Value::I32(h.grant_address_space(0, 1 << 20)),
-        ]
-    };
+    let grant = |h: &mut Host| powerbox(h, 1 << 20, std::time::Duration::ZERO);
     let mut hi = Host::new();
     let mut hj = Host::new();
     let args = grant(&mut hi);
@@ -1178,17 +1161,7 @@ fn c_function_pointer_signature_mismatch_traps() {
 
     let mut hi = Host::new();
     let mut hj = Host::new();
-    let grant = |h: &mut Host| {
-        [
-            Value::I32(h.grant_stream(StreamRole::Out)),
-            Value::I32(h.grant_stream(StreamRole::In)),
-            Value::I32(h.grant_exit()),
-            Value::I32(h.grant_memory()),
-            // The 5th powerbox handle (§14 AddressSpace); unused by these tests, but `_start`'s
-            // arity now requires it. A generous span — the cap is never exercised here.
-            Value::I32(h.grant_address_space(0, 1 << 20)),
-        ]
-    };
+    let grant = |h: &mut Host| powerbox(h, 1 << 20, std::time::Duration::ZERO);
     let args = grant(&mut hi);
     grant(&mut hj);
     let mut fuel = 50_000_000u64;
@@ -1934,13 +1907,7 @@ fn c_threads_deterministic_sweep() {
     let ir = c_to_ir(C_ATOMIC_COUNTER);
     let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse: {e:?}\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{ir}"));
-    let args = [
-        Value::I32(0),
-        Value::I32(0),
-        Value::I32(0),
-        Value::I32(0),
-        Value::I32(0),
-    ];
+    let args = [Value::I32(0); 7]; // 7 dummy powerbox handles (the program makes no cap.calls)
     for seed in 0..100u64 {
         let r = run_scheduled(&m, 0, &args, 50_000_000, seed);
         assert_eq!(r, Ok(vec![Value::I32(2000)]), "explorer seed {seed}");
@@ -2131,71 +2098,52 @@ fn c_guest_work_stealing_demo() {
     );
 }
 
-/// §9/§12 increment 3c — the async **event-loop runtime** in real C (`demos/async_io`). One vCPU
-/// `submit_async`s a batch of `Blocking` ops onto the host offload pool, then parks on an in-window
-/// completion **counter** (`__vm_wait32`) and reaps completions as the pool delivers them — the
-/// "submit, park, run another, resume on completion" loop, with the parked vCPU woken by a pool
-/// worker's `notify` (an I/O completion is a futex notify, DESIGN §12). The printed total — the sum of
-/// the host's deterministic per-op results — is completion-order-invariant, so the interpreter (its
-/// `Scheduler::notify` wake hook, installed by `drive`) and the JIT (its per-run `Domain` futex, wired
-/// via `svm_run::HostAsyncHooks`) must agree. This exercises the new `codegen_ir.c` ring builtins
-/// (`__vm_io_submit_async`/`__vm_io_reap`/`__vm_blocking_handle`) + the 7-handle powerbox end to end.
-#[test]
+/// The host's deterministic `Blocking.work(i)` result (mirrors `svm_interp::AsyncState::mix`).
 #[cfg(all(unix, target_arch = "x86_64"))]
-fn c_guest_async_io_runtime() {
+fn async_mix(arg: i64) -> i64 {
+    arg.wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+}
+
+/// Compile + run an async-ring C demo on **both** backends, returning their captured stdout. The
+/// `Blocking` op blocks ~10 ms so the batch is genuinely in flight when a vCPU parks. The interp drives
+/// the M:N executor (`run_with_host` → `drive` installs the `Scheduler::notify` wake hook); the JIT
+/// uses the async entry + `svm_run::HostAsyncHooks` (its per-run `Domain` futex as the wake hook). Both
+/// must return 0; the caller compares their stdout to the order-invariant expected total.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn run_async_demo(src: &str) -> (Vec<u8>, Vec<u8>) {
     use std::time::Duration;
-    let src = include_str!("../../svm-run/demos/async_io/async_io.c");
     let ir = c_to_ir(src);
     let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{ir}"));
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
 
-    // Each `Blocking.work(i)` returns `mix(i)` after a ~10 ms block, so the batch is genuinely in
-    // flight on the pool when the vCPU parks. `NTASKS = 8` (see the demo) over a 4-thread pool ⇒ two
-    // waves, so the event loop parks/resumes more than once.
-    const NTASKS: i64 = 8;
-    fn mix(arg: i64) -> i64 {
-        arg.wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407)
-    }
-    let expected_total: u64 = (0..NTASKS).fold(0u64, |a, i| a.wrapping_add(mix(i) as u64));
-    let expected = format!("{expected_total}\n").into_bytes();
-
-    // The async powerbox: the usual 5 handles + IoRing + Blocking, granted in the order `_start`
-    // stashes them. Granted identically on both hosts (deterministic), with a 10 ms block duration.
-    let grant = |h: &mut Host| {
-        h.set_region_factory(svm_run::new_shared_region);
-        [
-            Value::I32(h.grant_stream(StreamRole::Out)),
-            Value::I32(h.grant_stream(StreamRole::In)),
-            Value::I32(h.grant_exit()),
-            Value::I32(h.grant_memory()),
-            Value::I32(h.grant_address_space(0, win)),
-            Value::I32(h.grant_io_ring()),
-            Value::I32(h.grant_blocking(Duration::from_millis(10), None)),
-        ]
-    };
     let mut hi = Host::new();
     let mut hj = Host::new();
-    let args = grant(&mut hi);
-    assert_eq!(args, grant(&mut hj), "grants are deterministic");
+    let args = powerbox(&mut hi, win, Duration::from_millis(10));
+    assert_eq!(
+        args,
+        powerbox(&mut hj, win, Duration::from_millis(10)),
+        "grants are deterministic"
+    );
 
-    // Interp: `run_with_host` drives the M:N executor (installing the `Scheduler::notify` wake hook).
-    let mut fuel = 200_000_000u64;
+    let mut fuel = 500_000_000u64;
     let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi).expect("interp ran ok");
-    assert_eq!(interp, vec![Value::I32(0)], "demo returns 0");
+    assert_eq!(interp, vec![Value::I32(0)], "demo returns 0 (interp)");
 
-    // JIT: the async entry installs the run's `Domain` futex as the wake hook via `HostAsyncHooks`.
     let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
     let init = vec![0u8; win as usize];
     // SAFETY: `hj` is the live cap-ctx Host for this run and outlives it.
     let hooks = unsafe { svm_run::HostAsyncHooks::new(&mut hj as *mut Host) };
+    // `DEFAULT_RESERVED_LOG2` gives the window its large reserved growth tail (§4) — needed so a guest
+    // `malloc` (e.g. a 256 KiB pthread stack) can grow the heap past the backed prefix via the Memory
+    // cap. (Passing `0` here would leave no tail, so `malloc` returns NULL.)
     let (jit, _jmem) = svm_jit::compile_and_run_capture_reserved_with_host_async(
         &m,
         0,
         &slots,
         &init,
-        0,
+        svm_ir::DEFAULT_RESERVED_LOG2,
         cap_thunk,
         &mut hj as *mut Host as *mut c_void,
         &hooks,
@@ -2205,13 +2153,51 @@ fn c_guest_async_io_runtime() {
         matches!(jit, JitOutcome::Returned(ref s) if s == &[0]),
         "jit demo returns 0: {jit:?}"
     );
+    (hi.stdout, hj.stdout)
+}
 
+/// §9/§12 increment 3c — the async **event-loop runtime** in real C (`demos/async_io`). One vCPU
+/// `submit_async`s a batch of `Blocking` ops onto the host offload pool, then parks on an in-window
+/// completion **counter** (`__vm_wait32`) and reaps completions as the pool delivers them — the
+/// "submit, park, run another, resume on completion" loop, with the parked vCPU woken by a pool
+/// worker's `notify` (an I/O completion is a futex notify, DESIGN §12). The printed total — the sum of
+/// the host's deterministic per-op results — is completion-order-invariant, so the interpreter (its
+/// `Scheduler::notify` wake hook) and the JIT (its per-run `Domain` futex) must agree. Exercises the
+/// new `codegen_ir.c` ring builtins + the 7-handle powerbox end to end.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_async_io_runtime() {
+    let (interp, jit) = run_async_demo(include_str!("../../svm-run/demos/async_io/async_io.c"));
+    // NTASKS = 8 (see the demo).
+    let total: u64 = (0..8).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
+    let expected = format!("{total}\n").into_bytes();
     assert_eq!(
-        hi.stdout, expected,
+        interp, expected,
         "interp total must be Σ mix(i) for i in 0..8"
     );
+    assert_eq!(jit, expected, "jit total must be Σ mix(i) for i in 0..8");
+}
+
+/// §9/§12 increment 3c (capstone) — the async **work-stealing M:N runtime** in real C
+/// (`demos/async_work_stealing`): `NWORKERS` vCPUs cooperatively drain `NTASKS` I/O-bound tasks, each
+/// issuing a blocking op through the ring. A worker never blocks on an I/O — it `submit_async`s a
+/// task's op onto the offload pool and moves on, **parking** on the completion counter only when
+/// nothing is runnable, woken by a pool worker's `notify`. Work-stealing and I/O overlap: N ops in
+/// flight on K pool threads while the vCPUs reap, not block. The total is completion-order- *and*
+/// interleaving-invariant, so the interp (M:N oracle) and JIT (real OS threads) must print the same
+/// regardless of which worker submitted/reaped each task.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_async_work_stealing() {
+    let (interp, jit) = run_async_demo(include_str!(
+        "../../svm-run/demos/async_work_stealing/async_work_stealing.c"
+    ));
+    // NTASKS = 16 (see the demo).
+    let total: u64 = (0..16).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
+    let expected = format!("{total}\n").into_bytes();
     assert_eq!(
-        hj.stdout, expected,
-        "jit total must be Σ mix(i) for i in 0..8"
+        interp, expected,
+        "interp total must be Σ mix(i) for i in 0..16"
     );
+    assert_eq!(jit, expected, "jit total must be Σ mix(i) for i in 0..16");
 }
