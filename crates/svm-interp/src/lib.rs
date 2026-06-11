@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -426,21 +426,286 @@ pub struct Exhaustive {
     pub complete: bool,
 }
 
-/// **Exhaustive interleaving model checker** (§18): enumerate *every* distinct schedule of a
-/// concurrent guest program and report the set of terminal outcomes — turning "sweep random seeds and
-/// hope" into a proof, for programs small enough to explore fully.
+/// The shared object a visible op touches, used by [`explore_all`]'s DPOR to decide which
+/// transitions **commute** (independent ⇒ their order is irrelevant) vs. **conflict** (dependent ⇒
+/// both orders must be explored). Memory/atomic accesses are a confined byte range + read/write;
+/// futex `wait`/`notify` are modelled as a read/write of their (confined, in-window) key, so they
+/// also conflict with atomic accesses to the same word. `thread.spawn`/`join` carry no racy object —
+/// their ordering is already enforced by the scheduler's *enabled* set (a child isn't runnable before
+/// its spawn; a joiner/waiter is parked, not a scheduling choice).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MemAccess {
+    /// No shared object (pure control/sync whose order the enabled set already fixes).
+    None,
+    /// A `[base, base+width)` byte range; `write` is true for any store/RMW/notify.
+    Range { base: u64, width: u32, write: bool },
+}
+
+impl MemAccess {
+    /// Two transitions are **dependent** (don't commute) iff they touch overlapping bytes and at
+    /// least one writes — the standard read/write conflict relation DPOR reduces over.
+    fn conflicts(self, other: MemAccess) -> bool {
+        match (self, other) {
+            (
+                MemAccess::Range {
+                    base: a,
+                    width: wa,
+                    write: wwa,
+                },
+                MemAccess::Range {
+                    base: b,
+                    width: wb,
+                    write: wwb,
+                },
+            ) => (wwa || wwb) && a < b.saturating_add(wb as u64) && b < a.saturating_add(wa as u64),
+            _ => false,
+        }
+    }
+}
+
+/// The confined object a visible instruction will access, computed from the live SSA values at the
+/// decision point (mirrors what `load`/`store`/`atomic_*`/`prepare_wait` confine to). A confinement
+/// failure (out-of-reserved) ⇒ [`MemAccess::None`]: the op will trap and the thread ends, contributing
+/// no ordering constraint.
+fn access_of(inst: &Inst, vals: &[Value], mem: &Option<Mem>) -> MemAccess {
+    let Some(m) = mem.as_ref() else {
+        return MemAccess::None;
+    };
+    let range = |addr: ValIdx, offset: u64, width: u32, write: bool| -> MemAccess {
+        match get(vals, addr).and_then(as_i64) {
+            Ok(a) => match m.confine_checked(a as u64, offset, width) {
+                Ok(base) => MemAccess::Range { base, width, write },
+                Err(_) => MemAccess::None,
+            },
+            Err(_) => MemAccess::None,
+        }
+    };
+    match inst {
+        Inst::Load {
+            op, addr, offset, ..
+        } => range(*addr, *offset, op.info().2, false),
+        Inst::Store {
+            op, addr, offset, ..
+        } => range(*addr, *offset, op.info().2, true),
+        Inst::AtomicLoad {
+            ty, addr, offset, ..
+        } => range(*addr, *offset, atomic_width(*ty), false),
+        Inst::AtomicStore {
+            ty, addr, offset, ..
+        } => range(*addr, *offset, atomic_width(*ty), true),
+        Inst::AtomicRmw {
+            ty, addr, offset, ..
+        } => range(*addr, *offset, atomic_width(*ty), true),
+        Inst::AtomicCmpxchg {
+            ty, addr, offset, ..
+        } => range(*addr, *offset, atomic_width(*ty), true),
+        // Futex key: `wait` reads it (compared under the lock), `notify` writes it (the wake). Width 4
+        // is the common i32 futex; an overlapping i64 atomic at the same word still conflicts by range.
+        Inst::MemoryWait { ty, addr, .. } => range(*addr, 0, atomic_width(*ty), false),
+        Inst::MemoryNotify { addr, .. } => range(*addr, 0, 4, true),
+        _ => MemAccess::None, // ThreadSpawn / ThreadJoin: ordering via the enabled set, not a race
+    }
+}
+
+/// One executed transition in a schedule: which vCPU ran (`tid`), the runnable vCPUs at that decision
+/// (`enabled`, sorted — the choices that were available), and the object it touched (`access`). The
+/// trace of these is what DPOR analyses for races.
+struct SchedEvent {
+    tid: TaskId,
+    enabled: Vec<TaskId>,
+    access: MemAccess,
+}
+
+/// Drives one schedule under DPOR: follow `plan` (one `TaskId` per decision); past its end pick the
+/// smallest enabled `TaskId` (a deterministic default). Records the executed `trace` for race analysis.
+struct Dpor {
+    plan: Vec<TaskId>,
+    depth: usize,
+    trace: Vec<SchedEvent>,
+    /// The `(tid, enabled)` chosen at the current decision, finalized into a [`SchedEvent`] once the
+    /// step's [`MemAccess`] is known (after it runs).
+    pending: Option<(TaskId, Vec<TaskId>)>,
+}
+
+impl Dpor {
+    fn new(plan: Vec<TaskId>) -> Dpor {
+        Dpor {
+            plan,
+            depth: 0,
+            trace: Vec::new(),
+            pending: None,
+        }
+    }
+
+    /// Choose the next vCPU by `TaskId` (not runnable index — the runnable order is reshuffled by
+    /// `swap_remove`, so addressing by id keeps the plan stable across replays). `enabled` is sorted.
+    fn pick(&mut self, enabled: &[TaskId]) -> TaskId {
+        let tid = self.plan.get(self.depth).copied().unwrap_or(enabled[0]);
+        debug_assert!(enabled.contains(&tid), "planned tid must be runnable");
+        self.pending = Some((tid, enabled.to_vec()));
+        tid
+    }
+
+    /// Finalize the current decision into the trace once its `access` is known.
+    fn finish(&mut self, access: MemAccess) {
+        if let Some((tid, enabled)) = self.pending.take() {
+            self.trace.push(SchedEvent {
+                tid,
+                enabled,
+                access,
+            });
+            self.depth += 1;
+        }
+    }
+}
+
+/// One node of the DPOR exploration along the current depth-first path: the vCPU `chosen` here, the
+/// `enabled` set at this point, and the `backtrack`/`done` sets (threads still to explore vs. already
+/// explored from this state) — the classic Flanagan–Godefroid bookkeeping.
+struct DporSlot {
+    chosen: TaskId,
+    enabled: Vec<TaskId>,
+    backtrack: BTreeSet<TaskId>,
+    done: BTreeSet<TaskId>,
+}
+
+/// **Exhaustive interleaving model checker** (§18) with **dynamic partial-order reduction** (DPOR):
+/// enumerate every distinct schedule of a concurrent guest *modulo independent-operation reordering*
+/// and report the set of terminal outcomes — turning "sweep random seeds and hope" into a proof, for
+/// programs small enough to explore fully.
 ///
 /// It's a *stateless* checker (CHESS / `shuttle`-style): each schedule is one fresh execution replayed
 /// from a planned sequence of scheduling choices, with no VM-state snapshotting. vCPUs run at
 /// **memory-op granularity** (`memop` + `quantum = 1`), so the decision points are exactly the
-/// shared-state / sync operations ([`is_visible`]) — the partial-order reduction that keeps the tree
-/// finite and small. After each run it backtracks to the deepest decision with an unexplored
-/// alternative (depth-first), stopping when the tree is exhausted or `max_schedules` is hit.
+/// shared-state / sync operations ([`is_visible`]). DPOR (Flanagan–Godefroid stateless form) then only
+/// explores *both* orders of two transitions when they actually **conflict** ([`MemAccess::conflicts`]:
+/// same bytes, one a write); independent operations keep one order. After each run it detects races
+/// (for each transition, the latest earlier conflicting transition by a *different* vCPU) and adds the
+/// conflicting vCPU to that earlier decision's `backtrack` set, then DFS-backtracks to the deepest
+/// decision with an unexplored alternative — stopping when the tree is exhausted or `max_schedules` is
+/// hit. The reduction is sound: reordering independent ops cannot change the terminal state, so the set
+/// of reachable outcomes is identical to the unreduced enumeration ([`explore_all_bruteforce`], the
+/// differential oracle) at a fraction of the schedules.
 ///
-/// Because the single-threaded explorer realizes one valid sequential interleaving per schedule and
-/// covers all of them, *any* outcome a real concurrent run could produce appears here — so asserting
-/// `outcomes == [expected]` (with `complete`) proves the invariant holds under every interleaving.
+/// Asserting `outcomes == [expected]` (with `complete`) proves the invariant holds under every
+/// interleaving.
 pub fn explore_all(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    max_schedules: u64,
+) -> Exhaustive {
+    if m.funcs.get(func as usize).is_none() {
+        return Exhaustive {
+            outcomes: vec![Err(Trap::Malformed)],
+            schedules: 1,
+            complete: true,
+        };
+    }
+    let funcs: Arc<[Func]> = m.funcs.clone().into();
+
+    let mut stack: Vec<DporSlot> = Vec::new();
+    let mut outcomes: Vec<Result<Vec<Value>, Trap>> = Vec::new();
+    let mut schedules = 0u64;
+    let complete;
+
+    loop {
+        // Replay the current path (`chosen` per depth), extending with the default choice past its end.
+        let plan: Vec<TaskId> = stack.iter().map(|s| s.chosen).collect();
+        let mut dpor = Dpor::new(plan);
+        let result = run_one_schedule(
+            &funcs,
+            &m.memory,
+            &m.data,
+            func,
+            args,
+            fuel,
+            Policy::Dpor(&mut dpor),
+        );
+        schedules += 1;
+        if !outcomes.contains(&result) {
+            outcomes.push(result);
+        }
+        let trace = dpor.trace;
+
+        // Sync the path stack with the trace just produced. Slots for the replayed prefix already
+        // exist (their `chosen` matches by construction); push fresh slots for newly reached depths;
+        // a forced choice that shortened the run drops the now-stale deeper slots.
+        if trace.len() < stack.len() {
+            stack.truncate(trace.len());
+        }
+        for (d, ev) in trace.iter().enumerate() {
+            if d < stack.len() {
+                debug_assert_eq!(stack[d].chosen, ev.tid);
+                stack[d].enabled.clone_from(&ev.enabled);
+            } else {
+                stack.push(DporSlot {
+                    chosen: ev.tid,
+                    enabled: ev.enabled.clone(),
+                    backtrack: BTreeSet::from([ev.tid]),
+                    done: BTreeSet::from([ev.tid]),
+                });
+            }
+        }
+
+        // Race detection (Flanagan–Godefroid): for each transition `j`, find the latest earlier
+        // transition `i` by a *different* vCPU that conflicts with it, and ensure the decision at `i`
+        // will also try `j`'s vCPU (or, if it wasn't co-enabled there, every enabled vCPU — the
+        // conservative "may-be-co-enabled" fallback). The recursion across runs then covers earlier
+        // conflicts.
+        for j in 0..trace.len() {
+            for i in (0..j).rev() {
+                if trace[i].tid != trace[j].tid && trace[i].access.conflicts(trace[j].access) {
+                    let q = trace[j].tid;
+                    if stack[i].enabled.contains(&q) {
+                        stack[i].backtrack.insert(q);
+                    } else {
+                        let enabled = stack[i].enabled.clone();
+                        stack[i].backtrack.extend(enabled);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Backtrack to the deepest decision with an unexplored alternative; force it next run.
+        let mut next = None;
+        for d in (0..stack.len()).rev() {
+            if let Some(&p) = stack[d].backtrack.difference(&stack[d].done).next() {
+                next = Some((d, p));
+                break;
+            }
+        }
+        match next {
+            Some((d, p)) if schedules < max_schedules => {
+                stack[d].done.insert(p);
+                stack[d].chosen = p;
+                stack.truncate(d + 1);
+            }
+            Some(_) => {
+                complete = false;
+                break;
+            }
+            None => {
+                complete = true;
+                break;
+            }
+        }
+    }
+
+    Exhaustive {
+        outcomes,
+        schedules,
+        complete,
+    }
+}
+
+/// The **unreduced** exhaustive enumerator — explores *every* ordering of visible ops, including
+/// reorderings of independent operations. Superseded by [`explore_all`] (DPOR) for real use; kept as
+/// the differential oracle that proves DPOR's reduction is sound (same `outcomes`, fewer `schedules`).
+#[doc(hidden)]
+pub fn explore_all_bruteforce(
     m: &Module,
     func: FuncIdx,
     args: &[Value],
@@ -463,7 +728,15 @@ pub fn explore_all(
 
     loop {
         let mut choices = Choices::new(plan);
-        let result = run_one_schedule(&funcs, &m.memory, &m.data, func, args, fuel, &mut choices);
+        let result = run_one_schedule(
+            &funcs,
+            &m.memory,
+            &m.data,
+            func,
+            args,
+            fuel,
+            Policy::Brute(&mut choices),
+        );
         schedules += 1;
         if !outcomes.contains(&result) {
             outcomes.push(result);
@@ -501,7 +774,8 @@ pub fn explore_all(
 }
 
 /// Run a single schedule under the exhaustive checker: a fresh memory image and root vCPU (at
-/// memory-op granularity), driven by `choices`. Returns the root task's outcome.
+/// memory-op granularity), driven by `policy` ([`Policy::Brute`] or [`Policy::Dpor`]). Returns the root
+/// task's outcome.
 fn run_one_schedule(
     funcs: &Arc<[Func]>,
     memory: &Option<Memory>,
@@ -509,7 +783,7 @@ fn run_one_schedule(
     func: FuncIdx,
     args: &[Value],
     fuel: u64,
-    choices: &mut Choices,
+    policy: Policy,
 ) -> Result<Vec<Value>, Trap> {
     let mem = memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
@@ -537,7 +811,7 @@ fn run_one_schedule(
         s.runnable.push(Box::new(root));
         id
     };
-    run_with_policy(&det, Policy::Exhaustive(choices));
+    run_with_policy(&det, policy);
     let out = det.lock().results.remove(&root_id);
     out.map_or(Err(Trap::ThreadFault), |o| o.result)
 }
@@ -1034,7 +1308,10 @@ impl DetSched {
 /// branch factor at each point so the caller can DFS the whole interleaving tree.
 enum Policy<'a> {
     Seeded,
-    Exhaustive(&'a mut Choices),
+    /// Unreduced enumeration ([`explore_all_bruteforce`]): pick by runnable *index* per `Choices`.
+    Brute(&'a mut Choices),
+    /// DPOR ([`explore_all`]): pick by `TaskId` per the plan, recording each step's [`MemAccess`].
+    Dpor(&'a mut Dpor),
 }
 
 /// Run a deterministic-explorer instance to completion (every vCPU finished, or a genuine deadlock —
@@ -1068,15 +1345,33 @@ fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
                 continue;
             }
             let n = s.runnable.len();
+            // One visible op per turn (`memop` vCPUs) so every shared-state access is a decision.
             let (pick, quantum) = match &mut policy {
                 Policy::Seeded => ((s.rng() as usize) % n, 1 + s.rng() % MAX_QUANTUM),
-                // One visible op per turn (`memop` vCPUs) so every shared-state access is a decision.
-                Policy::Exhaustive(c) => (c.pick(n), 1),
+                Policy::Brute(c) => (c.pick(n), 1),
+                Policy::Dpor(d) => {
+                    // Address by `TaskId` (the runnable order is reshuffled by `swap_remove`), so the
+                    // plan replays identically. `enabled` sorted ⇒ a stable default (smallest id).
+                    let mut enabled: Vec<TaskId> = s.runnable.iter().map(|v| v.id).collect();
+                    enabled.sort_unstable();
+                    let tid = d.pick(&enabled);
+                    let idx = s
+                        .runnable
+                        .iter()
+                        .position(|v| v.id == tid)
+                        .expect("planned tid is runnable");
+                    (idx, 1)
+                }
             };
             let v = s.runnable.swap_remove(pick);
             (v, quantum)
         };
-        match v.run(quantum) {
+        let step = v.run(quantum);
+        // DPOR: finalize this decision's trace entry now that the step's accessed object is known.
+        if let Policy::Dpor(d) = &mut policy {
+            d.finish(v.acc.take().unwrap_or(MemAccess::None));
+        }
+        match step {
             Step::Done(result) => {
                 let id = v.id;
                 let outcome = Outcome {
@@ -1278,6 +1573,10 @@ struct VCpu {
     /// ([`explore_all`]) uses `memop = true` + `quantum = 1` to make every shared-state access a
     /// scheduling point; the real pool and the seeded explorer leave it `false`.
     memop: bool,
+    /// The object touched by the **visible op this turn ran** (set in `memop` mode at the op's commit
+    /// point; `None` if the turn ran no visible op). Read back by the DPOR driver ([`explore_all`]) to
+    /// build the schedule trace; unused by the real pool / seeded explorer.
+    acc: Option<MemAccess>,
 }
 
 impl VCpu {
@@ -1317,6 +1616,7 @@ impl VCpu {
             pending: None,
             sched,
             memop: false,
+            acc: None,
         }
     }
 
@@ -1417,6 +1717,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         funcs: _,
         id: _,
         memop,
+        acc,
     } = v;
     let depth = *depth;
     let memop = *memop;
@@ -1449,6 +1750,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if budget == 0 {
                         return Ok(Inner::Yield);
                     }
+                    // Record the object this visible op touches (for DPOR's race analysis) before it
+                    // runs — the confined address is a pure function of the live SSA values here.
+                    *acc = Some(access_of(
+                        &block.insts[frames[top].inst],
+                        &frames[top].vals,
+                        mem,
+                    ));
                     budget -= 1;
                 }
             } else {

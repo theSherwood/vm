@@ -1346,8 +1346,10 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   (x86-64 unix). A spawned vCPU runs the guest entry under the §5 detect-and-kill
   guard on its own OS thread; the guest builds any M:N model over these. **No
   scheduler in the VM** (D56). Deterministic verification of all interleavings is
-  the interpreter oracle (`run_scheduled`/`explore_all`, §18), against which the
-  real-thread JIT is differential-tested; the futex glue is loom-checked.
+  the interpreter oracle (`run_scheduled` seed-sweep + `explore_all`, a stateless
+  **DPOR** model checker that prunes independent-op reorderings — sound vs an
+  unreduced enumerator, §18), against which the real-thread JIT is
+  differential-tested; the futex glue is loom-checked.
 
 ### Host-call ABI: async-first
 - Blocking-capable host calls are **submit/complete** (io_uring-shaped). The
