@@ -38,6 +38,7 @@
 //!
 //! This is a watch-it-over-time regression harness, not a statistical benchmark. Run with:
 //!   cargo run --release                          # from bench/, human table
+//!   cargo run --release -- --from-wasm           # SVM IR transpiled from the WAT (same bytes as wasm)
 //!   cargo run --release -- --csv                 # machine-readable line per kernel
 //!   cargo run --release -- --save-baseline FILE  # record the current ratios
 //!   cargo run --release -- --check FILE           # rerun + flag any ratio regression
@@ -367,7 +368,19 @@ struct Resolved {
 
 /// The hand-written [`KERNELS`] plus, when the C frontend is buildable, the chibicc-lowered
 /// kernels (`alu_c`, `locals_c` — see [`alu_from_c`] / [`locals_from_c`]).
-fn resolve_kernels() -> Vec<Resolved> {
+///
+/// With `from_wasm`, each **compute** kernel's SVM IR is replaced by transpiling its `wat32` through
+/// `svm-wasm` (the same bytes Wasmtime runs) — the genuine apples-to-apples comparison. Kernels the
+/// transpiler can't handle keep their hand-written IR, with a note saying why.
+///
+/// **svm-wasm doesn't transpile (so these are excluded / unchanged under `--from-wasm`):**
+/// - **imports / the host-function ABI** — so the `hostcall` / `hostbuf` interface kernels (which
+///   import `host.op` / `host.sum`) can't come from wasm; they keep their hand-written `cap.call` IR.
+/// - **`memory.grow` / `memory.size`**, **passive** data/element segments, **SIMD (v128)**, and
+///   **reference types** beyond funcref tables. (Supported: i32/i64/f32/f64 numeric + all conversions,
+///   locals, the full structured control set, linear memory, direct + indirect calls, globals, active
+///   data/element segments — enough for every *compute* kernel here.)
+fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
     let mut v: Vec<Resolved> = KERNELS
         .iter()
         .map(|k| Resolved {
@@ -389,7 +402,45 @@ fn resolve_kernels() -> Vec<Resolved> {
     // Interface (host-call) kernels — the §1a "around-compute" axis the harness was missing.
     v.push(hostcall_kernel());
     v.push(hostbuf_kernel());
+
+    if from_wasm {
+        for k in &mut v {
+            if k.mode != Mode::Compute {
+                eprintln!(
+                    "note: --from-wasm keeps `{}` hand-written — it imports a host function, \
+                     which svm-wasm doesn't transpile (no import / host-ABI support yet)",
+                    k.name
+                );
+                continue;
+            }
+            match transpile_wat_to_ir(&k.wat32) {
+                Ok((ir, entry)) => {
+                    k.ir = ir;
+                    k.entry = entry;
+                    k.lead_args = Vec::new();
+                }
+                Err(e) => eprintln!(
+                    "note: --from-wasm keeps `{}` hand-written (svm-wasm: {e})",
+                    k.name
+                ),
+            }
+        }
+    }
     v
+}
+
+/// Transpile a WAT kernel through `svm-wasm` to SVM IR text + the `run` entry index. The IR is printed
+/// and re-parsed by `measure`, so this also exercises the text round-trip.
+fn transpile_wat_to_ir(wat32: &str) -> Result<(String, u32), String> {
+    let wasm = wat::parse_str(wat32).map_err(|e| e.to_string())?;
+    let t = svm_wasm::transpile(&wasm).map_err(|e| e.to_string())?;
+    let entry = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|(_, i)| *i)
+        .ok_or_else(|| "transpiled module has no `run` export".to_string())?;
+    Ok((svm_text::print_module(&t.module), entry))
 }
 
 /// Interface benchmark — **scalar host round-trip.** Each iteration makes one guest→host→guest
@@ -1003,6 +1054,9 @@ fn print_csv(results: &[(Resolved, Raw)]) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let csv = args.iter().any(|a| a == "--csv");
+    // `--from-wasm`: get each compute kernel's SVM IR by transpiling its WAT (the same bytes Wasmtime
+    // runs) instead of using the hand-written IR — the apples-to-apples comparison.
+    let from_wasm = args.iter().any(|a| a == "--from-wasm");
     let save = flag_value(&args, "--save-baseline");
     let check = flag_value(&args, "--check");
     let tol = flag_value(&args, "--tol")
@@ -1024,7 +1078,7 @@ fn main() {
     config.wasm_memory64(true);
     let engine = Engine::new(&config).expect("engine");
 
-    let results: Vec<(Resolved, Raw)> = resolve_kernels()
+    let results: Vec<(Resolved, Raw)> = resolve_kernels(from_wasm)
         .into_iter()
         .map(|k| {
             let raw = measure(&engine, &k, reps);

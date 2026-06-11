@@ -14,6 +14,9 @@ path = "src/main.rs"
 svm-ir = { path = "../crates/svm-ir" }
 svm-text = { path = "../crates/svm-text" }
 svm-jit = { path = "../crates/svm-jit" }
+# The wasm→IR transpiler, for `--from-wasm`: run the *same* wasm bytes on SVM (transpiled to IR)
+# and on Wasmtime — the apples-to-apples comparison, instead of hand-paired IR/WAT.
+svm-wasm = { path = "../crates/svm-wasm" }
 # Minimal Wasmtime: the Cranelift compiler + the runtime, nothing else (no component
 # model / gc / async), so we compare like-for-like (both lower core wasm via Cranelift).
 wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "std"] }
