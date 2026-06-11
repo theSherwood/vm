@@ -397,8 +397,8 @@ security — UB in a sandbox IR would void the escape guarantee.
   abs neg ceil floor trunc nearest copysign`.
 - **Float compare** (→ i32): `eq ne lt le gt ge`.
 - **Conversions:** `i64.extend_i32_s/u`, `i32.wrap_i64`, `extend8_s/extend16_s/
-  extend32_s` (the narrow sign-extends — *defined here + in `svm-ir`/the interpreter but **not yet
-  JIT-lowered**; the frontend narrows with shifts instead — see "Narrow integer types" below*);
+  extend32_s` (the narrow sign-extends — *defined here + in `svm-ir`, the interpreter, **and the JIT**
+  (`ireduce`→`sextend`); the chibicc frontend still narrows with shifts — see "Narrow integer types" below*);
   `trunc_sat_f→i_s/u` (**saturating default**, deterministic; trapping
   variant available), `convert_i→f_s/u`, `f32.demote/f64.promote`; `reinterpret`
   (i32↔f32, i64↔f64 — bit-level, for NaN-boxing).
@@ -453,11 +453,12 @@ load/store/cast/atomic *boundaries*, which the current model already covers (exc
 **Recommendation (revisit only if a concrete need appears — likely the LLVM on-ramp or a
 narrow-atomic workload):** keep the `i32`/`i64` model; prefer the cheaper, TCB-preserving fixes
 over adding `i8`/`i16`:
-- **Complete the already-specified `extend8_s`/`extend16_s` ops** so narrowing is one canonical,
-  fuzzable op instead of a shift pair. They exist in `svm-ir` + the interpreter and are *listed in
-  the IR spec above*, but the **JIT does not lower them yet** (its `IntUn` match returns
-  `Unsupported("int extend ops")`) — which is exactly why the frontend emits shifts. This adds *no*
-  narrow-arithmetic surface to the TCB.
+- **Use the already-specified `extend8_s`/`extend16_s` ops** so narrowing is one canonical,
+  fuzzable op instead of a shift pair. They exist in `svm-ir`, the interpreter, **and the JIT**
+  (lowered as `ireduce`→`sextend`; they ride the 4000-seed interp↔JIT differential, pinned by
+  `jit_diff::jit_matches_interp_sign_extend_ops`). The chibicc frontend still emits shifts for
+  narrowing casts (a future frontend can emit the op directly). This adds *no* narrow-arithmetic
+  surface to the TCB.
 - For any `_Atomic char/short`, emit a **CAS loop over the enclosing aligned word** in the guest
   libc (the standard lock-free narrow-atomic trick) — zero VM/TCB change — rather than adding
   `IntTy::I8/I16`.

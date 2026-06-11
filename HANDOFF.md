@@ -1266,9 +1266,10 @@ regressions one commit old"):
 >    tradeoff):** `char`/`short`/`_Bool` are `i32` values (no `i8`/`i16` SSA types), so frontends must
 >    lower narrowing casts explicitly and **narrow-width atomics (`_Atomic char/short`) have no IR form**.
 >    Decision + recommendation written up in **DESIGN.md §3b "Narrow integer types"** — keep the model;
->    if it bites (likely the LLVM on-ramp, or a narrow-atomic workload), prefer completing the existing
->    `extend8_s`/`extend16_s` ops (in `svm-ir` + interp but **not JIT-lowered** — the frontend uses
->    shifts) + a guest-libc CAS-loop for narrow atomics, *not* adding `i8`/`i16` (which would widen the
+>    if it bites (likely the LLVM on-ramp, or a narrow-atomic workload), prefer the existing
+>    `extend8_s`/`extend16_s`/`extend32_s` ops (now lowered on **both** backends — interp + JIT via
+>    `ireduce`→`sextend`, ride the 4000-seed differential; `jit_diff::jit_matches_interp_sign_extend_ops`)
+>    + a guest-libc CAS-loop for narrow atomics, *not* adding `i8`/`i16` (which would widen the
 >    escape-TCB). *(Done this batch: the JIT cap-path page-map persistence
 >    (`Host::cap_window_pages` + `MprotectWindow::new_shared`); the **thread-safe guest `malloc`**; and a
 >    **chibicc narrowing-cast bug** found via the malloc demo — a value-level cast to `char`/`short`/

@@ -1454,10 +1454,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::RefFunc { .. }
                 | Inst::IntBin { .. }
                 | Inst::Convert { .. } => {}
-                Inst::IntUn { op, .. } => match op {
-                    IntUnOp::Clz | IntUnOp::Ctz | IntUnOp::Popcnt => {}
-                    _ => return Err(JitError::Unsupported("int extend ops")),
-                },
+                Inst::IntUn { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -2103,13 +2100,28 @@ fn lower_block(
                     _ => int_bin(b, *op, x, y),
                 }
             }
-            Inst::IntUn { op, a, .. } => {
+            Inst::IntUn { op, a, ty } => {
                 let x = get(&vals, *a)?;
+                let rt = int_clif_ty(*ty);
+                // `extendN_s` sign-extends the low N bits: reduce to iN, then sign-extend
+                // back to the (same) result width. When N == the result width (`extend32_s`
+                // on `i32`) it's the identity — `ireduce`/`sextend` both require a strict
+                // width change, so pass `x` through.
+                let sext_low = |b: &mut FunctionBuilder, nt: Type| {
+                    if nt == rt {
+                        x
+                    } else {
+                        let r = b.ins().ireduce(nt, x);
+                        b.ins().sextend(rt, r)
+                    }
+                };
                 match op {
                     IntUnOp::Clz => b.ins().clz(x),
                     IntUnOp::Ctz => b.ins().ctz(x),
                     IntUnOp::Popcnt => b.ins().popcnt(x),
-                    _ => return Err(JitError::Unsupported("int extend ops")),
+                    IntUnOp::Extend8S => sext_low(b, I8),
+                    IntUnOp::Extend16S => sext_low(b, I16),
+                    IntUnOp::Extend32S => sext_low(b, I32),
                 }
             }
             Inst::IntCmp { op, a, b: rb, .. } => {

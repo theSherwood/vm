@@ -203,6 +203,59 @@ block0(v0: i64, v1: i64):
 }
 
 #[test]
+fn jit_matches_interp_sign_extend_ops() {
+    // `extendN_s` sign-extends the low N bits of an iN value (same width in and out).
+    // The interpreter has always had these; this pins the JIT lowering (ireduce→sextend,
+    // with extend32_s on i32 the identity) against it. i32 first.
+    let src32 = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.extend8_s v0
+  v2 = i32.extend16_s v0
+  v3 = i32.extend32_s v0
+  v4 = i32.add v1 v2
+  v5 = i32.add v4 v3
+  return v5
+}
+"#;
+    assert_jit_matches_interp(
+        src32,
+        &[
+            i32s(&[0x0000_00ff]), // low byte 0xff → -1 (extend8), 0x00ff (extend16)
+            i32s(&[0x0000_7f80]), // bit7 set in the byte, bit15 clear in the halfword
+            i32s(&[0x1234_5678]),
+            i32s(&[-1]),
+            i32s(&[0]),
+            i32s(&[i32::MIN]),
+        ],
+    );
+
+    // i64 — extend32_s is a genuine narrowing here (low 32 bits, sign-extended to 64).
+    let src64 = r#"
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.extend8_s v0
+  v2 = i64.extend16_s v0
+  v3 = i64.extend32_s v0
+  v4 = i64.add v1 v2
+  v5 = i64.add v4 v3
+  return v5
+}
+"#;
+    assert_jit_matches_interp(
+        src64,
+        &[
+            vec![Value::I64(0x0000_0000_0000_00ff)],
+            vec![Value::I64(0x0000_0000_8000_0080)], // bit7, bit31 both set
+            vec![Value::I64(0x1234_5678_9abc_def0u64 as i64)],
+            vec![Value::I64(-1)],
+            vec![Value::I64(0)],
+            vec![Value::I64(i64::MIN)],
+        ],
+    );
+}
+
+#[test]
 fn jit_matches_interp_loop_with_back_edge() {
     // sum = 1 + 2 + ... + n via a back-edge loop with block parameters — exercises
     // br / br_if and multi-block SSA lowering.
