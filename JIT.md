@@ -26,6 +26,7 @@ resource hardening are landed and differentially tested:
 | **old→new** (B2 install): pre-reserved table + `install` op both backends + `__vm_jit_install` | `svm-jit` (`CompiledModule::install`, `table_reserve_log2`, `DefinedFn`), `svm-interp` (op-3 arm, `grant_jit_with_table`), `svm-run` (`jit_native_op` op 3), `frontend/chibicc`; tests in `jit_cap.rs`/`jit_incremental.rs` |
 | **new→new** (B2): an invoked unit calls an installed one (live `fn_table` / invoke-time snapshot) | `svm-interp` (`VCpu::new_invoke` snapshot); test in `jit_cap.rs` |
 | **slot reclaim** (B2): `uninstall(slot)` frees a table slot for reuse (both backends) | `svm-jit` (`CompiledModule::uninstall`, `n_real_funcs`), `svm-interp` (op-4 arm), `svm-run`, `frontend/chibicc`; tests in `jit_cap.rs` |
+| **code-memory compaction** (§6 reclaim, mechanism): `install_at` (exact-slot reinstall) + `extra_fn_count`/`is_running` (occupancy + quiescence) — whole-module recompaction rebuilds the live set into a fresh module, dropping the old arena | `svm-jit` (`CompiledModule::install_at`/`extra_fn_count`/`is_running`); simulated-REPL test `crates/svm/tests/jit_compaction.rs` |
 
 The W^X spike resolved affirmatively (incremental finalize leaves running code intact —
 pinned by tests including finalize *during* a run). Phase 5 (B2 table install) and
@@ -445,6 +446,30 @@ Phased; each phase is independently testable and keeps the escape-TCB crates unt
    *amortized-periodic* O(live-program) recompile — better than recompile-per-entry, but not
    free — so the cost model must be stated honestly. MVP for one-shot: cap total compiled bytes
    / return `-ENOMEM`.
+   - **Mechanism landed (the reclaim primitives + a simulated-REPL test).** The
+     recompaction strategy above is realized against three `CompiledModule` primitives that
+     add **no escape-TCB codegen** — compaction only replays the existing
+     `compile`/`define_extra`/`install` paths into a fresh module and drops the old one (RAII
+     frees its whole arena): `install_at(slot, code, type_id)` reinstalls a unit at its
+     **exact** old slot (so a funcref a guest already holds keeps resolving to the same unit
+     across the swap — `install` only fills the *next* padding slot, which cannot reproduce a
+     history with `uninstall` gaps); `extra_fn_count()` is the monotonic occupancy proxy a
+     watermark watches (it restarts near zero in the fresh module — the visible reclaim);
+     `is_running()` is the quiescence guard (recompaction is only sound when no run is in
+     flight — the guest is suspended *inside* the module being compacted, so a guest op can
+     never trigger it; it is embedder-facing, e.g. a REPL driver between prompts).
+     `crates/svm/tests/jit_compaction.rs` drives the embedder pattern end-to-end: redefining
+     one function 40 times accumulates 40 dead definitions, then recompaction rebuilds only the
+     single live definition into a fresh module that behaves identically, keeps its slot, and
+     bounds occupancy by the live set, not the history; a second case pins exact-slot
+     reproduction across an `uninstall` gap. **Remaining (the guest-facing integration):**
+     wiring this through the `svm-run`/`Host` `Jit` path — enumerating the domain's *live*
+     units (liveness is the embedder's handle-table policy: a unit dies when its `CompiledCode`
+     handle is released *and* it is not installed), remapping `Host` unit→native pointers + the
+     handle table across the swap, and driving a multi-prompt REPL over a **persistent window**
+     (carrying `final_mem` forward as the next prompt's `init_mem`) with a differential against
+     the interpreter. That integration is its own focused slice; the load-bearing mechanism it
+     builds on is the part above.
 
 ---
 
@@ -486,12 +511,16 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
   REPL installs definitions: **addressed** by `uninstall(slot)` (op 4), which frees a slot for
   reuse (a redefinition `uninstall`s the old slot and `install`s the new code, reusing the
   index). (2) **Code-memory** pressure — repeated `compile`s consume the 256 MiB code arena
-  (`:955`) with no per-function reclaim in `cranelift-jit`: **still open.** This is *not* an
-  orthogonal allocator feature — with no per-function free, reclaim means periodic whole-module
-  compaction (recompile the live set → swap), reintroducing amortized-periodic recompile cost
-  (plan step 6). The recommended A-with-re-emission REPL path *increases* arena pressure
-  (duplicated helper bodies), so the MVP byte-cap / `-ENOMEM` backstop is what gets profiled
-  first; compaction is the upgrade if real sessions hit the cap.
+  (`:955`) with no per-function reclaim in `cranelift-jit`: **mechanism landed; guest-facing
+  integration open.** This is *not* an orthogonal allocator feature — with no per-function
+  free, reclaim means periodic whole-module compaction (recompile the live set → swap),
+  reintroducing amortized-periodic recompile cost (plan step 6). The reclaim *primitives*
+  (`install_at` / `extra_fn_count` / `is_running`) and a simulated-REPL test now exist
+  (`crates/svm/tests/jit_compaction.rs`); what remains is wiring them through the
+  `svm-run`/`Host` `Jit` path (live-unit enumeration, handle remap, a persistent-window REPL
+  differential — plan step 6). The recommended A-with-re-emission REPL path *increases* arena
+  pressure (duplicated helper bodies), so the MVP byte-cap / `-ENOMEM` backstop is what gets
+  profiled first; compaction is the upgrade if real sessions hit the cap.
 - **W^X integrity of incremental `finalize_definitions` (escape-relevant, not just
   functional).** Today `finalize_definitions()` is called exactly once (`:1134`), so the
   multi-finalize path is unexercised. The real question is not re-entrancy correctness but

@@ -2,7 +2,7 @@
 
 Pick-up notes for a fresh session. Written 2026-06-12. Branch: **`main`** (this work commits
 straight to `main`; remote `theSherwood/vm`). Everything below is committed and the full
-workspace suite is green (`cargo test --workspace` → 64 test binaries pass).
+workspace suite is green (`cargo test --workspace` → 65 test binaries pass).
 
 The **design + status doc** is `JIT.md` (read it first — this file is the operational
 pick-up companion). DESIGN.md section refs (§2a, §3c, §4, §8, §13) are the VM's contracts.
@@ -127,6 +127,8 @@ guest-compiled unit in `units[k-1]`). Direct calls stay in the caller's module;
   JIT-level `install`. (JIT-only.)
 - `cargo test -p svm --test jit_reentry` — mid-run `define_extra`/`invoke_extra` (incl. the
   strongest W^X case: `finalize_definitions` while parent code is live on the stack).
+- `cargo test -p svm --test jit_compaction` — §6 code-memory reclaim: the simulated-REPL
+  recompaction mechanism (`install_at` exact-slot reinstall, `extra_fn_count` occupancy proxy).
 - `cargo test -p svm --test jit_cap` — **the differential suite** (interp ≡ JIT): compile/invoke,
   all 4 cross-call directions, install/uninstall, garbage/memory-mismatch/data/concurrency
   rejection, quota, traps, a deterministic blob fuzz. This is the one that matters most.
@@ -144,15 +146,31 @@ guest program + Host setup + blob on interp (`run_capture_reserved_with_host`) a
 
 The user's core asks are **done** (old↔new both directions, install, slot reclaim). What's open:
 
-1. **Code-memory compaction reclaim** — *the* valuable item; **substantial.** Slot reclaim
-   (`uninstall`) shipped, but repeated `compile`s still consume the 256 MiB code arena with no
-   per-function free in `cranelift-jit`. Reclaim = periodic **whole-module compaction** (recompile
-   the live set into a fresh `CompiledModule`, swap). Key constraint: it can **only** run at a
-   *quiescent* point — the guest is suspended *inside* the very module being compacted, so the
-   guest can't trigger it mid-`cap.call`. So it is **embedder-facing** (a REPL driver between
-   prompts), realized as a `CompiledModule` API (enumerate live units → recompile → swap, remapping
-   handles/slots), not a guest op. Recommend building this as its own focused effort + a
-   simulated-REPL test. The `-ENOMEM` byte-cap backstop is what bounds the arena until then.
+1. **Code-memory compaction reclaim** — *the* valuable item; **mechanism landed, guest-facing
+   integration open.** Slot reclaim (`uninstall`) shipped, but repeated `compile`s still consume
+   the 256 MiB code arena with no per-function free in `cranelift-jit`. Reclaim = periodic
+   **whole-module compaction** (recompile the live set into a fresh `CompiledModule`, swap). Key
+   constraint: it can **only** run at a *quiescent* point — the guest is suspended *inside* the
+   very module being compacted, so the guest can't trigger it mid-`cap.call`. So it is
+   **embedder-facing** (a REPL driver between prompts).
+   - **Landed (the load-bearing mechanism + a simulated-REPL test):** three `CompiledModule`
+     primitives that add **no escape-TCB codegen** — compaction only replays the existing
+     `compile`/`define_extra`/`install` paths into a fresh module and drops the old one (RAII
+     frees its arena). `install_at(slot, code, type_id)` reinstalls a unit at its **exact** old
+     slot (so a funcref the guest holds keeps resolving across the swap — `install` only fills
+     the *next* padding slot, which can't reproduce an `uninstall`-gap history);
+     `extra_fn_count()` is the occupancy proxy a watermark watches (restarts near zero in the
+     fresh module — the visible reclaim); `is_running()` is the quiescence guard. The test
+     `crates/svm/tests/jit_compaction.rs` redefines one function 40 times (40 dead definitions
+     accumulate), recompacts to the single live definition (identical behavior, same slot,
+     occupancy bounded by the live set not the history), and pins exact-slot reproduction across
+     an `uninstall` gap.
+   - **Open (the guest-facing integration, its own focused slice):** wire this through the
+     `svm-run`/`Host` `Jit` path — enumerate the domain's *live* units (liveness is the
+     embedder's handle policy: dead = `CompiledCode` handle released **and** not installed),
+     remap `Host` unit→native pointers + the handle table across the swap, and drive a
+     multi-prompt REPL over a **persistent window** (carry `final_mem` → next `init_mem`) with a
+     differential vs the interpreter. The `-ENOMEM` byte-cap backstop bounds the arena until then.
 
 2. **Threaded install** + **install-during-own-invocation** — *one* refactor, **niche + risky.**
    Today the interp's dispatch table is per-`VCpu` (owned `Vec`); spawned threads get a snapshot,
