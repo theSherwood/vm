@@ -278,20 +278,30 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
      spawned *first*, then main compiles+installs, worker executes the fresh code → 52), green on all
      `fiber_rt` targets incl. aarch64 macOS. (install-during-own-invocation is covered structurally by
      the interp's `INVOKE_MODULE` + shared table.)
-   - **Threaded-compile remainders (genuinely open, narrow):** (a) **`recompact_jit`/`JitSession` +
-     concurrent** — compaction keeps the single-threaded path (a REPL compacts between prompts when
-     quiescent); threaded-compile **+** auto-compaction would have `JitSession` *own* a `Mutex<Host>`
-     for the session's life — a small API change, build it if a guest needs both. (b) a coarse-lock→
-     **fine-grained / sharded-module** optimization if parallel-compile *throughput* is ever measured
-     to matter — deliberately deferred (no demonstrated need; the guest `cap.call 11` iface is
-     unchanged, so it's a pure internal swap). (c) a C-level threaded-compile **demo** under `demos/`
-     (the IR-level differential + the concurrent C demos already cover the mechanism).
+   - **Compaction + multithreaded — done.** `JitSession` now **owns** the `Host` behind a boxed
+     `Mutex` (stable address) and bakes `cap_thunk_locked`, so a multi-threaded guest's workers can
+     `cap.call` (incl. threaded `Jit.compile`) *and* the session auto-compacts between prompts (a
+     quiescent point), re-baking the **same** locked thunk so the next multi-threaded prompt stays
+     sound. The thunk-agnostic keep-set rebuild is factored into `pub recompact_into(fresh, host,
+     domain, old)`; `recompact_jit` stays the single-threaded standalone primitive (a concurrent
+     custom driver replicates `JitSession`'s `Mutex<Host>` + `cap_thunk_locked` + `recompact_into`
+     pattern). `JitSession::new` now takes `Host` by value; `run_prompt`/`compact` drop the host
+     param; `into_host` recovers it. Pinned by `jit_compaction::threaded_session_compacts_transparently`
+     (every prompt spawns a worker that concurrently `Jit.compile`s; identical with/without
+     compaction; occupancy bounded). A single-threaded session pays only an uncontended lock per
+     `cap.call` (negligible for an interactive driver; the perf path `jit_cap_run` stays unlocked).
+   - **Threaded-compile remainders (narrow):** (a) a coarse-lock→**fine-grained / sharded-module**
+     optimization if parallel-compile *throughput* is ever measured to matter — deliberately deferred
+     (no demonstrated need; the guest `cap.call 11` iface is unchanged, so it's a pure internal swap).
+     (b) a C-level threaded-compile **demo** under `demos/` (the IR-level differential + the concurrent
+     C demos already cover the mechanism).
 
 **Recommendation:** #1 (compaction) and #2 (threaded **install** + threaded **compile**) are both
 landed end-to-end — install with full platform parity, compile via the per-domain serialized thunk
-(single-threaded paths untouched), CLI wired, and the cross-thread-execute case confirmed needing no
-`isb`. The only open threaded-compile items are narrow: `recompact`/`JitSession`+concurrent (a small
-API change), a throughput optimization (gated on a measured need), and a C demo.
+(single-threaded paths untouched), CLI wired, the cross-thread-execute case confirmed needing no
+`isb`, and **compaction works for multithreaded guests** (`JitSession` owns the `Mutex<Host>`). The
+only open threaded-compile items are a throughput optimization (gated on a measured need) and a C
+demo.
 
 Also nice-to-have, low priority: a guest convention/helper so emitting C-ABI units (the `sp`-first
 shape) for `install` is less manual; today the demo hand-rolls it.
