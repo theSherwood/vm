@@ -26,7 +26,7 @@ resource hardening are landed and differentially tested:
 | **old→new** (B2 install): pre-reserved table + `install` op both backends + `__vm_jit_install` | `svm-jit` (`CompiledModule::install`, `table_reserve_log2`, `DefinedFn`), `svm-interp` (op-3 arm, `grant_jit_with_table`), `svm-run` (`jit_native_op` op 3), `frontend/chibicc`; tests in `jit_cap.rs`/`jit_incremental.rs` |
 | **new→new** (B2): an invoked unit calls an installed one (live `fn_table` / invoke-time snapshot) | `svm-interp` (`VCpu::new_invoke` snapshot); test in `jit_cap.rs` |
 | **slot reclaim** (B2): `uninstall(slot)` frees a table slot for reuse (both backends) | `svm-jit` (`CompiledModule::uninstall`, `n_real_funcs`), `svm-interp` (op-4 arm), `svm-run`, `frontend/chibicc`; tests in `jit_cap.rs` |
-| **code-memory compaction** (§6 reclaim): whole-module recompaction rebuilds the live set into a fresh module, dropping the old arena — both the `CompiledModule` primitives **and** the embedder-integrated `recompact_jit` driver (live-unit enumeration + handle/slot remap through the `Host`) | `svm-jit` (`CompiledModule::install_at`/`installed_slots`/`extra_fn_count`/`is_running`), `svm-interp` (`Host::jit_unit_count`/`jit_live_units`), `svm-run` (`recompact_jit`); tests `crates/svm/tests/jit_compaction.rs` (simulated-REPL mechanism + embedder-integrated transparency/reclaim + live invoke-only carry) |
+| **code-memory compaction** (§6 reclaim): whole-module recompaction rebuilds the live set into a fresh module, dropping the old arena — the `CompiledModule` primitives, the embedder-integrated `recompact_jit` driver (live-unit enumeration + handle/slot remap through the `Host`), **and** the auto-compacting `JitSession` REPL driver (watermark policy + persistent window) | `svm-jit` (`CompiledModule::install_at`/`installed_slots`/`extra_fn_count`/`is_running`), `svm-interp` (`Host::jit_unit_count`/`jit_live_units`), `svm-run` (`recompact_jit`, `JitSession`); tests `crates/svm/tests/jit_compaction.rs` (mechanism + embedder transparency/reclaim + live invoke-only carry + guest-driven auto-compacting session) |
 
 The W^X spike resolved affirmatively (incremental finalize leaves running code intact —
 pinned by tests including finalize *during* a run). Phase 5 (B2 table install) and
@@ -480,9 +480,20 @@ Phased; each phase is independently testable and keeps the escape-TCB crates unt
      interp↔JIT differential across *multiple* runs is blocked by the reference interp rebuilding
      its per-`VCpu` dispatch table each run (the separate shared-table refactor, "Remaining work"
      #2), so single-run correctness stays differential in `jit_cap.rs` and transparency-across-
-     the-swap is pinned against the production backend. **Remaining:** a guest-driven end-to-end
-     REPL demo, and the `-ENOMEM` watermark policy that *triggers* `recompact_jit` automatically
-     (today the embedder calls it between prompts on its own cadence).
+     the-swap is pinned against the production backend.
+   - **Auto-trigger policy landed (`JitSession`).** `svm_run::JitSession` is the persistent REPL
+     driver: it owns the long-lived `CompiledModule` + carried window an embedder re-enters once
+     per prompt (`run_prompt`, the prior prompt's low bytes seeding the next so guest state
+     persists), and **auto-compacts** when `extra_fn_count()` reaches a watermark — at the
+     quiescent point *after* a prompt returns, the only place compaction is sound (the guest is
+     suspended *inside* the module during any `cap.call`, so it can never self-trigger).
+     `seed_window` places argv/blob state before the first prompt; `compact` is the manual
+     trigger; `occupancy`/`compactions` observe. `jit_session_auto_compacts_transparently` drives
+     a 30-prompt session whose guest `cap.call`-compiles/invokes/releases a fresh unit each prompt
+     (real `cap.call`s end-to-end): identical per-prompt results + window with auto-compaction off
+     vs on, occupancy bounded at the watermark instead of growing every prompt. **Remaining:** a
+     C-level guest REPL demo under `demos/` (the IR-level guest test covers the mechanism), and a
+     byte-accurate watermark (today the proxy is `extra_fn_count`, not arena bytes).
 
 ---
 
@@ -525,17 +536,18 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
   reuse (a redefinition `uninstall`s the old slot and `install`s the new code, reusing the
   index). (2) **Code-memory** pressure — repeated `compile`s consume the 256 MiB code arena
   (`:955`) with no per-function reclaim in `cranelift-jit`: **landed (mechanism + embedder
-  integration); auto-trigger policy open.** This is *not* an orthogonal allocator feature — with
-  no per-function free, reclaim means periodic whole-module compaction (recompile the live set →
+  integration + auto-trigger).** This is *not* an orthogonal allocator feature — with no
+  per-function free, reclaim means periodic whole-module compaction (recompile the live set →
   swap), reintroducing amortized-periodic recompile cost (plan step 6). The reclaim primitives
-  (`install_at` / `installed_slots` / `extra_fn_count` / `is_running`) **and** the embedder
-  driver (`svm_run::recompact_jit` over `Host::jit_unit_count`/`jit_live_units`) now exist, with
-  a persistent-window REPL transparency/reclaim test (`crates/svm/tests/jit_compaction.rs`). What
-  remains is the *policy*: an `-ENOMEM` watermark that calls `recompact_jit` automatically (today
-  the embedder picks the cadence) and a guest-driven end-to-end demo. The recommended
-  A-with-re-emission REPL path *increases* arena pressure (duplicated helper bodies), so the MVP
-  byte-cap / `-ENOMEM` backstop is what gets profiled first; compaction is the upgrade if real
-  sessions hit the cap.
+  (`install_at` / `installed_slots` / `extra_fn_count` / `is_running`), the embedder driver
+  (`svm_run::recompact_jit` over `Host::jit_unit_count`/`jit_live_units`), **and** the
+  auto-compacting `svm_run::JitSession` REPL driver (watermark + persistent window) now exist,
+  with transparency/reclaim tests incl. a guest-driven `cap.call`-end-to-end session
+  (`crates/svm/tests/jit_compaction.rs`). What remains is polish: a byte-accurate watermark (the
+  proxy today is `extra_fn_count`, not arena bytes) and a C-level guest REPL demo under `demos/`.
+  The recommended A-with-re-emission REPL path *increases* arena pressure (duplicated helper
+  bodies), so the MVP byte-cap / `-ENOMEM` backstop is what gets profiled first; compaction is the
+  upgrade if real sessions hit the cap.
 - **W^X integrity of incremental `finalize_definitions` (escape-relevant, not just
   functional).** Today `finalize_definitions()` is called exactly once (`:1134`), so the
   multi-finalize path is unexercised. The real question is not re-entrancy correctness but
