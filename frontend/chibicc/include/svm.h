@@ -52,4 +52,10 @@ long __vm_jit_invoke2(long code, long a, long b);
 // is forged/already released (non-fatal).
 long __vm_jit_release(long code);
 
+// Install a compiled unit into the `call_indirect` table (Model B2), returning its slot index
+// — a funcref that old code (or another unit) can call indirectly at native speed (old→new).
+// Cast the slot to a function pointer of the unit's signature to call it. Returns -28 (ENOSPC)
+// if the table is full (the embedder sizes the reservation; the CLI reserves 1024 slots).
+long __vm_jit_install(long code);
+
 #endif // __SVM_H

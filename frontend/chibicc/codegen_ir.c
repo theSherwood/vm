@@ -914,6 +914,20 @@ static int gen_builtin_jit_release(Node *node) {
   return r;
 }
 
+// `__vm_jit_install(code) -> slot` (iface 11 op 3, JIT.md Model B2): install a compiled unit
+// into the `call_indirect` table; the returned slot index is a funcref old code (or another
+// unit) can call indirectly at native speed. Returns -28 (ENOSPC) if the table is full.
+static int gen_builtin_jit_install(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_jit_install(code) expects 1 argument");
+  int code = widen_i64(gen_expr(a), a->ty);
+  int h = load_handle(JIT_SLOT);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 11 3 (i64) -> (i64) v%d (v%d)\n", r, h, code);
+  return r;
+}
+
 // §13/§14 SharedRegion builtins — guest-minted shareable memory + multi-offset window
 // aliasing (the magic ring buffer), over the granted AddressSpace/region capabilities:
 //
@@ -1340,6 +1354,8 @@ static int gen_expr(Node *node) {
           return gen_builtin_jit_invoke2(node);
         if (!strcmp(fname, "__vm_jit_release"))
           return gen_builtin_jit_release(node);
+        if (!strcmp(fname, "__vm_jit_install"))
+          return gen_builtin_jit_install(node);
       }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the

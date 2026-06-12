@@ -23,26 +23,35 @@ resource hardening are landed and differentially tested:
 | Compile quota (`-ENOMEM`, shared gate) | `Host::jit_compile` / `set_jit_quota` |
 | C surface (`__vm_jit_compile/invoke2/release`, 8-handle powerbox) + demo | `frontend/chibicc`, `crates/svm-run/demos/jit/` (`cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c`) |
 | **new→old** (slice #1): module-aware interpreter frames + explicit dispatch table (the B2 foundation) | `crates/svm-interp/src/lib.rs` (`Frame.module`, `TableSlot`, `dispatch_indirect`, `VCpu::new_invoke`); tests in `jit_cap.rs` |
+| **old→new** (B2 install): pre-reserved table + `install` op both backends + `__vm_jit_install` | `svm-jit` (`CompiledModule::install`, `table_reserve_log2`, `DefinedFn`), `svm-interp` (op-3 arm, `grant_jit_with_table`), `svm-run` (`jit_native_op` op 3), `frontend/chibicc`; tests in `jit_cap.rs`/`jit_incremental.rs` |
 
 The W^X spike resolved affirmatively (incremental finalize leaves running code intact —
 pinned by tests including finalize *during* a run). Phase 5 (B2 table install) and
 compaction-based reclaim remain contingent, per the Recommendation. The design analysis
 below is preserved as written.
 
-**Cross-call scope — old→new *and* new→old (slice #1 landed).** The capability supports
-**old→new** (parent code `invoke`s a JITed unit) and **new→old** (a submitted unit
-`call_indirect`s back into the original program's table). The JIT always implemented new→old
-(`define_extra` lowers a unit's `call_indirect` against the parent `fn_table`); the reference
-interpreter now matches it via **module-aware frames** (the "per-frame domain tag" option):
-each `Frame` carries a `module` (0 = the vCPU's own program, ≥ 1 = a guest-compiled unit),
-direct calls stay in the caller's module, and `call_indirect`/`return_call_indirect` dispatch
-through an explicit module-aware table (`TableSlot`) built from module 0 — so a unit's indirect
-call lands in the original program exactly as the JIT lowers it. The `dispatch_indirect` table
-is the structure Model B2's `install` will **grow** (appending unit entries into the
-power-of-two padding); slice #1 populates it from module 0 only. Differential tests pin
-new→old (returns the parent function's result on both backends) and its fail-closed
-signature-mismatch trap. *Not yet covered:* a unit `call_indirect`ing **another unit** (only
-B2's `install` puts unit functions in the table) — that is the remaining B2 increment.
+**Cross-call scope — old↔new both directions land (slices #1 and B2 install).** The capability
+supports **new→old** (a submitted unit `call_indirect`s back into the original program's table)
+and **old→new** (old code `call_indirect`s a unit it `install`ed). Mechanism:
+- **new→old (slice #1):** the JIT always lowered a unit's `call_indirect` against the parent
+  `fn_table`; the reference interpreter matches it with **module-aware frames** — each `Frame`
+  carries a `module` (0 = the vCPU's own program, ≥ 1 = a guest-compiled unit), direct calls
+  stay in the caller's module, and `call_indirect` dispatches through an explicit module-aware
+  table (`TableSlot`) built from module 0.
+- **old→new (B2 install):** a `Jit.install(code_handle) -> slot` op (iface 11 op 3) writes the
+  unit into the dispatch table's next **pre-reserved** padding slot — on the JIT via
+  `CompiledModule::install` (the unit's natural entry + interned `type_id` into the `fn_table`);
+  on the interpreter by registering the unit as a module and filling the same `TableSlot`. Both
+  reserve the table identically (`table_reserve_log2` / `grant_jit_with_table`) and fill from the
+  parent funcs count, so the returned slot index agrees. The returned slot is a funcref old code
+  (or another unit) `call_indirect`s at native speed.
+
+Differential tests pin new→old (parent function's result, both backends), old→new via install
+(installed-unit result + matching slot index, both backends), fail-closed signature-mismatch
+and `-ENOSPC` (table full). C surface: `__vm_jit_install` (iface 11 op 3). **Remaining B2
+increment:** *new→new* — an *invoked* (not-yet-installed) unit calling an installed one needs the
+invoke child to share the main domain's table; the foundation (module-aware dispatch + the
+reserved growable table) is in place.
 
 **Verdict up front: yes, it's feasible and a strong architectural fit.** The submit-a-blob
 boundary the feature needs already exists, the verifier is *designed* to be the trust hinge

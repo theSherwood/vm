@@ -3818,7 +3818,9 @@ pub mod iface {
     /// code, which the generic dispatch can't) and by the embedder's cap thunk on the JIT (it calls
     /// the unit's native trampoline); traps in invoked code are **terminal for the domain**; op 2
     /// `release(code_handle) -> 0 | -errno` revokes the handle (no code reclaim yet — JIT.md
-    /// "Code reclaim").
+    /// "Code reclaim"); op 3 `install(code_handle) -> slot_index | -errno` (Model B2) installs the
+    /// unit into the `call_indirect` table's next reserved slot so old code (or another unit) can
+    /// dispatch it at native speed (old→new), `-ENOSPC` if the table is full.
     pub const JIT: u32 = 11;
     /// `CompiledCode` — a unit minted by `Jit.compile`. Like `Module`, it has no directly callable
     /// ops (`cap.call` on it is an inert `CapFault`); it confers only the authority to be named in
