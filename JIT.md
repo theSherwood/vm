@@ -569,16 +569,21 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
   (`jit_cap::threaded_install_agrees_*`, run on every `fiber_rt` target incl. aarch64 macOS). The
   visibility is carried by the **guest's own** ready-flag acquire/release, so it is correct on
   weakly-ordered targets without any dispatch-side acquire; the atomic `FnEntry` additionally
-  ensures a racy reader never sees a torn code pointer (uniform safety, no escape). The one
-  remaining single-threaded restriction is **threaded *compile*** (a worker calling `Jit.compile` →
-  `finalize_definitions` under live threads); threaded install sidesteps it (compile precedes the
-  spawn). **The W^X spike is now done** (HANDOFF §6 #2): `ArenaMemoryProvider::finalize` only
-  re-protects *non-finalized* segments, so executing code is never touched — **no stop-the-world**;
-  i-cache coherence is handled by cranelift's `clear_cache` + `pipeline_flush_mt` (membarrier
-  `SYNC_CORE` on Linux aarch64), with a no-op on aarch64 macOS that wants an executing-thread `isb`
-  at a safepoint. So threaded compile needs a per-domain compile lock + a JIT-side `Host` lock
-  (concurrent `cap.call`) + that aarch64-macOS safepoint — pinned empirically by
-  `jit_incremental::concurrent_finalize_does_not_disturb_running_code`.
+  ensures a racy reader never sees a torn code pointer (uniform safety, no escape).
+  **Threaded *compile* now works too** (a real target language drove it): `svm_run::cap_thunk_locked`
+  serializes `cap.call` through a per-domain `Mutex<Host>` so concurrent `Jit.compile`s are sound
+  (`define_extra` exclusive) while execution stays parallel — the W^X spike proved
+  `ArenaMemoryProvider::finalize` only re-protects *non-finalized* segments (executing code is never
+  touched → no stop-the-world) and i-cache coherence is cranelift's `clear_cache` +
+  `pipeline_flush_mt` (membarrier `SYNC_CORE` on Linux aarch64). The re-entrant "running units
+  compile more" case is handled by releasing the lock around `Jit.invoke`. `jit_cap_run` engages the
+  locked thunk **only for concurrent modules** (`Func::uses_concurrency`), so single-threaded runs
+  keep the unlocked path at zero cost; the guest `cap.call 11` iface is unchanged. Pinned by
+  `jit_cap::threaded_compile_*` (differential, non-flaky) + the W^X corroboration
+  `jit_incremental::concurrent_finalize_does_not_disturb_running_code`. Remainders: CLI/`recompact`
+  wiring (only `jit_cap_run` engages the lock today), an aarch64-macOS executing-thread `isb` for the
+  cross-thread-execute-of-fresh-code case, and a fine-grained/sharded-module throughput optimization
+  if ever measured to matter.
 
 ## Verification approach
 

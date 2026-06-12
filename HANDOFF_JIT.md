@@ -134,8 +134,9 @@ guest-compiled unit in `units[k-1]`). Direct calls stay in the caller's module;
   `cap.call`-end-to-end session).
 - `cargo test -p svm --test jit_cap` — **the differential suite** (interp ≡ JIT): compile/invoke,
   all 4 cross-call directions, install/uninstall, **threaded install** (a worker dispatching a
-  post-spawn install — §6 #2), garbage/memory-mismatch/data/concurrency rejection, quota, traps, a
-  deterministic blob fuzz. This is the one that matters most.
+  post-spawn install) **+ threaded compile** (concurrent `Jit.compile` from a worker — §6 #2),
+  garbage/memory-mismatch/data/concurrency rejection, quota, traps, a deterministic blob fuzz. This
+  is the one that matters most.
 - `cargo test -p svm --test c_frontend c_guest_jit_demo` — the C demo end-to-end on both backends.
 - Always finish with `cargo test --workspace` + `cargo clippy -p svm-jit -p svm-interp -p svm-run`.
 
@@ -247,19 +248,40 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
        **aarch64 macOS** `pipeline_flush_mt` is a no-op, so a busy-spinning executing core's own
        `isb` isn't guaranteed — that one target needs the executing thread to context-synchronize
        at a safepoint (a brief quiesce, *not* a global stop-the-world).
-     - **So threaded compile needs:** (a) a per-domain **compile lock** (serialize `define_extra`'s
-       `&mut`), (b) the **JIT-side Host lock** (`cap_thunk` derefs a raw `*mut Host`; concurrent
-       `cap.call`s — which a worker `Jit.compile` introduces — race), and on **aarch64 macOS only**
-       (c) an executing-thread `isb` at a safepoint. Then the end-to-end differential. The interp
-       side is already ready (compile = `Host`-state mutation under the `Arc<Mutex<Host>>`, no
-       finalize). (install-during-own-invocation is covered structurally by the interp's
-       `INVOKE_MODULE` + shared table; a dedicated end-to-end case is worth adding if a guest needs
-       it.)
+   - **Threaded *compile* — MVP landed (a real target language needs it).** The spike's path,
+     built: `svm_run::cap_thunk_locked` serializes `cap.call` through a **per-domain `Mutex<Host>`**
+     so concurrent compiles are sound — `define_extra`'s `&mut *cm` is exclusive because the lock
+     serializes all cap.calls, while *execution stays fully parallel* (the spike's Finding #1: a
+     finalize never touches a running page). The confirmed **re-entrant** case ("running units
+     compile more") is handled: `Jit.invoke` resolves the unit under the lock, **releases**, then
+     trampolines, so an invoked unit may itself compile on the same thread without self-deadlock and
+     other threads keep progressing. Every other op is host-side only (Instantiator/fibers re-enter
+     via their own runtimes, not `cap_thunk`), so holding the lock across a delegate to the unlocked
+     `cap_thunk` is deadlock-free. **`jit_cap_run` engages the locked thunk only when the module uses
+     concurrency** (`Func::uses_concurrency`); a single-threaded guest keeps the unlocked
+     `cap_thunk` + raw `*mut Host` path **verbatim — zero lock cost**. The guest-facing `cap.call 11`
+     iface is **unchanged**, so the serialization is an internal detail swappable later (sharded
+     modules for parallel-compile throughput) without breaking guest software. Tests
+     `jit_cap::threaded_compile_agrees_across_backends` (main + worker concurrently compile+invoke →
+     134) and `threaded_compile_loop_stress_agrees` (≈20 overlapping compiles → 515), both
+     differential, non-flaky, on all `fiber_rt` targets. The interp already serialized via its
+     `Arc<Mutex<Host>>`, so it needed no change.
+   - **Threaded-compile remainders (smaller, follow-ups):** (a) **CLI + recompact wiring** — only
+     `jit_cap_run` engages the locked thunk today; `run_powerbox` (CLI) and `recompact_jit` keep the
+     raw thunk, so a CLI-launched threaded-compile guest, or compaction of a concurrent domain, isn't
+     wired yet (mechanical: same `uses_concurrency` branch + `Mutex<Host>`). (b) **aarch64-macOS isb**
+     — a worker *executing code another thread just compiled* (compile-then-cross-thread-execute, e.g.
+     threaded compile **+** install) needs the executing core's `isb`; cranelift's finalize covers
+     Linux aarch64 (membarrier `SYNC_CORE`) and x86, but on aarch64 macOS the executing thread wants
+     a safepoint `isb` (the current tests don't exercise cross-thread-execute-of-fresh-code, so this
+     is latent there). (c) a coarse-lock→**fine-grained / sharded-module** optimization if
+     parallel-compile *throughput* is ever measured to matter. (install-during-own-invocation is
+     covered structurally by the interp's `INVOKE_MODULE` + shared table.)
 
-**Recommendation:** #1 (compaction) is done; #2 threaded **install** is done end-to-end with full
-platform parity; the threaded-*compile* **spike is done** — it needs two locks (compile + Host) and
-an aarch64-macOS safepoint `isb`, **not** a stop-the-world. Build it when a real threaded-compile
-workload arrives; the path is now concrete.
+**Recommendation:** #1 (compaction) is done; #2 threaded **install** and threaded **compile** are
+both landed end-to-end (differential, non-flaky) — install with full platform parity, compile via the
+per-domain serialized thunk (single-threaded paths untouched). Remainders are mechanical (CLI/recompact
+wiring) or narrow (aarch64-macOS cross-thread-execute `isb`, a throughput optimization).
 
 Also nice-to-have, low priority: a guest convention/helper so emitting C-ABI units (the `sp`-first
 shape) for `install` is less manual; today the demo hand-rolls it.
