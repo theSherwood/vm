@@ -131,6 +131,67 @@ block3(v17: i64):
     wat64: None,
 };
 
+/// `(i64 n) -> i64`: a §17 `v128` compute loop — an `i32x4` accumulator gains `[1,2,3,4]`
+/// each iteration, then a horizontal `extract_lane` sum. The "real hardware SIMD" datapoint
+/// (D58): SVM lowers the lane add to one native SSE2/NEON `paddd`, exactly as Wasmtime does
+/// (shared Cranelift). Result after `n` iters = (1+2+3+4)·n = 10n (mod 2^32), identical on
+/// every engine (the harness asserts agreement before timing).
+///
+/// **Measured (a reference point, not a goal):** under `--from-wasm` — where SVM and Wasmtime
+/// run the *same* transpiled-from-WAT IR — `simd` lands at **~1.1× of Wasmtime**, i.e. SIMD
+/// *compute parity*, the shared-Cranelift "as fast as wasm" story (§1a/D36) extended to v128.
+/// The default (hand-written-IR) path runs ~3× here: identical lane semantics, but a
+/// block-param loop shape Cranelift schedules less well than the transpiler's CFG — an
+/// IR-authoring artifact, not a SIMD-lowering gap (the `--from-wasm` parity proves the JIT
+/// emits the fast code). Left out of `baseline.txt` so no misleading ratio is regression-tracked.
+const SIMD: Kernel = Kernel {
+    name: "simd",
+    ir: "\
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  v3 = v128.const 1 0 0 0 2 0 0 0 3 0 0 0 4 0 0 0
+  br block1(v0, v1, v2, v3)
+block1(v4: i64, v5: i64, v6: v128, v7: v128):
+  v8 = i64.lt_s v5 v4
+  br_if v8 block2(v4, v5, v6, v7) block3(v6)
+block2(v9: i64, v10: i64, v11: v128, v12: v128):
+  v13 = i32x4.add v11 v12
+  v14 = i64.const 1
+  v15 = i64.add v10 v14
+  br block1(v9, v15, v13, v12)
+block3(v16: v128):
+  v17 = i32x4.extract_lane 0 v16
+  v18 = i32x4.extract_lane 1 v16
+  v19 = i32x4.extract_lane 2 v16
+  v20 = i32x4.extract_lane 3 v16
+  v21 = i32.add v17 v18
+  v22 = i32.add v19 v20
+  v23 = i32.add v21 v22
+  v24 = i64.extend_i32_u v23
+  return v24
+}
+",
+    wat32: r#"
+(module
+  (func (export "run") (param $n i64) (result i64)
+    (local $i i64) (local $acc v128)
+    (local.set $acc (v128.const i32x4 0 0 0 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc (i32x4.add (local.get $acc) (v128.const i32x4 1 2 3 4)))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (i64.extend_i32_u
+      (i32.add
+        (i32.add (i32x4.extract_lane 0 (local.get $acc)) (i32x4.extract_lane 1 (local.get $acc)))
+        (i32.add (i32x4.extract_lane 2 (local.get $acc)) (i32x4.extract_lane 3 (local.get $acc)))))))
+"#,
+    wat64: None,
+};
+
 /// `(i64 n) -> i64`: store then load `i` through a windowed address each iteration, so the
 /// memory path is exercised. Result = Σ i (independent of where it lands). Timed against
 /// both wasm32 (i32 address + guard page) and wasm64 (i64 address + bounds check); we use a
@@ -198,7 +259,7 @@ block3(v18: i64):
     ),
 };
 
-const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER];
+const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER, SIMD];
 
 /// `(i64 n) -> i64`: like `memsum` but the store and the load go to **different, per-iter
 /// varying** slots — write slot `(i·M1)&1023`, read slot `(i·M2)&1023` (M1,M2 odd, so each
