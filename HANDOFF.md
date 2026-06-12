@@ -1416,7 +1416,58 @@ regressions one commit old"):
 > **`SCHEDULING.md`** + **DESIGN D56/D57** (the concurrency-primitives decision), **`DESIGN.md`** /
 > **`README.md`**.
 >
-> **Just landed (this session): (A) the wasm transpiler — function imports / host ABI + heap growth;
+> ---
+>
+> **▶▶ ACTIVE FRONTIER — Migratable fibers / stackful work-stealing (D57).** The maintainer's stated
+> ideal, in progress. Full design + roadmap: **`SCHEDULING.md`** (read it first). The maintainer
+> **cannot expert-review the asm/signal seam and has no model-checking for it**, so safety for the
+> cross-thread-resume step rests on an **empirical net** (a stated decision — see SCHEDULING.md
+> "Verification story"): a differential fuzzer, ASan on the Rust glue, a runtime single-owner assert,
+> guard-page detection, and soak. Honest residual: fuzzing detects, it doesn't prove.
+>
+> **Done + committed (this session, all CI-green):**
+> - **Verified ownership core** — `crates/svm-jit/src/fiber_registry.rs`: the single-owner atomic
+>   protocol (`OWNED`/`RUNNABLE`/`RUNNING`/`FREE`, generation-tagged in one `AtomicU64`). Two
+>   invariants **loom-verified + mutation-proof**: exactly-one-winner steal
+>   (`loom_single_owner_steal_is_exclusive`) and ABA-safety across slot reuse
+>   (`stale_generation_steal_fails_across_reuse`). Run: `RUSTFLAGS="--cfg loom" cargo test -p svm-jit
+>   --lib fiber_registry`. **Not yet wired into the live runtime** (`#[allow(dead_code)]`).
+> - **Integration design** — `SCHEDULING.md` "Integration design (steps 3b–3c)". **Key reframing
+>   (D56/D57):** the VM builds **no work-stealing deque** — that's guest code. The VM owes only (1) a
+>   shared fiber-handle namespace and (2) the single-owner arbiter (the verified CAS). The whole
+>   VM-side surface is one shared slot table of `Ownership` words.
+> - **Hardened the asm foundation** — `crates/svm/tests/fiber_fuzz.rs` is now a **differential
+>   interp≡JIT fiber fuzzer** (`generated_fiber_programs_agree_on_interp_and_jit`), hardening the
+>   `svm-fiber` stack-switch the cross-thread resume reuses *unchanged*. Made hang-/bomb-proof by
+>   construction: acyclic call + fiber-spawn graph, a low symmetric fiber quota, and only running the
+>   JIT on interp-terminating programs. It surfaced 3 real interp/JIT divergences (now scoped out).
+> - **Documented divergence (a gate on 3b-i)** — `cont.new` returns handle `N` on the interp but `N−1`
+>   on the JIT (the interp counts the root as fiber-slot 0; the JIT runs the root off-table), and a
+>   forged handle masks to different slots. **Safe** (numbering is internal, DESIGN §3a) and harmless
+>   in production, but it means a fiber-handle *value* is **not** differentially observable. Recorded
+>   in **DESIGN §3a** + **SCHEDULING §1**. **The fix is part of 3b-i** (a shared registry hands both
+>   backends the same `(slot, generation)`) — *not* a standalone pre-change (it touches
+>   `resolve_fiber`/`chain`/`live_frames`, the exact code 3b-i restructures).
+>
+> **NEXT SLICE = 3b-i — interp shared registry + cross-vCPU resume (safe Rust, the oracle).** Replace
+> the per-`VCpu` `fibers: Vec<Fiber>` with one run-shared registry + a **unified handle namespace**
+> (closing the divergence above); allow `cont.resume(handle)` on any vCPU (a fiber there is
+> `Fiber::Live(Vec<Frame>)` — pure data, so migration is a safe data hand-off). **The crux/risk:** the
+> deterministic explorer hashes `self.fibers` as **per-vCPU** state (`svm-interp/src/lib.rs` ~line
+> 2120) — sharing the table moves that into the **global** configuration the explorer enumerates. It's
+> a *moderate* change (cross-vCPU resume races are already decided by the vCPU interleavings
+> `explore_all` enumerates, with the ownership CAS as arbiter), but it touches the oracle underpinning
+> every differential test, so guard it with the existing **fiber tests + `explore_all`/`dpor` tests**
+> as the regression net. **Gate:** after the shared registry lands, verify handle *values* match
+> across backends, then strengthen `fiber_fuzz` to let handle values flow into output (turning today's
+> workaround into extra coverage). **Then:** 3b-ii (JIT shared registry, affinity preserved — storage
+> refactor under the test net) → 3c (the cross-thread asm resume — the empirical-net-gated seam) →
+> Demo 3 (`mn_sched` re-pointed at a shared steal pool, differential interp≡JIT). Staging table in
+> SCHEDULING.md §8.
+>
+> ---
+>
+> **Just landed (an earlier session): (A) the wasm transpiler — function imports / host ABI + heap growth;
 > (B) D45 — the devirtualized `cap.call` fast path.**
 >
 > **(B) D45 cap.call fast path** (investigation → fix). Profiled why `hostcall` was slow: the generic
@@ -1612,11 +1663,12 @@ regressions one commit old"):
 >    proves (aggregates via memory; hard-error on vectors/unsupported intrinsics), with a differential
 >    harness running the existing C demos through *stock LLVM* and matching native `clang`. (LLVM 18 +
 >    `libLLVM.so` confirmed present in the dev container.)
-> 2. **Migratable-fiber primitive (D57)** — the maintainer's stated ideal (stackful work-stealing).
->    Feasible (Go is the proof) but re-accepts D56's cross-thread-migration unsafe as a *primitive*
->    (guest owns the stealing policy; VM enforces single-owner). **Gated on a loom-verified ownership
->    protocol + expert review.** Design + roadmap in `SCHEDULING.md`. Now unblocked: B has landed (and
->    its suspend/wake protocol — the futex park + completion notify — informs the fiber's).
+> 2. **Migratable-fiber primitive (D57)** — **IN PROGRESS → see the "ACTIVE FRONTIER" block at the top
+>    of this section.** The ownership protocol is loom-verified, the integration design + empirical
+>    safety net are written, and the fiber stack-switch asm is differential-fuzzed; the next slice is
+>    3b-i (interp shared registry + cross-vCPU resume). Re-accepts D56's cross-thread-migration unsafe
+>    as a *primitive* (guest owns the stealing policy; VM enforces single-owner); the expert-review gate
+>    is replaced by the empirical net (no reviewer available — SCHEDULING.md "Verification story").
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); the
 >    async-ring pool could grow more offloadable ops. *(Done across recent batches: **fiber/vCPU quota
 >    metering** (§15) — host-configurable spawn ceilings (`Quota` on the `Host`, enforced on both
