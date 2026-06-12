@@ -141,8 +141,14 @@ differential oracle, and expert review of that seam.
      pure atomics and **loom-model-checked** (`loom_single_owner_steal_is_exclusive`
      proves exactly-one-winner across every interleaving + the acquire/release
      visibility; `loom_running_fiber_is_never_stealable`), plus a mutation check
-     confirming a non-CAS steal makes loom find a double-claim. It is **not yet wired
-     into the live runtime** — that integration (a shared registry replacing the
-     per-thread tables) and the cross-thread asm resume (design sketch #3, expert-review
-     gated) are the remaining steps. Verifying the dangerous invariant first is the
-     "earn the risk" discipline this feature demands.
+     confirming a non-CAS steal makes loom find a double-claim. The ownership word is
+     **generation-tagged** (`(generation, state)` packed into one `AtomicU64`, the
+     generation bumped on `finish`) so the shared registry can **reuse slots** without
+     the classic **ABA hazard**: a stealer holding a stale `(slot, gen)` after the slot
+     was finished and reused for a different fiber finds its `try_steal(gen)` CAS fail —
+     pinned by a deterministic reuse-cycle unit test (dropping the bump defeats it). It
+     is **not yet wired into the live runtime** — that integration (a shared registry
+     replacing the per-thread tables, over a Chase-Lev steal deque) and the cross-thread
+     asm resume (design sketch #3, expert-review gated) are the remaining steps.
+     Verifying the dangerous invariants first is the "earn the risk" discipline this
+     feature demands.
