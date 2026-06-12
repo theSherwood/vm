@@ -317,12 +317,17 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
    - **Threaded-compile remainders (narrow):** (a) a coarse-lock→**fine-grained / sharded-module**
      optimization if parallel-compile *throughput* is ever measured to matter — deliberately deferred
      (no demonstrated need; the guest `cap.call 11` iface is unchanged, so it's a pure internal swap).
-     (b) **C-level threaded-compile demo — done.** `demos/jit/jit_threads.c`: `NWORKERS` guest threads
-     each build IR for a distinct unit and `__vm_jit_compile` it (several `Jit.compile`s in flight,
-     serialized through the powerbox's per-domain `Mutex<Host>` since the guest `thread.spawn`s), invoke
-     the native code, and check it against a C reference — prints `0` mismatches. Product-path smoke
-     test `run::demo_jit_threads_runs` (through the `svm-run` binary's locked thunk), on all `fiber_rt`
-     targets; the interp↔JIT differential stays at the IR level (`jit_cap::threaded_compile_agrees_across_backends`).
+     (b) **C-level threaded-compile demo — done, *differential*.** `demos/jit/jit_threads.c`: `NWORKERS`
+     guest threads each build IR for a distinct unit and `__vm_jit_compile` it (several `Jit.compile`s in
+     flight, serialized through the per-domain `Mutex<Host>` since the guest `thread.spawn`s), invoke the
+     native code, and check it against a C reference — prints `0` mismatches. Pinned two ways: the
+     product-path smoke test `run::demo_jit_threads_runs` (through the `svm-run` binary's locked thunk),
+     **and** a full interp≡JIT differential `c_frontend::c_guest_jit_threads_demo`. The latter needed
+     `run_c_full` to become **concurrency-aware**: a guest whose module `uses_concurrency()` now drives the
+     JIT side through `cap_thunk_locked` over a `Mutex<Host>` (single-threaded guests keep the unlocked
+     raw-`*mut Host` fast path verbatim), mirroring `run_powerbox` — so any genuinely-concurrent C JIT
+     feature is now differentially testable, not just demonstrable. (The IR-level
+     `jit_cap::threaded_compile_agrees_across_backends` + `…_loop_stress_agrees` remain the race/stress pin.)
 
 **Recommendation:** #1 (compaction) and #2 (threaded **install** + threaded **compile**) are both
 landed end-to-end — install with full platform parity, compile via the per-domain serialized thunk
@@ -348,3 +353,10 @@ shape) for `install` is less manual; today the demo hand-rolls it.
 - Module ids (interp): module 0 = the guest program; module `k` = `units[k-1]`. `install` pushes a
   unit as a new module and points a `TableSlot` at it. The JIT has no "module" concept (native
   pointers); only the **slot index** must agree across backends.
+- **Testing a *concurrent* C guest differentially:** `c_frontend::run_c_full` is now concurrency-aware
+  — a module that `uses_concurrency()` drives the JIT side through `cap_thunk_locked` over a
+  `Mutex<Host>` (so worker `cap.call`s, incl. threaded `Jit.compile`, don't race), while a
+  single-threaded guest keeps the unlocked raw-`*mut Host` fast path. So a threaded C demo can go
+  straight through `run_c_full` for a real interp≡JIT differential; you do **not** need a bespoke
+  harness. A single run is still a weak *race* detector, though — keep the stress/repetition pin at the
+  IR level (`jit_cap::threaded_compile_loop_stress_agrees`).

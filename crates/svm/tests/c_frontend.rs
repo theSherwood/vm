@@ -165,28 +165,69 @@ fn run_c_full(src: &str) -> CRun {
     // The long-lived compile→run split, with the live module registered so the guest-driven
     // `Jit` capability (the `__vm_jit_*` builtins) works under the JIT backend too — for a
     // guest that never uses it, behavior-identical to the one-shot `compile_and_run_with_host`.
-    let mut cm = svm_jit::CompiledModule::compile(
-        &m,
-        0,
-        cap_thunk,
-        &mut hj as *mut Host as *mut c_void,
-        svm_ir::DEFAULT_RESERVED_LOG2,
-        None,
-        None,
-        None,
-        None,
-        svm_jit::Quota::default(),
-        0,
-    )
-    .expect("jit compiles");
-    let cm_ptr: *mut svm_jit::CompiledModule = &mut cm;
-    hj.set_jit_native_ctx(cm_ptr as usize);
-    // SAFETY: the single caller-managed pointer for this run (the thunk's `Jit` handlers
-    // re-enter through the registered copy while the guest is suspended), on this thread.
-    let jit = unsafe { svm_jit::CompiledModule::run_raw(cm_ptr, &slots, None, None, None) }
-        .expect("jit runs")
-        .0;
-    hj.set_jit_native_ctx(0);
+    //
+    // A **concurrent** guest (worker `cap.call`s — incl. threaded `Jit.compile`) takes the serialized
+    // `cap_thunk_locked` over a per-domain `Mutex<Host>` so its workers don't race on the `Host`,
+    // mirroring `run_powerbox` / `jit_cap::diff_run_t`; a single-threaded guest keeps the unlocked
+    // raw-`*mut Host` fast path verbatim. The interp side already serializes `Host` access across its
+    // M:N threads, so this makes the JIT side a sound differential oracle for concurrent guests too.
+    let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
+    let jit = if concurrent {
+        let locked = std::sync::Mutex::new(std::mem::take(&mut hj));
+        let ctx = &locked as *const std::sync::Mutex<Host> as *mut c_void;
+        let mut cm = svm_jit::CompiledModule::compile(
+            &m,
+            0,
+            svm_run::cap_thunk_locked,
+            ctx,
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            None,
+            None, // no D45 fast path: it derefs a raw `*mut Host`, not a `Mutex<Host>`
+            svm_jit::Quota::default(),
+            0,
+        )
+        .expect("jit compiles");
+        locked
+            .lock()
+            .unwrap()
+            .set_jit_native_ctx(&mut cm as *mut svm_jit::CompiledModule as usize);
+        // SAFETY: `cm` is the single caller-managed module for this run (its address registered
+        // above); the guest's worker `cap.call`s serialize through `locked`; `cm` is not moved
+        // during the run (the locked thunk's `Jit` handlers re-derive `&mut *cm` under the lock).
+        let out = unsafe { svm_jit::CompiledModule::run_raw(&mut cm, &slots, None, None, None) }
+            .expect("jit runs")
+            .0;
+        locked.lock().unwrap().set_jit_native_ctx(0);
+        drop(cm); // release the baked `&locked` ctx before reclaiming the host
+        hj = locked.into_inner().unwrap();
+        out
+    } else {
+        let mut cm = svm_jit::CompiledModule::compile(
+            &m,
+            0,
+            cap_thunk,
+            &mut hj as *mut Host as *mut c_void,
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            None,
+            None,
+            svm_jit::Quota::default(),
+            0,
+        )
+        .expect("jit compiles");
+        let cm_ptr: *mut svm_jit::CompiledModule = &mut cm;
+        hj.set_jit_native_ctx(cm_ptr as usize);
+        // SAFETY: the single caller-managed pointer for this run (the thunk's `Jit` handlers
+        // re-enter through the registered copy while the guest is suspended), on this thread.
+        let out = unsafe { svm_jit::CompiledModule::run_raw(cm_ptr, &slots, None, None, None) }
+            .expect("jit runs")
+            .0;
+        hj.set_jit_native_ctx(0);
+        out
+    };
 
     let typed = |s: &[i64]| -> Vec<Value> {
         m.funcs[0]
@@ -2172,6 +2213,25 @@ fn c_guest_jit_demo() {
         ),
         "the guest's interpreter, its invoked JIT code, and its installed call_indirect slot \
          must all agree on both backends:\n{out}"
+    );
+}
+
+/// The **threaded** guest-driven JIT capstone (`demos/jit/jit_threads.c`, JIT.md §6 #2), run as a
+/// full interp≡JIT **differential**: `NWORKERS` guest threads each emit a distinct unit, `Jit.compile`
+/// it **concurrently**, and invoke the native code, checking it against a C reference. Because the
+/// guest `thread.spawn`s, `run_c_full` drives the JIT side through the serialized `cap_thunk_locked`
+/// (a `Mutex<Host>`) — so concurrent `Jit.compile`s don't race — while the interpreter (the M:N
+/// oracle) compiles each unit as a nested eval. The `0` mismatch total is interleaving-invariant, so
+/// both backends must print it; `run_c_full` enforces identical stdout. This is what makes a
+/// genuinely-concurrent C JIT feature differentially testable, not merely demonstrable.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_threads_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_threads.c");
+    let run = run_c_full(src);
+    assert_eq!(
+        run.stdout, b"0\n",
+        "every worker's concurrently-JITed unit must agree with the reference on both backends"
     );
 }
 
