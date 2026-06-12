@@ -137,13 +137,19 @@ block3(v17: i64):
 /// (shared Cranelift). Result after `n` iters = (1+2+3+4)·n = 10n (mod 2^32), identical on
 /// every engine (the harness asserts agreement before timing).
 ///
-/// **Measured (a reference point, not a goal):** under `--from-wasm` — where SVM and Wasmtime
-/// run the *same* transpiled-from-WAT IR — `simd` lands at **~1.1× of Wasmtime**, i.e. SIMD
+/// **Measured (a reference point, not a goal):** `simd` lands at **~1.0× of Wasmtime** — SIMD
 /// *compute parity*, the shared-Cranelift "as fast as wasm" story (§1a/D36) extended to v128.
-/// The default (hand-written-IR) path runs ~3× here: identical lane semantics, but a
-/// block-param loop shape Cranelift schedules less well than the transpiler's CFG — an
-/// IR-authoring artifact, not a SIMD-lowering gap (the `--from-wasm` parity proves the JIT
-/// emits the fast code). Left out of `baseline.txt` so no misleading ratio is regression-tracked.
+///
+/// The loop below is written in the **canonical hot-loop shape**: the header's `br_if` exits on
+/// the *taken* edge and the loop body is the *fall-through* (else) edge, with a backward `br` to
+/// the header. That shape matters more than it looks: an earlier hand-written version inverted it
+/// (loop body on the taken edge) and measured **~3×** on the identical JIT — purely a machine-block
+/// layout effect (two taken branches per iteration vs one), not a SIMD-lowering gap. The wasm→IR
+/// transpiler emits the canonical shape natively (wasm's `br_if $done` ⇒ "exit on true, fall
+/// through to body"), so `--from-wasm` is always ~parity; this kernel mirrors that. The effect is
+/// outsized here only because the body is one `paddd` — when the body does real work (see `alu`)
+/// the per-iteration branch cost is a negligible fraction. Left out of `baseline.txt` (a fixed-
+/// shape micro-loop the harness doesn't need to regression-track).
 const SIMD: Kernel = Kernel {
     name: "simd",
     ir: "\
@@ -151,27 +157,28 @@ func (i64) -> (i64) {
 block0(v0: i64):
   v1 = i64.const 0
   v2 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  br block1(v0, v1, v2)
+block1(v0: i64, v1: i64, v2: v128):
+  v3 = i64.ge_s v1 v0
+  br_if v3 block2(v0, v1, v2) block3(v0, v1, v2)
+block2(v0: i64, v1: i64, v2: v128):
+  v3 = i32x4.extract_lane 0 v2
+  v4 = i32x4.extract_lane 1 v2
+  v5 = i32.add v3 v4
+  v6 = i32x4.extract_lane 2 v2
+  v7 = i32x4.extract_lane 3 v2
+  v8 = i32.add v6 v7
+  v9 = i32.add v5 v8
+  v10 = i64.extend_i32_u v9
+  return v10
+block3(v0: i64, v1: i64, v2: v128):
   v3 = v128.const 1 0 0 0 2 0 0 0 3 0 0 0 4 0 0 0
-  br block1(v0, v1, v2, v3)
-block1(v4: i64, v5: i64, v6: v128, v7: v128):
-  v8 = i64.lt_s v5 v4
-  br_if v8 block2(v4, v5, v6, v7) block3(v6)
-block2(v9: i64, v10: i64, v11: v128, v12: v128):
-  v13 = i32x4.add v11 v12
-  v14 = i64.const 1
-  v15 = i64.add v10 v14
-  br block1(v9, v15, v13, v12)
-block3(v16: v128):
-  v17 = i32x4.extract_lane 0 v16
-  v18 = i32x4.extract_lane 1 v16
-  v19 = i32x4.extract_lane 2 v16
-  v20 = i32x4.extract_lane 3 v16
-  v21 = i32.add v17 v18
-  v22 = i32.add v19 v20
-  v23 = i32.add v21 v22
-  v24 = i64.extend_i32_u v23
-  return v24
+  v4 = i32x4.add v2 v3
+  v5 = i64.const 1
+  v6 = i64.add v1 v5
+  br block1(v0, v6, v4)
 }
+
 ",
     wat32: r#"
 (module
