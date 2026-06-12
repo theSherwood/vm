@@ -137,11 +137,14 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 #define EXIT_SLOT 8
 #define MEMORY_SLOT 12
 #define ADDRSPACE_SLOT 16
-// §9/§12 async I/O ring: the IoRing + Blocking handles — part of the fixed 7-handle powerbox every
+// §9/§12 async I/O ring: the IoRing + Blocking handles — part of the fixed 8-handle powerbox every
 // entry imports (see `emit_start`).
 #define IORING_SLOT 20
 #define BLOCKING_SLOT 24
-// The reserved region's size: 7 handle slots (0..28), 16-aligned. Globals start here so no data
+// The guest-driven `Jit` capability (iface 11, JIT.md Model A): submit serialized IR at runtime,
+// invoke the compiled unit over this same window (the `__vm_jit_*` builtins).
+#define JIT_SLOT 28
+// The reserved region's size: 8 handle slots (0..32), 16-aligned. Globals start here so no data
 // segment ever overlaps a stashed handle (a collision corrupts a global, e.g. a pthread mutex).
 #define RESERVED_BYTES 32
 
@@ -864,6 +867,53 @@ static int gen_builtin_blocking_handle(Node *node) {
   return load_handle(BLOCKING_SLOT);
 }
 
+// Guest-driven JIT builtins (iface 11, JIT.md Model A) on the stashed Jit handle:
+//
+//   long __vm_jit_compile(void *blob, long len);          // submit serialized IR -> code | -errno
+//   long __vm_jit_invoke2(long code, long a, long b);     // call a compiled (i64,i64)->(i64) unit
+//   long __vm_jit_release(long code);                     // revoke the code handle -> 0 | -errno
+//
+// `compile` validates the blob (decode + verify + the memory-match precondition) and compiles it
+// into THIS domain — same window, same powerbox; a trap in invoked code is terminal (§5).
+// `invoke2` is the fixed-arity MVP shape: the unit's entry must be exactly `(i64, i64) -> (i64)`
+// (the strict-arity check rejects anything else as a CapFault).
+static int gen_builtin_jit_compile(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_jit_compile(blob, len) expects 2 arguments");
+  int blob = widen_i64(gen_expr(a), a->ty);
+  int len = widen_i64(gen_expr(a->next), a->next->ty);
+  int h = load_handle(JIT_SLOT);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 11 0 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, blob, len);
+  return r;
+}
+
+static int gen_builtin_jit_invoke2(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || a->next->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_jit_invoke2(code, a, b) expects 3 arguments");
+  int code = widen_i64(gen_expr(a), a->ty);
+  int x = widen_i64(gen_expr(a->next), a->next->ty);
+  int y = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int h = load_handle(JIT_SLOT);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 11 1 (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r, h, code,
+          x, y);
+  return r;
+}
+
+static int gen_builtin_jit_release(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_jit_release(code) expects 1 argument");
+  int code = widen_i64(gen_expr(a), a->ty);
+  int h = load_handle(JIT_SLOT);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 11 2 (i64) -> (i64) v%d (v%d)\n", r, h, code);
+  return r;
+}
+
 // §13/§14 SharedRegion builtins — guest-minted shareable memory + multi-offset window
 // aliasing (the magic ring buffer), over the granted AddressSpace/region capabilities:
 //
@@ -1284,6 +1334,12 @@ static int gen_expr(Node *node) {
           return gen_builtin_io_reap(node);
         if (!strcmp(fname, "__vm_blocking_handle"))
           return gen_builtin_blocking_handle(node);
+        if (!strcmp(fname, "__vm_jit_compile"))
+          return gen_builtin_jit_compile(node);
+        if (!strcmp(fname, "__vm_jit_invoke2"))
+          return gen_builtin_jit_invoke2(node);
+        if (!strcmp(fname, "__vm_jit_release"))
+          return gen_builtin_jit_release(node);
       }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the
@@ -2125,18 +2181,18 @@ static void emit_start(Obj *main_fn) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
   bool is_void = mret->kind == TY_VOID;
-  // A single **fixed** powerbox: every entry imports the same 7 handles regardless of which it uses
+  // A single **fixed** powerbox: every entry imports the same 8 handles regardless of which it uses
   // (mirroring how the frontend already always imports Memory/AddressSpace). A guest that never
-  // touches the ring just leaves those two handles stashed and unused — one `_start` shape, so every
-  // runner/harness grants the same set.
-#define NHANDLES 7
-  int slots[NHANDLES] = {STDOUT_SLOT,    STDIN_SLOT,  EXIT_SLOT,    MEMORY_SLOT,
-                         ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT};
+  // touches the ring or the JIT just leaves those handles stashed and unused — one `_start` shape,
+  // so every runner/harness grants the same set.
+#define NHANDLES 8
+  int slots[NHANDLES] = {STDOUT_SLOT,    STDIN_SLOT,  EXIT_SLOT,     MEMORY_SLOT,
+                         ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT, JIT_SLOT};
   fprintf(o, "func (");
   for (int i = 0; i < NHANDLES; i++)
     fprintf(o, "%si32", i ? ", " : "");
   fprintf(o, ") -> (%s) {\n", is_void ? "" : irty(mret));
-  // stdout, stdin, exit, memory, addrspace (§14), ioring, blocking (§9/§12)
+  // stdout, stdin, exit, memory, addrspace (§14), ioring, blocking (§9/§12), jit (JIT.md)
   fprintf(o, "block0(");
   for (int i = 0; i < NHANDLES; i++)
     fprintf(o, "%sv%d: i32", i ? ", " : "", i);

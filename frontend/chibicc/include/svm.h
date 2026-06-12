@@ -34,4 +34,22 @@ long __vm_region_unmap(int region, long win_off, long len);
 // allocation granularity: 4 KiB or 16 KiB on unix, 64 KiB on Windows). Query it; never assume.
 long __vm_region_page_size(int region);
 
+// --- Guest-driven JIT (iface 11, JIT.md Model A) --------------------------------------------
+//
+// Submit serialized SVM IR (the binary `svm-encode` format) built at runtime in this window;
+// the host validates it (decode + verify + the memory-match precondition: the blob must declare
+// the same `memory` as this module, no data segments, no fibers/threads) and compiles it into
+// THIS domain — same window, same powerbox. Returns a code handle (> 0) or a negative errno
+// (-22 invalid, -12 compile quota exhausted). Fail-closed: on any error nothing is installed.
+long __vm_jit_compile(void *blob, long len);
+
+// Call a compiled unit's entry, which must be exactly `(i64, i64) -> (i64)` (the strict-arity
+// MVP shape; anything else faults). The unit reads/writes this window directly (zero copy). A
+// trap inside the unit is terminal for the whole domain (§5 detect-and-kill).
+long __vm_jit_invoke2(long code, long a, long b);
+
+// Revoke a code handle (the code itself is not reclaimed yet). Returns 0, or -22 if the handle
+// is forged/already released (non-fatal).
+long __vm_jit_release(long code);
+
 #endif // __SVM_H

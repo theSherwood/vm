@@ -39,14 +39,16 @@ fn to_slot(v: Value) -> i64 {
     }
 }
 
-/// The fixed **7-handle powerbox** a chibicc `_start` imports — stdout, stdin, exit, memory,
-/// addrspace (§14), ioring + blocking (§9/§12) — granted in that order so the handle values are
-/// deterministic (and identical across two hosts). Every entry imports the same set (one `_start`
-/// shape); a guest that never touches the ring just leaves those two handles stashed and unused.
-/// `block_for` is the mock Blocking op's duration — `ZERO` for ordinary programs, non-zero for an
-/// async demo that wants its I/O to actually block on the pool.
-fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 7] {
+/// The fixed **8-handle powerbox** a chibicc `_start` imports — stdout, stdin, exit, memory,
+/// addrspace (§14), ioring + blocking (§9/§12), jit (JIT.md) — granted in that order so the
+/// handle values are deterministic (and identical across two hosts). Every entry imports the
+/// same set (one `_start` shape); a guest that never touches the ring or the JIT just leaves
+/// those handles stashed and unused. `block_for` is the mock Blocking op's duration — `ZERO`
+/// for ordinary programs, non-zero for an async demo that wants its I/O to actually block.
+fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 8] {
     h.set_region_factory(svm_run::new_shared_region);
+    h.set_jit_validator(svm_run::jit_blob_validator);
+    let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
     [
         Value::I32(h.grant_stream(StreamRole::Out)),
         Value::I32(h.grant_stream(StreamRole::In)),
@@ -55,6 +57,7 @@ fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 7
         Value::I32(h.grant_address_space(0, win)),
         Value::I32(h.grant_io_ring()),
         Value::I32(h.grant_blocking(block_for, None)),
+        Value::I32(h.grant_jit(mem_log2)),
     ]
 }
 
@@ -159,14 +162,30 @@ fn run_c_full(src: &str) -> CRun {
     let mut fuel = 50_000_000u64;
     let interp = run_with_host(&m, 0, &args, &mut fuel, &mut hi);
     let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let jit = compile_and_run_with_host(
+    // The long-lived compile→run split, with the live module registered so the guest-driven
+    // `Jit` capability (the `__vm_jit_*` builtins) works under the JIT backend too — for a
+    // guest that never uses it, behavior-identical to the one-shot `compile_and_run_with_host`.
+    let mut cm = svm_jit::CompiledModule::compile(
         &m,
         0,
-        &slots,
         cap_thunk,
         &mut hj as *mut Host as *mut c_void,
+        svm_ir::DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        svm_jit::Quota::default(),
     )
     .expect("jit compiles");
+    let cm_ptr: *mut svm_jit::CompiledModule = &mut cm;
+    hj.set_jit_native_ctx(cm_ptr as usize);
+    // SAFETY: the single caller-managed pointer for this run (the thunk's `Jit` handlers
+    // re-enter through the registered copy while the guest is suspended), on this thread.
+    let jit = unsafe { svm_jit::CompiledModule::run_raw(cm_ptr, &slots, None, None, None) }
+        .expect("jit runs")
+        .0;
+    hj.set_jit_native_ctx(0);
 
     let typed = |s: &[i64]| -> Vec<Value> {
         m.funcs[0]
@@ -1932,7 +1951,7 @@ fn c_threads_deterministic_sweep() {
     let ir = c_to_ir(C_ATOMIC_COUNTER);
     let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse: {e:?}\n{ir}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{ir}"));
-    let args = [Value::I32(0); 7]; // 7 dummy powerbox handles (the program makes no cap.calls)
+    let args = [Value::I32(0); 8]; // 8 dummy powerbox handles (the program makes no cap.calls)
     for seed in 0..100u64 {
         let r = run_scheduled(&m, 0, &args, 50_000_000, seed);
         assert_eq!(r, Ok(vec![Value::I32(2000)]), "explorer seed {seed}");
@@ -2133,6 +2152,24 @@ fn c_guest_mn_scheduler_demo() {
 
 /// The §12 work-stealing capstone: a guest-built **work-stealing** M:N scheduler over **stackless**
 /// tasks (`demos/work_stealing`) runs identically on the interpreter (the M:N oracle) and the JIT.
+/// The guest-driven **JIT capstone** (JIT.md Phase 4, `demos/jit`): a C bytecode interpreter
+/// that JITs itself — it emits serialized SVM IR at runtime (the binary `svm-encode` format,
+/// byte-by-byte in guest memory), submits it through the `Jit` capability, and invokes the
+/// compiled unit, checking it against its own interpreter on a 49-input grid. Differential:
+/// under the reference interpreter the `invoke` is a nested eval over the same window; under
+/// the JIT it is native Cranelift code — `run_c_full` enforces identical results and stdout.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_demo.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.ends_with("49 inputs agree: guest-emitted, host-verified, Cranelift-compiled\n"),
+        "the guest's interpreter and its JITed code must agree on both backends:\n{out}"
+    );
+}
+
 /// Tasks are state-machine structs (just data), so an idle worker steals one from a busy sibling /
 /// the global injector and resumes it on its own thread — cross-thread task migration with **no VM
 /// change** (the migratable-fiber primitive, D57, is *not* needed for stackless tasks). The total

@@ -26,10 +26,7 @@ use svm_ir::{Module, ValType};
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
 pub use svm_interp::{Quota, Value};
-use svm_jit::{
-    compile_and_run, compile_and_run_with_host_fast, compile_and_run_with_host_interruptible_fast,
-    CompiledModule, JitOutcome, TrapKind, EXIT_CODE,
-};
+use svm_jit::{compile_and_run, CompiledModule, JitOutcome, TrapKind, EXIT_CODE};
 
 /// The host trampoline bridging the JIT's [`svm_jit::CapThunk`] ABI (§9) to the reference
 /// [`Host`]'s capability dispatch — the host code a real embedder supplies. One shared copy.
@@ -1356,12 +1353,13 @@ pub struct Run {
 /// uses the Memory capability (a guest heap that grows via `map`, §3e/§4). A module whose entry
 /// matches either is a runnable *program*; anything else is a bare kernel (run with [`run_kernel`]).
 pub fn is_powerbox_entry(module: &Module) -> bool {
-    // The powerbox entry imports 3–7 `i32` capability handles (stdout, stdin, exit, [memory],
-    // [addrspace], [ioring], [blocking] — §3e/§9/§12; a chibicc `_start` always imports the full 7).
-    // The runner grants exactly as many as the entry declares (see `run_powerbox_with_deadline`).
+    // The powerbox entry imports 3–8 `i32` capability handles (stdout, stdin, exit, [memory],
+    // [addrspace], [ioring], [blocking], [jit] — §3e/§9/§12/JIT.md; a chibicc `_start` always
+    // imports the full 8). The runner grants exactly as many as the entry declares (see
+    // `run_powerbox_with_deadline`).
     matches!(
         module.funcs.first().map(|f| f.params.as_slice()),
-        Some(p) if (3..=7).contains(&p.len()) && p.iter().all(|t| matches!(t, ValType::I32))
+        Some(p) if (3..=8).contains(&p.len()) && p.iter().all(|t| matches!(t, ValType::I32))
     )
 }
 
@@ -1451,6 +1449,12 @@ pub fn run_powerbox_with_deadline_and_quota(
     if arity >= 7 {
         slots.push(host.grant_blocking(std::time::Duration::ZERO, None) as i64);
     }
+    // The guest-driven `Jit` capability (iface 11, JIT.md) — the 8th of the fixed chibicc
+    // powerbox. The canonical validator is the security hinge; the live `CompiledModule` is
+    // registered below, once it exists.
+    if arity >= 8 {
+        slots.push(grant_jit(&mut host, module) as i64);
+    }
     // §15: the powerbox's spawn quota (default = the anti-bomb ceilings) — the JIT enforces the same
     // fiber/vCPU caps as the interpreter would. (An embedder sets it on the `Host`; a `run_powerbox`
     // quota arg is a follow-up.)
@@ -1460,6 +1464,12 @@ pub fn run_powerbox_with_deadline_and_quota(
         max_vcpus: hq.max_vcpus,
     };
     let ctx = &mut host as *mut Host as *mut c_void;
+    // The long-lived compile→run split (JIT.md Phase 1): compile once, register the live module
+    // for the `Jit` capability's mid-run re-entry (define_extra / invoke_extra from `cap_thunk`),
+    // then run through the same caller-managed pointer (`run_raw`'s provenance contract).
+    // Behavior-identical to the historical one-shot entry points for a guest that never uses the
+    // `Jit` cap — they are thin wrappers over this same machinery.
+    //
     // §5 fuel/epoch kill-path: when a `deadline` is given, arm the JIT's interrupt poll with a
     // watchdog so a runaway guest is stopped after the deadline instead of hanging the process.
     // `None` ⇒ the ordinary unbounded run. The watchdog wakes early when the run finishes, so a
@@ -1476,23 +1486,53 @@ pub fn run_powerbox_with_deadline_and_quota(
         });
         // SAFETY: `interrupt` (an `Arc<AtomicU64>`) outlives the run — it is dropped only after the
         // watchdog is joined below; `cap_thunk`/`ctx`/`fast_cap_resolver` honour their contracts.
-        let r = compile_and_run_with_host_interruptible_fast(
+        let r = CompiledModule::compile(
             module,
             0,
-            &slots,
             cap_thunk,
             ctx,
-            std::sync::Arc::as_ptr(&interrupt),
-            fast_cap_resolver,
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            Some(std::sync::Arc::as_ptr(&interrupt)),
+            Some(fast_cap_resolver),
             quota,
-        );
+        )
+        .and_then(|mut cm| {
+            let cm_ptr: *mut CompiledModule = &mut cm;
+            host.set_jit_native_ctx(cm_ptr as usize);
+            // SAFETY: `cm_ptr` is the single pointer for this run (registered above for the
+            // thunk's `Jit` handlers); the run is on this thread; `init_mem`/snapshot unused.
+            let r = unsafe { CompiledModule::run_raw(cm_ptr, &slots, None, None, None) };
+            host.set_jit_native_ctx(0);
+            r.map(|(out, _)| out)
+        });
         let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
         let _ = watchdog.join();
         r
     } else {
         // The §9/D45 fast path for the hot window-independent ops (Clock/Blocking); everything else
         // falls back to `cap_thunk` inside the resolver, so the run is otherwise identical.
-        compile_and_run_with_host_fast(module, 0, &slots, cap_thunk, ctx, fast_cap_resolver, quota)
+        CompiledModule::compile(
+            module,
+            0,
+            cap_thunk,
+            ctx,
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            None,
+            Some(fast_cap_resolver),
+            quota,
+        )
+        .and_then(|mut cm| {
+            let cm_ptr: *mut CompiledModule = &mut cm;
+            host.set_jit_native_ctx(cm_ptr as usize);
+            // SAFETY: as above — the single caller-managed pointer for this run.
+            let r = unsafe { CompiledModule::run_raw(cm_ptr, &slots, None, None, None) };
+            host.set_jit_native_ctx(0);
+            r.map(|(out, _)| out)
+        })
     }
     .map_err(|e| format!("JIT compile failed: {e:?}"))?;
 
