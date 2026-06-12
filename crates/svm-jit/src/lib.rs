@@ -135,11 +135,16 @@ const SNAP_CAP: usize = 1 << 18; // 256 KiB
 /// The fields are **atomic** so a guest-driven `install`/`uninstall` (a host-side write) is sound
 /// against a *concurrent* `call_indirect` from another thread (JIT.md §6 #2 threaded install). The
 /// `#[repr(C)]` layout (`type_id` @0, `code` @8) is exactly what [`indirect_dispatch`] bakes its
-/// loads against, unchanged. Publication is **release-ordered**: `install` stores `code` first then
-/// `type_id` (the "ready" field), so a reader that observes the unit's `type_id` also observes its
-/// `code` — on x86-64 (TSO) the generated plain loads at @0 then @8 complete the message-passing
-/// pair with no codegen change; a weakly-ordered target (aarch64) additionally needs an
-/// acquire load on the baked `type_id` read (a future codegen change — see JIT.md §6 #2).
+/// loads against, unchanged. Two distinct guarantees, both platform-uniform:
+/// - **Visibility** (a synchronized reader sees a complete install) rides the **guest's own**
+///   acquire/release — the worker only dispatches a slot it learned about through a guest atomic, so
+///   the install's stores are ordered-before the worker's dispatch loads via that synchronization,
+///   on weakly-ordered targets too. The dispatch's own plain loads need no acquire. `publish` still
+///   stores `code` before `type_id` (release-ordered) as belt-and-suspenders for a reader that
+///   happens to synchronize on `type_id` directly.
+/// - **No torn pointer** (a *racy* reader never sees a half-written `code`): each field is a single
+///   atomic word, so a concurrent dispatch reads either the old or the new value — never a wild
+///   pointer. A racy reinstall is the guest's own bug and is contained (trap), never an escape.
 #[repr(C)]
 pub(crate) struct FnEntry {
     type_id: AtomicU32,

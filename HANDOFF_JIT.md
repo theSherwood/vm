@@ -219,18 +219,30 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
    - **End-to-end differential (landed):** `jit_cap::threaded_install_agrees_across_backends` — main
      compiles, spawns a worker, then installs + signals readiness via a guest atomic; the worker
      `call_indirect`s the post-spawn install → both backends return 52 (non-flaky 12/12). Compile (the
-     only `finalize`) is before the spawn, so install is the lone concurrent table op.
-   - **Open (narrowed):** (a) **aarch64** — the generated dispatch relies on x86 TSO for the
-     `type_id`-then-`code` read order; a weakly-ordered target needs an **acquire load on the baked
-     `type_id`** (an escape-TCB codegen change to `indirect_dispatch`). (b) **Threaded *compile*** — a
-     worker calling `Jit.compile` while others run hits `finalize_definitions` under live threads (the
-     W^X spike JIT.md flags); threaded *install* sidesteps it. (c) install-during-own-invocation is
-     covered structurally by the interp's `INVOKE_MODULE` + shared table; a dedicated end-to-end case
-     is still worth adding if a guest needs it.
+     only `finalize`) is before the spawn, so install is the lone concurrent table op. The test runs
+     on **all `fiber_rt` targets** (x86-64 unix, aarch64 unix/macOS, x86-64 Windows) — full platform
+     parity (see below).
+   - **Platform parity (no aarch64 gap).** The install's *visibility* rides the **guest's own**
+     acquire/release on its ready flag (install stores → `ready` store-release → `ready` load-acquire
+     → the worker's dispatch loads), so the worker's `type_id`+`code` loads observe the completed
+     install on a weakly-ordered target too — the dispatch's own load order is irrelevant, so **no
+     acquire-on-`type_id` codegen change is needed**. The atomic `FnEntry` is for a *different*,
+     platform-uniform property: a **racy** guest (a worker dispatching a slot concurrently being
+     reinstalled without synchronizing) still reads a *complete* code pointer (old or new — both
+     valid `AtomicU64` values), never a torn/half-written pointer (no wild jump → no escape); a racy
+     outcome is the guest's own bug and is contained.
+   - **Open (the one remaining item): threaded *compile*.** A worker calling `Jit.compile` while
+     others run hits `finalize_definitions` under live threads — a **correctness/safety** question
+     (does cranelift-jit 0.132's arena finalize ever flip already-finalized, *executing* pages back
+     to writable? a W^X violation on running code), the spike JIT.md flags. Threaded *install*
+     sidesteps it (compile precedes the spawn; install never finalizes). (install-during-own-
+     invocation is covered structurally by the interp's `INVOKE_MODULE` + shared table; a dedicated
+     end-to-end case is worth adding if a guest needs it.)
 
-**Recommendation:** #1 (compaction) is done; #2 threaded **install** is done end-to-end on x86-64.
-The narrowed remainder — aarch64 acquire-load codegen and threaded-*compile* W^X — stays gated; the
-W^X spike especially should not be half-baked.
+**Recommendation:** #1 (compaction) is done; #2 threaded **install** is done end-to-end with full
+platform parity. The one remaining item — threaded-*compile* W^X — is a correctness spike on
+cranelift's finalize-under-threads behavior; gate it on a real threaded-compile workload and don't
+half-bake it.
 
 Also nice-to-have, low priority: a guest convention/helper so emitting C-ABI units (the `sp`-first
 shape) for `install` is less manual; today the demo hand-rolls it.

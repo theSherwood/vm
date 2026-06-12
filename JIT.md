@@ -564,12 +564,15 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
   environment — only the call's own args use the i64-slot ABI. Confirm in Phase 2.
 - **Concurrency.** If the guest uses threads/fibers, compiling mid-run interacts with the
   cooperative scheduler and the W^X question above. **Update (§6 #2):** threaded **install** now
-  works end-to-end on both backends — the interp's shared atomic `DomainTable` and the JIT's atomic
-  `FnEntry` make a post-spawn install visible to a worker (`jit_cap::threaded_install_agrees_*`),
-  with visibility carried by the guest's own ready flag. The remaining single-threaded restriction
-  is **threaded *compile*** (a worker calling `Jit.compile` → `finalize_definitions` under live
-  threads, the W^X spike); threaded install sidesteps it (compile precedes the spawn). aarch64 also
-  needs an acquire load on the baked `type_id` (x86 TSO covers it today).
+  works end-to-end on both backends, with **full platform parity** — the interp's shared atomic
+  `DomainTable` and the JIT's atomic `FnEntry` make a post-spawn install visible to a worker
+  (`jit_cap::threaded_install_agrees_*`, run on every `fiber_rt` target incl. aarch64 macOS). The
+  visibility is carried by the **guest's own** ready-flag acquire/release, so it is correct on
+  weakly-ordered targets without any dispatch-side acquire; the atomic `FnEntry` additionally
+  ensures a racy reader never sees a torn code pointer (uniform safety, no escape). The one
+  remaining single-threaded restriction is **threaded *compile*** (a worker calling `Jit.compile` →
+  `finalize_definitions` under live threads — the W^X correctness spike); threaded install sidesteps
+  it (compile precedes the spawn).
 
 ## Verification approach
 

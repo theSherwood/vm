@@ -519,8 +519,19 @@ fn two_units_interleaved_agree_across_backends() {
 ///
 /// `func 0` = main `(jit) -> i32`; `func 1` = worker `(sp, arg) -> i64` (so two real funcs → install
 /// lands at slot 2 of the reserved table). Window: `[0]` ready flag, `[4]` slot index, `[8]` result.
+///
+/// **Platform parity.** Runs on every target with a JIT thread runtime (`fiber_rt`: x86-64 unix,
+/// aarch64 unix/macOS, x86-64 Windows), like the other JIT thread tests. Correct on weakly-ordered
+/// aarch64 because the install's visibility rides the *guest's own* acquire/release on the ready
+/// flag (install stores → ready store-release → ready load-acquire → the worker's dispatch loads),
+/// not the dispatch's own load order; the atomic `FnEntry` fields additionally guarantee a racy
+/// reader never observes a torn (half-written) code pointer on any platform.
 #[test]
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
 fn threaded_install_agrees_across_backends() {
     let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const 10\n  v4 = i32.add v2 v3\n  return v4\n}\n");
     let guest_src = concat!(
