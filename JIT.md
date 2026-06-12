@@ -23,6 +23,11 @@ one authority-TCB precondition is enforced** (the submitted module's declared me
 equal the parent window — see the Security argument). With that check, the MVP is
 authority-TCB-only.
 
+**Recommended path: Model A (cap.call trampoline) for all workloads, including REPLs** —
+where hot cross-unit calls are absorbed by guest-side IR re-emission rather than a shared
+table. Model B2 (persistent shared function table) is specified below but gated on measured
+evidence; see "Recommendation".
+
 ---
 
 ## Framing correction (important)
@@ -235,36 +240,50 @@ input. This is not a wart — it is exactly the §13 linking direction ("domain-
 assigned at instantiation/link") — but it should be reviewed as a (small) escape-relevant
 change, not waved through as "byte-identical."
 
-### Recommendation — workload-keyed
+### Recommendation — Model A; B2 only on measured evidence
 
-The right model depends on the workload, and the deciding axis is **how often compiled units
-call *each other* in hot paths**, not raw call count:
+**Ship Model A (Phases 1–4) for all workloads, including the REPL. Treat B2 as a contingency
+kept cheap by the shared Phase-1 groundwork, not a committed destination.** Three reasons, in
+descending weight:
 
-- **One-shot "JIT a hot loop" → Model A.** An interpreter compiles a whole hot region and
-  calls it once per outer iteration; the per-call boundary cost amortizes to ~0. Minimal,
-  safest, reuses existing machinery verbatim. This is the MVP path for that use case.
+**1. The risk asymmetry is lopsided.** A's worst case is a *performance* problem (boundary
+cost on cross-unit calls); B2's worst case is a *security* problem (the domain-global
+`type_id` registry is an escape-relevant provenance change, plus a host-writes-into-live-table
+surface, plus compaction touching the module lifecycle). A performance problem announces
+itself in a benchmark; an escape-TCB mistake announces itself in an audit, or worse. For a
+sandbox whose whole pitch is the §2a contract, demand *demonstrated* need before buying B2's
+surface — not a hypothesized workload sketch.
 
-- **REPL / shell → Model B2 (pre-reserved fixed table + global `type_id` registry +
-  code reclaim).** A REPL is **long-lived with accumulating, mutually-referencing
-  definitions** — exactly the shape that breaks both of A's escape hatches:
-  - *A + cap.call per cross-call*: fine for top-level prompts (human cadence), but fatal when
-    a compiled unit calls a previously-defined one **inside a loop** — every iteration eats a
-    boundary crossing, and REPLs do this constantly (define helpers early, loop over them
-    later).
-  - *A + recompile-the-world each entry* (so cross-calls become native *direct* calls): great
-    cross-call speed, but recompile latency grows **O(total accumulated program) per entry**
-    and re-emits everything every time → the 256 MiB code arena blows out fast in a long
-    session.
+**2. The measured numbers narrow the gap from both ends.** The cap.call correction (≈0.67× a
+Wasmtime import, not the pre-optimization 1.24×) shrinks A's penalty — a cross-unit call
+through the thunk is single-digit nanoseconds, roughly 5–20× a native `call_indirect`, not an
+order-of-magnitude cliff. Meanwhile the reclaim finding (no per-function free → periodic
+whole-module compaction, plan step 6) means B2 does not actually deliver "incremental forever"
+for the REPL — it delivers amortized-periodic recompile. The gap between "A degrades" and "B2
+degrades gracefully" is real but much narrower than naive framing suggests.
 
-  Both A routes degrade as the session grows; **B2 degrades more gracefully** — each entry
-  compiles only its new code, and cross-calls go through the persistent shared table at native
-  `call_indirect` speed. For the REPL shape, incremental-compile + a persistent call table
-  *is* the natural data model. **Caveat:** "gracefully" is qualified by reclaim — see below;
-  with cranelift-jit's lack of per-function free, the realistic REPL profile is B2 **plus
-  periodic whole-module compaction**, i.e. amortized-periodic recompile rather than flat.
+**3. A has a guest-side escape hatch for the REPL's hot cross-calls: re-emission.** The
+classic objection to A for a REPL — *define helpers early, loop over them later, and every
+iteration eats a boundary crossing* — assumes cross-unit calls must cross the boundary. They
+don't: the guest *owns the IR* for everything it has compiled. When a new unit hot-calls an
+earlier helper, the guest re-emits that helper's IR into the new blob, making the cross-call a
+verified *direct* call — full native speed, zero boundary crossings, zero new host surface.
+This is selective inlining at the guest layer: not recompile-the-world (O(accumulated program)
+per entry), but recompile-the-hot-closure, and the guest — not the host — has the profile
+information to decide when. The cost is some code duplication in the arena; the benefit is
+that the entire escape hatch is guest policy, invisible to the TCB.
+
+**The decision rule for B2 (Phase 5):** instrument the demo REPL under Model A, and start
+Phase 5 only on measured evidence that cross-unit boundary cost dominates *and* guest-side
+re-emission cannot absorb it. The genuine residual case is **megamorphic / late-bound call
+sites** — where the callee is not known when the calling unit is compiled, so re-emission has
+nothing to inline and every dispatch must either cross the boundary or go through a shared
+table. If profiling shows that shape dominating a real workload, B2 (pre-reserved fixed table
++ global `type_id` registry + compaction-based reclaim) is the right tool, and the analysis
+below stands. Until then, its escape-relevant surface stays off the books.
 
 Both models share the long-lived-`JITModule` prerequisite, so building A first is never
-throwaway work toward B2. For a REPL specifically, **code reclaim is the load-bearing
+throwaway work toward B2. If B2 is ever built, **code reclaim is its load-bearing
 constraint** — more so than dispatch speed — and it is entangled with the module lifecycle,
 not an orthogonal allocator feature; see Open questions.
 
@@ -304,7 +323,9 @@ Phased; each phase is independently testable and keeps the escape-TCB crates unt
    SVM IR for a hot loop, `compile`s it, and `invoke`s it — the end-to-end proof, checked
    against a pure-interpreter run of the same program.
 
-5. **Model B2 for the REPL/shell path** (the recommended target for that workload):
+5. **Model B2 — contingent, gated on Phase-4 profiling** (see the decision rule in the
+   Recommendation: built only if measured cross-unit boundary cost dominates a real workload
+   and guest-side re-emission cannot absorb it, e.g. megamorphic call sites):
    - a **pre-reserved fixed-size power-of-two function table** populated dynamically (empty
      slots stay `PADDING_TYPE_ID`); the indirect-call lowering and its mask `iconst` are left
      byte-identical;
@@ -317,7 +338,9 @@ Phased; each phase is independently testable and keeps the escape-TCB crates unt
    Avoid the B1 growable-table variant (moving base + dynamic mask) — it edits the
    Spectre-safe dispatch for no benefit B2 lacks.
 
-6. **Code reclaim** (load-bearing for REPL/shell, optional for one-shot). Because
+6. **Code reclaim** (load-bearing if B2 is built; for Model A — including the A-with-re-emission
+   REPL path, whose duplication makes arena pressure *more* likely — the MVP cap below
+   suffices until profiling says otherwise). Because
    `cranelift-jit`'s `JITModule` has **no per-function free**, `release` cannot be a drop-in
    allocator swap. The realistic strategy is **periodic whole-module compaction**: track the
    live definition set, and when the arena passes a watermark, recompile the live set into a
@@ -359,11 +382,14 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
 
 ## Open questions / risks
 
-- **Code reclaim ⇄ module lifecycle (the load-bearing REPL constraint).** Repeated `compile`s
-  consume the 256 MiB code arena (`:955`) with no per-function reclaim in `cranelift-jit`. This
-  is *not* an orthogonal allocator feature: with no per-function free, reclaim means periodic
-  whole-module compaction (recompile live set → swap), reintroducing amortized-periodic
-  recompile cost (plan step 6). MVP for one-shot: cap total compiled bytes / `-ENOMEM`.
+- **Code reclaim ⇄ module lifecycle (the load-bearing constraint for any long session).**
+  Repeated `compile`s consume the 256 MiB code arena (`:955`) with no per-function reclaim in
+  `cranelift-jit`. This is *not* an orthogonal allocator feature: with no per-function free,
+  reclaim means periodic whole-module compaction (recompile live set → swap), reintroducing
+  amortized-periodic recompile cost (plan step 6). Note the recommended A-with-re-emission
+  REPL path *increases* arena pressure (duplicated helper bodies), so the MVP byte-cap /
+  `-ENOMEM` backstop is what gets profiled first; compaction is the upgrade if real sessions
+  hit the cap.
 - **W^X integrity of incremental `finalize_definitions` (escape-relevant, not just
   functional).** Today `finalize_definitions()` is called exactly once (`:1134`), so the
   multi-finalize path is unexercised. The real question is not re-entrancy correctness but
