@@ -202,12 +202,19 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
      guest that `cap.call`-compiles/invokes/releases a fresh unit each prompt (real `cap.call`s
      end-to-end): identical results+window with auto-compaction off vs on, occupancy bounded at the
      watermark.
-   - **Open (polish only):** a *byte-accurate* watermark (the proxy today is `extra_fn_count`, not
-     arena bytes), and a C-level guest REPL demo under `demos/` (the IR-level guest test covers the
-     mechanism). The `-ENOMEM` byte-cap backstop bounds the arena regardless.
+   - **Byte-accurate watermark — done.** `CompiledModule::extra_byte_count()` sums the actual
+     machine-code bytes of every `define_extra`'d function + trampoline (read from
+     `ctx.compiled_code().code_buffer().len()` at finalize, before `clear_context`; the dominant term
+     in arena consumption, alignment/rodata excluded so it slightly under-counts). `JitSession`'s
+     watermark and `occupancy()` are now in **code bytes** (the count-based `extra_fn_count()` stays
+     for callers who want it); the `jit_compaction` session tests derive the watermark from a
+     one-prompt byte probe so they're robust to per-platform code sizes.
+   - **Open (polish only):** a C-level guest REPL demo under `demos/` (the IR-level guest test covers
+     the mechanism). The `-ENOMEM` byte-cap backstop bounds the arena regardless.
 
-2. **Threaded install** + **install-during-own-invocation** — **done on x86-64; only aarch64 codegen
-   + threaded-*compile* remain.** The root cause was a *structural mismatch*: the interp modeled the
+2. **Threaded install + install-during-own-invocation + threaded compile** — **all landed, full
+   platform parity** (x86-64 Linux/Windows, aarch64 macOS); only a throughput optimization and a C
+   demo remain (see the end of this item). The root cause was a *structural mismatch*: the interp modeled the
    dispatch table as per-`VCpu` owned state (a `Vec` rebuilt at `thread.spawn`, snapshotted at
    `Jit.invoke`), while the JIT has one `fn_table` shared by every thread — so a post-spawn (or
    during-own-invocation) install was visible to the JIT but not the interp.

@@ -1022,6 +1022,12 @@ pub struct CompiledModule {
     fn_table_mask: u64,
     /// Monotonic counter for unique `declare_function` symbol names across `define_extra` calls.
     next_extra: usize,
+    /// Cumulative machine-code bytes of every `define_extra`'d function + trampoline lowered over
+    /// this module's life — a **byte-accurate** code-arena occupancy measure (the actual emitted
+    /// code size, summed at finalize; the dominant term in arena consumption). Like `next_extra` it
+    /// only grows, and restarts near zero in a freshly-compacted module. An embedder watermarks on
+    /// [`Self::extra_byte_count`] to auto-compact (JIT.md §6).
+    extra_bytes: usize,
     /// The in-flight run's window fault range, published by `run_code_raw` for the duration of
     /// the guarded call so a mid-run [`Self::invoke_extra`] can arm its nested recovery.
     /// `None` ⇒ no run in flight (invoke is rejected).
@@ -1429,6 +1435,7 @@ impl CompiledModule {
             epoch_addr,
             fn_table_mask: (table_len as u64) - 1,
             next_extra: 0,
+            extra_bytes: 0,
             live_fault_range: None,
             win_mapped,
             win_reserved,
@@ -1875,6 +1882,8 @@ impl CompiledModule {
             self.module
                 .define_function(*id, &mut ctx)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
+            // Byte-accurate occupancy: the just-emitted code size, read before `clear_context`.
+            self.extra_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
             self.module.clear_context(&mut ctx);
         }
         // One buffer-ABI trampoline per function, so the host can invoke any of them (any arity).
@@ -1892,6 +1901,7 @@ impl CompiledModule {
                 self.module
                     .define_function(t, &mut ctx)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
+                self.extra_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
                 self.module.clear_context(&mut ctx);
                 Ok(t)
             })
@@ -2004,6 +2014,17 @@ impl CompiledModule {
     /// near zero — and drop this one, reclaiming the arena. See `tests/jit_compaction.rs`.
     pub fn extra_fn_count(&self) -> usize {
         self.next_extra
+    }
+
+    /// **Byte-accurate** code-arena occupancy: the cumulative machine-code bytes of every
+    /// `define_extra`'d function + trampoline this module has lowered (the actual emitted size,
+    /// summed at finalize — the dominant term in arena consumption; alignment/rodata padding is
+    /// excluded, so this slightly *under*counts the true arena bytes). Monotonic; restarts near zero
+    /// in a freshly-compacted module. Prefer this over [`Self::extra_fn_count`] for a watermark when
+    /// units vary widely in size (a few large functions vs many tiny ones). See
+    /// [`crate::CompiledModule`] / `tests/jit_compaction.rs`.
+    pub fn extra_byte_count(&self) -> usize {
+        self.extra_bytes
     }
 
     /// Whether a run is in flight on this module (a guarded call published its window fault range).

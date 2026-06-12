@@ -12,8 +12,10 @@
 //! primitives `CompiledModule` provides:
 //! - [`CompiledModule::install_at`] — reinstall a unit at its *exact* old slot, so a funcref a guest
 //!   already holds keeps resolving to the same unit across the swap;
-//! - [`CompiledModule::extra_fn_count`] — the occupancy proxy an embedder watches to trigger
-//!   compaction, and which restarts near zero in the fresh module (the visible reclaim).
+//! - [`CompiledModule::extra_fn_count`] / [`CompiledModule::extra_byte_count`] — code-arena
+//!   occupancy measures (function count, and the **byte-accurate** sum of emitted code) an embedder
+//!   watches to trigger compaction; both restart near zero in the fresh module (the visible
+//!   reclaim). `JitSession`'s auto-compaction watermarks on the byte count.
 //!
 //! What is pinned: recompaction is **behaviorally transparent** (every live slot dispatches
 //! identically before and after), **reproduces exact slot indices** (including around `uninstall`
@@ -514,16 +516,26 @@ fn run_session(watermark: usize, n: usize) -> (Vec<i64>, Vec<u8>, usize, usize) 
     )
 }
 
-/// **Auto-compaction keeps a long REPL's arena bounded, transparently.** A 30-prompt session that
-/// JITs + invokes + releases a fresh unit every prompt produces identical per-prompt results and
-/// window state whether auto-compaction is off (`watermark = 0`) or on (`watermark = 8`); with it
-/// on, the session actually compacts and its final occupancy is bounded, while off it grows with
-/// every prompt.
+/// **Auto-compaction keeps a long REPL's arena bounded, transparently — on a byte-accurate
+/// watermark.** A 30-prompt session that JITs + invokes + releases a fresh unit every prompt
+/// produces identical per-prompt results and window state whether auto-compaction is off
+/// (`watermark = 0`) or on (a byte watermark of ~4 units), and with it on the session compacts and
+/// keeps its **byte** occupancy near the watermark while off it grows with every prompt. The
+/// watermark is derived from a one-prompt probe so the test is robust to per-platform code sizes.
 #[test]
 fn jit_session_auto_compacts_transparently() {
     let n = 30;
+    // Probe: one prompt's code-byte cost (a fresh unit + trampoline), to set a watermark that
+    // triggers roughly every ~4 prompts regardless of the target's instruction encoding.
+    let (_, _, unit_bytes, _) = run_session(0, 1);
+    assert!(
+        unit_bytes > 0,
+        "a compiled unit must report nonzero code bytes"
+    );
+    let watermark = unit_bytes * 4;
+
     let (r_off, w_off, occ_off, c_off) = run_session(0, n);
-    let (r_on, w_on, occ_on, c_on) = run_session(8, n);
+    let (r_on, w_on, occ_on, c_on) = run_session(watermark, n);
 
     assert_eq!(r_off, r_on, "per-prompt results must be identical");
     assert_eq!(w_off, w_on, "persistent window must be identical");
@@ -532,14 +544,17 @@ fn jit_session_auto_compacts_transparently() {
     assert_eq!(*r_on.last().unwrap(), expected);
 
     assert_eq!(c_off, 0, "watermark 0 disables auto-compaction");
-    assert!(c_on > 0, "watermark 8 must trip auto-compaction");
+    assert!(c_on > 0, "the byte watermark must trip auto-compaction");
     assert!(
-        occ_off >= 50,
-        "without compaction the arena grows with every prompt, got {occ_off}"
+        occ_off > watermark,
+        "without compaction the byte occupancy grows past the watermark: {occ_off}"
     );
+    // After each prompt the session compacts once occupancy reaches the watermark; since every unit
+    // is released, a compaction drops occupancy to ~0, so the final occupancy is bounded by the
+    // watermark plus at most one prompt's worth.
     assert!(
-        occ_on <= 8 && occ_on < occ_off,
-        "auto-compaction must bound occupancy at the watermark: {occ_on} (off {occ_off})"
+        occ_on <= watermark + unit_bytes && occ_on < occ_off,
+        "auto-compaction must bound byte occupancy near the watermark: {occ_on} (off {occ_off}, wm {watermark})"
     );
 }
 
@@ -589,12 +604,12 @@ fn run_threaded_session(watermark: usize, n: usize) -> (Vec<i64>, Vec<u8>, usize
     )
 }
 
-/// **Compaction works for a multi-threaded guest.** A 12-prompt session whose every prompt spawns a
-/// worker that concurrently `Jit.compile`s produces identical per-prompt results and window state
-/// whether auto-compaction is off (`watermark=0`) or on (`watermark=8`) — and with it on the session
-/// actually compacts and bounds its occupancy, while off it grows with every prompt. This pins both
-/// the threaded-compile serialization through `JitSession`'s `Mutex<Host>` and that compaction (a
-/// quiescent, between-prompts rebuild that re-bakes the locked thunk) is transparent across it.
+/// **Compaction works for a multi-threaded guest — byte-accurate watermark.** A 12-prompt session
+/// whose every prompt spawns a worker that concurrently `Jit.compile`s produces identical per-prompt
+/// results and window state whether auto-compaction is off (`watermark=0`) or on (a byte watermark
+/// of ~2 prompts), and with it on the session compacts and bounds its **byte** occupancy. This pins
+/// both the threaded-compile serialization through `JitSession`'s `Mutex<Host>` and that compaction
+/// (a quiescent, between-prompts rebuild re-baking the locked thunk) is transparent across it.
 #[test]
 #[cfg(any(
     all(unix, target_arch = "x86_64"),
@@ -603,8 +618,17 @@ fn run_threaded_session(watermark: usize, n: usize) -> (Vec<i64>, Vec<u8>, usize
 ))]
 fn threaded_session_compacts_transparently() {
     let n = 12;
+    // Probe one prompt's code-byte cost (main + worker each compile a unit), so the watermark is
+    // robust to per-platform code sizes.
+    let (_, _, prompt_bytes, _) = run_threaded_session(0, 1);
+    assert!(
+        prompt_bytes > 0,
+        "a prompt's compiled units must report nonzero code bytes"
+    );
+    let watermark = prompt_bytes * 2;
+
     let (r_off, w_off, occ_off, c_off) = run_threaded_session(0, n);
-    let (r_on, w_on, occ_on, c_on) = run_threaded_session(8, n);
+    let (r_on, w_on, occ_on, c_on) = run_threaded_session(watermark, n);
 
     assert_eq!(
         r_off, r_on,
@@ -618,14 +642,14 @@ fn threaded_session_compacts_transparently() {
     assert_eq!(c_off, 0, "watermark 0 disables auto-compaction");
     assert!(
         c_on > 0,
-        "watermark 8 must trip auto-compaction in the threaded session"
+        "the byte watermark must trip auto-compaction in the threaded session"
     );
     assert!(
-        occ_off >= 24,
-        "no-compaction occupancy grows (2 units/prompt), got {occ_off}"
+        occ_off > watermark,
+        "no-compaction byte occupancy grows past the watermark, got {occ_off}"
     );
     assert!(
-        occ_on <= 8 && occ_on < occ_off,
-        "auto-compaction bounds the threaded session's occupancy: {occ_on} (off {occ_off})"
+        occ_on <= watermark + prompt_bytes && occ_on < occ_off,
+        "auto-compaction bounds the threaded session's byte occupancy: {occ_on} (off {occ_off}, wm {watermark})"
     );
 }

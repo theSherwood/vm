@@ -695,7 +695,7 @@ pub fn recompact_into(
 /// final low bytes seed the next, so guest heap/global state persists across prompts) with the
 /// module registered for the `Jit` capability's mid-run re-entry (`compile`/`invoke`/`install`,
 /// exactly as [`jit_cap_run`]). After the prompt returns — a **quiescent** point, the guest no
-/// longer suspended — if [`CompiledModule::extra_fn_count`] has reached `watermark`, the session
+/// longer suspended — if [`CompiledModule::extra_byte_count`] has reached `watermark` code bytes, the session
 /// rebuilds the domain's live code into a fresh module ([`recompact_jit`]) and drops the old one,
 /// reclaiming its arena. Because compaction is transparent (live slots + handles are preserved,
 /// see `recompact_jit`), the guest never observes it.
@@ -717,8 +717,9 @@ pub struct JitSession {
     reserved_log2: u8,
     table_reserve_log2: u8,
     domain: u32,
-    /// Auto-compact once `cm.extra_fn_count() >= watermark` (checked after each prompt, at the
-    /// quiescent point). `0` disables auto-compaction (the embedder may still call
+    /// Auto-compact once `cm.extra_byte_count() >= watermark` **code bytes** (checked after each
+    /// prompt, at the quiescent point) — a byte-accurate trigger, so a few large units fire it the
+    /// same as many tiny ones. `0` disables auto-compaction (the embedder may still call
     /// [`Self::compact`] by hand).
     watermark: usize,
     cm: CompiledModule,
@@ -738,8 +739,9 @@ const SESSION_SNAP: usize = 1 << 18;
 impl JitSession {
     /// Build a session that **takes ownership** of `host`: compile `base` (entry `func`) long-lived
     /// with the `Jit` ctx baked to the session's boxed `Mutex<Host>`, ready to run prompts on
-    /// `domain` (the [`grant_jit`]-returned domain). `watermark` is the auto-compaction occupancy
-    /// threshold (`0` = manual only). Pass the **same** `reserved_log2`/`table_reserve_log2` you
+    /// `domain` (the [`grant_jit`]-returned domain). `watermark` is the auto-compaction threshold in
+    /// **code bytes** ([`CompiledModule::extra_byte_count`]; `0` = manual only). Pass the **same**
+    /// `reserved_log2`/`table_reserve_log2` you
     /// grant the cap with. Recover the host via [`Self::into_host`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -804,7 +806,7 @@ impl JitSession {
             .set_jit_native_ctx(0);
         let (out, mem) = r?;
         self.window = mem;
-        if self.watermark != 0 && self.cm.extra_fn_count() >= self.watermark {
+        if self.watermark != 0 && self.cm.extra_byte_count() >= self.watermark {
             self.compact()?;
         }
         Ok(out)
@@ -863,9 +865,10 @@ impl JitSession {
         &self.window
     }
 
-    /// Current code-arena occupancy proxy ([`CompiledModule::extra_fn_count`]).
+    /// Current code-arena occupancy in **code bytes** ([`CompiledModule::extra_byte_count`]) — the
+    /// quantity the `watermark` is compared against.
     pub fn occupancy(&self) -> usize {
-        self.cm.extra_fn_count()
+        self.cm.extra_byte_count()
     }
 
     /// How many auto/manual compactions have run over this session's life.
