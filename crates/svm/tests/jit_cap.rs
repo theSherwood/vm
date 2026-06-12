@@ -30,8 +30,19 @@ fn blob(src: &str) -> Vec<u8> {
 
 /// Run `guest_src`'s func 0 on both backends with the `Jit` cap granted (handle = arg 0) and
 /// `blob_bytes` seeded at [`BLOB_OFF`]; assert the outcomes agree and return the JIT's view
-/// `(outcome, final_mem)` for the caller's expectations.
+/// `(outcome, final_mem)` for the caller's expectations. Natural table (no `install` room).
 fn diff_run(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (JitOutcome, Vec<u8>) {
+    diff_run_t(guest_src, blob_bytes, user_args, 0)
+}
+
+/// Like [`diff_run`], but reserve a `2^table_log2`-slot `call_indirect` table on **both**
+/// backends (identically) so the guest can `install` units — Model B2 old→new.
+fn diff_run_t(
+    guest_src: &str,
+    blob_bytes: &[u8],
+    user_args: &[i64],
+    table_log2: u8,
+) -> (JitOutcome, Vec<u8>) {
     let m = parse_module(guest_src).expect("parse guest");
     verify_module(&m).expect("verify guest");
     let mut init = vec![0u8; BLOB_OFF + blob_bytes.len()];
@@ -39,7 +50,7 @@ fn diff_run(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (JitOutcom
 
     // Interpreter run.
     let mut host_i = Host::new();
-    let h_i = grant_jit(&mut host_i, &m);
+    let h_i = grant_jit(&mut host_i, &m, table_log2);
     let mut iargs = vec![Value::I32(h_i)];
     iargs.extend(user_args.iter().map(|&a| Value::I32(a as i32)));
     let mut fuel = 50_000_000u64;
@@ -56,15 +67,23 @@ fn diff_run(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (JitOutcom
     // JIT run — a fresh Host configured identically (the grant is deterministic, so the
     // handle value the guest receives is identical too).
     let mut host_j = Host::new();
-    let h_j = grant_jit(&mut host_j, &m);
+    let h_j = grant_jit(&mut host_j, &m, table_log2);
     assert_eq!(
         h_i, h_j,
         "identical powerbox setup must mint identical handles"
     );
     let mut jargs = vec![h_j as i64];
     jargs.extend_from_slice(user_args);
-    let (jout, jmem) =
-        jit_cap_run(&m, 0, &jargs, &init, DEFAULT_RESERVED_LOG2, 0, &mut host_j).expect("jit run");
+    let (jout, jmem) = jit_cap_run(
+        &m,
+        0,
+        &jargs,
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        table_log2,
+        &mut host_j,
+    )
+    .expect("jit run");
 
     // Differential: result/trap equivalence…
     match (&ires, &jout) {
@@ -312,7 +331,7 @@ fn compile_quota_enforced_identically() {
     init[BLOB_OFF..].copy_from_slice(&b);
 
     let mut host_i = Host::new();
-    let h = grant_jit(&mut host_i, &m);
+    let h = grant_jit(&mut host_i, &m, 0);
     host_i.set_jit_quota(2, 1 << 20);
     let mut fuel = 50_000_000u64;
     let (ires, _) = run_capture_reserved_with_host(
@@ -331,7 +350,7 @@ fn compile_quota_enforced_identically() {
     );
 
     let mut host_j = Host::new();
-    let h = grant_jit(&mut host_j, &m);
+    let h = grant_jit(&mut host_j, &m, 0);
     host_j.set_jit_quota(2, 1 << 20);
     let (jout, _) = jit_cap_run(
         &m,
@@ -346,6 +365,40 @@ fn compile_quota_enforced_identically() {
     assert!(
         matches!(jout, JitOutcome::Returned(ref s) if s == &[-12]),
         "jit: third compile is -ENOMEM, got {jout:?}"
+    );
+}
+
+/// **old→new via `install`** (JIT.md Model B2): the guest compiles a unit, installs it into the
+/// reserved `call_indirect` table (getting a slot index), then **old code** `call_indirect`s
+/// that slot to reach the new code. Differentially: the JIT writes the unit's native entry into
+/// the fn_table padding; the interpreter registers the unit as a module + fills the same table
+/// slot. Both must return the same slot index and the same call result.
+#[test]
+fn install_then_old_calls_new_agrees() {
+    // (jit, a, b) -> slot = install(compile(blob)); call_indirect[slot](a, b).
+    let guest_src = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32, v2: i32):\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = cap.call 11 3 (i64) -> (i64) v0 (v5)\n  v7 = i32.wrap_i64 v6\n  v8 = call_indirect (i32, i32) -> (i32) v7 (v1, v2)\n  return v8\n}\n";
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const 100\n  v4 = i32.add v2 v3\n  return v4\n}\n");
+    let guest = with_len(guest_src, b.len());
+    // Reserve a 16-slot table on both backends; the parent has 1 func, so install lands at slot 1.
+    let (out, _) = diff_run_t(&guest, &b, &[6, 7], 4);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[142]), // 6 * 7 + 100
+        "{out:?}"
+    );
+}
+
+/// `install` fail-closed: with **no** table reservation there is no padding slot, so `install`
+/// returns `-ENOSPC` identically on both backends (and nothing is installed).
+#[test]
+fn install_full_table_enospc_identically() {
+    // (jit) -> install(compile(blob)); return the raw result. Natural table (reserve 0) → full.
+    let guest_src = "memory 16\nfunc (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n}\n";
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  return v2\n}\n");
+    let guest = with_len(guest_src, b.len());
+    let (out, _) = diff_run_t(&guest, &b, &[], 0);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[-28]),
+        "{out:?}"
     );
 }
 

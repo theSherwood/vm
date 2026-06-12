@@ -28,6 +28,11 @@ use svm_ir::{Module, ValType};
 pub use svm_interp::{Quota, Value};
 use svm_jit::{compile_and_run, CompiledModule, JitOutcome, TrapKind, EXIT_CODE};
 
+/// Default `call_indirect` table reservation for the CLI powerbox (`2^10` = 1024 slots) so a
+/// guest using the `Jit` capability can `install` units (JIT.md Model B2). Embedders pick their
+/// own via [`grant_jit`] + the compile `table_reserve_log2`.
+const CLI_JIT_TABLE_LOG2: u8 = 10;
+
 /// The host trampoline bridging the JIT's [`svm_jit::CapThunk`] ABI (§9) to the reference
 /// [`Host`]'s capability dispatch — the host code a real embedder supplies. One shared copy.
 ///
@@ -260,6 +265,37 @@ unsafe fn jit_native_op(
             };
             put(results, n_results, v, trap_out);
         }
+        3 => {
+            // install(code_handle) -> slot_index | -errno (JIT.md Model B2): write the unit's
+            // natural entry + interned type_id into the live fn_table's next padding slot. The
+            // slot index agrees with the interpreter's (both fill from the parent's funcs count).
+            const ENOSPC: i64 = -28;
+            let Ok(domain) = host.resolve_jit_domain(handle) else {
+                return cap_fault(trap_out);
+            };
+            let Some(&ch) = args.first() else {
+                return cap_fault(trap_out);
+            };
+            let Ok((cd, cu)) = host.resolve_jit_code(ch as i32) else {
+                return cap_fault(trap_out);
+            };
+            if cd != domain {
+                return cap_fault(trap_out);
+            }
+            let cm = host.jit_native_ctx(cd) as *mut CompiledModule;
+            let (code, type_id) = host.jit_unit_install(cd, cu);
+            if cm.is_null() || code == 0 {
+                return cap_fault(trap_out);
+            }
+            // SAFETY: `cm` is the in-flight run's CompiledModule (guest suspended in this
+            // synchronous cap.call); `code` is a natural-ABI entry the JIT registered for this
+            // unit. The slot write does not move the table base (pre-reserved at compile).
+            let v = match (*cm).install(code as *const u8, type_id) {
+                Some(slot) => slot as i64,
+                None => ENOSPC,
+            };
+            put(results, n_results, v, trap_out);
+        }
         _ => put(results, n_results, EINVAL, trap_out),
     }
 }
@@ -302,9 +338,11 @@ pub fn jit_blob_validator(bytes: &[u8], mem_log2: Option<u8>) -> Result<Arc<[svm
 /// [`jit_blob_validator`] and mint the domain handle bound to `m`'s declared memory (the
 /// memory-match precondition). Works for both backends — the interpreter services the iface
 /// in its eval loop/dispatch; the JIT needs the module registered too (see [`jit_cap_run`]).
-pub fn grant_jit(host: &mut Host, m: &Module) -> i32 {
+/// `table_log2` reserves the `call_indirect` table for B2 `install` (pass the **same** value as
+/// the JIT compile's `table_reserve_log2`); `0` ⇒ no install room.
+pub fn grant_jit(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.set_jit_validator(jit_blob_validator);
-    host.grant_jit(m.memory.map(|mc| mc.size_log2))
+    host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
 }
 
 /// Run `m` on the **JIT** with the `Jit` capability live: the long-lived compile→run split
@@ -1470,7 +1508,7 @@ pub fn run_powerbox_with_deadline_and_quota(
     // powerbox. The canonical validator is the security hinge; the live `CompiledModule` is
     // registered below, once it exists.
     if arity >= 8 {
-        slots.push(grant_jit(&mut host, module) as i64);
+        slots.push(grant_jit(&mut host, module, CLI_JIT_TABLE_LOG2) as i64);
     }
     // §15: the powerbox's spawn quota (default = the anti-bomb ceilings) — the JIT enforces the same
     // fiber/vCPU caps as the interpreter would. (An embedder sets it on the `Host`; a `run_powerbox`
@@ -1514,7 +1552,7 @@ pub fn run_powerbox_with_deadline_and_quota(
             Some(std::sync::Arc::as_ptr(&interrupt)),
             Some(fast_cap_resolver),
             quota,
-            0, // CLI powerbox: natural table size (B2 install reservation is an embedder opt-in)
+            CLI_JIT_TABLE_LOG2, // reserve install room (JIT.md Model B2)
         )
         .and_then(|mut cm| {
             let cm_ptr: *mut CompiledModule = &mut cm;
@@ -1542,7 +1580,7 @@ pub fn run_powerbox_with_deadline_and_quota(
             None,
             Some(fast_cap_resolver),
             quota,
-            0, // CLI powerbox: natural table size
+            CLI_JIT_TABLE_LOG2,
         )
         .and_then(|mut cm| {
             let cm_ptr: *mut CompiledModule = &mut cm;

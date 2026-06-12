@@ -142,6 +142,9 @@ fn drive(
     // §15: the domain's spawn quota (already clamped to the hard ceilings by `set_quota`) sizes the
     // executor's live-vCPU cap and each vCPU's fiber cap. Default = the ceilings (unchanged behavior).
     let quota = host.quota();
+    // B2 `install`: the table reservation the root vCPU builds its dispatch table with (must
+    // equal the JIT's `table_reserve_log2`). Read before the host is moved into the Arc below.
+    let jit_table_log2 = host.jit_table_log2();
     let sched = Arc::new(Scheduler::new(quota.max_vcpus, workers));
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
@@ -165,8 +168,8 @@ fn drive(
         s.next_task += 1;
         s.live += 1;
         s.workers = 1; // the calling thread acts as worker 0
-        let root = Box::new(VCpu::new(
-            funcs,
+        let mut root = Box::new(VCpu::new(
+            Arc::clone(&funcs),
             entry,
             args,
             mem.take(),
@@ -177,6 +180,11 @@ fn drive(
             SchedRef::Real(Arc::clone(&sched)),
             quota,
         ));
+        // B2 `install` reserves a larger dispatch table on the domain's root vCPU (no effect when
+        // `jit_table_log2 == 0` — the natural table already covers the module).
+        if jit_table_log2 != 0 {
+            root.table = build_table(&funcs, jit_table_log2);
+        }
         s.runnable.push_back(root);
         id
     };
@@ -924,11 +932,16 @@ struct TableSlot {
 const TABLE_EMPTY: u32 = u32::MAX;
 
 /// Build a vCPU's dispatch table from its module-0 functions: slot `i` holds `(module 0, i)` for
-/// each function, padded to the next power of two with empty (trapping) slots — the reference
-/// mirror of the JIT's power-of-two `fn_table` over the parent module. `install` (Model B2) will
-/// later append unit entries into the padding.
-fn build_table(funcs: &[Func]) -> Arc<[TableSlot]> {
-    let len = funcs.len().next_power_of_two().max(1);
+/// each function, then empty (trapping) padding up to a power-of-two length — the reference
+/// mirror of the JIT's `fn_table`. `table_reserve_log2` reserves a *larger* table than the
+/// module needs (matching the JIT's `table_reserve_log2`) so `install` (Model B2) fills the
+/// padding slots; `0` ⇒ the natural `next_pow2(funcs.len())`. Real functions stay in `[0,
+/// funcs.len())` and padding starts at `funcs.len()` on **both** backends, so the slot index
+/// `install` returns agrees.
+fn build_table(funcs: &[Func], table_reserve_log2: u8) -> Vec<TableSlot> {
+    let len = (1usize << table_reserve_log2)
+        .max(funcs.len().next_power_of_two())
+        .max(1);
     (0..len)
         .map(|i| {
             if i < funcs.len() {
@@ -1844,8 +1857,9 @@ struct VCpu {
     /// parent table), so new code reaches old code (new→old) through the shared table.
     units: Vec<Arc<[Func]>>,
     /// This vCPU's `call_indirect` dispatch table (see [`TableSlot`]) — built from module 0 at
-    /// construction, the reference mirror of the JIT's power-of-two `fn_table`.
-    table: Arc<[TableSlot]>,
+    /// construction (reserved larger for B2 `install`), the reference mirror of the JIT's
+    /// power-of-two `fn_table`. `install` fills a padding slot in place.
+    table: Vec<TableSlot>,
 }
 
 impl VCpu {
@@ -1864,7 +1878,7 @@ impl VCpu {
         sched: SchedRef,
         quota: Quota,
     ) -> VCpu {
-        let table = build_table(&funcs);
+        let table = build_table(&funcs, 0);
         VCpu {
             funcs,
             fibers: vec![Fiber::Running],
@@ -1911,7 +1925,7 @@ impl VCpu {
         sched: SchedRef,
         quota: Quota,
     ) -> VCpu {
-        let table = build_table(&parent); // the parent module's table (new→old target)
+        let table = build_table(&parent, 0); // the parent module's table (new→old target)
         VCpu {
             funcs: parent,
             fibers: vec![Fiber::Running],
@@ -2067,10 +2081,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         None => {}
     }
 
-    let funcs = Arc::clone(&v.funcs); // module 0 (this vCPU's primary program)
-    let units = v.units.clone(); // modules ≥ 1: guest-compiled Jit units (JIT.md Model A)
-    let table = Arc::clone(&v.table); // the call_indirect dispatch table (built from module 0)
+    let funcs = Arc::clone(&v.funcs); // module 0 (this vCPU's primary program), immutable for the run
     let spawn_quota = v.quota; // §15 fiber/vCPU ceilings (distinct from the Instantiator's i64 fuel quota)
+                               // `units` and `table` are bound **mutably** (not cloned) so the `Jit.install` arm can grow
+                               // them mid-run. The borrow tangle (a running unit frame would otherwise hold `units`
+                               // borrowed across the instruction loop) is avoided by cloning the current frame's module
+                               // `Arc` into a local (`cur` below) — so neither `units` nor `table` is borrowed across the
+                               // loop and `install` is free to mutate them.
     let VCpu {
         fibers,
         chain,
@@ -2090,8 +2107,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         memop,
         acc,
         quota: _,
-        units: _,
-        table: _,
+        units,
+        table,
     } = v;
     let depth = *depth;
     let memop = *memop;
@@ -2104,9 +2121,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     'frames: loop {
         let top = frames.len() - 1;
         // Resolve the running frame against *its* module (module 0 = this vCPU's program; ≥ 1 = a
-        // Jit unit). `block` borrows `fs` (the owned function table), *not* `frames`, so the loop
-        // body is free to push/pop/mutate `frames` (and move it on a fiber switch) while holding it.
-        let fs: &[Func] = mod_funcs(&funcs, &units, frames[top].module);
+        // Jit unit). Clone the module's `Arc` into a local so neither `units` nor `table` is
+        // borrowed across the loop body — leaving the `Jit.install` arm free to mutate them.
+        // `block` borrows `cur` (the owned local), *not* `frames`, so the loop body is free to
+        // push/pop/mutate `frames` (and move it on a fiber switch) while holding it.
+        let cur_funcs: Arc<[Func]> = {
+            let m = frames[top].module;
+            if m == 0 {
+                Arc::clone(&funcs)
+            } else {
+                Arc::clone(&units[(m - 1) as usize])
+            }
+        };
+        let fs: &[Func] = &cur_funcs;
         let block = fs
             .get(frames[top].func as usize)
             .ok_or(Trap::Malformed)?
@@ -2171,9 +2198,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Dispatch through the module-0 table (new→old; matches the JIT, where every
                     // function — parent or unit — is lowered against the parent `fn_table`).
                     let (cmod, cfunc) = dispatch_indirect(
-                        &table,
+                        &table[..],
                         &funcs,
-                        &units,
+                        &units[..],
                         as_i32(get(&frames[top].vals, *idx)?)?,
                         ty,
                     )?;
@@ -2605,6 +2632,51 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // unit's native trampoline over the live window (`invoke_extra`), so the two
                 // backends stay in differential lockstep. compile/release (ops 0/2) take the
                 // generic dispatch below like any host-state op.
+                // Guest-driven `Jit.install` (iface 11 op 3, JIT.md Model B2): install a compiled
+                // unit into the `call_indirect` dispatch table, returning its slot index — a
+                // funcref old code can `call_indirect` (old→new). Serviced here (it mutates this
+                // vCPU's `units`/`table`, which the generic host dispatch can't reach). The JIT
+                // mirrors it by writing the unit's natural entry + `type_id` into the same padding
+                // slot (`CompiledModule::install`), so the returned index agrees.
+                Inst::CapCall {
+                    type_id: iface::JIT,
+                    op: 3,
+                    handle,
+                    args,
+                    ..
+                } => {
+                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let ch = val_to_slot(get(
+                        &frames[top].vals,
+                        *args.first().ok_or(Trap::Malformed)?,
+                    )?) as i32;
+                    let unit_funcs = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let domain = hg.resolve_jit_domain(h)?;
+                        let (cd, cu) = hg.resolve_jit_code(ch)?;
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
+                    };
+                    // Register the unit as a module of this vCPU (module id = `units.len()`
+                    // after the push, since module `k` ≡ `units[k-1]`), then fill the next empty
+                    // table slot. The padding starts at `funcs.len()` on both backends, so the
+                    // first install lands at the same index the JIT's `install` returns.
+                    units.push(unit_funcs);
+                    let module = units.len() as u32;
+                    let res = match table.iter().position(|s| s.module == TABLE_EMPTY) {
+                        Some(slot) => {
+                            table[slot] = TableSlot { module, func: 0 };
+                            slot as i64
+                        }
+                        None => {
+                            units.pop(); // nothing installed — keep `units`/`table` consistent
+                            ENOSPC
+                        }
+                    };
+                    frames[top].vals.push(Value::I64(res));
+                }
                 Inst::CapCall {
                     type_id: iface::JIT,
                     op: 1,
@@ -2966,9 +3038,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
             Terminator::ReturnCallIndirect { ty, idx, args } => {
                 let (cmod, cfunc) = dispatch_indirect(
-                    &table,
+                    &table[..],
                     &funcs,
-                    &units,
+                    &units[..],
                     as_i32(get(&frames[top].vals, *idx)?)?,
                     ty,
                 )?;
@@ -3760,6 +3832,7 @@ const ENOMEM: i64 = -12; // resource quota exhausted (e.g. the Jit compile budge
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
+const ENOSPC: i64 = -28; // no free table slot — the Jit install table is full
 
 /// A `Trap` → small status code for an `IoRing` CQE, numbered to match the JIT's `TrapKind` codes
 /// (so the whole system speaks one trap-code vocabulary). `0` is reserved for success in the CQE.
@@ -4329,6 +4402,11 @@ pub struct Host {
     /// its tiny dependency set *and* both backends run the **identical** decode+verify gate.
     /// `None` (the default) fail-closes every `compile` (`-EINVAL`).
     jit_validator: Option<JitValidator>,
+    /// The `call_indirect` table reservation (`log2` of the slot count) for B2 `install` — the
+    /// run's root vCPU builds its table this large so installs have padding slots. Must equal the
+    /// JIT's `table_reserve_log2` for the backends to agree on slot indices. `0` ⇒ natural size
+    /// (no install room).
+    jit_table_log2: u8,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (JIT.md "Security
@@ -4421,6 +4499,7 @@ impl Host {
             quota: Quota::default(),
             jit_domains: Vec::new(),
             jit_validator: None,
+            jit_table_log2: 0,
         }
     }
 
@@ -4655,6 +4734,13 @@ impl Host {
     /// parent module's declared memory — the memory-match precondition submitted blobs are
     /// checked against (JIT.md "Security argument").
     pub fn grant_jit(&mut self, mem_log2: Option<u8>) -> i32 {
+        self.grant_jit_with_table(mem_log2, 0)
+    }
+
+    /// Like [`Host::grant_jit`], but also reserve a `call_indirect` table of `2^table_log2`
+    /// slots for B2 `install` (the run's root vCPU honours it; pass the **same** value as the
+    /// JIT's `table_reserve_log2`). `0` ⇒ natural size (no install room).
+    pub fn grant_jit_with_table(&mut self, mem_log2: Option<u8>, table_log2: u8) -> i32 {
         let id = self.jit_domains.len() as u32;
         self.jit_domains.push(JitDomainState {
             mem_log2,
@@ -4663,7 +4749,14 @@ impl Host {
             units_left: JIT_DEFAULT_MAX_UNITS,
             bytes_left: JIT_DEFAULT_MAX_BLOB_BYTES,
         });
+        self.jit_table_log2 = self.jit_table_log2.max(table_log2);
         self.grant(iface::JIT, Binding::JitDomain(id))
+    }
+
+    /// The `call_indirect` table reservation (`log2`) the run's root vCPU should build for B2
+    /// `install`; `0` ⇒ natural size.
+    pub fn jit_table_log2(&self) -> u8 {
+        self.jit_table_log2
     }
 
     /// Tighten (or widen) every granted `Jit` domain's compile quota — the §15-style resource
