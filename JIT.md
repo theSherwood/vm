@@ -25,8 +25,10 @@ authority-TCB-only.
 
 **Recommended path: Model A (cap.call trampoline) for all workloads, including REPLs** —
 where hot cross-unit calls are absorbed by guest-side IR re-emission rather than a shared
-table. Model B2 (persistent shared function table) is specified below but gated on measured
-evidence; see "Recommendation".
+table. Model B2 (persistent shared function table) is specified below and got materially
+cheaper after Phase 1 landed its type-id registry as an append-only intern; it is gated on
+either a measured megamorphic workload or a real interpreter port finding the shim convention
+burdensome — see "Recommendation".
 
 ---
 
@@ -205,6 +207,21 @@ the compiled code.
   handler + interface signature, a host-owned `JITModule`, the memory-match check, nothing
   else. No table growth, no vmctx reshaping, no verifier work.
 
+**The heterogeneity question (and the shim answer).** Under A, JITed code has no table
+index — so a guest-language array mixing old and new procedures cannot be uniform funcrefs,
+which looks like a tag-every-callable tax on every guest interpreter. The tax is real but
+**compressible to one shim function**, because interpreters' function values are already
+polymorphic (Lua: Lua-fn vs C-fn; Python: function/builtin/bound-method) and closure-shaped
+(`{code_idx, env}`): the parent module pre-declares `shim(env) → cap.call invoke(env.handle,
+…)` in its table at t=0, and a JITed function is represented as `{shim_idx, env carrying the
+handle}`. Every call site stays a plain `call_indirect(closure.code_idx, closure.env)` — the
+tag collapses into the code pointer, exactly the tiered-VM trick (the function object's entry
+point *is* the dispatch). No value-representation change, no call-site branches; the residual
+cost is the boundary crossing per call into JITed code (`call_indirect` → shim → `cap.call` →
+trampoline). What the shim can't fix: a guest whose callables are *bare* funcrefs with no env
+slot (no closure representation at all), and the per-call boundary itself — those are what B2
+removes.
+
 ### Model B — invoke via direct `call_indirect` (persistent shared table)
 Install the compiled function as a slot in the function table so the guest `call_indirect`s
 straight into it at near-native speed. Two sub-variants — and the variant choice matters
@@ -232,26 +249,36 @@ table up front (e.g. 2^16 slots ≈ 1 MiB of `FnEntry`). Then:
 Safety / speed / simplicity, for B2:
 - **Safety — moderate, bounded.** No change to the indirect-call lowering's *shape*; the new
   surface is "host writes new `FnEntry` slots into a live table + keeps the `JITModule` alive +
-  the type_id registry below." Reviewable, and far smaller than B1.
+  the (small) interning function below." Reviewable, and far smaller than B1.
 - **Speed — near-native per call.** A masked table load + type check + indirect branch
   (retpoline/eIBRS), identical to any existing `call_indirect`. **No boundary crossing on
   cross-unit calls** — the decisive property for REPL/shell cross-calling.
-- **Simplicity — lower than middle.** Long-lived module (shared with A) **plus** dynamic
-  table population, a fixed-table cap, **and the domain-global `type_id` registry below** — the
-  registry makes B2 effectively "implement the type-identity half of §13 linking," which is
-  more than a fixed-table bolt-on.
+- **Simplicity — middle, and most of it already landed.** Long-lived module (shared with A)
+  **plus** an `install` op filling reserved slots, a fixed-table cap, and the type-id registry —
+  which Phase 1's implementation demystified to an append-only intern (below), already merged.
+- **Guest simplicity — the whole point.** An installed function *is* a funcref: mixed arrays
+  of old and new procedures are uniform, old code calls everything with plain `call_indirect`,
+  and the interpreter tax (even the one-shim version) is zero.
 
-**B's one real new requirement: a domain-global signature→`type_id` registry.** Today
-`type_id`s are computed *per-module* via `distinct_types`, and the indirect-call check loads
-the slot's `type_id` and compares it against `type_id_of(lower.distinct, ty)` (`:2823`/`:2827`).
-For a `call_indirect` in a later unit to type-check against a function compiled in an earlier
-unit, `type_id`s must be assigned from a persistent per-domain registry. Note this is *not*
-a change to the dispatch instruction sequence, but it **does change the provenance of the
-`type_id` immediate** fed into the `icmp` — the constant now comes from a cross-unit registry
-rather than a module-local distinct set. Same instructions, different (and now escape-relevant)
-input. This is not a wart — it is exactly the §13 linking direction ("domain-global indices…
-assigned at instantiation/link") — but it should be reviewed as a (small) escape-relevant
-change, not waved through as "byte-identical."
+**B's type-identity requirement, demystified: an append-only intern, not a linking subsystem.**
+An earlier draft priced this as "the type-identity half of §13 linking" — that framing was
+inherited from the general multi-peer-module problem and is wrong for the shape Phase 1
+actually landed: a *single* `CompiledModule` owns the domain's entire id space (`distinct`),
+ids are baked as immediates at compile time, and the registry is **never read at runtime** —
+it is consulted only inside a synchronous `cap.call` while the guest is suspended, and adds
+zero runtime-readable state. Dispatch soundness reduces to one property: the map
+`FuncType → type_id` is an **injection, stable over time (append-only — an id never remaps),
+and total over participants** (every signature at any call site or table slot is interned
+before code referencing it is lowered). Given that, id-equality coincides *exactly* with the
+interpreter's structural equality — which makes interning **cleaner** than a frozen
+parent-anchored universe, not just more expressive: a frozen universe bakes always-trapping
+`NO_MATCH_TYPE_ID` into any site whose signature arrives in a later unit (a wart the Phase-3
+reference handler would have had to replicate), while interning lets a later install satisfy
+it, matching structural semantics by construction. **This landed in Phase 1** (`intern_type` /
+`intern_unit_sigs` / `CompiledModule::interned_type_id`, behavior-preserving today, pinned by
+`type_ids_are_interned_append_only_across_units`); new signatures — e.g. a guest JIT's arity-
+or type-specialized calling conventions for hot callees — are first-class for table dispatch,
+not just for intra-unit direct calls.
 
 ### Recommendation — Model A; B2 only on measured evidence
 
@@ -259,13 +286,16 @@ change, not waved through as "byte-identical."
 kept cheap by the shared Phase-1 groundwork, not a committed destination.** Three reasons, in
 descending weight:
 
-**1. The risk asymmetry is lopsided.** A's worst case is a *performance* problem (boundary
-cost on cross-unit calls); B2's worst case is a *security* problem (the domain-global
-`type_id` registry is an escape-relevant provenance change, plus a host-writes-into-live-table
-surface, plus compaction touching the module lifecycle). A performance problem announces
-itself in a benchmark; an escape-TCB mistake announces itself in an audit, or worse. For a
-sandbox whose whole pitch is the §2a contract, demand *demonstrated* need before buying B2's
-surface — not a hypothesized workload sketch.
+**1. The risk asymmetry is lopsided — though narrower than first priced.** A's worst case is
+a *performance/ergonomics* problem (boundary cost on cross-unit calls, the one-shim
+convention); B2's worst case is a *security* problem (a host-writes-into-live-table primitive,
+plus compaction touching the module lifecycle). A performance problem announces itself in a
+benchmark; an escape-TCB mistake announces itself in an audit, or worse. The type-id registry
+**no longer counts against B2** — it demystified to an append-only intern with zero
+runtime-readable state and landed in Phase 1 (see "demystified" above) — so B2's residual
+surface is the `install` write itself, which under the single-threaded MVP (synchronous
+`cap.call`, guest suspended, no concurrent reader) has no publication race to reason about.
+Still: demand a *demonstrated* need before buying it.
 
 **2. The measured numbers narrow the gap from both ends.** The cap.call correction (≈0.67× a
 Wasmtime import, not the pre-optimization 1.24×) shrinks A's penalty — a cross-unit call
@@ -286,14 +316,18 @@ per entry), but recompile-the-hot-closure, and the guest — not the host — ha
 information to decide when. The cost is some code duplication in the arena; the benefit is
 that the entire escape hatch is guest policy, invisible to the TCB.
 
-**The decision rule for B2 (Phase 5):** instrument the demo REPL under Model A, and start
-Phase 5 only on measured evidence that cross-unit boundary cost dominates *and* guest-side
-re-emission cannot absorb it. The genuine residual case is **megamorphic / late-bound call
-sites** — where the callee is not known when the calling unit is compiled, so re-emission has
-nothing to inline and every dispatch must either cross the boundary or go through a shared
-table. If profiling shows that shape dominating a real workload, B2 (pre-reserved fixed table
-+ global `type_id` registry + compaction-based reclaim) is the right tool, and the analysis
-below stands. Until then, its escape-relevant surface stays off the books.
+**The decision rule for B2 (Phase 5):** build it when a real guest gives a concrete reason —
+a *lower* bar than the original "profiling must prove boundary cost dominates," for two
+reasons. First, B2 got cheaper: the registry landed in Phase 1 as the append-only intern, so
+the remaining delta is the pre-reserved table size + the `install` op. Second, the case for it
+gained a second independent axis beyond perf: **guest implementation complexity** — under A,
+uniformity costs every interpreter the shim convention (workable, but a porting tax, and
+unavailable to bare-funcref guests); under B2 it costs nothing, because installed functions
+are real funcrefs. The perf trigger remains **megamorphic / late-bound call sites** — where
+the callee is unknown when the calling unit is compiled, so re-emission has nothing to inline
+and every dispatch must cross the boundary or go through a shared table. Either trigger — a
+measured megamorphic workload, or a real interpreter port finding the shim burdensome — is
+sufficient. Until one fires, B2's `install` surface stays off the books.
 
 Both models share the long-lived-`JITModule` prerequisite, so building A first is never
 throwaway work toward B2. If B2 is ever built, **code reclaim is its load-bearing
@@ -336,17 +370,21 @@ Phased; each phase is independently testable and keeps the escape-TCB crates unt
    SVM IR for a hot loop, `compile`s it, and `invoke`s it — the end-to-end proof, checked
    against a pure-interpreter run of the same program.
 
-5. **Model B2 — contingent, gated on Phase-4 profiling** (see the decision rule in the
-   Recommendation: built only if measured cross-unit boundary cost dominates a real workload
-   and guest-side re-emission cannot absorb it, e.g. megamorphic call sites):
-   - a **pre-reserved fixed-size power-of-two function table** populated dynamically (empty
-     slots stay `PADDING_TYPE_ID`); the indirect-call lowering and its mask `iconst` are left
-     byte-identical;
-   - a **domain-global signature→`type_id` registry** so cross-unit `call_indirect` type
-     checks resolve across separately-compiled units (reviewed as the small escape-relevant
-     provenance change it is);
-   - the `compile` op returns a **funcref slot index** (not a cap handle), which the guest
-     `call_indirect`s directly at native speed;
+5. **Model B2 — contingent** (see the decision rule in the Recommendation: a measured
+   megamorphic workload, *or* a real interpreter port finding the shim convention burdensome —
+   either trigger suffices). The remaining delta, the registry having already landed in
+   Phase 1 (`intern_type` / `interned_type_id`):
+   - a **pre-reserved fixed-size power-of-two function table**: pad the parent's table to a
+     host-chosen reserved length at compile (empty slots stay `PADDING_TYPE_ID`); the
+     indirect-call lowering and its mask `iconst` are byte-identical from `t=0` — and
+     `define_extra` already takes the parent's mask as an explicit parameter, so extra units
+     inherit it unchanged;
+   - an **`install(handle) → slot_index`** op: look the function's signature up in the
+     interned registry, write `(type_id, verified code ptr)` into the next `PADDING_TYPE_ID`
+     slot, return the index — a funcref the guest `call_indirect`s directly at native speed.
+     Under the single-threaded MVP the write is race-free by construction (synchronous
+     `cap.call`, guest suspended); a multi-threaded future needs release-ordered publication
+     (code pointer first, `type_id` last — a padding slot traps until the id lands);
    - the fiber/thread runtimes use the reserved table length (`:997`).
    Avoid the B1 growable-table variant (moving base + dynamic mask) — it edits the
    Spectre-safe dispatch for no benefit B2 lacks.
@@ -388,9 +426,11 @@ interp↔JIT differential (Phase 3).
 
 Beyond that: Model A adds **no** escape-TCB surface (authority-TCB only); Model B2 leaves the
 Spectre-safe indirect-call lowering *structurally* byte-identical and only adds dynamic table
-*population* + a per-domain `type_id` registry — a bounded, reviewable surface, with the
-understanding that the registry changes the *provenance* of the `type_id` immediate fed into
-the dispatch check (B1's growable table, which we reject, would have edited the dispatch
+*population* on top of the already-landed type-id intern. The intern's soundness obligation is
+the registry invariant (injective, append-only-stable, total over participants — then
+id-equality ≡ structural equality; see the "demystified" note), discharged by a ~10-line
+auditable function that is never read at runtime; the `install` write is the one remaining
+reviewable surface (B1's growable table, which we reject, would have edited the dispatch
 itself). The capability is opt-in and attenuable like every other powerbox grant.
 
 ## Open questions / risks
