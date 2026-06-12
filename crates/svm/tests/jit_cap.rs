@@ -507,3 +507,71 @@ fn two_units_interleaved_agree_across_backends() {
         "{out:?}"
     );
 }
+
+/// **Threaded install** (JIT.md §6 #2): the main thread compiles a unit, **spawns a worker
+/// thread**, then `install`s the unit and signals readiness through a guest atomic; the worker —
+/// already running — `call_indirect`s the **post-spawn-installed** slot. This is the divergence #2
+/// named: a per-vCPU/snapshotted table would hide the install from the worker. With the interp's
+/// shared atomic `DomainTable` and the JIT's atomic `FnEntry` (release-ordered publication, the
+/// visibility carried by the guest's own ready flag), both backends now agree: the worker reaches
+/// the installed unit and returns `6 * 7 + 10 = 52`. Compile (the only `finalize`) happens *before*
+/// the spawn, so install is the lone concurrent table op — no threaded-`compile` W^X concern.
+///
+/// `func 0` = main `(jit) -> i32`; `func 1` = worker `(sp, arg) -> i64` (so two real funcs → install
+/// lands at slot 2 of the reserved table). Window: `[0]` ready flag, `[4]` slot index, `[8]` result.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn threaded_install_agrees_across_backends() {
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const 10\n  v4 = i32.add v2 v3\n  return v4\n}\n");
+    let guest_src = concat!(
+        // func 0 — main(jit): compile, spawn worker, install, publish slot + ready, join.
+        "memory 16\n",
+        "func (i32) -> (i32) {\n",
+        "block0(v0: i32):\n",
+        "  v1 = i64.const 4096\n",
+        "  v2 = i64.const BLOBLEN\n",
+        "  v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n", // code handle
+        "  v4 = i64.const 2048\n",                                // worker data-stack base (unused)
+        "  v5 = i64.const 0\n",
+        "  v6 = thread.spawn 1 v4 v5\n", // spawn worker BEFORE install
+        "  v7 = cap.call 11 3 (i64) -> (i64) v0 (v3)\n", // install -> slot (i64)
+        "  v8 = i32.wrap_i64 v7\n",
+        "  v9 = i64.const 4\n",
+        "  i32.store v9 v8\n", // window[4] = slot
+        "  v10 = i64.const 0\n",
+        "  v11 = i32.const 1\n",
+        "  i32.atomic.store v10 v11\n", // window[0] = ready (release)
+        "  v12 = thread.join v6\n",     // worker result (i64)
+        "  v13 = i32.wrap_i64 v12\n",
+        "  return v13\n",
+        "}\n",
+        // func 1 — worker(sp, arg): spin on ready, then call_indirect[slot](6, 7).
+        "func (i64, i64) -> (i64) {\n",
+        "block0(v0: i64, v1: i64):\n",
+        "  br block1()\n",
+        "block1():\n",
+        "  v2 = i64.const 0\n",
+        "  v3 = i32.atomic.load v2\n", // ready? (acquire)
+        "  v4 = i32.const 0\n",
+        "  v5 = i32.ne v3 v4\n",
+        "  br_if v5 block2() block1()\n", // spin until ready
+        "block2():\n",
+        "  v6 = i64.const 4\n",
+        "  v7 = i32.load v6\n", // slot (visible via the acquire)
+        "  v8 = i32.const 6\n",
+        "  v9 = i32.const 7\n",
+        "  v10 = call_indirect (i32, i32) -> (i32) v7 (v8, v9)\n", // the post-spawn-installed unit
+        "  v11 = i64.const 8\n",
+        "  i32.store v11 v10\n",
+        "  v12 = i64.extend_i32_u v10\n",
+        "  return v12\n",
+        "}\n",
+    );
+    let guest = with_len(guest_src, b.len());
+    // Reserve a 16-slot table; 2 real funcs → install lands at slot 2.
+    let (out, _) = diff_run_t(&guest, &b, &[], 4);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[52]), // 6 * 7 + 10
+        "worker must reach the post-spawn install on both backends: {out:?}"
+    );
+}
