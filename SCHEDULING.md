@@ -109,11 +109,48 @@ it unlocks — **to be earned with verification + review, not assumed.**
 ### Verification story (and its limit)
 
 The ownership protocol is **loom-verifiable** — that is where the dangerous
-invariant lives. The **composition** of (verified protocol) + (real asm switch) +
-(per-thread signal recovery) cannot be exhaustively model-checked (asm + signals are
-outside loom/TSan) — the *same* residual caveat that already applies to today's
-fiber+thread code, exercised harder. Mitigation: heavy stress, the interp↔JIT
-differential oracle, and expert review of that seam.
+invariant lives, and it is done (step 3a). The **composition** of (verified protocol) +
+(real asm switch) + (per-thread signal recovery) cannot be exhaustively model-checked
+(asm + signals are outside loom/TSan) — the *same* residual caveat that already applies
+to today's fiber+thread code, exercised harder.
+
+**No expert review is available for the asm/signal seam** (a stated project constraint),
+so safety for step 3c rests entirely on an **empirical net** designed to make every
+plausible failure mode *loud and detectable* rather than silent corruption. Two facts make
+this a reasonable — not reckless — posture:
+
+- The cross-thread resume introduces **no new assembly**: it calls the *same* `svm-fiber`
+  stack-switch already in production for `thread.spawn`'d vCPUs and per-vCPU fibers (unix
+  has no thread-bound state in the switch; Win64 already swaps the TEB stack fields per
+  switch). The delta is *which thread* calls it; the instruction sequence is unchanged.
+- The project **already** trusts that asm via differential + stress, not TSan (TSan cannot
+  instrument JITted code). So this extends the existing bar; it does not invent a new one.
+
+**The net (each layer turns a class of silent failure into a detected one):**
+
+1. **Differential randomized-schedule fuzzer.** The interpreter is **safe Rust — it cannot
+   corrupt memory** — and is the oracle. A generator emits guest work-stealing-over-fibers
+   schedules with randomized migration decisions; each runs on interp **and** JIT and must
+   agree on the result and never crash. Any JIT-only divergence or fault is an asm-seam bug.
+   Thousands of seeds as a stable CI test + a libFuzzer `diff` target (the §18 methodology
+   the whole JIT already uses).
+2. **Sanitizer job (ASan).** The *runtime glue* around the switch — the shared registry, the
+   `Box<Fiber>` lifetimes, `CURRENT_RT`, the yielders — is **Rust and is ASan-instrumentable**
+   (only the JITted guest body is opaque). A switch that corrupts a stack or frees a live
+   fiber surfaces as an ASan report. Run the stress suite under ASan in a dedicated job.
+3. **Runtime single-owner assertion.** The `Ownership` CAS already guarantees exclusivity;
+   assert it *at the resume seam* so a double-resume **panics loudly** (→ detect-and-kill)
+   instead of running one stack on two threads.
+4. **Guard-page detection.** `svm-fiber` stacks are guard-paged, so a wild/torn switch faults
+   into the §5 handler (a clean kill) rather than scribbling silently.
+5. **Soak.** Many workers × many fibers × many migrations, repeated — CI-bounded, plus a
+   longer nightly run.
+
+**Honest residual:** fuzzing *detects*, it does not *prove*. A sufficiently rare cross-thread
+race could still escape the net. The layers above are chosen so that the *likely* failure modes
+are caught and made non-silent; we accept the residual knowingly, as the price of the
+capability, and gate landing 3c on the net being green and the stress genuinely exercising
+migration (asserted, not assumed — e.g. counting observed cross-thread resumes).
 
 ## Demo roadmap
 
