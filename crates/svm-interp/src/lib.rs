@@ -2444,6 +2444,91 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         _ => return Err(Trap::CapFault),
                     }
                 }
+                // Guest-driven `Jit.invoke` (iface 11 op 1, JIT.md Model A): serviced here, not in
+                // the generic dispatch, because it must **run guest code** — a nested evaluation of
+                // the compiled unit's entry over THIS vCPU's window, fuel, and powerbox. That is
+                // exactly the same-domain/same-window semantics the JIT backend gets by calling the
+                // unit's native trampoline over the live window (`invoke_extra`), so the two
+                // backends stay in differential lockstep. compile/release (ops 0/2) take the
+                // generic dispatch below like any host-state op.
+                Inst::CapCall {
+                    type_id: iface::JIT,
+                    op: 1,
+                    handle,
+                    args,
+                    sig,
+                } => {
+                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    // arg0 = the CompiledCode handle; the rest are the invoke args. Args cross in
+                    // the i64-slot ABI (the handle rides the low 32 bits of its slot, like every
+                    // handle-as-arg — e.g. the Instantiator's module ops), so read it as a slot.
+                    let ch = val_to_slot(get(
+                        &frames[top].vals,
+                        *args.first().ok_or(Trap::Malformed)?,
+                    )?) as i32;
+                    let unit_funcs = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        let domain = hg.resolve_jit_domain(h)?;
+                        let (cd, cu) = hg.resolve_jit_code(ch)?;
+                        // A code handle is only valid on the domain that compiled it.
+                        if cd != domain {
+                            return Err(Trap::CapFault);
+                        }
+                        hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
+                    };
+                    let entry = unit_funcs.first().ok_or(Trap::CapFault)?;
+                    // Strict arity: the cap.call's declared signature must match the unit entry's
+                    // (minus the code-handle arg) — fail-closed, identically on the JIT path.
+                    if sig.params.len() != entry.params.len() + 1
+                        || sig.results.len() != entry.results.len()
+                    {
+                        return Err(Trap::CapFault);
+                    }
+                    // Marshal the invoke args through the i64-slot ABI (value → slot → entry-typed),
+                    // exactly the JIT trampoline's decode.
+                    let mut child_args = Vec::with_capacity(entry.params.len());
+                    for (a, ty) in args[1..].iter().zip(entry.params.clone()) {
+                        let slot = val_to_slot(get(&frames[top].vals, *a)?);
+                        child_args.push(slot_to_val(ty, slot));
+                    }
+                    // Nested run over the SAME window/fuel/powerbox: move them into an
+                    // inline-driven child vCPU (like a §14 coroutine, but sharing the window) and
+                    // move them back whatever the outcome — the parent's snapshot/teardown still
+                    // needs them after a trap.
+                    let child_mem = mem.take();
+                    let mut child = VCpu::new(
+                        unit_funcs,
+                        0, // the unit's entry is funcs[0]
+                        &child_args,
+                        child_mem,
+                        Arc::clone(host),
+                        *fuel,
+                        // A nested invoke costs call depth like a call, so invoke recursion is
+                        // bounded by the same stack-overflow bound as ordinary recursion.
+                        depth + frames.len() as u32 + 1,
+                        0, // unused: driven inline, never via the executor
+                        sched.clone(),
+                        spawn_quota,
+                    );
+                    child.memop = memop;
+                    let out = run_inner(&mut child, u64::MAX);
+                    *mem = child.mem.take();
+                    *fuel = child.fuel;
+                    match out {
+                        Ok(Inner::Done(results)) => {
+                            // Results cross back as slots (arity already checked equal).
+                            for (v, ty) in results.iter().zip(&sig.results) {
+                                frames[top].vals.push(slot_to_val(*ty, val_to_slot(*v)));
+                            }
+                        }
+                        // The unit cannot park/yield (concurrency is rejected at compile);
+                        // defensive fail-closed.
+                        Ok(_) => return Err(Trap::CapFault),
+                        // A trap in invoked code is terminal for the domain (JIT.md Model A),
+                        // matching the JIT's trap-cell propagation.
+                        Err(t) => return Err(t),
+                    }
+                }
                 Inst::CapCall {
                     type_id,
                     op,
@@ -2925,9 +3010,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             let a = as_i64(get(vals, *addr)?)? as u64;
             m.load_v128(a, *offset)?
         }
-        Inst::Splat { shape, a } => {
-            Value::V128(simd_splat(*shape, store_bits(get(vals, *a)?)))
-        }
+        Inst::Splat { shape, a } => Value::V128(simd_splat(*shape, store_bits(get(vals, *a)?))),
         Inst::ExtractLane {
             shape,
             lane,
@@ -2978,9 +3061,10 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_v128(get(vals, *b)?)?,
         )),
-        Inst::Swizzle { a, b } => {
-            Value::V128(simd_swizzle(as_v128(get(vals, *a)?)?, as_v128(get(vals, *b)?)?))
-        }
+        Inst::Swizzle { a, b } => Value::V128(simd_swizzle(
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
         // The §17/D58 feature-detect hook: a deterministic constant in the fixed-128 MVP, so it
         // stays identical across the interp↔JIT oracle.
         Inst::SimdWidthBytes => Value::I32(16),
@@ -3487,6 +3571,22 @@ pub mod iface {
     /// `submit` batch can hand it to the offload pool instead of the guest's vCPU thread. Op 0 is also
     /// a perfectly ordinary synchronous `cap.call` (it then blocks the caller — the degenerate path).
     pub const BLOCKING: u32 = 10;
+    /// `Jit` — the guest-driven JIT capability (JIT.md Model A): submit serialized IR at runtime to
+    /// be validated (decode + verify + the memory-match precondition, via the host-injected
+    /// [`crate::JitValidator`]) and compiled into the **same domain** (same window, same powerbox —
+    /// a module is not an isolation unit, DESIGN §8). op 0 `compile(ptr, len) -> code_handle | -errno`
+    /// (fail-closed: nothing is installed on any validation failure); op 1
+    /// `invoke(code_handle, args…) -> results` runs the compiled unit's entry (`funcs[0]`) over the
+    /// caller's **live window** — serviced by the eval loop on the interpreter (it must run guest
+    /// code, which the generic dispatch can't) and by the embedder's cap thunk on the JIT (it calls
+    /// the unit's native trampoline); traps in invoked code are **terminal for the domain**; op 2
+    /// `release(code_handle) -> 0 | -errno` revokes the handle (no code reclaim yet — JIT.md
+    /// "Code reclaim").
+    pub const JIT: u32 = 11;
+    /// `CompiledCode` — a unit minted by `Jit.compile`. Like `Module`, it has no directly callable
+    /// ops (`cap.call` on it is an inert `CapFault`); it confers only the authority to be named in
+    /// `Jit.invoke`/`release` on the domain handle that compiled it.
+    pub const JIT_CODE: u32 = 12;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -3762,6 +3862,16 @@ enum Binding {
     /// mock synchronous-only/blocking op the offload pool can overlap. Out-of-line (an index, not the
     /// `Arc`) so `Binding` stays `Copy`, like [`Binding::SharedRegion`]/[`Binding::Module`].
     Blocking(u32),
+    /// A guest-driven `Jit` domain handle (iface 11, JIT.md Model A), carrying the index of its
+    /// [`JitDomainState`] in [`Host::jit_domains`]. Out-of-line so `Binding` stays `Copy`.
+    JitDomain(u32),
+    /// A `CompiledCode` handle minted by `Jit.compile` (iface 12): `(domain, unit)` indices into
+    /// [`Host::jit_domains`]. No directly callable ops (like [`Binding::Module`]) — it is only
+    /// *named* in `Jit.invoke`/`release`.
+    JitCode {
+        domain: u32,
+        unit: u32,
+    },
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -4043,6 +4153,55 @@ pub struct Host {
     /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
     /// size the executor's live-vCPU cap and each vCPU's fiber cap.
     quota: Quota,
+    /// Guest-driven `Jit` domains (iface 11), indexed by the id a [`Binding::JitDomain`] carries.
+    /// Append-only for the life of the `Host` (units are never removed — `release` only revokes
+    /// the *handle*; code reclaim is a JIT.md follow-up), so unit `Arc`s and native pointers stay
+    /// valid for the whole run.
+    jit_domains: Vec<JitDomainState>,
+    /// The host-injected validation gate for guest-submitted `Jit` blobs ([`JitValidator`]) —
+    /// injected (like [`Host::region_factory`]) rather than implemented here so this crate keeps
+    /// its tiny dependency set *and* both backends run the **identical** decode+verify gate.
+    /// `None` (the default) fail-closes every `compile` (`-EINVAL`).
+    jit_validator: Option<JitValidator>,
+}
+
+/// The host-injected validation gate for guest-submitted `Jit` blobs (JIT.md "Security
+/// argument"): `(blob bytes, expected declared memory)` → the verified functions, or a
+/// negative errno. The embedder's implementation must run the full hinge —
+/// `decode_module` + `verify_module` + the **memory-match precondition** (declared memory ==
+/// the parent window) + reject data segments and §12 concurrency ops
+/// ([`Func::uses_concurrency`]) — and the *same* function must be installed for the
+/// interpreter and JIT runs of a differential pair, so both backends accept/reject
+/// identically (`svm-run` provides the canonical one).
+pub type JitValidator = fn(&[u8], Option<u8>) -> Result<Arc<[Func]>, i64>;
+
+/// A successful [`Host::jit_compile`]: the minted `CompiledCode` handle and the `(domain,
+/// unit)` indices the JIT embedder needs to compile the unit natively and register its
+/// trampoline ([`Host::set_jit_unit_native`]).
+pub struct JitCompiled {
+    pub handle: i32,
+    pub domain: u32,
+    pub unit: u32,
+}
+
+/// One guest-compiled `Jit` unit: the validated functions (the unit's entry is `funcs[0]`;
+/// the rest are unit-local helpers reached by direct calls), plus the native trampoline the
+/// JIT embedder registered for the entry (`0` in a reference/interpreter run).
+struct JitUnit {
+    funcs: Arc<[Func]>,
+    native_code: usize,
+}
+
+/// Per-`Jit`-handle domain state.
+struct JitDomainState {
+    /// The memory-match precondition (JIT.md "Security argument"): a submitted blob's declared
+    /// memory must equal the parent module's, fixed when the capability is granted.
+    mem_log2: Option<u8>,
+    units: Vec<JitUnit>,
+    /// Opaque native context the JIT embedder registered (its `*mut CompiledModule` as a
+    /// `usize`); `0` in a reference run. Never dereferenced here — only stored and handed back
+    /// ([`Host::jit_native_ctx`]).
+    native_ctx: usize,
 }
 
 /// One §14 module grant: the verified module's functions, declared window size, and data segments —
@@ -4077,6 +4236,8 @@ impl Host {
             async_notify: None,
             cap_pages: None,
             quota: Quota::default(),
+            jit_domains: Vec::new(),
+            jit_validator: None,
         }
     }
 
@@ -4298,6 +4459,137 @@ impl Host {
         let id = self.regions.len() as u32;
         self.regions.push(backing);
         self.grant(iface::SHARED_REGION, Binding::SharedRegion(id))
+    }
+
+    /// Install the [`JitValidator`] — the decode+verify gate every `Jit.compile` runs. The
+    /// embedder must install the **same** function for the interpreter and JIT runs of a
+    /// differential pair (see [`JitValidator`]); without one, every `compile` is `-EINVAL`.
+    pub fn set_jit_validator(&mut self, v: JitValidator) {
+        self.jit_validator = Some(v);
+    }
+
+    /// Grant a guest-driven `Jit` capability (iface 11, opt-in like `Memory`). `mem_log2` is the
+    /// parent module's declared memory — the memory-match precondition submitted blobs are
+    /// checked against (JIT.md "Security argument").
+    pub fn grant_jit(&mut self, mem_log2: Option<u8>) -> i32 {
+        let id = self.jit_domains.len() as u32;
+        self.jit_domains.push(JitDomainState {
+            mem_log2,
+            units: Vec::new(),
+            native_ctx: 0,
+        });
+        self.grant(iface::JIT, Binding::JitDomain(id))
+    }
+
+    /// Register the JIT embedder's native context (its `*mut CompiledModule` as a `usize`) on
+    /// every granted `Jit` domain — called after the parent module is compiled, before the run.
+    /// Stored opaquely; only the embedder's cap thunk dereferences it. A reference
+    /// (interpreter) run never calls this, leaving `0`.
+    pub fn set_jit_native_ctx(&mut self, ctx: usize) {
+        for d in &mut self.jit_domains {
+            d.native_ctx = ctx;
+        }
+    }
+
+    /// The native context registered for `domain` (`0` ⇒ reference run / none registered).
+    pub fn jit_native_ctx(&self, domain: u32) -> usize {
+        self.jit_domains
+            .get(domain as usize)
+            .map_or(0, |d| d.native_ctx)
+    }
+
+    /// `Jit.compile` minus the backend-specific half (shared by the reference dispatch arm and
+    /// the JIT embedder's thunk): resolve `handle` as a `Jit` domain, run the injected
+    /// [`JitValidator`] (fail-closed `-EINVAL` when none is installed), store the validated unit,
+    /// and mint its `CompiledCode` handle. `Ok(Err(errno))` is a guest-visible failure (nothing
+    /// installed); `Err(Trap)` is a forged/wrong-type domain handle. The JIT embedder then
+    /// compiles the unit natively and registers the trampoline via [`Host::set_jit_unit_native`].
+    pub fn jit_compile(
+        &mut self,
+        handle: i32,
+        bytes: &[u8],
+    ) -> Result<Result<JitCompiled, i64>, Trap> {
+        let domain = self.resolve_jit_domain(handle)?;
+        let Some(validate) = self.jit_validator else {
+            return Ok(Err(EINVAL));
+        };
+        let d = &mut self.jit_domains[domain as usize];
+        let funcs = match validate(bytes, d.mem_log2) {
+            Ok(f) if !f.is_empty() => f,
+            Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
+            Err(e) => return Ok(Err(e)),
+        };
+        let unit = d.units.len() as u32;
+        d.units.push(JitUnit {
+            funcs,
+            native_code: 0,
+        });
+        // Guest-minting: a full handle table is -EMFILE, never a panic (§3c / audit #1). The
+        // stored unit stays (append-only storage; harmless without a handle).
+        match self.try_grant(iface::JIT_CODE, Binding::JitCode { domain, unit }) {
+            Some(h) => Ok(Ok(JitCompiled {
+                handle: h,
+                domain,
+                unit,
+            })),
+            None => Ok(Err(EMFILE)),
+        }
+    }
+
+    /// Register the native trampoline (a finalized code pointer, as `usize`) for a unit the JIT
+    /// embedder compiled via `define_extra`. `0` (the default) means "no native code" — a native
+    /// `invoke` of such a unit is rejected fail-closed.
+    pub fn set_jit_unit_native(&mut self, domain: u32, unit: u32, code: usize) {
+        if let Some(u) = self
+            .jit_domains
+            .get_mut(domain as usize)
+            .and_then(|d| d.units.get_mut(unit as usize))
+        {
+            u.native_code = code;
+        }
+    }
+
+    /// Resolve a handle as a `Jit` domain (a forged/closed/wrong-type handle is a `CapFault`).
+    pub fn resolve_jit_domain(&self, handle: i32) -> Result<u32, Trap> {
+        match self.resolve(handle, iface::JIT)? {
+            Binding::JitDomain(d) => Ok(d),
+            _ => Err(Trap::CapFault),
+        }
+    }
+
+    /// Resolve a handle as a `CompiledCode` unit → `(domain, unit)`.
+    pub fn resolve_jit_code(&self, handle: i32) -> Result<(u32, u32), Trap> {
+        match self.resolve(handle, iface::JIT_CODE)? {
+            Binding::JitCode { domain, unit } => Ok((domain, unit)),
+            _ => Err(Trap::CapFault),
+        }
+    }
+
+    /// The validated functions of a compiled unit (its entry is `funcs[0]`).
+    pub fn jit_unit_funcs(&self, domain: u32, unit: u32) -> Option<Arc<[Func]>> {
+        self.jit_domains
+            .get(domain as usize)
+            .and_then(|d| d.units.get(unit as usize))
+            .map(|u| Arc::clone(&u.funcs))
+    }
+
+    /// The native trampoline registered for a unit (`0` ⇒ none).
+    pub fn jit_unit_native(&self, domain: u32, unit: u32) -> usize {
+        self.jit_domains
+            .get(domain as usize)
+            .and_then(|d| d.units.get(unit as usize))
+            .map_or(0, |u| u.native_code)
+    }
+
+    /// `Jit.release`: revoke a `CompiledCode` handle (the slot is cleared; the per-slot
+    /// generation makes the old handle value inert forever, D37). The unit's code/funcs stay —
+    /// reclaim is a JIT.md follow-up. A forged/closed handle is `Err` (the caller maps it to a
+    /// non-fatal `-EINVAL`: release is guest-reachable in a loop, so it must not trap).
+    pub fn jit_release(&mut self, code_handle: i32) -> Result<(), Trap> {
+        self.resolve_jit_code(code_handle)?;
+        let slot = (code_handle as u32 as usize) & (CAP - 1);
+        self.table[slot].entry = None;
+        Ok(())
     }
 
     /// Fallible [`grant_shared_region_backed`] for **guest-minting** paths (`create_region`, the
@@ -4527,6 +4819,44 @@ impl Host {
             // module ops); it has no callable ops — and crucially, the generic dispatch never exposes
             // the grant's host-side data, so no host pointer is guest-reachable.
             Binding::Module(_) => Err(Trap::CapFault),
+            // Guest-driven `Jit` (iface 11, JIT.md Model A). This generic arm is the **reference**
+            // path (an interpreter run, or a wiring-bug fallback): op 0 `compile` validates +
+            // stores the unit and mints its handle; op 2 `release` revokes one. op 1 `invoke` can
+            // never be serviced here — it must *run guest code* (the interp eval loop intercepts
+            // it before dispatch; the JIT embedder's thunk intercepts the whole iface) — so
+            // reaching it is fail-closed.
+            Binding::JitDomain(_) => match op {
+                0 => {
+                    // compile(ptr, len) -> code_handle | -errno. The blob is borrowed from guest
+                    // memory; with no window there is nothing to read (-EFAULT, like Stream).
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let ptr = *args.first().unwrap_or(&0) as u64;
+                    let len = *args.get(1).unwrap_or(&0) as u64;
+                    let Some(bytes) = mem.read_bytes(ptr, len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    Ok(vec![match self.jit_compile(handle, &bytes)? {
+                        Ok(c) => c.handle as i64,
+                        Err(e) => e,
+                    }])
+                }
+                1 => Err(Trap::CapFault),
+                2 => {
+                    // release(code_handle) -> 0 | -EINVAL. A forged/already-released handle is a
+                    // non-fatal errno (guest-reachable in a loop; must not trap).
+                    let ch = *args.first().unwrap_or(&0) as i32;
+                    Ok(vec![match self.jit_release(ch) {
+                        Ok(()) => 0,
+                        Err(_) => EINVAL,
+                    }])
+                }
+                _ => Ok(vec![EINVAL]),
+            },
+            // A `CompiledCode` handle has no directly callable ops (like `Module`): it is only
+            // *named* in `Jit.invoke`/`release`.
+            Binding::JitCode { .. } => Err(Trap::CapFault),
             // §9/§12 IoRing. op 0 `submit(sq_ptr, n, cq_ptr)` — synchronous batch (increment 1/2). op 1
             // `submit_async(sq_ptr, n, counter_addr)` — kick the batch onto the pool and return; each
             // completion posts to the ring's [`RingState`] + bumps the in-window futex counter + wakes

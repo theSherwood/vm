@@ -1758,8 +1758,7 @@ impl CompiledModule {
         }
         for f in funcs {
             ensure_supported(f)?;
-            #[cfg(fiber_rt)]
-            if func_uses_fibers_or_threads(f) {
+            if f.uses_concurrency() {
                 return Err(JitError::Unsupported(
                     "an incrementally defined function using fibers/threads is not supported yet",
                 ));
@@ -1994,7 +1993,7 @@ fn compile_child(
         ensure_supported(f)?;
         // A child using §12 fibers/threads would compile against null fiber/thread thunks (no
         // per-child runtime yet) — reject rather than emit a call through a null pointer.
-        if func_uses_fibers_or_threads(f) {
+        if f.uses_concurrency() {
             return Err(JitError::Unsupported(
                 "a §14 JIT child using fibers/threads is not supported yet",
             ));
@@ -2101,27 +2100,6 @@ fn compile_child(
         fn_table,
         code,
         module,
-    })
-}
-
-/// Whether `f` uses any §12 fiber/thread/futex op — which a §14 JIT child cannot yet run (it would
-/// compile against this run's null fiber/thread thunks). Memory + `cap.call` are fine (the latter is
-/// an inert `CapFault` under the child's empty powerbox).
-#[cfg(fiber_rt)]
-fn func_uses_fibers_or_threads(f: &Func) -> bool {
-    f.blocks.iter().any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(
-                i,
-                Inst::ContNew { .. }
-                    | Inst::ContResume { .. }
-                    | Inst::Suspend { .. }
-                    | Inst::ThreadSpawn { .. }
-                    | Inst::ThreadJoin { .. }
-                    | Inst::MemoryWait { .. }
-                    | Inst::MemoryNotify { .. }
-            )
-        })
     })
 }
 

@@ -255,7 +255,11 @@ fn print_inst(inst: &Inst) -> String {
 
         // ----- §17 SIMD (D58) — lane shape carried by the op, bytes printed little-endian. -----
         Inst::ConstV128(bytes) => format!("v128.const{}", byte_list(bytes)),
-        Inst::V128Load { addr, offset, align } => {
+        Inst::V128Load {
+            addr,
+            offset,
+            align,
+        } => {
             format!("v128.load v{addr}{}", memarg(*offset, *align))
         }
         Inst::V128Store {

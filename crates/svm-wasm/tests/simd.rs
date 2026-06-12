@@ -48,7 +48,11 @@ fn eval(wat: &str, entry: &str, args: &[Value]) -> Value {
             }
             _ => panic!("result type/value mismatch at {i}"),
         };
-        assert!(ok, "interp != jit at result {i}: {:?} vs {:#x}", interp[i], jit[i]);
+        assert!(
+            ok,
+            "interp != jit at result {i}: {:?} vs {:#x}",
+            interp[i], jit[i]
+        );
     }
     interp[0]
 }
@@ -99,7 +103,11 @@ fn saxpy_f32x4() {
     "#;
     let expect = [14.0f32, 23.0, 32.0, 41.0];
     for (lane, &want) in expect.iter().enumerate() {
-        let got = f32(eval(wat, "saxpy", &[Value::F32(10.0), Value::I32(lane as i32)]));
+        let got = f32(eval(
+            wat,
+            "saxpy",
+            &[Value::F32(10.0), Value::I32(lane as i32)],
+        ));
         assert_eq!(got, want, "saxpy lane {lane}");
     }
 }
@@ -164,11 +172,22 @@ fn clang_saxpy_transpiles_to_verified_simd_ir() {
         for b in &f.blocks {
             for inst in &b.insts {
                 match inst {
-                    Inst::Splat { shape: VShape::F32x4, .. } => splat += 1,
+                    Inst::Splat {
+                        shape: VShape::F32x4,
+                        ..
+                    } => splat += 1,
                     Inst::V128Load { .. } => load += 1,
                     Inst::V128Store { .. } => store += 1,
-                    Inst::VFloatBin { shape: VShape::F32x4, op: VFloatBinOp::Mul, .. } => mul += 1,
-                    Inst::VFloatBin { shape: VShape::F32x4, op: VFloatBinOp::Add, .. } => add += 1,
+                    Inst::VFloatBin {
+                        shape: VShape::F32x4,
+                        op: VFloatBinOp::Mul,
+                        ..
+                    } => mul += 1,
+                    Inst::VFloatBin {
+                        shape: VShape::F32x4,
+                        op: VFloatBinOp::Add,
+                        ..
+                    } => add += 1,
                     _ => {}
                 }
             }

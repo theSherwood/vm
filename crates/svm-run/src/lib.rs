@@ -14,7 +14,9 @@ use core::ffi::c_void;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use svm_interp::{AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, StreamRole, Trap};
+use svm_interp::{
+    iface, AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, StreamRole, Trap,
+};
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
@@ -26,7 +28,7 @@ use svm_ir::{Module, ValType};
 pub use svm_interp::{Quota, Value};
 use svm_jit::{
     compile_and_run, compile_and_run_with_host_fast, compile_and_run_with_host_interruptible_fast,
-    JitOutcome, TrapKind, EXIT_CODE,
+    CompiledModule, JitOutcome, TrapKind, EXIT_CODE,
 };
 
 /// The host trampoline bridging the JIT's [`svm_jit::CapThunk`] ABI (§9) to the reference
@@ -80,6 +82,18 @@ pub unsafe extern "C" fn cap_thunk(
         let _ = (mem_base, mem_size, mem_reserved);
         None
     };
+    // Guest-driven `Jit` (iface 11, JIT.md Model A): serviced natively here, not in the generic
+    // Host dispatch — `compile` must call into Cranelift (`define_extra` on the live
+    // `CompiledModule`) and `invoke` must call the unit's trampoline over the live window,
+    // neither of which `svm-interp` can (or should) reach. The interpreter backend services the
+    // same iface in its eval loop; both share the Host-side state and validator, so they stay in
+    // differential lockstep.
+    if type_id == iface::JIT {
+        jit_native_op(
+            host, op, handle, arg_slots, results, n_results, trap_out, gm, mem_base,
+        );
+        return;
+    }
     match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
         Ok(res) => {
             if n_results != 0 {
@@ -93,6 +107,230 @@ pub unsafe extern "C" fn cap_thunk(
         Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
         Err(_) => *trap_out = TrapKind::CapFault as i64,
     }
+}
+
+/// The native (Cranelift) half of the guest-driven `Jit` capability (JIT.md Model A), reached
+/// from [`cap_thunk`]'s iface-11 intercept. Op semantics — including every fail-closed path —
+/// mirror the interpreter reference (`svm-interp`'s `Binding::JitDomain` dispatch arm + its
+/// eval-loop `invoke`) exactly, so the two backends agree on results, errnos, and traps:
+/// - op 0 `compile(ptr, len)`: borrow the blob, run the shared `Host::jit_compile` (the
+///   injected validator gate), then **additionally** compile the unit into the live
+///   [`CompiledModule`] (`define_extra`) and register its trampoline. Any failure leaves
+///   nothing installed.
+/// - op 1 `invoke(code_handle, args…)`: strict-arity call of the unit's trampoline over the
+///   **live window** (`invoke_extra`); a trap in the invoked code lands in `trap_out` (the
+///   run's trap cell) — terminal for the domain.
+/// - op 2 `release(code_handle)`: revoke the handle (non-fatal `-EINVAL` if forged/closed).
+///
+/// # Safety
+/// Called from [`cap_thunk`] (same contract); additionally, when a `Jit` domain has a native
+/// ctx registered it must be the `*mut CompiledModule` of the **in-flight run on this thread**
+/// (see [`jit_cap_run`]), so the transient re-entry here aliases no live reference
+/// (`CompiledModule::run_raw`'s contract).
+#[allow(clippy::too_many_arguments)]
+unsafe fn jit_native_op(
+    host: &mut Host,
+    op: u32,
+    handle: i32,
+    args: &[i64],
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+    mut gm: Option<&mut dyn GuestMem>,
+    mem_base: *mut u8,
+) {
+    // Negative-errno results (§3e D42), matching `svm-interp`'s private consts.
+    const EINVAL: i64 = -22;
+    const EFAULT: i64 = -14;
+    // One errno/handle result slot + a clean trap cell — the compile/release result shape.
+    let put = |results: *mut i64, n_results: u64, v: i64, trap_out: *mut i64| {
+        if n_results != 0 {
+            *results = v;
+        }
+        *trap_out = 0;
+    };
+    let cap_fault = |trap_out: *mut i64| *trap_out = TrapKind::CapFault as i64;
+    match op {
+        0 => {
+            // compile(ptr, len) -> code_handle | -errno.
+            let Ok(domain) = host.resolve_jit_domain(handle) else {
+                return cap_fault(trap_out);
+            };
+            let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
+            if cm.is_null() {
+                // No live module registered (host wiring bug) — fail closed, non-fatally.
+                return put(results, n_results, EINVAL, trap_out);
+            }
+            let ptr = *args.first().unwrap_or(&0) as u64;
+            let len = *args.get(1).unwrap_or(&0) as u64;
+            let Some(bytes) = gm.as_mut().and_then(|m| m.read_bytes(ptr, len)) else {
+                return put(results, n_results, EFAULT, trap_out);
+            };
+            let compiled = match host.jit_compile(handle, &bytes) {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return put(results, n_results, e, trap_out),
+                Err(_) => return cap_fault(trap_out),
+            };
+            let funcs = host
+                .jit_unit_funcs(compiled.domain, compiled.unit)
+                .expect("unit was just stored");
+            // SAFETY: `cm` is the in-flight run's CompiledModule (jit_cap_run registered it);
+            // the guest is suspended in this synchronous cap.call, so this transient re-entry
+            // aliases no live reference (run_raw's contract).
+            match (*cm).define_extra(&funcs) {
+                Ok(ptrs) => {
+                    host.set_jit_unit_native(compiled.domain, compiled.unit, ptrs[0] as usize);
+                    put(results, n_results, compiled.handle as i64, trap_out);
+                }
+                Err(_) => {
+                    // Verified but not natively lowerable (a backend gap): revoke the minted
+                    // handle so nothing half-installed is guest-reachable; non-fatal errno.
+                    let _ = host.jit_release(compiled.handle);
+                    put(results, n_results, EINVAL, trap_out);
+                }
+            }
+        }
+        1 => {
+            // invoke(code_handle, args…) -> results.
+            let Ok(domain) = host.resolve_jit_domain(handle) else {
+                return cap_fault(trap_out);
+            };
+            let Some(&ch) = args.first() else {
+                return cap_fault(trap_out);
+            };
+            let Ok((cd, cu)) = host.resolve_jit_code(ch as i32) else {
+                return cap_fault(trap_out);
+            };
+            // A code handle is only valid on the domain that compiled it.
+            if cd != domain {
+                return cap_fault(trap_out);
+            }
+            let code = host.jit_unit_native(cd, cu);
+            let cm = host.jit_native_ctx(cd) as *mut CompiledModule;
+            let Some(funcs) = host.jit_unit_funcs(cd, cu) else {
+                return cap_fault(trap_out);
+            };
+            if code == 0 || cm.is_null() {
+                return cap_fault(trap_out);
+            }
+            // Strict arity vs the unit's entry (parity with the interp eval arm): the invoke
+            // args are the cap.call args minus the code handle; results must match exactly.
+            let entry = &funcs[0];
+            if args.len() - 1 != entry.params.len() || n_results as usize != entry.results.len() {
+                return cap_fault(trap_out);
+            }
+            let out: &mut [i64] = if n_results == 0 {
+                &mut []
+            } else {
+                std::slice::from_raw_parts_mut(results, n_results as usize)
+            };
+            // SAFETY: an in-flight run on this thread (we are inside its cap.call); `code` is
+            // the unit's finalized trampoline; arity checked above; `mem_base`/`trap_out` are
+            // the live run's window base and trap cell. On a clean return the cell stays 0; on
+            // a trap the trampoline / nested guard wrote it — either way it holds the truth.
+            if CompiledModule::invoke_extra(
+                cm,
+                code as *const u8,
+                &args[1..],
+                out,
+                mem_base,
+                trap_out,
+            )
+            .is_err()
+            {
+                cap_fault(trap_out);
+            }
+        }
+        2 => {
+            // release(code_handle) -> 0 | -EINVAL (forged/double release is non-fatal: it is
+            // guest-reachable in a loop and must not kill the domain).
+            if host.resolve_jit_domain(handle).is_err() {
+                return cap_fault(trap_out);
+            }
+            let ch = *args.first().unwrap_or(&0) as i32;
+            let v = match host.jit_release(ch) {
+                Ok(()) => 0,
+                Err(_) => EINVAL,
+            };
+            put(results, n_results, v, trap_out);
+        }
+        _ => put(results, n_results, EINVAL, trap_out),
+    }
+}
+
+/// The canonical [`svm_interp::JitValidator`] — the **security hinge** of the guest-driven
+/// `Jit` capability (JIT.md "Security argument"): `decode_module` (untrusted-input-facing,
+/// fail-closed) → `verify_module` (the escape-freedom gate) → the **memory-match
+/// precondition** (declared memory must equal the parent window, so verified bounds and the
+/// runtime mask agree) → reject data segments (they would overwrite live guest memory) and
+/// §12 concurrency ops (the single-threaded MVP restriction). Install the *same* function on
+/// the interpreter and JIT `Host`s of a differential pair ([`grant_jit`] does), so both
+/// backends accept/reject identically. All failures are `-EINVAL` (guest-visible, non-fatal,
+/// nothing installed).
+pub fn jit_blob_validator(bytes: &[u8], mem_log2: Option<u8>) -> Result<Arc<[svm_ir::Func]>, i64> {
+    const EINVAL: i64 = -22;
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return Err(EINVAL);
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        return Err(EINVAL);
+    }
+    if m.memory.map(|mc| mc.size_log2) != mem_log2 {
+        return Err(EINVAL);
+    }
+    if !m.data.is_empty() {
+        return Err(EINVAL);
+    }
+    if m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_concurrency()) {
+        return Err(EINVAL);
+    }
+    Ok(m.funcs.into())
+}
+
+/// Grant the guest-driven `Jit` capability (opt-in, like `Memory`): install the canonical
+/// [`jit_blob_validator`] and mint the domain handle bound to `m`'s declared memory (the
+/// memory-match precondition). Works for both backends — the interpreter services the iface
+/// in its eval loop/dispatch; the JIT needs the module registered too (see [`jit_cap_run`]).
+pub fn grant_jit(host: &mut Host, m: &Module) -> i32 {
+    host.set_jit_validator(jit_blob_validator);
+    host.grant_jit(m.memory.map(|mc| mc.size_log2))
+}
+
+/// Run `m` on the **JIT** with the `Jit` capability live: the long-lived compile→run split
+/// ([`CompiledModule`]), with the module pointer registered in `host` so [`cap_thunk`]'s
+/// native `Jit` ops can re-enter it mid-run (`define_extra` / `invoke_extra` while the guest
+/// is suspended in its synchronous `cap.call`). The interpreter counterpart is the plain
+/// `run_capture_reserved_with_host` over the same `Host` setup ([`grant_jit`]) — drive both
+/// with identical inputs for the differential.
+pub fn jit_cap_run(
+    m: &Module,
+    entry: u32,
+    args: &[i64],
+    init_mem: &[u8],
+    reserved_log2: u8,
+    host: &mut Host,
+) -> Result<(JitOutcome, Vec<u8>), svm_jit::JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        entry,
+        cap_thunk,
+        host as *mut Host as *mut c_void,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        svm_jit::Quota::default(),
+    )?;
+    let cm_ptr: *mut CompiledModule = &mut cm;
+    host.set_jit_native_ctx(cm_ptr as usize);
+    // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing.
+    // SAFETY: `cm_ptr` is the only pointer used for this run (the same one the thunk's handlers
+    // re-enter through, registered above); the run is single-threaded on this thread.
+    let r = unsafe { CompiledModule::run_raw(cm_ptr, args, Some(init_mem), Some(1 << 18), None) };
+    // The module dies with this call — leave no dangling registration behind.
+    host.set_jit_native_ctx(0);
+    r
 }
 
 /// The §9/D45 **devirtualized `cap.call` fast-path resolver** for the production powerbox. It claims

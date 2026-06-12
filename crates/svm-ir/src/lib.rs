@@ -1500,6 +1500,31 @@ pub struct Func {
     pub blocks: Vec<Block>,
 }
 
+impl Func {
+    /// Whether this function uses any §12 fiber/thread/futex op (`cont.*`, `thread.*`,
+    /// `atomic.wait`/`notify`). The single source of truth for backends that must agree on
+    /// rejecting concurrency in a context that cannot host it — e.g. a §14 JIT child (no
+    /// per-child runtimes) or a guest-submitted `Jit`-capability unit (the single-threaded
+    /// MVP restriction; JIT.md "Concurrency") — so the reference interpreter and the JIT
+    /// fail-close on exactly the same set.
+    pub fn uses_concurrency(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::ContNew { .. }
+                        | Inst::ContResume { .. }
+                        | Inst::Suspend { .. }
+                        | Inst::ThreadSpawn { .. }
+                        | Inst::ThreadJoin { .. }
+                        | Inst::MemoryWait { .. }
+                        | Inst::MemoryNotify { .. }
+                )
+            })
+        })
+    }
+}
+
 /// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —
 /// a power of two, so confinement is a single `addr & (size − 1)` mask. The window
 /// is a reserved virtual range; guest pointers are offsets into it.
