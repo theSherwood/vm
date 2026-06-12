@@ -175,8 +175,17 @@ unsafe fn jit_native_op(
             // the guest is suspended in this synchronous cap.call, so this transient re-entry
             // aliases no live reference (run_raw's contract).
             match (*cm).define_extra(&funcs) {
-                Ok(ptrs) => {
-                    host.set_jit_unit_native(compiled.domain, compiled.unit, ptrs[0] as usize);
+                Ok(defs) => {
+                    // The unit entry (func 0): trampoline for `invoke`, natural code + type_id
+                    // for B2 `install` into the call_indirect table.
+                    let d = defs[0];
+                    host.set_jit_unit_native(
+                        compiled.domain,
+                        compiled.unit,
+                        d.tramp as usize,
+                        d.code as usize,
+                        d.type_id,
+                    );
                     put(results, n_results, compiled.handle as i64, trap_out);
                 }
                 Err(_) => {

@@ -59,7 +59,7 @@ unsafe extern "C" fn reentry_thunk(
         // Re-entrant incremental compile: the guest is suspended on this thread; the parent's
         // code is on the stack below us while finalize_definitions mprotects the new pages.
         let ptrs = (*cm).define_extra(&tc.funcs).expect("define_extra mid-run");
-        tc.code.set(ptrs[0]);
+        tc.code.set(ptrs[0].tramp);
     }
     let args = std::slice::from_raw_parts(args, n_args as usize);
     let results = std::slice::from_raw_parts_mut(results, n_results as usize);
@@ -169,7 +169,7 @@ fn memory_fault_in_invoked_code_is_caught_and_terminal() {
 fn invoke_outside_a_run_is_rejected() {
     let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  return v2\n}\n";
     let (ctx, mut cm) = setup(extra_src);
-    let code = cm.define_extra(&ctx.funcs).expect("define outside run")[0];
+    let code = cm.define_extra(&ctx.funcs).expect("define outside run")[0].tramp;
     let mut results = [0i64; 1];
     let mut trap = 0i64;
     let err = unsafe {

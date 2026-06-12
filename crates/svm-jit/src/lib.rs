@@ -929,6 +929,17 @@ fn run_inner(
 /// installed in the function table, so the table mask baked into every `call_indirect` site
 /// (`fn_table_mask`) never changes — the escape-relevant dispatch is byte-identical to the
 /// one-shot path.
+/// One function produced by [`CompiledModule::define_extra`]: its buffer-ABI **trampoline**
+/// (for `invoke` over a fresh/live window, any arity) and its natural-ABI **entry** + interned
+/// **`type_id`** (for B2 [`CompiledModule::install`] into the `call_indirect` table). Pointers
+/// are valid for the life of the `CompiledModule`.
+#[derive(Clone, Copy)]
+pub struct DefinedFn {
+    pub tramp: *const u8,
+    pub code: *const u8,
+    pub type_id: u32,
+}
+
 pub struct CompiledModule {
     /// The padded function table `call_indirect` dispatches through. Its address is threaded as
     /// a runtime argument (not baked), but running code reads it — boxed so it never moves, and
@@ -1764,7 +1775,7 @@ impl CompiledModule {
     /// Functions using §12 fibers/threads are rejected (`Unsupported`) — the MVP restricts
     /// incremental definition to single-threaded code (JIT.md "Concurrency"), and lowering
     /// `cont.*`/`thread.*` here would need per-unit runtime wiring this slice doesn't do.
-    pub fn define_extra(&mut self, funcs: &[Func]) -> Result<Vec<*const u8>, JitError> {
+    pub fn define_extra(&mut self, funcs: &[Func]) -> Result<Vec<DefinedFn>, JitError> {
         if funcs.is_empty() {
             return Ok(Vec::new());
         }
@@ -1842,10 +1853,45 @@ impl CompiledModule {
         self.module
             .finalize_definitions()
             .map_err(|e| JitError::Backend(e.to_string()))?;
-        Ok(tramp_ids
-            .into_iter()
-            .map(|t| self.module.get_finalized_function(t))
+        // Per function: the buffer-ABI trampoline (for `invoke` over a window) **and** the
+        // natural-ABI entry + interned `type_id` (for B2 `install` into the function table —
+        // `call_indirect` calls the natural ABI, not the trampoline).
+        Ok(funcs
+            .iter()
+            .zip(&ids)
+            .zip(&tramp_ids)
+            .map(|((f, id), t)| DefinedFn {
+                tramp: self.module.get_finalized_function(*t),
+                code: self.module.get_finalized_function(*id),
+                type_id: type_id_of(
+                    &self.distinct,
+                    &FuncType {
+                        params: f.params.clone(),
+                        results: f.results.clone(),
+                    },
+                ),
+            })
             .collect())
+    }
+
+    /// **Install** an incrementally-defined function into the live `call_indirect` table (JIT.md
+    /// Model B2): write its natural-ABI `code` + interned `type_id` into the next reserved
+    /// padding slot, returning that slot index — a funcref the guest (or another unit) can
+    /// `call_indirect` at native speed (old→new / new→new). `None` if the table is full (every
+    /// reserved slot taken). The base never moves (the table was pre-reserved at compile, the
+    /// mask is a baked constant), so this is just a slot write — safe mid-run under the
+    /// single-threaded MVP (the guest is suspended in its synchronous `cap.call`).
+    pub fn install(&mut self, code: *const u8, type_id: u32) -> Option<u32> {
+        let slot = self
+            .fn_table
+            .iter()
+            .position(|e| e.type_id == PADDING_TYPE_ID)?;
+        self.fn_table[slot] = FnEntry {
+            type_id,
+            _pad: 0,
+            code: code as u64,
+        };
+        Some(slot as u32)
     }
 
     /// The stable type id `ty` was interned under, or `None` if no unit this module compiled

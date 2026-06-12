@@ -4351,11 +4351,15 @@ pub struct JitCompiled {
 }
 
 /// One guest-compiled `Jit` unit: the validated functions (the unit's entry is `funcs[0]`;
-/// the rest are unit-local helpers reached by direct calls), plus the native trampoline the
-/// JIT embedder registered for the entry (`0` in a reference/interpreter run).
+/// the rest are unit-local helpers reached by direct calls), plus the JIT embedder's
+/// registrations for the entry (`0` in a reference/interpreter run): the buffer-ABI
+/// trampoline (`native_code`, for `invoke`) and the natural-ABI entry + interned `type_id`
+/// (`install_code`/`install_type_id`, for B2 table `install`).
 struct JitUnit {
     funcs: Arc<[Func]>,
     native_code: usize,
+    install_code: usize,
+    install_type_id: u32,
 }
 
 /// Per-`Jit`-handle domain state.
@@ -4722,6 +4726,8 @@ impl Host {
         d.units.push(JitUnit {
             funcs,
             native_code: 0,
+            install_code: 0,
+            install_type_id: 0,
         });
         // Guest-minting: a full handle table is -EMFILE, never a panic (§3c / audit #1). The
         // stored unit stays (append-only storage; harmless without a handle).
@@ -4735,17 +4741,37 @@ impl Host {
         }
     }
 
-    /// Register the native trampoline (a finalized code pointer, as `usize`) for a unit the JIT
-    /// embedder compiled via `define_extra`. `0` (the default) means "no native code" — a native
-    /// `invoke` of such a unit is rejected fail-closed.
-    pub fn set_jit_unit_native(&mut self, domain: u32, unit: u32, code: usize) {
+    /// Register the JIT embedder's code for a unit it compiled via `define_extra`: the
+    /// buffer-ABI trampoline (`tramp`, for `invoke`) and the natural-ABI entry + interned
+    /// `type_id` (`install_code`/`install_type_id`, for B2 table `install`). `0` (the default)
+    /// means "no native code" — a native `invoke`/`install` of such a unit is rejected
+    /// fail-closed.
+    pub fn set_jit_unit_native(
+        &mut self,
+        domain: u32,
+        unit: u32,
+        tramp: usize,
+        install_code: usize,
+        install_type_id: u32,
+    ) {
         if let Some(u) = self
             .jit_domains
             .get_mut(domain as usize)
             .and_then(|d| d.units.get_mut(unit as usize))
         {
-            u.native_code = code;
+            u.native_code = tramp;
+            u.install_code = install_code;
+            u.install_type_id = install_type_id;
         }
+    }
+
+    /// The natural-ABI entry pointer + interned `type_id` the JIT embedder registered for a
+    /// unit (for B2 `install`); `(0, 0)` if none / a reference run.
+    pub fn jit_unit_install(&self, domain: u32, unit: u32) -> (usize, u32) {
+        self.jit_domains
+            .get(domain as usize)
+            .and_then(|d| d.units.get(unit as usize))
+            .map_or((0, 0), |u| (u.install_code, u.install_type_id))
     }
 
     /// Resolve a handle as a `Jit` domain (a forged/closed/wrong-type handle is a `CapFault`).

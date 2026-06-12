@@ -99,7 +99,7 @@ fn define_extra_pure_function_matches_interp() {
     verify_module(&extra).expect("verify");
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
     assert_eq!(ptrs.len(), 1);
-    let (out, _) = unsafe { cm.run_extra(ptrs[0], 2, 1, &[6, 7], None) }.expect("run_extra");
+    let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 2, 1, &[6, 7], None) }.expect("run_extra");
     let want = interp(extra_src, &[Value::I32(6), Value::I32(7)]);
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &want));
 }
@@ -114,7 +114,7 @@ fn define_extra_unit_local_direct_calls() {
     verify_module(&extra).expect("verify");
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
     assert_eq!(ptrs.len(), 2);
-    let (out, _) = unsafe { cm.run_extra(ptrs[0], 1, 1, &[5], None) }.expect("run_extra");
+    let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 1, 1, &[5], None) }.expect("run_extra");
     let want = interp(extra_src, &[Value::I32(5)]); // (5 + 10) * 2 = 30
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &want));
 }
@@ -139,10 +139,10 @@ fn incremental_finalize_keeps_earlier_code_runnable() {
     let p2 = cm.define_extra(&unit2.funcs).expect("second define_extra");
 
     // After the SECOND finalize: unit 1's code (finalized earlier) still runs…
-    let (out, _) = unsafe { cm.run_extra(p1[0], 1, 1, &[41], None) }.expect("unit1");
+    let (out, _) = unsafe { cm.run_extra(p1[0].tramp, 1, 1, &[41], None) }.expect("unit1");
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[42]));
     // …unit 2 runs…
-    let (out, _) = unsafe { cm.run_extra(p2[0], 1, 1, &[21], None) }.expect("unit2");
+    let (out, _) = unsafe { cm.run_extra(p2[0].tramp, 1, 1, &[21], None) }.expect("unit2");
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[42]));
     // …and the parent entry (finalized before both) still runs.
     let (out, _) = cm.run(&[40, 2], None, None, None).expect("parent");
@@ -173,14 +173,14 @@ fn define_extra_call_indirect_uses_parent_table_and_mask() {
     verify_module(&extra).expect("verify");
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
     // Slot 0 → the parent's add.
-    let (out, _) = unsafe { cm.run_extra(ptrs[0], 2, 1, &[30, 12], None) }.expect("idx 0");
+    let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 2, 1, &[30, 12], None) }.expect("idx 0");
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[42]),
         "{out:?}"
     );
     // Slot 3 wraps under the parent's mask (0) to slot 0 → the same add. The dispatch
     // lowering and its mask constant are byte-identical to the parent's.
-    let (out, _) = unsafe { cm.run_extra(ptrs[1], 2, 1, &[40, 2], None) }.expect("idx 3");
+    let (out, _) = unsafe { cm.run_extra(ptrs[1].tramp, 2, 1, &[40, 2], None) }.expect("idx 3");
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[42]),
         "{out:?}"
@@ -228,7 +228,7 @@ fn parent_call_indirect_cannot_reach_extra_code() {
     verify_module(&extra).expect("verify");
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
     // The new code is alive and callable — through the host trampoline only.
-    let (out, _) = unsafe { cm.run_extra(ptrs[0], 1, 1, &[100], None) }.expect("run_extra");
+    let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 1, 1, &[100], None) }.expect("run_extra");
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[1100]));
 
     // Every guest-nameable index dispatches byte-identically to before.
@@ -250,7 +250,7 @@ fn define_extra_unknown_signature_traps_fail_closed() {
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
-    let (out, _) = unsafe { cm.run_extra(ptrs[0], 1, 1, &[7], None) }.expect("run_extra");
+    let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 1, 1, &[7], None) }.expect("run_extra");
     assert!(
         matches!(out, JitOutcome::Trapped(TrapKind::IndirectCallType)),
         "unknown signature must trap fail-closed, got {out:?}"
@@ -276,7 +276,8 @@ fn define_extra_masking_matches_interp_memory_effects() {
     assert_eq!(want, vec![Value::I32(171)]);
 
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
-    let (out, final_mem) = unsafe { cm.run_extra(ptrs[0], 0, 1, &[], None) }.expect("run_extra");
+    let (out, final_mem) =
+        unsafe { cm.run_extra(ptrs[0].tramp, 0, 1, &[], None) }.expect("run_extra");
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[171]),
         "{out:?}"
@@ -297,7 +298,7 @@ fn define_extra_masking_matches_interp_memory_effects() {
         "interp: a store past the backed extent must fault"
     );
     let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
-    let (out, _) = unsafe { cm.run_extra(ptrs[0], 0, 1, &[], None) }.expect("run_extra");
+    let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 0, 1, &[], None) }.expect("run_extra");
     assert!(
         matches!(out, JitOutcome::Trapped(TrapKind::MemoryFault)),
         "jit: extra code past the backed extent must detect-and-kill, got {out:?}"
@@ -345,7 +346,7 @@ fn type_ids_are_interned_append_only_across_units() {
     );
 
     // No table entry carries the novel id, so dispatch with it stays fail-closed.
-    let (out, _) = unsafe { cm.run_extra(ptrs[0], 1, 1, &[7], None) }.expect("run_extra");
+    let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 1, 1, &[7], None) }.expect("run_extra");
     assert!(matches!(
         out,
         JitOutcome::Trapped(TrapKind::IndirectCallType)
@@ -357,4 +358,68 @@ fn type_ids_are_interned_append_only_across_units() {
 fn define_extra_empty_unit() {
     let mut cm = compile(ADD);
     assert!(cm.define_extra(&[]).expect("empty").is_empty());
+}
+
+/// B2 `install` (JIT level, JIT.md slice #4): a `define_extra` unit installed into a
+/// **pre-reserved** table slot becomes `call_indirect`-able — old→new. The parent entry is
+/// `(slot, a, b) -> call_indirect[slot](a, b)`; with a reserved table the unit lands in the
+/// first padding slot, and dispatching that slot runs the unit over the live window. An
+/// un-installed slot still traps `IndirectCallType` fail-closed.
+#[test]
+fn install_makes_unit_call_indirectable() {
+    let parent_src = "func (i32, i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32, v2: i32):\n  v3 = call_indirect (i32, i32) -> (i32) v0 (v1, v2)\n  return v3\n}\n";
+    let m = parse_module(parent_src).expect("parse");
+    verify_module(&m).expect("verify");
+    // Reserve a 16-slot table (log2 = 4) so there is padding for install (parent has 1 func).
+    let mut cm = CompiledModule::compile(
+        &m,
+        0,
+        INERT_CAP_THUNK,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        4,
+    )
+    .expect("compile");
+
+    let unit_src = "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const 100\n  v4 = i32.add v2 v3\n  return v4\n}\n";
+    let unit = parse_module(unit_src).expect("parse");
+    verify_module(&unit).expect("verify");
+    let defs = cm.define_extra(&unit.funcs).expect("define_extra");
+    let slot = cm.install(defs[0].code, defs[0].type_id).expect("install");
+    assert_eq!(
+        slot, 1,
+        "first padding slot is just past the parent's 1 function"
+    );
+
+    // old→new: parent `call_indirect` of the installed slot reaches the unit.
+    let (out, _) = cm.run(&[slot as i64, 6, 7], None, None, None).expect("run");
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[142]),
+        "{out:?}"
+    ); // 6 * 7 + 100
+
+    // An un-installed (padding) slot still traps fail-closed.
+    let (out, _) = cm.run(&[2, 6, 7], None, None, None).expect("run");
+    assert!(matches!(
+        out,
+        JitOutcome::Trapped(TrapKind::IndirectCallType)
+    ));
+}
+
+/// `install` returns `None` when every reserved slot is full (here: no reservation, so the
+/// natural padding is the only room, and a 1-function module padded to 1 slot has none).
+#[test]
+fn install_full_table_returns_none() {
+    let mut cm = compile(ADD); // natural table, 1 func → next_pow2(1) = 1 slot, zero padding
+    let unit = parse_module(ADD).expect("parse");
+    let defs = cm.define_extra(&unit.funcs).expect("define_extra");
+    assert!(
+        cm.install(defs[0].code, defs[0].type_id).is_none(),
+        "no padding to install into"
+    );
 }
