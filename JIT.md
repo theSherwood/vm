@@ -22,34 +22,27 @@ resource hardening are landed and differentially tested:
 | Differential + fuzz suite (results/errnos/traps/final-memory equality) | `crates/svm/tests/jit_cap.rs` |
 | Compile quota (`-ENOMEM`, shared gate) | `Host::jit_compile` / `set_jit_quota` |
 | C surface (`__vm_jit_compile/invoke2/release`, 8-handle powerbox) + demo | `frontend/chibicc`, `crates/svm-run/demos/jit/` (`cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c`) |
+| **new→old** (slice #1): module-aware interpreter frames + explicit dispatch table (the B2 foundation) | `crates/svm-interp/src/lib.rs` (`Frame.module`, `TableSlot`, `dispatch_indirect`, `VCpu::new_invoke`); tests in `jit_cap.rs` |
 
 The W^X spike resolved affirmatively (incremental finalize leaves running code intact —
 pinned by tests including finalize *during* a run). Phase 5 (B2 table install) and
 compaction-based reclaim remain contingent, per the Recommendation. The design analysis
 below is preserved as written.
 
-**MVP cross-call scope — old→new only.** The capability supports **old→new** (parent code
-`invoke`s a JITed unit) fully. **new→old** (a submitted unit `call_indirect`s back into the
-original program's table) is *not* exposed by the MVP capability, even though the underlying
-`define_extra` primitive implements it (and `jit_incremental.rs` tests it on the JIT). Reason:
-the JIT dispatches a unit's `call_indirect` through the parent table via code pointers, but the
-reference interpreter resolves functions by index into a single array and cannot model a frame
-spanning the parent and unit function spaces without hot-path surgery — so the two backends
-would diverge. The shared validator therefore **rejects `call_indirect` in a submitted unit**
-(`Func::uses_indirect_call`), keeping both backends provably in lockstep. Uniform cross-unit /
-new→old dispatch is properly a **Model B2** feature (table install + the interned registry,
-already landed); lifting the gate is part of Phase 5, *or* a deliberate earlier choice to teach
-the reference interpreter cross-module frames (see "new→old options" below).
-
-**new→old options (deferred decision).** To expose new→old in Model A before B2, the reference
-interpreter must execute frames from two function spaces. Two faithful shapes: (a) **append +
-remap** — the invoke child's funcs = parent ++ unit (unit `Call`/`ReturnCall`/`RefFunc` indices
-shifted by `parent_len`), with `call_indirect` masking against the parent prefix so a resolved
-slot is valid in both; medium size, but it rewrites verified IR (re-validation question, plus
-`ref.func` edge cases). (b) **per-frame domain tag** — each `Frame` records which function space
-it indexes; cleaner model, wider touch (the hot `Frame` struct + every resolution site). Both
-are interpreter-only (no escape-TCB change). Recommendation: defer to B2 unless a concrete guest
-needs Model-A new→old sooner, since B2 makes it first-class anyway.
+**Cross-call scope — old→new *and* new→old (slice #1 landed).** The capability supports
+**old→new** (parent code `invoke`s a JITed unit) and **new→old** (a submitted unit
+`call_indirect`s back into the original program's table). The JIT always implemented new→old
+(`define_extra` lowers a unit's `call_indirect` against the parent `fn_table`); the reference
+interpreter now matches it via **module-aware frames** (the "per-frame domain tag" option):
+each `Frame` carries a `module` (0 = the vCPU's own program, ≥ 1 = a guest-compiled unit),
+direct calls stay in the caller's module, and `call_indirect`/`return_call_indirect` dispatch
+through an explicit module-aware table (`TableSlot`) built from module 0 — so a unit's indirect
+call lands in the original program exactly as the JIT lowers it. The `dispatch_indirect` table
+is the structure Model B2's `install` will **grow** (appending unit entries into the
+power-of-two padding); slice #1 populates it from module 0 only. Differential tests pin
+new→old (returns the parent function's result on both backends) and its fail-closed
+signature-mismatch trap. *Not yet covered:* a unit `call_indirect`ing **another unit** (only
+B2's `install` puts unit functions in the table) — that is the remaining B2 increment.
 
 **Verdict up front: yes, it's feasible and a strong architectural fit.** The submit-a-blob
 boundary the feature needs already exists, the verifier is *designed* to be the trust hinge
