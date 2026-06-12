@@ -1,10 +1,10 @@
-//! JIT.md §6 #1 — **code-memory compaction reclaim** for the guest-driven `Jit`.
+//! DESIGN.md §22 — **code-memory compaction reclaim** for the guest-driven `Jit`.
 //!
 //! `cranelift-jit`'s `JITModule` has **no per-function free**: every `define_extra` consumes the
 //! code arena and nothing is ever returned, so a long REPL that redefines functions leaks code
 //! memory until the 256 MiB arena is exhausted (`-ENOMEM`). Slot reclaim (`uninstall`) frees a
 //! `call_indirect` *table slot* but not the *code* behind a stale definition. The reclaim strategy
-//! (JIT.md §6) is therefore **whole-module recompaction**: at a quiescent point, rebuild the *live*
+//! (DESIGN.md §22) is therefore **whole-module recompaction**: at a quiescent point, rebuild the *live*
 //! unit set into a **fresh** `CompiledModule` and drop the old one — RAII frees its entire arena.
 //!
 //! This is an **embedder-orchestrated** operation (the embedder owns liveness/handle policy and the
@@ -251,7 +251,7 @@ fn install_at_rejects_invalid_targets() {
 //
 // Oracle: **compacting-JIT vs non-compacting-JIT** over a persistent-window REPL. (An interp↔JIT
 // differential across *multiple* runs is blocked by the reference interp rebuilding its dispatch
-// table per run — the separately-tracked shared-table refactor; JIT.md §6 "Remaining work" #2 — so
+// table per run — the separately-tracked shared-table refactor; DESIGN.md §22 "Remaining work" #2 — so
 // single-run correctness stays differential in `jit_cap.rs` and *transparency across the swap* is
 // pinned here against the non-compacting JIT, the production backend.)
 

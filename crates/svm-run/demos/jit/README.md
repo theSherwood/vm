@@ -1,6 +1,6 @@
 # Guest-driven JIT demo
 
-A tiny **bytecode interpreter that JITs itself, entirely inside the sandbox** — the JIT.md
+A tiny **bytecode interpreter that JITs itself, entirely inside the sandbox** — the DESIGN.md §22
 Phase-4 capstone for the guest-driven `Jit` capability (Model A).
 
 `jit_demo.c` defines a toy "calculator bytecode" (an accumulator machine over two inputs) and
@@ -49,7 +49,7 @@ asserting identical results and output.
 
 ## Threaded JIT (`jit_threads.c`)
 
-The single-threaded capstone's concurrent sibling (JIT.md §6 #2): `NWORKERS` guest threads each
+The single-threaded capstone's concurrent sibling (DESIGN.md §22): `NWORKERS` guest threads each
 build serialized IR for a **distinct** unit and `__vm_jit_compile` it — so several `Jit.compile`s
 run at once — then invoke the native code and check it against a C reference. Each worker keeps its
 blob in its own stack buffer and threads the emit cursor explicitly, so the only concurrency the VM
@@ -78,7 +78,7 @@ is pinned at the IR level by `jit_cap::threaded_compile_agrees_across_backends`.
 ## Auto-compacting REPL (`jit_repl.c`)
 
 The prompt body of a long-lived REPL that JITs a fresh unit **every prompt** — and never exhausts the
-code arena (JIT.md §6 #1). `cranelift-jit`'s arena has no per-function free, so a REPL that compiles
+code arena (DESIGN.md §22). `cranelift-jit`'s arena has no per-function free, so a REPL that compiles
 each prompt would eventually hit `-ENOMEM`; the reclaim is **whole-module recompaction** at a
 quiescent point, and the only sound one is *between* prompts. So unlike the demos above, this is not a
 standalone `cargo run` program: it is driven by the embedder's `svm_run::JitSession`, which re-enters

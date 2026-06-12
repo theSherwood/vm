@@ -1,4 +1,4 @@
-// Threaded guest-driven JIT (JIT.md §6 #2): multiple guest **worker threads each Cranelift-compile
+// Threaded guest-driven JIT (DESIGN.md §22): multiple guest **worker threads each Cranelift-compile
 // their own unit concurrently**, entirely inside the sandbox.
 //
 // `jit_demo.c` is the single-threaded capstone (a guest that JITs itself). This is its threaded
@@ -8,7 +8,7 @@
 // a grid of inputs. Each worker releases its handle when done.
 //
 // The host runs this through the JIT backend with the **per-domain serialized cap-thunk** (a
-// `Mutex<Host>` engaged automatically because the guest `thread.spawn`s, JIT.md §6 #2): a worker
+// `Mutex<Host>` engaged automatically because the guest `thread.spawn`s, DESIGN.md §22): a worker
 // calling `Jit.compile` (`finalize_definitions`) while siblings run is sound because the lock
 // serializes the *compiles* while execution stays fully parallel — cranelift-jit appends new
 // functions to fresh arena pages and never modifies running code, so a finalize never disturbs a

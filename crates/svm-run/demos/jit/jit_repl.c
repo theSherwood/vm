@@ -1,10 +1,10 @@
-// Auto-compacting guest-driven JIT REPL (JIT.md §6 #1): the **prompt body** of a long-lived REPL
+// Auto-compacting guest-driven JIT REPL (DESIGN.md §22): the **prompt body** of a long-lived REPL
 // that JITs a fresh unit every prompt — and never exhausts the code arena, because the embedder
 // recompacts between prompts.
 //
 // `cranelift-jit`'s code arena has no per-function free: every `__vm_jit_compile` consumes arena
 // bytes and nothing is returned, so a REPL that compiles each prompt would eventually hit `-ENOMEM`.
-// The reclaim (JIT.md §6) is **whole-module recompaction** at a quiescent point — and the only sound
+// The reclaim (DESIGN.md §22) is **whole-module recompaction** at a quiescent point — and the only sound
 // quiescent point is *between* prompts, when the guest has returned to the host. So this is not a
 // standalone `cargo run` program like `jit_demo.c`: it is driven by the embedder's `svm_run::JitSession`,
 // which re-enters this entry once per prompt over a **persistent window** and auto-compacts when the

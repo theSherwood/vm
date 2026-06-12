@@ -1,4 +1,4 @@
-//! JIT.md Phase 1: the long-lived `CompiledModule` split (`compile` → `run`) and
+//! DESIGN.md §22: the long-lived `CompiledModule` split (`compile` → `run`) and
 //! **incremental definition** (`define_extra`) — the enabling primitives for the
 //! guest-driven `Jit` capability (Model A).
 //!
@@ -10,11 +10,11 @@
 //!   environment: same confinement mask (escape-oracle checked), same table mask, the
 //!   parent's `distinct` type-id space (unknown signatures trap fail-closed), and
 //!   unit-local direct calls.
-//! - The **W^X / incremental-finalize spike** (JIT.md Phase 1 / Open questions):
+//! - The **W^X / incremental-finalize spike** (DESIGN.md §22 / Open questions):
 //!   cranelift-jit 0.132's define→finalize→define→finalize cycle leaves already-finalized
 //!   code intact and runnable — exercised by interleaving `define_extra` calls with runs
 //!   of both the parent entry and earlier units.
-//! - **Mask invariance** (JIT.md "the baked function-table mask"): extra units are never
+//! - **Mask invariance** (DESIGN.md §22 "the baked function-table mask"): extra units are never
 //!   installed in the function table, so `call_indirect` from an extra unit dispatches
 //!   through the parent's table with the parent's mask — byte-identical dispatch, even
 //!   when the cumulative function count crosses a power-of-two boundary.
@@ -119,7 +119,7 @@ fn define_extra_unit_local_direct_calls() {
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &want));
 }
 
-/// The W^X / incremental-finalize spike (JIT.md Phase 1): two `define_extra` calls — two
+/// The W^X / incremental-finalize spike (DESIGN.md §22): two `define_extra` calls — two
 /// `finalize_definitions` cycles after the parent's — with runs of the parent entry and the
 /// *first* unit interleaved **after the second finalize**. Already-finalized code must stay
 /// intact and runnable across later finalizes.
@@ -149,7 +149,7 @@ fn incremental_finalize_keeps_earlier_code_runnable() {
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[42]));
 }
 
-/// Mask invariance (JIT.md "the baked function-table mask"): the parent declares ONE
+/// Mask invariance (DESIGN.md §22 "the baked function-table mask"): the parent declares ONE
 /// function (table mask = 0); the extra unit holds FOUR functions, so the *cumulative*
 /// count crosses a power-of-two boundary — but extra functions are thunk-reachable only
 /// and never enter the table, so a `call_indirect` from extra code dispatches through the
@@ -187,7 +187,7 @@ fn define_extra_call_indirect_uses_parent_table_and_mask() {
     );
 }
 
-/// The complement of mask invariance: **extra code is invisible to guest dispatch** (JIT.md
+/// The complement of mask invariance: **extra code is invisible to guest dispatch** (DESIGN.md §22
 /// Model A — parent→extra calls do not exist; the only entry into extra code is the host
 /// trampoline). The parent dispatches `call_indirect` over every index a guest could name;
 /// then an extra function with the *same signature* as the table's functions is defined; the
@@ -259,7 +259,7 @@ fn define_extra_unknown_signature_traps_fail_closed() {
 
 const MEM_PARENT: &str = "memory 16\nfunc () -> (i32) {\nblock0():\n  v0 = i64.const 8\n  v1 = i32.load v0\n  return v1\n}\n";
 
-/// Extra code shares the parent's window environment (JIT.md "vmctx sharing"): it is
+/// Extra code shares the parent's window environment (DESIGN.md §22 "vmctx sharing"): it is
 /// compiled against the same confinement mask + backed extent, so its memory effects match
 /// the interpreter's — an in-window store lands at the same byte (final-memory equality),
 /// and a store beyond the backed `mapped` extent (but inside the reserved mask domain)
@@ -305,7 +305,7 @@ fn define_extra_masking_matches_interp_memory_effects() {
     );
 }
 
-/// The append-only type-id registry (JIT.md B2 groundwork): a novel signature introduced by
+/// The append-only type-id registry (DESIGN.md §22 groundwork): a novel signature introduced by
 /// one unit is interned under a stable id that a later unit — mentioning it only at a call
 /// site — shares; parent ids never move; and until a table entry carries the id, dispatch
 /// with it stays fail-closed. (End-to-end observability arrives with the table `install` op;
@@ -360,7 +360,7 @@ fn define_extra_empty_unit() {
     assert!(cm.define_extra(&[]).expect("empty").is_empty());
 }
 
-/// B2 `install` (JIT level, JIT.md slice #4): a `define_extra` unit installed into a
+/// B2 `install` (JIT level, DESIGN.md §22 slice #4): a `define_extra` unit installed into a
 /// **pre-reserved** table slot becomes `call_indirect`-able — old→new. The parent entry is
 /// `(slot, a, b) -> call_indirect[slot](a, b)`; with a reserved table the unit lands in the
 /// first padding slot, and dispatching that slot runs the unit over the live window. An
@@ -425,7 +425,7 @@ fn install_full_table_returns_none() {
 }
 
 /// **Spike: `finalize_definitions` is safe while a sibling thread executes finalized code**
-/// (JIT.md §6 #2 threaded *compile*, the W^X question). A worker thread hammers an
+/// (DESIGN.md §22 threaded *compile*, the W^X question). A worker thread hammers an
 /// already-finalized leaf function in a tight loop via its `extern "C"` trampoline, while the
 /// main thread does hundreds of `define_extra`s — each running `finalize_definitions`, which
 /// `mprotect`s the *new* code pages and issues a cross-core pipeline flush. If finalize ever

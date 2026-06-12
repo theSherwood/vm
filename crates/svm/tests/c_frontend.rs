@@ -40,7 +40,7 @@ fn to_slot(v: Value) -> i64 {
 }
 
 /// The fixed **8-handle powerbox** a chibicc `_start` imports — stdout, stdin, exit, memory,
-/// addrspace (§14), ioring + blocking (§9/§12), jit (JIT.md) — granted in that order so the
+/// addrspace (§14), ioring + blocking (§9/§12), jit (DESIGN.md §22) — granted in that order so the
 /// handle values are deterministic (and identical across two hosts). Every entry imports the
 /// same set (one `_start` shape); a guest that never touches the ring or the JIT just leaves
 /// those handles stashed and unused. `block_for` is the mock Blocking op's duration — `ZERO`
@@ -2194,7 +2194,7 @@ fn c_guest_mn_scheduler_demo() {
 
 /// The §12 work-stealing capstone: a guest-built **work-stealing** M:N scheduler over **stackless**
 /// tasks (`demos/work_stealing`) runs identically on the interpreter (the M:N oracle) and the JIT.
-/// The guest-driven **JIT capstone** (JIT.md Phase 4, `demos/jit`): a C bytecode interpreter
+/// The guest-driven **JIT capstone** (DESIGN.md §22, `demos/jit`): a C bytecode interpreter
 /// that JITs itself — it emits serialized SVM IR at runtime (the binary `svm-encode` format,
 /// byte-by-byte in guest memory), submits it through the `Jit` capability, and invokes the
 /// compiled unit, checking it against its own interpreter on a 49-input grid. Differential:
@@ -2216,7 +2216,7 @@ fn c_guest_jit_demo() {
     );
 }
 
-/// The **threaded** guest-driven JIT capstone (`demos/jit/jit_threads.c`, JIT.md §6 #2), run as a
+/// The **threaded** guest-driven JIT capstone (`demos/jit/jit_threads.c`, DESIGN.md §22), run as a
 /// full interp≡JIT **differential**: `NWORKERS` guest threads each emit a distinct unit, `Jit.compile`
 /// it **concurrently**, and invoke the native code, checking it against a C reference. Because the
 /// guest `thread.spawn`s, `run_c_full` drives the JIT side through the serialized `cap_thunk_locked`
@@ -2286,7 +2286,7 @@ fn run_jit_repl_session(
     (results, host.stdout, occ, compactions)
 }
 
-/// The **auto-compacting guest-driven JIT REPL** capstone in real C (`demos/jit/jit_repl.c`, JIT.md
+/// The **auto-compacting guest-driven JIT REPL** capstone in real C (`demos/jit/jit_repl.c`, DESIGN.md §22
 /// §6 #1): a long REPL that `__vm_jit_compile`s a fresh unit every prompt would exhaust the code
 /// arena, but `JitSession` recompacts between prompts so occupancy stays bounded — transparently. A
 /// 30-prompt session produces byte-identical results **and** stdout transcript whether

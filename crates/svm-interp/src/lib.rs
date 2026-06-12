@@ -170,7 +170,7 @@ fn drive(
         s.workers = 1; // the calling thread acts as worker 0
                        // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
                        // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
-                       // across `thread.spawn`/`Jit.invoke` children (JIT.md §6 #2).
+                       // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
         let dt = Arc::new(DomainTable::new(&funcs, jit_table_log2));
         let root = Box::new(VCpu::new(
             Arc::clone(&funcs),
@@ -907,7 +907,7 @@ struct Frame {
     /// threads. Resolved against [`Frame::module`]'s `Arc<[Func]>` at each use.
     func: FuncIdx,
     /// Which **function space** [`Frame::func`] indexes — `0` is the vCPU's primary module (its
-    /// own program), `k ≥ 1` is `units[k-1]`, a guest-compiled `Jit` unit (JIT.md Model A). A
+    /// own program), `k ≥ 1` is `units[k-1]`, a guest-compiled `Jit` unit (DESIGN.md §22). A
     /// `call_indirect` always dispatches through the **module-0** table (matching the JIT, where
     /// every function — parent or unit — is lowered against the parent `fn_table`), so a unit's
     /// indirect call lands in module 0 (new→old); a **direct** call stays in the caller's module
@@ -938,7 +938,7 @@ const TABLE_EMPTY: u32 = u32::MAX;
 /// It is a **per-vCPU transient** module, kept *out* of the shared [`DomainTable`]'s `units`, so the
 /// invoked unit is never an installed (`call_indirect`-reachable) module and never collides with a
 /// concurrent install — even one the invoked unit performs on itself (install-during-own-invocation,
-/// JIT.md §6 #2). Far above any reachable install count, just below `TABLE_EMPTY`.
+/// DESIGN.md §22). Far above any reachable install count, just below `TABLE_EMPTY`.
 const INVOKE_MODULE: u32 = u32::MAX - 1;
 
 #[inline]
@@ -956,7 +956,7 @@ fn unpack_slot(w: u64) -> TableSlot {
 /// The domain's **shared, live** `call_indirect` dispatch table — the reference mirror of the JIT's
 /// one `fn_table`, shared by every vCPU of a domain (root, `thread.spawn` children, `Jit.invoke`
 /// children) via `Arc`. Sharing it is what makes guest-driven `install` faithful across threads and
-/// across a nested invocation (JIT.md §6 #2): a slot write is visible to every vCPU, exactly as the
+/// across a nested invocation (DESIGN.md §22): a slot write is visible to every vCPU, exactly as the
 /// JIT's one shared table is.
 ///
 /// **No lock on the dispatch hot path.** Each slot is a single `u64` word (`module<<32 | func`), so
@@ -1973,7 +1973,7 @@ struct VCpu {
     quota: Quota,
     /// The domain's **shared, live** dispatch table (slots + installed units), shared by every vCPU
     /// of the domain via `Arc` so a guest-driven `install` is visible across `thread.spawn` children
-    /// and `Jit.invoke` children (JIT.md §6 #2). Reads are lock-free atomic loads (see
+    /// and `Jit.invoke` children (DESIGN.md §22). Reads are lock-free atomic loads (see
     /// [`DomainTable`]).
     dt: Arc<DomainTable>,
     /// A lock-free **local clone** (a prefix) of `dt`'s installed units (module `k` ≡ `units[k-1]`),
@@ -2035,7 +2035,7 @@ impl VCpu {
     }
 
     /// A vCPU that runs a guest-compiled **`Jit` unit**'s entry (`unit[0]`) over the parent's
-    /// world — same window/host/fuel — for the `Jit.invoke` op (JIT.md Model A/B2). Module 0 is
+    /// world — same window/host/fuel — for the `Jit.invoke` op (DESIGN.md §22/B2). Module 0 is
     /// the `parent` program; `dt` is the **shared, live** domain table, so the unit's `call_indirect`
     /// reaches the original program (new→old) *and* any already- **or later-** `install`ed units
     /// (new→new, incl. install-during-own-invocation), exactly as the JIT's invoked code dispatches
@@ -2756,14 +2756,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         _ => return Err(Trap::CapFault),
                     }
                 }
-                // Guest-driven `Jit.invoke` (iface 11 op 1, JIT.md Model A): serviced here, not in
+                // Guest-driven `Jit.invoke` (iface 11 op 1, DESIGN.md §22): serviced here, not in
                 // the generic dispatch, because it must **run guest code** — a nested evaluation of
                 // the compiled unit's entry over THIS vCPU's window, fuel, and powerbox. That is
                 // exactly the same-domain/same-window semantics the JIT backend gets by calling the
                 // unit's native trampoline over the live window (`invoke_extra`), so the two
                 // backends stay in differential lockstep. compile/release (ops 0/2) take the
                 // generic dispatch below like any host-state op.
-                // Guest-driven `Jit.install` (iface 11 op 3, JIT.md Model B2): install a compiled
+                // Guest-driven `Jit.install` (iface 11 op 3, DESIGN.md §22): install a compiled
                 // unit into the `call_indirect` dispatch table, returning its slot index — a
                 // funcref old code can `call_indirect` (old→new). Serviced here (it mutates this
                 // vCPU's `units`/`table`, which the generic host dispatch can't reach). The JIT
@@ -2792,7 +2792,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     // Append the unit to the **shared** domain table (module id = its 1-based
                     // index) and fill the next empty slot — visible at once to every vCPU of the
-                    // domain (JIT.md §6 #2). The padding starts at `funcs.len()` on both backends,
+                    // domain (DESIGN.md §22). The padding starts at `funcs.len()` on both backends,
                     // so the first install lands at the same index the JIT's `install` returns.
                     let res = match dt.install(unit_funcs) {
                         Some(slot) => slot as i64,
@@ -2800,7 +2800,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     frames[top].vals.push(Value::I64(res));
                 }
-                // `Jit.uninstall(slot)` (iface 11 op 4, JIT.md Model B2 reclaim): clear a
+                // `Jit.uninstall(slot)` (iface 11 op 4, DESIGN.md §22 reclaim): clear a
                 // previously-installed table slot so the index is reusable and a stale
                 // `call_indirect` of it traps. Serviced here (it mutates the table). A guest may
                 // only clear slots it installed (`≥ funcs.len()`, the module-0 function count);
@@ -2907,7 +2907,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // The unit cannot park/yield (concurrency is rejected at compile);
                         // defensive fail-closed.
                         Ok(_) => return Err(Trap::CapFault),
-                        // A trap in invoked code is terminal for the domain (JIT.md Model A),
+                        // A trap in invoked code is terminal for the domain (DESIGN.md §22),
                         // matching the JIT's trap-cell propagation.
                         Err(t) => return Err(t),
                     }
@@ -3967,7 +3967,7 @@ pub mod iface {
     /// `submit` batch can hand it to the offload pool instead of the guest's vCPU thread. Op 0 is also
     /// a perfectly ordinary synchronous `cap.call` (it then blocks the caller — the degenerate path).
     pub const BLOCKING: u32 = 10;
-    /// `Jit` — the guest-driven JIT capability (JIT.md Model A): submit serialized IR at runtime to
+    /// `Jit` — the guest-driven JIT capability (DESIGN.md §22): submit serialized IR at runtime to
     /// be validated (decode + verify + the memory-match precondition, via the host-injected
     /// [`crate::JitValidator`]) and compiled into the **same domain** (same window, same powerbox —
     /// a module is not an isolation unit, DESIGN §8). op 0 `compile(ptr, len) -> code_handle | -errno`
@@ -3976,7 +3976,7 @@ pub mod iface {
     /// caller's **live window** — serviced by the eval loop on the interpreter (it must run guest
     /// code, which the generic dispatch can't) and by the embedder's cap thunk on the JIT (it calls
     /// the unit's native trampoline); traps in invoked code are **terminal for the domain**; op 2
-    /// `release(code_handle) -> 0 | -errno` revokes the handle (no code reclaim yet — JIT.md
+    /// `release(code_handle) -> 0 | -errno` revokes the handle (no code reclaim yet — DESIGN.md §22
     /// "Code reclaim"); op 3 `install(code_handle) -> slot_index | -errno` (Model B2) installs the
     /// unit into the `call_indirect` table's next reserved slot so old code (or another unit) can
     /// dispatch it at native speed (old→new), `-ENOSPC` if the table is full; op 4
@@ -4264,7 +4264,7 @@ enum Binding {
     /// mock synchronous-only/blocking op the offload pool can overlap. Out-of-line (an index, not the
     /// `Arc`) so `Binding` stays `Copy`, like [`Binding::SharedRegion`]/[`Binding::Module`].
     Blocking(u32),
-    /// A guest-driven `Jit` domain handle (iface 11, JIT.md Model A), carrying the index of its
+    /// A guest-driven `Jit` domain handle (iface 11, DESIGN.md §22), carrying the index of its
     /// [`JitDomainState`] in [`Host::jit_domains`]. Out-of-line so `Binding` stays `Copy`.
     JitDomain(u32),
     /// A `CompiledCode` handle minted by `Jit.compile` (iface 12): `(domain, unit)` indices into
@@ -4557,7 +4557,7 @@ pub struct Host {
     quota: Quota,
     /// Guest-driven `Jit` domains (iface 11), indexed by the id a [`Binding::JitDomain`] carries.
     /// Append-only for the life of the `Host` (units are never removed — `release` only revokes
-    /// the *handle*; code reclaim is a JIT.md follow-up), so unit `Arc`s and native pointers stay
+    /// the *handle*; code reclaim is a DESIGN.md §22 follow-up), so unit `Arc`s and native pointers stay
     /// valid for the whole run.
     jit_domains: Vec<JitDomainState>,
     /// The host-injected validation gate for guest-submitted `Jit` blobs ([`JitValidator`]) —
@@ -4572,7 +4572,7 @@ pub struct Host {
     jit_table_log2: u8,
 }
 
-/// The host-injected validation gate for guest-submitted `Jit` blobs (JIT.md "Security
+/// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
 /// argument"): `(blob bytes, expected declared memory)` → the verified functions, or a
 /// negative errno. The embedder's implementation must run the full hinge —
 /// `decode_module` + `verify_module` + the **memory-match precondition** (declared memory ==
@@ -4605,7 +4605,7 @@ struct JitUnit {
 
 /// Per-`Jit`-handle domain state.
 struct JitDomainState {
-    /// The memory-match precondition (JIT.md "Security argument"): a submitted blob's declared
+    /// The memory-match precondition (DESIGN.md §22 "Security argument"): a submitted blob's declared
     /// memory must equal the parent module's, fixed when the capability is granted.
     mem_log2: Option<u8>,
     units: Vec<JitUnit>,
@@ -4613,7 +4613,7 @@ struct JitDomainState {
     /// `usize`); `0` in a reference run. Never dereferenced here — only stored and handed back
     /// ([`Host::jit_native_ctx`]).
     native_ctx: usize,
-    /// Compile quota (JIT.md "Code reclaim", the MVP byte-cap): remaining units / cumulative
+    /// Compile quota (DESIGN.md §22 "Code reclaim", the MVP byte-cap): remaining units / cumulative
     /// submitted-blob bytes this domain may still `compile`. A guest looping `compile` is
     /// bounded with `-ENOMEM` here — in the **shared** gate, so both backends reject
     /// identically — instead of pressuring the JIT's finite code arena (whose exhaustion path
@@ -4895,7 +4895,7 @@ impl Host {
 
     /// Grant a guest-driven `Jit` capability (iface 11, opt-in like `Memory`). `mem_log2` is the
     /// parent module's declared memory — the memory-match precondition submitted blobs are
-    /// checked against (JIT.md "Security argument").
+    /// checked against (DESIGN.md §22 "Security argument").
     pub fn grant_jit(&mut self, mem_log2: Option<u8>) -> i32 {
         self.grant_jit_with_table(mem_log2, 0)
     }
@@ -5055,7 +5055,7 @@ impl Host {
     }
 
     /// The number of units a `Jit` domain has compiled (append-only; released units stay, their
-    /// handle merely revoked). The code-memory compaction driver (JIT.md §6) walks `0..count`
+    /// handle merely revoked). The code-memory compaction driver (DESIGN.md §22) walks `0..count`
     /// deciding which to carry into the fresh module.
     pub fn jit_unit_count(&self, domain: u32) -> u32 {
         self.jit_domains
@@ -5092,7 +5092,7 @@ impl Host {
 
     /// `Jit.release`: revoke a `CompiledCode` handle (the slot is cleared; the per-slot
     /// generation makes the old handle value inert forever, D37). The unit's code/funcs stay —
-    /// reclaim is a JIT.md follow-up. A forged/closed handle is `Err` (the caller maps it to a
+    /// reclaim is a DESIGN.md §22 follow-up. A forged/closed handle is `Err` (the caller maps it to a
     /// non-fatal `-EINVAL`: release is guest-reachable in a loop, so it must not trap).
     pub fn jit_release(&mut self, code_handle: i32) -> Result<(), Trap> {
         self.resolve_jit_code(code_handle)?;
@@ -5328,7 +5328,7 @@ impl Host {
             // module ops); it has no callable ops — and crucially, the generic dispatch never exposes
             // the grant's host-side data, so no host pointer is guest-reachable.
             Binding::Module(_) => Err(Trap::CapFault),
-            // Guest-driven `Jit` (iface 11, JIT.md Model A). This generic arm is the **reference**
+            // Guest-driven `Jit` (iface 11, DESIGN.md §22). This generic arm is the **reference**
             // path (an interpreter run, or a wiring-bug fallback): op 0 `compile` validates +
             // stores the unit and mints its handle; op 2 `release` revokes one. op 1 `invoke` can
             // never be serviced here — it must *run guest code* (the interp eval loop intercepts
@@ -7399,7 +7399,7 @@ mod prot_tests {
 
 #[cfg(test)]
 mod domain_table_tests {
-    //! The shared, live [`DomainTable`] (JIT.md §6 #2): an `install` on one vCPU's view is visible to
+    //! The shared, live [`DomainTable`] (DESIGN.md §22): an `install` on one vCPU's view is visible to
     //! every vCPU sharing the `Arc` — the threaded-install / install-during-own-invocation
     //! faithfulness the reference interpreter previously lacked (a per-vCPU table snapshot hid a
     //! post-spawn install from a worker, diverging from the JIT's one shared `fn_table`). Slot reads

@@ -29,7 +29,7 @@ pub use svm_interp::{Quota, Value};
 use svm_jit::{compile_and_run, CompiledModule, JitOutcome, TrapKind, EXIT_CODE};
 
 /// Default `call_indirect` table reservation for the CLI powerbox (`2^10` = 1024 slots) so a
-/// guest using the `Jit` capability can `install` units (JIT.md Model B2). Embedders pick their
+/// guest using the `Jit` capability can `install` units (DESIGN.md §22). Embedders pick their
 /// own via [`grant_jit`] + the compile `table_reserve_log2`.
 const CLI_JIT_TABLE_LOG2: u8 = 10;
 
@@ -84,7 +84,7 @@ pub unsafe extern "C" fn cap_thunk(
         let _ = (mem_base, mem_size, mem_reserved);
         None
     };
-    // Guest-driven `Jit` (iface 11, JIT.md Model A): serviced natively here, not in the generic
+    // Guest-driven `Jit` (iface 11, DESIGN.md §22): serviced natively here, not in the generic
     // Host dispatch — `compile` must call into Cranelift (`define_extra` on the live
     // `CompiledModule`) and `invoke` must call the unit's trampoline over the live window,
     // neither of which `svm-interp` can (or should) reach. The interpreter backend services the
@@ -111,7 +111,7 @@ pub unsafe extern "C" fn cap_thunk(
     }
 }
 
-/// **Multi-threaded `cap.call` thunk** (JIT.md §6 #2 threaded *compile*): the same dispatch as
+/// **Multi-threaded `cap.call` thunk** (DESIGN.md §22 threaded *compile*): the same dispatch as
 /// [`cap_thunk`], but serialized through a per-domain [`Mutex<Host>`] so a guest whose worker
 /// threads make concurrent `cap.call`s (notably `Jit.compile`, which mutates the `Host` unit
 /// registry and the live `CompiledModule`) does not data-race. `ctx` is `*const Mutex<Host>`
@@ -242,7 +242,7 @@ unsafe fn jit_invoke_locked(
     }
 }
 
-/// The native (Cranelift) half of the guest-driven `Jit` capability (JIT.md Model A), reached
+/// The native (Cranelift) half of the guest-driven `Jit` capability (DESIGN.md §22), reached
 /// from [`cap_thunk`]'s iface-11 intercept. Op semantics — including every fail-closed path —
 /// mirror the interpreter reference (`svm-interp`'s `Binding::JitDomain` dispatch arm + its
 /// eval-loop `invoke`) exactly, so the two backends agree on results, errnos, and traps:
@@ -397,7 +397,7 @@ unsafe fn jit_native_op(
             put(results, n_results, v, trap_out);
         }
         3 => {
-            // install(code_handle) -> slot_index | -errno (JIT.md Model B2): write the unit's
+            // install(code_handle) -> slot_index | -errno (DESIGN.md §22): write the unit's
             // natural entry + interned type_id into the live fn_table's next padding slot. The
             // slot index agrees with the interpreter's (both fill from the parent's funcs count).
             const ENOSPC: i64 = -28;
@@ -428,7 +428,7 @@ unsafe fn jit_native_op(
             put(results, n_results, v, trap_out);
         }
         4 => {
-            // uninstall(slot) -> 0 | -EINVAL (JIT.md Model B2 reclaim): clear an installed slot
+            // uninstall(slot) -> 0 | -EINVAL (DESIGN.md §22 reclaim): clear an installed slot
             // so the index is reusable and a stale call_indirect of it traps.
             let Ok(domain) = host.resolve_jit_domain(handle) else {
                 return cap_fault(trap_out);
@@ -451,7 +451,7 @@ unsafe fn jit_native_op(
 }
 
 /// The canonical [`svm_interp::JitValidator`] — the **security hinge** of the guest-driven
-/// `Jit` capability (JIT.md "Security argument"): `decode_module` (untrusted-input-facing,
+/// `Jit` capability (DESIGN.md §22 "Security argument"): `decode_module` (untrusted-input-facing,
 /// fail-closed) → `verify_module` (the escape-freedom gate) → the **memory-match
 /// precondition** (declared memory must equal the parent window, so verified bounds and the
 /// runtime mask agree) → reject data segments (they would overwrite live guest memory) and
@@ -480,7 +480,7 @@ pub fn jit_blob_validator(bytes: &[u8], mem_log2: Option<u8>) -> Result<Arc<[svm
     // dispatches through the parent `fn_table`; the reference interpreter mirrors this with its
     // module-aware dispatch table (a unit runs as a module ≥ 1 whose indirect calls resolve into
     // module 0). Both backends therefore reach the original program's functions identically
-    // (JIT.md Model A new→old).
+    // (DESIGN.md §22 new→old).
     Ok(m.funcs.into())
 }
 
@@ -511,7 +511,7 @@ pub fn jit_cap_run(
     table_reserve_log2: u8,
     host: &mut Host,
 ) -> Result<(JitOutcome, Vec<u8>), svm_jit::JitError> {
-    // A guest whose workers make concurrent `cap.call`s (threaded `Jit.compile`, JIT.md §6 #2) runs
+    // A guest whose workers make concurrent `cap.call`s (threaded `Jit.compile`, DESIGN.md §22) runs
     // the **serialized** thunk over a per-domain `Mutex<Host>`; a single-threaded guest keeps the
     // unlocked `cap_thunk` + raw `Host` path verbatim (zero lock cost). The guest-facing iface is
     // identical either way — the serialization is an internal detail that can be made finer-grained
@@ -571,7 +571,7 @@ pub fn jit_cap_run(
     r
 }
 
-/// **Code-memory compaction** for a guest-driven `Jit` domain (JIT.md §6): rebuild the domain's
+/// **Code-memory compaction** for a guest-driven `Jit` domain (DESIGN.md §22): rebuild the domain's
 /// *live* JIT code into a **fresh** [`CompiledModule`], reclaiming the old module's 256 MiB code
 /// arena (cranelift-jit has no per-function free, so reclaim = whole-module recompaction — drop
 /// the old module and its arena goes with it). Returns the fresh module for the caller to swap in
@@ -611,7 +611,7 @@ pub fn recompact_jit(
     // Single-threaded path: the fresh module bakes the unlocked `cap_thunk` + raw `Host`. A
     // *concurrent* guest must compact through [`JitSession`] (or replicate its pattern:
     // `cap_thunk_locked` over a stable `Mutex<Host>`, then [`recompact_into`]) — re-running a fresh
-    // module that baked the unlocked thunk under threads would race (JIT.md §6 #2).
+    // module that baked the unlocked thunk under threads would race (DESIGN.md §22).
     let mut fresh = CompiledModule::compile(
         base,
         entry,
@@ -685,7 +685,7 @@ pub fn recompact_into(
     Ok(())
 }
 
-/// A long-lived **guest-driven JIT REPL session** over one domain (JIT.md §6): the persistent
+/// A long-lived **guest-driven JIT REPL session** over one domain (DESIGN.md §22): the persistent
 /// `CompiledModule` + window an embedder re-enters once per prompt, with **automatic compaction**
 /// when code-arena occupancy crosses a watermark. This is the auto-trigger policy that turns the
 /// [`recompact_jit`] primitive into a usable long-session story — the missing piece between
@@ -702,7 +702,7 @@ pub fn recompact_into(
 ///
 /// **Concurrency.** The session **owns** the `Host` behind a boxed `Mutex` (stable address) and bakes
 /// [`cap_thunk_locked`], so a **multi-threaded** guest's worker `cap.call`s (incl. threaded
-/// `Jit.compile`, JIT.md §6 #2) serialize correctly — and compaction (a quiescent, between-prompts
+/// `Jit.compile`, DESIGN.md §22) serialize correctly — and compaction (a quiescent, between-prompts
 /// operation) rebuilds the module with the **same** locked thunk, so the next multi-threaded prompt
 /// stays sound. A single-threaded guest pays only an uncontended lock per `cap.call`, negligible for
 /// an interactive REPL driver (the perf-critical single-run path is [`jit_cap_run`], which stays
@@ -1901,7 +1901,7 @@ pub struct Run {
 /// matches either is a runnable *program*; anything else is a bare kernel (run with [`run_kernel`]).
 pub fn is_powerbox_entry(module: &Module) -> bool {
     // The powerbox entry imports 3–8 `i32` capability handles (stdout, stdin, exit, [memory],
-    // [addrspace], [ioring], [blocking], [jit] — §3e/§9/§12/JIT.md; a chibicc `_start` always
+    // [addrspace], [ioring], [blocking], [jit] — §3e/§9/§12/DESIGN.md §22; a chibicc `_start` always
     // imports the full 8). The runner grants exactly as many as the entry declares (see
     // `run_powerbox_with_deadline`).
     matches!(
@@ -2061,7 +2061,7 @@ pub fn run_powerbox_with_deadline_and_quota(
     if arity >= 7 {
         slots.push(host.grant_blocking(std::time::Duration::ZERO, None) as i64);
     }
-    // The guest-driven `Jit` capability (iface 11, JIT.md) — the 8th of the fixed chibicc
+    // The guest-driven `Jit` capability (iface 11, DESIGN.md §22) — the 8th of the fixed chibicc
     // powerbox. The canonical validator is the security hinge; the live `CompiledModule` is
     // registered below, once it exists.
     if arity >= 8 {
@@ -2075,10 +2075,10 @@ pub fn run_powerbox_with_deadline_and_quota(
         max_fibers: hq.max_fibers,
         max_vcpus: hq.max_vcpus,
     };
-    // The long-lived compile→run split (JIT.md Phase 1): compile once, register the live module for
+    // The long-lived compile→run split (DESIGN.md §22): compile once, register the live module for
     // the `Jit` cap's mid-run re-entry, run through one caller-managed pointer. A **concurrent**
     // guest (`thread.spawn`) takes the serialized cap-thunk over a per-domain `Mutex<Host>` so its
-    // workers can `cap.call` (incl. threaded `Jit.compile`, JIT.md §6 #2) safely; a single-threaded
+    // workers can `cap.call` (incl. threaded `Jit.compile`, DESIGN.md §22) safely; a single-threaded
     // guest keeps the unlocked fast path verbatim (zero lock cost). See [`powerbox_compile_run`].
     let concurrent = module.funcs.iter().any(|f| f.uses_concurrency());
     //

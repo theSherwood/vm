@@ -141,7 +141,7 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 // entry imports (see `emit_start`).
 #define IORING_SLOT 20
 #define BLOCKING_SLOT 24
-// The guest-driven `Jit` capability (iface 11, JIT.md Model A): submit serialized IR at runtime,
+// The guest-driven `Jit` capability (iface 11, DESIGN.md §22): submit serialized IR at runtime,
 // invoke the compiled unit over this same window (the `__vm_jit_*` builtins).
 #define JIT_SLOT 28
 // The reserved region's size: 8 handle slots (0..32), 16-aligned. Globals start here so no data
@@ -867,7 +867,7 @@ static int gen_builtin_blocking_handle(Node *node) {
   return load_handle(BLOCKING_SLOT);
 }
 
-// Guest-driven JIT builtins (iface 11, JIT.md Model A) on the stashed Jit handle:
+// Guest-driven JIT builtins (iface 11, DESIGN.md §22) on the stashed Jit handle:
 //
 //   long __vm_jit_compile(void *blob, long len);          // submit serialized IR -> code | -errno
 //   long __vm_jit_invoke2(long code, long a, long b);     // call a compiled (i64,i64)->(i64) unit
@@ -914,7 +914,7 @@ static int gen_builtin_jit_release(Node *node) {
   return r;
 }
 
-// `__vm_jit_install(code) -> slot` (iface 11 op 3, JIT.md Model B2): install a compiled unit
+// `__vm_jit_install(code) -> slot` (iface 11 op 3, DESIGN.md §22): install a compiled unit
 // into the `call_indirect` table; the returned slot index is a funcref old code (or another
 // unit) can call indirectly at native speed. Returns -28 (ENOSPC) if the table is full.
 static int gen_builtin_jit_install(Node *node) {
@@ -928,7 +928,7 @@ static int gen_builtin_jit_install(Node *node) {
   return r;
 }
 
-// `__vm_jit_uninstall(slot) -> 0 | -errno` (iface 11 op 4, JIT.md Model B2 reclaim): clear an
+// `__vm_jit_uninstall(slot) -> 0 | -errno` (iface 11 op 4, DESIGN.md §22 reclaim): clear an
 // installed call_indirect slot so the index is reusable and a stale call of it traps.
 static int gen_builtin_jit_uninstall(Node *node) {
   Node *a = node->args;
@@ -2223,7 +2223,7 @@ static void emit_start(Obj *main_fn) {
   for (int i = 0; i < NHANDLES; i++)
     fprintf(o, "%si32", i ? ", " : "");
   fprintf(o, ") -> (%s) {\n", is_void ? "" : irty(mret));
-  // stdout, stdin, exit, memory, addrspace (§14), ioring, blocking (§9/§12), jit (JIT.md)
+  // stdout, stdin, exit, memory, addrspace (§14), ioring, blocking (§9/§12), jit (DESIGN.md §22)
   fprintf(o, "block0(");
   for (int i = 0; i < NHANDLES; i++)
     fprintf(o, "%sv%d: i32", i ? ", " : "", i);

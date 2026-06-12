@@ -1,4 +1,4 @@
-//! JIT.md Phase 2b/2c: the guest-driven **`Jit` capability** (iface 11, Model A),
+//! DESIGN.md §22b/2c: the guest-driven **`Jit` capability** (iface 11, Model A),
 //! differentially tested — the same guest program, the same `Host` powerbox setup, and the
 //! same submitted blob run on the reference interpreter (eval-loop `invoke` + dispatch
 //! `compile`/`release`) and the Cranelift JIT (`cap_thunk` native intercept →
@@ -151,7 +151,7 @@ fn garbage_blob_rejected_identically() {
     );
 }
 
-/// The memory-match precondition (JIT.md "Security argument"): a *valid, verified* blob whose
+/// The memory-match precondition (DESIGN.md §22 "Security argument"): a *valid, verified* blob whose
 /// declared memory differs from the parent window is rejected — on both backends, before any
 /// compilation.
 #[test]
@@ -166,7 +166,7 @@ fn memory_mismatch_rejected_identically() {
     );
 }
 
-/// **new→old** (JIT.md Model A): a submitted unit `call_indirect`s back into the *original
+/// **new→old** (DESIGN.md §22): a submitted unit `call_indirect`s back into the *original
 /// program's* function table. The parent's func 1 is `(a, b) -> a + b + 5000`, sitting in
 /// table slot 1; the unit's entry does `call_indirect slot 1 (a, b)`. On the JIT the unit is
 /// lowered against the parent `fn_table`; on the interpreter it runs as a module-1 frame whose
@@ -206,7 +206,7 @@ func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  r
 }
 
 /// A blob with data segments is rejected (it would overwrite live guest memory at define
-/// time — JIT.md "Reject, don't apply").
+/// time — DESIGN.md §22 "Reject, don't apply").
 #[test]
 fn data_segment_blob_rejected_identically() {
     let b = blob("data 0 \"\\x01\"\nmemory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  return v2\n}\n");
@@ -274,7 +274,7 @@ fn release_then_invoke_capfaults_identically() {
     );
 }
 
-/// Fuzz the `compile` op (JIT.md "Verification approach"): random byte strings and bit-flipped
+/// Fuzz the `compile` op (DESIGN.md §22 "Verification approach"): random byte strings and bit-flipped
 /// mutations of a *valid* blob, fed through the full guest-side `cap.call compile` on **both**
 /// backends. Every input must either mint a handle or return `-EINVAL` — identically — and
 /// nothing may crash the host. (Deterministic xorshift so failures reproduce.)
@@ -315,7 +315,7 @@ fn fuzzed_blobs_fail_closed_identically() {
     }
 }
 
-/// The compile quota (JIT.md "Code reclaim", the MVP byte-cap): with a 2-unit budget, a guest's
+/// The compile quota (DESIGN.md §22 "Code reclaim", the MVP byte-cap): with a 2-unit budget, a guest's
 /// third `compile` is `-ENOMEM` — identically on both backends (the check lives in the shared
 /// `Host::jit_compile` gate), and a guest cannot pressure the finite code arena unboundedly.
 #[test]
@@ -368,7 +368,7 @@ fn compile_quota_enforced_identically() {
     );
 }
 
-/// **old→new via `install`** (JIT.md Model B2): the guest compiles a unit, installs it into the
+/// **old→new via `install`** (DESIGN.md §22): the guest compiles a unit, installs it into the
 /// reserved `call_indirect` table (getting a slot index), then **old code** `call_indirect`s
 /// that slot to reach the new code. Differentially: the JIT writes the unit's native entry into
 /// the fn_table padding; the interpreter registers the unit as a module + fills the same table
@@ -387,7 +387,7 @@ fn install_then_old_calls_new_agrees() {
     );
 }
 
-/// **new→new** (JIT.md Model B2): an *invoked* unit `call_indirect`s an *installed* unit. The
+/// **new→new** (DESIGN.md §22): an *invoked* unit `call_indirect`s an *installed* unit. The
 /// guest installs unit A `(a,b)->a+b` at a slot, then invokes unit B whose body
 /// `call_indirect[slot](a,b) + 1` reaches A. On the JIT the invoked unit dispatches the live
 /// `fn_table` (which install wrote to); the interpreter gives the invoke child a snapshot of the
@@ -422,7 +422,7 @@ fn invoked_unit_calls_installed_unit_agrees() {
     );
 }
 
-/// **slot reclaim via `uninstall`** (JIT.md Model B2): after uninstalling an installed slot, a
+/// **slot reclaim via `uninstall`** (DESIGN.md §22): after uninstalling an installed slot, a
 /// `call_indirect` of it traps (`IndirectCallType`), and a later `install` reuses the freed
 /// slot index — identically on both backends. (Reclaims the slot, not the code memory.)
 #[test]
@@ -508,7 +508,7 @@ fn two_units_interleaved_agree_across_backends() {
     );
 }
 
-/// **Threaded install** (JIT.md §6 #2): the main thread compiles a unit, **spawns a worker
+/// **Threaded install** (DESIGN.md §22): the main thread compiles a unit, **spawns a worker
 /// thread**, then `install`s the unit and signals readiness through a guest atomic; the worker —
 /// already running — `call_indirect`s the **post-spawn-installed** slot. This is the divergence #2
 /// named: a per-vCPU/snapshotted table would hide the install from the worker. With the interp's
@@ -587,7 +587,7 @@ fn threaded_install_agrees_across_backends() {
     );
 }
 
-/// **Threaded compile** (JIT.md §6 #2): the main thread *and* a spawned worker thread each
+/// **Threaded compile** (DESIGN.md §22): the main thread *and* a spawned worker thread each
 /// `Jit.compile` a unit and `invoke` it **concurrently**. This is the case the single-threaded MVP
 /// forbade — two threads in `cap.call` at once would race the `Host` unit registry + the live
 /// `CompiledModule` (`define_extra`). With the per-domain serialized thunk (`cap_thunk_locked` over a
@@ -721,7 +721,7 @@ fn threaded_compile_loop_stress_agrees() {
     );
 }
 
-/// **Cross-thread execute of freshly-compiled code** (JIT.md §6 #2): the worker is spawned **first**,
+/// **Cross-thread execute of freshly-compiled code** (DESIGN.md §22): the worker is spawned **first**,
 /// then the main thread `compile`s + `install`s a unit — so the worker executes code that another
 /// thread compiled **while the worker was already running** (compile *after* spawn, unlike
 /// `threaded_install_*` where compile precedes the spawn). This is the case a cross-modifying-code

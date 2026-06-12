@@ -1873,6 +1873,148 @@ nesting bites.
 
 ---
 
+## 22. Guest-driven JIT (the `Jit` capability)  [SETTLED — built, differentially tested]
+
+**The problem.** Can *guest* code (an interpreter running inside the sandbox) generate SVM IR at
+runtime, hand it to the VM to verify and Cranelift-compile, and call into the resulting native code?
+This is the "JIT-inside-the-sandbox" problem wasm handles poorly (W^X + immutable modules force a
+guest to ship its own interpreter forever, or round-trip to the host for a fresh module). SVM does it
+cleanly, because the submit-a-blob boundary already exists and **the verifier is designed to be the
+trust hinge for exactly this**. **Built and merged on both backends, differentially identical**
+(`crates/svm/tests/jit_cap.rs`, `jit_incremental.rs`, `jit_reentry.rs`, `jit_compaction.rs`).
+
+**Shape (everything crosses `cap.call`, D55).** The guest builds a serialized IR blob (the binary
+`svm-encode` format) in its own window, `cap.call`s a granted **`Jit`** capability with a `(ptr, len)`,
+and the host reads the blob, runs `decode_module` → `verify_module` **plus the memory-match
+precondition** (below), and — only if all pass — Cranelift-compiles it into a long-lived `JITModule`,
+returning a `CompiledCode` handle. Adding the capability needed **no verifier/IR/escape-TCB change** —
+an interface signature + a host handler (D45/D46).
+
+**Isolation model — same domain, not a nested guest.** The compiled code joins the *submitter's* domain:
+same window, same handle table, same authority (§8 — a module is a unit of code, not an isolation unit).
+So the trust boundary is **verification, not isolation**: the blob is exactly as powerful as its
+submitter, no more (it cannot reach beyond the window or the granted handles) and no less. For running
+*untrusted* code with *less* authority, the right tool is the §13/§14 `Instantiator` (a child VM with its
+own window and attenuated handles), not `Jit`. **`Jit` adds speed to a guest; it never adds a protection
+domain.**
+
+### Capability surface (iface 11)
+
+`cap.call 11 <op> …` on a granted `Jit` domain handle (negative-errno `i64` ABI, D42):
+
+| op | signature | meaning |
+| --- | --- | --- |
+| 0 `compile` | `(ptr, len) -> code \| -errno` | borrow blob, decode+verify+precondition gate, compile into the domain, mint a `CompiledCode` handle. Fail-closed. |
+| 1 `invoke` | `(code, args…) -> results` | run the unit's entry over the live window (raw i64-slot ABI); a trap is **terminal for the domain** (§5). |
+| 2 `release` | `(code) -> 0 \| -errno` | revoke the handle (generation bump). Code/slots not freed (see reclaim). |
+| 3 `install` | `(code) -> slot \| -errno` | write the unit into the `call_indirect` table's next reserved slot; returns a funcref index (`-ENOSPC` if full). |
+| 4 `uninstall` | `(slot) -> 0 \| -errno` | clear an installed slot (reusable; stale calls trap). |
+
+C surface (`frontend/chibicc`, `<svm.h>`): `__vm_jit_compile/invoke2/install/uninstall/release`, the
+8th of the fixed chibicc powerbox. Demos in `crates/svm-run/demos/jit/` (`jit_demo.c` self-JITs a
+bytecode interpreter; `jit_threads.c` concurrently compiles from worker threads; `jit_repl.c` is the
+auto-compacting REPL driven by `JitSession`).
+
+### The one structural obstacle — the baked function-table mask
+
+Dropping the module at end-of-run is *policy*; the real obstacle to incremental compilation is that the
+**function-table mask is baked as a compile-time `iconst` at every `call_indirect` site** (the
+Spectre-safe `slot = band(idx, fn_table_mask)` + `type_id` check, invariant I2 — the touchiest
+escape-TCB lowering). Add a function that crosses a power-of-two boundary and every already-compiled
+site holds the stale mask. Two models design *around* it, not through it:
+
+- **Model A (shipped, the default) — sidestep the mask.** A submitted unit is reached through the host
+  `cap.call` thunk, never installed in the shared table, so the mask never moves; incremental
+  define/finalize on a live module is a pure Cranelift capability (`cranelift-jit 0.132`). Cross-unit
+  hot calls a REPL would pay per-iteration are absorbed by the guest **re-emitting** the callee's IR
+  into the new blob (it owns the IR) — a verified *direct* call at native speed, guest policy, invisible
+  to the TCB.
+- **Model B2 (shipped, `install`) — neutralize the mask by pre-sizing.** Reserve a fixed power-of-two
+  table up front (`table_reserve_log2` / `grant_jit_with_table`, identical on both backends), so the mask
+  is constant from `t=0`; only *population* is dynamic (empty slots are `PADDING_TYPE_ID` and trap until
+  filled). An installed unit *is* a funcref — old code `call_indirect`s it at native speed, with no
+  boundary crossing. (B1, a *growable* table that moves base+mask, is rejected — it would edit the
+  Spectre-safe dispatch for nothing B2 lacks.)
+
+All four cross-call directions — old→old, old→new (`install`), new→old, new→new — are covered and
+differentially pinned. The reference interpreter matches the JIT's code-pointer dispatch with
+**module-aware frames** (`Frame.module`: 0 = the program, ≥1 = an installed unit) dispatching through a
+shared, live `DomainTable`.
+
+**Type identity = an append-only intern, not a linking subsystem.** Cross-unit `call_indirect` is sound
+because a single `CompiledModule` owns the domain's entire id space: the map `FuncType → type_id` is an
+**injection, append-only (an id never remaps), and total over participants** (every signature is interned
+before code referencing it is lowered). Given that, id-equality coincides *exactly* with the interpreter's
+structural equality. The registry is consulted only inside a synchronous `cap.call` and is **never read at
+runtime** — a ~10-line auditable function, zero runtime-readable state. Interning is *cleaner* than a
+frozen parent-anchored universe: a later `install` can satisfy a site whose signature arrived in a later
+unit, matching structural semantics by construction.
+
+### Security argument
+
+The escape contract (§2a) `Verified ∧ Correct(JIT) ∧ Correct(runtime) ⟹ escape-free` extends to
+guest-submitted code: it passes the *same* `decode`+`verify` gate before a single instruction reaches
+Cranelift, so a malicious/garbage blob is rejected fail-closed. **The one new authority-TCB precondition
+that keeps "no escape-TCB change" true:** confinement masking (I1) masks into `[0, size)` for the
+*declared* memory; a blob declaring a *larger* memory, compiled against its own size, would get the JIT to
+mask into a larger region — an escape, without touching the masking lowering. The fix lives in the
+authority-TCB `Jit` handler: **reject any submitted module whose declared memory ≠ the parent window**
+(the host then compiles the blob with the parent's base/mask, so I1 confines it exactly as the main
+module). The handler also rejects data segments and §12 concurrency ops inside a *submitted unit* (a
+JIT'd blob stays single-threaded; the *parent* may be multi-threaded). A per-domain **compile quota**
+(`-ENOMEM`) bounds a looping guest. Net: **Model A adds no escape-TCB surface (authority-TCB only); B2
+leaves the indirect-call lowering byte-identical and only adds dynamic table population** on top of the
+intern.
+
+### Code reclaim — whole-module compaction
+
+`cranelift-jit`'s `JITModule` has **no per-function free**: every incremental `define_extra` consumes the
+256 MiB code arena and nothing is returned, so a long REPL that JITs each prompt would leak code until
+`-ENOMEM`. `uninstall` frees a *table slot* but not the *code* behind a stale definition. The reclaim is
+therefore **whole-module recompaction**: at a quiescent point, rebuild the *live* unit set into a fresh
+`CompiledModule` and drop the old one — RAII frees its entire arena. This is amortized-periodic
+O(live-set) recompile, stated honestly, not "incremental forever". The primitives add **no escape-TCB
+codegen** (compaction only replays `compile`/`define_extra`/`install` into a fresh module): `install_at`
+reinstalls a unit at its *exact* old slot (so a held funcref keeps resolving across the swap, including
+around `uninstall` gaps); `extra_byte_count()` is the **byte-accurate** occupancy a watermark watches
+(it restarts near zero in the fresh module — the visible reclaim); `is_running()` is the quiescence guard
+(the guest is suspended *inside* the module during a `cap.call`, so it can never self-trigger compaction).
+The embedder driver `recompact_jit` enumerates live units — installed (`installed_slots`) **or** held
+through a live handle (`Host::jit_live_units`) — re-defines each, remaps the `Host` unit→native record
+(handles name `(domain, unit)`, not a code address, so they keep working), and reproduces occupied slots.
+**`JitSession`** is the auto-compacting REPL driver: it owns the long-lived module + a carried window,
+re-enters the entry once per prompt (prior prompt's low bytes seed the next so guest state persists), and
+auto-compacts once `extra_byte_count()` crosses a byte watermark — at the quiescent point *after* a prompt.
+A 30-prompt session that JITs+invokes+releases a fresh unit every prompt is byte-identical with/without
+compaction while occupancy stays bounded (`jit_compaction.rs`, and the C-level `jit_repl.c`).
+
+### Concurrency — threaded install + threaded compile, full platform parity
+
+A guest may be multi-threaded while its JIT'd units stay single-threaded. **Threaded `install`** works on
+both backends with no aarch64 gap: the interp shares an atomic `DomainTable` (each slot a packed `u64` —
+one `Acquire` load to dispatch, one `Release` store to install, no lock), the JIT publishes
+release-ordered atomic `FnEntry` writes (same `#[repr(C)]` layout, so `indirect_dispatch` codegen is
+byte-identical). Install *visibility* rides the **guest's own** acquire/release on its ready flag, so a
+worker observes a completed install even on weakly-ordered targets — no dispatch-side acquire needed; the
+atomic `FnEntry` only guarantees a racy reader never sees a *torn* code pointer. **Threaded `compile`**
+works via `svm_run::cap_thunk_locked`, which serializes `cap.call` through a per-domain `Mutex<Host>` so
+concurrent `Jit.compile`s are sound (`define_extra`'s `&mut` is exclusive) **while execution stays fully
+parallel** — the W^X spike proved `ArenaMemoryProvider::finalize` only re-protects *non-finalized*
+segments (executing code, always on a finalized segment, is never touched → no stop-the-world), and i-cache
+coherence is cranelift's `clear_cache` + `pipeline_flush_mt`; cranelift *appends* to fresh addresses, so no
+cross-modifying-code `isb` is needed. The re-entrant "a running unit compiles more" case is handled by
+releasing the lock around `Jit.invoke`. The locked thunk engages **only for concurrent modules**
+(`Func::uses_concurrency`); single-threaded runs keep the unlocked fast path at zero lock cost, and the
+guest `cap.call 11` iface is unchanged. `JitSession` owns the boxed `Mutex<Host>` and re-bakes the locked
+thunk on every recompaction, so a multi-threaded guest auto-compacts soundly between prompts. Pinned by
+`jit_cap::threaded_{install,compile}_*` + `cross_thread_execute_fresh_code_agrees` + the
+`threaded_session_compacts_transparently` capstone, on every `fiber_rt` target incl. aarch64 macOS.
+
+**Deferred (gated on a measured need):** a coarse-lock→sharded-module optimization if parallel-compile
+*throughput* is ever shown to matter — a pure internal swap, since the guest iface is unchanged.
+
+---
+
 ## Prior art / touchstones
 
 - **eBPF** — verified bytecode in a hostile host; helper calls as the only
@@ -2068,3 +2210,4 @@ as open-ended, not a byproduct of the build.
 | D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |
 | D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`svm-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |
 | D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful work-stealing over *migratable* fibers is Proposed, not adopted:** it would re-accept D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread*; the guest owns the stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections but **not** its TCB-risk one. Feasible (Go is the existence proof; the voluntarily-suspended set is stealable, fault-suspended fibers stay pinned, and the ownership protocol is loom-verifiable), gated behind that loom-verified protocol + expert review for the asm/signal seam loom can't reach. | Proposed (extends D56) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full reasoning + design + demo roadmap in `SCHEDULING.md` |
+| D59 | **Guest-driven JIT = the `Jit` capability (§22): a guest submits verified IR and gets native code in its *own* domain.** Verification, not isolation, is the trust boundary — a JIT'd unit is exactly as powerful as its submitter (same window/handles), with one new authority-TCB precondition (declared memory ≡ parent window; reject data segments + concurrency ops in a unit) keeping "no escape-TCB change" true. Model A (cap.call trampoline, default) sidesteps the baked function-table mask; Model B2 (`install` into a pre-reserved table) neutralizes it by pre-sizing — both ship, all four cross-call directions differentially pinned. Type identity is an append-only intern (id-equality ≡ structural equality), never read at runtime. Code reclaim is whole-module recompaction (no per-function free in cranelift-jit), driven by `recompact_jit`/`JitSession` on a byte watermark. Threaded `install` + threaded `compile` work with full platform parity (atomic `DomainTable`/`FnEntry`; `cap_thunk_locked` serializes compiles while execution stays parallel; no aarch64 `isb` needed). | Settled (built, differentially tested) | The "JIT inside the sandbox" wasm handles poorly; the submit-a-blob boundary + verifier-as-hinge already existed, so it was authority-TCB-mostly. Model A's worst case is perf/ergonomics (announced by a benchmark), B2's is a host-writes-into-live-table primitive — both earned their place; the sharded-module throughput optimization stays deferred until measured. Full design + security argument + reclaim/concurrency in §22 |

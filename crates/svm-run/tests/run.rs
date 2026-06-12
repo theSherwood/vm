@@ -469,7 +469,7 @@ fn demo_work_stealing_runs() {
     assert_eq!(out.stdout, b"256\n", "guest work-stealing scheduler total");
 }
 
-/// The **threaded guest-driven JIT** demo (`demos/jit/jit_threads.c`, JIT.md §6 #2), end to end
+/// The **threaded guest-driven JIT** demo (`demos/jit/jit_threads.c`, DESIGN.md §22), end to end
 /// through the `svm-run` binary: 4 worker threads each Cranelift-compile a distinct unit
 /// **concurrently** (several `Jit.compile`s in flight, serialized through the per-domain
 /// `Mutex<Host>` the powerbox engages for a `thread.spawn`ing guest) and invoke the native code,

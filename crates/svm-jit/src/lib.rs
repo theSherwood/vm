@@ -133,7 +133,7 @@ const SNAP_CAP: usize = 1 << 18; // 256 KiB
 /// `type_id` (offset 0), then calls `code` (offset 8) — confinement at the use site (invariant I2).
 ///
 /// The fields are **atomic** so a guest-driven `install`/`uninstall` (a host-side write) is sound
-/// against a *concurrent* `call_indirect` from another thread (JIT.md §6 #2 threaded install). The
+/// against a *concurrent* `call_indirect` from another thread (DESIGN.md §22 threaded install). The
 /// `#[repr(C)]` layout (`type_id` @0, `code` @8) is exactly what [`indirect_dispatch`] bakes its
 /// loads against, unchanged. Two distinct guarantees, both platform-uniform:
 /// - **Visibility** (a synchronized reader sees a complete install) rides the **guest's own**
@@ -221,7 +221,7 @@ fn type_id_of(distinct: &[FuncType], ty: &FuncType) -> u32 {
         .unwrap_or(NO_MATCH_TYPE_ID)
 }
 
-/// Intern `ty` into the **append-only** type-id registry (JIT.md B2: the per-domain id space
+/// Intern `ty` into the **append-only** type-id registry (DESIGN.md §22: the per-domain id space
 /// made incremental), returning its stable id. Soundness of the `call_indirect` dispatch check
 /// reduces to this map being an *injection*, *stable over time* (an id never remaps — appends
 /// only), and *total over participants* (every signature that can appear at a call site or in
@@ -946,7 +946,7 @@ fn run_inner(
     quota: Quota,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     // The historical one-shot lifecycle, now compile → run over the long-lived split
-    // (JIT.md Phase 1): `CompiledModule` owns the `JITModule` for the whole run and the
+    // (DESIGN.md §22): `CompiledModule` owns the `JITModule` for the whole run and the
     // executable memory is freed when it drops, after `run` returns — behavior-identical
     // to the old inline compile→run→drop.
     let mut cm = CompiledModule::compile(
@@ -965,7 +965,7 @@ fn run_inner(
     cm.run(args, init_mem, snapshot_cap, async_hooks)
 }
 
-/// A compiled module whose executable code **outlives a single run** (JIT.md Phase 1: the
+/// A compiled module whose executable code **outlives a single run** (DESIGN.md §22: the
 /// long-lived `JITModule` split). Owns the [`JITModule`] (the executable memory lives until
 /// drop), the power-of-two-padded function table, the entry's buffer-ABI trampoline, and the
 /// §12/§14 runtimes whose addresses are baked into the code. Produced by
@@ -974,7 +974,7 @@ fn run_inner(
 ///
 /// [`CompiledModule::define_extra`] then declares + defines + finalizes **additional**
 /// functions into the same live module — the enabling primitive for the guest-driven `Jit`
-/// capability (JIT.md Model A). Extra functions are *thunk-reachable only*: they are **never**
+/// capability (DESIGN.md §22). Extra functions are *thunk-reachable only*: they are **never**
 /// installed in the function table, so the table mask baked into every `call_indirect` site
 /// (`fn_table_mask`) never changes — the escape-relevant dispatch is byte-identical to the
 /// one-shot path.
@@ -1007,7 +1007,7 @@ pub struct CompiledModule {
     n_real_funcs: usize,
     // --- the baked lowering environment, reused verbatim by `define_extra` so an extra
     // --- function compiles against the *same* constants as the parent (same confinement
-    // --- mask, same cap thunk, same table mask — JIT.md "vmctx sharing").
+    // --- mask, same cap thunk, same table mask — DESIGN.md §22 "vmctx sharing").
     distinct: Vec<FuncType>,
     cap: CapEnv,
     fiber: FiberEnv,
@@ -1026,7 +1026,7 @@ pub struct CompiledModule {
     /// this module's life — a **byte-accurate** code-arena occupancy measure (the actual emitted
     /// code size, summed at finalize; the dominant term in arena consumption). Like `next_extra` it
     /// only grows, and restarts near zero in a freshly-compacted module. An embedder watermarks on
-    /// [`Self::extra_byte_count`] to auto-compact (JIT.md §6).
+    /// [`Self::extra_byte_count`] to auto-compact (DESIGN.md §22).
     extra_bytes: usize,
     /// The in-flight run's window fault range, published by `run_code_raw` for the duration of
     /// the guarded call so a mid-run [`Self::invoke_extra`] can arm its nested recovery.
@@ -1090,7 +1090,7 @@ impl CompiledModule {
     ) -> Result<CompiledModule, JitError> {
         let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
         // The `call_indirect` function table is power-of-two padded; `table_reserve_log2`
-        // (JIT.md Model B2) reserves a *larger* table than the module needs so `install` can
+        // (DESIGN.md §22) reserves a *larger* table than the module needs so `install` can
         // fill the padding slots without moving the Spectre-safe mask constant (which is baked
         // from this length into every call site). `0` ⇒ the natural `next_pow2(funcs.len())`,
         // i.e. behavior-identical to before B2.
@@ -1213,7 +1213,7 @@ impl CompiledModule {
         // function traps either way (a fresh id ≥ the function-sig count matches no table
         // entry, exactly like `NO_MATCH_TYPE_ID`) — but interning it now means a *later*
         // `define_extra`/install of a function with that signature can satisfy the site,
-        // keeping id-equality ≡ structural equality across units (JIT.md B2).
+        // keeping id-equality ≡ structural equality across units (DESIGN.md §22).
         let mut distinct = distinct_types(&m.funcs);
         intern_unit_sigs(&mut distinct, &m.funcs)?;
         let distinct = distinct;
@@ -1559,7 +1559,7 @@ impl CompiledModule {
     /// the same §14 child-fault pattern as `compile_child_and_run`): a memory fault in the
     /// invoked code is caught *here*, written to `trap_out` as `MemoryFault`, and this returns
     /// normally — the guest's `cap.call` trap-propagation check then unwinds the domain. Traps
-    /// in invoked code are **terminal for the domain** (JIT.md Model A); a guest wanting
+    /// in invoked code are **terminal for the domain** (DESIGN.md §22); a guest wanting
     /// trap isolation uses the `Instantiator`, not `Jit`.
     ///
     /// # Safety
@@ -1809,17 +1809,17 @@ impl CompiledModule {
         Ok((outcome, final_mem))
     }
 
-    /// Declare + define + finalize **additional functions** into the live module (JIT.md Phase 1:
+    /// Declare + define + finalize **additional functions** into the live module (DESIGN.md §22:
     /// the enabling primitive for the guest-driven `Jit` capability). The slice is a
     /// self-contained unit: its `FuncIdx` space is unit-local, so direct calls resolve within the
     /// unit only (cross-unit calls go through `call_indirect` against the parent table, or the
-    /// guest re-emits the callee — JIT.md "Recommendation"). Returns one buffer-ABI trampoline
+    /// guest re-emits the callee — DESIGN.md §22 "Recommendation"). Returns one buffer-ABI trampoline
     /// pointer per function, in order; invoke via [`Self::run_extra`] (or, in the capability
     /// layer, directly over a live run's window).
     ///
     /// **The function table is deliberately untouched**: extra functions are thunk-reachable
     /// only, so the table mask baked into every existing `call_indirect` site never changes
-    /// (JIT.md Model A — zero new escape-relevant dispatch surface). Extra code is lowered
+    /// (DESIGN.md §22 — zero new escape-relevant dispatch surface). Extra code is lowered
     /// against the *parent's* environment: same confinement mask, same `cap.call` thunk, same
     /// table mask, and the module's shared **append-only type-id registry** (see
     /// [`Self::interned_type_id`]) — the unit's signatures are interned before lowering, so
@@ -1829,7 +1829,7 @@ impl CompiledModule {
     /// a future table install of a structurally equal function can satisfy it.
     ///
     /// Functions using §12 fibers/threads are rejected (`Unsupported`) — the MVP restricts
-    /// incremental definition to single-threaded code (JIT.md "Concurrency"), and lowering
+    /// incremental definition to single-threaded code (DESIGN.md §22 "Concurrency"), and lowering
     /// `cont.*`/`thread.*` here would need per-unit runtime wiring this slice doesn't do.
     pub fn define_extra(&mut self, funcs: &[Func]) -> Result<Vec<DefinedFn>, JitError> {
         if funcs.is_empty() {
@@ -1846,7 +1846,7 @@ impl CompiledModule {
         // Intern the unit's signatures (its functions' own + its call sites') into the
         // append-only registry BEFORE lowering, so the ids baked into this unit's dispatch
         // checks are real, stable ids — id-equality ≡ structural equality across all units
-        // sharing this module, past and future (JIT.md B2; see `intern_type`).
+        // sharing this module, past and future (DESIGN.md §22; see `intern_type`).
         intern_unit_sigs(&mut self.distinct, funcs)?;
         // Declare the unit's functions first so intra-unit direct calls can reference any of them.
         let ids: Vec<FuncId> = funcs
@@ -1907,7 +1907,7 @@ impl CompiledModule {
             })
             .collect::<Result<_, JitError>>()?;
         // Incremental finalize: mprotects only the newly defined code pages; already-finalized,
-        // possibly-running code is untouched (the JIT.md Phase-1 W^X spike is the test asserting
+        // possibly-running code is untouched (the DESIGN.md §22 Phase-1 W^X spike is the test asserting
         // exactly this).
         self.module
             .finalize_definitions()
@@ -1933,7 +1933,7 @@ impl CompiledModule {
             .collect())
     }
 
-    /// **Install** an incrementally-defined function into the live `call_indirect` table (JIT.md
+    /// **Install** an incrementally-defined function into the live `call_indirect` table (DESIGN.md §22
     /// Model B2): write its natural-ABI `code` + interned `type_id` into the next reserved
     /// padding slot, returning that slot index — a funcref the guest (or another unit) can
     /// `call_indirect` at native speed (old→new / new→new). `None` if the table is full (every
@@ -1952,7 +1952,7 @@ impl CompiledModule {
         Some(slot as u32)
     }
 
-    /// **Uninstall** a previously-`install`ed `call_indirect` slot (JIT.md Model B2 reclaim): set
+    /// **Uninstall** a previously-`install`ed `call_indirect` slot (DESIGN.md §22 reclaim): set
     /// it back to a trapping padding slot so the index is reusable by a later `install` and a
     /// stale `call_indirect` of it fails closed (`IndirectCallType`). Returns `true` on success;
     /// `false` for an out-of-range slot, a real module-function slot (`< n_real_funcs`), or an
@@ -1970,7 +1970,7 @@ impl CompiledModule {
         true
     }
 
-    /// **Install at a specific slot** — the compaction counterpart of [`Self::install`] (JIT.md §6
+    /// **Install at a specific slot** — the compaction counterpart of [`Self::install`] (DESIGN.md §22
     /// code-memory compaction). `install` fills the *next* padding slot, which reproduces a dense
     /// install history but not one with `uninstall` gaps; recompaction must reproduce **exact** slot
     /// indices so a funcref a guest already holds keeps resolving to the same unit across the swap.
@@ -1992,7 +1992,7 @@ impl CompiledModule {
     }
 
     /// The currently-occupied **installable** slots (`≥ n_real_funcs`) of the `call_indirect`
-    /// table, as `(slot, code, type_id)`. The reclaim driver (JIT.md §6) reads this from the
+    /// table, as `(slot, code, type_id)`. The reclaim driver (DESIGN.md §22) reads this from the
     /// *old* module to learn which units occupy which slots, joins each `code` back to its owning
     /// unit (via the embedder's per-unit install record), and reproduces the exact slot in the
     /// fresh module with [`Self::install_at`]. Real module-function slots (`< n_real_funcs`) are
@@ -2010,7 +2010,7 @@ impl CompiledModule {
     /// The number of extra (`define_extra`) functions+trampolines this module has lowered over its
     /// life — a monotonic proxy for code-arena occupancy (cranelift-jit exposes no byte count, and
     /// has no per-function free, so this only grows). An embedder watches it to decide when to
-    /// **compact** (JIT.md §6): rebuild the live unit set into a fresh module — whose count restarts
+    /// **compact** (DESIGN.md §22): rebuild the live unit set into a fresh module — whose count restarts
     /// near zero — and drop this one, reclaiming the arena. See `tests/jit_compaction.rs`.
     pub fn extra_fn_count(&self) -> usize {
         self.next_extra
@@ -2028,7 +2028,7 @@ impl CompiledModule {
     }
 
     /// Whether a run is in flight on this module (a guarded call published its window fault range).
-    /// Compaction (and any rebuild that drops `self`) is only sound at a **quiescent** point — JIT.md
+    /// Compaction (and any rebuild that drops `self`) is only sound at a **quiescent** point — DESIGN.md §22
     /// §6: "it can only run at a quiescent point — the guest is suspended *inside* the very module
     /// being compacted." An embedder asserts `!is_running()` before swapping a freshly-compacted
     /// module in for this one.
@@ -2040,7 +2040,7 @@ impl CompiledModule {
     /// has mentioned it (as a function signature or a call-site type). Ids are append-only —
     /// once returned, an id never remaps — and id-equality coincides with structural equality
     /// over everything this module compiled (see `intern_type`). This is the lookup a table
-    /// `install` operation uses to stamp a slot's `type_id` (JIT.md B2).
+    /// `install` operation uses to stamp a slot's `type_id` (DESIGN.md §22).
     pub fn interned_type_id(&self, ty: &FuncType) -> Option<u32> {
         self.distinct.iter().position(|t| t == ty).map(|i| i as u32)
     }
@@ -2546,7 +2546,7 @@ struct Lower<'a> {
 /// `ids.len()`) because an **incrementally defined** function (`CompiledModule::define_extra`)
 /// has its own unit-local `ids` for direct calls but dispatches through the *parent's*
 /// function table, whose mask was fixed when the parent was compiled (the mask is baked as a
-/// constant into every call site — JIT.md "the baked function-table mask").
+/// constant into every call site — DESIGN.md §22 "the baked function-table mask").
 #[allow(clippy::too_many_arguments)]
 fn build_clif(
     module: &mut JITModule,

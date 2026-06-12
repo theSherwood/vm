@@ -23,6 +23,12 @@ This file's single source of truth for status + open work is **§10**; the concu
   (`run_scheduled` / `explore_all`); the **JIT** runs 1:1 OS-thread vCPUs (`os_thread_rt`) + fibers
   (`fiber_rt`) over the `svm-fiber` stack switch on **x86-64 unix, aarch64 unix (macOS), and x86-64
   Windows** — cross-platform parity, all CI-green. Full breakdown + open items: §10.
+- **Guest-driven JIT — DONE (the `Jit` capability, iface 11).** Guest code submits serialized SVM IR
+  across `cap.call`; the host verifies it and Cranelift-compiles it into the guest's *own* domain
+  (verification, not isolation, is the boundary). `compile`/`invoke`/`release` + `install`/`uninstall`
+  (native funcref), whole-module **compaction** for long REPLs (`JitSession`), and **threaded
+  install + compile** with full platform parity. Both backends, differentially identical. Design +
+  security argument: **DESIGN §22**; status: §10.
 
 ---
 
@@ -1150,6 +1156,26 @@ leave a shared view — add a unix test for this alongside the Windows work.
   are not).
 - [ ] **Language on-ramp:** native **LLVM backend** (the differentiator vehicle) and/or an
   optional **wasm bridge** (compat). chibicc stays the MVP frontend; this is breadth work.
+- [x] **Guest-driven JIT — DONE (the `Jit` capability, iface 11; design + security argument in
+  DESIGN §22).** Guest code submits serialized SVM IR across `cap.call`; the host verifies it (same
+  `decode`+`verify` gate + a memory-match precondition) and Cranelift-compiles it into the guest's
+  **own** domain — verification, not isolation, is the trust boundary. `compile`/`invoke`/`release`
+  (Model A, trampoline) + `install`/`uninstall` (Model B2, a pre-reserved `call_indirect` table → the
+  unit is a native funcref); all four old↔new cross-call directions differential-pinned. Type identity
+  is an append-only intern (id-equality ≡ structural equality, never read at runtime). **Code reclaim =
+  whole-module compaction** (cranelift-jit has no per-function free): `recompact_jit` + the
+  auto-compacting `JitSession` driver on a **byte watermark** (`extra_byte_count`). **Threaded install +
+  threaded compile** work with full platform parity — atomic `DomainTable`/`FnEntry`, and
+  `cap_thunk_locked` serializes compiles through a per-domain `Mutex<Host>` while execution stays
+  parallel (engaged only for `uses_concurrency()` modules; single-threaded keeps the unlocked fast path).
+  Crates: `svm-jit` (`CompiledModule`, `define_extra`, `install`/`install_at`, `extra_byte_count`),
+  `svm-interp` (dispatch arms, shared `DomainTable`, `Host::jit_*`), `svm-run` (`cap_thunk`/
+  `cap_thunk_locked`, `jit_blob_validator`, `grant_jit`, `recompact_jit`, `JitSession`), `frontend/chibicc`
+  (`<svm.h>`). Tests: `jit_cap.rs` (differential + fuzz), `jit_incremental.rs`, `jit_reentry.rs`,
+  `jit_compaction.rs`; C demos `demos/jit/{jit_demo,jit_threads,jit_repl}.c`
+  (`c_frontend::c_guest_jit_*`, `run::demo_jit_threads_runs`). **Deferred (gated on a measured need):** a
+  sharded-module parallel-compile throughput optimization (a pure internal swap — the guest iface is
+  unchanged).
 
 ### Fuzzing — have vs. gaps
 Have (✅ continuously, except where noted):

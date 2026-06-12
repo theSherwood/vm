@@ -1505,7 +1505,7 @@ impl Func {
     /// `atomic.wait`/`notify`). The single source of truth for backends that must agree on
     /// rejecting concurrency in a context that cannot host it — e.g. a §14 JIT child (no
     /// per-child runtimes) or a guest-submitted `Jit`-capability unit (the single-threaded
-    /// MVP restriction; JIT.md "Concurrency") — so the reference interpreter and the JIT
+    /// MVP restriction; DESIGN.md §22 "Concurrency") — so the reference interpreter and the JIT
     /// fail-close on exactly the same set.
     pub fn uses_concurrency(&self) -> bool {
         self.blocks.iter().any(|b| {

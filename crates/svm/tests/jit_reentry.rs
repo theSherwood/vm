@@ -1,4 +1,4 @@
-//! JIT.md Phase 2a: **mid-run re-entry** into a live [`CompiledModule`] — the engine of the
+//! DESIGN.md §22a: **mid-run re-entry** into a live [`CompiledModule`] — the engine of the
 //! guest-driven `Jit` capability (Model A), exercised below the capability layer with a
 //! custom cap thunk standing in for the Phase-2b/2c host plumbing.
 //!

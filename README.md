@@ -99,6 +99,19 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > quotas** — host-configurable fiber/vCPU ceilings enforced identically on both backends (CLI
 > `SVM_MAX_FIBERS`/`SVM_MAX_VCPUS`) — contain a spawn-bomb (`FiberFault`/`ThreadFault`), DoS
 > containment that complements the kill-path's bound on runaway execution.
+> A **guest-driven JIT** (the **`Jit`** capability, §22) closes the "JIT inside the sandbox" gap wasm
+> handles poorly: guest code (e.g. an interpreter) builds serialized SVM IR at runtime, hands the blob
+> across `cap.call`, and the host **verifies** it (the same `decode`+`verify` gate every module passes,
+> plus a memory-match precondition) and **Cranelift-compiles** it into the guest's *own* domain — same
+> window, same powerbox; verification, not isolation, is the trust boundary. The compiled unit is reached
+> by `invoke` (a trampoline) or, once `install`ed into the `call_indirect` table, as a first-class
+> **funcref** at native speed (all four old↔new cross-call directions differentially pinned). It runs
+> end-to-end **from C** (`<svm.h>`: `__vm_jit_compile`/`invoke2`/`install`/…): a guest bytecode interpreter
+> that **JITs itself** (`demos/jit/jit_demo.c`). Long REPL sessions don't exhaust the code arena —
+> `JitSession` does **whole-module compaction** on a byte watermark (cranelift-jit has no per-function
+> free), transparently — and worker threads can **compile concurrently** (a per-domain `Mutex<Host>`
+> serializes compiles while execution stays parallel), with full platform parity. All on **both backends,
+> differentially identical**.
 > Still ahead:
 > narrow-scalar promotion, honoring *weak* memory orderings (both backends seq-cst today), SIMD
 > (v128), isolation tiers, Spectre hardening, and the LLVM-bitcode on-ramp.
@@ -160,6 +173,8 @@ cargo run -p svm-run -- crates/svm-run/demos/tinfl/tinfl_demo.c # miniz tinfl (D
 cargo run -p svm-run -- crates/svm-run/demos/perlin/perlin_demo.c # stb_perlin (3D Perlin noise, floats)
 cargo run -p svm-run -- crates/svm-run/demos/regex/regex_demo.c   # tiny-regex-c (backtracking matcher)
 cargo run -p svm-run -- crates/svm-run/demos/heapgrow/heapgrow.c  # a guest heap that grows via the Memory cap
+cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c      # a guest bytecode interpreter that JITs itself (§22)
+cargo run -p svm-run -- crates/svm-run/demos/jit/jit_threads.c   # worker threads each Cranelift-compile concurrently
 echo 'int main(){ return 42; }' > /tmp/r.c
 cargo run -p svm-run -- /tmp/r.c ; echo "exit $?"        # → exit 42
 ```

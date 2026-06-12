@@ -1,4 +1,4 @@
-// Guest-driven JIT demo (JIT.md Phase 4, Model A): a tiny **bytecode interpreter that JITs
+// Guest-driven JIT demo (DESIGN.md §22, Model A): a tiny **bytecode interpreter that JITs
 // itself** — entirely inside the sandbox.
 //
 // A toy "calculator bytecode" (a two-input expression machine over `(a, b)`) is first run on a
