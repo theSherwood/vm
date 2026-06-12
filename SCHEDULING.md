@@ -148,7 +148,124 @@ differential oracle, and expert review of that seam.
      was finished and reused for a different fiber finds its `try_steal(gen)` CAS fail —
      pinned by a deterministic reuse-cycle unit test (dropping the bump defeats it). It
      is **not yet wired into the live runtime** — that integration (a shared registry
-     replacing the per-thread tables, over a Chase-Lev steal deque) and the cross-thread
-     asm resume (design sketch #3, expert-review gated) are the remaining steps.
-     Verifying the dangerous invariants first is the "earn the risk" discipline this
-     feature demands.
+     replacing the per-thread tables) and the cross-thread asm resume (design sketch #3,
+     expert-review gated) are the remaining steps, specified in
+     "Integration design (steps 3b–3c)" below. Verifying the dangerous invariants first
+     is the "earn the risk" discipline this feature demands.
+
+## Integration design (steps 3b–3c)
+
+The full plan for wiring the verified ownership protocol (step 3a, above) into the live
+runtime. Written for review **before** any escape-TCB/asm code, because steps 3b–3c
+re-accept the cross-thread native-stack-resume unsafe D56 removed.
+
+### 0. The reframing: the VM owes a *namespace + arbiter*, not a scheduler
+
+The instinct is "build a Chase-Lev work-stealing deque." **The VM builds no deque.** D56/D57
+is *primitives, not policy*: the work-stealing run-queue is **guest code** (a deque of fiber
+handles in guest memory, exactly as the stackless `demos/work_stealing` already does for
+state-machine tasks). The VM owes only two things migration needs that the guest cannot
+provide itself:
+
+1. a **shared fiber-handle namespace** — any worker (vCPU) can *name* any fiber, vs. today's
+   per-vCPU tables where a handle indexes only its creator's table; and
+2. the **single-owner arbiter** — when two workers race to `cont.resume` the same handle,
+   exactly one wins and the other gets a clean `FiberFault`. That arbiter is the step-3a
+   `Ownership` CAS (`RUNNABLE → RUNNING`), already loom-verified.
+
+So the entire VM-side surface is **one shared slot table, each slot carrying an `Ownership`
+word** — no deque, no new policy, no scheduler. This shrinks the risk surface dramatically and
+keeps the "VM ships mechanism" thesis intact.
+
+### 1. Handle = `(slot, generation)`; one shared registry per run
+
+Replace the per-vCPU/per-runtime fiber tables with **one registry shared by all vCPUs of a
+run** (an `Arc`), mirroring the threaded-install refactor that already made the JIT
+`call_indirect` table (the interp's `DomainTable`) a shared atomic structure (DESIGN §22).
+A `cont.new` handle becomes the pair **`(slot index, generation)`** packed into the i32/i64
+the guest already holds; `cont.resume`/`suspend` carry it. The generation is the step-3a ABA
+guard: it lets the registry **reuse** a finished fiber's slot (so a long work-stealing session
+doesn't leak slots up to `MAX_FIBERS`) while a stale handle to the previous occupant fails
+closed.
+
+### 2. Op → ownership transition
+
+| Guest op | Registry action | `Ownership` transition |
+|---|---|---|
+| `cont.new(funcref)` | allocate or recycle a slot for a `Pending` fiber | `new_owned` / `recycle_owned` → `OWNED` |
+| `cont.resume(h)` on **any** worker | claim the fiber to run it here | `begin_owned` (`OWNED→RUNNING`, owner) or `try_steal` (`RUNNABLE→RUNNING`, migrated); **lose ⇒ `FiberFault`** (running elsewhere, or stale generation) |
+| `suspend` (voluntary) | publish to the shared pool — now migratable | `suspend_to_pool` (`RUNNING→RUNNABLE`) |
+| `suspend` **inside the §5/§14 fault handler** | keep thread-affine (recovery state is bound to this thread) | `pin` (`RUNNING→OWNED`) — **excluded from migration** |
+| fiber returns | free the slot for reuse | `finish` (`RUNNING→FREE`, generation bumped) |
+
+This is the whole protocol: the existing `resolve_fiber` "already running / dead" `FiberFault`
+check *becomes* the lost-CAS path, so the guest-visible error model is unchanged.
+
+### 3. What stays per-thread (unchanged)
+
+The **resume chain** (the worker's current native/eval call stack) and the JIT `yielders`
+stack are per-running-worker — migration only ever moves a *suspended* fiber (on no chain).
+The re-entrant-resume aliasing guard (`chain.contains`) stays a per-worker check. `CURRENT_RT`
+becomes "the running worker's context," with the fiber *table* lifted out to the shared
+registry.
+
+### 4. Interp integration (step 3b-i) — safe, the oracle
+
+A fiber in the interp is **`Fiber::Live(Vec<Frame>)` — pure data** (`crates/svm-interp`), so
+migration is a *data hand-off*, exactly like a stackless task; **no `unsafe`, no asm.** The
+per-`VCpu` `fibers: Vec<Fiber>` becomes the shared registry (behind the run's existing
+`Arc<Mutex<…>>`-style sharing, or a lock-free slot table — the `Ownership` CAS is the arbiter
+either way). `cont.resume` on any vCPU takes the `Vec<Frame>` under the ownership claim, runs
+it inline on the current vCPU, and `suspend` returns it to the pool. The scheduler already
+migrates **vCPUs** freely (`runnable: VecDeque<Box<VCpu>>`); fibers now migrate the same way.
+This establishes the **reference semantics** and the differential oracle before any JIT asm.
+
+### 5. JIT integration (steps 3b-ii, 3c) — the review-gated seam
+
+- **3b-ii (no behavior change, regression net):** lift the JIT `FiberRuntime`'s
+  `fibers: Vec<Option<Box<Fiber>>>` into the shared registry but **keep affinity** (a vCPU
+  resumes only fibers it owns). Existing fiber tests must stay green — the safety net for the
+  storage refactor.
+- **3c (the asm seam — EXPERT REVIEW REQUIRED):** allow a worker to resume a fiber whose
+  native stack another worker created. SCHEDULING.md design sketch #3 holds: the `svm-fiber`
+  switch is the same instruction sequence; **unix has no thread-bound state in it**, and
+  **Win64 already swaps the TEB `StackBase`/`StackLimit`/`DeallocationStack` per switch**, so
+  "this stack is now active on *this* thread" is handled; fixed-mmap stacks are fine (migration
+  moves the executing thread, not the stack — Go copies stacks only for *growth*). The
+  re-entrancy discipline is preserved: **no `&mut` registry crosses a switch; only the
+  address-stable `Box<Fiber>` does.** This composition (verified protocol + real asm switch +
+  per-thread signal recovery) **cannot be model-checked** — it gets heavy stress, the interp↔JIT
+  differential, and human review of the asm/signal seam. This is the one place the feature's
+  risk is genuinely irreducible.
+
+### 6. Quota, accounting, compatibility
+
+- **Quota (§15):** `max_fibers` moves from per-vCPU to **per-run** (the shared registry's slot
+  count); the spawn-bomb ceiling still trips a `FiberFault`. `live_frames` accounting (the
+  per-vCPU fiber-frame total) is computed over the chain the worker is actually running, which
+  is unchanged.
+- **Backward-compatible / additive:** a guest that never resumes a *foreign* fiber sees
+  identical behavior; single-threaded runs are untouched (a lone vCPU owns everything, never
+  steals). Migration is opt-in by the guest's own scheduler choosing to resume a handle on a
+  different worker.
+
+### 7. Test plan
+
+- Ownership CAS + ABA: **loom + deterministic** (step 3a, done).
+- Shared registry claim/recycle: unit tests; loom if the slot table is made lock-free.
+- **Interp cross-vCPU resume:** a guest *stackful* work-stealing scheduler (Demo 3 — `mn_sched`
+  re-pointed at a shared handle pool) with an interleaving-invariant total, proving a fiber
+  created on one worker runs to completion on another. Safe, exhaustively schedulable by the
+  interp oracle (`explore_all`).
+- **Differential interp↔JIT** on that program — the JIT asm seam validated against the safe
+  interp semantics.
+- Stress (many workers, many migrations) + the documented expert-review of the asm seam.
+
+### 8. Staging (each its own reviewed slice)
+
+1. **3a — ownership protocol (loom-verified).** ✅ Done.
+2. **3b-i — interp shared registry + cross-vCPU resume.** Safe; establishes semantics + oracle.
+3. **3b-ii — JIT shared registry, affinity preserved.** Storage refactor under the existing
+   test net (no new capability, no asm change).
+4. **3c — JIT cross-thread asm resume.** The review-gated seam; differential + stress.
+5. **Demo 3 — guest stackful work-stealing**, differential interp ≡ JIT.
