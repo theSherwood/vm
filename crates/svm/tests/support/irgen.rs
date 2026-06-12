@@ -110,6 +110,14 @@ impl Gen {
             FloatTy::F32
         }
     }
+    /// Any of the six §17 lane shapes.
+    fn vshape(&mut self) -> VShape {
+        VShape::ALL[self.below(6) as usize]
+    }
+    /// An integer lane shape (`i8x16`/`i16x8`/`i32x4`/`i64x2`).
+    fn vshape_int(&mut self) -> VShape {
+        [VShape::I8x16, VShape::I16x8, VShape::I32x4, VShape::I64x2][self.below(4) as usize]
+    }
     /// Pick one of the given memory orderings (§12). Callers pass only the orderings valid for the
     /// op, so the generated module always verifies.
     fn order_from(&mut self, opts: &[Ordering]) -> Ordering {
@@ -241,7 +249,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
     let nfuncs = sigs.len();
     let can_call = fi + 1 < nfuncs;
     loop {
-        match bb.g.below(25) {
+        match bb.g.below(26) {
             0 => {
                 let ty = bb.g.inttype();
                 let op = BinOp::from_index(bb.g.below(15) as u8).unwrap();
@@ -589,9 +597,130 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 let k = bb.g.below(nfuncs as u32);
                 bb.push(Inst::RefFunc { func: k as FuncIdx }, ValType::I32);
             }
+            // §17 SIMD (D58): every v128 op, so they ride the interp↔JIT differential. Vector
+            // arithmetic is register-only (no escape surface); a v128.load/store is the 16-byte
+            // masked access exercising `svm-mask`'s wider width under the oracle.
+            25 => gen_simd(bb, has_mem),
             _ => continue, // a mem/call kind that isn't available here — re-roll
         }
         break;
+    }
+}
+
+/// Append one random §17 SIMD instruction (D58). Operands are drawn from the pool via `want`,
+/// which materializes a `v128.const`/scalar const when none exists, so the result always verifies.
+///
+/// **Deliberately excluded: the *computed*-float ops `VFloatBin`/`VFloatUn`.** They can synthesize a
+/// NaN whose payload isn't pinned across backends; read back through an integer `extract_lane` that
+/// payload would leak into an *exactly*-compared scalar result (the value oracle is NaN-insensitive
+/// only for float-typed results). Splat/extract/replace of an *input* float just move identical
+/// bits, so they stay. Float-lane arithmetic is differential-tested under NaN control in `simd.rs`,
+/// matching the §17/D58 "value differential is NaN-insensitive per lane" note.
+fn gen_simd(bb: &mut BB, has_mem: bool) {
+    match bb.g.below(13) {
+        0 => {
+            let bytes = bb.g.v128bytes();
+            bb.push(Inst::ConstV128(bytes), ValType::V128);
+        }
+        1 => {
+            let shape = bb.g.vshape();
+            let a = bb.want(shape.lane_val());
+            bb.push(Inst::Splat { shape, a }, ValType::V128);
+        }
+        2 => {
+            let shape = bb.g.vshape();
+            let lane = bb.g.below(shape.lanes() as u32) as u8;
+            let signed = bb.g.boolean();
+            let a = bb.want(ValType::V128);
+            bb.push(
+                Inst::ExtractLane {
+                    shape,
+                    lane,
+                    signed,
+                    a,
+                },
+                shape.lane_val(),
+            );
+        }
+        3 => {
+            let shape = bb.g.vshape();
+            let lane = bb.g.below(shape.lanes() as u32) as u8;
+            let a = bb.want(ValType::V128);
+            let b = bb.want(shape.lane_val());
+            bb.push(Inst::ReplaceLane { shape, lane, a, b }, ValType::V128);
+        }
+        4 => {
+            // Lane-wise integer add/sub/mul. `i8x16.mul` has no single-instruction JIT lowering
+            // (it bails to `Unsupported`, which would make the whole module skip), so avoid it.
+            let shape = bb.g.vshape_int();
+            let op = loop {
+                let o = VIntBinOp::ALL[bb.g.below(3) as usize];
+                if !(shape == VShape::I8x16 && o == VIntBinOp::Mul) {
+                    break o;
+                }
+            };
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VIntBin { shape, op, a, b }, ValType::V128);
+        }
+        5 => {
+            let op = VBitBinOp::ALL[bb.g.below(4) as usize];
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VBitBin { op, a, b }, ValType::V128);
+        }
+        6 => {
+            let a = bb.want(ValType::V128);
+            bb.push(Inst::VNot { a }, ValType::V128);
+        }
+        7 => {
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            let mask = bb.want(ValType::V128);
+            bb.push(Inst::Bitselect { a, b, mask }, ValType::V128);
+        }
+        8 => {
+            let mut lanes = [0u8; 16];
+            for l in &mut lanes {
+                *l = bb.g.below(32) as u8; // valid: any byte of the 32-byte a++b
+            }
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::Shuffle { lanes, a, b }, ValType::V128);
+        }
+        9 => {
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::Swizzle { a, b }, ValType::V128);
+        }
+        10 if has_mem => {
+            // The 16-byte masked load — exercises `svm-mask`'s wider width under the oracle.
+            let addr = bb.want(ValType::I64);
+            let offset = bb.g.below(256) as u64;
+            bb.push(
+                Inst::V128Load {
+                    addr,
+                    offset,
+                    align: 0,
+                },
+                ValType::V128,
+            );
+        }
+        11 if has_mem => {
+            let addr = bb.want(ValType::I64);
+            let value = bb.want(ValType::V128);
+            let offset = bb.g.below(256) as u64;
+            bb.push0(Inst::V128Store {
+                addr,
+                value,
+                offset,
+                align: 0,
+            });
+        }
+        // The feature-detect hook, and the fallback when memory isn't available for 10/11.
+        _ => {
+            bb.push(Inst::SimdWidthBytes, ValType::I32);
+        }
     }
 }
 
@@ -992,6 +1121,12 @@ fn has_float(m: &Module) -> bool {
                         }
                         Inst::Load { op, .. } => is_float(op.info().1),
                         Inst::Store { op, .. } => is_float(op.info().1),
+                        // §17/D58: a lane-wise float op can *compute* a NaN whose bit-pattern isn't
+                        // pinned across backends — same hazard as scalar floats, so a v128 it stores
+                        // could diverge legitimately. Disqualify the memory byte-oracle (integer-lane
+                        // v128 work stays byte-compared). Splat/extract/replace only move input bits,
+                        // not compute NaNs, so they don't trip this.
+                        Inst::VFloatBin { .. } | Inst::VFloatUn { .. } => true,
                         _ => false,
                     })
             })

@@ -61,7 +61,12 @@ fuzz_target!(|data: &[u8]| {
 
     let addr = u64::from_le_bytes(b[0..8].try_into().unwrap());
     let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
-    let width = (b[16] % 8) as u32 + 1; // 1..=8
+    // 1..=8 scalar widths, plus 16 for the §17 `v128` access (D58) — the masking unit is
+    // width-parametric, so the wider SIMD load/store rides the same confinement invariant.
+    let width = match b[16] % 9 {
+        8 => 16,
+        k => (k as u32) + 1,
+    };
     let reserved_log2 = b[17]; // any byte, incl. out-of-range (Window clamps)
     let mapped = u64::from_le_bytes(b[18..26].try_into().unwrap()); // clamped to reserved
     let base = u64::from_le_bytes(b[26..34].try_into().unwrap()); // clamped size-aligned by `sub`
