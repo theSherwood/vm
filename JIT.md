@@ -25,6 +25,7 @@ resource hardening are landed and differentially tested:
 | **new→old** (slice #1): module-aware interpreter frames + explicit dispatch table (the B2 foundation) | `crates/svm-interp/src/lib.rs` (`Frame.module`, `TableSlot`, `dispatch_indirect`, `VCpu::new_invoke`); tests in `jit_cap.rs` |
 | **old→new** (B2 install): pre-reserved table + `install` op both backends + `__vm_jit_install` | `svm-jit` (`CompiledModule::install`, `table_reserve_log2`, `DefinedFn`), `svm-interp` (op-3 arm, `grant_jit_with_table`), `svm-run` (`jit_native_op` op 3), `frontend/chibicc`; tests in `jit_cap.rs`/`jit_incremental.rs` |
 | **new→new** (B2): an invoked unit calls an installed one (live `fn_table` / invoke-time snapshot) | `svm-interp` (`VCpu::new_invoke` snapshot); test in `jit_cap.rs` |
+| **slot reclaim** (B2): `uninstall(slot)` frees a table slot for reuse (both backends) | `svm-jit` (`CompiledModule::uninstall`, `n_real_funcs`), `svm-interp` (op-4 arm), `svm-run`, `frontend/chibicc`; tests in `jit_cap.rs` |
 
 The W^X spike resolved affirmatively (incremental finalize leaves running code intact —
 pinned by tests including finalize *during* a run). Phase 5 (B2 table install) and
@@ -481,13 +482,16 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
 ## Open questions / risks
 
 - **Code reclaim ⇄ module lifecycle (the load-bearing constraint for any long session).**
-  Repeated `compile`s consume the 256 MiB code arena (`:955`) with no per-function reclaim in
-  `cranelift-jit`. This is *not* an orthogonal allocator feature: with no per-function free,
-  reclaim means periodic whole-module compaction (recompile live set → swap), reintroducing
-  amortized-periodic recompile cost (plan step 6). Note the recommended A-with-re-emission
-  REPL path *increases* arena pressure (duplicated helper bodies), so the MVP byte-cap /
-  `-ENOMEM` backstop is what gets profiled first; compaction is the upgrade if real sessions
-  hit the cap.
+  *Two distinct pressures.* (1) **Slot** pressure — the fixed `call_indirect` table fills as a
+  REPL installs definitions: **addressed** by `uninstall(slot)` (op 4), which frees a slot for
+  reuse (a redefinition `uninstall`s the old slot and `install`s the new code, reusing the
+  index). (2) **Code-memory** pressure — repeated `compile`s consume the 256 MiB code arena
+  (`:955`) with no per-function reclaim in `cranelift-jit`: **still open.** This is *not* an
+  orthogonal allocator feature — with no per-function free, reclaim means periodic whole-module
+  compaction (recompile the live set → swap), reintroducing amortized-periodic recompile cost
+  (plan step 6). The recommended A-with-re-emission REPL path *increases* arena pressure
+  (duplicated helper bodies), so the MVP byte-cap / `-ENOMEM` backstop is what gets profiled
+  first; compaction is the upgrade if real sessions hit the cap.
 - **W^X integrity of incremental `finalize_definitions` (escape-relevant, not just
   functional).** Today `finalize_definitions()` is called exactly once (`:1134`), so the
   multi-finalize path is unexercised. The real question is not re-entrancy correctness but
