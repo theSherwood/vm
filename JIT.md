@@ -161,6 +161,19 @@ new code reads/writes the guest interpreter's own linear memory with zero copy a
 own args use the i64-slot ABI). Submitted IR uses the binary `svm-encode` format (the
 hardened, fuzzed decode path) — not text.
 
+**Isolation model — same guest, not a nested guest.** The compiled code runs in the *same
+domain* as the guest that submitted it: same window, same handle table, same authority. This
+is DESIGN.md §8 working as intended — a module is a unit of code, not an isolation unit, and
+the JITed blob is simply a second module joining the guest's domain. Two consequences: (1) the
+trust boundary is **verification, not isolation** — the blob is exactly as powerful as its
+submitter, no more (it cannot reach beyond the window or the guest's granted handles) and no
+less (there is no inner sandbox); (2) this is why the memory-match precondition is
+load-bearing — a blob declaring a different memory size would be a module claiming a different
+domain while running in this one. For evaluating *untrusted* code with *less* authority than
+the submitter (e.g. a REPL running foreign user code), the right tool is the §13/§14
+`Instantiator` capability (a child VM with its own window and attenuated handles), not `Jit`.
+`Jit` adds speed to a guest; it never adds a protection domain.
+
 ---
 
 ## Invocation models compared (the explicit ask: safety / speed / simplicity)
