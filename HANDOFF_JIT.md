@@ -178,8 +178,9 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
      `cap.call`): a 20-prompt persistent-window REPL is byte-identical with/without compaction
      while occupancy stays bounded, and a live invoke-only unit survives the swap with its
      trampoline remapped. Oracle is compacting-JIT vs non-compacting-JIT (a multi-run interp↔JIT
-     differential is blocked by item #2's per-`VCpu` table; single-run correctness stays
-     differential in `jit_cap.rs`).
+     differential needs the interp to persist installs *across runs* — the shared `DomainTable` from
+     #2 now makes that possible, but the harness still builds a fresh table per `run`; single-run
+     correctness stays differential in `jit_cap.rs`).
    - **Auto-trigger:** `svm_run::JitSession` is the persistent REPL driver — owns the long-lived
      `CompiledModule` + carried window, `run_prompt` re-enters once per prompt (prior prompt's low
      bytes seed the next so guest state persists), and **auto-compacts** at a watermark on
@@ -193,19 +194,32 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
      arena bytes), and a C-level guest REPL demo under `demos/` (the IR-level guest test covers the
      mechanism). The `-ENOMEM` byte-cap backstop bounds the arena regardless.
 
-2. **Threaded install** + **install-during-own-invocation** — *one* refactor, **niche + risky.**
-   Today the interp's dispatch table is per-`VCpu` (owned `Vec`); spawned threads get a snapshot,
-   so a *post-spawn* install isn't seen by workers (the JIT, sharing the live `fn_table`, would
-   see it → divergence). Making it differentially faithful needs the table behind an
-   `Arc<Mutex>`, i.e. a **lock on the reference interp's hot `call_indirect` path** (used by every
-   concurrency/DPOR test) — the riskiest change in this area for niche value. Gate on a real need
-   for threaded guests using `install`. The same refactor also closes the
-   install-during-own-invocation edge case (currently: JIT live, interp snapshot stale — exotic;
-   needs the invoked unit to hold the `Jit` handle).
+2. **Threaded install** + **install-during-own-invocation** — **interp half landed; JIT half +
+   end-to-end still gated.** The root cause was a *structural mismatch*: the interp modeled the
+   dispatch table as per-`VCpu` owned state (a `Vec` rebuilt at `thread.spawn`, snapshotted at
+   `Jit.invoke`), while the JIT has one `fn_table` shared by every thread — so a post-spawn (or
+   during-own-invocation) install was visible to the JIT but not the interp.
+   - **Landed (interp):** the table is now a **shared, live `DomainTable`** (`Arc`-shared by every
+     vCPU), making the two backends structurally isomorphic. The feared "lock on the hot path" was
+     a false constraint — each slot is a single packed `u64` word, so dispatch is one **`Acquire`
+     atomic load** (free on x86) and `install`/`uninstall` one **`Release` store**, no lock, no torn
+     read (the table is pre-reserved). The `units` backing is append-only behind a writer-only
+     `Mutex`; readers keep a lock-free local clone re-synced on a miss, so module-0 dispatch touches
+     neither lock nor `units`, and the type-check resolves by borrow (no `Arc` clone). A `Jit.invoke`
+     unit runs as a transient `INVOKE_MODULE` kept out of the shared `units` (no collision with an
+     install, incl. one it performs on itself). Behavior-preserving (full suite + DPOR/loom green);
+     **perf:** `svm-bench interp_ci` ~79.7→~80.8 µs best-of (+1.4%, within ~3% noise). Unit-tested in
+     `svm-interp` (`domain_table_tests`).
+   - **Open (JIT half + end-to-end):** `CompiledModule::install` writes a 16-byte `FnEntry`
+     **non-atomically**, so concurrent install+dispatch on the JIT can tear — the JIT needs an
+     atomic slot too (and `compile`/`finalize` under running threads is the W^X spike JIT.md flags).
+     Plus lifting the single-threaded `Jit` restriction and the interp↔JIT differential threaded-
+     install test (a worker dispatching a post-spawn install). Still gated on a real threaded-install
+     workload.
 
-**Recommendation:** do #1 (compaction) as a focused effort when REPL arena pressure is real; treat
-#2/#3 as a separate, carefully-reviewed shared-table refactor gated on demonstrated need. Don't
-half-bake the shared-table change.
+**Recommendation:** #1 (compaction) and the interp half of #2 are done. The remaining #2 work (JIT
+atomic `FnEntry` + finalize-under-threads W^X + the end-to-end differential) stays gated on a
+demonstrated threaded-`install` workload — don't half-bake the JIT-side concurrency change.
 
 Also nice-to-have, low priority: a guest convention/helper so emitting C-ABI units (the `sp`-first
 shape) for `install` is less manual; today the demo hand-rolls it.

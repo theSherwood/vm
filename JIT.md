@@ -477,10 +477,11 @@ Phased; each phase is independently testable and keeps the escape-TCB crates unt
      `cap.call`): a 20-prompt persistent-window REPL is byte-identical with and without
      compaction while occupancy stays bounded, and an invoke-only live unit survives the swap
      with its trampoline remapped. **Oracle: compacting-JIT vs non-compacting-JIT** — an
-     interp↔JIT differential across *multiple* runs is blocked by the reference interp rebuilding
-     its per-`VCpu` dispatch table each run (the separate shared-table refactor, "Remaining work"
-     #2), so single-run correctness stays differential in `jit_cap.rs` and transparency-across-
-     the-swap is pinned against the production backend.
+     interp↔JIT differential across *multiple* runs needs the interp to persist installs across
+     runs; the shared `DomainTable` ("Remaining work" #2, interp half now landed) makes that
+     possible, but the harness still builds a fresh table per `run`, so single-run correctness
+     stays differential in `jit_cap.rs` and transparency-across-the-swap is pinned against the
+     production backend.
    - **Auto-trigger policy landed (`JitSession`).** `svm_run::JitSession` is the persistent REPL
      driver: it owns the long-lived `CompiledModule` + carried window an embedder re-enters once
      per prompt (`run_prompt`, the prior prompt's low bytes seeding the next so guest state
