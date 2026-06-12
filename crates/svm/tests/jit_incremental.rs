@@ -20,7 +20,7 @@
 //!   when the cumulative function count crosses a power-of-two boundary.
 
 use svm_interp::{run, Value};
-use svm_ir::DEFAULT_RESERVED_LOG2;
+use svm_ir::{FuncType, ValType, DEFAULT_RESERVED_LOG2};
 use svm_jit::{CompiledModule, JitOutcome, Quota, TrapKind, INERT_CAP_THUNK};
 use svm_text::parse_module;
 use svm_verify::verify_module;
@@ -238,9 +238,10 @@ fn parent_call_indirect_cannot_reach_extra_code() {
     );
 }
 
-/// Fail-closed type ids: a `call_indirect` in an extra unit whose signature the parent
-/// never declared gets `NO_MATCH_TYPE_ID` — no table entry can satisfy it, so it traps
-/// `IndirectCallType` (it must NOT silently call anything).
+/// Fail-closed type ids: a `call_indirect` in an extra unit whose signature no table entry
+/// carries traps `IndirectCallType` (it must NOT silently call anything). The signature gets
+/// a real interned id — stable for a future install — but until something with that
+/// signature sits in the table, every dispatch with it is inert.
 #[test]
 fn define_extra_unknown_signature_traps_fail_closed() {
     let mut cm = compile(ADD); // parent declares only (i32, i32) -> (i32)
@@ -300,6 +301,54 @@ fn define_extra_masking_matches_interp_memory_effects() {
         matches!(out, JitOutcome::Trapped(TrapKind::MemoryFault)),
         "jit: extra code past the backed extent must detect-and-kill, got {out:?}"
     );
+}
+
+/// The append-only type-id registry (JIT.md B2 groundwork): a novel signature introduced by
+/// one unit is interned under a stable id that a later unit — mentioning it only at a call
+/// site — shares; parent ids never move; and until a table entry carries the id, dispatch
+/// with it stays fail-closed. (End-to-end observability arrives with the table `install` op;
+/// this pins the registry semantics it will rely on.)
+#[test]
+fn type_ids_are_interned_append_only_across_units() {
+    let mut cm = compile(ADD);
+    let add_sig = FuncType {
+        params: vec![ValType::I32, ValType::I32],
+        results: vec![ValType::I32],
+    };
+    let novel = FuncType {
+        params: vec![ValType::I64],
+        results: vec![ValType::I64],
+    };
+    // The parent's only function signature is id 0; the novel signature is unknown.
+    assert_eq!(cm.interned_type_id(&add_sig), Some(0));
+    assert_eq!(cm.interned_type_id(&novel), None);
+
+    // Unit A introduces (i64) -> (i64) as a *function* signature.
+    let unit_a_src =
+        "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i64.const 1\n  v2 = i64.add v0 v1\n  return v2\n}\n";
+    let unit_a = parse_module(unit_a_src).expect("parse");
+    verify_module(&unit_a).expect("verify");
+    cm.define_extra(&unit_a.funcs).expect("unit A");
+    let id = cm.interned_type_id(&novel).expect("interned by unit A");
+
+    // Unit B mentions the same signature only at a call site — same id, nothing remapped.
+    let unit_b_src = "func (i64) -> (i64) {\nblock0(v0: i64):\n  v1 = i32.const 0\n  v2 = call_indirect (i64) -> (i64) v1 (v0)\n  return v2\n}\n";
+    let unit_b = parse_module(unit_b_src).expect("parse");
+    verify_module(&unit_b).expect("verify");
+    let ptrs = cm.define_extra(&unit_b.funcs).expect("unit B");
+    assert_eq!(cm.interned_type_id(&novel), Some(id), "stable across units");
+    assert_eq!(
+        cm.interned_type_id(&add_sig),
+        Some(0),
+        "parent ids never move"
+    );
+
+    // No table entry carries the novel id, so dispatch with it stays fail-closed.
+    let (out, _) = unsafe { cm.run_extra(ptrs[0], 1, 1, &[7], None) }.expect("run_extra");
+    assert!(matches!(
+        out,
+        JitOutcome::Trapped(TrapKind::IndirectCallType)
+    ));
 }
 
 /// An empty unit is a no-op.

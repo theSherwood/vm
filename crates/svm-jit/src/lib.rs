@@ -172,6 +172,57 @@ fn type_id_of(distinct: &[FuncType], ty: &FuncType) -> u32 {
         .unwrap_or(NO_MATCH_TYPE_ID)
 }
 
+/// Intern `ty` into the **append-only** type-id registry (JIT.md B2: the per-domain id space
+/// made incremental), returning its stable id. Soundness of the `call_indirect` dispatch check
+/// reduces to this map being an *injection*, *stable over time* (an id never remaps — appends
+/// only), and *total over participants* (every signature that can appear at a call site or in
+/// a table slot is interned before any code referencing it is lowered) — then id-equality
+/// coincides exactly with the interpreter's structural equality. The registry is consulted
+/// only at compile/install time (inside a synchronous `cap.call`, guest suspended); compiled
+/// code holds ids as immediates and never reads it at runtime.
+fn intern_type(distinct: &mut Vec<FuncType>, ty: &FuncType) -> Result<u32, JitError> {
+    if let Some(i) = distinct.iter().position(|t| t == ty) {
+        return Ok(i as u32);
+    }
+    // Defensive: never collide with the `NO_MATCH_TYPE_ID` / `PADDING_TYPE_ID` sentinels
+    // (unreachable in practice — it would take ~2^32 distinct signatures).
+    if distinct.len() as u64 >= NO_MATCH_TYPE_ID as u64 {
+        return Err(JitError::Unsupported("type-id registry full"));
+    }
+    distinct.push(ty.clone());
+    Ok((distinct.len() - 1) as u32)
+}
+
+/// Intern every signature `funcs` can put into play for table dispatch: each function's own
+/// signature (what a table slot holding it would carry) and every `call_indirect` /
+/// `return_call_indirect` **site** signature (what the check compares against). Site
+/// signatures matter: an id is baked into the call site as an immediate when the unit is
+/// lowered, so a site whose signature is only defined by a *later* unit must already hold the
+/// real id — interning up front keeps id-equality ≡ structural equality across units instead
+/// of freezing a site to the always-trapping `NO_MATCH_TYPE_ID`.
+fn intern_unit_sigs(distinct: &mut Vec<FuncType>, funcs: &[Func]) -> Result<(), JitError> {
+    for f in funcs {
+        intern_type(
+            distinct,
+            &FuncType {
+                params: f.params.clone(),
+                results: f.results.clone(),
+            },
+        )?;
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::CallIndirect { ty, .. } = i {
+                    intern_type(distinct, ty)?;
+                }
+            }
+            if let Terminator::ReturnCallIndirect { ty, .. } = &b.term {
+                intern_type(distinct, ty)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Why the JIT could not compile (or run) a function. The integer slice rejects
 /// anything it does not yet lower with [`JitError::Unsupported`]; the differential
 /// harness treats that as "skip", not "fail".
@@ -1070,8 +1121,17 @@ impl CompiledModule {
             .collect::<Result<_, _>>()?;
 
         // Distinct signatures give each function (and call site) a structural type id, the
-        // basis for the `call_indirect` type check (matching the interpreter).
-        let distinct = distinct_types(&m.funcs);
+        // basis for the `call_indirect` type check (matching the interpreter). Function
+        // signatures come first (`distinct_types`, ids identical to the historical one-shot
+        // compile — the fn-table and `fiber_type_id` depend on those positions), then every
+        // call-site signature is interned after them. Today a site whose signature matches no
+        // function traps either way (a fresh id ≥ the function-sig count matches no table
+        // entry, exactly like `NO_MATCH_TYPE_ID`) — but interning it now means a *later*
+        // `define_extra`/install of a function with that signature can satisfy the site,
+        // keeping id-equality ≡ structural equality across units (JIT.md B2).
+        let mut distinct = distinct_types(&m.funcs);
+        intern_unit_sigs(&mut distinct, &m.funcs)?;
+        let distinct = distinct;
 
         // The host thunk + ctx addresses, baked into `cap.call` sites as constants.
         let cap = CapEnv {
@@ -1552,8 +1612,12 @@ impl CompiledModule {
     /// only, so the table mask baked into every existing `call_indirect` site never changes
     /// (JIT.md Model A — zero new escape-relevant dispatch surface). Extra code is lowered
     /// against the *parent's* environment: same confinement mask, same `cap.call` thunk, same
-    /// table mask, and the parent's `distinct` type-id space — a `call_indirect` whose signature
-    /// the parent module never declared gets `NO_MATCH_TYPE_ID` and traps, fail-closed.
+    /// table mask, and the module's shared **append-only type-id registry** (see
+    /// [`Self::interned_type_id`]) — the unit's signatures are interned before lowering, so
+    /// id-equality coincides with structural equality across every unit this module has
+    /// compiled or will compile. A `call_indirect` whose signature no table entry carries
+    /// still traps, fail-closed — but a signature first introduced here keeps a stable id, so
+    /// a future table install of a structurally equal function can satisfy it.
     ///
     /// Functions using §12 fibers/threads are rejected (`Unsupported`) — the MVP restricts
     /// incremental definition to single-threaded code (JIT.md "Concurrency"), and lowering
@@ -1571,6 +1635,11 @@ impl CompiledModule {
                 ));
             }
         }
+        // Intern the unit's signatures (its functions' own + its call sites') into the
+        // append-only registry BEFORE lowering, so the ids baked into this unit's dispatch
+        // checks are real, stable ids — id-equality ≡ structural equality across all units
+        // sharing this module, past and future (JIT.md B2; see `intern_type`).
+        intern_unit_sigs(&mut self.distinct, funcs)?;
         // Declare the unit's functions first so intra-unit direct calls can reference any of them.
         let ids: Vec<FuncId> = funcs
             .iter()
@@ -1636,6 +1705,15 @@ impl CompiledModule {
             .into_iter()
             .map(|t| self.module.get_finalized_function(t))
             .collect())
+    }
+
+    /// The stable type id `ty` was interned under, or `None` if no unit this module compiled
+    /// has mentioned it (as a function signature or a call-site type). Ids are append-only —
+    /// once returned, an id never remaps — and id-equality coincides with structural equality
+    /// over everything this module compiled (see `intern_type`). This is the lookup a table
+    /// `install` operation uses to stamp a slot's `type_id` (JIT.md B2).
+    pub fn interned_type_id(&self, ty: &FuncType) -> Option<u32> {
+        self.distinct.iter().position(|t| t == ty).map(|i| i as u32)
     }
 }
 
