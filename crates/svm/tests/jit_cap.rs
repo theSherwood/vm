@@ -146,6 +146,22 @@ fn memory_mismatch_rejected_identically() {
     );
 }
 
+/// A submitted unit containing `call_indirect` (the new→old path) is rejected identically.
+/// On the JIT it would dispatch through the parent table, but the reference interpreter cannot
+/// model a frame spanning the parent and unit function spaces — so the shared validator gates
+/// it (Model A MVP supports old→new only; uniform cross-unit dispatch is the B2 feature). This
+/// is the safe closure of a divergence the bare `define_extra` JIT primitive otherwise exposes.
+#[test]
+fn call_indirect_unit_rejected_identically() {
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.const 0\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n}\n");
+    let guest = with_len(COMPILE_ONLY, b.len());
+    let (out, _) = diff_run(&guest, &b, &[]);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[-22]),
+        "{out:?}"
+    );
+}
+
 /// A blob with data segments is rejected (it would overwrite live guest memory at define
 /// time — JIT.md "Reject, don't apply").
 #[test]

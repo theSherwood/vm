@@ -281,6 +281,15 @@ pub fn jit_blob_validator(bytes: &[u8], mem_log2: Option<u8>) -> Result<Arc<[svm
     if m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_concurrency()) {
         return Err(EINVAL);
     }
+    // Reject `call_indirect` in a submitted unit (the new→old path). On the JIT it dispatches
+    // through the parent table, but the reference interpreter cannot model a frame spanning the
+    // parent and unit function spaces, so the backends would diverge. Model A MVP supports
+    // old→new (`invoke`); uniform cross-unit dispatch is the B2 (table-install) feature. Gating
+    // it in the shared validator keeps both backends provably in lockstep (see
+    // [`svm_ir::Func::uses_indirect_call`]).
+    if m.funcs.iter().any(|f| f.uses_indirect_call()) {
+        return Err(EINVAL);
+    }
     Ok(m.funcs.into())
 }
 
