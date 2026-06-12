@@ -563,8 +563,13 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
   constants directly (as for the main module), so no runtime vmctx pointer is needed for the
   environment — only the call's own args use the i64-slot ABI. Confirm in Phase 2.
 - **Concurrency.** If the guest uses threads/fibers, compiling mid-run interacts with the
-  cooperative scheduler and the W^X question above — MVP restricts the `Jit` cap to
-  single-threaded domains, which also makes the transient-W concern non-exploitable.
+  cooperative scheduler and the W^X question above. **Update (§6 #2):** threaded **install** now
+  works end-to-end on both backends — the interp's shared atomic `DomainTable` and the JIT's atomic
+  `FnEntry` make a post-spawn install visible to a worker (`jit_cap::threaded_install_agrees_*`),
+  with visibility carried by the guest's own ready flag. The remaining single-threaded restriction
+  is **threaded *compile*** (a worker calling `Jit.compile` → `finalize_definitions` under live
+  threads, the W^X spike); threaded install sidesteps it (compile precedes the spawn). aarch64 also
+  needs an acquire load on the baked `type_id` (x86 TSO covers it today).
 
 ## Verification approach
 

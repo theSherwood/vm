@@ -133,8 +133,9 @@ guest-compiled unit in `units[k-1]`). Direct calls stay in the caller's module;
   live invoke-only carry), **and** the auto-compacting `JitSession` (watermark policy, guest-driven
   `cap.call`-end-to-end session).
 - `cargo test -p svm --test jit_cap` — **the differential suite** (interp ≡ JIT): compile/invoke,
-  all 4 cross-call directions, install/uninstall, garbage/memory-mismatch/data/concurrency
-  rejection, quota, traps, a deterministic blob fuzz. This is the one that matters most.
+  all 4 cross-call directions, install/uninstall, **threaded install** (a worker dispatching a
+  post-spawn install — §6 #2), garbage/memory-mismatch/data/concurrency rejection, quota, traps, a
+  deterministic blob fuzz. This is the one that matters most.
 - `cargo test -p svm --test c_frontend c_guest_jit_demo` — the C demo end-to-end on both backends.
 - Always finish with `cargo test --workspace` + `cargo clippy -p svm-jit -p svm-interp -p svm-run`.
 
@@ -194,32 +195,42 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
      arena bytes), and a C-level guest REPL demo under `demos/` (the IR-level guest test covers the
      mechanism). The `-ENOMEM` byte-cap backstop bounds the arena regardless.
 
-2. **Threaded install** + **install-during-own-invocation** — **interp half landed; JIT half +
-   end-to-end still gated.** The root cause was a *structural mismatch*: the interp modeled the
+2. **Threaded install** + **install-during-own-invocation** — **done on x86-64; only aarch64 codegen
+   + threaded-*compile* remain.** The root cause was a *structural mismatch*: the interp modeled the
    dispatch table as per-`VCpu` owned state (a `Vec` rebuilt at `thread.spawn`, snapshotted at
    `Jit.invoke`), while the JIT has one `fn_table` shared by every thread — so a post-spawn (or
    during-own-invocation) install was visible to the JIT but not the interp.
-   - **Landed (interp):** the table is now a **shared, live `DomainTable`** (`Arc`-shared by every
-     vCPU), making the two backends structurally isomorphic. The feared "lock on the hot path" was
-     a false constraint — each slot is a single packed `u64` word, so dispatch is one **`Acquire`
-     atomic load** (free on x86) and `install`/`uninstall` one **`Release` store**, no lock, no torn
-     read (the table is pre-reserved). The `units` backing is append-only behind a writer-only
-     `Mutex`; readers keep a lock-free local clone re-synced on a miss, so module-0 dispatch touches
-     neither lock nor `units`, and the type-check resolves by borrow (no `Arc` clone). A `Jit.invoke`
-     unit runs as a transient `INVOKE_MODULE` kept out of the shared `units` (no collision with an
-     install, incl. one it performs on itself). Behavior-preserving (full suite + DPOR/loom green);
-     **perf:** `svm-bench interp_ci` ~79.7→~80.8 µs best-of (+1.4%, within ~3% noise). Unit-tested in
-     `svm-interp` (`domain_table_tests`).
-   - **Open (JIT half + end-to-end):** `CompiledModule::install` writes a 16-byte `FnEntry`
-     **non-atomically**, so concurrent install+dispatch on the JIT can tear — the JIT needs an
-     atomic slot too (and `compile`/`finalize` under running threads is the W^X spike JIT.md flags).
-     Plus lifting the single-threaded `Jit` restriction and the interp↔JIT differential threaded-
-     install test (a worker dispatching a post-spawn install). Still gated on a real threaded-install
-     workload.
+   - **Interp — shared atomic `DomainTable`:** the table is now `Arc`-shared by every vCPU, making
+     the two backends structurally isomorphic. The feared "lock on the hot path" was a false
+     constraint — each slot is a single packed `u64` word, so dispatch is one **`Acquire` load**
+     (free on x86) and `install`/`uninstall` one **`Release` store**, no lock, no torn read (table
+     pre-reserved). `units` is append-only behind a writer-only `Mutex`; readers keep a lock-free
+     local clone re-synced on a miss, so module-0 dispatch touches neither lock nor `units`, and the
+     type-check resolves by borrow (no `Arc` clone). A `Jit.invoke` unit runs as a transient
+     `INVOKE_MODULE` kept out of the shared `units` (no collision with an install it performs on
+     itself). **Perf:** `svm-bench interp_ci` ~79.7→~80.8 µs best-of (+1.4%, within ~3% noise).
+     Unit-tested (`domain_table_tests`).
+   - **JIT — atomic `FnEntry`:** `install`/`uninstall`/`install_at` now publish **release-ordered
+     atomic** writes (`FnEntry { type_id: AtomicU32, code: AtomicU64 }`, same `#[repr(C)]` layout, so
+     `indirect_dispatch` codegen is **byte-identical** — no runtime regression) with `&self`
+     (interior mutability, since the running generated code reads the table through raw pointers).
+     `code` first then `type_id` (the ready field), so a reader observing the unit's `type_id` sees
+     its `code`. The fiber/thread funcref dispatch reads via the atomic accessors.
+   - **End-to-end differential (landed):** `jit_cap::threaded_install_agrees_across_backends` — main
+     compiles, spawns a worker, then installs + signals readiness via a guest atomic; the worker
+     `call_indirect`s the post-spawn install → both backends return 52 (non-flaky 12/12). Compile (the
+     only `finalize`) is before the spawn, so install is the lone concurrent table op.
+   - **Open (narrowed):** (a) **aarch64** — the generated dispatch relies on x86 TSO for the
+     `type_id`-then-`code` read order; a weakly-ordered target needs an **acquire load on the baked
+     `type_id`** (an escape-TCB codegen change to `indirect_dispatch`). (b) **Threaded *compile*** — a
+     worker calling `Jit.compile` while others run hits `finalize_definitions` under live threads (the
+     W^X spike JIT.md flags); threaded *install* sidesteps it. (c) install-during-own-invocation is
+     covered structurally by the interp's `INVOKE_MODULE` + shared table; a dedicated end-to-end case
+     is still worth adding if a guest needs it.
 
-**Recommendation:** #1 (compaction) and the interp half of #2 are done. The remaining #2 work (JIT
-atomic `FnEntry` + finalize-under-threads W^X + the end-to-end differential) stays gated on a
-demonstrated threaded-`install` workload — don't half-bake the JIT-side concurrency change.
+**Recommendation:** #1 (compaction) is done; #2 threaded **install** is done end-to-end on x86-64.
+The narrowed remainder — aarch64 acquire-load codegen and threaded-*compile* W^X — stays gated; the
+W^X spike especially should not be half-baked.
 
 Also nice-to-have, low priority: a guest convention/helper so emitting C-ABI units (the `sp`-first
 shape) for `install` is less manual; today the demo hand-rolls it.
