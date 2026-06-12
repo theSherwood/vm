@@ -55,6 +55,38 @@ block2(v8: i32):
         let r = svm_interp::run(&module, 0, &[Value::I32(0)], &mut fuel);
         std::hint::black_box(&r);
     });
+
+    // `call_indirect` dispatch throughput: a loop that dispatches through the table every
+    // iteration (mask + slot read + structural type-check → the reference mirror of the JIT's
+    // `fn_table`). This is the hot path the shared-`DomainTable` work touches, so it is tracked
+    // on its own. The entry loops `n` times calling `call_indirect[0]` (an `acc+1` leaf).
+    let ci_src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 0
+  br block1(v0, v1)
+block1(v2: i32, v3: i32):
+  v4 = i32.const 1
+  v5 = call_indirect (i32) -> (i32) v4 (v3)
+  v6 = i32.const 1
+  v7 = i32.sub v2 v6
+  br_if v7 block1(v7, v5) block2(v5)
+block2(v8: i32):
+  return v8
+}
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 1
+  v2 = i32.add v0 v1
+  return v2
+}
+"#;
+    let ci_module = ir_from_text(ci_src);
+    bench("interp_ci", 50_000, || {
+        let mut fuel = 10_000u64;
+        let r = svm_interp::run(&ci_module, 0, &[Value::I32(200)], &mut fuel);
+        std::hint::black_box(&r);
+    });
 }
 
 fn ir_from_text(src: &str) -> ir::Module {
