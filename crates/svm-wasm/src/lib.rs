@@ -33,7 +33,8 @@
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, ValIdx, ValType,
+    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, VBitBinOp,
+    VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -91,7 +92,8 @@ fn val_type(w: W) -> Result<ValType, Error> {
         W::I64 => Ok(ValType::I64),
         W::F32 => Ok(ValType::F32),
         W::F64 => Ok(ValType::F64),
-        W::V128 => unsup("v128 / SIMD"),
+        // §17/D58: wasm v128 maps directly to our fixed-128 vector type.
+        W::V128 => Ok(ValType::V128),
         W::Ref(_) => unsup("reference type"),
     }
 }
@@ -979,6 +981,80 @@ fn fcast(lo: &mut Lower, op: CastOp, out: ValType) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::Cast { op, a });
     lo.push(v, out);
+    Ok(())
+}
+
+// ---- §17 SIMD (D58): wasm v128 → IR v128 ----
+fn v_splat(lo: &mut Lower, shape: VShape) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::Splat { shape, a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_extract(lo: &mut Lower, shape: VShape, lane: u8, signed: bool) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::ExtractLane {
+        shape,
+        lane,
+        signed,
+        a,
+    });
+    lo.push(v, shape.lane_val());
+    Ok(())
+}
+fn v_replace(lo: &mut Lower, shape: VShape, lane: u8) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::ReplaceLane { shape, lane, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_intbin(lo: &mut Lower, shape: VShape, op: VIntBinOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VIntBin { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_fbin(lo: &mut Lower, shape: VShape, op: VFloatBinOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VFloatBin { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_fun(lo: &mut Lower, shape: VShape, op: VFloatUnOp) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VFloatUn { shape, op, a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_bitbin(lo: &mut Lower, op: VBitBinOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VBitBin { op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v128_load(lo: &mut Lower, m: MemArg) -> Result<(), Error> {
+    let addr = pop_addr(lo)?;
+    let v = lo.emit(Inst::V128Load {
+        addr,
+        offset: m.offset,
+        align: m.align,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v128_store(lo: &mut Lower, m: MemArg) -> Result<(), Error> {
+    let (value, _) = lo.pop()?;
+    let addr = pop_addr(lo)?;
+    lo.emit_void(Inst::V128Store {
+        addr,
+        value,
+        offset: m.offset,
+        align: m.align,
+    });
     Ok(())
 }
 
@@ -2023,6 +2099,100 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             lo.set_term(Terminator::Return(args));
         }
         O::End => end_frame(lo)?,
+
+        // ---- §17 SIMD (D58): the pragmatic v128 subset our IR supports ----
+        O::V128Const { value } => {
+            let v = lo.emit(Inst::ConstV128(*value.bytes()));
+            lo.push(v, ValType::V128);
+        }
+        O::V128Load { memarg } => v128_load(lo, memarg)?,
+        O::V128Store { memarg } => v128_store(lo, memarg)?,
+        // splat
+        O::I8x16Splat => v_splat(lo, VShape::I8x16)?,
+        O::I16x8Splat => v_splat(lo, VShape::I16x8)?,
+        O::I32x4Splat => v_splat(lo, VShape::I32x4)?,
+        O::I64x2Splat => v_splat(lo, VShape::I64x2)?,
+        O::F32x4Splat => v_splat(lo, VShape::F32x4)?,
+        O::F64x2Splat => v_splat(lo, VShape::F64x2)?,
+        // extract_lane (narrow int shapes carry sign)
+        O::I8x16ExtractLaneS { lane } => v_extract(lo, VShape::I8x16, lane, true)?,
+        O::I8x16ExtractLaneU { lane } => v_extract(lo, VShape::I8x16, lane, false)?,
+        O::I16x8ExtractLaneS { lane } => v_extract(lo, VShape::I16x8, lane, true)?,
+        O::I16x8ExtractLaneU { lane } => v_extract(lo, VShape::I16x8, lane, false)?,
+        O::I32x4ExtractLane { lane } => v_extract(lo, VShape::I32x4, lane, false)?,
+        O::I64x2ExtractLane { lane } => v_extract(lo, VShape::I64x2, lane, false)?,
+        O::F32x4ExtractLane { lane } => v_extract(lo, VShape::F32x4, lane, false)?,
+        O::F64x2ExtractLane { lane } => v_extract(lo, VShape::F64x2, lane, false)?,
+        // replace_lane
+        O::I8x16ReplaceLane { lane } => v_replace(lo, VShape::I8x16, lane)?,
+        O::I16x8ReplaceLane { lane } => v_replace(lo, VShape::I16x8, lane)?,
+        O::I32x4ReplaceLane { lane } => v_replace(lo, VShape::I32x4, lane)?,
+        O::I64x2ReplaceLane { lane } => v_replace(lo, VShape::I64x2, lane)?,
+        O::F32x4ReplaceLane { lane } => v_replace(lo, VShape::F32x4, lane)?,
+        O::F64x2ReplaceLane { lane } => v_replace(lo, VShape::F64x2, lane)?,
+        // integer lane add/sub/mul (i8x16.mul has no wasm op, so it never appears)
+        O::I8x16Add => v_intbin(lo, VShape::I8x16, VIntBinOp::Add)?,
+        O::I8x16Sub => v_intbin(lo, VShape::I8x16, VIntBinOp::Sub)?,
+        O::I16x8Add => v_intbin(lo, VShape::I16x8, VIntBinOp::Add)?,
+        O::I16x8Sub => v_intbin(lo, VShape::I16x8, VIntBinOp::Sub)?,
+        O::I16x8Mul => v_intbin(lo, VShape::I16x8, VIntBinOp::Mul)?,
+        O::I32x4Add => v_intbin(lo, VShape::I32x4, VIntBinOp::Add)?,
+        O::I32x4Sub => v_intbin(lo, VShape::I32x4, VIntBinOp::Sub)?,
+        O::I32x4Mul => v_intbin(lo, VShape::I32x4, VIntBinOp::Mul)?,
+        O::I64x2Add => v_intbin(lo, VShape::I64x2, VIntBinOp::Add)?,
+        O::I64x2Sub => v_intbin(lo, VShape::I64x2, VIntBinOp::Sub)?,
+        O::I64x2Mul => v_intbin(lo, VShape::I64x2, VIntBinOp::Mul)?,
+        // float lane arithmetic
+        O::F32x4Add => v_fbin(lo, VShape::F32x4, VFloatBinOp::Add)?,
+        O::F32x4Sub => v_fbin(lo, VShape::F32x4, VFloatBinOp::Sub)?,
+        O::F32x4Mul => v_fbin(lo, VShape::F32x4, VFloatBinOp::Mul)?,
+        O::F32x4Div => v_fbin(lo, VShape::F32x4, VFloatBinOp::Div)?,
+        O::F32x4Min => v_fbin(lo, VShape::F32x4, VFloatBinOp::Min)?,
+        O::F32x4Max => v_fbin(lo, VShape::F32x4, VFloatBinOp::Max)?,
+        O::F64x2Add => v_fbin(lo, VShape::F64x2, VFloatBinOp::Add)?,
+        O::F64x2Sub => v_fbin(lo, VShape::F64x2, VFloatBinOp::Sub)?,
+        O::F64x2Mul => v_fbin(lo, VShape::F64x2, VFloatBinOp::Mul)?,
+        O::F64x2Div => v_fbin(lo, VShape::F64x2, VFloatBinOp::Div)?,
+        O::F64x2Min => v_fbin(lo, VShape::F64x2, VFloatBinOp::Min)?,
+        O::F64x2Max => v_fbin(lo, VShape::F64x2, VFloatBinOp::Max)?,
+        O::F32x4Abs => v_fun(lo, VShape::F32x4, VFloatUnOp::Abs)?,
+        O::F32x4Neg => v_fun(lo, VShape::F32x4, VFloatUnOp::Neg)?,
+        O::F32x4Sqrt => v_fun(lo, VShape::F32x4, VFloatUnOp::Sqrt)?,
+        O::F64x2Abs => v_fun(lo, VShape::F64x2, VFloatUnOp::Abs)?,
+        O::F64x2Neg => v_fun(lo, VShape::F64x2, VFloatUnOp::Neg)?,
+        O::F64x2Sqrt => v_fun(lo, VShape::F64x2, VFloatUnOp::Sqrt)?,
+        // whole-vector bitwise
+        O::V128And => v_bitbin(lo, VBitBinOp::And)?,
+        O::V128Or => v_bitbin(lo, VBitBinOp::Or)?,
+        O::V128Xor => v_bitbin(lo, VBitBinOp::Xor)?,
+        O::V128AndNot => v_bitbin(lo, VBitBinOp::AndNot)?,
+        O::V128Not => {
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::VNot { a });
+            lo.push(v, ValType::V128);
+        }
+        O::V128Bitselect => {
+            // wasm stack: a, b, mask (mask on top). IR `bitselect(a, b, mask)` = `(a&mask)|(b&!mask)`,
+            // matching wasm's `v128.bitselect` (bit set in mask ⇒ take a).
+            let (mask, _) = lo.pop()?;
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Bitselect { a, b, mask });
+            lo.push(v, ValType::V128);
+        }
+        O::I8x16Shuffle { lanes } => {
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Shuffle { lanes, a, b });
+            lo.push(v, ValType::V128);
+        }
+        O::I8x16Swizzle => {
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Swizzle { a, b });
+            lo.push(v, ValType::V128);
+        }
+
         other => return unsup(format!("operator {other:?}")),
     }
     Ok(())
