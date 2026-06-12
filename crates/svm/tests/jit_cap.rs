@@ -644,3 +644,79 @@ fn threaded_compile_agrees_across_backends() {
         "threaded compile must agree on both backends: {out:?}"
     );
 }
+
+/// Threaded-compile **stress**: main and a worker each run a 10-iteration loop that `compile`s a
+/// fresh unit and `invoke`s it every iteration — ~20 heavily-overlapping concurrent compiles. If the
+/// per-domain serialization were missing, the racing `define_extra`s / `Host`-registry writes would
+/// corrupt or crash; instead both backends agree. main sums `i*3+10` over `i=0..10` (= 235), the
+/// worker sums `i*4+10` (= 280); main returns `235 + 280 = 515`.
+#[test]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn threaded_compile_loop_stress_agrees() {
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const 10\n  v4 = i32.add v2 v3\n  return v4\n}\n");
+    let guest_src = concat!(
+        "memory 16\n",
+        // func 0 — main(jit): spawn worker, loop compile+invoke(i,3), join, return main+worker.
+        "func (i32) -> (i32) {\n",
+        "block0(v0: i32):\n",
+        "  v1 = i64.extend_i32_u v0\n",
+        "  v2 = i64.const 2048\n",
+        "  v3 = thread.spawn 1 v2 v1\n", // worker handle
+        "  v4 = i32.const 0\n",
+        "  br block1(v0, v3, v4, v4)\n", // jit, wh, i, acc
+        "block1(v5: i32, v6: i32, v7: i32, v8: i32):\n",
+        "  v9 = i32.const 10\n",
+        "  v10 = i32.lt_u v7 v9\n",
+        "  br_if v10 block2(v5, v6, v7, v8) block3(v6, v8)\n",
+        "block2(v11: i32, v12: i32, v13: i32, v14: i32):\n", // jit, wh, i, acc
+        "  v15 = i64.const 4096\n",
+        "  v16 = i64.const BLOBLEN\n",
+        "  v17 = cap.call 11 0 (i64, i64) -> (i64) v11 (v15, v16)\n",
+        "  v18 = i32.const 3\n",
+        "  v19 = cap.call 11 1 (i64, i32, i32) -> (i32) v11 (v17, v13, v18)\n", // i*3+10
+        "  v20 = i32.add v14 v19\n",
+        "  v21 = i32.const 1\n",
+        "  v22 = i32.add v13 v21\n",
+        "  br block1(v11, v12, v22, v20)\n",
+        "block3(v23: i32, v24: i32):\n", // wh, acc
+        "  v25 = thread.join v23\n",
+        "  v26 = i32.wrap_i64 v25\n",
+        "  v27 = i32.add v24 v26\n",
+        "  return v27\n",
+        "}\n",
+        // func 1 — worker(sp, jit): loop compile+invoke(i,4), return sum.
+        "func (i64, i64) -> (i64) {\n",
+        "block0(v0: i64, v1: i64):\n",
+        "  v2 = i32.wrap_i64 v1\n", // jit
+        "  v3 = i32.const 0\n",
+        "  br block1(v2, v3, v3)\n", // jit, i, acc
+        "block1(v4: i32, v5: i32, v6: i32):\n",
+        "  v7 = i32.const 10\n",
+        "  v8 = i32.lt_u v5 v7\n",
+        "  br_if v8 block2(v4, v5, v6) block3(v6)\n",
+        "block2(v9: i32, v10: i32, v11: i32):\n", // jit, i, acc
+        "  v12 = i64.const 4096\n",
+        "  v13 = i64.const BLOBLEN\n",
+        "  v14 = cap.call 11 0 (i64, i64) -> (i64) v9 (v12, v13)\n",
+        "  v15 = i32.const 4\n",
+        "  v16 = cap.call 11 1 (i64, i32, i32) -> (i32) v9 (v14, v10, v15)\n", // i*4+10
+        "  v17 = i32.add v11 v16\n",
+        "  v18 = i32.const 1\n",
+        "  v19 = i32.add v10 v18\n",
+        "  br block1(v9, v19, v17)\n",
+        "block3(v20: i32):\n",
+        "  v21 = i64.extend_i32_u v20\n",
+        "  return v21\n",
+        "}\n",
+    );
+    let guest = with_len(guest_src, b.len());
+    let (out, _) = diff_run_t(&guest, &b, &[], 0);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[515]), // 235 + 280
+        "threaded-compile stress must agree on both backends: {out:?}"
+    );
+}
