@@ -685,8 +685,13 @@ this is the index.)
   - **Capstone (`crates/svm-wasm/tests/simd.rs`):** a WAT f32x4 dot + saxpy run byte-identically on
     interp and JIT vs hand oracles; an embedded **real `clang --target=wasm32 -msimd128 -O2`** saxpy
     (hermetic `.wasm` fixture) transpiles to verified SIMD IR. **Bench:** the `bench` `simd` kernel
-    vs Wasmtime lands at **~1.1× under `--from-wasm`** (identical transpiled IR) — SIMD compute
-    parity, the shared-Cranelift story extended to v128.
+    vs Wasmtime lands at **~1.0×** — SIMD compute parity, the shared-Cranelift story extended to
+    v128. *(Footnote, root-caused: an earlier hand-written version of this kernel measured ~3× on
+    the identical JIT — purely loop branch layout, not SIMD codegen. Bisected: re-materializing vs
+    threading the invariant addend was neutral; flipping only the header `br_if` polarity — loop
+    body on the taken edge vs the fall-through else edge — flipped 1.04× → 3.07×. The wasm→IR
+    transpiler emits the canonical shape, so `--from-wasm` is always parity; the kernel now mirrors
+    it. Outsized here only because the body is one `paddd`; heavier bodies like `alu` are immune.)*
   - **Deferred (D58, revisit when a kernel demands it):** wider widths `v256`/`v512` (feature-
     detected, split-to-`v128` fallback); `i8x16.mul` (no single-instruction JIT lowering — bails to
     `Unsupported`; interp covers it). Scalable vectors (SVE/RVV) rejected.

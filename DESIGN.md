@@ -1916,7 +1916,7 @@ team has **no expert safety net**.
   native Cranelift SSE2/NEON codegen; the only escape-TCB delta is the 16-byte masked
   load/store on `svm-mask`'s width-parametric guard; v128 ops ride the 4000-seed
   interp↔JIT differential, a real clang `-msimd128` saxpy transpiles to verified SIMD
-  IR, and the `bench` SIMD kernel is at ~1.1× Wasmtime under `--from-wasm`. Wider
+  IR, and the `bench` SIMD kernel is at ~1.0× Wasmtime (compute parity). Wider
   widths `v256`/`v512` deferred (D58). **Concurrency
   primitives have landed early**: fibers `cont.*`, 1:1 `thread.spawn`/`join`, the
   `wait`/`notify` futex + C11 atomics, in IR/interp/JIT across the parity matrix
