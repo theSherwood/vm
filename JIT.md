@@ -24,6 +24,7 @@ resource hardening are landed and differentially tested:
 | C surface (`__vm_jit_compile/invoke2/release`, 8-handle powerbox) + demo | `frontend/chibicc`, `crates/svm-run/demos/jit/` (`cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c`) |
 | **new→old** (slice #1): module-aware interpreter frames + explicit dispatch table (the B2 foundation) | `crates/svm-interp/src/lib.rs` (`Frame.module`, `TableSlot`, `dispatch_indirect`, `VCpu::new_invoke`); tests in `jit_cap.rs` |
 | **old→new** (B2 install): pre-reserved table + `install` op both backends + `__vm_jit_install` | `svm-jit` (`CompiledModule::install`, `table_reserve_log2`, `DefinedFn`), `svm-interp` (op-3 arm, `grant_jit_with_table`), `svm-run` (`jit_native_op` op 3), `frontend/chibicc`; tests in `jit_cap.rs`/`jit_incremental.rs` |
+| **new→new** (B2): an invoked unit calls an installed one (live `fn_table` / invoke-time snapshot) | `svm-interp` (`VCpu::new_invoke` snapshot); test in `jit_cap.rs` |
 
 The W^X spike resolved affirmatively (incremental finalize leaves running code intact —
 pinned by tests including finalize *during* a run). Phase 5 (B2 table install) and
@@ -46,12 +47,16 @@ and **old→new** (old code `call_indirect`s a unit it `install`ed). Mechanism:
   parent funcs count, so the returned slot index agrees. The returned slot is a funcref old code
   (or another unit) `call_indirect`s at native speed.
 
-Differential tests pin new→old (parent function's result, both backends), old→new via install
-(installed-unit result + matching slot index, both backends), fail-closed signature-mismatch
-and `-ENOSPC` (table full). C surface: `__vm_jit_install` (iface 11 op 3). **Remaining B2
-increment:** *new→new* — an *invoked* (not-yet-installed) unit calling an installed one needs the
-invoke child to share the main domain's table; the foundation (module-aware dispatch + the
-reserved growable table) is in place.
+- **new→new (B2):** an *invoked* unit `call_indirect`s an *installed* one. The JIT's invoked
+  code dispatches the live `fn_table` (which `install` writes to); the interpreter gives the
+  invoke child a snapshot of the domain table + units at invoke time (`VCpu::new_invoke`).
+
+**All four cross-call directions are covered and differentially pinned:** old→old, old→new
+(install), new→old (slice #1), new→new. Tests assert matching results, slot indices, and
+fail-closed traps (signature mismatch, `-ENOSPC`). C surface: `__vm_jit_install` (iface 11 op 3).
+*Edge case noted for later:* a unit that `install`s **during** its own invocation is seen live
+by the JIT but not by the interpreter's invoke-time snapshot — exotic (it requires the invoked
+unit to hold the `Jit` handle).
 
 **Verdict up front: yes, it's feasible and a strong architectural fit.** The submit-a-blob
 boundary the feature needs already exists, the verifier is *designed* to be the trust hinge
