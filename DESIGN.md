@@ -1318,9 +1318,12 @@ requirement.
 - **Substrate / backends** (§16): commodity-OS vs seL4; whether to adopt seL4's
   capability-derivation-tree revocation (would close the §7 revocation item).
 - **SIMD wider widths** (§17/D58): fixed-128 baseline now SETTLED; `v256`/`v512`
-  IR types (feature-detected, split-to-`v128` fallback) deferred until a kernel
-  demands them. Scalable vectors (SVE/RVV) rejected. (GPU settled — WebGPU via
-  sandboxed broker.)
+  IR types deferred — **blocked by the backend** (Cranelift has no YMM/ZMM register
+  class; owning that codegen contradicts D36/D49), not by the design (which holds:
+  the differential survives width-agnostic lane semantics). **Revisit when Cranelift
+  adds upstream wide vectors**, not on per-kernel demand. Width-hungry work is better
+  served by a host SIMD capability (§7/§13) or the GPU broker. Scalable vectors
+  (SVE/RVV) rejected. (GPU settled — WebGPU via sandboxed broker.)
 
 ---
 
@@ -1687,12 +1690,39 @@ IR v128 and cleanly rejects what it can't map (`Unsupported`), its existing stan
   aren't pinned across backends, so the interp↔JIT v128 differential is
   NaN-insensitive per lane and vector-float modules stay excluded from the
   byte-exact window oracle — the same caveat as scalar floats today.
-- **Wider widths (256/512) are feature-detected, deferred.** MVP ships `v128`
-  only plus a **feature-detection hook** (host reports supported vector width) so
-  guests/frontends can dispatch. Wider-width IR *types* (`v256`/`v512`, lowered to
-  AVX when present, split into 2×/4× `v128` otherwise) are **deferred until a
-  kernel demands them** — see D58. **Scalable vectors (SVE/RVV) are rejected**
-  (width unknown at compile time → harder to verify/JIT, no demand).
+- **Wider widths (256/512) are feature-detected, deferred — and the blocker is the
+  backend, not the design.** MVP ships `v128` plus a **feature-detection hook** (host
+  reports supported vector width) so guests/frontends can dispatch; the wider-width IR
+  *types* (`v256`/`v512`) are deferred. The design skeleton is already right and the
+  verification story holds: a wider type would add only total lane-typing (zero new
+  escape surface), the masked load/store just widens to 32/64 B on `svm-mask`'s
+  width-parametric guard, and **the differential survives because lane semantics are
+  width-agnostic** — the interpreter (exact per-lane) and the JIT (1× wide *or* split
+  into 2×/4× `v128`) agree bit-for-bit on integer lanes, and the feature-detect query is
+  per-*machine* not per-*backend* so interp and JIT on one host take the same path (only
+  the existing float-NaN caveat carries over). **What's actually missing is in Cranelift:
+  its x64 backend has no YMM/ZMM register class** (`RegClass::Float` is XMM/128-bit; the
+  `has_avx512f`/`use_avx2` predicates only pick better *128-bit* encodings). Emitting a
+  native `vpaddd ymm` needs a new register class + lowering rules *in the shared backend*
+  — i.e. owning codegen, which **D36/D49 deliberately don't**. So the "native" lowering
+  arm is empty until Cranelift grows wide vectors upstream; the "split-to-`v128`" arm
+  gives nothing a hand-written `v128` loop didn't. **ROI of guest-emitted wide SIMD is
+  therefore low for this project**: (1) we can't capture the throughput without forking
+  the backend off the "as fast/secure as wasm" line; (2) it's effectively **x86-only** —
+  ARM has no NEON-256 (its wide path is *scalable* SVE, rejected below), so it cuts
+  against portability; (3) AVX-512 presence is fragmented (fused off on Intel hybrid
+  client; AVX10 mid-consolidation), and many vector kernels are memory-bandwidth-bound
+  where width buys ~0. **The higher-ROI homes for width-hungry work are elsewhere:**
+  *(a)* a **host-provided vectorized capability** (`dot`/`gemm`/`memcpy`/crypto/codec the
+  host implements with its own tuned AVX-512, invoked via `cap.call` + a zero-copy
+  `(ptr,len)` borrow, §7/§13) — guest stays portable + sandboxed, host owns the
+  fast/unsafe SIMD, zero backend cost to us, the project's exact grain; *(b)* the **GPU
+  broker** (below) for genuinely throughput-bound dense numerics. **Revisit trigger:
+  Cranelift adding upstream wide-vector support** (then it slots in nearly for free) — not
+  merely "a kernel wants it," since that wouldn't lift the backend blocker. **Scalable
+  vectors (SVE/RVV) are rejected** (runtime-variable width makes the one security-critical
+  unit — the masked-access bounds proof — runtime-variable too; no Cranelift support;
+  fragmented HW benefit).
 
 ### GPU = WebGPU via a sandboxed broker  [SETTLED]
 The VM does *not* execute GPU code, and the guest never touches the driver. GPU
@@ -2036,5 +2066,5 @@ as open-ended, not a byproduct of the build.
 | D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset) and wasm→IR bridge (compat) — vehicle priority deferred.** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | Open (strategy settled) | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
 | D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
 | D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |
-| D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`svm-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED** — MVP ships `v128` + a feature-detect hook; wider IR types (AVX when present, split-to-`v128` fallback) wait until a kernel demands them. **Scalable vectors (SVE/RVV) rejected** (compile-time-unknown width → harder to verify/JIT, no demand). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback; pricing in `v256` speculatively violates the evidence-driven discipline, so it's recorded here to revisit when a kernel needs it. Vector ops are value-only so the security story barely moves — only the masked access widens |
+| D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`svm-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |
 | D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful work-stealing over *migratable* fibers is Proposed, not adopted:** it would re-accept D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread*; the guest owns the stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections but **not** its TCB-risk one. Feasible (Go is the existence proof; the voluntarily-suspended set is stealable, fault-suspended fibers stay pinned, and the ownership protocol is loom-verifiable), gated behind that loom-verified protocol + expert review for the asm/signal seam loom can't reach. | Proposed (extends D56) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full reasoning + design + demo roadmap in `SCHEDULING.md` |

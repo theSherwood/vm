@@ -692,8 +692,17 @@ this is the index.)
     body on the taken edge vs the fall-through else edge — flipped 1.04× → 3.07×. The wasm→IR
     transpiler emits the canonical shape, so `--from-wasm` is always parity; the kernel now mirrors
     it. Outsized here only because the body is one `paddd`; heavier bodies like `alu` are immune.)*
-  - **Deferred (D58, revisit when a kernel demands it):** wider widths `v256`/`v512` (feature-
-    detected, split-to-`v128` fallback); `i8x16.mul` (no single-instruction JIT lowering — bails to
+  - **Deferred — wider widths `v256`/`v512` (D58), blocked by the *backend*, not the design.**
+    The design holds (wider type = total lane-typing only; mask widens to 32/64 B; the differential
+    survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-
+    split). The blocker is **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit;
+    the `avx2`/`avx512` predicates only pick better 128-bit encodings), so native wide ops need a new
+    register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse; the
+    split-to-`v128` fallback equals a hand-written `v128` loop. ROI is low (x86-only — ARM's wide path
+    is scalable SVE, rejected; AVX-512 fragmented; many kernels memory-bound). **Revisit trigger =
+    Cranelift adding upstream wide vectors**, not per-kernel demand; width-hungry work is better served
+    by a **host SIMD capability** (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13)
+    or the **GPU broker**. Also deferred: `i8x16.mul` (no single-instruction JIT lowering — bails to
     `Unsupported`; interp covers it). Scalable vectors (SVE/RVV) rejected.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
@@ -1133,7 +1142,9 @@ leave a shared view — add a unix test for this alongside the Windows work.
   then the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
 - [x] **SIMD (§17/D58)** — fixed-128 `v128` landed across all backends (see the SIMD item in
-  the Phase-4 list above); wider widths `v256`/`v512` deferred until a kernel demands them.
+  the Phase-4 list above); wider widths `v256`/`v512` deferred — **blocked by Cranelift having no
+  YMM/ZMM register class** (owning that codegen contradicts D36/D49), revisit when Cranelift adds
+  wide vectors upstream; width-hungry work better served by a host SIMD capability or the GPU broker.
 - [ ] GPU; capability revocation; cross-domain channels (§7); exception /
   `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
   are not).
