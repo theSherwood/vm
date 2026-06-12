@@ -497,6 +497,159 @@ pub fn recompact_jit(
     Ok(fresh)
 }
 
+/// A long-lived **guest-driven JIT REPL session** over one domain (JIT.md §6): the persistent
+/// `CompiledModule` + window an embedder re-enters once per prompt, with **automatic compaction**
+/// when code-arena occupancy crosses a watermark. This is the auto-trigger policy that turns the
+/// [`recompact_jit`] primitive into a usable long-session story — the missing piece between
+/// "compaction works if you call it" and "a REPL never exhausts the 256 MiB arena."
+///
+/// Each [`Self::run_prompt`] runs the guest entry over the **carried window** (the prior prompt's
+/// final low bytes seed the next, so guest heap/global state persists across prompts) with the
+/// module registered for the `Jit` capability's mid-run re-entry (`compile`/`invoke`/`install`,
+/// exactly as [`jit_cap_run`]). After the prompt returns — a **quiescent** point, the guest no
+/// longer suspended — if [`CompiledModule::extra_fn_count`] has reached `watermark`, the session
+/// rebuilds the domain's live code into a fresh module ([`recompact_jit`]) and drops the old one,
+/// reclaiming its arena. Because compaction is transparent (live slots + handles are preserved,
+/// see `recompact_jit`), the guest never observes it.
+///
+/// # Safety / lifetime contract
+/// The `Host` passed to [`Self::new`] and every [`Self::run_prompt`] must be the **same** `Host`
+/// at a **stable address** for the session's life: its pointer is baked into the compiled code as
+/// the `cap.call` ctx (at construction and at every recompaction), the same contract
+/// [`CompiledModule::compile`] documents, stretched across prompts. Single-threaded; the `Jit`
+/// MVP is single-threaded anyway.
+pub struct JitSession {
+    base: Module,
+    entry: u32,
+    reserved_log2: u8,
+    table_reserve_log2: u8,
+    domain: u32,
+    /// Auto-compact once `cm.extra_fn_count() >= watermark` (checked after each prompt, at the
+    /// quiescent point). `0` disables auto-compaction (the embedder may still call
+    /// [`Self::compact`] by hand).
+    watermark: usize,
+    cm: CompiledModule,
+    /// The carried guest window (low `SNAP` bytes), seeding each prompt and updated from its result.
+    window: Vec<u8>,
+    /// How many times this session has auto-compacted (observability / tests).
+    compactions: usize,
+}
+
+/// The window snapshot span carried across prompts — matches the interp/JIT `SNAP_CAP` pairing
+/// ([`jit_cap_run`]).
+const SESSION_SNAP: usize = 1 << 18;
+
+impl JitSession {
+    /// Build a session: compile `base` (entry `func`) long-lived with the `Jit` ctx baked to
+    /// `host`, ready to run prompts on `domain` (the [`grant_jit`]-returned domain). `watermark`
+    /// is the auto-compaction occupancy threshold (`0` = manual only). Pass the **same**
+    /// `reserved_log2`/`table_reserve_log2` you grant the cap with.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        base: &Module,
+        entry: u32,
+        reserved_log2: u8,
+        table_reserve_log2: u8,
+        domain: u32,
+        watermark: usize,
+        host: &mut Host,
+    ) -> Result<JitSession, svm_jit::JitError> {
+        let cm = CompiledModule::compile(
+            base,
+            entry,
+            cap_thunk,
+            host as *mut Host as *mut c_void,
+            reserved_log2,
+            None,
+            None,
+            None,
+            None,
+            svm_jit::Quota::default(),
+            table_reserve_log2,
+        )?;
+        Ok(JitSession {
+            base: base.clone(),
+            entry,
+            reserved_log2,
+            table_reserve_log2,
+            domain,
+            watermark,
+            cm,
+            window: vec![0u8; SESSION_SNAP],
+            compactions: 0,
+        })
+    }
+
+    /// Run the guest entry on `args` over the carried window, then auto-compact if the watermark is
+    /// reached. Returns the prompt's [`JitOutcome`]; the window snapshot is retained for the next
+    /// prompt (read it via [`Self::window`]). `args` is the raw i64-slot ABI (e.g. the `Jit` handle
+    /// followed by the guest's own arguments).
+    pub fn run_prompt(
+        &mut self,
+        host: &mut Host,
+        args: &[i64],
+    ) -> Result<JitOutcome, svm_jit::JitError> {
+        let cm_ptr: *mut CompiledModule = &mut self.cm;
+        host.set_jit_native_ctx(cm_ptr as usize);
+        // SAFETY: `cm_ptr` is the only pointer used for this run and the one the thunk's handlers
+        // re-enter through (registered above); single-threaded; `self.cm` is not moved during the
+        // call (we hold `&mut self`, and `run_raw` keeps no live reference across the guarded call).
+        let r = unsafe {
+            CompiledModule::run_raw(cm_ptr, args, Some(&self.window), Some(SESSION_SNAP), None)
+        };
+        host.set_jit_native_ctx(0);
+        let (out, mem) = r?;
+        self.window = mem;
+        if self.watermark != 0 && self.cm.extra_fn_count() >= self.watermark {
+            self.compact(host)?;
+        }
+        Ok(out)
+    }
+
+    /// Force a compaction now (the embedder's manual trigger; [`Self::run_prompt`] calls it
+    /// automatically at the watermark). Quiescent — only valid between prompts.
+    pub fn compact(&mut self, host: &mut Host) -> Result<(), svm_jit::JitError> {
+        let fresh = recompact_jit(
+            &self.base,
+            self.entry,
+            self.reserved_log2,
+            self.table_reserve_log2,
+            host,
+            self.domain,
+            &self.cm,
+        )?;
+        self.cm = fresh;
+        self.compactions += 1;
+        Ok(())
+    }
+
+    /// Seed `bytes` into the carried guest window at `off` before the next prompt — e.g. a
+    /// submitted-IR blob the guest `cap.call compile`s, or argv/env/data a REPL hands the first
+    /// prompt. Persists like any window state (each prompt seeds from, and writes back to, the
+    /// carried window). Out-of-range writes are clamped to the window.
+    pub fn seed_window(&mut self, off: usize, bytes: &[u8]) {
+        let end = (off + bytes.len()).min(self.window.len());
+        if off < end {
+            self.window[off..end].copy_from_slice(&bytes[..end - off]);
+        }
+    }
+
+    /// The carried guest window (low [`SESSION_SNAP`] bytes) as of the last prompt.
+    pub fn window(&self) -> &[u8] {
+        &self.window
+    }
+
+    /// Current code-arena occupancy proxy ([`CompiledModule::extra_fn_count`]).
+    pub fn occupancy(&self) -> usize {
+        self.cm.extra_fn_count()
+    }
+
+    /// How many auto/manual compactions have run over this session's life.
+    pub fn compactions(&self) -> usize {
+        self.compactions
+    }
+}
+
 /// The §9/D45 **devirtualized `cap.call` fast-path resolver** for the production powerbox. It claims
 /// only the **window-independent, authority-checked** hot ops — `Clock.now` and `Blocking.work` — so
 /// they take the register-to-register fast path; every other op (all *window-touching* ones —

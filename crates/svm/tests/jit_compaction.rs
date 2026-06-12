@@ -23,7 +23,7 @@ use svm_encode::encode_module;
 use svm_interp::Host;
 use svm_ir::{Func, Module, DEFAULT_RESERVED_LOG2};
 use svm_jit::{CompiledModule, JitOutcome, Quota, TrapKind, INERT_CAP_THUNK};
-use svm_run::{grant_jit, recompact_jit};
+use svm_run::{grant_jit, recompact_jit, JitSession};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -462,4 +462,92 @@ fn recompaction_carries_live_invoke_only_unit() {
         JitOutcome::Returned(s) if s.len() == 1 => assert_eq!(s[0], 5 * 5 + 99),
         other => panic!("dispatch V returned {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Auto-compacting guest-driven REPL (`svm_run::JitSession`) — the capstone: a *real* guest that
+// drives compile/invoke/release through `cap.call` across many prompts over a persistent window,
+// with the session auto-compacting at an occupancy watermark. This closes the §6 loop: a long REPL
+// that JITs a fresh unit every prompt never exhausts the 256 MiB code arena, and the guest never
+// observes the reclaim.
+
+/// The REPL guest entry `(jit_handle, x) -> (i32)`: compile the blob into a fresh unit, invoke it
+/// with `(x, x)`, **release** it (so it becomes dead code the next compaction reclaims), and
+/// accumulate the result into window[0] (persisted across prompts). `BLOBLEN` is patched to the
+/// blob's byte length before parsing.
+const REPL_INVOKE_SHELL: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i64.const 4096\n  v3 = i64.const BLOBLEN\n  v4 = cap.call 11 0 (i64, i64) -> (i64) v0 (v2, v3)\n  v5 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v4, v1, v1)\n  v6 = cap.call 11 2 (i64) -> (i64) v0 (v4)\n  v7 = i64.const 0\n  v8 = i32.load v7\n  v9 = i32.add v8 v5\n  i32.store v7 v9\n  return v9\n}\n";
+
+/// Drive a `watermark`-auto-compacting `JitSession` for `n` prompts; the blob is seeded at window
+/// offset 4096 once and reused every prompt. Returns `(per-prompt results, final window[..16],
+/// final occupancy, compactions run)`.
+fn run_session(watermark: usize, n: usize) -> (Vec<i64>, Vec<u8>, usize, usize) {
+    let blob = unit_blob(10); // x*x + 10
+    let base_src = REPL_INVOKE_SHELL.replace("BLOBLEN", &blob.len().to_string());
+    let base = parse_module(&base_src).expect("parse shell");
+    verify_module(&base).expect("verify shell");
+
+    let mut host = Host::new();
+    let jit_h = grant_jit(&mut host, &base, 0); // invoke-only: no install table needed
+    let domain = host.resolve_jit_domain(jit_h).expect("domain");
+    let mut session = JitSession::new(
+        &base,
+        0,
+        DEFAULT_RESERVED_LOG2,
+        0,
+        domain,
+        watermark,
+        &mut host,
+    )
+    .expect("session");
+
+    // Seed the blob into the carried window at offset 4096 (where the guest `cap.call compile`s it);
+    // it persists across prompts like any guest state.
+    session.seed_window(4096, &blob);
+
+    let mut results = Vec::new();
+    for i in 0..n {
+        let x = (i as i64) + 2;
+        let out = session
+            .run_prompt(&mut host, &[jit_h as i64, x])
+            .expect("prompt");
+        match out {
+            JitOutcome::Returned(s) if s.len() == 1 => results.push(s[0]),
+            other => panic!("prompt returned {other:?}"),
+        }
+    }
+    (
+        results,
+        session.window()[..16].to_vec(),
+        session.occupancy(),
+        session.compactions(),
+    )
+}
+
+/// **Auto-compaction keeps a long REPL's arena bounded, transparently.** A 30-prompt session that
+/// JITs + invokes + releases a fresh unit every prompt produces identical per-prompt results and
+/// window state whether auto-compaction is off (`watermark = 0`) or on (`watermark = 8`); with it
+/// on, the session actually compacts and its final occupancy is bounded, while off it grows with
+/// every prompt.
+#[test]
+fn jit_session_auto_compacts_transparently() {
+    let n = 30;
+    let (r_off, w_off, occ_off, c_off) = run_session(0, n);
+    let (r_on, w_on, occ_on, c_on) = run_session(8, n);
+
+    assert_eq!(r_off, r_on, "per-prompt results must be identical");
+    assert_eq!(w_off, w_on, "persistent window must be identical");
+    // The accumulator advanced: each prompt added x*x + 10 for x = 2..(n+1).
+    let expected: i64 = (0..n as i64).map(|i| (i + 2) * (i + 2) + 10).sum();
+    assert_eq!(*r_on.last().unwrap(), expected);
+
+    assert_eq!(c_off, 0, "watermark 0 disables auto-compaction");
+    assert!(c_on > 0, "watermark 8 must trip auto-compaction");
+    assert!(
+        occ_off >= 50,
+        "without compaction the arena grows with every prompt, got {occ_off}"
+    );
+    assert!(
+        occ_on <= 8 && occ_on < occ_off,
+        "auto-compaction must bound occupancy at the watermark: {occ_on} (off {occ_off})"
+    );
 }
