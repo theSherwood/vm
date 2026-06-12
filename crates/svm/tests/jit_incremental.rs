@@ -186,6 +186,58 @@ fn define_extra_call_indirect_uses_parent_table_and_mask() {
     );
 }
 
+/// The complement of mask invariance: **extra code is invisible to guest dispatch** (JIT.md
+/// Model A — parent→extra calls do not exist; the only entry into extra code is the host
+/// trampoline). The parent dispatches `call_indirect` over every index a guest could name;
+/// then an extra function with the *same signature* as the table's functions is defined; the
+/// sweep must be outcome-identical — no index reaches the new code, including the padding
+/// slots and wrapped indices. (A guest array mixing old and new procedures therefore cannot
+/// be uniform funcrefs under Model A: new procedures are reached via the Phase-2 `invoke`
+/// op, i.e. tagged dispatch. Uniform funcref arrays are exactly what Model B2's table
+/// installation would buy.)
+#[test]
+fn parent_call_indirect_cannot_reach_extra_code() {
+    // Parent: f0 = the dispatching entry, f1 = +10, f2 = *2 (both (i32) -> (i32)).
+    // Table is padded to 4 slots; slot 3 is padding (traps), idx ≥ 4 wraps (mask 3).
+    let parent_src = concat!(
+        "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = call_indirect (i32) -> (i32) v0 (v1)\n  return v2\n}\n",
+        "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = i32.const 10\n  v2 = i32.add v0 v1\n  return v2\n}\n",
+        "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = i32.const 2\n  v2 = i32.mul v0 v1\n  return v2\n}\n",
+    );
+    let mut cm = compile(parent_src);
+    let sweep = |cm: &mut CompiledModule| -> Vec<JitOutcome> {
+        (0..8)
+            .map(|idx| cm.run(&[idx, 100], None, None, None).expect("run").0)
+            .collect()
+    };
+    let before = sweep(&mut cm);
+    // Sanity: the sweep exercises real dispatch — hits (+10, *2), a self-type-mismatch,
+    // padding traps, and wraparound.
+    assert!(matches!(before[1], JitOutcome::Returned(ref s) if s == &[110]));
+    assert!(matches!(before[2], JitOutcome::Returned(ref s) if s == &[200]));
+    assert!(matches!(
+        before[3],
+        JitOutcome::Trapped(TrapKind::IndirectCallType)
+    ));
+
+    // An extra function with the SAME signature as f1/f2 — if it leaked into the table
+    // anywhere, some index would now return x + 1000.
+    let extra_src = "func (i32) -> (i32) {\nblock0(v0: i32):\n  v1 = i32.const 1000\n  v2 = i32.add v0 v1\n  return v2\n}\n";
+    let extra = parse_module(extra_src).expect("parse");
+    verify_module(&extra).expect("verify");
+    let ptrs = cm.define_extra(&extra.funcs).expect("define_extra");
+    // The new code is alive and callable — through the host trampoline only.
+    let (out, _) = unsafe { cm.run_extra(ptrs[0], 1, 1, &[100], None) }.expect("run_extra");
+    assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[1100]));
+
+    // Every guest-nameable index dispatches byte-identically to before.
+    let after = sweep(&mut cm);
+    assert_eq!(
+        before, after,
+        "extra code must be unreachable from the table"
+    );
+}
+
 /// Fail-closed type ids: a `call_indirect` in an extra unit whose signature the parent
 /// never declared gets `NO_MATCH_TYPE_ID` — no table entry can satisfy it, so it traps
 /// `IndirectCallType` (it must NOT silently call anything).

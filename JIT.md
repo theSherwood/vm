@@ -428,5 +428,12 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
 - Phase 2/3: new differential cases — a guest that compiles+invokes IR must produce identical
   results/traps on the interpreter reference and the JIT; fuzz the `compile` op with arbitrary
   blobs to confirm decode/verify/memory-match reject fail-closed (never compile invalid IR, and
-  in particular never compile a blob whose declared memory ≠ the parent window).
+  in particular never compile a blob whose declared memory ≠ the parent window). Include the
+  **mixed-dispatch array** case: the guest builds an in-window array of *tagged* callables —
+  table indices for original procedures, `CompiledCode` handles for JITed ones — and old code
+  iterates it, branching to `call_indirect` or `cap.call invoke` per tag. This is the canonical
+  "closures added next to old procedures" REPL shape under Model A (heterogeneous dispatch is
+  A's ergonomic cost; uniform funcref arrays are what B2's table installation would buy), and
+  the Phase-1 invariant it leans on — extra code is *unreachable* from the table, so the tags
+  can never be confused — is already pinned by `parent_call_indirect_cannot_reach_extra_code`.
 - Phase 4: `cargo run -p svm-run -- crates/svm-run/demos/jit/…` matches a pure-interpreter run.
