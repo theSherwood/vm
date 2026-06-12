@@ -266,22 +266,32 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
      134) and `threaded_compile_loop_stress_agrees` (≈20 overlapping compiles → 515), both
      differential, non-flaky, on all `fiber_rt` targets. The interp already serialized via its
      `Arc<Mutex<Host>>`, so it needed no change.
-   - **Threaded-compile remainders (smaller, follow-ups):** (a) **CLI + recompact wiring** — only
-     `jit_cap_run` engages the locked thunk today; `run_powerbox` (CLI) and `recompact_jit` keep the
-     raw thunk, so a CLI-launched threaded-compile guest, or compaction of a concurrent domain, isn't
-     wired yet (mechanical: same `uses_concurrency` branch + `Mutex<Host>`). (b) **aarch64-macOS isb**
-     — a worker *executing code another thread just compiled* (compile-then-cross-thread-execute, e.g.
-     threaded compile **+** install) needs the executing core's `isb`; cranelift's finalize covers
-     Linux aarch64 (membarrier `SYNC_CORE`) and x86, but on aarch64 macOS the executing thread wants
-     a safepoint `isb` (the current tests don't exercise cross-thread-execute-of-fresh-code, so this
-     is latent there). (c) a coarse-lock→**fine-grained / sharded-module** optimization if
-     parallel-compile *throughput* is ever measured to matter. (install-during-own-invocation is
-     covered structurally by the interp's `INVOKE_MODULE` + shared table.)
+   - **Threaded-compile follow-ups (done / resolved):** (a) **CLI wiring — done.** `run_powerbox`
+     now routes a concurrent guest through `cap_thunk_locked` + a `Mutex<Host>` (single-threaded keeps
+     the fast path); validated by the existing concurrent C demos (`c_guest_work_stealing_demo`,
+     `c_guest_thread_safe_malloc`, …), which do concurrent cap.calls and pass on the locked path. (b)
+     **No aarch64 `isb` needed — resolved.** The earlier concern was over-cautious: cranelift-jit
+     *appends* new functions to fresh arena addresses and never modifies executing code in place, so
+     an executing core has no stale prefetch — the cross-modifying-code `isb` is for *in-place*
+     modification, which never happens; `clear_cache`'s `ic ivau` + `dsb ish` make the new bytes
+     visible to a sibling's fetch. Pinned by `jit_cap::cross_thread_execute_fresh_code_agrees` (worker
+     spawned *first*, then main compiles+installs, worker executes the fresh code → 52), green on all
+     `fiber_rt` targets incl. aarch64 macOS. (install-during-own-invocation is covered structurally by
+     the interp's `INVOKE_MODULE` + shared table.)
+   - **Threaded-compile remainders (genuinely open, narrow):** (a) **`recompact_jit`/`JitSession` +
+     concurrent** — compaction keeps the single-threaded path (a REPL compacts between prompts when
+     quiescent); threaded-compile **+** auto-compaction would have `JitSession` *own* a `Mutex<Host>`
+     for the session's life — a small API change, build it if a guest needs both. (b) a coarse-lock→
+     **fine-grained / sharded-module** optimization if parallel-compile *throughput* is ever measured
+     to matter — deliberately deferred (no demonstrated need; the guest `cap.call 11` iface is
+     unchanged, so it's a pure internal swap). (c) a C-level threaded-compile **demo** under `demos/`
+     (the IR-level differential + the concurrent C demos already cover the mechanism).
 
-**Recommendation:** #1 (compaction) is done; #2 threaded **install** and threaded **compile** are
-both landed end-to-end (differential, non-flaky) — install with full platform parity, compile via the
-per-domain serialized thunk (single-threaded paths untouched). Remainders are mechanical (CLI/recompact
-wiring) or narrow (aarch64-macOS cross-thread-execute `isb`, a throughput optimization).
+**Recommendation:** #1 (compaction) and #2 (threaded **install** + threaded **compile**) are both
+landed end-to-end — install with full platform parity, compile via the per-domain serialized thunk
+(single-threaded paths untouched), CLI wired, and the cross-thread-execute case confirmed needing no
+`isb`. The only open threaded-compile items are narrow: `recompact`/`JitSession`+concurrent (a small
+API change), a throughput optimization (gated on a measured need), and a C demo.
 
 Also nice-to-have, low priority: a guest convention/helper so emitting C-ABI units (the `sp`-first
 shape) for `install` is less manual; today the demo hand-rolls it.

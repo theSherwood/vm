@@ -580,10 +580,12 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
   locked thunk **only for concurrent modules** (`Func::uses_concurrency`), so single-threaded runs
   keep the unlocked path at zero cost; the guest `cap.call 11` iface is unchanged. Pinned by
   `jit_cap::threaded_compile_*` (differential, non-flaky) + the W^X corroboration
-  `jit_incremental::concurrent_finalize_does_not_disturb_running_code`. Remainders: CLI/`recompact`
-  wiring (only `jit_cap_run` engages the lock today), an aarch64-macOS executing-thread `isb` for the
-  cross-thread-execute-of-fresh-code case, and a fine-grained/sharded-module throughput optimization
-  if ever measured to matter.
+  `jit_incremental::concurrent_finalize_does_not_disturb_running_code`. The **CLI is wired**
+  (`run_powerbox` routes concurrent guests through the locked thunk; the concurrent C demos validate
+  it) and **no aarch64 `isb` is needed** — cranelift appends to fresh addresses (no in-place
+  modification), confirmed by `jit_cap::cross_thread_execute_fresh_code_agrees` on aarch64 macOS.
+  Remaining (narrow): `recompact`/`JitSession`+concurrent (a small API change), a sharded-module
+  throughput optimization if ever measured to matter, and a C demo.
 
 ## Verification approach
 
