@@ -18,6 +18,15 @@ the compiled unit joins *this* domain (same window, same powerbox; verification,
 isolation, is the trust boundary). A malformed blob is a clean `-22`; compile quota
 exhaustion is `-12`; a trap in JITed code detect-and-kills the whole domain (§5).
 
+It exercises **both** ways the JITed code is reached:
+
+1. **`invoke`** (`__vm_jit_invoke2`) — the interpreter calls the JITed hot loop directly with
+   raw `(i64, i64)` args. The shape that accelerates a loop your own code drives.
+2. **`install` + a C function pointer** (`__vm_jit_install`, Model B2 old→new) — the same hot
+   loop is emitted with the guest ABI (a leading data-SP param), installed into the
+   `call_indirect` table, and called like any C function pointer at native speed. Old code
+   dispatching freshly-JITed code.
+
 Run it sandboxed:
 
 ```sh
@@ -28,11 +37,12 @@ Expected output:
 
 ```text
 emitted 38 bytes of IR
-interp(5, 9) = 223
-jit(5, 9)    = 223
-49 inputs agree: guest-emitted, host-verified, Cranelift-compiled
+invoke jit(5, 9) = 223 (interp 223)
+installed hot(5, 9) = 223 via call_indirect slot 9
+98 inputs agree (invoke + installed call_indirect): guest-emitted, host-verified, Cranelift-compiled
 ```
 
 The differential test (`c_frontend.rs::c_guest_jit_demo`) runs the same program on the
-reference interpreter — where `invoke` is a nested evaluation over the same window — and on
-the Cranelift JIT, asserting identical results and output.
+reference interpreter — where `invoke` is a nested evaluation and the installed slot dispatches
+through the module-aware table — and on the Cranelift JIT (native code over the live `fn_table`),
+asserting identical results and output.

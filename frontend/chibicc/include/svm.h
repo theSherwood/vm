@@ -43,9 +43,11 @@ long __vm_region_page_size(int region);
 // (-22 invalid, -12 compile quota exhausted). Fail-closed: on any error nothing is installed.
 long __vm_jit_compile(void *blob, long len);
 
-// Call a compiled unit's entry, which must be exactly `(i64, i64) -> (i64)` (the strict-arity
-// MVP shape; anything else faults). The unit reads/writes this window directly (zero copy). A
-// trap inside the unit is terminal for the whole domain (§5 detect-and-kill).
+// Call a compiled unit's entry, which must be exactly the **raw** shape `(i64, i64) -> (i64)`
+// (no C frame — the args go straight to the entry's block params; the strict-arity MVP shape,
+// anything else faults). The unit reads/writes this window directly (zero copy). A trap inside
+// the unit is terminal for the whole domain (§5 detect-and-kill). Use this to accelerate a hot
+// loop your own code drives; to expose a unit as a *callable C function*, install it instead.
 long __vm_jit_invoke2(long code, long a, long b);
 
 // Revoke a code handle (the code itself is not reclaimed yet). Returns 0, or -22 if the handle
@@ -53,9 +55,16 @@ long __vm_jit_invoke2(long code, long a, long b);
 long __vm_jit_release(long code);
 
 // Install a compiled unit into the `call_indirect` table (Model B2), returning its slot index
-// — a funcref that old code (or another unit) can call indirectly at native speed (old→new).
-// Cast the slot to a function pointer of the unit's signature to call it. Returns -28 (ENOSPC)
-// if the table is full (the embedder sizes the reservation; the CLI reserves 1024 slots).
+// — a funcref old code (or another unit) can call indirectly at native speed (old→new). Cast
+// the slot to a function pointer and call it like any C function. Returns -28 (ENOSPC) if the
+// table is full (the embedder sizes the reservation; the CLI reserves 1024 slots).
+//
+// **Calling convention for an installed unit.** A unit reached through a C function pointer
+// `T (*fp)(A, B)` must follow the **guest ABI**: this frontend threads the data-stack pointer
+// as every function's hidden *first* parameter, so the unit's entry signature must be
+// `(i64 sp, <A>, <B>) -> <T>` — the leaf body simply ignores `sp`. (A unit shaped for
+// `__vm_jit_invoke2` instead omits `sp`; calling that one via a pointer is a clean
+// `IndirectCallType` trap, never an escape.)
 long __vm_jit_install(long code);
 
 #endif // __SVM_H

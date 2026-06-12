@@ -2166,8 +2166,12 @@ fn c_guest_jit_demo() {
     let run = run_c_full(src);
     let out = String::from_utf8_lossy(&run.stdout);
     assert!(
-        out.ends_with("49 inputs agree: guest-emitted, host-verified, Cranelift-compiled\n"),
-        "the guest's interpreter and its JITed code must agree on both backends:\n{out}"
+        out.ends_with(
+            "98 inputs agree (invoke + installed call_indirect): \
+             guest-emitted, host-verified, Cranelift-compiled\n"
+        ),
+        "the guest's interpreter, its invoked JIT code, and its installed call_indirect slot \
+         must all agree on both backends:\n{out}"
     );
 }
 

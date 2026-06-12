@@ -110,7 +110,17 @@ static void sleb(char *buf, long v) {
 
 // Emit a one-function module — the unit's entry, `(i64, i64) -> (i64)` (the fixed shape
 // `__vm_jit_invoke2` calls) — computing the bytecode program as straight-line IR.
-static long emit_unit(Ins *prog, char *buf) {
+//
+// `abi_sp` selects the entry's calling convention:
+//   0 = raw `(i64 a, i64 b) -> (i64)`         — for `__vm_jit_invoke2` (no C frame).
+//   1 = guest ABI `(i64 sp, i64 a, i64 b) -> (i64)` — for `install` + a C function-pointer
+//       call: this frontend threads the data-stack pointer as every function's hidden first
+//       param, so a unit reached through a C `(*fp)(a, b)` MUST declare it (the leaf body
+//       ignores it). Picking the wrong shape is a clean `IndirectCallType` trap, not an escape.
+static long emit_unit(Ins *prog, char *buf, int abi_sp) {
+  int nparams = abi_sp + 2; // [sp,] a, b
+  long a_idx = abi_sp;      // the accumulator seed (v0 raw, v1 with the SP param)
+  long b_idx = abi_sp + 1;
   n_out = 0;
   // Header: magic + version.
   eb(buf, 'S');
@@ -125,17 +135,17 @@ static long emit_unit(Ins *prog, char *buf) {
   eb(buf, 16);
   eb(buf, 0); // no data segments (the validator rejects them anyway)
   eb(buf, 1); // one function
-  // params (i64, i64), results (i64) — type tag 1 = i64.
-  eb(buf, 2);
+  // params (nparams × i64), results (i64) — type tag 1 = i64.
+  eb(buf, nparams);
+  for (int k = 0; k < nparams; k++)
+    eb(buf, 1);
   eb(buf, 1);
   eb(buf, 1);
+  // One block whose params mirror the function's.
   eb(buf, 1);
-  eb(buf, 1);
-  // One block whose params mirror the function's: v0 = a, v1 = b.
-  eb(buf, 1);
-  eb(buf, 2);
-  eb(buf, 1);
-  eb(buf, 1);
+  eb(buf, nparams);
+  for (int k = 0; k < nparams; k++)
+    eb(buf, 1);
   // Instruction count: ADDB/MULB are one binop; ADDK/MULK are a const + a binop.
   long ni = 0;
   for (int i = 0; prog[i].op != OP_END; i++)
@@ -143,8 +153,8 @@ static long emit_unit(Ins *prog, char *buf) {
   uleb(buf, ni);
   // The straight-line body. Opcodes mirror svm-encode: 0x11 = i64.const (+ sleb immediate);
   // 0x40 + BinOp index = i64 binop (add = 0x40, mul = 0x42) + uleb operand indices.
-  long acc = 0;  // value index of the accumulator (v0 = a)
-  long next = 2; // v0, v1 are the block params
+  long acc = a_idx;
+  long next = nparams; // results follow the block params
   for (int i = 0; prog[i].op != OP_END; i++) {
     long rhs;
     int mul = (prog[i].op == OP_MULB || prog[i].op == OP_MULK);
@@ -153,7 +163,7 @@ static long emit_unit(Ins *prog, char *buf) {
       sleb(buf, prog[i].k);
       rhs = next++;
     } else {
-      rhs = 1; // v1 = b
+      rhs = b_idx;
     }
     eb(buf, mul ? 0x42 : 0x40);
     uleb(buf, acc);
@@ -179,11 +189,13 @@ int main() {
   prog[4].op = OP_END;
 
   static char buf[256];
-  long n = emit_unit(prog, buf);
+  long bad = 0;
+
+  // --- Path 1: raw `invoke` of the JITed hot loop (the interpreter-accelerates-itself shape).
+  long n = emit_unit(prog, buf, 0); // raw (i64, i64) -> (i64)
   puts1("emitted ");
   put_i64(n);
   puts1(" bytes of IR\n");
-
   long code = __vm_jit_compile(buf, n);
   if (code < 0) {
     puts1("jit compile failed: ");
@@ -191,27 +203,48 @@ int main() {
     puts1("\n");
     return 1;
   }
-
-  // The JITed code must agree with the interpreter everywhere.
-  long bad = 0;
   for (long a = -3; a <= 3; a++)
     for (long b = -3; b <= 3; b++)
       if (interp(prog, a, b) != __vm_jit_invoke2(code, a, b))
         bad++;
-
-  puts1("interp(5, 9) = ");
-  put_i64(interp(prog, 5, 9));
-  puts1("\njit(5, 9)    = ");
+  puts1("invoke jit(5, 9) = ");
   put_i64(__vm_jit_invoke2(code, 5, 9));
-  puts1("\n");
-
+  puts1(" (interp ");
+  put_i64(interp(prog, 5, 9));
+  puts1(")\n");
   __vm_jit_release(code);
+
+  // --- Path 2: old→new via install. Emit the SAME hot loop with the guest ABI (a leading
+  // data-SP param), install it into the call_indirect table, and call it like an ordinary C
+  // function pointer — old code dispatching freshly-JITed code at native speed.
+  long n2 = emit_unit(prog, buf, 1); // guest ABI (i64 sp, i64, i64) -> (i64)
+  long code2 = __vm_jit_compile(buf, n2);
+  long slot = code2 < 0 ? code2 : __vm_jit_install(code2);
+  if (slot < 0) {
+    puts1("install failed: ");
+    put_i64(slot);
+    puts1("\n");
+    return 1;
+  }
+  long (*hot)(long, long) = (long (*)(long, long))slot;
+  for (long a = -3; a <= 3; a++)
+    for (long b = -3; b <= 3; b++)
+      if (interp(prog, a, b) != hot(a, b))
+        bad++;
+  puts1("installed hot(5, 9) = ");
+  put_i64(hot(5, 9));
+  puts1(" via call_indirect slot ");
+  put_i64(slot);
+  puts1("\n");
+  __vm_jit_release(code2);
+
   if (bad) {
     puts1("MISMATCHES: ");
     put_i64(bad);
     puts1("\n");
     return 1;
   }
-  puts1("49 inputs agree: guest-emitted, host-verified, Cranelift-compiled\n");
+  puts1("98 inputs agree (invoke + installed call_indirect): "
+        "guest-emitted, host-verified, Cranelift-compiled\n");
   return 0;
 }
