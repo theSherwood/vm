@@ -1921,6 +1921,49 @@ impl CompiledModule {
         true
     }
 
+    /// **Install at a specific slot** — the compaction counterpart of [`Self::install`] (JIT.md §6
+    /// code-memory compaction). `install` fills the *next* padding slot, which reproduces a dense
+    /// install history but not one with `uninstall` gaps; recompaction must reproduce **exact** slot
+    /// indices so a funcref a guest already holds keeps resolving to the same unit across the swap.
+    /// Writes the unit's natural-ABI `code` + interned `type_id` into `slot`, returning `true` on
+    /// success. Refuses (`false`) an out-of-range slot, a real module-function slot
+    /// (`< n_real_funcs`, guarding the original program's funcrefs), or an already-occupied slot
+    /// (the target must be padding — a fresh module's reserved slots all are). Same trust class as
+    /// `install`: a host-driven slot write into a pre-reserved table whose base never moves.
+    pub fn install_at(&mut self, slot: u32, code: *const u8, type_id: u32) -> bool {
+        let i = slot as usize;
+        if i < self.n_real_funcs || i >= self.fn_table.len() {
+            return false;
+        }
+        if self.fn_table[i].type_id != PADDING_TYPE_ID {
+            return false; // occupied — install_at never overwrites a live slot
+        }
+        self.fn_table[i] = FnEntry {
+            type_id,
+            _pad: 0,
+            code: code as u64,
+        };
+        true
+    }
+
+    /// The number of extra (`define_extra`) functions+trampolines this module has lowered over its
+    /// life — a monotonic proxy for code-arena occupancy (cranelift-jit exposes no byte count, and
+    /// has no per-function free, so this only grows). An embedder watches it to decide when to
+    /// **compact** (JIT.md §6): rebuild the live unit set into a fresh module — whose count restarts
+    /// near zero — and drop this one, reclaiming the arena. See `tests/jit_compaction.rs`.
+    pub fn extra_fn_count(&self) -> usize {
+        self.next_extra
+    }
+
+    /// Whether a run is in flight on this module (a guarded call published its window fault range).
+    /// Compaction (and any rebuild that drops `self`) is only sound at a **quiescent** point — JIT.md
+    /// §6: "it can only run at a quiescent point — the guest is suspended *inside* the very module
+    /// being compacted." An embedder asserts `!is_running()` before swapping a freshly-compacted
+    /// module in for this one.
+    pub fn is_running(&self) -> bool {
+        self.live_fault_range.is_some()
+    }
+
     /// The stable type id `ty` was interned under, or `None` if no unit this module compiled
     /// has mentioned it (as a function signature or a call-site type). Ids are append-only —
     /// once returned, an id never remaps — and id-equality coincides with structural equality
