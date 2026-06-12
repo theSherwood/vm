@@ -28,6 +28,29 @@ pinned by tests including finalize *during* a run). Phase 5 (B2 table install) a
 compaction-based reclaim remain contingent, per the Recommendation. The design analysis
 below is preserved as written.
 
+**MVP cross-call scope — old→new only.** The capability supports **old→new** (parent code
+`invoke`s a JITed unit) fully. **new→old** (a submitted unit `call_indirect`s back into the
+original program's table) is *not* exposed by the MVP capability, even though the underlying
+`define_extra` primitive implements it (and `jit_incremental.rs` tests it on the JIT). Reason:
+the JIT dispatches a unit's `call_indirect` through the parent table via code pointers, but the
+reference interpreter resolves functions by index into a single array and cannot model a frame
+spanning the parent and unit function spaces without hot-path surgery — so the two backends
+would diverge. The shared validator therefore **rejects `call_indirect` in a submitted unit**
+(`Func::uses_indirect_call`), keeping both backends provably in lockstep. Uniform cross-unit /
+new→old dispatch is properly a **Model B2** feature (table install + the interned registry,
+already landed); lifting the gate is part of Phase 5, *or* a deliberate earlier choice to teach
+the reference interpreter cross-module frames (see "new→old options" below).
+
+**new→old options (deferred decision).** To expose new→old in Model A before B2, the reference
+interpreter must execute frames from two function spaces. Two faithful shapes: (a) **append +
+remap** — the invoke child's funcs = parent ++ unit (unit `Call`/`ReturnCall`/`RefFunc` indices
+shifted by `parent_len`), with `call_indirect` masking against the parent prefix so a resolved
+slot is valid in both; medium size, but it rewrites verified IR (re-validation question, plus
+`ref.func` edge cases). (b) **per-frame domain tag** — each `Frame` records which function space
+it indexes; cleaner model, wider touch (the hot `Frame` struct + every resolution site). Both
+are interpreter-only (no escape-TCB change). Recommendation: defer to B2 unless a concrete guest
+needs Model-A new→old sooner, since B2 makes it first-class anyway.
+
 **Verdict up front: yes, it's feasible and a strong architectural fit.** The submit-a-blob
 boundary the feature needs already exists, the verifier is *designed* to be the trust hinge
 for exactly this, and the only real engineering obstacle is the JIT's current one-shot
