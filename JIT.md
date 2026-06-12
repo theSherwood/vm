@@ -24,7 +24,7 @@ resource hardening are landed and differentially tested:
 | C surface (`__vm_jit_compile/invoke2/release`, 8-handle powerbox) + demo | `frontend/chibicc`, `crates/svm-run/demos/jit/` (`cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c`) |
 | **new→old** (slice #1): module-aware interpreter frames + explicit dispatch table (the B2 foundation) | `crates/svm-interp/src/lib.rs` (`Frame.module`, `TableSlot`, `dispatch_indirect`, `VCpu::new_invoke`); tests in `jit_cap.rs` |
 | **old→new** (B2 install): pre-reserved table + `install` op both backends + `__vm_jit_install` | `svm-jit` (`CompiledModule::install`, `table_reserve_log2`, `DefinedFn`), `svm-interp` (op-3 arm, `grant_jit_with_table`), `svm-run` (`jit_native_op` op 3), `frontend/chibicc`; tests in `jit_cap.rs`/`jit_incremental.rs` |
-| **new→new** (B2): an invoked unit calls an installed one (live `fn_table` / invoke-time snapshot) | `svm-interp` (`VCpu::new_invoke` snapshot); test in `jit_cap.rs` |
+| **new→new** (B2): an invoked unit calls an installed one (live `fn_table` / shared `DomainTable`) | `svm-interp` (`VCpu::new_invoke` shares the `Arc<DomainTable>`); test in `jit_cap.rs` |
 | **slot reclaim** (B2): `uninstall(slot)` frees a table slot for reuse (both backends) | `svm-jit` (`CompiledModule::uninstall`, `n_real_funcs`), `svm-interp` (op-4 arm), `svm-run`, `frontend/chibicc`; tests in `jit_cap.rs` |
 | **code-memory compaction** (§6 reclaim): whole-module recompaction rebuilds the live set into a fresh module, dropping the old arena — the `CompiledModule` primitives, the embedder-integrated `recompact_jit` driver (live-unit enumeration + handle/slot remap through the `Host`), **and** the auto-compacting `JitSession` REPL driver (watermark policy + persistent window) | `svm-jit` (`CompiledModule::install_at`/`installed_slots`/`extra_fn_count`/`is_running`), `svm-interp` (`Host::jit_unit_count`/`jit_live_units`), `svm-run` (`recompact_jit`, `JitSession`); tests `crates/svm/tests/jit_compaction.rs` (mechanism + embedder transparency/reclaim + live invoke-only carry + guest-driven auto-compacting session) |
 
@@ -51,14 +51,15 @@ and **old→new** (old code `call_indirect`s a unit it `install`ed). Mechanism:
 
 - **new→new (B2):** an *invoked* unit `call_indirect`s an *installed* one. The JIT's invoked
   code dispatches the live `fn_table` (which `install` writes to); the interpreter gives the
-  invoke child a snapshot of the domain table + units at invoke time (`VCpu::new_invoke`).
+  invoke child a **share** of the domain's live `Arc<DomainTable>` (`VCpu::new_invoke`), so a unit it
+  installs during its own invocation is visible to it too (§6 #2).
 
 **All four cross-call directions are covered and differentially pinned:** old→old, old→new
 (install), new→old (slice #1), new→new. Tests assert matching results, slot indices, and
 fail-closed traps (signature mismatch, `-ENOSPC`). C surface: `__vm_jit_install` (iface 11 op 3).
-*Edge case noted for later:* a unit that `install`s **during** its own invocation is seen live
-by the JIT but not by the interpreter's invoke-time snapshot — exotic (it requires the invoked
-unit to hold the `Jit` handle).
+*Edge case (now resolved, §6 #2):* a unit that `install`s **during** its own invocation is seen by
+both backends — the JIT via the live `fn_table`, the interpreter via the shared `Arc<DomainTable>`
+(`VCpu::new_invoke` shares it rather than snapshotting), so it is no longer a divergence.
 
 **Verdict up front: yes, it's feasible and a strong architectural fit.** The submit-a-blob
 boundary the feature needs already exists, the verifier is *designed* to be the trust hinge
@@ -549,15 +550,17 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
   The recommended A-with-re-emission REPL path *increases* arena pressure (duplicated helper
   bodies), so the MVP byte-cap / `-ENOMEM` backstop is what gets profiled first; compaction is the
   upgrade if real sessions hit the cap.
-- **W^X integrity of incremental `finalize_definitions` (escape-relevant, not just
-  functional).** Today `finalize_definitions()` is called exactly once (`:1134`), so the
-  multi-finalize path is unexercised. The real question is not re-entrancy correctness but
-  whether `cranelift-jit 0.132`'s `ArenaMemoryProvider` ever flips *already-finalized* pages
-  back to writable during a *later* finalize — a transient W^X violation on running code. The
-  single-threaded MVP sidesteps this entirely (the compile thunk runs synchronously on the
-  guest stack; nothing else is executing during finalize), which is the *stronger* reason for
-  the single-threaded restriction below. For the multi-threaded future this is the gating
-  spike — resolve it in Phase 1.
+- **W^X integrity of incremental `finalize_definitions` — RESOLVED (§6 #2 spike).** The original
+  question: does `cranelift-jit 0.132`'s `ArenaMemoryProvider` ever flip *already-finalized* pages
+  back to writable during a *later* finalize (a transient W^X violation on running code)? The spike
+  answered **no, by construction**: `Segment::finalize` early-returns on already-finalized segments
+  and the allocate `set_rw` path skips them, so executing code (always on a finalized segment) is
+  never touched — **no stop-the-world**. I-cache coherence is cranelift's `clear_cache` +
+  `pipeline_flush_mt` (membarrier `SYNC_CORE` on Linux aarch64; x86 coherent), and append-only
+  addresses mean no cross-modifying-code `isb` is needed. Pinned by
+  `jit_incremental::concurrent_finalize_does_not_disturb_running_code` +
+  `jit_cap::cross_thread_execute_fresh_code_agrees`. So threaded **compile** is sound and landed
+  (see Concurrency below); the old single-threaded restriction is lifted.
 - **vmctx sharing.** The compiled code must observe the parent's window base/mask/thunk so
   masking + callbacks resolve. Because the host controls compilation it bakes the parent's
   constants directly (as for the main module), so no runtime vmctx pointer is needed for the

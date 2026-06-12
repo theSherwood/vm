@@ -43,7 +43,8 @@ asserted to produce identical results / errnos / traps / final-memory on both
 `JitValidator` fn so `svm-interp` keeps its tiny dep set and *both backends run the identical
 gate*): `decode_module` → `verify_module` → **memory-match precondition** (the blob's declared
 memory must equal the parent window — else the JIT would mask to a different size; an escape) →
-reject data segments → reject §12 concurrency ops (`Func::uses_concurrency`, single-threaded MVP).
+reject data segments → reject §12 concurrency ops inside a *submitted unit* (`Func::uses_concurrency`
+— a JIT'd blob stays single-threaded; the **parent** guest may now be multi-threaded, §6 #2).
 All failures `-EINVAL`. A per-domain **compile quota** (`-ENOMEM`, `Host::jit_compile` /
 `set_jit_quota`) bounds a looping guest.
 
@@ -83,36 +84,45 @@ trampoline over the *live* window under a nested detect-and-kill guard (`run_gua
 
 **Cross-module execution in the reference interpreter (slice #1 — the conceptual heart):** the
 interp resolved functions by index into one `funcs` array; the JIT uses code pointers. To match
-new→old/new→new, each `Frame` gained a `module` tag (0 = the vCPU's own program, ≥1 = a
-guest-compiled unit in `units[k-1]`). Direct calls stay in the caller's module;
-`call_indirect`/`return_call_indirect` dispatch through an explicit module-aware table
-(`TableSlot` + `dispatch_indirect`), the reference mirror of the JIT's `fn_table`.
-- **Borrow gotcha (important if you touch the eval loop):** `units`/`table` are bound `&mut` from
-  the `VCpu` destructure so `install`/`uninstall` can mutate them mid-loop; the running frame's
-  module functions are cloned into a local `Arc` (`cur_funcs`) each iteration so neither `units`
-  nor `table` is borrowed across the instruction loop. Do **not** reintroduce a long-lived borrow
-  of them.
-- `Jit.invoke` runs a unit as a nested inline-driven `VCpu` (`VCpu::new_invoke`) that takes a
-  **snapshot** of the domain's `units` + `table`, so an invoked unit reaches the original program
-  (new→old) and already-installed units (new→new). The JIT gets this for free (invoked native
-  code dispatches the live `fn_table`).
+new→old/new→new, each `Frame` gained a `module` tag (0 = the vCPU's own program, `≥ 1` = an
+installed unit, `INVOKE_MODULE` = the transient unit a `Jit.invoke` is running). Direct calls stay
+in the caller's module; `call_indirect`/`return_call_indirect` dispatch through a **shared, live
+`DomainTable`** (atomic slots + the writer-locked installed `units`), `Arc`-shared by every vCPU —
+the reference mirror of the JIT's one `fn_table` (§6 #2; this replaced the old per-`VCpu`
+`Vec<TableSlot>` that diverged on threaded install).
+- **Dispatch is lock-free:** a slot is a single `u64` word read with an `Acquire` atomic load;
+  `install`/`uninstall` publish a `Release` store; `units` is append-only behind a writer-only
+  `Mutex` with a per-vCPU lock-free local clone (re-synced on a miss). `resolve_module` resolves a
+  frame's/slot's module; the type-check borrows (no `Arc` clone). Module 0 dispatch touches neither
+  lock nor `units`.
+- `Jit.invoke` runs a unit as a nested inline-driven `VCpu` (`VCpu::new_invoke`) that **shares** the
+  parent's `Arc<DomainTable>` (no longer a snapshot), so an invoked unit reaches the original program
+  (new→old), already-installed units (new→new), **and** units installed *during* its own invocation;
+  its own transient unit is `INVOKE_MODULE`, kept out of the shared `units`. The JIT gets the same
+  from the live `fn_table` (now atomic `FnEntry` for threaded-install safety).
 
 ---
 
 ## 4. Where things live
 
 - `crates/svm-jit/src/lib.rs` — `CompiledModule` (`compile`/`run`/`run_raw`/`define_extra`/
-  `invoke_extra`/`install`/`uninstall`), `DefinedFn`, `intern_*`, `n_real_funcs`,
-  `table_reserve_log2`. The escape-TCB-adjacent crate.
-- `crates/svm-interp/src/lib.rs` — `Frame.module`, `TableSlot`/`build_table`/`dispatch_indirect`,
-  `VCpu::new_invoke`, the eval-loop `Jit` op arms (invoke=1, install=3, uninstall=4 serviced in
-  the loop; compile=0/release=2 in generic dispatch `Binding::JitDomain`), `Host` Jit state
-  (`grant_jit`/`grant_jit_with_table`/`jit_compile`/`jit_unit_*`/`set_jit_native_ctx`),
-  `iface::JIT`=11 / `JIT_CODE`=12, the `JitValidator` seam.
-- `crates/svm-run/src/lib.rs` — `cap_thunk` intercepts iface 11 → `jit_native_op` (native
-  compile/invoke/install/uninstall over the registered live `CompiledModule`); `jit_blob_validator`
-  (the canonical gate); `grant_jit(host, m, table_log2)`; `jit_cap_run` (drives the JIT with the
-  module registered for mid-run re-entry).
+  `invoke_extra`/`install`/`install_at`/`uninstall`/`installed_slots`/`extra_fn_count`/`is_running`),
+  `DefinedFn`, `intern_*`, `n_real_funcs`, `table_reserve_log2`, and the **atomic `FnEntry`**
+  (`AtomicU32` type_id + `AtomicU64` code, release-ordered publish — threaded-install safety, §6 #2).
+  The escape-TCB-adjacent crate.
+- `crates/svm-interp/src/lib.rs` — `Frame.module`, the **shared `DomainTable`** (atomic slots +
+  writer-locked `units`) / `resolve_module` / `dispatch_indirect` / `INVOKE_MODULE`, `VCpu::new`
+  (takes the shared `Arc<DomainTable>`) / `new_invoke` (shares it), the eval-loop `Jit` op arms
+  (invoke=1, install=3, uninstall=4 in the loop; compile=0/release=2 in generic dispatch
+  `Binding::JitDomain`), `Host` Jit state (`grant_jit`/`grant_jit_with_table`/`jit_compile`/
+  `jit_unit_*`/`jit_unit_count`/`jit_live_units`/`set_jit_native_ctx`), `iface::JIT`=11 /
+  `JIT_CODE`=12, the `JitValidator` seam, `domain_table_tests`.
+- `crates/svm-run/src/lib.rs` — `cap_thunk` intercepts iface 11 → `jit_native_op`; **`cap_thunk_locked`**
+  (the per-domain `Mutex<Host>` serialized thunk for a concurrent guest, with invoke-release
+  re-entrancy) + `jit_invoke_locked`; `jit_blob_validator` (the canonical gate); `grant_jit`;
+  `jit_cap_run` (locked path when `uses_concurrency`); `run_powerbox`/`powerbox_compile_run` (CLI,
+  same locked branch); `recompact_jit` + `recompact_into` (compaction); `JitSession` (auto-compacting
+  REPL driver, owns a boxed `Mutex<Host>`, concurrency-capable).
 - `crates/svm-ir/src/lib.rs` — `Func::uses_concurrency`.
 - `frontend/chibicc/codegen_ir.c` + `include/svm.h` — the `__vm_jit_*` builtins (JIT_SLOT=28,
   8-handle powerbox).
