@@ -1910,12 +1910,17 @@ impl VCpu {
     }
 
     /// A vCPU that runs a guest-compiled **`Jit` unit**'s entry (`unit[0]`) over the parent's
-    /// world — same window/host/fuel — for the `Jit.invoke` op (JIT.md Model A). Module 0 is the
-    /// `parent` program (so the unit's `call_indirect` dispatches through the parent table —
-    /// new→old), and the unit is module 1; the root frame runs the unit entry as module 1.
+    /// world — same window/host/fuel — for the `Jit.invoke` op (JIT.md Model A/B2). Module 0 is
+    /// the `parent` program; `parent_units`/`parent_table` are a **snapshot of the domain's
+    /// dispatch state** at invoke time, so the unit's `call_indirect` reaches the original program
+    /// (new→old) *and* any already-`install`ed units (new→new), exactly as the JIT's invoked code
+    /// dispatches through the live `fn_table`. The invoked unit is appended as the next module and
+    /// the root frame runs its entry.
     #[allow(clippy::too_many_arguments)]
     fn new_invoke(
         parent: Arc<[Func]>,
+        parent_units: Vec<Arc<[Func]>>,
+        parent_table: Vec<TableSlot>,
         unit: Arc<[Func]>,
         args: &[Value],
         mem: Option<Mem>,
@@ -1925,7 +1930,9 @@ impl VCpu {
         sched: SchedRef,
         quota: Quota,
     ) -> VCpu {
-        let table = build_table(&parent, 0); // the parent module's table (new→old target)
+        let mut units = parent_units;
+        units.push(unit);
+        let module = units.len() as u32; // the invoked unit's module id (its index + 1)
         VCpu {
             funcs: parent,
             fibers: vec![Fiber::Running],
@@ -1933,7 +1940,7 @@ impl VCpu {
             cur: 0,
             frames: vec![Frame {
                 func: 0, // the unit's entry
-                module: 1,
+                module,
                 block: 0,
                 inst: 0,
                 vals: args.to_vec(),
@@ -1951,8 +1958,8 @@ impl VCpu {
             memop: false,
             acc: None,
             quota,
-            units: vec![unit],
-            table,
+            units,
+            table: parent_table,
         }
     }
 
@@ -2722,12 +2729,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // move them back whatever the outcome — the parent's snapshot/teardown still
                     // needs them after a trap.
                     let child_mem = mem.take();
-                    // The unit runs over the parent's world: module 0 = this vCPU's program (so the
-                    // unit's `call_indirect` reaches the parent table — new→old), the unit is
-                    // module 1. A nested invoke costs call depth like a call, so invoke recursion is
-                    // bounded by the same stack-overflow bound as ordinary recursion.
+                    // The unit runs over the parent's world: module 0 = this vCPU's program and a
+                    // snapshot of the domain's dispatch table + units, so the unit's `call_indirect`
+                    // reaches the original program (new→old) and any installed units (new→new),
+                    // matching the JIT's invoked code over the live `fn_table`. A nested invoke
+                    // costs call depth like a call, so invoke recursion is bounded by the same
+                    // stack-overflow bound as ordinary recursion.
                     let mut child = VCpu::new_invoke(
                         Arc::clone(&funcs),
+                        units.clone(),
+                        table.clone(),
                         unit_funcs,
                         &child_args,
                         child_mem,

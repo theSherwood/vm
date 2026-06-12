@@ -387,6 +387,41 @@ fn install_then_old_calls_new_agrees() {
     );
 }
 
+/// **new→new** (JIT.md Model B2): an *invoked* unit `call_indirect`s an *installed* unit. The
+/// guest installs unit A `(a,b)->a+b` at a slot, then invokes unit B whose body
+/// `call_indirect[slot](a,b) + 1` reaches A. On the JIT the invoked unit dispatches the live
+/// `fn_table` (which install wrote to); the interpreter gives the invoke child a snapshot of the
+/// domain table + units — so both reach the installed unit identically.
+#[test]
+fn invoked_unit_calls_installed_unit_agrees() {
+    // (jit, a, b):
+    //   slot = install(compile(A));            // A = (a,b)->a+b at slot 1
+    //   codeB = compile(B(slot));              // B = (a,b)-> call_indirect[slot](a,b) + 1
+    //   return invoke(codeB, a, b);
+    let a_blob = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  return v2\n}\n");
+    // B's entry call_indirects slot 1 (where A installs) then adds 1.
+    let b_blob = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.const 1\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  v4 = i32.const 1\n  v5 = i32.add v3 v4\n  return v5\n}\n");
+    // Lay A at 4096, B right after it.
+    let mut both = a_blob.clone();
+    both.extend_from_slice(&b_blob);
+    let guest_src = format!(
+        "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32, v2: i32):\n  \
+         v3 = i64.const 4096\n  v4 = i64.const {}\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
+         v6 = cap.call 11 3 (i64) -> (i64) v0 (v5)\n  \
+         v7 = i64.const {}\n  v8 = i64.const {}\n  v9 = cap.call 11 0 (i64, i64) -> (i64) v0 (v7, v8)\n  \
+         v10 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v9, v1, v2)\n  return v10\n}}\n",
+        a_blob.len(),
+        4096 + a_blob.len(),
+        b_blob.len(),
+    );
+    let (out, _) = diff_run_t(&guest_src, &both, &[6, 7], 4);
+    // B: call_indirect slot 1 = A(6,7) = 13; + 1 = 14.
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[14]),
+        "{out:?}"
+    );
+}
+
 /// `install` fail-closed: with **no** table reservation there is no padding slot, so `install`
 /// returns `-ENOSPC` identically on both backends (and nothing is installed).
 #[test]
