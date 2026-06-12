@@ -720,3 +720,70 @@ fn threaded_compile_loop_stress_agrees() {
         "threaded-compile stress must agree on both backends: {out:?}"
     );
 }
+
+/// **Cross-thread execute of freshly-compiled code** (JIT.md §6 #2): the worker is spawned **first**,
+/// then the main thread `compile`s + `install`s a unit — so the worker executes code that another
+/// thread compiled **while the worker was already running** (compile *after* spawn, unlike
+/// `threaded_install_*` where compile precedes the spawn). This is the case a cross-modifying-code
+/// `isb` would be needed for *if* cranelift modified code in place — but it **appends** to fresh
+/// arena addresses the worker's core never executed before, so there is no stale prefetch and no
+/// `isb` is required on any platform (incl. aarch64 macOS, where `pipeline_flush_mt` is a no-op);
+/// `clear_cache`'s `ic ivau` + `dsb ish` make the new bytes visible to the worker's fetch. Both
+/// backends return `6*7+10 = 52`; running green on every `fiber_rt` target is the empirical proof.
+#[test]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn cross_thread_execute_fresh_code_agrees() {
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const 10\n  v4 = i32.add v2 v3\n  return v4\n}\n");
+    let guest_src = concat!(
+        "memory 16\n",
+        // func 0 — main(jit): spawn worker FIRST, THEN compile + install + signal; join.
+        "func (i32) -> (i32) {\n",
+        "block0(v0: i32):\n",
+        "  v1 = i64.const 2048\n",
+        "  v2 = i64.const 0\n",
+        "  v3 = thread.spawn 1 v1 v2\n", // worker runs before any compile
+        "  v4 = i64.const 4096\n",
+        "  v5 = i64.const BLOBLEN\n",
+        "  v6 = cap.call 11 0 (i64, i64) -> (i64) v0 (v4, v5)\n", // compile while the worker runs
+        "  v7 = cap.call 11 3 (i64) -> (i64) v0 (v6)\n",          // install -> slot
+        "  v8 = i32.wrap_i64 v7\n",
+        "  v9 = i64.const 4\n",
+        "  i32.store v9 v8\n",
+        "  v10 = i64.const 0\n",
+        "  v11 = i32.const 1\n",
+        "  i32.atomic.store v10 v11\n", // publish ready (release)
+        "  v12 = thread.join v3\n",
+        "  v13 = i32.wrap_i64 v12\n",
+        "  return v13\n",
+        "}\n",
+        // func 1 — worker(sp, arg): spin on ready, then call_indirect the freshly-compiled slot.
+        "func (i64, i64) -> (i64) {\n",
+        "block0(v0: i64, v1: i64):\n",
+        "  br block1()\n",
+        "block1():\n",
+        "  v2 = i64.const 0\n",
+        "  v3 = i32.atomic.load v2\n", // ready? (acquire)
+        "  v4 = i32.const 0\n",
+        "  v5 = i32.ne v3 v4\n",
+        "  br_if v5 block2() block1()\n",
+        "block2():\n",
+        "  v6 = i64.const 4\n",
+        "  v7 = i32.load v6\n", // slot
+        "  v8 = i32.const 6\n",
+        "  v9 = i32.const 7\n",
+        "  v10 = call_indirect (i32, i32) -> (i32) v7 (v8, v9)\n", // execute main's fresh code
+        "  v11 = i64.extend_i32_u v10\n",
+        "  return v11\n",
+        "}\n",
+    );
+    let guest = with_len(guest_src, b.len());
+    let (out, _) = diff_run_t(&guest, &b, &[], 4);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[52]), // 6*7+10
+        "a worker must coherently execute code another thread compiled while it ran: {out:?}"
+    );
+}
