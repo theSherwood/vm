@@ -296,6 +296,25 @@ unsafe fn jit_native_op(
             };
             put(results, n_results, v, trap_out);
         }
+        4 => {
+            // uninstall(slot) -> 0 | -EINVAL (JIT.md Model B2 reclaim): clear an installed slot
+            // so the index is reusable and a stale call_indirect of it traps.
+            let Ok(domain) = host.resolve_jit_domain(handle) else {
+                return cap_fault(trap_out);
+            };
+            let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
+            if cm.is_null() {
+                return put(results, n_results, EINVAL, trap_out);
+            }
+            let slot = *args.first().unwrap_or(&-1);
+            // SAFETY: `cm` is the in-flight run's CompiledModule (guest suspended).
+            let v = if slot >= 0 && (*cm).uninstall(slot as u32) {
+                0
+            } else {
+                EINVAL
+            };
+            put(results, n_results, v, trap_out);
+        }
         _ => put(results, n_results, EINVAL, trap_out),
     }
 }

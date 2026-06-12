@@ -422,6 +422,54 @@ fn invoked_unit_calls_installed_unit_agrees() {
     );
 }
 
+/// **slot reclaim via `uninstall`** (JIT.md Model B2): after uninstalling an installed slot, a
+/// `call_indirect` of it traps (`IndirectCallType`), and a later `install` reuses the freed
+/// slot index — identically on both backends. (Reclaims the slot, not the code memory.)
+#[test]
+fn uninstall_frees_slot_then_reinstall_reuses_it_agrees() {
+    // (jit, a, b):
+    //   s1 = install(compile(A));   // A = a+b -> slot 1
+    //   uninstall(s1);
+    //   s2 = install(compile(B));   // B = a*b -> reuses slot 1
+    //   return s2 * 1000 + call_indirect[s2](a, b);   // proves s2 == s1 and dispatches B
+    let a_blob = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  return v2\n}\n");
+    let b_blob = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  return v2\n}\n");
+    let mut both = a_blob.clone();
+    both.extend_from_slice(&b_blob);
+    let guest_src = format!(
+        "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32, v2: i32):\n  \
+         v3 = i64.const 4096\n  v4 = i64.const {}\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
+         v6 = cap.call 11 3 (i64) -> (i64) v0 (v5)\n  \
+         v7 = cap.call 11 4 (i64) -> (i64) v0 (v6)\n  \
+         v8 = i64.const {}\n  v9 = i64.const {}\n  v10 = cap.call 11 0 (i64, i64) -> (i64) v0 (v8, v9)\n  \
+         v11 = cap.call 11 3 (i64) -> (i64) v0 (v10)\n  \
+         v12 = i32.wrap_i64 v11\n  v13 = call_indirect (i32, i32) -> (i32) v12 (v1, v2)\n  \
+         v14 = i32.const 1000\n  v15 = i32.mul v12 v14\n  v16 = i32.add v15 v13\n  return v16\n}}\n",
+        a_blob.len(),
+        4096 + a_blob.len(),
+        b_blob.len(),
+    );
+    // a=6,b=7: s2 must be slot 1 (reused), call B = 6*7 = 42 → 1*1000 + 42 = 1042.
+    let (out, _) = diff_run_t(&guest_src, &both, &[6, 7], 4);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[1042]),
+        "{out:?}"
+    );
+}
+
+/// `uninstall` fail-closed: clearing a real module-function slot (0) or an out-of-range slot is
+/// `-EINVAL` identically; nothing is cleared.
+#[test]
+fn uninstall_protects_real_functions_identically() {
+    // (jit) -> uninstall(0)  (slot 0 is a real module function — must be rejected).
+    let guest_src = "memory 16\nfunc (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 0\n  v2 = cap.call 11 4 (i64) -> (i64) v0 (v1)\n  return v2\n}\n";
+    let (out, _) = diff_run_t(guest_src, &[], &[], 4);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[-22]),
+        "{out:?}"
+    );
+}
+
 /// `install` fail-closed: with **no** table reservation there is no padding slot, so `install`
 /// returns `-ENOSPC` identically on both backends (and nothing is installed).
 #[test]

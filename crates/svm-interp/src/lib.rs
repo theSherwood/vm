@@ -2684,6 +2684,41 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     frames[top].vals.push(Value::I64(res));
                 }
+                // `Jit.uninstall(slot)` (iface 11 op 4, JIT.md Model B2 reclaim): clear a
+                // previously-installed table slot so the index is reusable and a stale
+                // `call_indirect` of it traps. Serviced here (it mutates the table). A guest may
+                // only clear slots it installed (`≥ funcs.len()`, the module-0 function count);
+                // `0` on success, `-EINVAL` for a real-function/out-of-range/already-empty slot.
+                Inst::CapCall {
+                    type_id: iface::JIT,
+                    op: 4,
+                    handle,
+                    args,
+                    ..
+                } => {
+                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.resolve_jit_domain(h)?; // authority: a forged handle is inert
+                    }
+                    let slot = val_to_slot(get(
+                        &frames[top].vals,
+                        *args.first().ok_or(Trap::Malformed)?,
+                    )?) as usize;
+                    let res = if slot >= funcs.len()
+                        && slot < table.len()
+                        && table[slot].module != TABLE_EMPTY
+                    {
+                        table[slot] = TableSlot {
+                            module: TABLE_EMPTY,
+                            func: 0,
+                        };
+                        0
+                    } else {
+                        EINVAL
+                    };
+                    frames[top].vals.push(Value::I64(res));
+                }
                 Inst::CapCall {
                     type_id: iface::JIT,
                     op: 1,
@@ -3831,7 +3866,9 @@ pub mod iface {
     /// `release(code_handle) -> 0 | -errno` revokes the handle (no code reclaim yet — JIT.md
     /// "Code reclaim"); op 3 `install(code_handle) -> slot_index | -errno` (Model B2) installs the
     /// unit into the `call_indirect` table's next reserved slot so old code (or another unit) can
-    /// dispatch it at native speed (old→new), `-ENOSPC` if the table is full.
+    /// dispatch it at native speed (old→new), `-ENOSPC` if the table is full; op 4
+    /// `uninstall(slot) -> 0 | -errno` clears an installed slot so the index is reusable and a
+    /// stale `call_indirect` of it traps (slot reclaim — the code memory itself is not freed).
     pub const JIT: u32 = 11;
     /// `CompiledCode` — a unit minted by `Jit.compile`. Like `Module`, it has no directly callable
     /// ops (`cap.call` on it is an inert `CapFault`); it confers only the authority to be named in

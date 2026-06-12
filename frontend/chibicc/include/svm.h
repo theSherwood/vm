@@ -67,4 +67,9 @@ long __vm_jit_release(long code);
 // `IndirectCallType` trap, never an escape.)
 long __vm_jit_install(long code);
 
+// Reclaim an installed slot (Model B2): clear it so the index is reusable by a later install
+// and a stale call of it traps. Returns 0, or -22 for an out-of-range / not-installed slot.
+// (Reclaims the table *slot*; the unit's code memory is not freed.)
+long __vm_jit_uninstall(long slot);
+
 #endif // __SVM_H

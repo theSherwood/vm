@@ -928,6 +928,19 @@ static int gen_builtin_jit_install(Node *node) {
   return r;
 }
 
+// `__vm_jit_uninstall(slot) -> 0 | -errno` (iface 11 op 4, JIT.md Model B2 reclaim): clear an
+// installed call_indirect slot so the index is reusable and a stale call of it traps.
+static int gen_builtin_jit_uninstall(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_jit_uninstall(slot) expects 1 argument");
+  int slot = widen_i64(gen_expr(a), a->ty);
+  int h = load_handle(JIT_SLOT);
+  int r = nv++;
+  fprintf(o, "  v%d = cap.call 11 4 (i64) -> (i64) v%d (v%d)\n", r, h, slot);
+  return r;
+}
+
 // §13/§14 SharedRegion builtins — guest-minted shareable memory + multi-offset window
 // aliasing (the magic ring buffer), over the granted AddressSpace/region capabilities:
 //
@@ -1356,6 +1369,8 @@ static int gen_expr(Node *node) {
           return gen_builtin_jit_release(node);
         if (!strcmp(fname, "__vm_jit_install"))
           return gen_builtin_jit_install(node);
+        if (!strcmp(fname, "__vm_jit_uninstall"))
+          return gen_builtin_jit_uninstall(node);
       }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the

@@ -952,6 +952,10 @@ pub struct CompiledModule {
     n_params: usize,
     /// The entry's result count (`run` sizes the result buffer).
     n_results: usize,
+    /// The module's own function count — where the `fn_table`'s installable padding begins.
+    /// `uninstall` refuses to clear a slot `< n_real_funcs` (a real module function), so a guest
+    /// can only reclaim slots it `install`ed.
+    n_real_funcs: usize,
     // --- the baked lowering environment, reused verbatim by `define_extra` so an extra
     // --- function compiles against the *same* constants as the parent (same confinement
     // --- mask, same cap thunk, same table mask — JIT.md "vmctx sharing").
@@ -1369,6 +1373,7 @@ impl CompiledModule {
             tramp_code,
             n_params: entry.params.len(),
             n_results: entry.results.len(),
+            n_real_funcs: m.funcs.len(),
             distinct,
             cap,
             fiber,
@@ -1892,6 +1897,28 @@ impl CompiledModule {
             code: code as u64,
         };
         Some(slot as u32)
+    }
+
+    /// **Uninstall** a previously-`install`ed `call_indirect` slot (JIT.md Model B2 reclaim): set
+    /// it back to a trapping padding slot so the index is reusable by a later `install` and a
+    /// stale `call_indirect` of it fails closed (`IndirectCallType`). Returns `true` on success;
+    /// `false` for an out-of-range slot, a real module-function slot (`< n_real_funcs`), or an
+    /// already-empty slot — a guest may only reclaim what it installed. (The code memory itself
+    /// is not freed — cranelift-jit has no per-function free; this reclaims the *slot*.)
+    pub fn uninstall(&mut self, slot: u32) -> bool {
+        let i = slot as usize;
+        if i < self.n_real_funcs || i >= self.fn_table.len() {
+            return false;
+        }
+        if self.fn_table[i].type_id == PADDING_TYPE_ID {
+            return false; // already empty
+        }
+        self.fn_table[i] = FnEntry {
+            type_id: PADDING_TYPE_ID,
+            _pad: 0,
+            code: 0,
+        };
+        true
     }
 
     /// The stable type id `ty` was interned under, or `None` if no unit this module compiled
