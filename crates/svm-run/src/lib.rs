@@ -111,6 +111,137 @@ pub unsafe extern "C" fn cap_thunk(
     }
 }
 
+/// **Multi-threaded `cap.call` thunk** (JIT.md §6 #2 threaded *compile*): the same dispatch as
+/// [`cap_thunk`], but serialized through a per-domain [`Mutex<Host>`] so a guest whose worker
+/// threads make concurrent `cap.call`s (notably `Jit.compile`, which mutates the `Host` unit
+/// registry and the live `CompiledModule`) does not data-race. `ctx` is `*const Mutex<Host>`
+/// (vs `cap_thunk`'s raw `*mut Host`), so single-threaded guests keep the unlocked `cap_thunk`
+/// and pay nothing; only a concurrent guest's run bakes *this* thunk (see [`jit_cap_run`]).
+///
+/// **Re-entrancy** (the "running units compile more" case): `Jit.invoke` runs guest code that may
+/// itself `cap.call` (e.g. compile more) on the same thread, so the lock must **not** be held
+/// across it — invoke reads the unit under the lock, *releases*, then trampolines. Every other op
+/// is host-side only (the §14 Instantiator / fibers re-enter via their own runtimes, never through
+/// here), so holding the lock across a plain delegate to [`cap_thunk`] is deadlock-free.
+///
+/// # Safety
+/// Same contract as [`cap_thunk`]; additionally `ctx` is a live `*const Mutex<Host>` whose `Host`
+/// has the in-flight run's `Jit` native ctx registered, and the lock is uncontended-safe to take
+/// from any of the run's vCPU threads.
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn cap_thunk_locked(
+    ctx: *mut c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    mem_reserved: u64,
+    type_id: u32,
+    op: u32,
+    handle: i32,
+    args: *const i64,
+    n_args: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) {
+    let m = &*(ctx as *const Mutex<Host>);
+    // `Jit.invoke` (iface 11 op 1) re-enters guest code → never hold the lock across it.
+    if type_id == iface::JIT && op == 1 {
+        let arg_slots = if n_args == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(args, n_args as usize)
+        };
+        jit_invoke_locked(m, handle, arg_slots, results, n_results, trap_out, mem_base);
+        return;
+    }
+    // Everything else is host-side only: hold the lock across a plain delegate to the unlocked
+    // thunk over the locked `Host`'s pointer (compile/install/uninstall/release mutate the unit
+    // registry + the live module; the generic ops mutate `Host` state). The guard is released on
+    // return.
+    let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    let host_ptr = &mut *guard as *mut Host as *mut c_void;
+    cap_thunk(
+        host_ptr,
+        mem_base,
+        mem_size,
+        mem_reserved,
+        type_id,
+        op,
+        handle,
+        args,
+        n_args,
+        results,
+        n_results,
+        trap_out,
+    );
+}
+
+/// `Jit.invoke` for the [`cap_thunk_locked`] path: resolve the unit **under the lock**, then
+/// **release** before running its trampoline (`invoke_extra`), so the invoked unit may itself
+/// `cap.call` (e.g. compile more) on this thread without self-deadlocking and other threads keep
+/// making progress while it runs. Mirrors [`jit_native_op`]'s op-1 arm exactly, minus the lock
+/// scope.
+///
+/// # Safety
+/// As [`cap_thunk_locked`].
+unsafe fn jit_invoke_locked(
+    m: &Mutex<Host>,
+    handle: i32,
+    args: &[i64],
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+    mem_base: *mut u8,
+) {
+    let cap_fault = |trap_out: *mut i64| *trap_out = TrapKind::CapFault as i64;
+    // Read the target unit + its module pointer under the lock, then drop the guard.
+    let resolved: Option<(usize, usize)> = {
+        let host = m.lock().unwrap_or_else(|e| e.into_inner());
+        (|| {
+            let domain = host.resolve_jit_domain(handle).ok()?;
+            let &ch = args.first()?;
+            let (cd, cu) = host.resolve_jit_code(ch as i32).ok()?;
+            if cd != domain {
+                return None;
+            }
+            let code = host.jit_unit_native(cd, cu);
+            let cm = host.jit_native_ctx(cd);
+            let funcs = host.jit_unit_funcs(cd, cu)?;
+            if code == 0 || cm == 0 {
+                return None;
+            }
+            let entry = &funcs[0];
+            if args.len() - 1 != entry.params.len() || n_results as usize != entry.results.len() {
+                return None;
+            }
+            Some((code, cm))
+        })()
+    };
+    let Some((code, cm)) = resolved else {
+        return cap_fault(trap_out);
+    };
+    let out: &mut [i64] = if n_results == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(results, n_results as usize)
+    };
+    // SAFETY: lock released; `cm` is the in-flight run's CompiledModule, `code` its unit's
+    // finalized trampoline; arity checked above; a nested `cap.call` (e.g. compile) from the
+    // invoked code re-acquires the lock on this thread.
+    if CompiledModule::invoke_extra(
+        cm as *mut CompiledModule,
+        code as *const u8,
+        &args[1..],
+        out,
+        mem_base,
+        trap_out,
+    )
+    .is_err()
+    {
+        cap_fault(trap_out);
+    }
+}
+
 /// The native (Cranelift) half of the guest-driven `Jit` capability (JIT.md Model A), reached
 /// from [`cap_thunk`]'s iface-11 intercept. Op semantics — including every fail-closed path —
 /// mirror the interpreter reference (`svm-interp`'s `Binding::JitDomain` dispatch arm + its
@@ -380,6 +511,42 @@ pub fn jit_cap_run(
     table_reserve_log2: u8,
     host: &mut Host,
 ) -> Result<(JitOutcome, Vec<u8>), svm_jit::JitError> {
+    // A guest whose workers make concurrent `cap.call`s (threaded `Jit.compile`, JIT.md §6 #2) runs
+    // the **serialized** thunk over a per-domain `Mutex<Host>`; a single-threaded guest keeps the
+    // unlocked `cap_thunk` + raw `Host` path verbatim (zero lock cost). The guest-facing iface is
+    // identical either way — the serialization is an internal detail that can be made finer-grained
+    // later without changing guest software.
+    if m.funcs.iter().any(|f| f.uses_concurrency()) {
+        let host_mutex = Mutex::new(std::mem::take(host));
+        let ctx = &host_mutex as *const Mutex<Host> as *mut c_void;
+        let mut cm = CompiledModule::compile(
+            m,
+            entry,
+            cap_thunk_locked,
+            ctx,
+            reserved_log2,
+            None,
+            None,
+            None,
+            None,
+            svm_jit::Quota::default(),
+            table_reserve_log2,
+        )?;
+        host_mutex
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+        // SAFETY: `&mut cm` is the only pointer the thunk's handlers re-enter through (registered
+        // above); all of the run's vCPU threads serialize their `cap.call`s through `host_mutex`.
+        let r =
+            unsafe { CompiledModule::run_raw(&mut cm, args, Some(init_mem), Some(1 << 18), None) };
+        host_mutex
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_jit_native_ctx(0);
+        *host = host_mutex.into_inner().unwrap_or_else(|e| e.into_inner());
+        return r;
+    }
     let mut cm = CompiledModule::compile(
         m,
         entry,

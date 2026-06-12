@@ -586,3 +586,61 @@ fn threaded_install_agrees_across_backends() {
         "worker must reach the post-spawn install on both backends: {out:?}"
     );
 }
+
+/// **Threaded compile** (JIT.md §6 #2): the main thread *and* a spawned worker thread each
+/// `Jit.compile` a unit and `invoke` it **concurrently**. This is the case the single-threaded MVP
+/// forbade — two threads in `cap.call` at once would race the `Host` unit registry + the live
+/// `CompiledModule` (`define_extra`). With the per-domain serialized thunk (`cap_thunk_locked` over a
+/// `Mutex<Host>`, engaged because the guest uses `thread.spawn`) the compiles serialize while
+/// execution stays parallel, and the JIT agrees with the interpreter (which already serializes via
+/// its `Arc<Mutex<Host>>`). main computes `6*7+10 = 52`, the worker `8*9+10 = 82`; main returns their
+/// sum, `134`, on both backends. The submitted blob is concurrency-free (the validator still rejects
+/// concurrency *inside* a submitted unit); only the *parent* guest is multi-threaded.
+#[test]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn threaded_compile_agrees_across_backends() {
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const 10\n  v4 = i32.add v2 v3\n  return v4\n}\n");
+    let guest_src = concat!(
+        // func 0 — main(jit): spawn worker, compile+invoke(6,7), join, return main+worker.
+        "memory 16\n",
+        "func (i32) -> (i32) {\n",
+        "block0(v0: i32):\n",
+        "  v1 = i64.extend_i32_u v0\n", // pass the jit handle to the worker
+        "  v2 = i64.const 2048\n",      // worker data-stack base (unused)
+        "  v3 = thread.spawn 1 v2 v1\n", // worker handle
+        "  v4 = i64.const 4096\n",
+        "  v5 = i64.const BLOBLEN\n",
+        "  v6 = cap.call 11 0 (i64, i64) -> (i64) v0 (v4, v5)\n", // main compiles
+        "  v7 = i32.const 6\n",
+        "  v8 = i32.const 7\n",
+        "  v9 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v6, v7, v8)\n", // 6*7+10 = 52
+        "  v10 = thread.join v3\n",                                        // worker result (i64)
+        "  v11 = i32.wrap_i64 v10\n",
+        "  v12 = i32.add v9 v11\n", // 52 + 82 = 134
+        "  return v12\n",
+        "}\n",
+        // func 1 — worker(sp, jit): compile+invoke(8,9) concurrently with main.
+        "func (i64, i64) -> (i64) {\n",
+        "block0(v0: i64, v1: i64):\n",
+        "  v2 = i32.wrap_i64 v1\n", // jit handle
+        "  v3 = i64.const 4096\n",
+        "  v4 = i64.const BLOBLEN\n",
+        "  v5 = cap.call 11 0 (i64, i64) -> (i64) v2 (v3, v4)\n", // worker compiles
+        "  v6 = i32.const 8\n",
+        "  v7 = i32.const 9\n",
+        "  v8 = cap.call 11 1 (i64, i32, i32) -> (i32) v2 (v5, v6, v7)\n", // 8*9+10 = 82
+        "  v9 = i64.extend_i32_u v8\n",
+        "  return v9\n",
+        "}\n",
+    );
+    let guest = with_len(guest_src, b.len());
+    let (out, _) = diff_run_t(&guest, &b, &[], 0);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[134]), // 52 + 82
+        "threaded compile must agree on both backends: {out:?}"
+    );
+}
