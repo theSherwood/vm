@@ -404,6 +404,99 @@ pub fn jit_cap_run(
     r
 }
 
+/// **Code-memory compaction** for a guest-driven `Jit` domain (JIT.md §6): rebuild the domain's
+/// *live* JIT code into a **fresh** [`CompiledModule`], reclaiming the old module's 256 MiB code
+/// arena (cranelift-jit has no per-function free, so reclaim = whole-module recompaction — drop
+/// the old module and its arena goes with it). Returns the fresh module for the caller to swap in
+/// (register its pointer with [`Host::set_jit_native_ctx`] and run on it from now on); the old
+/// module stays valid until the caller drops it.
+///
+/// **Quiescent-only.** The guest is suspended *inside* the module being compacted during any
+/// `cap.call`, so this is **embedder-facing** — call it between runs (a REPL between prompts),
+/// never from a `cap.call` handler. Asserts `!old.is_running()`.
+///
+/// **What is carried, and why it is transparent.** Every unit that is still reachable — either
+/// occupying a `call_indirect` table slot ([`CompiledModule::installed_slots`]) or held through a
+/// live `CompiledCode` handle ([`Host::jit_live_units`]) — is re-`define_extra`'d into the fresh
+/// module, its `Host` unit→native pointers are remapped (so existing `CompiledCode` handles, which
+/// name a `(domain, unit)` not a code address, keep invoking the right code), and any slot it
+/// occupied is reproduced at the **exact** index with [`CompiledModule::install_at`] (so a funcref
+/// old code already holds still resolves to it). A unit that is neither installed nor live-handled
+/// is dead and is **not** carried — that is the reclaim. The handle table itself needs no edit
+/// (handles are `(domain, unit)` indices, indirected through the remapped native pointers).
+///
+/// `base`/`entry`/`reserved_log2`/`table_reserve_log2` must be the **same** inputs the old module
+/// was compiled with (the caller owns them — the same ones it passed to [`jit_cap_run`] /
+/// [`CompiledModule::compile`]); the fresh module shares the parent's baked environment exactly.
+pub fn recompact_jit(
+    base: &Module,
+    entry: u32,
+    reserved_log2: u8,
+    table_reserve_log2: u8,
+    host: &mut Host,
+    domain: u32,
+    old: &CompiledModule,
+) -> Result<CompiledModule, svm_jit::JitError> {
+    assert!(
+        !old.is_running(),
+        "recompact_jit is quiescent-only: no run may be in flight on the old module"
+    );
+    // The set of live table slots in the OLD module, keyed by the unit's natural-entry code so we
+    // can rejoin slot → owning unit below (a unit may, in principle, occupy more than one slot).
+    let mut code_to_slots: std::collections::HashMap<u64, Vec<u32>> =
+        std::collections::HashMap::new();
+    for (slot, code, _type_id) in old.installed_slots() {
+        code_to_slots.entry(code).or_default().push(slot);
+    }
+    // Carry every unit that is still reachable: live-handled OR occupying a slot. (A slot can be
+    // occupied by a unit whose handle was already released — a redefinition survivor — so the two
+    // sources are unioned, not either alone.)
+    let mut keep: Vec<u32> = host.jit_live_units(domain);
+    for unit in 0..host.jit_unit_count(domain) {
+        let (install_code, _) = host.jit_unit_install(domain, unit);
+        if install_code != 0
+            && code_to_slots.contains_key(&(install_code as u64))
+            && !keep.contains(&unit)
+        {
+            keep.push(unit);
+        }
+    }
+    keep.sort_unstable();
+    keep.dedup();
+
+    let mut fresh = CompiledModule::compile(
+        base,
+        entry,
+        cap_thunk,
+        host as *mut Host as *mut c_void,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        svm_jit::Quota::default(),
+        table_reserve_log2,
+    )?;
+    for unit in keep {
+        // The unit's OLD natural-entry pointer — used to find the slot(s) it occupied — read
+        // *before* we overwrite the Host's record with the fresh pointers.
+        let (old_install_code, _) = host.jit_unit_install(domain, unit);
+        let Some(funcs) = host.jit_unit_funcs(domain, unit) else {
+            continue; // no IR retained (cannot happen for a compiled unit) — skip defensively
+        };
+        let defs = fresh.define_extra(&funcs)?;
+        let d = defs[0];
+        host.set_jit_unit_native(domain, unit, d.tramp as usize, d.code as usize, d.type_id);
+        if let Some(slots) = code_to_slots.get(&(old_install_code as u64)) {
+            for &slot in slots {
+                // Exact-slot reproduction: a funcref old code holds keeps resolving to this unit.
+                fresh.install_at(slot, d.code, d.type_id);
+            }
+        }
+    }
+    Ok(fresh)
+}
+
 /// The §9/D45 **devirtualized `cap.call` fast-path resolver** for the production powerbox. It claims
 /// only the **window-independent, authority-checked** hot ops — `Clock.now` and `Blocking.work` — so
 /// they take the register-to-register fast path; every other op (all *window-touching* ones —

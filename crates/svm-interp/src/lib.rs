@@ -4941,6 +4941,34 @@ impl Host {
             .map(|u| Arc::clone(&u.funcs))
     }
 
+    /// The number of units a `Jit` domain has compiled (append-only; released units stay, their
+    /// handle merely revoked). The code-memory compaction driver (JIT.md §6) walks `0..count`
+    /// deciding which to carry into the fresh module.
+    pub fn jit_unit_count(&self, domain: u32) -> u32 {
+        self.jit_domains
+            .get(domain as usize)
+            .map_or(0, |d| d.units.len() as u32)
+    }
+
+    /// The units of `domain` still reachable through a **live `CompiledCode` handle** (a
+    /// `Binding::JitCode` entry the guest can still `invoke`/`install`/`release`). Compaction must
+    /// carry these (their trampoline pointers move, so the handle would dangle otherwise); a unit
+    /// that is neither here nor occupying a table slot is dead and is reclaimed. Scans the
+    /// host-owned handle table — small (`CAP` = 256) and done only at a quiescent compaction point.
+    pub fn jit_live_units(&self, domain: u32) -> Vec<u32> {
+        let mut units: Vec<u32> = self
+            .table
+            .iter()
+            .filter_map(|s| match s.entry {
+                Some(Binding::JitCode { domain: d, unit }) if d == domain => Some(unit),
+                _ => None,
+            })
+            .collect();
+        units.sort_unstable();
+        units.dedup();
+        units
+    }
+
     /// The native trampoline registered for a unit (`0` ⇒ none).
     pub fn jit_unit_native(&self, domain: u32, unit: u32) -> usize {
         self.jit_domains

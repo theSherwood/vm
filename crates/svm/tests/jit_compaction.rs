@@ -19,8 +19,11 @@
 //! identically before and after), **reproduces exact slot indices** (including around `uninstall`
 //! gaps), and **bounds occupancy by the live set, not the cumulative history** (the reclaim).
 
+use svm_encode::encode_module;
+use svm_interp::Host;
 use svm_ir::{Func, Module, DEFAULT_RESERVED_LOG2};
 use svm_jit::{CompiledModule, JitOutcome, Quota, TrapKind, INERT_CAP_THUNK};
+use svm_run::{grant_jit, recompact_jit};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -233,4 +236,230 @@ fn install_at_rejects_invalid_targets() {
     );
     // Quiescent between runs — an embedder checks this before swapping in a compacted module.
     assert!(!cm.is_running());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Embedder-integrated compaction (svm-run `recompact_jit` + the `Host` unit/handle plumbing).
+//
+// These go through the *real* `Host` unit tracking — `jit_compile` stores a unit's IR and mints a
+// `CompiledCode` handle; `set_jit_unit_native` records its native pointers; `jit_live_units` /
+// `installed_slots` are what `recompact_jit` enumerates — driving the compile/install/release
+// sequence from Rust exactly as `svm_run::jit_native_op` does from a guest `cap.call`. The dispatch
+// itself runs real JIT `call_indirect` over the live window.
+//
+// Oracle: **compacting-JIT vs non-compacting-JIT** over a persistent-window REPL. (An interp↔JIT
+// differential across *multiple* runs is blocked by the reference interp rebuilding its dispatch
+// table per run — the separately-tracked shared-table refactor; JIT.md §6 "Remaining work" #2 — so
+// single-run correctness stays differential in `jit_cap.rs` and *transparency across the swap* is
+// pinned here against the non-compacting JIT, the production backend.)
+
+/// A unit blob `(i32, i32) -> (i32)` = `a * b + k`, declaring the parent's `memory 16` so it passes
+/// the `Jit` memory-match precondition.
+fn unit_blob(k: i32) -> Vec<u8> {
+    let src = format!(
+        "memory 16\nfunc (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n  v2 = i32.mul v0 v1\n  v3 = i32.const {k}\n  v4 = i32.add v2 v3\n  return v4\n}}\n"
+    );
+    let m = parse_module(&src).expect("parse blob");
+    verify_module(&m).expect("verify blob");
+    encode_module(&m)
+}
+
+/// The REPL shell program: `(slot, x) -> (i32)` dispatches `unit[slot](x, x)` and **accumulates the
+/// result into window[0]** — so the running total persists across prompts (each prompt is a fresh
+/// `run` seeded with the prior prompt's final window), and compaction between prompts must leave
+/// both the installed slot and that window state untouched.
+const REPL_SHELL: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = call_indirect (i32, i32) -> (i32) v0 (v1, v1)\n  v3 = i64.const 0\n  v4 = i32.load v3\n  v5 = i32.add v4 v2\n  i32.store v3 v5\n  return v5\n}\n";
+
+/// Compile a unit into the live module exactly as the guest-driven `compile` op does: validate +
+/// store it in the `Host` (minting a `CompiledCode` handle), lower it (`define_extra`), and register
+/// its native pointers. Returns `(unit, code_handle)`.
+fn host_define(host: &mut Host, cm: &mut CompiledModule, jit_h: i32, blob: &[u8]) -> (u32, i32) {
+    let c = host
+        .jit_compile(jit_h, blob)
+        .expect("jit domain")
+        .expect("validate");
+    let funcs = host.jit_unit_funcs(c.domain, c.unit).expect("unit funcs");
+    let defs = cm.define_extra(&funcs).expect("define_extra");
+    host.set_jit_unit_native(
+        c.domain,
+        c.unit,
+        defs[0].tramp as usize,
+        defs[0].code as usize,
+        defs[0].type_id,
+    );
+    (c.unit, c.handle)
+}
+
+/// Run one REPL of `n` redefine+call prompts over a persistent window, optionally compacting every
+/// `compact_every` prompts. Each prompt **redefines** the one live function (release + uninstall the
+/// previous, compile + install the new at the reused slot) then **calls** it, accumulating. Returns
+/// `(per-call results, final window low bytes, final extra-fn occupancy)`.
+fn run_repl(table_log2: u8, n: usize, compact_every: Option<usize>) -> (Vec<i64>, Vec<u8>, usize) {
+    let base = parse_module(REPL_SHELL).expect("parse shell");
+    verify_module(&base).expect("verify shell");
+    let mut host = Host::new();
+    let jit_h = grant_jit(&mut host, &base, table_log2);
+    let domain = host.resolve_jit_domain(jit_h).expect("domain");
+    let mut cm = CompiledModule::compile(
+        &base,
+        0,
+        INERT_CAP_THUNK,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        table_log2,
+    )
+    .expect("compile shell");
+
+    let mut mem = vec![0u8; 1 << 18];
+    let mut results = Vec::new();
+    let mut cur: Option<(i32 /*handle*/, u32 /*slot*/)> = None;
+    for i in 0..n {
+        // Redefine: drop the previous definition (the REPL releasing its handle + freeing the slot),
+        // so it becomes dead code the next compaction reclaims.
+        if let Some((h, slot)) = cur.take() {
+            host.jit_release(h).expect("release");
+            assert!(cm.uninstall(slot), "uninstall previous");
+        }
+        let (unit, handle) = host_define(&mut host, &mut cm, jit_h, &unit_blob(10));
+        let (code, type_id) = host.jit_unit_install(domain, unit);
+        let slot = cm.install(code as *const u8, type_id).expect("install");
+        cur = Some((handle, slot));
+
+        // Call: dispatch the live slot with x = i + 2; the accumulator lives in window[0].
+        let x = (i as i64) + 2;
+        let (out, m2) = cm
+            .run(&[slot as i64, x], Some(&mem), Some(1 << 18), None)
+            .expect("dispatch run");
+        mem = m2;
+        match out {
+            JitOutcome::Returned(s) if s.len() == 1 => results.push(s[0]),
+            other => panic!("dispatch returned {other:?}"),
+        }
+
+        if let Some(every) = compact_every {
+            if (i + 1) % every == 0 {
+                // Quiescent point (between runs): reclaim the dead definitions.
+                cm = recompact_jit(
+                    &base,
+                    0,
+                    DEFAULT_RESERVED_LOG2,
+                    table_log2,
+                    &mut host,
+                    domain,
+                    &cm,
+                )
+                .expect("recompact");
+            }
+        }
+    }
+    (results, mem[..16].to_vec(), cm.extra_fn_count())
+}
+
+/// **Compaction is transparent and reclaims** through the real `Host`/`recompact_jit` path: a
+/// 20-prompt REPL that redefines one function each prompt produces byte-identical per-call results
+/// and window state whether or not it compacts every 5 prompts — but the compacting run's code-arena
+/// occupancy stays bounded by the one live definition while the non-compacting run accumulates all 20.
+#[test]
+fn repl_recompaction_is_transparent_and_reclaims() {
+    let (r_plain, m_plain, occ_plain) = run_repl(6, 20, None);
+    let (r_comp, m_comp, occ_comp) = run_repl(6, 20, Some(5));
+
+    assert_eq!(r_plain, r_comp, "per-call results must be identical");
+    assert_eq!(m_plain, m_comp, "persistent window must be identical");
+    // Sanity: the accumulator actually advanced (x=2..21, each unit(x,x) = x*x + 10).
+    let expect_last: i64 = (0..20).map(|i| ((i + 2) * (i + 2) + 10) as i64).sum();
+    assert_eq!(*r_comp.last().unwrap(), expect_last);
+
+    // Reclaim: the non-compacting run carries all 20 definitions; the compacting run only the live one.
+    assert!(
+        occ_plain >= 40,
+        "non-compacting arena should hold every definition, got {occ_plain}"
+    );
+    assert!(
+        occ_comp <= 4 && occ_comp < occ_plain,
+        "compaction must bound occupancy by the live set: {occ_comp} (plain {occ_plain})"
+    );
+}
+
+/// Compaction carries an **invoke-only, never-installed** unit when its `CompiledCode` handle is
+/// still live (the `jit_live_units` branch of `recompact_jit`): its trampoline pointer moves across
+/// the swap, so `recompact_jit` must remap the `Host` unit→native record for the existing handle to
+/// keep invoking the right code — alongside a separately-installed unit reached by `call_indirect`.
+#[test]
+fn recompaction_carries_live_invoke_only_unit() {
+    let base = parse_module(REPL_SHELL).expect("parse shell");
+    verify_module(&base).expect("verify shell");
+    let table_log2 = 4;
+    let mut host = Host::new();
+    let jit_h = grant_jit(&mut host, &base, table_log2);
+    let domain = host.resolve_jit_domain(jit_h).expect("domain");
+    let mut cm = CompiledModule::compile(
+        &base,
+        0,
+        INERT_CAP_THUNK,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        table_log2,
+    )
+    .expect("compile shell");
+
+    // Unit U: invoke-only (handle kept, never installed). a*b + 7.
+    let (u_unit, _u_handle) = host_define(&mut host, &mut cm, jit_h, &unit_blob(7));
+    // Unit V: installed at a slot, reached by call_indirect. a*b + 99.
+    let (v_unit, _v_handle) = host_define(&mut host, &mut cm, jit_h, &unit_blob(99));
+    let (v_code, v_tid) = host.jit_unit_install(domain, v_unit);
+    let v_slot = cm.install(v_code as *const u8, v_tid).expect("install V");
+
+    // Before: invoke U directly through its trampoline (3*4 + 7 = 19).
+    let u_tramp_before = host.jit_unit_native(domain, u_unit);
+    let (out, _) = unsafe { cm.run_extra(u_tramp_before as *const u8, 2, 1, &[3, 4], None) }
+        .expect("invoke U");
+    assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[19]));
+
+    // Compact: both U (live handle) and V (installed) must be carried.
+    let mut cm2 = recompact_jit(
+        &base,
+        0,
+        DEFAULT_RESERVED_LOG2,
+        table_log2,
+        &mut host,
+        domain,
+        &cm,
+    )
+    .expect("recompact");
+    drop(cm); // free the old arena; both units now live only in cm2
+
+    // After: U's trampoline moved, but its handle still names (domain, u_unit) → the Host record was
+    // remapped, so invoking through the *new* trampoline gives the same result.
+    let u_tramp_after = host.jit_unit_native(domain, u_unit);
+    assert_ne!(
+        u_tramp_after, u_tramp_before,
+        "trampoline must have moved into the fresh arena"
+    );
+    let (out, _) = unsafe { cm2.run_extra(u_tramp_after as *const u8, 2, 1, &[3, 4], None) }
+        .expect("invoke U after compaction");
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[19]),
+        "live invoke-only unit must survive compaction: {out:?}"
+    );
+
+    // And V is still reachable at its exact slot via call_indirect (5*6 + 99 = 129).
+    let (out, _) = cm2
+        .run(&[v_slot as i64, 5, 6], None, Some(1 << 18), None)
+        .expect("dispatch V");
+    // (slot, x) shell: but V's slot dispatch uses the shell entry (slot, x) -> unit[slot](x,x).
+    match out {
+        JitOutcome::Returned(s) if s.len() == 1 => assert_eq!(s[0], 5 * 5 + 99),
+        other => panic!("dispatch V returned {other:?}"),
+    }
 }

@@ -1946,6 +1946,22 @@ impl CompiledModule {
         true
     }
 
+    /// The currently-occupied **installable** slots (`≥ n_real_funcs`) of the `call_indirect`
+    /// table, as `(slot, code, type_id)`. The reclaim driver (JIT.md §6) reads this from the
+    /// *old* module to learn which units occupy which slots, joins each `code` back to its owning
+    /// unit (via the embedder's per-unit install record), and reproduces the exact slot in the
+    /// fresh module with [`Self::install_at`]. Real module-function slots (`< n_real_funcs`) are
+    /// excluded — they are reproduced by `compile` itself, not by the driver.
+    pub fn installed_slots(&self) -> Vec<(u32, u64, u32)> {
+        self.fn_table
+            .iter()
+            .enumerate()
+            .skip(self.n_real_funcs)
+            .filter(|(_, e)| e.type_id != PADDING_TYPE_ID)
+            .map(|(i, e)| (i as u32, e.code, e.type_id))
+            .collect()
+    }
+
     /// The number of extra (`define_extra`) functions+trampolines this module has lowered over its
     /// life — a monotonic proxy for code-arena occupancy (cranelift-jit exposes no byte count, and
     /// has no per-function free, so this only grows). An embedder watches it to decide when to
