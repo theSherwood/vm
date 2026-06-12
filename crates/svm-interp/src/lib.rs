@@ -7396,3 +7396,115 @@ mod prot_tests {
         assert_eq!(m.map_region(65536, 0, page(), PROT_READ, 0, r), EINVAL); // window past reserved
     }
 }
+
+#[cfg(test)]
+mod domain_table_tests {
+    //! The shared, live [`DomainTable`] (JIT.md §6 #2): an `install` on one vCPU's view is visible to
+    //! every vCPU sharing the `Arc` — the threaded-install / install-during-own-invocation
+    //! faithfulness the reference interpreter previously lacked (a per-vCPU table snapshot hid a
+    //! post-spawn install from a worker, diverging from the JIT's one shared `fn_table`). Slot reads
+    //! are lock-free atomic loads; the units backing resolves via a lazily-resynced local clone.
+    use super::*;
+    use svm_ir::{Func, ValType};
+
+    /// A one-function unit `(i32 × n) -> (i32)` — blocks are irrelevant to table mechanics.
+    fn unit(n: usize) -> Arc<[Func]> {
+        Arc::from(vec![Func {
+            params: vec![ValType::I32; n],
+            results: vec![ValType::I32],
+            blocks: Vec::new(),
+        }])
+    }
+
+    fn sig(n: usize) -> FuncType {
+        FuncType {
+            params: vec![ValType::I32; n],
+            results: vec![ValType::I32],
+        }
+    }
+
+    /// **The faithfulness property:** an `install` is visible to another vCPU sharing the domain's
+    /// `Arc<DomainTable>` (the `thread.spawn` / `Jit.invoke` child) *immediately* — not snapshotted.
+    #[test]
+    fn install_is_visible_across_a_shared_view() {
+        let parent: Arc<[Func]> = unit(1); // module 0: one (i32)->(i32) function
+        let dt = Arc::new(DomainTable::new(&parent, 3)); // reserve 8 slots → padding at 1..8
+        assert_eq!(dt.slot(0).module, 0);
+        assert_eq!(dt.slot(1).module, TABLE_EMPTY);
+
+        // A second view — a worker thread / invoke child sharing the same live table.
+        let worker = Arc::clone(&dt);
+
+        let slot = dt.install(unit(2)).expect("install"); // a (i32,i32)->(i32) unit
+        assert_eq!(
+            slot, 1,
+            "first padding slot is just past the 1 module function"
+        );
+
+        // The worker observes the install at once (shared, not a stale snapshot).
+        assert_eq!(worker.slot(1).module, 1, "module id = units[0]");
+        assert_eq!(worker.units_snapshot().len(), 1);
+
+        // Resolve it through the worker's *stale* (empty) local cache — it re-syncs and finds the
+        // unit, with the right signature. This is the dispatch path a worker takes.
+        let mut local: Vec<Arc<[Func]>> = Vec::new();
+        let got = dispatch_indirect(&worker, &parent, &mut local, &None, 1, &sig(2));
+        assert_eq!(got, Ok((1, 0)));
+        assert_eq!(local.len(), 1, "the miss re-synced the local prefix");
+        // A signature mismatch on the same slot traps fail-closed.
+        assert_eq!(
+            dispatch_indirect(&worker, &parent, &mut local, &None, 1, &sig(1)),
+            Err(Trap::IndirectCallType)
+        );
+    }
+
+    /// `uninstall` clears a slot back to trapping padding and guards real-function / out-of-range /
+    /// already-empty slots; the change is likewise visible across a shared view.
+    #[test]
+    fn uninstall_clears_and_guards() {
+        let parent: Arc<[Func]> = unit(1);
+        let dt = Arc::new(DomainTable::new(&parent, 2)); // 4 slots, 1 real func
+        let slot = dt.install(unit(1)).expect("install") as usize;
+        assert_eq!(slot, 1);
+        assert!(!dt.uninstall(0, 1), "slot 0 is the real function");
+        assert!(!dt.uninstall(99, 1), "out of range");
+        assert!(dt.uninstall(slot, 1), "installed padding slot clears");
+        assert_eq!(dt.slot(slot).module, TABLE_EMPTY);
+        assert!(!dt.uninstall(slot, 1), "already empty");
+        // A stale `call_indirect` of the cleared slot now traps.
+        let mut local: Vec<Arc<[Func]>> = Vec::new();
+        assert_eq!(
+            dispatch_indirect(&dt, &parent, &mut local, &None, slot as i32, &sig(1)),
+            Err(Trap::IndirectCallType)
+        );
+    }
+
+    /// `resolve_module` routes the three module classes: 0 → the program, `INVOKE_MODULE` → the
+    /// invoked unit (kept out of the shared `units`, so it never collides with an install), and
+    /// `k ≥ 1` → an installed unit (via the lazily-resynced local clone).
+    #[test]
+    fn resolve_module_routes_program_invoke_and_installed() {
+        let parent: Arc<[Func]> = unit(1);
+        let dt = Arc::new(DomainTable::new(&parent, 2));
+        dt.install(unit(2)).expect("install"); // module 1
+        let invoked = Some(unit(3));
+        let mut local: Vec<Arc<[Func]>> = Vec::new();
+
+        let m0 = resolve_module(&parent, &mut local, &None, &dt, 0).unwrap();
+        assert_eq!(m0[0].params.len(), 1);
+        let mi = resolve_module(&parent, &mut local, &invoked, &dt, INVOKE_MODULE).unwrap();
+        assert_eq!(
+            mi[0].params.len(),
+            3,
+            "the invoked unit, not an installed module"
+        );
+        let m1 = resolve_module(&parent, &mut local, &None, &dt, 1).unwrap();
+        assert_eq!(
+            m1[0].params.len(),
+            2,
+            "installed unit, resolved via a re-synced local cache"
+        );
+        // An out-of-range module (a forged/stale slot) yields None → the caller traps.
+        assert!(resolve_module(&parent, &mut local, &None, &dt, 9).is_none());
+    }
+}
