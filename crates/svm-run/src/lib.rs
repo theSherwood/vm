@@ -1866,6 +1866,71 @@ fn typed(t: ValType, v: i64) -> Value {
     }
 }
 
+/// Compile `module`'s entry, register the live module for the `Jit` cap's mid-run re-entry, and run
+/// it over `slots` under the §5 kill-path armed by `interrupt`. A **concurrent** guest (`locked` is
+/// `Some`) runs the serialized [`cap_thunk_locked`] over a per-domain `Mutex<Host>` — so worker
+/// threads can `cap.call` (incl. threaded `Jit.compile`) without racing — and forgoes the
+/// single-threaded-only D45 fast path; a single-threaded guest keeps the unlocked [`cap_thunk`] +
+/// raw `*mut Host` + [`fast_cap_resolver`] exactly as before (zero lock cost). Exactly one of
+/// `locked` / `raw_host` is used.
+///
+/// # Safety
+/// `raw_host` (when `locked` is `None`) is a live `*mut Host`; `interrupt` (when `Some`) outlives the
+/// call; the same `cap_thunk`/ctx/resolver contracts as [`run_powerbox_with_deadline_and_quota`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn powerbox_compile_run(
+    module: &Module,
+    locked: Option<&Mutex<Host>>,
+    raw_host: *mut Host,
+    slots: &[i64],
+    interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    quota: svm_jit::Quota,
+) -> Result<JitOutcome, svm_jit::JitError> {
+    let interrupt_ptr = interrupt.map(std::sync::Arc::as_ptr);
+    if let Some(m) = locked {
+        let ctx = m as *const Mutex<Host> as *mut c_void;
+        let mut cm = CompiledModule::compile(
+            module,
+            0,
+            cap_thunk_locked,
+            ctx,
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            interrupt_ptr,
+            None, // no D45 fast path: the fast fns deref a raw `*mut Host`, not a `Mutex<Host>`
+            quota,
+            CLI_JIT_TABLE_LOG2,
+        )?;
+        m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+        let r = CompiledModule::run_raw(&mut cm, slots, None, None, None);
+        m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_jit_native_ctx(0);
+        return r.map(|(out, _)| out);
+    }
+    let mut cm = CompiledModule::compile(
+        module,
+        0,
+        cap_thunk,
+        raw_host as *mut c_void,
+        svm_ir::DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        interrupt_ptr,
+        Some(fast_cap_resolver),
+        quota,
+        CLI_JIT_TABLE_LOG2,
+    )?;
+    let host = &mut *raw_host;
+    host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+    let r = CompiledModule::run_raw(&mut cm, slots, None, None, None);
+    host.set_jit_native_ctx(0);
+    r.map(|(out, _)| out)
+}
+
 /// Run `module`'s entry (function 0) on the JIT under the MVP powerbox (§3e): a writable
 /// `stdout`, a readable `stdin` seeded from `stdin`, and `Exit` — the three handles the
 /// frontend's `_start` expects, granted in declared order. Returns the outcome and captured
@@ -1950,80 +2015,56 @@ pub fn run_powerbox_with_deadline_and_quota(
         max_fibers: hq.max_fibers,
         max_vcpus: hq.max_vcpus,
     };
-    let ctx = &mut host as *mut Host as *mut c_void;
-    // The long-lived compile→run split (JIT.md Phase 1): compile once, register the live module
-    // for the `Jit` capability's mid-run re-entry (define_extra / invoke_extra from `cap_thunk`),
-    // then run through the same caller-managed pointer (`run_raw`'s provenance contract).
-    // Behavior-identical to the historical one-shot entry points for a guest that never uses the
-    // `Jit` cap — they are thin wrappers over this same machinery.
+    // The long-lived compile→run split (JIT.md Phase 1): compile once, register the live module for
+    // the `Jit` cap's mid-run re-entry, run through one caller-managed pointer. A **concurrent**
+    // guest (`thread.spawn`) takes the serialized cap-thunk over a per-domain `Mutex<Host>` so its
+    // workers can `cap.call` (incl. threaded `Jit.compile`, JIT.md §6 #2) safely; a single-threaded
+    // guest keeps the unlocked fast path verbatim (zero lock cost). See [`powerbox_compile_run`].
+    let concurrent = module.funcs.iter().any(|f| f.uses_concurrency());
     //
     // §5 fuel/epoch kill-path: when a `deadline` is given, arm the JIT's interrupt poll with a
     // watchdog so a runaway guest is stopped after the deadline instead of hanging the process.
-    // `None` ⇒ the ordinary unbounded run. The watchdog wakes early when the run finishes, so a
-    // fast program is never delayed.
-    let jit = if let Some(d) = deadline.filter(|d| !d.is_zero()) {
-        let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let wd = interrupt.clone();
-        let watchdog = std::thread::spawn(move || {
-            // Timed out (or the run dropped the sender) ⇒ request the kill.
-            if done_rx.recv_timeout(d).is_err() {
-                wd.store(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        });
-        // SAFETY: `interrupt` (an `Arc<AtomicU64>`) outlives the run — it is dropped only after the
-        // watchdog is joined below; `cap_thunk`/`ctx`/`fast_cap_resolver` honour their contracts.
-        let r = CompiledModule::compile(
-            module,
-            0,
-            cap_thunk,
-            ctx,
-            svm_ir::DEFAULT_RESERVED_LOG2,
-            None,
-            None,
-            Some(std::sync::Arc::as_ptr(&interrupt)),
-            Some(fast_cap_resolver),
-            quota,
-            CLI_JIT_TABLE_LOG2, // reserve install room (JIT.md Model B2)
-        )
-        .and_then(|mut cm| {
-            let cm_ptr: *mut CompiledModule = &mut cm;
-            host.set_jit_native_ctx(cm_ptr as usize);
-            // SAFETY: `cm_ptr` is the single pointer for this run (registered above for the
-            // thunk's `Jit` handlers); the run is on this thread; `init_mem`/snapshot unused.
-            let r = unsafe { CompiledModule::run_raw(cm_ptr, &slots, None, None, None) };
-            host.set_jit_native_ctx(0);
-            r.map(|(out, _)| out)
-        });
-        let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
-        let _ = watchdog.join();
+    // The watchdog wakes early when the run finishes, so a fast program is never delayed.
+    let (interrupt, watchdog) = match deadline.filter(|d| !d.is_zero()) {
+        Some(d) => {
+            let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let wd = interrupt.clone();
+            let handle = std::thread::spawn(move || {
+                // Timed out (or the run dropped the sender) ⇒ request the kill.
+                if done_rx.recv_timeout(d).is_err() {
+                    wd.store(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            (Some(interrupt), Some((done_tx, handle)))
+        }
+        None => (None, None),
+    };
+    // SAFETY: `interrupt` (an `Arc<AtomicU64>`) outlives the run — dropped only after the watchdog
+    // is joined below; the host ctx (locked or raw) lives across the run; the thunk/ctx/resolver
+    // honour their contracts.
+    let jit = if concurrent {
+        let m = Mutex::new(std::mem::take(&mut host));
+        let r = unsafe {
+            powerbox_compile_run(
+                module,
+                Some(&m),
+                std::ptr::null_mut(),
+                &slots,
+                interrupt.as_ref(),
+                quota,
+            )
+        };
+        host = m.into_inner().unwrap_or_else(|e| e.into_inner());
         r
     } else {
-        // The §9/D45 fast path for the hot window-independent ops (Clock/Blocking); everything else
-        // falls back to `cap_thunk` inside the resolver, so the run is otherwise identical.
-        CompiledModule::compile(
-            module,
-            0,
-            cap_thunk,
-            ctx,
-            svm_ir::DEFAULT_RESERVED_LOG2,
-            None,
-            None,
-            None,
-            Some(fast_cap_resolver),
-            quota,
-            CLI_JIT_TABLE_LOG2,
-        )
-        .and_then(|mut cm| {
-            let cm_ptr: *mut CompiledModule = &mut cm;
-            host.set_jit_native_ctx(cm_ptr as usize);
-            // SAFETY: as above — the single caller-managed pointer for this run.
-            let r = unsafe { CompiledModule::run_raw(cm_ptr, &slots, None, None, None) };
-            host.set_jit_native_ctx(0);
-            r.map(|(out, _)| out)
-        })
+        unsafe { powerbox_compile_run(module, None, &mut host, &slots, interrupt.as_ref(), quota) }
+    };
+    if let Some((done_tx, handle)) = watchdog {
+        let _ = done_tx.send(()); // run finished — wake the watchdog so it exits promptly
+        let _ = handle.join();
     }
-    .map_err(|e| format!("JIT compile failed: {e:?}"))?;
+    let jit = jit.map_err(|e| format!("JIT compile failed: {e:?}"))?;
 
     let outcome = match jit {
         JitOutcome::Returned(s) => {
