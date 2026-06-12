@@ -223,7 +223,12 @@ mod tests {
         for _ in 0..2_000_000 {
             let addr = rng.next();
             let offset = rng.next();
-            let width = (rng.next() % 8 + 1) as u32; // 1..=8
+            // 1..=8 scalar widths, plus 16 for the §17 `v128` access (D58) — the masking unit is
+            // width-parametric, so the wider SIMD access is covered by the same invariant.
+            let width = match rng.next() % 9 {
+                8 => 16,
+                k => (k + 1) as u32,
+            };
             let size_log2 = (rng.next() % 66) as u8; // include out-of-range (clamped)
 
             let w = Window::new(size_log2);
@@ -258,7 +263,10 @@ mod tests {
         for _ in 0..2_000_000 {
             let addr = rng.next();
             let offset = rng.next();
-            let width = (rng.next() % 8 + 1) as u32; // 1..=8
+            let width = match rng.next() % 9 {
+                8 => 16, // §17 `v128` width (D58)
+                k => (k + 1) as u32,
+            };
             let reserved_log2 = (rng.next() % 66) as u8; // include out-of-range (clamped)
                                                          // A `mapped` biased to land both below and at/above `reserved` (clamped).
             let reserved = 1u64 << (reserved_log2.min(63));
@@ -380,7 +388,10 @@ mod tests {
             let base_in = rng.next();
             let addr = rng.next();
             let offset = rng.next();
-            let width = (rng.next() % 8 + 1) as u32; // 1..=8
+            let width = match rng.next() % 9 {
+                8 => 16, // §17 `v128` width (D58)
+                k => (k + 1) as u32,
+            };
             let reserved_log2 = (rng.next() % 66) as u8; // include out-of-range (clamped)
             let reserved = 1u64 << reserved_log2.min(63);
             let mask = reserved - 1;

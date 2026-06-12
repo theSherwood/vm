@@ -79,6 +79,13 @@ pub enum VerifyError {
     /// An atomic carried an ordering its op can't have: a load with release semantics, or a store
     /// with acquire semantics (§12 / C11).
     BadAtomicOrdering { func: u32, block: u32 },
+    /// A `<shape>.extract_lane`/`replace_lane` named a lane index `>= shape.lanes()`, or an
+    /// `i8x16.shuffle` byte index `>= 32` (§17). Lane indices are immediates, so this is a
+    /// structural check.
+    BadSimdLane { func: u32, block: u32 },
+    /// A lane-wise op was given a shape of the wrong category — an integer op on a float shape
+    /// or a float op on an integer shape (§17).
+    BadSimdShape { func: u32, block: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -327,6 +334,18 @@ fn check_inst(
         cx.expect(*value, ty.val())?;
         return Ok(None);
     }
+    // §17 `v128.store` — the third no-result memory op (a 16-byte masked access).
+    if let Inst::V128Store { addr, value, .. } = inst {
+        if !has_memory {
+            return Err(VerifyError::MemoryNotDeclared {
+                func: fi,
+                block: bi,
+            });
+        }
+        cx.expect(*addr, ValType::I64)?;
+        cx.expect(*value, ValType::V128)?;
+        return Ok(None);
+    }
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
@@ -514,9 +533,116 @@ fn check_inst(
         // A standalone fence produces no value and needs no memory or operands (any ordering is
         // valid for a fence) — accept it directly.
         Inst::AtomicFence { .. } => return Ok(None),
+
+        // ----- §17 SIMD (D58): total lane-typing rules -----
+        Inst::ConstV128(_) => ValType::V128,
+        Inst::V128Load { addr, .. } => {
+            if !has_memory {
+                return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*addr, ValType::I64)?;
+            ValType::V128
+        }
+        Inst::Splat { shape, a } => {
+            cx.expect(*a, shape.lane_val())?;
+            ValType::V128
+        }
+        Inst::ExtractLane { shape, lane, a, .. } => {
+            if *lane >= shape.lanes() {
+                return Err(VerifyError::BadSimdLane {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            shape.lane_val()
+        }
+        Inst::ReplaceLane {
+            shape, lane, a, b, ..
+        } => {
+            if *lane >= shape.lanes() {
+                return Err(VerifyError::BadSimdLane {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, shape.lane_val())?;
+            ValType::V128
+        }
+        Inst::VIntBin { shape, a, b, .. } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::VFloatBin { shape, a, b, .. } => {
+            if !shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::VFloatUn { shape, a, .. } => {
+            if !shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::VBitBin { a, b, .. } => {
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::VNot { a } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::Bitselect { a, b, mask } => {
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            cx.expect(*mask, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::Shuffle { lanes, a, b } => {
+            // Each byte index selects from the 32-byte `a ++ b`; ≥32 is structurally invalid.
+            if lanes.iter().any(|&l| l >= 32) {
+                return Err(VerifyError::BadSimdLane {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::Swizzle { a, b } => {
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::SimdWidthBytes => ValType::I32,
+
         // Handled before/around the match; listed for exhaustiveness (no panic).
         Inst::Store { .. }
         | Inst::AtomicStore { .. }
+        | Inst::V128Store { .. }
         | Inst::Call { .. }
         | Inst::RefFunc { .. }
         | Inst::CallIndirect { .. }

@@ -157,6 +157,14 @@ impl Gen {
             _ => self.u64v(),
         }
     }
+    /// 16 random bytes for a `v128.const` (§17). Built from two `u64v` draws so the lane
+    /// patterns are varied across the whole vector.
+    fn v128bytes(&mut self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&self.u64v().to_le_bytes());
+        b[8..].copy_from_slice(&self.u64v().to_le_bytes());
+        b
+    }
 }
 
 /// Per-block builder: the typed value pool, the instruction list, and the next SSA index.
@@ -214,6 +222,7 @@ impl<'g> BB<'g> {
             ValType::I64 => Inst::ConstI64(self.g.i64c()),
             ValType::F32 => Inst::ConstF32(self.g.f32bits()),
             ValType::F64 => Inst::ConstF64(self.g.f64bits()),
+            ValType::V128 => Inst::ConstV128(self.g.v128bytes()),
         };
         self.push(inst, ty)
     }
@@ -878,6 +887,7 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<svm_interp::Value> {
             ValType::I64 => Value::I64(g.i64c()),
             ValType::F32 => Value::F32(f32::from_bits(g.f32bits())),
             ValType::F64 => Value::F64(f64::from_bits(g.f64bits())),
+            ValType::V128 => Value::V128(g.v128bytes()),
         })
         .collect()
 }
@@ -903,6 +913,9 @@ fn to_slot(v: Value) -> i64 {
         Value::I64(x) => x,
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
+        // The entry signature never returns a v128 (the generator's entry results are scalar), so
+        // this is a total fall-through, not a live path.
+        Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
     }
 }
 fn from_slot(t: ValType, s: i64) -> Value {
@@ -911,6 +924,11 @@ fn from_slot(t: ValType, s: i64) -> Value {
         ValType::I64 => Value::I64(s),
         ValType::F32 => Value::F32(f32::from_bits(s as u32)),
         ValType::F64 => Value::F64(f64::from_bits(s as u64)),
+        ValType::V128 => {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&s.to_le_bytes());
+            Value::V128(b)
+        }
     }
 }
 fn values_equal(a: &Value, b: &Value) -> bool {

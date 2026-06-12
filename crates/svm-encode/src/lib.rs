@@ -17,7 +17,7 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
-    Terminator, ValIdx, ValType,
+    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -48,6 +48,7 @@ mod op {
     pub const T_I64: u8 = 1;
     pub const T_F32: u8 = 2;
     pub const T_F64: u8 = 3;
+    pub const T_V128: u8 = 4;
 
     // Constants.
     pub const CONST_I32: u8 = 0x10;
@@ -130,6 +131,27 @@ mod op {
     pub const ITOF_END: u8 = 0xE7;
     pub const ATOMIC_NOTIFY: u8 = 0xE8; // addr, count -> i32 woken
     pub const ATOMIC_FENCE: u8 = 0xE9; // order byte
+
+    // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
+    // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
+    pub const SIMD: u8 = 0xFE;
+    pub mod simd {
+        pub const CONST: u8 = 0x00; // + 16 raw value bytes (LE)
+        pub const LOAD: u8 = 0x01; // addr, offset (uleb), align (byte)
+        pub const STORE: u8 = 0x02; // addr, value, offset, align
+        pub const SPLAT: u8 = 0x03; // shape, a
+        pub const EXTRACT_LANE: u8 = 0x04; // shape, lane (byte), signed (byte), a
+        pub const REPLACE_LANE: u8 = 0x05; // shape, lane (byte), a, b
+        pub const VINT_BIN: u8 = 0x06; // shape, op, a, b
+        pub const VFLOAT_BIN: u8 = 0x07; // shape, op, a, b
+        pub const VFLOAT_UN: u8 = 0x08; // shape, op, a
+        pub const VBIT_BIN: u8 = 0x09; // op, a, b
+        pub const NOT: u8 = 0x0A; // a
+        pub const BITSELECT: u8 = 0x0B; // a, b, mask
+        pub const SHUFFLE: u8 = 0x0C; // 16 lane bytes, a, b
+        pub const SWIZZLE: u8 = 0x0D; // a, b
+        pub const WIDTH_BYTES: u8 = 0x0E; // (no payload) -> i32
+    }
 
     // Terminators (decoded in a separate context from instruction opcodes).
     pub const BR: u8 = 0x80;
@@ -467,7 +489,227 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(op::ATOMIC_FENCE);
             out.push(order.index());
         }
+
+        // ----- §17 SIMD (D58): prefix byte + sub-opcode -----
+        Inst::ConstV128(bytes) => {
+            out.push(op::SIMD);
+            out.push(op::simd::CONST);
+            out.extend_from_slice(bytes);
+        }
+        Inst::V128Load {
+            addr,
+            offset,
+            align,
+        } => {
+            out.push(op::SIMD);
+            out.push(op::simd::LOAD);
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *offset);
+            out.push(*align);
+        }
+        Inst::V128Store {
+            addr,
+            value,
+            offset,
+            align,
+        } => {
+            out.push(op::SIMD);
+            out.push(op::simd::STORE);
+            write_uleb(out, *addr as u64);
+            write_uleb(out, *value as u64);
+            write_uleb(out, *offset);
+            out.push(*align);
+        }
+        Inst::Splat { shape, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::SPLAT);
+            out.push(shape.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::ExtractLane {
+            shape,
+            lane,
+            signed,
+            a,
+        } => {
+            out.push(op::SIMD);
+            out.push(op::simd::EXTRACT_LANE);
+            out.push(shape.index());
+            out.push(*lane);
+            out.push(*signed as u8);
+            write_uleb(out, *a as u64);
+        }
+        Inst::ReplaceLane { shape, lane, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::REPLACE_LANE);
+            out.push(shape.index());
+            out.push(*lane);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VIntBin { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VINT_BIN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VFloatBin { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VFLOAT_BIN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VFloatUn { shape, op: o, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VFLOAT_UN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VBitBin { op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VBIT_BIN);
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VNot { a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::NOT);
+            write_uleb(out, *a as u64);
+        }
+        Inst::Bitselect { a, b, mask } => {
+            out.push(op::SIMD);
+            out.push(op::simd::BITSELECT);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+            write_uleb(out, *mask as u64);
+        }
+        Inst::Shuffle { lanes, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::SHUFFLE);
+            out.extend_from_slice(lanes);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::Swizzle { a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::SWIZZLE);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::SimdWidthBytes => {
+            out.push(op::SIMD);
+            out.push(op::simd::WIDTH_BYTES);
+        }
     }
+}
+
+/// Decode the 16 value/lane bytes of a `v128.const` / `i8x16.shuffle`.
+fn dec_byte16(c: &mut Cursor) -> Result<[u8; 16], DecodeError> {
+    let s = c.take(16)?;
+    let mut a = [0u8; 16];
+    a.copy_from_slice(s);
+    Ok(a)
+}
+
+/// Decode a [`VShape`] index byte.
+fn dec_shape(c: &mut Cursor) -> Result<VShape, DecodeError> {
+    let b = c.byte()?;
+    VShape::from_index(b).ok_or(DecodeError::BadOpcode(b))
+}
+
+/// Decode one SIMD sub-opcode (the byte after the [`op::SIMD`] prefix).
+fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let sub = c.byte()?;
+    Ok(match sub {
+        op::simd::CONST => Inst::ConstV128(dec_byte16(c)?),
+        op::simd::LOAD => Inst::V128Load {
+            addr: c.idx()?,
+            offset: c.uleb()?,
+            align: c.byte()?,
+        },
+        op::simd::STORE => Inst::V128Store {
+            addr: c.idx()?,
+            value: c.idx()?,
+            offset: c.uleb()?,
+            align: c.byte()?,
+        },
+        op::simd::SPLAT => Inst::Splat {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+        },
+        op::simd::EXTRACT_LANE => Inst::ExtractLane {
+            shape: dec_shape(c)?,
+            lane: c.byte()?,
+            signed: c.byte()? != 0,
+            a: c.idx()?,
+        },
+        op::simd::REPLACE_LANE => Inst::ReplaceLane {
+            shape: dec_shape(c)?,
+            lane: c.byte()?,
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::VINT_BIN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VIntBin {
+                shape,
+                op: VIntBinOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VFLOAT_BIN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VFloatBin {
+                shape,
+                op: VFloatBinOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VFLOAT_UN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VFloatUn {
+                shape,
+                op: VFloatUnOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VBIT_BIN => {
+            let ob = c.byte()?;
+            Inst::VBitBin {
+                op: VBitBinOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::NOT => Inst::VNot { a: c.idx()? },
+        op::simd::BITSELECT => Inst::Bitselect {
+            a: c.idx()?,
+            b: c.idx()?,
+            mask: c.idx()?,
+        },
+        op::simd::SHUFFLE => Inst::Shuffle {
+            lanes: dec_byte16(c)?,
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::SWIZZLE => Inst::Swizzle {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::WIDTH_BYTES => Inst::SimdWidthBytes,
+        other => return Err(DecodeError::BadOpcode(other)),
+    })
 }
 
 fn fbin_base(ty: FloatTy) -> u8 {
@@ -584,6 +826,7 @@ fn type_tag(t: ValType) -> u8 {
         ValType::I64 => op::T_I64,
         ValType::F32 => op::T_F32,
         ValType::F64 => op::T_F64,
+        ValType::V128 => op::T_V128,
     }
 }
 
@@ -703,6 +946,7 @@ fn decode_block(c: &mut Cursor) -> Result<Block, DecodeError> {
 fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
     let b = c.byte()?;
     Ok(match b {
+        op::SIMD => decode_simd(c)?,
         op::CONST_I32 => Inst::ConstI32(c.sleb_i32()?),
         op::CONST_I64 => Inst::ConstI64(c.sleb()?),
 
@@ -1013,6 +1257,7 @@ fn decode_type(c: &mut Cursor) -> Result<ValType, DecodeError> {
         op::T_I64 => ValType::I64,
         op::T_F32 => ValType::F32,
         op::T_F64 => ValType::F64,
+        op::T_V128 => ValType::V128,
         other => return Err(DecodeError::BadType(other)),
     })
 }

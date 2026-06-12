@@ -863,6 +863,7 @@ fn lower_func(
             ValType::I64 => lo.emit(Inst::ConstI64(0)),
             ValType::F32 => lo.emit(Inst::ConstF32(0)),
             ValType::F64 => lo.emit(Inst::ConstF64(0)),
+            ValType::V128 => lo.emit(Inst::ConstV128([0; 16])),
         };
         lo.locals.push(v);
     }
@@ -1009,10 +1010,13 @@ fn global_addr(lo: &Lower, g: u32) -> u64 {
     lo.globals_base + g as u64 * 8
 }
 /// The full-width load/store op for a value type (globals occupy whole 8-byte slots).
+/// `v128` globals are out of MVP scope (a v128 needs 16 bytes, not the 8-byte slot); the
+/// transpiler never lowers one, so the `V128` arms are unreachable placeholders that keep
+/// these helpers total.
 fn load_op(ty: ValType) -> LoadOp {
     match ty {
         ValType::I32 => LoadOp::I32,
-        ValType::I64 => LoadOp::I64,
+        ValType::I64 | ValType::V128 => LoadOp::I64,
         ValType::F32 => LoadOp::F32,
         ValType::F64 => LoadOp::F64,
     }
@@ -1020,7 +1024,7 @@ fn load_op(ty: ValType) -> LoadOp {
 fn store_op(ty: ValType) -> StoreOp {
     match ty {
         ValType::I32 => StoreOp::I32,
-        ValType::I64 => StoreOp::I64,
+        ValType::I64 | ValType::V128 => StoreOp::I64,
         ValType::F32 => StoreOp::F32,
         ValType::F64 => StoreOp::F64,
     }

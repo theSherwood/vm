@@ -57,10 +57,12 @@
 
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::types::{F32, F64, I16, I32, I64, I8};
+use cranelift_codegen::ir::types::{
+    F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
+};
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, Endianness, Function, InstBuilder,
-    JumpTableData, MemFlags, StackSlotData, StackSlotKind, Type, UserFuncName, Value,
+    AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, Function,
+    InstBuilder, JumpTableData, MemFlags, StackSlotData, StackSlotKind, Type, UserFuncName, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -68,8 +70,8 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
-    FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, ValType,
-    DEFAULT_RESERVED_LOG2,
+    FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
+    VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -406,7 +408,45 @@ fn clif_ty(t: ValType) -> Type {
         ValType::I64 => I64,
         ValType::F32 => F32,
         ValType::F64 => F64,
+        // §17/D58: a `v128` SSA value is canonically held as `I8X16`; lane ops bitcast to the
+        // shape-specific vector type and back.
+        ValType::V128 => I8X16,
     }
+}
+
+/// The shape-specific CLIF vector type for a lane op (all 128-bit).
+fn vec_ty(shape: VShape) -> Type {
+    match shape {
+        VShape::I8x16 => I8X16,
+        VShape::I16x8 => I16X8,
+        VShape::I32x4 => I32X4,
+        VShape::I64x2 => I64X2,
+        VShape::F32x4 => F32X4,
+        VShape::F64x2 => F64X2,
+    }
+}
+
+/// The CLIF **lane** type for a shape (the scalar a lane holds in CLIF).
+fn lane_clif(shape: VShape) -> Type {
+    match shape {
+        VShape::I8x16 => I8,
+        VShape::I16x8 => I16,
+        VShape::I32x4 => I32,
+        VShape::I64x2 => I64,
+        VShape::F32x4 => F32,
+        VShape::F64x2 => F64,
+    }
+}
+
+/// Reinterpret a 128-bit vector value to another 128-bit vector type (a no-op bitcast,
+/// little-endian lane order). Used to move between the canonical `I8X16` and a shape type.
+fn vcast(b: &mut FunctionBuilder, v: Value, to: Type) -> Value {
+    if b.func.dfg.value_type(v) == to {
+        return v;
+    }
+    let mut mf = MemFlags::new();
+    mf.set_endianness(Endianness::Little);
+    b.ins().bitcast(to, mf, v)
 }
 
 /// The CLIF type for an integer-class IR type (operands to int↔float conversions).
@@ -1610,6 +1650,25 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::IntBin { .. }
                 | Inst::Convert { .. } => {}
                 Inst::IntUn { .. } => {}
+                // §17 SIMD (D58): all lowered via Cranelift's native vector ops.
+                Inst::ConstV128(_)
+                | Inst::V128Load { .. }
+                | Inst::V128Store { .. }
+                | Inst::Splat { .. }
+                | Inst::ExtractLane { .. }
+                | Inst::ReplaceLane { .. }
+                | Inst::VFloatBin { .. }
+                | Inst::VFloatUn { .. }
+                | Inst::VBitBin { .. }
+                | Inst::VNot { .. }
+                | Inst::Bitselect { .. }
+                | Inst::Shuffle { .. }
+                | Inst::Swizzle { .. }
+                | Inst::SimdWidthBytes => {}
+                // `i8x16.mul` has no single-instruction lowering on the target ISAs, so Cranelift
+                // can't legalize it; bail to `Unsupported` (the interp oracle still covers it).
+                Inst::VIntBin { shape, op, .. }
+                    if !(*shape == VShape::I8x16 && *op == VIntBinOp::Mul) => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -2367,6 +2426,131 @@ fn lower_block(
                 let (from, to, signed) = op.parts();
                 lower_trunc_trap(b, lower, get(&vals, *a)?, from, to, signed)
             }
+            // ----- §17 SIMD (D58): native Cranelift vector lowering -----
+            Inst::ConstV128(bytes) => {
+                let c = b.func.dfg.constants.insert(ConstantData::from(&bytes[..]));
+                b.ins().vconst(I8X16, c)
+            }
+            Inst::V128Load { addr, offset, .. } => {
+                // The 16-byte masked access — the lone escape-TCB delta SIMD adds (§17/D58).
+                let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                b.ins().load(I8X16, mem_flags(), phys, 0)
+            }
+            Inst::V128Store {
+                addr, value, offset, ..
+            } => {
+                let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
+                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
+                b.ins().store(mem_flags(), get(&vals, *value)?, phys, 0);
+                continue; // store produces no value
+            }
+            Inst::Splat { shape, a } => {
+                let s = get(&vals, *a)?;
+                // The scalar arrives as the lane's `lane_val` (i32 for narrow ints); narrow to the
+                // CLIF lane type, splat, then canonicalize to I8X16.
+                let lane = lane_clif(*shape);
+                let s = if b.func.dfg.value_type(s) == lane {
+                    s
+                } else if lane == I8 || lane == I16 {
+                    b.ins().ireduce(lane, s)
+                } else {
+                    s
+                };
+                let v = b.ins().splat(vec_ty(*shape), s);
+                vcast(b, v, I8X16)
+            }
+            Inst::ExtractLane {
+                shape, lane, signed, a,
+            } => {
+                let v = vcast(b, get(&vals, *a)?, vec_ty(*shape));
+                let raw = b.ins().extractlane(v, *lane);
+                match shape {
+                    // Narrow integer lanes widen to the i32 result (sign/zero per `signed`).
+                    VShape::I8x16 | VShape::I16x8 => {
+                        if *signed {
+                            b.ins().sextend(I32, raw)
+                        } else {
+                            b.ins().uextend(I32, raw)
+                        }
+                    }
+                    // i32x4/i64x2/f32x4/f64x2 extract to the lane type directly.
+                    _ => raw,
+                }
+            }
+            Inst::ReplaceLane { shape, lane, a, b: rb } => {
+                let v = vcast(b, get(&vals, *a)?, vec_ty(*shape));
+                let s = get(&vals, *rb)?;
+                let lty = lane_clif(*shape);
+                let s = if b.func.dfg.value_type(s) == lty {
+                    s
+                } else if lty == I8 || lty == I16 {
+                    b.ins().ireduce(lty, s)
+                } else {
+                    s
+                };
+                let r = b.ins().insertlane(v, s, *lane);
+                vcast(b, r, I8X16)
+            }
+            Inst::VIntBin { shape, op, a, b: rb } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let r = match op {
+                    VIntBinOp::Add => b.ins().iadd(x, y),
+                    VIntBinOp::Sub => b.ins().isub(x, y),
+                    VIntBinOp::Mul => b.ins().imul(x, y),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VFloatBin { shape, op, a, b: rb } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                // Reuse the scalar float lowering — Cranelift's `fadd`/`fmin`/… are polymorphic over
+                // scalar and vector, so lanes lower the same way scalars do.
+                let r = float_bin(b, vf_bin(*op), x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VFloatUn { shape, op, a } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let r = float_un(b, vf_un(*op), x);
+                vcast(b, r, I8X16)
+            }
+            Inst::VBitBin { op, a, b: rb } => {
+                // Whole-vector — operate on the canonical I8X16 directly.
+                let x = get(&vals, *a)?;
+                let y = get(&vals, *rb)?;
+                match op {
+                    VBitBinOp::And => b.ins().band(x, y),
+                    VBitBinOp::Or => b.ins().bor(x, y),
+                    VBitBinOp::Xor => b.ins().bxor(x, y),
+                    VBitBinOp::AndNot => b.ins().band_not(x, y),
+                }
+            }
+            Inst::VNot { a } => b.ins().bnot(get(&vals, *a)?),
+            Inst::Bitselect { a, b: rb, mask } => {
+                // IR `(a & mask) | (b & !mask)` == Cranelift `bitselect(mask, a, b)`.
+                let x = get(&vals, *a)?;
+                let y = get(&vals, *rb)?;
+                let m = get(&vals, *mask)?;
+                b.ins().bitselect(m, x, y)
+            }
+            Inst::Shuffle { lanes, a, b: rb } => {
+                let x = get(&vals, *a)?;
+                let y = get(&vals, *rb)?;
+                let imm = b.func.dfg.immediates.push(ConstantData::from(&lanes[..]));
+                b.ins().shuffle(x, y, imm)
+            }
+            Inst::Swizzle { a, b: rb } => {
+                let x = get(&vals, *a)?;
+                let y = get(&vals, *rb)?;
+                b.ins().swizzle(x, y)
+            }
+            // §17/D58 feature-detect hook: the fixed-128 constant (matches the interpreter).
+            Inst::SimdWidthBytes => b.ins().iconst(I32, 16),
+
             Inst::Load {
                 op, addr, offset, ..
             } => {
@@ -3214,6 +3398,11 @@ fn decode_slot(b: &mut FunctionBuilder, slot: Value, ty: ValType) -> Value {
             b.ins().bitcast(F32, MemFlags::new(), i)
         }
         ValType::F64 => b.ins().bitcast(F64, MemFlags::new(), slot),
+        // `v128` cap-ABI slots are out of MVP scope (§17); a zero vector keeps this total.
+        ValType::V128 => {
+            let z = b.ins().iconst(I8, 0);
+            b.ins().splat(I8X16, z)
+        }
     }
 }
 
@@ -3229,6 +3418,26 @@ fn encode_slot(b: &mut FunctionBuilder, v: Value) -> Value {
         }
         F64 => b.ins().bitcast(I64, MemFlags::new(), v),
         _ => v,
+    }
+}
+
+/// Map a vector float op to the scalar [`FBinOp`]/[`FUnOp`] so vector lanes lower exactly
+/// like scalars (§17/D58).
+fn vf_bin(op: VFloatBinOp) -> FBinOp {
+    match op {
+        VFloatBinOp::Add => FBinOp::Add,
+        VFloatBinOp::Sub => FBinOp::Sub,
+        VFloatBinOp::Mul => FBinOp::Mul,
+        VFloatBinOp::Div => FBinOp::Div,
+        VFloatBinOp::Min => FBinOp::Min,
+        VFloatBinOp::Max => FBinOp::Max,
+    }
+}
+fn vf_un(op: VFloatUnOp) -> FUnOp {
+    match op {
+        VFloatUnOp::Abs => FUnOp::Abs,
+        VFloatUnOp::Neg => FUnOp::Neg,
+        VFloatUnOp::Sqrt => FUnOp::Sqrt,
     }
 }
 

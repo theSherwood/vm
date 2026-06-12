@@ -24,12 +24,15 @@ pub type BlockIdx = u32;
 pub type FuncIdx = u32;
 
 /// SSA value types. `i8`/`i16` are memory access *widths*, not value types (§3a).
+/// `v128` is the fixed-128 SIMD vector (§17/D58): a first-class value carrying 16
+/// raw bytes whose lane interpretation is per-op, never per-value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum ValType {
     I32,
     I64,
     F32,
     F64,
+    V128,
 }
 
 impl ValType {
@@ -40,6 +43,7 @@ impl ValType {
             ValType::I64 => "i64",
             ValType::F32 => "f32",
             ValType::F64 => "f64",
+            ValType::V128 => "v128",
         }
     }
 
@@ -51,8 +55,222 @@ impl ValType {
             "i64" => ValType::I64,
             "f32" => ValType::F32,
             "f64" => ValType::F64,
+            "v128" => ValType::V128,
             _ => return None,
         })
+    }
+}
+
+/// A `v128` **lane shape** (§17/D58): how a 16-byte vector is split into typed lanes
+/// for one op. The shape is carried by the op, never by the `v128` value itself — the
+/// same bytes are reinterpreted per instruction, exactly like hardware SIMD.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VShape {
+    I8x16,
+    I16x8,
+    I32x4,
+    I64x2,
+    F32x4,
+    F64x2,
+}
+
+impl VShape {
+    pub const ALL: [VShape; 6] = [
+        VShape::I8x16,
+        VShape::I16x8,
+        VShape::I32x4,
+        VShape::I64x2,
+        VShape::F32x4,
+        VShape::F64x2,
+    ];
+    /// Number of lanes.
+    pub fn lanes(self) -> u8 {
+        match self {
+            VShape::I8x16 => 16,
+            VShape::I16x8 => 8,
+            VShape::I32x4 | VShape::F32x4 => 4,
+            VShape::I64x2 | VShape::F64x2 => 2,
+        }
+    }
+    /// Lane width in bytes.
+    pub fn lane_bytes(self) -> u32 {
+        match self {
+            VShape::I8x16 => 1,
+            VShape::I16x8 => 2,
+            VShape::I32x4 | VShape::F32x4 => 4,
+            VShape::I64x2 | VShape::F64x2 => 8,
+        }
+    }
+    /// Whether the lanes are floating-point.
+    pub fn is_float(self) -> bool {
+        matches!(self, VShape::F32x4 | VShape::F64x2)
+    }
+    /// The **scalar** value type a lane extracts to / splats from / replaces with.
+    /// Narrow integer lanes (`i8`/`i16`) widen to `i32` (the lane scalar is an `i32`),
+    /// matching the wasm/hardware convention.
+    pub fn lane_val(self) -> ValType {
+        match self {
+            VShape::I8x16 | VShape::I16x8 | VShape::I32x4 => ValType::I32,
+            VShape::I64x2 => ValType::I64,
+            VShape::F32x4 => ValType::F32,
+            VShape::F64x2 => ValType::F64,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            VShape::I8x16 => "i8x16",
+            VShape::I16x8 => "i16x8",
+            VShape::I32x4 => "i32x4",
+            VShape::I64x2 => "i64x2",
+            VShape::F32x4 => "f32x4",
+            VShape::F64x2 => "f64x2",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VShape> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VShape> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise binary integer ops on a `v128` (§17). Defined for every integer [`VShape`]
+/// (the JIT may lower a shape to several instructions — e.g. `i64x2.mul` — but the lane
+/// semantics are always total). Wrapping arithmetic; shifts take the scalar amount mod
+/// the lane bit-width.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VIntBinOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+impl VIntBinOp {
+    pub const ALL: [VIntBinOp; 3] = [VIntBinOp::Add, VIntBinOp::Sub, VIntBinOp::Mul];
+    pub fn name(self) -> &'static str {
+        match self {
+            VIntBinOp::Add => "add",
+            VIntBinOp::Sub => "sub",
+            VIntBinOp::Mul => "mul",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VIntBinOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VIntBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise binary float ops on a `v128` (§17, IEEE 754, no traps). `Min`/`Max` are the
+/// IEEE `minimum`/`maximum` (NaN-propagating, `-0 < +0`) matching the scalar [`FBinOp`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VFloatBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+}
+
+impl VFloatBinOp {
+    pub const ALL: [VFloatBinOp; 6] = [
+        VFloatBinOp::Add,
+        VFloatBinOp::Sub,
+        VFloatBinOp::Mul,
+        VFloatBinOp::Div,
+        VFloatBinOp::Min,
+        VFloatBinOp::Max,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VFloatBinOp::Add => "add",
+            VFloatBinOp::Sub => "sub",
+            VFloatBinOp::Mul => "mul",
+            VFloatBinOp::Div => "div",
+            VFloatBinOp::Min => "min",
+            VFloatBinOp::Max => "max",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VFloatBinOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VFloatBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise unary float ops on a `v128` (§17, IEEE 754, no traps).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VFloatUnOp {
+    Abs,
+    Neg,
+    Sqrt,
+}
+
+impl VFloatUnOp {
+    pub const ALL: [VFloatUnOp; 3] = [VFloatUnOp::Abs, VFloatUnOp::Neg, VFloatUnOp::Sqrt];
+    pub fn name(self) -> &'static str {
+        match self {
+            VFloatUnOp::Abs => "abs",
+            VFloatUnOp::Neg => "neg",
+            VFloatUnOp::Sqrt => "sqrt",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VFloatUnOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VFloatUnOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Whole-vector bitwise binary ops on a `v128` (§17). Shape-agnostic — they operate on
+/// all 128 bits regardless of lane interpretation. `AndNot` is `a & !b`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VBitBinOp {
+    And,
+    Or,
+    Xor,
+    AndNot,
+}
+
+impl VBitBinOp {
+    pub const ALL: [VBitBinOp; 4] = [
+        VBitBinOp::And,
+        VBitBinOp::Or,
+        VBitBinOp::Xor,
+        VBitBinOp::AndNot,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VBitBinOp::And => "and",
+            VBitBinOp::Or => "or",
+            VBitBinOp::Xor => "xor",
+            VBitBinOp::AndNot => "andnot",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VBitBinOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VBitBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
     }
 }
 
@@ -1094,6 +1312,105 @@ pub enum Inst {
     AtomicFence {
         order: Ordering,
     },
+
+    // ----- §17 SIMD: fixed-128 `v128` (D58) -----
+    /// `v128.const`: materialize a 16-byte vector constant (little-endian byte order).
+    ConstV128([u8; 16]),
+    /// `v128.load`: read 16 little-endian bytes from the confined effective address
+    /// `addr + offset` into a `v128`. The single widened (16-byte) masked access — the
+    /// only escape-TCB delta SIMD adds (§17/D58); confinement masking is implicit, as for
+    /// [`Inst::Load`]. `align` is a hint (see [`Inst::Load`]).
+    V128Load {
+        addr: ValIdx,
+        offset: u64,
+        align: u8,
+    },
+    /// `v128.store`: write the 16 little-endian bytes of `value` at the confined effective
+    /// address. Produces no SSA result (like [`Inst::Store`]).
+    V128Store {
+        addr: ValIdx,
+        value: ValIdx,
+        offset: u64,
+        align: u8,
+    },
+    /// `<shape>.splat`: broadcast a scalar (the shape's [`VShape::lane_val`] type) into
+    /// every lane, producing a `v128`.
+    Splat {
+        shape: VShape,
+        a: ValIdx,
+    },
+    /// `<shape>.extract_lane <lane>`: read lane `lane` of `a` as the shape's scalar type.
+    /// For narrow integer shapes (`i8x16`/`i16x8`) `signed` selects sign- vs zero-extension
+    /// into the `i32` result; it is ignored for the other shapes.
+    ExtractLane {
+        shape: VShape,
+        lane: u8,
+        signed: bool,
+        a: ValIdx,
+    },
+    /// `<shape>.replace_lane <lane>`: `a` with lane `lane` set to scalar `b` (the shape's
+    /// [`VShape::lane_val`] type); result `v128`.
+    ReplaceLane {
+        shape: VShape,
+        lane: u8,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise binary integer op (see [`VIntBinOp`]); `a`/`b`/result are `v128`.
+    VIntBin {
+        shape: VShape,
+        op: VIntBinOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise binary float op (see [`VFloatBinOp`]); `a`/`b`/result are `v128`.
+    VFloatBin {
+        shape: VShape,
+        op: VFloatBinOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise unary float op (see [`VFloatUnOp`]); `a`/result are `v128`.
+    VFloatUn {
+        shape: VShape,
+        op: VFloatUnOp,
+        a: ValIdx,
+    },
+    /// Whole-vector bitwise binary op (see [`VBitBinOp`]); `a`/`b`/result are `v128`.
+    VBitBin {
+        op: VBitBinOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// `v128.not`: bitwise complement of all 128 bits.
+    VNot {
+        a: ValIdx,
+    },
+    /// `v128.bitselect`: per-bit `(a & mask) | (b & !mask)`. All three operands `v128`.
+    Bitselect {
+        a: ValIdx,
+        b: ValIdx,
+        mask: ValIdx,
+    },
+    /// `i8x16.shuffle`: a constant byte shuffle. Each `lanes[i]` (0..32) selects byte `i`
+    /// of the result from the 32-byte concatenation `a ++ b` (indices 0..16 = `a`, 16..32
+    /// = `b`). Out-of-range indices (≥32) are verifier-rejected.
+    Shuffle {
+        lanes: [u8; 16],
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// `i8x16.swizzle`: dynamic byte select — result byte `i` is `a[b[i]]` when `b[i] < 16`,
+    /// else `0`. Both operands and result `v128`.
+    Swizzle {
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// `simd.width_bytes`: the host's supported SIMD vector width in bytes, as an `i32`.
+    /// The §17/D58 **feature-detection hook**. In the fixed-128 MVP this is the constant
+    /// `16` on every backend (so it stays deterministic across the interp↔JIT oracle); it
+    /// becomes a real runtime query when feature-detected wider widths (`v256`/`v512`) land.
+    SimdWidthBytes,
 }
 
 impl Inst {
@@ -1104,7 +1421,10 @@ impl Inst {
     /// (indexed by [`FuncIdx`]) to answer; `CallIndirect` carries its own signature.
     pub fn result_count(&self, fn_results: &[usize]) -> usize {
         match self {
-            Inst::Store { .. } | Inst::AtomicStore { .. } | Inst::AtomicFence { .. } => 0,
+            Inst::Store { .. }
+            | Inst::AtomicStore { .. }
+            | Inst::AtomicFence { .. }
+            | Inst::V128Store { .. } => 0,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),

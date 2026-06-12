@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
     FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator,
-    ValIdx, ValType, DEFAULT_RESERVED_LOG2,
+    VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -29,6 +29,9 @@ pub enum Value {
     I64(i64),
     F32(f32),
     F64(f64),
+    /// A `v128` SIMD vector (§17/D58): 16 raw little-endian bytes. Lane interpretation is
+    /// per-op, never per-value — so the value carries only the bytes.
+    V128([u8; 16]),
 }
 
 /// Reasons execution stopped without producing results.
@@ -1816,6 +1819,7 @@ impl VCpu {
                     Value::I64(x) => (1u8, *x).hash(h),
                     Value::F32(x) => (2u8, x.to_bits() as u64).hash(h),
                     Value::F64(x) => (3u8, x.to_bits()).hash(h),
+                    Value::V128(b) => (4u8, *b).hash(h),
                 }
             }
         }
@@ -2762,6 +2766,20 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         m.atomic_store(a, *offset, *ty, v)?;
         return Ok(None);
     }
+    // §17 `v128.store` — the third no-result memory op (a 16-byte masked write, D58).
+    if let Inst::V128Store {
+        addr,
+        value,
+        offset,
+        ..
+    } = inst
+    {
+        let m = mem.as_mut().ok_or(Trap::Malformed)?;
+        let a = as_i64(get(vals, *addr)?)? as u64;
+        let v = as_v128(get(vals, *value)?)?;
+        m.store_v128(a, *offset, v)?;
+        return Ok(None);
+    }
     let v = match inst {
         Inst::ConstI32(c) => Value::I32(*c),
         Inst::ConstI64(c) => Value::I64(*c),
@@ -2899,10 +2917,79 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             }
             return Ok(None);
         }
+
+        // ----- §17 SIMD reference lane semantics (the differential oracle, D58) -----
+        Inst::ConstV128(b) => Value::V128(*b),
+        Inst::V128Load { addr, offset, .. } => {
+            let m = mem.as_ref().ok_or(Trap::Malformed)?;
+            let a = as_i64(get(vals, *addr)?)? as u64;
+            m.load_v128(a, *offset)?
+        }
+        Inst::Splat { shape, a } => {
+            Value::V128(simd_splat(*shape, store_bits(get(vals, *a)?)))
+        }
+        Inst::ExtractLane {
+            shape,
+            lane,
+            signed,
+            a,
+        } => simd_extract(*shape, *lane, *signed, as_v128(get(vals, *a)?)?),
+        Inst::ReplaceLane { shape, lane, a, b } => Value::V128(simd_replace(
+            *shape,
+            *lane,
+            as_v128(get(vals, *a)?)?,
+            store_bits(get(vals, *b)?),
+        )),
+        Inst::VIntBin { shape, op, a, b } => Value::V128(simd_vint_bin(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
+        Inst::VFloatBin { shape, op, a, b } => Value::V128(simd_vfloat_bin(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
+        Inst::VFloatUn { shape, op, a } => {
+            Value::V128(simd_vfloat_un(*shape, *op, as_v128(get(vals, *a)?)?))
+        }
+        Inst::VBitBin { op, a, b } => Value::V128(simd_vbit_bin(
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
+        Inst::VNot { a } => {
+            let x = as_v128(get(vals, *a)?)?;
+            let mut o = [0u8; 16];
+            for i in 0..16 {
+                o[i] = !x[i];
+            }
+            Value::V128(o)
+        }
+        Inst::Bitselect { a, b, mask } => Value::V128(simd_bitselect(
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+            as_v128(get(vals, *mask)?)?,
+        )),
+        Inst::Shuffle { lanes, a, b } => Value::V128(simd_shuffle(
+            lanes,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
+        Inst::Swizzle { a, b } => {
+            Value::V128(simd_swizzle(as_v128(get(vals, *a)?)?, as_v128(get(vals, *b)?)?))
+        }
+        // The §17/D58 feature-detect hook: a deterministic constant in the fixed-128 MVP, so it
+        // stays identical across the interp↔JIT oracle.
+        Inst::SimdWidthBytes => Value::I32(16),
+
         // Handled before/around the match (or in `run_func` for the §12 fiber ops, which
         // switch stacks); listed for exhaustiveness (no panic).
         Inst::Store { .. }
         | Inst::AtomicStore { .. }
+        | Inst::V128Store { .. }
         | Inst::Call { .. }
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
@@ -2915,6 +3002,197 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         | Inst::MemoryNotify { .. } => return Ok(None),
     };
     Ok(Some(v))
+}
+
+// ----- §17 SIMD lane semantics (reference oracle, D58) -----
+// Lanes are little-endian within the 16 bytes. Float lanes reuse the scalar `fbin*`/`fun*`
+// helpers so a vector lane and its scalar op are bit-identical (NaN bits included).
+
+/// Read lane `lane` (of `bytes` width) as a zero-extended `u64`.
+fn lane_read(v: &[u8; 16], lane: usize, bytes: usize) -> u64 {
+    let mut x = 0u64;
+    for k in 0..bytes {
+        x |= (v[lane * bytes + k] as u64) << (8 * k);
+    }
+    x
+}
+
+/// Write the low `bytes` of `x` into lane `lane`.
+fn lane_write(v: &mut [u8; 16], lane: usize, bytes: usize, x: u64) {
+    for k in 0..bytes {
+        v[lane * bytes + k] = (x >> (8 * k)) as u8;
+    }
+}
+
+/// `<shape>.splat`: broadcast the low `lane_bytes` of `bits` into every lane.
+fn simd_splat(shape: VShape, bits: u64) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        lane_write(&mut o, i, bytes, bits);
+    }
+    o
+}
+
+/// `<shape>.extract_lane`: read lane `lane` as the shape's scalar [`Value`]. Narrow integer
+/// lanes sign- or zero-extend into the `i32` result per `signed`.
+fn simd_extract(shape: VShape, lane: u8, signed: bool, v: [u8; 16]) -> Value {
+    let bytes = shape.lane_bytes() as usize;
+    // Lane index is verifier-bounded; clamp defensively so this stays total on raw input.
+    let lane = (lane as usize).min(shape.lanes() as usize - 1);
+    let raw = lane_read(&v, lane, bytes);
+    match shape {
+        VShape::I8x16 | VShape::I16x8 => {
+            let bits = (bytes * 8) as u32;
+            let ext = if signed {
+                let shift = 32 - bits;
+                (((raw as u32) << shift) as i32) >> shift
+            } else {
+                raw as i32
+            };
+            Value::I32(ext)
+        }
+        VShape::I32x4 => Value::I32(raw as i32),
+        VShape::I64x2 => Value::I64(raw as i64),
+        VShape::F32x4 => Value::F32(f32::from_bits(raw as u32)),
+        VShape::F64x2 => Value::F64(f64::from_bits(raw)),
+    }
+}
+
+/// `<shape>.replace_lane`: `v` with lane `lane` set to the low `lane_bytes` of `bits`.
+fn simd_replace(shape: VShape, lane: u8, mut v: [u8; 16], bits: u64) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let lane = (lane as usize).min(shape.lanes() as usize - 1);
+    lane_write(&mut v, lane, bytes, bits);
+    v
+}
+
+/// Lane-wise integer add/sub/mul (wrapping at the lane width — only the low `lane_bytes`
+/// are kept, which is exactly modular arithmetic).
+fn simd_vint_bin(shape: VShape, op: VIntBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_read(&a, i, bytes);
+        let y = lane_read(&b, i, bytes);
+        let r = match op {
+            VIntBinOp::Add => x.wrapping_add(y),
+            VIntBinOp::Sub => x.wrapping_sub(y),
+            VIntBinOp::Mul => x.wrapping_mul(y),
+        };
+        lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// Map a vector float op onto the scalar [`FBinOp`]/[`FUnOp`] so lanes match scalars exactly.
+fn vf_bin(op: VFloatBinOp) -> FBinOp {
+    match op {
+        VFloatBinOp::Add => FBinOp::Add,
+        VFloatBinOp::Sub => FBinOp::Sub,
+        VFloatBinOp::Mul => FBinOp::Mul,
+        VFloatBinOp::Div => FBinOp::Div,
+        VFloatBinOp::Min => FBinOp::Min,
+        VFloatBinOp::Max => FBinOp::Max,
+    }
+}
+fn vf_un(op: VFloatUnOp) -> FUnOp {
+    match op {
+        VFloatUnOp::Abs => FUnOp::Abs,
+        VFloatUnOp::Neg => FUnOp::Neg,
+        VFloatUnOp::Sqrt => FUnOp::Sqrt,
+    }
+}
+
+fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                lane_write(&mut o, i, 4, fbin32(vf_bin(op), x, y).to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                lane_write(&mut o, i, 8, fbin64(vf_bin(op), x, y).to_bits());
+            }
+        }
+        // Verifier rejects an integer shape here; total fall-through returns zero.
+        _ => {}
+    }
+    o
+}
+
+fn simd_vfloat_un(shape: VShape, op: VFloatUnOp, a: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, fun32(vf_un(op), x).to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 8, fun64(vf_un(op), x).to_bits());
+            }
+        }
+        _ => {}
+    }
+    o
+}
+
+fn simd_vbit_bin(op: VBitBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..16 {
+        o[i] = match op {
+            VBitBinOp::And => a[i] & b[i],
+            VBitBinOp::Or => a[i] | b[i],
+            VBitBinOp::Xor => a[i] ^ b[i],
+            VBitBinOp::AndNot => a[i] & !b[i],
+        };
+    }
+    o
+}
+
+/// `v128.bitselect`: per-bit `(a & mask) | (b & !mask)`.
+fn simd_bitselect(a: [u8; 16], b: [u8; 16], mask: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..16 {
+        o[i] = (a[i] & mask[i]) | (b[i] & !mask[i]);
+    }
+    o
+}
+
+/// `i8x16.shuffle`: result byte `i` is byte `lanes[i]` of the concatenation `a ++ b`.
+fn simd_shuffle(lanes: &[u8; 16], a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..16 {
+        let sel = lanes[i] as usize;
+        o[i] = if sel < 16 {
+            a[sel]
+        } else if sel < 32 {
+            b[sel - 16]
+        } else {
+            0 // verifier rejects ≥32; total fall-through
+        };
+    }
+    o
+}
+
+/// `i8x16.swizzle`: result byte `i` is `a[b[i]]` when `b[i] < 16`, else `0`.
+fn simd_swizzle(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..16 {
+        let sel = b[i] as usize;
+        o[i] = if sel < 16 { a[sel] } else { 0 };
+    }
+    o
 }
 
 /// Resolve a `call_indirect`: mask the index into the power-of-two-padded function
@@ -4988,6 +5266,30 @@ impl Mem {
         Ok(())
     }
 
+    /// §17 `v128.load`: the **16-byte** masked access — the sole escape-TCB delta SIMD adds
+    /// (D58). Shares the exact confinement + page-protection path as the scalar `load`, just
+    /// with `width = 16`, so `svm-mask`'s width-parametric guard covers it unchanged.
+    fn load_v128(&self, addr: u64, offset: u64) -> Result<Value, Trap> {
+        let base = self.confine_checked(addr, offset, 16)?;
+        self.check_prot(base, 16, false)?;
+        let mut b = [0u8; 16];
+        for (k, slot) in b.iter_mut().enumerate() {
+            *slot = self.byte(base + k as u64);
+        }
+        Ok(Value::V128(b))
+    }
+
+    /// §17 `v128.store`: the 16-byte masked write (see [`Mem::load_v128`]).
+    fn store_v128(&mut self, addr: u64, offset: u64, b: [u8; 16]) -> Result<(), Trap> {
+        let base = self.confine_checked(addr, offset, 16)?;
+        self.check_prot(base, 16, true)?;
+        for (k, byte) in b.iter().enumerate() {
+            self.set_byte(base + k as u64, *byte);
+        }
+        self.writes += 1;
+        Ok(())
+    }
+
     /// §12 atomics share the confinement + page-protection path with `load`/`store`, and add a
     /// **natural-alignment** requirement: a misaligned effective address traps (`MemoryFault`). The
     /// window base and mask domain are width-aligned, so checking the confined address suffices.
@@ -5537,6 +5839,9 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
     match rty {
         ValType::F32 => Value::F32(f32::from_bits(raw as u32)),
         ValType::F64 => Value::F64(f64::from_bits(raw)),
+        // `v128` never reaches here — its loads go through the dedicated 16-byte path, not
+        // a `LoadOp` (whose widths are ≤8). Total arm for exhaustiveness only.
+        ValType::V128 => Value::V128([0; 16]),
         ValType::I32 | ValType::I64 => {
             let bits = width * 8;
             let ext = if signed && bits < 64 {
@@ -5561,6 +5866,9 @@ fn store_bits(v: Value) -> u64 {
         Value::I64(x) => x as u64,
         Value::F32(x) => x.to_bits() as u64,
         Value::F64(x) => x.to_bits(),
+        // `v128` stores go through the dedicated 16-byte path; a scalar store never sees one.
+        // Total arm: low 8 bytes (little-endian).
+        Value::V128(b) => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
     }
 }
 
@@ -5787,6 +6095,9 @@ fn val_to_slot(v: Value) -> i64 {
         Value::I64(x) => x,
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
+        // The cap ABI marshals scalars only; a `v128` arg/result is out of MVP scope (§17). Total
+        // arm — its low 8 bytes — keeps the interpreter panic-free if a module declares one.
+        Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
     }
 }
 
@@ -5797,12 +6108,26 @@ fn slot_to_val(ty: ValType, s: i64) -> Value {
         ValType::I64 => Value::I64(s),
         ValType::F32 => Value::F32(f32::from_bits(s as u32)),
         ValType::F64 => Value::F64(f64::from_bits(s as u64)),
+        // `v128` cap results are out of MVP scope; zero-extend the slot into the low lanes.
+        ValType::V128 => {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&s.to_le_bytes());
+            Value::V128(b)
+        }
     }
 }
 
 fn as_i32(v: Value) -> Result<i32, Trap> {
     match v {
         Value::I32(x) => Ok(x),
+        _ => Err(Trap::Malformed),
+    }
+}
+
+#[inline]
+fn as_v128(v: Value) -> Result<[u8; 16], Trap> {
+    match v {
+        Value::V128(b) => Ok(b),
         _ => Err(Trap::Malformed),
     }
 }

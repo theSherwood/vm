@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
-    Terminator, ValType,
+    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -252,6 +252,67 @@ fn print_inst(inst: &Inst) -> String {
         } => format!("{}.atomic.wait v{addr} v{expected} v{timeout}", ty.prefix()),
         Inst::MemoryNotify { addr, count } => format!("atomic.notify v{addr} v{count}"),
         Inst::AtomicFence { order } => format!("atomic.fence{}", ord_suffix(*order)),
+
+        // ----- §17 SIMD (D58) — lane shape carried by the op, bytes printed little-endian. -----
+        Inst::ConstV128(bytes) => format!("v128.const{}", byte_list(bytes)),
+        Inst::V128Load { addr, offset, align } => {
+            format!("v128.load v{addr}{}", memarg(*offset, *align))
+        }
+        Inst::V128Store {
+            addr,
+            value,
+            offset,
+            align,
+        } => format!("v128.store v{addr} v{value}{}", memarg(*offset, *align)),
+        Inst::Splat { shape, a } => format!("{}.splat v{a}", shape.name()),
+        Inst::ExtractLane {
+            shape,
+            lane,
+            signed,
+            a,
+        } => format!(
+            "{}.extract_lane{} {lane} v{a}",
+            shape.name(),
+            lane_sign_suffix(*shape, *signed)
+        ),
+        Inst::ReplaceLane { shape, lane, a, b } => {
+            format!("{}.replace_lane {lane} v{a} v{b}", shape.name())
+        }
+        Inst::VIntBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VFloatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VFloatUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VBitBin { op, a, b } => format!("v128.{} v{a} v{b}", op.name()),
+        Inst::VNot { a } => format!("v128.not v{a}"),
+        Inst::Bitselect { a, b, mask } => format!("v128.bitselect v{a} v{b} v{mask}"),
+        Inst::Shuffle { lanes, a, b } => format!("i8x16.shuffle{} v{a} v{b}", byte_list(lanes)),
+        Inst::Swizzle { a, b } => format!("i8x16.swizzle v{a} v{b}"),
+        Inst::SimdWidthBytes => "simd.width_bytes".to_string(),
+    }
+}
+
+/// Render 16 bytes as ` b0 b1 ... b15` (decimal, leading space). Used by `v128.const`
+/// (little-endian value bytes) and `i8x16.shuffle` (byte indices).
+fn byte_list(bytes: &[u8; 16]) -> String {
+    let mut s = String::new();
+    for b in bytes {
+        s.push(' ');
+        s.push_str(&b.to_string());
+    }
+    s
+}
+
+/// The `_s`/`_u` suffix on a narrow-integer `extract_lane` (`i8x16`/`i16x8`); empty for
+/// the wider shapes where extraction is unambiguous.
+fn lane_sign_suffix(shape: VShape, signed: bool) -> &'static str {
+    match shape {
+        VShape::I8x16 | VShape::I16x8 => {
+            if signed {
+                "_s"
+            } else {
+                "_u"
+            }
+        }
+        _ => "",
     }
 }
 
@@ -1191,6 +1252,70 @@ impl<'a> Parser<'a> {
             return self.parse_atomic(IntTy::I64, rest, names);
         }
 
+        // ----- §17 SIMD (D58) -----
+        if op == "v128.const" {
+            let bytes = self.parse_byte16()?;
+            return Ok(Inst::ConstV128(bytes));
+        }
+        if op == "v128.load" {
+            let addr = self.value(names)?;
+            let (offset, align) = self.parse_memarg()?;
+            return Ok(Inst::V128Load {
+                addr,
+                offset,
+                align,
+            });
+        }
+        if op == "v128.store" {
+            let addr = self.value(names)?;
+            let value = self.value(names)?;
+            let (offset, align) = self.parse_memarg()?;
+            return Ok(Inst::V128Store {
+                addr,
+                value,
+                offset,
+                align,
+            });
+        }
+        if op == "v128.not" {
+            return Ok(Inst::VNot {
+                a: self.value(names)?,
+            });
+        }
+        if op == "v128.bitselect" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            let mask = self.value(names)?;
+            return Ok(Inst::Bitselect { a, b, mask });
+        }
+        if let Some(s) = op.strip_prefix("v128.") {
+            if let Some(o) = VBitBinOp::from_name(s) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VBitBin { op: o, a, b });
+            }
+        }
+        if op == "i8x16.shuffle" {
+            let lanes = self.parse_byte16()?;
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::Shuffle { lanes, a, b });
+        }
+        if op == "i8x16.swizzle" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::Swizzle { a, b });
+        }
+        if op == "simd.width_bytes" {
+            return Ok(Inst::SimdWidthBytes);
+        }
+        if let Some((sh, suffix)) = op
+            .split_once('.')
+            .and_then(|(p, s)| VShape::from_name(p).map(|sh| (sh, s)))
+        {
+            return self.parse_shape_inst(sh, suffix, &op, names);
+        }
+
         let (prefix, suffix) = op
             .split_once('.')
             .ok_or_else(|| ParseError(format!("unknown opcode `{op}`")))?;
@@ -1201,6 +1326,83 @@ impl<'a> Parser<'a> {
             "f64" => self.parse_float_inst(FloatTy::F64, suffix, &op, names),
             _ => err(format!("unknown opcode `{op}`")),
         }
+    }
+
+    /// Parse a `<shape>.<suffix>` SIMD op (splat/extract_lane/replace_lane and the
+    /// lane-wise int/float arithmetic). The whole-vector bitwise ops, `v128.const`,
+    /// load/store, shuffle/swizzle are matched by full name in [`Self::parse_inst`].
+    fn parse_shape_inst(
+        &mut self,
+        shape: VShape,
+        suffix: &str,
+        op: &str,
+        names: &HashMap<String, u32>,
+    ) -> Result<Inst, ParseError> {
+        if suffix == "splat" {
+            return Ok(Inst::Splat {
+                shape,
+                a: self.value(names)?,
+            });
+        }
+        // `extract_lane[_s|_u] <lane> v<a>` — the sign suffix is only meaningful for narrow
+        // integer shapes; accept (and ignore) it elsewhere only if absent.
+        if let Some(rest) = suffix.strip_prefix("extract_lane") {
+            let signed = match rest {
+                "" => true, // wide shapes: extraction is exact; `signed` is unused
+                "_s" => true,
+                "_u" => false,
+                _ => return err(format!("unknown opcode `{op}`")),
+            };
+            let lane = u8::try_from(self.parse_int()?)
+                .map_err(|_| ParseError(format!("lane index out of range in `{op}`")))?;
+            let a = self.value(names)?;
+            return Ok(Inst::ExtractLane {
+                shape,
+                lane,
+                signed,
+                a,
+            });
+        }
+        if suffix == "replace_lane" {
+            let lane = u8::try_from(self.parse_int()?)
+                .map_err(|_| ParseError(format!("lane index out of range in `{op}`")))?;
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::ReplaceLane { shape, lane, a, b });
+        }
+        // Dispatch the lane-arithmetic suffix by shape category — `add`/`sub`/`mul` name both an
+        // integer and a float op, so the shape decides which (a float op on an int shape, or vice
+        // versa, is then rejected at verify, not silently mis-parsed).
+        if shape.is_float() {
+            if let Some(o) = VFloatBinOp::from_name(suffix) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VFloatBin { shape, op: o, a, b });
+            }
+            if let Some(o) = VFloatUnOp::from_name(suffix) {
+                return Ok(Inst::VFloatUn {
+                    shape,
+                    op: o,
+                    a: self.value(names)?,
+                });
+            }
+        } else if let Some(o) = VIntBinOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VIntBin { shape, op: o, a, b });
+        }
+        err(format!("unknown opcode `{op}`"))
+    }
+
+    /// Parse exactly 16 byte (`0..=255`) integer tokens into a `[u8; 16]` — the operand
+    /// of `v128.const` (value bytes) and `i8x16.shuffle` (byte indices).
+    fn parse_byte16(&mut self) -> Result<[u8; 16], ParseError> {
+        let mut bytes = [0u8; 16];
+        for slot in &mut bytes {
+            let v = self.parse_int()?;
+            *slot = u8::try_from(v).map_err(|_| ParseError(format!("byte out of range: {v}")))?;
+        }
+        Ok(bytes)
     }
 
     fn parse_int_inst(

@@ -24,6 +24,7 @@ fn to_slot(v: &Value) -> i64 {
         Value::I64(x) => *x,
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
+        Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
     }
 }
 

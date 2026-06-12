@@ -35,6 +35,7 @@ fn to_slot(v: Value) -> i64 {
         Value::I64(x) => x,
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
+        Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
     }
 }
 
@@ -177,6 +178,7 @@ fn run_c_full(src: &str) -> CRun {
                 ValType::I64 => Value::I64(v),
                 ValType::F32 => Value::F32(f32::from_bits(v as u32)),
                 ValType::F64 => Value::F64(f64::from_bits(v as u64)),
+                ValType::V128 => Value::V128([0; 16]),
             })
             .collect()
     };
