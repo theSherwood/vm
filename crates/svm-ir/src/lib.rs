@@ -1523,23 +1523,6 @@ impl Func {
             })
         })
     }
-
-    /// Whether this function uses `call_indirect` or `return_call_indirect`. The guest-driven
-    /// `Jit`-capability validator rejects submitted units that do (JIT.md Model A MVP): on the
-    /// JIT such a unit's indirect call dispatches through the **parent** table (new→old into the
-    /// original program's functions), but the reference interpreter resolves functions by index
-    /// into a single array and cannot faithfully model a frame that spans the parent and unit
-    /// function spaces — so the two backends would diverge. Uniform cross-unit dispatch is the
-    /// Model B2 (table-install) feature; until it lands, the MVP supports old→new (`invoke`) but
-    /// not new→old, and both backends fail-close on indirect calls in a submitted unit.
-    pub fn uses_indirect_call(&self) -> bool {
-        self.blocks.iter().any(|b| {
-            b.insts
-                .iter()
-                .any(|i| matches!(i, Inst::CallIndirect { .. }))
-                || matches!(b.term, Terminator::ReturnCallIndirect { .. })
-        })
-    }
 }
 
 /// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —

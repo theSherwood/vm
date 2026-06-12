@@ -82,6 +82,7 @@ fn diff_run(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (JitOutcom
         (Err(Trap::Unreachable), JitOutcome::Trapped(TrapKind::Unreachable))
         | (Err(Trap::CapFault), JitOutcome::Trapped(TrapKind::CapFault))
         | (Err(Trap::MemoryFault), JitOutcome::Trapped(TrapKind::MemoryFault))
+        | (Err(Trap::IndirectCallType), JitOutcome::Trapped(TrapKind::IndirectCallType))
         | (Err(Trap::DivByZero), JitOutcome::Trapped(TrapKind::DivByZero)) => {}
         other => panic!("backends disagree: {other:?}"),
     }
@@ -146,18 +147,41 @@ fn memory_mismatch_rejected_identically() {
     );
 }
 
-/// A submitted unit containing `call_indirect` (the new→old path) is rejected identically.
-/// On the JIT it would dispatch through the parent table, but the reference interpreter cannot
-/// model a frame spanning the parent and unit function spaces — so the shared validator gates
-/// it (Model A MVP supports old→new only; uniform cross-unit dispatch is the B2 feature). This
-/// is the safe closure of a divergence the bare `define_extra` JIT primitive otherwise exposes.
+/// **new→old** (JIT.md Model A): a submitted unit `call_indirect`s back into the *original
+/// program's* function table. The parent's func 1 is `(a, b) -> a + b + 5000`, sitting in
+/// table slot 1; the unit's entry does `call_indirect slot 1 (a, b)`. On the JIT the unit is
+/// lowered against the parent `fn_table`; on the interpreter it runs as a module-1 frame whose
+/// indirect call dispatches into module 0 — both reach the parent's func 1 and return the same
+/// value. (This was a confirmed backend divergence before slice #1's cross-module dispatch.)
 #[test]
-fn call_indirect_unit_rejected_identically() {
-    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.const 0\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n}\n");
-    let guest = with_len(COMPILE_ONLY, b.len());
-    let (out, _) = diff_run(&guest, &b, &[]);
+fn new_calls_old_via_call_indirect_agrees() {
+    // Parent: func 0 = entry (compiles + invokes the blob), func 1 = the indirect target.
+    let parent = "memory 16\n\
+func (i32, i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32, v2: i32):\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n}\n\
+func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  v3 = i32.const 5000\n  v4 = i32.add v2 v3\n  return v4\n}\n";
+    // Unit entry (i32,i32)->(i32): call_indirect slot 1 with the target's signature → new→old.
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.const 1\n  v3 = call_indirect (i32, i32) -> (i32) v2 (v0, v1)\n  return v3\n}\n");
+    let guest = with_len(parent, b.len());
+    let (out, _) = diff_run(&guest, &b, &[10, 20]);
     assert!(
-        matches!(out, JitOutcome::Returned(ref s) if s == &[-22]),
+        matches!(out, JitOutcome::Returned(ref s) if s == &[5030]), // 10 + 20 + 5000
+        "{out:?}"
+    );
+}
+
+/// new→old fail-closed: a unit `call_indirect`ing a slot whose signature doesn't match the
+/// parent function there traps `IndirectCallType` — identically on both backends.
+#[test]
+fn new_to_old_signature_mismatch_traps_identically() {
+    // Parent func 1 is (i32,i32)->(i32); the unit calls slot 1 with a wrong (i32)->(i32) sig.
+    let parent = "memory 16\n\
+func (i32, i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32, v2: i32):\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n}\n\
+func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  return v2\n}\n";
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.const 1\n  v3 = call_indirect (i32) -> (i32) v2 (v0)\n  return v3\n}\n");
+    let guest = with_len(parent, b.len());
+    let (out, _) = diff_run(&guest, &b, &[10, 20]);
+    assert!(
+        matches!(out, JitOutcome::Trapped(TrapKind::IndirectCallType)),
         "{out:?}"
     );
 }

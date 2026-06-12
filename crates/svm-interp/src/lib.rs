@@ -892,8 +892,15 @@ fn run_one_schedule(
 struct Frame {
     /// The function this activation is executing — stored as an **index** (not a borrow) so a
     /// `Frame` (hence a whole vCPU continuation) is self-contained and movable between worker
-    /// threads. Resolved against the vCPU's owned `Arc<[Func]>` at each use.
+    /// threads. Resolved against [`Frame::module`]'s `Arc<[Func]>` at each use.
     func: FuncIdx,
+    /// Which **function space** [`Frame::func`] indexes — `0` is the vCPU's primary module (its
+    /// own program), `k ≥ 1` is `units[k-1]`, a guest-compiled `Jit` unit (JIT.md Model A). A
+    /// `call_indirect` always dispatches through the **module-0** table (matching the JIT, where
+    /// every function — parent or unit — is lowered against the parent `fn_table`), so a unit's
+    /// indirect call lands in module 0 (new→old); a **direct** call stays in the caller's module
+    /// (unit-local). Ordinary vCPUs only ever use module 0.
+    module: u32,
     /// Index of the block currently executing.
     block: usize,
     /// Index of the **next** instruction to execute within that block. Saved across a
@@ -901,6 +908,79 @@ struct Frame {
     inst: usize,
     /// Block-local SSA values produced so far (entry = the call arguments).
     vals: Vec<Value>,
+}
+
+/// One slot of a vCPU's **`call_indirect` dispatch table** — the explicit, module-aware
+/// generalization of "mask the index into `funcs`". Each slot names which module's function it
+/// holds, so the table can mix the parent's functions (Model A: populated from module 0) with
+/// later-installed unit functions (Model B2: `install` appends). `module == TABLE_EMPTY` is a
+/// power-of-two padding slot — a forged index landing there traps, like the JIT's
+/// `PADDING_TYPE_ID`. The table length is a power of two; the mask is `len - 1`.
+#[derive(Clone, Copy)]
+struct TableSlot {
+    module: u32,
+    func: FuncIdx,
+}
+const TABLE_EMPTY: u32 = u32::MAX;
+
+/// Build a vCPU's dispatch table from its module-0 functions: slot `i` holds `(module 0, i)` for
+/// each function, padded to the next power of two with empty (trapping) slots — the reference
+/// mirror of the JIT's power-of-two `fn_table` over the parent module. `install` (Model B2) will
+/// later append unit entries into the padding.
+fn build_table(funcs: &[Func]) -> Arc<[TableSlot]> {
+    let len = funcs.len().next_power_of_two().max(1);
+    (0..len)
+        .map(|i| {
+            if i < funcs.len() {
+                TableSlot {
+                    module: 0,
+                    func: i as FuncIdx,
+                }
+            } else {
+                TableSlot {
+                    module: TABLE_EMPTY,
+                    func: 0,
+                }
+            }
+        })
+        .collect()
+}
+
+/// The functions of module `m` for a running vCPU — module 0 is its primary program, `k ≥ 1` a
+/// guest-compiled unit in `units[k-1]` (JIT.md Model A new→old).
+fn mod_funcs<'a>(funcs: &'a [Func], units: &'a [Arc<[Func]>], m: u32) -> &'a [Func] {
+    if m == 0 {
+        funcs
+    } else {
+        &units[(m - 1) as usize]
+    }
+}
+
+/// Resolve a `call_indirect` through the dispatch `table`: mask the guest index, reject a padding
+/// slot, then type-check the target's signature structurally (matching the JIT's masked load +
+/// `type_id` check, where the interned id ≡ structural equality). Returns the target `(module,
+/// func)`.
+fn dispatch_indirect(
+    table: &[TableSlot],
+    funcs: &[Func],
+    units: &[Arc<[Func]>],
+    idx: i32,
+    ty: &FuncType,
+) -> Result<(u32, FuncIdx), Trap> {
+    let mask = table.len() - 1; // table.len() is a power of two
+    let slot = (idx as u32 as usize) & mask;
+    let e = table[slot];
+    if e.module == TABLE_EMPTY {
+        return Err(Trap::IndirectCallType);
+    }
+    let f = mod_funcs(funcs, units, e.module)
+        .get(e.func as usize)
+        .ok_or(Trap::IndirectCallType)?;
+    if f.params == ty.params && f.results == ty.results {
+        Ok((e.module, e.func))
+    } else {
+        Err(Trap::IndirectCallType)
+    }
 }
 
 /// Maximum number of fibers a single run may create (§12). Bounds the fiber table so a
@@ -1758,6 +1838,14 @@ struct VCpu {
     acc: Option<MemAccess>,
     /// §15 spawn quota (fiber/vCPU ceilings) — inherited by every vCPU of the run from the root.
     quota: Quota,
+    /// Guest-compiled `Jit` units (JIT.md Model A) reachable from this vCPU as **modules `≥ 1`**
+    /// (`units[k]` is module `k+1`); empty for an ordinary vCPU. A `Jit.invoke` runs a unit's
+    /// entry as a module-`k+1` frame while `call_indirect` still dispatches through module 0 (the
+    /// parent table), so new code reaches old code (new→old) through the shared table.
+    units: Vec<Arc<[Func]>>,
+    /// This vCPU's `call_indirect` dispatch table (see [`TableSlot`]) — built from module 0 at
+    /// construction, the reference mirror of the JIT's power-of-two `fn_table`.
+    table: Arc<[TableSlot]>,
 }
 
 impl VCpu {
@@ -1776,6 +1864,7 @@ impl VCpu {
         sched: SchedRef,
         quota: Quota,
     ) -> VCpu {
+        let table = build_table(&funcs);
         VCpu {
             funcs,
             fibers: vec![Fiber::Running],
@@ -1783,6 +1872,7 @@ impl VCpu {
             cur: 0,
             frames: vec![Frame {
                 func: entry,
+                module: 0,
                 block: 0,
                 inst: 0,
                 vals: args.to_vec(),
@@ -1800,6 +1890,55 @@ impl VCpu {
             memop: false,
             acc: None,
             quota,
+            units: Vec::new(),
+            table,
+        }
+    }
+
+    /// A vCPU that runs a guest-compiled **`Jit` unit**'s entry (`unit[0]`) over the parent's
+    /// world — same window/host/fuel — for the `Jit.invoke` op (JIT.md Model A). Module 0 is the
+    /// `parent` program (so the unit's `call_indirect` dispatches through the parent table —
+    /// new→old), and the unit is module 1; the root frame runs the unit entry as module 1.
+    #[allow(clippy::too_many_arguments)]
+    fn new_invoke(
+        parent: Arc<[Func]>,
+        unit: Arc<[Func]>,
+        args: &[Value],
+        mem: Option<Mem>,
+        host: Arc<Mutex<Host>>,
+        fuel: u64,
+        depth: u32,
+        sched: SchedRef,
+        quota: Quota,
+    ) -> VCpu {
+        let table = build_table(&parent); // the parent module's table (new→old target)
+        VCpu {
+            funcs: parent,
+            fibers: vec![Fiber::Running],
+            chain: vec![0],
+            cur: 0,
+            frames: vec![Frame {
+                func: 0, // the unit's entry
+                module: 1,
+                block: 0,
+                inst: 0,
+                vals: args.to_vec(),
+            }],
+            mem,
+            host,
+            fuel,
+            threads: Vec::new(),
+            coroutines: Vec::new(),
+            fault_yields: false,
+            depth,
+            id: 0, // unused: driven inline, never via the executor
+            pending: None,
+            sched,
+            memop: false,
+            acc: None,
+            quota,
+            units: vec![unit],
+            table,
         }
     }
 
@@ -1826,7 +1965,7 @@ impl VCpu {
         fn hash_frames(h: &mut std::collections::hash_map::DefaultHasher, frames: &[Frame]) {
             frames.len().hash(h);
             for f in frames {
-                (f.func, f.block, f.inst).hash(h);
+                (f.func, f.module, f.block, f.inst).hash(h);
                 hash_vals(h, &f.vals);
             }
         }
@@ -1928,8 +2067,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         None => {}
     }
 
-    let funcs = Arc::clone(&v.funcs);
-    let fs: &[Func] = &funcs;
+    let funcs = Arc::clone(&v.funcs); // module 0 (this vCPU's primary program)
+    let units = v.units.clone(); // modules ≥ 1: guest-compiled Jit units (JIT.md Model A)
+    let table = Arc::clone(&v.table); // the call_indirect dispatch table (built from module 0)
     let spawn_quota = v.quota; // §15 fiber/vCPU ceilings (distinct from the Instantiator's i64 fuel quota)
     let VCpu {
         fibers,
@@ -1950,6 +2090,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         memop,
         acc,
         quota: _,
+        units: _,
+        table: _,
     } = v;
     let depth = *depth;
     let memop = *memop;
@@ -1961,8 +2103,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // fiber's stack is in `frames` — see the comments on those arms.
     'frames: loop {
         let top = frames.len() - 1;
-        // `block` borrows `fs` (the owned function table), *not* `frames`, so the loop body is free
-        // to push/pop/mutate `frames` (and move it on a fiber switch) while holding it.
+        // Resolve the running frame against *its* module (module 0 = this vCPU's program; ≥ 1 = a
+        // Jit unit). `block` borrows `fs` (the owned function table), *not* `frames`, so the loop
+        // body is free to push/pop/mutate `frames` (and move it on a fiber switch) while holding it.
+        let fs: &[Func] = mod_funcs(&funcs, &units, frames[top].module);
         let block = fs
             .get(frames[top].func as usize)
             .ok_or(Trap::Malformed)?
@@ -2016,6 +2160,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     frames.push(Frame {
                         func: *func,
+                        module: frames[top].module, // a direct call stays in the caller's module
                         block: 0,
                         inst: 0,
                         vals: argv,
@@ -2023,7 +2168,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     continue 'frames;
                 }
                 Inst::CallIndirect { ty, idx, args } => {
-                    let callee = table_lookup(fs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
+                    // Dispatch through the module-0 table (new→old; matches the JIT, where every
+                    // function — parent or unit — is lowered against the parent `fn_table`).
+                    let (cmod, cfunc) = dispatch_indirect(
+                        &table,
+                        &funcs,
+                        &units,
+                        as_i32(get(&frames[top].vals, *idx)?)?,
+                        ty,
+                    )?;
                     let argv = collect(&frames[top].vals, args)?;
                     if depth as usize + live_frames(&fibers[..], &chain[..], frames.len())
                         > MAX_CALL_DEPTH as usize
@@ -2031,7 +2184,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::StackOverflow);
                     }
                     frames.push(Frame {
-                        func: callee,
+                        func: cfunc,
+                        module: cmod,
                         block: 0,
                         inst: 0,
                         vals: argv,
@@ -2496,17 +2650,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // move them back whatever the outcome — the parent's snapshot/teardown still
                     // needs them after a trap.
                     let child_mem = mem.take();
-                    let mut child = VCpu::new(
+                    // The unit runs over the parent's world: module 0 = this vCPU's program (so the
+                    // unit's `call_indirect` reaches the parent table — new→old), the unit is
+                    // module 1. A nested invoke costs call depth like a call, so invoke recursion is
+                    // bounded by the same stack-overflow bound as ordinary recursion.
+                    let mut child = VCpu::new_invoke(
+                        Arc::clone(&funcs),
                         unit_funcs,
-                        0, // the unit's entry is funcs[0]
                         &child_args,
                         child_mem,
                         Arc::clone(host),
                         *fuel,
-                        // A nested invoke costs call depth like a call, so invoke recursion is
-                        // bounded by the same stack-overflow bound as ordinary recursion.
                         depth + frames.len() as u32 + 1,
-                        0, // unused: driven inline, never via the executor
                         sched.clone(),
                         spawn_quota,
                     );
@@ -2580,9 +2735,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let new_frames = match std::mem::replace(&mut fibers[target], Fiber::Running) {
                         Fiber::Pending { func: funcref, sp } => {
                             let callee = table_lookup(fs, funcref, &fiber_sig())?;
-                            // First entry: call `func(sp, arg)` on the fiber's data stack.
+                            // First entry: call `func(sp, arg)` on the fiber's data stack. Fibers
+                            // are module-0 only (a unit cannot use `cont.*`, gated at compile).
                             vec![Frame {
                                 func: callee,
+                                module: 0,
                                 block: 0,
                                 inst: 0,
                                 vals: vec![Value::I64(sp), Value::I64(av)],
@@ -2801,16 +2958,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 frames[top] = Frame {
                     func: *func,
+                    module: frames[top].module, // a direct tail call stays in the caller's module
                     block: 0,
                     inst: 0,
                     vals: argv,
                 };
             }
             Terminator::ReturnCallIndirect { ty, idx, args } => {
-                let callee = table_lookup(fs, as_i32(get(&frames[top].vals, *idx)?)?, ty)?;
+                let (cmod, cfunc) = dispatch_indirect(
+                    &table,
+                    &funcs,
+                    &units,
+                    as_i32(get(&frames[top].vals, *idx)?)?,
+                    ty,
+                )?;
                 let argv = collect(&frames[top].vals, args)?;
                 frames[top] = Frame {
-                    func: callee,
+                    func: cfunc,
+                    module: cmod,
                     block: 0,
                     inst: 0,
                     vals: argv,
