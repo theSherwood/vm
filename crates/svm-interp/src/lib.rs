@@ -3591,6 +3591,7 @@ pub mod iface {
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal.
+const ENOMEM: i64 = -12; // resource quota exhausted (e.g. the Jit compile budget)
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
@@ -4202,7 +4203,20 @@ struct JitDomainState {
     /// `usize`); `0` in a reference run. Never dereferenced here — only stored and handed back
     /// ([`Host::jit_native_ctx`]).
     native_ctx: usize,
+    /// Compile quota (JIT.md "Code reclaim", the MVP byte-cap): remaining units / cumulative
+    /// submitted-blob bytes this domain may still `compile`. A guest looping `compile` is
+    /// bounded with `-ENOMEM` here — in the **shared** gate, so both backends reject
+    /// identically — instead of pressuring the JIT's finite code arena (whose exhaustion path
+    /// inside Cranelift is not a guest-reachable-safe failure mode). Blob bytes are the budget
+    /// *proxy* for compiled bytes.
+    units_left: u32,
+    bytes_left: u64,
 }
+
+/// Default per-domain compile quota: generous for a long REPL session, far below what could
+/// pressure the 256 MiB code arena. Tighten per domain with [`Host::set_jit_quota`].
+const JIT_DEFAULT_MAX_UNITS: u32 = 4096;
+const JIT_DEFAULT_MAX_BLOB_BYTES: u64 = 1 << 26; // 64 MiB of cumulative submitted IR
 
 /// One §14 module grant: the verified module's functions, declared window size, and data segments —
 /// what spawning a child domain of it needs.
@@ -4477,8 +4491,21 @@ impl Host {
             mem_log2,
             units: Vec::new(),
             native_ctx: 0,
+            units_left: JIT_DEFAULT_MAX_UNITS,
+            bytes_left: JIT_DEFAULT_MAX_BLOB_BYTES,
         });
         self.grant(iface::JIT, Binding::JitDomain(id))
+    }
+
+    /// Tighten (or widen) every granted `Jit` domain's compile quota — the §15-style resource
+    /// bound on guest-driven compilation (units and cumulative submitted-blob bytes; enforced
+    /// in the shared [`Host::jit_compile`] gate, so a quota'd `compile` fails `-ENOMEM`
+    /// identically on both backends). Set before the run, like [`Host::set_quota`].
+    pub fn set_jit_quota(&mut self, max_units: u32, max_blob_bytes: u64) {
+        for d in &mut self.jit_domains {
+            d.units_left = max_units;
+            d.bytes_left = max_blob_bytes;
+        }
     }
 
     /// Register the JIT embedder's native context (its `*mut CompiledModule` as a `usize`) on
@@ -4514,11 +4541,18 @@ impl Host {
             return Ok(Err(EINVAL));
         };
         let d = &mut self.jit_domains[domain as usize];
+        // Compile quota first: charge the *attempt's* bytes (validation is the cost a looping
+        // guest imposes), the unit slot only on success; out of either budget is `-ENOMEM`.
+        if d.units_left == 0 || (bytes.len() as u64) > d.bytes_left {
+            return Ok(Err(ENOMEM));
+        }
+        d.bytes_left -= bytes.len() as u64;
         let funcs = match validate(bytes, d.mem_log2) {
             Ok(f) if !f.is_empty() => f,
             Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
             Err(e) => return Ok(Err(e)),
         };
+        d.units_left -= 1;
         let unit = d.units.len() as u32;
         d.units.push(JitUnit {
             funcs,

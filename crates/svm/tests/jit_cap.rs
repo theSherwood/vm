@@ -256,6 +256,58 @@ fn fuzzed_blobs_fail_closed_identically() {
     }
 }
 
+/// The compile quota (JIT.md "Code reclaim", the MVP byte-cap): with a 2-unit budget, a guest's
+/// third `compile` is `-ENOMEM` — identically on both backends (the check lives in the shared
+/// `Host::jit_compile` gate), and a guest cannot pressure the finite code arena unboundedly.
+#[test]
+fn compile_quota_enforced_identically() {
+    let b = blob("memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i32.add v0 v1\n  return v2\n}\n");
+    // Three sequential compiles of the same blob; return the third's result.
+    let guest_src = "memory 16\nfunc (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  return v5\n}\n";
+    let guest = with_len(guest_src, b.len());
+
+    let m = parse_module(&guest).expect("parse guest");
+    verify_module(&m).expect("verify guest");
+    let mut init = vec![0u8; BLOB_OFF + b.len()];
+    init[BLOB_OFF..].copy_from_slice(&b);
+
+    let mut host_i = Host::new();
+    let h = grant_jit(&mut host_i, &m);
+    host_i.set_jit_quota(2, 1 << 20);
+    let mut fuel = 50_000_000u64;
+    let (ires, _) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(h)],
+        &mut fuel,
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        &mut host_i,
+    );
+    assert_eq!(
+        ires,
+        Ok(vec![Value::I64(-12)]),
+        "interp: third compile is -ENOMEM"
+    );
+
+    let mut host_j = Host::new();
+    let h = grant_jit(&mut host_j, &m);
+    host_j.set_jit_quota(2, 1 << 20);
+    let (jout, _) = jit_cap_run(
+        &m,
+        0,
+        &[h as i64],
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        &mut host_j,
+    )
+    .expect("jit run");
+    assert!(
+        matches!(jout, JitOutcome::Returned(ref s) if s == &[-12]),
+        "jit: third compile is -ENOMEM, got {jout:?}"
+    );
+}
+
 /// Two units compiled in one run, invoked alternately — the accumulating-definitions REPL
 /// shape: `(jit, a, b) -> invoke(u1, a, b) + invoke(u2, a, b)` where u1 = a+b, u2 = a*b.
 #[test]
