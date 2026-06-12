@@ -489,16 +489,9 @@ fn run_session(watermark: usize, n: usize) -> (Vec<i64>, Vec<u8>, usize, usize) 
     let mut host = Host::new();
     let jit_h = grant_jit(&mut host, &base, 0); // invoke-only: no install table needed
     let domain = host.resolve_jit_domain(jit_h).expect("domain");
-    let mut session = JitSession::new(
-        &base,
-        0,
-        DEFAULT_RESERVED_LOG2,
-        0,
-        domain,
-        watermark,
-        &mut host,
-    )
-    .expect("session");
+    // The session takes ownership of the host (boxed `Mutex<Host>`, stable address).
+    let mut session = JitSession::new(&base, 0, DEFAULT_RESERVED_LOG2, 0, domain, watermark, host)
+        .expect("session");
 
     // Seed the blob into the carried window at offset 4096 (where the guest `cap.call compile`s it);
     // it persists across prompts like any guest state.
@@ -507,9 +500,7 @@ fn run_session(watermark: usize, n: usize) -> (Vec<i64>, Vec<u8>, usize, usize) 
     let mut results = Vec::new();
     for i in 0..n {
         let x = (i as i64) + 2;
-        let out = session
-            .run_prompt(&mut host, &[jit_h as i64, x])
-            .expect("prompt");
+        let out = session.run_prompt(&[jit_h as i64, x]).expect("prompt");
         match out {
             JitOutcome::Returned(s) if s.len() == 1 => results.push(s[0]),
             other => panic!("prompt returned {other:?}"),
@@ -549,5 +540,92 @@ fn jit_session_auto_compacts_transparently() {
     assert!(
         occ_on <= 8 && occ_on < occ_off,
         "auto-compaction must bound occupancy at the watermark: {occ_on} (off {occ_off})"
+    );
+}
+
+/// A **multi-threaded** REPL shell: `(jit, x) -> (i32)` spawns a worker that compiles+invokes+
+/// releases `(7,7)=59` while main compiles+invokes+releases `(x,x)=x*x+10`, joins (so the prompt is
+/// quiescent at its end), and accumulates `main+worker` into window[0]. `BLOBLEN` is patched in. Each
+/// prompt redefines (compile) + releases two units, so the arena accumulates dead code that
+/// compaction reclaims — exactly the single-threaded REPL pattern, but threaded.
+const REPL_THREADED_SHELL: &str = "memory 16\nfunc (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n  v2 = i64.extend_i32_u v0\n  v3 = i64.const 2048\n  v4 = thread.spawn 1 v3 v2\n  v5 = i64.const 4096\n  v6 = i64.const BLOBLEN\n  v7 = cap.call 11 0 (i64, i64) -> (i64) v0 (v5, v6)\n  v8 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v7, v1, v1)\n  v9 = cap.call 11 2 (i64) -> (i64) v0 (v7)\n  v10 = thread.join v4\n  v11 = i32.wrap_i64 v10\n  v12 = i64.const 0\n  v13 = i32.load v12\n  v14 = i32.add v13 v8\n  v15 = i32.add v14 v11\n  i32.store v12 v15\n  return v15\n}\nfunc (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n  v2 = i32.wrap_i64 v1\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v2 (v3, v4)\n  v6 = i32.const 7\n  v7 = cap.call 11 1 (i64, i32, i32) -> (i32) v2 (v5, v6, v6)\n  v8 = cap.call 11 2 (i64) -> (i64) v2 (v5)\n  v9 = i64.extend_i32_u v7\n  return v9\n}\n";
+
+/// Drive a `watermark`-auto-compacting `JitSession` for a **multi-threaded** guest: each prompt
+/// spawns a worker that concurrently `Jit.compile`s (so the session's `Mutex<Host>` serialization is
+/// exercised), the prompt joins it (quiescent end), and compaction runs between prompts. Returns
+/// `(per-prompt results, final window[..8], final occupancy, compactions)`.
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn run_threaded_session(watermark: usize, n: usize) -> (Vec<i64>, Vec<u8>, usize, usize) {
+    let blob = unit_blob(10);
+    let base_src = REPL_THREADED_SHELL.replace("BLOBLEN", &blob.len().to_string());
+    let base = parse_module(&base_src).expect("parse threaded shell");
+    verify_module(&base).expect("verify threaded shell");
+
+    let mut host = Host::new();
+    let jit_h = grant_jit(&mut host, &base, 0);
+    let domain = host.resolve_jit_domain(jit_h).expect("domain");
+    let mut session = JitSession::new(&base, 0, DEFAULT_RESERVED_LOG2, 0, domain, watermark, host)
+        .expect("session");
+    session.seed_window(4096, &blob);
+
+    let mut results = Vec::new();
+    for i in 0..n {
+        let x = (i as i64) + 2;
+        let out = session.run_prompt(&[jit_h as i64, x]).expect("prompt");
+        match out {
+            JitOutcome::Returned(s) if s.len() == 1 => results.push(s[0]),
+            other => panic!("threaded prompt returned {other:?}"),
+        }
+    }
+    (
+        results,
+        session.window()[..8].to_vec(),
+        session.occupancy(),
+        session.compactions(),
+    )
+}
+
+/// **Compaction works for a multi-threaded guest.** A 12-prompt session whose every prompt spawns a
+/// worker that concurrently `Jit.compile`s produces identical per-prompt results and window state
+/// whether auto-compaction is off (`watermark=0`) or on (`watermark=8`) — and with it on the session
+/// actually compacts and bounds its occupancy, while off it grows with every prompt. This pins both
+/// the threaded-compile serialization through `JitSession`'s `Mutex<Host>` and that compaction (a
+/// quiescent, between-prompts rebuild that re-bakes the locked thunk) is transparent across it.
+#[test]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn threaded_session_compacts_transparently() {
+    let n = 12;
+    let (r_off, w_off, occ_off, c_off) = run_threaded_session(0, n);
+    let (r_on, w_on, occ_on, c_on) = run_threaded_session(8, n);
+
+    assert_eq!(
+        r_off, r_on,
+        "per-prompt results must match with/without compaction"
+    );
+    assert_eq!(w_off, w_on, "persistent window must match");
+    // Each prompt adds main (x*x+10, x=2..n+1) + worker (7*7+10 = 59).
+    let expected: i64 = (0..n as i64).map(|i| (i + 2) * (i + 2) + 10 + 59).sum();
+    assert_eq!(*r_on.last().unwrap(), expected);
+
+    assert_eq!(c_off, 0, "watermark 0 disables auto-compaction");
+    assert!(
+        c_on > 0,
+        "watermark 8 must trip auto-compaction in the threaded session"
+    );
+    assert!(
+        occ_off >= 24,
+        "no-compaction occupancy grows (2 units/prompt), got {occ_off}"
+    );
+    assert!(
+        occ_on <= 8 && occ_on < occ_off,
+        "auto-compaction bounds the threaded session's occupancy: {occ_on} (off {occ_off})"
     );
 }

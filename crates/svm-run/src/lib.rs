@@ -608,6 +608,40 @@ pub fn recompact_jit(
         !old.is_running(),
         "recompact_jit is quiescent-only: no run may be in flight on the old module"
     );
+    // Single-threaded path: the fresh module bakes the unlocked `cap_thunk` + raw `Host`. A
+    // *concurrent* guest must compact through [`JitSession`] (or replicate its pattern:
+    // `cap_thunk_locked` over a stable `Mutex<Host>`, then [`recompact_into`]) — re-running a fresh
+    // module that baked the unlocked thunk under threads would race (JIT.md §6 #2).
+    let mut fresh = CompiledModule::compile(
+        base,
+        entry,
+        cap_thunk,
+        host as *mut Host as *mut c_void,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        svm_jit::Quota::default(),
+        table_reserve_log2,
+    )?;
+    recompact_into(&mut fresh, host, domain, old)?;
+    Ok(fresh)
+}
+
+/// Rebuild the domain's **live unit set** into an already-compiled `fresh` module: carry every unit
+/// still reachable (held through a live `CompiledCode` handle, [`Host::jit_live_units`], **or**
+/// occupying a `call_indirect` slot of `old`), re-`define_extra` it, remap the `Host` unit→native
+/// record (so existing handles keep resolving), and reproduce occupied slots at their **exact**
+/// index. The thunk/ctx baked into `fresh` (locked vs raw) is the caller's choice — this is the
+/// thunk-agnostic half of compaction, shared by [`recompact_jit`] (raw) and [`JitSession`] (locked,
+/// concurrency-capable). Quiescent-only.
+pub fn recompact_into(
+    fresh: &mut CompiledModule,
+    host: &mut Host,
+    domain: u32,
+    old: &CompiledModule,
+) -> Result<(), svm_jit::JitError> {
     // The set of live table slots in the OLD module, keyed by the unit's natural-entry code so we
     // can rejoin slot → owning unit below (a unit may, in principle, occupy more than one slot).
     let mut code_to_slots: std::collections::HashMap<u64, Vec<u32>> =
@@ -631,19 +665,6 @@ pub fn recompact_jit(
     keep.sort_unstable();
     keep.dedup();
 
-    let mut fresh = CompiledModule::compile(
-        base,
-        entry,
-        cap_thunk,
-        host as *mut Host as *mut c_void,
-        reserved_log2,
-        None,
-        None,
-        None,
-        None,
-        svm_jit::Quota::default(),
-        table_reserve_log2,
-    )?;
     for unit in keep {
         // The unit's OLD natural-entry pointer — used to find the slot(s) it occupied — read
         // *before* we overwrite the Host's record with the fresh pointers.
@@ -661,7 +682,7 @@ pub fn recompact_jit(
             }
         }
     }
-    Ok(fresh)
+    Ok(())
 }
 
 /// A long-lived **guest-driven JIT REPL session** over one domain (JIT.md §6): the persistent
@@ -679,12 +700,17 @@ pub fn recompact_jit(
 /// reclaiming its arena. Because compaction is transparent (live slots + handles are preserved,
 /// see `recompact_jit`), the guest never observes it.
 ///
-/// # Safety / lifetime contract
-/// The `Host` passed to [`Self::new`] and every [`Self::run_prompt`] must be the **same** `Host`
-/// at a **stable address** for the session's life: its pointer is baked into the compiled code as
-/// the `cap.call` ctx (at construction and at every recompaction), the same contract
-/// [`CompiledModule::compile`] documents, stretched across prompts. Single-threaded; the `Jit`
-/// MVP is single-threaded anyway.
+/// **Concurrency.** The session **owns** the `Host` behind a boxed `Mutex` (stable address) and bakes
+/// [`cap_thunk_locked`], so a **multi-threaded** guest's worker `cap.call`s (incl. threaded
+/// `Jit.compile`, JIT.md §6 #2) serialize correctly — and compaction (a quiescent, between-prompts
+/// operation) rebuilds the module with the **same** locked thunk, so the next multi-threaded prompt
+/// stays sound. A single-threaded guest pays only an uncontended lock per `cap.call`, negligible for
+/// an interactive REPL driver (the perf-critical single-run path is [`jit_cap_run`], which stays
+/// unlocked). Retrieve the host with [`Self::into_host`].
+///
+/// # Lifetime contract
+/// The boxed `Mutex<Host>`'s heap address is baked into the compiled code as the `cap.call` ctx (at
+/// construction and at every recompaction); the `Box` keeps it stable across `JitSession` moves.
 pub struct JitSession {
     base: Module,
     entry: u32,
@@ -696,6 +722,9 @@ pub struct JitSession {
     /// [`Self::compact`] by hand).
     watermark: usize,
     cm: CompiledModule,
+    /// The session-owned powerbox, boxed so its address is stable (baked as the `cap.call` ctx) and
+    /// behind a `Mutex` so a multi-threaded guest's concurrent `cap.call`s serialize.
+    host: Box<Mutex<Host>>,
     /// The carried guest window (low `SNAP` bytes), seeding each prompt and updated from its result.
     window: Vec<u8>,
     /// How many times this session has auto-compacted (observability / tests).
@@ -707,10 +736,11 @@ pub struct JitSession {
 const SESSION_SNAP: usize = 1 << 18;
 
 impl JitSession {
-    /// Build a session: compile `base` (entry `func`) long-lived with the `Jit` ctx baked to
-    /// `host`, ready to run prompts on `domain` (the [`grant_jit`]-returned domain). `watermark`
-    /// is the auto-compaction occupancy threshold (`0` = manual only). Pass the **same**
-    /// `reserved_log2`/`table_reserve_log2` you grant the cap with.
+    /// Build a session that **takes ownership** of `host`: compile `base` (entry `func`) long-lived
+    /// with the `Jit` ctx baked to the session's boxed `Mutex<Host>`, ready to run prompts on
+    /// `domain` (the [`grant_jit`]-returned domain). `watermark` is the auto-compaction occupancy
+    /// threshold (`0` = manual only). Pass the **same** `reserved_log2`/`table_reserve_log2` you
+    /// grant the cap with. Recover the host via [`Self::into_host`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         base: &Module,
@@ -719,13 +749,15 @@ impl JitSession {
         table_reserve_log2: u8,
         domain: u32,
         watermark: usize,
-        host: &mut Host,
+        host: Host,
     ) -> Result<JitSession, svm_jit::JitError> {
+        let host = Box::new(Mutex::new(host));
+        let ctx = &*host as *const Mutex<Host> as *mut c_void;
         let cm = CompiledModule::compile(
             base,
             entry,
-            cap_thunk,
-            host as *mut Host as *mut c_void,
+            cap_thunk_locked,
+            ctx,
             reserved_log2,
             None,
             None,
@@ -742,6 +774,7 @@ impl JitSession {
             domain,
             watermark,
             cm,
+            host,
             window: vec![0u8; SESSION_SNAP],
             compactions: 0,
         })
@@ -750,44 +783,68 @@ impl JitSession {
     /// Run the guest entry on `args` over the carried window, then auto-compact if the watermark is
     /// reached. Returns the prompt's [`JitOutcome`]; the window snapshot is retained for the next
     /// prompt (read it via [`Self::window`]). `args` is the raw i64-slot ABI (e.g. the `Jit` handle
-    /// followed by the guest's own arguments).
-    pub fn run_prompt(
-        &mut self,
-        host: &mut Host,
-        args: &[i64],
-    ) -> Result<JitOutcome, svm_jit::JitError> {
+    /// followed by the guest's own arguments). The guest may spawn threads (its worker `cap.call`s
+    /// serialize through the session's `Mutex<Host>`).
+    pub fn run_prompt(&mut self, args: &[i64]) -> Result<JitOutcome, svm_jit::JitError> {
         let cm_ptr: *mut CompiledModule = &mut self.cm;
-        host.set_jit_native_ctx(cm_ptr as usize);
+        self.host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_jit_native_ctx(cm_ptr as usize);
         // SAFETY: `cm_ptr` is the only pointer used for this run and the one the thunk's handlers
-        // re-enter through (registered above); single-threaded; `self.cm` is not moved during the
-        // call (we hold `&mut self`, and `run_raw` keeps no live reference across the guarded call).
+        // re-enter through (registered above); the run's vCPU threads serialize their `cap.call`s
+        // through the session's `Mutex<Host>`; `self.cm` is not moved during the call (we hold
+        // `&mut self`, and `run_raw` keeps no live reference across the guarded call).
         let r = unsafe {
             CompiledModule::run_raw(cm_ptr, args, Some(&self.window), Some(SESSION_SNAP), None)
         };
-        host.set_jit_native_ctx(0);
+        self.host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_jit_native_ctx(0);
         let (out, mem) = r?;
         self.window = mem;
         if self.watermark != 0 && self.cm.extra_fn_count() >= self.watermark {
-            self.compact(host)?;
+            self.compact()?;
         }
         Ok(out)
     }
 
     /// Force a compaction now (the embedder's manual trigger; [`Self::run_prompt`] calls it
-    /// automatically at the watermark). Quiescent — only valid between prompts.
-    pub fn compact(&mut self, host: &mut Host) -> Result<(), svm_jit::JitError> {
-        let fresh = recompact_jit(
+    /// automatically at the watermark). Quiescent — only valid between prompts. The fresh module
+    /// bakes the **same** locked thunk over the session's `Mutex<Host>`, so a subsequent
+    /// multi-threaded prompt stays sound.
+    pub fn compact(&mut self) -> Result<(), svm_jit::JitError> {
+        assert!(
+            !self.cm.is_running(),
+            "JitSession::compact is quiescent-only: no prompt may be in flight"
+        );
+        let ctx = &*self.host as *const Mutex<Host> as *mut c_void;
+        let mut fresh = CompiledModule::compile(
             &self.base,
             self.entry,
+            cap_thunk_locked,
+            ctx,
             self.reserved_log2,
+            None,
+            None,
+            None,
+            None,
+            svm_jit::Quota::default(),
             self.table_reserve_log2,
-            host,
-            self.domain,
-            &self.cm,
         )?;
+        {
+            let mut host = self.host.lock().unwrap_or_else(|e| e.into_inner());
+            recompact_into(&mut fresh, &mut host, self.domain, &self.cm)?;
+        }
         self.cm = fresh;
         self.compactions += 1;
         Ok(())
+    }
+
+    /// Recover the owned `Host` (e.g. to read captured stdout) after the session ends.
+    pub fn into_host(self) -> Host {
+        (*self.host).into_inner().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Seed `bytes` into the carried guest window at `off` before the next prompt — e.g. a
