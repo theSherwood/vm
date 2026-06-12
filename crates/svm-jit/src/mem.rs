@@ -236,13 +236,13 @@ pub(crate) fn install_guard() {
 }
 
 /// Run an `Entry`-shaped `code` with faults in `[lo, hi)` caught (detect-and-kill), for a window
-/// fault range obtained from [`GuestWindow::fault_range`]. Used to run a fiber resume on a worker: a
-/// guest memory fault inside the fiber unwinds back here (the fiber stack is abandoned — the domain is
-/// being killed). Returns `true` if a guarded fault was caught.
+/// fault range obtained from [`GuestWindow::fault_range`]. Used to run a fiber resume on a worker (a
+/// guest memory fault inside the fiber unwinds back here — the fiber stack is abandoned, the domain is
+/// being killed) and by `CompiledModule::invoke_extra` to nest a recovery inside an in-flight run
+/// (re-entrant, like the §14 child path). Returns `true` if a guarded fault was caught.
 ///
 /// # Safety
 /// `code` must honour the [`Entry`] ABI and its pointer args must be valid for the call.
-#[cfg(fiber_rt)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_guarded_range(
     code: *const u8,

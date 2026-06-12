@@ -957,6 +957,10 @@ pub struct CompiledModule {
     fn_table_mask: u64,
     /// Monotonic counter for unique `declare_function` symbol names across `define_extra` calls.
     next_extra: usize,
+    /// The in-flight run's window fault range, published by `run_code_raw` for the duration of
+    /// the guarded call so a mid-run [`Self::invoke_extra`] can arm its nested recovery.
+    /// `None` ⇒ no run in flight (invoke is rejected).
+    live_fault_range: Option<(usize, usize)>,
     // --- the per-run window *plan* (the window itself is allocated in `run`; the mask and
     // --- extents are baked into the code, so they were fixed at compile time).
     win_mapped: usize,
@@ -1353,6 +1357,7 @@ impl CompiledModule {
             epoch_addr,
             fn_table_mask: (m.funcs.len().next_power_of_two() as u64) - 1,
             next_extra: 0,
+            live_fault_range: None,
             win_mapped,
             win_reserved,
             win_size,
@@ -1390,7 +1395,50 @@ impl CompiledModule {
         async_hooks: Option<&dyn AsyncHostHooks>,
     ) -> Result<(JitOutcome, Vec<u8>), JitError> {
         let (code, n_params, n_results) = (self.tramp_code, self.n_params, self.n_results);
-        self.run_code(
+        // SAFETY: `self` is a unique borrow for the whole call and this path hands no pointer
+        // to any handler — the re-entrant powerbox path goes through `run_raw` instead.
+        unsafe {
+            Self::run_code_raw(
+                self,
+                code,
+                n_params,
+                n_results,
+                args,
+                init_mem,
+                snapshot_cap,
+                async_hooks,
+            )
+        }
+    }
+
+    /// [`Self::run`] through a **caller-managed raw pointer** — the entry the Phase-2 `Jit`
+    /// capability path uses, because its handlers re-enter this module mid-run: the host gives
+    /// the `Jit` binding a copy of `this`, calls `run_raw(this, …)`, and while the guest is
+    /// suspended inside a synchronous `cap.call` the handler may call
+    /// [`Self::define_extra`] / [`Self::invoke_extra`] through its copy. `run_raw` keeps no
+    /// Rust reference into `*this` alive across the guarded call (see `run_code_raw`), so the
+    /// handler's transient `&mut *this` aliases nothing.
+    ///
+    /// # Safety
+    /// - `this` must point at a live `CompiledModule`, not concurrently accessed by any other
+    ///   thread, and **the same pointer value** must be the one handlers use (don't re-derive a
+    ///   fresh `&mut` elsewhere while the run is in flight).
+    /// - Handlers may call `define_extra` / `invoke_extra` through `this` only while the guest
+    ///   is suspended in a synchronous `cap.call` on this thread, and must not call `run` /
+    ///   `run_raw` re-entrantly.
+    pub unsafe fn run_raw(
+        this: *mut CompiledModule,
+        args: &[i64],
+        init_mem: Option<&[u8]>,
+        snapshot_cap: Option<usize>,
+        async_hooks: Option<&dyn AsyncHostHooks>,
+    ) -> Result<(JitOutcome, Vec<u8>), JitError> {
+        let (code, n_params, n_results) = {
+            let t = &*this;
+            (t.tramp_code, t.n_params, t.n_results)
+        };
+        Self::run_code_raw(
+            this,
             code,
             n_params,
             n_results,
@@ -1403,9 +1451,8 @@ impl CompiledModule {
 
     /// Run an **incrementally defined** function (a trampoline pointer returned by
     /// [`Self::define_extra`]) over a fresh guest window, exactly like [`Self::run`] runs the
-    /// entry. This is the Phase-1 test/demo surface; the Phase-2 `Jit` capability instead calls
-    /// the trampoline directly over the *live* window of an in-flight run (the host thunk has the
-    /// run's `mem_base`/`fn_table`/trap cell in hand).
+    /// entry. This is the test/demo surface; the Phase-2 `Jit` capability instead uses
+    /// [`Self::invoke_extra`] over the *live* window of an in-flight run.
     ///
     /// # Safety
     /// `code` must be a trampoline pointer returned by `define_extra` **on this module**, and
@@ -1420,14 +1467,82 @@ impl CompiledModule {
         args: &[i64],
         init_mem: Option<&[u8]>,
     ) -> Result<(JitOutcome, Vec<u8>), JitError> {
-        self.run_code(code, n_params, n_results, args, init_mem, None, None)
+        Self::run_code_raw(self, code, n_params, n_results, args, init_mem, None, None)
+    }
+
+    /// Invoke an extra trampoline **over the live window of an in-flight run** — the engine of
+    /// the `Jit` capability's `invoke` op. Called from inside a `cap.call` handler while the
+    /// guest is suspended; `mem_base`/`trap_out` are the values the cap thunk received (the
+    /// run's window base and trap cell), so the invoked code reads/writes the guest's own
+    /// memory in place and a trap in it propagates exactly like a guest trap.
+    ///
+    /// Runs under a **nested** detect-and-kill recovery (`run_guarded_range` is re-entrant —
+    /// the same §14 child-fault pattern as `compile_child_and_run`): a memory fault in the
+    /// invoked code is caught *here*, written to `trap_out` as `MemoryFault`, and this returns
+    /// normally — the guest's `cap.call` trap-propagation check then unwinds the domain. Traps
+    /// in invoked code are **terminal for the domain** (JIT.md Model A); a guest wanting
+    /// trap isolation uses the `Instantiator`, not `Jit`.
+    ///
+    /// # Safety
+    /// - `this` must be the pointer an in-flight [`Self::run_raw`] on **this thread** is
+    ///   executing on (the guest suspended in its synchronous `cap.call`), and the caller must
+    ///   hold no Rust reference into `*this` across this call.
+    /// - `code` must be a trampoline returned by `define_extra` on this module; `args` must
+    ///   cover its param count and `results` its result count.
+    /// - `mem_base` and `trap_out` must be the live run's window base and trap cell.
+    pub unsafe fn invoke_extra(
+        this: *mut CompiledModule,
+        code: *const u8,
+        args: &[i64],
+        results: &mut [i64],
+        mem_base: *mut u8,
+        trap_out: *mut i64,
+    ) -> Result<(), JitError> {
+        let (fn_table_ptr, live) = {
+            let t = &*this;
+            (
+                t.fn_table.as_ptr() as *const core::ffi::c_void,
+                t.live_fault_range,
+            )
+        };
+        let (lo, hi) = live.ok_or(JitError::Unsupported(
+            "invoke_extra outside an in-flight run",
+        ))?;
+        let faulted = mem::run_guarded_range(
+            code,
+            args.as_ptr(),
+            results.as_mut_ptr(),
+            mem_base,
+            fn_table_ptr,
+            trap_out,
+            lo,
+            hi,
+        );
+        if faulted {
+            // Detect-and-kill (§5), reported the same way the outer run reports it; the
+            // guest's cap.call propagation check sees the cell and unwinds the domain.
+            *trap_out = mem::FAULT_TRAP;
+        }
+        Ok(())
     }
 
     /// The shared run body: window setup → guarded call → snapshot → teardown. `code` is a
-    /// buffer-ABI trampoline owned by `self.module` (the entry's, or an extra function's).
+    /// buffer-ABI trampoline owned by the module (the entry's, or an extra function's).
+    ///
+    /// Structured for **mid-run re-entry**: every reference into `*this` is derived
+    /// transiently and dropped before the guarded call (raw pointers extracted up front), so a
+    /// `cap.call` handler re-entering through its own copy of `this` while the guest is
+    /// suspended aliases no live Rust reference. The fields a re-entrant `define_extra`
+    /// mutates (`module`, `distinct`, `next_extra`) are disjoint from everything the in-flight
+    /// call reads through raw pointers (`fn_table` is boxed, never grown or moved; the window
+    /// is a local).
+    ///
+    /// # Safety
+    /// As [`Self::run_raw`]; additionally `code`/`n_params`/`n_results` must describe a
+    /// trampoline owned by this module.
     #[allow(clippy::too_many_arguments)]
-    fn run_code(
-        &mut self,
+    unsafe fn run_code_raw(
+        this: *mut CompiledModule,
         code: *const u8,
         n_params: usize,
         n_results: usize,
@@ -1442,35 +1557,40 @@ impl CompiledModule {
         if args.len() < n_params {
             return Err(JitError::Malformed);
         }
+        // ---- Setup: references into `*this` live only inside this block. ----
         // Allocate the guest window for this run: `mapped` backed RW bytes inside the reserved
         // virtual range planned at compile time (§4); zero-sized when the module has no memory.
-        let mut window = mem::GuestWindow::new(self.win_mapped, self.win_reserved);
-        let win_size = self.win_size;
-        // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
-        if let Some(init) = init_mem {
-            let n = init.len().min(win_size);
-            window.rw_mut()[..n].copy_from_slice(&init[..n]);
-        }
-
-        // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
-        // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
-        // verifier already bounds every segment to `[0, size)`. Segment offsets are child-relative, so
-        // a §14 sub-window shifts them by `sub_base` into the parent backing. Done while fully RW.
-        if let Some(size_log2) = self.mem_size_log2 {
-            let size = 1u64 << size_log2;
-            let rw = window.rw_mut();
-            for d in &self.data {
-                let lo = self.sub_base + d.offset.min(size);
-                let hi = self.sub_base + (d.offset + d.bytes.len() as u64).min(size);
-                let (start, end) = (lo as usize, hi as usize);
-                rw[start..end].copy_from_slice(&d.bytes[..end - start]);
+        let (mut window, win_size, mask, fn_table_ptr) = {
+            let t = &mut *this;
+            let mut window = mem::GuestWindow::new(t.win_mapped, t.win_reserved);
+            let win_size = t.win_size;
+            // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
+            if let Some(init) = init_mem {
+                let n = init.len().min(win_size);
+                window.rw_mut()[..n].copy_from_slice(&init[..n]);
             }
-        }
-        for d in &self.data {
-            if d.readonly && !d.bytes.is_empty() {
-                window.protect_ro(self.sub_base + d.offset, d.bytes.len() as u64);
+            // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
+            // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
+            // verifier already bounds every segment to `[0, size)`. Segment offsets are child-relative, so
+            // a §14 sub-window shifts them by `sub_base` into the parent backing. Done while fully RW.
+            if let Some(size_log2) = t.mem_size_log2 {
+                let size = 1u64 << size_log2;
+                let rw = window.rw_mut();
+                for d in &t.data {
+                    let lo = t.sub_base + d.offset.min(size);
+                    let hi = t.sub_base + (d.offset + d.bytes.len() as u64).min(size);
+                    let (start, end) = (lo as usize, hi as usize);
+                    rw[start..end].copy_from_slice(&d.bytes[..end - start]);
+                }
             }
-        }
+            for d in &t.data {
+                if d.readonly && !d.bytes.is_empty() {
+                    window.protect_ro(t.sub_base + d.offset, d.bytes.len() as u64);
+                }
+            }
+            let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
+            (window, win_size, t.mask, fn_table_ptr)
+        };
 
         let mem_base = window.base();
         let mut results = vec![0i64; n_results];
@@ -1485,38 +1605,39 @@ impl CompiledModule {
         // vCPUs run on their own OS threads via the baked `Domain`. Seed the `Domain`'s per-run `Env` now
         // that the window / fn-table / trap-cell / call-trampoline are all known.
         #[cfg(fiber_rt)]
-        if let Some(d) = &self.domain {
-            d.set_env(
-                mem_base as u64,
-                self.fn_table.as_ptr() as u64,
-                trap_cell.as_ptr(),
-                self.call_tramp
-                    .expect("call-trampoline set for a threaded module"),
-                window.fault_range(),
-                self.fiber_cfg,
-                self.epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
-            );
-        }
-
-        // §9/§12 async ring: publish this run's futex-`notify` into the embedder's `Host` so an offload
-        // worker can wake a vCPU parked in `submit_async` on a completion counter (the futex `phys` is the
-        // parking key). Needs the thread `Domain` (a module that parks on a counter uses `atomic.wait`, so
-        // `uses_threads` holds). With no `Domain`/hooks, `submit_async` stays an inert `-EINVAL`.
-        #[cfg(fiber_rt)]
-        if let (Some(hooks), Some(d)) = (async_hooks, &self.domain) {
-            // The `Domain` pointer as a `usize` so the hook closure is `Send + Sync` (a raw pointer is not,
-            // and Rust-2021 disjoint capture would otherwise grab the bare pointer field).
-            let dom_addr = (&**d as *const os_thread_rt::Domain) as usize;
-            hooks.install_notify(std::sync::Arc::new(move |key: u64, count: u32| {
-                let n = count.min(i32::MAX as u32) as i32;
-                // SAFETY: the `Domain` outlives the run; the hook is dropped by `hooks.finish()` after
-                // `join_all`, before the `Domain` is freed, so the pointer is valid whenever a worker
-                // calls this. `thread_notify` is sound from any thread (it locks the domain futex), like a
-                // guest `atomic.notify`.
-                unsafe {
-                    os_thread_rt::thread_notify(dom_addr as *const os_thread_rt::Domain, key, n)
-                };
-            }));
+        {
+            let t = &*this;
+            if let Some(d) = &t.domain {
+                d.set_env(
+                    mem_base as u64,
+                    fn_table_ptr as u64,
+                    trap_cell.as_ptr(),
+                    t.call_tramp
+                        .expect("call-trampoline set for a threaded module"),
+                    window.fault_range(),
+                    t.fiber_cfg,
+                    t.epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
+                );
+            }
+            // §9/§12 async ring: publish this run's futex-`notify` into the embedder's `Host` so an offload
+            // worker can wake a vCPU parked in `submit_async` on a completion counter (the futex `phys` is the
+            // parking key). Needs the thread `Domain` (a module that parks on a counter uses `atomic.wait`, so
+            // `uses_threads` holds). With no `Domain`/hooks, `submit_async` stays an inert `-EINVAL`.
+            if let (Some(hooks), Some(d)) = (async_hooks, &t.domain) {
+                // The `Domain` pointer as a `usize` so the hook closure is `Send + Sync` (a raw pointer is not,
+                // and Rust-2021 disjoint capture would otherwise grab the bare pointer field).
+                let dom_addr = (&**d as *const os_thread_rt::Domain) as usize;
+                hooks.install_notify(std::sync::Arc::new(move |key: u64, count: u32| {
+                    let n = count.min(i32::MAX as u32) as i32;
+                    // SAFETY: the `Domain` outlives the run; the hook is dropped by `hooks.finish()` after
+                    // `join_all`, before the `Domain` is freed, so the pointer is valid whenever a worker
+                    // calls this. `thread_notify` is sound from any thread (it locks the domain futex), like a
+                    // guest `atomic.notify`.
+                    unsafe {
+                        os_thread_rt::thread_notify(dom_addr as *const os_thread_rt::Domain, key, n)
+                    };
+                }));
+            }
         }
         #[cfg(not(fiber_rt))]
         let _ = &async_hooks;
@@ -1524,34 +1645,43 @@ impl CompiledModule {
         // Publish the root fiber runtime (when the module uses `cont.*`) so its thunks find it via the
         // thread-local for the duration of the entry; spawned vCPUs publish their own.
         #[cfg(fiber_rt)]
-        let prev_rt = self
-            .fiber_rt
-            .as_mut()
-            .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime));
+        let prev_rt = {
+            let t = &mut *this;
+            t.fiber_rt
+                .as_mut()
+                .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime))
+        };
 
+        // Publish the live window's fault range so a mid-run `invoke_extra` (from a cap.call
+        // handler) can arm its nested recovery against this run's window.
+        (*this).live_fault_range = Some(window.fault_range());
+
+        // ---- The guarded call: NO Rust reference into `*this` is live here, so a handler's
+        // ---- transient `&mut *this` (define_extra / invoke_extra mid-run) aliases nothing.
         // SAFETY: `code` is a finalized buffer-ABI trampoline honouring the `Entry` ABI. It reads the
         // arg slots, writes the result slots, accesses only the guarded window (any escape faults into
         // the guard page), reads `fn_table`, and writes `trap_cell`. All buffers outlive the call;
-        // `self.module` owns the executable pages until `self` drops (after every spawned vCPU is
+        // the module owns the executable pages until `*this` drops (after every spawned vCPU is
         // joined below).
-        let faulted = unsafe {
-            mem::run_guarded(
-                &window,
-                code,
-                args.as_ptr(),
-                results.as_mut_ptr(),
-                mem_base,
-                self.fn_table.as_ptr() as *const core::ffi::c_void,
-                trap_cell.as_ptr(),
-            )
-        };
+        let faulted = mem::run_guarded(
+            &window,
+            code,
+            args.as_ptr(),
+            results.as_mut_ptr(),
+            mem_base,
+            fn_table_ptr,
+            trap_cell.as_ptr(),
+        );
+
+        // ---- Teardown: transient references again. ----
+        (*this).live_fault_range = None;
         #[cfg(fiber_rt)]
         if let Some(p) = prev_rt {
             fiber_rt::set_current(p);
         }
         // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
         #[cfg(fiber_rt)]
-        if let Some(d) = &self.domain {
+        if let Some(d) = &(*this).domain {
             d.join_all();
         }
         // §9/§12 async ring: now that every vCPU is joined, drain the offload pool and drop the futex hook
@@ -1574,7 +1704,7 @@ impl CompiledModule {
         // cover reserved-tail pages the guest grew/`unmap`-ed (§1a growth path), `commit`-ing them so the
         // read sees zero/their content instead of faulting. `read_low` clamps to the reservation.
         let snap = match snapshot_cap {
-            Some(cap) if win_size > 0 => cap.min((self.mask + 1) as usize).max(win_size),
+            Some(cap) if win_size > 0 => cap.min((mask + 1) as usize).max(win_size),
             _ => win_size,
         };
         let final_mem = if snap > win_size {
@@ -1582,8 +1712,8 @@ impl CompiledModule {
         } else {
             window.rw_mut()[..win_size].to_vec()
         };
-        // The window dies with this run; the code (`self.module`), function table, and runtimes
-        // stay alive in `self` for the next `run` / `define_extra` / drop.
+        // The window dies with this run; the code, function table, and runtimes stay alive in
+        // `*this` for the next `run` / `define_extra` / drop.
         drop(window);
 
         // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
