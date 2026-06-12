@@ -46,3 +46,31 @@ The differential test (`c_frontend.rs::c_guest_jit_demo`) runs the same program 
 reference interpreter — where `invoke` is a nested evaluation and the installed slot dispatches
 through the module-aware table — and on the Cranelift JIT (native code over the live `fn_table`),
 asserting identical results and output.
+
+## Threaded JIT (`jit_threads.c`)
+
+The single-threaded capstone's concurrent sibling (JIT.md §6 #2): `NWORKERS` guest threads each
+build serialized IR for a **distinct** unit and `__vm_jit_compile` it — so several `Jit.compile`s
+run at once — then invoke the native code and check it against a C reference. Each worker keeps its
+blob in its own stack buffer and threads the emit cursor explicitly, so the only concurrency the VM
+mediates is the cap.call into the host.
+
+Because the guest `thread.spawn`s, the powerbox runs it through the **per-domain serialized
+cap-thunk** (a `Mutex<Host>`): a worker's `Jit.compile` (`finalize_definitions`) is serialized
+against its siblings' compiles while their *execution* stays fully parallel — cranelift-jit appends
+new functions to fresh arena pages and never modifies running code, so a finalize never disturbs an
+executing unit. The guest-facing iface 11 is unchanged; the serialization is an internal host detail.
+
+```sh
+cargo run -p svm-run -- crates/svm-run/demos/jit/jit_threads.c
+```
+
+Expected output — `0` input mismatches across every worker:
+
+```text
+0
+```
+
+The product-path smoke test is `run.rs::demo_jit_threads_runs` (through the `svm-run` binary, which
+engages the locked thunk for a concurrent guest); the interp↔JIT differential for threaded compile
+is pinned at the IR level by `jit_cap::threaded_compile_agrees_across_backends`.

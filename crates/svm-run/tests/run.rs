@@ -469,6 +469,39 @@ fn demo_work_stealing_runs() {
     assert_eq!(out.stdout, b"256\n", "guest work-stealing scheduler total");
 }
 
+/// The **threaded guest-driven JIT** demo (`demos/jit/jit_threads.c`, JIT.md §6 #2), end to end
+/// through the `svm-run` binary: 4 worker threads each Cranelift-compile a distinct unit
+/// **concurrently** (several `Jit.compile`s in flight, serialized through the per-domain
+/// `Mutex<Host>` the powerbox engages for a `thread.spawn`ing guest) and invoke the native code,
+/// checking each against a C reference. Must print `0` (no input mismatches across any worker) — the
+/// product-path proof that concurrent guest JIT compilation is sound. Gated to the `fiber_rt` targets
+/// (elsewhere `thread.spawn` is `Unsupported`). Skipped (not failed) when the frontend is unavailable.
+#[test]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn demo_jit_threads_runs() {
+    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
+        .arg(demo("jit/jit_threads.c"))
+        .output()
+        .expect("spawn svm-run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.contains("chibicc") {
+        eprintln!(
+            "note: skipping jit_threads demo (frontend unavailable): {}",
+            err.trim()
+        );
+        return;
+    }
+    assert!(out.status.success(), "svm-run on jit_threads failed: {err}");
+    assert_eq!(
+        out.stdout, b"0\n",
+        "every worker's concurrently-JITed unit must agree with the reference"
+    );
+}
+
 /// §15 the embedder-facing spawn quota (`run_powerbox_with_deadline_and_quota`) is enforced
 /// end-to-end on the JIT: a powerbox guest that spawns a vCPU is **detect-and-killed** under a
 /// `max_vcpus = 1` quota (the root fills it), and runs under the default. Gated to the targets where

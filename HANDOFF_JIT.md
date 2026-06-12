@@ -310,15 +310,18 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
    - **Threaded-compile remainders (narrow):** (a) a coarse-lock→**fine-grained / sharded-module**
      optimization if parallel-compile *throughput* is ever measured to matter — deliberately deferred
      (no demonstrated need; the guest `cap.call 11` iface is unchanged, so it's a pure internal swap).
-     (b) a C-level threaded-compile **demo** under `demos/` (the IR-level differential + the concurrent
-     C demos already cover the mechanism).
+     (b) **C-level threaded-compile demo — done.** `demos/jit/jit_threads.c`: `NWORKERS` guest threads
+     each build IR for a distinct unit and `__vm_jit_compile` it (several `Jit.compile`s in flight,
+     serialized through the powerbox's per-domain `Mutex<Host>` since the guest `thread.spawn`s), invoke
+     the native code, and check it against a C reference — prints `0` mismatches. Product-path smoke
+     test `run::demo_jit_threads_runs` (through the `svm-run` binary's locked thunk), on all `fiber_rt`
+     targets; the interp↔JIT differential stays at the IR level (`jit_cap::threaded_compile_agrees_across_backends`).
 
 **Recommendation:** #1 (compaction) and #2 (threaded **install** + threaded **compile**) are both
 landed end-to-end — install with full platform parity, compile via the per-domain serialized thunk
 (single-threaded paths untouched), CLI wired, the cross-thread-execute case confirmed needing no
 `isb`, and **compaction works for multithreaded guests** (`JitSession` owns the `Mutex<Host>`). The
-only open threaded-compile items are a throughput optimization (gated on a measured need) and a C
-demo.
+only open threaded-compile item is the throughput optimization (gated on a measured need).
 
 Also nice-to-have, low priority: a guest convention/helper so emitting C-ABI units (the `sp`-first
 shape) for `install` is less manual; today the demo hand-rolls it.
