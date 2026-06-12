@@ -261,7 +261,11 @@ fn diff_bitwise_and_bitselect() {
           v8 = v128.andnot v7 v2\n\
           v9 = v128.bitselect v2 v3 v8\n\
           v10 = i32x4.extract_lane 0 v9\n  return v10\n}\n";
-    for (a, b) in [(0xF0F0_F0F0u32 as i32, 0x0FF0_0FF0), (0, -1), (12345, 67890)] {
+    for (a, b) in [
+        (0xF0F0_F0F0u32 as i32, 0x0FF0_0FF0),
+        (0, -1),
+        (12345, 67890),
+    ] {
         diff1(s, &[Value::I32(a), Value::I32(b)]);
     }
 }

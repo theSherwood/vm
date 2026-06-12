@@ -401,6 +401,11 @@ unsafe extern "C" fn empty_cap_thunk(
     unsafe { *trap_out = TrapKind::CapFault as i64 };
 }
 
+/// The inert [`CapThunk`] (every `cap.call` is a `CapFault`) for callers with no host — the
+/// long-lived [`CompiledModule::compile`] counterpart of [`compile_and_run`]'s empty powerbox.
+/// Pass with a null `cap_ctx`.
+pub const INERT_CAP_THUNK: CapThunk = empty_cap_thunk;
+
 /// The CLIF type backing an IR value type.
 fn clif_ty(t: ValType) -> Type {
     match t {
@@ -818,9 +823,9 @@ pub fn compile_and_run_capture_reserved_with_host_async(
 /// top-level window (the add is elided). The parent is seeded/snapshotted whole, so the
 /// escape-oracle can assert the child only ever touched its own slice.
 #[derive(Clone, Copy)]
-struct SubWindow {
-    base: u64,
-    parent_bytes: u64,
+pub struct SubWindow {
+    pub base: u64,
+    pub parent_bytes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -840,473 +845,798 @@ fn run_inner(
     fast_resolver: Option<FastCapResolver>,
     quota: Quota,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
-    let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
-    // §5 fuel/epoch kill-path: the address of the host-owned interrupt cell the lowering polls at
-    // loop back-edges + function entries. `0` when the caller armed no kill-path (then no checks are
-    // emitted — guest code is byte-identical to before). The cell must outlive the run; the caller
-    // owns it (e.g. an `Arc<AtomicU64>` a watchdog thread sets), so the baked address stays valid.
-    let epoch_addr = interrupt.map_or(0, |p| p as i64);
-    // Calls can reach any function, so every function must be lowerable.
-    for f in &m.funcs {
-        ensure_supported(f)?;
-    }
-
-    // Allocate the guest window if the module declares memory: `mapped` backed RW bytes inside
-    // a host-configured `reserved` virtual range whose unmapped tail + guard page fault (§4).
-    // `mask` is the §4 confinement mask (`reserved − 1`, the mask domain); `win_size` is the
-    // seed/snapshot extent (the parent for a sub-window); `cap_mapped` is the child's backed
-    // `mapped` that cap-call buffer borrows bound against; `mem_base` is null when none.
-    // `sub_base` is the §14 sub-window offset the masking lowering adds (0 for a top-level window).
-    let (mut window, mask, win_size, cap_mapped, sub_base): (
-        mem::GuestWindow,
-        u64,
-        usize,
-        u64,
-        u64,
-    ) = match m.memory {
-        Some(mc) => {
-            if mc.size_log2 > MAX_JIT_WINDOW_LOG2 {
-                return Err(JitError::Unsupported(
-                    "window too large for the reference JIT",
-                ));
-            }
-            let mapped = 1usize << mc.size_log2;
-            // Host reservation policy: at least `mapped` (fully mapped if `reserved_log2` is
-            // smaller, e.g. 0), capped so the reference JIT's reservation stays sane.
-            let reserved_log2 = reserved_log2.max(mc.size_log2).min(MAX_JIT_RESERVED_LOG2);
-            match sub {
-                // §14 sub-window: a fully-backed parent of `parent_bytes`, with the child
-                // confined (mask = child `reserved − 1`) into the slice at `base`. The child's
-                // mask domain `[0, reserved)` plus `base` must fit in the parent — the
-                // verifier-bounded child size + host-chosen `base` guarantee it (the
-                // Instantiator will enforce this).
-                Some(sw) => {
-                    let parent = sw.parent_bytes as usize;
-                    (
-                        mem::GuestWindow::new(parent, parent),
-                        (1u64 << reserved_log2) - 1,
-                        parent,
-                        mapped as u64,
-                        sw.base,
-                    )
-                }
-                None => {
-                    let reserved = 1usize << reserved_log2;
-                    (
-                        mem::GuestWindow::new(mapped, reserved),
-                        (1u64 << reserved_log2) - 1,
-                        mapped,
-                        mapped as u64,
-                        0,
-                    )
-                }
-            }
-        }
-        None => (mem::GuestWindow::new(0, 0), 0, 0, 0, 0),
-    };
-    // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
-    if let Some(init) = init_mem {
-        let n = init.len().min(win_size);
-        window.rw_mut()[..n].copy_from_slice(&init[..n]);
-    }
-
-    // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
-    // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
-    // verifier already bounds every segment to `[0, size)`. Segment offsets are child-relative, so
-    // a §14 sub-window shifts them by `sub_base` into the parent backing. Done while fully RW.
-    if let Some(mc) = m.memory {
-        let size = 1u64 << mc.size_log2;
-        let rw = window.rw_mut();
-        for d in &m.data {
-            let lo = sub_base + d.offset.min(size);
-            let hi = sub_base + (d.offset + d.bytes.len() as u64).min(size);
-            let (start, end) = (lo as usize, hi as usize);
-            rw[start..end].copy_from_slice(&d.bytes[..end - start]);
-        }
-    }
-    for d in &m.data {
-        if d.readonly && !d.bytes.is_empty() {
-            window.protect_ro(sub_base + d.offset, d.bytes.len() as u64);
-        }
-    }
-
-    let mut flags = settings::builder();
-    // A JIT'd function is called directly, not relocated into a shared object.
-    let _ = flags.set("is_pic", "false");
-    // Cranelift's x64 `return_call` (tail calls, §3b) lowering requires frame pointers.
-    let _ = flags.set("preserve_frame_pointers", "true");
-    // Run Cranelift's mid-end optimizer (GVN/CSE, constant materialization, store-to-load
-    // forwarding). Wasmtime defaults to this; without it (the prior default `none`) redundant
-    // address computations weren't CSE'd and constants were pool loads. "SSA on the wire" (no SSA
-    // reconstruction) keeps cold start ahead even with the optimizer on.
-    let _ = flags.set("opt_level", "speed");
-    let isa = cranelift_native::builder()
-        .map_err(|e| JitError::Backend(e.to_string()))?
-        .finish(settings::Flags::new(flags))
-        .map_err(|e| JitError::Backend(e.to_string()))?;
-    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    // Allocate code + read-only data (float constants, jump tables) from a single contiguous
-    // arena rather than the default separate `mmap`s. cranelift's x64 `call`/rip-relative
-    // loads use 32-bit PC-relative relocations (`X86CallPCRel4`/`X86PCRel4`); with independent
-    // mmaps, ASLR can place code and rodata > 2 GiB apart, overflowing the i32 offset (a
-    // `compiled_blob.rs` panic) — intermittent, and only on large modules with rodata (e.g.
-    // a whole UI library). A 256 MiB reserved arena (VA only, committed on demand) keeps every
-    // segment in range. Reserve falls back to the default provider if it cannot map.
-    if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
-        builder.memory_provider(Box::new(arena));
-    }
-    let mut module = JITModule::new(builder);
-
-    // Declare every function (natural ABI) up front so calls can reference any of them.
-    let ids: Vec<_> = m
-        .funcs
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let sig = natural_sig(&mut module, f);
-            module
-                .declare_function(&format!("f{i}"), Linkage::Local, &sig)
-                .map_err(|e| JitError::Backend(e.to_string()))
-        })
-        .collect::<Result<_, _>>()?;
-
-    // Distinct signatures give each function (and call site) a structural type id, the
-    // basis for the `call_indirect` type check (matching the interpreter).
-    let distinct = distinct_types(&m.funcs);
-
-    // The host thunk + ctx addresses, baked into `cap.call` sites as constants.
-    let cap = CapEnv {
-        thunk_addr: cap_thunk as usize as i64,
-        ctx_addr: cap_ctx as usize as i64,
+    // The historical one-shot lifecycle, now compile → run over the long-lived split
+    // (JIT.md Phase 1): `CompiledModule` owns the `JITModule` for the whole run and the
+    // executable memory is freed when it drops, after `run` returns — behavior-identical
+    // to the old inline compile→run→drop.
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        sub,
+        resolve_module,
+        interrupt,
         fast_resolver,
-    };
+        quota,
+    )?;
+    cm.run(args, init_mem, snapshot_cap, async_hooks)
+}
 
-    // §12 fibers: if the module uses `cont.*`, stand up a host fiber runtime (its address baked into
-    // the `cont.*` sites). The `FiberRuntime` box is created now so its address is stable; the
-    // call-trampoline address is filled in after finalize. On targets without stack-switch support,
-    // `ensure_supported` has already rejected the fiber ops, so this stays `null`.
+/// A compiled module whose executable code **outlives a single run** (JIT.md Phase 1: the
+/// long-lived `JITModule` split). Owns the [`JITModule`] (the executable memory lives until
+/// drop), the power-of-two-padded function table, the entry's buffer-ABI trampoline, and the
+/// §12/§14 runtimes whose addresses are baked into the code. Produced by
+/// [`CompiledModule::compile`]; [`CompiledModule::run`] executes the entry over a fresh guest
+/// window (allocated per run — the window base is threaded as a runtime argument, not baked).
+///
+/// [`CompiledModule::define_extra`] then declares + defines + finalizes **additional**
+/// functions into the same live module — the enabling primitive for the guest-driven `Jit`
+/// capability (JIT.md Model A). Extra functions are *thunk-reachable only*: they are **never**
+/// installed in the function table, so the table mask baked into every `call_indirect` site
+/// (`fn_table_mask`) never changes — the escape-relevant dispatch is byte-identical to the
+/// one-shot path.
+pub struct CompiledModule {
+    /// The padded function table `call_indirect` dispatches through. Its address is threaded as
+    /// a runtime argument (not baked), but running code reads it — boxed so it never moves, and
+    /// declared before `module` so drop order matches the old `drop(fn_table); drop(module)`.
+    fn_table: Box<[FnEntry]>,
+    /// The entry's buffer-ABI trampoline (finalized code, owned by `module`).
+    tramp_code: *const u8,
+    /// The entry's parameter count — `run` rejects shorter `args` (the trampoline reads
+    /// exactly this many slots).
+    n_params: usize,
+    /// The entry's result count (`run` sizes the result buffer).
+    n_results: usize,
+    // --- the baked lowering environment, reused verbatim by `define_extra` so an extra
+    // --- function compiles against the *same* constants as the parent (same confinement
+    // --- mask, same cap thunk, same table mask — JIT.md "vmctx sharing").
+    distinct: Vec<FuncType>,
+    cap: CapEnv,
+    fiber: FiberEnv,
+    thread: ThreadEnv,
+    inst: InstEnv,
+    mask: u64,
+    cap_mapped: u64,
+    sub_base: u64,
+    epoch_addr: i64,
+    /// The `call_indirect` index mask fixed at compile time (`next_pow2(n_funcs) - 1`) and baked
+    /// into every call site. `define_extra` compiles new units against this same constant.
+    fn_table_mask: u64,
+    /// Monotonic counter for unique `declare_function` symbol names across `define_extra` calls.
+    next_extra: usize,
+    // --- the per-run window *plan* (the window itself is allocated in `run`; the mask and
+    // --- extents are baked into the code, so they were fixed at compile time).
+    win_mapped: usize,
+    win_reserved: usize,
+    win_size: usize,
+    mem_size_log2: Option<u8>,
+    /// Initialized data segments, owned so a run can seed a fresh window (the module may
+    /// outlive the borrowed `IrModule`).
+    data: Vec<Data>,
+    // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
+    // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
-    let uses_fibers = module_uses_fibers(m);
+    fiber_rt: Option<Box<fiber_rt::FiberRuntime>>,
     #[cfg(fiber_rt)]
-    let uses_threads = module_uses_threads(m);
-    // Per-run fiber constants (the §12 fiber entry type id + the function-table mask), used to build
-    // fiber runtimes — one standalone, or one per vCPU when threads use `cont.*`.
+    domain: Option<Box<os_thread_rt::Domain>>,
+    /// Kept alive because its address is baked into the module's `Instantiator` cap.call sites.
     #[cfg(fiber_rt)]
-    let fiber_type_id = type_id_of(&distinct, &fiber_func_type());
+    _nursery: Option<Box<instantiator_rt::Nursery>>,
     #[cfg(fiber_rt)]
-    let fiber_mask = (m.funcs.len().next_power_of_two() as u64) - 1;
-    // Fibers + threads compose via a **per-vCPU** fiber runtime, published through a thread-local. This
-    // is the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
-    // builds its own from `fiber_cfg` (`os_thread_rt`). Created whenever the module uses `cont.*`.
+    call_tramp: Option<fiber_rt::FiberCallTramp>,
+    /// `(fiber_type_id, fiber_mask, max_fibers)` when the module uses `cont.*` — the per-vCPU
+    /// fiber config spawned vCPUs build their runtimes from (`Domain::set_env`).
     #[cfg(fiber_rt)]
-    let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
-        Some(Box::new(fiber_rt::FiberRuntime::new(
-            fiber_type_id,
-            fiber_mask,
-            quota.max_fibers,
-        )))
-    } else {
-        None
-    };
-    // The `cont.*` thunk addresses (the runtime itself is found via a thread-local at call time).
-    #[cfg(fiber_rt)]
-    let fiber = if uses_fibers {
-        FiberEnv {
-            new_thunk: fiber_rt::fiber_new as *const () as i64,
-            resume_thunk: fiber_rt::fiber_resume as *const () as i64,
-            suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
+    fiber_cfg: Option<(u32, u64, usize)>,
+    /// Owns the executable memory — the whole point of the long-lived split. Dropped last
+    /// (declaration order), after everything that points into it.
+    module: JITModule,
+}
+
+impl CompiledModule {
+    /// Compile the whole module (the compile half of the old one-shot `compile_and_run*`):
+    /// declare + define every function, the entry's buffer-ABI trampoline, finalize once, and
+    /// build the function table. Everything *baked into code* — the confinement mask, the
+    /// `cap.call` thunk/ctx, the runtime addresses, the table mask, the §5 interrupt cell — is
+    /// fixed here; per-run state (the window, the trap cell) is supplied by [`Self::run`].
+    ///
+    /// # Safety-relevant contract (not `unsafe`, but load-bearing)
+    /// `cap_thunk`/`cap_ctx`/`fast_resolver`/`interrupt` addresses are baked into the compiled
+    /// code: they must stay valid for the **lifetime of this `CompiledModule`** (not just one
+    /// run) and honour their respective ABIs — the same contract the one-shot entry points
+    /// documented per call, stretched over the module's life.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        m: &IrModule,
+        func: FuncIdx,
+        cap_thunk: CapThunk,
+        cap_ctx: *mut core::ffi::c_void,
+        reserved_log2: u8,
+        sub: Option<SubWindow>,
+        resolve_module: Option<ModuleResolver>,
+        interrupt: Option<*const AtomicU64>,
+        fast_resolver: Option<FastCapResolver>,
+        quota: Quota,
+    ) -> Result<CompiledModule, JitError> {
+        let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
+        // §5 fuel/epoch kill-path: the address of the host-owned interrupt cell the lowering polls at
+        // loop back-edges + function entries. `0` when the caller armed no kill-path (then no checks are
+        // emitted — guest code is byte-identical to before). The cell must outlive the module; the caller
+        // owns it (e.g. an `Arc<AtomicU64>` a watchdog thread sets), so the baked address stays valid.
+        let epoch_addr = interrupt.map_or(0, |p| p as i64);
+        // Calls can reach any function, so every function must be lowerable.
+        for f in &m.funcs {
+            ensure_supported(f)?;
         }
-    } else {
-        FiberEnv::null()
-    };
-    #[cfg(not(fiber_rt))]
-    let fiber = FiberEnv::null();
 
-    // §12 threads: stand up the 1:1 OS-thread executor `Domain` whose stable address is baked into the
-    // `thread.*` sites. It owns no scheduling policy — `thread.spawn` launches a real OS thread (the
-    // guest builds any M:N model itself, D22). The per-run `Env` (call-trampoline, window, trap cell)
-    // is supplied after finalize via `set_env`; the address is stable now.
-    #[cfg(fiber_rt)]
-    let domain: Option<Box<os_thread_rt::Domain>> = if uses_threads {
-        Some(Box::new(os_thread_rt::Domain::new(quota.max_vcpus)))
-    } else {
-        None
-    };
-    #[cfg(fiber_rt)]
-    let thread = if let Some(d) = &domain {
-        ThreadEnv {
-            sched_addr: (&**d as *const os_thread_rt::Domain) as i64,
-            spawn_thunk: os_thread_rt::thread_spawn as *const () as i64,
-            join_thunk: os_thread_rt::thread_join as *const () as i64,
-            wait_thunk: os_thread_rt::thread_wait as *const () as i64,
-            notify_thunk: os_thread_rt::thread_notify as *const () as i64,
+        // Plan the guest window if the module declares memory (allocation happens per `run`):
+        // `mapped` backed RW bytes inside a host-configured `reserved` virtual range whose
+        // unmapped tail + guard page fault (§4). `mask` is the §4 confinement mask (`reserved − 1`,
+        // the mask domain); `win_size` is the seed/snapshot extent (the parent for a sub-window);
+        // `cap_mapped` is the child's backed `mapped` that cap-call buffer borrows bound against.
+        // `sub_base` is the §14 sub-window offset the masking lowering adds (0 for a top-level
+        // window). All of these are baked into the code, so they are fixed at compile time.
+        let (win_mapped, win_reserved, mask, win_size, cap_mapped, sub_base): (
+            usize,
+            usize,
+            u64,
+            usize,
+            u64,
+            u64,
+        ) = match m.memory {
+            Some(mc) => {
+                if mc.size_log2 > MAX_JIT_WINDOW_LOG2 {
+                    return Err(JitError::Unsupported(
+                        "window too large for the reference JIT",
+                    ));
+                }
+                let mapped = 1usize << mc.size_log2;
+                // Host reservation policy: at least `mapped` (fully mapped if `reserved_log2` is
+                // smaller, e.g. 0), capped so the reference JIT's reservation stays sane.
+                let reserved_log2 = reserved_log2.max(mc.size_log2).min(MAX_JIT_RESERVED_LOG2);
+                match sub {
+                    // §14 sub-window: a fully-backed parent of `parent_bytes`, with the child
+                    // confined (mask = child `reserved − 1`) into the slice at `base`. The child's
+                    // mask domain `[0, reserved)` plus `base` must fit in the parent — the
+                    // verifier-bounded child size + host-chosen `base` guarantee it (the
+                    // Instantiator will enforce this).
+                    Some(sw) => {
+                        let parent = sw.parent_bytes as usize;
+                        (
+                            parent,
+                            parent,
+                            (1u64 << reserved_log2) - 1,
+                            parent,
+                            mapped as u64,
+                            sw.base,
+                        )
+                    }
+                    None => {
+                        let reserved = 1usize << reserved_log2;
+                        (
+                            mapped,
+                            reserved,
+                            (1u64 << reserved_log2) - 1,
+                            mapped,
+                            mapped as u64,
+                            0,
+                        )
+                    }
+                }
+            }
+            None => (0, 0, 0, 0, 0, 0),
+        };
+
+        let mut flags = settings::builder();
+        // A JIT'd function is called directly, not relocated into a shared object.
+        let _ = flags.set("is_pic", "false");
+        // Cranelift's x64 `return_call` (tail calls, §3b) lowering requires frame pointers.
+        let _ = flags.set("preserve_frame_pointers", "true");
+        // Run Cranelift's mid-end optimizer (GVN/CSE, constant materialization, store-to-load
+        // forwarding). Wasmtime defaults to this; without it (the prior default `none`) redundant
+        // address computations weren't CSE'd and constants were pool loads. "SSA on the wire" (no SSA
+        // reconstruction) keeps cold start ahead even with the optimizer on.
+        let _ = flags.set("opt_level", "speed");
+        let isa = cranelift_native::builder()
+            .map_err(|e| JitError::Backend(e.to_string()))?
+            .finish(settings::Flags::new(flags))
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // Allocate code + read-only data (float constants, jump tables) from a single contiguous
+        // arena rather than the default separate `mmap`s. cranelift's x64 `call`/rip-relative
+        // loads use 32-bit PC-relative relocations (`X86CallPCRel4`/`X86PCRel4`); with independent
+        // mmaps, ASLR can place code and rodata > 2 GiB apart, overflowing the i32 offset (a
+        // `compiled_blob.rs` panic) — intermittent, and only on large modules with rodata (e.g.
+        // a whole UI library). A 256 MiB reserved arena (VA only, committed on demand) keeps every
+        // segment in range. Reserve falls back to the default provider if it cannot map.
+        if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
+            builder.memory_provider(Box::new(arena));
         }
-    } else {
-        ThreadEnv::null()
-    };
-    #[cfg(not(fiber_rt))]
-    let thread = ThreadEnv::null();
+        let mut module = JITModule::new(builder);
 
-    // §14 nesting: if the module holds an `Instantiator` (a `cap.call` to iface 6), stand up the
-    // per-run `Nursery` whose stable address is baked into those sites. `instantiate` re-compiles a
-    // child confined to a sub-window and runs it over this window (its detect-and-kill fault range is
-    // supplied post-finalize via `set_env`, like the thread `Domain`). A child runs synchronously
-    // today, so the nursery is touched only on the calling thread.
-    #[cfg(fiber_rt)]
-    let nursery: Option<Box<instantiator_rt::Nursery>> = if module_uses_instantiator(m) {
-        Some(Box::new(instantiator_rt::Nursery::new(
-            m.funcs.clone().into(),
-            cap_thunk,
-            cap_ctx,
-            resolve_module,
-            epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
-        )))
-    } else {
-        None
-    };
-    #[cfg(fiber_rt)]
-    let inst = if let Some(n) = &nursery {
-        InstEnv {
-            nursery_addr: (&**n as *const instantiator_rt::Nursery) as i64,
-            instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
-            join_thunk: instantiator_rt::join as *const () as i64,
-            coro_spawn_thunk: instantiator_rt::coro_spawn as *const () as i64,
-            coro_resume_thunk: instantiator_rt::coro_resume as *const () as i64,
+        // Declare every function (natural ABI) up front so calls can reference any of them.
+        let ids: Vec<_> = m
+            .funcs
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let sig = natural_sig(&mut module, f);
+                module
+                    .declare_function(&format!("f{i}"), Linkage::Local, &sig)
+                    .map_err(|e| JitError::Backend(e.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Distinct signatures give each function (and call site) a structural type id, the
+        // basis for the `call_indirect` type check (matching the interpreter).
+        let distinct = distinct_types(&m.funcs);
+
+        // The host thunk + ctx addresses, baked into `cap.call` sites as constants.
+        let cap = CapEnv {
+            thunk_addr: cap_thunk as usize as i64,
+            ctx_addr: cap_ctx as usize as i64,
+            fast_resolver,
+        };
+
+        // §12 fibers: if the module uses `cont.*`, stand up a host fiber runtime (its address baked into
+        // the `cont.*` sites). The `FiberRuntime` box is created now so its address is stable; the
+        // call-trampoline address is filled in after finalize. On targets without stack-switch support,
+        // `ensure_supported` has already rejected the fiber ops, so this stays `null`.
+        #[cfg(fiber_rt)]
+        let uses_fibers = module_uses_fibers(m);
+        #[cfg(fiber_rt)]
+        let uses_threads = module_uses_threads(m);
+        // Per-run fiber constants (the §12 fiber entry type id + the function-table mask), used to build
+        // fiber runtimes — one standalone, or one per vCPU when threads use `cont.*`.
+        #[cfg(fiber_rt)]
+        let fiber_type_id = type_id_of(&distinct, &fiber_func_type());
+        #[cfg(fiber_rt)]
+        let fiber_mask = (m.funcs.len().next_power_of_two() as u64) - 1;
+        // Fibers + threads compose via a **per-vCPU** fiber runtime, published through a thread-local. This
+        // is the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
+        // builds its own from `fiber_cfg` (`os_thread_rt`). Created whenever the module uses `cont.*`.
+        #[cfg(fiber_rt)]
+        let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
+            Some(Box::new(fiber_rt::FiberRuntime::new(
+                fiber_type_id,
+                fiber_mask,
+                quota.max_fibers,
+            )))
+        } else {
+            None
+        };
+        // The `cont.*` thunk addresses (the runtime itself is found via a thread-local at call time).
+        #[cfg(fiber_rt)]
+        let fiber = if uses_fibers {
+            FiberEnv {
+                new_thunk: fiber_rt::fiber_new as *const () as i64,
+                resume_thunk: fiber_rt::fiber_resume as *const () as i64,
+                suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
+            }
+        } else {
+            FiberEnv::null()
+        };
+        #[cfg(not(fiber_rt))]
+        let fiber = FiberEnv::null();
+
+        // §12 threads: stand up the 1:1 OS-thread executor `Domain` whose stable address is baked into the
+        // `thread.*` sites. It owns no scheduling policy — `thread.spawn` launches a real OS thread (the
+        // guest builds any M:N model itself, D22). The per-run `Env` (call-trampoline, window, trap cell)
+        // is supplied after finalize via `set_env`; the address is stable now.
+        #[cfg(fiber_rt)]
+        let domain: Option<Box<os_thread_rt::Domain>> = if uses_threads {
+            Some(Box::new(os_thread_rt::Domain::new(quota.max_vcpus)))
+        } else {
+            None
+        };
+        #[cfg(fiber_rt)]
+        let thread = if let Some(d) = &domain {
+            ThreadEnv {
+                sched_addr: (&**d as *const os_thread_rt::Domain) as i64,
+                spawn_thunk: os_thread_rt::thread_spawn as *const () as i64,
+                join_thunk: os_thread_rt::thread_join as *const () as i64,
+                wait_thunk: os_thread_rt::thread_wait as *const () as i64,
+                notify_thunk: os_thread_rt::thread_notify as *const () as i64,
+            }
+        } else {
+            ThreadEnv::null()
+        };
+        #[cfg(not(fiber_rt))]
+        let thread = ThreadEnv::null();
+
+        // §14 nesting: if the module holds an `Instantiator` (a `cap.call` to iface 6), stand up the
+        // per-run `Nursery` whose stable address is baked into those sites. `instantiate` re-compiles a
+        // child confined to a sub-window and runs it over this window (its detect-and-kill fault range is
+        // supplied post-finalize via `set_env`, like the thread `Domain`). A child runs synchronously
+        // today, so the nursery is touched only on the calling thread.
+        #[cfg(fiber_rt)]
+        let nursery: Option<Box<instantiator_rt::Nursery>> = if module_uses_instantiator(m) {
+            Some(Box::new(instantiator_rt::Nursery::new(
+                m.funcs.clone().into(),
+                cap_thunk,
+                cap_ctx,
+                resolve_module,
+                epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
+            )))
+        } else {
+            None
+        };
+        #[cfg(fiber_rt)]
+        let inst = if let Some(n) = &nursery {
+            InstEnv {
+                nursery_addr: (&**n as *const instantiator_rt::Nursery) as i64,
+                instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
+                join_thunk: instantiator_rt::join as *const () as i64,
+                coro_spawn_thunk: instantiator_rt::coro_spawn as *const () as i64,
+                coro_resume_thunk: instantiator_rt::coro_resume as *const () as i64,
+            }
+        } else {
+            InstEnv::null()
+        };
+        #[cfg(not(fiber_rt))]
+        let inst = InstEnv::null();
+
+        // Define each function body. `clear_context` after each define resets the cached
+        // CFG/domtree so the next function never compiles against a stale CFG.
+        let mut ctx = module.make_context();
+        for (f, id) in m.funcs.iter().zip(&ids) {
+            build_clif(
+                &mut module,
+                &ids,
+                &distinct,
+                cap,
+                fiber,
+                thread,
+                inst,
+                &mut ctx.func,
+                f,
+                mask,
+                cap_mapped,
+                sub_base,
+                epoch_addr,
+                (ids.len().next_power_of_two() as u64) - 1,
+            )?;
+            module
+                .define_function(*id, &mut ctx)
+                .map_err(|e| JitError::Backend(e.to_string()))?;
+            module.clear_context(&mut ctx);
         }
-    } else {
-        InstEnv::null()
-    };
-    #[cfg(not(fiber_rt))]
-    let inst = InstEnv::null();
 
-    // Define each function body. `clear_context` after each define resets the cached
-    // CFG/domtree so the next function never compiles against a stale CFG.
-    let mut ctx = module.make_context();
-    for (f, id) in m.funcs.iter().zip(&ids) {
-        build_clif(
-            &mut module,
-            &ids,
-            &distinct,
+        // The buffer-ABI trampoline for the entry, exported so Rust can call it.
+        build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry);
+        let tramp = module
+            .declare_function("trampoline", Linkage::Export, &ctx.func.signature)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module
+            .define_function(tramp, &mut ctx)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module.clear_context(&mut ctx);
+
+        // The generic call-trampoline (one per module; calls any `Tail`-ABI `(sp, arg) -> i64` entry from
+        // Rust). Needed by both the fiber runtime (`cont.*`) and the thread scheduler (vCPU entries).
+        #[cfg(fiber_rt)]
+        let fiber_tramp = if uses_fibers || uses_threads {
+            build_fiber_call_trampoline(&mut module, &mut ctx.func);
+            let id = module
+                .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
+                .map_err(|e| JitError::Backend(e.to_string()))?;
+            module
+                .define_function(id, &mut ctx)
+                .map_err(|e| JitError::Backend(e.to_string()))?;
+            module.clear_context(&mut ctx);
+            Some(id)
+        } else {
+            None
+        };
+
+        module
+            .finalize_definitions()
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+
+        // Now that code is finalized, hand the root fiber runtime its call-trampoline address (and keep it
+        // to seed the thread `Domain`'s `Env`, which spawned vCPUs use to call their entry).
+        #[cfg(fiber_rt)]
+        let mut call_tramp: Option<fiber_rt::FiberCallTramp> = None;
+        #[cfg(fiber_rt)]
+        if let Some(id) = fiber_tramp {
+            let addr = module.get_finalized_function(id);
+            // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the `FiberCallTramp` ABI.
+            let t: fiber_rt::FiberCallTramp = unsafe { std::mem::transmute(addr) };
+            if let Some(rt) = &mut fiber_rt {
+                rt.set_call_tramp(t);
+            }
+            call_tramp = Some(t);
+        }
+
+        // Build the function table (§3c) now that code addresses are known: power-of-two
+        // padded, AoS, host-owned. `call_indirect` masks the guest index into this.
+        let table_len = m.funcs.len().next_power_of_two();
+        let fn_table: Box<[FnEntry]> = (0..table_len)
+            .map(|slot| match m.funcs.get(slot) {
+                Some(f) => FnEntry {
+                    type_id: type_id_of(
+                        &distinct,
+                        &FuncType {
+                            params: f.params.clone(),
+                            results: f.results.clone(),
+                        },
+                    ),
+                    _pad: 0,
+                    code: module.get_finalized_function(ids[slot]) as u64,
+                },
+                None => FnEntry {
+                    type_id: PADDING_TYPE_ID,
+                    _pad: 0,
+                    code: 0,
+                },
+            })
+            .collect();
+
+        let tramp_code = module.get_finalized_function(tramp);
+        #[cfg(not(fiber_rt))]
+        let _ = &quota;
+        Ok(CompiledModule {
+            fn_table,
+            tramp_code,
+            n_params: entry.params.len(),
+            n_results: entry.results.len(),
+            distinct,
             cap,
             fiber,
             thread,
             inst,
-            &mut ctx.func,
-            f,
             mask,
             cap_mapped,
             sub_base,
             epoch_addr,
-        )?;
-        module
-            .define_function(*id, &mut ctx)
-            .map_err(|e| JitError::Backend(e.to_string()))?;
-        module.clear_context(&mut ctx);
-    }
-
-    // The buffer-ABI trampoline for the entry, exported so Rust can call it.
-    build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry);
-    let tramp = module
-        .declare_function("trampoline", Linkage::Export, &ctx.func.signature)
-        .map_err(|e| JitError::Backend(e.to_string()))?;
-    module
-        .define_function(tramp, &mut ctx)
-        .map_err(|e| JitError::Backend(e.to_string()))?;
-    module.clear_context(&mut ctx);
-
-    // The generic call-trampoline (one per module; calls any `Tail`-ABI `(sp, arg) -> i64` entry from
-    // Rust). Needed by both the fiber runtime (`cont.*`) and the thread scheduler (vCPU entries).
-    #[cfg(fiber_rt)]
-    let fiber_tramp = if uses_fibers || uses_threads {
-        build_fiber_call_trampoline(&mut module, &mut ctx.func);
-        let id = module
-            .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
-            .map_err(|e| JitError::Backend(e.to_string()))?;
-        module
-            .define_function(id, &mut ctx)
-            .map_err(|e| JitError::Backend(e.to_string()))?;
-        module.clear_context(&mut ctx);
-        Some(id)
-    } else {
-        None
-    };
-
-    module
-        .finalize_definitions()
-        .map_err(|e| JitError::Backend(e.to_string()))?;
-
-    // Now that code is finalized, hand the root fiber runtime its call-trampoline address (and keep it
-    // to seed the thread `Domain`'s `Env`, which spawned vCPUs use to call their entry).
-    #[cfg(fiber_rt)]
-    let mut call_tramp: Option<fiber_rt::FiberCallTramp> = None;
-    #[cfg(fiber_rt)]
-    if let Some(id) = fiber_tramp {
-        let addr = module.get_finalized_function(id);
-        // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the `FiberCallTramp` ABI.
-        let t: fiber_rt::FiberCallTramp = unsafe { std::mem::transmute(addr) };
-        if let Some(rt) = &mut fiber_rt {
-            rt.set_call_tramp(t);
-        }
-        call_tramp = Some(t);
-    }
-
-    // Build the function table (§3c) now that code addresses are known: power-of-two
-    // padded, AoS, host-owned. `call_indirect` masks the guest index into this.
-    let table_len = m.funcs.len().next_power_of_two();
-    let fn_table: Vec<FnEntry> = (0..table_len)
-        .map(|slot| match m.funcs.get(slot) {
-            Some(f) => FnEntry {
-                type_id: type_id_of(
-                    &distinct,
-                    &FuncType {
-                        params: f.params.clone(),
-                        results: f.results.clone(),
-                    },
-                ),
-                _pad: 0,
-                code: module.get_finalized_function(ids[slot]) as u64,
+            fn_table_mask: (m.funcs.len().next_power_of_two() as u64) - 1,
+            next_extra: 0,
+            win_mapped,
+            win_reserved,
+            win_size,
+            mem_size_log2: m.memory.map(|mc| mc.size_log2),
+            data: m.data.clone(),
+            #[cfg(fiber_rt)]
+            fiber_rt,
+            #[cfg(fiber_rt)]
+            domain,
+            #[cfg(fiber_rt)]
+            _nursery: nursery,
+            #[cfg(fiber_rt)]
+            call_tramp,
+            #[cfg(fiber_rt)]
+            fiber_cfg: if uses_fibers {
+                Some((fiber_type_id, fiber_mask, quota.max_fibers))
+            } else {
+                None
             },
-            None => FnEntry {
-                type_id: PADDING_TYPE_ID,
-                _pad: 0,
-                code: 0,
-            },
+            module,
         })
-        .collect();
-
-    let code = module.get_finalized_function(tramp);
-    let mem_base = window.base();
-    let mut results = vec![0i64; entry.results.len()];
-    // Trap cell: 0 = ok; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit
-    // code for an Exit. A trapping path (or the cap thunk) writes it. It is **shared across vCPU
-    // threads** (every spawned vCPU gets its address via `set_env`), so the Rust accesses are atomic
-    // (audit #2): the JIT writes it via an aligned `i64` store in emitted code (hardware-atomic,
-    // foreign to Rust's model); concurrent Rust writers (dying vCPUs) and this reader must not race.
-    let trap_cell = AtomicI64::new(0);
-
-    // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
-    // vCPUs run on their own OS threads via the baked `Domain`. Seed the `Domain`'s per-run `Env` now
-    // that the window / fn-table / trap-cell / call-trampoline are all known.
-    #[cfg(fiber_rt)]
-    if let Some(d) = &domain {
-        let fiber_cfg = if uses_fibers {
-            Some((fiber_type_id, fiber_mask, quota.max_fibers))
-        } else {
-            None
-        };
-        d.set_env(
-            mem_base as u64,
-            fn_table.as_ptr() as u64,
-            trap_cell.as_ptr(),
-            call_tramp.expect("call-trampoline set for a threaded module"),
-            window.fault_range(),
-            fiber_cfg,
-            epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
-        );
     }
 
-    // §9/§12 async ring: publish this run's futex-`notify` into the embedder's `Host` so an offload
-    // worker can wake a vCPU parked in `submit_async` on a completion counter (the futex `phys` is the
-    // parking key). Needs the thread `Domain` (a module that parks on a counter uses `atomic.wait`, so
-    // `uses_threads` holds). With no `Domain`/hooks, `submit_async` stays an inert `-EINVAL`.
-    #[cfg(fiber_rt)]
-    if let (Some(hooks), Some(d)) = (async_hooks, &domain) {
-        // The `Domain` pointer as a `usize` so the hook closure is `Send + Sync` (a raw pointer is not,
-        // and Rust-2021 disjoint capture would otherwise grab the bare pointer field).
-        let dom_addr = (&**d as *const os_thread_rt::Domain) as usize;
-        hooks.install_notify(std::sync::Arc::new(move |key: u64, count: u32| {
-            let n = count.min(i32::MAX as u32) as i32;
-            // SAFETY: the `Domain` outlives the run; the hook is dropped by `hooks.finish()` after
-            // `join_all`, before the `Domain` is freed, so the pointer is valid whenever a worker
-            // calls this. `thread_notify` is sound from any thread (it locks the domain futex), like a
-            // guest `atomic.notify`.
-            unsafe { os_thread_rt::thread_notify(dom_addr as *const os_thread_rt::Domain, key, n) };
-        }));
-    }
-    #[cfg(not(fiber_rt))]
-    let _ = &async_hooks;
-
-    // §14: the nesting `Nursery`'s address is baked into the Instantiator cap.call sites; a child runs
-    // over its own window (allocated per `instantiate`), so there is no per-run env to seed here. Keep
-    // it alive until the run completes.
-    #[cfg(fiber_rt)]
-    let _nursery = &nursery;
-
-    // Publish the root fiber runtime (when the module uses `cont.*`) so its thunks find it via the
-    // thread-local for the duration of the entry; spawned vCPUs publish their own.
-    #[cfg(fiber_rt)]
-    let prev_rt = fiber_rt
-        .as_mut()
-        .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime));
-
-    // SAFETY: `code` is the finalized entry trampoline honouring the `Entry` ABI. It reads the arg
-    // slots, writes the result slots, accesses only the guarded window (any escape faults into the
-    // guard page), reads `fn_table`, and writes `trap_cell`. All buffers outlive the call; `module`
-    // owns the executable page until dropped below (after every spawned vCPU is joined).
-    let faulted = unsafe {
-        mem::run_guarded(
-            &window,
+    /// Run the compiled entry over a **fresh guest window** on slot-encoded `args` (the run half
+    /// of the old one-shot `compile_and_run*`): allocate + seed the window (init bytes, data
+    /// segments, RO protection), seed the per-run runtime env, execute under the §5
+    /// detect-and-kill guard, snapshot, and tear the window down. The executable code and the
+    /// runtimes stay alive in `self`, so `run` can be called again (and
+    /// [`Self::define_extra`]-d code stays valid across runs).
+    pub fn run(
+        &mut self,
+        args: &[i64],
+        init_mem: Option<&[u8]>,
+        snapshot_cap: Option<usize>,
+        async_hooks: Option<&dyn AsyncHostHooks>,
+    ) -> Result<(JitOutcome, Vec<u8>), JitError> {
+        let (code, n_params, n_results) = (self.tramp_code, self.n_params, self.n_results);
+        self.run_code(
             code,
-            args.as_ptr(),
-            results.as_mut_ptr(),
-            mem_base,
-            fn_table.as_ptr() as *const core::ffi::c_void,
-            trap_cell.as_ptr(),
+            n_params,
+            n_results,
+            args,
+            init_mem,
+            snapshot_cap,
+            async_hooks,
         )
-    };
-    #[cfg(fiber_rt)]
-    if let Some(p) = prev_rt {
-        fiber_rt::set_current(p);
     }
-    // Join every spawned vCPU OS thread before freeing the window/code — no vCPU may outlive them.
-    #[cfg(fiber_rt)]
-    if let Some(d) = &domain {
-        d.join_all();
-    }
-    // §9/§12 async ring: now that every vCPU is joined, drain the offload pool and drop the futex hook
-    // (which holds the `Domain` pointer) before the window / `Domain` are freed below — so no worker
-    // can still write the window counter or call into a dead `Domain`.
-    #[cfg(fiber_rt)]
-    if let Some(hooks) = async_hooks {
-        hooks.finish();
-    }
-    // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host. All vCPUs are
-    // joined by now (`join_all` above), so this store no longer races; Relaxed is fine.
-    if faulted {
-        trap_cell.store(mem::FAULT_TRAP, Ordering::Relaxed);
-    }
-    // Snapshot the in-window bytes (escape-oracle). The guest may have made pages non-readable
-    // via the Memory cap (unmap/protect), so restore RW first — else this read faults outside the
-    // guarded call and crashes the host.
-    window.restore_rw();
-    // `snapshot_cap` (the `_with_host` capture) widens the snapshot past the backed prefix to also
-    // cover reserved-tail pages the guest grew/`unmap`-ed (§1a growth path), `commit`-ing them so the
-    // read sees zero/their content instead of faulting. `read_low` clamps to the reservation.
-    let snap = match snapshot_cap {
-        Some(cap) if win_size > 0 => cap.min((mask + 1) as usize).max(win_size),
-        _ => win_size,
-    };
-    let final_mem = if snap > win_size {
-        window.read_low(snap)
-    } else {
-        window.rw_mut()[..win_size].to_vec()
-    };
-    drop(window);
-    drop(fn_table);
-    drop(module); // frees the executable memory after the call has returned
 
-    // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
-    // synchronization point); Relaxed suffices.
-    let cell = trap_cell.load(Ordering::Relaxed);
-    let code = cell as u32;
-    let outcome = if code == 0 {
-        JitOutcome::Returned(results)
-    } else if code == EXIT_CODE {
-        JitOutcome::Exited((cell >> 32) as i32)
-    } else {
-        JitOutcome::Trapped(TrapKind::from_code(code).ok_or(JitError::Malformed)?)
-    };
-    Ok((outcome, final_mem))
+    /// Run an **incrementally defined** function (a trampoline pointer returned by
+    /// [`Self::define_extra`]) over a fresh guest window, exactly like [`Self::run`] runs the
+    /// entry. This is the Phase-1 test/demo surface; the Phase-2 `Jit` capability instead calls
+    /// the trampoline directly over the *live* window of an in-flight run (the host thunk has the
+    /// run's `mem_base`/`fn_table`/trap cell in hand).
+    ///
+    /// # Safety
+    /// `code` must be a trampoline pointer returned by `define_extra` **on this module**, and
+    /// `n_params`/`n_results` must match the parameter/result counts of the function it wraps
+    /// (the trampoline reads exactly `n_params` arg slots and writes exactly `n_results` result
+    /// slots).
+    pub unsafe fn run_extra(
+        &mut self,
+        code: *const u8,
+        n_params: usize,
+        n_results: usize,
+        args: &[i64],
+        init_mem: Option<&[u8]>,
+    ) -> Result<(JitOutcome, Vec<u8>), JitError> {
+        self.run_code(code, n_params, n_results, args, init_mem, None, None)
+    }
+
+    /// The shared run body: window setup → guarded call → snapshot → teardown. `code` is a
+    /// buffer-ABI trampoline owned by `self.module` (the entry's, or an extra function's).
+    #[allow(clippy::too_many_arguments)]
+    fn run_code(
+        &mut self,
+        code: *const u8,
+        n_params: usize,
+        n_results: usize,
+        args: &[i64],
+        init_mem: Option<&[u8]>,
+        snapshot_cap: Option<usize>,
+        async_hooks: Option<&dyn AsyncHostHooks>,
+    ) -> Result<(JitOutcome, Vec<u8>), JitError> {
+        // The trampoline reads exactly `n_params` arg slots; a shorter buffer would be an
+        // out-of-bounds read from safe code. (The one-shot wrappers always pass exact-length
+        // args; this check makes the now-public entry sound rather than contractual.)
+        if args.len() < n_params {
+            return Err(JitError::Malformed);
+        }
+        // Allocate the guest window for this run: `mapped` backed RW bytes inside the reserved
+        // virtual range planned at compile time (§4); zero-sized when the module has no memory.
+        let mut window = mem::GuestWindow::new(self.win_mapped, self.win_reserved);
+        let win_size = self.win_size;
+        // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
+        if let Some(init) = init_mem {
+            let n = init.len().min(win_size);
+            window.rw_mut()[..n].copy_from_slice(&init[..n]);
+        }
+
+        // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
+        // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
+        // verifier already bounds every segment to `[0, size)`. Segment offsets are child-relative, so
+        // a §14 sub-window shifts them by `sub_base` into the parent backing. Done while fully RW.
+        if let Some(size_log2) = self.mem_size_log2 {
+            let size = 1u64 << size_log2;
+            let rw = window.rw_mut();
+            for d in &self.data {
+                let lo = self.sub_base + d.offset.min(size);
+                let hi = self.sub_base + (d.offset + d.bytes.len() as u64).min(size);
+                let (start, end) = (lo as usize, hi as usize);
+                rw[start..end].copy_from_slice(&d.bytes[..end - start]);
+            }
+        }
+        for d in &self.data {
+            if d.readonly && !d.bytes.is_empty() {
+                window.protect_ro(self.sub_base + d.offset, d.bytes.len() as u64);
+            }
+        }
+
+        let mem_base = window.base();
+        let mut results = vec![0i64; n_results];
+        // Trap cell: 0 = ok; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit
+        // code for an Exit. A trapping path (or the cap thunk) writes it. It is **shared across vCPU
+        // threads** (every spawned vCPU gets its address via `set_env`), so the Rust accesses are atomic
+        // (audit #2): the JIT writes it via an aligned `i64` store in emitted code (hardware-atomic,
+        // foreign to Rust's model); concurrent Rust writers (dying vCPUs) and this reader must not race.
+        let trap_cell = AtomicI64::new(0);
+
+        // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
+        // vCPUs run on their own OS threads via the baked `Domain`. Seed the `Domain`'s per-run `Env` now
+        // that the window / fn-table / trap-cell / call-trampoline are all known.
+        #[cfg(fiber_rt)]
+        if let Some(d) = &self.domain {
+            d.set_env(
+                mem_base as u64,
+                self.fn_table.as_ptr() as u64,
+                trap_cell.as_ptr(),
+                self.call_tramp
+                    .expect("call-trampoline set for a threaded module"),
+                window.fault_range(),
+                self.fiber_cfg,
+                self.epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
+            );
+        }
+
+        // §9/§12 async ring: publish this run's futex-`notify` into the embedder's `Host` so an offload
+        // worker can wake a vCPU parked in `submit_async` on a completion counter (the futex `phys` is the
+        // parking key). Needs the thread `Domain` (a module that parks on a counter uses `atomic.wait`, so
+        // `uses_threads` holds). With no `Domain`/hooks, `submit_async` stays an inert `-EINVAL`.
+        #[cfg(fiber_rt)]
+        if let (Some(hooks), Some(d)) = (async_hooks, &self.domain) {
+            // The `Domain` pointer as a `usize` so the hook closure is `Send + Sync` (a raw pointer is not,
+            // and Rust-2021 disjoint capture would otherwise grab the bare pointer field).
+            let dom_addr = (&**d as *const os_thread_rt::Domain) as usize;
+            hooks.install_notify(std::sync::Arc::new(move |key: u64, count: u32| {
+                let n = count.min(i32::MAX as u32) as i32;
+                // SAFETY: the `Domain` outlives the run; the hook is dropped by `hooks.finish()` after
+                // `join_all`, before the `Domain` is freed, so the pointer is valid whenever a worker
+                // calls this. `thread_notify` is sound from any thread (it locks the domain futex), like a
+                // guest `atomic.notify`.
+                unsafe {
+                    os_thread_rt::thread_notify(dom_addr as *const os_thread_rt::Domain, key, n)
+                };
+            }));
+        }
+        #[cfg(not(fiber_rt))]
+        let _ = &async_hooks;
+
+        // Publish the root fiber runtime (when the module uses `cont.*`) so its thunks find it via the
+        // thread-local for the duration of the entry; spawned vCPUs publish their own.
+        #[cfg(fiber_rt)]
+        let prev_rt = self
+            .fiber_rt
+            .as_mut()
+            .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime));
+
+        // SAFETY: `code` is a finalized buffer-ABI trampoline honouring the `Entry` ABI. It reads the
+        // arg slots, writes the result slots, accesses only the guarded window (any escape faults into
+        // the guard page), reads `fn_table`, and writes `trap_cell`. All buffers outlive the call;
+        // `self.module` owns the executable pages until `self` drops (after every spawned vCPU is
+        // joined below).
+        let faulted = unsafe {
+            mem::run_guarded(
+                &window,
+                code,
+                args.as_ptr(),
+                results.as_mut_ptr(),
+                mem_base,
+                self.fn_table.as_ptr() as *const core::ffi::c_void,
+                trap_cell.as_ptr(),
+            )
+        };
+        #[cfg(fiber_rt)]
+        if let Some(p) = prev_rt {
+            fiber_rt::set_current(p);
+        }
+        // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
+        #[cfg(fiber_rt)]
+        if let Some(d) = &self.domain {
+            d.join_all();
+        }
+        // §9/§12 async ring: now that every vCPU is joined, drain the offload pool and drop the futex hook
+        // (which holds the `Domain` pointer) before the window is freed below — so no worker
+        // can still write the window counter or call into a dead `Domain`.
+        #[cfg(fiber_rt)]
+        if let Some(hooks) = async_hooks {
+            hooks.finish();
+        }
+        // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host. All vCPUs are
+        // joined by now (`join_all` above), so this store no longer races; Relaxed is fine.
+        if faulted {
+            trap_cell.store(mem::FAULT_TRAP, Ordering::Relaxed);
+        }
+        // Snapshot the in-window bytes (escape-oracle). The guest may have made pages non-readable
+        // via the Memory cap (unmap/protect), so restore RW first — else this read faults outside the
+        // guarded call and crashes the host.
+        window.restore_rw();
+        // `snapshot_cap` (the `_with_host` capture) widens the snapshot past the backed prefix to also
+        // cover reserved-tail pages the guest grew/`unmap`-ed (§1a growth path), `commit`-ing them so the
+        // read sees zero/their content instead of faulting. `read_low` clamps to the reservation.
+        let snap = match snapshot_cap {
+            Some(cap) if win_size > 0 => cap.min((self.mask + 1) as usize).max(win_size),
+            _ => win_size,
+        };
+        let final_mem = if snap > win_size {
+            window.read_low(snap)
+        } else {
+            window.rw_mut()[..win_size].to_vec()
+        };
+        // The window dies with this run; the code (`self.module`), function table, and runtimes
+        // stay alive in `self` for the next `run` / `define_extra` / drop.
+        drop(window);
+
+        // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
+        // synchronization point); Relaxed suffices.
+        let cell = trap_cell.load(Ordering::Relaxed);
+        let code = cell as u32;
+        let outcome = if code == 0 {
+            JitOutcome::Returned(results)
+        } else if code == EXIT_CODE {
+            JitOutcome::Exited((cell >> 32) as i32)
+        } else {
+            JitOutcome::Trapped(TrapKind::from_code(code).ok_or(JitError::Malformed)?)
+        };
+        Ok((outcome, final_mem))
+    }
+
+    /// Declare + define + finalize **additional functions** into the live module (JIT.md Phase 1:
+    /// the enabling primitive for the guest-driven `Jit` capability). The slice is a
+    /// self-contained unit: its `FuncIdx` space is unit-local, so direct calls resolve within the
+    /// unit only (cross-unit calls go through `call_indirect` against the parent table, or the
+    /// guest re-emits the callee — JIT.md "Recommendation"). Returns one buffer-ABI trampoline
+    /// pointer per function, in order; invoke via [`Self::run_extra`] (or, in the capability
+    /// layer, directly over a live run's window).
+    ///
+    /// **The function table is deliberately untouched**: extra functions are thunk-reachable
+    /// only, so the table mask baked into every existing `call_indirect` site never changes
+    /// (JIT.md Model A — zero new escape-relevant dispatch surface). Extra code is lowered
+    /// against the *parent's* environment: same confinement mask, same `cap.call` thunk, same
+    /// table mask, and the parent's `distinct` type-id space — a `call_indirect` whose signature
+    /// the parent module never declared gets `NO_MATCH_TYPE_ID` and traps, fail-closed.
+    ///
+    /// Functions using §12 fibers/threads are rejected (`Unsupported`) — the MVP restricts
+    /// incremental definition to single-threaded code (JIT.md "Concurrency"), and lowering
+    /// `cont.*`/`thread.*` here would need per-unit runtime wiring this slice doesn't do.
+    pub fn define_extra(&mut self, funcs: &[Func]) -> Result<Vec<*const u8>, JitError> {
+        if funcs.is_empty() {
+            return Ok(Vec::new());
+        }
+        for f in funcs {
+            ensure_supported(f)?;
+            #[cfg(fiber_rt)]
+            if func_uses_fibers_or_threads(f) {
+                return Err(JitError::Unsupported(
+                    "an incrementally defined function using fibers/threads is not supported yet",
+                ));
+            }
+        }
+        // Declare the unit's functions first so intra-unit direct calls can reference any of them.
+        let ids: Vec<FuncId> = funcs
+            .iter()
+            .map(|f| {
+                let name = format!("x{}", self.next_extra);
+                self.next_extra += 1;
+                let sig = natural_sig(&mut self.module, f);
+                self.module
+                    .declare_function(&name, Linkage::Local, &sig)
+                    .map_err(|e| JitError::Backend(e.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut ctx = self.module.make_context();
+        for (f, id) in funcs.iter().zip(&ids) {
+            build_clif(
+                &mut self.module,
+                &ids,
+                &self.distinct,
+                self.cap,
+                self.fiber,
+                self.thread,
+                self.inst,
+                &mut ctx.func,
+                f,
+                self.mask,
+                self.cap_mapped,
+                self.sub_base,
+                self.epoch_addr,
+                self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
+            )?;
+            self.module
+                .define_function(*id, &mut ctx)
+                .map_err(|e| JitError::Backend(e.to_string()))?;
+            self.module.clear_context(&mut ctx);
+        }
+        // One buffer-ABI trampoline per function, so the host can invoke any of them (any arity).
+        let tramp_ids: Vec<FuncId> = funcs
+            .iter()
+            .zip(&ids)
+            .map(|(f, id)| {
+                build_trampoline(&mut self.module, &mut ctx.func, *id, f);
+                let name = format!("xt{}", self.next_extra);
+                self.next_extra += 1;
+                let t = self
+                    .module
+                    .declare_function(&name, Linkage::Export, &ctx.func.signature)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                self.module
+                    .define_function(t, &mut ctx)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                self.module.clear_context(&mut ctx);
+                Ok(t)
+            })
+            .collect::<Result<_, JitError>>()?;
+        // Incremental finalize: mprotects only the newly defined code pages; already-finalized,
+        // possibly-running code is untouched (the JIT.md Phase-1 W^X spike is the test asserting
+        // exactly this).
+        self.module
+            .finalize_definitions()
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        Ok(tramp_ids
+            .into_iter()
+            .map(|t| self.module.get_finalized_function(t))
+            .collect())
+    }
 }
 
 /// Compile `func` (and the module's other functions, which `call`/`call_indirect` may reach) as a
@@ -1512,6 +1842,7 @@ fn compile_child(
             child_size,        // the child is fully mapped (reserved == mapped == size)
             0,                 // top-level confinement over the child's own window
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
+            (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
         )?;
         module
             .define_function(*id, &mut ctx)
@@ -1828,6 +2159,13 @@ struct Lower<'a> {
 /// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
 /// -> (results…)`. The CLIF entry block holds the native params and jumps into IR
 /// block 0 passing the parameters as its block args.
+///
+/// `fn_table_mask` is the `call_indirect` index mask — `next_pow2(table_len) - 1` for the
+/// table this function will dispatch through. It is an explicit parameter (not derived from
+/// `ids.len()`) because an **incrementally defined** function (`CompiledModule::define_extra`)
+/// has its own unit-local `ids` for direct calls but dispatches through the *parent's*
+/// function table, whose mask was fixed when the parent was compiled (the mask is baked as a
+/// constant into every call site — JIT.md "the baked function-table mask").
 #[allow(clippy::too_many_arguments)]
 fn build_clif(
     module: &mut JITModule,
@@ -1843,6 +2181,7 @@ fn build_clif(
     mapped: u64,
     sub_base: u64,
     epoch_addr: i64,
+    fn_table_mask: u64,
 ) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
@@ -1889,7 +2228,7 @@ fn build_clif(
         mask,
         mapped,
         sub_base,
-        fn_table_mask: (ids.len().next_power_of_two() as u64) - 1,
+        fn_table_mask,
         cap,
         fiber,
         thread,
@@ -2438,7 +2777,10 @@ fn lower_block(
                 b.ins().load(I8X16, mem_flags(), phys, 0)
             }
             Inst::V128Store {
-                addr, value, offset, ..
+                addr,
+                value,
+                offset,
+                ..
             } => {
                 let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide);
@@ -2461,7 +2803,10 @@ fn lower_block(
                 vcast(b, v, I8X16)
             }
             Inst::ExtractLane {
-                shape, lane, signed, a,
+                shape,
+                lane,
+                signed,
+                a,
             } => {
                 let v = vcast(b, get(&vals, *a)?, vec_ty(*shape));
                 let raw = b.ins().extractlane(v, *lane);
@@ -2478,7 +2823,12 @@ fn lower_block(
                     _ => raw,
                 }
             }
-            Inst::ReplaceLane { shape, lane, a, b: rb } => {
+            Inst::ReplaceLane {
+                shape,
+                lane,
+                a,
+                b: rb,
+            } => {
                 let v = vcast(b, get(&vals, *a)?, vec_ty(*shape));
                 let s = get(&vals, *rb)?;
                 let lty = lane_clif(*shape);
@@ -2492,7 +2842,12 @@ fn lower_block(
                 let r = b.ins().insertlane(v, s, *lane);
                 vcast(b, r, I8X16)
             }
-            Inst::VIntBin { shape, op, a, b: rb } => {
+            Inst::VIntBin {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
                 let ty = vec_ty(*shape);
                 let x = vcast(b, get(&vals, *a)?, ty);
                 let y = vcast(b, get(&vals, *rb)?, ty);
@@ -2503,7 +2858,12 @@ fn lower_block(
                 };
                 vcast(b, r, I8X16)
             }
-            Inst::VFloatBin { shape, op, a, b: rb } => {
+            Inst::VFloatBin {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
                 let ty = vec_ty(*shape);
                 let x = vcast(b, get(&vals, *a)?, ty);
                 let y = vcast(b, get(&vals, *rb)?, ty);
