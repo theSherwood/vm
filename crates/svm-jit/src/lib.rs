@@ -88,6 +88,13 @@ mod fiber_rt;
 #[cfg(fiber_rt)]
 mod os_thread_rt;
 
+// Migratable-fiber ownership protocol (D57 / SCHEDULING.md): the loom-verified single-owner atomic
+// state machine that guarantees a stolen fiber is resumed by exactly one thread — the gating safety
+// core of stackful work-stealing, proven in isolation before the runtime integration + cross-thread
+// resume land. Pure atomics; not yet wired into the live runtime.
+#[cfg(fiber_rt)]
+mod fiber_registry;
+
 // §14 nesting runtime: the host side of the `Instantiator` capability for the JIT — `instantiate`
 // re-compiles a child confined to a sub-window (nesting cost paid at setup) and runs it over the
 // parent's live window; `join` returns its result. Available where children can run (`fiber_rt`).

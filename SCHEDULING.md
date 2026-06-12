@@ -131,3 +131,18 @@ differential oracle, and expert review of that seam.
    evolution: the shared registry + ownership protocol (loom-verified) + Demo 1
    re-pointed at a shared steal pool. Done deliberately, with review, only after 1–2
    establish the baseline and the value is concrete.
+   - **Step 3a — the single-owner ownership protocol, loom-verified (DONE).** The
+     load-bearing atomic state machine (`OWNED`/`RUNNABLE`/`RUNNING`/`FREE`) is built
+     in isolation in `crates/svm-jit/src/fiber_registry.rs`: a fiber is stealable only
+     while `RUNNABLE` (voluntarily suspended, ownerless), and a steal is a single
+     `RUNNABLE → RUNNING` CAS, so **exactly one** thread can ever claim it (acquire on
+     the claim / release on the suspend publishes the saved context). This is the whole
+     safety argument of migration — "one native stack, exactly one thread" — reduced to
+     pure atomics and **loom-model-checked** (`loom_single_owner_steal_is_exclusive`
+     proves exactly-one-winner across every interleaving + the acquire/release
+     visibility; `loom_running_fiber_is_never_stealable`), plus a mutation check
+     confirming a non-CAS steal makes loom find a double-claim. It is **not yet wired
+     into the live runtime** — that integration (a shared registry replacing the
+     per-thread tables) and the cross-thread asm resume (design sketch #3, expert-review
+     gated) are the remaining steps. Verifying the dangerous invariant first is the
+     "earn the risk" discipline this feature demands.
