@@ -1911,7 +1911,13 @@ team has **no expert safety net**.
   solid Phase-3 MVP.*
 - **Phase 4 — Deferred (post-MVP), developed against the parity matrix** — full
   concurrency, nesting, shared memory, isolation tiers, Spectre hardening,
-  split-host supervisor, monitoring, GPU, SIMD, revocation. *(**Concurrency
+  split-host supervisor, monitoring, GPU, revocation. *(**§17 SIMD has landed**:
+  fixed-128 `v128` (D58) end-to-end across IR/text/encode/verify/interp/JIT/wasm with
+  native Cranelift SSE2/NEON codegen; the only escape-TCB delta is the 16-byte masked
+  load/store on `svm-mask`'s width-parametric guard; v128 ops ride the 4000-seed
+  interp↔JIT differential, a real clang `-msimd128` saxpy transpiles to verified SIMD
+  IR, and the `bench` SIMD kernel is at ~1.1× Wasmtime under `--from-wasm`. Wider
+  widths `v256`/`v512` deferred (D58). **Concurrency
   primitives have landed early**: fibers `cont.*`, 1:1 `thread.spawn`/`join`, the
   `wait`/`notify` futex + C11 atomics, in IR/interp/JIT across the parity matrix
   (interp everywhere; JIT on x86-64 unix, aarch64 unix, x86-64 Windows) — **no VM

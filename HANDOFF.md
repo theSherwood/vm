@@ -1,6 +1,6 @@
 # Handoff — C frontend (chibicc → SVM IR) + differential fuzzing
 
-Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-10**.
+Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-12**.
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
@@ -655,10 +655,41 @@ this is the index.)
     toolchain (`make`+`cc`) → `#![cfg(unix)]` (runs on Linux + macOS; skipped on Windows).
 - [ ] **Phase 4 — post-MVP (started):** the **concurrency primitives** have landed (fibers, 1:1
   threads, atomics + C11 ordering surface, futex, a `<pthread.h>` libc — interp on all platforms,
-  JIT on x86-64/aarch64 unix + x86-64 Windows; see below), and **§14 nesting** has landed on both
+  JIT on x86-64/aarch64 unix + x86-64 Windows; see below), **§14 nesting** has landed on both
   backends (sub-windows, `AddressSpace` + attenuation, the `Instantiator` incl. recursion,
-  co-fibers, fault-driven yield; see §10). The rest (isolation tiers, Spectre, split-host, SIMD,
-  GPU, the language on-ramp) is deferred, developed against the parity matrix.
+  co-fibers, fault-driven yield; see §10), and **§17 SIMD has landed** (fixed-128 `v128`, D58 —
+  see the SIMD item below). The rest (isolation tiers, Spectre, split-host, GPU, wider SIMD
+  widths, the language on-ramp) is deferred, developed against the parity matrix.
+
+- [x] **§17 SIMD — fixed-128 `v128` (D58), all backends.** First-class `v128` with real hardware
+  codegen (Cranelift → SSE2/NEON), end-to-end through the pipeline: `svm-ir` (the `ValType::V128`
+  type, `VShape`, op enums), `svm-text` (syntax + round-trip), `svm-encode` (the `0xFE` SIMD-prefix
+  opcodes), `svm-verify` (total lane-typing + shuffle-index/shape-category checks), `svm-interp`
+  (exact reference lane semantics — float lanes reuse the scalar `fbin`/`fun` helpers so a lane and
+  its scalar op are bit-identical), `svm-jit` (native Cranelift vector lowering), and `svm-wasm`
+  (wasm v128 → IR). **Op set (pragmatic, evidence-driven):** `v128.const`, masked `v128.load`/
+  `store`, `splat`, `extract`/`replace_lane` (6 shapes), integer-lane `add`/`sub`/`mul`, float-lane
+  `add`/`sub`/`mul`/`div`/`min`/`max`/`abs`/`neg`/`sqrt`, whole-vector bitwise + `bitselect`,
+  `i8x16.shuffle`/`swizzle`, and the `simd.width_bytes` feature-detect hook (fixed at 16 in the MVP
+  so it stays deterministic across the oracle).
+  - **Escape-TCB delta is tiny and isolated:** vector arithmetic is register-only (zero new escape
+    surface — the verifier just gains lane typing); the *only* confinement change is the 16-byte
+    masked `v128.load`/`store`, which rides `svm-mask`'s already width-parametric guard (its
+    property tests + the `fuzz/mask` target now exercise width 16).
+  - **Oracle coverage:** `irgen` emits the full integer-lane v128 surface, so v128 ops ride the
+    4000-seed interp↔JIT differential + the libFuzzer `diff` target. *Computed*-float lane ops
+    (`VFloatBin`/`VFloatUn`) are held out of the fuzzer — a cross-backend NaN payload read back
+    through an integer `extract_lane` would leak into an exactly-compared result — and the memory
+    byte-oracle (`has_float`) disqualifies vector-float modules, mirroring the scalar-float caveat.
+    Float-lane semantics are differential-tested under NaN control in `crates/svm/tests/simd.rs`.
+  - **Capstone (`crates/svm-wasm/tests/simd.rs`):** a WAT f32x4 dot + saxpy run byte-identically on
+    interp and JIT vs hand oracles; an embedded **real `clang --target=wasm32 -msimd128 -O2`** saxpy
+    (hermetic `.wasm` fixture) transpiles to verified SIMD IR. **Bench:** the `bench` `simd` kernel
+    vs Wasmtime lands at **~1.1× under `--from-wasm`** (identical transpiled IR) — SIMD compute
+    parity, the shared-Cranelift story extended to v128.
+  - **Deferred (D58, revisit when a kernel demands it):** wider widths `v256`/`v512` (feature-
+    detected, split-to-`v128` fallback); `i8x16.mul` (no single-instruction JIT lowering — bails to
+    `Unsupported`; interp covers it). Scalable vectors (SVE/RVV) rejected.
 
 ### Phase 3 / MVP remainder (what's left to call it a "Solid MVP")
 - [x] **Production trap-catching (memory)** — *done (unix)*: the JIT window is now `mmap`'d
@@ -1096,7 +1127,9 @@ leave a shared view — add a unix test for this alongside the Windows work.
   executor/JIT children, richer cap pass-through, and a non-blocking JIT `instantiate` child;
   then the isolation tiers.
 - [ ] Spectre hardening (§9); split-host supervisor; monitoring.
-- [ ] SIMD (§17); GPU; capability revocation; cross-domain channels (§7); exception /
+- [x] **SIMD (§17/D58)** — fixed-128 `v128` landed across all backends (see the SIMD item in
+  the Phase-4 list above); wider widths `v256`/`v512` deferred until a kernel demands them.
+- [ ] GPU; capability revocation; cross-domain channels (§7); exception /
   `setjmp` **unwinding mechanics** (the stack-switch primitive is settled; unwind tables
   are not).
 - [ ] **Language on-ramp:** native **LLVM backend** (the differentiator vehicle) and/or an
