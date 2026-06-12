@@ -571,8 +571,14 @@ itself). The capability is opt-in and attenuable like every other powerbox grant
   weakly-ordered targets without any dispatch-side acquire; the atomic `FnEntry` additionally
   ensures a racy reader never sees a torn code pointer (uniform safety, no escape). The one
   remaining single-threaded restriction is **threaded *compile*** (a worker calling `Jit.compile` →
-  `finalize_definitions` under live threads — the W^X correctness spike); threaded install sidesteps
-  it (compile precedes the spawn).
+  `finalize_definitions` under live threads); threaded install sidesteps it (compile precedes the
+  spawn). **The W^X spike is now done** (HANDOFF §6 #2): `ArenaMemoryProvider::finalize` only
+  re-protects *non-finalized* segments, so executing code is never touched — **no stop-the-world**;
+  i-cache coherence is handled by cranelift's `clear_cache` + `pipeline_flush_mt` (membarrier
+  `SYNC_CORE` on Linux aarch64), with a no-op on aarch64 macOS that wants an executing-thread `isb`
+  at a safepoint. So threaded compile needs a per-domain compile lock + a JIT-side `Host` lock
+  (concurrent `cap.call`) + that aarch64-macOS safepoint — pinned empirically by
+  `jit_incremental::concurrent_finalize_does_not_disturb_running_code`.
 
 ## Verification approach
 

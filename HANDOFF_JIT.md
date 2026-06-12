@@ -231,18 +231,35 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
      reinstalled without synchronizing) still reads a *complete* code pointer (old or new — both
      valid `AtomicU64` values), never a torn/half-written pointer (no wild jump → no escape); a racy
      outcome is the guest's own bug and is contained.
-   - **Open (the one remaining item): threaded *compile*.** A worker calling `Jit.compile` while
-     others run hits `finalize_definitions` under live threads — a **correctness/safety** question
-     (does cranelift-jit 0.132's arena finalize ever flip already-finalized, *executing* pages back
-     to writable? a W^X violation on running code), the spike JIT.md flags. Threaded *install*
-     sidesteps it (compile precedes the spawn; install never finalizes). (install-during-own-
-     invocation is covered structurally by the interp's `INVOKE_MODULE` + shared table; a dedicated
-     end-to-end case is worth adding if a guest needs it.)
+   - **Threaded *compile* — spike done; no stop-the-world needed.** A worker calling `Jit.compile`
+     while others run hits `finalize_definitions` under live threads. The spike (source analysis of
+     cranelift-jit 0.132 + a concurrent stress test, `jit_incremental::
+     concurrent_finalize_does_not_disturb_running_code`) settled the W^X question:
+     - **Page protection: safe by construction.** `ArenaMemoryProvider::finalize` only `mprotect`s
+       *non-finalized* segments (`Segment::finalize` early-returns on `finalized`; the allocate
+       `set_rw` resize path skips finalized segments). Executing code always lives on a finalized
+       segment, so finalize/allocate **never touch a running page** — no transient W^X, no
+       stop-the-world. The stress test (a sibling hammering a finalized leaf through millions of
+       calls across 400 `define_extra`/finalize cycles, returning 42, non-flaky) corroborates it.
+     - **I-cache cross-core: handled, one macOS caveat.** finalize does `clear_cache` (aarch64:
+       `ic ivau` broadcast + `dsb ish` + `isb`) + `pipeline_flush_mt`, which on Linux aarch64 is
+       `membarrier(SYNC_CORE)` (broadcasts an `isb` to every core); x86 is coherent (no-op). On
+       **aarch64 macOS** `pipeline_flush_mt` is a no-op, so a busy-spinning executing core's own
+       `isb` isn't guaranteed — that one target needs the executing thread to context-synchronize
+       at a safepoint (a brief quiesce, *not* a global stop-the-world).
+     - **So threaded compile needs:** (a) a per-domain **compile lock** (serialize `define_extra`'s
+       `&mut`), (b) the **JIT-side Host lock** (`cap_thunk` derefs a raw `*mut Host`; concurrent
+       `cap.call`s — which a worker `Jit.compile` introduces — race), and on **aarch64 macOS only**
+       (c) an executing-thread `isb` at a safepoint. Then the end-to-end differential. The interp
+       side is already ready (compile = `Host`-state mutation under the `Arc<Mutex<Host>>`, no
+       finalize). (install-during-own-invocation is covered structurally by the interp's
+       `INVOKE_MODULE` + shared table; a dedicated end-to-end case is worth adding if a guest needs
+       it.)
 
 **Recommendation:** #1 (compaction) is done; #2 threaded **install** is done end-to-end with full
-platform parity. The one remaining item — threaded-*compile* W^X — is a correctness spike on
-cranelift's finalize-under-threads behavior; gate it on a real threaded-compile workload and don't
-half-bake it.
+platform parity; the threaded-*compile* **spike is done** — it needs two locks (compile + Host) and
+an aarch64-macOS safepoint `isb`, **not** a stop-the-world. Build it when a real threaded-compile
+workload arrives; the path is now concrete.
 
 Also nice-to-have, low priority: a guest convention/helper so emitting C-ABI units (the `sp`-first
 shape) for `install` is less manual; today the demo hand-rolls it.
