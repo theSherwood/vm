@@ -168,7 +168,11 @@ fn drive(
         s.next_task += 1;
         s.live += 1;
         s.workers = 1; // the calling thread acts as worker 0
-        let mut root = Box::new(VCpu::new(
+                       // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
+                       // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
+                       // across `thread.spawn`/`Jit.invoke` children (JIT.md §6 #2).
+        let dt = Arc::new(DomainTable::new(&funcs, jit_table_log2));
+        let root = Box::new(VCpu::new(
             Arc::clone(&funcs),
             entry,
             args,
@@ -179,12 +183,8 @@ fn drive(
             id,
             SchedRef::Real(Arc::clone(&sched)),
             quota,
+            dt,
         ));
-        // B2 `install` reserves a larger dispatch table on the domain's root vCPU (no effect when
-        // `jit_table_log2 == 0` — the natural table already covers the module).
-        if jit_table_log2 != 0 {
-            root.table = build_table(&funcs, jit_table_log2);
-        }
         s.runnable.push_back(root);
         id
     };
@@ -371,6 +371,7 @@ pub fn run_scheduled(
         let id = s.next_task;
         s.next_task += 1;
         s.live += 1;
+        let dt = Arc::new(DomainTable::new(&funcs, 0)); // DPOR: no Jit install, natural table
         let root = Box::new(VCpu::new(
             funcs,
             func,
@@ -382,6 +383,7 @@ pub fn run_scheduled(
             id,
             SchedRef::Det(Arc::clone(&det)),
             Quota::default(), // deterministic oracle path: the fixed anti-bomb ceilings
+            dt,
         ));
         s.runnable.push(root);
         id
@@ -872,6 +874,7 @@ fn run_one_schedule(
         let id = s.next_task;
         s.next_task += 1;
         s.live += 1;
+        let dt = Arc::new(DomainTable::new(funcs, 0)); // DPOR: no Jit install, natural table
         let mut root = VCpu::new(
             Arc::clone(funcs),
             func,
@@ -883,6 +886,7 @@ fn run_one_schedule(
             id,
             SchedRef::Det(Arc::clone(&det)),
             Quota::default(), // exhaustive model-checker path: the fixed anti-bomb ceilings
+            dt,
         );
         root.memop = true;
         s.runnable.push(Box::new(root));
@@ -930,65 +934,181 @@ struct TableSlot {
     func: FuncIdx,
 }
 const TABLE_EMPTY: u32 = u32::MAX;
+/// The reserved module id of the unit a `Jit.invoke` is currently running ([`VCpu::new_invoke`]).
+/// It is a **per-vCPU transient** module, kept *out* of the shared [`DomainTable`]'s `units`, so the
+/// invoked unit is never an installed (`call_indirect`-reachable) module and never collides with a
+/// concurrent install — even one the invoked unit performs on itself (install-during-own-invocation,
+/// JIT.md §6 #2). Far above any reachable install count, just below `TABLE_EMPTY`.
+const INVOKE_MODULE: u32 = u32::MAX - 1;
 
-/// Build a vCPU's dispatch table from its module-0 functions: slot `i` holds `(module 0, i)` for
-/// each function, then empty (trapping) padding up to a power-of-two length — the reference
-/// mirror of the JIT's `fn_table`. `table_reserve_log2` reserves a *larger* table than the
-/// module needs (matching the JIT's `table_reserve_log2`) so `install` (Model B2) fills the
-/// padding slots; `0` ⇒ the natural `next_pow2(funcs.len())`. Real functions stay in `[0,
-/// funcs.len())` and padding starts at `funcs.len()` on **both** backends, so the slot index
-/// `install` returns agrees.
-fn build_table(funcs: &[Func], table_reserve_log2: u8) -> Vec<TableSlot> {
-    let len = (1usize << table_reserve_log2)
-        .max(funcs.len().next_power_of_two())
-        .max(1);
-    (0..len)
-        .map(|i| {
-            if i < funcs.len() {
-                TableSlot {
-                    module: 0,
-                    func: i as FuncIdx,
-                }
-            } else {
-                TableSlot {
-                    module: TABLE_EMPTY,
-                    func: 0,
-                }
-            }
-        })
-        .collect()
+#[inline]
+fn pack_slot(module: u32, func: u32) -> u64 {
+    ((module as u64) << 32) | func as u64
 }
-
-/// The functions of module `m` for a running vCPU — module 0 is its primary program, `k ≥ 1` a
-/// guest-compiled unit in `units[k-1]` (JIT.md Model A new→old).
-fn mod_funcs<'a>(funcs: &'a [Func], units: &'a [Arc<[Func]>], m: u32) -> &'a [Func] {
-    if m == 0 {
-        funcs
-    } else {
-        &units[(m - 1) as usize]
+#[inline]
+fn unpack_slot(w: u64) -> TableSlot {
+    TableSlot {
+        module: (w >> 32) as u32,
+        func: w as u32,
     }
 }
 
-/// Resolve a `call_indirect` through the dispatch `table`: mask the guest index, reject a padding
-/// slot, then type-check the target's signature structurally (matching the JIT's masked load +
-/// `type_id` check, where the interned id ≡ structural equality). Returns the target `(module,
-/// func)`.
+/// The domain's **shared, live** `call_indirect` dispatch table — the reference mirror of the JIT's
+/// one `fn_table`, shared by every vCPU of a domain (root, `thread.spawn` children, `Jit.invoke`
+/// children) via `Arc`. Sharing it is what makes guest-driven `install` faithful across threads and
+/// across a nested invocation (JIT.md §6 #2): a slot write is visible to every vCPU, exactly as the
+/// JIT's one shared table is.
+///
+/// **No lock on the dispatch hot path.** Each slot is a single `u64` word (`module<<32 | func`), so
+/// dispatch is one `Acquire` atomic load (free on x86) and `install`/`uninstall` one `Release`
+/// store — no `Mutex`, no torn read (the table is pre-reserved and never resized). `units` (the
+/// funcs backing installed modules) is append-only; *writers* serialize under its `Mutex`, while
+/// *readers* keep a lock-free local clone (a prefix of `units`) and re-sync only on a miss — so a
+/// steady-state `call_indirect` to module 0 (the common case) touches neither a lock nor `units`.
+struct DomainTable {
+    slots: Box<[AtomicU64]>,
+    units: Mutex<Vec<Arc<[Func]>>>,
+}
+
+impl DomainTable {
+    /// Build a domain's table from its module-0 functions: slot `i` = `(module 0, i)`, then trapping
+    /// padding to a power-of-two length. `reserve_log2` reserves a *larger* table than the module
+    /// needs (matching the JIT's `table_reserve_log2`) so `install` (Model B2) fills the padding;
+    /// `0` ⇒ the natural `next_pow2(funcs.len())`. Real functions stay in `[0, funcs.len())` and
+    /// padding starts at `funcs.len()` on both backends, so the slot index `install` returns agrees.
+    fn new(funcs: &[Func], reserve_log2: u8) -> DomainTable {
+        let len = (1usize << reserve_log2)
+            .max(funcs.len().next_power_of_two())
+            .max(1);
+        let slots = (0..len)
+            .map(|i| {
+                AtomicU64::new(if i < funcs.len() {
+                    pack_slot(0, i as u32)
+                } else {
+                    pack_slot(TABLE_EMPTY, 0)
+                })
+            })
+            .collect();
+        DomainTable {
+            slots,
+            units: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Dispatch-path read: one `Acquire` load. Ordered after the matching `install` `Release` store,
+    /// so a reader that observes a filled slot also observes the pushed unit (the `units` `Mutex` in
+    /// `install` releases before the slot store, and `units_snapshot` re-acquires it).
+    #[inline]
+    fn slot(&self, i: usize) -> TableSlot {
+        unpack_slot(self.slots[i].load(Ordering::Acquire))
+    }
+
+    /// `Jit.install` (Model B2): append `unit` (module id = its 1-based index) and fill the first
+    /// padding slot, returning the slot. `None` if every reserved slot is full. Writers serialize
+    /// under the `units` lock (rare — only inside a synchronous `cap.call`, the guest suspended); the
+    /// slot store is `Release` so the pushed unit is visible to any reader that observes the slot.
+    fn install(&self, unit: Arc<[Func]>) -> Option<u32> {
+        let mut units = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self
+            .slots
+            .iter()
+            .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == TABLE_EMPTY)?;
+        units.push(unit);
+        let module = units.len() as u32; // module k ≡ units[k-1]
+        self.slots[slot].store(pack_slot(module, 0), Ordering::Release);
+        Some(slot as u32)
+    }
+
+    /// `Jit.uninstall` (Model B2 reclaim): clear an installed slot (`≥ n_real`, currently filled)
+    /// back to trapping padding so the index is reusable and a stale `call_indirect` of it traps.
+    /// `units` stays (append-only; the unit is just no longer reachable). Serialized like `install`.
+    fn uninstall(&self, slot: usize, n_real: usize) -> bool {
+        let _g = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        if slot >= n_real
+            && slot < self.slots.len()
+            && (self.slots[slot].load(Ordering::Relaxed) >> 32) as u32 != TABLE_EMPTY
+        {
+            self.slots[slot].store(pack_slot(TABLE_EMPTY, 0), Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A clone of the installed-units prefix (Arc clones — cheap). A reader calls this only on a
+    /// local-cache miss (a unit installed since its last sync); the `Mutex` acquire pairs with the
+    /// `install` slot `Release` to make the pushed unit visible.
+    fn units_snapshot(&self) -> Vec<Arc<[Func]>> {
+        self.units.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Resolve module `m`'s functions for a running vCPU: module 0 is its primary program; `INVOKE_MODULE`
+/// is the transient unit a `Jit.invoke` is running (`invoked`); `k ≥ 1` is an installed unit in the
+/// shared [`DomainTable`]. `local_units` is the vCPU's lock-free clone of the shared installed units
+/// (a prefix); a miss (a unit installed since the last sync) refreshes it. Returns `None` for an
+/// out-of-range module (a forged/stale slot) → the caller traps.
+fn resolve_module(
+    funcs: &Arc<[Func]>,
+    local_units: &mut Vec<Arc<[Func]>>,
+    invoked: &Option<Arc<[Func]>>,
+    dt: &DomainTable,
+    m: u32,
+) -> Option<Arc<[Func]>> {
+    if m == 0 {
+        return Some(Arc::clone(funcs));
+    }
+    if m == INVOKE_MODULE {
+        return invoked.clone();
+    }
+    let i = (m - 1) as usize;
+    if i >= local_units.len() {
+        *local_units = dt.units_snapshot(); // a unit installed since our last sync
+    }
+    local_units.get(i).cloned()
+}
+
+/// Resolve a `call_indirect` through the shared [`DomainTable`]: mask the guest index, one `Acquire`
+/// load of the slot, reject a padding slot, then type-check the target's signature structurally
+/// (matching the JIT's masked load + `type_id` check, where the interned id ≡ structural equality).
+/// Returns the target `(module, func)`. `local_units`/`invoked` resolve the slot's module (see
+/// [`resolve_module`]).
 fn dispatch_indirect(
-    table: &[TableSlot],
-    funcs: &[Func],
-    units: &[Arc<[Func]>],
+    dt: &DomainTable,
+    funcs: &Arc<[Func]>,
+    local_units: &mut Vec<Arc<[Func]>>,
+    invoked: &Option<Arc<[Func]>>,
     idx: i32,
     ty: &FuncType,
 ) -> Result<(u32, FuncIdx), Trap> {
-    let mask = table.len() - 1; // table.len() is a power of two
+    let mask = dt.len() - 1; // len is a power of two
     let slot = (idx as u32 as usize) & mask;
-    let e = table[slot];
+    let e = dt.slot(slot);
     if e.module == TABLE_EMPTY {
         return Err(Trap::IndirectCallType);
     }
-    let f = mod_funcs(funcs, units, e.module)
-        .get(e.func as usize)
-        .ok_or(Trap::IndirectCallType)?;
+    // Resolve the target module's funcs **by borrow** (the type-check needs no owned `Arc`, so the
+    // hot path adds no refcount op over the old `&[Func]` lookup). A miss on an installed unit
+    // re-syncs the local prefix first.
+    let funcs_m: &[Func] = match e.module {
+        0 => funcs,
+        INVOKE_MODULE => invoked.as_deref().ok_or(Trap::IndirectCallType)?,
+        m => {
+            let i = (m - 1) as usize;
+            if i >= local_units.len() {
+                *local_units = dt.units_snapshot();
+            }
+            local_units
+                .get(i)
+                .map(|a| &**a)
+                .ok_or(Trap::IndirectCallType)?
+        }
+    };
+    let f = funcs_m.get(e.func as usize).ok_or(Trap::IndirectCallType)?;
     if f.params == ty.params && f.results == ty.results {
         Ok((e.module, e.func))
     } else {
@@ -1851,15 +1971,19 @@ struct VCpu {
     acc: Option<MemAccess>,
     /// §15 spawn quota (fiber/vCPU ceilings) — inherited by every vCPU of the run from the root.
     quota: Quota,
-    /// Guest-compiled `Jit` units (JIT.md Model A) reachable from this vCPU as **modules `≥ 1`**
-    /// (`units[k]` is module `k+1`); empty for an ordinary vCPU. A `Jit.invoke` runs a unit's
-    /// entry as a module-`k+1` frame while `call_indirect` still dispatches through module 0 (the
-    /// parent table), so new code reaches old code (new→old) through the shared table.
+    /// The domain's **shared, live** dispatch table (slots + installed units), shared by every vCPU
+    /// of the domain via `Arc` so a guest-driven `install` is visible across `thread.spawn` children
+    /// and `Jit.invoke` children (JIT.md §6 #2). Reads are lock-free atomic loads (see
+    /// [`DomainTable`]).
+    dt: Arc<DomainTable>,
+    /// A lock-free **local clone** (a prefix) of `dt`'s installed units (module `k` ≡ `units[k-1]`),
+    /// re-synced only on a miss (see [`resolve_module`]) — so resolving a running unit frame or an
+    /// installed `call_indirect` target never locks the shared `units`.
     units: Vec<Arc<[Func]>>,
-    /// This vCPU's `call_indirect` dispatch table (see [`TableSlot`]) — built from module 0 at
-    /// construction (reserved larger for B2 `install`), the reference mirror of the JIT's
-    /// power-of-two `fn_table`. `install` fills a padding slot in place.
-    table: Vec<TableSlot>,
+    /// The transient unit a `Jit.invoke` is running on this vCPU (`Some` only for an invoke child),
+    /// resolved as module [`INVOKE_MODULE`] — kept out of the shared `dt.units` so it is never
+    /// installed/`call_indirect`-reachable and never collides with a concurrent install.
+    invoked: Option<Arc<[Func]>>,
 }
 
 impl VCpu {
@@ -1877,8 +2001,8 @@ impl VCpu {
         id: TaskId,
         sched: SchedRef,
         quota: Quota,
+        dt: Arc<DomainTable>,
     ) -> VCpu {
-        let table = build_table(&funcs, 0);
         VCpu {
             funcs,
             fibers: vec![Fiber::Running],
@@ -1904,23 +2028,23 @@ impl VCpu {
             memop: false,
             acc: None,
             quota,
+            dt,
             units: Vec::new(),
-            table,
+            invoked: None,
         }
     }
 
     /// A vCPU that runs a guest-compiled **`Jit` unit**'s entry (`unit[0]`) over the parent's
     /// world — same window/host/fuel — for the `Jit.invoke` op (JIT.md Model A/B2). Module 0 is
-    /// the `parent` program; `parent_units`/`parent_table` are a **snapshot of the domain's
-    /// dispatch state** at invoke time, so the unit's `call_indirect` reaches the original program
-    /// (new→old) *and* any already-`install`ed units (new→new), exactly as the JIT's invoked code
-    /// dispatches through the live `fn_table`. The invoked unit is appended as the next module and
-    /// the root frame runs its entry.
+    /// the `parent` program; `dt` is the **shared, live** domain table, so the unit's `call_indirect`
+    /// reaches the original program (new→old) *and* any already- **or later-** `install`ed units
+    /// (new→new, incl. install-during-own-invocation), exactly as the JIT's invoked code dispatches
+    /// through the live `fn_table`. The invoked unit runs as the transient [`INVOKE_MODULE`] (kept
+    /// out of `dt.units`, so it is never itself `call_indirect`-reachable).
     #[allow(clippy::too_many_arguments)]
     fn new_invoke(
         parent: Arc<[Func]>,
-        parent_units: Vec<Arc<[Func]>>,
-        parent_table: Vec<TableSlot>,
+        dt: Arc<DomainTable>,
         unit: Arc<[Func]>,
         args: &[Value],
         mem: Option<Mem>,
@@ -1930,9 +2054,6 @@ impl VCpu {
         sched: SchedRef,
         quota: Quota,
     ) -> VCpu {
-        let mut units = parent_units;
-        units.push(unit);
-        let module = units.len() as u32; // the invoked unit's module id (its index + 1)
         VCpu {
             funcs: parent,
             fibers: vec![Fiber::Running],
@@ -1940,7 +2061,7 @@ impl VCpu {
             cur: 0,
             frames: vec![Frame {
                 func: 0, // the unit's entry
-                module,
+                module: INVOKE_MODULE,
                 block: 0,
                 inst: 0,
                 vals: args.to_vec(),
@@ -1958,8 +2079,9 @@ impl VCpu {
             memop: false,
             acc: None,
             quota,
-            units,
-            table: parent_table,
+            dt,
+            units: Vec::new(),
+            invoked: Some(unit),
         }
     }
 
@@ -2090,11 +2212,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
 
     let funcs = Arc::clone(&v.funcs); // module 0 (this vCPU's primary program), immutable for the run
     let spawn_quota = v.quota; // §15 fiber/vCPU ceilings (distinct from the Instantiator's i64 fuel quota)
-                               // `units` and `table` are bound **mutably** (not cloned) so the `Jit.install` arm can grow
-                               // them mid-run. The borrow tangle (a running unit frame would otherwise hold `units`
-                               // borrowed across the instruction loop) is avoided by cloning the current frame's module
-                               // `Arc` into a local (`cur` below) — so neither `units` nor `table` is borrowed across the
-                               // loop and `install` is free to mutate them.
+                               // `dt` is the **shared** domain table (atomic slots + the writer-locked installed
+                               // units); reads off it are lock-free. `units` here is this vCPU's **local clone** of
+                               // the installed-units prefix, refreshed lazily on a miss (`resolve_module`) so neither
+                               // a running unit frame nor the `Jit.install` arm needs the shared lock on the hot loop.
     let VCpu {
         fibers,
         chain,
@@ -2114,8 +2235,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         memop,
         acc,
         quota: _,
+        dt,
         units,
-        table,
+        invoked,
     } = v;
     let depth = *depth;
     let memop = *memop;
@@ -2127,19 +2249,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // fiber's stack is in `frames` — see the comments on those arms.
     'frames: loop {
         let top = frames.len() - 1;
-        // Resolve the running frame against *its* module (module 0 = this vCPU's program; ≥ 1 = a
-        // Jit unit). Clone the module's `Arc` into a local so neither `units` nor `table` is
-        // borrowed across the loop body — leaving the `Jit.install` arm free to mutate them.
-        // `block` borrows `cur` (the owned local), *not* `frames`, so the loop body is free to
-        // push/pop/mutate `frames` (and move it on a fiber switch) while holding it.
-        let cur_funcs: Arc<[Func]> = {
-            let m = frames[top].module;
-            if m == 0 {
-                Arc::clone(&funcs)
-            } else {
-                Arc::clone(&units[(m - 1) as usize])
-            }
-        };
+        // Resolve the running frame against *its* module (module 0 = this vCPU's program;
+        // `INVOKE_MODULE` = the invoked unit; ≥ 1 = an installed Jit unit). Clone the module's `Arc`
+        // into a local so the shared `dt` is never borrowed across the loop body. `block` borrows
+        // `cur` (the owned local), *not* `frames`, so the loop body is free to push/pop/mutate
+        // `frames` (and move it on a fiber switch) while holding it.
+        let cur_funcs: Arc<[Func]> = resolve_module(&funcs, units, invoked, dt, frames[top].module)
+            .ok_or(Trap::Malformed)?;
         let fs: &[Func] = &cur_funcs;
         let block = fs
             .get(frames[top].func as usize)
@@ -2205,9 +2321,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Dispatch through the module-0 table (new→old; matches the JIT, where every
                     // function — parent or unit — is lowered against the parent `fn_table`).
                     let (cmod, cfunc) = dispatch_indirect(
-                        &table[..],
+                        dt,
                         &funcs,
-                        &units[..],
+                        units,
+                        invoked,
                         as_i32(get(&frames[top].vals, *idx)?)?,
                         ty,
                     )?;
@@ -2436,6 +2553,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     .map_or_else(|| Arc::clone(&funcs), |(f, _, _)| Arc::clone(f));
                                 let csched = sched.clone();
                                 let made = sched.spawn(move |id| {
+                                    // A nested child is its **own** domain (own host/window/program),
+                                    // so it gets its own dispatch table, not the parent's.
+                                    let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                                     let mut child = VCpu::new(
                                         cfuncs,
                                         entry as u32,
@@ -2447,6 +2567,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         id,
                                         csched,
                                         spawn_quota, // a nested child inherits the domain's spawn quota
+                                        cdt,
                                     );
                                     child.memop = memop;
                                     Box::new(child)
@@ -2548,6 +2669,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let cfuncs = child_mod
                                     .as_ref()
                                     .map_or_else(|| Arc::clone(&funcs), |(f, _, _)| Arc::clone(f));
+                                // A co-fiber child is its own domain → its own dispatch table.
+                                let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                                 let mut child = VCpu::new(
                                     cfuncs,
                                     entry as u32,
@@ -2559,6 +2682,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     0, // unused: a coroutine is driven inline, never via the executor
                                     sched.clone(),
                                     spawn_quota, // co-fiber child inherits the domain's spawn quota
+                                    cdt,
                                 );
                                 child.fault_yields = true; // its page faults suspend to us, not trap
                                 coroutines.push(Some(Coro {
@@ -2666,21 +2790,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
                     };
-                    // Register the unit as a module of this vCPU (module id = `units.len()`
-                    // after the push, since module `k` ≡ `units[k-1]`), then fill the next empty
-                    // table slot. The padding starts at `funcs.len()` on both backends, so the
-                    // first install lands at the same index the JIT's `install` returns.
-                    units.push(unit_funcs);
-                    let module = units.len() as u32;
-                    let res = match table.iter().position(|s| s.module == TABLE_EMPTY) {
-                        Some(slot) => {
-                            table[slot] = TableSlot { module, func: 0 };
-                            slot as i64
-                        }
-                        None => {
-                            units.pop(); // nothing installed — keep `units`/`table` consistent
-                            ENOSPC
-                        }
+                    // Append the unit to the **shared** domain table (module id = its 1-based
+                    // index) and fill the next empty slot — visible at once to every vCPU of the
+                    // domain (JIT.md §6 #2). The padding starts at `funcs.len()` on both backends,
+                    // so the first install lands at the same index the JIT's `install` returns.
+                    let res = match dt.install(unit_funcs) {
+                        Some(slot) => slot as i64,
+                        None => ENOSPC,
                     };
                     frames[top].vals.push(Value::I64(res));
                 }
@@ -2705,14 +2821,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         &frames[top].vals,
                         *args.first().ok_or(Trap::Malformed)?,
                     )?) as usize;
-                    let res = if slot >= funcs.len()
-                        && slot < table.len()
-                        && table[slot].module != TABLE_EMPTY
-                    {
-                        table[slot] = TableSlot {
-                            module: TABLE_EMPTY,
-                            func: 0,
-                        };
+                    // A guest may only clear slots it installed (`≥ funcs.len()`, the module-0
+                    // function count) — `dt.uninstall` enforces the range + filled checks.
+                    let res = if dt.uninstall(slot, funcs.len()) {
                         0
                     } else {
                         EINVAL
@@ -2764,16 +2875,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // move them back whatever the outcome — the parent's snapshot/teardown still
                     // needs them after a trap.
                     let child_mem = mem.take();
-                    // The unit runs over the parent's world: module 0 = this vCPU's program and a
-                    // snapshot of the domain's dispatch table + units, so the unit's `call_indirect`
-                    // reaches the original program (new→old) and any installed units (new→new),
-                    // matching the JIT's invoked code over the live `fn_table`. A nested invoke
-                    // costs call depth like a call, so invoke recursion is bounded by the same
-                    // stack-overflow bound as ordinary recursion.
+                    // The unit runs over the parent's world: module 0 = this vCPU's program and the
+                    // **shared, live** domain table, so the unit's `call_indirect` reaches the
+                    // original program (new→old) and any installed units (new→new, incl. one it
+                    // installs during its own invocation), matching the JIT's invoked code over the
+                    // live `fn_table`. A nested invoke costs call depth like a call, so invoke
+                    // recursion is bounded by the same stack-overflow bound as ordinary recursion.
                     let mut child = VCpu::new_invoke(
                         Arc::clone(&funcs),
-                        units.clone(),
-                        table.clone(),
+                        Arc::clone(dt),
                         unit_funcs,
                         &child_args,
                         child_mem,
@@ -2913,6 +3023,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let child_host = Arc::clone(host); // inherit the domain powerbox
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
                     let cfuncs = Arc::clone(&funcs);
+                    let cdt = Arc::clone(dt); // **share** the domain table: a post-spawn install is visible here (§6 #2)
                     let csched = sched.clone();
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
@@ -2926,6 +3037,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             id,
                             csched,
                             spawn_quota, // spawned vCPU inherits the domain's spawn quota
+                            cdt,
                         );
                         child.memop = memop; // inherit the explorer's memory-op granularity
                         Box::new(child)
@@ -3084,9 +3196,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
             Terminator::ReturnCallIndirect { ty, idx, args } => {
                 let (cmod, cfunc) = dispatch_indirect(
-                    &table[..],
+                    dt,
                     &funcs,
-                    &units[..],
+                    units,
+                    invoked,
                     as_i32(get(&frames[top].vals, *idx)?)?,
                     ty,
                 )?;
