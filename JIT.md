@@ -10,8 +10,23 @@ their own slow interpreter or round-trip to the host for a fresh module). If SVM
 it cleanly, guest interpreters (Lua/JS/Python-style) get a fast path for their hot loops
 without leaving the sandbox's security model.
 
-**Deliverable for this task: a design/feasibility write-up + implementation plan only —
-no code changes yet.** This file is that write-up.
+**Status: the Model A MVP is built and merged** (this file began as the feasibility
+write-up; it now also records implementation status). Phases 1–4 + the reference handler +
+resource hardening are landed and differentially tested:
+
+| Piece | Where |
+| --- | --- |
+| Long-lived `CompiledModule` split + `define_extra` + append-only type-id intern | `crates/svm-jit/src/lib.rs`; tests `crates/svm/tests/jit_incremental.rs` |
+| Re-entrancy-sound `run_raw` + mid-run `invoke_extra` (nested guard) | `crates/svm-jit/src/lib.rs`; tests `crates/svm/tests/jit_reentry.rs` |
+| `Jit` capability (iface 11): `compile`/`invoke`/`release`, both backends | interp: `crates/svm-interp/src/lib.rs` (dispatch arm + eval-loop nested-VCpu invoke); native: `crates/svm-run/src/lib.rs` (`cap_thunk` intercept, `jit_blob_validator`, `grant_jit`, `jit_cap_run`) |
+| Differential + fuzz suite (results/errnos/traps/final-memory equality) | `crates/svm/tests/jit_cap.rs` |
+| Compile quota (`-ENOMEM`, shared gate) | `Host::jit_compile` / `set_jit_quota` |
+| C surface (`__vm_jit_compile/invoke2/release`, 8-handle powerbox) + demo | `frontend/chibicc`, `crates/svm-run/demos/jit/` (`cargo run -p svm-run -- crates/svm-run/demos/jit/jit_demo.c`) |
+
+The W^X spike resolved affirmatively (incremental finalize leaves running code intact —
+pinned by tests including finalize *during* a run). Phase 5 (B2 table install) and
+compaction-based reclaim remain contingent, per the Recommendation. The design analysis
+below is preserved as written.
 
 **Verdict up front: yes, it's feasible and a strong architectural fit.** The submit-a-blob
 boundary the feature needs already exists, the verifier is *designed* to be the trust hinge
@@ -336,7 +351,7 @@ not an orthogonal allocator feature; see Open questions.
 
 ---
 
-## Implementation plan (for when we build it; design-doc deliverable lands first)
+## Implementation plan (phases 1–4 landed — see Status; 5–6 contingent)
 
 Phased; each phase is independently testable and keeps the escape-TCB crates untouched.
 
