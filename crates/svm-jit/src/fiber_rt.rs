@@ -160,11 +160,11 @@ pub(crate) unsafe extern "C" fn fiber_new(
             // Resolve + type-check the funcref now (first resume), like the interpreter.
             let slot = (funcref as u32 as usize) & (mask as usize);
             let entry = (fn_table_base as *const FnEntry).add(slot);
-            let result = if (*entry).type_id != type_id {
+            let result = if (*entry).type_id() != type_id {
                 fault(trap_out);
                 0u64
             } else {
-                call_tramp((*entry).code, mem_base, fn_table_base, trap_out, sp, arg)
+                call_tramp((*entry).code(), mem_base, fn_table_base, trap_out, sp, arg)
             };
             (*rt_ptr).yielders.pop();
             result

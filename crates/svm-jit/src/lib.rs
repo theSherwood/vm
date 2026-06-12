@@ -55,7 +55,7 @@
 //! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
 //! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
 
-use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
@@ -130,13 +130,57 @@ const SNAP_CAP: usize = 1 << 18; // 256 KiB
 /// A function-table entry (§3c `FnEntry`): host-owned, guest-unwritable. `type_id`
 /// identifies the signature (distinct-`FuncType` index); `code` is the finalized
 /// function address. `call_indirect` masks the guest index into the table, checks
-/// `type_id`, then calls `code` — confinement at the use site (invariant I2).
+/// `type_id` (offset 0), then calls `code` (offset 8) — confinement at the use site (invariant I2).
+///
+/// The fields are **atomic** so a guest-driven `install`/`uninstall` (a host-side write) is sound
+/// against a *concurrent* `call_indirect` from another thread (JIT.md §6 #2 threaded install). The
+/// `#[repr(C)]` layout (`type_id` @0, `code` @8) is exactly what [`indirect_dispatch`] bakes its
+/// loads against, unchanged. Publication is **release-ordered**: `install` stores `code` first then
+/// `type_id` (the "ready" field), so a reader that observes the unit's `type_id` also observes its
+/// `code` — on x86-64 (TSO) the generated plain loads at @0 then @8 complete the message-passing
+/// pair with no codegen change; a weakly-ordered target (aarch64) additionally needs an
+/// acquire load on the baked `type_id` read (a future codegen change — see JIT.md §6 #2).
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub(crate) struct FnEntry {
-    type_id: u32,
+    type_id: AtomicU32,
     _pad: u32,
-    code: u64,
+    code: AtomicU64,
+}
+
+impl FnEntry {
+    /// A real/installed entry.
+    pub(crate) fn new(type_id: u32, code: u64) -> FnEntry {
+        FnEntry {
+            type_id: AtomicU32::new(type_id),
+            _pad: 0,
+            code: AtomicU64::new(code),
+        }
+    }
+    /// A trapping padding entry (`call_indirect` here is inert).
+    pub(crate) fn padding() -> FnEntry {
+        FnEntry::new(PADDING_TYPE_ID, 0)
+    }
+    /// The slot's signature id (the host-side bookkeeping read; the hot dispatch read is in
+    /// generated code). `Acquire` pairs with [`Self::publish`]'s release of `type_id`.
+    pub(crate) fn type_id(&self) -> u32 {
+        self.type_id.load(Ordering::Acquire)
+    }
+    /// The slot's code pointer (host-side bookkeeping read).
+    pub(crate) fn code(&self) -> u64 {
+        self.code.load(Ordering::Acquire)
+    }
+    /// **Publish** an installed function: `code` first, then `type_id` (release-ordered), so a
+    /// concurrent reader that sees the new `type_id` also sees the new `code`.
+    pub(crate) fn publish(&self, type_id: u32, code: u64) {
+        self.code.store(code, Ordering::Release);
+        self.type_id.store(type_id, Ordering::Release);
+    }
+    /// **Clear** to trapping padding: `type_id` (the ready field) first so a new dispatch traps
+    /// promptly, then zero `code`.
+    pub(crate) fn clear(&self) {
+        self.type_id.store(PADDING_TYPE_ID, Ordering::Release);
+        self.code.store(0, Ordering::Relaxed);
+    }
 }
 
 /// `type_id` for a table slot that holds no function (the power-of-two padding) — it
@@ -1346,22 +1390,17 @@ impl CompiledModule {
         // `install` fills them.
         let fn_table: Box<[FnEntry]> = (0..table_len)
             .map(|slot| match m.funcs.get(slot) {
-                Some(f) => FnEntry {
-                    type_id: type_id_of(
+                Some(f) => FnEntry::new(
+                    type_id_of(
                         &distinct,
                         &FuncType {
                             params: f.params.clone(),
                             results: f.results.clone(),
                         },
                     ),
-                    _pad: 0,
-                    code: module.get_finalized_function(ids[slot]) as u64,
-                },
-                None => FnEntry {
-                    type_id: PADDING_TYPE_ID,
-                    _pad: 0,
-                    code: 0,
-                },
+                    module.get_finalized_function(ids[slot]) as u64,
+                ),
+                None => FnEntry::padding(),
             })
             .collect();
 
@@ -1884,18 +1923,17 @@ impl CompiledModule {
     /// padding slot, returning that slot index — a funcref the guest (or another unit) can
     /// `call_indirect` at native speed (old→new / new→new). `None` if the table is full (every
     /// reserved slot taken). The base never moves (the table was pre-reserved at compile, the
-    /// mask is a baked constant), so this is just a slot write — safe mid-run under the
-    /// single-threaded MVP (the guest is suspended in its synchronous `cap.call`).
-    pub fn install(&mut self, code: *const u8, type_id: u32) -> Option<u32> {
+    /// mask is a baked constant), so this is just a slot write. The write is **release-ordered and
+    /// atomic** ([`FnEntry::publish`]), so it is sound against a concurrent `call_indirect` from
+    /// another thread — the JIT §6 #2 threaded-install path — not only the single-threaded MVP.
+    /// Takes `&self`: the running generated code reads the table through raw pointers, so the host
+    /// install must not claim a Rust exclusive borrow over it.
+    pub fn install(&self, code: *const u8, type_id: u32) -> Option<u32> {
         let slot = self
             .fn_table
             .iter()
-            .position(|e| e.type_id == PADDING_TYPE_ID)?;
-        self.fn_table[slot] = FnEntry {
-            type_id,
-            _pad: 0,
-            code: code as u64,
-        };
+            .position(|e| e.type_id() == PADDING_TYPE_ID)?;
+        self.fn_table[slot].publish(type_id, code as u64);
         Some(slot as u32)
     }
 
@@ -1905,19 +1943,15 @@ impl CompiledModule {
     /// `false` for an out-of-range slot, a real module-function slot (`< n_real_funcs`), or an
     /// already-empty slot — a guest may only reclaim what it installed. (The code memory itself
     /// is not freed — cranelift-jit has no per-function free; this reclaims the *slot*.)
-    pub fn uninstall(&mut self, slot: u32) -> bool {
+    pub fn uninstall(&self, slot: u32) -> bool {
         let i = slot as usize;
         if i < self.n_real_funcs || i >= self.fn_table.len() {
             return false;
         }
-        if self.fn_table[i].type_id == PADDING_TYPE_ID {
+        if self.fn_table[i].type_id() == PADDING_TYPE_ID {
             return false; // already empty
         }
-        self.fn_table[i] = FnEntry {
-            type_id: PADDING_TYPE_ID,
-            _pad: 0,
-            code: 0,
-        };
+        self.fn_table[i].clear();
         true
     }
 
@@ -1930,19 +1964,15 @@ impl CompiledModule {
     /// (`< n_real_funcs`, guarding the original program's funcrefs), or an already-occupied slot
     /// (the target must be padding — a fresh module's reserved slots all are). Same trust class as
     /// `install`: a host-driven slot write into a pre-reserved table whose base never moves.
-    pub fn install_at(&mut self, slot: u32, code: *const u8, type_id: u32) -> bool {
+    pub fn install_at(&self, slot: u32, code: *const u8, type_id: u32) -> bool {
         let i = slot as usize;
         if i < self.n_real_funcs || i >= self.fn_table.len() {
             return false;
         }
-        if self.fn_table[i].type_id != PADDING_TYPE_ID {
+        if self.fn_table[i].type_id() != PADDING_TYPE_ID {
             return false; // occupied — install_at never overwrites a live slot
         }
-        self.fn_table[i] = FnEntry {
-            type_id,
-            _pad: 0,
-            code: code as u64,
-        };
+        self.fn_table[i].publish(type_id, code as u64);
         true
     }
 
@@ -1957,8 +1987,8 @@ impl CompiledModule {
             .iter()
             .enumerate()
             .skip(self.n_real_funcs)
-            .filter(|(_, e)| e.type_id != PADDING_TYPE_ID)
-            .map(|(i, e)| (i as u32, e.code, e.type_id))
+            .filter(|(_, e)| e.type_id() != PADDING_TYPE_ID)
+            .map(|(i, e)| (i as u32, e.code(), e.type_id()))
             .collect()
     }
 
@@ -2220,22 +2250,17 @@ fn compile_child(
     let table_len = funcs.len().next_power_of_two();
     let fn_table: Box<[FnEntry]> = (0..table_len)
         .map(|slot| match funcs.get(slot) {
-            Some(f) => FnEntry {
-                type_id: type_id_of(
+            Some(f) => FnEntry::new(
+                type_id_of(
                     &distinct,
                     &FuncType {
                         params: f.params.clone(),
                         results: f.results.clone(),
                     },
                 ),
-                _pad: 0,
-                code: module.get_finalized_function(ids[slot]) as u64,
-            },
-            None => FnEntry {
-                type_id: PADDING_TYPE_ID,
-                _pad: 0,
-                code: 0,
-            },
+                module.get_finalized_function(ids[slot]) as u64,
+            ),
+            None => FnEntry::padding(),
         })
         .collect();
 

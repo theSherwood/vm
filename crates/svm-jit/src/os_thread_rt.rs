@@ -360,7 +360,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     let dom = &*sched;
     let env = dom.env();
     let entry = (env.fn_table_base as *const FnEntry).add(func_idx as usize);
-    let code = (*entry).code;
+    let code = (*entry).code();
     let done = std::sync::Arc::new(Done {
         state: Mutex::new(None),
         cv: Condvar::new(),
