@@ -225,6 +225,20 @@ guard: it lets the registry **reuse** a finished fiber's slot (so a long work-st
 doesn't leak slots up to `MAX_FIBERS`) while a stale handle to the previous occupant fails
 closed.
 
+**A shared registry also *unifies the handle namespace* across backends — closing a known
+interp↔JIT divergence (do this here, not before).** Today the two backends number fiber handles
+differently: the interp keeps the root computation as fiber-slot 0, the JIT runs the root
+off-table, so the same fiber is handle `N` on the interp and `N−1` on the JIT (and a forged
+handle masks to different slots). It is **safe** — numbering is internal, resolution confined to
+the domain's own table (DESIGN §3a) — and **harmless in production** (a single backend is
+self-consistent), but it is a real hole in the interp≡JIT differential: a fiber-handle *value*
+that flows into observable output diverges. The fiber fuzzer works around it (resumes only
+genuine handles); the durable record is in DESIGN §3a. The fix is *this* slice — a shared
+registry hands both backends the **same** `(slot, generation)` for a fiber, so handle values
+match and the differential can observe them. Deliberately **not** fixed as a standalone
+pre-change: aligning the numbering touches `resolve_fiber`/`chain`/`live_frames`, the exact code
+3b-i restructures, so doing it separately would duplicate the risk on soon-replaced code.
+
 ### 2. Op → ownership transition
 
 | Guest op | Registry action | `Ownership` transition |
