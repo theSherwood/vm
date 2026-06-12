@@ -118,9 +118,9 @@ fn with_len(src: &str, len: usize) -> String {
     src.replace("BLOBLEN", &len.to_string())
 }
 
-/// The full Model A loop, differentially: guest submits IR, both backends validate + compile
-/// + invoke it over the live window; the invoked code's store is visible in both final
-/// memories (byte-identical), and the result crosses back through the cap.call.
+/// The full Model A loop, differentially: guest submits IR, both backends validate, compile, and
+/// invoke it over the live window; the invoked code's store is visible in both final memories
+/// (byte-identical), and the result crosses back through the cap.call.
 #[test]
 fn compile_and_invoke_agree_across_backends() {
     // (a, b) -> a + b + 1000, plus a store of 0xAB at window offset 64.
