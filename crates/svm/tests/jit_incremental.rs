@@ -423,3 +423,81 @@ fn install_full_table_returns_none() {
         "no padding to install into"
     );
 }
+
+/// **Spike: `finalize_definitions` is safe while a sibling thread executes finalized code**
+/// (JIT.md §6 #2 threaded *compile*, the W^X question). A worker thread hammers an
+/// already-finalized leaf function in a tight loop via its `extern "C"` trampoline, while the
+/// main thread does hundreds of `define_extra`s — each running `finalize_definitions`, which
+/// `mprotect`s the *new* code pages and issues a cross-core pipeline flush. If finalize ever
+/// re-protected or disturbed the *running* leaf's page, the sibling would `SIGSEGV`/`SIGBUS` or
+/// read garbage; instead it must keep returning `42`. This corroborates the source finding that
+/// `ArenaMemoryProvider::finalize` skips already-finalized segments (`Segment::finalize` early-
+/// returns on `finalized`, and the `set_rw` resize path skips finalized segments), so executing
+/// code — always on a finalized segment — is never touched. The sibling holds only the raw code
+/// pointer (a `usize`), never `cm`, so there is no Rust aliasing with the main thread's `&mut`.
+#[test]
+fn concurrent_finalize_does_not_disturb_running_code() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // The buffer-ABI trampoline shape (`svm_jit::mem::Entry`): args, results, mem_base, fn_table,
+    // trap_cell. A no-memory, no-call leaf never faults, so it is safe to call outside the
+    // detect-and-kill guard.
+    type Entry = extern "C" fn(*const i64, *mut i64, *mut u8, *const std::ffi::c_void, *mut i64);
+
+    let mut cm = compile(ADD);
+    // Leaf `() -> (i64)` returning 42 — no memory, no calls.
+    let leaf_src = "func () -> (i64) {\nblock0():\n  v0 = i64.const 42\n  return v0\n}\n";
+    let leaf = parse_module(leaf_src).expect("parse");
+    verify_module(&leaf).expect("verify");
+    let defs = cm.define_extra(&leaf.funcs).expect("define leaf");
+    let tramp = defs[0].tramp as usize; // Send across the thread boundary as a plain integer
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_w = Arc::clone(&stop);
+    let worker = std::thread::spawn(move || {
+        // SAFETY: `tramp` is a finalized buffer-ABI trampoline for the leaf; the arena never frees
+        // finalized code, so it stays valid for the whole run. The leaf touches no memory, so
+        // calling it outside the signal guard cannot fault.
+        let f: Entry = unsafe { std::mem::transmute(tramp as *const u8) };
+        let mut results = [0i64];
+        let mut trap = 0i64;
+        let mut calls = 0u64;
+        while !stop_w.load(Ordering::Relaxed) {
+            for _ in 0..1000 {
+                f(
+                    std::ptr::null(),
+                    results.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &mut trap,
+                );
+                assert_eq!(
+                    results[0], 42,
+                    "running code corrupted by a concurrent finalize"
+                );
+                assert_eq!(trap, 0, "running code trapped during a concurrent finalize");
+            }
+            calls += 1000;
+        }
+        calls
+    });
+
+    // Hammer `finalize_definitions` from the main thread while the worker executes the leaf.
+    for k in 0..400i64 {
+        let src =
+            format!("func () -> (i64) {{\nblock0():\n  v0 = i64.const {k}\n  return v0\n}}\n");
+        let m = parse_module(&src).expect("parse");
+        verify_module(&m).expect("verify");
+        cm.define_extra(&m.funcs)
+            .expect("define_extra under concurrent execution");
+    }
+    stop.store(true, Ordering::Relaxed);
+    let calls = worker
+        .join()
+        .expect("worker thread panicked → finalize disturbed running code");
+    assert!(
+        calls > 0,
+        "the worker must have executed during the finalizes"
+    );
+}
