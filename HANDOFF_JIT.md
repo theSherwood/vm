@@ -209,8 +209,15 @@ The user's core asks are **done** (old↔new both directions, install, slot recl
      watermark and `occupancy()` are now in **code bytes** (the count-based `extra_fn_count()` stays
      for callers who want it); the `jit_compaction` session tests derive the watermark from a
      one-prompt byte probe so they're robust to per-platform code sizes.
-   - **Open (polish only):** a C-level guest REPL demo under `demos/` (the IR-level guest test covers
-     the mechanism). The `-ENOMEM` byte-cap backstop bounds the arena regardless.
+   - **C-level guest REPL demo — done.** `demos/jit/jit_repl.c`: a prompt body that `__vm_jit_compile`s
+     a fresh unit, invokes + releases it, and accumulates into a **BSS** global (no `data` segment, so
+     it carries across the session's per-prompt window reseed). Driven by `JitSession` in
+     `c_frontend::c_guest_jit_repl_compacts` (30 prompts, watermark off vs on): identical results **and**
+     stdout transcript while the on-run's byte occupancy stays bounded by the live set — a long C REPL
+     that JITs every prompt and never exhausts the arena. (Not a standalone `cargo run` showcase like
+     `jit_demo`/`jit_threads` — compaction is an embedder-between-prompts operation, so the embedder
+     `JitSession` is the driver; run standalone it executes one prompt.) The `-ENOMEM` byte-cap backstop
+     bounds the arena regardless.
 
 2. **Threaded install + install-during-own-invocation + threaded compile** — **all landed, full
    platform parity** (x86-64 Linux/Windows, aarch64 macOS); only a throughput optimization and a C

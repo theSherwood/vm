@@ -2175,6 +2175,101 @@ fn c_guest_jit_demo() {
     );
 }
 
+/// Drive the **auto-compacting JIT REPL** C demo (`demos/jit/jit_repl.c`) through
+/// `svm_run::JitSession`: re-enter the C `_start` (func 0) once per prompt over a persistent window,
+/// passing the fixed 8-handle powerbox each time, with the session auto-compacting once the live code
+/// crosses `watermark` bytes. Returns `(per-prompt results, captured stdout, final occupancy,
+/// compactions run)`. The accumulator/prompt counter live in BSS (no `data` segment), so they carry
+/// across prompts as window state; each prompt JITs + invokes + releases a fresh unit.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn run_jit_repl_session(
+    src: &str,
+    watermark: usize,
+    n: usize,
+) -> (Vec<i64>, Vec<u8>, usize, usize) {
+    let ir = c_to_ir(src);
+    let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}\n{ir}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{ir}"));
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+
+    let mut host = Host::new();
+    // The fixed 8-handle powerbox a chibicc `_start` imports; the 8th (JIT) grants an invoke-only
+    // domain (`table_log2 = 0`, no install table), matching the session's `table_reserve_log2` below.
+    let args = powerbox(&mut host, win, std::time::Duration::ZERO);
+    let Value::I32(jit_handle) = args[7] else {
+        panic!("the 8th powerbox handle is the JIT domain");
+    };
+    let domain = host.resolve_jit_domain(jit_handle).expect("jit domain");
+    let slot_args: Vec<i64> = args.iter().copied().map(to_slot).collect();
+
+    // The session takes ownership of the host (boxed `Mutex<Host>`); recover it for stdout below.
+    let mut session = svm_run::JitSession::new(
+        &m,
+        0,
+        svm_ir::DEFAULT_RESERVED_LOG2,
+        0,
+        domain,
+        watermark,
+        host,
+    )
+    .expect("session");
+
+    let mut results = Vec::new();
+    for _ in 0..n {
+        match session.run_prompt(&slot_args).expect("prompt") {
+            JitOutcome::Returned(s) if s.len() == 1 => results.push(s[0]),
+            other => panic!("prompt returned {other:?}"),
+        }
+    }
+    let (occ, compactions) = (session.occupancy(), session.compactions());
+    let host = session.into_host();
+    (results, host.stdout, occ, compactions)
+}
+
+/// The **auto-compacting guest-driven JIT REPL** capstone in real C (`demos/jit/jit_repl.c`, JIT.md
+/// §6 #1): a long REPL that `__vm_jit_compile`s a fresh unit every prompt would exhaust the code
+/// arena, but `JitSession` recompacts between prompts so occupancy stays bounded — transparently. A
+/// 30-prompt session produces byte-identical results **and** stdout transcript whether
+/// auto-compaction is off (`watermark = 0`) or on (a byte watermark of ~4 units), and with it on the
+/// session compacts while its code-arena occupancy stays near the watermark instead of growing with
+/// every prompt. The watermark is derived from a one-prompt byte probe so the test is robust to
+/// per-platform code sizes.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_repl_compacts() {
+    let src = include_str!("../../svm-run/demos/jit/jit_repl.c");
+    let n = 30;
+    // Probe one prompt's code-byte cost (a fresh unit + trampoline) to set a per-platform-robust
+    // watermark that trips roughly every ~4 prompts.
+    let (_, _, unit_bytes, _) = run_jit_repl_session(src, 0, 1);
+    assert!(unit_bytes > 0, "a compiled unit must report nonzero bytes");
+    let watermark = unit_bytes * 4;
+
+    let (r_off, out_off, occ_off, c_off) = run_jit_repl_session(src, 0, n);
+    let (r_on, out_on, occ_on, c_on) = run_jit_repl_session(src, watermark, n);
+
+    assert_eq!(r_off, r_on, "per-prompt results must be identical");
+    assert_eq!(
+        out_off, out_on,
+        "the REPL transcript must be byte-identical with/without compaction"
+    );
+    // The accumulator advanced: prompt i (0-based) folds in (i+2)*(i+2) + 10; the returned value is
+    // the running total, so the last result is the full sum.
+    let expected: i64 = (0..n as i64).map(|i| (i + 2) * (i + 2) + 10).sum();
+    assert_eq!(*r_on.last().unwrap(), expected);
+
+    assert_eq!(c_off, 0, "watermark 0 disables auto-compaction");
+    assert!(c_on > 0, "the byte watermark must trip auto-compaction");
+    assert!(
+        occ_off > watermark,
+        "without compaction the byte occupancy grows past the watermark: {occ_off}"
+    );
+    assert!(
+        occ_on <= watermark + unit_bytes && occ_on < occ_off,
+        "auto-compaction must bound byte occupancy near the watermark: {occ_on} (off {occ_off}, wm {watermark})"
+    );
+}
+
 /// Tasks are state-machine structs (just data), so an idle worker steals one from a busy sibling /
 /// the global injector and resumes it on its own thread — cross-thread task migration with **no VM
 /// change** (the migratable-fiber primitive, D57, is *not* needed for stackless tasks). The total

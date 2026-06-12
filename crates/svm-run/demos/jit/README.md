@@ -74,3 +74,32 @@ Expected output — `0` input mismatches across every worker:
 The product-path smoke test is `run.rs::demo_jit_threads_runs` (through the `svm-run` binary, which
 engages the locked thunk for a concurrent guest); the interp↔JIT differential for threaded compile
 is pinned at the IR level by `jit_cap::threaded_compile_agrees_across_backends`.
+
+## Auto-compacting REPL (`jit_repl.c`)
+
+The prompt body of a long-lived REPL that JITs a fresh unit **every prompt** — and never exhausts the
+code arena (JIT.md §6 #1). `cranelift-jit`'s arena has no per-function free, so a REPL that compiles
+each prompt would eventually hit `-ENOMEM`; the reclaim is **whole-module recompaction** at a
+quiescent point, and the only sound one is *between* prompts. So unlike the demos above, this is not a
+standalone `cargo run` program: it is driven by the embedder's `svm_run::JitSession`, which re-enters
+this entry once per prompt over a **persistent window** and auto-compacts when the live code crosses a
+byte watermark. The guest never observes the reclaim.
+
+Each prompt builds IR for `(a, b) -> a*b + 10`, `__vm_jit_compile`s it (a *fresh* compilation — new
+arena bytes — even though the blob is identical), `__vm_jit_invoke2`s it with `(x, x)` for
+`x = prompt + 2`, **releases** the handle (dead code the next compaction reclaims), and folds the
+result into a running accumulator. The accumulator and prompt counter live in **zero-initialized BSS**
+(no `data` segment), so the session's per-prompt window reseed leaves them untouched and they carry as
+ordinary window state.
+
+Run standalone it executes exactly one prompt:
+
+```sh
+cargo run -p svm-run -- crates/svm-run/demos/jit/jit_repl.c
+# prompt 1: +14 -> acc=14
+```
+
+The capstone test is `c_frontend.rs::c_guest_jit_repl_compacts`, which drives a 30-prompt session with
+the watermark off and on and asserts identical results **and** stdout transcript while the on-run's
+code-arena occupancy stays bounded by the live set — the long REPL that JITs every prompt without
+exhausting the arena.
