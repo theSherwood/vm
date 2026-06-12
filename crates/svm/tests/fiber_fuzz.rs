@@ -13,8 +13,12 @@
 //!   * **Serialization round-trips** — text and binary encodings are identity, so the new
 //!     ops survive the whole pipeline even in adversarially-shaped programs.
 //!
-//! The JIT bails `Unsupported` on fibers (step 4), so this is interpreter-only by design
-//! and does not touch the interp↔JIT differential.
+//! Plus an **interp↔JIT differential** (`generated_fiber_programs_agree_on_interp_and_jit`): the
+//! generated fiber programs run on *both* backends and must agree, hardening the `svm-fiber` native
+//! stack-switch the JIT lowers fibers to — the exact asm a future migratable-fiber resume reuses
+//! unchanged (`SCHEDULING.md`). It runs an **acyclic** generator (bounded call + fiber-spawn depth)
+//! over a low fiber quota and only hands the JIT programs the interpreter proved terminate, so it is
+//! hang-/bomb-proof by construction while exercising thousands of real resume chains.
 
 use svm_encode::{decode_module, encode_module};
 use svm_interp::run;
@@ -47,12 +51,30 @@ impl Rng {
 /// callee, or the entry, and a `cont.resume` always finds a signature-matching target. A
 /// single straight-line block keeps the module trivially well-typed (operands reference
 /// strictly-earlier values) while letting `cont.new`/`resume`/`suspend`/`call` interleave.
-fn gen_func(g: &mut Rng, nfuncs: usize) -> Func {
+/// Generate one fiber function. `acyclic_from` selects the call/fiber graph shape:
+/// - `None` — a `call`/`cont.new` may target **any** function (a possibly-cyclic graph, incl. recursive
+///   fiber creation). Fine for the interp-only fuzzer: recursion is heap-framed and fuel-bounded.
+/// - `Some(self_idx)` — every direct `call` **and** every `cont.new` funcref targets a *strictly
+///   higher* function index, so both the call graph and the fiber-spawn graph are **acyclic** (depth ≤
+///   `nfuncs`). Required for the interp↔JIT differential: unbounded native recursion would overflow the
+///   JIT's fixed fiber stack, and unbounded recursive *fiber* creation would fiber-bomb the two
+///   backends at slightly different resource boundaries (heap frames vs `mmap`'d stacks). With the
+///   spawn graph acyclic, the last function spawns no fibers and the whole tree is small, so a
+///   `FiberFault` is once again a genuine *semantic* signal both backends must agree on.
+fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
+    // The lowest function index a `call`/`cont.new` may target (`0` ⇒ any).
+    let call_floor = acyclic_from.map_or(0, |i| i + 1);
     // Indices 0,1 are the params `v0: i64` (data-SP) and `v1: i64` (arg). Track which
     // produced indices hold each value type.
     let mut next: u32 = 2;
     let mut i64s: Vec<u32> = vec![0, 1];
     let mut i32s: Vec<u32> = Vec::new();
+    // Value indices that are *genuine* fiber handles (results of `cont.new`). The acyclic differential
+    // resumes only these — a forged i32 handle masks to different table slots on the two backends
+    // (the interp counts the root as fiber slot 0, the JIT does not), so forged-handle resolution is
+    // safe-but-backend-specific and not differentially comparable. The interp-only fuzzer still
+    // resumes arbitrary i32s (forged-handle robustness).
+    let mut fiber_handles: Vec<u32> = Vec::new();
     let mut insts: Vec<Inst> = Vec::new();
 
     // Ensure at least one i32 value exists (for handles / funcrefs), synthesizing a const.
@@ -97,18 +119,49 @@ fn gen_func(g: &mut Rng, nfuncs: usize) -> Func {
                 next += 1;
             }
             3 => {
-                // cont.new(funcref, sp) -> i32 handle. The funcref is any i32 in scope (a
-                // forgeable index, masked into the func table at first resume); sp is any
-                // i64 (the fiber's data-stack base).
-                let func = any_i32!();
+                // cont.new(funcref, sp) -> i32 handle; sp is any i64 (the fiber's data-stack base).
+                // Interp-only: the funcref is any i32 in scope (a forgeable index, masked into the
+                // func table at first resume). Acyclic differential: the funcref is a *const* equal to
+                // a strictly-higher function index (`< nfuncs ≤ next_pow2`, so masking is the identity)
+                // — the spawn graph stays acyclic, so a fiber-bomb can't arise. A last (leaf) function
+                // has no higher target, so it emits a const i64 instead — spawning no fibers.
+                let func = match call_floor {
+                    0 => any_i32!(),
+                    lo if lo < nfuncs => {
+                        let target = lo + g.range(nfuncs - lo);
+                        insts.push(Inst::ConstI32(target as i32));
+                        i32s.push(next);
+                        next += 1;
+                        next - 1
+                    }
+                    _ => {
+                        insts.push(Inst::ConstI64(g.next_u64() as i64));
+                        i64s.push(next);
+                        next += 1;
+                        continue;
+                    }
+                };
                 let sp = any_i64!();
                 insts.push(Inst::ContNew { func, sp });
                 i32s.push(next);
+                fiber_handles.push(next); // a genuine fiber handle
                 next += 1;
             }
             4 => {
-                // cont.resume(handle, arg) -> (status: i32, value: i64).
-                let k = any_i32!();
+                // cont.resume(handle, arg) -> (status: i32, value: i64). The acyclic differential
+                // resumes only a genuine fiber handle (see `fiber_handles`); with none yet in scope it
+                // emits a const instead. The interp-only fuzzer resumes any i32 (forged handles too).
+                let k = if acyclic_from.is_some() {
+                    if fiber_handles.is_empty() {
+                        insts.push(Inst::ConstI64(g.next_u64() as i64));
+                        i64s.push(next);
+                        next += 1;
+                        continue;
+                    }
+                    fiber_handles[g.range(fiber_handles.len())]
+                } else {
+                    any_i32!()
+                };
                 let arg = any_i64!();
                 insts.push(Inst::ContResume { k, arg });
                 i32s.push(next); // status
@@ -123,13 +176,19 @@ fn gen_func(g: &mut Rng, nfuncs: usize) -> Func {
                 next += 1;
             }
             _ => {
-                // call a random function (all are `(i64, i64) -> (i64)`).
-                let a0 = any_i64!();
-                let a1 = any_i64!();
-                insts.push(Inst::Call {
-                    func: g.range(nfuncs) as u32,
-                    args: vec![a0, a1],
-                });
+                // call a function (all are `(i64, i64) -> (i64)`); targets are `[call_floor, nfuncs)`.
+                // With no valid target (an acyclic last function), emit a const so the arm still
+                // produces an i64 — keeping the corpus non-degenerate.
+                if call_floor < nfuncs {
+                    let a0 = any_i64!();
+                    let a1 = any_i64!();
+                    insts.push(Inst::Call {
+                        func: (call_floor + g.range(nfuncs - call_floor)) as u32,
+                        args: vec![a0, a1],
+                    });
+                } else {
+                    insts.push(Inst::ConstI64(g.next_u64() as i64));
+                }
                 i64s.push(next);
                 next += 1;
             }
@@ -152,7 +211,25 @@ fn gen_func(g: &mut Rng, nfuncs: usize) -> Func {
 fn gen_module(g: &mut Rng) -> Module {
     let nfuncs = 1 + g.range(4);
     Module {
-        funcs: (0..nfuncs).map(|_| gen_func(g, nfuncs)).collect(),
+        funcs: (0..nfuncs).map(|_| gen_func(g, nfuncs, None)).collect(),
+        memory: None,
+        data: Vec::new(),
+    }
+}
+
+/// Like [`gen_module`] but with an **acyclic** call graph (function `i` calls only functions `> i`),
+/// so direct-call recursion depth is bounded by `nfuncs` — required for the interp↔JIT differential,
+/// where the JIT runs fibers on a fixed-size native stack that unbounded recursion would overflow.
+/// (Fiber-creation depth is bounded separately by only running JIT on interp-terminating programs.)
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn gen_module_acyclic(g: &mut Rng) -> Module {
+    let nfuncs = 1 + g.range(4);
+    Module {
+        funcs: (0..nfuncs).map(|i| gen_func(g, nfuncs, Some(i))).collect(),
         memory: None,
         data: Vec::new(),
     }
@@ -192,4 +269,119 @@ fn generated_fiber_programs_never_panic_and_are_deterministic() {
     }
     // Guard against the whole corpus silently degenerating into no-ops.
     assert!(executed > 2_000, "expected to interpret many functions");
+}
+
+/// **Differential interp↔JIT fuzzing of the fiber stack-switch.** The generated fiber programs run
+/// on *both* backends and must agree — hardening the `svm-fiber` native stack-switch the JIT lowers
+/// fibers to (the exact asm a future migratable-fiber resume reuses unchanged, SCHEDULING.md). The
+/// interpreter is the spec.
+///
+/// **Termination safety (the load-bearing rule).** A generated program can recurse or fiber-bomb
+/// without bound; the interpreter bounds that with **fuel** (and a depth cap), but `compile_and_run`
+/// arms **no** kill-path, so running a non-terminating program on the JIT would hang or overflow its
+/// OS stack. So we run the interpreter **first** and only hand the JIT programs the interp proved
+/// terminate (returned `Ok` within fuel) — a completed interp run bounds the JIT to the *same* finite,
+/// deterministic computation (fibers are cooperative/single-threaded, so there is no scheduling
+/// nondeterminism to diverge on). Any interp trap (fuel/depth/fiber-bomb, or a semantic fault) is
+/// skipped: the two backends bound resources differently, and fiber trap *kinds* are already pinned
+/// by the hand-written `jit_fibers` cases. This makes the fuzzer hang-proof by construction while
+/// still exercising thousands of real resume chains through the native switch.
+#[test]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn generated_fiber_programs_agree_on_interp_and_jit() {
+    use svm_interp::{run_with_host, Host, Value};
+    use svm_jit::{CompiledModule, JitError, JitOutcome, INERT_CAP_THUNK};
+
+    // A **low, symmetric fiber quota** on both backends. Interp fibers are cheap heap `Vec<Frame>`s,
+    // but each JIT fiber `mmap`s a guard-paged native stack, so a program that creates thousands is
+    // `Ok` on the interp yet exhausts the OS map limit on the JIT. `fiber_new` checks the quota
+    // *before* allocating the stack, so a bomb is a clean `FiberFault` on both — and an interp run
+    // that *completes* under it created ≤ `MAX_FIBERS_Q` fibers, bounding the JIT to that many stacks.
+    const MAX_FIBERS_Q: usize = 64;
+    let interp_quota = svm_interp::Quota {
+        max_fibers: MAX_FIBERS_Q,
+        ..Default::default()
+    };
+    let jit_quota = svm_jit::Quota {
+        max_fibers: MAX_FIBERS_Q,
+        ..Default::default()
+    };
+
+    // Windows commits every page against the system commit limit (no overcommit), and the JIT's
+    // per-iteration window + code-arena commits don't all return immediately, so the long sweep runs
+    // on Linux/macOS; Windows takes a smaller one over the same seeds (mirrors `jit_fuzz`).
+    let iters: u64 = if cfg!(windows) { 400 } else { 1_500 };
+    let mut rng = Rng(0x5F1B_E12D_1FF0_0D5A);
+    let mut compared = 0u64;
+    for _ in 0..iters {
+        let m = gen_module_acyclic(&mut rng);
+        verify_module(&m).expect("generated module must verify");
+
+        // The fiber entry shape is `(i64 sp, i64 arg)`; a modest fuel keeps a runaway program's
+        // interp run short (it bails `OutOfFuel`) while completing every bounded one.
+        let args = [Value::I64(4096), Value::I64(1)];
+        let mut fuel = 20_000u64;
+        let mut host = Host::new();
+        host.set_quota(interp_quota);
+        let interp = run_with_host(&m, 0, &args, &mut fuel, &mut host);
+
+        // Only the JIT-safe (interp-terminating, fiber-bounded) programs are run on the JIT — see the
+        // doc comment.
+        let Ok(vals) = interp else {
+            continue;
+        };
+
+        // The lower-level compile entry (vs `compile_and_run`) lets us pass the matching fiber quota.
+        let mut cm = match CompiledModule::compile(
+            &m,
+            0,
+            INERT_CAP_THUNK,
+            core::ptr::null_mut(),
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            None,
+            None,
+            jit_quota,
+            0,
+        ) {
+            Ok(cm) => cm,
+            Err(JitError::Unsupported(_)) => continue, // off a fiber_rt target / an unlowered op
+            Err(e) => panic!("JIT failed to compile a verified fiber module: {e:?}\n{m:#?}"),
+        };
+        let (jit, _) = cm.run(&[4096, 1], None, None, None).expect("jit fiber run");
+
+        match jit {
+            JitOutcome::Returned(slots) => {
+                let want: Vec<i64> = vals
+                    .iter()
+                    .map(|v| match v {
+                        Value::I32(x) => *x as i64,
+                        Value::I64(x) => *x,
+                        other => panic!("unexpected fiber result type {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    want, slots,
+                    "interp completed but the JIT diverged on a fiber program\n{m:#?}"
+                );
+            }
+            // The interp returned a value, so the program terminates; the JIT must too, identically.
+            other => panic!("interp returned {vals:?} but the JIT gave {other:?}\n{m:#?}"),
+        }
+        compared += 1;
+    }
+    // Coverage guard: most generated programs terminate, so the differential must actually fire on a
+    // healthy fraction (not silently skip everything via `Unsupported`/`OutOfFuel`/fiber-bomb).
+    // ~⅓ of programs are compared; the rest are skipped (an entry-level `suspend` → `FiberFault`, a
+    // fuel/fiber bound, or an unlowered op). A quarter is a comfortable floor that still guarantees
+    // the differential actually fired on hundreds of real resume chains.
+    assert!(
+        compared > iters / 4,
+        "the interp↔JIT fiber differential compared only {compared}/{iters} programs"
+    );
 }
