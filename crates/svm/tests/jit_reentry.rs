@@ -90,6 +90,7 @@ fn setup(extra_src: &str) -> (Box<TestCtx>, Box<CompiledModule>) {
         None,
         None,
         Quota::default(),
+        0,
     )
     .expect("compile parent");
     let mut cm = Box::new(cm);

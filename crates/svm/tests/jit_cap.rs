@@ -64,7 +64,7 @@ fn diff_run(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (JitOutcom
     let mut jargs = vec![h_j as i64];
     jargs.extend_from_slice(user_args);
     let (jout, jmem) =
-        jit_cap_run(&m, 0, &jargs, &init, DEFAULT_RESERVED_LOG2, &mut host_j).expect("jit run");
+        jit_cap_run(&m, 0, &jargs, &init, DEFAULT_RESERVED_LOG2, 0, &mut host_j).expect("jit run");
 
     // Differential: result/trap equivalence…
     match (&ires, &jout) {
@@ -339,6 +339,7 @@ fn compile_quota_enforced_identically() {
         &[h as i64],
         &init,
         DEFAULT_RESERVED_LOG2,
+        0,
         &mut host_j,
     )
     .expect("jit run");

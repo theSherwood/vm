@@ -304,12 +304,14 @@ pub fn grant_jit(host: &mut Host, m: &Module) -> i32 {
 /// is suspended in its synchronous `cap.call`). The interpreter counterpart is the plain
 /// `run_capture_reserved_with_host` over the same `Host` setup ([`grant_jit`]) — drive both
 /// with identical inputs for the differential.
+#[allow(clippy::too_many_arguments)]
 pub fn jit_cap_run(
     m: &Module,
     entry: u32,
     args: &[i64],
     init_mem: &[u8],
     reserved_log2: u8,
+    table_reserve_log2: u8,
     host: &mut Host,
 ) -> Result<(JitOutcome, Vec<u8>), svm_jit::JitError> {
     let mut cm = CompiledModule::compile(
@@ -323,6 +325,7 @@ pub fn jit_cap_run(
         None,
         None,
         svm_jit::Quota::default(),
+        table_reserve_log2,
     )?;
     let cm_ptr: *mut CompiledModule = &mut cm;
     host.set_jit_native_ctx(cm_ptr as usize);
@@ -1502,6 +1505,7 @@ pub fn run_powerbox_with_deadline_and_quota(
             Some(std::sync::Arc::as_ptr(&interrupt)),
             Some(fast_cap_resolver),
             quota,
+            0, // CLI powerbox: natural table size (B2 install reservation is an embedder opt-in)
         )
         .and_then(|mut cm| {
             let cm_ptr: *mut CompiledModule = &mut cm;
@@ -1529,6 +1533,7 @@ pub fn run_powerbox_with_deadline_and_quota(
             None,
             Some(fast_cap_resolver),
             quota,
+            0, // CLI powerbox: natural table size
         )
         .and_then(|mut cm| {
             let cm_ptr: *mut CompiledModule = &mut cm;

@@ -40,6 +40,7 @@ fn compile(src: &str) -> CompiledModule {
         None,
         None,
         Quota::default(),
+        0,
     )
     .expect("compile")
 }

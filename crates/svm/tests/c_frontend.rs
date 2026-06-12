@@ -176,6 +176,7 @@ fn run_c_full(src: &str) -> CRun {
         None,
         None,
         svm_jit::Quota::default(),
+        0,
     )
     .expect("jit compiles");
     let cm_ptr: *mut svm_jit::CompiledModule = &mut cm;

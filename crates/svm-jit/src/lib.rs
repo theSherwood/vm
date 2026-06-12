@@ -911,6 +911,7 @@ fn run_inner(
         interrupt,
         fast_resolver,
         quota,
+        0, // one-shot path: natural table size (no B2 reservation)
     )?;
     cm.run(args, init_mem, snapshot_cap, async_hooks)
 }
@@ -1003,6 +1004,7 @@ impl CompiledModule {
     /// run) and honour their respective ABIs — the same contract the one-shot entry points
     /// documented per call, stretched over the module's life.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn compile(
         m: &IrModule,
         func: FuncIdx,
@@ -1014,8 +1016,17 @@ impl CompiledModule {
         interrupt: Option<*const AtomicU64>,
         fast_resolver: Option<FastCapResolver>,
         quota: Quota,
+        table_reserve_log2: u8,
     ) -> Result<CompiledModule, JitError> {
         let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
+        // The `call_indirect` function table is power-of-two padded; `table_reserve_log2`
+        // (JIT.md Model B2) reserves a *larger* table than the module needs so `install` can
+        // fill the padding slots without moving the Spectre-safe mask constant (which is baked
+        // from this length into every call site). `0` ⇒ the natural `next_pow2(funcs.len())`,
+        // i.e. behavior-identical to before B2.
+        let table_len = (1usize << table_reserve_log2)
+            .max(m.funcs.len().next_power_of_two())
+            .max(1);
         // §5 fuel/epoch kill-path: the address of the host-owned interrupt cell the lowering polls at
         // loop back-edges + function entries. `0` when the caller armed no kill-path (then no checks are
         // emitted — guest code is byte-identical to before). The cell must outlive the module; the caller
@@ -1260,7 +1271,7 @@ impl CompiledModule {
                 cap_mapped,
                 sub_base,
                 epoch_addr,
-                (ids.len().next_power_of_two() as u64) - 1,
+                (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
             )?;
             module
                 .define_function(*id, &mut ctx)
@@ -1315,8 +1326,9 @@ impl CompiledModule {
         }
 
         // Build the function table (§3c) now that code addresses are known: power-of-two
-        // padded, AoS, host-owned. `call_indirect` masks the guest index into this.
-        let table_len = m.funcs.len().next_power_of_two();
+        // padded (to `table_len`, possibly B2-reserved beyond the module), AoS, host-owned.
+        // `call_indirect` masks the guest index into this; padding/reserved slots trap until
+        // `install` fills them.
         let fn_table: Box<[FnEntry]> = (0..table_len)
             .map(|slot| match m.funcs.get(slot) {
                 Some(f) => FnEntry {
@@ -1355,7 +1367,7 @@ impl CompiledModule {
             cap_mapped,
             sub_base,
             epoch_addr,
-            fn_table_mask: (m.funcs.len().next_power_of_two() as u64) - 1,
+            fn_table_mask: (table_len as u64) - 1,
             next_extra: 0,
             live_fault_range: None,
             win_mapped,
