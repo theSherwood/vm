@@ -306,18 +306,21 @@ index.** The split is defined by what a forged value can do:
     Forging confines to your own table (cannot reach host code). The standard wasm
     limitations follow — funcptr↔dataptr casts and funcptr arithmetic don't carry
     meaning across the boundary — and are accepted (§3b lowering notes).
-  - **Index values are backend-local — a differential-oracle caveat.** Because a
-    handle/funcref/§12-fiber index is *positional*, its concrete value is whatever the
-    backend's table assigns; the **interpreter and JIT may number the same logical entity
-    differently** and still each be self-consistent. The known case is **`cont.new` fiber
-    handles**: the interp keeps the root computation as fiber-slot 0, the JIT runs the root
-    off-table, so a fiber's handle is `N` on the interp but `N−1` on the JIT (and a *forged*
-    handle masks to different slots). This is **safe** (numbering is internal; resolution is
-    confined to the domain's own table) but means a fiber-handle *value* is **not
-    differentially observable** — interp↔JIT tests must not let it flow into output (the
-    fiber fuzzer resumes only genuine handles for this reason). The migratable-fiber shared
-    registry (`SCHEDULING.md`) unifies the namespace, which removes the divergence; until
-    then it is a recorded testing caveat, not a bug.
+  - **Index values are backend-local — a differential-oracle caveat (fiber case now
+    resolved).** Because a handle/funcref/§12-fiber index is *positional*, its concrete value
+    is whatever the backend's table assigns; the **interpreter and JIT may number the same
+    logical entity differently** and still each be self-consistent. The known case was
+    **`cont.new` fiber handles**: the interp's table held the root computation as fiber-slot 0
+    (first handle 1) while the JIT runs the root off-table (first handle 0), and a *forged*
+    handle masked to different slots. That was **safe** (numbering is internal; resolution is
+    confined to the domain's own table) but made a fiber-handle *value* non-observable to the
+    interp↔JIT differential. The D57 3b-i **run-shared fiber registry** (`SCHEDULING.md`)
+    unified the namespace — the interp registry, like the JIT, holds only `cont.new`-created
+    fibers, so handles are `0, 1, …` on **both** backends, the fiber fuzzer lets handle values
+    flow into compared output, and `jit_fibers::fiber_handle_values_match_across_backends`
+    pins the absolute numbering. (Residual, until the JIT shared registry of 3b-ii: in a
+    *multi-vCPU* run the JIT's tables are still per-thread, so forged-handle masking can
+    differ there; single-vCPU programs — all current differential surfaces — agree exactly.)
 - **Pointers** are a CHERI-ready-but-erasable refinement of `i64` (§10): off-CHERI
   a no-op; the type exists for the JIT's masking and a future CHERI *host* backend.
 

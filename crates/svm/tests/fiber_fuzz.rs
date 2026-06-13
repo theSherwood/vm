@@ -69,11 +69,12 @@ fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
     let mut next: u32 = 2;
     let mut i64s: Vec<u32> = vec![0, 1];
     let mut i32s: Vec<u32> = Vec::new();
-    // Value indices that are *genuine* fiber handles (results of `cont.new`). The acyclic differential
-    // resumes only these — a forged i32 handle masks to different table slots on the two backends
-    // (the interp counts the root as fiber slot 0, the JIT does not), so forged-handle resolution is
-    // safe-but-backend-specific and not differentially comparable. The interp-only fuzzer still
-    // resumes arbitrary i32s (forged-handle robustness).
+    // Value indices that are *genuine* fiber handles (results of `cont.new`). The acyclic
+    // differential mostly resumes these (keeping the corpus rich in real resume chains), with an
+    // occasional forged i32 — since the D57 3b-i shared registry unified the handle namespace
+    // (the interp's table, like the JIT's, holds only `cont.new`-created fibers), a forged handle
+    // masks to the *same* slot on both backends, so forged resolution is differentially
+    // comparable too. The interp-only fuzzer resumes arbitrary i32s throughout.
     let mut fiber_handles: Vec<u32> = Vec::new();
     let mut insts: Vec<Inst> = Vec::new();
 
@@ -146,12 +147,24 @@ fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
                 i32s.push(next);
                 fiber_handles.push(next); // a genuine fiber handle
                 next += 1;
+                // Widen the handle into the i64 pool so its *value* can flow into returns/args —
+                // the differential then observes handle numbering itself (the D57 3b-i unified
+                // namespace: handles match across backends, pinned per-program here).
+                insts.push(Inst::Convert {
+                    op: svm_ir::ConvOp::ExtendI32U,
+                    a: next - 1,
+                });
+                i64s.push(next);
+                next += 1;
             }
             4 => {
                 // cont.resume(handle, arg) -> (status: i32, value: i64). The acyclic differential
-                // resumes only a genuine fiber handle (see `fiber_handles`); with none yet in scope it
-                // emits a const instead. The interp-only fuzzer resumes any i32 (forged handles too).
-                let k = if acyclic_from.is_some() {
+                // resumes a genuine fiber handle (see `fiber_handles`) most of the time, a forged
+                // i32 ~1-in-8 (comparable across backends since the 3b-i unified namespace; a
+                // forged resume that traps just makes the interp skip that program). With no
+                // genuine handle in scope it emits a const instead. The interp-only fuzzer
+                // resumes any i32 throughout.
+                let k = if acyclic_from.is_some() && g.range(8) != 0 {
                     if fiber_handles.is_empty() {
                         insts.push(Inst::ConstI64(g.next_u64() as i64));
                         i64s.push(next);

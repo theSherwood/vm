@@ -51,14 +51,19 @@ suspend point there). Conversely, stackless is the only safe way to *migrate* a
 task for work-stealing without moving native stacks. They are complementary; the VM
 offers both substrates and the guest picks.
 
-## Why fibers are thread-affine today
+## Why JIT fibers are thread-affine today (the interp no longer is)
 
-Each OS-thread vCPU builds its **own** `FiberRuntime` (JIT: `CURRENT_RT`
-thread-local + a per-runtime `fibers` table; interp: a per-`VCpu` `fibers: Vec`).
-A fiber handle indexes the *creating* thread's table, so a fiber can only be
-resumed on the worker that created it. This is deliberate and good: zero locking on
-the fiber table, cache locality — the thread-per-core architecture chosen on
-purpose by glommio/seastar, not merely "the easy option."
+Each JIT OS-thread vCPU builds its **own** `FiberRuntime` (`CURRENT_RT`
+thread-local + a per-runtime `fibers` table). A fiber handle indexes the
+*creating* thread's table, so a fiber can only be resumed on the worker that
+created it. This is deliberate and good: zero locking on the fiber table, cache
+locality — the thread-per-core architecture chosen on purpose by glommio/seastar,
+not merely "the easy option."
+
+**The interpreter crossed over (step 3b-i, done):** its per-`VCpu` `fibers: Vec`
+is now the run-shared `FiberRegistry` (`svm-interp`), so any vCPU can claim and
+continue a suspended fiber — the reference semantics for migration, established
+in safe Rust before any JIT asm changes.
 
 ## Proposed evolution: migratable fibers → stackful work-stealing
 
@@ -260,16 +265,32 @@ The re-entrant-resume aliasing guard (`chain.contains`) stays a per-worker check
 becomes "the running worker's context," with the fiber *table* lifted out to the shared
 registry.
 
-### 4. Interp integration (step 3b-i) — safe, the oracle
+### 4. Interp integration (step 3b-i) — safe, the oracle — ✅ DONE
 
-A fiber in the interp is **`Fiber::Live(Vec<Frame>)` — pure data** (`crates/svm-interp`), so
-migration is a *data hand-off*, exactly like a stackless task; **no `unsafe`, no asm.** The
-per-`VCpu` `fibers: Vec<Fiber>` becomes the shared registry (behind the run's existing
-`Arc<Mutex<…>>`-style sharing, or a lock-free slot table — the `Ownership` CAS is the arbiter
-either way). `cont.resume` on any vCPU takes the `Vec<Frame>` under the ownership claim, runs
-it inline on the current vCPU, and `suspend` returns it to the pool. The scheduler already
-migrates **vCPUs** freely (`runnable: VecDeque<Box<VCpu>>`); fibers now migrate the same way.
-This establishes the **reference semantics** and the differential oracle before any JIT asm.
+A fiber in the interp is **pure data — `Vec<Frame>`** (`crates/svm-interp`), so migration is a
+*data hand-off*, exactly like a stackless task; **no `unsafe`, no asm.** As built: the
+per-`VCpu` `fibers: Vec<Fiber>` is now the run-shared **`FiberRegistry`** — one mutex'd slot
+table per domain (root + `thread.spawn` children; nested §14 children get their own), whose
+states mirror the verified protocol (`Pending` ≈ OWNED, `Parked` ≈ RUNNABLE, `Running` ≈
+RUNNING — incl. parked mid-resume ancestors, never claimable — `Done` ≈ FREE-unrecycled) with
+the mutex as the claim arbiter (the sanctioned safe-Rust stand-in; the lock-free `Ownership`
+word is the JIT's, 3b-ii/3c). `cont.resume` on **any** vCPU claims the fiber (exactly one
+racing claimant wins; a loser gets the clean `FiberFault`); `suspend` publishes it back, and
+each vCPU's **root runs off-table** — which *unified the handle namespace* with the JIT
+(handles `0, 1, …` on both backends; pinned by
+`jit_fibers::fiber_handle_values_match_across_backends`, observed generatively by the fiber
+fuzzer whose handle values now flow into compared output). Slots are deliberately **not
+recycled** yet (matches both backends' historical tables; recycling + the generation tag land
+with 3b-ii so the backends adopt one policy together). The `max_fibers` quota is now
+**per-run** (§6 below). The explorer/oracle crux landed with it: `cont.new`/`cont.resume`/
+`suspend` are **visible ops** recording a `MemAccess::Fiber` that conflicts with itself, so
+DPOR explores both orders of racing fiber ops (cross-checked against the unreduced
+brute-force enumerator), and the spin-detection fingerprint covers the chain/frames/parked
+root instead of the now-shared table (sound: a vCPU's chain-held slots can't change within
+its own turn, and every fiber op visibly changes its fingerprint). Tests:
+`svm/tests/fiber_migrate.rs` (mid-life migration across vCPUs on the real pool + seeded +
+exhaustive explorers, racing resumes ⇒ exactly one winner, the no-race foreign-claim control,
+and the per-run quota pin).
 
 ### 5. JIT integration (steps 3b-ii, 3c) — the review-gated seam
 
@@ -315,8 +336,10 @@ This establishes the **reference semantics** and the differential oracle before 
 ### 8. Staging (each its own reviewed slice)
 
 1. **3a — ownership protocol (loom-verified).** ✅ Done.
-2. **3b-i — interp shared registry + cross-vCPU resume.** Safe; establishes semantics + oracle.
+2. **3b-i — interp shared registry + cross-vCPU resume.** ✅ Done (see §4 above): safe-Rust
+   registry, unified handle namespace, racing-resume arbiter, explorer/DPOR integration.
 3. **3b-ii — JIT shared registry, affinity preserved.** Storage refactor under the existing
-   test net (no new capability, no asm change).
+   test net (no new capability, no asm change). Adopt the slot/generation policy here (incl.
+   recycling) on **both** backends together, and align multi-vCPU forged-handle masking.
 4. **3c — JIT cross-thread asm resume.** The review-gated seam; differential + stress.
 5. **Demo 3 — guest stackful work-stealing**, differential interp ≡ JIT.

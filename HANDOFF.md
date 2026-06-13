@@ -1,6 +1,6 @@
 # Handoff — C frontend (chibicc → SVM IR) + differential fuzzing
 
-Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-12**.
+Pick-up notes for a fresh session. Written 2026-06-03, **last updated 2026-06-13**.
 Branch: **`main`** (this work has been committing straight to `main`; the remote is
 `theSherwood/vm`). Everything below is committed and CI-green.
 
@@ -1410,8 +1410,8 @@ regressions one commit old"):
 > the **windows cross-check** (`cargo check -p svm-jit -p svm-run --target x86_64-pc-windows-gnu`),
 > and — when touching the futex/thread runtime — the **loom** model check
 > (`RUSTFLAGS="--cfg loom" cargo test -p svm-jit --lib loom`). The container can reset mid-session →
-> recover with `git fetch origin main && git reset --hard origin/main`. Push to `main`, keep branch
-> `claude/hopeful-franklin-66kiL` force-synced. **Never** push `.github/workflows/*` (no `workflow`
+> recover with `git fetch origin main && git reset --hard origin/main`. Push to `main`, keep the
+> session branch force-synced. **Never** push `.github/workflows/*` (no `workflow`
 > token scope). Key design artifacts: **`AUDIT.md`** (security audit register — all 8 findings closed),
 > **`SCHEDULING.md`** + **DESIGN D56/D57** (the concurrency-primitives decision), **`DESIGN.md`** /
 > **`README.md`**.
@@ -1425,7 +1425,30 @@ regressions one commit old"):
 > "Verification story"): a differential fuzzer, ASan on the Rust glue, a runtime single-owner assert,
 > guard-page detection, and soak. Honest residual: fuzzing detects, it doesn't prove.
 >
-> **Done + committed (this session, all CI-green):**
+> **Done + committed (latest session, 2026-06-13, all green):**
+> - **3b-i — interp shared registry + cross-vCPU resume (the slice below) — LANDED.** The per-`VCpu`
+>   `fibers: Vec<Fiber>` is now the run-shared **`FiberRegistry`** (`svm-interp`, safe Rust): one
+>   mutex'd slot table per domain (root + `thread.spawn` children), states mirroring the verified
+>   protocol (`Pending`/`Parked`/`Running` — incl. parked mid-resume ancestors, never claimable —
+>   /`Done`; no recycling yet, that lands with 3b-ii so both backends adopt one policy). `cont.resume`
+>   on **any** vCPU claims the fiber — exactly one racing claimant wins, a loser gets the clean
+>   `FiberFault`; `suspend` publishes it back (the migration point). Each vCPU's **root runs
+>   off-table**, which **closed the handle-namespace divergence**: handles are `0, 1, …` on both
+>   backends — pinned by `jit_fibers::fiber_handle_values_match_across_backends`, and `fiber_fuzz`
+>   now lets handle values **flow into compared output** (plus ~1-in-8 forged-handle resumes in the
+>   differential, comparable now that masking unifies). The explorer crux landed with it:
+>   `cont.new`/`cont.resume`/`suspend` are **visible ops** recording a `MemAccess::Fiber` conflict
+>   (fiber ops don't commute), so DPOR explores both orders of racing fiber ops — cross-checked
+>   against `explore_all_bruteforce` — and the spin fingerprint covers chain/frames/parked-root
+>   instead of the now-shared table (sound: chain-held slots can't change within the owner's turn;
+>   every fiber op visibly changes the fingerprint). `max_fibers` quota is **per-run** now
+>   (SCHEDULING §6; single-vCPU admits unchanged, pinned by `quota.rs` + the new cross-vCPU pin).
+>   Tests: **`svm/tests/fiber_migrate.rs`** (mid-life migration across vCPUs on real pool + seeded +
+>   exhaustive, racing resumes ⇒ one winner, foreign-claim control, per-run quota). Docs updated:
+>   SCHEDULING.md §4/§8 (3b-i ✅), DESIGN §3a (divergence resolved; multi-vCPU forged-handle masking
+>   residual until 3b-ii). **NEXT = 3b-ii** (JIT shared registry, affinity preserved — see below).
+>
+> **Done + committed (earlier sessions, all CI-green):**
 > - **Verified ownership core** — `crates/svm-jit/src/fiber_registry.rs`: the single-owner atomic
 >   protocol (`OWNED`/`RUNNABLE`/`RUNNING`/`FREE`, generation-tagged in one `AtomicU64`). Two
 >   invariants **loom-verified + mutation-proof**: exactly-one-winner steal
@@ -1441,7 +1464,7 @@ regressions one commit old"):
 >   `svm-fiber` stack-switch the cross-thread resume reuses *unchanged*. Made hang-/bomb-proof by
 >   construction: acyclic call + fiber-spawn graph, a low symmetric fiber quota, and only running the
 >   JIT on interp-terminating programs. It surfaced 3 real interp/JIT divergences (now scoped out).
-> - **Documented divergence (a gate on 3b-i)** — `cont.new` returns handle `N` on the interp but `N−1`
+> - **Documented divergence (a gate on 3b-i — since CLOSED by it)** — `cont.new` returns handle `N` on the interp but `N−1`
 >   on the JIT (the interp counts the root as fiber-slot 0; the JIT runs the root off-table), and a
 >   forged handle masks to different slots. **Safe** (numbering is internal, DESIGN §3a) and harmless
 >   in production, but it means a fiber-handle *value* is **not** differentially observable. Recorded
@@ -1449,21 +1472,23 @@ regressions one commit old"):
 >   backends the same `(slot, generation)`) — *not* a standalone pre-change (it touches
 >   `resolve_fiber`/`chain`/`live_frames`, the exact code 3b-i restructures).
 >
-> **NEXT SLICE = 3b-i — interp shared registry + cross-vCPU resume (safe Rust, the oracle).** Replace
-> the per-`VCpu` `fibers: Vec<Fiber>` with one run-shared registry + a **unified handle namespace**
-> (closing the divergence above); allow `cont.resume(handle)` on any vCPU (a fiber there is
-> `Fiber::Live(Vec<Frame>)` — pure data, so migration is a safe data hand-off). **The crux/risk:** the
-> deterministic explorer hashes `self.fibers` as **per-vCPU** state (`svm-interp/src/lib.rs` ~line
-> 2120) — sharing the table moves that into the **global** configuration the explorer enumerates. It's
-> a *moderate* change (cross-vCPU resume races are already decided by the vCPU interleavings
-> `explore_all` enumerates, with the ownership CAS as arbiter), but it touches the oracle underpinning
-> every differential test, so guard it with the existing **fiber tests + `explore_all`/`dpor` tests**
-> as the regression net. **Gate:** after the shared registry lands, verify handle *values* match
-> across backends, then strengthen `fiber_fuzz` to let handle values flow into output (turning today's
-> workaround into extra coverage). **Then:** 3b-ii (JIT shared registry, affinity preserved — storage
-> refactor under the test net) → 3c (the cross-thread asm resume — the empirical-net-gated seam) →
-> Demo 3 (`mn_sched` re-pointed at a shared steal pool, differential interp≡JIT). Staging table in
-> SCHEDULING.md §8.
+> ~~**NEXT SLICE = 3b-i — interp shared registry + cross-vCPU resume.**~~ **DONE** (see the latest
+> session's record above; the explorer-crux landed as predicted — fiber ops became visible
+> `MemAccess::Fiber` decision points and the spin fingerprint dropped the shared table, validated
+> against the brute-force enumerator).
+>
+> **NEXT SLICE = 3b-ii — JIT shared registry, affinity preserved (storage refactor, no asm change).**
+> Lift the JIT `FiberRuntime`'s per-thread `fibers: Vec<Option<Box<Fiber>>>` into a registry shared
+> across a domain's OS-thread vCPUs, but **keep affinity** (a vCPU resumes only fibers it owns) —
+> the regression-netted storage refactor before the 3c asm seam. This is where the **`Ownership`
+> word** (`svm-jit/src/fiber_registry.rs`, loom-verified, still `#[allow(dead_code)]`) gets wired
+> in, where **slot recycling + generation-tagged handles** land on *both* backends together (the
+> interp registry deliberately doesn't recycle yet — keep handle values in lockstep), and where
+> multi-vCPU **forged-handle masking** aligns (interp masks over the run table, JIT today over
+> per-thread tables — the DESIGN §3a residual). Existing `jit_fibers`/`jit_threads`/`fiber_fuzz` +
+> the new `fiber_migrate.rs` interp pins are the net. **Then:** 3c (the cross-thread asm resume —
+> the empirical-net-gated seam; SCHEDULING.md "Verification story") → Demo 3 (`mn_sched` re-pointed
+> at a shared steal pool, differential interp≡JIT). Staging table in SCHEDULING.md §8.
 >
 > ---
 >
@@ -1665,8 +1690,10 @@ regressions one commit old"):
 >    `libLLVM.so` confirmed present in the dev container.)
 > 2. **Migratable-fiber primitive (D57)** — **IN PROGRESS → see the "ACTIVE FRONTIER" block at the top
 >    of this section.** The ownership protocol is loom-verified, the integration design + empirical
->    safety net are written, and the fiber stack-switch asm is differential-fuzzed; the next slice is
->    3b-i (interp shared registry + cross-vCPU resume). Re-accepts D56's cross-thread-migration unsafe
+>    safety net are written, the fiber stack-switch asm is differential-fuzzed, and **3b-i (interp
+>    shared registry + cross-vCPU resume) is DONE** — the reference semantics + unified handle
+>    namespace are in; the next slice is 3b-ii (JIT shared registry, affinity preserved).
+>    Re-accepts D56's cross-thread-migration unsafe
 >    as a *primitive* (guest owns the stealing policy; VM enforces single-owner); the expert-review gate
 >    is replaced by the empirical net (no reviewer available — SCHEDULING.md "Verification story").
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); the

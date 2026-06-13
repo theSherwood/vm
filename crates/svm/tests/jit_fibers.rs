@@ -180,6 +180,43 @@ fn fiber_root_suspend_traps() {
     assert_jit_matches_interp(src);
 }
 
+/// **Fiber handle *values* are identical across backends** (the D57 3b-i gate). Historically the
+/// interp's table held the root as slot 0 (first `cont.new` → handle 1) while the JIT ran the root
+/// off-table (first handle 0) — a documented safe divergence (DESIGN §3a) the fiber fuzzer had to
+/// work around. The run-shared interp registry holds only `cont.new`-created fibers, unifying the
+/// namespace: handles are 0, 1, … on **both** backends and may flow into observable output. Pins
+/// both the cross-backend agreement and the absolute values (so the namespace can't drift again).
+#[test]
+fn fiber_handle_values_match_across_backends() {
+    let src = "func () -> (i64, i64, i32, i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = cont.new v0 v1\n\
+        \x20 v4 = i64.const 3\n\
+        \x20 v5, v6 = cont.resume v3 v4\n\
+        \x20 v7 = i64.extend_i32_u v2\n\
+        \x20 v8 = i64.extend_i32_u v3\n\
+        \x20 return v7 v8 v5 v6\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 return v1\n\
+        }\n";
+    // Cross-backend agreement (the differential)…
+    assert_jit_matches_interp(src);
+    // …and the absolute namespace: first handle 0, second 1, resume ran fiber 1 to completion.
+    let m = parse_module(src).expect("parse");
+    let mut fuel = 1_000_000u64;
+    let got = run(&m, 0, &[], &mut fuel).expect("interp");
+    assert_eq!(
+        got,
+        vec![Value::I64(0), Value::I64(1), Value::I32(1), Value::I64(3)],
+        "the unified handle namespace must start at 0 and number densely"
+    );
+}
+
 /// A fiber whose body actually uses the **data stack** (its `sp`) and shared memory: it stores `arg`
 /// to `mem[sp]`, suspends, then reloads and returns it — exercising the two-stack split end to end and
 /// the `mem_base`/`sp` threading into the fiber entry.

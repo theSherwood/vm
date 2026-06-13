@@ -457,6 +457,13 @@ enum MemAccess {
     None,
     /// A `[base, base+width)` byte range; `write` is true for any store/RMW/notify.
     Range { base: u64, width: u32, write: bool },
+    /// A §12 fiber op (`cont.new`/`cont.resume`/`suspend`) on the **run-shared registry** (D57).
+    /// Every fiber op mutates that one shared object (a slot claim/publish, or the allocation
+    /// cursor that determines the next handle value), so any two fiber ops by different vCPUs are
+    /// conservatively dependent — racing `cont.resume`s decide a winner, and `cont.new` order
+    /// decides handle values, so both orders must be explored. (Per-slot precision would only be a
+    /// DPOR-efficiency upgrade, not a soundness need.)
+    Fiber,
 }
 
 impl MemAccess {
@@ -476,6 +483,7 @@ impl MemAccess {
                     write: wwb,
                 },
             ) => (wwa || wwb) && a < b.saturating_add(wb as u64) && b < a.saturating_add(wa as u64),
+            (MemAccess::Fiber, MemAccess::Fiber) => true,
             _ => false,
         }
     }
@@ -486,6 +494,14 @@ impl MemAccess {
 /// failure (out-of-reserved) ⇒ [`MemAccess::None`]: the op will trap and the thread ends, contributing
 /// no ordering constraint.
 fn access_of(inst: &Inst, vals: &[Value], mem: &Option<Mem>) -> MemAccess {
+    // Fiber ops touch the run-shared registry, not the window — classified before the memory
+    // check (a module with no linear memory can still race on fibers via handles in args).
+    if matches!(
+        inst,
+        Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+    ) {
+        return MemAccess::Fiber;
+    }
     let Some(m) = mem.as_ref() else {
         return MemAccess::None;
     };
@@ -1136,7 +1152,10 @@ const MAX_VCPUS: usize = 1 << 16;
 /// default is the hard ceilings, so an unconfigured run behaves exactly as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quota {
-    /// Max fibers a single vCPU may create (`cont.new`); capped at [`MAX_FIBERS`].
+    /// Max fibers a **run** (domain) may create (`cont.new`, counting the root computation as 1);
+    /// capped at [`MAX_FIBERS`]. Per-run, not per-vCPU, since the fiber table is the run-shared
+    /// registry (D57 3b-i / SCHEDULING.md §6) — for a single-vCPU run the admitted creations are
+    /// unchanged (and match the JIT's per-vCPU count exactly).
     pub max_fibers: usize,
     /// Max concurrently-live vCPUs across the run (`thread.spawn`); capped at [`MAX_VCPUS`].
     pub max_vcpus: usize,
@@ -1811,23 +1830,147 @@ fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
     }
 }
 
-/// A §12 fiber: a first-class suspendable computation whose continuation is exactly its
-/// reified call stack. `cont.new` makes one (`Pending`); `cont.resume` switches into it;
-/// `suspend` switches back out, parking it (`Live`).
-enum Fiber {
+/// Sentinel "fiber slot" for a vCPU's **root computation**, which lives *off-table*: the shared
+/// [`FiberRegistry`] holds only `cont.new`-created fibers, so the first handle of a run is `0` on
+/// both backends (the JIT has always run the root off-table — this is the handle-namespace
+/// unification of D57 step 3b-i, closing the documented interp↔JIT divergence). The root's parked
+/// frames (while it is resuming a fiber) live in `VCpu::root_parked`.
+const ROOT_FIBER: usize = usize::MAX;
+
+/// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
+/// continuation is exactly its reified call stack. `cont.new` makes one (`Pending`);
+/// `cont.resume` claims and switches into it; `suspend` parks it back, claimable again
+/// (`Parked`). The states mirror the loom-verified single-owner `Ownership` protocol
+/// (`svm-jit/src/fiber_registry.rs`, D57 step 3a): `Pending` ≈ `OWNED` (fresh), `Parked` ≈
+/// `RUNNABLE` (the only claimable-by-anyone state besides a fresh `Pending`), `Running` ≈
+/// `RUNNING` (never claimable), `Done` ≈ `FREE` (unrecycled).
+enum RegFiber {
     /// Created by `cont.new`, not yet started: holds the `i32` funcref to launch on the
     /// first resume (resolved then through the function table as `(i64 sp, i64 arg) ->
-    /// i64`) and the `i64` data-stack base `sp` to run it on.
+    /// i64`) and the `i64` data-stack base `sp` to run it on. Claimable by any vCPU.
     Pending { func: i32, sp: i64 },
-    /// Started and currently **parked** — suspended at a `suspend`, or an ancestor in the
-    /// resume chain — holding its reified call stack, ready to continue.
-    Live(Vec<Frame>),
-    /// The fiber whose frames are currently *in flight* in the driver's local `frames`.
-    /// A placeholder keeping the table slot addressable (a handle resolving here is in the
-    /// resume chain → inert / traps).
-    Running,
-    /// Returned: resuming it again traps.
+    /// **Voluntarily suspended** at a `suspend`, holding its reified call stack — in the pool,
+    /// claimable by any vCPU (this is what makes a fiber *migratable*: the stack is pure data,
+    /// so a foreign vCPU's claim is a safe hand-off).
+    Parked(Vec<Frame>),
+    /// Claimed by a vCPU — **never** claimable (a second `cont.resume` loses and faults).
+    /// `None`: its frames are in flight as the claimant's live `frames`. `Some`: it is itself
+    /// parked mid-`cont.resume` as an ancestor in its claimant's resume chain (the frames are
+    /// stored here, but only that claimant pops back into them — a foreign claim would alias a
+    /// running computation).
+    Running(Option<Vec<Frame>>),
+    /// Returned: resuming it again traps. Slots are **not recycled** (matching both backends'
+    /// historical tables, so handles stay dense and deterministic); recycling + the generation
+    /// tag land with the JIT shared registry (3b-ii) so both backends adopt one policy together.
     Done,
+}
+
+/// What a successful [`FiberRegistry::claim`] hands the winning vCPU.
+enum Claimed {
+    /// A `Pending` fiber: launch `func(sp, arg)` on its data stack.
+    Start { func: i32, sp: i64 },
+    /// A `Parked` fiber: its reified call stack, ready to continue past its `suspend`.
+    Live(Vec<Frame>),
+}
+
+/// The **run-shared fiber registry** (D57 step 3b-i, SCHEDULING.md "Integration design"): one
+/// slot table shared by every vCPU of a domain (the root + its `thread.spawn` children),
+/// replacing the old per-vCPU fiber tables. This is exactly the VM-side surface migratable
+/// fibers need — (1) a **shared handle namespace**, so any vCPU can name any fiber, and (2) the
+/// **single-owner arbiter**: a `cont.resume` *claims* the fiber, exactly one claimant wins, and
+/// a loser gets a clean [`Trap::FiberFault`]. The interpreter's fiber is `Vec<Frame>` — pure
+/// data — so cross-vCPU migration is a safe hand-off; this table's mutex is the claim arbiter
+/// (the safe-Rust stand-in SCHEDULING.md §4 sanctions for the oracle; the JIT's lock-free
+/// `Ownership`-word table is slice 3b-ii/3c). The lock is a leaf (nothing else is locked while
+/// it is held) and is touched only by fiber ops, never the execution hot path.
+struct FiberRegistry {
+    mx: Mutex<Vec<RegFiber>>,
+}
+
+impl FiberRegistry {
+    fn new() -> FiberRegistry {
+        FiberRegistry {
+            mx: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<RegFiber>> {
+        self.mx.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `cont.new`: allocate the next slot — the guest handle — under the §15 quota, which is
+    /// **per run** now that the table is run-shared (SCHEDULING.md §6). The `+ 1` counts the
+    /// off-table root computation, so a quota value admits exactly the creations the JIT's
+    /// `fibers.len() + 1 >= max_fibers` check admits for a single-vCPU run.
+    fn create(&self, func: i32, sp: i64, max_fibers: usize) -> Result<i32, Trap> {
+        let mut t = self.lock();
+        if t.len() + 1 >= max_fibers {
+            return Err(Trap::FiberFault);
+        }
+        t.push(RegFiber::Pending { func, sp });
+        Ok((t.len() - 1) as i32)
+    }
+
+    /// `cont.resume`: resolve the (forgeable) handle — **masked** into the power-of-two-padded
+    /// table (Spectre-safe, like `call_indirect`) — and **claim** the fiber for the calling vCPU.
+    /// Exactly one of any racing claimants wins (the mutex arbitrates); out-of-range, `Running`
+    /// (anyone's — incl. an ancestor in the caller's own resume chain), or `Done` is a lost claim
+    /// ⇒ inert [`Trap::FiberFault`]. On a win the slot is `Running(None)` — if the *caller* then
+    /// traps before running it (a bad `Pending` funcref), the slot stays claimed forever, which a
+    /// later resume sees as an ordinary lost claim.
+    fn claim(&self, handle: i32) -> Result<(usize, Claimed), Trap> {
+        let mut t = self.lock();
+        let mask = t.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
+        let slot = (handle as u32 as usize) & mask;
+        if slot >= t.len() {
+            return Err(Trap::FiberFault);
+        }
+        match std::mem::replace(&mut t[slot], RegFiber::Running(None)) {
+            RegFiber::Pending { func, sp } => Ok((slot, Claimed::Start { func, sp })),
+            RegFiber::Parked(f) => Ok((slot, Claimed::Live(f))),
+            old => {
+                t[slot] = old; // lost: already running (or done) — put it back untouched
+                Err(Trap::FiberFault)
+            }
+        }
+    }
+
+    /// Park the claimant's current fiber as an **active resumer** (it just executed
+    /// `cont.resume`): its frames are stored but the slot stays `Running` — an ancestor in a
+    /// resume chain is never claimable.
+    fn park_resumer(&self, slot: usize, frames: Vec<Frame>) {
+        let mut t = self.lock();
+        debug_assert!(matches!(t[slot], RegFiber::Running(None)));
+        t[slot] = RegFiber::Running(Some(frames));
+    }
+
+    /// Pop back into a parked resumer (its resumee suspended or returned): take its frames; the
+    /// slot stays `Running(None)` (its frames are in flight again).
+    fn unpark_resumer(&self, slot: usize) -> Result<Vec<Frame>, Trap> {
+        let mut t = self.lock();
+        match std::mem::replace(
+            t.get_mut(slot).ok_or(Trap::Malformed)?,
+            RegFiber::Running(None),
+        ) {
+            RegFiber::Running(Some(f)) => Ok(f),
+            _ => Err(Trap::Malformed),
+        }
+    }
+
+    /// `suspend`: publish the claimant's current fiber back to the pool — claimable by **any**
+    /// vCPU again (the migration point).
+    fn park_suspended(&self, slot: usize, frames: Vec<Frame>) {
+        let mut t = self.lock();
+        debug_assert!(matches!(t[slot], RegFiber::Running(None)));
+        t[slot] = RegFiber::Parked(frames);
+    }
+
+    /// The claimant's current fiber returned: the slot is `Done` (resuming it again faults).
+    fn finish(&self, slot: usize) {
+        let mut t = self.lock();
+        debug_assert!(matches!(t[slot], RegFiber::Running(None)));
+        t[slot] = RegFiber::Done;
+    }
 }
 
 /// The fixed fiber entry signature (§12): a fiber runs a function of type `(i64 sp, i64
@@ -1839,36 +1982,6 @@ fn fiber_sig() -> FuncType {
     FuncType {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
-    }
-}
-
-/// Total live activation records across the resume chain — the running fiber's `frames`
-/// (length `current_len`) plus every parked ancestor's stack. Bounds recursion across
-/// *all* active fibers, not just the current one. With no fibers (`chain == [0]`) this is
-/// just `current_len`, so the depth bound is unchanged from the single-stack case.
-fn live_frames(fibers: &[Fiber], chain: &[usize], current_len: usize) -> usize {
-    let mut total = current_len;
-    for &i in &chain[..chain.len() - 1] {
-        if let Fiber::Live(f) = &fibers[i] {
-            total += f.len();
-        }
-    }
-    total
-}
-
-/// Resolve a `cont.resume` handle to a table slot (§12). The handle is forgeable, so it is
-/// **masked** into the power-of-two-padded table (Spectre-safe, like `call_indirect`), then
-/// the slot is checked: in the resume chain (would alias a running stack), `Running`, or
-/// `Done` ⇒ inert ([`Trap::FiberFault`]); only a `Pending`/`Live` slot is resumable.
-fn resolve_fiber(fibers: &[Fiber], chain: &[usize], handle: i32) -> Result<usize, Trap> {
-    let mask = fibers.len().next_power_of_two() - 1;
-    let slot = (handle as u32 as usize) & mask;
-    if slot >= fibers.len() || chain.contains(&slot) {
-        return Err(Trap::FiberFault);
-    }
-    match &fibers[slot] {
-        Fiber::Pending { .. } | Fiber::Live(_) => Ok(slot),
-        Fiber::Running | Fiber::Done => Err(Trap::FiberFault),
     }
 }
 
@@ -1885,14 +1998,6 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
         return Err(Trap::ThreadFault);
     }
     Ok(slot)
-}
-
-/// Take a parked (`Live`) fiber's frames out for execution, marking its slot `Running`.
-fn take_running(fibers: &mut [Fiber], i: usize) -> Result<Vec<Frame>, Trap> {
-    match std::mem::replace(&mut fibers[i], Fiber::Running) {
-        Fiber::Live(f) => Ok(f),
-        _ => Err(Trap::Malformed),
-    }
 }
 
 /// Run one vCPU. `funcs` is an `Arc<[Func]>` the vCPU **owns** (a child gets its own cheap clone), so
@@ -1921,15 +2026,24 @@ struct Coro {
 struct VCpu {
     /// The owned function table; `Frame::func` resolves against it.
     funcs: Arc<[Func]>,
-    /// The fiber table (§12). `fibers[0]` is the root; `cont.new` appends. The *running* fiber's
-    /// frames live in `frames`; its slot holds `Running`.
-    fibers: Vec<Fiber>,
-    /// The resume chain: `chain[0]` the root, `chain.last()` the running fiber.
+    /// The §12 fiber table — **shared by every vCPU of the domain** (root + `thread.spawn`
+    /// children, D57 3b-i), so any vCPU can resume any fiber; the registry's claim is the
+    /// single-owner arbiter. Nested §14 children / separate domains get a fresh registry.
+    registry: Arc<FiberRegistry>,
+    /// The resume chain: `chain[0]` is [`ROOT_FIBER`] (this vCPU's off-table root computation),
+    /// `chain.last()` the running fiber's registry slot.
     chain: Vec<usize>,
-    /// Index of the running fiber.
+    /// Registry slot of the running fiber ([`ROOT_FIBER`] when the root is running).
     cur: usize,
     /// The running fiber's reified call stack.
     frames: Vec<Frame>,
+    /// The root computation's parked frames while it is resuming a fiber (the root lives
+    /// off-table — see [`ROOT_FIBER`] — so its parked state can't go in the registry).
+    root_parked: Option<Vec<Frame>>,
+    /// Total frames across this vCPU's parked resume-chain ancestors (incl. a parked root) —
+    /// maintained at fiber switches so the recursion depth bound (`MAX_CALL_DEPTH`) spans all
+    /// active fibers without walking the shared registry on every call.
+    parked_frames: usize,
     /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
     mem: Option<Mem>,
     /// The domain's powerbox, **shared** by every vCPU of the run (`Arc<Mutex<Host>>`): a spawned
@@ -2005,9 +2119,9 @@ impl VCpu {
     ) -> VCpu {
         VCpu {
             funcs,
-            fibers: vec![Fiber::Running],
-            chain: vec![0],
-            cur: 0,
+            registry: Arc::new(FiberRegistry::new()),
+            chain: vec![ROOT_FIBER],
+            cur: ROOT_FIBER,
             frames: vec![Frame {
                 func: entry,
                 module: 0,
@@ -2015,6 +2129,8 @@ impl VCpu {
                 inst: 0,
                 vals: args.to_vec(),
             }],
+            root_parked: None,
+            parked_frames: 0,
             mem,
             host,
             fuel,
@@ -2056,9 +2172,10 @@ impl VCpu {
     ) -> VCpu {
         VCpu {
             funcs: parent,
-            fibers: vec![Fiber::Running],
-            chain: vec![0],
-            cur: 0,
+            // A unit cannot use `cont.*` (gated at compile), so its registry is never touched.
+            registry: Arc::new(FiberRegistry::new()),
+            chain: vec![ROOT_FIBER],
+            cur: ROOT_FIBER,
             frames: vec![Frame {
                 func: 0, // the unit's entry
                 module: INVOKE_MODULE,
@@ -2066,6 +2183,8 @@ impl VCpu {
                 inst: 0,
                 vals: args.to_vec(),
             }],
+            root_parked: None,
+            parked_frames: 0,
             mem,
             host,
             fuel,
@@ -2085,8 +2204,9 @@ impl VCpu {
         }
     }
 
-    /// A 64-bit fingerprint of this vCPU's **local** execution configuration (its fibers + reified call
-    /// stacks: function / block / instruction / SSA values — everything *except* shared memory). The
+    /// A 64-bit fingerprint of this vCPU's **local** execution configuration (its resume chain +
+    /// reified call stacks: function / block / instruction / SSA values — everything *except* shared
+    /// memory and the shared fiber registry, see below). The
     /// explorer compares it across one turn: a visible op that returns the vCPU to the same fingerprint
     /// has gone once around a loop with no local progress — a spin (livelock unless shared memory it
     /// reads changes). Collisions would risk a false spin-park, but two configs of the *same* vCPU one
@@ -2116,18 +2236,18 @@ impl VCpu {
         self.cur.hash(&mut h);
         self.chain.hash(&mut h);
         hash_frames(&mut h, &self.frames);
-        // Parked fibers are part of the configuration (a resume could re-enter them).
-        self.fibers.len().hash(&mut h);
-        for fib in &self.fibers {
-            match fib {
-                Fiber::Pending { func, sp } => (0u8, *func, *sp).hash(&mut h),
-                Fiber::Live(frames) => {
-                    1u8.hash(&mut h);
-                    hash_frames(&mut h, frames);
-                }
-                Fiber::Running => 2u8.hash(&mut h),
-                Fiber::Done => 3u8.hash(&mut h),
+        // The root's parked frames are local configuration (a suspend could pop back into them).
+        // The **shared** fiber registry (D57) is deliberately *not* hashed: the compare is
+        // pre/post one turn of *this* vCPU, and within a turn its chain-held slots can't change
+        // (claimed exclusively by it) while pool fibers can't affect a spin — every fiber op is a
+        // visible op that visibly changes this fingerprint (chain/vals), so a fingerprint-stable
+        // turn touched no fiber state, and a failed claim is a trap (vCPU ends), not a retry.
+        match &self.root_parked {
+            Some(f) => {
+                1u8.hash(&mut h);
+                hash_frames(&mut h, f);
             }
+            None => 0u8.hash(&mut h),
         }
         h.finish()
     }
@@ -2173,6 +2293,12 @@ fn is_visible(inst: &Inst) -> bool {
             | Inst::ThreadJoin { .. }
             | Inst::MemoryWait { .. }
             | Inst::MemoryNotify { .. }
+            // §12 fiber ops operate on the **run-shared** fiber registry (D57 3b-i), so another
+            // vCPU can observe them (a racing `cont.resume` decides a winner; `cont.new` order
+            // decides handle values) — they are scheduling decision points like memory ops.
+            | Inst::ContNew { .. }
+            | Inst::ContResume { .. }
+            | Inst::Suspend { .. }
     )
 }
 
@@ -2217,10 +2343,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                // the installed-units prefix, refreshed lazily on a miss (`resolve_module`) so neither
                                // a running unit frame nor the `Jit.install` arm needs the shared lock on the hot loop.
     let VCpu {
-        fibers,
+        registry,
         chain,
         cur,
         frames,
+        root_parked,
+        parked_frames,
         mem,
         host,
         fuel,
@@ -2303,9 +2431,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if fs.get(*func as usize).is_none() {
                         return Err(Trap::Malformed);
                     }
-                    if depth as usize + live_frames(&fibers[..], &chain[..], frames.len())
-                        > MAX_CALL_DEPTH as usize
-                    {
+                    if depth as usize + *parked_frames + frames.len() > MAX_CALL_DEPTH as usize {
                         return Err(Trap::StackOverflow);
                     }
                     frames.push(Frame {
@@ -2329,9 +2455,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         ty,
                     )?;
                     let argv = collect(&frames[top].vals, args)?;
-                    if depth as usize + live_frames(&fibers[..], &chain[..], frames.len())
-                        > MAX_CALL_DEPTH as usize
-                    {
+                    if depth as usize + *parked_frames + frames.len() > MAX_CALL_DEPTH as usize {
                         return Err(Trap::StackOverflow);
                     }
                     frames.push(Frame {
@@ -2937,31 +3061,28 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(slot_to_val(*ty, *s));
                     }
                 }
-                // §12 fiber create: record a `Pending` fiber, yield its handle. No switch.
+                // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
+                // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
+                // both backends, the unified namespace). No switch.
                 Inst::ContNew { func, sp } => {
                     let funcref = as_i32(get(&frames[top].vals, *func)?)?;
                     let stack_base = as_i64(get(&frames[top].vals, *sp)?)?;
-                    if fibers.len() >= spawn_quota.max_fibers {
-                        return Err(Trap::FiberFault);
-                    }
-                    let handle = fibers.len() as i32;
-                    fibers.push(Fiber::Pending {
-                        func: funcref,
-                        sp: stack_base,
-                    });
+                    let handle = registry.create(funcref, stack_base, spawn_quota.max_fibers)?;
                     frames[top].vals.push(Value::I32(handle));
                 }
-                // §12 fiber resume: switch into fiber `k`, delivering `arg`. The two results
+                // §12 fiber resume: **claim** fiber `k` — any vCPU may, so a fiber suspended on
+                // one vCPU migrates to whichever claims it next; exactly one racing claimant wins
+                // and a loser faults (D57) — and switch into it, delivering `arg`. The two results
                 // `(status, value)` are appended to *this* frame later, when `k` suspends or
                 // returns control here (see `Suspend` and `Return`).
                 Inst::ContResume { k, arg } => {
                     let kh = as_i32(get(&frames[top].vals, *k)?)?;
                     let av = as_i64(get(&frames[top].vals, *arg)?)?;
-                    let target = resolve_fiber(&fibers[..], &chain[..], kh)?;
                     // Materialize the target's frames: start a `Pending` fiber, or continue a
                     // parked one (delivering `arg` as the result of its `suspend`).
-                    let new_frames = match std::mem::replace(&mut fibers[target], Fiber::Running) {
-                        Fiber::Pending { func: funcref, sp } => {
+                    let (target, claimed) = registry.claim(kh)?;
+                    let new_frames = match claimed {
+                        Claimed::Start { func: funcref, sp } => {
                             let callee = table_lookup(fs, funcref, &fiber_sig())?;
                             // First entry: call `func(sp, arg)` on the fiber's data stack. Fibers
                             // are module-0 only (a unit cannot use `cont.*`, gated at compile).
@@ -2973,34 +3094,45 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 vals: vec![Value::I64(sp), Value::I64(av)],
                             }]
                         }
-                        Fiber::Live(mut f) => {
+                        Claimed::Live(mut f) => {
                             f.last_mut()
                                 .ok_or(Trap::Malformed)?
                                 .vals
                                 .push(Value::I64(av));
                             f
                         }
-                        // `resolve_fiber` already rejected Running/Done.
-                        _ => return Err(Trap::FiberFault),
                     };
-                    // Park the resumer and switch to the target.
-                    fibers[*cur] = Fiber::Live(std::mem::take(frames));
+                    // Park the resumer — it stays claimed (`Running`), since an ancestor in a
+                    // resume chain is never stealable — and switch to the target.
+                    let parked = std::mem::take(frames);
+                    *parked_frames += parked.len();
+                    if *cur == ROOT_FIBER {
+                        *root_parked = Some(parked);
+                    } else {
+                        registry.park_resumer(*cur, parked);
+                    }
                     chain.push(target);
                     *cur = target;
                     *frames = new_frames;
                     continue 'frames;
                 }
                 // §12 fiber suspend: hand `value` back to the resumer with status SUSPENDED;
-                // park this fiber (its `suspend` result pends until the next resume).
+                // publish this fiber back to the pool — claimable by **any** vCPU now, the D57
+                // migration point — and pop back into the resumer.
                 Inst::Suspend { value } => {
-                    if chain.len() == 1 {
+                    if *cur == ROOT_FIBER {
                         return Err(Trap::FiberFault); // no resumer (the root cannot suspend)
                     }
                     let v = as_i64(get(&frames[top].vals, *value)?)?;
-                    fibers[*cur] = Fiber::Live(std::mem::take(frames));
+                    registry.park_suspended(*cur, std::mem::take(frames));
                     chain.pop();
                     *cur = *chain.last().expect("chain keeps the root");
-                    *frames = take_running(&mut fibers[..], *cur)?;
+                    *frames = if *cur == ROOT_FIBER {
+                        root_parked.take().ok_or(Trap::Malformed)?
+                    } else {
+                        registry.unpark_resumer(*cur)?
+                    };
+                    *parked_frames -= frames.len();
                     let rtop = frames.len() - 1;
                     frames[rtop].vals.push(Value::I32(FIBER_SUSPENDED));
                     frames[rtop].vals.push(Value::I64(v));
@@ -3024,6 +3156,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
                     let cfuncs = Arc::clone(&funcs);
                     let cdt = Arc::clone(dt); // **share** the domain table: a post-spawn install is visible here (§6 #2)
+                                              // **Share** the fiber registry (D57 3b-i): one handle namespace per domain, so
+                                              // the child can resume fibers the parent (or a sibling) created and suspended.
+                    let creg = Arc::clone(registry);
                     let csched = sched.clone();
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
@@ -3039,6 +3174,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             spawn_quota, // spawned vCPU inherits the domain's spawn quota
                             cdt,
                         );
+                        child.registry = creg;
                         child.memop = memop; // inherit the explorer's memory-op granularity
                         Box::new(child)
                     });
@@ -3163,15 +3299,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
                     caller.vals.extend(results);
-                } else if *cur == 0 {
+                } else if *cur == ROOT_FIBER {
                     return Ok(Inner::Done(results)); // the root returned: this vCPU is done
                 } else {
                     // A fiber's function returned: hand its single `i64` back to the resumer
                     // with status RETURNED; the fiber is now `Done` (resuming again traps).
-                    fibers[*cur] = Fiber::Done;
+                    registry.finish(*cur);
                     chain.pop();
                     *cur = *chain.last().expect("chain keeps the root");
-                    *frames = take_running(&mut fibers[..], *cur)?;
+                    *frames = if *cur == ROOT_FIBER {
+                        root_parked.take().ok_or(Trap::Malformed)?
+                    } else {
+                        registry.unpark_resumer(*cur)?
+                    };
+                    *parked_frames -= frames.len();
                     let rtop = frames.len() - 1;
                     frames[rtop].vals.push(Value::I32(FIBER_RETURNED));
                     frames[rtop]
