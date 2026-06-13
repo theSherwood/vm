@@ -2347,6 +2347,26 @@ fn c_guest_work_stealing_demo() {
     );
 }
 
+/// **Demo 3 (SCHEDULING.md) — work-stealing over *stackful, migratable* fibers (D57 complete).**
+/// Tasks are fibers whose handles sit in guest queues (injector + per-worker deques); an idle
+/// worker steals a **suspended fiber** and resumes it on its own OS thread — the fiber's whole
+/// native stack migrates (on the JIT, a real cross-thread `svm-fiber` switch claimed through the
+/// loom-verified `Ownership` word; on the interp, a `Vec<Frame>` hand-off). The task yields from
+/// *inside a nested call frame* (`step_in_callee`) — inexpressible for a stackless state machine —
+/// and its return value depends on locals carried across every yield/migration, so the second
+/// printed total (`121920`) is the stack-integrity check, not just a work count. Both totals are
+/// interleaving-invariant; interp == JIT is enforced inside `run_c_full`.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_steal_fibers_demo() {
+    let src = include_str!("../../svm-run/demos/steal_fibers/steal_fibers.c");
+    let run = run_c_full(src);
+    assert_eq!(
+        run.stdout, b"256\n121920\n",
+        "the stackful work-stealing scheduler must produce both invariant totals on both backends"
+    );
+}
+
 /// The §3d **thread-safe guest `malloc`** (`include/stdlib.h`): 4 vCPUs each `malloc` 64 blocks and
 /// fill them with per-block patterns; main re-checks every byte. If two concurrent allocations had
 /// overlapped (the race the old bump allocator allowed), a fill would have clobbered another block and

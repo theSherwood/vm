@@ -1418,12 +1418,20 @@ regressions one commit old"):
 >
 > ---
 >
-> **▶▶ ACTIVE FRONTIER — Migratable fibers / stackful work-stealing (D57).** The maintainer's stated
-> ideal, in progress. Full design + roadmap: **`SCHEDULING.md`** (read it first). The maintainer
-> **cannot expert-review the asm/signal seam and has no model-checking for it**, so safety for the
-> cross-thread-resume step rests on an **empirical net** (a stated decision — see SCHEDULING.md
-> "Verification story"): a differential fuzzer, ASan on the Rust glue, a runtime single-owner assert,
-> guard-page detection, and soak. Honest residual: fuzzing detects, it doesn't prove.
+> **▶▶ Migratable fibers / stackful work-stealing (D57) — COMPLETE.** The maintainer's stated ideal,
+> delivered across slices 3a–3c + Demo 3 (full record: **`SCHEDULING.md`**; D57 in DESIGN.md is
+> Adopted). Fibers migrate on both backends; the safety posture is the **empirical net** (a stated
+> decision — no expert reviewer for the asm/signal seam): the randomized-migration interp↔JIT
+> differential, ASan with real fiber-switch annotations, the runtime single-owner assert, guard-page
+> detection, and concurrent-steal stress — all built and green. Honest residual: fuzzing detects, it
+> doesn't prove. The capstone **Demo 3** is `demos/steal_fibers` — a guest work-stealing scheduler
+> whose tasks are fibers stolen across OS threads, yielding from inside nested call frames, both
+> invariant totals identical on interp + JIT (`c_guest_steal_fibers_demo`/`demo_steal_fibers_runs`).
+>
+> **▶ NEXT:** pick from the ranked "Immediate frontier" below — the wasm transpiler's next
+> evidence-driven gap (item 0), the LLVM on-ramp (item 1), or the smaller open items (weak memory
+> orderings; fiber-slot recycling behind the fiber-return DPOR access; the maintainer-applied
+> nightly ASan/miri CI jobs).
 >
 > **Done + committed (latest session, 2026-06-13, all green):**
 > - **3b-i — interp shared registry + cross-vCPU resume (the slice below) — LANDED.** The per-`VCpu`
@@ -1516,17 +1524,20 @@ regressions one commit old"):
 > into the migration differential (`fiber_suspended_on_root_migrates_to_spawned_vcpu`, both backends
 > = 75). D57 is **Adopted** in DESIGN.md; honest residual unchanged: fuzzing detects, not proves.
 >
-> **NEXT SLICE = Demo 3 — guest stackful work-stealing (SCHEDULING.md §8 step 5, the capstone).**
-> Re-point `demos/mn_sched` (the sharded guest M:N scheduler) at a **shared steal pool**: tasks are
-> *fibers* in guest memory (handles in a shared deque/queue), workers steal with guest atomics and
-> `cont.resume` whatever they claim — stackful work-stealing entirely as guest policy over the new
-> primitive, run differentially (interp `run` ≡ JIT, schedule-invariant total), ideally also as a C
-> demo via the existing `<pthread.h>`/builtins surface (cf. `demos/work_stealing` for the stackless
-> twin). Mind the guest-level race: a worker must not resume a handle another worker just won — lost
-> claims trap, so gate resumes behind the deque's exclusivity like the steal-stress test does.
-> **Also open (smaller):** slot recycling + generation-carrying handles on both backends (needs the
-> interp explorer's fiber-return DPOR access first); a maintainer-applied **nightly ASan CI job**
-> for the fiber net (workflow-scope token; command above). Staging table in SCHEDULING.md §8.
+> ~~**NEXT SLICE = Demo 3 — guest stackful work-stealing.**~~ **DONE** (same session):
+> **`demos/steal_fibers/steal_fibers.c`** — the work-stealing scheduler from `demos/work_stealing`
+> with the state-machine structs replaced by **fibers**: handles in a guest injector + per-worker
+> deques (mutex'd, so a popped handle is exclusively owned between pop and push — resumes never
+> lose a claim race), idle workers steal a *suspended fiber* and resume it on their own OS thread.
+> The task yields from **inside a nested call frame** (`step_in_callee` — inexpressible for a
+> stackless task) and returns a value computed from locals carried across every yield/migration, so
+> the second printed total (`121920`) is a stack-integrity check, not just a work count
+> (`256`). Interp == JIT byte-for-byte (`c_frontend::c_guest_steal_fibers_demo`, 0/10 flake) + the
+> `svm-run` product path (`run::demo_steal_fibers_runs`). SCHEDULING.md demo roadmap + §8 all ✅.
+> **Still open (smaller):** slot recycling + generation-carrying handles on both backends (needs
+> the interp explorer's fiber-return DPOR access first — a `Return` that `finish`es a slot must
+> conflict with `cont.new` once slots recycle); a maintainer-applied **nightly ASan CI job** for
+> the fiber net (workflow-scope token; command in the 3c record above).
 >
 > ---
 >
@@ -1728,10 +1739,9 @@ regressions one commit old"):
 >    `libLLVM.so` confirmed present in the dev container.)
 > 2. **Migratable-fiber primitive (D57)** — **IN PROGRESS → see the "ACTIVE FRONTIER" block at the top
 >    of this section.** The ownership protocol is loom-verified, the integration design + empirical
->    safety net are written, and **the primitive is DONE (3a–3c)** — fibers migrate on both
->    backends through the loom-verified claim + the delivered empirical net (randomized-migration
->    differential, ASan with real fiber-switch annotations, single-owner assert, steal stress);
->    the next slice is Demo 3 (guest stackful work-stealing over it).
+>    safety net are written, and **the whole track is DONE (3a–3c + Demo 3)** — fibers migrate on
+>    both backends through the loom-verified claim + the delivered empirical net, and
+>    `demos/steal_fibers` is the guest stackful work-stealing capstone.
 >    Re-accepted D56's cross-thread-migration unsafe
 >    as a *primitive* (guest owns the stealing policy; VM enforces single-owner); the expert-review gate
 >    is replaced by the empirical net (no reviewer available — SCHEDULING.md "Verification story").

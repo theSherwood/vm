@@ -160,20 +160,25 @@ migration (asserted, not assumed — e.g. counting observed cross-thread resumes
 
 ## Demo roadmap
 
-1. **Demo 1 — sharded stackful M:N** *(in progress)*. A guest cooperative scheduler
+1. **Demo 1 — sharded stackful M:N** *(done — `demos/mn_sched`)*. A guest cooperative scheduler
    over `cont.*`: N `thread.spawn` workers, each round-robining its own pool of
    fiber tasks that yield; a shared atomic aggregate. Proves fibers + threads +
    atomics compose into a real M:N runtime, and establishes the scheduler machinery
    (run queue, resume-until-suspend, park/unpark) the later versions reuse. Honest
    about affinity (tasks pinned per worker).
-2. **Demo 2 — stackless work-stealing M:N**. Tasks as guest state machines, a
-   Chase-Lev deque over atomics, futex park/unpark — cross-core load balancing with
+2. **Demo 2 — stackless work-stealing M:N** *(done — `demos/work_stealing`)*. Tasks as guest
+   state machines, queues over atomics — cross-core load balancing with
    **no VM change**. Proves the harder claim and is the natural lead-in to the async
    I/O ring (B).
-3. **Migratable-fiber primitive + Demo 3 — stackful work-stealing**. The D57
-   evolution: the shared registry + ownership protocol (loom-verified) + Demo 1
-   re-pointed at a shared steal pool. Done deliberately, with review, only after 1–2
-   establish the baseline and the value is concrete.
+3. **Migratable-fiber primitive + Demo 3 — stackful work-stealing** *(done — the primitive via
+   slices 3a–3c below; the demo is `demos/steal_fibers`)*: a guest work-stealing scheduler
+   whose tasks are **fibers** — an idle worker steals a *suspended fiber* from a sibling's deque
+   and resumes it on its own OS thread, the task yielding from inside a nested call frame
+   (inexpressible stackless) with live locals carried across every migration. Both invariant
+   totals (`256` work units, `121920` return-sum — the stack-integrity check) print identically
+   on interp (the migrating-registry oracle) and JIT (real cross-thread switches):
+   `c_frontend::c_guest_steal_fibers_demo` + `run::demo_steal_fibers_runs`. The VM contributed
+   exactly the namespace + arbiter; every scheduling decision is guest C.
    - **Step 3a — the single-owner ownership protocol, loom-verified (DONE).** The
      load-bearing atomic state machine (`OWNED`/`RUNNABLE`/`RUNNING`/`FREE`) is built
      in isolation in `crates/svm-jit/src/fiber_registry.rs`: a fiber is stealable only
@@ -373,4 +378,5 @@ and the per-run quota pin).
    explorer's fiber-return DPOR access; the generation already ticks under the hood).
 4. **3c — JIT cross-thread asm resume.** ✅ Done (see §5): `claim` + `suspend_to_pool` live,
    post-switch `CURRENT_RT` re-reads, the five-layer empirical net delivered and green.
-5. **Demo 3 — guest stackful work-stealing**, differential interp ≡ JIT. ← **next**
+5. **Demo 3 — guest stackful work-stealing**, differential interp ≡ JIT. ✅ Done
+   (`demos/steal_fibers` — see the demo roadmap above). **The D57 track is complete.**

@@ -469,6 +469,38 @@ fn demo_work_stealing_runs() {
     assert_eq!(out.stdout, b"256\n", "guest work-stealing scheduler total");
 }
 
+/// **Demo 3** — the guest-built work-stealing scheduler over **stackful, migratable fibers**
+/// (`demos/steal_fibers`, D57 complete), end to end through the `svm-run` binary: suspended
+/// fibers are stolen across real OS threads and must print both interleaving-invariant totals
+/// (`256` work units; `121920` = the sum of returns whose values depend on locals carried across
+/// every migration — the stack-integrity check). The interp↔JIT differential lives in
+/// `c_frontend::c_guest_steal_fibers_demo`; this is the product-path smoke test. Skipped (not
+/// failed) when the frontend is unavailable.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_steal_fibers_runs() {
+    let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
+        .arg(demo("steal_fibers/steal_fibers.c"))
+        .output()
+        .expect("spawn svm-run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.contains("chibicc") {
+        eprintln!(
+            "note: skipping steal_fibers demo (frontend unavailable): {}",
+            err.trim()
+        );
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "svm-run on steal_fibers failed: {err}"
+    );
+    assert_eq!(
+        out.stdout, b"256\n121920\n",
+        "stackful work-stealing scheduler totals"
+    );
+}
+
 /// The **threaded guest-driven JIT** demo (`demos/jit/jit_threads.c`, DESIGN.md §22), end to end
 /// through the `svm-run` binary: 4 worker threads each Cranelift-compile a distinct unit
 /// **concurrently** (several `Jit.compile`s in flight, serialized through the per-domain
