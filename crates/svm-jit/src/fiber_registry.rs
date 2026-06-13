@@ -4,22 +4,22 @@
 //! The dangerous invariant of stackful work-stealing is **"one native stack, exactly one thread":**
 //! a fiber's saved stack + register context must never be resumed by two OS threads at once — that
 //! would execute one call stack on two cores and corrupt it irrecoverably (the precise unsafe D56
-//! removed when it deleted the VM-owned M:N executor). Today fibers are *thread-affine* (each vCPU
-//! owns a private fiber table, see `fiber_rt`/the interp), so the invariant holds trivially. Making
-//! fibers **migratable** trades that for a shared registry where any worker may *steal* a
-//! voluntarily-suspended fiber — and the whole safety of the feature reduces to one atomic property:
+//! removed when it deleted the VM-owned M:N executor). Fibers are **migratable** (D57 3c): any
+//! worker may claim a voluntarily-suspended fiber from the shared registry — and the whole safety
+//! of the feature reduces to one atomic property:
 //!
 //! > a fiber in the steal pool is claimed (transitioned to `Running`) by **exactly one** thread.
 //!
 //! This module is that property, isolated. It is **pure atomics — it touches no real stack** — so it
 //! is fully `loom`-model-checkable, exactly as the `wait`/`notify` futex core is. Per SCHEDULING.md's
 //! "earn the risk with verification, not assume it" mandate and the demo roadmap (#3), the protocol
-//! was proven here first; it is now **wired into the live runtime** (D57 3b-ii): each slot of the
-//! domain-shared `fiber_rt::SharedFiberTable` carries one [`Ownership`] word — `cont.resume` claims
-//! via [`Ownership::begin_owned`], a voluntary suspend re-parks via [`Ownership::pin`] (thread-affine
-//! in this slice), and a return [`Ownership::finish`]es the slot. The remaining methods
-//! ([`Ownership::suspend_to_pool`]/[`Ownership::try_steal`]/[`Ownership::recycle_owned`]) are the
-//! cross-thread-migration step (3c) and slot recycling, still staged.
+//! was proven here first; it is **wired into the live runtime** (D57 3b-ii/3c): each slot of the
+//! domain-shared `fiber_rt::SharedFiberTable` carries one [`Ownership`] word — `cont.resume` on
+//! **any** vCPU claims via [`Ownership::claim`] (fresh `OWNED` or pooled `RUNNABLE` → `RUNNING`;
+//! exactly one racing claimant wins), a voluntary suspend publishes via
+//! [`Ownership::suspend_to_pool`], and a return [`Ownership::finish`]es the slot. Still staged:
+//! [`Ownership::recycle_owned`] (slot recycling, with generation-carrying handles on both backends
+//! together) and [`Ownership::pin`] (fault-suspended thread-affine fibers, design sketch #2).
 //!
 //! ## States (low 2 bits of an `AtomicU64`)
 //! - `OWNED` — owned by one worker, **not** running and **not** in the steal pool: a just-created
@@ -54,7 +54,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Owned by one worker; not running, not stealable (just-created, or pinned/fault-suspended).
 const OWNED: u64 = 0;
 /// Voluntarily suspended in the shared steal pool; ownerless — the only stealable state.
-#[allow(dead_code)] // staged for 3c: `pin` keeps suspended fibers OWNED until migration lands
 const RUNNABLE: u64 = 1;
 /// A worker is executing this fiber's native stack — never stealable.
 const RUNNING: u64 = 2;
@@ -98,9 +97,36 @@ impl Ownership {
     /// `false` if the slot is not `OWNED` (a caller bug — an owned fiber is not concurrently
     /// stealable, so only its owner transitions it, and this CAS cannot legitimately lose).
     /// **Acquire** on success: the owner observes whatever it published when it last `pin`ned it.
+    #[allow(dead_code)] // the owner-path primitive; the live resume claims via `claim` (3c) — kept for pinned fibers + tests
     pub(crate) fn begin_owned(&self) -> bool {
         let w = self.word.load(Ordering::Relaxed);
         if state_of(w) != OWNED {
+            return false;
+        }
+        self.word
+            .compare_exchange(
+                w,
+                pack(gen_of(w), RUNNING),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// **Claim the fiber for a resume, from any thread (3c).** A `cont.resume` does not know (or
+    /// care) whether the slot is `OWNED` (fresh — never started) or `RUNNABLE` (voluntarily
+    /// suspended, possibly by *another* thread): both are resumable, so this claims either —
+    /// one CAS `(gen, OWNED|RUNNABLE) → (gen, RUNNING)` — and **exactly one** racing claimant
+    /// wins (the same single-owner argument as [`Self::try_steal`], to which this is the
+    /// "resume-by-handle" front end: the generation comes from the *current* word rather than a
+    /// caller-recorded `(slot, gen)`, which is equivalent while slots are not recycled).
+    /// `RUNNING`/`FREE`, or losing the CAS, ⇒ `false` (the caller faults — the loser semantics).
+    /// **Acquire** on success: the winner synchronizes-with the releasing suspend
+    /// ([`Self::suspend_to_pool`]/[`Self::pin`]) and observes the complete saved stack context —
+    /// the load-bearing edge that makes a *cross-thread* resume of the saved native stack sound.
+    pub(crate) fn claim(&self) -> bool {
+        let w = self.word.load(Ordering::Relaxed);
+        if state_of(w) != OWNED && state_of(w) != RUNNABLE {
             return false;
         }
         self.word
@@ -117,7 +143,6 @@ impl Ownership {
     /// generation), a **release** store so a stealer's acquiring claim sees the complete saved
     /// context. Returns the slot's current **generation**, which the caller records alongside the
     /// slot index when it pushes the fiber onto the steal deque — a later `try_steal` must present it.
-    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
     pub(crate) fn suspend_to_pool(&self) -> u64 {
         let w = self.word.load(Ordering::Relaxed);
         debug_assert_eq!(state_of(w), RUNNING);
@@ -132,7 +157,7 @@ impl Ownership {
     /// slot) if the slot was already stolen, is running/pinned, or — the ABA guard — was **finished
     /// and reused** since the caller recorded it (its generation has advanced). **Acquire** on
     /// success: the winner synchronizes-with the suspending thread and observes the published context.
-    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
+    #[allow(dead_code)] // staged: the recycling/deque path presents a recorded (slot, gen); `claim` covers resume-by-handle
     pub(crate) fn try_steal(&self, generation: u64) -> bool {
         self.word
             .compare_exchange(
@@ -148,6 +173,7 @@ impl Ownership {
     /// generation. Used for a fault-suspended fiber whose recovery state (`sigjmp_buf`/VEH `CONTEXT`)
     /// is thread-affine, so it must resume on the same thread (design sketch #2). A **release** store,
     /// symmetric with `suspend_to_pool`, so the eventual `begin_owned` sees the saved context.
+    #[allow(dead_code)] // staged: fault-suspended (thread-affine) fibers — design sketch #2; tests exercise it
     pub(crate) fn pin(&self) {
         let w = self.word.load(Ordering::Relaxed);
         debug_assert_eq!(state_of(w), RUNNING);
@@ -166,7 +192,7 @@ impl Ownership {
 
     /// Reuse a `FREE` slot for a **new** fiber: `FREE → OWNED`, keeping the (already-bumped)
     /// generation so stale stealers of the *previous* occupant remain locked out (the ABA guard).
-    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
+    #[allow(dead_code)] // staged: slot recycling lands with generation-carrying handles on both backends
     pub(crate) fn recycle_owned(&self) {
         let w = self.word.load(Ordering::Relaxed);
         debug_assert_eq!(state_of(w), FREE);
@@ -174,13 +200,13 @@ impl Ownership {
     }
 
     /// The current generation (relaxed) — for observability / assertions.
-    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
+    #[allow(dead_code)] // observability/assertions (tests)
     pub(crate) fn generation(&self) -> u64 {
         gen_of(self.word.load(Ordering::Relaxed))
     }
 
     /// The current state, one of `OWNED`/`RUNNABLE`/`RUNNING`/`FREE` (relaxed) — for assertions.
-    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
+    #[allow(dead_code)] // observability/assertions (tests)
     pub(crate) fn state(&self) -> u64 {
         state_of(self.word.load(Ordering::Relaxed))
     }
@@ -233,6 +259,19 @@ mod tests {
         assert_eq!(o.generation(), 1, "finish bumps the generation");
         assert!(!o.try_steal(0), "a freed slot is not stealable");
         assert!(!o.begin_owned(), "a freed slot is not runnable");
+    }
+
+    /// The 3c `claim` front end's transition table: claims succeed exactly on `OWNED` (fresh) and
+    /// `RUNNABLE` (suspended), never on `RUNNING`/`FREE`.
+    #[test]
+    fn claim_transition_table() {
+        let o = Ownership::new_owned();
+        assert!(o.claim(), "a fresh (OWNED) fiber is claimable"); // → RUNNING
+        assert!(!o.claim(), "a running fiber is not claimable");
+        o.suspend_to_pool(); // → RUNNABLE
+        assert!(o.claim(), "a suspended (RUNNABLE) fiber is claimable"); // → RUNNING
+        o.finish(); // → FREE
+        assert!(!o.claim(), "a finished slot is not claimable");
     }
 
     /// **The ABA guard, deterministically.** A stealer records a pooled fiber as `(slot, gen0)`. Before
@@ -316,6 +355,69 @@ mod loom_tests {
             let winners: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
             assert_eq!(winners, 1, "exactly one thread may steal a runnable fiber");
             assert_eq!(own.state(), RUNNING, "the stolen fiber ends up Running");
+        });
+    }
+
+    /// **The 3c resume arbiter:** several workers race to `claim` (resume) one fiber a suspending
+    /// worker just published — exactly one wins, and the winner observes the published context
+    /// (the acquire/release pairing that makes resuming the saved *native stack* from another
+    /// thread sound). This is `loom_single_owner_steal_is_exclusive` through the `claim` front
+    /// end the live `cont.resume` thunk actually calls.
+    #[test]
+    fn loom_claim_is_exclusive_across_threads() {
+        const CLAIMANTS: usize = 2;
+        loom::model(|| {
+            let own = Arc::new(Ownership::new_owned());
+            let ctx = Arc::new(LoomU64::new(0));
+
+            // The creating worker runs the fiber, writes its saved context, suspends it to the pool.
+            assert!(own.begin_owned());
+            ctx.store(0xF1BE5, LoomOrdering::Relaxed);
+            own.suspend_to_pool(); // release-publishes RUNNABLE
+
+            let handles: Vec<_> = (0..CLAIMANTS)
+                .map(|_| {
+                    let own = own.clone();
+                    let ctx = ctx.clone();
+                    loom::thread::spawn(move || {
+                        if own.claim() {
+                            assert_eq!(
+                                ctx.load(LoomOrdering::Relaxed),
+                                0xF1BE5,
+                                "the winning claimant must observe the published stack context"
+                            );
+                            1u32
+                        } else {
+                            0
+                        }
+                    })
+                })
+                .collect();
+
+            let winners: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+            assert_eq!(winners, 1, "exactly one thread may claim a resumable fiber");
+            assert_eq!(own.state(), RUNNING);
+        });
+    }
+
+    /// `claim` races on a **fresh** (`OWNED`, never-started) fiber: still exactly one winner — the
+    /// interp registry lets any vCPU first-resume a pending fiber, so the JIT arbiter must too.
+    #[test]
+    fn loom_claim_of_fresh_fiber_is_exclusive() {
+        loom::model(|| {
+            let own = Arc::new(Ownership::new_owned()); // OWNED, never run
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let own = own.clone();
+                    loom::thread::spawn(move || u32::from(own.claim()))
+                })
+                .collect();
+            let winners: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+            assert_eq!(
+                winners, 1,
+                "exactly one thread may first-resume a fresh fiber"
+            );
+            assert_eq!(own.state(), RUNNING);
         });
     }
 

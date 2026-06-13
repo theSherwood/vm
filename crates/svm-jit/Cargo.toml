@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Passthrough to svm-fiber's ASan fiber-switch annotations (the sanitizer job).
+asan = ["svm-fiber/asan"]
+
 [dependencies]
 cranelift-codegen = "0.132.0"
 cranelift-frontend = "0.132.0"

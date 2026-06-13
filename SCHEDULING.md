@@ -34,9 +34,9 @@ we growing a third primitive?" — no, stackless is a guest *pattern*.)
 |  | **Sharded** (over fibers) | **Work-stealing** (over stackless tasks) |
 |---|---|---|
 | Task representation | a stackful fiber (`cont.*`) | a state-machine struct (guest data) |
-| Migration across cores | **no** — fibers are thread-affine | **yes** — moving a struct is a pointer hand-off |
+| Migration across cores | **yes** since D57 3c — `cont.resume` from any vCPU claims + migrates the fiber (the sharded *demo* keeps tasks pinned by choice) | **yes** — moving a struct is a pointer hand-off |
 | Load balancing | none (thread-per-core) | dynamic (steal from busy workers) |
-| Safety of migration | n/a (no migration) | safe by construction (it's just data) |
+| Safety of migration | the `Ownership` claim (loom-verified) + the 3c empirical net | safe by construction (it's just data) |
 | Can suspend *unmodified* code | **yes** (suspends the whole native stack) | **no** — function-coloring: only at transformed points |
 | Real-world analogue | glommio, seastar, redpanda (thread-per-core) | tokio, Go-style work-stealing |
 | VM change required | none | none |
@@ -51,29 +51,26 @@ suspend point there). Conversely, stackless is the only safe way to *migrate* a
 task for work-stealing without moving native stacks. They are complementary; the VM
 offers both substrates and the guest picks.
 
-## Why JIT fibers are thread-affine today (the interp no longer is)
+## Fibers are migratable on both backends (3a–3c landed)
 
-JIT fiber **storage** is domain-shared now (step 3b-ii: `fiber_rt::SharedFiberTable`,
-one handle namespace + quota for root and every spawned vCPU), but **execution is
-still thread-affine**: each slot records its creating vCPU's `owner` token and a
-foreign vCPU's resume is a clean `FiberFault`. Affinity is deliberate and good as a
-default: no cross-thread stack resumption, cache locality — the thread-per-core
-architecture chosen on purpose by glommio/seastar, not merely "the easy option."
-Step 3c relaxes exactly this check (`try_steal` on pooled fibers) to make fibers
-migratable.
+The per-vCPU fiber tables are gone on both backends: the interp's run-shared
+`FiberRegistry` (step 3b-i — pure-data `Vec<Frame>` hand-off, the oracle) and the
+JIT's domain-shared `fiber_rt::SharedFiberTable` (3b-ii storage + the live
+`Ownership` word; 3c lifted the affinity gate) give one handle namespace and a
+single-owner claim per slot, so **`cont.resume` on any vCPU migrates a suspended
+fiber to that vCPU's OS thread** — exactly one racing claimant wins; a loser gets
+a clean `FiberFault`. Thread-per-core affinity (glommio/seastar-style) remains
+available as *guest policy* — a scheduler that only resumes its own fibers gets
+exactly the old locality — but it is no longer a VM constraint.
 
-**The interpreter crossed over (step 3b-i, done):** its per-`VCpu` `fibers: Vec`
-is now the run-shared `FiberRegistry` (`svm-interp`), so any vCPU can claim and
-continue a suspended fiber — the reference semantics for migration, established
-in safe Rust before any JIT asm changes.
+## Migratable fibers → stackful work-stealing (D57)
 
-## Proposed evolution: migratable fibers → stackful work-stealing
-
-**Status: Proposed (D57), not adopted.** The ideal outcome is work-stealing M:N
-over *stackful* fibers — Go-class scheduling for **arbitrary unmodified compiled
-code** inside a confinement sandbox, strictly more than either flavor above. It is
-**feasible and safely so** — Go is the decade-long, planet-scale existence proof of
-stackful work-stealing. But it carries a real, eyes-open cost.
+**Status: ADOPTED — the primitive landed (slices 3a–3c); Demo 3 (a guest stackful
+work-stealing scheduler over it) is the remaining roadmap item.** The outcome is
+work-stealing M:N over *stackful* fibers — Go-class scheduling for **arbitrary
+unmodified compiled code** inside a confinement sandbox, strictly more than either
+flavor above. Go is the decade-long, planet-scale existence proof of stackful
+work-stealing. It carried a real, eyes-open cost, accounted below.
 
 ### The honest tension with D56
 
@@ -123,7 +120,9 @@ to today's fiber+thread code, exercised harder.
 
 **No expert review is available for the asm/signal seam** (a stated project constraint),
 so safety for step 3c rests entirely on an **empirical net** designed to make every
-plausible failure mode *loud and detectable* rather than silent corruption. Two facts make
+plausible failure mode *loud and detectable* rather than silent corruption. *(Status: 3c is
+landed and every net layer below is built and green — see §5's 3c entry for the concrete
+artifacts, including the ASan fiber-switch annotations that made layer 2 actually runnable.)* Two facts make
 this a reasonable — not reckless — posture:
 
 - The cross-thread resume introduces **no new assembly**: it calls the *same* `svm-fiber`
@@ -313,17 +312,32 @@ and the per-run quota pin).
   under affinity, the 3c prep. Slot recycling + generation-carrying handles stay deferred to a
   later slice on both backends together (the interp explorer needs a fiber-return DPOR access
   first; `finish` already maintains the generation).
-- **3c (the asm seam — EXPERT REVIEW REQUIRED):** allow a worker to resume a fiber whose
-  native stack another worker created. SCHEDULING.md design sketch #3 holds: the `svm-fiber`
-  switch is the same instruction sequence; **unix has no thread-bound state in it**, and
-  **Win64 already swaps the TEB `StackBase`/`StackLimit`/`DeallocationStack` per switch**, so
-  "this stack is now active on *this* thread" is handled; fixed-mmap stacks are fine (migration
-  moves the executing thread, not the stack — Go copies stacks only for *growth*). The
-  re-entrancy discipline is preserved: **no `&mut` registry crosses a switch; only the
-  address-stable `Box<Fiber>` does.** This composition (verified protocol + real asm switch +
-  per-thread signal recovery) **cannot be model-checked** — it gets heavy stress, the interp↔JIT
-  differential, and human review of the asm/signal seam. This is the one place the feature's
-  risk is genuinely irreducible.
+- **3c (the asm seam — empirical-net gated) — ✅ DONE.** A worker resumes fibers whose native
+  stacks other workers created/suspended. As built: `cont.resume` claims via the new
+  loom-verified [`Ownership::claim`] (fresh `OWNED` *or* pooled `RUNNABLE` → `RUNNING`; the
+  acquire pairs with the suspender's `suspend_to_pool` release, so the saved stack context is
+  fully visible cross-thread), a voluntary suspend publishes back to the pool, and per-thread
+  state is **re-read after every switch-in, never carried across a suspension** — the fiber
+  body closure and `fiber_suspend` re-read `CURRENT_RT` post-switch so yielder pairing targets
+  the *resuming* thread (the two latent landmines this slice defused). Design sketch #3 held:
+  the `svm-fiber` switch is the same instruction sequence (verified: SysV/AAPCS64 save only
+  callee-saved registers, no TLS/x18; MS-x64 swaps the TEB stack fields per switch), and the
+  re-entrancy discipline is preserved (no lock or `&mut` crosses a switch; only the
+  address-stable boxed fiber, exclusive via the claim). **The empirical net, delivered:**
+  (1) `fiber_fuzz::generated_migration_schedules_agree_on_interp_and_jit` — randomized
+  migration schedules, interp (the safe oracle) ≡ JIT, with cross-executor saved-stack resumes
+  *counted and asserted*; (2) ASan is now genuinely runnable on fiber stacks — `svm-fiber`
+  gained real `__sanitizer_{start,finish}_switch_fiber` annotations behind the `asan` feature
+  (`RUSTFLAGS=-Zsanitizer=address cargo +nightly test -Zbuild-std --target
+  x86_64-unknown-linux-gnu -p svm --features asan --test jit_fibers --test jit_threads --test
+  fiber_fuzz`), whole fiber net clean; (3) a **runtime single-owner assert** at the resume seam
+  (`FiberSlot::running_on` — a double-claim aborts loudly instead of running one stack on two
+  threads); (4) guard-paged stacks fault into detect-and-kill on whichever thread runs the
+  fiber; (5) concurrent-steal stress (`jit_threads::concurrent_fiber_steal_stress` — 16 fibers
+  × 2 rounds × 4 racing workers, every second resume a guaranteed cross-thread migration of a
+  saved stack, schedule-invariant sum). The former staged-divergence pin flipped into the
+  migration differential (`fiber_suspended_on_root_migrates_to_spawned_vcpu`). Honest residual
+  (unchanged from the stated decision): fuzzing detects, it does not prove.
 
 ### 6. Quota, accounting, compatibility
 
@@ -357,5 +371,6 @@ and the per-run quota pin).
    `SharedFiberTable` with the `Ownership` word live, unified multi-vCPU namespace + per-domain
    quota + masking; slot *recycling*/generation-carrying handles deferred (needs the interp
    explorer's fiber-return DPOR access; the generation already ticks under the hood).
-4. **3c — JIT cross-thread asm resume.** The review-gated seam; differential + stress.
-5. **Demo 3 — guest stackful work-stealing**, differential interp ≡ JIT.
+4. **3c — JIT cross-thread asm resume.** ✅ Done (see §5): `claim` + `suspend_to_pool` live,
+   post-switch `CURRENT_RT` re-reads, the five-layer empirical net delivered and green.
+5. **Demo 3 — guest stackful work-stealing**, differential interp ≡ JIT. ← **next**

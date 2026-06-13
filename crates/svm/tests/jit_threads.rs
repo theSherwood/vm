@@ -400,14 +400,16 @@ fn fiber_namespace_is_domain_wide() {
     assert_eq!(run(&m, 0, &[], &mut fuel), Ok(vec![Value::I64(148)]));
 }
 
-/// **The 3b-ii staging gap, pinned explicitly:** a fiber suspended on the root and resumed from a
-/// spawned vCPU **migrates on the interpreter** (the 3b-i shared registry — the reference
-/// semantics for D57) but **faults on the JIT**, whose shared table keeps fibers thread-affine
-/// until the 3c cross-thread asm-resume slice (the foreign owner's claim is rejected, a clean
-/// `FiberFault` that kills the domain). This test is the *inverse* of a differential: it pins the
-/// documented divergence so 3c can flip it to `assert_jit_matches_interp` and prove migration.
+/// **Stackful fiber migration, differentially (D57 3c — the headline).** A fiber created and
+/// part-run on the root (it suspends, capturing its first-resume argument 5 in its parked
+/// *native stack*) is resumed from a **spawned vCPU on another OS thread**: the JIT claims the
+/// slot through the loom-verified `Ownership` CAS and resumes the saved stack with the *same*
+/// `svm-fiber` switch — and must produce exactly what the interpreter's migrating registry
+/// (3b-i, the oracle) does: `10*7 + 5 = 75`, the `+ 5` proving the stack state captured on the
+/// root survived the migration intact (a restart would lose it). Until 3c this test pinned the
+/// staged divergence (the JIT's foreign claim faulted); it is now the migration differential.
 #[test]
-fn foreign_vcpu_resume_faults_on_jit_until_3c() {
+fn fiber_suspended_on_root_migrates_to_spawned_vcpu() {
     let src = "func () -> (i64) {\n\
         block0():\n\
         \x20 v0 = ref.func 2\n\
@@ -435,16 +437,151 @@ fn foreign_vcpu_resume_faults_on_jit_until_3c() {
         \x20 v3 = i64.add v2 varg\n\
         \x20 return v3\n\
         }\n";
+    // Both backends agree (the differential)…
+    assert_jit_matches_interp(src);
+    // …and the absolute migration semantics: the fiber *continued* on the worker, stack intact.
     let m = parse_module(src).expect("parse");
-    verify_module(&m).expect("verify");
-    // Interp (the migratable-fiber oracle): the fiber continues on the worker → 10*7 + 5 = 75.
     let mut fuel = 1_000_000u64;
     assert_eq!(run(&m, 0, &[], &mut fuel), Ok(vec![Value::I64(75)]));
-    // JIT (thread-affine until 3c): the worker's claim is rejected → FiberFault.
-    match compile_and_run(&m, 0, &[]).expect("jit") {
-        JitOutcome::Trapped(TrapKind::FiberFault) => {}
-        other => {
-            panic!("expected the foreign resume to FiberFault on the JIT (until 3c), got {other:?}")
+}
+
+/// **Concurrent steal stress (the D57 3c empirical net, layer 5).** K=16 fibers are created on
+/// the root; **round 1** spawns 4 workers that race over an atomic work index, each claiming and
+/// first-resuming fibers (every fiber yields `3*id + 1` and parks, published `RUNNABLE`); after a
+/// join barrier, **round 2** spawns 4 *fresh* OS threads that race a second index and resume each
+/// parked fiber to completion (`7*id + 2`) — so **all 16 second resumes are cross-thread
+/// migrations of saved native stacks**, claimed concurrently through the `Ownership` CAS while
+/// siblings race. The atomic sum is schedule-invariant: `Σ (10·id + 3) = 1248` — any torn switch,
+/// lost claim, or double-resume changes it (or faults via the guard page / single-owner assert).
+/// 30 reps on the JIT (real cores) + the interp differential.
+#[test]
+fn concurrent_fiber_steal_stress() {
+    // mem[16]: round-1 work index; mem[20]: round-2 work index; mem[24+4i]: fiber i's handle;
+    // mem[128]: the i64 atomic sum. Fiber identity rides its `sp` (= its index i).
+    // Worker body (funcs 1 and 2, differing only in the work-index address):
+    //   loop: i = i32.atomic.rmw.add idx 1; if i >= 16 return 0;
+    //         h = i32.load(24+4i); (st, v) = cont.resume h 0; i64.atomic.rmw.add mem[128] v
+    let worker = |idx_addr: u64| -> String {
+        format!(
+            "func (i64, i64) -> (i64) {{\n\
+             block0(v0: i64, v1: i64):\n\
+             \x20 br block1()\n\
+             block1():\n\
+             \x20 v2 = i64.const {idx_addr}\n\
+             \x20 v3 = i32.const 1\n\
+             \x20 v4 = i32.atomic.rmw.add v2 v3\n\
+             \x20 v5 = i32.const 16\n\
+             \x20 v6 = i32.lt_u v4 v5\n\
+             \x20 br_if v6 block2(v4) block3()\n\
+             block2(v7: i32):\n\
+             \x20 v8 = i64.extend_i32_u v7\n\
+             \x20 v9 = i64.const 4\n\
+             \x20 v10 = i64.mul v8 v9\n\
+             \x20 v11 = i64.const 24\n\
+             \x20 v12 = i64.add v11 v10\n\
+             \x20 v13 = i32.load v12\n\
+             \x20 v14 = i64.const 0\n\
+             \x20 v15, v16 = cont.resume v13 v14\n\
+             \x20 v17 = i64.const 128\n\
+             \x20 v18 = i64.atomic.rmw.add v17 v16\n\
+             \x20 br block1()\n\
+             block3():\n\
+             \x20 v19 = i64.const 0\n\
+             \x20 return v19\n\
+             }}\n"
+        )
+    };
+    // Root: create the 16 fibers (handle at 24+4i, sp = i), then two rounds of spawn-4 / join-4.
+    let mut root = String::from(
+        "memory 16\n\
+         func () -> (i64) {\n\
+         block0():\n\
+         \x20 v0 = i64.const 0\n\
+         \x20 br block1(v0)\n\
+         block1(v1: i64):\n\
+         \x20 v2 = i64.const 16\n\
+         \x20 v3 = i64.lt_u v1 v2\n\
+         \x20 br_if v3 block2(v1) block3()\n\
+         block2(v4: i64):\n\
+         \x20 v5 = ref.func 3\n\
+         \x20 v6 = cont.new v5 v4\n\
+         \x20 v7 = i64.const 4\n\
+         \x20 v8 = i64.mul v4 v7\n\
+         \x20 v9 = i64.const 24\n\
+         \x20 v10 = i64.add v9 v8\n\
+         \x20 i32.store v10 v6\n\
+         \x20 v11 = i64.const 1\n\
+         \x20 v12 = i64.add v4 v11\n\
+         \x20 br block1(v12)\n\
+         block3():\n",
+    );
+    // Two rounds: spawn 4 workers of func `r` (1 then 2), storing thread handles at 256+…, then
+    // join all 4 — the barrier between first-resumes and the migrating second-resumes.
+    let mut v = 13;
+    for r in 1..=2u32 {
+        for w in 0..4 {
+            root.push_str(&format!(
+                "\x20 v{a} = i64.const 0\n\
+                 \x20 v{b} = thread.spawn {r} v{a} v{a}\n\
+                 \x20 v{c} = i64.const {addr}\n\
+                 \x20 i32.store v{c} v{b}\n",
+                a = v,
+                b = v + 1,
+                c = v + 2,
+                addr = 256 + (r as u64 - 1) * 16 + w * 4,
+            ));
+            v += 3;
+        }
+        for w in 0..4 {
+            root.push_str(&format!(
+                "\x20 v{a} = i64.const {addr}\n\
+                 \x20 v{b} = i32.load v{a}\n\
+                 \x20 v{c} = thread.join v{b}\n",
+                a = v,
+                b = v + 1,
+                c = v + 2,
+                addr = 256 + (r as u64 - 1) * 16 + w * 4,
+            ));
+            v += 3;
         }
     }
+    root.push_str(&format!(
+        "\x20 v{a} = i64.const 128\n\
+         \x20 v{b} = i64.atomic.load v{a}\n\
+         \x20 return v{b}\n\
+         }}\n",
+        a = v,
+        b = v + 1,
+    ));
+    // The fiber body: yield 3*sp+1 (parking RUNNABLE for round 2), then return 7*sp+2.
+    root.push_str(&worker(16));
+    root.push_str(&worker(20));
+    root.push_str(
+        "func (i64, i64) -> (i64) {\n\
+         block0(v0: i64, v1: i64):\n\
+         \x20 v2 = i64.const 3\n\
+         \x20 v3 = i64.mul v0 v2\n\
+         \x20 v4 = i64.const 1\n\
+         \x20 v5 = i64.add v3 v4\n\
+         \x20 v6 = suspend v5\n\
+         \x20 v7 = i64.const 7\n\
+         \x20 v8 = i64.mul v0 v7\n\
+         \x20 v9 = i64.const 2\n\
+         \x20 v10 = i64.add v8 v9\n\
+         \x20 return v10\n\
+         }\n",
+    );
+    let m = parse_module(&root).unwrap_or_else(|e| panic!("parse: {e:?}\n{root}"));
+    verify_module(&m).expect("verify");
+    // Σ over id in 0..16 of (3·id+1) + (7·id+2) = 10·(0+…+15) + 3·16 = 1200 + 48 = 1248.
+    let reps = if cfg!(windows) { 10 } else { 30 };
+    for _ in 0..reps {
+        match compile_and_run(&m, 0, &[]).expect("jit") {
+            JitOutcome::Returned(x) => assert_eq!(x, [1248], "steal-stress sum wrong"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // And the interpreter (its real M:N pool) agrees on the invariant.
+    let mut fuel = 100_000_000u64;
+    assert_eq!(run(&m, 0, &[], &mut fuel), Ok(vec![Value::I64(1248)]));
 }

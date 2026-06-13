@@ -398,3 +398,201 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
         "the interp↔JIT fiber differential compared only {compared}/{iters} programs"
     );
 }
+
+/// **Randomized-migration differential (the D57 3c empirical net, layer 1 — SCHEDULING.md
+/// "Verification story").** Generates programs in which fibers created (and part-run) on the root
+/// vCPU are suspended and resumed across a random sequence of *spawned* vCPUs — every worker is a
+/// fresh OS thread, so each generated "resume a fiber last suspended elsewhere" step drives the
+/// real `svm-fiber` stack switch **cross-thread** through the shared-table claim. The interpreter
+/// (safe Rust, the 3b-i migrating registry) is the oracle: results must match exactly.
+///
+/// Determinism by construction: workers run strictly sequentially (each `thread.spawn` is
+/// immediately `thread.join`ed), every fiber is resumed at most `suspends + 1` times (no faults),
+/// and all values are pure integer arithmetic — so one canonical execution order exists and any
+/// interp↔JIT divergence is a migration-seam bug, not scheduling noise. Migration coverage is
+/// **counted, not assumed**: the generator tallies resumes of a suspended fiber by a different
+/// executor than the one that suspended it, and the test asserts the corpus actually performed
+/// thousands of them.
+#[test]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn generated_migration_schedules_agree_on_interp_and_jit() {
+    use std::fmt::Write as _;
+    use svm_interp::{run, Value};
+    use svm_jit::{compile_and_run, JitOutcome};
+
+    /// One generated step: executor `exec` (0 = root, 1.. = worker) resumes fiber `fiber` with a
+    /// constant argument.
+    struct Step {
+        fiber: usize,
+        arg: i64,
+    }
+
+    /// Emit one resume step into a function body. `addr_base + 4*fiber` holds the fiber's handle
+    /// (the root stores each handle right after `cont.new`). Accumulates `1000*status + value`.
+    fn emit_step(src: &mut String, v: &mut u32, step: &Step, acc: u32) -> u32 {
+        let a = *v;
+        writeln!(src, "  v{a} = i64.const {}", 16 + 4 * step.fiber).unwrap();
+        writeln!(src, "  v{} = i32.load v{a}", a + 1).unwrap();
+        writeln!(src, "  v{} = i64.const {}", a + 2, step.arg).unwrap();
+        writeln!(
+            src,
+            "  v{}, v{} = cont.resume v{} v{}",
+            a + 3,
+            a + 4,
+            a + 1,
+            a + 2
+        )
+        .unwrap();
+        writeln!(src, "  v{} = i64.extend_i32_u v{}", a + 5, a + 3).unwrap();
+        writeln!(src, "  v{} = i64.const 1000", a + 6).unwrap();
+        writeln!(src, "  v{} = i64.mul v{} v{}", a + 7, a + 5, a + 6).unwrap();
+        writeln!(src, "  v{} = i64.add v{} v{}", a + 8, acc, a + 7).unwrap();
+        writeln!(src, "  v{} = i64.add v{} v{}", a + 9, a + 8, a + 4).unwrap();
+        *v += 10;
+        a + 9
+    }
+
+    let mut rng = Rng(0x3C3C_F1BE_5EED_77AA);
+    let iters: u64 = if cfg!(windows) { 80 } else { 250 };
+    let mut migrations = 0u64;
+    for _ in 0..iters {
+        let nf = 1 + rng.range(3); // fibers
+        let nw = 1 + rng.range(3); // sequential workers (each a fresh OS thread)
+        let suspends: Vec<usize> = (0..nf).map(|_| 1 + rng.range(3)).collect();
+        let mut budget: Vec<usize> = suspends.iter().map(|s| s + 1).collect();
+
+        // Phases alternate root, worker1, root, worker2, … root. Each phase takes 0..=2 random
+        // steps on fibers with remaining resume budget.
+        let nphases = 2 * nw + 1;
+        let mut phases: Vec<Vec<Step>> = Vec::new();
+        // Which executor last ran each fiber (suspended it), for the migration tally. `None` =
+        // never started (a first resume enters a fresh stack — not a saved-context migration).
+        let mut last_exec: Vec<Option<usize>> = vec![None; nf];
+        for p in 0..nphases {
+            let exec = if p % 2 == 0 { 0 } else { p.div_ceil(2) }; // 0 = root, else worker index
+            let mut steps = Vec::new();
+            for _ in 0..rng.range(3) {
+                let candidates: Vec<usize> = (0..nf).filter(|&f| budget[f] > 0).collect();
+                if candidates.is_empty() {
+                    break;
+                }
+                let fiber = candidates[rng.range(candidates.len())];
+                budget[fiber] -= 1;
+                if let Some(prev) = last_exec[fiber] {
+                    if prev != exec {
+                        migrations += 1; // resuming a stack suspended on a different executor
+                    }
+                }
+                last_exec[fiber] = Some(exec);
+                steps.push(Step {
+                    fiber,
+                    arg: (rng.next_u64() % 1000) as i64,
+                });
+            }
+            phases.push(steps);
+        }
+
+        // ---- Emit the module: func 0 = root, funcs 1..=nw = workers, then the fiber bodies.
+        let mut src = String::from("memory 16\n");
+        // Root: create the fibers (handle of fiber f stored at mem[16+4f]), then run its phases,
+        // spawning + joining each worker in between (strictly sequential).
+        src.push_str("func () -> (i64) {\nblock0():\n");
+        let mut v: u32 = 0;
+        for f in 0..nf {
+            writeln!(src, "  v{v} = ref.func {}", 1 + nw + f).unwrap();
+            writeln!(src, "  v{} = i64.const {}", v + 1, 4096 * (f + 1)).unwrap();
+            writeln!(src, "  v{} = cont.new v{v} v{}", v + 2, v + 1).unwrap();
+            writeln!(src, "  v{} = i64.const {}", v + 3, 16 + 4 * f).unwrap();
+            writeln!(src, "  i32.store v{} v{}", v + 3, v + 2).unwrap();
+            v += 4;
+        }
+        writeln!(src, "  v{v} = i64.const 0").unwrap(); // the root's accumulator
+        let mut acc = v;
+        v += 1;
+        for (p, steps) in phases.iter().enumerate() {
+            if p % 2 == 0 {
+                for s in steps {
+                    acc = emit_step(&mut src, &mut v, s, acc);
+                }
+            } else {
+                // Spawn worker p/2+1 (func index (p+1)/2), join it immediately, accumulate.
+                let w = p.div_ceil(2);
+                writeln!(src, "  v{v} = i64.const 0").unwrap();
+                writeln!(src, "  v{} = thread.spawn {} v{v} v{v}", v + 1, w).unwrap();
+                writeln!(src, "  v{} = thread.join v{}", v + 2, v + 1).unwrap();
+                writeln!(src, "  v{} = i64.add v{acc} v{}", v + 3, v + 2).unwrap();
+                acc = v + 3;
+                v += 4;
+            }
+        }
+        writeln!(src, "  return v{acc}").unwrap();
+        src.push_str("}\n");
+        // Workers: each runs its phase's steps and returns its accumulator.
+        for w in 1..=nw {
+            src.push_str("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
+            let mut v: u32 = 2;
+            writeln!(src, "  v{v} = i64.const 0").unwrap();
+            let mut acc = v;
+            v += 1;
+            for s in &phases[2 * w - 1] {
+                acc = emit_step(&mut src, &mut v, s, acc);
+            }
+            writeln!(src, "  return v{acc}").unwrap();
+            src.push_str("}\n");
+        }
+        // Fiber bodies: fiber f does `suspends[f]` suspends, mixing each delivered value in.
+        for s in &suspends {
+            src.push_str("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
+            let mut v: u32 = 2;
+            let mut acc = 1; // start from the first-resume arg
+            for _ in 0..*s {
+                writeln!(src, "  v{v} = i64.const {}", (rng.next_u64() % 97) as i64).unwrap();
+                writeln!(src, "  v{} = i64.add v{acc} v{v}", v + 1).unwrap();
+                writeln!(src, "  v{} = suspend v{}", v + 2, v + 1).unwrap();
+                writeln!(src, "  v{} = i64.const 3", v + 3).unwrap();
+                writeln!(src, "  v{} = i64.mul v{} v{}", v + 4, v + 2, v + 3).unwrap();
+                writeln!(src, "  v{} = i64.add v{} v{}", v + 5, v + 4, v + 1).unwrap();
+                acc = v + 5;
+                v += 6;
+            }
+            writeln!(src, "  return v{acc}").unwrap();
+            src.push_str("}\n");
+        }
+
+        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+        verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
+
+        // Interp (the migrating oracle) — deterministic, must complete.
+        let mut fuel = 10_000_000u64;
+        let interp = run(&m, 0, &[], &mut fuel).unwrap_or_else(|t| {
+            panic!("interp trapped on a by-construction-valid program: {t:?}\n{src}")
+        });
+        // JIT — the real cross-thread stack switches; must match exactly.
+        match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+            JitOutcome::Returned(slots) => {
+                let want: Vec<i64> = interp
+                    .iter()
+                    .map(|x| match x {
+                        Value::I64(x) => *x,
+                        other => panic!("unexpected result type {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    want, slots,
+                    "interp and JIT diverged on a migration schedule\n{src}"
+                );
+            }
+            other => panic!("interp returned {interp:?} but the JIT gave {other:?}\n{src}"),
+        }
+    }
+    // Coverage guard: the corpus must have actually exercised saved-stack cross-executor resumes
+    // (≈1.9 per program empirically; a quarter of that is a comfortable floor).
+    assert!(
+        migrations > iters / 2,
+        "migration corpus degenerated: only {migrations} cross-executor resumes in {iters} programs"
+    );
+}

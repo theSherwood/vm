@@ -122,6 +122,11 @@ mod switch_tests {
         unreachable!()
     }
 
+    // Not under ASan: with `detect_stack_use_after_return`, ASan may place the local's frame on
+    // its heap-side *fake stack*, so "the local's address lies inside the mmap'd fiber stack" is
+    // not a meaningful assertion there (this raw-primitive test also bypasses the annotated
+    // `Fiber` API on purpose). The switch itself is still exercised under ASan by every other test.
+    #[cfg(not(feature = "asan"))]
     #[test]
     fn runs_on_the_fiber_stack() {
         let stack = Stack::new(64 * 1024);

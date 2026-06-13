@@ -9,6 +9,12 @@ publish = false
 # The stack-switching substrate (§3d/§6/§12): guard-paged out-of-band control stacks plus the native
 # context switch that swaps them. This is the *only* place the JIT's green-thread `unsafe` lives —
 # mirroring how `svm-mem` isolates the memory `unsafe` — so it stays small and auditable.
+[features]
+# AddressSanitizer fiber-switch annotations (`__sanitizer_{start,finish}_switch_fiber`) around
+# every stack switch, so ASan-instrumented code can run on fiber stacks. Enabled by the dedicated
+# sanitizer job (nightly, -Zsanitizer=address); zero-cost otherwise.
+asan = []
+
 [dependencies]
 
 [target.'cfg(unix)'.dependencies]

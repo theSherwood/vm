@@ -15,6 +15,54 @@ use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::abort;
 
+/// AddressSanitizer **fiber-switch annotations** (`feature = "asan"`). ASan tracks each thread's
+/// current stack (shadow + fake-stack bookkeeping), so every manual stack switch must be bracketed:
+/// `__sanitizer_start_switch_fiber` on the *outgoing* stack right before the jump, and
+/// `__sanitizer_finish_switch_fiber` on the *incoming* stack right after arrival — otherwise
+/// ASan-instrumented code running on a fiber stack crashes or misreports. This is what makes the
+/// migratable-fiber empirical net's sanitizer layer (SCHEDULING.md) actually runnable: with the
+/// feature on, the whole fiber suite runs under ASan, fiber stacks included. Zero-cost otherwise.
+#[cfg(feature = "asan")]
+mod asan {
+    use core::ffi::c_void;
+    extern "C" {
+        /// Save the current (outgoing) context's fake stack into `*fake_stack_save` and announce
+        /// the stack we are about to switch to. A null `fake_stack_save` means the outgoing
+        /// context is **dying** — ASan releases its fake stack.
+        pub fn __sanitizer_start_switch_fiber(
+            fake_stack_save: *mut *mut c_void,
+            bottom: *const c_void,
+            size: usize,
+        );
+        /// Restore this (incoming) context's fake stack (`null` on first entry) and report the
+        /// bounds of the stack the switch came *from* through the out-params (may be null).
+        pub fn __sanitizer_finish_switch_fiber(
+            fake_stack: *mut c_void,
+            bottom_old: *mut *const c_void,
+            size_old: *mut usize,
+        );
+    }
+}
+
+/// Per-fiber ASan bookkeeping (`feature = "asan"`): each side's saved fake-stack pointer plus the
+/// bounds of whatever stack last switched *into* the fiber — re-captured on every switch-in, since
+/// the resumer may be a **different OS thread** each time (the D57 3c migration case).
+#[cfg(feature = "asan")]
+struct AsanState {
+    /// The resumer's fake stack, saved while the fiber runs (written by `resume`'s start, restored
+    /// by its finish when control returns).
+    resumer_fake: Cell<*mut core::ffi::c_void>,
+    /// The fiber's fake stack, saved while it is suspended.
+    fiber_fake: Cell<*mut core::ffi::c_void>,
+    /// Bounds of the stack the last switch-in came from (the current resumer's stack), captured by
+    /// the fiber side's `finish` and used when suspending back out.
+    from_bottom: Cell<*const core::ffi::c_void>,
+    from_size: Cell<usize>,
+    /// The fiber's own usable stack bounds (constant for its lifetime).
+    stack_bottom: *const core::ffi::c_void,
+    stack_size: usize,
+}
+
 /// The outcome of a [`Fiber::resume`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
@@ -40,6 +88,9 @@ struct Control {
     closure: Cell<*mut ()>,
     /// Monomorphized dropper for `closure`, used only if the fiber is dropped before it ever ran.
     drop_closure: unsafe fn(*mut ()),
+    /// ASan fiber-switch bookkeeping (see [`AsanState`]).
+    #[cfg(feature = "asan")]
+    asan: AsanState,
 }
 
 /// Handed to a fiber body so it can suspend back to whoever resumed it.
@@ -56,8 +107,30 @@ impl Yielder {
         // access.
         let c = unsafe { &*self.control };
         c.value.set(val);
+        // ASan: leaving the fiber stack for the resumer's stack (whose bounds were captured at our
+        // last switch-in).
+        #[cfg(feature = "asan")]
+        // SAFETY: bracketing the jump below per the sanitizer fiber-annotation contract.
+        unsafe {
+            asan::__sanitizer_start_switch_fiber(
+                c.asan.fiber_fake.as_ptr(),
+                c.asan.from_bottom.get(),
+                c.asan.from_size.get(),
+            );
+        }
         // SAFETY: `resumer` is the live context that switched into us.
         let t = unsafe { jump(c.resumer.get(), 0) };
+        // Back on the fiber stack — possibly resumed from a *different thread/stack* than the one
+        // we suspended toward (migration), so re-capture where this resume came from.
+        #[cfg(feature = "asan")]
+        // SAFETY: the arrival half of the bracketing above.
+        unsafe {
+            asan::__sanitizer_finish_switch_fiber(
+                c.asan.fiber_fake.get(),
+                c.asan.from_bottom.as_ptr(),
+                c.asan.from_size.as_ptr(),
+            );
+        }
         c.resumer.set(t.fctx); // the resumer may be a different context next time
         c.value.get()
     }
@@ -92,6 +165,17 @@ where
     let control = t.data as *const Control;
     // SAFETY: `control` was just handed to us by `resume`; the resumer is parked.
     let c = unsafe { &*control };
+    // ASan: first arrival on this fiber's stack (no fake stack to restore yet); capture the
+    // resumer's stack bounds for the eventual suspend/exit back out.
+    #[cfg(feature = "asan")]
+    // SAFETY: the arrival half of `resume`'s start_switch bracketing.
+    unsafe {
+        asan::__sanitizer_finish_switch_fiber(
+            core::ptr::null_mut(),
+            c.asan.from_bottom.as_ptr(),
+            c.asan.from_size.as_ptr(),
+        );
+    }
     c.resumer.set(t.fctx);
     c.taken.set(true);
     // SAFETY: `closure` is a `Box<F>` for this exact `F` (set in `Fiber::new`).
@@ -107,6 +191,16 @@ where
 
     c.value.set(result);
     c.done.set(true);
+    // ASan: this context is dying — a null save slot tells ASan to release its fake stack.
+    #[cfg(feature = "asan")]
+    // SAFETY: bracketing the final jump; the matching finish runs in `resume`.
+    unsafe {
+        asan::__sanitizer_start_switch_fiber(
+            core::ptr::null_mut(),
+            c.asan.from_bottom.get(),
+            c.asan.from_size.get(),
+        );
+    }
     // SAFETY: final switch back to the resumer; this context is never resumed again.
     unsafe { jump(c.resumer.get(), 0) };
     unreachable!("fiber resumed after completion")
@@ -120,6 +214,8 @@ impl Fiber {
         F: FnOnce(&Yielder, u64) -> u64 + 'static,
     {
         let stack = Stack::new(stack_size);
+        #[cfg(feature = "asan")]
+        let (asan_bottom, asan_size) = stack.usable();
         let control = Box::new(Control {
             value: Cell::new(0),
             resumer: Cell::new(std::ptr::null_mut()),
@@ -127,6 +223,15 @@ impl Fiber {
             taken: Cell::new(false),
             closure: Cell::new(Box::into_raw(Box::new(f)) as *mut ()),
             drop_closure: drop_closure_impl::<F>,
+            #[cfg(feature = "asan")]
+            asan: AsanState {
+                resumer_fake: Cell::new(std::ptr::null_mut()),
+                fiber_fake: Cell::new(std::ptr::null_mut()),
+                from_bottom: Cell::new(std::ptr::null()),
+                from_size: Cell::new(0),
+                stack_bottom: asan_bottom as *const core::ffi::c_void,
+                stack_size: asan_size,
+            },
         });
         // SAFETY: fresh, live stack; `fiber_entry::<F>` matches the boxed closure's type.
         let ctx = unsafe { make(&stack, fiber_entry::<F>) };
@@ -151,8 +256,28 @@ impl Fiber {
         assert!(!self.done, "resumed a finished fiber");
         self.control.value.set(val);
         let cptr = &*self.control as *const Control as u64;
+        // ASan: leaving this (the resumer's) stack for the fiber's stack.
+        #[cfg(feature = "asan")]
+        // SAFETY: bracketing the jump below per the sanitizer fiber-annotation contract.
+        unsafe {
+            asan::__sanitizer_start_switch_fiber(
+                self.control.asan.resumer_fake.as_ptr(),
+                self.control.asan.stack_bottom,
+                self.control.asan.stack_size,
+            );
+        }
         // SAFETY: `ctx` is the fiber's live suspended context (fresh from `make`, or refreshed below).
         let t = unsafe { jump(self.ctx, cptr) };
+        // Control returned to this stack (the fiber suspended or completed): restore our fake stack.
+        #[cfg(feature = "asan")]
+        // SAFETY: the arrival half of the bracketing above.
+        unsafe {
+            asan::__sanitizer_finish_switch_fiber(
+                self.control.asan.resumer_fake.get(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+        }
         self.ctx = t.fctx; // the fiber's new suspended context
         if self.control.done.get() {
             self.done = true;

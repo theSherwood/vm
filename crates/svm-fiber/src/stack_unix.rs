@@ -51,6 +51,15 @@ impl Stack {
         unsafe { self.base.add(self.len) }
     }
 
+    /// The usable region's low address + size (above the guard page) — the stack bounds handed to
+    /// AddressSanitizer's fiber-switch annotations (`feature = "asan"`).
+    #[cfg(feature = "asan")]
+    pub fn usable(&self) -> (*const u8, usize) {
+        // SAFETY: arithmetic within the allocation; not dereferenced.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        (unsafe { self.base.add(page) as *const u8 }, self.len - page)
+    }
+
     /// The usable address range `[low, high)` (above the guard page), for tests/asserts that a fiber
     /// is really running on this stack.
     #[cfg(test)]

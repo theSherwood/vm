@@ -1445,8 +1445,8 @@ regressions one commit old"):
 >   (SCHEDULING §6; single-vCPU admits unchanged, pinned by `quota.rs` + the new cross-vCPU pin).
 >   Tests: **`svm/tests/fiber_migrate.rs`** (mid-life migration across vCPUs on real pool + seeded +
 >   exhaustive, racing resumes ⇒ one winner, foreign-claim control, per-run quota). Docs updated:
->   SCHEDULING.md §4/§8 (3b-i ✅), DESIGN §3a (divergence resolved). **3b-ii landed the same day —
->   see the strikethrough block below for its record; NEXT = 3c.**
+>   SCHEDULING.md §4/§8 (3b-i ✅), DESIGN §3a (divergence resolved). **3b-ii and 3c landed the same
+>   day — see the strikethrough blocks below for their records; NEXT = Demo 3.**
 >
 > **Done + committed (earlier sessions, all CI-green):**
 > - **Verified ownership core** — `crates/svm-jit/src/fiber_registry.rs`: the single-owner atomic
@@ -1491,18 +1491,42 @@ regressions one commit old"):
 > interp explorer a fiber-return DPOR access (a `Return` that `finish`es a slot must conflict with
 > `cont.new` once slots recycle); `finish` already maintains the generation under the hood.
 >
-> **NEXT SLICE = 3c — the cross-thread asm resume (the empirical-net-gated seam).** Allow a worker
-> to resume a fiber whose native stack another worker created: flip `pin` → `suspend_to_pool` and
-> the foreign-owner fault → `try_steal` in `fiber_rt.rs` (the storage + arbiter are already in
-> place). **No new assembly** — the same `svm-fiber` switch, called from a different thread (unix
-> has no thread-bound state in it; Win64 already swaps the TEB stack fields per switch). Safety
-> rests on the **empirical net** (SCHEDULING.md "Verification story" — a stated decision, no expert
-> reviewer available): (1) extend `fiber_fuzz` to a randomized-migration differential vs the interp
-> oracle (3b-i made interp migration the reference; the divergence pin above becomes the first
-> differential), (2) the runtime single-owner assert (the `Ownership` CAS already provides it),
-> (3) ASan job on the Rust glue, (4) guard-page detection (already armed), (5) soak with counted
-> cross-thread resumes (asserted, not assumed). Then **Demo 3** (`mn_sched` re-pointed at a shared
-> steal pool, differential interp≡JIT). Staging table in SCHEDULING.md §8.
+> ~~**NEXT SLICE = 3c — the cross-thread asm resume.**~~ **DONE** (same session as 3b-i/3b-ii):
+> **fibers are migratable on both backends.** The JIT's `cont.resume` claims any resumable fiber via
+> the new loom-verified `Ownership::claim` (fresh `OWNED` or pooled `RUNNABLE` → `RUNNING`; the
+> acquire pairs with `suspend_to_pool`'s release so a saved stack is fully visible cross-thread); a
+> voluntary suspend publishes back to the pool; per-thread state is **re-read after every switch-in**
+> (the fiber body closure + `fiber_suspend` re-read `CURRENT_RT` post-switch — two latent landmines
+> for migration, defused). The switch asm is untouched (verified thread-agnostic: SysV/AAPCS64 save
+> only callee-saved regs, no TLS/x18; MS-x64 swaps TEB stack fields per switch). **The empirical net
+> (SCHEDULING.md "Verification story") is fully delivered:** (1) the randomized-migration interp↔JIT
+> differential (`fiber_fuzz::generated_migration_schedules_agree_on_interp_and_jit`, cross-executor
+> saved-stack resumes counted + asserted); (2) **ASan now actually runs on fiber stacks** — svm-fiber
+> gained real `__sanitizer_{start,finish}_switch_fiber` annotations behind a new `asan` cargo feature
+> (chained `svm/asan → svm-jit/asan → svm-fiber/asan`); run with
+> `RUSTFLAGS=-Zsanitizer=address cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
+> -p svm --features asan --test jit_fibers --test jit_threads --test fiber_fuzz` — whole fiber net
+> clean (NB: a plain `--features asan` build without the sanitizer flag link-fails by design; never
+> enable it outside the sanitizer invocation); (3) the runtime **single-owner assert** at the resume
+> seam (`FiberSlot::running_on` — a double-claim aborts loudly); (4) guard-paged stacks +
+> per-thread detect-and-kill recovery (a fault in a migrated fiber unwinds the resuming thread's
+> guard); (5) **concurrent-steal stress** (`jit_threads::concurrent_fiber_steal_stress`: 16 fibers ×
+> 2 rounds × 4 racing workers — every second resume a guaranteed cross-thread migration —
+> schedule-invariant sum, 30 reps + interp differential). The 3b-ii staged-divergence pin flipped
+> into the migration differential (`fiber_suspended_on_root_migrates_to_spawned_vcpu`, both backends
+> = 75). D57 is **Adopted** in DESIGN.md; honest residual unchanged: fuzzing detects, not proves.
+>
+> **NEXT SLICE = Demo 3 — guest stackful work-stealing (SCHEDULING.md §8 step 5, the capstone).**
+> Re-point `demos/mn_sched` (the sharded guest M:N scheduler) at a **shared steal pool**: tasks are
+> *fibers* in guest memory (handles in a shared deque/queue), workers steal with guest atomics and
+> `cont.resume` whatever they claim — stackful work-stealing entirely as guest policy over the new
+> primitive, run differentially (interp `run` ≡ JIT, schedule-invariant total), ideally also as a C
+> demo via the existing `<pthread.h>`/builtins surface (cf. `demos/work_stealing` for the stackless
+> twin). Mind the guest-level race: a worker must not resume a handle another worker just won — lost
+> claims trap, so gate resumes behind the deque's exclusivity like the steal-stress test does.
+> **Also open (smaller):** slot recycling + generation-carrying handles on both backends (needs the
+> interp explorer's fiber-return DPOR access first); a maintainer-applied **nightly ASan CI job**
+> for the fiber net (workflow-scope token; command above). Staging table in SCHEDULING.md §8.
 >
 > ---
 >
@@ -1704,10 +1728,11 @@ regressions one commit old"):
 >    `libLLVM.so` confirmed present in the dev container.)
 > 2. **Migratable-fiber primitive (D57)** — **IN PROGRESS → see the "ACTIVE FRONTIER" block at the top
 >    of this section.** The ownership protocol is loom-verified, the integration design + empirical
->    safety net are written, the fiber stack-switch asm is differential-fuzzed, and **3b-i + 3b-ii
->    are DONE** — the interp migrates (the oracle), the JIT has the shared table + live `Ownership`
->    arbiter with affinity preserved; the next slice is 3c (the cross-thread asm resume).
->    Re-accepts D56's cross-thread-migration unsafe
+>    safety net are written, and **the primitive is DONE (3a–3c)** — fibers migrate on both
+>    backends through the loom-verified claim + the delivered empirical net (randomized-migration
+>    differential, ASan with real fiber-switch annotations, single-owner assert, steal stress);
+>    the next slice is Demo 3 (guest stackful work-stealing over it).
+>    Re-accepted D56's cross-thread-migration unsafe
 >    as a *primitive* (guest owns the stealing policy; VM enforces single-owner); the expert-review gate
 >    is replaced by the empirical net (no reviewer available — SCHEDULING.md "Verification story").
 > 3. **Smaller open items:** honor *weak* memory orderings (§12; both backends seq-cst today); the

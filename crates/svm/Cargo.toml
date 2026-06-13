@@ -8,6 +8,10 @@ publish = false
 
 # Intentionally dependency-free (no criterion etc.) to keep build times low and the
 # TCB auditable. The benchmark harness uses only std (src/bin/bench.rs).
+[features]
+# Passthrough to svm-fiber's ASan fiber-switch annotations (the sanitizer job).
+asan = ["svm-jit/asan"]
+
 [dependencies]
 svm-ir.workspace = true
 svm-text.workspace = true

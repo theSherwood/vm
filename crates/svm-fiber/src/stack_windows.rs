@@ -48,6 +48,14 @@ impl Stack {
         }
     }
 
+    /// The usable region's low address + size (above the guard page) — the stack bounds handed to
+    /// AddressSanitizer's fiber-switch annotations (`feature = "asan"`).
+    #[cfg(feature = "asan")]
+    pub fn usable(&self) -> (*const u8, usize) {
+        // SAFETY: within the reservation; not dereferenced.
+        (unsafe { self.base.add(PAGE) as *const u8 }, self.len - PAGE)
+    }
+
     /// The top of the stack (highest address, exclusive) — pass to `make`; also TEB `StackBase`.
     pub fn top(&self) -> *mut u8 {
         // SAFETY: one-past-the-end of our own reservation.
