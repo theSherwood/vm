@@ -14,10 +14,12 @@
 //! This module is that property, isolated. It is **pure atomics — it touches no real stack** — so it
 //! is fully `loom`-model-checkable, exactly as the `wait`/`notify` futex core is. Per SCHEDULING.md's
 //! "earn the risk with verification, not assume it" mandate and the demo roadmap (#3), the protocol
-//! is proven here first; the runtime integration (a shared registry replacing the per-thread tables)
-//! and the cross-thread asm resume (the `svm-fiber` switch, which barely changes — design sketch #3)
-//! are the *next*, review-gated slices that build on this proof. Nothing in this module is wired into
-//! the live runtime yet, hence `#[allow(dead_code)]`.
+//! was proven here first; it is now **wired into the live runtime** (D57 3b-ii): each slot of the
+//! domain-shared `fiber_rt::SharedFiberTable` carries one [`Ownership`] word — `cont.resume` claims
+//! via [`Ownership::begin_owned`], a voluntary suspend re-parks via [`Ownership::pin`] (thread-affine
+//! in this slice), and a return [`Ownership::finish`]es the slot. The remaining methods
+//! ([`Ownership::suspend_to_pool`]/[`Ownership::try_steal`]/[`Ownership::recycle_owned`]) are the
+//! cross-thread-migration step (3c) and slot recycling, still staged.
 //!
 //! ## States (low 2 bits of an `AtomicU64`)
 //! - `OWNED` — owned by one worker, **not** running and **not** in the steal pool: a just-created
@@ -52,6 +54,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Owned by one worker; not running, not stealable (just-created, or pinned/fault-suspended).
 const OWNED: u64 = 0;
 /// Voluntarily suspended in the shared steal pool; ownerless — the only stealable state.
+#[allow(dead_code)] // staged for 3c: `pin` keeps suspended fibers OWNED until migration lands
 const RUNNABLE: u64 = 1;
 /// A worker is executing this fiber's native stack — never stealable.
 const RUNNING: u64 = 2;
@@ -79,12 +82,10 @@ fn gen_of(word: u64) -> u64 {
 /// the only synchronization a steal needs (pool membership *is* `state == RUNNABLE`, so the
 /// load-bearing race is this single CAS, not the pool container — a Chase-Lev deque or a mutex'd vec
 /// is an orthogonal, non-unsafe choice layered on top).
-#[allow(dead_code)] // staged: verified in isolation here; runtime integration is the next slice
 pub(crate) struct Ownership {
     word: AtomicU64,
 }
 
-#[allow(dead_code)] // staged: see the module header
 impl Ownership {
     /// A freshly created fiber, **owned by its creator** and not yet in the steal pool (generation 0).
     pub(crate) fn new_owned() -> Ownership {
@@ -116,6 +117,7 @@ impl Ownership {
     /// generation), a **release** store so a stealer's acquiring claim sees the complete saved
     /// context. Returns the slot's current **generation**, which the caller records alongside the
     /// slot index when it pushes the fiber onto the steal deque — a later `try_steal` must present it.
+    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
     pub(crate) fn suspend_to_pool(&self) -> u64 {
         let w = self.word.load(Ordering::Relaxed);
         debug_assert_eq!(state_of(w), RUNNING);
@@ -130,6 +132,7 @@ impl Ownership {
     /// slot) if the slot was already stolen, is running/pinned, or — the ABA guard — was **finished
     /// and reused** since the caller recorded it (its generation has advanced). **Acquire** on
     /// success: the winner synchronizes-with the suspending thread and observes the published context.
+    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
     pub(crate) fn try_steal(&self, generation: u64) -> bool {
         self.word
             .compare_exchange(
@@ -163,6 +166,7 @@ impl Ownership {
 
     /// Reuse a `FREE` slot for a **new** fiber: `FREE → OWNED`, keeping the (already-bumped)
     /// generation so stale stealers of the *previous* occupant remain locked out (the ABA guard).
+    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
     pub(crate) fn recycle_owned(&self) {
         let w = self.word.load(Ordering::Relaxed);
         debug_assert_eq!(state_of(w), FREE);
@@ -170,11 +174,13 @@ impl Ownership {
     }
 
     /// The current generation (relaxed) — for observability / assertions.
+    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
     pub(crate) fn generation(&self) -> u64 {
         gen_of(self.word.load(Ordering::Relaxed))
     }
 
     /// The current state, one of `OWNED`/`RUNNABLE`/`RUNNING`/`FREE` (relaxed) — for assertions.
+    #[allow(dead_code)] // staged for 3c (migration) / recycling — loom-verified, not yet wired
     pub(crate) fn state(&self) -> u64 {
         state_of(self.word.load(Ordering::Relaxed))
     }

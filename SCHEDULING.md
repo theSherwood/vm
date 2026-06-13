@@ -53,12 +53,14 @@ offers both substrates and the guest picks.
 
 ## Why JIT fibers are thread-affine today (the interp no longer is)
 
-Each JIT OS-thread vCPU builds its **own** `FiberRuntime` (`CURRENT_RT`
-thread-local + a per-runtime `fibers` table). A fiber handle indexes the
-*creating* thread's table, so a fiber can only be resumed on the worker that
-created it. This is deliberate and good: zero locking on the fiber table, cache
-locality — the thread-per-core architecture chosen on purpose by glommio/seastar,
-not merely "the easy option."
+JIT fiber **storage** is domain-shared now (step 3b-ii: `fiber_rt::SharedFiberTable`,
+one handle namespace + quota for root and every spawned vCPU), but **execution is
+still thread-affine**: each slot records its creating vCPU's `owner` token and a
+foreign vCPU's resume is a clean `FiberFault`. Affinity is deliberate and good as a
+default: no cross-thread stack resumption, cache locality — the thread-per-core
+architecture chosen on purpose by glommio/seastar, not merely "the easy option."
+Step 3c relaxes exactly this check (`try_steal` on pooled fibers) to make fibers
+migratable.
 
 **The interpreter crossed over (step 3b-i, done):** its per-`VCpu` `fibers: Vec`
 is now the run-shared `FiberRegistry` (`svm-interp`), so any vCPU can claim and
@@ -294,10 +296,23 @@ and the per-run quota pin).
 
 ### 5. JIT integration (steps 3b-ii, 3c) — the review-gated seam
 
-- **3b-ii (no behavior change, regression net):** lift the JIT `FiberRuntime`'s
-  `fibers: Vec<Option<Box<Fiber>>>` into the shared registry but **keep affinity** (a vCPU
-  resumes only fibers it owns). Existing fiber tests must stay green — the safety net for the
-  storage refactor.
+- **3b-ii (storage refactor, affinity preserved) — ✅ DONE.** The per-thread
+  `fibers: Vec<Option<Box<Fiber>>>` is now **`fiber_rt::SharedFiberTable`** — one slot table per
+  domain (root + spawned vCPUs), each slot carrying the loom-verified [`Ownership`] word *live*:
+  `cont.resume` claims via `begin_owned` (a re-entrant/racing/finished claim **loses and
+  faults**, replacing the old per-thread `chain` check), a voluntary suspend re-parks via `pin`
+  (thread-affine — deliberately *not* `suspend_to_pool` yet), and a return `finish`es the slot
+  (generation bumped under the hood; the box is dropped, unmapping its stack). **Affinity is the
+  slot's `owner` token:** a foreign vCPU's resume is a clean `FiberFault` — pinned, alongside the
+  interp's migrating semantics, by `jit_threads::foreign_vcpu_resume_faults_on_jit_until_3c`
+  (the test 3c flips into a differential). What this aligned with the interp registry: the
+  **domain-wide handle namespace** incl. multi-vCPU (`fiber_namespace_is_domain_wide`), the
+  **per-domain §15 fiber quota** (`jit_quota::jit_fiber_quota_spans_vcpus`), and forged-handle
+  masking over one table shape. The fiber's body closure now reads `CURRENT_RT` dynamically
+  (not captured) so its yielder pairing targets whichever thread resumes it — behavior-neutral
+  under affinity, the 3c prep. Slot recycling + generation-carrying handles stay deferred to a
+  later slice on both backends together (the interp explorer needs a fiber-return DPOR access
+  first; `finish` already maintains the generation).
 - **3c (the asm seam — EXPERT REVIEW REQUIRED):** allow a worker to resume a fiber whose
   native stack another worker created. SCHEDULING.md design sketch #3 holds: the `svm-fiber`
   switch is the same instruction sequence; **unix has no thread-bound state in it**, and
@@ -338,8 +353,9 @@ and the per-run quota pin).
 1. **3a — ownership protocol (loom-verified).** ✅ Done.
 2. **3b-i — interp shared registry + cross-vCPU resume.** ✅ Done (see §4 above): safe-Rust
    registry, unified handle namespace, racing-resume arbiter, explorer/DPOR integration.
-3. **3b-ii — JIT shared registry, affinity preserved.** Storage refactor under the existing
-   test net (no new capability, no asm change). Adopt the slot/generation policy here (incl.
-   recycling) on **both** backends together, and align multi-vCPU forged-handle masking.
+3. **3b-ii — JIT shared registry, affinity preserved.** ✅ Done (see §5 above): domain-shared
+   `SharedFiberTable` with the `Ownership` word live, unified multi-vCPU namespace + per-domain
+   quota + masking; slot *recycling*/generation-carrying handles deferred (needs the interp
+   explorer's fiber-return DPOR access; the generation already ticks under the hood).
 4. **3c — JIT cross-thread asm resume.** The review-gated seam; differential + stress.
 5. **Demo 3 — guest stackful work-stealing**, differential interp ≡ JIT.

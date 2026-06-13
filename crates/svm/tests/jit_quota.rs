@@ -192,3 +192,60 @@ fn jit_vcpu_quota_spawn_join_loop_is_concurrent() {
         other => panic!("spawn-join loop must not trip a concurrent quota, got {other:?}"),
     }
 }
+
+/// **The fiber quota is per-domain on the JIT too (D57 3b-ii)** — the shared fiber table carries
+/// one `max_fibers` budget for root + every spawned vCPU, matching the interpreter's run-shared
+/// registry (`fiber_migrate::fiber_quota_spans_vcpus`). With `max_fibers = 2` (root + one
+/// creation), the root's `cont.new` fills the domain budget, so a *spawned vCPU's* `cont.new`
+/// trips it — under the old per-vCPU tables the child's fresh table would have admitted it. One
+/// more slot admits it, and the child's handle (1) continues the domain's numbering.
+const FIBER_QUOTA_SPANS: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 2
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = thread.spawn 1 v1 v1
+  v4 = thread.join v3
+  return v4
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v0 = ref.func 2
+  v1 = cont.new v0 varg
+  v2 = i64.extend_i32_u v1
+  return v2
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  return varg
+}
+"#;
+
+#[test]
+fn jit_fiber_quota_spans_vcpus() {
+    match run(
+        FIBER_QUOTA_SPANS,
+        Quota {
+            max_fibers: 2,
+            max_vcpus: 1 << 16,
+        },
+    ) {
+        JitOutcome::Trapped(TrapKind::FiberFault) => {}
+        other => {
+            panic!("the child's cont.new must trip the domain-wide fiber quota, got {other:?}")
+        }
+    }
+    match run(
+        FIBER_QUOTA_SPANS,
+        Quota {
+            max_fibers: 3,
+            max_vcpus: 1 << 16,
+        },
+    ) {
+        JitOutcome::Returned(v) => {
+            assert_eq!(v[0], 1, "the child's handle continues the domain numbering")
+        }
+        other => panic!("one more slot must admit the child's cont.new, got {other:?}"),
+    }
+}

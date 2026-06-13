@@ -23,7 +23,7 @@
 //! single host interrupt stops the entire multithreaded domain, not just its busy threads, and
 //! `join_all` never hangs on a vCPU that would otherwise wait forever.
 
-use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime};
+use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime, SharedFiberTable};
 use crate::{mem, FnEntry, TrapKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -96,8 +96,9 @@ struct Env {
     fault_lo: usize,
     fault_hi: usize,
     /// `(fiber_type_id, fn_table_mask)` when the module mixes fibers + threads — each vCPU then gets
-    /// its own `FiberRuntime` for `cont.*`. `None` for pure-thread modules.
-    fiber_cfg: Option<(u32, u64, usize)>,
+    /// its own `FiberRuntime` (execution context over the domain-shared [`SharedFiberTable`], held
+    /// by the `Domain`) for `cont.*`. `None` for pure-thread modules.
+    fiber_cfg: Option<(u32, u64)>,
     /// Address of the §5 kill-path interrupt cell (an `AtomicU64`), or `0` when no kill-path is
     /// armed. *Spinning* vCPUs already poll it (it is baked into the same compiled code every vCPU
     /// runs); this lets a **parked** vCPU — blocked in a futex `wait` or `thread.join` — re-check it
@@ -123,6 +124,11 @@ struct Done {
 /// call-trampoline-bearing [`Env`] afterwards.
 pub(crate) struct Domain {
     env: Mutex<Option<Env>>,
+    /// The **domain-shared fiber table** (D57 3b-ii) every spawned vCPU's `FiberRuntime` is built
+    /// over — one handle namespace + one §15 fiber quota for the whole domain (the root vCPU's
+    /// runtime shares the same `Arc`, held by the `CompiledModule`). `None` for fiber-free modules.
+    /// `std::sync::Arc`/`Mutex<Option<…>>` like `env` (set once on the setup thread, read at spawns).
+    fiber_table: Mutex<Option<std::sync::Arc<SharedFiberTable>>>,
     threads: Mutex<Threads>,
     futex: Mutex<HashMap<u64, FutexEntry>>,
     futex_cv: Condvar,
@@ -161,6 +167,7 @@ impl Domain {
     pub(crate) fn new(max_vcpus: usize) -> Domain {
         Domain {
             env: Mutex::new(None),
+            fiber_table: Mutex::new(None),
             // `live` starts at 1: the root vCPU (the main thread running the entry) counts toward the
             // §15 quota, like the interpreter's `s.live`.
             threads: Mutex::new(Threads {
@@ -183,7 +190,8 @@ impl Domain {
         trap_out: *mut i64,
         call_tramp: FiberCallTramp,
         fault: (usize, usize),
-        fiber_cfg: Option<(u32, u64, usize)>,
+        fiber_cfg: Option<(u32, u64)>,
+        fiber_table: Option<std::sync::Arc<SharedFiberTable>>,
         epoch_addr: usize,
     ) {
         *lock(&self.env) = Some(Env {
@@ -196,6 +204,12 @@ impl Domain {
             fiber_cfg,
             epoch_addr,
         });
+        *lock(&self.fiber_table) = fiber_table;
+    }
+
+    /// The domain-shared fiber table (for a spawned vCPU to build its `FiberRuntime` over).
+    fn fiber_table(&self) -> Option<std::sync::Arc<SharedFiberTable>> {
+        lock(&self.fiber_table).clone()
     }
 
     fn env(&self) -> Env {
@@ -282,9 +296,14 @@ fn run_child(a: SpawnArgs) {
     // Arm this OS thread's detect-and-kill recovery (idempotent; handler is process-wide, recovery is
     // thread-local — §5 / `mem::install_guard`).
     mem::install_guard();
-    // A vCPU that uses `cont.*` gets its own fiber runtime, published for the duration of its run.
-    let mut frt = env.fiber_cfg.map(|(tid, mask, max_fibers)| {
-        let mut rt = FiberRuntime::new(tid, mask, max_fibers);
+    // A vCPU that uses `cont.*` gets its own fiber *execution context* over the **domain-shared**
+    // fiber table (D57 3b-ii: one handle namespace + quota; the table outlives every vCPU — it is
+    // held by the `CompiledModule` and the `Domain`, both joined-after). SAFETY: `a.dom` is the
+    // run's live `Domain` (joined at run end).
+    let mut frt = env.fiber_cfg.map(|(tid, mask)| {
+        let table = unsafe { (*a.dom).fiber_table() }
+            .expect("fiber_cfg set ⇒ the domain fiber table is set");
+        let mut rt = FiberRuntime::new(table, tid, mask);
         rt.set_call_tramp(env.call_tramp);
         Box::new(rt)
     });

@@ -318,9 +318,13 @@ index.** The split is defined by what a forged value can do:
     unified the namespace — the interp registry, like the JIT, holds only `cont.new`-created
     fibers, so handles are `0, 1, …` on **both** backends, the fiber fuzzer lets handle values
     flow into compared output, and `jit_fibers::fiber_handle_values_match_across_backends`
-    pins the absolute numbering. (Residual, until the JIT shared registry of 3b-ii: in a
-    *multi-vCPU* run the JIT's tables are still per-thread, so forged-handle masking can
-    differ there; single-vCPU programs — all current differential surfaces — agree exactly.)
+    pins the absolute numbering. The 3b-ii **JIT shared table** (`fiber_rt::SharedFiberTable`)
+    extended the unification to *multi-vCPU* runs: handles allocate from one domain-wide
+    namespace and forged handles mask over the same table shape on both backends
+    (`jit_threads::fiber_namespace_is_domain_wide`). One *intentional, staged* divergence
+    remains until 3c: a **foreign vCPU's resume** migrates the fiber on the interp but faults
+    (`FiberFault`, thread-affinity) on the JIT — pinned, both semantics, by
+    `jit_threads::foreign_vcpu_resume_faults_on_jit_until_3c`.
 - **Pointers** are a CHERI-ready-but-erasable refinement of `i64` (§10): off-CHERI
   a no-op; the type exists for the JIT's masking and a future CHERI *host* backend.
 

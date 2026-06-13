@@ -1445,8 +1445,8 @@ regressions one commit old"):
 >   (SCHEDULING §6; single-vCPU admits unchanged, pinned by `quota.rs` + the new cross-vCPU pin).
 >   Tests: **`svm/tests/fiber_migrate.rs`** (mid-life migration across vCPUs on real pool + seeded +
 >   exhaustive, racing resumes ⇒ one winner, foreign-claim control, per-run quota). Docs updated:
->   SCHEDULING.md §4/§8 (3b-i ✅), DESIGN §3a (divergence resolved; multi-vCPU forged-handle masking
->   residual until 3b-ii). **NEXT = 3b-ii** (JIT shared registry, affinity preserved — see below).
+>   SCHEDULING.md §4/§8 (3b-i ✅), DESIGN §3a (divergence resolved). **3b-ii landed the same day —
+>   see the strikethrough block below for its record; NEXT = 3c.**
 >
 > **Done + committed (earlier sessions, all CI-green):**
 > - **Verified ownership core** — `crates/svm-jit/src/fiber_registry.rs`: the single-owner atomic
@@ -1472,23 +1472,37 @@ regressions one commit old"):
 >   backends the same `(slot, generation)`) — *not* a standalone pre-change (it touches
 >   `resolve_fiber`/`chain`/`live_frames`, the exact code 3b-i restructures).
 >
-> ~~**NEXT SLICE = 3b-i — interp shared registry + cross-vCPU resume.**~~ **DONE** (see the latest
-> session's record above; the explorer-crux landed as predicted — fiber ops became visible
-> `MemAccess::Fiber` decision points and the spin fingerprint dropped the shared table, validated
-> against the brute-force enumerator).
+> ~~**NEXT SLICE = 3b-i — interp shared registry + cross-vCPU resume.**~~ **DONE** (record above).
+> ~~**THEN 3b-ii — JIT shared registry, affinity preserved.**~~ **DONE** (same session): the JIT's
+> per-thread `fibers: Vec<Option<Box<Fiber>>>` is now **`fiber_rt::SharedFiberTable`** — one slot
+> table per domain (root + every spawned vCPU), with the loom-verified **`Ownership` word live** on
+> every slot: `cont.resume` claims via `begin_owned` (a re-entrant/racing/finished claim loses and
+> faults — this replaced the per-thread `chain` check), voluntary suspend re-parks via `pin`
+> (thread-affine — *deliberately not* `suspend_to_pool` yet), return `finish`es the slot (generation
+> bumped; the fiber box dropped, stack unmapped). **Affinity = the slot's `owner` token**; a foreign
+> vCPU's resume is a clean `FiberFault`. Aligned with the interp registry: domain-wide handle
+> namespace incl. multi-vCPU (`jit_threads::fiber_namespace_is_domain_wide`, differential),
+> per-domain §15 fiber quota (`jit_quota::jit_fiber_quota_spans_vcpus`), forged-handle masking over
+> one table shape. The **staged divergence** is pinned explicitly:
+> `jit_threads::foreign_vcpu_resume_faults_on_jit_until_3c` asserts interp-migrates / JIT-faults —
+> 3c flips it into a differential. The fiber body closure reads `CURRENT_RT` dynamically now
+> (3c prep, behavior-neutral under affinity). Loom green (futex + fiber_registry). **Deferred:**
+> slot recycling + generation-*carrying* handles (both backends together) — blocked on giving the
+> interp explorer a fiber-return DPOR access (a `Return` that `finish`es a slot must conflict with
+> `cont.new` once slots recycle); `finish` already maintains the generation under the hood.
 >
-> **NEXT SLICE = 3b-ii — JIT shared registry, affinity preserved (storage refactor, no asm change).**
-> Lift the JIT `FiberRuntime`'s per-thread `fibers: Vec<Option<Box<Fiber>>>` into a registry shared
-> across a domain's OS-thread vCPUs, but **keep affinity** (a vCPU resumes only fibers it owns) —
-> the regression-netted storage refactor before the 3c asm seam. This is where the **`Ownership`
-> word** (`svm-jit/src/fiber_registry.rs`, loom-verified, still `#[allow(dead_code)]`) gets wired
-> in, where **slot recycling + generation-tagged handles** land on *both* backends together (the
-> interp registry deliberately doesn't recycle yet — keep handle values in lockstep), and where
-> multi-vCPU **forged-handle masking** aligns (interp masks over the run table, JIT today over
-> per-thread tables — the DESIGN §3a residual). Existing `jit_fibers`/`jit_threads`/`fiber_fuzz` +
-> the new `fiber_migrate.rs` interp pins are the net. **Then:** 3c (the cross-thread asm resume —
-> the empirical-net-gated seam; SCHEDULING.md "Verification story") → Demo 3 (`mn_sched` re-pointed
-> at a shared steal pool, differential interp≡JIT). Staging table in SCHEDULING.md §8.
+> **NEXT SLICE = 3c — the cross-thread asm resume (the empirical-net-gated seam).** Allow a worker
+> to resume a fiber whose native stack another worker created: flip `pin` → `suspend_to_pool` and
+> the foreign-owner fault → `try_steal` in `fiber_rt.rs` (the storage + arbiter are already in
+> place). **No new assembly** — the same `svm-fiber` switch, called from a different thread (unix
+> has no thread-bound state in it; Win64 already swaps the TEB stack fields per switch). Safety
+> rests on the **empirical net** (SCHEDULING.md "Verification story" — a stated decision, no expert
+> reviewer available): (1) extend `fiber_fuzz` to a randomized-migration differential vs the interp
+> oracle (3b-i made interp migration the reference; the divergence pin above becomes the first
+> differential), (2) the runtime single-owner assert (the `Ownership` CAS already provides it),
+> (3) ASan job on the Rust glue, (4) guard-page detection (already armed), (5) soak with counted
+> cross-thread resumes (asserted, not assumed). Then **Demo 3** (`mn_sched` re-pointed at a shared
+> steal pool, differential interp≡JIT). Staging table in SCHEDULING.md §8.
 >
 > ---
 >
@@ -1690,9 +1704,9 @@ regressions one commit old"):
 >    `libLLVM.so` confirmed present in the dev container.)
 > 2. **Migratable-fiber primitive (D57)** — **IN PROGRESS → see the "ACTIVE FRONTIER" block at the top
 >    of this section.** The ownership protocol is loom-verified, the integration design + empirical
->    safety net are written, the fiber stack-switch asm is differential-fuzzed, and **3b-i (interp
->    shared registry + cross-vCPU resume) is DONE** — the reference semantics + unified handle
->    namespace are in; the next slice is 3b-ii (JIT shared registry, affinity preserved).
+>    safety net are written, the fiber stack-switch asm is differential-fuzzed, and **3b-i + 3b-ii
+>    are DONE** — the interp migrates (the oracle), the JIT has the shared table + live `Ownership`
+>    arbiter with affinity preserved; the next slice is 3c (the cross-thread asm resume).
 >    Re-accepts D56's cross-thread-migration unsafe
 >    as a *primitive* (guest owns the stealing policy; VM enforces single-owner); the expert-review gate
 >    is replaced by the empirical net (no reviewer available — SCHEDULING.md "Verification story").

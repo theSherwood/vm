@@ -1059,10 +1059,14 @@ pub struct CompiledModule {
     _nursery: Option<Box<instantiator_rt::Nursery>>,
     #[cfg(fiber_rt)]
     call_tramp: Option<fiber_rt::FiberCallTramp>,
-    /// `(fiber_type_id, fiber_mask, max_fibers)` when the module uses `cont.*` — the per-vCPU
-    /// fiber config spawned vCPUs build their runtimes from (`Domain::set_env`).
+    /// `(fiber_type_id, fiber_mask)` when the module uses `cont.*` — the per-vCPU fiber config
+    /// spawned vCPUs build their runtimes from (`Domain::set_env`).
     #[cfg(fiber_rt)]
-    fiber_cfg: Option<(u32, u64, usize)>,
+    fiber_cfg: Option<(u32, u64)>,
+    /// The **domain-shared fiber table** (D57 3b-ii) the root's `fiber_rt` and every spawned
+    /// vCPU's runtime are built over — one handle namespace + one §15 fiber quota per domain.
+    #[cfg(fiber_rt)]
+    fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>>,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
     /// (declaration order), after everything that points into it.
     module: JITModule,
@@ -1246,19 +1250,28 @@ impl CompiledModule {
         let fiber_type_id = type_id_of(&distinct, &fiber_func_type());
         #[cfg(fiber_rt)]
         let fiber_mask = (m.funcs.len().next_power_of_two() as u64) - 1;
-        // Fibers + threads compose via a **per-vCPU** fiber runtime, published through a thread-local. This
-        // is the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
-        // builds its own from `fiber_cfg` (`os_thread_rt`). Created whenever the module uses `cont.*`.
+        // Fibers + threads compose via a per-vCPU fiber runtime (execution context), published through a
+        // thread-local, all over **one domain-shared fiber table** (D57 3b-ii: a unified handle
+        // namespace + a per-domain §15 quota, matching the interpreter's run-shared registry). This is
+        // the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
+        // builds its own over the same table from `fiber_cfg` (`os_thread_rt`). Created whenever the
+        // module uses `cont.*`.
         #[cfg(fiber_rt)]
-        let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = if uses_fibers {
-            Some(Box::new(fiber_rt::FiberRuntime::new(
-                fiber_type_id,
-                fiber_mask,
+        let fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>> = if uses_fibers {
+            Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
                 quota.max_fibers,
             )))
         } else {
             None
         };
+        #[cfg(fiber_rt)]
+        let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = fiber_table.as_ref().map(|t| {
+            Box::new(fiber_rt::FiberRuntime::new(
+                std::sync::Arc::clone(t),
+                fiber_type_id,
+                fiber_mask,
+            ))
+        });
         // The `cont.*` thunk addresses (the runtime itself is found via a thread-local at call time).
         #[cfg(fiber_rt)]
         let fiber = if uses_fibers {
@@ -1459,10 +1472,12 @@ impl CompiledModule {
             call_tramp,
             #[cfg(fiber_rt)]
             fiber_cfg: if uses_fibers {
-                Some((fiber_type_id, fiber_mask, quota.max_fibers))
+                Some((fiber_type_id, fiber_mask))
             } else {
                 None
             },
+            #[cfg(fiber_rt)]
+            fiber_table,
             module,
         })
     }
@@ -1702,6 +1717,7 @@ impl CompiledModule {
                         .expect("call-trampoline set for a threaded module"),
                     window.fault_range(),
                     t.fiber_cfg,
+                    t.fiber_table.clone(), // the domain-shared table spawned vCPUs build over
                     t.epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
                 );
             }

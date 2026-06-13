@@ -349,3 +349,102 @@ fn thread_double_join_traps() {
         }\n";
     assert_jit_matches_interp(src);
 }
+
+/// **The fiber handle namespace is domain-wide on both backends (D57 3b-ii).** The JIT's fiber
+/// table is now one `SharedFiberTable` per domain (like the interp's run-shared registry), so a
+/// fiber created on a spawned vCPU gets the *next domain slot* — not slot 0 of a private
+/// per-thread table. Root creates fiber 0 before spawning; the worker's `cont.new` must yield
+/// handle **1** (the old per-thread tables gave it 0, diverging from the interpreter). Both
+/// fibers are also driven to completion, proving the distinct slots both work.
+#[test]
+fn fiber_namespace_is_domain_wide() {
+    let src = "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 2\n\
+        \x20 v1 = i64.const 0\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = thread.spawn 1 v1 v1\n\
+        \x20 v4 = thread.join v3\n\
+        \x20 v5 = i64.const 7\n\
+        \x20 v6, v7 = cont.resume v2 v5\n\
+        \x20 v8 = i64.const 100\n\
+        \x20 v9 = i64.mul v4 v8\n\
+        \x20 v10 = i64.add v9 v7\n\
+        \x20 v11 = i64.extend_i32_u v2\n\
+        \x20 v12 = i64.add v10 v11\n\
+        \x20 return v12\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, varg: i64):\n\
+        \x20 v0 = ref.func 2\n\
+        \x20 v1 = cont.new v0 vsp\n\
+        \x20 v2 = i64.const 1\n\
+        \x20 v3, v4 = cont.resume v1 v2\n\
+        \x20 v5 = i64.extend_i32_u v1\n\
+        \x20 v6 = i64.const 42\n\
+        \x20 v7 = i64.sub v4 v6\n\
+        \x20 v8 = i64.add v5 v7\n\
+        \x20 return v8\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, varg: i64):\n\
+        \x20 v0 = i64.const 41\n\
+        \x20 v1 = i64.add varg v0\n\
+        \x20 return v1\n\
+        }\n";
+    assert_jit_matches_interp(src);
+    // Pin the absolute result too (worker handle 1 ⇒ join 1 ⇒ 100, + root fiber's 7+41 = 148):
+    // the old per-thread JIT tables produced 48 here (worker handle 0).
+    let m = parse_module(src).expect("parse");
+    let mut fuel = 1_000_000u64;
+    assert_eq!(run(&m, 0, &[], &mut fuel), Ok(vec![Value::I64(148)]));
+}
+
+/// **The 3b-ii staging gap, pinned explicitly:** a fiber suspended on the root and resumed from a
+/// spawned vCPU **migrates on the interpreter** (the 3b-i shared registry — the reference
+/// semantics for D57) but **faults on the JIT**, whose shared table keeps fibers thread-affine
+/// until the 3c cross-thread asm-resume slice (the foreign owner's claim is rejected, a clean
+/// `FiberFault` that kills the domain). This test is the *inverse* of a differential: it pins the
+/// documented divergence so 3c can flip it to `assert_jit_matches_interp` and prove migration.
+#[test]
+fn foreign_vcpu_resume_faults_on_jit_until_3c() {
+    let src = "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 2\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 5\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.extend_i32_u v2\n\
+        \x20 v7 = thread.spawn 1 v6 v6\n\
+        \x20 v8 = thread.join v7\n\
+        \x20 return v8\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, varg: i64):\n\
+        \x20 v0 = i32.wrap_i64 varg\n\
+        \x20 v1 = i64.const 7\n\
+        \x20 v2, v3 = cont.resume v0 v1\n\
+        \x20 return v3\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(vsp: i64, varg: i64):\n\
+        \x20 v0 = suspend varg\n\
+        \x20 v1 = i64.const 10\n\
+        \x20 v2 = i64.mul v0 v1\n\
+        \x20 v3 = i64.add v2 varg\n\
+        \x20 return v3\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    // Interp (the migratable-fiber oracle): the fiber continues on the worker → 10*7 + 5 = 75.
+    let mut fuel = 1_000_000u64;
+    assert_eq!(run(&m, 0, &[], &mut fuel), Ok(vec![Value::I64(75)]));
+    // JIT (thread-affine until 3c): the worker's claim is rejected → FiberFault.
+    match compile_and_run(&m, 0, &[]).expect("jit") {
+        JitOutcome::Trapped(TrapKind::FiberFault) => {}
+        other => {
+            panic!("expected the foreign resume to FiberFault on the JIT (until 3c), got {other:?}")
+        }
+    }
+}

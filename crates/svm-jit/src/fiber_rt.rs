@@ -9,21 +9,36 @@
 //! within that guest code switches the whole native stack back to the resumer — the §3d two-stack
 //! model in action.
 //!
-//! **Single-threaded / cooperative:** fibers (unlike `thread.spawn`, not yet in the JIT) never run
-//! concurrently — exactly one is on the stack at a time. So the runtime's `Vec`s are touched only by
-//! the one running OS thread, and the reentrancy (a resumed fiber calling back in to create/resume/
-//! suspend) is sound via raw-pointer field access: no `&mut FiberRuntime` is ever held across a switch
-//! (only a `*mut Fiber` to the boxed, address-stable fiber being resumed), and the per-fiber control
-//! `chain` rejects re-entrant resume of an already-running fiber, so each `Fiber`'s `&mut` is exclusive.
+//! **Storage is domain-shared, execution is thread-affine (D57 step 3b-ii).** The fiber table is one
+//! [`SharedFiberTable`] per compiled module, shared by every vCPU of the domain — the same unified
+//! handle namespace as the interpreter's run-shared registry (handles are `0, 1, …` domain-wide; the
+//! §15 fiber quota is per-domain). Each slot carries the loom-verified single-owner [`Ownership`]
+//! word (`fiber_registry`): a resume claims `OWNED → RUNNING` (`begin_owned`), a voluntary suspend
+//! returns it with `pin` (`RUNNING → OWNED` — deliberately *not* `suspend_to_pool`: fibers stay
+//! **thread-affine** in this slice, a foreign vCPU's resume is a clean `FiberFault` via the slot's
+//! `owner` token), and a return `finish`es the slot (`FREE`, generation bumped — a stale handle's
+//! claim fails). Step 3c relaxes exactly two points — `pin` becomes `suspend_to_pool` and the foreign-
+//! owner fault becomes `try_steal` — to make fibers migratable; the storage and arbiter land here,
+//! under the existing test net, with no asm change.
+//!
+//! **Reentrancy/aliasing:** exactly one fiber of a chain is on a native stack at a time, and a fiber
+//! whose handle is anywhere in a resume chain is `RUNNING`, so a re-entrant resume *loses the claim*
+//! and faults (this replaces the old per-thread `chain` vec). No table lock or `&mut FiberRuntime`
+//! is ever held across a switch — only a `*mut Fiber` to the boxed, address-stable fiber being
+//! resumed, exclusive because its slot is `RUNNING` and only the claimant proceeds.
 
+use crate::fiber_registry::Ownership;
 use crate::{FnEntry, TrapKind};
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use svm_fiber::{Fiber, State, Yielder};
 
 thread_local! {
     /// The fiber runtime of the computation currently running on this OS thread — the standalone root,
-    /// or the vCPU a scheduler is resuming. The `cont.*` thunks read it, so **each vCPU has its own
-    /// fiber table** and threads + fibers compose (a threaded module can use `cont.*` per vCPU). Null
+    /// or the vCPU a scheduler is resuming. The `cont.*` thunks read it; each vCPU has its own
+    /// *execution context* (yielders + owner token) while the fiber **table** is domain-shared
+    /// ([`SharedFiberTable`]), so threads + fibers compose with one handle namespace. Null
     /// between resumes / when no fiber-capable computation is running.
     static CURRENT_RT: Cell<*mut FiberRuntime> = const { Cell::new(std::ptr::null_mut()) };
 }
@@ -58,15 +73,94 @@ pub(crate) type FiberCallTramp = extern "C" fn(
     arg: u64,
 ) -> u64;
 
-/// Host-side fiber table + switch bookkeeping for one JIT run.
+/// One slot of the domain-shared fiber table (D57 3b-ii). The `Arc` keeps a resolved slot stable
+/// while the table grows (a re-entrant `cont.new` from inside a running fiber pushes new slots).
+pub(crate) struct FiberSlot {
+    /// The loom-verified single-owner state word (`fiber_registry`): claims, suspends, and the
+    /// generation-bumping `finish` all go through it — the migration arbiter 3c builds on.
+    own: Ownership,
+    /// The owning vCPU's token — the **affinity check** of this slice: only the owner may resume.
+    /// 3c replaces a foreign owner's fault with `try_steal` on pooled (`RUNNABLE`) fibers.
+    owner: u64,
+    /// The parked native fiber. `Some` while the slot is `OWNED` (pending or suspended); the box
+    /// stays in place during a resume (`RUNNING` guarantees the claimant exclusive access to it)
+    /// and is dropped — its stack unmapped — when the fiber returns (`finish`).
+    fiber: Mutex<Option<Box<Fiber>>>,
+}
+
+/// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
+/// and every `thread.spawn`ed vCPU — the unified handle namespace (slot index = the guest handle,
+/// exactly the interpreter registry's numbering) and the per-domain §15 fiber quota. Slots are not
+/// recycled yet (matching the interp registry; recycling + generation-carrying handles are a later
+/// slice on both backends together — `finish` already bumps the slot generation under the hood).
+pub(crate) struct SharedFiberTable {
+    slots: Mutex<Vec<Arc<FiberSlot>>>,
+    /// §15 quota: max fibers (incl. the implicit root computation) for the **whole domain**,
+    /// clamped to [`MAX_FIBERS`] — per-run like the interpreter's, not per-vCPU.
+    max_fibers: usize,
+    /// Owner-token allocator: each vCPU's `FiberRuntime` takes a unique token at construction.
+    next_owner: AtomicU64,
+}
+
+impl SharedFiberTable {
+    pub(crate) fn new(max_fibers: usize) -> SharedFiberTable {
+        SharedFiberTable {
+            slots: Mutex::new(Vec::new()),
+            max_fibers: max_fibers.clamp(1, MAX_FIBERS),
+            next_owner: AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Arc<FiberSlot>>> {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Quota pre-check (no allocation yet): would one more fiber exceed the domain budget? Checked
+    /// *before* the fiber's stack is mmap'd so a fiber-bomb is a clean `FiberFault` that never
+    /// touches the OS map limit.
+    fn has_room(&self) -> bool {
+        self.lock().len() + 1 < self.max_fibers
+    }
+
+    /// Allocate the next slot for a fresh (`OWNED`) fiber; the returned slot index is the guest
+    /// handle. `None` if a racing allocation filled the domain quota since [`Self::has_room`].
+    fn create(&self, owner: u64, fiber: Box<Fiber>) -> Option<i32> {
+        let mut t = self.lock();
+        if t.len() + 1 >= self.max_fibers {
+            return None;
+        }
+        t.push(Arc::new(FiberSlot {
+            own: Ownership::new_owned(),
+            owner,
+            fiber: Mutex::new(Some(fiber)),
+        }));
+        Some((t.len() - 1) as i32)
+    }
+
+    /// Resolve a (forgeable) handle: **masked** into the power-of-two-padded table (Spectre-safe,
+    /// like `call_indirect` — and the same shape as the interp registry, so a forged handle now
+    /// resolves over the same domain-wide namespace on both backends). Out of range ⇒ `None`.
+    fn resolve(&self, handle: i32) -> Option<Arc<FiberSlot>> {
+        let t = self.lock();
+        let mask = t.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
+        let slot = (handle as u32 as usize) & mask;
+        if slot >= t.len() {
+            return None;
+        }
+        Some(Arc::clone(&t[slot]))
+    }
+}
+
+/// Per-vCPU fiber execution context: the shared table plus this vCPU's identity and switch
+/// bookkeeping. The table (the storage) is domain-shared; everything here is touched only by the
+/// one OS thread running this vCPU.
 pub(crate) struct FiberRuntime {
-    /// The fiber table; the handle a `cont.new` returns is an index here. `Box` so a fiber's address
-    /// is stable across table growth (a `cont.new` from inside a running fiber may grow this).
-    fibers: Vec<Option<Box<Fiber>>>,
-    /// Handles currently on the resume chain — used to reject re-entrant resume of a running fiber
-    /// (which would alias its `&mut`), matching the interpreter's `chain.contains` check.
-    chain: Vec<usize>,
-    /// The running fibers' `Yielder`s (same depth as `chain`); `suspend` switches via the top one.
+    /// The domain-shared fiber table (storage + ownership arbiter).
+    table: Arc<SharedFiberTable>,
+    /// This vCPU's owner token (the 3b-ii affinity identity).
+    me: u64,
+    /// The running fibers' `Yielder`s, one per live resume on this vCPU; `suspend` switches via
+    /// the top one.
     yielders: Vec<*const Yielder>,
     /// The generated call-trampoline address (filled in after the module is finalized).
     call_tramp: Option<FiberCallTramp>,
@@ -75,22 +169,22 @@ pub(crate) struct FiberRuntime {
     fiber_type_id: u32,
     /// `next_pow2(nfuncs) - 1`, to mask a funcref into the function table.
     fn_table_mask: u64,
-    /// §15 spawn quota: max fibers (incl. the implicit root computation) this vCPU may have, clamped to
-    /// [`MAX_FIBERS`] at construction. Exceeding it is a clean `FiberFault`, matching the interpreter's
-    /// per-vCPU `Quota::max_fibers` (whose table counts the root).
-    max_fibers: usize,
 }
 
 impl FiberRuntime {
-    pub(crate) fn new(fiber_type_id: u32, fn_table_mask: u64, max_fibers: usize) -> FiberRuntime {
+    pub(crate) fn new(
+        table: Arc<SharedFiberTable>,
+        fiber_type_id: u32,
+        fn_table_mask: u64,
+    ) -> FiberRuntime {
+        let me = table.next_owner.fetch_add(1, Ordering::Relaxed);
         FiberRuntime {
-            fibers: Vec::new(),
-            chain: Vec::new(),
+            table,
+            me,
             yielders: Vec::new(),
             call_tramp: None,
             fiber_type_id,
             fn_table_mask,
-            max_fibers: max_fibers.clamp(1, MAX_FIBERS),
         }
     }
 
@@ -109,14 +203,16 @@ unsafe fn fault(trap_out: u64) {
 }
 
 // Reentrancy discipline (all three thunks): a running fiber may call back in (create/resume/suspend),
-// so no `&mut FiberRuntime` is ever held across a stack switch — `&mut *rt` is taken only in short
-// scopes that end *before* `resume`/`suspend`, and only a `*mut Fiber` (to an address-stable boxed
-// fiber) crosses the switch. The `chain` re-entrancy check makes each fiber's `&mut` exclusive, and
-// fibers live in separate heap allocations from the table, so a re-entrant `cont.new` growing the
-// table never aliases a fiber being resumed.
+// so no table lock or `&mut FiberRuntime` is ever held across a stack switch — borrows are taken only
+// in short scopes that end *before* `resume`/`suspend`, and only a `*mut Fiber` (to an address-stable
+// boxed fiber, kept alive by its slot `Arc`) crosses the switch. The `Ownership` claim makes each
+// fiber's `&mut` exclusive — a fiber anywhere in a resume chain is `RUNNING`, so a re-entrant resume
+// loses the claim — and slots are separate heap allocations from the table vec, so a re-entrant
+// `cont.new` growing the table never moves a fiber being resumed.
 
 /// `cont.new` thunk: allocate a suspended fiber that, on first resume, calls guest `funcref(sp, arg)`.
-/// Returns the fiber handle (table index), or traps (`-1`) on a fiber-bomb.
+/// Returns the fiber handle (the domain-shared table's slot index — the same numbering as the interp
+/// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** §15 quota).
 ///
 /// # Safety
 /// `fn_table_base`/`trap_out` are the threaded context. The running vCPU's fiber runtime is read from
@@ -134,12 +230,12 @@ pub(crate) unsafe extern "C" fn fiber_new(
         fault(trap_out);
         return -1;
     }
-    let (mask, type_id, call_tramp) = {
-        let rt = &mut *rt;
-        // `+ 1` counts the implicit **root** computation (not a slot in `fibers`, unlike the
-        // interpreter's table which starts with the root) so `max_fibers` means the same total on both
-        // backends. Like the interpreter, the table is cumulative (a finished fiber keeps its slot).
-        if rt.fibers.len() + 1 >= rt.max_fibers {
+    let (mask, type_id, call_tramp, me) = {
+        let rt = &*rt;
+        // Quota pre-check **before** the stack mmap, so a fiber-bomb is a clean `FiberFault` that
+        // never exhausts the OS map limit. (`create` re-checks under the table lock — a racing
+        // sibling vCPU may fill the last slot — at the cost of one transient stack allocation.)
+        if !rt.table.has_room() {
             fault(trap_out);
             return -1;
         }
@@ -148,13 +244,17 @@ pub(crate) unsafe extern "C" fn fiber_new(
             rt.fiber_type_id,
             rt.call_tramp
                 .expect("call-trampoline set before any fiber runs"),
+            rt.me,
         )
     };
-    let rt_ptr: *mut FiberRuntime = rt;
 
     let fiber = Fiber::new(FIBER_STACK, move |y: &Yielder, arg: u64| -> u64 {
-        // SAFETY: the fiber only runs while `rt` is alive (during the guarded run); each `&mut *rt`
-        // here is momentary and single-threaded.
+        // The *resuming* vCPU's runtime — read dynamically (not captured) so the yielder pairing
+        // targets whichever thread runs this fiber. Under 3b-ii affinity that is always the
+        // creator; reading it dynamically is the behavior-neutral prep for 3c migration.
+        let rt_ptr = current();
+        // SAFETY: a fiber only runs under a resume, so `rt_ptr` is the live runtime CURRENT_RT
+        // published for this thread; each `&mut *rt_ptr` here is momentary and single-threaded.
         unsafe {
             (*rt_ptr).yielders.push(y as *const Yielder);
             // Resolve + type-check the funcref now (first resume), like the interpreter.
@@ -171,9 +271,14 @@ pub(crate) unsafe extern "C" fn fiber_new(
         }
     });
 
-    let rt = &mut *rt;
-    rt.fibers.push(Some(Box::new(fiber)));
-    (rt.fibers.len() - 1) as i32
+    let rt = &*rt;
+    match rt.table.create(me, Box::new(fiber)) {
+        Some(handle) => handle,
+        None => {
+            fault(trap_out); // a sibling vCPU filled the domain quota since the pre-check
+            -1
+        }
+    }
 }
 
 /// `cont.resume` thunk: switch into fiber `handle`, delivering `arg`; writes `*status_out` (0 =
@@ -194,46 +299,59 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         *status_out = 1;
         return 0;
     }
-    // Phase 1: validate + extract a raw fiber pointer, releasing the `&mut *rt` before the switch.
-    let fib: *mut Fiber = {
-        let rt = &mut *rt;
-        let nfib = rt.fibers.len();
-        let mask = if nfib == 0 {
-            0
-        } else {
-            nfib.next_power_of_two() - 1
+    // Phase 1: resolve + **claim** (D57): the slot must be this vCPU's (affinity, 3b-ii) and
+    // `OWNED` — the `begin_owned` claim takes it to `RUNNING`, so a re-entrant resume (the fiber is
+    // somewhere in a resume chain), a racing resume, or a finished fiber all *lose the claim* and
+    // fault. No lock or `&mut` is held past this block; the `Arc` keeps the slot (and the boxed
+    // fiber it owns) stable across the switch.
+    let (slot, fib): (Arc<FiberSlot>, *mut Fiber) = {
+        let rt = &*rt;
+        let Some(slot) = rt.table.resolve(handle) else {
+            fault(trap_out);
+            *status_out = 1;
+            return 0;
         };
-        let slot = (handle as u32 as usize) & mask;
-        if slot >= nfib || rt.chain.contains(&slot) {
+        // Thread affinity (this slice): only the owner resumes. 3c replaces this fault with
+        // `try_steal` on pooled (`RUNNABLE`) fibers — the migratable-fiber step.
+        if slot.owner != rt.me || !slot.own.begin_owned() {
             fault(trap_out);
             *status_out = 1;
             return 0;
         }
-        match &mut rt.fibers[slot] {
-            Some(b) if !b.is_done() => {
-                rt.chain.push(slot);
-                &mut **b as *mut Fiber
-            }
-            _ => {
+        let fib = match slot
+            .fiber
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            Some(b) => &mut **b as *mut Fiber,
+            // Unreachable by invariant (an `OWNED` slot holds its fiber); fail closed, leaving the
+            // slot claimed (inert thereafter) rather than aliasing anything.
+            None => {
                 fault(trap_out);
                 *status_out = 1;
                 return 0;
             }
-        }
+        };
+        (slot, fib)
     };
-    // Phase 2: the switch (may reenter the runtime) — no `&mut *rt` held.
+    // Phase 2: the switch (may reenter the runtime) — no lock or `&mut` held; the claim makes
+    // `*fib` exclusive to this vCPU.
     let st = (*fib).resume(arg as u64);
-    // Phase 3: pop the chain under a fresh short borrow.
-    {
-        let rt = &mut *rt;
-        rt.chain.pop();
-    }
+    // Phase 3: publish the fiber's new state.
     match st {
         State::Yielded(v) => {
+            // Voluntarily suspended: back to `OWNED` (thread-affine — *not* the steal pool; 3c
+            // turns this into `suspend_to_pool` to make the fiber migratable).
+            slot.own.pin();
             *status_out = 0;
             v as i64
         }
         State::Complete(v) => {
+            // Returned: drop the fiber (unmapping its stack) and free the slot — `finish` bumps
+            // the generation, so any stale claim of this slot keeps failing.
+            slot.fiber.lock().unwrap_or_else(|e| e.into_inner()).take();
+            slot.own.finish();
             *status_out = 1;
             v as i64
         }
