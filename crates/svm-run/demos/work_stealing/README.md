@@ -4,7 +4,7 @@
 cargo run -p svm-run -- crates/svm-run/demos/work_stealing/work_stealing.c   # prints 256
 ```
 
-Demo 2 of the concurrency-validation track (DESIGN D56/D57; see `SCHEDULING.md`). The companion to
+Demo 2 of the concurrency-validation track (DESIGN D56/D57; see DESIGN.md §23). The companion to
 `demos/mn_sched` (which is *sharded, stackful* — fibers pinned per worker). Here a task is a
 **state machine** (a plain struct; its resume state is a field), so it is just **data** and moves
 freely between worker threads. That makes **work-stealing** possible **with no VM change**: an idle
@@ -20,6 +20,6 @@ was lost or double-run as they migrated — so it is identical on the interprete
 deterministic oracle) and the JIT (real OS threads), regardless of *which* worker ran each task.
 Pinned by `c_frontend::c_guest_work_stealing_demo`.
 
-This is the work-stealing M:N that the migratable-fiber primitive (D57) would later bring to
-*stackful* tasks; stackless gets it for free today, and is the natural substrate for the async I/O
-ring (B).
+The migratable-fiber primitive (D57) has since brought this architecture to *stackful* tasks too —
+see `demos/steal_fibers` (Demo 3). Stackless remains the natural substrate for the async I/O
+ring (B) and anything that must move tasks without native stacks.

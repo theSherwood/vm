@@ -1,4 +1,4 @@
-/* Demo 3 (SCHEDULING.md): a guest-built **work-stealing** M:N scheduler over **stackful,
+/* Demo 3 (DESIGN.md §23): a guest-built **work-stealing** M:N scheduler over **stackful,
  * migratable fibers** — D57 complete, entirely as guest policy.
  *
  * The capstone of the migratable-fiber track. Contrast the two earlier flavors:
@@ -12,7 +12,7 @@
  * "unmodified" is in `step_in_callee`: the task yields from *inside a nested call frame*, which no
  * state-machine rewrite can express — the task's entire stack must (and does) migrate with it.
  *
- * The VM's role is exactly two things (D57, SCHEDULING.md "the VM owes a namespace + arbiter"):
+ * The VM's role is exactly two things (D57, DESIGN.md §23 "what the VM owes"):
  * the domain-wide fiber-handle namespace, and the single-owner claim under `cont.resume` (exactly
  * one racing resumer wins; a loser faults). *This program* owns every policy decision — the
  * injector queue, the per-worker deques, the steal order — in ordinary guest C over pthreads +
@@ -29,7 +29,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 
-/* VM fiber primitive (cont.* — a stackful coroutine; see SCHEDULING.md). */
+/* VM fiber primitive (cont.* — a stackful coroutine; see DESIGN.md §23). */
 int  __vm_fiber_new(long (*f)(long), void *stack);
 long __vm_fiber_resume(int k, long arg, int *done);
 long __vm_fiber_suspend(long value);

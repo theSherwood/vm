@@ -2347,7 +2347,7 @@ fn c_guest_work_stealing_demo() {
     );
 }
 
-/// **Demo 3 (SCHEDULING.md) — work-stealing over *stackful, migratable* fibers (D57 complete).**
+/// **Demo 3 (DESIGN.md §23) — work-stealing over *stackful, migratable* fibers (D57 complete).**
 /// Tasks are fibers whose handles sit in guest queues (injector + per-worker deques); an idle
 /// worker steals a **suspended fiber** and resumes it on its own OS thread — the fiber's whole
 /// native stack migrates (on the JIT, a real cross-thread `svm-fiber` switch claimed through the

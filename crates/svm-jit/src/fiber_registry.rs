@@ -1,4 +1,4 @@
-//! Single-owner ownership protocol for **migratable fibers** (D57 / `SCHEDULING.md` "Design sketch"
+//! Single-owner ownership protocol for **migratable fibers** (D57 / DESIGN.md §23
 //! #1) — the load-bearing, loom-verifiable core of stackful work-stealing.
 //!
 //! The dangerous invariant of stackful work-stealing is **"one native stack, exactly one thread":**
@@ -11,7 +11,7 @@
 //! > a fiber in the steal pool is claimed (transitioned to `Running`) by **exactly one** thread.
 //!
 //! This module is that property, isolated. It is **pure atomics — it touches no real stack** — so it
-//! is fully `loom`-model-checkable, exactly as the `wait`/`notify` futex core is. Per SCHEDULING.md's
+//! is fully `loom`-model-checkable, exactly as the `wait`/`notify` futex core is. Per DESIGN.md §23's
 //! "earn the risk with verification, not assume it" mandate and the demo roadmap (#3), the protocol
 //! was proven here first; it is **wired into the live runtime** (D57 3b-ii/3c): each slot of the
 //! domain-shared `fiber_rt::SharedFiberTable` carries one [`Ownership`] word — `cont.resume` on

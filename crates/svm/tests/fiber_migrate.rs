@@ -1,4 +1,4 @@
-//! §12/D57 **migratable fibers on the interpreter** (step 3b-i, SCHEDULING.md "Integration
+//! §12/D57 **migratable fibers on the interpreter** (step 3b-i, DESIGN.md §23 "Integration
 //! design"): the per-vCPU fiber tables are replaced by one **run-shared registry**, so a fiber
 //! created (and even part-run) on one vCPU can be claimed and continued by another — a safe
 //! `Vec<Frame>` hand-off, exactly like the vCPUs the scheduler already migrates. The registry's
@@ -192,7 +192,7 @@ fn foreign_vcpu_claim_succeeds_without_a_race() {
     assert_outcomes(NO_RACE, &[Ok(42)]);
 }
 
-/// **The fiber quota is per-run now** (the registry is run-shared; SCHEDULING.md §6): with
+/// **The fiber quota is per-run now** (the registry is run-shared; DESIGN.md §23 (per-run quota)): with
 /// `max_fibers = 2` (the root computation + one creation), the root's `cont.new` fills the run's
 /// budget, so a *spawned vCPU's* `cont.new` trips it — under the old per-vCPU tables the child's
 /// fresh table would have admitted it (this is the non-vacuous pin of the semantic change).

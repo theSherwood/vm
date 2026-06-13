@@ -88,7 +88,7 @@ mod fiber_rt;
 #[cfg(fiber_rt)]
 mod os_thread_rt;
 
-// Migratable-fiber ownership protocol (D57 / SCHEDULING.md): the loom-verified single-owner atomic
+// Migratable-fiber ownership protocol (D57 / DESIGN.md §23): the loom-verified single-owner atomic
 // state machine that guarantees a stolen fiber is resumed by exactly one thread — the gating safety
 // core of stackful work-stealing, proven in isolation before the runtime integration + cross-thread
 // resume land. Pure atomics; not yet wired into the live runtime.

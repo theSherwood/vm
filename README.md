@@ -89,6 +89,12 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > vCPU on an in-window futex counter that a pool worker wakes (an I/O completion *is* a futex
 > notify) — driven end-to-end by an **async event-loop runtime in real C**, including an async
 > **work-stealing M:N** scheduler that is *entirely guest code* over the two primitives (D56/D57).
+> **Fibers are migratable (D57 complete, DESIGN §23):** `cont.resume` on any vCPU claims a suspended
+> fiber and continues its *native stack* on that OS thread — a loom-verified single-owner protocol
+> arbitrates racing claims, with an empirical net (randomized-migration interp↔JIT differential,
+> ASan with real fiber-switch annotations, concurrent-steal stress) in place of unavailable expert
+> review — capstoned by `demos/steal_fibers`, a guest **work-stealing scheduler over stackful
+> tasks** that suspends from inside nested call frames (inexpressible for stackless state machines).
 > A **second frontend, `svm-wasm`**, transpiles **core wasm → IR** (reconstructing SSA from the
 > stack machine) and runs real clang-compiled programs and **real C libraries** — the jsmn JSON
 > tokenizer and B-Con SHA-256 — byte-identically to native, including bulk memory

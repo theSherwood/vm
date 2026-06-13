@@ -1,4 +1,4 @@
-/* A guest-built M:N green-thread scheduler — sharded, thread-per-core (SCHEDULING.md, D56/D57).
+/* A guest-built M:N green-thread scheduler — sharded, thread-per-core (DESIGN.md §23, D56/D57).
  *
  * The VM ships only primitives: vCPUs (`thread.spawn`, 1:1 OS threads), stackful fibers
  * (`cont.*`), and the futex + C11 atomics. *This program is the scheduler* — proof the
@@ -17,7 +17,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 
-/* VM fiber primitive (cont.* — a stackful coroutine; see SCHEDULING.md). */
+/* VM fiber primitive (cont.* — a stackful coroutine; see DESIGN.md §23). */
 int  __vm_fiber_new(long (*f)(long), void *stack);
 long __vm_fiber_resume(int k, long arg, int *done);
 long __vm_fiber_suspend(long value);

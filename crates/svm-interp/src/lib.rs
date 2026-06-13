@@ -1154,7 +1154,7 @@ const MAX_VCPUS: usize = 1 << 16;
 pub struct Quota {
     /// Max fibers a **run** (domain) may create (`cont.new`, counting the root computation as 1);
     /// capped at [`MAX_FIBERS`]. Per-run, not per-vCPU, since the fiber table is the run-shared
-    /// registry (D57 3b-i / SCHEDULING.md §6) — for a single-vCPU run the admitted creations are
+    /// registry (D57 3b-i / DESIGN.md §23 (per-run quota)) — for a single-vCPU run the admitted creations are
     /// unchanged (and match the JIT's per-vCPU count exactly).
     pub max_fibers: usize,
     /// Max concurrently-live vCPUs across the run (`thread.spawn`); capped at [`MAX_VCPUS`].
@@ -1873,14 +1873,14 @@ enum Claimed {
     Live(Vec<Frame>),
 }
 
-/// The **run-shared fiber registry** (D57 step 3b-i, SCHEDULING.md "Integration design"): one
+/// The **run-shared fiber registry** (D57 step 3b-i, DESIGN.md §23): one
 /// slot table shared by every vCPU of a domain (the root + its `thread.spawn` children),
 /// replacing the old per-vCPU fiber tables. This is exactly the VM-side surface migratable
 /// fibers need — (1) a **shared handle namespace**, so any vCPU can name any fiber, and (2) the
 /// **single-owner arbiter**: a `cont.resume` *claims* the fiber, exactly one claimant wins, and
 /// a loser gets a clean [`Trap::FiberFault`]. The interpreter's fiber is `Vec<Frame>` — pure
 /// data — so cross-vCPU migration is a safe hand-off; this table's mutex is the claim arbiter
-/// (the safe-Rust stand-in SCHEDULING.md §4 sanctions for the oracle; the JIT's lock-free
+/// (the safe-Rust stand-in DESIGN.md §23 sanctions for the oracle; the JIT's lock-free
 /// `Ownership`-word table is slice 3b-ii/3c). The lock is a leaf (nothing else is locked while
 /// it is held) and is touched only by fiber ops, never the execution hot path.
 struct FiberRegistry {
@@ -1899,7 +1899,7 @@ impl FiberRegistry {
     }
 
     /// `cont.new`: allocate the next slot — the guest handle — under the §15 quota, which is
-    /// **per run** now that the table is run-shared (SCHEDULING.md §6). The `+ 1` counts the
+    /// **per run** now that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the
     /// off-table root computation, so a quota value admits exactly the creations the JIT's
     /// `fibers.len() + 1 >= max_fibers` check admits for a single-vCPU run.
     fn create(&self, func: i32, sp: i64, max_fibers: usize) -> Result<i32, Trap> {

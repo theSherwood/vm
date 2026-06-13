@@ -1,4 +1,4 @@
-/* A guest-built **work-stealing** M:N scheduler over **stackless** tasks (SCHEDULING.md, D56/D57).
+/* A guest-built **work-stealing** M:N scheduler over **stackless** tasks (DESIGN.md §23, D56/D57).
  *
  * Contrast with demos/mn_sched (sharded, *stackful* fibers, tasks pinned per worker). Here a task
  * is a **state machine** — a plain struct (its resume state is the `i` field) — so it is just

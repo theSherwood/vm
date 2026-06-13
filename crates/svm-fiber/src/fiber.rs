@@ -20,7 +20,7 @@ use std::process::abort;
 /// `__sanitizer_start_switch_fiber` on the *outgoing* stack right before the jump, and
 /// `__sanitizer_finish_switch_fiber` on the *incoming* stack right after arrival — otherwise
 /// ASan-instrumented code running on a fiber stack crashes or misreports. This is what makes the
-/// migratable-fiber empirical net's sanitizer layer (SCHEDULING.md) actually runnable: with the
+/// migratable-fiber empirical net's sanitizer layer (DESIGN.md §23) actually runnable: with the
 /// feature on, the whole fiber suite runs under ASan, fiber stacks included. Zero-cost otherwise.
 #[cfg(feature = "asan")]
 mod asan {

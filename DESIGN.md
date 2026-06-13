@@ -314,7 +314,7 @@ index.** The split is defined by what a forged value can do:
     (first handle 1) while the JIT runs the root off-table (first handle 0), and a *forged*
     handle masked to different slots. That was **safe** (numbering is internal; resolution is
     confined to the domain's own table) but made a fiber-handle *value* non-observable to the
-    interp↔JIT differential. The D57 3b-i **run-shared fiber registry** (`SCHEDULING.md`)
+    interp↔JIT differential. The D57 3b-i **run-shared fiber registry** (§23)
     unified the namespace — the interp registry, like the JIT, holds only `cont.new`-created
     fibers, so handles are `0, 1, …` on **both** backends, the fiber fuzzer lets handle values
     flow into compared output, and `jit_fibers::fiber_handle_values_match_across_backends`
@@ -2034,6 +2034,173 @@ thunk on every recompaction, so a multi-threaded guest auto-compacts soundly bet
 
 ---
 
+## 23. Scheduling & migratable fibers (D56/D57)  [SETTLED — built, all slices landed]
+
+How the VM exposes concurrency, why, and how **stackful work-stealing over migratable
+fibers** was designed, staged, and verified. (Absorbed from the former `SCHEDULING.md`
+when the track completed; the build history lives in HANDOFF.md's log.)
+
+### The model: two primitives, nothing more
+
+| Primitive | What it is | Why only the VM can provide it |
+|---|---|---|
+| **vCPU** (`thread.spawn`/`join`) | one real OS thread, 1:1 (D56) | parallelism across physical cores — not expressible in portable guest code |
+| **fiber** (`cont.new`/`resume`/`suspend`) | a *stackful* coroutine that owns a native call stack | switching the native execution stack needs the `svm-fiber` asm stack-switch — the guest's instruction set can't save/restore SP + callee-saved regs and redirect execution mid-function |
+
+Plus the coordination glue that is *also* primitive-minimal: the `wait`/`notify` **futex**
+and **C11 atomics** over the shared window. Everything richer — mutexes, channels, M:N
+schedulers, work-stealing, async runtimes — is **guest-built** from those (D22/D56:
+*primitives, not policy; no scheduler in the VM*).
+
+**"Stackless tasks" are NOT a third primitive.** A stackless task is a function rewritten
+as a state machine (a struct of locals + a resume fn with a `switch` on a state field —
+exactly how Rust `async`/C++ coroutines lower). It needs **zero** VM support: suspend is
+`return`, resume is calling it again. The primitive surface stays at two; stackless is a
+guest *pattern*. It is also strictly *less expressive* (function-coloring: it can suspend
+only at points in its own transformed body, never across an arbitrary or unmodified call
+frame) — fibers are the only way to cooperatively suspend **unmodified real code**, and
+they underpin the §14 fault-driven yield (suspending at an arbitrary hardware-fault PC is
+inherently stackful).
+
+### Migratable fibers (D57) — what the VM owes, and what it doesn't
+
+The instinct is "build a Chase-Lev work-stealing deque." **The VM builds no deque.** The
+work-stealing run-queue is guest code (a deque of fiber handles in guest memory). The VM
+owes only the two things migration needs that the guest cannot provide itself:
+
+1. a **shared fiber-handle namespace** — any vCPU can *name* any fiber (one slot table per
+   domain on both backends; handles are `0, 1, …` domain-wide, identical across backends);
+2. the **single-owner arbiter** — when two workers race to `cont.resume` the same handle,
+   exactly one wins and the loser gets a clean `FiberFault`.
+
+So the entire VM-side surface is one shared slot table, each slot carrying an **`Ownership`
+word** — no deque, no policy, no scheduler.
+
+**The ownership protocol** (`svm-jit/src/fiber_registry.rs`, loom-model-checked): one
+`AtomicU64` per slot packing `(generation, state)` with states `OWNED` (fresh, or pinned
+fault-suspended) / `RUNNABLE` (voluntarily suspended — the pool) / `RUNNING` (never
+claimable) / `FREE` (returned; generation bumped, so a stale handle's claim fails — the ABA
+guard for eventual slot recycling). The live resume path claims via `claim()`
+(`OWNED|RUNNABLE → RUNNING`, acquire CAS; loom proves exactly-one-winner from both start
+states plus published-context visibility); a voluntary suspend publishes via
+`suspend_to_pool` (release), a return `finish`es. The acquire/release pair is the
+happens-before edge that makes resuming a native stack *another thread* saved sound.
+
+**As built, per backend:**
+- **Interpreter** (the oracle): a fiber is pure data (`Vec<Frame>`), so migration is a safe
+  hand-off through the run-shared `FiberRegistry` (one mutex'd table per domain; the mutex
+  is the arbiter — observably identical to the CAS). Each vCPU's root computation runs
+  off-table (this unified the handle namespace with the JIT, closing the recorded §3a
+  divergence). Fiber ops are *visible* ops to the deterministic explorer, recording a
+  `MemAccess::Fiber` conflict so DPOR explores both orders of racing fiber ops; the
+  spin-detection fingerprint covers chain/frames/parked-root rather than the shared table.
+- **JIT**: the domain-shared `fiber_rt::SharedFiberTable` (slots are `Arc`'d; the boxed
+  fiber stays address-stable across table growth; the finished fiber's stack is unmapped at
+  `finish`). The cross-thread resume calls the **unchanged** `svm-fiber` switch — none of
+  the three ABIs carries thread-bound state (SysV/AAPCS64 save only callee-saved registers,
+  no TLS/x18; MS-x64 swaps the TEB `StackBase`/`StackLimit`/`DeallocationStack` per switch).
+  Per-thread state (`CURRENT_RT` for yielder pairing; the §5 guard recovery) is re-read
+  after **every** switch-in, never carried across a suspension. Fixed-mmap stacks are fine:
+  migration moves the executing thread, not the stack (Go copies stacks only for growth).
+
+**What stays per-thread:** the resume chain (a worker's current native/eval call stack) and
+the JIT `yielders` stack — migration only ever moves a *suspended* fiber (on no chain). A
+fiber anywhere in a resume chain is `RUNNING`, so a re-entrant resume loses the claim and
+faults (this replaced the per-thread `chain` checks on both backends). **Quota (§15):**
+`max_fibers` is per-run/domain (the shared table's slot count) on both backends.
+**Compatibility:** a guest that never resumes a foreign fiber sees identical behavior;
+migration is opt-in by the guest's scheduler choosing where to resume a handle.
+
+**Staged remainders** (recorded here; tracked in HANDOFF): *slot recycling* +
+generation-carrying handles must land on both backends together and need the interp
+explorer to record a fiber-return DPOR access first (a `Return` that frees a slot conflicts
+with `cont.new` once slots recycle — `finish` already maintains the generation under the
+hood); *pinned fault-suspended fibers* (`pin`: `RUNNING → OWNED`, excluded from migration
+because `sigjmp_buf`/VEH recovery state is thread-affine) is designed and kept in the
+protocol but nothing produces such fibers on the `cont.*` surface yet.
+
+### The honest tension with D56, and the verification story
+
+D56 removed a VM-owned M:N executor specifically because it reintroduced the project's
+highest-risk unsafe — fiber migration across OS threads — in the runtime TCB. D57
+re-accepts **exactly that risk**, but as a *primitive* (single-owner
+resume-from-any-thread; the guest owns all stealing policy), resolving D56's policy
+objections while accepting its TCB-risk one with eyes open: **no expert review is available
+for the asm/signal seam** (a stated project constraint), and the composition (verified
+protocol + real asm switch + per-thread signal recovery) cannot be model-checked. Safety
+therefore rests on an **empirical net**, every layer of which is built and green:
+
+1. **Randomized-migration differential** — `fiber_fuzz::generated_migration_schedules_agree_on_interp_and_jit`:
+   generated programs whose fibers suspend/resume across sequences of spawned vCPUs,
+   deterministic by construction; the safe-Rust interpreter is the oracle; cross-executor
+   saved-stack resumes are *counted and asserted*, not assumed.
+2. **ASan with real fiber-switch annotations** — `svm-fiber` brackets every switch with
+   `__sanitizer_start/finish_switch_fiber` behind the `asan` cargo feature (chained
+   `svm/asan → svm-jit/asan → svm-fiber/asan`), re-capturing came-from stack bounds at each
+   switch-in so even migrated resumes are tracked; the whole fiber suite runs clean under
+   `-Zsanitizer=address`. (The feature link-requires the sanitizer runtime by design.)
+3. **Runtime single-owner assert** at the resume seam (`FiberSlot::running_on`): a
+   double-claim aborts loudly instead of running one native stack on two threads.
+4. **Guard-paged stacks** + per-thread detect-and-kill recovery: a wild/torn switch faults
+   cleanly on whichever thread runs the fiber.
+5. **Concurrent-steal stress** — `jit_threads::concurrent_fiber_steal_stress`: racing
+   workers claim saved stacks under contention, every second resume a guaranteed
+   cross-thread migration, schedule-invariant sum.
+
+**Honest residual:** fuzzing *detects*, it does not *prove*; a sufficiently rare
+cross-thread race could escape the net. Accepted knowingly as the price of the capability.
+
+### The evidence: three guest schedulers (demos)
+
+1. `demos/mn_sched` — **sharded stackful M:N** (thread-per-core, tasks pinned by choice;
+   glommio/seastar shape).
+2. `demos/work_stealing` — **work-stealing over stackless tasks** (state-machine structs,
+   injector + per-worker deques; tokio shape). No VM change needed — the pre-D57 proof.
+3. `demos/steal_fibers` — **work-stealing over stackful fibers** (the D57 capstone): idle
+   workers steal *suspended fibers* and resume them on their own OS threads; the task
+   yields from inside a nested call frame (inexpressible stackless) with live locals
+   carried across every migration, so its return-sum is a stack-integrity check. Both
+   invariant totals identical on interp and JIT
+   (`c_frontend::c_guest_steal_fibers_demo`, `run::demo_steal_fibers_runs`).
+
+All three are *entirely guest code* over the two primitives — the D56/D57 thesis, proven
+three ways.
+
+## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
+
+Audit date **2026-06-10** (register formerly `AUDIT.md`; deleted when every finding
+closed). Scope: the escape-TCB (verifier, masking unit, memory substrate, decoder) and the
+unsafe-heavy backends (JIT lowering + mask elision + cap ABI, the §14 nesting runtime, the
+fiber/thread runtime + the §5 kill-path). Method: four parallel deep-dive reviews + a
+direct review of the capability/authority model.
+
+**Verdict: the escape-TCB is sound.** No memory-safety escape, no unsound optimization
+(mask elision is provably upper-bound-sound), no arbitrary-code path. All findings
+clustered in **availability (host-survivability)** and on-paper-UB/robustness hardening,
+not confinement — and all eight are fixed:
+
+| # | Sev | Finding (all ✅ fixed) |
+|---|-----|------|
+| 1 | MED–HIGH | guest could abort the host by exhausting the 256-slot handle table (`grant` panicked across the `extern "C"` thunk) → fallible `try_grant`, guest-minting sites return `-EMFILE`; pinned by `address_space::minting_past_table_capacity_returns_emfile_not_panic` |
+| 2 | MED (on-paper UB) | racy non-atomic Rust writes to the shared `trap_out` cell → `AtomicI64` + `store_trap`/`load_trap` (Relaxed); JIT code keeps its aligned hardware-atomic store |
+| 3 | MED (defensive) | JIT nesting validated child size vs clamped size could diverge → one clamped value for both |
+| 4 | LOW | cap.call result buffer partially uninitialized on host arity mismatch → zero-filled |
+| 5 | LOW | `Mapped` atomic width dispatch treated any non-4 width as 8 → `debug_assert!(width == 4 \|\| 8)` |
+| 6 | LOW | `Paged::read_into` debug-overflow on huge `off` → early out-of-range guard (inert, per the `Region` contract) |
+| 7 | LOW | decoder `Vec::with_capacity(ndata)` ~40× allocation amplification → incremental growth |
+| 8 | LOW | futex `HashMap` entries never pruned → removed at `waiters == 0` |
+
+**Checked and found sound (no action):** the verifier (fail-closed, `forbid(unsafe_code)`,
+every bound checked); `svm-mask` `confine` (in-window for all inputs incl. `u64::MAX`;
+`Window::sub` can't wrap past its sub-range); the `svm-mem` unsafe contracts; JIT mask
+elision (`ub_of`/`in_window` upper-bound-sound, saturating, width-accounted); the cap.call
+ABI (buffers sized from the compile-time verified sig); trap propagation (re-checked after
+every call/thunk); `call_indirect` (Spectre-safe masked dispatch + type-id check); the
+`svm-fiber` switches (register/alignment-complete on all three ABIs; body panic → abort);
+the decoder (every count bounded, LEB128 overflow-guarded); the §5 kill-path (epoch-cell
+lifetime via `join_all`; parked vCPUs re-check); capability forgery resistance (generation
++ type_id checked under a Spectre-safe masked index; `create_region` capped).
+
 ## Prior art / touchstones
 
 - **eBPF** — verified bytecode in a hostile host; helper calls as the only
@@ -2228,5 +2395,5 @@ as open-ended, not a byproduct of the build.
 | D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
 | D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |
 | D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`svm-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |
-| D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful migration over *migratable* fibers is ADOPTED and landed (slices 3a–3c):** it re-accepts D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread* — the loom-verified `Ownership` claim; the guest owns any stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections while accepting its TCB-risk one *with eyes open*: no expert reviewer is available for the asm/signal seam, so safety rests on the **empirical net** (SCHEDULING.md "Verification story" — the randomized-migration interp↔JIT differential, ASan with real fiber-switch annotations in `svm-fiber`, a runtime single-owner assert at the resume seam, guard-paged stacks, concurrent-steal stress). Both backends migrate: the interp's run-shared registry (pure-data hand-off, the oracle) and the JIT's domain-shared table over the *unchanged* `svm-fiber` switch (no thread-bound state in any of the three ABIs; MS-x64 swaps the TEB stack fields per switch). Fault-suspended fibers stay pinned (`pin`, staged); slot recycling is staged behind generation-carrying handles on both backends. | Adopted (extends D56; 3a–3c landed) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full reasoning + design + demo roadmap in `SCHEDULING.md` |
+| D57 | **Two concurrency primitives are the floor; "stackless tasks" add none.** vCPU (`thread.spawn`, 1:1) gives parallelism; fiber (`cont.*`) gives suspension of *native* execution. A **stackless task** (a guest-compiled state machine — struct + resume fn + a `switch` on a state field) is a *guest pattern* needing **zero** primitives: its suspend point is the state-machine transition, built from ordinary loads/stores/branches. So guest-built M:N comes in two flavors **today, with no VM change**: *sharded* M:N over **thread-affine** fibers (tasks pinned to their worker), and **work-stealing** M:N over **stackless** tasks (freely movable — moving a struct is a pointer hand-off, safe by construction; over `thread.spawn`+futex+atomics). Stackless is strictly *less expressive* (function-coloring: it can only suspend at points in a transformed body, not across arbitrary/unmodified frames), so fibers stay — they're the only way to cooperatively suspend **unmodified real code** and they underpin the §14 fault-driven yield (suspend at an arbitrary hardware-fault PC is inherently stackful). **Stackful migration over *migratable* fibers is ADOPTED and landed (slices 3a–3c):** it re-accepts D56's deliberately-removed cross-thread-fiber-migration unsafe, but as a **primitive** (the VM enforces a single-owner *resume-from-any-thread* — the loom-verified `Ownership` claim; the guest owns any stealing policy) rather than a VM scheduler — resolving D56's policy-lock-in / double-scheduler objections while accepting its TCB-risk one *with eyes open*: no expert reviewer is available for the asm/signal seam, so safety rests on the **empirical net** (§23 "verification story" — the randomized-migration interp↔JIT differential, ASan with real fiber-switch annotations in `svm-fiber`, a runtime single-owner assert at the resume seam, guard-paged stacks, concurrent-steal stress). Both backends migrate: the interp's run-shared registry (pure-data hand-off, the oracle) and the JIT's domain-shared table over the *unchanged* `svm-fiber` switch (no thread-bound state in any of the three ABIs; MS-x64 swaps the TEB stack fields per switch). Fault-suspended fibers stay pinned (`pin`, staged); slot recycling is staged behind generation-carrying handles on both backends. | Adopted (extends D56; 3a–3c landed) | Pins the primitive count at two and the "no VM scheduler" rule; records the migratable-fiber path honestly as a re-acceptance of a known high-risk unsafe, not a free win — to be earned, not assumed. Full design + verification story + demo evidence in **§23** |
 | D59 | **Guest-driven JIT = the `Jit` capability (§22): a guest submits verified IR and gets native code in its *own* domain.** Verification, not isolation, is the trust boundary — a JIT'd unit is exactly as powerful as its submitter (same window/handles), with one new authority-TCB precondition (declared memory ≡ parent window; reject data segments + concurrency ops in a unit) keeping "no escape-TCB change" true. Model A (cap.call trampoline, default) sidesteps the baked function-table mask; Model B2 (`install` into a pre-reserved table) neutralizes it by pre-sizing — both ship, all four cross-call directions differentially pinned. Type identity is an append-only intern (id-equality ≡ structural equality), never read at runtime. Code reclaim is whole-module recompaction (no per-function free in cranelift-jit), driven by `recompact_jit`/`JitSession` on a byte watermark. Threaded `install` + threaded `compile` work with full platform parity (atomic `DomainTable`/`FnEntry`; `cap_thunk_locked` serializes compiles while execution stays parallel; no aarch64 `isb` needed). | Settled (built, differentially tested) | The "JIT inside the sandbox" wasm handles poorly; the submit-a-blob boundary + verifier-as-hinge already existed, so it was authority-TCB-mostly. Model A's worst case is perf/ergonomics (announced by a benchmark), B2's is a host-writes-into-live-table primitive — both earned their place; the sharded-module throughput optimization stays deferred until measured. Full design + security argument + reclaim/concurrency in §22 |

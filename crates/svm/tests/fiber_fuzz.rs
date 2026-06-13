@@ -16,7 +16,7 @@
 //! Plus an **interp↔JIT differential** (`generated_fiber_programs_agree_on_interp_and_jit`): the
 //! generated fiber programs run on *both* backends and must agree, hardening the `svm-fiber` native
 //! stack-switch the JIT lowers fibers to — the exact asm a future migratable-fiber resume reuses
-//! unchanged (`SCHEDULING.md`). It runs an **acyclic** generator (bounded call + fiber-spawn depth)
+//! unchanged (DESIGN.md §23). It runs an **acyclic** generator (bounded call + fiber-spawn depth)
 //! over a low fiber quota and only hands the JIT programs the interpreter proved terminate, so it is
 //! hang-/bomb-proof by construction while exercising thousands of real resume chains.
 
@@ -286,7 +286,7 @@ fn generated_fiber_programs_never_panic_and_are_deterministic() {
 
 /// **Differential interp↔JIT fuzzing of the fiber stack-switch.** The generated fiber programs run
 /// on *both* backends and must agree — hardening the `svm-fiber` native stack-switch the JIT lowers
-/// fibers to (the exact asm a future migratable-fiber resume reuses unchanged, SCHEDULING.md). The
+/// fibers to (the exact asm a future migratable-fiber resume reuses unchanged, DESIGN.md §23). The
 /// interpreter is the spec.
 ///
 /// **Termination safety (the load-bearing rule).** A generated program can recurse or fiber-bomb
@@ -399,7 +399,7 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
     );
 }
 
-/// **Randomized-migration differential (the D57 3c empirical net, layer 1 — SCHEDULING.md
+/// **Randomized-migration differential (the D57 3c empirical net, layer 1 — DESIGN.md §23
 /// "Verification story").** Generates programs in which fibers created (and part-run) on the root
 /// vCPU are suspended and resumed across a random sequence of *spawned* vCPUs — every worker is a
 /// fresh OS thread, so each generated "resume a fiber last suspended elsewhere" step drives the

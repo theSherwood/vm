@@ -21,7 +21,7 @@
 //! fiber suspended on one OS thread continues on whichever thread claims it next — **stackful
 //! migration**, matching the interpreter oracle's 3b-i semantics.
 //!
-//! **Why the cross-thread resume is sound (the 3c argument — SCHEDULING.md "Verification story"):**
+//! **Why the cross-thread resume is sound (the 3c argument — DESIGN.md §23's verification story):**
 //! the switch itself is the *same* `svm-fiber` instruction sequence that has always run — none of
 //! the three ABIs touches thread-bound state (SysV/AAPCS64 save only callee-saved registers; the
 //! MS-x64 switch swaps the TEB `StackBase`/`StackLimit`/`DeallocationStack` per switch, so "this
@@ -98,7 +98,7 @@ pub(crate) struct FiberSlot {
     /// The loom-verified single-owner state word (`fiber_registry`): the migration arbiter — a
     /// `cont.resume` claims through it, from **any** vCPU (3c).
     own: Ownership,
-    /// The **runtime single-owner assert** (empirical-net layer #3, SCHEDULING.md): the vCPU token
+    /// The **runtime single-owner assert** (empirical-net layer #3, DESIGN.md §23): the vCPU token
     /// currently running this fiber, [`NOT_RUNNING`] when parked. Set (and checked) right after a
     /// won claim, cleared right before the slot is republished — so if the claim protocol were
     /// ever mis-wired, a double-resume aborts loudly at the seam instead of silently running one
