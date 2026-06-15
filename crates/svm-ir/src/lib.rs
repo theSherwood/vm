@@ -1694,6 +1694,25 @@ pub struct ResolvedCap {
     pub op: u32,
 }
 
+/// What an import **name** binds to when [`resolve_imports_with`] lowers it. The §7 capability
+/// case (`Cap`) is the host-ABI binding; `Func` is the **compile-time (static) linking** case — the
+/// name resolved to a concrete function index, so the call lowers to a direct [`Inst::Call`]. (A
+/// data-symbol binding — lowering to a constant window offset — is a natural follow-up.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Resolved {
+    /// A host capability: lower to a `cap.call` on the import's handle operand (§7).
+    Cap(ResolvedCap),
+    /// Another function in the linked module (by index): lower to a direct `call`. This is the
+    /// in-window loader's core operation — a symbol resolved to a function at link time.
+    Func(FuncIdx),
+}
+
+impl From<ResolvedCap> for Resolved {
+    fn from(c: ResolvedCap) -> Self {
+        Resolved::Cap(c)
+    }
+}
+
 /// Why [`resolve_imports`] failed (fail-closed: a missing/garbled import never silently
 /// becomes a no-op or a wrong call).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1716,9 +1735,22 @@ pub fn resolve_imports(
     module: &Module,
     mut resolve: impl FnMut(&str) -> Option<ResolvedCap>,
 ) -> Result<Module, ImportError> {
+    resolve_imports_with(module, |name| resolve(name).map(Resolved::Cap))
+}
+
+/// The general §7 import-lowering pass: like [`resolve_imports`], but a name may bind to **either**
+/// a host capability ([`Resolved::Cap`] → `cap.call`) **or** another function in the linked module
+/// ([`Resolved::Func`] → a direct `call`). The latter is the compile-time (static) linking step the
+/// in-window loader builds on: a symbol resolved to a concrete function index. Each `CallImport`
+/// rewrites **1:1** (no value renumbering) — a `Func` binding drops the unused handle operand.
+/// Fails closed on an unresolved name. The result is import-free (verifier/both backends accept it).
+pub fn resolve_imports_with(
+    module: &Module,
+    mut resolve: impl FnMut(&str) -> Option<Resolved>,
+) -> Result<Module, ImportError> {
     // Resolve each declared import once, up front (so a name binds consistently and a
     // missing one fails before any rewriting).
-    let bound: Vec<ResolvedCap> = module
+    let bound: Vec<Resolved> = module
         .imports
         .iter()
         .map(|imp| resolve(&imp.name).ok_or_else(|| ImportError::Unresolved(imp.name.clone())))
@@ -1734,15 +1766,23 @@ pub fn resolve_imports(
                     args,
                 } = inst
                 {
-                    let cap = *bound
+                    let bind = *bound
                         .get(*import as usize)
                         .ok_or(ImportError::BadImportIndex(*import))?;
-                    *inst = Inst::CapCall {
-                        type_id: cap.type_id,
-                        op: cap.op,
-                        sig: std::mem::take(sig),
-                        handle: *handle,
-                        args: std::mem::take(args),
+                    *inst = match bind {
+                        Resolved::Cap(cap) => Inst::CapCall {
+                            type_id: cap.type_id,
+                            op: cap.op,
+                            sig: std::mem::take(sig),
+                            handle: *handle,
+                            args: std::mem::take(args),
+                        },
+                        // Static-link a function symbol → a direct call (the handle is unused; the
+                        // import sig must match the callee's, which the re-verifier checks).
+                        Resolved::Func(func) => Inst::Call {
+                            func,
+                            args: std::mem::take(args),
+                        },
                     };
                 }
             }
