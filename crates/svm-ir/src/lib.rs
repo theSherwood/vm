@@ -1299,8 +1299,10 @@ pub enum Inst {
         expected: ValIdx,
         timeout: ValIdx,
     },
-    /// §12 futex notify (`atomic.notify`): wake up to `count` (`i32`) vCPUs waiting on the confined
-    /// address `addr`. Yields an `i32`: the number of waiters woken (capped at `count`). Accesses no
+    /// §12 futex notify (`atomic.notify`): wake up to `count` vCPUs waiting on the confined address
+    /// `addr`. The count is the **unsigned** "wake up to N" bound (wasm's `memory.atomic.notify` count
+    /// is u32; the wake-all idiom is `-1` = `u32::MAX`), so the runtime reinterprets the `i32` bits as
+    /// u32 and caps the result at the real waiter count. Yields an `i32`: the number woken. Accesses no
     /// memory, so it never faults on protection — only the address is confined.
     MemoryNotify {
         addr: ValIdx,

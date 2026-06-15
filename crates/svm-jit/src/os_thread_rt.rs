@@ -540,7 +540,9 @@ pub(crate) unsafe extern "C" fn thread_wait(
 /// `sched` is the run's live `Domain`.
 pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, count: i32) -> i32 {
     let dom = &*sched;
-    futex_notify(&dom.futex, &dom.futex_cv, phys, count.max(0) as u32) as i32
+    // The count is **unsigned** "wake up to N" (wasm's notify count is u32; `-1` = wake all);
+    // `futex_notify` caps at the real waiter count, so reinterpret the i32 bits as u32.
+    futex_notify(&dom.futex, &dom.futex_cv, phys, count as u32) as i32
 }
 
 /// Futex park core (shared by the thunk and the loom test). `still_eq` re-checks the guest value under

@@ -68,7 +68,7 @@ fn parallel_counter_wat(nworkers: i32, steps: i32) -> String {
           (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))   ;; remaining -= 1
           (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))  ;; wake the main thread
         (func (export "run") (result i32)
-          (local $i i32)
+          (local $i i32) (local $r i32)
           (i32.atomic.store (i32.const 4) (i32.const {nworkers}))    ;; remaining = nworkers
           (block $spawned
             (loop $sp
@@ -76,13 +76,14 @@ fn parallel_counter_wat(nworkers: i32, steps: i32) -> String {
               (drop (call $spawn (local.get $i)))                     ;; start_arg = i
               (local.set $i (i32.add (local.get $i) (i32.const 1)))
               (br $sp)))
+          ;; standard futex wait: load remaining ONCE into $r and wait expecting that same value, so a
+          ;; worker that drives it to 0 (and notifies) in the gap makes the wait return immediately
+          ;; rather than blocking on a stale value (a lost wakeup).
           (block $finished
             (loop $wait
-              (br_if $finished (i32.eq (i32.atomic.load (i32.const 4)) (i32.const 0)))
-              ;; futex-wait on mem[4] for the current value (re-checked atomically); 2s safety timeout.
-              (drop (memory.atomic.wait32 (i32.const 4)
-                       (i32.atomic.load (i32.const 4))
-                       (i64.const 2000000000)))
+              (local.set $r (i32.atomic.load (i32.const 4)))
+              (br_if $finished (i32.eqz (local.get $r)))
+              (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 2000000000)))
               (br $wait)))
           (i32.atomic.load (i32.const 0))))
       "#
@@ -113,15 +114,14 @@ fn spawn_returns_positive_tid() {
           (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))
           (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))
         (func (export "run") (result i32)
-          (local $tid i32)
+          (local $tid i32) (local $r i32)
           (i32.atomic.store (i32.const 4) (i32.const 1))
           (local.set $tid (call $spawn (i32.const 0)))               ;; → tid (1)
           (block $finished
             (loop $wait
-              (br_if $finished (i32.eq (i32.atomic.load (i32.const 4)) (i32.const 0)))
-              (drop (memory.atomic.wait32 (i32.const 4)
-                       (i32.atomic.load (i32.const 4))
-                       (i64.const 2000000000)))
+              (local.set $r (i32.atomic.load (i32.const 4)))
+              (br_if $finished (i32.eqz (local.get $r)))
+              (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 2000000000)))
               (br $wait)))
           (local.get $tid)))"#;
     assert_eq!(run(wat, "run", &[]), 1, "first spawned tid is 1");

@@ -3228,7 +3228,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // §12 futex notify: wake up to `count` vCPUs parked on the confined address.
                 Inst::MemoryNotify { addr, count } => {
                     let a = as_i64(get(&frames[top].vals, *addr)?)? as u64;
-                    let n = as_i32(get(&frames[top].vals, *count)?)?.max(0) as u32;
+                    // The count is **unsigned** "wake up to N" (wasm's `memory.atomic.notify` count is
+                    // u32; the wake-all idiom is `-1` = u32::MAX). `notify` caps at the real waiter
+                    // count, so reinterpreting the i32 bits as u32 is safe and faithful.
+                    let n = as_i32(get(&frames[top].vals, *count)?)? as u32;
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let base = m.confine_for_notify(a)?;
                     frames[top]
