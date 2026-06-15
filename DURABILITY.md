@@ -189,7 +189,16 @@ No always-on safepoint infra, no global regalloc constraint, no metadata section
 
 **Key mitigation — may-suspend analysis:** only calls that transitively reach a
 `cap.call` (conservatively: any indirect call) get polls; only functions on such paths
-get instrumented.
+get instrumented. *(Phase-1 status: only **directly** `cap.call`-bearing functions are
+instrumented — the transitive analysis arrives with call-chain propagation.)*
+
+**Cost unit is the state-word load, not the branch.** In `NORMAL` state the poll
+branch is perfectly predicted; the real cost is the `i32.load` of the state word. That
+word lives **in the guest window** (a masked load each poll) deliberately — so the
+window snapshot captures it for free (§12.0). A register/host-side state word would be
+faster but needs separate capture: that's the main perf lever if `NORMAL`-state
+overhead ever shows up on `svm-bench`. **Non-durable modules pay none of this** — the
+pass is opt-in and no runtime/TCB crate depends on `svm-durable`.
 
 **Caveat on "pure compute untouched":** the conservative rule treats *any indirect
 call* as may-suspend, and `call_indirect` is the normal lowering for C function
@@ -282,6 +291,10 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     function (more `br_table` arms); multi-block CFGs; call-chain propagation (poll
     after `Call` to a may-suspend callee → real multi-frame stacks, exercising the
     non-deepest rewind path); minimal live-set instead of the current over-capture.
+  - **Hazards introduced by the as-built transform: R8–R11 (§11).** Notably R9 —
+    **do not run real guests through the Phase-1 transform** (the durable region at
+    `[0, SHADOW_BASE)` is unenforced) — and R8 (the deepest-frame assumption that
+    call-chain propagation must revisit).
 - **[ ] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT;
   `svm-mem` page+prot snapshot/**restore**. Risk: low (oracle does the work);
   Windows placeholder semantics the known annoyance. *(escape-TCB touch — restore.)*
@@ -312,6 +325,18 @@ extra mechanism beyond snapshot/restore.
 | R5 | Snapshot-format identity: artifact is coupled to the *instrumented-module* hash, not just backend-independent. Must be pinned in the format. | §1, §9 | open |
 | R6 | v1 latency bound includes "longest poll-free path" until back-edge polls (phase 4); a tight direct-call compute loop is un-preemptable in v1. | §5, §6 | open |
 | R7 | Breadth of instrumentation: "any indirect call = may-suspend" instruments more ordinary C than "compute is free" suggests. Validate on `svm-bench`. | §6 | open |
+
+**Phase-1 implementation hazards** (introduced by the `svm-durable` transform as built;
+the transform *fails closed* — out-of-scope shapes return a `TransformError` rather
+than miscompiling, so these are latent/extension hazards, not silent-miscompile bugs):
+
+| # | Risk / question | Where | Status |
+| --- | --- | --- | --- |
+| R8 | **Deepest-frame assumption.** `ARM0` unconditionally flips to `NORMAL` on rewind because the Phase-1 scope guarantees a single shadow frame. Correct today, but **wrong the moment call-chain propagation lands** without the non-deepest branch (re-issue vs. continue). Needs a multi-frame test when extended. | §2, §12.7, `svm-durable` | open |
+| R9 | **Unenforced low-address durable region.** The state word + shadow stack sit at `[0, SHADOW_BASE)` and nothing checks an instrumented guest doesn't use that range → silent mutual corruption on a real guest. Phase-1 only; the per-fiber guard-paged placement (§12.7) is the fix. **Do not run real guests through the Phase-1 transform.** | §12.7, `svm-durable` | open |
+| R10 | **No concurrency protection on the in-window control state** (state word, shadow-SP). Fine at single-vCPU; a hazard once fibers/multi-vCPU arrive (relates to R1, but specifically about the control words racing). | §3, §12.7 | open |
+| R11 | **Equivalence proven by examples, not the fuzzer.** "Inert in `NORMAL`" and the round-trip are tested on a handful of modules, not yet the §7 generative property. Wire the property into `fuzz/diff.rs` to make it continuous. | §7, §12.6 | open |
+
 
 ---
 
