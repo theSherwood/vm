@@ -10,8 +10,8 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slices A–H):** multi-block scalar functions with stack memory, calls,
-//! `switch`, global variables, floats, indirect calls, and struct aggregates.
+//! **Scope (Milestone 1, slices A–I):** multi-block scalar functions with stack memory, calls,
+//! `switch`, global variables, floats, indirect calls, struct aggregates, and memory intrinsics.
 //! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
 //!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
 //!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
@@ -43,10 +43,14 @@
 //!   byte offset); struct `alloca`s (struct-sized frame slots) and struct global initializers
 //!   serialize with field padding. Covers structs accessed via pointers/locals/globals — *not* the
 //!   by-value pass/return ABI (`sret`/`byval`), which is a follow-up.
+//! - **I — memory intrinsics.** `llvm.memcpy`/`memmove`/`memset` (constant length) lower to inline
+//!   chunked load/stores (widest-first 8/4/2/1, the `svm-wasm` plan); copies load-all-then-store-all
+//!   (overlap-safe); `memset` replicates the fill byte across an `i64`. The data stack is page-aligned
+//!   above the globals so a stack write never faults on a read-only global's page (D40).
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): by-value aggregate args/returns
-//! (`sret`/`byval`), libc/math *function* calls (e.g. `sqrt` with errno), pointer-valued globals
-//! (relocations — incl. function-pointer tables), SIMD vectors, and non-byte integer widths (`i33`).
+//! (`sret`/`byval`), variable-length `mem*`, libc/math *function* calls (e.g. `sqrt` with errno),
+//! pointer-valued globals (relocations — incl. function-pointer tables), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -110,7 +114,11 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     }
     // Globals live low (from `DATA_BASE`); the data stack starts just above them.
     let (globals, data, globals_end) = globals_layout(m)?;
-    let entry_sp = globals_end.div_ceil(16) * 16;
+    // Page-align the data stack above the globals so it never shares a page with a *read-only*
+    // global (D40 protects RO segments page-granularly — a stack write into a shared page would
+    // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
+    // writable global sharing a page is a separate latent issue — page-isolating those is a follow-up.)
+    let entry_sp = globals_end.div_ceil(STACK_PAGE) * STACK_PAGE;
 
     let mut funcs = Vec::with_capacity(defined.len());
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
@@ -152,6 +160,9 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
 
 /// The low window offset where globals begin (kept off a null-like 0).
 const DATA_BASE: u64 = 16;
+/// The page granularity the data stack is aligned to above the globals (≥ the largest OS page so
+/// a stack write never lands in a read-only global's protected page, D40).
+const STACK_PAGE: u64 = 16384;
 /// The data-stack reserve (bytes) above the entry SP before the guard region — a stack overflow
 /// past this faults rather than escaping the window.
 const STACK_RESERVE: u64 = 1 << 20;
@@ -689,6 +700,149 @@ fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
     }
 }
 
+/// The largest constant byte length we unroll a `memcpy`/`memset` into chunked load/stores; a
+/// larger one would need a runtime loop (synthetic blocks), a later slice. clang's struct/array
+/// bulk ops carry small constant sizes.
+const MAX_MEM_UNROLL: u64 = 4096;
+
+/// Split `len` bytes into `(offset, width)` chunks, widest first (8/4/2/1) — the same unroll plan
+/// `svm-wasm` uses for `memory.copy`/`fill`.
+fn mem_chunks(len: u64) -> Vec<(u64, u8)> {
+    let mut out = Vec::new();
+    let mut off = 0u64;
+    let mut rem = len;
+    for w in [8u64, 4, 2, 1] {
+        while rem >= w {
+            out.push((off, w as u8));
+            off += w;
+            rem -= w;
+        }
+    }
+    out
+}
+
+fn load_w(w: u8) -> svm_ir::LoadOp {
+    use svm_ir::LoadOp as L;
+    match w {
+        8 => L::I64,
+        4 => L::I32,
+        2 => L::I32_16U,
+        _ => L::I32_8U,
+    }
+}
+
+fn store_w(w: u8) -> svm_ir::StoreOp {
+    use svm_ir::StoreOp as S;
+    match w {
+        8 => S::I64,
+        4 => S::I32,
+        2 => S::I32_16,
+        _ => S::I32_8,
+    }
+}
+
+/// The constant integer value of an operand, if it is one.
+fn const_int(op: &Operand) -> Option<u64> {
+    match op {
+        Operand::ConstantOperand(c) => match c.as_ref() {
+            Constant::Int { value, .. } => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Lower `llvm.memcpy`/`memmove`/`memset` (constant length) to inline chunked load/stores, the way
+/// `svm-wasm` lowers `memory.copy`/`fill`. Copies **load all chunks then store all** (overlap-safe,
+/// so `memmove` and `memcpy` share a path); `memset` replicates the fill byte across an `i64` and
+/// stores it chunk-wide. Returns `Ok(true)` if it handled a (void) mem intrinsic, `Ok(false)`
+/// otherwise. A variable or too-large length is a clean `Unsupported`.
+fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<bool, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(false);
+    };
+    let is_copy = name.starts_with("llvm.memcpy") || name.starts_with("llvm.memmove");
+    let is_set = name.starts_with("llvm.memset");
+    if !is_copy && !is_set {
+        return Ok(false);
+    }
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let len = const_int(args[2])
+        .ok_or_else(|| Error::Unsupported("variable-length mem intrinsic".into()))?;
+    if len == 0 {
+        return Ok(true);
+    }
+    if len > MAX_MEM_UNROLL {
+        return unsup(format!(
+            "mem intrinsic length {len} > {MAX_MEM_UNROLL} (needs a loop)"
+        ));
+    }
+    let chunks = mem_chunks(len);
+    if is_copy {
+        let dst = ctx.operand(args[0])?;
+        let src = ctx.operand(args[1])?;
+        // Load every chunk first (overlap-safe), then store them all.
+        let loaded: Vec<(u64, u8, ValIdx)> = chunks
+            .iter()
+            .map(|&(off, w)| {
+                let v = ctx.push(Inst::Load {
+                    op: load_w(w),
+                    addr: src,
+                    offset: off,
+                    align: 0,
+                });
+                (off, w, v)
+            })
+            .collect();
+        for (off, w, v) in loaded {
+            ctx.push_effect(Inst::Store {
+                op: store_w(w),
+                addr: dst,
+                value: v,
+                offset: off,
+                align: 0,
+            });
+        }
+    } else {
+        let dst = ctx.operand(args[0])?;
+        let val = ctx.operand(args[1])?; // i8 fill, carried as i32
+                                         // rep64 = (val & 0xFF) * 0x0101010101010101 — the fill byte replicated across 8 bytes.
+        let mask = ctx.push(Inst::ConstI32(0xFF));
+        let vb = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::And,
+            a: val,
+            b: mask,
+        });
+        let vb64 = ctx.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: vb,
+        });
+        let magic = ctx.push(Inst::ConstI64(0x0101_0101_0101_0101u64 as i64));
+        let rep64 = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Mul,
+            a: vb64,
+            b: magic,
+        });
+        let rep32 = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: rep64,
+        });
+        for &(off, w) in &chunks {
+            let value = if w == 8 { rep64 } else { rep32 };
+            ctx.push_effect(Inst::Store {
+                op: store_w(w),
+                addr: dst,
+                value,
+                offset: off,
+                align: 0,
+            });
+        }
+    }
+    Ok(true)
+}
+
 /// Lower a float math intrinsic call to inline float ops, returning its result index. `fmuladd`/
 /// `fma` lower to `fmul`+`fadd` (unfused — a defined IEEE approximation; both backends agree).
 /// Returns `Ok(None)` if the call is not a recognized float intrinsic.
@@ -1171,6 +1325,10 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 }
             }
             return Ok(());
+        }
+        // `llvm.memcpy`/`memmove`/`memset` lower to inline chunked load/stores (constant length).
+        if lower_mem_intrinsic(ctx, c)? {
+            return Ok(()); // void — no SSA result
         }
         // Pass the callee its own data-stack frame at `sp + frame_size` (§3d), then the mapped
         // arguments. The IR signature is `(sp, c-args…)`, so the callee's frame never overlaps ours.

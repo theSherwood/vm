@@ -121,6 +121,27 @@ fn check_traps(name: &str, src: &str, args: &[Value]) {
 }
 
 #[test]
+fn memcpy_struct_copy() {
+    // `struct Big q = G` → `llvm.memcpy` (32 bytes) from a const global into a stack struct; we
+    // lower it to chunked load/stores. A runtime field read keeps the alloca + copy.
+    let src = "struct Big { int a[8]; }; \
+               static const struct Big G = { {1,2,3,4,5,6,7,8} }; \
+               int pick(int i){ struct Big q = G; q.a[0] += 100; return q.a[i & 7]; }";
+    check("pick_0", src, &[Value::I32(0)], &[Value::I32(101)]); // modified field
+    check("pick_3", src, &[Value::I32(3)], &[Value::I32(4)]);
+    check("pick_7", src, &[Value::I32(7)], &[Value::I32(8)]);
+}
+
+#[test]
+fn memset_fill() {
+    // `__builtin_memset(b, 0xAB, 16)` → `llvm.memset`; the fill byte is replicated across the
+    // chunked stores. A signed-char read sign-extends 0xAB to -85.
+    let src = "int hset(int i){ char b[16]; __builtin_memset(b, 0xAB, 16); return b[i & 15]; }";
+    check("hset_0", src, &[Value::I32(0)], &[Value::I32(-85)]);
+    check("hset_9", src, &[Value::I32(9)], &[Value::I32(-85)]);
+}
+
+#[test]
 fn data_stack_guard_traps_on_overflow() {
     // A non-tail recursion (the `+ buf[k]` after the call keeps the result live) with a large
     // 32 KiB frame — a *runtime* index `k` stops clang from shrinking the `volatile` array. A

@@ -8,9 +8,9 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–H (control flow, memory, calls, switch, globals, floats, indirect
-calls, struct aggregates) done — a broad swath of scalar C from `clang -O2` translates and runs
-on both backends.** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–I (control flow, memory, calls, switch, globals, floats, indirect
+calls, struct aggregates, memory intrinsics) done — a broad swath of scalar C from `clang -O2`
+translates and runs on both backends (30 tests).** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -22,8 +22,9 @@ the common float intrinsics, `fmuladd` lowered unfused). Real `clang -O2` progra
 collatz loops, if-converted select, a stack-array sum, recursive `fib`, a cross-function call, a
 dense switch, `even`/`odd` mutual recursion, a const lookup table, a mutable global counter,
 indexed string reads, a gapped switch (a global jump table), double arithmetic/compares/
-conversions, `fabs`/`floor`, an indirect call through a function pointer, and struct field
-access (global/array-of-struct/stack) — run **interp == JIT == hand-computed** (28 tests).
+conversions, `fabs`/`floor`, an indirect call through a function pointer, struct field access
+(global/array-of-struct/stack), and a struct `memcpy` + `memset` — run **interp == JIT ==
+hand-computed** (30 tests).
 Remaining M1: by-value aggregate args/returns (`sret`/`byval`), libc/math function calls,
 function-pointer global tables (relocations), then the demo Lane C. Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
@@ -356,6 +357,16 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       with field padding (read-only D40). Tested on a global struct read field-by-field, an
       array-of-structs (`arr[i].field`), and a `volatile` stack struct (store/load via field GEP).
       Covers structs via pointers/locals/globals — **not** the by-value pass/return ABI.
+
+**Slice I (DONE) — memory intrinsics.**
+- [x] `llvm.memcpy`/`memmove`/`memset` (constant length) lower to inline **chunked load/stores**
+      (widest-first 8/4/2/1, the plan `svm-wasm` uses for `memory.copy`/`fill`). Copies
+      **load-all-then-store-all** (overlap-safe → `memcpy` and `memmove` share a path); `memset`
+      replicates the fill byte across an `i64` (`val·0x01010101_01010101`) and stores it chunk-wide.
+      Variable-length / `> 4 KiB` is a clean `Unsupported` (needs a runtime loop). Also **page-aligned
+      the data stack** above the globals (16 KiB) so a stack write never faults on a read-only
+      global's page (D40 protects RO segments page-granularly — the bug a struct-`memcpy`-into-stack
+      test surfaced). Tested on a struct `memcpy` from a const global and a `memset` fill.
 
 **Remaining slices.**
 - [ ] **By-value aggregate args/returns** (`sret`/`byval`, D39) — passing/returning structs by value.
