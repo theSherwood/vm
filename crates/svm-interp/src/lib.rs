@@ -3408,6 +3408,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
     let v = match inst {
         Inst::ConstI32(c) => Value::I32(*c),
         Inst::ConstI64(c) => Value::I64(*c),
+        // §7 named imports must be lowered to `cap.call` by `resolve_imports` before
+        // execution; a stray `CallImport` is fail-closed (it carries no `type_id`/`op`).
+        Inst::CallImport { .. } => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
             IntTy::I32 => Value::I32(bin32(
                 *op,

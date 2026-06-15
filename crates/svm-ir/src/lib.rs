@@ -1234,6 +1234,21 @@ pub enum Inst {
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
+    /// Call a host capability by **name** — the §7 late-binding import. `import` indexes
+    /// [`Module::imports`] (which supplies the name); `handle` is the `i32` capability
+    /// handle (frontend-supplied, e.g. loaded from the powerbox stash, exactly like
+    /// `cap.call`); `args` are the op arguments; `sig` is a self-describing copy of the
+    /// import's op signature (mirroring `cap.call`/`call_indirect`, so result counting needs
+    /// no module context). It deliberately carries **no** `type_id`/`op`: those are bound at
+    /// instantiation by [`resolve_imports`], the host's `name → (type_id, op)` policy, which
+    /// rewrites every `CallImport` into a concrete [`Inst::CapCall`]. A `CallImport` that
+    /// reaches the verifier or a backend is a fail-closed error (resolution is mandatory).
+    CallImport {
+        import: u32,
+        sig: FuncType,
+        handle: ValIdx,
+        args: Vec<ValIdx>,
+    },
     /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
     /// function referenced by `func` on the data stack based at `sp`. `func` is an `i32`
     /// funcref, resolved through the function table with signature `(i64 sp, i64 arg) ->
@@ -1432,6 +1447,7 @@ impl Inst {
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),
+            Inst::CallImport { sig, .. } => sig.results.len(),
             _ => 1,
         }
     }
@@ -1565,6 +1581,93 @@ pub struct Module {
     /// to it faults, §4/§5). Like an ELF loader laying out `.data`/`.rodata`; replaces the
     /// frontend's per-byte `_start` init stores.
     pub data: Vec<Data>,
+    /// Named capability imports (§7 "Host-defined capabilities & discoverability"): the
+    /// interfaces this module expects the host to bind. Each is a `name` + op `sig`; a
+    /// [`Inst::CallImport`] references one by index. The host's instantiation policy resolves
+    /// each name to a concrete `(type_id, op)` via [`resolve_imports`], which lowers every
+    /// `CallImport` to a [`Inst::CapCall`] and clears this list — so the verifier and both
+    /// backends only ever see import-free modules. An import-bearing module that reaches a
+    /// backend is a fail-closed error (resolution is mandatory first). Empty for modules that
+    /// inline their capability calls (the legacy `cap.call`-only form).
+    pub imports: Vec<Import>,
+}
+
+/// A named capability import (§7). `name` is the symbolic tag the host resolves at
+/// instantiation; `sig` is the operation signature (op args → results, excluding the
+/// handle). Declared in [`Module::imports`] and referenced by index from
+/// [`Inst::CallImport`]. Listing a module's imports is the up-front, fail-closed
+/// "what capabilities does this need?" check (a missing binding never silently no-ops).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Import {
+    pub name: String,
+    pub sig: FuncType,
+}
+
+/// A capability binding resolved from an import name at instantiation (§7): the concrete
+/// interface `type_id` and operation `op` the host bound the name to. Returned by the
+/// resolver passed to [`resolve_imports`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ResolvedCap {
+    pub type_id: u32,
+    pub op: u32,
+}
+
+/// Why [`resolve_imports`] failed (fail-closed: a missing/garbled import never silently
+/// becomes a no-op or a wrong call).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ImportError {
+    /// The host policy returned no binding for this import name.
+    Unresolved(String),
+    /// A `CallImport` referenced an import index past the module's [`Module::imports`].
+    BadImportIndex(u32),
+}
+
+/// Lower every [`Inst::CallImport`] to a concrete [`Inst::CapCall`] using `resolve` (the
+/// host's `name → (type_id, op)` instantiation policy, §7), then drop the import section.
+/// This is the §7 **late binding at instantiation**: the module names the capabilities it
+/// wants, the host decides what each name binds to, and the result is an import-free module
+/// the verifier and both backends accept unchanged (so the §3c handle table + use-site
+/// checks carry safety — resolution moves only the `(type_id, op)` immediates, never a
+/// handle). Fails closed if any declared import name is unresolved, so a missing required
+/// capability surfaces at load, never as a silent miscompile.
+pub fn resolve_imports(
+    module: &Module,
+    mut resolve: impl FnMut(&str) -> Option<ResolvedCap>,
+) -> Result<Module, ImportError> {
+    // Resolve each declared import once, up front (so a name binds consistently and a
+    // missing one fails before any rewriting).
+    let bound: Vec<ResolvedCap> = module
+        .imports
+        .iter()
+        .map(|imp| resolve(&imp.name).ok_or_else(|| ImportError::Unresolved(imp.name.clone())))
+        .collect::<Result<_, _>>()?;
+    let mut out = module.clone();
+    for f in &mut out.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Inst::CallImport {
+                    import,
+                    sig,
+                    handle,
+                    args,
+                } = inst
+                {
+                    let cap = *bound
+                        .get(*import as usize)
+                        .ok_or(ImportError::BadImportIndex(*import))?;
+                    *inst = Inst::CapCall {
+                        type_id: cap.type_id,
+                        op: cap.op,
+                        sig: std::mem::take(sig),
+                        handle: *handle,
+                        args: std::mem::take(args),
+                    };
+                }
+            }
+        }
+    }
+    out.imports.clear();
+    Ok(out)
 }
 
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`
@@ -1574,4 +1677,133 @@ pub struct Data {
     pub offset: u64,
     pub readonly: bool,
     pub bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    // Build a one-function module whose body issues two CallImports ("write", "exit").
+    fn module_with_imports() -> Module {
+        let sig_write = FuncType {
+            params: vec![ValType::I64, ValType::I64],
+            results: vec![ValType::I64],
+        };
+        let sig_exit = FuncType {
+            params: vec![ValType::I32],
+            results: vec![],
+        };
+        let block = Block {
+            params: vec![ValType::I32], // v0 = a capability handle
+            insts: vec![
+                Inst::ConstI64(0), // v1 = buf
+                Inst::ConstI64(3), // v2 = len
+                Inst::CallImport {
+                    // v3 = write(handle=v0, v1, v2)
+                    import: 0,
+                    sig: sig_write.clone(),
+                    handle: 0,
+                    args: vec![1, 2],
+                },
+                Inst::ConstI32(0), // v4 = exit code
+                Inst::CallImport {
+                    // exit(handle=v0, v4)
+                    import: 1,
+                    sig: sig_exit.clone(),
+                    handle: 0,
+                    args: vec![4],
+                },
+            ],
+            term: Terminator::Unreachable,
+        };
+        Module {
+            funcs: vec![Func {
+                params: vec![ValType::I32],
+                results: vec![],
+                blocks: vec![block],
+            }],
+            memory: None,
+            data: vec![],
+            imports: vec![
+                Import {
+                    name: "write".into(),
+                    sig: sig_write,
+                },
+                Import {
+                    name: "exit".into(),
+                    sig: sig_exit,
+                },
+            ],
+        }
+    }
+
+    // The host policy under test: "write" → (Stream=0, op 1), "exit" → (Exit=1, op 0).
+    fn policy(name: &str) -> Option<ResolvedCap> {
+        match name {
+            "write" => Some(ResolvedCap { type_id: 0, op: 1 }),
+            "exit" => Some(ResolvedCap { type_id: 1, op: 0 }),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn resolves_callimports_to_capcalls() {
+        let m = module_with_imports();
+        let r = resolve_imports(&m, policy).expect("resolve");
+        // Import section is gone; the module is now backend-ready.
+        assert!(r.imports.is_empty());
+        let insts = &r.funcs[0].blocks[0].insts;
+        // No CallImport survives.
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::CallImport { .. })),
+            "all imports must be lowered"
+        );
+        // "write" became cap.call 0 1 on handle v0 with args [1,2].
+        match &insts[2] {
+            Inst::CapCall {
+                type_id,
+                op,
+                handle,
+                args,
+                sig,
+            } => {
+                assert_eq!((*type_id, *op, *handle), (0, 1, 0));
+                assert_eq!(args, &vec![1, 2]);
+                assert_eq!(sig.results.len(), 1);
+            }
+            other => panic!("expected CapCall, got {other:?}"),
+        }
+        // "exit" became cap.call 1 0.
+        match &insts[4] {
+            Inst::CapCall {
+                type_id, op, args, ..
+            } => {
+                assert_eq!((*type_id, *op), (1, 0));
+                assert_eq!(args, &vec![4]);
+            }
+            other => panic!("expected CapCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unresolved_import_fails_closed() {
+        let m = module_with_imports();
+        // A policy that knows "write" but not "exit" must error, not silently drop it.
+        let err = resolve_imports(&m, |n| {
+            (n == "write").then_some(ResolvedCap { type_id: 0, op: 1 })
+        })
+        .expect_err("must fail closed");
+        assert_eq!(err, ImportError::Unresolved("exit".into()));
+    }
+
+    #[test]
+    fn module_without_imports_is_unchanged() {
+        let mut m = module_with_imports();
+        // Replace the import calls with a plain return so there's nothing to resolve.
+        m.imports.clear();
+        m.funcs[0].blocks[0].insts.clear();
+        m.funcs[0].blocks[0].term = Terminator::Return(vec![]);
+        let r = resolve_imports(&m, policy).expect("resolve");
+        assert_eq!(r, m, "a no-import module round-trips identically");
+    }
 }

@@ -237,6 +237,13 @@ fn encode_func(out: &mut Vec<u8>, f: &Func) {
 
 fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
     match inst {
+        // §7 named imports have no wire opcode: the binary form is always import-free
+        // (resolution to `cap.call` precedes encoding). Reaching here is a toolchain bug
+        // — encoding an unresolved module — not an untrusted-input path (decode never
+        // produces a `CallImport`).
+        Inst::CallImport { .. } => {
+            unreachable!("encode: resolve_imports must run before binary encoding")
+        }
         Inst::ConstI32(c) => {
             out.push(op::CONST_I32);
             write_sleb(out, *c as i64);
@@ -910,6 +917,8 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         funcs,
         memory,
         data,
+        // The binary form is always import-free (§7 imports are resolved before encoding).
+        imports: Vec::new(),
     })
 }
 

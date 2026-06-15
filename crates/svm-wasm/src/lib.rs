@@ -593,6 +593,9 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             funcs,
             memory,
             data,
+            // svm-wasm lowers capability imports to `cap.call` inline (numeric type_id/op
+            // convention); it does not use §7 named imports.
+            imports: Vec::new(),
         },
         exports,
     })

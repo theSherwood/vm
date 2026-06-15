@@ -975,6 +975,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         funcs,
         memory,
         data,
+        imports: Vec::new(),
     }
 }
 

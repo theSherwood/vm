@@ -227,6 +227,7 @@ fn gen_module(g: &mut Rng) -> Module {
         funcs: (0..nfuncs).map(|_| gen_func(g, nfuncs, None)).collect(),
         memory: None,
         data: Vec::new(),
+        imports: Vec::new(),
     }
 }
 
@@ -245,6 +246,7 @@ fn gen_module_acyclic(g: &mut Rng) -> Module {
         funcs: (0..nfuncs).map(|i| gen_func(g, nfuncs, Some(i))).collect(),
         memory: None,
         data: Vec::new(),
+        imports: Vec::new(),
     }
 }
 
