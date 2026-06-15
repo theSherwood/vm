@@ -8,9 +8,10 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–L (control flow, memory, calls, switch, globals, floats, indirect
-calls, struct aggregates, memory intrinsics, by-value aggregates, relocations, libm math) done — a
-broad swath of scalar C from `clang -O2` translates and runs on both backends (38 tests).** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–M (control flow, memory, calls, switch, globals, floats, indirect
+calls, struct aggregates, memory intrinsics, by-value aggregates, relocations, libm math, int
+min/max+bit intrinsics) done — a broad swath of scalar C from `clang -O2` runs on both backends
+(39 tests). Next: a libc/powerbox `main` entry, then a full demo (Lane C).** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -398,9 +399,15 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       (half-away-from-zero) and transcendentals (`sin`/`cos`/`exp`/`log`/`pow`) have no SVM op, so
       they stay calls (`Unsupported` for now). Tested on `sqrt` and `fmin`.
 
+**Slice M (DONE) — integer min/max + bit intrinsics.**
+- [x] `llvm.smax`/`smin`/`umax`/`umin` → `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` →
+      `clz`/`ctz`/`popcnt` (the trailing `is_*_poison` `i1` ignored — SVM defines the zero case);
+      `llvm.abs` → `select(x<0, -x, x)` (`lower_int_intrinsic`). Tested on `smax` (a `?:` max),
+      `ctlz`, `ctpop`, and an `abs`.
+
 **Remaining slices.**
-- [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/`cttz`/`ctpop`/…) lowered inline;
-      `llvm.load.relative`; transcendental math (needs a guest libm).
+- [ ] `llvm.load.relative` (relative-offset string tables); transcendental math (needs a guest libm);
+      `llvm.bswap`/`bitreverse`/`fshl`.
 - [ ] Libc/powerbox entry (`write`/`exit`/`malloc` via §7 named imports) + a `main` wrapper.
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
       (the same corpus chibicc passes — clay, jsmn, sha256, xxhash, tinfl, perlin, regex,

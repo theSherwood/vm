@@ -195,6 +195,35 @@ fn byval_and_sret_large_struct() {
 }
 
 #[test]
+fn int_minmax_bit_intrinsics() {
+    // `a > b ? a : b` → `llvm.smax`; the bit builtins → `llvm.ctlz`/`ctpop`; `abs` → `llvm.abs`.
+    check(
+        "imax",
+        "int imax(int a, int b){ return a > b ? a : b; }",
+        &[Value::I32(3), Value::I32(7)],
+        &[Value::I32(7)],
+    );
+    check(
+        "clz",
+        "int clz(unsigned x){ return __builtin_clz(x); }",
+        &[Value::I32(1)],
+        &[Value::I32(31)],
+    );
+    check(
+        "pc",
+        "int pc(unsigned x){ return __builtin_popcount(x); }",
+        &[Value::I32(0xFF)],
+        &[Value::I32(8)],
+    );
+    check(
+        "absn",
+        "int ab(int x){ return x < 0 ? -x : x; }",
+        &[Value::I32(-5)],
+        &[Value::I32(5)],
+    );
+}
+
+#[test]
 fn libm_math_calls() {
     // `sqrt`/`fmin` stay external libm calls at -O2 (errno) — we recognize the named function and
     // lower it to the SVM float op inline.

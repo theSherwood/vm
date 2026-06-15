@@ -10,9 +10,9 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slices A–L):** multi-block scalar functions with stack memory, calls,
+//! **Scope (Milestone 1, slices A–M):** multi-block scalar functions with stack memory, calls,
 //! `switch`, globals, floats, indirect calls, struct aggregates, memory intrinsics, by-value
-//! aggregates, pointer-valued global relocations, and libm math calls.
+//! aggregates, pointer-valued global relocations, libm math calls, and integer min/max+bit intrinsics.
 //! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
 //!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
 //!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
@@ -61,6 +61,8 @@
 //! - **L — libm math calls.** A call to an *external* `sqrt`/`fabs`/`floor`/`ceil`/`trunc`/`rint`/
 //!   `copysign`/`fmin`/`fmax` (and `…f` f32 variants) lowers to the matching SVM float op inline —
 //!   unless the guest defines its own. (`round` and transcendentals have no SVM op → still a call.)
+//! - **M — integer min/max + bit intrinsics.** `llvm.smax`/`smin`/`umax`/`umin` → `icmp`+`select`;
+//!   `llvm.ctlz`/`cttz`/`ctpop` → `clz`/`ctz`/`popcnt`; `llvm.abs` → `select(x<0,-x,x)`.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): variable-length `mem*`, libc/host
 //! *function* calls (`write`/`malloc`/`printf`/transcendental math), `llvm.load.relative` (clang's
@@ -77,7 +79,7 @@ use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
-    IntTy, Module, Terminator, ValIdx, ValType,
+    IntTy, IntUnOp, Module, Terminator, ValIdx, ValType,
 };
 
 /// Why a translation could not be produced.
@@ -858,6 +860,79 @@ fn const_int(op: &Operand) -> Option<u64> {
     }
 }
 
+/// Lower an integer min/max or bit intrinsic to inline ops: `llvm.smax`/`smin`/`umax`/`umin` →
+/// `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` → the `clz`/`ctz`/`popcnt` unary op (the trailing
+/// `is_*_poison` `i1` arg is ignored — SVM defines the zero case); `llvm.abs` → `select(x<0,-x,x)`.
+/// Returns `Ok(None)` for any other call.
+fn lower_int_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    types: &Types,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    let base = name.rsplit_once('.').map_or(name.as_str(), |(b, _)| b); // drop the `.iN` suffix
+    if !matches!(
+        base,
+        "llvm.smax"
+            | "llvm.smin"
+            | "llvm.umax"
+            | "llvm.umin"
+            | "llvm.ctlz"
+            | "llvm.cttz"
+            | "llvm.ctpop"
+            | "llvm.abs"
+    ) {
+        return Ok(None);
+    }
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
+    let cmp_select = |ctx: &mut BlockCtx, op: CmpOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        let b = ctx.operand(args[1])?;
+        let cond = ctx.push(Inst::IntCmp { ty, op, a, b });
+        Ok(ctx.push(Inst::Select { cond, a, b }))
+    };
+    let unop = |ctx: &mut BlockCtx, op: IntUnOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        Ok(ctx.push(Inst::IntUn { ty, op, a }))
+    };
+    let idx = match base {
+        "llvm.smax" => cmp_select(ctx, CmpOp::GtS)?,
+        "llvm.smin" => cmp_select(ctx, CmpOp::LtS)?,
+        "llvm.umax" => cmp_select(ctx, CmpOp::GtU)?,
+        "llvm.umin" => cmp_select(ctx, CmpOp::LtU)?,
+        "llvm.ctlz" => unop(ctx, IntUnOp::Clz)?,
+        "llvm.cttz" => unop(ctx, IntUnOp::Ctz)?,
+        "llvm.ctpop" => unop(ctx, IntUnOp::Popcnt)?,
+        // abs(x) = select(x < 0, 0 - x, x).
+        "llvm.abs" => {
+            let x = ctx.operand(args[0])?;
+            let zero = ctx.push(if ty == IntTy::I64 {
+                Inst::ConstI64(0)
+            } else {
+                Inst::ConstI32(0)
+            });
+            let cond = ctx.push(Inst::IntCmp {
+                ty,
+                op: CmpOp::LtS,
+                a: x,
+                b: zero,
+            });
+            let neg = ctx.push(Inst::IntBin {
+                ty,
+                op: BinOp::Sub,
+                a: zero,
+                b: x,
+            });
+            ctx.push(Inst::Select { cond, a: neg, b: x })
+        }
+        _ => unreachable!(),
+    };
+    Ok(Some(idx))
+}
+
 /// Lower a call to an external **libm math** function that has a direct SVM float op (`sqrt`,
 /// `fabs`, `floor`, `ceil`, `trunc`, `rint`/`nearbyint`, `copysign`, `fmin`, `fmax` and their `…f`
 /// f32 variants) to that op inline. Skipped if the guest *defines* a function of that name (then
@@ -1488,6 +1563,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // A call to an external libm-math function with a direct SVM op (`sqrt`/`floor`/…) lowers
         // inline (only when the guest hasn't defined its own function of that name).
         if let Some(idx) = lower_libm_call(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // Integer min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/`ctpop`/`abs`/…) lower inline.
+        if let Some(idx) = lower_int_intrinsic(ctx, c, types)? {
             if let Some(dest) = &c.dest {
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
                     ctx.idx_of.insert(vid, idx);
