@@ -42,12 +42,13 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 
 ### 🔴 Not fail-closed — fix first
 
-- [ ] **Start section (`(start $f)`) is silently ignored.** Falls into the default `_ => {}` section
-  arm (`lib.rs`, with custom sections/datacount), so a module's start function **never runs** and
-  there is **no error** — a silent miscompile (skips C++ static ctors / runtime init). Fix: at minimum
-  a clean `Unsupported`; ideally *run it* (synthesize "call `f` before the entry" — SVM controls the
-  entry path, so this is cheap). *Note: wasm-ld usually emits an exported `_start`/`_initialize`, not a
-  start section, so it may not bite typical clang output — but the silence is the real problem.*
+- [x] **Start section (`(start $f)`) — DONE (runs it).** Was silently ignored (the default `_ => {}`
+  section arm), so a module's start function never ran. Now the transpiler remaps each **exported**
+  function to a synthesized wrapper that calls `start` then the real export, so `start` runs once
+  before the chosen entry (data/element segments are already materialized when the run begins);
+  internal `call`s reach the export directly and don't re-run it. The start function is validated
+  `() -> ()`. `tests/start.rs` (runs-before-export, param/result threading, runs-once/internal-bypass,
+  bad-signature rejection). A non-`(start)` module is byte-identical to before.
 
 ### 🟠 Host-ABI — blocks real WASI programs
 
