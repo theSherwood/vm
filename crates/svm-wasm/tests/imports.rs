@@ -227,11 +227,23 @@ fn import_multiple_interfaces_is_clean_error() {
     assert!(matches!(e, svm_wasm::Error::Unsupported(_)), "{e:?}");
 }
 
-/// A non-function import (here a memory) is unsupported — only function imports map to `cap.call`.
+/// An **imported memory** is now supported (the wasi-threads shape — the host owns the one shared
+/// linear memory). SVM treats it exactly like a defined memory: the window's linear region at offset
+/// 0. (Imported table/global/tag stay unsupported.)
 #[test]
-fn import_memory_is_clean_error() {
-    let e = err(
-        r#"(module (import "env" "mem" (memory 1)) (func (export "f") (result i32) (i32.const 0)))"#,
+fn import_memory_is_supported() {
+    let wasm = wat::parse_str(
+        r#"(module (import "env" "memory" (memory 1)) (func (export "f") (result i32)
+             (i32.store (i32.const 0) (i32.const 42)) (i32.load (i32.const 0))))"#,
+    )
+    .expect("assemble wat");
+    let t = svm_wasm::transpile(&wasm).expect("imported memory should transpile");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let idx = t.exports.iter().find(|(n, _)| n == "f").unwrap().1;
+    let mut fuel = 1_000_000u64;
+    assert_eq!(
+        svm_interp::run(&t.module, idx, &[], &mut fuel).expect("run"),
+        vec![Value::I32(42)],
+        "an imported memory behaves like a defined one"
     );
-    assert!(matches!(e, svm_wasm::Error::Unsupported(_)), "{e:?}");
 }

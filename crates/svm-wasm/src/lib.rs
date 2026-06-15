@@ -181,7 +181,17 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                         wasmparser::TypeRef::Func(t) => t,
                         wasmparser::TypeRef::FuncExact(t) => t,
                         wasmparser::TypeRef::Table(_) => return unsup("imported table"),
-                        wasmparser::TypeRef::Memory(_) => return unsup("imported memory"),
+                        // §12 wasm threads: an **imported** (shared) memory is the canonical
+                        // wasi-threads shape — the host owns the one shared linear memory so it is
+                        // shared across the per-thread instances. SVM treats it exactly like a defined
+                        // memory (the window's linear region at offset 0); only the *declaration* site
+                        // differs. (A non-memory import follows the function/host-ABI path below.)
+                        wasmparser::TypeRef::Memory(mt) => {
+                            if mem.replace(mt).is_some() {
+                                return unsup("multi-memory");
+                            }
+                            continue;
+                        }
                         wasmparser::TypeRef::Global(_) => return unsup("imported global"),
                         wasmparser::TypeRef::Tag(_) => return unsup("imported tag"),
                     };
