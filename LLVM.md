@@ -8,20 +8,21 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–D (control flow + memory + calls + switch) done — multi-block
-integer functions with stack memory, (recursive) calls, and `switch` translate and run on both
-backends.** `crates/svm-llvm` does the **SSA → block-argument conversion** (LLVM dominance SSA +
-φ-nodes → SVM's block-local form via liveness; loops/joins/critical edges, no edge splitting), the
-integer scalar op set, the **§3d data-stack** (`alloca` → window frame slots, `load`/`store` incl.
-narrow widths, `getelementptr` → address arithmetic), **direct calls with the threaded data-SP**
-(every function takes a leading `sp`; a call passes `sp + frame_size`, so recursion is sound), and
-**`switch` → `br_table`** (biased by the min case, dense spans). Real `clang -O2` programs —
-popcount/collatz loops, if-converted select, a stack-array sum (GEP/store/load), recursive `fib`,
-a cross-function call, a dense switch, and an `even`/`odd` mutual recursion (which `-O2` lowers
-onto a switch-loop) — run **interp == JIT == hand-computed** (14 tests). Remaining M1: floats,
-indirect calls (funcref), **global variables** (clang materializes lookup tables / string
-constants as globals), aggregates/`sret`, more intrinsics, then the demo Lane C. Section numbers
-like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
+**Status: Milestone 1 slices A–E (control flow + memory + calls + switch + globals) done —
+multi-block integer functions with stack memory, (recursive) calls, `switch`, and global
+variables translate and run on both backends.** `crates/svm-llvm` does the **SSA → block-argument
+conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
+critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
+window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
+**direct calls with the threaded data-SP** (every function takes a leading `sp`; a call passes
+`sp + frame_size`, so recursion is sound), **`switch` → `br_table`**, and **global variables**
+(a fixed high window region as `data` segments, constants read-only D40; a `@global` ref is its
+window address). Real `clang -O2` programs — popcount/collatz loops, if-converted select, a
+stack-array sum, recursive `fib`, a cross-function call, a dense switch, `even`/`odd` mutual
+recursion, a static const lookup table, a mutable global counter, indexed string-literal reads,
+and a gapped switch (a global jump table) — run **interp == JIT == hand-computed** (18 tests).
+Remaining M1: floats, indirect calls (funcref), aggregates/`sret`, more intrinsics, then the demo
+Lane C. Section numbers like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
 
@@ -311,13 +312,22 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       (span > 4096) and i64-operand switches are a clean `Unsupported`. Tested on a dense switch and
       the `even`/`odd` mutual recursion `-O2` lowers onto a switch-loop.
 
+**Slice E (DONE) — global variables.**
+- [x] Globals laid out in a fixed high window region (`GLOBALS_BASE`, 512 KiB), above the data
+      stack, each natural-aligned. Emitted as IR `data` segments — constants **read-only** (D40),
+      BSS/zero globals just reserve space in the zero-init window. A `@global` reference resolves
+      to its window address (a constant `i64`); int/array/string/zero initializers serialize to
+      little-endian bytes. Tested on a const lookup table, a mutable counter, indexed string reads,
+      and the gapped switch (a global jump table). *(Stack-vs-globals are split by a fixed offset,
+      not a guard page — overflow corrupts globals rather than faulting, still window-confined; a
+      guard refinement is noted.)*
+
 **Remaining slices.**
-- [ ] **Global variables** — clang materializes lookup tables and string constants as globals
-      (e.g. a sparse switch becomes a global `[N x i32]` table + GEP + load; string literals).
-      Lower to IR `data` segments (§3a/D40) + GEP/load on the global's window address. *Now a top
-      need — it blocks string/table-heavy programs and the demo corpus.*
+- [ ] Floats (`f32`/`f64`: `fadd`/…/`fcmp`/`fptosi`/`sitofp`/…). *Likely the top remaining need —
+      the demo corpus has float-heavy programs (perlin), and `double` math is common.*
 - [ ] Indirect `call` (funcref §3c — `call` through a function pointer; needs `ref.func` + the table).
-- [ ] Floats (`f32`/`f64`: `fadd`/…/`fcmp`/`fptosi`/`sitofp`/…).
+- [ ] Pointer-valued global initializers (relocations — a global holding `&other_global`/a string
+      pointer; resolve addresses after layout).
 - [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline.
 - [ ] Struct/vector GEP + by-value aggregates via `sret`/hidden pointer (D39).
 - [ ] `memcpy`/`memset`/`memmove` intrinsics; libc/powerbox entry (`write`/`exit`/`malloc`).

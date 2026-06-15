@@ -224,6 +224,45 @@ fn mutual_recursion_even_odd() {
 }
 
 #[test]
+fn global_const_table() {
+    // A `static const` lookup table → an `internal constant [4 x i32]` global; the read is a
+    // GEP on the global's window address + a load. Exercises read-only `data` segments (D40).
+    let src = "int tbl(int i){ static const int t[4] = {10,20,30,40}; return t[i & 3]; }";
+    check("tbl_0", src, &[Value::I32(0)], &[Value::I32(10)]);
+    check("tbl_2", src, &[Value::I32(2)], &[Value::I32(30)]);
+    check("tbl_5", src, &[Value::I32(5)], &[Value::I32(20)]); // 5 & 3 == 1
+}
+
+#[test]
+fn global_mutable_counter() {
+    // A mutable initialized global → a writable `data` segment; `++g` is load + add + store.
+    let src = "int g = 7; int bump(void){ return ++g; }";
+    check("bump", src, &[], &[Value::I32(8)]);
+}
+
+#[test]
+fn global_string_indexed() {
+    // A string literal → a `[N x i8]` constant global; a runtime-indexed read is GEP + narrow
+    // (`i8`) load, sign-extended to the `char` return.
+    let src = "int nth(int i){ return \"Xyz!\"[i & 3]; }";
+    check("nth_0", src, &[Value::I32(0)], &[Value::I32('X' as i32)]);
+    check("nth_1", src, &[Value::I32(1)], &[Value::I32('y' as i32)]);
+    check("nth_3", src, &[Value::I32(3)], &[Value::I32('!' as i32)]);
+}
+
+#[test]
+fn switch_with_gaps_via_global_table() {
+    // `-O2` compiles a gapped switch into a global lookup table + a range-check + GEP/load — so
+    // this now works via global-variable support (it was the case that revealed the need).
+    let src = "int sg(int x){ switch (x) { case 2: return 20; case 5: return 50; \
+               case 8: return 80; default: return 0; } }";
+    check("sg_2", src, &[Value::I32(2)], &[Value::I32(20)]);
+    check("sg_5", src, &[Value::I32(5)], &[Value::I32(50)]);
+    check("sg_4", src, &[Value::I32(4)], &[Value::I32(0)]); // a gap → default
+    check("sg_8", src, &[Value::I32(8)], &[Value::I32(80)]);
+}
+
+#[test]
 fn unsupported_is_fail_closed() {
     // A float return is outside slice A — it must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).

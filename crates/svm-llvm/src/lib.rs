@@ -10,7 +10,8 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slices A–C):** multi-block integer functions with stack memory and calls.
+//! **Scope (Milestone 1, slices A–E):** multi-block integer functions with stack memory, calls,
+//! `switch`, and global variables.
 //! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
 //!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
 //!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
@@ -25,11 +26,13 @@
 //!   frame_size`, so activations get fresh frames and recursion is sound.
 //! - **D — `switch`.** Lowered to a `br_table` biased by the minimum case value, gaps filled with
 //!   the default edge (dense spans only; a too-sparse switch is `Unsupported`).
+//! - **E — global variables.** Globals live in a fixed high window region as `data` segments
+//!   (constants read-only, D40); a `@global` reference is its window address. Int/array/string/
+//!   zero initializers serialize to bytes.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): floats, indirect calls (funcref),
-//! **global variables** (clang materializes lookup tables / string constants as globals — e.g. a
-//! sparse switch becomes a global table + GEP + load), struct/vector GEP, by-value aggregates,
-//! intrinsics beyond the dropped ones, and non-byte integer widths (e.g. `i33`).
+//! pointer-valued globals (relocations), struct/vector GEP + aggregates, intrinsics beyond the
+//! dropped ones, and non-byte integer widths (e.g. `i33`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -79,24 +82,30 @@ pub fn translate(m: &LModule) -> Result<Module, Error> {
         name2idx.insert(f.name.clone(), i as u32);
     }
 
+    // Lay out global variables (their window addresses + the `data` segments to emit).
+    let (globals, data, globals_end) = globals_layout(m)?;
+
     let mut funcs = Vec::with_capacity(defined.len());
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
     for f in &defined {
-        let (func, frame_size) = translate_func(f, &m.types, &name2idx)?;
+        let (func, frame_size) = translate_func(f, &m.types, &name2idx, &globals)?;
         any_frame |= frame_size > 0;
         funcs.push(func);
     }
-    // A window is declared only if some function uses the data stack. Frames are `sp`-relative
-    // (§3d): each call passes `sp + frame_size`, so activations get fresh frames and recursion is
-    // sound. The reserve is a fixed stack window; deep recursion overflows into the guard region
-    // (detect-and-kill, §5) — matching chibicc. (No calls cross a window yet; one domain, one stack.)
-    let memory = any_frame.then_some(svm_ir::Memory {
-        size_log2: STACK_LOG2,
+    // A window is declared if any function uses the data stack *or* the module has globals. It must
+    // cover the data stack (low, from `FRAME_BASE`) and the globals region (high). Frames are
+    // `sp`-relative (§3d): each call passes `sp + frame_size`, so activations get fresh frames and
+    // recursion is sound; deep recursion overflows into the guard region (§5).
+    let need_window = any_frame || !globals.is_empty();
+    let memory = need_window.then(|| {
+        let end = globals_end.max(1);
+        let log2 = ((64 - (end - 1).leading_zeros()) as u8).max(STACK_LOG2);
+        svm_ir::Memory { size_log2: log2 }
     });
     Ok(Module {
         funcs,
         memory,
-        data: Vec::new(),
+        data,
         // §7 named capability imports — the LLVM on-ramp emits none yet.
         imports: Vec::new(),
     })
@@ -108,9 +117,85 @@ pub fn translate(m: &LModule) -> Result<Module, Error> {
 pub const FRAME_BASE: u64 = 16;
 /// The data-stack window size (`log2`): a fixed 1 MiB reserve when any `alloca` is present.
 const STACK_LOG2: u8 = 20;
+/// Where module globals live in the window — a fixed high region (512 KiB), well above the
+/// data stack growing up from [`FRAME_BASE`]. (A stack that grows this far corrupts globals
+/// rather than faulting — intra-domain, still window-confined; proper guard-paging between the
+/// two is a refinement.) Globals are laid out upward from here as `data` segments.
+const GLOBALS_BASE: u64 = 0x8_0000;
 /// The data-SP's synthetic value id — threaded as block-local index 0 of *every* block (§3d),
 /// like chibicc's `v0`. It carries no LLVM name; it is supplied positionally.
 const SP: ValueId = usize::MAX;
+
+/// An LLVM value/global name as a `String` key (named or numbered).
+fn name_str(n: &Name) -> String {
+    match n {
+        Name::Name(s) => s.to_string(),
+        Name::Number(k) => k.to_string(),
+    }
+}
+
+/// Serialize a constant initializer to its little-endian window bytes (the §3d/x86-64 layout).
+/// Integers (incl. the `i8`s of a C string), arrays, and zero/null aggregates are covered;
+/// pointer-valued globals (relocations), structs, floats, and vectors are a later slice.
+fn const_bytes(c: &Constant) -> Result<Vec<u8>, Error> {
+    match c {
+        Constant::Int { bits, value } if *bits <= 64 => {
+            let n = (*bits as usize).div_ceil(8).max(1);
+            Ok(value.to_le_bytes()[..n].to_vec())
+        }
+        Constant::Array { elements, .. } | Constant::Vector(elements) => {
+            let mut out = Vec::new();
+            for e in elements {
+                out.extend(const_bytes(e.as_ref())?);
+            }
+            Ok(out)
+        }
+        Constant::AggregateZero(t) | Constant::Null(t) => {
+            Ok(vec![0u8; type_size(t.as_ref())? as usize])
+        }
+        other => unsup(format!("global initializer {other:?}")),
+    }
+}
+
+/// The result of [`globals_layout`]: name → window address, the `data` segments to emit, and the
+/// globals region's end offset (for window sizing).
+type Globals = (HashMap<String, u64>, Vec<svm_ir::Data>, u64);
+
+/// Lay out the module's global variables in the window's globals region (from [`GLOBALS_BASE`],
+/// each natural-aligned), returning the name → window-address map, the `data` segments to emit
+/// (constants read-only, §3a/D40; all-zero/BSS globals just reserve space in the zero-init
+/// window), and the region's end (for window sizing).
+fn globals_layout(m: &LModule) -> Result<Globals, Error> {
+    let mut addr = HashMap::new();
+    let mut segs = Vec::new();
+    let mut off = GLOBALS_BASE;
+    for g in &m.global_vars {
+        let (bytes, size) = match &g.initializer {
+            Some(init) => {
+                let b = const_bytes(init.as_ref())?;
+                let n = b.len() as u64;
+                (Some(b), n.max(1))
+            }
+            None => (None, type_size(g.ty.as_ref())?.max(1)),
+        };
+        let align = (g.alignment as u64).max(1);
+        off = off.div_ceil(align) * align;
+        addr.insert(name_str(&g.name), off);
+        // Emit a segment only for non-zero initialized data (the window is zero-init, so BSS and
+        // explicit zeros need none). A read-only segment is protected (D40), so a guest write faults.
+        if let Some(b) = bytes {
+            if g.is_constant || b.iter().any(|&x| x != 0) {
+                segs.push(svm_ir::Data {
+                    offset: off,
+                    readonly: g.is_constant,
+                    bytes: b,
+                });
+            }
+        }
+        off += size;
+    }
+    Ok((addr, segs, off))
+}
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
 /// are memory widths only, not SSA value types); `i64` stays `i64`. Non-byte widths (`i33`,
@@ -181,6 +266,7 @@ fn translate_func(
     f: &Function,
     types: &Types,
     name2idx: &HashMap<String, u32>,
+    globals: &HashMap<String, u64>,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
         return unsup(format!("varargs function `{}`", f.name));
@@ -216,6 +302,7 @@ fn translate_func(
             &frame,
             frame_size,
             name2idx,
+            globals,
         )?);
     }
     Ok((
@@ -588,6 +675,8 @@ struct BlockCtx<'a> {
     frame_size: u64,
     /// Defined LLVM function name → its IR function index (for resolving a direct `call`).
     name2idx: &'a HashMap<String, u32>,
+    /// Global variable name → its window address (for resolving a `@global` reference).
+    globals: &'a HashMap<String, u64>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     next_val: ValIdx,
@@ -670,6 +759,16 @@ impl<'a> BlockCtx<'a> {
                         other => unsup(format!("undef/poison/null of type {}", other.as_str())),
                     }
                 }
+                // A reference to a global variable is its window address (a constant `i64`). A
+                // reference to a *function* (a function pointer) is not in the globals map → it is
+                // funcref territory (a later slice), so a clean `Unsupported`.
+                Constant::GlobalReference { name, .. } => {
+                    let n = name_str(name);
+                    match self.globals.get(&n) {
+                        Some(&a) => Ok(self.push(Inst::ConstI64(a as i64))),
+                        None => unsup(format!("reference to `@{n}` (function/undefined global)")),
+                    }
+                }
                 other => unsup(format!("constant operand {other:?}")),
             },
             Operand::MetadataOperand => unsup("metadata operand"),
@@ -688,6 +787,7 @@ fn translate_block(
     frame: &HashMap<ValueId, u64>,
     frame_size: u64,
     name2idx: &HashMap<String, u32>,
+    globals: &HashMap<String, u64>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // The data-SP (`SP` sentinel) types as `i64`; every other param reads its scanned type.
@@ -700,6 +800,7 @@ fn translate_block(
         frame,
         frame_size,
         name2idx,
+        globals,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         next_val: 0,
