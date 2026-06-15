@@ -1534,7 +1534,7 @@ regressions one commit old"):
 > **Immediate frontier, ranked** *(the async ring (B) is done — these are the next big rocks):*
 > 0. **wasm → IR transpiler (`crates/svm-wasm`) — DONE / feature-complete for typical clang output**
 >    (numeric + control + if/else + memory + grow + bulk-memory + imports + **v128 SIMD** + **threads**:
->    atomics, shared/imported memory, wasi-threads spawn → native `thread.spawn`; 67 tests + the
+>    atomics, shared/imported memory, wasi-threads spawn → native `thread.spawn`; 63 tests + the
 >    `bench --threads` concurrency comparison vs Wasmtime+wasi-threads).
 >    Remaining `Unsupported` arms are niche (narrow atomics, passive segments, multi-interface imports, reference types,
 >    multi-memory/table) — see the missing-features note below. Not the active frontier; LLVM is (item 1).
