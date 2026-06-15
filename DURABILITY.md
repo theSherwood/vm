@@ -1,0 +1,317 @@
+# Durable Domains — Snapshot / Restore / Clone
+
+> **Status: Proposed (design tracking doc).** Nothing here is implemented yet. This
+> file is the single source of truth for the *design and implementation status* of
+> durable domains. The master design is `DESIGN.md` (D-notes, §-sections); the
+> project status/pickup doc is `HANDOFF.md`. Keep all three in step — if code and a
+> doc disagree, fix one of them in the same change (per `AGENTS.md`).
+>
+> Proposed decision: **D60** (D59 is currently the last). See bottom of file.
+
+A "durable" domain can be quiesced, serialized to `(window pages + prots, shadow
+control state, handle table)`, and later restored to bytewise-equivalent execution —
+possibly on the other backend, possibly on a different host. The artifact must
+survive: a recompile, a Cranelift version bump, ASLR, and JIT↔interp migration
+(see §1 for the precise meaning of "survive a recompile" — it is narrower than it
+sounds).
+
+---
+
+## 0. Orientation — how this lands on the existing VM
+
+Grounding the proposal in what already exists (verified against the tree):
+
+- **IR shape is ideal for the codec.** `svm-ir` is a flat CFG of block-local typed
+  SSA with explicit block params and **no phi nodes** (`crates/svm-ir/src/lib.rs`
+  `Block { params, insts, term }`). So resume-point liveness is *free*: a
+  continuation block's `params` already are the live set, and the verifier
+  (`svm-verify`) does no liveness/dominance analysis — it is a single linear forward
+  type pass.
+- **Dispatch primitive exists.** `Terminator::BrTable` (verifier-constrained: valid
+  well-typed arm or trapping default, checks in `crates/svm-verify/src/lib.rs`) is
+  exactly the rewind dispatch we need. No new instruction.
+- **Suspension is explicit IR.** `Suspend`, `ContResume`, `ContNew`, and `CapCall`
+  are real instructions; `Func::uses_concurrency()` already scans for them.
+- **Memory substrate is close.** `svm-mem` owns the window; page protections
+  (`PageProt`) and bulk snapshot-read (`read_into`, `SNAP_CAP`) already exist for the
+  escape-oracle. **Restore (write pages back + re-establish prots) does not exist yet
+  and is new escape-TCB code** — see §6/§9.
+- **Nesting is real.** A child window is a power-of-two sub-range of the parent's via
+  `Window::sub()` (`crates/svm-mask/src/lib.rs`). This is the §4 subtree.
+- **The oracle is production machinery.** `crates/svm/tests/jit_diff.rs` and
+  `fuzz/fuzz_targets/diff.rs` already run every program on interp and JIT and assert
+  equivalence. The new snapshot property (§7) plugs straight in.
+- **Tooling-tier precedent.** `svm-text` is a non-TCB crate depending only on
+  `svm-ir`. The transform pass follows the same pattern (+0 TCB).
+
+---
+
+## 1. Goal & non-goals
+
+**Goal.** Capture a running durable domain into a backend-independent,
+recompile-survivable artifact and resume it later.
+
+**What "survives a recompile" precisely means** (this needs to be exact — see
+Risk R5):
+- **Backend recompile / Cranelift bump / ASLR / JIT↔interp:** yes. The suspended
+  state is IR-level and references no native address, register, or compiled code.
+- **Re-running the *transform* (different block-splitting → different resume-id
+  numbering):** **no, not automatically.** The shadow-stack schema is a function of
+  the instrumented module's structure. The artifact is therefore *backend-portable*
+  but *coupled to a specific instrumented-module identity*. The snapshot format must
+  carry the instrumented-module hash; restore requires the same instrumented module.
+  (This is asyncify's "can't thaw into a differently-compiled binary.")
+
+**Non-goals.** Snapshotting non-durable domains (they pay nothing — §6). Capturing a
+native stack as bytes (dies on relocation/recompile — §2). A built-in scheduler or
+M:N runtime (orthogonal; honours D22/D56 — the VM ships *mechanism, not a
+scheduler*).
+
+---
+
+## 2. Mechanism — IR-level freeze/thaw (the codec)
+
+The native stack is a continuation in the least durable schema possible: *these exact
+addresses in this exact build*. So we never serialize it. Instead a **durable** domain
+is compiled through one IR→IR pass that lets each fiber flatten itself into
+guest-resident, IR-level state and rebuild itself from it. The native stack remains
+the runtime suspension mechanism (scheduling, fault-driven yield, hot suspend); the
+transform is only the **codec** for `fiber.freeze` / `fiber.thaw`.
+
+**The transform** (output is ordinary verifier-passing IR; no new instructions):
+
+- **State word** (per vCPU, in-window): `NORMAL | UNWINDING | REWINDING`.
+- **Shadow stack** (in-window): per frame, a *resume id* (small int enumerating a
+  function's resume points) + the values live across that point.
+- **Resume points = block heads.** Split each block after a may-suspend call; the
+  continuation block's params *are* the live set (block-local SSA → liveness is
+  explicit, no analysis).
+- **Unwind:** after each may-suspend call, `if UNWINDING → spill continuation block's
+  args to the shadow frame, push resume id, return`. Propagates out to the host.
+- **Rewind:** function prologue, `if REWINDING → br_table over resume blocks`; each
+  arm reloads its params from the shadow frame and re-issues the in-flight call.
+  Dispatch is the existing, verified `br_table`.
+
+**Freeze** = host sets `UNWINDING`, drives every fiber (suspend sites are resume
+points) until all native stacks are empty. **Thaw** = restore memory, set
+`REWINDING`, re-enter; the stack rebuilds itself through verified code.
+
+**Why not host-side frame capture (annotate existing stacks).** Capture is feasible
+(FP-walk + call-site stack maps decode frames into the interp `Frame`). Restore is
+not: native re-entry stubs that rebuild each frame *are* asyncify's rewind, but
+implemented in `svm-jit` with per-arch unsafe, *outside the differential oracle*. The
+transform puts the same logic in verified IR, inside the oracle. (Full comparison: §8.
+Note: the rejection rests on "per-arch unsafe outside the oracle," **not** on D56 —
+see §8 for why the earlier D56 framing was wrong.)
+
+---
+
+## 3. Security
+
+The shadow stack holds **IR-level tokens only** — never a native address. Adversarial
+writes to it reduce to guest-harms-guest, already conceded by the §2a threat model:
+
+| Guest tampering | Outcome |
+| --- | --- |
+| Forge a resume id | `br_table` is verifier-constrained: lands on a valid, well-typed arm in the same function, or the trapping default. Wrong data or trap — **never a control escape.** |
+| Corrupt saved values | Garbage in well-typed slots — a wild store could already do this. |
+| Forge the state word | Spurious self-unwind / broken self-rewind — self-DoS. |
+
+This is the `call_indirect` story exactly: the guest already keeps control-adjacent
+state (function-table indices, the in-window data stack) in its window, and the answer
+is **masked, verified dispatch** — not memory integrity.
+
+**Why this is +0 to the security argument.** Per `DESIGN.md` §4/D38, the escape hinge
+is the **confinement-masking lowering** (`svm-mask`), not the verifier. The shadow
+stack is ordinary guest memory, so its stores/loads go through that same masked path
+as any guest access — the existing hinge already covers it. The verifier still secures
+typing/control-flow/index-ranges of the instrumented IR. A transform bug is a
+*correctness* bug, never a confinement bug.
+
+Corollary: restore never crosses a trust boundary as structured data (host loads
+opaque bytes and calls the entry), unlike host-side frame capture, whose restore path
+is a parser over attacker-controlled frames in the host.
+
+---
+
+## 4. Unit of durability
+
+- **Instrumentation unit = the module** (a compile-mode flag). Includes `Jit`-cap
+  units (`DESIGN.md` §22): the host runs the pass on submitted IR before
+  verification, so guest-driven JIT composes for free.
+- **Snapshot unit = the domain, closed over its nesting subtree (§14).** State lives
+  in the domain (window, vCPUs/fibers, handle/dispatch tables); a child's window is a
+  power-of-two sub-range of the parent's (`Window::sub`), and a fault-suspended child
+  can only be drained-then-unwound if its code is instrumented.
+
+**Enforcement (one flag check at instantiate/install):** *a durable domain admits
+only freezable modules and may only spawn durable children.* STW quiesces the subtree
+as a unit.
+
+**Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
+durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
+shared edge (consistent-cut). Decide as a `SharedRegion` constraint: either a durable
+domain can't share outside its subtree, or regions carry a snapshot protocol. This is
+the only place the unit-of-durability question has a real design consequence.
+
+---
+
+## 5. STW & the non-instrumented residue
+
+Two states can't be translated and are **drained**, not decoded:
+
+- **Fault-suspended fiber** (parked at an arbitrary PC, demand-paged coroutine):
+  supply the page, let it run to the next poll site, then it unwinds.
+- **vCPU inside a host `cap.call`:** let the call return, then unwind.
+
+So freeze = cooperative STW: request unwind, wait for quiescence-at-safepoints (the
+Go/JVM shape). The drain protocol is **host-side and identical on both backends** — no
+codegen, no native-stack decode. Snapshot latency is bounded by the longest host call
+**plus the longest poll-free code path** (until back-edge polls land in phase 4 — see
+R6); needs a cancellation story for `Blocking.work` before latency guarantees are
+tight.
+
+---
+
+## 6. Performance
+
+**Non-durable modules: zero, structurally.** The pass runs only on request; an
+uninstrumented module's bytes, verification, and codegen are byte-identical to today.
+No always-on safepoint infra, no global regalloc constraint, no metadata sections.
+
+**Durable modules:**
+
+| Cost | When | Estimate |
+| --- | --- | --- |
+| Poll (load+cmp+branch on state word) | after may-suspend calls; (later) back-edges | epoch-interruption shape; low single-digit %, worst case 10–30% call/loop-dense |
+| Code size | cold-path dispatch + spill/reload blocks | +50–100% in instrumented functions (icache, not host binary) |
+| Spill/reload | only on actual unwind | snapshot frequency, not exec frequency |
+
+**Key mitigation — may-suspend analysis:** only calls that transitively reach a
+`cap.call` (conservatively: any indirect call) get polls; only functions on such paths
+get instrumented.
+
+**Caveat on "pure compute untouched":** the conservative rule treats *any indirect
+call* as may-suspend, and `call_indirect` is the normal lowering for C function
+pointers / vtables. So "untouched" holds for **direct-call** compute (sha256/perlin/
+xxhash shapes); function-pointer-heavy C still gets instrumented. The 10–30% worst
+case may be more common than "compute is free" implies. *Validate by running the pass
+over `svm-bench` + demos — the harness makes this ~a day.*
+
+---
+
+## 7. Backend equivalence
+
+Both backends run the **same instrumented IR**; the suspended representation is
+IR-level, so the artifact references no native address, recompiled code, or register
+layout. Consequences: snapshots are **backend-portable** (freeze under JIT, thaw under
+interp), and the existing generative fuzzer **proves** it via one new property:
+
+> for any valid module and any snapshot point:
+> run-to-snapshot → serialize → restore → run-to-end  ≡  uninterrupted run
+
+checked on interp, on JIT, and cross-backend (extends `crates/svm/tests/jit_diff.rs`
+and `fuzz/fuzz_targets/diff.rs`). Equivalence is continuously tested, not asserted.
+The §5 residue is drained identically on both backends, so no backend ever decodes a
+native stack.
+
+---
+
+## 8. Alternatives considered
+
+| Path | Capture | Restore | Complexity lands in |
+| --- | --- | --- | --- |
+| **Freeze/thaw transform (chosen)** | guest unwinds itself | guest rewinds itself | verified IR, both backends, oracle-checked |
+| Annotate existing stacks (B-lite) | FP-walk + call-site maps | native re-entry stubs (≈ asyncify, in JIT) | per-arch unsafe, outside oracle |
+| CRIU-lite (pin code arena + stacks) | memcpy | memcpy | host-heap pointer aliasing; same-binary only — not durable in any useful sense |
+
+**Correction to the original draft:** an earlier version of this argument said
+host-side capture "re-opens the unsafe class D56 evicted." That is inaccurate. **D56**
+removed a *built-in M:N green-thread executor*, whose highest-risk unsafe was *fiber
+migration across OS threads in the runtime TCB* — not a per-arch stack-unwind unsafe
+class. Moreover **D57 deliberately re-adopted** migratable-fiber unsafe ("with eyes
+open") as a primitive. So host-side capture is rejected on its *own* merits —
+**per-arch unsafe, outside the differential oracle** — not because D56 forbade it.
+
+Why the transform is *small here specifically*: Binaryen's asyncify is hairy because
+of wasm's structured control flow + locals model + interprocedural liveness. This IR
+is a flat CFG of block-local SSA with explicit block params, so resume-point liveness
+is free, splitting is mechanical, and dispatch reuses `br_table`. The pass is the only
+transform-specific work; everything else in §9 is needed by *any* snapshot design.
+
+---
+
+## 9. Implementation plan & status
+
+New non-TCB crate (tooling tier, like `svm-text`) for the pass; thin plumbing
+elsewhere. Net ~1.5–3k lines.
+
+- **TCB impact:** the **pass itself is +0 TCB** (tooling tier; an embedder running
+  pre-instrumented modules links none of it). **But phase 2 adds a small escape-TCB
+  surface** — page+prot *restore* lives in `svm-mem`, which is escape-TCB. Honest
+  accounting: +0 TCB for the codec, +small escape-TCB for the restore path (covered
+  by the oracle).
+
+**Sizing:** ~4–8 weeks to a v1 (cap.call-boundary snapshots, MVP-powerbox handles,
+restore-on-either-backend). Variance concentrates almost entirely in **phase 3**
+(concurrency/quiesce vs. the D57 migratable-fiber ownership protocol) and in fuzz
+findings; the transform itself is the *most* predictable piece. Phase 1's
+predictability should not be read as overall low risk.
+
+**Before phase 1:** write the one-page snapshot-format + handle-durability spec so the
+fuzz property has a stable target. The format **must** include the instrumented-module
+hash (see §1 / R5). Scope v1 handle durability to re-grantable handles only.
+
+### Phase tracker
+
+Legend: `[ ]` not started · `[~]` in progress · `[x]` done
+
+- **[ ] Phase 0 — Spec.** One-page snapshot-format + handle-durability spec.
+  Format carries instrumented-module hash. v1 = re-grantable handles only.
+- **[ ] Phase 1 — Transform + interp round-trip.** Single vCPU → `cap.call` →
+  unwind → serialize window → restore → rewind → finish. No STW/JIT/fibers.
+  **Go/no-go gate.** Risk: low (most predictable part).
+- **[ ] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT;
+  `svm-mem` page+prot snapshot/**restore**. Risk: low (oracle does the work);
+  Windows placeholder semantics the known annoyance. *(escape-TCB touch — restore.)*
+- **[ ] Phase 3 — STW + multi-vCPU + fiber freeze/thaw.** Cooperative quiesce, drain
+  residue, freeze/thaw choreography against the D57 migratable-fiber ownership
+  protocol. **Highest risk** — concurrency seam (loom-check, like the futex glue).
+- **[ ] Phase 4 — Back-edge polls, handle hardening, CoW clone.** Latency +
+  durability quality + cheap clone. Incremental, off critical path.
+
+---
+
+## 10. Clone
+
+Falls out of the same machinery at a quiescent point: window copy (CoW via
+`memfd` + `MAP_PRIVATE` for cheap) + dispatch-table rebuild + handle re-grant. No
+extra mechanism beyond snapshot/restore.
+
+---
+
+## 11. Risk register / open questions
+
+| # | Risk / question | Where | Status |
+| --- | --- | --- | --- |
+| R1 | Phase-3 quiesce vs. D57 migratable-fiber single-owner protocol (a fiber may be mid-migration / owned by another OS thread at safepoint request). The crux of the schedule variance. | §5, §9 | open |
+| R2 | `Blocking.work` cancellation needed before snapshot-latency guarantees are tight. | §5 | open |
+| R3 | escape-TCB growth from the page+prot **restore** path in `svm-mem`. | §6, §9 | open |
+| R4 | `SharedRegion` cross-tree sharing: co-snapshot the sharing group, or regions carry a snapshot protocol? Decide as a `SharedRegion` constraint. | §4 | open |
+| R5 | Snapshot-format identity: artifact is coupled to the *instrumented-module* hash, not just backend-independent. Must be pinned in the format. | §1, §9 | open |
+| R6 | v1 latency bound includes "longest poll-free path" until back-edge polls (phase 4); a tight direct-call compute loop is un-preemptable in v1. | §5, §6 | open |
+| R7 | Breadth of instrumentation: "any indirect call = may-suspend" instruments more ordinary C than "compute is free" suggests. Validate on `svm-bench`. | §6 | open |
+
+---
+
+## Proposed decision record
+
+> **D60 (Proposed). Durability via an IR-level freeze/thaw transform, not native-stack
+> capture.** Durable domains compile through an opt-in IR→IR pass that flattens fibers
+> into guest-resident, verifier-checked control state; snapshots are
+> `(window, shadow state, handles)`, backend-portable and surviving a backend
+> recompile / Cranelift bump (but coupled to the instrumented-module identity — R5).
+> Rejected: host-side frame capture (per-arch unsafe, outside the differential
+> oracle) and CRIU-lite (same-binary only). The confinement-masking lowering stays the
+> escape hinge (D38); the codec pass adds +0 TCB, the page+prot restore path adds a
+> small escape-TCB surface in `svm-mem`; non-durable modules pay nothing.
