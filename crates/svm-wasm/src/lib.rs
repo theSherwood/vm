@@ -153,6 +153,18 @@ fn val_type(w: W) -> Result<ValType, Error> {
 /// the size cell only governs the `size`/`grow` *return values*. A module that never grows is
 /// unchanged (no cell, the tight initial-sized window, `memory.size` a constant).
 pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
+    // Fail-closed on malformed / invalid wasm *before* any lowering. The lowering pass below indexes
+    // attacker-controlled type/function/global/local/table/branch indices and derives operand-stack
+    // heights straight from the byte stream; on hostile-but-decodable input those raw `[...]` accesses
+    // and `len() - k` subtractions would panic, and an oversized locals/table declaration would
+    // allocate unboundedly (a host-side OOM / `abort`). A full validation pass up front guarantees wasm
+    // validity — in-range indices, well-typed and arity-correct operands, and wasmparser's
+    // implementation limits (≤50 000 locals/function, ≤10 000 000 table entries, …) — so every such
+    // hostile input becomes a clean `Error` here instead. The default feature set covers exactly the
+    // proposals we lower (mutable-global, bulk-memory, SIMD, threads, multi-value, …); anything we do
+    // not support is still rejected later by an `Unsupported` bail or, ultimately, the IR verifier.
+    wasmparser::Validator::new().validate_all(wasm)?;
+
     let mut types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
     let mut func_type_idx: Vec<u32> = Vec::new();
     let mut bodies: Vec<wasmparser::FunctionBody> = Vec::new();

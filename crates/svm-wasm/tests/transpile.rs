@@ -1119,3 +1119,72 @@ int digest_byte(int k){ if(!done) compute(); if(k<0||k>=32) return -1; return di
         );
     }
 }
+
+/// H2 robustness regression: `transpile` must **fail closed** on hostile/malformed wasm — never panic,
+/// OOM, or hang — and any IR it does emit must still verify. Before the up-front `wasmparser::Validator`
+/// gate, malformed-but-decodable input reached the lowering pass and could panic (out-of-range
+/// type/func/local/table/branch indices, operand-stack-height underflow) or allocate unboundedly
+/// (an oversized locals/table declaration). This drives a seeded byte-mutation sweep over a module that
+/// exercises the type/global/table/elem/local/`call_indirect` lowering paths; a panic fails the test
+/// (the harness catches unwinds), and a successful transpile is checked to verify. A standing
+/// `cargo +nightly fuzz run wasm_transpile` target covers this exhaustively — this is the stable net.
+#[test]
+fn transpile_fails_closed_on_malformed_input() {
+    let wat = r#"(module
+      (memory 1)
+      (global $g (mut i32) (i32.const 7))
+      (table 2 funcref)
+      (elem (i32.const 0) $a $b)
+      (type $t (func (param i32) (result i32)))
+      (func $a (type $t) (param i32) (result i32) (local i32 i64)
+        local.get 0 i32.const 1 i32.add)
+      (func $b (type $t) (param i32) (result i32)
+        local.get 0 i32.const 2 i32.mul)
+      (func (export "main") (param i32) (result i32)
+        (call_indirect (type $t) (local.get 0) (i32.const 0))))"#;
+    let base = wat::parse_str(wat).expect("assemble");
+    // The pristine module must transpile + verify (sanity: the corpus seed is valid).
+    let t = svm_wasm::transpile(&base).expect("transpile base");
+    svm_verify::verify_module(&t.module).expect("verify base");
+
+    // A tiny inline xorshift PRNG (escape-TCB-style: no dev-deps), deterministic so a failure replays.
+    let mut s: u64 = 0x1234_5678_9abc_def0;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    for _ in 0..5000 {
+        let mut bytes = base.clone();
+        // Mix of mutations: single/multi-byte corruption and truncation — keeps the wasm header valid
+        // often enough to drive past decode into validation/lowering, while still exercising garbage.
+        match next() % 3 {
+            0 => {
+                // corrupt a handful of bytes
+                for _ in 0..(1 + next() % 6) {
+                    let i = (next() as usize) % bytes.len();
+                    bytes[i] = next() as u8;
+                }
+            }
+            1 => {
+                // truncate to a random prefix
+                let n = (next() as usize) % bytes.len();
+                bytes.truncate(n);
+            }
+            _ => {
+                // append random tail bytes
+                for _ in 0..(next() % 16) {
+                    bytes.push(next() as u8);
+                }
+            }
+        }
+        // The contract: never panic. If it returns Ok, the IR must verify (transpile only emits
+        // escape-safe IR for the bytes it accepts).
+        if let Ok(t) = svm_wasm::transpile(&bytes) {
+            svm_verify::verify_module(&t.module).expect(
+                "transpiled IR must verify (transpile accepted malformed-but-decodable bytes)",
+            );
+        }
+    }
+}
