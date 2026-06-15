@@ -255,6 +255,24 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.push(ValType::I64); // value
                 continue;
             }
+            // §7 reflection: `cap.self.count` appends an `i32`; `cap.self.get` reads an `i32`
+            // index and appends `(handle: i32, type_id: i32)`. Always valid (no module/memory
+            // dependency) — the runtime bounds the index against the live table.
+            if let Inst::CapSelfCount = inst {
+                types.push(ValType::I32);
+                continue;
+            }
+            if let Inst::CapSelfGet { idx } = inst {
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*idx, ValType::I32)?;
+                types.push(ValType::I32); // handle
+                types.push(ValType::I32); // type_id
+                continue;
+            }
             // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
             // thread-entry type `(i64 sp, i64 arg) -> i64`, so — like `call` — it needs whole-module
             // info.
@@ -365,6 +383,10 @@ fn check_inst(
         // §7 named imports are rejected above (the multi-result/call section); unreachable here.
         Inst::CallImport { .. } => {
             unreachable!("CallImport handled before check_inst's value match")
+        }
+        // §7 reflection appends its results in the multi-result section above; unreachable here.
+        Inst::CapSelfCount | Inst::CapSelfGet { .. } => {
+            unreachable!("cap.self.* handled before check_inst's value match")
         }
         Inst::IntBin { ty, a, b, .. } => {
             let t = ty.val();

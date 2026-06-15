@@ -29,6 +29,19 @@
 #define VM_CAP_JIT 7
 int __vm_cap(int i);
 //
+// **Reflection** (§7): discover what the host actually granted *this* domain — read-only and
+// authority-neutral (it only re-surfaces handles you already hold). `__vm_cap_count()` is how many
+// capabilities you hold; `__vm_cap_at(i, &type_id)` returns the i-th one's handle (usable directly
+// as a capability call's first argument) and writes its interface type_id. So runtime code can
+// enumerate, introspect, and use its capabilities without the host telling it in advance:
+//
+//     for (int i = 0, n = __vm_cap_count(); i < n; i++) {
+//       int type_id; int h = __vm_cap_at(i, &type_id);
+//       /* ... dispatch on type_id, call ops on h ... */
+//     }
+int __vm_cap_count(void);
+int __vm_cap_at(int i, int *type_id_out);
+//
 // **Using an arbitrary host capability** (§7 late binding): declare it as a plain `extern` whose
 // FIRST parameter is the capability handle (an `int`), then call it. The frontend lowers any call
 // to an undefined `extern` (that isn't one of the builtins in this header) to a named import; the

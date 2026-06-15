@@ -87,6 +87,8 @@ mod op {
     pub const PTR_TO_INT: u8 = 0x77;
     pub const PTR_ADD: u8 = 0x78; // (i64, i64) -> i64
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
+    pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
+    pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -243,6 +245,12 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         // produces a `CallImport`).
         Inst::CallImport { .. } => {
             unreachable!("encode: resolve_imports must run before binary encoding")
+        }
+        // §7 capability reflection intrinsics.
+        Inst::CapSelfCount => out.push(op::CAP_SELF_COUNT),
+        Inst::CapSelfGet { idx } => {
+            out.push(op::CAP_SELF_GET);
+            write_uleb(out, *idx as u64);
         }
         Inst::ConstI32(c) => {
             out.push(op::CONST_I32);
@@ -1034,6 +1042,8 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             handle: c.idx()?,
             args: decode_idxs(c)?,
         },
+        op::CAP_SELF_COUNT => Inst::CapSelfCount,
+        op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
 
         op::CONST_F32 => Inst::ConstF32(c.u32_le()?),
         op::CONST_F64 => Inst::ConstF64(c.u64_le()?),

@@ -259,6 +259,9 @@ fn print_inst(inst: &Inst) -> String {
             args,
             ..
         } => format!("call.import {import} v{handle}{}", arglist(args)),
+        // §7 capability reflection intrinsics.
+        Inst::CapSelfCount => "cap.self.count".to_string(),
+        Inst::CapSelfGet { idx } => format!("cap.self.get v{idx}"),
         // §12 fibers (stack switching).
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
@@ -1214,6 +1217,14 @@ impl<'a> Parser<'a> {
             let func = u32::try_from(n)
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
             return Ok(Inst::RefFunc { func });
+        }
+        // §7 capability reflection intrinsics.
+        if op == "cap.self.count" {
+            return Ok(Inst::CapSelfCount);
+        }
+        if op == "cap.self.get" {
+            let idx = self.value(names)?;
+            return Ok(Inst::CapSelfGet { idx });
         }
         if op == "call_indirect" {
             let params = self.parse_type_list()?;

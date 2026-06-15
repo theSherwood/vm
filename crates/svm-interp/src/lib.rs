@@ -3061,6 +3061,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(slot_to_val(*ty, *s));
                     }
                 }
+                // §7 reflection: how many capabilities this domain holds (live handle-table
+                // entries). Read-only over the shared powerbox — authority-neutral.
+                Inst::CapSelfCount => {
+                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = hg.self_caps().len() as i32;
+                    frames[top].vals.push(Value::I32(n));
+                }
+                // §7 reflection: the `idx`-th held capability as `(handle, type_id)`. An
+                // out-of-range index is fail-closed (the guest bounds it by `cap.self.count`).
+                Inst::CapSelfGet { idx } => {
+                    let i = as_i32(get(&frames[top].vals, *idx)?)?;
+                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let (handle, type_id) = usize::try_from(i)
+                        .ok()
+                        .and_then(|i| hg.self_caps().get(i).copied())
+                        .ok_or(Trap::Malformed)?;
+                    drop(hg);
+                    frames[top].vals.push(Value::I32(handle));
+                    frames[top].vals.push(Value::I32(type_id as i32));
+                }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
                 // both backends, the unified namespace). No switch.
@@ -3411,6 +3431,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         // §7 named imports must be lowered to `cap.call` by `resolve_imports` before
         // execution; a stray `CallImport` is fail-closed (it carries no `type_id`/`op`).
         Inst::CallImport { .. } => return Err(Trap::Malformed),
+        // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
+        // (like `cap.call`), never here.
+        Inst::CapSelfCount | Inst::CapSelfGet { .. } => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
             IntTy::I32 => Value::I32(bin32(
                 *op,
@@ -4874,6 +4897,24 @@ impl Host {
         s.entry = Some(binding);
         s.type_id = type_id;
         Some(((s.generation << CAP_LOG2) | slot as u32) as i32)
+    }
+
+    /// §7 capability **reflection** (backs `cap.self.count`/`cap.self.get`): the live handle-table
+    /// entries this **domain** holds, as `(handle, type_id)` in slot order. The handle value is the
+    /// same `(generation << CAP_LOG2) | slot` a grant returns, so the guest can *use* what it
+    /// discovers. Read-only and authority-neutral — every handle is one the domain already holds,
+    /// so this confers nothing and reveals nothing the host did not grant. The `Host` *is* the
+    /// domain's table (a nested §14 child gets a fresh one), so this auto-scopes to the caller.
+    fn self_caps(&self) -> Vec<(i32, u32)> {
+        self.table
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.entry.is_some())
+            .map(|(slot, s)| {
+                let handle = ((s.generation << CAP_LOG2) | slot as u32) as i32;
+                (handle, s.type_id)
+            })
+            .collect()
     }
 
     /// Infallible grant for **host-controlled** powerbox setup (`grant_stream`/`grant_memory`/… and

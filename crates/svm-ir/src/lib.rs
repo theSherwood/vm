@@ -1249,6 +1249,21 @@ pub enum Inst {
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
+    /// §7 capability **reflection** (`cap.self.count`): the number of capabilities the calling
+    /// **domain** currently holds — the count of live entries in its own handle table. An
+    /// always-available, read-only intrinsic (not a handle-gated `cap.call`): reflecting your own
+    /// granted set confers no authority (you already hold every one of those handles), so it does
+    /// not widen the §9 egress closure. A nested §14 child has its own table, so it sees only its
+    /// attenuated carve. Result is `i32`.
+    CapSelfCount,
+    /// §7 capability **reflection** (`cap.self.get`): the `idx`-th capability the calling domain
+    /// holds, as `(handle: i32, type_id: i32)` — the live handle-table entries in slot order, with
+    /// `idx` in `[0, cap.self.count)`. Read-only and authority-neutral (it returns a handle the
+    /// domain already possesses); an out-of-range `idx` traps (the guest bounds it by the count).
+    /// Lets runtime code discover *what* it was granted and obtain the handle to *use* it.
+    CapSelfGet {
+        idx: ValIdx,
+    },
     /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
     /// function referenced by `func` on the data stack based at `sp`. `func` is an `i32`
     /// funcref, resolved through the function table with signature `(i64 sp, i64 arg) ->
@@ -1444,6 +1459,9 @@ impl Inst {
             | Inst::V128Store { .. } => 0,
             // `cont.resume` is the one multi-result non-call op: `(status, value)`.
             Inst::ContResume { .. } => 2,
+            // `cap.self.get` appends `(handle, type_id)`; `cap.self.count` appends one `i32`.
+            Inst::CapSelfGet { .. } => 2,
+            Inst::CapSelfCount => 1,
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
             Inst::CallIndirect { ty, .. } => ty.results.len(),
             Inst::CapCall { sig, .. } => sig.results.len(),

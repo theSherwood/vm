@@ -953,6 +953,33 @@ static int gen_builtin_import(Node *node) {
   return r;
 }
 
+// §7 capability **reflection** — a guest discovers what its host granted *this* domain. Read-only
+// and authority-neutral (it only re-surfaces handles the domain already holds). `__vm_cap_count()`
+// is `cap.self.count`; `__vm_cap_at(i, &type_id)` is `cap.self.get` — it returns the i-th held
+// capability's handle (usable directly as the first arg of a capability call) and writes its
+// interface type_id through the pointer. Together they let runtime code enumerate and use the
+// capabilities it was given.
+static int gen_builtin_cap_count(Node *node) {
+  if (node->args)
+    error_tok(node->tok, "codegen_ir: __vm_cap_count() takes no arguments");
+  int r = nv++;
+  fprintf(o, "  v%d = cap.self.count\n", r);
+  return r;
+}
+
+static int gen_builtin_cap_at(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_cap_at(i, type_id_out) expects 2 arguments");
+  int i = gen_expr(a);        // the index (i32)
+  int p = gen_expr(a->next);  // int *type_id_out (an i64 window pointer)
+  int h = nv++;               // result 0: the capability handle
+  int t = nv++;               // result 1: its interface type_id
+  fprintf(o, "  v%d, v%d = cap.self.get v%d\n", h, t, i);
+  fprintf(o, "  i32.store v%d v%d\n", p, t); // *type_id_out = type_id
+  return h;
+}
+
 // Guest-driven JIT builtins (iface 11, DESIGN.md §22) on the stashed Jit handle:
 //
 //   long __vm_jit_compile(void *blob, long len);          // submit serialized IR -> code | -errno
@@ -1451,6 +1478,10 @@ static int gen_expr(Node *node) {
           return gen_builtin_blocking_handle(node);
         if (!strcmp(fname, "__vm_cap"))
           return gen_builtin_cap(node);
+        if (!strcmp(fname, "__vm_cap_count"))
+          return gen_builtin_cap_count(node);
+        if (!strcmp(fname, "__vm_cap_at"))
+          return gen_builtin_cap_at(node);
         if (!strcmp(fname, "__vm_jit_compile"))
           return gen_builtin_jit_compile(node);
         if (!strcmp(fname, "__vm_jit_invoke2"))
