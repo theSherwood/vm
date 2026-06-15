@@ -63,13 +63,14 @@ fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
     let Some(bc) = compile_to_bc(name, src) else {
         return;
     };
-    let module = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     let results = module.funcs[0].results.clone();
 
     // The IR signature prepends the data-SP (§3d): the entry takes `(sp, c-args…)`. Pass the
-    // initial data-stack base, then the C arguments.
-    let mut full: Vec<Value> = vec![Value::I64(svm_llvm::FRAME_BASE as i64)];
+    // translator-computed initial data-stack base (just above the globals), then the C arguments.
+    let mut full: Vec<Value> = vec![Value::I64(t.entry_sp as i64)];
     full.extend_from_slice(args);
 
     let mut fuel = 10_000_000u64;
@@ -86,6 +87,45 @@ fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
         other => panic!("{name}: unexpected JIT outcome {other:?}"),
     };
     assert_eq!(jit, expect, "{name}: JIT result (interp said {interp:?})");
+}
+
+/// Translate + verify + run on both backends, asserting both **trap** (neither returns a value).
+/// Used for the data-stack guard: a deep recursion with a real frame must fault past the window's
+/// mapped region, not corrupt globals or return garbage.
+fn check_traps(name: &str, src: &str, args: &[Value]) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let mut full: Vec<Value> = vec![Value::I64(t.entry_sp as i64)];
+    full.extend_from_slice(args);
+
+    let mut fuel = 1_000_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel);
+    assert!(
+        interp.is_err(),
+        "{name}: interp should trap, got {interp:?}"
+    );
+
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match svm_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Trapped(_) => {}
+        other => panic!("{name}: JIT should trap, got {other:?}"),
+    }
+}
+
+#[test]
+fn data_stack_guard_traps_on_overflow() {
+    // A non-tail recursion (the `+ buf[k]` after the call keeps the result live) with a large
+    // 32 KiB frame — a *runtime* index `k` stops clang from shrinking the `volatile` array. A
+    // shallow call returns; a deep one overflows the data stack past the window's mapped region
+    // and faults (§5) — the guard catches it, no corruption. deep(n) sums 0..n (buf[k] == n).
+    let src = "int deep(int n){ volatile int buf[8192]; int k = n & 8191; buf[k] = n; \
+               if (n <= 0) return 0; return deep(n - 1) + buf[k]; }";
+    check("deep_3", src, &[Value::I32(3)], &[Value::I32(6)]); // 4 frames ≪ window
+    check_traps("deep_overflow", src, &[Value::I32(2000)]); // ~64 frames fills the ~2 MiB window
 }
 
 #[test]

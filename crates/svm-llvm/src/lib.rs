@@ -26,9 +26,10 @@
 //!   frame_size`, so activations get fresh frames and recursion is sound.
 //! - **D — `switch`.** Lowered to a `br_table` biased by the minimum case value, gaps filled with
 //!   the default edge (dense spans only; a too-sparse switch is `Unsupported`).
-//! - **E — global variables.** Globals live in a fixed high window region as `data` segments
-//!   (constants read-only, D40); a `@global` reference is its window address. Int/array/string/
-//!   zero initializers serialize to bytes.
+//! - **E — global variables.** Globals live low in the window as `data` segments (constants
+//!   read-only, D40); a `@global` reference is its window address. The data stack starts just
+//!   above them and grows up toward the window's guard region, so a stack overflow faults (§5)
+//!   rather than corrupting globals. Int/array/string/zero initializers serialize to bytes.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): floats, indirect calls (funcref),
 //! pointer-valued globals (relocations), struct/vector GEP + aggregates, intrinsics beyond the
@@ -60,15 +61,25 @@ fn unsup<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Unsupported(what.into()))
 }
 
-/// Translate a legalized LLVM bitcode file (`*.bc`) into a verifier-checkable [`Module`].
-/// The bitcode must come from the pinned LLVM (18); off-version input is an [`Error::Parse`].
-pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Module, Error> {
+/// The translation result: the verifier-checkable module plus the **initial data-SP** the entry
+/// must be invoked with (§3d). The data stack starts just above the globals and grows up toward
+/// the window's guard region, so an overflow faults rather than corrupting globals.
+#[derive(Debug)]
+pub struct Translated {
+    pub module: Module,
+    /// The value to pass as the entry's first (`sp`) argument.
+    pub entry_sp: u64,
+}
+
+/// Translate a legalized LLVM bitcode file (`*.bc`). The bitcode must come from the pinned LLVM
+/// (18); off-version input is an [`Error::Parse`].
+pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
     let m = LModule::from_bc_path(path).map_err(Error::Parse)?;
     translate(&m)
 }
 
 /// Translate an already-parsed `llvm-ir` module.
-pub fn translate(m: &LModule) -> Result<Module, Error> {
+pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // Pass 0: assign each *defined* function an IR index (its position among defined functions),
     // so a `call` can resolve its target by name. Declaration-only functions (extern/intrinsic
     // prototypes) have no body and are skipped — a call to one needs import support (a later slice).
@@ -82,8 +93,9 @@ pub fn translate(m: &LModule) -> Result<Module, Error> {
         name2idx.insert(f.name.clone(), i as u32);
     }
 
-    // Lay out global variables (their window addresses + the `data` segments to emit).
+    // Globals live low (from `DATA_BASE`); the data stack starts just above them.
     let (globals, data, globals_end) = globals_layout(m)?;
+    let entry_sp = globals_end.div_ceil(16) * 16;
 
     let mut funcs = Vec::with_capacity(defined.len());
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
@@ -92,36 +104,40 @@ pub fn translate(m: &LModule) -> Result<Module, Error> {
         any_frame |= frame_size > 0;
         funcs.push(func);
     }
-    // A window is declared if any function uses the data stack *or* the module has globals. It must
-    // cover the data stack (low, from `FRAME_BASE`) and the globals region (high). Frames are
-    // `sp`-relative (§3d): each call passes `sp + frame_size`, so activations get fresh frames and
-    // recursion is sound; deep recursion overflows into the guard region (§5).
+    // A window is declared if any function uses the data stack *or* the module has globals. Layout
+    // (§3d): globals `[DATA_BASE, globals_end)` low, then the data stack from `entry_sp` growing up.
+    // `mapped` covers the globals plus a stack reserve; the runtime leaves a faulting guard beyond
+    // `mapped` (reserved > mapped), so a stack overflow faults (detect-and-kill, §5) instead of
+    // corrupting the globals below it.
     let need_window = any_frame || !globals.is_empty();
     let memory = need_window.then(|| {
-        let end = globals_end.max(1);
-        let log2 = ((64 - (end - 1).leading_zeros()) as u8).max(STACK_LOG2);
+        let top = if any_frame {
+            entry_sp + STACK_RESERVE
+        } else {
+            globals_end
+        }
+        .max(1);
+        let log2 = (64 - (top - 1).leading_zeros()) as u8;
         svm_ir::Memory { size_log2: log2 }
     });
-    Ok(Module {
-        funcs,
-        memory,
-        data,
-        // §7 named capability imports — the LLVM on-ramp emits none yet.
-        imports: Vec::new(),
+    Ok(Translated {
+        module: Module {
+            funcs,
+            memory,
+            data,
+            // §7 named capability imports — the LLVM on-ramp emits none yet.
+            imports: Vec::new(),
+        },
+        entry_sp,
     })
 }
 
-/// The initial data-SP the entry must be invoked with (the base of the data stack; keeps `alloca`
-/// addresses away from a null-like 0). The entry's first IR parameter is this `sp`; callees
-/// receive `sp + caller_frame`. Exposed so a host/test driver passes the right initial value.
-pub const FRAME_BASE: u64 = 16;
-/// The data-stack window size (`log2`): a fixed 1 MiB reserve when any `alloca` is present.
-const STACK_LOG2: u8 = 20;
-/// Where module globals live in the window — a fixed high region (512 KiB), well above the
-/// data stack growing up from [`FRAME_BASE`]. (A stack that grows this far corrupts globals
-/// rather than faulting — intra-domain, still window-confined; proper guard-paging between the
-/// two is a refinement.) Globals are laid out upward from here as `data` segments.
-const GLOBALS_BASE: u64 = 0x8_0000;
+/// The low window offset where globals begin (kept off a null-like 0).
+const DATA_BASE: u64 = 16;
+/// The data-stack reserve (bytes) above the entry SP before the guard region — a stack overflow
+/// past this faults rather than escaping the window.
+const STACK_RESERVE: u64 = 1 << 20;
+
 /// The data-SP's synthetic value id — threaded as block-local index 0 of *every* block (§3d),
 /// like chibicc's `v0`. It carries no LLVM name; it is supplied positionally.
 const SP: ValueId = usize::MAX;
@@ -168,7 +184,7 @@ type Globals = (HashMap<String, u64>, Vec<svm_ir::Data>, u64);
 fn globals_layout(m: &LModule) -> Result<Globals, Error> {
     let mut addr = HashMap::new();
     let mut segs = Vec::new();
-    let mut off = GLOBALS_BASE;
+    let mut off = DATA_BASE;
     for g in &m.global_vars {
         let (bytes, size) = match &g.initializer {
             Some(init) => {

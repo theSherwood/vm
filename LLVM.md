@@ -312,15 +312,20 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       (span > 4096) and i64-operand switches are a clean `Unsupported`. Tested on a dense switch and
       the `even`/`odd` mutual recursion `-O2` lowers onto a switch-loop.
 
-**Slice E (DONE) — global variables.**
-- [x] Globals laid out in a fixed high window region (`GLOBALS_BASE`, 512 KiB), above the data
-      stack, each natural-aligned. Emitted as IR `data` segments — constants **read-only** (D40),
-      BSS/zero globals just reserve space in the zero-init window. A `@global` reference resolves
-      to its window address (a constant `i64`); int/array/string/zero initializers serialize to
-      little-endian bytes. Tested on a const lookup table, a mutable counter, indexed string reads,
-      and the gapped switch (a global jump table). *(Stack-vs-globals are split by a fixed offset,
-      not a guard page — overflow corrupts globals rather than faulting, still window-confined; a
-      guard refinement is noted.)*
+**Slice E (DONE) — global variables + the data-stack guard.**
+- [x] Globals laid out **low** in the window (`[DATA_BASE, globals_end)`), each natural-aligned.
+      Emitted as IR `data` segments — constants **read-only** (D40), BSS/zero globals just reserve
+      space in the zero-init window. A `@global` reference resolves to its window address (a
+      constant `i64`); int/array/string/zero initializers serialize to little-endian bytes. Tested
+      on a const lookup table, a mutable counter, indexed string reads, and the gapped switch
+      (a global jump table).
+- [x] **Guard:** the data stack now starts **just above** the globals (`entry_sp = align(globals_end)`)
+      and grows up toward the window's mapped top; `mapped` is sized for the globals + a 1 MiB stack
+      reserve, and the runtime leaves a faulting guard beyond `mapped` (reserved > mapped). So a
+      stack overflow **faults** (§5) instead of corrupting the globals below — tested by a deep
+      recursion with a 32 KiB frame that traps on both backends (a shallow call returns).
+- [x] **API:** `translate`/`translate_bc_path` now return `Translated { module, entry_sp }` — the
+      host/driver invokes the entry with `entry_sp` as its first (`sp`) argument.
 
 **Remaining slices.**
 - [ ] Floats (`f32`/`f64`: `fadd`/…/`fcmp`/`fptosi`/`sitofp`/…). *Likely the top remaining need —
