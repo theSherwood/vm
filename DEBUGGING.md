@@ -49,7 +49,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded; multithread pending) |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
-| `§3a` IR debug-info side-table (source locations in IR) | **Missing** (IR has no loc fields) | `svm-ir`, frontend `codegen_ir.c` |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Missing — design settled** (D-DBG-7/§6; IR has no loc fields) | `svm-ir`, `svm-encode`, `svm-text`, `codegen_ir.c` |
 | DWARF emission + DAP server | **Missing** | — |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -262,45 +262,97 @@ backtrace; the trace names the right fibers under work-stealing migration.
 
 ---
 
-## 6. W4 — §3a IR debug-info side-table (source locations)
+## 6. W4 — debug-info ABI: a frontend-neutral narrow waist (D-DBG-7)
 
 **Pillar 4, step zero.** Goal: carry source `(file, line, col)` and variable→location info from
-the frontend through the IR so every later tool (interpreter source view, DWARF, DAP) has
-something to symbolize against.
+**any** frontend through the IR, so every later tool (interpreter source view, DWARF, DAP) has
+something to symbolize against — without baking in one frontend's debug model.
 
-**Current substrate.** None — and this is the gating gap. The IR (`svm-ir`) has **no**
-source-location fields, and chibicc's `codegen_ir.c` discards locations. The binary format
-(§3a) is section-based with a deferred "module-level type/interface section" already noted, so a
-new **strippable debug section** fits the format without touching the hot path.
+**The reframe — do not design around chibicc.** Three frontends are in scope (§20), and two of
+the three already carry rich, DWARF-shaped debug info:
 
-**Design sketch.**
-- A **side-table**, not inline ops: `DebugInfo { files: Vec<String>, locs: Map<IrPc,
-  SourceLoc>, vars: Vec<VarInfo { name, ty, scope, location: VarLoc }> }`, where `VarLoc` is
-  `WindowSlot(off)` | `SsaValue(id)` | `Promoted(then resolved per build mode, W6)`.
-- A new **strippable binary section** + text-format syntax (1:1 text↔binary per D33); absent ⇒
-  no debug info, zero cost; verifier ignores it (§2a, untrusted-for-escape).
-- **Frontend**: chibicc's AST already carries `Token`/line info; thread it into `codegen_ir.c`
-  emit calls. Keep the chibicc diff minimal (the project rule — only `codegen_ir.c` is ours).
+| Frontend | Debug info it carries | Shape |
+|---|---|---|
+| **chibicc** | AST `Token` (file/line/col) | bespoke, minimal |
+| **LLVM** (D54) | `!DILocation`, `!DILocalVariable`, `llvm.dbg.value`, DI type graph | DWARF-shaped, rich; **already solves optimized variable locations** |
+| **wasm** | embedded DWARF (`.debug_*`) + name section | literally DWARF |
 
-**API surface.** `Module::debug_info: Option<DebugInfo>`; helpers `loc_of(ir_pc)`,
-`vars_in_scope(ir_pc)`. Consumed first by W2 (interpreter source view), then W5 (DWARF).
+chibicc is the outlier, so designing the waist around its token model would be backwards.
 
-**Dependencies.** None upstream. Blocks W5 and the source-level half of W2.
+**The principle.** Debug info crosses the IR boundary like everything else, so it follows §20's
+*"IR is the stable ABI; frontends are plugins"* — a **narrow waist**: a small mandatory
+frontend-neutral **core** plus an optional opaque per-producer **rich blob**.
+
+- **Neutral core (mandatory; every frontend populates it during lowering)** — only what *our*
+  tools need:
+  - `IrPc → SourceLoc { file_id, line, col? }` — keyed on S1's `IrPc`, stored as **ranges**.
+  - `VarInfo { name, ty: TypeRef, scope: IrPc-range, loc: VarLoc }` — `VarLoc` is exactly **S2**
+    (`Window{off}` | `Ssa(LocList)` | `Machine(..)`).
+  - a `files` table + a **neutral** `TypeRef { name, encoding: Signed|Unsigned|Float|Bool|Ptr|
+    Aggregate|Opaque, size }` — enough to render primitives and "opaque struct of N bytes at
+    addr"; full structure lives in the rich blob.
+  This is everything the **interpreter stepper** (pillar 3) and **backtraces** (pillar 2) need.
+- **Rich blob (optional, opaque, per-producer)** — `{ producer: Chibicc|Llvm|Wasm|Other(str),
+  bytes }`, strippable, that the **middle never parses**. Carries full DWARF DIEs / LLVM DI
+  metadata / language type graphs. Only **W5 (DWARF emit)** and a **DAP server** consume it,
+  host-side. The verifier and interpreter ignore it (§2a, untrusted tooling).
+
+**Why the waist beats the alternatives.**
+- *vs. a chibicc-shaped table* — forces LLVM/wasm to down-convert richer info into a C-flavored
+  schema (fidelity loss), and gets reworked the moment a non-C language appears.
+- *vs. "just use DWARF as the interchange"* — our `IrPc` is **structural** (`module/func/block/
+  inst`); DWARF line programs assume a **linear** PC. That forces a structural model into a
+  linear one at the IR and back out for the JIT, and makes the interpreter parse DWARF for basic
+  stepping. The waist keeps DWARF an *output* (W5) and an *input* (ingest), never the waist;
+  faithful DWARF re-emit for LLVM/wasm comes from carrying their original blob and having W5
+  *prefer* it.
+
+**Load-bearing insight.** The `IrPc → source` map **must be built during lowering**, by each
+frontend — only the lowering step knows "this source position produced these IR ops." It can't
+be reconstructed downstream. So the neutral core is the mandatory interchange every frontend
+populates as it lowers; the rich blob is optional pass-through.
+
+**Per-frontend mapping.**
+- *chibicc* — emits only the neutral core from its `Token`s. No DWARF generation; the toy
+  frontend stays toy. Sufficient for C.
+- *LLVM* — `!DILocation` → `SourceLoc`; **`llvm.dbg.value` → `VarLoc` location lists** (LLVM
+  already computes post-optimization variable locations, so **S2's promotion-vs-inspectability
+  problem is solved for free on the LLVM path** — its dbg intrinsics survive mem2reg/SROA).
+  DI type graph → rich blob.
+- *wasm* — remap the embedded DWARF line program (wasm-offset → `IrPc`) into the neutral core
+  during translation; pass the original `.debug_*` through as the blob (W5 mostly relocates).
+
+**Storage.** A new **strippable binary section** + text-format syntax (1:1 text↔binary per D33);
+absent ⇒ no debug info, zero cost; verifier ignores it (§2a). `Module::debug_info:
+Option<DebugInfo>`; helpers `loc_of(ir_pc)`, `vars_in_scope(ir_pc)`. Consumed first by W2
+(interpreter source view), then W5 (DWARF/DAP).
+
+**Build order.** Implement **chibicc populating the neutral core first** — it's the MVP and
+validates the waist end-to-end against the interpreter stepper (W2) — but **freeze the schema
+now with LLVM/wasm in mind** (file table; **optional** columns, since wasm DWARF often lacks
+them; `IrPc` ranges; neutral `TypeRef`; producer-tagged opaque blob; room for an `inlined_at`
+chain, since LLVM/DWARF carry inlining).
+
+**Dependencies.** Builds on S1 (`IrPc`) + S2 (`VarLoc`), both settled. Blocks W5 and the
+source-level half of W2.
 
 **Open questions.**
-- *Granularity*: per-op locs (precise, larger) vs per-statement (smaller). Start per-statement.
-- *Variable scoping* with SSA promotion (W6 tension) — `VarLoc` (designed in §13/S2) expresses
-  this: `Window{off}` for memory locals, a PC-keyed `Ssa(LocList)` for promoted ones.
-- *Text-format ergonomics*: keep debug info in the text IR (agent-friendly, D33) vs binary-only.
-  Lean text-first for the build, per D33.
+- *Core loc granularity*: per-op (precise, larger) vs per-statement (smaller). Start
+  per-statement ranges.
+- *Rich-blob versioning*: the blob is producer+version tagged (LLVM bitcode/DWARF versions
+  drift); W5/DAP refuse an unknown version rather than mis-render.
+- *Text-format ergonomics*: neutral core in the text IR (agent-friendly, D33); rich blob
+  binary-only (it is opaque bytes). Lean that way.
 
-**Effort / risk.** **Moderate.** New IR section + encode/decode + verifier skip + frontend
-threading + text syntax. Low *risk* (additive, strippable, no TCB), but touches several crates
-(`svm-ir`, `svm-encode`, `svm-text`, `svm-verify` skip, `frontend/chibicc/codegen_ir.c`).
+**Effort / risk.** **Moderate** for the neutral core + chibicc (new IR section + encode/decode +
+verifier skip + frontend threading + text syntax; `svm-ir`, `svm-encode`, `svm-text`,
+`svm-verify` skip, `codegen_ir.c`). Low *risk* (additive, strippable, no TCB). The LLVM/wasm
+ingest sides are scoped by their own on-ramps (LLVM.md/WASM.md), targeting this waist.
 
-**Acceptance.** A C program compiled with `--emit-ir -g` round-trips source locations through
-text and binary; the interpreter can print the source line for any IR-PC; stripping the section
-yields a byte-identical-minus-debug module that runs identically.
+**Acceptance.** A C program compiled with `--emit-ir -g` round-trips its neutral core through
+text and binary; the interpreter prints the source line + a named local for any `IrPc`; stripping
+the debug section yields a byte-identical-minus-debug module that runs identically; the schema has
+a place for an LLVM/wasm rich blob without change (a `producer` tag + opaque bytes round-trips).
 
 ---
 
@@ -318,7 +370,9 @@ the JIT'd blob; a thin **DAP server** translating DAP requests onto the `Inspect
 DWARF. Reuse the interpreter (W2) as the *stepping engine behind DAP* for a source-level
 experience without solving optimized-code inspection first.
 
-**Dependencies.** W4 (info), W6 (promoted-local locations), W3 (frame/unwind for call-stack
+**Dependencies.** W4 (the neutral core + the per-producer rich blob — for LLVM/wasm guests W5
+prefers the native DWARF blob and mostly relocates addresses; for chibicc it synthesizes DWARF
+from the core, D-DBG-7), W6 (promoted-local locations), W3 (frame/unwind for call-stack
 requests), W8 (the `Inspector` DAP binds to).
 
 **Open questions.** Two-engine DAP (interpreter for stepping/inspection, JIT for speed) vs
@@ -472,9 +526,19 @@ the genuinely expensive, deferrable production tooling.
   §5's undisableable fuel/epoch kill without reopening the runaway-guest hole. Options: a
   host-only "inspector-paused" state that stops the fuel clock only while an `Inspector` holds
   the guest (recommend), vs. a wall-clock grace that still bounds total stopped time.
+- **D-DBG-7 — debug info is a frontend-neutral IR waist (W4): SETTLED (design).** A **narrow
+  waist** at the IR: a small mandatory neutral core (`IrPc→SourceLoc`, `VarInfo`+`VarLoc`,
+  neutral `TypeRef`) every frontend populates *during lowering*, plus an optional **opaque
+  per-producer rich blob** (DWARF/LLVM-DI) the middle never parses and only W5/DAP consume.
+  Rejected: a chibicc-shaped table (forces lossy down-conversion from LLVM/wasm), and DWARF-as-
+  interchange (forces our structural `IrPc` into linear DWARF + makes the interpreter parse
+  DWARF). chibicc emits only the core; LLVM/wasm map their DWARF-shaped info in (LLVM's
+  `dbg.value` solves S2 promotion-vs-inspectability for free) and pass their native blob through.
+  Full design + per-frontend mapping in §6. Implement chibicc-core first; freeze the schema now.
 
 When these are settled, fold the resolved ones into `DESIGN.md` §19 / the decision log as
-`D54+` so DESIGN stays the canonical record.
+`D54+` so DESIGN stays the canonical record. (D-DBG-7's waist is the debug-info analog of D33's
+"IR is the stable target" — worth a DESIGN §19/§20 cross-reference when it lands.)
 
 ---
 
