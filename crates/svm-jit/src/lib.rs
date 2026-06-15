@@ -1683,10 +1683,19 @@ impl CompiledModule {
                     let (start, end) = (lo as usize, hi as usize);
                     rw[start..end].copy_from_slice(&d.bytes[..end - start]);
                 }
-            }
-            for d in &t.data {
-                if d.readonly && !d.bytes.is_empty() {
-                    window.protect_ro(t.sub_base + d.offset, d.bytes.len() as u64);
+                // Map the `readonly` segments RO (so a guest write to const data faults into the guard,
+                // §4/§5). Clamp the range to `[0, size)` exactly as the copy loop above: the verifier
+                // already bounds every data segment into the window, so this is defensive consistency —
+                // an out-of-window segment must never `mprotect` past the backed region.
+                for d in &t.data {
+                    if !d.readonly {
+                        continue;
+                    }
+                    let lo = d.offset.min(size);
+                    let hi = d.offset.saturating_add(d.bytes.len() as u64).min(size);
+                    if hi > lo {
+                        window.protect_ro(t.sub_base + lo, hi - lo);
+                    }
                 }
             }
             let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
