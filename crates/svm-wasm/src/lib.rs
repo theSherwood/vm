@@ -36,9 +36,9 @@
 //! types, multi-memory/multi-table.
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, VBitBinOp,
-    VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
+    Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
+    VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -223,9 +223,10 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             Payload::MemorySection(reader) => {
                 for mt in reader {
                     let mt = mt?;
-                    if mt.shared {
-                        return unsup("shared memory");
-                    }
+                    // wasm `shared` memory (the threads proposal) is accepted: SVM's window is already
+                    // shared across vCPUs, so the layout is identical — only the `*.atomic.*` ops and
+                    // the spawn convention differ (§12; the wasm→IR atomic mapping below). wasm requires
+                    // a declared `maximum` on shared memory, which the grow path already honours.
                     if mem.replace(mt).is_some() {
                         return unsup("multi-memory");
                     }
@@ -1232,6 +1233,120 @@ fn mem_store(lo: &mut Lower, op: StoreOp, m: MemArg) -> Result<(), Error> {
     Ok(())
 }
 
+// ---- §12 wasm threads: the full-width `*.atomic.*` ops → IR atomics ----
+//
+// The wasm threads atomics map 1:1 onto SVM's IR atomic surface (same widths, same
+// trap-on-misalignment, all seq-cst). Only the **full-width** (i32/i64) ops are lowered here; the
+// **narrow** forms (`*.atomic.load8_u`/`rmw8`/`rmw16`/…) have no IR analogue (SVM atomics are
+// 32/64-bit only) and fall through to the `worker_op` catch-all as a clean `Unsupported`. The IR
+// atomic load/store/rmw/cmpxchg carry an `offset` field (folded by the runtime, like a plain
+// load/store); `wait`/`notify` do not, so [`pop_atomic_addr`] folds it into the address.
+
+/// The IR value type for an atomic's integer width.
+fn int_vt(ty: IntTy) -> ValType {
+    match ty {
+        IntTy::I32 => ValType::I32,
+        IntTy::I64 => ValType::I64,
+    }
+}
+
+/// Pop the wasm address and fold the memarg `offset` into it (for `wait`/`notify`, whose IR ops
+/// have no `offset` field — unlike load/store/rmw/cmpxchg, which carry it).
+fn pop_atomic_addr(lo: &mut Lower, offset: u64) -> Result<ValIdx, Error> {
+    let addr = pop_addr(lo)?;
+    if offset == 0 {
+        return Ok(addr);
+    }
+    let off = lo.emit(Inst::ConstI64(offset as i64));
+    Ok(lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a: addr,
+        b: off,
+    }))
+}
+
+fn atomic_load(lo: &mut Lower, ty: IntTy, m: MemArg) -> Result<(), Error> {
+    let addr = pop_addr(lo)?;
+    let v = lo.emit(Inst::AtomicLoad {
+        ty,
+        addr,
+        offset: m.offset,
+        order: Ordering::SeqCst,
+    });
+    lo.push(v, int_vt(ty));
+    Ok(())
+}
+
+fn atomic_store(lo: &mut Lower, ty: IntTy, m: MemArg) -> Result<(), Error> {
+    let (value, _) = lo.pop()?;
+    let addr = pop_addr(lo)?;
+    lo.emit_void(Inst::AtomicStore {
+        ty,
+        addr,
+        value,
+        offset: m.offset,
+        order: Ordering::SeqCst,
+    });
+    Ok(())
+}
+
+fn atomic_rmw(lo: &mut Lower, ty: IntTy, op: AtomicRmwOp, m: MemArg) -> Result<(), Error> {
+    let (value, _) = lo.pop()?;
+    let addr = pop_addr(lo)?;
+    let v = lo.emit(Inst::AtomicRmw {
+        ty,
+        op,
+        addr,
+        value,
+        offset: m.offset,
+        order: Ordering::SeqCst,
+    });
+    lo.push(v, int_vt(ty)); // yields the old value
+    Ok(())
+}
+
+fn atomic_cmpxchg(lo: &mut Lower, ty: IntTy, m: MemArg) -> Result<(), Error> {
+    let (replacement, _) = lo.pop()?;
+    let (expected, _) = lo.pop()?;
+    let addr = pop_addr(lo)?;
+    let v = lo.emit(Inst::AtomicCmpxchg {
+        ty,
+        addr,
+        expected,
+        replacement,
+        offset: m.offset,
+        order: Ordering::SeqCst,
+    });
+    lo.push(v, int_vt(ty)); // yields the old value
+    Ok(())
+}
+
+/// `memory.atomic.wait32`/`wait64`: pop `[addr, expected, timeout]`, futex-wait, push the i32 status
+/// (0 woken / 1 not-equal / 2 timed-out — the IR `MemoryWait` contract).
+fn atomic_wait(lo: &mut Lower, ty: IntTy, m: MemArg) -> Result<(), Error> {
+    let (timeout, _) = lo.pop()?;
+    let (expected, _) = lo.pop()?;
+    let addr = pop_atomic_addr(lo, m.offset)?;
+    let v = lo.emit(Inst::MemoryWait {
+        ty,
+        addr,
+        expected,
+        timeout,
+    });
+    lo.push(v, ValType::I32);
+    Ok(())
+}
+
+/// `memory.atomic.notify`: pop `[addr, count]`, wake up to `count` waiters, push the i32 count woken.
+fn atomic_notify(lo: &mut Lower, m: MemArg) -> Result<(), Error> {
+    let (count, _) = lo.pop()?;
+    let addr = pop_atomic_addr(lo, m.offset)?;
+    let v = lo.emit(Inst::MemoryNotify { addr, count });
+    lo.push(v, ValType::I32);
+    Ok(())
+}
+
 /// The wasm memory index/size type: `i64` for `memory64`, else `i32`.
 fn idx_ty(mem64: bool) -> ValType {
     if mem64 {
@@ -1877,6 +1992,33 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64Store8 { memarg } => mem_store(lo, StoreOp::I64_8, memarg)?,
         O::I64Store16 { memarg } => mem_store(lo, StoreOp::I64_16, memarg)?,
         O::I64Store32 { memarg } => mem_store(lo, StoreOp::I64_32, memarg)?,
+        // ---- §12 wasm threads: the full-width (i32/i64) atomics (narrow forms hit the catch-all) ----
+        O::I32AtomicLoad { memarg } => atomic_load(lo, IntTy::I32, memarg)?,
+        O::I64AtomicLoad { memarg } => atomic_load(lo, IntTy::I64, memarg)?,
+        O::I32AtomicStore { memarg } => atomic_store(lo, IntTy::I32, memarg)?,
+        O::I64AtomicStore { memarg } => atomic_store(lo, IntTy::I64, memarg)?,
+        O::I32AtomicRmwAdd { memarg } => atomic_rmw(lo, IntTy::I32, AtomicRmwOp::Add, memarg)?,
+        O::I32AtomicRmwSub { memarg } => atomic_rmw(lo, IntTy::I32, AtomicRmwOp::Sub, memarg)?,
+        O::I32AtomicRmwAnd { memarg } => atomic_rmw(lo, IntTy::I32, AtomicRmwOp::And, memarg)?,
+        O::I32AtomicRmwOr { memarg } => atomic_rmw(lo, IntTy::I32, AtomicRmwOp::Or, memarg)?,
+        O::I32AtomicRmwXor { memarg } => atomic_rmw(lo, IntTy::I32, AtomicRmwOp::Xor, memarg)?,
+        O::I32AtomicRmwXchg { memarg } => atomic_rmw(lo, IntTy::I32, AtomicRmwOp::Xchg, memarg)?,
+        O::I32AtomicRmwCmpxchg { memarg } => atomic_cmpxchg(lo, IntTy::I32, memarg)?,
+        O::I64AtomicRmwAdd { memarg } => atomic_rmw(lo, IntTy::I64, AtomicRmwOp::Add, memarg)?,
+        O::I64AtomicRmwSub { memarg } => atomic_rmw(lo, IntTy::I64, AtomicRmwOp::Sub, memarg)?,
+        O::I64AtomicRmwAnd { memarg } => atomic_rmw(lo, IntTy::I64, AtomicRmwOp::And, memarg)?,
+        O::I64AtomicRmwOr { memarg } => atomic_rmw(lo, IntTy::I64, AtomicRmwOp::Or, memarg)?,
+        O::I64AtomicRmwXor { memarg } => atomic_rmw(lo, IntTy::I64, AtomicRmwOp::Xor, memarg)?,
+        O::I64AtomicRmwXchg { memarg } => atomic_rmw(lo, IntTy::I64, AtomicRmwOp::Xchg, memarg)?,
+        O::I64AtomicRmwCmpxchg { memarg } => atomic_cmpxchg(lo, IntTy::I64, memarg)?,
+        O::MemoryAtomicWait32 { memarg } => atomic_wait(lo, IntTy::I32, memarg)?,
+        O::MemoryAtomicWait64 { memarg } => atomic_wait(lo, IntTy::I64, memarg)?,
+        O::MemoryAtomicNotify { memarg } => atomic_notify(lo, memarg)?,
+        // A standalone seq-cst fence (`__atomic_thread_fence`): the IR fence is honoured by the interp
+        // and lowered to a real hardware barrier by the JIT (all SVM atomics are already seq-cst).
+        O::AtomicFence => lo.emit_void(Inst::AtomicFence {
+            order: Ordering::SeqCst,
+        }),
         // ---- memory.size / memory.grow (pages; the window holds the growable span) ----
         O::MemorySize { mem } => {
             if mem != 0 {
