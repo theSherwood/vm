@@ -2,7 +2,7 @@
 //! stepping, IR-value / window inspection, and a backtrace across a call — driven through the
 //! host-side `Inspector`. These pin the S4 per-op seam + S5 driver model end-to-end.
 
-use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, WatchKind};
+use svm_interp::{Host, Inspector, IrPc, Stop, StopReason, StreamRole, Value, WatchKind};
 use svm_text::parse_module;
 
 // sum = 1 + 2 + ... + N via a back-edge loop with block parameters (same shape as pipeline.rs).
@@ -254,4 +254,69 @@ fn watchpoint_outside_the_accessed_range_does_not_fire() {
     let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
     insp.set_watchpoint(64, 8, WatchKind::Write);
     assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(0)]);
+}
+
+// Writes "Hi" into the window then `cap.call 0 1` (Stream::write) of 2 bytes to a stdout handle
+// passed as v0 — the standard capability-using shape (§3c/§3e).
+const CAP_WRITE: &str = r#"
+memory 16
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i32.const 72
+  i32.store8 v1 v2
+  v3 = i64.const 1
+  v4 = i32.const 105
+  i32.store8 v3 v4
+  v5 = i64.const 0
+  v6 = i64.const 2
+  v7 = cap.call 0 1 (i64, i64) -> (i64) v0 (v5, v6)
+  return v7
+}
+"#;
+
+#[test]
+fn debugs_a_capability_using_guest_end_to_end() {
+    // attach_with_host: grant a stdout stream, pass its handle as v0, run to completion, and read
+    // the captured host-side effect back through the Inspector.
+    let m = parse_module(CAP_WRITE).expect("parse");
+    let mut host = Host::new();
+    let stdout = host.grant_stream(StreamRole::Out);
+    let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(stdout)], 100_000, host);
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I64(2)]);
+    assert_eq!(insp.host().stdout, b"Hi".to_vec());
+}
+
+#[test]
+fn cap_call_stop_pauses_at_the_host_boundary_before_the_effect() {
+    let m = parse_module(CAP_WRITE).expect("parse");
+    let mut host = Host::new();
+    let stdout = host.grant_stream(StreamRole::Out);
+    let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(stdout)], 100_000, host);
+    insp.set_cap_call_stops(true);
+
+    // Stops *before* the write (Stream = type_id 0, write = op 1); the handle is live as v0.
+    match insp.run_until_stop() {
+        Stop::Break { reason: StopReason::CapCall { type_id, op }, .. } => {
+            assert_eq!((type_id, op), (0, 1));
+        }
+        other => panic!("expected cap.call stop, got {other:?}"),
+    }
+    assert_eq!(insp.read_ir_value(0, 0), Some(Value::I32(stdout)));
+    assert!(insp.host().stdout.is_empty(), "effect not applied before the boundary stop");
+
+    // Step performs the call: now the bytes are captured and the count is returned.
+    let _ = insp.step();
+    assert_eq!(insp.host().stdout, b"Hi".to_vec());
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I64(2)]);
+}
+
+#[test]
+fn cap_call_stops_off_by_default() {
+    // Without the toggle, a cap.call is just another op — no pause.
+    let m = parse_module(CAP_WRITE).expect("parse");
+    let mut host = Host::new();
+    let stdout = host.grant_stream(StreamRole::Out);
+    let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(stdout)], 100_000, host);
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I64(2)]);
 }

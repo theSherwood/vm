@@ -126,6 +126,11 @@ pub enum StopReason {
     /// takes effect (`addr`/`write` describe the access); `step` once to apply it and observe the
     /// new bytes. `addr` is the confined window offset the op touches.
     Watchpoint { addr: u64, write: bool },
+    /// About to execute a capability call (§3c) — the host-boundary stop, enabled by
+    /// [`Inspector::set_cap_call_stops`]. The handle/args are live in the frame (read them via
+    /// [`Inspector::read_ir_value`]); `step` once to perform the call and see its results. This is
+    /// the boundary W1 record/replay will hook (DEBUGGING.md S5).
+    CapCall { type_id: u32, op: u32 },
 }
 
 /// Which accesses a watchpoint fires on (`Inspector::set_watchpoint`).
@@ -200,6 +205,8 @@ struct DebugCtx {
     resume_clock: u64,
     /// When `Some(t)`, stop once `clock` reaches `t` (a pending single-step).
     step_target: Option<u64>,
+    /// Pause before every `cap.call` (the host boundary, DEBUGGING.md S5).
+    cap_stops: bool,
 }
 
 impl DebugCtx {
@@ -211,11 +218,23 @@ impl DebugCtx {
             clock: 0,
             resume_clock: u64::MAX, // nothing stopped yet, so the first op may itself break
             step_target: None,
+            cap_stops: false,
         }
     }
 
     fn watches_armed(&self) -> bool {
         !self.watchpoints.is_empty()
+    }
+
+    /// A `cap.call`-boundary stop, if armed and `inst` is one.
+    fn cap_stop(&self, inst: &Inst) -> Option<StopReason> {
+        match inst {
+            Inst::CapCall { type_id, op, .. } if self.cap_stops => Some(StopReason::CapCall {
+                type_id: *type_id,
+                op: *op,
+            }),
+            _ => None,
+        }
     }
 
     /// First watchpoint the `access` hits (overlapping bytes + matching read/write kind), if any.
@@ -232,11 +251,11 @@ impl DebugCtx {
     }
 
     /// Decide whether to pause *before* the op at `pc`. `access` is the op's memory effect (only
-    /// computed by the caller when watchpoints are armed; [`MemAccess::None`] otherwise).
-    /// `Some(reason)` pauses (the op has not run, `clock` unchanged, so the continuation re-enters
-    /// here); `None` charges one tick of logical time and lets the op run. The `resume_clock` guard
-    /// makes resume step off the current op.
-    fn before_op(&mut self, pc: IrPc, access: MemAccess) -> Option<StopReason> {
+    /// computed by the caller when watchpoints are armed; [`MemAccess::None`] otherwise); `inst` is
+    /// the op itself (for the `cap.call` boundary stop). `Some(reason)` pauses (the op has not run,
+    /// `clock` unchanged, so the continuation re-enters here); `None` charges one tick of logical
+    /// time and lets the op run. The `resume_clock` guard makes resume step off the current op.
+    fn before_op(&mut self, pc: IrPc, inst: &Inst, access: MemAccess) -> Option<StopReason> {
         let just_resumed = self.clock == self.resume_clock;
         let reason = if just_resumed {
             None
@@ -244,6 +263,8 @@ impl DebugCtx {
             Some(StopReason::Breakpoint)
         } else if let Some((addr, write)) = self.watch_hit(access) {
             Some(StopReason::Watchpoint { addr, write })
+        } else if let Some(r) = self.cap_stop(inst) {
+            Some(r)
         } else if self.step_target == Some(self.clock) {
             Some(StopReason::Step)
         } else {
@@ -269,26 +290,44 @@ impl DebugCtx {
 /// state. It is a *host* capability shaped like §15 `Monitor`: it never widens the guest's
 /// authority, and attaching with no breakpoints is behavior-identical to [`run`] (S7).
 ///
-/// Slice-1 scope: no capabilities granted, single vCPU. Capability-using and multithreaded guests,
-/// the §3a source mapping (W4), and time-travel (W1) are later slices.
+/// Single vCPU (multithreaded guests are Milestone B). The module must be **import-resolved** (no
+/// `CallImport` left — run `svm_run::resolve_capability_imports` first), as the interpreter only
+/// runs concrete `cap.call`s. The §3a source mapping (W4) and time-travel (W1) are later slices.
 pub struct Inspector {
     v: Box<VCpu>,
-    /// The shared powerbox (empty here); kept alive for the run's lifetime.
-    _host: Arc<Mutex<Host>>,
+    /// The shared powerbox: capabilities the guest may call. The driver owns it for the run; while
+    /// the guest is paused it is uncontended, so [`host`](Inspector::host) can lock it to read
+    /// effects (captured stdout, clock, grants).
+    host: Arc<Mutex<Host>>,
     finished: Option<Result<Vec<Value>, Trap>>,
 }
 
 impl Inspector {
-    /// Attach to `m`'s `func(args)` with `fuel`, paused before the first op. Set breakpoints, then
+    /// Attach to `m`'s `func(args)` with `fuel` and an **empty powerbox** (any `cap.call` faults),
+    /// paused before the first op. Set breakpoints, then
     /// [`run_until_stop`](Inspector::run_until_stop) or [`step`](Inspector::step).
     pub fn attach(m: &Module, func: FuncIdx, args: &[Value], fuel: u64) -> Inspector {
+        Inspector::attach_with_host(m, func, args, fuel, Host::new())
+    }
+
+    /// Like [`attach`](Inspector::attach), but with a caller-prepared [`Host`] (the powerbox):
+    /// `grant_*` the capabilities the guest needs, pass their handle indices in `args`, then debug a
+    /// capability-using guest (§3c/§3e). Read effects back through [`host`](Inspector::host) while
+    /// paused or after [`Stop::Finished`]. `m` must be import-resolved (see the type docs).
+    pub fn attach_with_host(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+    ) -> Inspector {
         let funcs: Arc<[Func]> = m.funcs.to_vec().into();
         let mem = m.memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
             mm.init_data(&m.data);
             mm
         });
-        let host = Arc::new(Mutex::new(Host::new()));
+        let host = Arc::new(Mutex::new(host));
         let quota = Quota::default();
         // A scheduler is required to construct a vCPU, but no workers ever run: a single-threaded
         // guest executes entirely on this driver's `v.run` pumps.
@@ -310,9 +349,15 @@ impl Inspector {
         root.debug = Some(Box::new(DebugCtx::new()));
         Inspector {
             v: Box::new(root),
-            _host: host,
+            host,
             finished: None,
         }
+    }
+
+    /// Lock the powerbox to inspect host-side effects (e.g. `host().stdout`). Safe while the guest
+    /// is paused or finished — it is not executing, so the lock is uncontended.
+    pub fn host(&self) -> std::sync::MutexGuard<'_, Host> {
+        self.host.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn dbg(&mut self) -> &mut DebugCtx {
@@ -350,6 +395,12 @@ impl Inspector {
         let before = w.len();
         w.retain(|x| x.id != id);
         w.len() != before
+    }
+
+    /// Enable/disable pausing before every `cap.call` ([`StopReason::CapCall`]) — the host-boundary
+    /// stop. Useful for tracing a guest's capability use and the boundary W1 record/replay hooks.
+    pub fn set_cap_call_stops(&mut self, on: bool) {
+        self.dbg().cap_stops = on;
     }
 
     /// Resume until the next breakpoint, completion, or block.
@@ -2756,14 +2807,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     inst: frames[top].inst,
                 };
                 // Watchpoints reuse `access_of` — the same confined-range analysis the DPOR
-                // explorer uses — but only when armed (it confines, so it isn't free). Breakpoints
-                // and stepping need no memory analysis.
+                // explorer uses — but only when armed (it confines, so it isn't free). Breakpoints,
+                // stepping, and the cap.call stop need no memory analysis.
+                let inst = &block.insts[frames[top].inst];
                 let access = if dbg.watches_armed() {
-                    access_of(&block.insts[frames[top].inst], &frames[top].vals, &*mem)
+                    access_of(inst, &frames[top].vals, &*mem)
                 } else {
                     MemAccess::None
                 };
-                if let Some(reason) = dbg.before_op(pc, access) {
+                if let Some(reason) = dbg.before_op(pc, inst, access) {
                     return Ok(Inner::Pause(reason, pc));
                 }
             }

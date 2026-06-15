@@ -47,7 +47,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
 | `cap.call` I/O record log | **Missing** | — |
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
-| Interpreter stepping / breakpoint / watchpoint / backtrace / value+window read | **Built — slices 1–2** | `svm-interp` `Inspector` (single-threaded; multithread pending) |
+| Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded; multithread pending) |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | `§3a` IR debug-info side-table (source locations in IR) | **Missing** (IR has no loc fields) | `svm-ir`, frontend `codegen_ir.c` |
 | DWARF emission + DAP server | **Missing** | — |
@@ -642,8 +642,18 @@ Because the window is one contiguous buffer, a watch catches every code path wit
 instrumentation. Four more tests: stop-before-store then step-applies, read/write kind filtering,
 clear, and non-overlapping range. Workspace green, clippy clean.
 
-**Not yet (next slices):** capability-using guests (grant into the Inspector's `Host`),
-multithreaded debugging (the `Policy` scheduler seam, Milestone B), and the source mapping (W4).
+**Slice 3 — capability-using guests + the cap.call boundary stop.** `Inspector::attach_with_host`
+takes a caller-prepared `Host` (the powerbox): `grant_*` the capabilities, pass their handles in
+`args`, and debug a real capability-using guest (§3c/§3e). `host()` locks the (uncontended-while-
+paused) powerbox to read effects — captured stdout, clock, grants. `set_cap_call_stops(true)`
+pauses *before* every `cap.call` with `StopReason::CapCall { type_id, op }` (the handle/args are
+live; `step` to perform it) — the §7 host boundary and the future W1 record/replay hook (S5). The
+module must be import-resolved (`svm_run::resolve_capability_imports`) per the new named-import
+model on `main`; the interpreter runs only concrete `cap.call`s. Three tests: end-to-end stdout
+capture, a boundary stop with the effect deferred until `step`, and the toggle defaulting off.
+
+**Not yet (next slices):** multithreaded debugging (the `Policy` scheduler seam, Milestone B),
+and the source mapping (W4).
 
 ### Open questions (S4/S5/S2)
 
