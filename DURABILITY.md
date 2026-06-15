@@ -269,9 +269,19 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - **[x] Phase 0 — Spec.** Snapshot-format + handle-durability spec **complete in
   §12** (D-scope/D-hash/D-region resolved). Format carries instrumented-module
   digest; v1 = re-grantable handles only.
-- **[ ] Phase 1 — Transform + interp round-trip.** Single vCPU → `cap.call` →
-  unwind → serialize window → restore → rewind → finish. No STW/JIT/fibers.
-  **Go/no-go gate.** Risk: low (most predictable part).
+- **[~] Phase 1 — Transform + interp round-trip. Go/no-go: PASSED.** The
+  freeze→serialize→restore→thaw round-trip works on the real interpreter
+  (`crates/svm-durable`, `tests/roundtrip.rs`): an in-window shadow stack + state
+  word + `br_table` rewind reconstructs a frozen single-vCPU domain bytewise, and the
+  thawed run reloads the saved `cap.call` result rather than re-issuing it.
+  - **Landed:** the `svm-durable` tooling-tier crate (+0 TCB, depends only on
+    `svm-ir`); the IR→IR transform for the canonical shape (single block, single
+    `cap.call`, `return`); the §12.7 frame layout; the round-trip + inert-instrumentation
+    + verifier tests.
+  - **Remaining Phase-1 work** (mechanical extensions): multiple resume points per
+    function (more `br_table` arms); multi-block CFGs; call-chain propagation (poll
+    after `Call` to a may-suspend callee → real multi-frame stacks, exercising the
+    non-deepest rewind path); minimal live-set instead of the current over-capture.
 - **[ ] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT;
   `svm-mem` page+prot snapshot/**restore**. Risk: low (oracle does the work);
   Windows placeholder semantics the known annoyance. *(escape-TCB touch — restore.)*

@@ -583,6 +583,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-durable"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+ "svm-text",
+ "svm-verify",
+]
+
+[[package]]
 name = "svm-encode"
 version = "0.0.0"
 dependencies = [
