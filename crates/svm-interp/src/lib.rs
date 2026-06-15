@@ -3068,6 +3068,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(slot_to_val(*ty, *s));
                     }
                 }
+                // §7 reflection (`cap.self.count`): how many capabilities this domain holds. Routed
+                // through `self_dispatch` (op 0) — the same path the JIT's thunk takes, so they agree.
+                Inst::CapSelfCount => {
+                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r = hg.self_dispatch(0, &[])?;
+                    frames[top].vals.push(Value::I32(r[0] as i32));
+                }
+                // §7 reflection (`cap.self.get`): the `idx`-th held capability as `(handle, type_id)`
+                // (op 1). An out-of-range index is fail-closed (the guest bounds it by the count).
+                Inst::CapSelfGet { idx } => {
+                    let i = as_i32(get(&frames[top].vals, *idx)?)? as i64;
+                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                    let r = hg.self_dispatch(1, &[i])?;
+                    drop(hg);
+                    frames[top].vals.push(Value::I32(r[0] as i32));
+                    frames[top].vals.push(Value::I32(r[1] as i32));
+                }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
                 // both backends, the unified namespace). No switch.
@@ -3415,6 +3432,12 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
     let v = match inst {
         Inst::ConstI32(c) => Value::I32(*c),
         Inst::ConstI64(c) => Value::I64(*c),
+        // §7 named imports must be lowered to `cap.call` by `resolve_imports` before
+        // execution; a stray `CallImport` is fail-closed (it carries no `type_id`/`op`).
+        Inst::CallImport { .. } => return Err(Trap::Malformed),
+        // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
+        // (like `cap.call`), never here.
+        Inst::CapSelfCount | Inst::CapSelfGet { .. } => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
             IntTy::I32 => Value::I32(bin32(
                 *op,
@@ -4138,6 +4161,13 @@ pub mod iface {
     /// ops (`cap.call` on it is an inert `CapFault`); it confers only the authority to be named in
     /// `Jit.invoke`/`release` on the domain handle that compiled it.
     pub const JIT_CODE: u32 = 12;
+    /// `HostFn` — an **embedder-registered** capability (§7 "host-defined capabilities"): the host
+    /// installs a handler closure with [`crate::Host::grant_host_fn`] and the guest reaches it like
+    /// any capability (`cap.call HOST_FN op …`). The interface's *semantics* live entirely in the
+    /// embedder's closure (e.g. an `svm-wasi` shim), **outside** this crate's TCB match — so a host
+    /// can add capabilities without touching the VM. The handler reads/writes the guest window
+    /// through the same masked `GuestMem` the built-in ops use (authority-TCB, not escape-TCB).
+    pub const HOST_FN: u32 = 13;
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -4425,6 +4455,10 @@ enum Binding {
         domain: u32,
         unit: u32,
     },
+    /// An **embedder-registered** host-function capability (iface 13): carries the index of its
+    /// handler closure in [`Host::host_fns`] (out-of-line so `Binding` stays `Copy`, like
+    /// [`Binding::Blocking`]). All ops dispatch to that one closure, which interprets `op`.
+    HostFn(u32),
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -4651,6 +4685,14 @@ impl AsyncCounter for RegionCounter {
     }
 }
 
+/// An **embedder-registered host-capability handler** (iface [`iface::HOST_FN`]): given the `op`,
+/// the slot-encoded `i64` args, and the guest window (`None` if the module has no memory), it runs
+/// the operation and returns its result slots — or a [`Trap`] (e.g. `Trap::Exit`). This is how a
+/// host adds a capability (e.g. an `svm-wasi` shim) **without** touching this crate: the semantics
+/// live in the closure, reached only through a granted handle (the §3c masked/type-checked table).
+pub type HostFn =
+    Box<dyn FnMut(u32, &[i64], Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> + Send>;
+
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -4682,6 +4724,9 @@ pub struct Host {
     /// §12 `Blocking` capability backings, indexed by the id a [`Binding::Blocking`] carries. Each is
     /// a `Send + Sync` [`AsyncState`] a `submit` batch can run on the offload pool.
     blockings: Vec<Arc<AsyncState>>,
+    /// §7 embedder-registered host-capability handlers, indexed by the id a [`Binding::HostFn`]
+    /// carries ([`Host::grant_host_fn`]). A dispatch takes the closure out, runs it, and restores it.
+    host_fns: Vec<HostFn>,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -4806,6 +4851,7 @@ impl Host {
             modules: Vec::new(),
             region_factory: None,
             blockings: Vec::new(),
+            host_fns: Vec::new(),
             pool: None,
             rings: Vec::new(),
             async_notify: None,
@@ -4880,6 +4926,44 @@ impl Host {
         Some(((s.generation << CAP_LOG2) | slot as u32) as i32)
     }
 
+    /// §7 capability **reflection** (backs `cap.self.count`/`cap.self.get`): the live handle-table
+    /// entries this **domain** holds, as `(handle, type_id)` in slot order. The handle value is the
+    /// same `(generation << CAP_LOG2) | slot` a grant returns, so the guest can *use* what it
+    /// discovers. Read-only and authority-neutral — every handle is one the domain already holds,
+    /// so this confers nothing and reveals nothing the host did not grant. The `Host` *is* the
+    /// domain's table (a nested §14 child gets a fresh one), so this auto-scopes to the caller.
+    /// §7 reflection dispatch (`cap.self.*`), shared by both backends: op 0 `count() -> [n]`; op 1
+    /// `get(idx) -> [handle, type_id]` (out-of-range index is fail-closed). The interpreter calls this
+    /// for its `CapSelf*` ops, and the JIT routes them through the `cap.call` thunk with the reserved
+    /// [`CAP_SELF_TYPE_ID`] — so the two stay in lockstep over one implementation.
+    fn self_dispatch(&self, op: u32, args: &[i64]) -> Result<Vec<i64>, Trap> {
+        let caps = self.self_caps();
+        match op {
+            0 => Ok(vec![caps.len() as i64]),
+            1 => {
+                let idx = *args.first().ok_or(Trap::Malformed)?;
+                let (handle, type_id) = usize::try_from(idx)
+                    .ok()
+                    .and_then(|i| caps.get(i).copied())
+                    .ok_or(Trap::Malformed)?;
+                Ok(vec![handle as i64, type_id as i64])
+            }
+            _ => Err(Trap::Malformed),
+        }
+    }
+
+    fn self_caps(&self) -> Vec<(i32, u32)> {
+        self.table
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.entry.is_some())
+            .map(|(slot, s)| {
+                let handle = ((s.generation << CAP_LOG2) | slot as u32) as i32;
+                (handle, s.type_id)
+            })
+            .collect()
+    }
+
     /// Infallible grant for **host-controlled** powerbox setup (`grant_stream`/`grant_memory`/… and
     /// the `grant_*` embedder APIs): the host grants a bounded handful into a fresh `CAP`-slot table,
     /// so the table cannot be full. Never call this on a **guest-reachable** path — use
@@ -4931,6 +5015,17 @@ impl Host {
             Ok(Binding::Blocking(idx)) => self.blockings.get(idx as usize).cloned(),
             _ => None,
         }
+    }
+
+    /// §7 Register an **embedder host-capability** handler and grant a handle to it (iface
+    /// [`iface::HOST_FN`]). The guest reaches it with `cap.call HOST_FN <op> <handle> (args)`; the
+    /// closure supplies the semantics, so a host adds a capability (e.g. an `svm-wasi` shim) without
+    /// changing the VM. The handler is host code in the **authority** TCB — it sees the guest window
+    /// (masked `GuestMem`) but is reached only through this masked, type-checked handle.
+    pub fn grant_host_fn(&mut self, f: HostFn) -> i32 {
+        let idx = self.host_fns.len() as u32;
+        self.host_fns.push(f);
+        self.grant(iface::HOST_FN, Binding::HostFn(idx))
     }
 
     /// Grant a §14 `AddressSpace` capability over the window sub-range `[base, base+size)` (§14). The
@@ -5324,8 +5419,25 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
+        // §7 reflection: the reserved pseudo-`type_id` has no handle to resolve — service it directly
+        // (read-only over this domain's own table). This is the JIT's entry point for `cap.self.*`.
+        if type_id == svm_ir::CAP_SELF_TYPE_ID {
+            return self.self_dispatch(op, args);
+        }
         match self.resolve(handle, type_id)? {
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
+            // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
+            // out for the call so the closure can't alias `self.host_fns` (it doesn't need `Host`),
+            // then restore it — a panic would only poison this one slot, never the host.
+            Binding::HostFn(idx) => {
+                let mut f = match self.host_fns.get_mut(idx as usize) {
+                    Some(slot) => std::mem::replace(slot, Box::new(|_, _, _| Err(Trap::CapFault))),
+                    None => return Err(Trap::CapFault),
+                };
+                let r = f(op, args, mem);
+                self.host_fns[idx as usize] = f;
+                r
+            }
             Binding::Exit => {
                 // op 0: exit(code: i32) — noreturn. Propagate as a (non-error) trap.
                 let code = *args.first().ok_or(Trap::Malformed)? as i32;

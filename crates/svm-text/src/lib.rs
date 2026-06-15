@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
-    Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
+    Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
     Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType,
 };
 
@@ -59,6 +59,20 @@ pub fn print_module(m: &Module) -> String {
     }
     if let Some(mem) = &m.memory {
         let _ = writeln!(s, "memory {}", mem.size_log2);
+        s.push('\n');
+    }
+    // §7 named capability imports, one per line, in declaration order (the index a
+    // `call.import` references): `import <idx> "<name>" (params) -> (results)`.
+    if !m.imports.is_empty() {
+        for (i, imp) in m.imports.iter().enumerate() {
+            let _ = writeln!(
+                s,
+                "import {i} \"{}\" ({}) -> ({})",
+                imp.name,
+                types(&imp.sig.params),
+                types(&imp.sig.results)
+            );
+        }
         s.push('\n');
     }
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
@@ -236,6 +250,18 @@ fn print_inst(inst: &Inst) -> String {
             types(&sig.results),
             arglist(args)
         ),
+        // §7 named import call: `call.import <idx> v<handle> (args)`. The op signature is
+        // recovered from the module's `import <idx>` declaration on re-parse, so it is not
+        // re-printed here (the import index is the link).
+        Inst::CallImport {
+            import,
+            handle,
+            args,
+            ..
+        } => format!("call.import {import} v{handle}{}", arglist(args)),
+        // §7 capability reflection intrinsics.
+        Inst::CapSelfCount => "cap.self.count".to_string(),
+        Inst::CapSelfGet { idx } => format!("cap.self.get v{idx}"),
         // §12 fibers (stack switching).
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
@@ -632,6 +658,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
         toks: &toks,
         pos: 0,
         fn_results,
+        imports: Vec::new(),
     };
     let mut funcs = Vec::new();
     let mut memory = None;
@@ -645,6 +672,24 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                 let size_log2 = u8::try_from(n)
                     .map_err(|_| ParseError(format!("memory size_log2 out of range: {n}")))?;
                 memory = Some(Memory { size_log2 });
+            }
+            // §7 named import: `import <idx> "<name>" (params) -> (results)`. Indices are
+            // dense and in declaration order (they are what `call.import` references).
+            Some(Tok::Ident(s)) if s == "import" => {
+                p.next()?;
+                let n = p.parse_int()?;
+                if n < 0 || n as usize != p.imports.len() {
+                    return err("import indices must be dense and in declaration order");
+                }
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("import name is not valid UTF-8".into()))?;
+                let params = p.parse_type_list()?;
+                p.expect(&Tok::Arrow)?;
+                let results = p.parse_type_list()?;
+                p.imports.push(Import {
+                    name,
+                    sig: FuncType { params, results },
+                });
             }
             // Module-level `data [ro] <offset> "<bytes>"` segment (§3a / D40).
             Some(Tok::Ident(s)) if s == "data" => {
@@ -670,6 +715,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
         funcs,
         memory,
         data,
+        imports: std::mem::take(&mut p.imports),
     })
 }
 
@@ -680,6 +726,7 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
         toks,
         pos: 0,
         fn_results: Vec::new(),
+        imports: Vec::new(),
     };
     let mut out = Vec::new();
     while !p.at_end() {
@@ -687,6 +734,15 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
             Some(Tok::Ident(s)) if s == "memory" => {
                 p.next()?;
                 p.parse_int()?;
+            }
+            // §7 `import <idx> "<name>" (params) -> (results)` — skip in the header prescan.
+            Some(Tok::Ident(s)) if s == "import" => {
+                p.next()?;
+                p.parse_int()?;
+                p.parse_str()?;
+                p.parse_type_list()?;
+                p.expect(&Tok::Arrow)?;
+                p.parse_type_list()?;
             }
             Some(Tok::Ident(s)) if s == "data" => {
                 // `data [ro] <offset> "<bytes>"` — skip past it in the header prescan.
@@ -723,6 +779,9 @@ struct Parser<'a> {
     pos: usize,
     /// Result arity of each function (by index), from the prescan.
     fn_results: Vec<usize>,
+    /// §7 named imports declared at module top, in order; a `call.import <idx>` recovers its
+    /// op signature from here (imports always precede the functions that reference them).
+    imports: Vec<Import>,
 }
 
 /// A branch edge whose target is still a label name.
@@ -1105,11 +1164,67 @@ impl<'a> Parser<'a> {
             let args = self.parse_value_list(names)?;
             return Ok(Inst::Call { func, args });
         }
+        // §7 named import call, two forms:
+        //   indexed:     `call.import <idx> v<handle> (args)`          — sig from the `import` decl
+        //   name-inline: `call.import "name" (params)->(results) v<h> (args)` — interned on the fly
+        // The name-inline form lets a streaming frontend (chibicc) emit a capability call per site
+        // with no pre-collected import table; the parser interns the name into `imports`.
+        if op == "call.import" {
+            let (import, sig) = if matches!(self.peek(), Some(Tok::Str(_))) {
+                let name = String::from_utf8(self.parse_str()?)
+                    .map_err(|_| ParseError("call.import name is not valid UTF-8".into()))?;
+                let params = self.parse_type_list()?;
+                self.expect(&Tok::Arrow)?;
+                let results = self.parse_type_list()?;
+                let sig = FuncType { params, results };
+                // Intern: reuse an existing import of the same (name, sig), else append.
+                let idx = self
+                    .imports
+                    .iter()
+                    .position(|imp| imp.name == name && imp.sig == sig)
+                    .unwrap_or_else(|| {
+                        self.imports.push(Import {
+                            name,
+                            sig: sig.clone(),
+                        });
+                        self.imports.len() - 1
+                    });
+                (idx as u32, sig)
+            } else {
+                let n = self.parse_int()?;
+                let import = u32::try_from(n)
+                    .map_err(|_| ParseError(format!("import index out of range: {n}")))?;
+                let sig = self
+                    .imports
+                    .get(import as usize)
+                    .map(|imp| imp.sig.clone())
+                    .ok_or_else(|| {
+                        ParseError(format!("call.import references undeclared import {import}"))
+                    })?;
+                (import, sig)
+            };
+            let handle = self.value(names)?;
+            let args = self.parse_value_list(names)?;
+            return Ok(Inst::CallImport {
+                import,
+                sig,
+                handle,
+                args,
+            });
+        }
         if op == "ref.func" {
             let n = self.parse_int()?;
             let func = u32::try_from(n)
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
             return Ok(Inst::RefFunc { func });
+        }
+        // §7 capability reflection intrinsics.
+        if op == "cap.self.count" {
+            return Ok(Inst::CapSelfCount);
+        }
+        if op == "cap.self.get" {
+            let idx = self.value(names)?;
+            return Ok(Inst::CapSelfGet { idx });
         }
         if op == "call_indirect" {
             let params = self.parse_type_list()?;
@@ -1636,5 +1751,112 @@ impl<'a> Parser<'a> {
             Tok::Int(v) => Ok(*v as f64),
             other => err(format!("expected number, found {other:?}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod import_text_tests {
+    use super::*;
+    use svm_ir::{Inst, ResolvedCap};
+
+    const SRC: &str = "\
+memory 16
+import 0 \"write\" (i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+
+func (i32) -> () {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 3
+  v3 = call.import 0 v0 (v1, v2)
+  v4 = i32.const 0
+  call.import 1 v0 (v4)
+  return
+}
+";
+
+    #[test]
+    fn imports_round_trip() {
+        let m = parse_module(SRC).expect("parse");
+        assert_eq!(m.imports.len(), 2);
+        assert_eq!(m.imports[0].name, "write");
+        assert_eq!(m.imports[1].name, "exit");
+        // The body carries two CallImports, sigs recovered from the import table.
+        let insts = &m.funcs[0].blocks[0].insts;
+        let imports: Vec<_> = insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::CallImport { import, handle, .. } => Some((*import, *handle)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imports, vec![(0, 0), (1, 0)]);
+        // Print → re-parse is identity.
+        let printed = print_module(&m);
+        let m2 = parse_module(&printed).expect("reparse");
+        assert_eq!(m, m2, "import syntax must round-trip");
+    }
+
+    #[test]
+    fn resolves_to_capcalls_and_clears_imports() {
+        let m = parse_module(SRC).expect("parse");
+        let r = svm_ir::resolve_imports(&m, |n| match n {
+            "write" => Some(ResolvedCap { type_id: 0, op: 1 }),
+            "exit" => Some(ResolvedCap { type_id: 1, op: 0 }),
+            _ => None,
+        })
+        .expect("resolve");
+        assert!(r.imports.is_empty());
+        let insts = &r.funcs[0].blocks[0].insts;
+        assert!(!insts.iter().any(|i| matches!(i, Inst::CallImport { .. })));
+        // write → cap.call 0 1, exit → cap.call 1 0.
+        let caps: Vec<_> = insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::CapCall { type_id, op, .. } => Some((*type_id, *op)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(caps, vec![(0, 1), (1, 0)]);
+    }
+}
+
+#[cfg(test)]
+mod import_inline_tests {
+    use super::*;
+    use svm_ir::Inst;
+
+    // Name-inline `call.import "name" (sig) v<h> (args)` needs no `import` declaration: the
+    // parser interns the name. Two sites with the same name+sig share one import index.
+    #[test]
+    fn name_inline_interns_imports() {
+        let src = "\
+func (i32) -> () {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 3
+  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v5 = i32.const 0
+  call.import \"exit\" (i32) -> () v0 (v5)
+  return
+}
+";
+        let m = parse_module(src).expect("parse name-inline imports");
+        // Two distinct names → two interned imports; the repeated "write" reuses index 0.
+        assert_eq!(m.imports.len(), 2);
+        assert_eq!(m.imports[0].name, "write");
+        assert_eq!(m.imports[1].name, "exit");
+        let idxs: Vec<u32> = m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::CallImport { import, .. } => Some(*import),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(idxs, vec![0, 0, 1], "repeated write shares index 0");
+        // Canonical print → re-parse is identity (printer emits the indexed form + decls).
+        assert_eq!(parse_module(&print_module(&m)).unwrap(), m);
     }
 }
