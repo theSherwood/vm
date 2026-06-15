@@ -13,6 +13,7 @@ members = [
     "crates/svm",
     "crates/svm-run",
     "crates/svm-wasm",
+    "crates/svm-wasi",
 ]
 # `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); `bench/` pulls in Wasmtime for
 # the comparison harness. Both are kept out of the workspace so stable

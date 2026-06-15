@@ -668,6 +668,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-wasi"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+ "svm-verify",
+ "svm-wasm",
+ "wat",
+]
+
+[[package]]
 name = "svm-wasm"
 version = "0.0.0"
 dependencies = [

@@ -50,22 +50,23 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `() -> ()`. `tests/start.rs` (runs-before-export, param/result threading, runs-once/internal-bypass,
   bad-signature rejection). A non-`(start)` module is byte-identical to before.
 
-### 🟠 Host-ABI — named multi-capability import binding
+### 🟠 Host-ABI — named import binding
 
-- [ ] **Named, multi-capability import binding.** *This is the in-scope mechanism, not WASI itself.*
-  The capability model is already fully general: `cap.call` (`Inst::CapCall { type_id, op, sig, handle,
-  args }`) + the host-owned handle table (`Host::try_grant`/`grant_*` → i32 handles, masked + type_id +
-  generation checked) lets a host expose *any* interface, and chibicc already threads a **multi-handle
-  powerbox** (7 caps) into the guest. The gap is purely svm-wasm frontend plumbing:
-    - imports must use **decimal** `module`/`name` (= `type_id`/`op`); there's no symbolic
-      `name → (type_id, op)` binding, so `("env", "now")` is a clean `Unsupported` (`lib.rs` import parse);
-    - only **one** capability handle is threaded (a single leading param; `has_handle` is module-wide),
-      so a module importing across **multiple** capability interfaces is rejected.
-  Work: (a) let the embedder supply a `name → (type_id, op)` table on `transpile`/`Transpiled`; (b)
-  thread **N** handles via reserved slots (the chibicc pattern) instead of one leading param. WASI's
-  specific fd/clock/random *semantics* stay a ⚪ non-goal — a host is free to bind WASI-shaped names to
-  its own capabilities through this mechanism, but svm-wasm doesn't ship the preview1 surface.
-  (The `wasi:thread/spawn` import is already special-cased; this generalizes it to arbitrary names.)
+- [x] **Named import binding — DONE (single-handle).** A non-numeric import (e.g. a real WASI
+  `("wasi_snapshot_preview1", "fd_write")`) now lowers to a §7 `Inst::CallImport "<module>.<name>"`
+  (declared in `Module.imports`); the embedder binds the name to a concrete `(type_id, op)` at load via
+  `svm_ir::resolve_imports`. The numeric `module`=type_id / `name`=op convention still lowers to an
+  inline `cap.call`. svm-wasm stays pure mechanism — it never interprets host semantics. The
+  **`svm-wasi`** crate is the worked example: a minimal preview1 shim (`fd_write`/`proc_exit`) as an
+  embedder `HostFn` capability (`svm_interp::iface::HOST_FN`, registered with `Host::grant_host_fn` —
+  WASI semantics live outside both svm-wasm and the interp TCB), plus a `resolve` policy. A real WASI
+  "hello world" runs end-to-end (`crates/svm-wasi/src/lib.rs` tests). WASI's specific fd/clock/random
+  *semantics* stay a ⚪ non-goal — the shim is a host-layer subset, not conformant preview1.
+- [ ] **Multi-*handle* import binding (remaining).** Still **one** capability handle threaded (a single
+  leading param; `has_handle` is module-wide), so all named imports must share one interface — fine for
+  WASI (one `HostFn` handle, many ops) but a module spanning **distinct** capability interfaces is
+  rejected. Work: thread **N** handles via reserved slots (the chibicc multi-handle powerbox pattern)
+  instead of one leading param. (The `wasi:thread/spawn` import remains separately special-cased.)
 
 ### 🟡 Fail-closed feature gaps (clean `Unsupported`)
 
