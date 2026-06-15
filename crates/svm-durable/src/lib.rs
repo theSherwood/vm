@@ -16,10 +16,10 @@
 //! * **rewind** = in the prologue, if `REWINDING`, `br_table` on the saved resume id,
 //!   reload the live values, and continue from the resume point.
 //!
-//! # Scope (single-block, single suspend point — the go/no-go gate, now with chains)
+//! # Scope (single-block, multi-suspend — the go/no-go gate, now with chains)
 //!
-//! The transform handles a **single-block** function with a `return` terminator and
-//! **exactly one may-suspend operation**, which is either:
+//! The transform handles a **single-block** function with a `return` terminator and any
+//! number of may-suspend operations (≥ 1), each either:
 //!
 //! * a **leaf** `cap.call` — the host performs the operation; on thaw the deepest frame
 //!   reloads the saved result and flips the state word back to `NORMAL`; or
@@ -29,15 +29,17 @@
 //!   `REWINDING` so the callee rewinds in turn); only the innermost leaf flips to
 //!   `NORMAL`. This is the DURABILITY.md §12.7 "re-issue vs. continue" branch (R8).
 //!
-//! A function is **may-suspend** iff it contains a `cap.call` or (transitively) a `Call`
-//! to a may-suspend function; only may-suspend functions are instrumented. Everything
-//! else is enough to prove the core risk end-to-end on the real interpreter
-//! (`tests/roundtrip.rs`, `tests/chain.rs`): does an in-window shadow stack + `br_table`
-//! rewind round-trip a frozen *call chain*? The remaining extensions (DURABILITY.md §9):
+//! The block is split at each suspend op into forward segments, and a `br_table` in the
+//! prologue dispatch routes a thaw to the resume point that was in flight (one arm per
+//! point). A function is **may-suspend** iff it contains a `cap.call` or (transitively) a
+//! `Call` to a may-suspend function; only may-suspend functions are instrumented.
 //!
-//! * multiple resume points per function (more `br_table` arms) — the dispatch and
-//!   frame machinery already generalize;
-//! * multi-block CFGs (split any block at its may-suspend calls);
+//! This is enough to prove the core risk end-to-end on the real interpreter
+//! (`tests/roundtrip.rs`, `tests/chain.rs`, `tests/multipoint.rs`): does an in-window
+//! shadow stack + `br_table` rewind round-trip a frozen *call chain* with multiple resume
+//! points? The remaining extensions (DURABILITY.md §9):
+//!
+//! * multi-block CFGs (split any block at its may-suspend calls — today a single block);
 //! * fibers / multi-vCPU / STW (Phase 3).
 //!
 //! A `call_indirect` whose runtime target may suspend is **out of scope**: the closure
@@ -81,14 +83,14 @@ pub const SHADOW_SP_OFF: u64 = 8;
 /// Window byte offset where the shadow stack begins (grows upward).
 pub const SHADOW_BASE: u64 = 64;
 
-// Fixed block indices in the instrumented function. Block 0 is the prologue (the
-// entry block, by position); the rest are referenced as branch targets below.
-const NORMAL: BlockIdx = 1;
-const CONT: BlockIdx = 2;
-const UNWIND: BlockIdx = 3;
-const DISPATCH: BlockIdx = 4;
-const ARM0: BlockIdx = 5;
-const TRAP: BlockIdx = 6;
+// Block layout of an instrumented function with `n` suspend points (computed by
+// `block indices` below; reduces to the 7-block single-point shape for `n == 1`):
+//   0                  PROLOGUE  — dispatch on the state word
+//   1 ..= n+1          S_0 .. S_n — forward segments split at each suspend op (S_n = tail)
+//   n+2 ..= 2n+1       UNWIND_0 .. UNWIND_{n-1} — spill + return placeholder, per point
+//   2n+2               DISPATCH  — read resume id, br_table to an arm
+//   2n+3 ..= 3n+2      ARM_0 .. ARM_{n-1} — reload + resume, per point
+//   3n+3               TRAP      — forged / reserved resume id
 
 /// Reasons the Phase-1 transform declines a module.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -182,8 +184,24 @@ enum SuspendKind {
     Propagated { callee: FuncIdx, args: Vec<ValIdx> },
 }
 
-/// Instrument one may-suspend function. `Ok((func, frame_size))` on success, or an error
-/// for an out-of-scope shape. (Non-may-suspend functions are not passed here.)
+/// One suspend point's resume metadata: where it is, what kind, and its frame layout.
+struct PointPlan {
+    pos: usize,            // instruction index of the suspend op
+    kind: SuspendKind,     // leaf cap.call or propagated call
+    out: usize,            // value count after the suspend op (= S_{k+1} param count)
+    nres: usize,           // result count of the suspend op
+    saved_types: Vec<ValType>,
+    frame_offsets: Vec<u64>,
+    frame_size: u64,
+    rid_off: u64,
+}
+
+/// Instrument one may-suspend function. `Ok((func, max_frame_size))` on success, or an
+/// error for an out-of-scope shape. (Non-may-suspend functions are not passed here.)
+///
+/// The single block is split at each may-suspend op into forward segments `S_0..S_n`; a
+/// poll after each op unwinds (per-point spill + resume id) or continues, and a `br_table`
+/// in the prologue dispatch routes a thaw to the matching arm. See the block-layout map.
 fn transform_func(
     f: &Func,
     func_results: &[Vec<ValType>],
@@ -198,67 +216,80 @@ fn transform_func(
         return Err(TransformError::UnsupportedShape);
     }
 
-    // Exactly one may-suspend op: a `cap.call` (leaf) or a `Call` to a may-suspend callee.
-    let mut suspend: Option<(usize, SuspendKind)> = None;
-    for (pos, inst) in b.insts.iter().enumerate() {
-        let kind = match inst {
-            Inst::CapCall { .. } => Some(SuspendKind::Leaf),
-            Inst::Call { func, args } if may_suspend[*func as usize] => Some(SuspendKind::Propagated {
-                callee: *func,
-                args: args.clone(),
-            }),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            if suspend.is_some() {
-                return Err(TransformError::UnsupportedShape); // >1 resume point: future work
-            }
-            suspend = Some((pos, kind));
-        }
-    }
-    let (sc, kind) = suspend.ok_or(TransformError::UnsupportedShape)?;
-
-    // Value types up to & including the suspend op. `split` = values live just after it
-    // (the CONT param count). The suspend op's own results occupy the last `nres`.
+    // Value types over the whole block, plus the value count after each instruction
+    // (`vend[pos]`), so we can slice the block into segments at the suspend ops.
     let p = f.params.len();
     let mut types = f.params.clone();
-    for inst in &b.insts[..=sc] {
+    let mut vend = Vec::with_capacity(b.insts.len());
+    for inst in &b.insts {
         types.extend(result_types(inst, &types, func_results)?);
-    }
-    let split = types.len();
-    let nres = match &kind {
-        SuspendKind::Leaf => match &b.insts[sc] {
-            Inst::CapCall { sig, .. } => sig.results.len(),
-            _ => unreachable!("leaf suspend op is a cap.call"),
-        },
-        SuspendKind::Propagated { callee, .. } => func_results[*callee as usize].len(),
-    };
-    // Saved (spilled) set: live values *before* the suspend op. A leaf reloads its
-    // `cap.call` result too (the host already produced it); a propagated frame re-issues
-    // the call instead, so its result is recomputed, not saved.
-    let save_end = match kind {
-        SuspendKind::Leaf => split,
-        SuspendKind::Propagated { .. } => split - nres,
-    };
-    let saved_types: Vec<ValType> = types[p..save_end].to_vec();
-    if saved_types.contains(&ValType::V128) {
-        return Err(TransformError::UnsupportedInst); // v128 spill/reload: future work
+        vend.push(types.len());
     }
 
-    // Frame layout (DURABILITY.md §12.7): packed values, then resume id in the top word.
-    let mut frame_offsets = Vec::with_capacity(saved_types.len());
-    let mut off = 0u64;
-    for &t in &saved_types {
-        off = align_up(off, vsize(t));
-        frame_offsets.push(off);
-        off += vsize(t);
+    // Find the may-suspend ops (any number ≥ 1): a `cap.call` (leaf) or a `Call` to a
+    // may-suspend callee (propagated). Each becomes a resume point with id `k+1`.
+    let mut points: Vec<PointPlan> = Vec::new();
+    for (pos, inst) in b.insts.iter().enumerate() {
+        let kind = match inst {
+            Inst::CapCall { .. } => SuspendKind::Leaf,
+            Inst::Call { func, args } if may_suspend[*func as usize] => {
+                SuspendKind::Propagated { callee: *func, args: args.clone() }
+            }
+            _ => continue,
+        };
+        let out = vend[pos];
+        let nres = match (&kind, &b.insts[pos]) {
+            (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => sig.results.len(),
+            (SuspendKind::Propagated { callee, .. }, _) => func_results[*callee as usize].len(),
+            _ => unreachable!("kind matches the instruction"),
+        };
+        // A leaf reloads its own result (the host produced it); a propagated frame re-issues
+        // its call, so the call's results are recomputed, not spilled.
+        let save_end = match kind {
+            SuspendKind::Leaf => out,
+            SuspendKind::Propagated { .. } => out - nres,
+        };
+        let saved_types: Vec<ValType> = types[p..save_end].to_vec();
+        if saved_types.contains(&ValType::V128) {
+            return Err(TransformError::UnsupportedInst); // v128 spill/reload: future work
+        }
+        // Frame layout (DURABILITY.md §12.7): packed values, then resume id in the top word.
+        let mut frame_offsets = Vec::with_capacity(saved_types.len());
+        let mut off = 0u64;
+        for &t in &saved_types {
+            off = align_up(off, vsize(t));
+            frame_offsets.push(off);
+            off += vsize(t);
+        }
+        let frame_size = align_up(off + 4, 16);
+        points.push(PointPlan {
+            pos,
+            kind,
+            out,
+            nres,
+            saved_types,
+            frame_offsets,
+            rid_off: frame_size - 4,
+            frame_size,
+        });
     }
-    let frame_size = align_up(off + 4, 16);
-    let rid_off = frame_size - 4; // resume id at `shadow_SP - 4`
+    // A may-suspend function must contain at least one suspend op in its own block.
+    if points.is_empty() {
+        return Err(TransformError::UnsupportedShape);
+    }
 
-    let all_args: Vec<ValIdx> = (0..split as u32).collect();
+    // Block-index layout (see the map near the constants). `n` = number of resume points.
+    let n = points.len() as u32;
+    let s_blk = |k: u32| 1 + k; // S_0 .. S_n  (k in 0..=n)
+    let unwind_blk = |k: u32| n + 2 + k; // UNWIND_0 .. UNWIND_{n-1}
+    let dispatch_blk = 2 * n + 2;
+    let arm_blk = |k: u32| 2 * n + 3 + k; // ARM_0 .. ARM_{n-1}
+    let trap_blk = 3 * n + 3;
+    // Param (incoming value) count of segment S_k: params for S_0, else the previous
+    // point's `out`.
+    let in_of = |k: usize| if k == 0 { p } else { points[k - 1].out };
 
-    // ---- block 0: PROLOGUE — dispatch on the state word ----
+    // ---- PROLOGUE — dispatch on the state word ----
     let mut pb = Bb::new(f.params.clone());
     let st_a = pb.one(Inst::ConstI64(STATE_OFF as i64));
     let st = pb.one(load(LoadOp::I32, st_a, 0));
@@ -266,132 +297,139 @@ fn transform_func(
     let is_rw = pb.one(icmp(IntTy::I32, CmpOp::Eq, st, rw));
     let prologue = pb.finish(Terminator::BrIf {
         cond: is_rw,
-        then_blk: DISPATCH,
+        then_blk: dispatch_blk,
         then_args: (0..p as u32).collect(),
-        else_blk: NORMAL,
+        else_blk: s_blk(0),
         else_args: (0..p as u32).collect(),
     });
 
-    // ---- block 1: NORMAL — original prefix + the poll after the suspend op ----
-    let mut nb = Bb::new(f.params.clone());
-    nb.insts.extend_from_slice(&b.insts[..=sc]);
-    nb.next = split as u32;
-    let st_a = nb.one(Inst::ConstI64(STATE_OFF as i64));
-    let st = nb.one(load(LoadOp::I32, st_a, 0));
-    let unw = nb.one(Inst::ConstI32(STATE_UNWINDING));
-    let is_unw = nb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
-    let normal = nb.finish(Terminator::BrIf {
-        cond: is_unw,
-        then_blk: UNWIND,
-        then_args: all_args.clone(),
-        else_blk: CONT,
-        else_args: all_args.clone(),
+    // ---- S_0 .. S_{n-1}: forward segment + suspend op + poll ----
+    let mut seg_blocks: Vec<Block> = Vec::with_capacity(points.len() + 1);
+    for (k, pt) in points.iter().enumerate() {
+        let seg_start = if k == 0 { 0 } else { points[k - 1].pos + 1 };
+        let mut sb = Bb::new(types[0..in_of(k)].to_vec());
+        sb.insts.extend_from_slice(&b.insts[seg_start..=pt.pos]); // segment + the suspend op
+        sb.next = pt.out as u32;
+        let st_a = sb.one(Inst::ConstI64(STATE_OFF as i64));
+        let st = sb.one(load(LoadOp::I32, st_a, 0));
+        let unw = sb.one(Inst::ConstI32(STATE_UNWINDING));
+        let is_unw = sb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
+        let live: Vec<ValIdx> = (0..pt.out as u32).collect();
+        seg_blocks.push(sb.finish(Terminator::BrIf {
+            cond: is_unw,
+            then_blk: unwind_blk(k as u32),
+            then_args: live.clone(),
+            else_blk: s_blk(k as u32 + 1),
+            else_args: live,
+        }));
+    }
+    // ---- S_n: the tail (post-last-suspend insts + the real return) ----
+    let last = points.len() - 1;
+    seg_blocks.push(Block {
+        params: types[0..points[last].out].to_vec(),
+        insts: b.insts[points[last].pos + 1..].to_vec(),
+        term: b.term.clone(),
     });
 
-    // ---- block 2: CONT — original tail (post-suspend insts + the real return) ----
-    let cont = Block {
-        params: types[0..split].to_vec(),
-        insts: b.insts[sc + 1..].to_vec(),
-        term: b.term.clone(),
-    };
-
-    // ---- block 3: UNWIND — spill the saved set + resume id, return a placeholder ----
-    let mut ub = Bb::new(types[0..split].to_vec());
-    let sp_a = ub.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
-    let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
-    for (j, &t) in saved_types.iter().enumerate() {
-        // the saved value is block-local index `p + j` (saved set is contiguous [p, save_end))
-        ub.zero(store(store_op(t), sp, (p + j) as u32, frame_offsets[j]));
+    // ---- UNWIND_k: spill point k's saved set + resume id k+1, return a placeholder ----
+    let mut unwind_blocks: Vec<Block> = Vec::with_capacity(points.len());
+    for (k, pt) in points.iter().enumerate() {
+        let mut ub = Bb::new(types[0..pt.out].to_vec());
+        let sp_a = ub.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+        let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
+        for (j, &t) in pt.saved_types.iter().enumerate() {
+            // saved value block-local index `p + j` (the saved set is contiguous [p, save_end))
+            ub.zero(store(store_op(t), sp, (p + j) as u32, pt.frame_offsets[j]));
+        }
+        let rid = ub.one(Inst::ConstI32(k as i32 + 1));
+        ub.zero(store(StoreOp::I32, sp, rid, pt.rid_off));
+        let fsz = ub.one(Inst::ConstI64(pt.frame_size as i64));
+        let newsp = ub.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
+        ub.zero(store(StoreOp::I64, sp_a, newsp, 0));
+        let ret: Vec<ValIdx> = f.results.iter().map(|&t| ub.one(zero_const(t))).collect();
+        unwind_blocks.push(ub.finish(Terminator::Return(ret)));
     }
-    let rid = ub.one(Inst::ConstI32(1)); // single resume point ⇒ id 1
-    ub.zero(store(StoreOp::I32, sp, rid, rid_off));
-    let fsz = ub.one(Inst::ConstI64(frame_size as i64));
-    let newsp = ub.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
-    ub.zero(store(StoreOp::I64, sp_a, newsp, 0));
-    let ret: Vec<ValIdx> = f.results.iter().map(|&t| ub.one(zero_const(t))).collect();
-    let unwind = ub.finish(Terminator::Return(ret));
 
-    // ---- block 4: DISPATCH — read the resume id at SP-4 and branch ----
+    // ---- DISPATCH — read the resume id at SP-4 and br_table to the matching arm ----
     let mut db = Bb::new(f.params.clone());
     let sp_a = db.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
     let sp = db.one(load(LoadOp::I64, sp_a, 0));
     let four = db.one(Inst::ConstI64(4));
     let sp_m4 = db.one(ibin(IntTy::I64, BinOp::Sub, sp, four));
     let rid = db.one(load(LoadOp::I32, sp_m4, 0));
+    // id 0 is reserved ("no resume" ⇒ trap); id k+1 selects ARM_k.
+    let mut targets: Vec<(BlockIdx, Vec<ValIdx>)> = vec![(trap_blk, vec![])];
+    for k in 0..points.len() as u32 {
+        targets.push((arm_blk(k), (0..p as u32).collect()));
+    }
     let dispatch = db.finish(Terminator::BrTable {
         idx: rid,
-        // id 0 is reserved ("no resume"); id 1 is our single resume point.
-        targets: vec![(TRAP, vec![]), (ARM0, (0..p as u32).collect())],
-        default: (TRAP, vec![]),
+        targets,
+        default: (trap_blk, vec![]),
     });
 
-    // ---- block 5: ARM0 — reload the saved set, pop, then resume the suspend op ----
-    let mut ab = Bb::new(f.params.clone());
-    let sp_a = ab.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
-    let sp = ab.one(load(LoadOp::I64, sp_a, 0));
-    let fsz = ab.one(Inst::ConstI64(frame_size as i64));
-    let base = ab.one(ibin(IntTy::I64, BinOp::Sub, sp, fsz));
-    let mut reloaded = Vec::with_capacity(saved_types.len());
-    for (j, &t) in saved_types.iter().enumerate() {
-        reloaded.push(ab.one(load(load_op(t), base, frame_offsets[j])));
+    // ---- ARM_k: reload point k's saved set, pop, resume the suspend op, continue ----
+    let mut arm_blocks: Vec<Block> = Vec::with_capacity(points.len());
+    for (k, pt) in points.iter().enumerate() {
+        let mut ab = Bb::new(f.params.clone());
+        let sp_a = ab.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+        let sp = ab.one(load(LoadOp::I64, sp_a, 0));
+        let fsz = ab.one(Inst::ConstI64(pt.frame_size as i64));
+        let base = ab.one(ibin(IntTy::I64, BinOp::Sub, sp, fsz));
+        let mut reloaded = Vec::with_capacity(pt.saved_types.len());
+        for (j, &t) in pt.saved_types.iter().enumerate() {
+            reloaded.push(ab.one(load(load_op(t), base, pt.frame_offsets[j])));
+        }
+        ab.zero(store(StoreOp::I64, sp_a, base, 0)); // pop: SP = frame base
+
+        // S_{k+1} expects `out` args: params, the reloaded values, then the suspend op's
+        // results (reloaded for a leaf, re-issued for a propagated call).
+        let mut cont_args: Vec<ValIdx> = (0..p as u32).collect();
+        cont_args.extend(reloaded.iter().copied());
+        let next_fwd = s_blk(k as u32 + 1);
+        let arm = match &pt.kind {
+            SuspendKind::Leaf => {
+                // Deepest frame: the host already performed the `cap.call`; its result is in
+                // the reloaded set. Flip the state word back to NORMAL and continue forward.
+                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                ab.finish(Terminator::Br { target: next_fwd, args: cont_args })
+            }
+            SuspendKind::Propagated { callee, args } => {
+                // Non-deepest frame (R8): leave the state REWINDING and re-issue the call so
+                // the callee rewinds. Map the call's operands to params / reloaded values.
+                let mapped: Vec<ValIdx> = args
+                    .iter()
+                    .map(|&a| if (a as usize) < p { a } else { reloaded[a as usize - p] })
+                    .collect();
+                let results = ab.many(Inst::Call { func: *callee, args: mapped }, pt.nres);
+                cont_args.extend(results);
+                ab.finish(Terminator::Br { target: next_fwd, args: cont_args })
+            }
+        };
+        arm_blocks.push(arm);
     }
-    ab.zero(store(StoreOp::I64, sp_a, base, 0)); // pop: SP = frame base
 
-    // CONT expects `split` args: params, then every value defined up to & including the
-    // suspend op. The first `save_end` come from params + the reloaded set; the suspend
-    // op's `nres` results are produced here per kind.
-    let mut cont_args: Vec<ValIdx> = (0..p as u32).collect();
-    cont_args.extend(reloaded.iter().copied());
+    // ---- TRAP — br_table default / forged resume id ----
+    let trap = Block { params: vec![], insts: vec![], term: Terminator::Unreachable };
 
-    let arm0 = match kind {
-        SuspendKind::Leaf => {
-            // Deepest frame: the host already performed the `cap.call`, whose result is in
-            // the reloaded set. Flip the state word back to NORMAL and fall into CONT.
-            let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
-            let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-            ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
-            ab.finish(Terminator::Br {
-                target: CONT,
-                args: cont_args,
-            })
-        }
-        SuspendKind::Propagated { callee, args } => {
-            // Non-deepest frame (R8): the in-flight op was a call into a may-suspend callee.
-            // Leave the state word REWINDING and *re-issue the call*, so the callee runs
-            // its own prologue→dispatch and rewinds. Map the call's original operands to
-            // their reloaded values (params map to themselves; saved values to `reloaded`).
-            let mapped: Vec<ValIdx> = args
-                .iter()
-                .map(|&a| {
-                    if (a as usize) < p {
-                        a
-                    } else {
-                        reloaded[a as usize - p]
-                    }
-                })
-                .collect();
-            let results = ab.many(Inst::Call { func: callee, args: mapped }, nres);
-            cont_args.extend(results);
-            ab.finish(Terminator::Br {
-                target: CONT,
-                args: cont_args,
-            })
-        }
-    };
+    // Assemble in the order the index layout assumes.
+    let mut blocks = Vec::with_capacity((3 * n + 4) as usize);
+    blocks.push(prologue);
+    blocks.extend(seg_blocks);
+    blocks.extend(unwind_blocks);
+    blocks.push(dispatch);
+    blocks.extend(arm_blocks);
+    blocks.push(trap);
 
-    // ---- block 6: TRAP — br_table default / forged resume id ----
-    let trap = Block {
-        params: vec![],
-        insts: vec![],
-        term: Terminator::Unreachable,
-    };
-
+    let max_frame = points.iter().map(|pt| pt.frame_size).max().unwrap_or(0);
     let func = Func {
         params: f.params.clone(),
         results: f.results.clone(),
-        blocks: vec![prologue, normal, cont, unwind, dispatch, arm0, trap],
+        blocks,
     };
-    Ok((func, frame_size))
+    Ok((func, max_frame))
 }
 
 // ---- window helpers for freeze/thaw drivers and tests ----
@@ -609,12 +647,15 @@ mod tests {
     }
 
     #[test]
-    fn multiple_cap_calls_are_out_of_scope() {
+    fn two_cap_calls_become_two_resume_points() {
+        // Two suspend points in one block ⇒ two br_table arms ⇒ 3·2 + 4 = 10 blocks.
         let m = parse_with_mem(
-            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v3\n}\n",
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v4 = i64.add v2 v3\n  return v4\n}\n",
             18,
         );
-        assert_eq!(transform_module(&m), Err(TransformError::UnsupportedShape));
+        let out = transform_module(&m).expect("two resume points are in scope");
+        svm_verify::verify_module(&out).expect("instrumented IR must verify");
+        assert_eq!(out.funcs[0].blocks.len(), 10, "two-point layout: 3n+4 with n=2");
     }
 
     #[test]

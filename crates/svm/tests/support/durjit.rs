@@ -60,18 +60,22 @@ fn window_with(state: i32) -> Vec<u8> {
 
 /// Run the instrumented entry on the interpreter against `window`, with the clock seeded to
 /// `clock_v`. Returns the result and the post-run window snapshot.
-fn interp_run(inst: &Module, clock_v: i64, window: &[u8]) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+/// Returns the result, the post-run window snapshot, and the host's final `clock_ns`
+/// (how far the monotonic clock advanced — used to seed the continuation host on thaw).
+fn interp_run(inst: &Module, clock_v: i64, window: &[u8]) -> (Result<Vec<Value>, Trap>, Vec<u8>, i64) {
     let mut h = Host::new();
     let clk = h.grant_clock();
     h.clock_ns = clock_v;
     let mut fuel = 1_000_000u64;
-    run_capture_reserved_with_host(inst, 0, &[Value::I32(clk)], &mut fuel, window, SIZE_LOG2, &mut h)
+    let (r, win) =
+        run_capture_reserved_with_host(inst, 0, &[Value::I32(clk)], &mut fuel, window, SIZE_LOG2, &mut h);
+    (r, win, h.clock_ns)
 }
 
 /// Run the instrumented entry on the JIT against `window`, with the clock seeded to
 /// `clock_v`. `None` if the JIT declines to compile (it only ever sees lowered ops, so this
-/// is a safety valve, not an expected path).
-fn jit_run(inst: &Module, clock_v: i64, window: &[u8]) -> Option<(JitOutcome, Vec<u8>)> {
+/// is a safety valve, not an expected path). On `Some`, also returns the final `clock_ns`.
+fn jit_run(inst: &Module, clock_v: i64, window: &[u8]) -> Option<(JitOutcome, Vec<u8>, i64)> {
     let mut h = Host::new();
     let clk = h.grant_clock();
     h.clock_ns = clock_v;
@@ -85,7 +89,7 @@ fn jit_run(inst: &Module, clock_v: i64, window: &[u8]) -> Option<(JitOutcome, Ve
         svm_run::cap_thunk,
         &mut h as *mut Host as *mut c_void,
     ) {
-        Ok(o) => Some(o),
+        Ok((o, win)) => Some((o, win, h.clock_ns)),
         Err(JitError::Unsupported(_)) => None,
         Err(e) => panic!("JIT failed to compile a verified instrumented module: {e:?}\n{inst:#?}"),
     }
@@ -116,25 +120,25 @@ pub fn fuzz_one_xbackend(g: &mut Gen) {
     svm_verify::verify_module(&inst).expect("instrumented IR must verify");
 
     let clock_v = g.u64v() as i64;
-    // A clock distinct from `clock_v`, used only for the thaw host: a correct thaw reloads
-    // the saved value and ignores it; a buggy re-issue would observe it and diverge.
-    let thaw_clock = !clock_v;
 
-    // Interpreter reference: the uninterrupted result and the frozen artifact.
-    let (base_i, _) = interp_run(&inst, clock_v, &window_with(STATE_NORMAL));
+    // Interpreter reference: the uninterrupted result and the frozen artifact. `clock_after`
+    // is how far the clock advanced during freeze — the thaw host continues from there
+    // (D-scope: the host clock is not in the artifact), so any suspend points re-performed
+    // after the resume match the baseline while the frozen point's result is reloaded.
+    let (base_i, _, _) = interp_run(&inst, clock_v, &window_with(STATE_NORMAL));
     let base = base_i.expect("generated programs are trap-free");
-    let (fr_i, snap_i) = interp_run(&inst, clock_v, &window_with(STATE_UNWINDING));
+    let (fr_i, snap_i, clock_after) = interp_run(&inst, clock_v, &window_with(STATE_UNWINDING));
     assert!(fr_i.is_ok(), "interp freeze returns a placeholder");
     assert_eq!(read_state(&snap_i), STATE_UNWINDING);
 
     // (1) NORMAL: the JIT agrees with the interpreter's value.
-    let Some((j_base, _)) = jit_run(&inst, clock_v, &window_with(STATE_NORMAL)) else {
+    let Some((j_base, _, _)) = jit_run(&inst, clock_v, &window_with(STATE_NORMAL)) else {
         return;
     };
     assert_returned_eq(&inst, &base, j_base, "NORMAL");
 
     // (2) freeze: the persisted artifact is byte-identical across backends.
-    let Some((j_fr, snap_j)) = jit_run(&inst, clock_v, &window_with(STATE_UNWINDING)) else {
+    let Some((j_fr, snap_j, _)) = jit_run(&inst, clock_v, &window_with(STATE_UNWINDING)) else {
         return;
     };
     assert!(
@@ -153,11 +157,13 @@ pub fn fuzz_one_xbackend(g: &mut Gen) {
         "interp/JIT freeze artifacts diverge over the live shadow region [0,{sp})\n{inst:#?}"
     );
 
-    // (3) thaw portability: resume the interpreter-frozen artifact on the JIT, under a
-    // *different* host clock. Must reproduce `base` (reload, not re-issue) and end NORMAL.
+    // (3) thaw portability: resume the interpreter-frozen artifact on the JIT, on a host
+    // whose clock *continues* from the freeze. Must reproduce `base` (the frozen point's
+    // result reloaded, not re-issued — a re-issue would consume the next tick) and end
+    // NORMAL. This crosses backends: the artifact was frozen by the interpreter.
     let mut thaw_win = snap_i.clone();
     write_state(&mut thaw_win, STATE_REWINDING);
-    let Some((j_thaw, final_j)) = jit_run(&inst, thaw_clock, &thaw_win) else {
+    let Some((j_thaw, final_j, _)) = jit_run(&inst, clock_after, &thaw_win) else {
         return;
     };
     assert_returned_eq(&inst, &base, j_thaw, "thaw");

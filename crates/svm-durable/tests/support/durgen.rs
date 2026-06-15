@@ -106,80 +106,93 @@ fn total_binop(g: &mut Gen) -> BinOp {
     }
 }
 
-/// The single may-suspend op a generated function suspends on.
+/// What a generated function suspends on.
 enum Suspend {
-    /// Leaf: `cap.call` to the clock (the deepest frame).
-    Cap,
-    /// Propagated: a `call` to function `callee` (a deeper may-suspend function).
+    /// Leaf: `npoints` sequential `cap.call`s to the clock (the deepest frame). `npoints`
+    /// > 1 gives a single function multiple resume points (multi-arm `br_table`).
+    Cap { npoints: u32 },
+    /// Propagated: a single `call` to function `callee` (a deeper may-suspend function).
     Call(u32),
 }
 
-/// Build one `func (i32) -> (i64)`: a randomized i64 prefix, the `suspend` op (whose i64
-/// result is `cap_result`), then a suffix whose result chains off `cap_result` — so the
-/// saved/reloaded value is genuinely exercised — and a `return`. The single param `v0` is
-/// the clock handle, threaded down the chain as the call/`cap.call` argument.
+/// Append a few i64 consts / total binops to `insts`, tracking value indices in
+/// `i64_vals` / `next`. Used for both the prefix and the inter-/post-suspend suffixes.
+fn gen_straightline(g: &mut Gen, insts: &mut Vec<Inst>, i64_vals: &mut Vec<u32>, next: &mut u32, acc: u32) {
+    for _ in 0..g.below(4) {
+        let b = if i64_vals.len() < 2 || g.below(2) == 0 {
+            insts.push(Inst::ConstI64(g.u64v() as i64));
+            let c = *next;
+            *next += 1;
+            i64_vals.push(c);
+            c
+        } else {
+            i64_vals[g.below(i64_vals.len() as u32) as usize]
+        };
+        insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b });
+        let r = *next;
+        *next += 1;
+        i64_vals.push(r);
+    }
+}
+
+/// Build one `func (i32) -> (i64)`: a randomized i64 prefix, the `suspend` op(s) (each i64
+/// result chained into the accumulator, so every saved/reloaded value is exercised), and a
+/// `return`. The single param `v0` is the clock handle, threaded as the call/`cap.call`
+/// argument.
 fn gen_func(g: &mut Gen, suspend: Suspend) -> Func {
     let mut insts: Vec<Inst> = Vec::new();
     let mut i64_vals: Vec<u32> = Vec::new();
     let mut next: u32 = 1; // v0 is the i32 handle param
 
     // Prefix: a few i64 consts / total binops (live across the suspend op for a wrapper).
-    for _ in 0..g.below(6) {
-        if i64_vals.len() < 2 || g.below(3) == 0 {
-            insts.push(Inst::ConstI64(g.u64v() as i64));
-        } else {
-            let a = i64_vals[g.below(i64_vals.len() as u32) as usize];
-            let b = i64_vals[g.below(i64_vals.len() as u32) as usize];
-            insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a, b });
-        }
-        i64_vals.push(next);
+    let mut acc = {
+        // seed the accumulator with a const so the chain always has something to fold into
+        insts.push(Inst::ConstI64(g.u64v() as i64));
+        let c = next;
         next += 1;
-    }
+        i64_vals.push(c);
+        c
+    };
+    gen_straightline(g, &mut insts, &mut i64_vals, &mut next, acc);
+    acc = *i64_vals.last().unwrap();
 
-    // The may-suspend op, producing an i64 in `cap_result`.
-    let cap_result = match suspend {
-        Suspend::Cap => {
-            insts.push(Inst::ConstI32(g.u64v() as i32)); // the i32 clock arg
-            let arg = next;
-            next += 1;
-            insts.push(Inst::CapCall {
-                type_id: CLOCK_TYPE_ID,
-                op: CLOCK_OP,
-                sig: FuncType {
-                    params: vec![ValType::I32],
-                    results: vec![ValType::I64],
-                },
-                handle: 0,
-                args: vec![arg],
-            });
-            let r = next;
-            next += 1;
-            r
+    match suspend {
+        Suspend::Cap { npoints } => {
+            for _ in 0..npoints {
+                insts.push(Inst::ConstI32(g.u64v() as i32)); // the i32 clock arg
+                let arg = next;
+                next += 1;
+                insts.push(Inst::CapCall {
+                    type_id: CLOCK_TYPE_ID,
+                    op: CLOCK_OP,
+                    sig: FuncType { params: vec![ValType::I32], results: vec![ValType::I64] },
+                    handle: 0,
+                    args: vec![arg],
+                });
+                let cap_result = next;
+                next += 1;
+                i64_vals.push(cap_result);
+                // fold this point's result in, then a short suffix using it
+                insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b: cap_result });
+                acc = next;
+                next += 1;
+                i64_vals.push(acc);
+                gen_straightline(g, &mut insts, &mut i64_vals, &mut next, acc);
+                acc = *i64_vals.last().unwrap();
+            }
         }
         Suspend::Call(callee) => {
             insts.push(Inst::Call { func: callee, args: vec![0] }); // pass the handle down
-            let r = next;
+            let call_result = next;
             next += 1;
-            r
+            i64_vals.push(call_result);
+            insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b: call_result });
+            acc = next;
+            next += 1;
+            i64_vals.push(acc);
+            gen_straightline(g, &mut insts, &mut i64_vals, &mut next, acc);
+            acc = *i64_vals.last().unwrap();
         }
-    };
-    i64_vals.push(cap_result);
-
-    // Suffix: chain off the call result so `return` depends on the resumed value.
-    let mut acc = cap_result;
-    for _ in 0..g.below(6) {
-        let b = if g.below(2) == 0 {
-            insts.push(Inst::ConstI64(g.u64v() as i64));
-            let c = next;
-            next += 1;
-            c
-        } else {
-            i64_vals[g.below(i64_vals.len() as u32) as usize]
-        };
-        insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b });
-        acc = next;
-        next += 1;
-        i64_vals.push(acc);
     }
 
     Func {
@@ -194,15 +207,16 @@ fn gen_func(g: &mut Gen, suspend: Suspend) -> Func {
 }
 
 /// Build an in-scope durable module: a call chain `func0 → func1 → … → leaf`, of a
-/// randomized depth `1..=4`. The entry (func 0) and every wrapper propagates the suspend
-/// through a `call`; only the deepest function holds the `cap.call`. At depth 1 this is
-/// the original single-frame leaf shape.
+/// randomized depth `1..=4`. Every wrapper propagates the suspend through a `call`; only
+/// the deepest function holds the `cap.call`(s) — `1..=3` of them, so the leaf exercises
+/// multiple resume points. At depth 1 / one point this is the original single-frame shape.
 pub fn gen_module(g: &mut Gen) -> Module {
     let depth = 1 + g.below(4); // 1..=4 stacked frames
+    let leaf_points = 1 + g.below(3); // 1..=3 resume points in the leaf
     let funcs: Vec<Func> = (0..depth)
         .map(|i| {
             let suspend = if i == depth - 1 {
-                Suspend::Cap
+                Suspend::Cap { npoints: leaf_points }
             } else {
                 Suspend::Call(i + 1)
             };
@@ -262,15 +276,17 @@ pub fn fuzz_one(g: &mut Gen) {
     );
     let base = r_base.expect("generated programs are trap-free");
 
-    // --- (2) freeze: the poll after the call unwinds out to the host ---
-    let (r_freeze, snap) = {
+    // --- (2) freeze: unwinding from the start, the poll after the first suspend point
+    // unwinds out to the host. Record how far the clock advanced (the suspend points
+    // reached during freeze each consumed a tick). ---
+    let (r_freeze, snap, clock_after) = {
         let mut h = Host::new();
         h.clock_ns = clock_v; // same initial conditions as the baseline
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
-        run_capture_reserved_with_host(
+        let (r, snap) = run_capture_reserved_with_host(
             &inst,
             0,
             &[Value::I32(clk)],
@@ -278,7 +294,8 @@ pub fn fuzz_one(g: &mut Gen) {
             &win,
             SIZE_LOG2,
             &mut h,
-        )
+        );
+        (r, snap, h.clock_ns)
     };
     assert!(r_freeze.is_ok(), "freeze returns a placeholder, not a trap");
     assert_eq!(
@@ -288,11 +305,15 @@ pub fn fuzz_one(g: &mut Gen) {
     );
     assert!(read_sp(&snap) > SHADOW_BASE, "a shadow frame was pushed");
 
-    // --- (3) thaw on a FRESH host (clock now 0): must reload, not re-issue ---
+    // --- (3) thaw on a fresh host whose clock *continues* from the freeze (D-scope: the
+    // host clock is not in the artifact). The frozen suspend point's result must be
+    // reloaded — a re-issue would consume the next tick and diverge — while any later
+    // suspend points re-perform against the continued clock, matching the baseline. ---
     let (r_thaw, final_win) = {
         let mut win = snap.clone();
         write_state(&mut win, STATE_REWINDING);
         let mut h = Host::new();
+        h.clock_ns = clock_after;
         let clk = h.grant_clock();
         let mut fuel = 1_000_000u64;
         run_capture_reserved_with_host(
@@ -308,7 +329,7 @@ pub fn fuzz_one(g: &mut Gen) {
     assert_eq!(
         r_thaw,
         Ok(base),
-        "thawed run must equal the uninterrupted run (saved cap result reloaded, not re-issued)"
+        "thawed run must equal the uninterrupted run (frozen result reloaded, not re-issued)"
     );
     assert_eq!(
         read_state(&final_win),
