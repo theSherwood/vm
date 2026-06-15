@@ -106,7 +106,8 @@ jobs:
           # Miri's weak-memory emulation ICEs on the differential test's mixed-size atomic accesses
           # ("partially overlapping store buffer when previous write was atomic" — a Miri bug, not ours).
           # Disabling it keeps full UB / provenance / data-race / alignment checking.
-          MIRIFLAGS: "-Zmiri-disable-weak-memory-emulation"  supply-chain:
+          MIRIFLAGS: "-Zmiri-disable-weak-memory-emulation"
+  supply-chain:
     # Scan the dependency tree against the RustSec advisory DB. Gated off pull_request so a
     # newly-published advisory on a transitive dep surfaces on main / nightly without blocking
     # unrelated feature PRs (same posture as the fuzz/bench jobs).
