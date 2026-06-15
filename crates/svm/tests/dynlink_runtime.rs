@@ -77,3 +77,70 @@ fn plugin_calls_host_program_by_resolved_slot() {
         "the plugin reached the host's F through the table: expected 23, got {out:?}"
     );
 }
+
+/// The symbol-resolved companion to `jit_incremental::install_makes_unit_call_indirectable` (which
+/// proves the install *mechanism* — old code `call_indirect`s a runtime slot value into newly-
+/// installed code). Here a separately-compiled **client** references a **newly-installed service**
+/// purely **by name**: the loader installs the service (getting its table slot), resolves the
+/// client's import to that slot (`Resolved::Slot`), and the client — compiled afterwards — reaches
+/// the installed service through the shared table. Both are runtime-loaded units; the callee is found
+/// by symbol, dispatched by slot. `service(a,b) = a*a + b`, so `service(5,2) = 27`.
+#[test]
+fn loaded_client_links_to_a_newly_installed_service_by_name() {
+    // A host reserving a 16-slot table (log2 = 4) so units can be installed into the padding slots.
+    let m = parse_module("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n").unwrap();
+    verify_module(&m).unwrap();
+    let mut cm = CompiledModule::compile(
+        &m,
+        0,
+        INERT_CAP_THUNK,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        4,
+    )
+    .expect("compile host");
+
+    // Compile + install the "service" at runtime → its table slot (slot 1, past the host's 1 func).
+    let service = parse_module(
+        "func (i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32):\n\
+         \x20 v2 = i32.mul v0 v0\n\
+         \x20 v3 = i32.add v2 v1\n\
+         \x20 return v3\n\
+         }\n",
+    )
+    .unwrap();
+    verify_module(&service).unwrap();
+    let svc = cm.define_extra(&service.funcs).expect("compile service");
+    let slot = cm
+        .install(svc[0].code, svc[0].type_id)
+        .expect("install service");
+
+    // The client references "service" by name; the loader binds it to the install slot, then compiles
+    // the client — which now `call_indirect`s the slot into the installed service.
+    let client = parse_module(
+        "func (i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32):\n\
+         \x20 v2 = i32.const 0\n\
+         \x20 v3 = call.import \"service\" (i32, i32) -> (i32) v2 (v0, v1)\n\
+         \x20 return v3\n\
+         }\n",
+    )
+    .unwrap();
+    let linked = svm_ir::resolve_imports_with(&client, |n| {
+        (n == "service").then_some(Resolved::Slot(slot))
+    })
+    .expect("resolve client → install slot");
+    verify_module(&linked).expect("verify client");
+    let cli = cm.define_extra(&linked.funcs).expect("compile client");
+    let (out, _) = unsafe { cm.run_extra(cli[0].tramp, 2, 1, &[5, 2], None) }.expect("run client");
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[27]),
+        "client reached the newly-installed service by name: expected 27, got {out:?}"
+    );
+}
