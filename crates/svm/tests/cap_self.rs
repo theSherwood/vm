@@ -131,3 +131,40 @@ fn jit_bails_unsupported() {
         "the JIT must bail Unsupported on cap.self.*, not miscompile"
     );
 }
+
+/// The capstone: a guest **discovers a capability it holds and uses it** entirely at runtime, with
+/// no compile-time knowledge of which handle it is. It reflects entry 0, confirms it's a `Stream`
+/// (`type_id == 0`), and writes "hi" through the *discovered* handle (`cap.call 0 1` on `v4`, the
+/// value `cap.self.get` returned) — so the bytes reaching `host.stdout` prove the discovered handle
+/// is a usable capability. This is the whole of "see what you've been granted and use it" — no
+/// Resolver, no acquisition, just reflection over what the host already granted.
+#[test]
+fn discover_then_use_a_granted_capability() {
+    let src = "memory 16\n\
+               data 0 \"hi\"\n\
+               func (i32, i32, i32) -> (i32) {\n\
+               block0(v0: i32, v1: i32, v2: i32):\n\
+               \x20 v3 = i32.const 0\n\
+               \x20 v4, v5 = cap.self.get v3\n\
+               \x20 v6 = i64.const 0\n\
+               \x20 v7 = i64.const 2\n\
+               \x20 v8 = cap.call 0 1 (i64, i64) -> (i64) v4(v6, v7)\n\
+               \x20 return v5\n\
+               }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut host = Host::new();
+    let args = vec![
+        Value::I32(host.grant_stream(StreamRole::Out)), // entry 0 — the Stream we'll discover
+        Value::I32(host.grant_stream(StreamRole::In)),
+        Value::I32(host.grant_exit()),
+    ];
+    let mut fuel = 10_000_000u64;
+    let out = run_with_host(&m, 0, &args, &mut fuel, &mut host).expect("run");
+    assert_eq!(
+        out,
+        vec![Value::I32(0)],
+        "entry 0 reflects as a Stream (type_id 0)"
+    );
+    assert_eq!(host.stdout, b"hi", "wrote through the discovered handle");
+}
