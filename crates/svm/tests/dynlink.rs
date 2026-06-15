@@ -356,3 +356,77 @@ fn bad_relocation_fails_closed() {
     };
     assert!(matches!(link(&[u]), Err(svm_ir::LinkError::BadReloc(_))));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Milestone 3: dynamic linking — resolve a symbol to a call_indirect TABLE SLOT (Resolved::Slot).
+// A separately-compiled unit reaches a function it doesn't share an index space with, by slot.
+// ---------------------------------------------------------------------------------------------
+
+/// `main` imports `F` by name and the loader resolves it to **table slot 1** — not a direct call but a
+/// `call_indirect` through the shared function table (how a separately-compiled unit reaches another).
+/// `F` (slot 1) is `a*2 + b`; a decoy `G` sits at slot 0. The handle placeholder const (`i32.const 0`)
+/// is patched to `1` and reused as the index, so a passing `F(10,3)=23` (not `G`'s 7) proves the slot.
+#[test]
+fn import_resolves_to_a_call_indirect_slot() {
+    let src = "\
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.sub v0 v1
+  return v2
+}
+
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.const 2
+  v3 = i32.mul v0 v2
+  v4 = i32.add v3 v1
+  return v4
+}
+
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.const 0
+  v3 = call.import \"F\" (i32, i32) -> (i32) v2 (v0, v1)
+  return v3
+}
+";
+    let m = svm_text::parse_module(src).expect("parse");
+    let linked =
+        svm_ir::resolve_imports_with(&m, |n| (n == "F").then_some(svm_ir::Resolved::Slot(1)))
+            .expect("resolve to slot");
+    // The import became a `call_indirect`, and the handle const was patched to the slot (1).
+    let insts = &linked.funcs[2].blocks[0].insts;
+    assert!(
+        matches!(insts[0], svm_ir::Inst::ConstI32(1)),
+        "handle const patched to slot 1"
+    );
+    assert!(
+        matches!(insts[1], svm_ir::Inst::CallIndirect { .. }),
+        "import lowered to call_indirect, not a direct call"
+    );
+    svm_verify::verify_module(&linked).expect("verify");
+    // main (entry 2) dispatches to slot 1 = F(a,b) = a*2+b; F(10,3) = 23 (G would give 7).
+    assert_eq!(
+        run_entry(&linked, 2, &[10, 3]),
+        23,
+        "reached F via the resolved slot"
+    );
+}
+
+/// A `Slot` import whose handle operand isn't a `ConstI32` placeholder is fail-closed (the frontend
+/// must emit one — it's patched to the slot and reused as the index).
+#[test]
+fn slot_import_requires_a_const_handle() {
+    // The handle here is a block *parameter* (v0), not a const → SlotHandleNotConst.
+    let src = "\
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = call.import \"F\" (i32) -> (i32) v0 (v1)
+  return v2
+}
+";
+    let m = svm_text::parse_module(src).expect("parse");
+    let err = svm_ir::resolve_imports_with(&m, |_| Some(svm_ir::Resolved::Slot(0)))
+        .expect_err("non-const handle must fail closed");
+    assert_eq!(err, svm_ir::ImportError::SlotHandleNotConst);
+}

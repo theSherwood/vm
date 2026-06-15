@@ -1702,9 +1702,15 @@ pub struct ResolvedCap {
 pub enum Resolved {
     /// A host capability: lower to a `cap.call` on the import's handle operand (§7).
     Cap(ResolvedCap),
-    /// Another function in the linked module (by index): lower to a direct `call`. This is the
-    /// in-window loader's core operation — a symbol resolved to a function at link time.
+    /// Another function in the **same** linked module (by index): lower to a direct `call`. The
+    /// static-linking case — a symbol resolved to a function merged into this module at link time.
     Func(FuncIdx),
+    /// A function reached through the shared `call_indirect` **table slot** (the *dynamic*-linking
+    /// case): lower to `call_indirect <slot>`, so a separately-compiled unit can call a function it
+    /// doesn't share an index space with (e.g. a plugin calling the host program it was loaded into).
+    /// The import's handle operand must be a `ConstI32` placeholder — it is patched to `slot` and
+    /// reused as the `call_indirect` index (a 1:1 rewrite, no value renumbering).
+    Slot(u32),
 }
 
 impl From<ResolvedCap> for Resolved {
@@ -1721,6 +1727,10 @@ pub enum ImportError {
     Unresolved(String),
     /// A `CallImport` referenced an import index past the module's [`Module::imports`].
     BadImportIndex(u32),
+    /// A [`Resolved::Slot`] binding's import had a handle operand that is **not** a `ConstI32`
+    /// placeholder (the frontend must emit one for a dynamic/slot import, since it is patched to the
+    /// slot and reused as the `call_indirect` index).
+    SlotHandleNotConst,
 }
 
 /// Lower every [`Inst::CallImport`] to a concrete [`Inst::CapCall`] using `resolve` (the
@@ -1756,35 +1766,62 @@ pub fn resolve_imports_with(
         .map(|imp| resolve(&imp.name).ok_or_else(|| ImportError::Unresolved(imp.name.clone())))
         .collect::<Result<_, _>>()?;
     let mut out = module.clone();
+    let fn_results: Vec<usize> = out.funcs.iter().map(|f| f.results.len()).collect();
     for f in &mut out.funcs {
         for b in &mut f.blocks {
-            for inst in &mut b.insts {
-                if let Inst::CallImport {
-                    import,
-                    sig,
-                    handle,
-                    args,
-                } = inst
-                {
-                    let bind = *bound
-                        .get(*import as usize)
-                        .ok_or(ImportError::BadImportIndex(*import))?;
-                    *inst = match bind {
-                        Resolved::Cap(cap) => Inst::CapCall {
-                            type_id: cap.type_id,
-                            op: cap.op,
-                            sig: std::mem::take(sig),
-                            handle: *handle,
-                            args: std::mem::take(args),
-                        },
-                        // Static-link a function symbol → a direct call (the handle is unused; the
-                        // import sig must match the callee's, which the re-verifier checks).
-                        Resolved::Func(func) => Inst::Call {
-                            func,
-                            args: std::mem::take(args),
-                        },
-                    };
+            // Map each value index to its defining instruction (block params → `None`) — a `Slot`
+            // import patches the `ConstI32` that defines its handle operand, so we may need to reach
+            // a *different* instruction than the `CallImport` we're rewriting.
+            let mut def_of: Vec<Option<usize>> = vec![None; b.params.len()];
+            for (p, inst) in b.insts.iter().enumerate() {
+                for _ in 0..inst.result_count(&fn_results) {
+                    def_of.push(Some(p));
                 }
+            }
+            for i in 0..b.insts.len() {
+                let (import, handle) = match &b.insts[i] {
+                    Inst::CallImport { import, handle, .. } => (*import, *handle),
+                    _ => continue,
+                };
+                let bind = *bound
+                    .get(import as usize)
+                    .ok_or(ImportError::BadImportIndex(import))?;
+                // Pull the call's pieces out of the placeholder so we can rebuild it.
+                let (sig, args) = match &mut b.insts[i] {
+                    Inst::CallImport { sig, args, .. } => {
+                        (std::mem::take(sig), std::mem::take(args))
+                    }
+                    _ => unreachable!(),
+                };
+                b.insts[i] = match bind {
+                    Resolved::Cap(cap) => Inst::CapCall {
+                        type_id: cap.type_id,
+                        op: cap.op,
+                        sig,
+                        handle,
+                        args,
+                    },
+                    // Static-link a function symbol → a direct call (handle unused; sig re-checked).
+                    Resolved::Func(func) => Inst::Call { func, args },
+                    // Dynamic-link a function symbol → a `call_indirect` through the table slot: patch
+                    // the handle's `ConstI32` placeholder to `slot` and reuse it as the index.
+                    Resolved::Slot(slot) => {
+                        let def = def_of
+                            .get(handle as usize)
+                            .copied()
+                            .flatten()
+                            .ok_or(ImportError::SlotHandleNotConst)?;
+                        match &mut b.insts[def] {
+                            Inst::ConstI32(c) => *c = slot as i32,
+                            _ => return Err(ImportError::SlotHandleNotConst),
+                        }
+                        Inst::CallIndirect {
+                            ty: sig,
+                            idx: handle,
+                            args,
+                        }
+                    }
+                };
             }
         }
     }
@@ -1925,6 +1962,11 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
                 .map_err(|e| match e {
                     ImportError::Unresolved(n) => LinkError::Unresolved(n),
                     ImportError::BadImportIndex(i) => LinkError::BadImportIndex(i),
+                    // `link` only ever resolves to `Func` (static merge), never `Slot`, so a
+                    // slot-handle error cannot arise here.
+                    ImportError::SlotHandleNotConst => {
+                        unreachable!("static link never resolves to a Slot")
+                    }
                 })?;
         funcs.extend(resolved.funcs);
         data.extend(resolved.data);
