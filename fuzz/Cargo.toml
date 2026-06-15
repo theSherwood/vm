@@ -19,6 +19,7 @@ svm-encode = { path = "../crates/svm-encode" }
 svm-verify = { path = "../crates/svm-verify" }
 svm-interp = { path = "../crates/svm-interp" }
 svm-jit = { path = "../crates/svm-jit" }
+svm-durable = { path = "../crates/svm-durable" }
 svm-run = { path = "../crates/svm-run" } # production cap.call thunk, for irgen's Memory-cap success path
 svm-mask = { path = "../crates/svm-mask" }
 svm-text = { path = "../crates/svm-text" }
@@ -47,6 +48,13 @@ bench = false
 [[bin]]
 name = "diff"
 path = "fuzz_targets/diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "durable"
+path = "fuzz_targets/durable.rs"
 test = false
 doc = false
 bench = false
