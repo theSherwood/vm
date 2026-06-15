@@ -1434,8 +1434,8 @@ regressions one commit old"):
 > invariant totals identical on interp + JIT (`c_guest_steal_fibers_demo`/`demo_steal_fibers_runs`).
 >
 > **▶ NEXT:** the biggest open frontier is the **LLVM-bitcode→IR on-ramp** (item 1 below, D54) — the
-> breadth play. The **wasm transpiler (`svm-wasm`) is feature-complete for typical clang output**: 67
-> tests green (40 transpile + 7 imports + 5 SIMD + 7 atomics + 4 threads + 4 incl. imported-memory),
+> breadth play. The **wasm transpiler (`svm-wasm`) is feature-complete for typical clang output**: 63
+> tests green (40 transpile + 7 imports + 5 SIMD + 7 atomics + 4 threads),
 > incl. **§17/D58 v128 SIMD** and **§12 wasm threads** — the full-width `*.atomic.*` ops (1:1 onto
 > SVM's IR atomics), shared+imported memory, and the **wasi-threads** `wasi:thread/spawn` → native
 > `thread.spawn` (the same bytes `wasmtime-wasi-threads` runs; `bench --threads` shows SVM **~1.35×
