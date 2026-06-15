@@ -1434,15 +1434,17 @@ regressions one commit old"):
 > invariant totals identical on interp + JIT (`c_guest_steal_fibers_demo`/`demo_steal_fibers_runs`).
 >
 > **▶ NEXT:** the biggest open frontier is the **LLVM-bitcode→IR on-ramp** (item 1 below, D54) — the
-> breadth play. The **wasm transpiler (`svm-wasm`) is feature-complete for typical clang output**: 52
-> tests green (40 transpile + 7 imports + 5 SIMD), incl. **§17/D58 v128 SIMD** (a real
-> `clang -msimd128 -O2` saxpy → verified SIMD IR, ~1.0× Wasmtime — *not* the deferred slow
-> scalar-expansion the old item-0 note feared; D58's first-class `v128` IR type made it direct). Its
-> only `Unsupported` arms are niche features clang doesn't emit: passive data/element segments +
-> `memory.init`/`data.drop` + `table.*` bulk ops, multi-interface imports, reference types,
-> multi-memory/table — pick one only if a concrete program needs it. Smaller open items: weak memory
-> orderings; fiber-slot recycling behind the fiber-return DPOR access; the maintainer-applied nightly
-> ASan/miri CI jobs.
+> breadth play. The **wasm transpiler (`svm-wasm`) is feature-complete for typical clang output**: 67
+> tests green (40 transpile + 7 imports + 5 SIMD + 7 atomics + 4 threads + 4 incl. imported-memory),
+> incl. **§17/D58 v128 SIMD** and **§12 wasm threads** — the full-width `*.atomic.*` ops (1:1 onto
+> SVM's IR atomics), shared+imported memory, and the **wasi-threads** `wasi:thread/spawn` → native
+> `thread.spawn` (the same bytes `wasmtime-wasi-threads` runs; `bench --threads` shows SVM **~1.35×
+> faster** on spawn-heavy, parity on compute — concurrency *in* the VM, §1a). Its only `Unsupported`
+> arms are niche features clang doesn't emit: **narrow** atomics (rmw8/16; SVM atomics are 32/64-bit —
+> a CAS-loop emulation is the deferred follow-up), wasi:thread/spawn *alongside* capability imports
+> (the per-thread handle stash), passive data/element segments + `memory.init`/`data.drop` + `table.*`
+> bulk ops, reference types, multi-memory/table. Smaller open items: weak memory orderings; fiber-slot
+> recycling behind the fiber-return DPOR access; the maintainer-applied nightly ASan/miri CI jobs.
 >
 > **Per-slice records:** condensed into the build log at the bottom of this section ("Migratable
 > fibers (D57)"); the durable design + as-built description is DESIGN.md §23.
@@ -1531,8 +1533,10 @@ regressions one commit old"):
 >
 > **Immediate frontier, ranked** *(the async ring (B) is done — these are the next big rocks):*
 > 0. **wasm → IR transpiler (`crates/svm-wasm`) — DONE / feature-complete for typical clang output**
->    (numeric + control + if/else + memory + grow + bulk-memory + imports + **v128 SIMD**; 52 tests).
->    Remaining `Unsupported` arms are niche (passive segments, multi-interface imports, reference types,
+>    (numeric + control + if/else + memory + grow + bulk-memory + imports + **v128 SIMD** + **threads**:
+>    atomics, shared/imported memory, wasi-threads spawn → native `thread.spawn`; 67 tests + the
+>    `bench --threads` concurrency comparison vs Wasmtime+wasi-threads).
+>    Remaining `Unsupported` arms are niche (narrow atomics, passive segments, multi-interface imports, reference types,
 >    multi-memory/table) — see the missing-features note below. Not the active frontier; LLVM is (item 1).
 >    A second frontend after chibicc, chosen *before* the LLVM on-ramp because it's smaller and directly
 >    serves the §1a benchmark thesis: take *any* wasm and run it on SVM vs Wasmtime on the *same bytes*,
@@ -1634,10 +1638,25 @@ regressions one commit old"):
 >      transpiler changes** — `real_clang_jsmn_tokenizer` (jsmn JSON tokenizer) and `real_clang_sha256`
 >      (B-Con SHA-256). So the speculated "next gap" (passive segments) is **not** emitted by typical
 >      clang output and is lower priority than assumed.
->    **Missing wasm features (what svm-wasm still rejects with a clean `Unsupported` — all niche, none
->    emitted by typical clang output):** (1) passive data / element segments + `memory.init`/`data.drop`
+>    **§12 wasm threads — DONE** (the slices-1–3 batch; design notes below). The full-width (i32/i64)
+>    `*.atomic.*` ops map 1:1 onto SVM's IR atomics (same widths/trap/seq-cst — `tests/atomics.rs`);
+>    `shared` and **imported** memory are accepted (the wasi-threads shape — the host owns the one
+>    shared memory; SVM treats it like a defined memory at window offset 0); and the **wasi-threads**
+>    ABI lowers to SVM's *native* `thread.spawn` — a `wasi:thread/spawn` import becomes a real OS-thread
+>    vCPU over the shared window via a synthesized `(i64 sp, i64 arg)` shim that unpacks `(tid,
+>    start_arg)` and calls `wasi_thread_start`, with unique tids from a reserved atomic counter slot
+>    (`tests/threads.rs`, both backends). **Bench (`cargo run --release -- --threads` from `bench/`):**
+>    same wasm bytes on SVM vs Wasmtime+wasmtime-wasi-threads — SVM **~1.35× faster on spawn-heavy**
+>    (native thread.spawn vs Wasmtime re-instantiating per thread), parity on compute (shared
+>    Cranelift). *A real latent bug surfaced + fixed:* the IR `atomic.notify` count was `.max(0)`-clamped
+>    on both backends, so the wasm wake-all idiom `notify(-1)` (count is u32) woke **zero** — now
+>    reinterpreted as u32 (commit `ffec466`). **Still rejected (clean `Unsupported`):** narrow atomics
+>    (rmw8/16 — 32/64-bit only; CAS-loop emulation deferred), wasi:thread/spawn *alongside* capability
+>    imports (the per-thread handle stash).
+>    **Other missing wasm features (all niche, none emitted by typical clang output):** (1) passive data /
+>    element segments + `memory.init`/`data.drop`
 >    + the `table.*` bulk ops — *confirmed not hit by typical clang output (jsmn/sha256 don't use them)*.
->    (2) imports spanning multiple capability interfaces (one handle is threaded). (3) reference types
+>    (2) capability imports spanning multiple interfaces (one handle is threaded). (3) reference types
 >    beyond funcref tables; multi-memory / multi-table. **SIMD (v128) is DONE** — it was the predicted
 >    "next gap" and landed with §17/D58: once the IR gained a **first-class `v128` type** (not the two-i64
 >    scalar-expansion an earlier draft of this note feared), the wasm path was *direct* and *fast*. The

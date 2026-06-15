@@ -30,10 +30,16 @@
 //! [`transpile`]) · **§17/D58 SIMD** (`v128` → the IR's first-class fixed-128 vector type: const,
 //! masked load/store, splat, extract/replace_lane, integer-/float-lane arithmetic, bitwise +
 //! `bitselect`, `shuffle`/`swizzle` — a real `clang -msimd128 -O2` saxpy transpiles to verified
-//! SIMD IR, `tests/simd.rs`). Still a clean [`Error::Unsupported`] (the niche features typical clang
-//! output doesn't emit): `memory.init`/`data.drop` + the `table.*` bulk ops, passive data/element
-//! segments, table/memory/global imports, imports across multiple capability interfaces, reference
-//! types, multi-memory/multi-table.
+//! SIMD IR, `tests/simd.rs`) · **§12 wasm threads**: the full-width (i32/i64) `*.atomic.*` ops map
+//! 1:1 onto SVM's IR atomics (`tests/atomics.rs`), **shared** + **imported** memory are accepted,
+//! and the **wasi-threads** ABI lowers to SVM's *native* `thread.spawn` — a `wasi:thread/spawn`
+//! import becomes a real OS-thread vCPU over the shared window via a synthesized shim (concurrency in
+//! the VM, DESIGN §1a; the same bytes `wasmtime-wasi-threads` runs — `tests/threads.rs`). Still a
+//! clean [`Error::Unsupported`] (the niche features typical clang output doesn't emit): **narrow**
+//! atomics (`*.atomic.rmw8`/`load16_u`/… — SVM atomics are 32/64-bit only), `memory.init`/`data.drop`
+//! + the `table.*` bulk ops, passive data/element segments, imported table/global/tag, imports across
+//! multiple capability interfaces (incl. wasi:thread/spawn *alongside* capability imports — the
+//! per-thread handle stash), reference types, multi-memory/multi-table.
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,

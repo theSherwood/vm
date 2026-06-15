@@ -98,9 +98,13 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > A **second frontend, `svm-wasm`**, transpiles **core wasm → IR** (reconstructing SSA from the
 > stack machine) and runs real clang-compiled programs and **real C libraries** — the jsmn JSON
 > tokenizer and B-Con SHA-256 — byte-identically to native, including bulk memory
-> (`memory.copy`/`fill`), `memory.grow`, **function imports** (a wasm `call` → a `cap.call`), and
-> **v128 SIMD** (a real `clang -msimd128 -O2` saxpy → first-class `v128` IR, ~1.0× Wasmtime); it
-> benches the §1a thesis on the *same bytes* Wasmtime runs. The host-call boundary is now
+> (`memory.copy`/`fill`), `memory.grow`, **function imports** (a wasm `call` → a `cap.call`),
+> **v128 SIMD** (a real `clang -msimd128 -O2` saxpy → first-class `v128` IR, ~1.0× Wasmtime), and
+> **wasm threads** (`*.atomic.*` + shared/imported memory; the **wasi-threads** `wasi:thread/spawn`
+> lowers to SVM's *native* `thread.spawn` — the same bytes `wasmtime-wasi-threads` runs, but
+> concurrency *in* the VM: on a spawn-heavy parallel kernel SVM is **~1.35× faster** than
+> Wasmtime+wasi-threads, parity on steady-state compute); it benches the §1a thesis on the *same
+> bytes* Wasmtime runs. The host-call boundary is now
 > **devirtualized** (D45): a `cap.call` to a statically-known capability op is a register-to-register
 > direct call, taking `hostcall` from ~parity to ~1.5× faster than Wasmtime. And **§15 spawn
 > quotas** — host-configurable fiber/vCPU ceilings enforced identically on both backends (CLI
