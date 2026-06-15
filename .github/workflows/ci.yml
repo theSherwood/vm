@@ -89,4 +89,24 @@ jobs:
         run: cargo test -p svm-jit --lib loom
         env:
           RUSTFLAGS: "--cfg loom"
+  svm-llvm:
+    name: svm-llvm (LLVM→IR on-ramp · Linux-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: crates/svm-llvm }
+      - name: install LLVM 18 (dev headers + dynamic lib)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: fmt · clippy · test
+        working-directory: crates/svm-llvm
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
 
