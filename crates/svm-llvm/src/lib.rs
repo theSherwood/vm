@@ -108,7 +108,6 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     for (i, f) in defined.iter().enumerate() {
         name2idx.insert(f.name.clone(), i as u32);
     }
-
     // Globals live low (from `DATA_BASE`); the data stack starts just above them.
     let (globals, data, globals_end) = globals_layout(m)?;
     let entry_sp = globals_end.div_ceil(16) * 16;
@@ -143,6 +142,9 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
             data,
             // §7 named capability imports — the LLVM on-ramp emits none yet.
             imports: Vec::new(),
+            // Debug info — the LLVM on-ramp will map `!DILocation`/`dbg.value` into the §6 waist
+            // (DEBUGGING.md D-DBG-7); none yet.
+            debug_info: None,
         },
         entry_sp,
     })
