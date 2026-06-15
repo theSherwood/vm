@@ -5,9 +5,9 @@
 //! surface. An embedder running pre-instrumented modules links none of it.
 //!
 //! This is the **Phase 1** slice of the plan (DURABILITY.md §9): it instruments a
-//! function so a single in-flight `cap.call` can be *unwound* into guest-resident
-//! shadow state and later *rewound* back into execution, byte-for-byte. The codec is
-//! exactly the §2 mechanism:
+//! function so an in-flight may-suspend op (a `cap.call`, or a `Call` into a suspended
+//! chain) can be *unwound* into guest-resident shadow state and later *rewound* back into
+//! execution, byte-for-byte. The codec is exactly the §2 mechanism:
 //!
 //! * a **state word** (`NORMAL | UNWINDING | REWINDING`) in the window,
 //! * a per-fiber **shadow stack** in the window (DURABILITY.md §12.7),
@@ -16,10 +16,10 @@
 //! * **rewind** = in the prologue, if `REWINDING`, `br_table` on the saved resume id,
 //!   reload the live values, and continue from the resume point.
 //!
-//! # Scope (single-block, multi-suspend — the go/no-go gate, now with chains)
+//! # Scope (arbitrary single-vCPU CFGs)
 //!
-//! The transform handles a **single-block** function with a `return` terminator and any
-//! number of may-suspend operations (≥ 1), each either:
+//! The transform handles an arbitrary-CFG function (branches, loops, joins) with any
+//! number of may-suspend operations, each either:
 //!
 //! * a **leaf** `cap.call` — the host performs the operation; on thaw the deepest frame
 //!   reloads the saved result and flips the state word back to `NORMAL`; or
@@ -29,29 +29,24 @@
 //!   `REWINDING` so the callee rewinds in turn); only the innermost leaf flips to
 //!   `NORMAL`. This is the DURABILITY.md §12.7 "re-issue vs. continue" branch (R8).
 //!
-//! The block is split at each suspend op into forward segments, and a `br_table` in the
-//! prologue dispatch routes a thaw to the resume point that was in flight (one arm per
-//! point). A function is **may-suspend** iff it contains a `cap.call` or (transitively) a
-//! `Call` to a may-suspend function; only may-suspend functions are instrumented.
-//!
-//! This is enough to prove the core risk end-to-end on the real interpreter
-//! (`tests/roundtrip.rs`, `tests/chain.rs`, `tests/multipoint.rs`): does an in-window
-//! shadow stack + `br_table` rewind round-trip a frozen *call chain* with multiple resume
-//! points? The remaining extensions (DURABILITY.md §9):
-//!
-//! * multi-block CFGs (split any block at its may-suspend calls — today a single block);
-//! * fibers / multi-vCPU / STW (Phase 3).
-//!
-//! A `call_indirect` whose runtime target may suspend is **out of scope**: the closure
-//! cannot resolve the target, so such a call is treated as non-suspending. Durable
-//! modules must reach suspension through direct calls (the generator only emits those).
+//! Each original block is split at its suspend ops into forward segments; branch targets
+//! are remapped to the target block's first segment; a `br_table` in the prologue dispatch
+//! routes a thaw to the resume point that was in flight (one arm per point). A function is
+//! **may-suspend** iff it contains a `cap.call` or (transitively) a `Call` to a may-suspend
+//! function; only may-suspend functions are instrumented. Covered end-to-end on the real
+//! interpreter (`tests/roundtrip.rs`, `chain.rs`, `multipoint.rs`, `multiblock.rs`) and
+//! across the interp/JIT differential (`crates/svm/tests/durable_jit.rs`).
 //!
 //! Each resume point spills only its **minimal live set** — the values used after the op
 //! (block-local SSA makes this a backward scan within the block), plus a propagated call's
 //! own operands. An unmodelled instruction in the tail falls back to spilling the whole
-//! range, so the analysis never under-spills. One Phase-1 simplification remains: the
-//! durable runtime region is carved at **low** window addresses (real placement is
-//! per-fiber and guard-paged, §12.7; guest memory use is rejected meanwhile, R9).
+//! range, so the analysis never under-spills.
+//!
+//! Out of scope (rejected / treated non-suspending): `call_indirect` and indirect tail
+//! calls to a may-suspend target (unresolved); a direct tail call into a may-suspend
+//! callee (the frame is replaced — no poll to unwind at).
+//!
+//! The remaining extensions (DURABILITY.md §9) are fibers / multi-vCPU / STW (Phase 3).
 
 #![forbid(unsafe_code)]
 
@@ -102,14 +97,14 @@ pub const DURABLE_RESERVE: u64 = 1 << 16;
 
 // Block layout of an instrumented function with `S` forward segments (each original
 // block is split at its suspend ops into `points+1` segments; non-suspend blocks are one
-// segment) and `P` resume points total (reduces to the 7-block shape for one block / one
-// point):
+// segment) and `P` resume points total (an 8-block shape for one block / one point):
 //   0                  PROLOGUE  — dispatch on the state word, then enter segment 0 of blk 0
 //   1 ..= S            forward segments (each original block's segments, in block order)
 //   1+S                DISPATCH  — read resume id, br_table to an arm
-//   2+S ..= 1+S+P      UNWIND_g  — spill + return placeholder, per resume point
-//   2+S+P ..= 1+S+2P   ARM_g     — reload + resume, per resume point
-//   2+S+2P             TRAP      — forged / reserved resume id
+//   2+S ..= 1+S+2P     UNWIND_g  — a (check, spill) pair per point: trap if the push would
+//                                  overflow the reserve, else spill + return placeholder
+//   2+S+2P ..= 1+S+3P  ARM_g     — reload + resume, per resume point
+//   2+S+3P             TRAP      — forged/reserved resume id, or shadow-stack overflow
 
 /// Reasons the Phase-1 transform declines a module.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -417,9 +412,11 @@ fn transform_func(
     let seg = |b: usize, k: usize| seg_base[b] + k as u32;
     let p_total = total_points as u32;
     let dispatch_blk = 1 + s_total;
+    // Each resume point has a UNWIND *pair*: a check block (traps if the push would exceed
+    // the reserve) and a spill block. `check_blk(g) = unwind_base + 2g`, spill is +1.
     let unwind_base = 2 + s_total;
-    let arm_base = 2 + s_total + p_total;
-    let trap_blk = 2 + s_total + 2 * p_total;
+    let arm_base = unwind_base + 2 * p_total;
+    let trap_blk = arm_base + p_total;
     let p = f.params.len();
 
     // Remap a terminator's block targets to segment 0 of each target block.
@@ -483,7 +480,7 @@ fn transform_func(
                 let live: Vec<ValIdx> = (0..out as u32).collect();
                 seg_blocks.push(sb.finish(Terminator::BrIf {
                     cond: is_unw,
-                    then_blk: unwind_base + gid,
+                    then_blk: unwind_base + 2 * gid, // the point's UNWIND check block
                     then_args: live.clone(),
                     else_blk: seg(b, k + 1),
                     else_args: live,
@@ -591,14 +588,34 @@ fn transform_func(
     }
     let dispatch = db.finish(Terminator::BrTable { idx: rid, targets, default: (trap_blk, vec![]) });
 
-    // ---- UNWIND_g / ARM_g, per resume point ----
-    let mut unwind_blocks: Vec<Block> = Vec::with_capacity(total_points);
+    // ---- UNWIND (check + spill pair) / ARM_g, per resume point ----
+    let mut unwind_blocks: Vec<Block> = Vec::with_capacity(2 * total_points);
     let mut arm_blocks: Vec<Block> = Vec::with_capacity(total_points);
     for (gid, pt) in points.iter().enumerate() {
         // index in `pt.spilled` (and thus the reloaded vec) of a block-local value, if spilled
         let spill_slot = |i: usize| pt.spilled.binary_search(&i).ok();
 
-        // UNWIND: spill the live (∪ call-arg) values + the resume id, push the frame.
+        // UNWIND check: a push of this frame must not run past the reserve into guest memory
+        // (R9 / DURABILITY.md §12.7). The shadow stack mirrors the call stack, so this only
+        // trips for a chain deeper than `DURABLE_RESERVE` holds — a clean trap, never silent
+        // corruption. It lives on the (cold) freeze path, not the per-call path.
+        let mut cb = Bb::new(pt.slot_types.clone());
+        let sp_a = cb.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+        let sp = cb.one(load(LoadOp::I64, sp_a, 0));
+        let fsz = cb.one(Inst::ConstI64(pt.frame_size as i64));
+        let newsp = cb.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
+        let reserve = cb.one(Inst::ConstI64(DURABLE_RESERVE as i64));
+        let over = cb.one(icmp(IntTy::I64, CmpOp::GtU, newsp, reserve));
+        let live: Vec<ValIdx> = (0..pt.out as u32).collect();
+        unwind_blocks.push(cb.finish(Terminator::BrIf {
+            cond: over,
+            then_blk: trap_blk,
+            then_args: vec![],
+            else_blk: unwind_base + 2 * gid as u32 + 1, // the spill block
+            else_args: live,
+        }));
+
+        // UNWIND spill: spill the live (∪ call-arg) values + the resume id, commit the new SP.
         let mut ub = Bb::new(pt.slot_types.clone());
         let sp_a = ub.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
         let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
@@ -891,7 +908,7 @@ mod tests {
         );
         let out = transform_module(&m).expect("transform");
         svm_verify::verify_module(&out).expect("instrumented IR must verify");
-        assert_eq!(out.funcs[0].blocks.len(), 7, "7 instrumented blocks");
+        assert_eq!(out.funcs[0].blocks.len(), 8, "one point: 4n+4 blocks with n=1");
     }
 
     #[test]
@@ -903,7 +920,7 @@ mod tests {
         );
         let out = transform_module(&m).expect("two resume points are in scope");
         svm_verify::verify_module(&out).expect("instrumented IR must verify");
-        assert_eq!(out.funcs[0].blocks.len(), 10, "two-point layout: 3n+4 with n=2");
+        assert_eq!(out.funcs[0].blocks.len(), 12, "two-point layout: 4n+4 with n=2");
     }
 
     #[test]
@@ -916,8 +933,8 @@ mod tests {
         );
         let out = transform_module(&m).expect("transform");
         svm_verify::verify_module(&out).expect("instrumented chain must verify");
-        assert_eq!(out.funcs[0].blocks.len(), 7, "caller (propagated) instrumented");
-        assert_eq!(out.funcs[1].blocks.len(), 7, "callee (leaf) instrumented");
+        assert_eq!(out.funcs[0].blocks.len(), 8, "caller (propagated) instrumented");
+        assert_eq!(out.funcs[1].blocks.len(), 8, "callee (leaf) instrumented");
     }
 
     #[test]
@@ -932,7 +949,7 @@ mod tests {
         let helper_before = m.funcs[1].clone();
         let out = transform_module(&m).expect("transform");
         svm_verify::verify_module(&out).expect("verify");
-        assert_eq!(out.funcs[0].blocks.len(), 7, "leaf instrumented");
+        assert_eq!(out.funcs[0].blocks.len(), 8, "leaf instrumented");
         assert_eq!(out.funcs[1], helper_before, "non-suspending helper untouched");
     }
 
