@@ -32,6 +32,9 @@ pub enum Value {
     /// A `v128` SIMD vector (§17/D58): 16 raw little-endian bytes. Lane interpretation is
     /// per-op, never per-value — so the value carries only the bytes.
     V128([u8; 16]),
+    /// An opaque 64-bit `ref` (GC.md §6 forward-compat reservation). Operationally identical to
+    /// `I64` — a distinct variant only so type confusion is compile-caught; it carries raw bits.
+    Ref(u64),
 }
 
 /// Reasons execution stopped without producing results.
@@ -2222,6 +2225,7 @@ impl VCpu {
                     Value::F32(x) => (2u8, x.to_bits() as u64).hash(h),
                     Value::F64(x) => (3u8, x.to_bits()).hash(h),
                     Value::V128(b) => (4u8, *b).hash(h),
+                    Value::Ref(x) => (5u8, *x).hash(h),
                 }
             }
         }
@@ -6943,7 +6947,7 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
         // `v128` never reaches here — its loads go through the dedicated 16-byte path, not
         // a `LoadOp` (whose widths are ≤8). Total arm for exhaustiveness only.
         ValType::V128 => Value::V128([0; 16]),
-        ValType::I32 | ValType::I64 => {
+        ValType::I32 | ValType::I64 | ValType::Ref => {
             let bits = width * 8;
             let ext = if signed && bits < 64 {
                 let shift = 64 - bits;
@@ -6951,10 +6955,10 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
             } else {
                 raw
             };
-            if rty == ValType::I32 {
-                Value::I32(ext as i32)
-            } else {
-                Value::I64(ext as i64)
+            match rty {
+                ValType::I32 => Value::I32(ext as i32),
+                ValType::Ref => Value::Ref(ext), // opaque, stored/loaded as an i64-width word
+                _ => Value::I64(ext as i64),
             }
         }
     }
@@ -6970,6 +6974,7 @@ fn store_bits(v: Value) -> u64 {
         // `v128` stores go through the dedicated 16-byte path; a scalar store never sees one.
         // Total arm: low 8 bytes (little-endian).
         Value::V128(b) => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => x, // opaque reference: its raw 64-bit word
     }
 }
 
@@ -7199,6 +7204,7 @@ fn val_to_slot(v: Value) -> i64 {
         // The cap ABI marshals scalars only; a `v128` arg/result is out of MVP scope (§17). Total
         // arm — its low 8 bytes — keeps the interpreter panic-free if a module declares one.
         Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => x as i64, // opaque reference marshals as its i64-width word
     }
 }
 
@@ -7209,6 +7215,7 @@ fn slot_to_val(ty: ValType, s: i64) -> Value {
         ValType::I64 => Value::I64(s),
         ValType::F32 => Value::F32(f32::from_bits(s as u32)),
         ValType::F64 => Value::F64(f64::from_bits(s as u64)),
+        ValType::Ref => Value::Ref(s as u64), // opaque i64-width reference
         // `v128` cap results are out of MVP scope; zero-extend the slot into the low lanes.
         ValType::V128 => {
             let mut b = [0u8; 16];

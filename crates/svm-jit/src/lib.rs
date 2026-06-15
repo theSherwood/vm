@@ -523,6 +523,8 @@ fn clif_ty(t: ValType) -> Type {
         // §17/D58: a `v128` SSA value is canonically held as `I8X16`; lane ops bitcast to the
         // shape-specific vector type and back.
         ValType::V128 => I8X16,
+        // An opaque `ref` lowers exactly as `i64` (GC forward-compat reservation, GC.md §6).
+        ValType::Ref => I64,
     }
 }
 
@@ -4196,7 +4198,7 @@ fn guard_atomic_align(b: &mut FunctionBuilder, lower: &Lower, phys: Value, width
 /// Decode an `i64` calling-convention slot to a value of IR type `ty`.
 fn decode_slot(b: &mut FunctionBuilder, slot: Value, ty: ValType) -> Value {
     match ty {
-        ValType::I64 => slot,
+        ValType::I64 | ValType::Ref => slot, // `ref` is an opaque i64 in the cap ABI
         ValType::I32 => b.ins().ireduce(I32, slot),
         ValType::F32 => {
             let i = b.ins().ireduce(I32, slot);

@@ -41,6 +41,13 @@ pub enum ValType {
     F32,
     F64,
     V128,
+    /// An opaque 64-bit **reference** (§GC.md §6 forward-compat reservation). Reserved now so
+    /// future *precise* GC (stack maps + value-location metadata) can name pointer-typed slots
+    /// without a format break. Today it is a pure reservation: no instruction produces a `ref`
+    /// literal, and wherever a `ref` value does flow (a `ref`-typed param/result/block-arg) it is
+    /// indistinguishable from an `i64` — it lowers as `i64` in the JIT and as the opaque
+    /// `Value::Ref` in the interp. Conservative GC needs none of this; it scans raw words.
+    Ref,
 }
 
 impl ValType {
@@ -52,6 +59,7 @@ impl ValType {
             ValType::F32 => "f32",
             ValType::F64 => "f64",
             ValType::V128 => "v128",
+            ValType::Ref => "ref",
         }
     }
 
@@ -64,6 +72,7 @@ impl ValType {
             "f32" => ValType::F32,
             "f64" => ValType::F64,
             "v128" => ValType::V128,
+            "ref" => ValType::Ref,
             _ => return None,
         })
     }

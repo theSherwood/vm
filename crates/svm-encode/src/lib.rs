@@ -49,6 +49,7 @@ mod op {
     pub const T_F32: u8 = 2;
     pub const T_F64: u8 = 3;
     pub const T_V128: u8 = 4;
+    pub const T_REF: u8 = 5; // opaque 64-bit reference (GC forward-compat reservation)
 
     // Constants.
     pub const CONST_I32: u8 = 0x10;
@@ -842,6 +843,7 @@ fn type_tag(t: ValType) -> u8 {
         ValType::F32 => op::T_F32,
         ValType::F64 => op::T_F64,
         ValType::V128 => op::T_V128,
+        ValType::Ref => op::T_REF,
     }
 }
 
@@ -1277,6 +1279,7 @@ fn decode_type(c: &mut Cursor) -> Result<ValType, DecodeError> {
         op::T_F32 => ValType::F32,
         op::T_F64 => ValType::F64,
         op::T_V128 => ValType::V128,
+        op::T_REF => ValType::Ref,
         other => return Err(DecodeError::BadType(other)),
     })
 }
