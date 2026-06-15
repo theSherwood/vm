@@ -15,7 +15,7 @@
 //! and shift the result. The `Clock` advances by one per call, so this is exact.
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
+    init_durable_window, read_state, transform_module_assume_confined, write_state, STATE_NORMAL,
     STATE_REWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
@@ -27,7 +27,10 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 fn instrument(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
     m.memory = Some(Memory { size_log2: SIZE_LOG2 });
-    let inst = transform_module(&m).expect("transform");
+    // These guests deliberately store to the state word to simulate a host-requested freeze
+    // at an interior point, which the R9 check would otherwise reject — so use the
+    // confinement-assuming entry. (A real freeze trigger comes from the host, not the guest.)
+    let inst = transform_module_assume_confined(&m).expect("transform");
     svm_verify::verify_module(&inst).expect("instrumented IR must verify");
     inst
 }

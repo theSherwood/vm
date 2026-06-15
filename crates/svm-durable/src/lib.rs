@@ -108,24 +108,59 @@ pub enum TransformError {
     /// A prefix instruction's result type isn't modelled by the Phase-1 transform
     /// (e.g. SIMD, conversions, concurrency ops before the call).
     UnsupportedInst,
+    /// The module is being instrumented but a (any) function contains a guest
+    /// linear-memory instruction (load/store/atomic). The durable region (state word +
+    /// shadow stack) shares the window at fixed low addresses (`[0, SHADOW_BASE)` and up),
+    /// and nothing confines a guest access away from it, so a guest memory op could
+    /// silently corrupt the freeze/thaw state — and vice versa (R9). Until the durable
+    /// region is relocated out of the guest's reach (the per-fiber, guard-paged §12.7
+    /// placement), instrumented modules must not touch linear memory themselves; this
+    /// fails closed instead of corrupting. (Cap-mediated window effects — e.g. a Memory
+    /// capability's map/unmap — are a separate facet the embedder must withhold.)
+    GuestUsesMemory,
 }
 
 /// Instrument every may-suspend function in `m` for freeze/thaw. Functions that can
 /// never suspend are returned unchanged. The result is ordinary IR; run it through
 /// `svm_verify::verify_module` before executing.
 pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
+    transform_module_inner(m, true)
+}
+
+/// Like [`transform_module`], but **skips the R9 guest-memory rejection**. For callers that
+/// confine the guest away from the durable region by other means — the per-fiber,
+/// guard-paged §12.7 placement, or a test that simulates a host-driven freeze (the host,
+/// not the guest, writes the state word). The caller takes responsibility for that
+/// confinement; prefer [`transform_module`], which fails closed.
+pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformError> {
+    transform_module_inner(m, false)
+}
+
+fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, TransformError> {
     let func_results: Vec<Vec<ValType>> = m.funcs.iter().map(|f| f.results.clone()).collect();
     let may_suspend = compute_may_suspend(m);
+    let any_instrumented = may_suspend.iter().any(|&s| s);
+
+    // R9 enforcement: the durable region shares the window with guest memory at fixed low
+    // addresses, with nothing confining the guest away from it. Rather than risk silent
+    // mutual corruption, refuse to instrument a module any of whose functions touch linear
+    // memory. (The generated/tested durable guests are pure SSA + `cap.call`, so they pass;
+    // the relocation that would lift this restriction is §12.7 future work.)
+    if enforce_r9
+        && any_instrumented
+        && m.funcs.iter().any(|f| f.blocks.iter().any(|b| b.insts.iter().any(is_guest_mem_op)))
+    {
+        return Err(TransformError::GuestUsesMemory);
+    }
+
     let mut out = m.clone();
     let mut max_frame = 0u64;
-    let mut any_instrumented = false;
 
     for (i, f) in m.funcs.iter().enumerate() {
         if may_suspend[i] {
             let (nf, frame_size) = transform_func(f, &func_results, &may_suspend)?;
             out.funcs[i] = nf;
             max_frame = max_frame.max(frame_size);
-            any_instrumented = true;
         }
     }
 
@@ -140,6 +175,24 @@ pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
         }
     }
     Ok(out)
+}
+
+/// A guest linear-memory instruction (one that reads or writes a window address). These
+/// can alias the durable region, so they are rejected in an instrumented module (R9). An
+/// `AtomicFence` carries no address and so is not included.
+fn is_guest_mem_op(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::Load { .. }
+            | Inst::Store { .. }
+            | Inst::AtomicLoad { .. }
+            | Inst::AtomicStore { .. }
+            | Inst::AtomicRmw { .. }
+            | Inst::AtomicCmpxchg { .. }
+            | Inst::V128Load { .. }
+            | Inst::V128Store { .. }
+            | Inst::MemoryWait { .. } // reads the window value at `addr`
+    )
 }
 
 /// Mark each function that can suspend: it contains a `cap.call`, or (transitively) a
@@ -736,6 +789,28 @@ mod tests {
         svm_verify::verify_module(&out).expect("verify");
         assert_eq!(out.funcs[0].blocks.len(), 7, "leaf instrumented");
         assert_eq!(out.funcs[1], helper_before, "non-suspending helper untouched");
+    }
+
+    #[test]
+    fn instrumented_module_with_guest_memory_op_is_rejected() {
+        // A guest store could alias the durable region at `[0, SHADOW_BASE)` → R9 fails closed.
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 7\n  i64.store v1 v3\n  return v2\n}\n",
+            18,
+        );
+        assert_eq!(transform_module(&m), Err(TransformError::GuestUsesMemory));
+    }
+
+    #[test]
+    fn guest_memory_op_in_uninstrumented_module_is_fine() {
+        // No `cap.call` anywhere ⇒ nothing is instrumented ⇒ no durable region ⇒ the
+        // guest's own memory use is left untouched.
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 7\n  i64.store v0 v1\n  v2 = i64.load v0\n  return v2\n}\n",
+            18,
+        );
+        let out = transform_module(&m).expect("no instrumentation, memory use is fine");
+        assert_eq!(out.funcs, m.funcs, "left unchanged");
     }
 
     #[test]
