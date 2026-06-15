@@ -99,10 +99,12 @@ pub(crate) struct FiberSlot {
     /// `cont.resume` claims through it, from **any** vCPU (3c).
     own: Ownership,
     /// The **runtime single-owner assert** (empirical-net layer #3, DESIGN.md §23): the vCPU token
-    /// currently running this fiber, [`NOT_RUNNING`] when parked. Set (and checked) right after a
-    /// won claim, cleared right before the slot is republished — so if the claim protocol were
-    /// ever mis-wired, a double-resume aborts loudly at the seam instead of silently running one
-    /// native stack on two threads. Purely diagnostic: exclusivity itself is the `Ownership` CAS.
+    /// currently running this fiber, [`NOT_RUNNING`] when parked. Set (AcqRel swap) right after a
+    /// won claim, cleared (Release store) right before the slot is republished — so if the claim
+    /// protocol were ever mis-wired, a double-resume aborts loudly at the seam instead of silently
+    /// running one native stack on two threads. Its Acquire/Release pair gives it a happens-before
+    /// **independent of the `own` word** it cross-checks, so a mis-ordering of `own` cannot silence
+    /// it in lockstep. Purely diagnostic: exclusivity itself is the `Ownership` CAS.
     running_on: AtomicU64,
     /// The parked native fiber. `Some` while the slot is `OWNED` (fresh) or `RUNNABLE`
     /// (suspended); the box stays in place during a resume (`RUNNING` guarantees the claimant
@@ -343,8 +345,12 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         }
         // Runtime single-owner assert (empirical net #3): a won claim must find the seam clear.
         // `RUNNING` slots are unclaimable, so a non-sentinel here means the protocol wiring is
-        // broken — abort loudly rather than run one native stack on two threads.
-        let prev = slot.running_on.swap(rt.me, Ordering::Relaxed);
+        // broken — abort loudly rather than run one native stack on two threads. The swap is
+        // **AcqRel** (and the clears below are **Release**) so this seam carries its *own*
+        // happens-before — it observes the prior owner's clear independently of the `own` word, the
+        // very thing it is meant to cross-check; a mis-wiring of `own` can no longer silence it in
+        // lockstep.
+        let prev = slot.running_on.swap(rt.me, Ordering::AcqRel);
         assert!(
             prev == NOT_RUNNING,
             "single-owner violation: fiber claimed while running on vCPU {prev}"
@@ -375,7 +381,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         State::Yielded(v) => {
             // Voluntarily suspended: **publish to the pool** — claimable by any vCPU now, on any
             // thread (the migration point; release-pairs with the next claimant's acquire).
-            slot.running_on.store(NOT_RUNNING, Ordering::Relaxed);
+            slot.running_on.store(NOT_RUNNING, Ordering::Release);
             slot.own.suspend_to_pool();
             *status_out = 0;
             v as i64
@@ -384,7 +390,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // Returned: drop the fiber (unmapping its stack) and free the slot — `finish` bumps
             // the generation, so any stale claim of this slot keeps failing.
             slot.fiber.lock().unwrap_or_else(|e| e.into_inner()).take();
-            slot.running_on.store(NOT_RUNNING, Ordering::Relaxed);
+            slot.running_on.store(NOT_RUNNING, Ordering::Release);
             slot.own.finish();
             *status_out = 1;
             v as i64
