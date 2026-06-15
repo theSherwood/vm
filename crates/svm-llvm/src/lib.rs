@@ -23,10 +23,13 @@
 //! - **C — calls + the threaded data-SP.** Every function takes a leading `sp` parameter (§3d),
 //!   threaded as block-local index 0 of every block; a direct `call` passes the callee `sp +
 //!   frame_size`, so activations get fresh frames and recursion is sound.
+//! - **D — `switch`.** Lowered to a `br_table` biased by the minimum case value, gaps filled with
+//!   the default edge (dense spans only; a too-sparse switch is `Unsupported`).
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): floats, `switch`, indirect calls
-//! (funcref), struct/vector GEP, by-value aggregates, intrinsics beyond the dropped ones, and
-//! non-byte integer widths (e.g. `i33`).
+//! Out of the current subset (clean [`Error::Unsupported`]): floats, indirect calls (funcref),
+//! **global variables** (clang materializes lookup tables / string constants as globals — e.g. a
+//! sparse switch becomes a global table + GEP + load), struct/vector GEP, by-value aggregates,
+//! intrinsics beyond the dropped ones, and non-byte integer widths (e.g. `i33`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -410,6 +413,7 @@ fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
         LTerm::Ret(r) => Ok(r.return_operand.as_ref().map(one).unwrap_or_default()),
         LTerm::Br(_) => Ok(Vec::new()),
         LTerm::CondBr(c) => Ok(one(&c.condition)),
+        LTerm::Switch(sw) => Ok(one(&sw.operand)),
         LTerm::Unreachable(_) => Ok(Vec::new()),
         other => unsup(format!("terminator {other:?}")),
     }
@@ -523,6 +527,13 @@ fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
     match term {
         LTerm::Br(x) => Ok(vec![b(&x.dest)?]),
         LTerm::CondBr(x) => Ok(vec![b(&x.true_dest)?, b(&x.false_dest)?]),
+        LTerm::Switch(sw) => {
+            let mut v = vec![b(&sw.default_dest)?];
+            for (_, dest) in &sw.dests {
+                v.push(b(dest)?);
+            }
+            Ok(v)
+        }
         LTerm::Ret(_) | LTerm::Unreachable(_) => Ok(Vec::new()),
         other => unsup(format!("terminator {other:?}")),
     }
@@ -1169,8 +1180,115 @@ fn translate_term(
                 else_args,
             })
         }
+        LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params),
         LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
         other => unsup(format!("terminator {other:?}")),
+    }
+}
+
+/// The largest `br_table` span we materialize for a `switch` (gaps fill with the default). A
+/// sparser switch — clang usually lowers those to compare chains in the IR anyway — is a clean
+/// `Unsupported` (a synthetic-block compare-chain lowering is a later option).
+const MAX_SWITCH_SPAN: i64 = 4096;
+
+/// Lower a `switch` to a `br_table` (§3b): bias the `i32` operand by the minimum case value, then
+/// index a target vector spanning `[min, max]` with gaps filled by the default edge. Each edge
+/// carries the destination's block arguments (computed once per distinct target). i64-operand or
+/// too-sparse switches are `Unsupported`.
+fn translate_switch(
+    ctx: &mut BlockCtx,
+    sw: &llvm_ir::terminator::Switch,
+    bi: usize,
+    f: &Function,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+) -> Result<Terminator, Error> {
+    // The operand must be `i32` (the common C `switch(int)`); `br_table`'s index is `i32`.
+    if operand_bits(&sw.operand)? > 32 {
+        return unsup("switch on i64 (Milestone 1+)");
+    }
+    // Collect the (value, dest-block) cases.
+    let mut cases: Vec<(i64, usize)> = Vec::with_capacity(sw.dests.len());
+    for (v, dest) in &sw.dests {
+        let val = match v.as_ref() {
+            Constant::Int { value, .. } => *value as i32 as i64,
+            other => return unsup(format!("switch case constant {other:?}")),
+        };
+        let blk = *s
+            .block_idx
+            .get(dest)
+            .ok_or_else(|| Error::Unsupported(format!("switch to unknown block {dest:?}")))?;
+        cases.push((val, blk));
+    }
+    let default_blk = *s
+        .block_idx
+        .get(&sw.default_dest)
+        .ok_or_else(|| Error::Unsupported("switch default to unknown block".into()))?;
+    if cases.is_empty() {
+        // Degenerate: an unconditional branch to the default.
+        let args = branch_args(ctx, bi, default_blk, f, s, block_params)?;
+        return Ok(Terminator::Br {
+            target: default_blk as u32,
+            args,
+        });
+    }
+    let min = cases.iter().map(|(v, _)| *v).min().unwrap();
+    let max = cases.iter().map(|(v, _)| *v).max().unwrap();
+    let span = max - min + 1;
+    if span > MAX_SWITCH_SPAN {
+        return unsup(format!("sparse switch (span {span} > {MAX_SWITCH_SPAN})"));
+    }
+
+    // Index = operand - min (so the table starts at 0). An out-of-range / unbiased value lands on
+    // the default (a negative bias wraps to a large `u32`, ≥ len ⇒ default).
+    let operand = ctx.operand(&sw.operand)?;
+    let idx = if min == 0 {
+        operand
+    } else {
+        let m = ctx.push(Inst::ConstI32(min as i32));
+        ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Sub,
+            a: operand,
+            b: m,
+        })
+    };
+
+    // Block arguments per distinct target (computed once — `branch_args` materializes constants).
+    let mut args_for: HashMap<usize, Vec<ValIdx>> = HashMap::new();
+    let default_args = branch_args(ctx, bi, default_blk, f, s, block_params)?;
+    args_for.insert(default_blk, default_args.clone());
+    for &(_, blk) in &cases {
+        if let std::collections::hash_map::Entry::Vacant(e) = args_for.entry(blk) {
+            let a = branch_args(ctx, bi, blk, f, s, block_params)?;
+            e.insert(a);
+        }
+    }
+
+    // Build the dense target vector, gaps → default.
+    let mut targets: Vec<svm_ir::Edge> =
+        vec![(default_blk as u32, default_args.clone()); span as usize];
+    for &(v, blk) in &cases {
+        targets[(v - min) as usize] = (blk as u32, args_for[&blk].clone());
+    }
+    Ok(Terminator::BrTable {
+        idx,
+        targets,
+        default: (default_blk as u32, default_args),
+    })
+}
+
+/// The integer bit width of a switch operand (a local carries its type; a constant its width).
+fn operand_bits(op: &Operand) -> Result<u32, Error> {
+    match op {
+        Operand::LocalOperand { ty, .. } => {
+            int_bits(ty.as_ref()).ok_or_else(|| Error::Unsupported("switch on non-integer".into()))
+        }
+        Operand::ConstantOperand(c) => match c.as_ref() {
+            Constant::Int { bits, .. } => Ok(*bits),
+            other => unsup(format!("switch operand {other:?}")),
+        },
+        Operand::MetadataOperand => unsup("switch on metadata"),
     }
 }
 

@@ -200,6 +200,30 @@ fn cross_function_call() {
 }
 
 #[test]
+fn switch_dense() {
+    // A dense `switch` -O2 keeps as a jump table → `br_table`.
+    let src = "int sw(int x){ switch (x) { case 0: return 100; case 1: return 200; \
+               case 2: return 300; case 3: return 400; default: return -1; } }";
+    check("sw_0", src, &[Value::I32(0)], &[Value::I32(100)]);
+    check("sw_2", src, &[Value::I32(2)], &[Value::I32(300)]);
+    check("sw_3", src, &[Value::I32(3)], &[Value::I32(400)]);
+    check("sw_def", src, &[Value::I32(9)], &[Value::I32(-1)]);
+    check("sw_neg", src, &[Value::I32(-5)], &[Value::I32(-1)]);
+}
+
+#[test]
+fn mutual_recursion_even_odd() {
+    // `-O2` lowers this mutual recursion into a `switch`-driven parity loop (the case that
+    // motivated switch support). even(n) = 1 if n even else 0.
+    let src = "int odd(int); \
+               int even(int n){ return n == 0 ? 1 : odd(n - 1); } \
+               int odd(int n){ return n == 0 ? 0 : even(n - 1); }";
+    check("even_10", src, &[Value::I32(10)], &[Value::I32(1)]);
+    check("even_7", src, &[Value::I32(7)], &[Value::I32(0)]);
+    check("even_0", src, &[Value::I32(0)], &[Value::I32(1)]);
+}
+
+#[test]
 fn unsupported_is_fail_closed() {
     // A float return is outside slice A — it must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).

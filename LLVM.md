@@ -8,18 +8,20 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–C (control flow + memory + calls) done — multi-block integer
-functions with stack memory and (recursive) calls translate and run on both backends.**
-`crates/svm-llvm` does the **SSA → block-argument conversion** (LLVM dominance SSA + φ-nodes →
-SVM's block-local form via liveness; loops/joins/critical edges, no edge splitting), the integer
-scalar op set, the **§3d data-stack** (`alloca` → window frame slots, `load`/`store` incl. narrow
-widths, `getelementptr` → address arithmetic), and **direct calls with the threaded data-SP**
-(every function takes a leading `sp`; a call passes `sp + frame_size`, so recursion is sound).
-Real `clang -O2` programs — popcount/collatz loops, if-converted select, a stack-array sum
-(GEP/store/load), recursive `fib`, a cross-function call — run **interp == JIT == hand-computed**
-(12 tests). Remaining M1: `switch` (clang lowers loops/mutual-recursion onto it), floats,
-indirect calls (funcref), aggregates/`sret`, more intrinsics, then the demo Lane C. Section
-numbers like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
+**Status: Milestone 1 slices A–D (control flow + memory + calls + switch) done — multi-block
+integer functions with stack memory, (recursive) calls, and `switch` translate and run on both
+backends.** `crates/svm-llvm` does the **SSA → block-argument conversion** (LLVM dominance SSA +
+φ-nodes → SVM's block-local form via liveness; loops/joins/critical edges, no edge splitting), the
+integer scalar op set, the **§3d data-stack** (`alloca` → window frame slots, `load`/`store` incl.
+narrow widths, `getelementptr` → address arithmetic), **direct calls with the threaded data-SP**
+(every function takes a leading `sp`; a call passes `sp + frame_size`, so recursion is sound), and
+**`switch` → `br_table`** (biased by the min case, dense spans). Real `clang -O2` programs —
+popcount/collatz loops, if-converted select, a stack-array sum (GEP/store/load), recursive `fib`,
+a cross-function call, a dense switch, and an `even`/`odd` mutual recursion (which `-O2` lowers
+onto a switch-loop) — run **interp == JIT == hand-computed** (14 tests). Remaining M1: floats,
+indirect calls (funcref), **global variables** (clang materializes lookup tables / string
+constants as globals), aggregates/`sret`, more intrinsics, then the demo Lane C. Section numbers
+like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
 
@@ -302,9 +304,18 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       overlap; recursion is sound), then the mapped arguments; the result threads back. Tested on
       `clang -O2` recursive `fib` and a `noinline` cross-function call, interp == JIT == hand-computed.
 
+**Slice D (DONE) — `switch`.**
+- [x] `switch` → `br_table` (§3b): the `i32` operand is biased by the minimum case value, then
+      indexes a target vector spanning `[min, max]` with gaps filled by the default edge; each edge
+      carries its destination's block args (computed once per distinct target). Too-sparse switches
+      (span > 4096) and i64-operand switches are a clean `Unsupported`. Tested on a dense switch and
+      the `even`/`odd` mutual recursion `-O2` lowers onto a switch-loop.
+
 **Remaining slices.**
-- [ ] `switch` → `br_table`/compare-chain. *(Now the top need: `-O2` lowers counted loops and
-      mutual recursion onto `switch` — e.g. an `even`/`odd` pair becomes a switch-driven parity loop.)*
+- [ ] **Global variables** — clang materializes lookup tables and string constants as globals
+      (e.g. a sparse switch becomes a global `[N x i32]` table + GEP + load; string literals).
+      Lower to IR `data` segments (§3a/D40) + GEP/load on the global's window address. *Now a top
+      need — it blocks string/table-heavy programs and the demo corpus.*
 - [ ] Indirect `call` (funcref §3c — `call` through a function pointer; needs `ref.func` + the table).
 - [ ] Floats (`f32`/`f64`: `fadd`/…/`fcmp`/`fptosi`/`sitofp`/…).
 - [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline.
