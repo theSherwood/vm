@@ -47,7 +47,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
 | `cap.call` I/O record log | **Missing** | — |
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
-| Interpreter stepping / breakpoint / backtrace / value+window read | **Built — slice 1** | `svm-interp` `Inspector` (single-threaded; watchpoints + multithread pending) |
+| Interpreter stepping / breakpoint / watchpoint / backtrace / value+window read | **Built — slices 1–2** | `svm-interp` `Inspector` (single-threaded; multithread pending) |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | `§3a` IR debug-info side-table (source locations in IR) | **Missing** (IR has no loc fields) | `svm-ir`, frontend `codegen_ir.c` |
 | DWARF emission + DAP server | **Missing** | — |
@@ -633,9 +633,17 @@ Five tests cover run-to-completion transparency, per-iteration breakpoints with 
 single-step that advances exactly one op + ticks the clock, a two-frame backtrace inside a
 callee, and a window read-back. Full workspace suite stays green.
 
-**Not yet (next slices):** watchpoints (the S4 `access_of` extension), capability-using guests
-(grant into the Inspector's `Host`), multithreaded debugging (the `Policy` scheduler seam,
-Milestone B), and the source mapping (W4).
+**Slice 2 — watchpoints.** `set_watchpoint(addr, len, WatchKind)` / `clear_watchpoint(id)` watch
+a window range for `Read`/`Write`/`ReadWrite` accesses, reported as `StopReason::Watchpoint {
+addr, write }` *before* the accessing op (step once to apply it). The hit test reuses
+`access_of` — the same confined-range analysis the DPOR explorer uses — computed in the hot loop
+**only when a watch is armed** (it confines, so it isn't free); breakpoints/stepping skip it.
+Because the window is one contiguous buffer, a watch catches every code path with no per-op
+instrumentation. Four more tests: stop-before-store then step-applies, read/write kind filtering,
+clear, and non-overlapping range. Workspace green, clippy clean.
+
+**Not yet (next slices):** capability-using guests (grant into the Inspector's `Host`),
+multithreaded debugging (the `Policy` scheduler seam, Milestone B), and the source mapping (W4).
 
 ### Open questions (S4/S5/S2)
 

@@ -2,7 +2,7 @@
 //! stepping, IR-value / window inspection, and a backtrace across a call — driven through the
 //! host-side `Inspector`. These pin the S4 per-op seam + S5 driver model end-to-end.
 
-use svm_interp::{Inspector, IrPc, Stop, StopReason, Value};
+use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, WatchKind};
 use svm_text::parse_module;
 
 // sum = 1 + 2 + ... + N via a back-edge loop with block parameters (same shape as pipeline.rs).
@@ -168,4 +168,90 @@ block0():
     let _ = finished_ok(insp.run_until_stop());
     let bytes = insp.read_window(0, 8).expect("read window");
     assert_eq!(bytes, MAGIC.to_le_bytes());
+}
+
+// A store to a fixed window offset, then return — for write-watchpoint tests.
+const STORE_PROG: &str = r#"
+memory 17
+func () -> (i32) {
+block0():
+  v0 = i64.const 0
+  v1 = i64.const 1234605616436508552
+  i64.store v0 v1
+  v2 = i32.const 0
+  return v2
+}
+"#;
+
+#[test]
+fn write_watchpoint_stops_before_the_store_then_step_applies_it() {
+    const MAGIC: u64 = 0x1122334455667788;
+    let m = parse_module(STORE_PROG).expect("parse");
+    let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
+    insp.set_watchpoint(0, 8, WatchKind::Write);
+
+    // Pauses *before* the store; the watched bytes are still the initial zeros.
+    match insp.run_until_stop() {
+        Stop::Break { reason: StopReason::Watchpoint { addr, write }, pc } => {
+            assert_eq!((addr, write), (0, true));
+            assert_eq!(pc, IrPc { module: 0, func: 0, block: 0, inst: 2 });
+        }
+        other => panic!("expected write watchpoint, got {other:?}"),
+    }
+    assert_eq!(insp.read_window(0, 8).unwrap(), [0u8; 8]);
+
+    // One step applies the store; now the new bytes are visible.
+    let _ = insp.step();
+    assert_eq!(insp.read_window(0, 8).unwrap(), MAGIC.to_le_bytes());
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(0)]);
+}
+
+#[test]
+fn write_watchpoint_does_not_fire_on_a_read_and_read_watch_does() {
+    // Load from offset 0, then return it. A *write* watch must ignore the load; a *read* watch fires.
+    let src = r#"
+memory 17
+func () -> (i64) {
+block0():
+  v0 = i64.const 0
+  v1 = i64.load v0
+  return v1
+}
+"#;
+    let m = parse_module(src).expect("parse");
+
+    // Write-kind watch: the load is not a write, so the guest runs clean to completion.
+    let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
+    insp.set_watchpoint(0, 8, WatchKind::Write);
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I64(0)]);
+
+    // Read-kind watch on the same range: pauses before the load.
+    let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
+    insp.set_watchpoint(0, 8, WatchKind::Read);
+    match insp.run_until_stop() {
+        Stop::Break { reason: StopReason::Watchpoint { addr, write }, .. } => {
+            assert_eq!((addr, write), (0, false));
+        }
+        other => panic!("expected read watchpoint, got {other:?}"),
+    }
+}
+
+#[test]
+fn clearing_a_watchpoint_lets_the_guest_run_clean() {
+    let m = parse_module(STORE_PROG).expect("parse");
+    let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
+    let id = insp.set_watchpoint(0, 8, WatchKind::Write);
+    assert!(insp.clear_watchpoint(id));
+    assert!(!insp.clear_watchpoint(id), "second clear is a no-op");
+    // With the watch gone, no pause: the store runs and the function returns 0.
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(0)]);
+}
+
+#[test]
+fn watchpoint_outside_the_accessed_range_does_not_fire() {
+    // Watch [64, 72): the store hits [0, 8), which does not overlap, so the guest runs clean.
+    let m = parse_module(STORE_PROG).expect("parse");
+    let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
+    insp.set_watchpoint(64, 8, WatchKind::Write);
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(0)]);
 }

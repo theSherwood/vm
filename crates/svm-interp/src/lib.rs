@@ -122,7 +122,36 @@ pub enum StopReason {
     Breakpoint,
     /// Completed a single-step (`Inspector::step`).
     Step,
+    /// About to execute an op that accesses a watched window range. Reported *before* the access
+    /// takes effect (`addr`/`write` describe the access); `step` once to apply it and observe the
+    /// new bytes. `addr` is the confined window offset the op touches.
+    Watchpoint { addr: u64, write: bool },
 }
+
+/// Which accesses a watchpoint fires on (`Inspector::set_watchpoint`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WatchKind {
+    /// Reads only.
+    Read,
+    /// Writes / RMW / `notify` only (the common case — "what changes this?").
+    Write,
+    /// Either.
+    ReadWrite,
+}
+
+impl WatchKind {
+    fn fires_on(self, write: bool) -> bool {
+        match self {
+            WatchKind::Read => !write,
+            WatchKind::Write => write,
+            WatchKind::ReadWrite => true,
+        }
+    }
+}
+
+/// Handle for a set watchpoint, used to clear it (`Inspector::clear_watchpoint`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct WatchId(u32);
 
 /// The outcome of resuming an [`Inspector`] ([`Inspector::run_until_stop`] / [`Inspector::step`]).
 #[derive(Clone, Debug)]
@@ -146,10 +175,23 @@ pub struct FrameInfo {
     pub vals: Vec<Value>,
 }
 
+/// A watched window range (DEBUGGING.md W2). Stop when an op accesses `[addr, addr+len)` with a
+/// matching read/write kind.
+struct Watch {
+    id: WatchId,
+    addr: u64,
+    len: u64,
+    kind: WatchKind,
+}
+
 /// Per-vCPU debug state, consulted by the per-op hook in [`run_inner`] (DEBUGGING.md S4). Present
 /// only while an [`Inspector`] drives the vCPU.
 struct DebugCtx {
     breakpoints: BTreeSet<IrPc>,
+    /// Window-range watchpoints. Empty in the common case, so the hot loop skips the (confining)
+    /// `access_of` computation entirely when none are armed (S4 cost gating).
+    watchpoints: Vec<Watch>,
+    next_watch: u32,
     /// S3 logical time: the number of ops this vCPU has executed. Monotonic; the coordinate a
     /// future `seek` (W1) and step-back will target.
     clock: u64,
@@ -164,21 +206,44 @@ impl DebugCtx {
     fn new() -> DebugCtx {
         DebugCtx {
             breakpoints: BTreeSet::new(),
+            watchpoints: Vec::new(),
+            next_watch: 0,
             clock: 0,
             resume_clock: u64::MAX, // nothing stopped yet, so the first op may itself break
             step_target: None,
         }
     }
 
-    /// Decide whether to pause *before* the op at `pc`. `Some(reason)` pauses (the op has not run,
-    /// `clock` unchanged, so the continuation re-enters here); `None` charges one tick of logical
-    /// time and lets the op run. The `resume_clock` guard makes resume step off the current op.
-    fn before_op(&mut self, pc: IrPc) -> Option<StopReason> {
+    fn watches_armed(&self) -> bool {
+        !self.watchpoints.is_empty()
+    }
+
+    /// First watchpoint the `access` hits (overlapping bytes + matching read/write kind), if any.
+    fn watch_hit(&self, access: MemAccess) -> Option<(u64, bool)> {
+        let MemAccess::Range { base, width, write } = access else {
+            return None;
+        };
+        let end = base.saturating_add(width as u64);
+        self.watchpoints.iter().find_map(|w| {
+            let w_end = w.addr.saturating_add(w.len);
+            let overlaps = base < w_end && w.addr < end;
+            (overlaps && w.kind.fires_on(write)).then_some((base, write))
+        })
+    }
+
+    /// Decide whether to pause *before* the op at `pc`. `access` is the op's memory effect (only
+    /// computed by the caller when watchpoints are armed; [`MemAccess::None`] otherwise).
+    /// `Some(reason)` pauses (the op has not run, `clock` unchanged, so the continuation re-enters
+    /// here); `None` charges one tick of logical time and lets the op run. The `resume_clock` guard
+    /// makes resume step off the current op.
+    fn before_op(&mut self, pc: IrPc, access: MemAccess) -> Option<StopReason> {
         let just_resumed = self.clock == self.resume_clock;
         let reason = if just_resumed {
             None
         } else if self.breakpoints.contains(&pc) {
             Some(StopReason::Breakpoint)
+        } else if let Some((addr, write)) = self.watch_hit(access) {
+            Some(StopReason::Watchpoint { addr, write })
         } else if self.step_target == Some(self.clock) {
             Some(StopReason::Step)
         } else {
@@ -265,6 +330,26 @@ impl Inspector {
     /// Remove a breakpoint; returns whether one was present.
     pub fn clear_breakpoint(&mut self, pc: IrPc) -> bool {
         self.dbg().breakpoints.remove(&pc)
+    }
+
+    /// Watch window range `[addr, addr+len)` for accesses of `kind`; the run pauses *before* the
+    /// op that accesses it ([`StopReason::Watchpoint`]). Because the window is one contiguous buffer
+    /// (DEBUGGING.md W2), this catches every code path — no per-op instrumentation needed. Returns a
+    /// handle for [`clear_watchpoint`](Inspector::clear_watchpoint). A zero-length watch never fires.
+    pub fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> WatchId {
+        let d = self.dbg();
+        let id = WatchId(d.next_watch);
+        d.next_watch += 1;
+        d.watchpoints.push(Watch { id, addr, len, kind });
+        id
+    }
+
+    /// Remove a watchpoint; returns whether one was present.
+    pub fn clear_watchpoint(&mut self, id: WatchId) -> bool {
+        let w = &mut self.dbg().watchpoints;
+        let before = w.len();
+        w.retain(|x| x.id != id);
+        w.len() != before
     }
 
     /// Resume until the next breakpoint, completion, or block.
@@ -2670,7 +2755,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     block: frames[top].block,
                     inst: frames[top].inst,
                 };
-                if let Some(reason) = dbg.before_op(pc) {
+                // Watchpoints reuse `access_of` — the same confined-range analysis the DPOR
+                // explorer uses — but only when armed (it confines, so it isn't free). Breakpoints
+                // and stepping need no memory analysis.
+                let access = if dbg.watches_armed() {
+                    access_of(&block.insts[frames[top].inst], &frames[top].vals, &*mem)
+                } else {
+                    MemAccess::None
+                };
+                if let Some(reason) = dbg.before_op(pc, access) {
                     return Ok(Inner::Pause(reason, pc));
                 }
             }
