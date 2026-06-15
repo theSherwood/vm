@@ -446,7 +446,12 @@ unsafe fn jit_native_op(
             };
             put(results, n_results, v, trap_out);
         }
-        _ => put(results, n_results, EINVAL, trap_out),
+        // An op-index outside the Jit interface's defined ops (0..=4) is out of range, so it
+        // traps (`CapFault`) — matching the interpreter, where an unknown Jit op falls through
+        // the explicit op arms to the generic dispatch and faults, and §3c (an out-of-range
+        // op-index is a runtime trap, not a non-fatal errno). The defined ops above own their
+        // own errno-vs-fault choices; only genuinely unknown ops land here.
+        _ => cap_fault(trap_out),
     }
 }
 

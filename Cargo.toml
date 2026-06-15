@@ -16,9 +16,10 @@ members = [
     "crates/svm-wasi",
 ]
 # `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); `bench/` pulls in Wasmtime for
-# the comparison harness. Both are kept out of the workspace so stable
-# `cargo build --workspace` / `cargo test` never pull them in.
-exclude = ["fuzz", "bench"]
+# the comparison harness; `crates/svm-llvm` links libLLVM (the AOT LLVM→IR on-ramp, D54 —
+# an opt-in, Linux-dev-only lane, off the runtime path). All three are kept out of the
+# workspace so stable `cargo build --workspace` / `cargo test` never pull them in.
+exclude = ["fuzz", "bench", "crates/svm-llvm"]
 
 [workspace.package]
 edition = "2021"

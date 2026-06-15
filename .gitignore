@@ -3,5 +3,6 @@
 /fuzz/corpus
 /fuzz/artifacts
 /bench/target
+/crates/svm-llvm/target
 **/*.rs.bk
 rustc-ice-*.txt
