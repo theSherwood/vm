@@ -122,3 +122,59 @@ fn stepping_a_stopped_thread_advances_one_op() {
         other => panic!("expected a step stop, got {other:?}"),
     }
 }
+
+/// `select_task` (DEBUGGING.md Milestone B `select_fiber`): while stopped at a breakpoint in one
+/// thread, inspect *any other* live thread — its own stack, pc, and logical clock — then switch
+/// back. Focus resets when the guest next moves.
+#[test]
+fn select_task_inspects_another_thread_while_stopped() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
+    let bp = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 1,
+    }; // the worker's `load`
+    insp.set_breakpoint(bp);
+    assert!(matches!(insp.run_until_stop(), Stop::Break { pc, .. } if pc == bp));
+
+    let stopped = insp.stopped_task().unwrap();
+    // By default inspection targets the stopped thread, paused before the load (inst 1).
+    assert_eq!(insp.focused_task(), Some(stopped));
+    assert_eq!(insp.backtrace().first().map(|f| f.pc.inst), Some(1));
+
+    // More than one thread is live (the two workers + the join-parked root).
+    let threads = insp.threads();
+    assert!(threads.contains(&stopped));
+    assert!(threads.len() >= 2, "several threads are live: {threads:?}");
+
+    // Focus another live thread and inspect IT: a distinct, live stack at a different pc.
+    let other = *threads.iter().find(|&&t| t != stopped).unwrap();
+    assert!(insp.select_task(other));
+    assert_eq!(insp.focused_task(), Some(other));
+    let other_bt = insp.backtrace();
+    assert!(!other_bt.is_empty(), "the other thread has a live stack");
+    assert_ne!(
+        other_bt.first().map(|f| f.pc),
+        Some(bp),
+        "the other thread is not sitting at the stopped thread's pc"
+    );
+
+    // Switch focus back to the stopped thread → its view (at the breakpoint) returns.
+    assert!(insp.select_task(stopped));
+    assert_eq!(insp.backtrace().first().map(|f| f.pc), Some(bp));
+
+    // Selecting a non-existent thread fails and leaves the focus unchanged.
+    assert!(!insp.select_task(99_999));
+    assert_eq!(insp.focused_task(), Some(stopped));
+
+    // Resuming resets the focus to whatever thread next stops.
+    if let Stop::Break { .. } = insp.run_until_stop() {
+        assert_eq!(
+            insp.focused_task(),
+            insp.stopped_task(),
+            "focus defaults back to the newly-stopped thread"
+        );
+    }
+}

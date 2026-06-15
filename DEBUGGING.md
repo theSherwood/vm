@@ -49,7 +49,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
 | W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `svm-interp` `find_schedule` / `replay_schedule` / `Witness` |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
-| Multithreaded debugging — drive a `thread.spawn` guest under a fixed schedule, per-thread breakpoints, replay a failing interleaving | **Built — Milestone B slice 1** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
+| Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`) | **Built — Milestone B slice 1–2** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
 | DWARF emission + DAP server | **Missing** | — |
@@ -235,12 +235,16 @@ it — `clock`/`step_target` stay per-vCPU; `thread.spawn` children inherit the 
 cooperative scheduler loop became a **re-entrant `SchedDriver`** that pauses on a debug stop
 (holding the interrupted vCPU's turn intact) and resumes without re-deciding the schedule —
 `run_with_policy` is now its non-pausing wrapper, so the model-checker path is unchanged.
-`stopped_task()` reports which thread is paused; `backtrace`/`read_var`/`read_window` target it.
-Tests (`debug_threads.rs`): a worker breakpoint fires once per spawned thread (distinct vCPUs); a
-W7 race witness replays to the lost update (1) *under the debugger*; single-stepping advances the
-stopped thread one op. *Not yet:* `select_fiber`/explicit thread switching while parked at a stop,
-watchpoints across threads as a headline test, and stepping that crosses a scheduler decision
-point (step-over-a-spawn). Those, plus W1 record/replay, are the rest of Milestone B.
+`stopped_task()` reports which thread is paused. `threads()` lists every live thread and
+`select_task(id)` focuses read-inspection (`backtrace`/`read_var`/`read_window`/`clock`) on **any**
+of them — found wherever the scheduler parks it (runnable / join / wait / spin) — so you can stand
+at a breakpoint in one thread and examine another's stack; the focus resets on the next resume,
+and stepping always drives the *stopped* thread. Tests (`debug_threads.rs`): a worker breakpoint
+fires once per spawned thread (distinct vCPUs); a W7 race witness replays to the lost update (1)
+*under the debugger*; single-stepping advances the stopped thread one op; `select_task` inspects a
+second live thread mid-stop and switches back. *Not yet:* watchpoints across threads as a headline
+test, and stepping that crosses a scheduler decision point (step-over-a-spawn). Those, plus W1
+record/replay, are the rest of Milestone B.
 
 ---
 

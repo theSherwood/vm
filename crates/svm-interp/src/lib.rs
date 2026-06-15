@@ -344,6 +344,11 @@ pub struct Inspector {
     /// fires in whichever thread reaches it — DEBUGGING.md Milestone B). The [`Inspector`] mutates
     /// it through `set_breakpoint`/`set_watchpoint`/`set_cap_call_stops`.
     shared: Arc<Mutex<DebugShared>>,
+    /// Which thread (vCPU) read-inspection (`backtrace`/`read_*`/`clock`) targets in scheduled mode
+    /// (DEBUGGING.md Milestone B `select_fiber`). `None` ⇒ the thread that stopped; `Some(id)` ⇒ a
+    /// thread the user `select_task`ed. Reset to `None` on each resume. Stepping always drives the
+    /// stopped thread, regardless of focus.
+    focus: Option<TaskId>,
     finished: Option<Result<Vec<Value>, Trap>>,
 }
 
@@ -431,6 +436,7 @@ impl Inspector {
             host,
             debug_info: m.debug_info.clone(),
             shared,
+            focus: None,
             finished: None,
         }
     }
@@ -497,6 +503,7 @@ impl Inspector {
             host,
             debug_info: m.debug_info.clone(),
             shared,
+            focus: None,
             finished: None,
         }
     }
@@ -523,6 +530,58 @@ impl Inspector {
         self.sched
             .as_ref()
             .and_then(|s| s.driver.held.as_ref().map(|h| h.v.id))
+    }
+
+    /// Every live thread (vCPU) id, sorted — the stopped thread plus every other thread the
+    /// scheduler is holding (runnable or parked on join/wait/spin). Single-threaded mode reports the
+    /// sole vCPU; once a thread finishes it drops out (only its outcome remains).
+    pub fn threads(&self) -> Vec<u64> {
+        match &self.sched {
+            None => self.cur().map(|v| vec![v.id]).unwrap_or_default(),
+            Some(s) => {
+                let mut ids = s.det.lock().live_ids();
+                // The stopped thread is held *out* of the scheduler, so add it back.
+                if let Some(h) = s.driver.held.as_ref() {
+                    if !ids.contains(&h.v.id) {
+                        ids.push(h.v.id);
+                        ids.sort_unstable();
+                    }
+                }
+                ids
+            }
+        }
+    }
+
+    /// Focus read-inspection (`backtrace`/`read_*`/`clock`) on thread `id` (DEBUGGING.md Milestone B
+    /// `select_fiber`): while stopped, look at *any* live thread, not just the one that hit the
+    /// breakpoint. Returns `false` (leaving the focus unchanged) if `id` is not a live thread.
+    /// Stepping still drives the stopped thread; the focus resets on the next resume.
+    pub fn select_task(&mut self, id: u64) -> bool {
+        if self.threads().contains(&id) {
+            self.focus = Some(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The thread read-inspection currently targets: the `select_task` focus, else the stopped
+    /// (scheduled) or sole (single-threaded) thread.
+    pub fn focused_task(&self) -> Option<u64> {
+        self.focus.or_else(|| self.cur().map(|v| v.id))
+    }
+
+    /// Run `f` against the focused thread's vCPU (the `select_task` target, else the stopped/sole
+    /// thread), resolving it wherever the scheduler parks it. `None` if there is no such live thread.
+    fn with_focused<R>(&self, f: impl FnOnce(&VCpu) -> R) -> Option<R> {
+        match (&self.sched, self.focus) {
+            // A selected thread other than the stopped one lives inside the scheduler.
+            (Some(s), Some(id)) if Some(id) != s.driver.held.as_ref().map(|h| h.v.id) => {
+                s.det.lock().find_vcpu(id).map(f)
+            }
+            // Otherwise it's the stopped (held) / sole vCPU.
+            _ => self.cur().map(f),
+        }
     }
 
     /// Lock the powerbox to inspect host-side effects (e.g. `host().stdout`). Safe while the guest
@@ -588,6 +647,7 @@ impl Inspector {
         if let Some(r) = &self.finished {
             return Stop::Finished(r.clone());
         }
+        self.focus = None; // a `select_task` focus lasts only until the guest moves again
         if self.sched.is_some() {
             return self.pump_sched();
         }
@@ -644,38 +704,42 @@ impl Inspector {
         self.finished.as_ref()
     }
 
-    /// Logical time (DEBUGGING.md S3): ops executed so far on the stopped thread.
+    /// Logical time (DEBUGGING.md S3): ops executed so far on the focused thread ([`select_task`],
+    /// else the stopped/sole thread).
+    ///
+    /// [`select_task`]: Inspector::select_task
     pub fn clock(&self) -> u64 {
-        self.cur()
-            .and_then(|v| v.debug.as_ref())
-            .map(|d| d.clock)
+        self.with_focused(|v| v.debug.as_ref().map(|d| d.clock).unwrap_or(0))
             .unwrap_or(0)
     }
 
-    /// The stopped thread's call stack, innermost frame first. Empty once the guest has finished (or,
-    /// in scheduled mode, before the first stop). Each frame carries its source location when the
-    /// module has debug info (DEBUGGING.md §6/W4).
+    /// The focused thread's call stack, innermost frame first ([`select_task`] chooses the thread;
+    /// by default the stopped/sole one). Empty once the guest has finished (or, in scheduled mode,
+    /// before the first stop). Each frame carries its source location when the module has debug info
+    /// (DEBUGGING.md §6/W4).
+    ///
+    /// [`select_task`]: Inspector::select_task
     pub fn backtrace(&self) -> Vec<FrameInfo> {
-        let Some(v) = self.cur() else {
-            return Vec::new();
-        };
-        v.frames
-            .iter()
-            .rev()
-            .map(|f| {
-                let pc = IrPc {
-                    module: f.module,
-                    func: f.func,
-                    block: f.block,
-                    inst: f.inst,
-                };
-                FrameInfo {
-                    pc,
-                    vals: f.vals.clone(),
-                    source: self.source_loc(pc),
-                }
-            })
-            .collect()
+        self.with_focused(|v| {
+            v.frames
+                .iter()
+                .rev()
+                .map(|f| {
+                    let pc = IrPc {
+                        module: f.module,
+                        func: f.func,
+                        block: f.block,
+                        inst: f.inst,
+                    };
+                    FrameInfo {
+                        pc,
+                        vals: f.vals.clone(),
+                        source: self.source_loc(pc),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
     }
 
     /// The source location of an [`IrPc`], if the module carries debug info (DEBUGGING.md §6/W4).
@@ -703,49 +767,62 @@ impl Inspector {
     /// read for a window variable (its type size); ignored for SSA variables.
     pub fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue> {
         let di = self.debug_info.as_ref()?;
-        let v = self.cur()?;
-        let n = v.frames.len();
-        let idx = n.checked_sub(1 + frame_from_top)?;
-        let frame = v.frames.get(idx)?;
-        // A var belongs to a function; match on the frame's function (module-0 program only).
-        if frame.module != 0 {
-            return None;
-        }
-        let var = di
-            .vars
-            .iter()
-            .find(|v| v.func == frame.func && v.name == name)?;
-        match var.loc {
-            VarLoc::Ssa { value } => frame.vals.get(value as usize).copied().map(VarValue::Value),
-            VarLoc::Window { off } => {
-                // Address = data-SP (block param v0) + off; read `width` raw bytes.
-                let base = as_i64(*frame.vals.first()?).ok()? as u64;
-                let bytes = self
-                    .read_window(base.wrapping_add(off as u64), width)
-                    .ok()?;
-                Some(VarValue::Bytes(bytes))
+        self.with_focused(|v| {
+            let n = v.frames.len();
+            let idx = n.checked_sub(1 + frame_from_top)?;
+            let frame = v.frames.get(idx)?;
+            // A var belongs to a function; match on the frame's function (module-0 program only).
+            if frame.module != 0 {
+                return None;
             }
-        }
+            let var = di
+                .vars
+                .iter()
+                .find(|x| x.func == frame.func && x.name == name)?;
+            match var.loc {
+                VarLoc::Ssa { value } => {
+                    frame.vals.get(value as usize).copied().map(VarValue::Value)
+                }
+                VarLoc::Window { off } => {
+                    // Address = data-SP (block param v0) + off; read `width` raw bytes from *this*
+                    // thread's window (read directly, not via `read_window`, to avoid re-locking).
+                    let base = as_i64(*frame.vals.first()?).ok()? as u64;
+                    let bytes = v
+                        .mem
+                        .as_ref()?
+                        .read_window(base.wrapping_add(off as u64), width)
+                        .ok()?;
+                    Some(VarValue::Bytes(bytes))
+                }
+            }
+        })
+        .flatten()
     }
 
-    /// Read SSA value `value_idx` of the frame `frame_from_top` levels up (0 = innermost). This is
-    /// the S2 `Ssa` resolution: the interpreter holds block-local SSA values by index, so a promoted
-    /// local is a direct lookup — no debug-build mode needed (DEBUGGING.md W6).
+    /// Read SSA value `value_idx` of the frame `frame_from_top` levels up (0 = innermost) of the
+    /// focused thread. This is the S2 `Ssa` resolution: the interpreter holds block-local SSA values
+    /// by index, so a promoted local is a direct lookup — no debug-build mode needed (DEBUGGING.md
+    /// W6).
     pub fn read_ir_value(&self, frame_from_top: usize, value_idx: usize) -> Option<Value> {
-        let v = self.cur()?;
-        let n = v.frames.len();
-        let idx = n.checked_sub(1 + frame_from_top)?;
-        v.frames.get(idx)?.vals.get(value_idx).copied()
+        self.with_focused(|v| {
+            let n = v.frames.len();
+            let idx = n.checked_sub(1 + frame_from_top)?;
+            v.frames.get(idx)?.vals.get(value_idx).copied()
+        })
+        .flatten()
     }
 
-    /// Read `len` bytes from confined window address `addr` (the S2 `Window` resolution + raw
-    /// inspection). Uses the same confinement as a guest load, so an out-of-window read faults
-    /// rather than escaping. Empty if the guest declared no memory.
+    /// Read `len` bytes from confined window address `addr` of the focused thread ([`select_task`])
+    /// — the S2 `Window` resolution + raw inspection. Uses the same confinement as a guest load, so
+    /// an out-of-window read faults rather than escaping. Empty if the guest declared no memory.
+    ///
+    /// [`select_task`]: Inspector::select_task
     pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        match self.cur().and_then(|v| v.mem.as_ref()) {
+        self.with_focused(|v| match v.mem.as_ref() {
             Some(m) => m.read_window(addr, len),
             None => Ok(Vec::new()),
-        }
+        })
+        .unwrap_or(Ok(Vec::new()))
     }
 }
 
@@ -2340,6 +2417,39 @@ struct DetState {
 }
 
 impl DetState {
+    /// Find a **live** vCPU by id wherever the scheduler parks it — runnable, join/wait/spin-parked
+    /// (DEBUGGING.md Milestone B: the debugger inspects any thread while stopped). Finished vCPUs are
+    /// gone (only their [`Outcome`] remains in `results`), so they aren't found here.
+    fn find_vcpu(&self, id: TaskId) -> Option<&VCpu> {
+        if let Some(v) = self.runnable.iter().find(|v| v.id == id) {
+            return Some(v);
+        }
+        if let Some(v) = self.join_waiters.get(&id) {
+            return Some(v);
+        }
+        if let Some(w) = self.wait_waiters.iter().find(|w| w.vcpu.id == id) {
+            return Some(&w.vcpu);
+        }
+        self.spin_waiters
+            .iter()
+            .find(|w| w.vcpu.id == id)
+            .map(|w| &*w.vcpu)
+    }
+
+    /// The ids of every live (not-yet-finished) vCPU the scheduler holds, sorted.
+    fn live_ids(&self) -> Vec<TaskId> {
+        let mut ids: Vec<TaskId> = self
+            .runnable
+            .iter()
+            .map(|v| v.id)
+            .chain(self.join_waiters.keys().copied())
+            .chain(self.wait_waiters.iter().map(|w| w.vcpu.id))
+            .chain(self.spin_waiters.iter().map(|w| w.vcpu.id))
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Move every spin-parked vCPU whose read range `[base, base+width)` overlaps the just-written
     /// `[w_base, w_base+w_width)` back to the runnable set — a write there may have changed the value it
     /// spins on, so it must re-check (it re-parks if still stuck). The interpreter is sequentially
