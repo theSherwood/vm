@@ -36,10 +36,11 @@
 //! import becomes a real OS-thread vCPU over the shared window via a synthesized shim (concurrency in
 //! the VM, DESIGN §1a; the same bytes `wasmtime-wasi-threads` runs — `tests/threads.rs`). Still a
 //! clean [`Error::Unsupported`] (the niche features typical clang output doesn't emit): **narrow**
-//! atomics (`*.atomic.rmw8`/`load16_u`/… — SVM atomics are 32/64-bit only); the `memory.init`/
-//! `data.drop`/`table.*` bulk ops; passive data/element segments; imported table/global/tag; imports
-//! across multiple capability interfaces (incl. wasi:thread/spawn *alongside* capability imports — the
-//! per-thread handle stash); reference types; multi-memory/multi-table.
+//! atomics (`*.atomic.rmw8`/`load16_u`/… — SVM atomics are 32/64-bit only); the `table.*` bulk ops
+//! and passive *element* segments; imported table/global/tag; imports across multiple capability
+//! interfaces (incl. wasi:thread/spawn *alongside* capability imports — the per-thread handle stash);
+//! reference types; multi-memory/multi-table. **Passive data segments + `memory.init`/`data.drop`**
+//! are supported (a constant-offset init unrolls to const-stores of the segment's known bytes).
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
@@ -158,6 +159,11 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut exports: Vec<(String, u32)> = Vec::new();
     let mut mem: Option<wasmparser::MemoryType> = None;
     let mut data: Vec<svm_ir::Data> = Vec::new();
+    // Every data segment's bytes, in declaration order — what `memory.init`/`data.drop` reference by
+    // index (both active and passive count). Active segments are *also* materialized into `data`
+    // (placed at instantiation); passive ones live only here. The bytes are known at transpile time,
+    // so a constant-offset `memory.init` is unrolled into stores of them (no runtime passive store).
+    let mut data_segments: Vec<Vec<u8>> = Vec::new();
     let mut globals: Vec<(ValType, Vec<u8>)> = Vec::new();
     let mut table_size: Option<u64> = None;
     let mut elements: Vec<(u64, Vec<u32>)> = Vec::new(); // (offset, func indices)
@@ -373,8 +379,11 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                                 readonly: false, // wasm linear memory is writable; RO data is a frontend choice
                                 bytes: seg.data.to_vec(),
                             });
+                            data_segments.push(seg.data.to_vec());
                         }
-                        wasmparser::DataKind::Passive => return unsup("passive data segment"),
+                        // A passive segment isn't placed at instantiation; its bytes are kept for
+                        // `memory.init` (lowered to const-stores of them — see `mem_init_op`).
+                        wasmparser::DataKind::Passive => data_segments.push(seg.data.to_vec()),
                     }
                 }
             }
@@ -531,6 +540,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             &body,
             mem64,
             &imports,
+            &data_segments,
             MemGrow {
                 uses_grow,
                 size_cell_off,
@@ -761,6 +771,8 @@ struct Lower<'a> {
     /// Number of imported functions: a wasm function index `< n_imp` is an import (→ `cap.call`), else
     /// a defined function at IR index `idx - n_imp`.
     n_imp: usize,
+    /// Every data segment's bytes by index (active + passive), for `memory.init`/`data.drop`.
+    data_segments: &'a [Vec<u8>],
     /// §12 wasm threads config — the `wasi:thread/spawn` lowering (the spawn import index, the shim,
     /// the unique-tid slot). `spawn_import` is `None` for non-threaded modules.
     threads: ThreadCfg,
@@ -1057,6 +1069,7 @@ fn lower_func(
     body: &wasmparser::FunctionBody,
     mem64: bool,
     imports: &[(u32, u32, FuncType)],
+    data_segments: &[Vec<u8>],
     mg: MemGrow,
     threads: ThreadCfg,
 ) -> Result<Func, Error> {
@@ -1111,6 +1124,7 @@ fn lower_func(
         handle: has_handle.then_some(0),
         imports,
         n_imp,
+        data_segments,
         threads,
     };
     // Initialize declared locals to zero (params already bound to block params), extending `locals`.
@@ -2079,6 +2093,69 @@ fn fill_dynamic(lo: &mut Lower, dest: ValIdx, val: ValIdx, len: ValIdx) -> Resul
     Ok(())
 }
 
+/// `memory.init(data_index, dest, src, len)`: copy `len` bytes from data segment `data_index` —
+/// whose bytes are known at transpile time — into the window at `dest`. The source range `src`/`len`
+/// must be **constant** (the toolchain's `__wasm_init_memory` uses `src = 0`, `len = seg_len`), so the
+/// exact bytes are known and unrolled into chunked const-stores at `dest` (a possibly-runtime
+/// address); a non-constant `src`/`len` is fail-closed (`Unsupported`) — there is no runtime
+/// passive-data store to read from. A static source out-of-bounds (`src + len > seg.len()`, which the
+/// toolchain never emits) is a clean transpile error.
+fn mem_init_op(lo: &mut Lower, data_index: u32) -> Result<(), Error> {
+    let (len_v, _) = lo.pop()?;
+    let (src_v, _) = lo.pop()?;
+    let dest = pop_addr(lo)?;
+    let (Some(src), Some(len)) = (const_bulk_len(lo, src_v), const_bulk_len(lo, len_v)) else {
+        return unsup(
+            "memory.init with a non-constant src/len (only the toolchain's constant-offset \
+             initialization is supported; there is no runtime passive-data store)",
+        );
+    };
+    let seg = lo.data_segments.get(data_index as usize).ok_or_else(|| {
+        Error::Parse(format!(
+            "memory.init references unknown data segment {data_index}"
+        ))
+    })?;
+    let (src, len) = (src as usize, len as usize);
+    let bytes = match src.checked_add(len).filter(|&e| e <= seg.len()) {
+        Some(end) => seg[src..end].to_vec(), // clone to release the borrow on `lo`
+        None => {
+            return Err(Error::Parse(format!(
+                "memory.init source [{src}, {src}+{len}) is out of segment {data_index}'s {} bytes",
+                seg.len()
+            )))
+        }
+    };
+    init_unroll(lo, dest, &bytes);
+    Ok(())
+}
+
+/// Unroll a known byte string into chunked const-stores at `dest` (the inverse of `copy_unroll`:
+/// the source is compile-time bytes, not loads). Mirrors the active-data placement, but at runtime.
+fn init_unroll(lo: &mut Lower, dest: ValIdx, bytes: &[u8]) {
+    for (off, w) in chunk_plan(bytes.len() as u64) {
+        let b = &bytes[off as usize..off as usize + w as usize];
+        let value = match w {
+            8 => lo.emit(Inst::ConstI64(
+                u64::from_le_bytes(b.try_into().unwrap()) as i64
+            )),
+            4 => lo.emit(Inst::ConstI32(
+                u32::from_le_bytes(b.try_into().unwrap()) as i32
+            )),
+            2 => lo.emit(Inst::ConstI32(
+                u16::from_le_bytes(b.try_into().unwrap()) as i32
+            )),
+            _ => lo.emit(Inst::ConstI32(b[0] as i32)),
+        };
+        lo.emit_void(Inst::Store {
+            op: store_w(w),
+            addr: dest,
+            value,
+            offset: off,
+            align: 0,
+        });
+    }
+}
+
 /// `memory.copy(dest, src, len)`: copy `len` bytes (overlap-safe, like memmove). A constant `len`
 /// loads every chunk before storing any (overlap-safe); a runtime `len` lowers to a direction-correct
 /// byte loop.
@@ -2459,6 +2536,21 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
                 return unsup("memory.copy on a non-zero memory");
             }
             mem_copy_op(lo)?;
+        }
+        O::MemoryInit { data_index, mem } => {
+            if mem != 0 {
+                return unsup("memory.init on a non-zero memory");
+            }
+            mem_init_op(lo, data_index)?;
+        }
+        O::DataDrop { data_index } => {
+            if (data_index as usize) >= lo.data_segments.len() {
+                return unsup("data.drop of an unknown data segment");
+            }
+            // No-op: a passive segment's bytes are inlined at each `memory.init` site (so there is
+            // nothing to free), and the toolchain's `__wasm_init_memory` drops only *after* its inits.
+            // (A `memory.init` of an already-dropped segment would diverge — it would still copy — but
+            // toolchain output never re-inits after a drop; the §1a "not the spec suite" stance.)
         }
         // ---- floats: const / arithmetic / unary / compare ----
         O::F32Const { value } => {

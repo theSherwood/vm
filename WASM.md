@@ -77,9 +77,18 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   import degrades to `cap.call` + `return` (correct, not tail-optimized; wasi:thread/spawn rejected).
   `tests/tailcall.rs`: 200k-deep tail recursion (would overflow a non-tail call), table dispatch,
   mutual even/odd recursion.
-- [ ] **Passive data/element segments + the rest of bulk memory**: `memory.init`, `data.drop`,
-  `elem.drop`, `table.init`, `table.copy`, `table.fill`, `table.grow`, `table.size`. (Only
-  `memory.copy`/`memory.fill` done.) clang `-O2` occasionally emits `memory.init` for large data.
+- [x] **Passive *data* segments + `memory.init`/`data.drop` — DONE.** A passive segment's bytes are
+  known at transpile time, so a **constant-offset** `memory.init` (the toolchain's `__wasm_init_memory`
+  shape: `src = 0`, `len = seg_len`, a possibly-runtime `dest`) unrolls into chunked const-stores of
+  those bytes — reusing the `memory.copy`/`fill` machinery, no IR/runtime change. `data.drop` is a
+  no-op (bytes are inlined at the init site). A non-constant `src`/`len` is fail-closed `Unsupported`
+  (no runtime passive-data store); a static source-OOB is a clean transpile error. `tests/bulk.rs`
+  (passive + active segments, partial range, runtime dest, multi-segment indexing, dynamic-len reject).
+- [ ] **The *table* bulk ops + passive *element* segments**: `elem.drop`, `table.init`, `table.copy`,
+  `table.fill`, `table.grow`, `table.size`. Need a **mutable runtime table** (a size cell + funcref
+  stores into the table region), unlike the memory side. Lower audience — C/Rust WASI output uses
+  *active* elem segments (already supported); passive elem + `table.init` shows up mainly with
+  reference-types / dynamic linking.
 - [ ] **Reference types**: `externref`/`funcref` as values, `table.get`/`set`/`grow`/`size`/`fill`,
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
@@ -132,7 +141,8 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
    mechanism for "host provides arbitrary capabilities, guest uses them"; the single biggest
    real-program blocker. (WASI *semantics* stay ⚪ — a host binds its own caps to whatever names.)
 3. **Tail calls** 🟡 — common LLVM output, likely near-free (IR terminators exist).
-4. **Passive segments + `memory.init`/`table.*` bulk ops** 🟡 — moderate, evidence-driven.
+4. **Passive *data* segments + `memory.init`/`data.drop`** 🟡 — DONE. (The *table* bulk ops + passive
+   *element* segments remain — they need a mutable runtime table; lower audience.)
 5. **Reference types** 🟡 (externref→handle, funcref→index), then the **SIMD remainder** 🟡 (breadth),
    then **narrow-atomic CAS-loop** 🟡.
 6. EH, relaxed SIMD, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
