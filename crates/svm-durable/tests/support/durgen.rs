@@ -135,33 +135,23 @@ fn gen_straightline(g: &mut Gen, insts: &mut Vec<Inst>, i64_vals: &mut Vec<u32>,
     }
 }
 
-/// Build one `func (i32) -> (i64)`: a randomized i64 prefix, the `suspend` op(s) (each i64
-/// result chained into the accumulator, so every saved/reloaded value is exercised), and a
-/// `return`. The single param `v0` is the clock handle, threaded as the call/`cap.call`
-/// argument.
-fn gen_func(g: &mut Gen, suspend: Suspend) -> Func {
-    let mut insts: Vec<Inst> = Vec::new();
-    let mut i64_vals: Vec<u32> = Vec::new();
-    let mut next: u32 = 1; // v0 is the i32 handle param
-
-    // Prefix: a few i64 consts / total binops (live across the suspend op for a wrapper).
-    let mut acc = {
-        // seed the accumulator with a const so the chain always has something to fold into
-        insts.push(Inst::ConstI64(g.u64v() as i64));
-        let c = next;
-        next += 1;
-        i64_vals.push(c);
-        c
-    };
-    gen_straightline(g, &mut insts, &mut i64_vals, &mut next, acc);
-    acc = *i64_vals.last().unwrap();
-
-    match suspend {
+/// Append the suspend op(s) + their folding/suffix to `insts`, given the handle at value
+/// index 0 and a starting accumulator `acc`. Returns the final accumulator. Each op's i64
+/// result is folded into `acc`, so every saved/reloaded value is exercised.
+fn emit_suspend_body(
+    g: &mut Gen,
+    suspend: &Suspend,
+    insts: &mut Vec<Inst>,
+    i64_vals: &mut Vec<u32>,
+    next: &mut u32,
+    mut acc: u32,
+) -> u32 {
+    match *suspend {
         Suspend::Cap { npoints } => {
             for _ in 0..npoints {
                 insts.push(Inst::ConstI32(g.u64v() as i32)); // the i32 clock arg
-                let arg = next;
-                next += 1;
+                let arg = *next;
+                *next += 1;
                 insts.push(Inst::CapCall {
                     type_id: CLOCK_TYPE_ID,
                     op: CLOCK_OP,
@@ -169,41 +159,88 @@ fn gen_func(g: &mut Gen, suspend: Suspend) -> Func {
                     handle: 0,
                     args: vec![arg],
                 });
-                let cap_result = next;
-                next += 1;
+                let cap_result = *next;
+                *next += 1;
                 i64_vals.push(cap_result);
-                // fold this point's result in, then a short suffix using it
                 insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b: cap_result });
-                acc = next;
-                next += 1;
+                acc = *next;
+                *next += 1;
                 i64_vals.push(acc);
-                gen_straightline(g, &mut insts, &mut i64_vals, &mut next, acc);
+                gen_straightline(g, insts, i64_vals, next, acc);
                 acc = *i64_vals.last().unwrap();
             }
         }
         Suspend::Call(callee) => {
             insts.push(Inst::Call { func: callee, args: vec![0] }); // pass the handle down
-            let call_result = next;
-            next += 1;
+            let call_result = *next;
+            *next += 1;
             i64_vals.push(call_result);
             insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b: call_result });
-            acc = next;
-            next += 1;
+            acc = *next;
+            *next += 1;
             i64_vals.push(acc);
-            gen_straightline(g, &mut insts, &mut i64_vals, &mut next, acc);
+            gen_straightline(g, insts, i64_vals, next, acc);
             acc = *i64_vals.last().unwrap();
         }
     }
+    acc
+}
 
-    Func {
-        params: vec![ValType::I32],
-        results: vec![ValType::I64],
-        blocks: vec![Block {
+/// Build one `func (i32) -> (i64)`. The single param `v0` is the clock handle, threaded as
+/// the call/`cap.call` argument. When `split`, the prefix lands in the entry block and the
+/// suspend body in a *non-entry* block (reached by an unconditional branch carrying the
+/// handle + accumulator as block params) — exercising the multi-block transform: the live
+/// values cross as branch args and must be spilled/reloaded, not recovered from the entry.
+fn gen_func(g: &mut Gen, suspend: Suspend, split: bool) -> Func {
+    if !split {
+        let mut insts: Vec<Inst> = Vec::new();
+        let mut i64_vals: Vec<u32> = Vec::new();
+        let mut next: u32 = 1; // v0 is the i32 handle param
+        insts.push(Inst::ConstI64(g.u64v() as i64)); // seed the accumulator
+        let mut acc = 1;
+        next += 1;
+        i64_vals.push(acc);
+        gen_straightline(g, &mut insts, &mut i64_vals, &mut next, acc);
+        acc = *i64_vals.last().unwrap();
+        acc = emit_suspend_body(g, &suspend, &mut insts, &mut i64_vals, &mut next, acc);
+        return Func {
             params: vec![ValType::I32],
-            insts,
-            term: Terminator::Return(vec![acc]),
-        }],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![ValType::I32],
+                insts,
+                term: Terminator::Return(vec![acc]),
+            }],
+        };
     }
+
+    // Entry block: prefix → accumulator, then branch to block1 carrying [handle, acc].
+    let mut b0: Vec<Inst> = Vec::new();
+    let mut i64_vals = vec![1u32];
+    let mut next = 2u32; // v0 = handle param, v1 = the seed const below
+    b0.push(Inst::ConstI64(g.u64v() as i64));
+    let mut acc = 1u32;
+    gen_straightline(g, &mut b0, &mut i64_vals, &mut next, acc);
+    acc = *i64_vals.last().unwrap();
+    let entry = Block {
+        params: vec![ValType::I32],
+        insts: b0,
+        term: Terminator::Br { target: 1, args: vec![0, acc] },
+    };
+
+    // block1(handle: i32, acc: i64): the suspend body, then return. Value indices restart:
+    // v0 = handle, v1 = acc.
+    let mut b1: Vec<Inst> = Vec::new();
+    let mut i64_vals = vec![1u32];
+    let mut next = 2u32;
+    let acc1 = emit_suspend_body(g, &suspend, &mut b1, &mut i64_vals, &mut next, 1);
+    let body = Block {
+        params: vec![ValType::I32, ValType::I64],
+        insts: b1,
+        term: Terminator::Return(vec![acc1]),
+    };
+
+    Func { params: vec![ValType::I32], results: vec![ValType::I64], blocks: vec![entry, body] }
 }
 
 /// Build an in-scope durable module: a call chain `func0 → func1 → … → leaf`, of a
@@ -220,7 +257,10 @@ pub fn gen_module(g: &mut Gen) -> Module {
             } else {
                 Suspend::Call(i + 1)
             };
-            gen_func(g, suspend)
+            // ~half the functions split their body across two blocks, so the suspend op
+            // lands in a non-entry block (multi-block segmentation + branch remapping).
+            let split = g.below(2) == 0;
+            gen_func(g, suspend, split)
         })
         .collect();
 

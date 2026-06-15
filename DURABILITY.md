@@ -284,15 +284,18 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   word + `br_table` rewind reconstructs a frozen single-vCPU domain bytewise, and the
   thawed run reloads the saved `cap.call` result rather than re-issuing it.
   - **Landed:** the `svm-durable` tooling-tier crate (+0 TCB, depends only on
-    `svm-ir`); the IR→IR transform for the canonical shape (single block, single
-    `cap.call`, `return`); the §12.7 frame layout; the round-trip + inert-instrumentation
-    + verifier tests.
-  - **Remaining Phase-1 work** (mechanical extensions): multi-block CFGs (today a single
-    block); minimal live-set instead of the current over-capture. *(Done: call-chain
-    propagation — the non-deepest re-issue rewind path, R8 below; and **multiple resume
-    points per function** — the block is split at each may-suspend op into forward
-    segments with a `br_table` arm per point, `tests/multipoint.rs` + the generator now
-    emits multi-point leaves, exercised by `durable_fuzz` / `durable_jit`.)*
+    `svm-ir`); the IR→IR transform — now covering **arbitrary single-/multi-block CFGs**
+    (branches, loops, joins) with **any number of resume points** across **call chains**
+    (leaf `cap.call` reload vs. propagated `Call` re-issue, R8); the §12.7 frame layout;
+    round-trip + inert-instrumentation + verifier tests (`tests/roundtrip.rs`,
+    `chain.rs`, `multipoint.rs`, `multiblock.rs`), plus the interp (`durable_fuzz`) and
+    cross-backend interp-vs-JIT (`durable_jit`) generative properties over a generator
+    that emits multi-frame, multi-point, multi-block modules.
+  - **Remaining Phase-1 work**: minimal live-set instead of the current over-capture (an
+    optimization — correctness is unaffected). The structural extensions (call-chain
+    propagation, multiple resume points, multi-block CFGs) are **done**. Out of scope and
+    rejected/ignored: `call_indirect` (and indirect tail calls) to may-suspend targets;
+    direct tail calls into may-suspend callees.
   - **Hazards introduced by the as-built transform: R8–R11 (§11).** Notably R9 —
     **do not run real guests through the Phase-1 transform** (the durable region at
     `[0, SHADOW_BASE)` is unenforced).
