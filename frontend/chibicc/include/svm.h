@@ -15,6 +15,44 @@
 #ifndef __SVM_H
 #define __SVM_H
 
+// --- §7 capability handles & arbitrary host capabilities (late binding) --------------------
+//
+// `__vm_cap(i)` returns the i-th powerbox capability **handle** the runtime granted `_start`.
+// Pass it as the first argument of a capability call. The indices:
+#define VM_CAP_STDOUT 0
+#define VM_CAP_STDIN 1
+#define VM_CAP_EXIT 2
+#define VM_CAP_MEMORY 3
+#define VM_CAP_ADDRSPACE 4
+#define VM_CAP_IORING 5
+#define VM_CAP_BLOCKING 6
+#define VM_CAP_JIT 7
+int __vm_cap(int i);
+//
+// **Reflection** (§7): discover what the host actually granted *this* domain — read-only and
+// authority-neutral (it only re-surfaces handles you already hold). `__vm_cap_count()` is how many
+// capabilities you hold; `__vm_cap_at(i, &type_id)` returns the i-th one's handle (usable directly
+// as a capability call's first argument) and writes its interface type_id. So runtime code can
+// enumerate, introspect, and use its capabilities without the host telling it in advance:
+//
+//     for (int i = 0, n = __vm_cap_count(); i < n; i++) {
+//       int type_id; int h = __vm_cap_at(i, &type_id);
+//       /* ... dispatch on type_id, call ops on h ... */
+//     }
+int __vm_cap_count(void);
+int __vm_cap_at(int i, int *type_id_out);
+//
+// **Using an arbitrary host capability** (§7 late binding): declare it as a plain `extern` whose
+// FIRST parameter is the capability handle (an `int`), then call it. The frontend lowers any call
+// to an undefined `extern` (that isn't one of the builtins in this header) to a named import; the
+// host binds the name to a concrete interface operation at load (see `default_cap_resolver`). So a
+// new capability needs no frontend change — just an `extern` and a host that knows the name. E.g.:
+//
+//     extern long now(int clock_handle, int clock_id);   // host maps "now" -> (Clock, op 0)
+//     long t = now(__vm_cap(/* a granted Clock handle */), 0);
+//
+// An unknown name is a clean load error (fail-closed), never a silent no-op.
+
 // --- §13/§14 SharedRegion (guest-minted, shareable, multi-offset-mappable) -----------------
 //
 // Mint a fresh zero-filled region of `len` bytes from the AddressSpace capability; returns a region

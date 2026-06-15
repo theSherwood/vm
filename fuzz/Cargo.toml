@@ -23,6 +23,7 @@ svm-durable = { path = "../crates/svm-durable" }
 svm-run = { path = "../crates/svm-run" } # production cap.call thunk, for irgen's Memory-cap success path
 svm-mask = { path = "../crates/svm-mask" }
 svm-text = { path = "../crates/svm-text" }
+svm-wasm = { path = "../crates/svm-wasm" } # untrusted core-wasm frontend, fuzzed for fail-closed decode
 
 [[bin]]
 name = "decode_verify"
@@ -62,6 +63,13 @@ bench = false
 [[bin]]
 name = "durable_jit"
 path = "fuzz_targets/durable_jit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wasm_transpile"
+path = "fuzz_targets/wasm_transpile.rs"
 test = false
 doc = false
 bench = false

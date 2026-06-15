@@ -26,8 +26,19 @@ use svm_interp::{run_scheduled, run_with_host, Host, StreamRole, Trap, Value};
 use svm_ir::ValType;
 use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind};
 use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§9)
-use svm_text::parse_module;
+use svm_text::parse_module as parse_module_raw;
 use svm_verify::verify_module;
+
+/// Parse frontend (chibicc) text IR and resolve its §7 named capability imports under the
+/// reference host policy ([`svm_run::resolve_capability_imports`]). The frontend now emits
+/// `call.import "<name>"` for capabilities instead of inline `cap.call`, so every harness parses
+/// through this — the *resolved* (import-free) module is what verifies and runs. A no-op for
+/// hand-written test IR that has no imports; an unresolved name is a frontend bug, so it panics.
+fn parse_module(ir: &str) -> Result<svm_ir::Module, svm_text::ParseError> {
+    let m = parse_module_raw(ir)?;
+    Ok(svm_run::resolve_capability_imports(m)
+        .unwrap_or_else(|e| panic!("resolve capability imports: {e}")))
+}
 
 fn to_slot(v: Value) -> i64 {
     match v {
@@ -2487,4 +2498,61 @@ fn c_guest_async_work_stealing() {
         "interp total must be Σ mix(i) for i in 0..16"
     );
     assert_eq!(jit, expected, "jit total must be Σ mix(i) for i in 0..16");
+}
+
+/// §7 slice 3b — a brand-new host capability reached as a plain `extern`, no frontend special-case.
+/// chibicc's builtins are `__vm_*`, but the host policy keys are `vm_*`, so `vm_page_size` is *not*
+/// a recognized builtin: it flows through the GENERIC undefined-extern → `call.import` path, with
+/// the capability handle obtained via `__vm_cap`. The default policy still binds the name to
+/// (Memory, page_size), so the generic-import result must equal the hardcoded `__vm_page_size()`
+/// builtin — proving the late-binding extern path is correct end-to-end (frontend + host + run).
+#[test]
+fn generic_extern_capability_import_equals_builtin() {
+    let src = r#"
+        extern long vm_page_size(int h);   /* undefined extern -> call.import "vm_page_size" */
+        long __vm_page_size(void);         /* recognized builtin -> inline Memory.page_size  */
+        int __vm_cap(int i);
+        int main(void) {
+          long viaextern  = vm_page_size(__vm_cap(3)); /* slot 3 = the Memory handle */
+          long viabuiltin = __vm_page_size();
+          return (viaextern == viabuiltin && viaextern > 0) ? 42 : 0;
+        }
+    "#;
+    assert_eq!(
+        i32_of(src),
+        42,
+        "the generic extern-import path must equal the hardcoded builtin"
+    );
+}
+
+/// §7 reflection from C: a guest enumerates the capabilities its host granted and introspects each
+/// one's interface type_id — `__vm_cap_count` / `__vm_cap_at` (`cap.self.count`/`cap.self.get`).
+/// Interp-only (the JIT bails `Unsupported` on `cap.self.*`, like fibers). The c_frontend powerbox
+/// grants 8 capabilities with exactly one Exit (type_id 1), so `n*100 + exits == 801`.
+#[test]
+fn reflection_enumerates_granted_capabilities() {
+    let src = r#"
+        int __vm_cap_count(void);
+        int __vm_cap_at(int i, int *type_id_out);
+        int main(void) {
+          int n = __vm_cap_count();
+          int exits = 0;
+          for (int i = 0; i < n; i++) {
+            int t;
+            __vm_cap_at(i, &t);
+            if (t == 1) exits++;   /* iface::EXIT == 1 */
+          }
+          return n * 100 + exits;  /* 8 capabilities, exactly one Exit -> 801 */
+        }
+    "#;
+    match run_c_interp(src).outcome {
+        Outcome::Returned(v) => {
+            assert_eq!(
+                v,
+                vec![Value::I32(801)],
+                "8 capabilities granted, exactly one Exit"
+            )
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
 }

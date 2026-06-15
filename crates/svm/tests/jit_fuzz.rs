@@ -13,6 +13,25 @@ mod irgen;
 
 use irgen::{fuzz_one, Gen};
 
+/// Byte inputs that once crashed the libFuzzer `diff` target, pinned so a regression can't
+/// silently return. Each drives the *same* `fuzz_one` the libFuzzer target does (via
+/// `Gen::from_bytes`), so a divergence here is the original miscompile resurfacing.
+///
+/// - `[0xad, 0xa9, 0xac]`: a `cap.call` to the Jit interface (type_id 11) with an out-of-range
+///   op-index (207). The interpreter faults (`CapFault`, the generic-dispatch path), but
+///   `svm-run`'s `jit_native_op` catch-all used to return `-EINVAL` as a value and clear the
+///   trap cell, so the JIT *returned* — an interp↔JIT divergence on the cap.call trap path.
+///   Fixed by faulting on an unknown Jit op (§3c: an out-of-range op-index traps).
+const DIFF_REGRESSIONS: &[&[u8]] = &[&[0xad, 0xa9, 0xac]];
+
+#[test]
+fn jit_matches_interp_on_pinned_regressions() {
+    for bytes in DIFF_REGRESSIONS {
+        let mut g = Gen::from_bytes(bytes);
+        fuzz_one(&mut g);
+    }
+}
+
 #[test]
 fn jit_matches_interp_on_generated_modules() {
     // Windows charges every committed page against the system commit limit (no overcommit like

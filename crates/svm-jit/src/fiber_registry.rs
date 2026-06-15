@@ -124,6 +124,15 @@ impl Ownership {
     /// **Acquire** on success: the winner synchronizes-with the releasing suspend
     /// ([`Self::suspend_to_pool`]/[`Self::pin`]) and observes the complete saved stack context —
     /// the load-bearing edge that makes a *cross-thread* resume of the saved native stack sound.
+    ///
+    /// # Precondition (ABA): only sound while slots are **not recycled**
+    /// Because the generation is taken from the *current* word, `claim` is **not** ABA-safe: a stale
+    /// caller presents no recorded generation for the CAS to reject. This is fine **only** while a slot
+    /// is never reused for a different fiber — the live arrangement today ([`SharedFiberTable`] is
+    /// push-only; [`Self::recycle_owned`] is unwired). The instant slot recycling is enabled, the
+    /// resume-by-handle path **must** switch to a generation-checked claim ([`Self::try_steal`]-style,
+    /// with generation-carrying guest handles), or a stale handle could claim a *recycled* fiber. See
+    /// [`Self::recycle_owned`] and the `claim_ignores_a_stale_generation` characterization test.
     pub(crate) fn claim(&self) -> bool {
         let w = self.word.load(Ordering::Relaxed);
         if state_of(w) != OWNED && state_of(w) != RUNNABLE {
@@ -192,6 +201,11 @@ impl Ownership {
 
     /// Reuse a `FREE` slot for a **new** fiber: `FREE → OWNED`, keeping the (already-bumped)
     /// generation so stale stealers of the *previous* occupant remain locked out (the ABA guard).
+    ///
+    /// **Wiring precondition:** enabling this on the live path is unsound while the resume-by-handle
+    /// front end is [`Self::claim`] (which re-reads the generation and so cannot reject a stale
+    /// handle to a recycled slot — see `claim`'s ABA precondition). Recycling must land *together*
+    /// with generation-carrying handles and a generation-checked claim ([`Self::try_steal`]).
     #[allow(dead_code)] // staged: slot recycling lands with generation-carrying handles on both backends
     pub(crate) fn recycle_owned(&self) {
         let w = self.word.load(Ordering::Relaxed);
@@ -301,6 +315,30 @@ mod tests {
         );
         // The correct generation still works.
         assert!(o.try_steal(g1), "the current generation steals normally");
+    }
+
+    /// **Characterization of `claim`'s ABA precondition (finding C1).** Unlike [`Ownership::try_steal`],
+    /// the resume-by-handle [`Ownership::claim`] takes the generation from the *current* word, so it
+    /// does **not** reject a caller holding a stale view. This test pins that root-cause behaviour: once
+    /// a slot is finished (generation bumped) and `recycle_owned`'d for a new fiber, `claim` succeeds on
+    /// the *new* occupant with no regard for the old generation. That is exactly why `claim` is sound
+    /// **only** while slots are push-only (the live arrangement), and why enabling `recycle_owned` on
+    /// the live path must come with a generation-checked claim. If this assertion ever needs to change,
+    /// it is because the resume path gained a generation check — update `claim`'s precondition doc too.
+    #[test]
+    fn claim_ignores_a_stale_generation() {
+        let o = Ownership::new_owned(); // fiber A, gen 0
+        assert!(o.begin_owned());
+        o.finish(); // A done → FREE, gen → 1
+        o.recycle_owned(); // slot reused for fiber B, gen 1 (the staged recycling primitive)
+        assert_eq!(o.generation(), 1);
+        // `claim` does not carry/record a generation, so it claims B regardless of any stale (gen-0)
+        // view a caller might hold — the unsafety the precondition guards against once recycling lands.
+        assert!(
+            o.claim(),
+            "claim takes the generation from the current word, so it claims the recycled fiber"
+        );
+        assert_eq!(o.state(), RUNNING);
     }
 }
 

@@ -86,6 +86,15 @@ const WASM_PAGE: u64 = 1 << 16;
 /// `wasmtime-wasi-threads` expects, so the same bytes run on both engines.
 const WASI_THREAD_MODULE: &str = "wasi";
 const WASI_THREAD_SPAWN_NAME: &str = "thread-spawn";
+/// Sentinel `type_id` marking a **§7 named import** in the internal `imports` table (one whose
+/// `module`/`name` are *not* the numeric host-ABI convention — e.g. a real WASI import like
+/// `("wasi_snapshot_preview1", "fd_write")`). Such an import lowers to an `Inst::CallImport` (the
+/// `op` field carries its index into the module's import table) rather than an inline `cap.call`; the
+/// embedder resolves the name to a concrete `(type_id, op)` at load (e.g. an `svm-wasi` shim). It is
+/// distinct from the `wasi:thread/spawn` placeholder (`u32::MAX`) and, being `!= u32::MAX`, it counts
+/// as a handle-using capability import in the existing one-handle / one-interface checks — so all
+/// named imports share the single threaded handle (the host grants one capability behind them).
+const NAMED_IMPORT: u32 = u32::MAX - 1;
 /// The export the host calls on a freshly spawned thread: `(func (param $tid i32) (param $start_arg
 /// i32))`. The synthesized spawn shim adapts SVM's `(i64 sp, i64 arg)` thread-entry ABI to it.
 const WASI_THREAD_START_EXPORT: &str = "wasi_thread_start";
@@ -143,6 +152,18 @@ fn val_type(w: W) -> Result<ValType, Error> {
 /// the size cell only governs the `size`/`grow` *return values*. A module that never grows is
 /// unchanged (no cell, the tight initial-sized window, `memory.size` a constant).
 pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
+    // Fail-closed on malformed / invalid wasm *before* any lowering. The lowering pass below indexes
+    // attacker-controlled type/function/global/local/table/branch indices and derives operand-stack
+    // heights straight from the byte stream; on hostile-but-decodable input those raw `[...]` accesses
+    // and `len() - k` subtractions would panic, and an oversized locals/table declaration would
+    // allocate unboundedly (a host-side OOM / `abort`). A full validation pass up front guarantees wasm
+    // validity — in-range indices, well-typed and arity-correct operands, and wasmparser's
+    // implementation limits (≤50 000 locals/function, ≤10 000 000 table entries, …) — so every such
+    // hostile input becomes a clean `Error` here instead. The default feature set covers exactly the
+    // proposals we lower (mutable-global, bulk-memory, SIMD, threads, multi-value, …); anything we do
+    // not support is still rejected later by an `Unsupported` bail or, ultimately, the IR verifier.
+    wasmparser::Validator::new().validate_all(wasm)?;
+
     let mut types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
     let mut func_type_idx: Vec<u32> = Vec::new();
     let mut bodies: Vec<wasmparser::FunctionBody> = Vec::new();
@@ -156,9 +177,17 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                                                          // convention (`module` = decimal type_id, `name` = decimal op) and lowers to a `cap.call`. The
                                                          // function index space puts imports first, so a wasm index `< imports.len()` is an import.
     let mut imports: Vec<(u32, u32, FuncType)> = Vec::new();
+    // §7 named imports (non-numeric module/name, e.g. real WASI): the module-level import table the
+    // `Inst::CallImport`s reference, resolved to concrete capabilities at load. Empty for the numeric
+    // host-ABI convention. Parallel to `imports` (a `NAMED_IMPORT` entry's `op` indexes this).
+    let mut named_imports: Vec<svm_ir::Import> = Vec::new();
     // §12 wasm threads: the wasm function index of the `wasi:thread/spawn` import, if present. Its
     // `call` lowers to `thread.spawn` (not a cap.call); see the spawn-shim synthesis.
     let mut spawn_import: Option<u32> = None;
+    // The `(start $f)` function index, if the module has a start section: it runs once at
+    // instantiation, before any export. SVM has no instantiation hook (a run calls one entry over a
+    // fresh window), so each export is wrapped to run `start` first — see the start-wrapper synthesis.
+    let mut start: Option<u32> = None;
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -219,26 +248,24 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                         imports.push((u32::MAX, 0, sig)); // placeholder (type_id unused; never cap-called)
                         continue;
                     }
-                    // The binding convention: `module` is the decimal capability type_id and `name`
-                    // the decimal op. This keeps the transpiler pure mechanism — it never interprets
-                    // the host semantics; the embedder grants the matching capability and the
-                    // (type_id, op) just select an interface/method. A non-numeric name is a clear
-                    // error rather than a silent mis-binding.
-                    let type_id: u32 = imp.module.parse().map_err(|_| {
-                        Error::Unsupported(format!(
-                            "import module {:?} is not a decimal capability type_id (the host-ABI \
-                             convention: module = type_id, name = op)",
-                            imp.module
-                        ))
-                    })?;
-                    let op: u32 = imp.name.parse().map_err(|_| {
-                        Error::Unsupported(format!(
-                            "import name {:?} is not a decimal capability op (the host-ABI \
-                             convention: module = type_id, name = op)",
-                            imp.name
-                        ))
-                    })?;
-                    imports.push((type_id, op, sig));
+                    // The binding convention has two forms. (a) **Numeric**: `module` is the decimal
+                    // capability type_id and `name` the decimal op — a pure-mechanism inline
+                    // `cap.call` (the transpiler never interprets host semantics). (b) **Named** (§7):
+                    // anything else (e.g. a real WASI `("wasi_snapshot_preview1", "fd_write")`) becomes
+                    // a `CallImport "<module>.<name>"` the embedder resolves to a concrete capability
+                    // at load — so the transpiler still stays pure mechanism, just deferring the bind.
+                    match (imp.module.parse::<u32>(), imp.name.parse::<u32>()) {
+                        (Ok(type_id), Ok(op)) => imports.push((type_id, op, sig)),
+                        _ => {
+                            let name = format!("{}.{}", imp.module, imp.name);
+                            let idx = named_imports.len() as u32;
+                            named_imports.push(svm_ir::Import {
+                                name,
+                                sig: sig.clone(),
+                            });
+                            imports.push((NAMED_IMPORT, idx, sig));
+                        }
+                    }
                 }
                 // v1 threads a single capability handle, so every **capability** import must share one
                 // type_id (one interface, methods distinguished by op); the `wasi:thread/spawn` import
@@ -362,6 +389,10 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                         wasmparser::DataKind::Passive => return unsup("passive data segment"),
                     }
                 }
+            }
+            Payload::StartSection { func, .. } => {
+                // At most one start section per spec; record it (run via the per-export wrappers below).
+                start = Some(func);
             }
             _ => {} // version header, custom sections, datacount, ends, etc. — ignore
         }
@@ -531,6 +562,35 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         funcs.push(build_spawn_shim(wts));
     }
 
+    // `(start $f)`: run the start function once before any export. SVM has no instantiation hook (a
+    // run calls one entry over a fresh window, with data/element segments already materialized), so
+    // each **exported** function is remapped to a synthesized wrapper that calls `start` then the real
+    // export. Internal `call`s (by function index) still reach the real export directly, so `start`
+    // runs exactly once, before the chosen entry — and a non-`(start)` module is unchanged.
+    if let Some(start_wasm) = start {
+        let n_imp = imports.len() as u32;
+        let start_ir = start_wasm.checked_sub(n_imp).ok_or_else(|| {
+            Error::Unsupported("start function is an import (must be a defined function)".into())
+        })?;
+        let (sp, sr) = func_sigs.get(start_ir as usize).ok_or_else(|| {
+            Error::Parse(format!("start function index {start_wasm} out of range"))
+        })?;
+        if !sp.is_empty() || !sr.is_empty() {
+            return unsup("start function must have type () -> ()");
+        }
+        let has_handle = imports.iter().any(|(t, _, _)| *t != u32::MAX);
+        for (_, ir_idx) in exports.iter_mut() {
+            if *ir_idx == start_ir {
+                continue; // exporting the start function itself: don't double-run it
+            }
+            let params = funcs[*ir_idx as usize].params.clone();
+            let results = funcs[*ir_idx as usize].results.clone();
+            let wrap = build_start_wrapper(start_ir, *ir_idx, params, results, has_handle);
+            *ir_idx = funcs.len() as u32;
+            funcs.push(wrap);
+        }
+    }
+
     // Our window is a power-of-two byte range (masking confines to it); size it to hold the linear
     // memory (its full growable span) **and** the size cell + globals + function-table regions. (wasm
     // bounds-checks-and-traps on out-of-range access while we mask-confine to the ≥ power-of-two
@@ -556,6 +616,9 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             funcs,
             memory,
             data,
+            // §7 named imports (real WASI etc.): the host resolves these to concrete capabilities at
+            // load (`resolve_imports`). Empty for the numeric host-ABI convention (inline `cap.call`).
+            imports: named_imports,
         },
         exports,
     })
@@ -940,6 +1003,45 @@ fn build_spawn_shim(wts: u32) -> Func {
     }
 }
 
+/// Synthesize a start wrapper for an exported function (`(start $f)` support): a function with the
+/// **same IR signature** as `target` that first calls `start` (which is `() -> ()` in wasm, so
+/// `(handle?) -> ()` here) and then `target` with all params, returning its results. The embedder
+/// runs this in place of the bare export, so the start function runs once before the entry; internal
+/// calls reach `target` directly and don't re-run it.
+fn build_start_wrapper(
+    start_ir: u32,
+    target: u32,
+    params: Vec<ValType>,
+    results: Vec<ValType>,
+    has_handle: bool,
+) -> Func {
+    let nparams = params.len() as ValIdx;
+    let insts = vec![
+        // call start() — thread the handle if the module has capability imports (start produces no
+        // value, so it doesn't advance the value counter).
+        Inst::Call {
+            func: start_ir,
+            args: if has_handle { vec![0] } else { vec![] },
+        },
+        // call the real export with every param in order (handle? ++ wasm params = values 0..nparams);
+        // its results land at values nparams.. .
+        Inst::Call {
+            func: target,
+            args: (0..nparams).collect(),
+        },
+    ];
+    let ret: Vec<ValIdx> = (nparams..nparams + results.len() as ValIdx).collect();
+    Func {
+        params: params.clone(),
+        results,
+        blocks: vec![Block {
+            params,
+            insts,
+            term: Terminator::Return(ret),
+        }],
+    }
+}
+
 /// Block-type → (param types, result types).
 fn block_sig(
     bt: BlockType,
@@ -1291,16 +1393,26 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
         args.reverse(); // stack top is the last argument
         let handle = lo.handle.expect("import call requires a threaded handle");
         let results = sig.results.clone();
-        let res = lo.emit_call(
+        // §7 named import (`type_id == NAMED_IMPORT`): emit a `CallImport` (the host binds the name to
+        // a concrete capability at load); `op` carries the index into the module's import table.
+        // Otherwise the numeric host-ABI convention → an inline `cap.call`.
+        let inst = if type_id == NAMED_IMPORT {
+            Inst::CallImport {
+                import: op,
+                sig,
+                handle,
+                args,
+            }
+        } else {
             Inst::CapCall {
                 type_id,
                 op,
                 sig,
                 handle,
                 args,
-            },
-            results.len(),
-        );
+            }
+        };
+        let res = lo.emit_call(inst, results.len());
         for (v, t) in res.into_iter().zip(results.iter()) {
             lo.push(v, *t);
         }
@@ -1444,6 +1556,94 @@ fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result
     for (v, t) in res.into_iter().zip(results.iter()) {
         lo.push(v, *t);
     }
+    Ok(())
+}
+
+/// `return_call $f` (the tail-call proposal): a **block-terminating** direct call — the callee
+/// replaces the current frame and its results become this function's results. A defined `$f` lowers
+/// to the IR `Terminator::ReturnCall` (a true tail call, no stack growth). A capability import can't
+/// be a terminator, so a tail call to one degrades to `cap.call` + `return` (correct, not
+/// tail-optimized); a tail call to `wasi:thread/spawn` is nonsensical and rejected.
+fn return_call_op(lo: &mut Lower, func: u32, fn_results: &[ValType]) -> Result<(), Error> {
+    if lo.threads.spawn_import == Some(func) {
+        return unsup("return_call to wasi:thread/spawn");
+    }
+    if (func as usize) < lo.n_imp {
+        // Tail call to a capability import: do the cap.call, then return its results.
+        call_op(lo, func)?;
+        let n = fn_results.len();
+        let args: Vec<ValIdx> = lo.stack[lo.stack.len() - n..]
+            .iter()
+            .map(|(v, _)| *v)
+            .collect();
+        lo.set_term(Terminator::Return(args));
+        return Ok(());
+    }
+    let ir_idx = func - lo.n_imp as u32;
+    let (params, _) = lo
+        .func_sigs
+        .get(ir_idx as usize)
+        .ok_or_else(|| Error::Parse(format!("return_call to unknown function {func}")))?
+        .clone();
+    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    for _ in 0..params.len() {
+        args.push(lo.pop()?.0);
+    }
+    args.reverse();
+    if let Some(h) = lo.handle {
+        args.insert(0, h); // the callee's leading handle param
+    }
+    lo.set_term(Terminator::ReturnCall { func: ir_idx, args });
+    Ok(())
+}
+
+/// `return_call_indirect (type $t)`: the indirect tail call — like [`call_indirect_op`] but emits the
+/// `Terminator::ReturnCallIndirect` (block-terminating, §3c masked + type-checked dispatch).
+fn return_call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result<(), Error> {
+    if table_index != 0 {
+        return unsup("return_call_indirect on a non-zero table");
+    }
+    let (params, results) = lo.types[type_index as usize].clone();
+    // table[index] → function index, at window byte `table_base + index*4` (same as call_indirect).
+    let (widx, _) = lo.pop()?;
+    let idx64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: widx,
+    });
+    let four = lo.emit(Inst::ConstI64(4));
+    let byte_off = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a: idx64,
+        b: four,
+    });
+    let funcref = lo.emit(Inst::Load {
+        op: LoadOp::I32,
+        addr: byte_off,
+        offset: lo.table_base,
+        align: 2,
+    });
+    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    for _ in 0..params.len() {
+        args.push(lo.pop()?.0);
+    }
+    args.reverse();
+    // The handle is a leading param of every defined function, so it rides both the args and the
+    // §3c type-check signature (matching the targets that carry it — same as `call_indirect`).
+    let mut ty_params = params;
+    if let Some(h) = lo.handle {
+        args.insert(0, h);
+        ty_params.insert(0, ValType::I32);
+    }
+    let ty = FuncType {
+        params: ty_params,
+        results,
+    };
+    lo.set_term(Terminator::ReturnCallIndirect {
+        ty,
+        idx: funcref,
+        args,
+    });
     Ok(())
 }
 
@@ -2387,6 +2587,12 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             type_index,
             table_index,
         } => call_indirect_op(lo, type_index, table_index)?,
+        // ---- tail calls (the tail-call proposal): a block-terminating call ----
+        O::ReturnCall { function_index } => return_call_op(lo, function_index, fn_results)?,
+        O::ReturnCallIndirect {
+            type_index,
+            table_index,
+        } => return_call_indirect_op(lo, type_index, table_index)?,
         // ---- structured control flow ----
         O::Block { blockty } => {
             let (p, r) = block_sig(blockty, lo.types)?;

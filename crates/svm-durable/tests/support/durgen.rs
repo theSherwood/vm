@@ -270,6 +270,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
             size_log2: SIZE_LOG2,
         }),
         data: Vec::new(),
+        imports: Vec::new(),
     }
 }
 

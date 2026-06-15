@@ -1,0 +1,355 @@
+# LLVM-bitcode → IR on-ramp (`crates/svm-llvm`) — design & tracking
+
+The plan, the constraints, and the prioritized work for the **third frontend**: an
+**ahead-of-time LLVM-bitcode → SVM-IR translator**. This is the big *breadth* play
+(D54) — one component buys every LLVM language (C, C++, Rust, Swift, Zig…) as a guest.
+
+This file is the working tracker for the on-ramp, the analog of `WASM.md` for the wasm
+bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
+the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
+
+**Status: Milestone 0 done — the skeleton crate builds, links libLLVM, and the first-light
+differential is green.** `crates/svm-llvm` translates `clang -O2 -emit-llvm` bitcode for the
+single-block integer subset, verifies it, and runs it on the interpreter matching native
+clang (4 tests). Milestone 1 (the real scalar+memory+call subset) is next. Section numbers
+like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
+
+---
+
+## 1. Why LLVM, and why now
+
+The two on-ramps in DESIGN §20 are **LLVM → IR (breadth)** and **wasm → IR (compat)**.
+The wasm bridge (`svm-wasm`) is feature-complete for typical `clang`/`rustc -O2` output
+(see `WASM.md`); the LLVM bridge is the remaining frontier (HANDOFF §10 "▶ NEXT", D54).
+
+**Thesis (DESIGN §20): we are a strictly better LLVM target than wasm.** The things LLVM
+emits naturally and that wasm forces a frontend to *contort* are exactly our §1a edges:
+
+| LLVM emits | wasm forces | SVM gives it natively |
+|---|---|---|
+| irreducible CFG | relooper / stackify (extra blocks+branches) | native irreducible CFG (D2/§3) |
+| 64-bit pointers | wasm32 windowing / wasm64 bounds checks | 64-bit address space + one mask (§4) |
+| multiple return values | single result + memory spill | multi-result instructions (§3a) |
+| `musttail` tail calls | not in core wasm | first-class `return_call`/`_indirect` (D6) |
+| **SSA with φ-nodes** | stackify → consumer SSA reconstruction | **SSA on the wire**; φ → block params (§3a) |
+
+The last row is the cleanest win and the reason the LLVM path is *less* work than the
+wasm path in its core: `svm-wasm` had to **reconstruct SSA from a stack machine**; we
+**already have SSA** from LLVM and only need to translate it. LLVM φ-nodes map directly
+onto our typed block parameters (§3a "no phi nodes"): each `phi` at a block's head becomes
+a block parameter, and each predecessor's terminator supplies the matching branch
+argument. (Critical edges get split first — standard.)
+
+---
+
+## 2. Decisions already taken (D54) — the frame
+
+- **Untrusted frontend, no TCB cost (§2a).** `svm-llvm` is the same trust class as the
+  chibicc fork and `svm-wasm`: it consumes the core crates to *produce* a Module, and is
+  **never a dependency of `svm-jit`/`svm-interp`**. Everything it emits is re-verified by
+  `svm-verify`, so a translation bug is a **clean error, never an escape**. Adding LLVM
+  costs zero escape-TCB — the eBPF lesson generalized (DESIGN §20).
+- **Architecture: AOT (HANDOFF §10 / D54).** The translator links libLLVM at build/dev
+  time and is **off the runtime path** — it does *not* go into the ~5 MiB JIT binary. We
+  ingest already-compiled bitcode; we are not a JIT-time LLVM dependency.
+- **Vehicle: a PNaCl-style bitcode translator, not a from-scratch TableGen backend**
+  (D54/D49). The cited NaCl/PNaCl lineage — "SSA as a portable sandbox target" — is the
+  team-tractable form.
+- **Pin a frozen subset.** LLVM bitcode is **not a stable format** (DESIGN §20). We pin a
+  specific LLVM version and a legalized subset of constructs we accept, exactly as PNaCl
+  did. Anything outside the subset is a hard, fail-closed `Unsupported` error (never
+  silent mis-translation) — same discipline as `svm-wasm`'s `unsup(...)`.
+- **MVP scope (D54):** the **scalar + memory + call** subset that chibicc already proves
+  end-to-end — aggregates via memory, hard-error on vectors and unsupported intrinsics —
+  with a differential harness running the existing C demos through *stock LLVM* and
+  matching native `clang`.
+
+### Toolchain present in the dev container (confirmed)
+- `clang` 18.1.3, `llvm-config` 18.1.3 (`/usr/lib/llvm-18/lib`).
+- `libLLVM.so.18.1` present (plus 17/20/21 — we **pin 18**, the `clang` default here).
+
+So the pinned baseline is **LLVM 18**. (Re-pin deliberately, never drift; a bitcode
+produced by a different major version is rejected, not best-effort parsed.)
+
+---
+
+## 3. The hard constraints (read before writing any translation)
+
+Three constraints shape every translation decision. The first two are *forced* by settled
+design; the chibicc frontend (`frontend/chibicc/codegen_ir.c`) already solves all three
+and is the **oracle** for how (see §5).
+
+### 3a. The two-stack split (§3d) — non-negotiable
+A pointer to an address-taken object must be a **window offset** so access through it is
+masked + MMU-confined (§4). The control stack is **out-of-band** (§5) and not in the
+window. Therefore any frontend must place:
+
+| Goes to | What | LLVM source |
+|---|---|---|
+| **SSA value** (register/spill, out-of-band) | scalars never address-taken | LLVM SSA registers after `mem2reg` |
+| **data stack** (in-window, `ptr.add`+load/store) | address-taken locals, aggregates, `alloca`, varargs, `sret` | LLVM `alloca`s that survive `mem2reg` |
+
+**LLVM does the hard half for us.** chibicc allocates *all* locals to memory and we wrote a
+reverse SSA-promotion pass to lift scalars out (HANDOFF §3). With LLVM we **run `mem2reg`/
+SROA in the ingest pipeline** so the bitcode arrives with scalars already in SSA registers;
+the `alloca`s that *remain* are genuinely address-taken → data-stack slots. The two-stack
+classification falls out of LLVM's own promotion — no bespoke pass needed.
+
+### 3b. Narrow integers — the wasm tradeoff (§3b note 1, "revisit at the LLVM on-ramp")
+SVM SSA value types are **`{i32, i64}`** only; `i8`/`i16` exist only as memory access
+widths. LLVM has native `i1`/`i8`/`i16`/`i24`/… So the translator must **collapse narrow
+integers to `i32`** and re-emit truncation explicitly — DESIGN §3b names this exact task:
+*"the LLVM on-ramp (D54) will need the same discipline when collapsing LLVM's native
+`i8`/`i16` to `i32`."*
+
+- `i1` (from `icmp`/`fcmp`, `br` conditions) → `i32` 0/1.
+- `i8`/`i16` SSA values → `i32`, with a canonical narrowing at truncating casts and narrow
+  stores. **Prefer the existing `extend8_s`/`extend16_s`/`extend32_s` ops** (lowered on
+  both backends, §3b recommendation) over shift-pairs — one fuzzable op, no narrow
+  arithmetic added to the TCB.
+- Non-byte widths (`i24`, `i48`, …, and `iN` bitfield temporaries) → widen to the
+  enclosing `i32`/`i64` with masked stores; reject `i128` for the MVP (clean `Unsupported`).
+- `_Atomic char/short`: **no IR form** (the one genuine capability gap, §3b note 2). Lower
+  via a 32-bit CAS-loop over the enclosing aligned word, exactly as `WASM.md` plans for
+  narrow wasm atomics — *not* by adding `i8`/`i16` to the IR.
+
+### 3c. Totality (§3b) — no UB reaches the IR
+The IR is **total**: every op is a defined value or a defined trap. LLVM IR has UB
+(`poison`/`undef`, OOB GEP, `unreachable`-after-UB). The translator must **resolve LLVM UB
+into defined IR**, the same role chibicc plays for C UB: `undef`/`poison` → a defined
+constant (0); `udiv`/`sdiv` by zero is already a defined trap in our IR (§3b); `unreachable`
+→ `trap`. We are **untrusted for correctness here**, but I4 totality is enforced by the
+verifier + IR semantics regardless (§2a), so a mistake is a wrong-answer bug, not an escape.
+
+---
+
+## 4. LLVM IR → SVM IR mapping (the MVP surface)
+
+The MVP target is the subset the chibicc demos already exercise. Mapping sketch (the
+"what lands first" contract; details firm up as code lands):
+
+**Types (DESIGN §3d data model, LP64):**
+- `i1/i8/i16/i32` → `i32`; `i64` → `i64`; `iN` (other) → widen or reject (see §3b).
+- `float` → `f32`; `double` → `f64`; `x86_fp80`/`fp128` → reject (`long double`=f64, §3d).
+- pointers (all address spaces) → `i64` window offset (§3a pointer-as-erasable-i64).
+- `[N x T]`, `{...}` aggregates → **by memory** (data-stack slot; SysV/§3d layout via the
+  module's `DataLayout`). By-value aggregate args/returns → hidden `sret` pointer (D39),
+  exactly the chibicc ABI (HANDOFF §2 "By-value aggregates").
+- `<N x T>` vectors → **reject for MVP** (`Unsupported`); SIMD is a later pass mirroring
+  the §17/D58 `v128` work `svm-wasm` already did.
+
+**Instructions:**
+- arithmetic/bitwise/shift (`add`/`sub`/`mul`/`and`/…/`shl`/`lshr`/`ashr`) → the typed
+  `iN.*` ops (wrap semantics, shift mod bitwidth — §3b). `nsw`/`nuw`/`exact` flags: ignore
+  (we define wrap; the flags only license UB we don't reproduce).
+- `icmp`/`fcmp` → the compare ops (→ `i32` 0/1). float `add`/`sub`/`mul`/`div` → `fN.*`.
+- `trunc`/`zext`/`sext`/`fptrunc`/`fpext`/`fptosi`/`sitofp`/`bitcast`/`inttoptr`/`ptrtoint`
+  → the §3b conversions (`wrap`/`extend`/`trunc_sat`/`reinterpret`/`ptr.from_int`/`to_int`).
+- `getelementptr` → `ptr.add` with the byte offset computed from `DataLayout` (constant
+  folded where possible; otherwise index-times-stride arithmetic).
+- `load`/`store` → typed `{i32,i64,f32,f64}.load/store` + narrow `load8/16`/`store8/16`
+  (the access width drives narrow handling, §3b). `align`/`volatile`: alignment is a hint
+  (§3b); `volatile` keeps the access in memory (no promotion — moot post-`mem2reg`).
+- `alloca` → bump the data-SP (a data-stack slot), §3d / HANDOFF §3.
+- `call` → `call` (direct) / `call_indirect` (function pointer, §3c funcref-index dispatch).
+  `musttail`/`tail` → `return_call`/`return_call_indirect` (D6, both backends do true tail
+  calls — cf. `svm-wasm` `tests/tailcall.rs`).
+- `br`/`switch`/`ret`/`unreachable` → `br`/`br_if`/`br_table`/`return`/`trap` terminators.
+  `switch` → `br_table` (dense) or a compare chain (sparse), mirroring chibicc `gen_switch`.
+- `phi` → **block parameters** (§1; the headline simplification).
+- `select` → `select` (branchless, §3b).
+- host calls: LLVM has no capability notion — the C-runtime entry (`write`/`exit`/`malloc`
+  over `cap.call`, §3b/§3d) is the same powerbox wiring chibicc uses; the translator binds
+  the libc surface to capabilities, it does not invent imports.
+
+**Intrinsics (MVP):** `llvm.memcpy`/`memset`/`memmove` → the loop/bulk lowering (cf.
+`svm-wasm` `memory.copy`/`fill`); `llvm.lifetime.*`/`llvm.dbg.*`/`llvm.assume` → drop;
+`llvm.trap` → `trap`; `llvm.*.with.overflow`, `llvm.ctlz/cttz/ctpop` → the `clz/ctz/popcnt`
+ops or expansions. **Everything else → fail-closed `Unsupported`.**
+
+**Ingest pass pipeline (the "legalize to the subset" step, PNaCl `abi-simplify` analog) —
+run out-of-process (DECIDED, §8 Q1/Q2):** `clang -O2 -emit-llvm -fno-vectorize
+-fno-slp-vectorize` already runs `mem2reg`+SROA, so the bitcode arrives with scalars
+promoted to SSA and only address-taken `alloca`s left — *the two-stack split (§3a) for
+free* — while `-fno-*-vectorize` keeps SIMD out of the MVP. For anything more (critical-edge
+splitting for φ→block-param, intrinsic/`switch` lowering) shell out to `opt -passes=...`.
+We **never run an in-process pass manager and never reimplement `mem2reg`** (PNaCl shipped
+`pnacl-opt`; same model). This pipeline is where "pin a frozen subset" is enforced in
+practice; the translator then ingests the legalized `.bc` read-only (§6).
+
+---
+
+## 5. The oracle & testing strategy — chibicc as the differential anchor
+
+The user's instinct is right: **chibicc is the oracle for this work.** We already have a
+proven, known-good path from C to running IR; the LLVM path consumes the *same C demos*, so
+we get a three-lane differential with chibicc as the reference for *our IR shape* and native
+`clang` as the reference for *C semantics*.
+
+```
+                       demos/*.c  (the existing corpus: clay, jsmn, sha256,
+                          │        xxhash, tinfl, perlin, regex, heapgrow, …)
+        ┌─────────────────┼──────────────────────────┐
+        ▼                 ▼                          ▼
+  Lane A: native      Lane B: chibicc → IR       Lane C (NEW): clang -emit-llvm
+   cc/clang binary       → interp / JIT             → .bc → svm-llvm → IR
+   (C-semantics            (proven; the              → interp / JIT
+    ground truth)          IR-shape oracle)
+        └─────────────────┴──────────────────────────┘
+                 all three must produce identical observable output
+```
+
+Why this is the strong setup:
+- **Lane B pinpoints translation bugs.** When Lane C diverges from native, we already hold
+  a known-good IR (Lane B) for the *same source* — diff the two IR modules to localize the
+  bug to the translator vs. something downstream. No other frontend had this luxury.
+- **The interp↔JIT differential applies for free.** Lane C's output is just IR, so it rides
+  the existing escape-oracle and the interp==JIT checks (HANDOFF §8) — a translator bug that
+  produces verifier-valid-but-wrong IR is still caught by interp==JIT==native.
+- **Reuse the demo harness.** `assert_demo_matches_cc` (`crates/svm-run/tests/run.rs`) and
+  the chibicc invocation (`compile_c` in `svm-run/src/main.rs`) are the template; add a
+  `clang -emit-llvm -c -o demo.bc demo.c` → `svm-llvm` → run lane, asserting stdout/exit ==
+  native, demo by demo. Start with the **simplest demos first** (a `fib`/`calc`), graduate to
+  the real libraries (jsmn, sha256, …) exactly as the chibicc rollout did (HANDOFF §2).
+- **Generative fuzzing comes later** — first make the fixed corpus green; the translator's
+  own fuzzer (round-trip a generated LLVM module, or reuse `irgen` shapes) is a §8-style
+  follow-on, not MVP.
+
+`clang`/`llvm-config` are already required-and-present in CI (the wasm + native-cc lanes use
+them), so Lane C adds no new build dependency the harness doesn't already have.
+
+---
+
+## 6. Crate & build plan (proposal — confirm before building)
+
+A new workspace crate **`crates/svm-llvm`**, modeled on `svm-wasm`:
+
+- **Deps:** `svm-ir` (produce the Module). **Dev-deps:** `svm-text`/`svm-verify`/
+  `svm-interp`/`svm-jit`/`svm-run` (the differential lanes), mirroring `svm-wasm/Cargo.toml`.
+- **LLVM ingest binding — `llvm-ir` 0.11.3, feature `llvm-18` (DECIDED, §8 Q1).** It reads
+  the legalized `.bc` via `llvm-sys` and hands the translator an **owned, pure-Rust AST**
+  (`enum Instruction`), so the translator is a boring pattern-match-and-emit walk — no
+  lifetimes, no `unsafe`, no LLVM context juggling (AGENTS.md "boring obvious"). It is *not*
+  asked to run passes (legalization is out-of-process, §4), so its read-only nature is no
+  loss. The libLLVM link it pulls in (via `llvm-sys`) is **build/dev-time only** and gated
+  so it never enters `svm-jit`/`svm-interp` (the D54 "off the runtime path" rule). Fallbacks
+  if it bites: `inkwell` (the maintained, version-tracking wrapper — same C-API limits) →
+  then a hand-rolled `.ll` parser over `opt -S` output (zero libLLVM link, but a rot-prone
+  parser we'd own). See §8 Q1 for why `llvm-ir` won.
+- **Output:** verifier-checked IR `Module`, re-verified in tests (untrusted-frontend, §2a).
+- **Tests:** `crates/svm-llvm/tests/` — a `translate.rs` (hand-written `.ll` snippets, the
+  unit oracle) and the demo differential lane (Lane C above).
+
+This is a proposal; §6 decisions (binding choice, pin mechanics, CI gating of the libLLVM
+dep) are the first things to settle with the maintainer before code lands.
+
+---
+
+## 7. Roadmap (MVP → breadth)
+
+Severity/coverage key mirrors `WASM.md`: **🟢 MVP**, **🟡 fail-closed gap (widen on
+demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
+
+### Milestone 0 — scaffold & first light 🟢 — DONE
+- [x] Binding decided: `llvm-ir` 0.11.3 / `llvm-18` (§6, §8 Q1). Legalize out-of-process
+      via `clang -O2 -emit-llvm` (+ `opt` as needed) (§4, §8 Q2).
+- [x] CI gating: `svm-llvm` **excluded from the workspace** (root `Cargo.toml`, alongside
+      `fuzz`/`bench`), so `cargo build/test --workspace` never links libLLVM — confirmed via
+      `cargo metadata` (svm-llvm is not a member). The cross-OS runtime matrix is untouched.
+- [x] `crates/svm-llvm` skeleton: ingest a `.bc` (`translate_bc_path`), walk functions/blocks,
+      emit a `Module`, verify it. Builds + links libLLVM dynamically (see §8 Q4 for prereqs).
+- [x] First light green: `clang -O2 -emit-llvm` of `return 42`, an `i32` `add` over params, and
+      `i64` arithmetic → translate → verify → interp, matching native semantics; plus a
+      fail-closed test (float return → clean `Unsupported`). `tests/translate.rs`, 4 tests.
+- [ ] Hand-written `.ll` → IR unit tests (`from_ir_path`) — defer to Milestone 1 alongside the
+      richer instruction set; the bitcode lane already covers the M0 surface.
+
+### Milestone 1 — the chibicc-proven scalar+memory+call subset 🟢 (the D54 MVP)
+- [ ] φ → block parameters (+ critical-edge splitting).
+- [ ] `mem2reg`/SROA ingest pass → two-stack split (§3a); remaining `alloca` → data stack.
+- [ ] Narrow-int collapse to `i32` with `extend8_s`/`16_s` discipline (§3b).
+- [ ] GEP → `ptr.add` via `DataLayout`; loads/stores incl. narrow widths.
+- [ ] Direct + indirect `call` (funcref §3c); `switch` → `br_table`/compare-chain.
+- [ ] By-value aggregates via `sret`/hidden pointer (D39).
+- [ ] `memcpy`/`memset`/`memmove` intrinsics; libc/powerbox entry (`write`/`exit`/`malloc`).
+- [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
+      (the same corpus chibicc passes — clay, jsmn, sha256, xxhash, tinfl, perlin, regex,
+      heapgrow). This is the D54 "matches native clang" exit criterion.
+
+### Milestone 2 — beyond chibicc's C subset 🟡
+- [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
+- [ ] Real Rust/C++ *without* EH/unwinding: `rustc --emit=llvm-bc` of a `no_std`/panic=abort
+      crate; a C++ TU compiled `-fno-exceptions -fno-rtti`. The breadth proof.
+- [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
+
+### Deferred / hard (name them, don't hide them — DESIGN §20) ⚪
+- [ ] **C++ exceptions / unwinding** — `invoke`/`landingpad`/`resume` + `.eh_frame` unwind
+      tables (the §18 open item). Lower onto §6 stack-switching; perf tax + ABI change. Low
+      ROI until a real workload needs it (mirrors `WASM.md`'s EH stance).
+- [ ] **`setjmp`/`longjmp`** — onto §6 stack-switching, same machinery as EH.
+- [ ] **SIMD** (`<N x T>` vectors) — a later pass mirroring §17/D58 `v128` (the proven
+      5-step pattern `svm-wasm` used). Reject cleanly until then.
+- [ ] **Full intrinsic coverage** — expand the table in §4 as real programs demand.
+- [ ] **`i128`, `x86_fp80`/`fp128`, vector-of-pointers, scalable vectors** — reject.
+- [ ] **GC / managed languages** — permanent non-goal (same as wasm-GC in `WASM.md`):
+      contradicts the linear-memory + small-TCB thesis. C/C++/Rust/Swift/Zig is the niche.
+
+---
+
+## 8. Decisions & open questions
+
+**Q1 — Ingest binding (DECIDED): `llvm-ir` 0.11.3, feature `llvm-18`.** The decision splits
+into two independent sub-questions, and separating them is what makes it clear:
+*(a) how to legalize* (Q2) and *(b) how to read the module*. The binding question is only
+(b). Because legalization is out-of-process (Q2), the binding never needs an in-process pass
+manager — which removes the main reason to reach for the full `inkwell`/`llvm-sys` API. That
+leaves "what's the nicest way to *read* a module": `llvm-ir`'s **owned, pure-Rust AST** wins
+on translator ergonomics (pattern-match-and-emit, no lifetimes/`unsafe`) — the boring,
+obvious code AGENTS.md asks for. Verified for this repo: `llvm-ir` 0.11.3 supports LLVM
+9–19, so the **`llvm-18` feature matches our pin**; its only representation gaps are debug
+metadata (we drop `llvm.dbg.*` regardless) and a few C-API-only getters (which constrain
+`inkwell` equally — both are LLVM-C-API-bound), neither of which touches the scalar+memory+
+call MVP. No mature *pure-Rust* bitcode reader exists, so any programmatic read links
+libLLVM; D54 sanctions that as a build/dev-time dep (Q4 keeps it off the runtime path).
+**Fallback order if `llvm-ir` bites:** `inkwell` (maintained, version-tracking wrapper) →
+hand-rolled `.ll` parser over `opt -S` (zero libLLVM link, but a rot-prone parser we own).
+
+**Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
+-fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
+gives `mem2reg`/SROA (the two-stack split for free, §3a); `-fno-*-vectorize` keeps SIMD out
+of the MVP. We never run an in-process pass manager or reimplement `mem2reg` (the PNaCl
+`pnacl-opt` model). See §4 "Ingest pass pipeline".
+
+**Q3 — Pin mechanics (open):** how strictly to reject off-version bitcode, and where the
+frozen-subset allow-list lives (a single `unsup(...)`-style chokepoint, like `svm-wasm`).
+
+**Q4 — CI gating (DONE for the build story; the CI yaml lane is the remaining piece):**
+`svm-llvm` is **excluded from the workspace** (root `Cargo.toml`, with `fuzz`/`bench`), so the
+default `cargo build/test --workspace` never resolves or links libLLVM and the cross-OS
+runtime matrix (`svm-jit`/`svm-interp` on Linux+macOS+Windows) is untouched (D54 off-the-
+runtime-path). The opt-in lane runs `cd crates/svm-llvm && cargo test`. **Build prerequisites
+found at first light (document these for the CI lane):**
+- **`llvm-18-dev`** (headers + the `.so`), not just `llvm-18`/`libllvm18` (runtime only). The
+  runtime package ships `libLLVM.so` but no `llvm-c/*.h`, which `llvm-sys`'s build script needs.
+- **Dynamic linking**: distros ship `libLLVM.so` without the static `.a`s (no `libPolly.a`),
+  and `llvm-sys` defaults to static. We depend on `llvm-sys` directly with feature
+  **`prefer-dynamic`** (feature-unifies onto the `llvm-sys` `llvm-ir` pulls in) so it links the
+  dylib. `clang`/`llvm-config` 18 must be on `PATH` (they are in this container + the existing
+  wasm/cc CI lanes).
+
+**Q5 — remaining CI yaml (open):** add the Linux-only `svm-llvm` job to `ci.yml` (install
+`llvm-18-dev`, `cd crates/svm-llvm && cargo test`); a maintainer one-liner like the §10 miri/
+ASan items in HANDOFF.
+
+---
+
+## 9. Code map
+- Translator + frozen-subset chokepoint: `crates/svm-llvm/src/lib.rs` — `translate`/
+  `translate_bc_path`, `val_type`/`operand_int_ty` (the §3b narrow-int collapse), `BlockCtx`
+  (block-local SSA numbering, §3a), and the `unsup(...)` fail-closed chokepoint.
+- First-light differential: `crates/svm-llvm/tests/translate.rs` — `compile_to_bc` runs the
+  pinned `clang -O2 -emit-llvm` pipeline; `run` does translate→verify→interp.
+- Crate config + build prereqs: `crates/svm-llvm/Cargo.toml` (the `llvm-ir`/`llvm-sys`
+  `prefer-dynamic` deps); workspace exclusion in the root `Cargo.toml`.
+- The oracle to diff against (Lane B): chibicc `frontend/chibicc/codegen_ir.c` + the running
+  demos in `demos/` — wired in at Milestone 1.

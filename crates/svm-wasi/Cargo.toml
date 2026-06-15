@@ -1,0 +1,23 @@
+[package]
+name = "svm-wasi"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# An **embedder host-capability provider**, not escape-TCB: it registers a `HostFn` handler (svm-interp)
+# implementing a minimal WASI preview1 subset, plus a §7 import-name resolver that binds the WASI
+# import names to it. WASI semantics live here, outside both svm-wasm (the transpiler) and the interp
+# TCB match — the guest reaches the shim only through a masked, type-checked capability handle.
+
+[dependencies]
+svm-ir = { path = "../svm-ir" }
+svm-interp = { path = "../svm-interp" }
+
+[dev-dependencies]
+svm-wasm = { path = "../svm-wasm" }
+svm-verify = { path = "../svm-verify" }
+# The JIT + its host bridge (`cap_thunk`), so the WASI demo runs on **both** backends — the HostFn
+# capability dispatches through the same `cap_dispatch_slots` the JIT's `cap.call` thunk calls.
+svm-jit = { path = "../svm-jit" }
+svm-run = { path = "../svm-run" }
+wat = "1"

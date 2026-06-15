@@ -17,10 +17,10 @@ jobs:
     name: build · test · fmt · clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { components: rustfmt, clippy }
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
@@ -37,9 +37,9 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --workspace
       - run: cargo test --workspace
   fuzz:
@@ -49,11 +49,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [decode_verify, diff, mask]
+        target: [decode_verify, diff, mask, wasm_transpile]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: fuzz }
       - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
@@ -69,9 +69,9 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: bench }
       # `cargo run` builds the chibicc fork itself (for the `alu_c` kernel); make + cc are
       # preinstalled on ubuntu-latest. If the frontend can't build, that kernel is skipped.
@@ -82,11 +82,96 @@ jobs:
     name: loom (parallel scheduler model check)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: loom model check
         run: cargo test -p svm-jit --lib loom
         env:
           RUSTFLAGS: "--cfg loom"
 
+  svm-llvm:
+    name: svm-llvm (LLVM→IR on-ramp · Linux-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: crates/svm-llvm }
+      - name: install LLVM 18 (dev headers + dynamic lib)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev clang-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: fmt · clippy · test
+        working-directory: crates/svm-llvm
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+  miri:
+    # Run the unsafe memory substrate under Miri's UB/provenance + data-race checkers. svm-mem is
+    # Miri-aware (a heap-backed fallback replaces the mmap FFI under `cfg(miri)`), so its raw-pointer
+    # atomics and the Mapped-vs-Paged differential get provenance/race-checked — complementing loom
+    # (which models the protocol atomics) and TSan.
+    name: miri (svm-mem unsafe substrate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: miri }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo +nightly miri test -p svm-mem
+        env:
+          # Miri's weak-memory emulation ICEs on the differential test's mixed-size atomic accesses
+          # ("partially overlapping store buffer when previous write was atomic" — a Miri bug, not ours).
+          # Disabling it keeps full UB / provenance / data-race / alignment checking.
+          MIRIFLAGS: "-Zmiri-disable-weak-memory-emulation"
+  supply-chain:
+    # Scan the dependency tree against the RustSec advisory DB. Gated off pull_request so a
+    # newly-published advisory on a transitive dep surfaces on main / nightly without blocking
+    # unrelated feature PRs (same posture as the fuzz/bench jobs).
+    name: cargo-audit (advisory scan)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  asan:
+    # AddressSanitizer over the fiber stack-switch paths. svm-fiber's `asan` feature emits the
+    # __sanitizer_{start,finish}_switch_fiber annotations so ASan can follow manual stack switches.
+    name: ASan (svm-fiber switches)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: cargo test -p svm-fiber (ASan + asan feature)
+        run: cargo test -p svm-fiber --features asan -Z build-std --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          # The scheduler intentionally leaks values live on a dropped-suspended fiber's stack
+          # (documented), so leak detection would false-positive — keep it to UB/races here.
+          ASAN_OPTIONS: "detect_leaks=0"
+  tsan:
+    # ThreadSanitizer over the shared-region hardware atomics (svm-mem's parallel vCPU substrate).
+    name: TSan (svm-mem concurrency)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: cargo test -p svm-mem (TSan)
+        run: cargo test -p svm-mem -Z build-std --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
