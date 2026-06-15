@@ -5,6 +5,7 @@ members = [
     "crates/svm-mask",
     "crates/svm-mem",
     "crates/svm-text",
+    "crates/svm-durable",
     "crates/svm-encode",
     "crates/svm-verify",
     "crates/svm-interp",
@@ -33,6 +34,7 @@ svm-ir = { path = "crates/svm-ir" }
 svm-mask = { path = "crates/svm-mask" }
 svm-mem = { path = "crates/svm-mem" }
 svm-text = { path = "crates/svm-text" }
+svm-durable = { path = "crates/svm-durable" }
 svm-encode = { path = "crates/svm-encode" }
 svm-verify = { path = "crates/svm-verify" }
 svm-interp = { path = "crates/svm-interp" }
