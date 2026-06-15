@@ -10,9 +10,9 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slices A–J):** multi-block scalar functions with stack memory, calls,
-//! `switch`, globals, floats, indirect calls, struct aggregates, memory intrinsics, and by-value
-//! aggregate args/returns.
+//! **Scope (Milestone 1, slices A–K):** multi-block scalar functions with stack memory, calls,
+//! `switch`, globals, floats, indirect calls, struct aggregates, memory intrinsics, by-value
+//! aggregates, and pointer-valued global relocations.
 //! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
 //!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
 //!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
@@ -53,10 +53,15 @@
 //!   (`{i32,i32}`→`i64`, `{int×3}`→`(i64,i32)`, SSE→`double`s), a large one passes via a `byval`/
 //!   `sret` pointer (the caller `alloca`s + `memcpy`s + passes the pointer). So slices A–I (scalar
 //!   params, memory, calls, struct GEP, memcpy) already cover it; this slice is the test lock-in.
+//! - **K — relocations (pointer-valued globals).** A global initializer holding a function pointer,
+//!   `&other_global`, or arithmetic over those resolves via a constexpr evaluator (`GlobalReference`
+//!   → address/funcref, `ptrtoint`/`sub`/`add`/`trunc`). The globals layout is two-phase (assign all
+//!   addresses, then serialize — forward references resolve). Covers function-pointer tables and
+//!   struct/array pointer members.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): variable-length `mem*`, libc/math
-//! *function* calls (e.g. `sqrt` with errno), pointer-valued globals (relocations — incl.
-//! function-pointer tables), SIMD vectors, `i33`.
+//! *function* calls (e.g. `sqrt` with errno), `llvm.load.relative` (clang's relative-offset string
+//! tables) and GEP-constexpr relocations (`&arr[k]`), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -119,7 +124,7 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         name2idx.insert(f.name.clone(), i as u32);
     }
     // Globals live low (from `DATA_BASE`); the data stack starts just above them.
-    let (globals, data, globals_end) = globals_layout(m)?;
+    let (globals, data, globals_end) = globals_layout(m, &name2idx)?;
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
     // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
@@ -185,10 +190,85 @@ fn name_str(n: &Name) -> String {
     }
 }
 
+/// Evaluate an integer/pointer **constexpr** to its window value (a relocation): a global's
+/// address, a function's funcref index, or arithmetic over those (`sub`/`add`/`ptrtoint`/`trunc`…).
+/// This is what lets a global hold `&other_global`, a function pointer, or clang's relative-offset
+/// table (`@.str − @table`). GEP-constexprs (`&arr[k]`) are a later addition.
+fn const_eval(
+    c: &Constant,
+    globals: &HashMap<String, u64>,
+    funcs: &HashMap<String, u32>,
+) -> Result<i64, Error> {
+    use Constant as K;
+    let bin = |a: &Constant, b: &Constant| -> Result<(i64, i64), Error> {
+        Ok((
+            const_eval(a, globals, funcs)?,
+            const_eval(b, globals, funcs)?,
+        ))
+    };
+    match c {
+        K::Int { value, .. } => Ok(*value as i64),
+        K::Null(_) => Ok(0),
+        K::GlobalReference { name, .. } => {
+            let n = name_str(name);
+            if let Some(&a) = globals.get(&n) {
+                Ok(a as i64) // a data global's window address
+            } else if let Some(&f) = funcs.get(&n) {
+                Ok(f as i64) // a function's §3c funcref index
+            } else {
+                unsup(format!("constexpr reference to `@{n}`"))
+            }
+        }
+        // Pointer/width casts pass the value through; the byte width is the *consumer*'s job.
+        K::PtrToInt(x) => const_eval(x.operand.as_ref(), globals, funcs),
+        K::IntToPtr(x) => const_eval(x.operand.as_ref(), globals, funcs),
+        K::BitCast(x) => const_eval(x.operand.as_ref(), globals, funcs),
+        K::Trunc(x) => const_eval(x.operand.as_ref(), globals, funcs),
+        K::Add(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_add(b)),
+        K::Sub(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_sub(b)),
+        K::Mul(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_mul(b)),
+        other => unsup(format!("constexpr initializer {other:?}")),
+    }
+}
+
+/// The serialized byte length of a constant initializer — identical to `const_bytes(…).len()`, but
+/// computed *without* resolving relocations (a pointer is 8 bytes whatever it points to). Used in
+/// the globals layout's phase A (assign addresses) before phase B can serialize the actual bytes.
+fn const_size(c: &Constant, types: &Types) -> Result<u64, Error> {
+    match c {
+        Constant::Int { bits, .. } if *bits <= 64 => Ok((*bits as u64).div_ceil(8).max(1)),
+        Constant::Float(Float::Single(_)) => Ok(4),
+        Constant::Float(Float::Double(_)) => Ok(8),
+        Constant::Array { elements, .. } | Constant::Vector(elements) => {
+            let mut n = 0;
+            for e in elements {
+                n += const_size(e.as_ref(), types)?;
+            }
+            Ok(n)
+        }
+        Constant::Struct {
+            values, is_packed, ..
+        } => {
+            let fields: Vec<llvm_ir::TypeRef> = values.iter().map(|v| v.get_type(types)).collect();
+            Ok(struct_layout(&fields, *is_packed, types)?.1)
+        }
+        Constant::AggregateZero(t) | Constant::Undef(t) | Constant::Poison(t) => {
+            type_size(t.as_ref(), types)
+        }
+        // A pointer / constexpr scalar leaf — its width is its type's size (8 for a pointer).
+        other => type_size(other.get_type(types).as_ref(), types),
+    }
+}
+
 /// Serialize a constant initializer to its little-endian window bytes (the §3d/x86-64 layout).
-/// Integers (incl. the `i8`s of a C string), floats, arrays, structs (with field padding), and
-/// zero/null aggregates are covered; pointer-valued globals (relocations) are a later slice.
-fn const_bytes(c: &Constant, types: &Types) -> Result<Vec<u8>, Error> {
+/// Aggregates recurse structurally (arrays/structs with field padding); a scalar leaf that is a
+/// pointer or constexpr is resolved via [`const_eval`] (relocations) and emitted at its type width.
+fn const_bytes(
+    c: &Constant,
+    types: &Types,
+    globals: &HashMap<String, u64>,
+    funcs: &HashMap<String, u32>,
+) -> Result<Vec<u8>, Error> {
     match c {
         Constant::Int { bits, value } if *bits <= 64 => {
             let n = (*bits as usize).div_ceil(8).max(1);
@@ -199,7 +279,7 @@ fn const_bytes(c: &Constant, types: &Types) -> Result<Vec<u8>, Error> {
         Constant::Array { elements, .. } | Constant::Vector(elements) => {
             let mut out = Vec::new();
             for e in elements {
-                out.extend(const_bytes(e.as_ref(), types)?);
+                out.extend(const_bytes(e.as_ref(), types, globals, funcs)?);
             }
             Ok(out)
         }
@@ -211,15 +291,25 @@ fn const_bytes(c: &Constant, types: &Types) -> Result<Vec<u8>, Error> {
             let (offsets, size, _) = struct_layout(&fields, *is_packed, types)?;
             let mut out = vec![0u8; size as usize];
             for (v, &off) in values.iter().zip(&offsets) {
-                let b = const_bytes(v.as_ref(), types)?;
+                let b = const_bytes(v.as_ref(), types, globals, funcs)?;
                 out[off as usize..off as usize + b.len()].copy_from_slice(&b);
             }
             Ok(out)
         }
-        Constant::AggregateZero(t) | Constant::Null(t) => {
+        Constant::AggregateZero(t) | Constant::Undef(t) | Constant::Poison(t) => {
             Ok(vec![0u8; type_size(t.as_ref(), types)? as usize])
         }
-        other => unsup(format!("global initializer {other:?}")),
+        // A pointer / constexpr scalar leaf (a relocation): resolve its value, emit at type width.
+        other => {
+            let width = type_size(other.get_type(types).as_ref(), types)?;
+            if width > 8 {
+                return unsup(format!(
+                    "constexpr initializer wider than 8 bytes ({width})"
+                ));
+            }
+            let v = const_eval(other, globals, funcs)?;
+            Ok(v.to_le_bytes()[..width as usize].to_vec())
+        }
     }
 }
 
@@ -231,34 +321,41 @@ type Globals = (HashMap<String, u64>, Vec<svm_ir::Data>, u64);
 /// each natural-aligned), returning the name → window-address map, the `data` segments to emit
 /// (constants read-only, §3a/D40; all-zero/BSS globals just reserve space in the zero-init
 /// window), and the region's end (for window sizing).
-fn globals_layout(m: &LModule) -> Result<Globals, Error> {
+fn globals_layout(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<Globals, Error> {
+    // Phase A: assign every global a window address (from its declared type size), so a relocation
+    // in any initializer can resolve a forward/backward reference to another global in phase B.
     let mut addr = HashMap::new();
-    let mut segs = Vec::new();
     let mut off = DATA_BASE;
-    for g in &m.global_vars {
-        let (bytes, size) = match &g.initializer {
-            Some(init) => {
-                let b = const_bytes(init.as_ref(), &m.types)?;
-                let n = b.len() as u64;
-                (Some(b), n.max(1))
-            }
-            None => (None, type_size(g.ty.as_ref(), &m.types)?.max(1)),
-        };
+    let mut placed: Vec<(usize, u64)> = Vec::with_capacity(m.global_vars.len());
+    for (gi, g) in m.global_vars.iter().enumerate() {
+        // Size from the initializer's serialized length (matches phase B exactly); BSS/extern
+        // globals have no initializer, so fall back to the declared type size.
+        let size = match &g.initializer {
+            Some(init) => const_size(init.as_ref(), &m.types)?,
+            None => type_size(g.ty.as_ref(), &m.types)?,
+        }
+        .max(1);
         let align = (g.alignment as u64).max(1);
         off = off.div_ceil(align) * align;
         addr.insert(name_str(&g.name), off);
-        // Emit a segment only for non-zero initialized data (the window is zero-init, so BSS and
-        // explicit zeros need none). A read-only segment is protected (D40), so a guest write faults.
-        if let Some(b) = bytes {
-            if g.is_constant || b.iter().any(|&x| x != 0) {
-                segs.push(svm_ir::Data {
-                    offset: off,
-                    readonly: g.is_constant,
-                    bytes: b,
-                });
-            }
-        }
+        placed.push((gi, off));
         off += size;
+    }
+    // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
+    let mut segs = Vec::new();
+    for (gi, at) in placed {
+        let g = &m.global_vars[gi];
+        let Some(init) = &g.initializer else { continue }; // BSS / extern → zero-init window
+        let bytes = const_bytes(init.as_ref(), &m.types, &addr, name2idx)?;
+        // Emit a segment only for non-zero initialized data (the window is zero-init). A read-only
+        // segment is protected (D40), so a guest write to it faults.
+        if g.is_constant || bytes.iter().any(|&x| x != 0) {
+            segs.push(svm_ir::Data {
+                offset: at,
+                readonly: g.is_constant,
+                bytes,
+            });
+        }
     }
     Ok((addr, segs, off))
 }

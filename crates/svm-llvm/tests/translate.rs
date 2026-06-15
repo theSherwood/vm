@@ -195,6 +195,50 @@ fn byval_and_sret_large_struct() {
 }
 
 #[test]
+fn function_pointer_table_global() {
+    // A global `static fp tbl[2] = {inc, dec}` — a relocation: each element serializes to the
+    // function's funcref index. `viafp` indexes the table at runtime and calls indirectly.
+    let src = "int inc(int); int dec(int); typedef int(*fp)(int); \
+               static fp tbl[2] = {inc, dec}; \
+               int viafp(int sel, int x){ return tbl[sel & 1](x); } \
+               __attribute__((noinline)) int inc(int x){ return x + 1; } \
+               __attribute__((noinline)) int dec(int x){ return x - 1; }";
+    check(
+        "fpt_inc",
+        src,
+        &[Value::I32(0), Value::I32(10)],
+        &[Value::I32(11)],
+    );
+    check(
+        "fpt_dec",
+        src,
+        &[Value::I32(1), Value::I32(10)],
+        &[Value::I32(9)],
+    );
+}
+
+#[test]
+fn struct_with_string_pointer_global() {
+    // A global struct holding a string pointer — the pointer field is a relocation (`@.str`
+    // address). The runtime reads the pointed-to char.
+    let src = "struct S { const char *name; int v; }; \
+               static const struct S g = { \"hi\", 7 }; \
+               int f(int i){ return g.name[i] + g.v; }";
+    check(
+        "sws_h",
+        src,
+        &[Value::I32(0)],
+        &[Value::I32('h' as i32 + 7)],
+    );
+    check(
+        "sws_i",
+        src,
+        &[Value::I32(1)],
+        &[Value::I32('i' as i32 + 7)],
+    );
+}
+
+#[test]
 fn memcpy_struct_copy() {
     // `struct Big q = G` → `llvm.memcpy` (32 bytes) from a const global into a stack struct; we
     // lower it to chunked load/stores. A runtime field read keeps the alloca + copy.

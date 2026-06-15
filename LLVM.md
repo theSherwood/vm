@@ -8,9 +8,9 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–J (control flow, memory, calls, switch, globals, floats, indirect
-calls, struct aggregates, memory intrinsics, by-value aggregates) done — a broad swath of scalar C
-from `clang -O2` translates and runs on both backends (35 tests).** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–K (control flow, memory, calls, switch, globals, floats, indirect
+calls, struct aggregates, memory intrinsics, by-value aggregates, relocations) done — a broad swath
+of scalar C from `clang -O2` translates and runs on both backends (37 tests).** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -24,8 +24,9 @@ dense switch, `even`/`odd` mutual recursion, a const lookup table, a mutable glo
 indexed string reads, a gapped switch (a global jump table), double arithmetic/compares/
 conversions, `fabs`/`floor`, an indirect call through a function pointer, struct field access
 (global/array-of-struct/stack), a struct `memcpy` + `memset`, and by-value struct args/returns
-(small-coerced + `byval`/`sret`) — run **interp == JIT == hand-computed** (35 tests).
-Remaining M1: libc/math function calls, function-pointer global tables (relocations), then the
+(small-coerced + `byval`/`sret`), and pointer-valued global relocations (a function-pointer table,
+a struct string-pointer member) — run **interp == JIT == hand-computed** (37 tests).
+Remaining M1: libc/math function calls, a libc/powerbox `main` entry, then the
 demo Lane C. Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
@@ -378,15 +379,23 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       so the call-site coercion is exercised: small `byval`/return, two-eightbyte `(i64,i32)`, an SSE
       `(double,double)`, and a large `mkBig` (`sret`) + `sumBig` (`byval`).
 
+**Slice K (DONE) — relocations (pointer-valued global initializers).**
+- [x] A global initializer holding a function pointer, `&other_global`, or arithmetic over those
+      resolves via a constexpr evaluator (`const_eval`): `GlobalReference` → a data global's address
+      or a function's funcref index, plus `ptrtoint`/`inttoptr`/`bitcast`/`trunc`/`sub`/`add`/`mul`.
+      The globals layout is **two-phase** — assign every global an address (sizing via `const_size`,
+      which matches the serialized length), then serialize each initializer (so a forward/backward
+      reference to another global resolves). Tested on a function-pointer table (`{inc,dec}`, called
+      indirectly) and a struct with a string-pointer member. (A regression caught here: phase-A
+      sizing must use the serialized length, not `type_size(g.ty)`, or the window mis-sizes.)
+      *Deferred: `llvm.load.relative` (clang's relative-offset string tables) and GEP-constexprs.*
+
 **Remaining slices.**
 - [ ] Libc/math **function** calls (e.g. `sqrt` keeps errno semantics → a real `@sqrt` call) — bind
       to a guest libc / capability, or recognize the named libc-math calls as intrinsics under
       `-fno-math-errno`.
-- [ ] Pointer-valued global initializers (relocations — a global holding `&other_global`/a string
-      pointer; resolve addresses after layout).
-- [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline.
-- [ ] Struct/vector GEP + by-value aggregates via `sret`/hidden pointer (D39).
-- [ ] `memcpy`/`memset`/`memmove` intrinsics; libc/powerbox entry (`write`/`exit`/`malloc`).
+- [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline; `llvm.load.relative`.
+- [ ] Libc/powerbox entry (`write`/`exit`/`malloc` via §7 named imports) + a `main` wrapper.
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
       (the same corpus chibicc passes — clay, jsmn, sha256, xxhash, tinfl, perlin, regex,
       heapgrow). This is the D54 "matches native clang" exit criterion.
