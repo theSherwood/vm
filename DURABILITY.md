@@ -1,10 +1,13 @@
 # Durable Domains — Snapshot / Restore / Clone
 
-> **Status: Proposed (design tracking doc).** Nothing here is implemented yet. This
-> file is the single source of truth for the *design and implementation status* of
-> durable domains. The master design is `DESIGN.md` (D-notes, §-sections); the
-> project status/pickup doc is `HANDOFF.md`. Keep all three in step — if code and a
-> doc disagree, fix one of them in the same change (per `AGENTS.md`).
+> **Status: Phase 1 + snapshot codec landed; Phases 2–4 ahead.** This file is the
+> single source of truth for the *design and implementation status* of durable
+> domains. Built so far: the `svm-durable` IR→IR transform (arbitrary single-vCPU
+> CFGs), the `svm-interp` handle-table durability primitives (§12.5), and the
+> `svm-snapshot` artifact codec (§12 container + window image + handle table + the R5
+> identity gate). The master design is `DESIGN.md` (D-notes, §-sections); the project
+> status/pickup doc is `HANDOFF.md`. Keep all three in step — if code and a doc
+> disagree, fix one of them in the same change (per `AGENTS.md`).
 >
 > Proposed decision: **D60** (D59 is currently the last). See bottom of file.
 
@@ -304,9 +307,17 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     on a cooperating-toolchain contract; corruption is self-contained and fails safe.
     Hard isolation against adversarial guests (guard-paged §12.7) is optional
     defense-in-depth.
-- **[ ] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT;
-  `svm-mem` page+prot snapshot/**restore**. Risk: low (oracle does the work);
-  Windows placeholder semantics the known annoyance. *(escape-TCB touch — restore.)*
+  - **Snapshot artifact codec + handle durability landed.** The `svm-interp` handle-table
+    durability primitives (§12.5) and the `svm-snapshot` §12 container — header w/ R5
+    digest, sparse zero-eliding window image, Section-3 handle table — now give a real
+    `freeze → bytes → restore → thaw` on the interpreter (`crates/svm-snapshot`), with the
+    §12.6 canonical + identity-gated invariants tested.
+- **[~] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT (the
+  `durable_jit` cross-backend property already holds); **artifact codec done** (above).
+  Remaining: `svm-mem` page+prot snapshot/**restore** for protected/large windows (the
+  codec's flat zero-eliding image covers the Phase-1 flat window), and routing the codec
+  through the cross-backend §7 property. Risk: low (oracle does the work); Windows
+  placeholder semantics the known annoyance. *(escape-TCB touch — restore.)*
 - **[ ] Phase 3 — STW + multi-vCPU + fiber freeze/thaw.** Cooperative quiesce, drain
   residue, freeze/thaw choreography against the D57 migratable-fiber ownership
   protocol. **Highest risk** — concurrency seam (loom-check, like the futex glue).
@@ -473,9 +484,8 @@ and pinning on `Host` (`crates/svm-interp/tests/handle_durability.rs`):
 re-grantable set in ascending slot order, or a clean refusal naming the first non-durable
 slot — freeze is all-or-nothing), `restore_durable_handles` + the `grant_at` pin, and
 `handle_capacity()` for the codec's bounds check. The value-typed descriptors
-(`DurableBinding`/`DurableHandle`) are public; `Binding` stays private. Still pending (the
-snapshot-codec slice): the byte-level **Section 3** TLV serialization of `DurableHandle`s
-and wiring it into the container + a real freeze→restore run.
+(`DurableBinding`/`DurableHandle`) are public; `Binding` stays private. The byte-level
+**Section 3** serialization is now wired into the `svm-snapshot` container (§12.6 below).
 
 ### 12.6 Round-trip / equivalence contract
 
@@ -489,6 +499,17 @@ Two derived invariants the fuzzer checks directly:
    byte-identical to the original artifact (§12.1).
 2. **Identity-gated:** restore against a mismatched instrumented-module digest
    refuses cleanly (never partial state) — R5.
+
+**Status: codec landed (single-vCPU Phase-1 shape).** `svm-snapshot` (tooling-tier, +0
+TCB; depends on `svm-ir`/`svm-encode`/`svm-interp`, **not** `svm-durable`) implements the
+§12 container: `freeze(module, window, host) -> Vec<u8>` and `restore(artifact, module,
+&mut host) -> window`. Header carries the 256-bit non-crypto instrumented-module digest
+(D-hash); the window image is sparse with zero-page elision (the shadow state rides along);
+Section 3 is the handle table. `crates/svm-snapshot/tests/roundtrip.rs` drives the real
+freeze→serialize→restore→thaw on the interpreter and asserts both invariants above plus the
+non-durable freeze refusal. Still ahead: §12.4 fiber/dispatch control state, `svm-mem`
+page-prot restore (Phase 2, escape-TCB), and folding the codec into the cross-backend §7
+property (currently interp-only here; `durable_jit` still exercises the manual path).
 
 ### 12.7 Shadow-frame layout
 
