@@ -71,7 +71,53 @@ W6 Debug-build mode (promotion off / value-locations)  ──→ W5
 W7 Concurrency-debug surfacing (explore_all UX) ── (← W2 optional)
 ```
 
-Recommended order is in §11. Each workstream below follows the same shape.
+The graph above is **functional** coupling ("A needs B to run"); honor it by ordering. The more
+dangerous coupling is **design-time** — shared representations (§2a) — which ordering does *not*
+solve. Recommended order is in §11. Each workstream below follows the same shape.
+
+---
+
+## 2a. Cross-workstream coupling — the shared "debug core"
+
+The §2 graph captures *functional* dependency (A needs B to work). It misses *design-time*
+coupling: places where two workstreams independently touch the **same representation**, so
+freezing one's version first forces the other to rework. Ordering cannot fix this; only deciding
+the representation **once, up front** can. Six such representations form a small shared **debug
+core** — each is a half-page data-model decision even though the implementations behind them are
+large and staged. That asymmetry is the argument: co-design the *vocabulary* first, iterate the
+*bodies* against it.
+
+| # | Shared representation | Consumed by | Rework if designed per-workstream |
+|---|---|---|---|
+| **S1** | **Location model** — naming "where in the program" (IR-PC + granularity: per-op vs per-statement) | W2, W3, W4, W5 | W2 picks an ad-hoc PC; W4 needs finer granularity → all breakpoint/frame addresses change |
+| **S2** | **Value-location model (`VarLoc`)** — where source var X lives at PC P (window slot / SSA value / promoted) | W2, W4, W5, W6 | W2 builds window-slot-only "read local" → can't express promoted SSA values → inspect API reworked |
+| **S3** | **Logical-time / position clock** — the monotonic coordinate `seek` targets | W1, W2, W7 | W1 uses cap-call count, W2 needs op count → no shared seek; time-travel + step-back don't compose |
+| **S4** | **Interpreter instrumentation seam** — the per-step / per-memop hook in the hot loop | W1, W2, W3, W7 | each bolts a parallel loop variant → conflicting hot paths, untestable. **The biggest pinch** |
+| **S5** | **Inspector control/session model** — stop-the-world vs observe-running vs many-runs | W1, W2, W3, W7 (home: W8) | W8 shaped only for synchronous stepping → W7 "explore many" + W1 "replay tape" don't fit → W8 reshaped |
+| **S6** | **Cranelift debug-emission layer** — enabling unwind/debug info in the JIT | W3, W5 | two Cranelift config paths for the same emission → duplication + drift |
+
+Plus two cross-cutting **invariants** (constraints, not representations) every workstream
+inherits:
+
+- **S7 — observe-only / behavior-preserving + strippable.** Interpreter hooks (W1/W2/W3/W7)
+  must not perturb scheduling or values: the **interp↔JIT differential** (the core testing
+  discipline) must hold with instrumentation off-path, and a debugger that changes the schedule
+  **hides the heisenbug**. Sanctioned exception: W2 *driving* a chosen deterministic schedule via
+  `run_scheduled` (control, not perturbation). All debug artifacts (W1 tape, W4 section, W5
+  DWARF) are strippable and untrusted-for-escape (§2a).
+- **S8 — metering-pause semantics.** Stopping at a breakpoint (W2) collides with §5's
+  **undisableable** fuel/epoch preemption (a runaway guest must always die). A guest stopped at a
+  breakpoint must not be fuel-killed, without reopening the runaway hole → a "metering paused
+  while stopped" state W8/W2 must define against §15/§5 (see D-DBG-6).
+
+**Genuinely separable** (iterate freely, low coupling): **W7 surfacing** (the functions exist),
+**W1 sequential `CapTape`** (couples to the cap ABI, not other debug work), **W6** (decoupled
+from the interpreter path — the interpreter holds SSA values explicitly, so Milestone A needs no
+debug-build mode), and the **DRF-or-trap tier** (standalone).
+
+**Conclusion.** The workstreams are *not* cleanly separable, but full co-design is unnecessary.
+Fix S1–S6 and decide S7/S8 in a thin **debug-core design pass** (Milestone 0, §11) before writing
+W2/W4; then the workstream bodies iterate independently against the frozen core.
 
 ---
 
@@ -378,7 +424,14 @@ verbs through it; attaching/detaching never changes guest-observable behavior.
 ## 11. Recommended sequencing
 
 Two tracks; the **cheap, interpreter-rooted source+stepping loop** first, the **expensive
-production-grade pieces** staged behind proof on the interpreter.
+production-grade pieces** staged behind proof on the interpreter. Gated on a **Milestone 0**
+design pass that fixes the shared debug core (§2a) so the bodies don't pinch.
+
+**Milestone 0 — debug-core design pass (paper, little/no code):** decide S1 (location model),
+S2 (`VarLoc`), S3 (logical-time clock), S4 (interpreter instrumentation seam), S5 (Inspector
+control model), S6 (Cranelift emission layer), and the S7/S8 invariants; resolve the
+cross-cutting decisions (§12) that gate them (D-DBG-3/4/6 especially). Cheap, and it prevents
+the rework §2a identifies.
 
 **Milestone A — "debug a single-threaded guest on the interpreter" (cheap, high value):**
 1. **W8 shell** (the capability to hang verbs on).
@@ -414,6 +467,10 @@ the genuinely expensive, deferrable production tooling.
 - **D-DBG-4 — debug-info location (W4):** text-first per D33 (recommend) vs binary-only.
 - **D-DBG-5 — `Inspector` delegation (W8):** host-only for v1 (recommend); guest-delegable
   self-debugging deferred.
+- **D-DBG-6 — metering-pause semantics (S8/W2/W8):** how a guest stopped at a breakpoint avoids
+  §5's undisableable fuel/epoch kill without reopening the runaway-guest hole. Options: a
+  host-only "inspector-paused" state that stops the fuel clock only while an `Inspector` holds
+  the guest (recommend), vs. a wall-clock grace that still bounds total stopped time.
 
 When these are settled, fold the resolved ones into `DESIGN.md` §19 / the decision log as
 `D54+` so DESIGN stays the canonical record.
