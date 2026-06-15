@@ -8,8 +8,9 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–G (control flow, memory, calls, switch, globals, floats, indirect
-calls) done — a broad swath of scalar C from `clang -O2` translates and runs on both backends.** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–H (control flow, memory, calls, switch, globals, floats, indirect
+calls, struct aggregates) done — a broad swath of scalar C from `clang -O2` translates and runs
+on both backends.** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -21,10 +22,11 @@ the common float intrinsics, `fmuladd` lowered unfused). Real `clang -O2` progra
 collatz loops, if-converted select, a stack-array sum, recursive `fib`, a cross-function call, a
 dense switch, `even`/`odd` mutual recursion, a const lookup table, a mutable global counter,
 indexed string reads, a gapped switch (a global jump table), double arithmetic/compares/
-conversions, `fabs`/`floor`, and an indirect call through a function pointer — run
-**interp == JIT == hand-computed** (25 tests). Remaining M1: aggregates/`sret` + struct GEP,
-libc/math function calls, function-pointer global tables (relocations), then the demo Lane C.
-Section numbers like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
+conversions, `fabs`/`floor`, an indirect call through a function pointer, and struct field
+access (global/array-of-struct/stack) — run **interp == JIT == hand-computed** (28 tests).
+Remaining M1: by-value aggregate args/returns (`sret`/`byval`), libc/math function calls,
+function-pointer global tables (relocations), then the demo Lane C. Section numbers like "§3d"
+refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
 
@@ -346,7 +348,19 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       prepended data-SP, so it matches the callee's IR signature. Tested on a `noinline` pointer-
       returning `pick` whose result `run` calls indirectly (a genuine `-O2` `call_indirect`).
 
+**Slice H (DONE) — aggregates (struct memory).**
+- [x] Struct layout (x86-64-SysV: natural field alignment + tail padding to the struct's alignment;
+      named structs resolved via the type table), **struct GEP** (a constant field index → the
+      field's byte offset, descending into the field type — composes with array indices), struct
+      `alloca`s (struct-sized, struct-aligned frame slots), and struct global initializers serialized
+      with field padding (read-only D40). Tested on a global struct read field-by-field, an
+      array-of-structs (`arr[i].field`), and a `volatile` stack struct (store/load via field GEP).
+      Covers structs via pointers/locals/globals — **not** the by-value pass/return ABI.
+
 **Remaining slices.**
+- [ ] **By-value aggregate args/returns** (`sret`/`byval`, D39) — passing/returning structs by value.
+      The gnarly part is clang's SysV register-classification (small structs coerced to int/array
+      params, large via `byval`/`sret` pointers); the IR must reconstruct/forward those.
 - [ ] Libc/math **function** calls (e.g. `sqrt` keeps errno semantics → a real `@sqrt` call) — bind
       to a guest libc / capability, or recognize the named libc-math calls as intrinsics under
       `-fno-math-errno`.

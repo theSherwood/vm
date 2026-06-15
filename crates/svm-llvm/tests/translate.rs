@@ -418,6 +418,37 @@ fn indirect_call_via_function_pointer() {
 }
 
 #[test]
+fn global_struct_fields() {
+    // A global struct {i32, i32, i64} read field-by-field — struct GEP (constant field offsets) +
+    // a read-only struct `data` segment with the {1,2,3} initializer laid out with field padding.
+    let src = "struct Point { int x; int y; long tag; }; \
+               const struct Point g = {1, 2, 3}; \
+               long sum(void){ return g.x + g.y + g.tag; }";
+    check("gstruct", src, &[], &[Value::I64(6)]);
+}
+
+#[test]
+fn array_of_structs() {
+    // `arr[i].field` — an array-of-struct GEP: a variable array index (stride = struct size) then
+    // a constant struct-field offset.
+    let src = "struct P { int x; int y; }; \
+               static const struct P arr[3] = {{1,2},{3,4},{5,6}}; \
+               int get(int i){ return arr[i].x + arr[i].y; }";
+    check("aos_1", src, &[Value::I32(1)], &[Value::I32(7)]); // 3+4
+    check("aos_2", src, &[Value::I32(2)], &[Value::I32(11)]); // 5+6
+}
+
+#[test]
+fn stack_struct() {
+    // A `volatile` struct local stays on the data stack (`alloca` of the struct) — exercises a
+    // struct-sized frame slot plus field store/load via struct GEP.
+    let src = "struct Point { int x; int y; long tag; }; \
+               long f(int a){ volatile struct Point p; p.x = a; p.y = a * 2; p.tag = a; \
+               return p.x + p.y + p.tag; }";
+    check("sstruct", src, &[Value::I32(5)], &[Value::I64(20)]); // 5+10+5
+}
+
+#[test]
 fn unsupported_is_fail_closed() {
     // A 128-bit integer is outside the subset — it must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).

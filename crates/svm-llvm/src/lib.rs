@@ -10,8 +10,8 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slices A–F):** multi-block scalar functions with stack memory, calls,
-//! `switch`, global variables, and floats.
+//! **Scope (Milestone 1, slices A–H):** multi-block scalar functions with stack memory, calls,
+//! `switch`, global variables, floats, indirect calls, and struct aggregates.
 //! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
 //!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
 //!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
@@ -38,10 +38,15 @@
 //!   the `i64` pointer rep); an indirect `call` truncates the function-pointer value to the `i32`
 //!   funcref and lowers to `call_indirect <sig>` (the runtime masks + type-id-checks it). The
 //!   signature is the callee's function type plus the prepended data-SP, matching the IR signature.
+//! - **H — aggregates (struct memory).** Struct layout (x86-64-SysV: natural field alignment +
+//!   tail padding; named structs resolved); **struct GEP** (a constant field index → the field's
+//!   byte offset); struct `alloca`s (struct-sized frame slots) and struct global initializers
+//!   serialize with field padding. Covers structs accessed via pointers/locals/globals — *not* the
+//!   by-value pass/return ABI (`sret`/`byval`), which is a follow-up.
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): libc/math *function* calls (e.g.
-//! `sqrt` with errno), pointer-valued globals (relocations — incl. function-pointer tables),
-//! struct/vector GEP + aggregates, SIMD vectors, and non-byte integer widths (e.g. `i33`).
+//! Out of the current subset (clean [`Error::Unsupported`]): by-value aggregate args/returns
+//! (`sret`/`byval`), libc/math *function* calls (e.g. `sqrt` with errno), pointer-valued globals
+//! (relocations — incl. function-pointer tables), SIMD vectors, and non-byte integer widths (`i33`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -162,23 +167,38 @@ fn name_str(n: &Name) -> String {
 }
 
 /// Serialize a constant initializer to its little-endian window bytes (the §3d/x86-64 layout).
-/// Integers (incl. the `i8`s of a C string), arrays, and zero/null aggregates are covered;
-/// pointer-valued globals (relocations), structs, floats, and vectors are a later slice.
-fn const_bytes(c: &Constant) -> Result<Vec<u8>, Error> {
+/// Integers (incl. the `i8`s of a C string), floats, arrays, structs (with field padding), and
+/// zero/null aggregates are covered; pointer-valued globals (relocations) are a later slice.
+fn const_bytes(c: &Constant, types: &Types) -> Result<Vec<u8>, Error> {
     match c {
         Constant::Int { bits, value } if *bits <= 64 => {
             let n = (*bits as usize).div_ceil(8).max(1);
             Ok(value.to_le_bytes()[..n].to_vec())
         }
+        Constant::Float(Float::Single(f)) => Ok(f.to_bits().to_le_bytes().to_vec()),
+        Constant::Float(Float::Double(d)) => Ok(d.to_bits().to_le_bytes().to_vec()),
         Constant::Array { elements, .. } | Constant::Vector(elements) => {
             let mut out = Vec::new();
             for e in elements {
-                out.extend(const_bytes(e.as_ref())?);
+                out.extend(const_bytes(e.as_ref(), types)?);
+            }
+            Ok(out)
+        }
+        // A struct: place each field at its laid-out offset, zero-filling alignment padding.
+        Constant::Struct {
+            values, is_packed, ..
+        } => {
+            let fields: Vec<llvm_ir::TypeRef> = values.iter().map(|v| v.get_type(types)).collect();
+            let (offsets, size, _) = struct_layout(&fields, *is_packed, types)?;
+            let mut out = vec![0u8; size as usize];
+            for (v, &off) in values.iter().zip(&offsets) {
+                let b = const_bytes(v.as_ref(), types)?;
+                out[off as usize..off as usize + b.len()].copy_from_slice(&b);
             }
             Ok(out)
         }
         Constant::AggregateZero(t) | Constant::Null(t) => {
-            Ok(vec![0u8; type_size(t.as_ref())? as usize])
+            Ok(vec![0u8; type_size(t.as_ref(), types)? as usize])
         }
         other => unsup(format!("global initializer {other:?}")),
     }
@@ -199,11 +219,11 @@ fn globals_layout(m: &LModule) -> Result<Globals, Error> {
     for g in &m.global_vars {
         let (bytes, size) = match &g.initializer {
             Some(init) => {
-                let b = const_bytes(init.as_ref())?;
+                let b = const_bytes(init.as_ref(), &m.types)?;
                 let n = b.len() as u64;
                 (Some(b), n.max(1))
             }
-            None => (None, type_size(g.ty.as_ref())?.max(1)),
+            None => (None, type_size(g.ty.as_ref(), &m.types)?.max(1)),
         };
         let align = (g.alignment as u64).max(1);
         off = off.div_ceil(align) * align;
@@ -295,18 +315,84 @@ fn fcmp_op(p: FPPredicate) -> Result<FCmpOp, Error> {
 }
 
 /// The size in bytes of an LLVM type (the SysV/§3d layout for the subset we lower). Used to lay
-/// out `alloca` frames and compute GEP strides. Aggregates beyond arrays (structs/vectors) and
-/// odd scalars are a clean `Unsupported` until a later slice.
-fn type_size(ty: &Type) -> Result<u64, Error> {
+/// out `alloca` frames and compute GEP strides. SIMD vectors and odd scalars are a clean
+/// `Unsupported` until a later slice.
+fn type_size(ty: &Type, types: &Types) -> Result<u64, Error> {
     match ty {
         Type::IntegerType { bits } => Ok((*bits as u64).div_ceil(8).max(1)),
         Type::PointerType { .. } => Ok(8),
+        Type::FPType(FPType::Single) => Ok(4),
+        Type::FPType(FPType::Double) => Ok(8),
         Type::ArrayType {
             element_type,
             num_elements,
-        } => Ok(*num_elements as u64 * type_size(element_type.as_ref())?),
+        } => Ok(*num_elements as u64 * type_size(element_type.as_ref(), types)?),
+        Type::StructType { .. } | Type::NamedStructType { .. } => {
+            let (fields, packed) = resolve_struct(ty, types)?;
+            Ok(struct_layout(&fields, packed, types)?.1)
+        }
         other => unsup(format!("size of type {other} (Milestone 1+)")),
     }
+}
+
+/// The natural alignment (bytes) of an LLVM type — scalar align = size; array = element align;
+/// struct = max field align (1 if packed).
+fn type_align(ty: &Type, types: &Types) -> Result<u64, Error> {
+    match ty {
+        Type::IntegerType { .. } | Type::PointerType { .. } | Type::FPType(_) => {
+            type_size(ty, types)
+        }
+        Type::ArrayType { element_type, .. } => type_align(element_type.as_ref(), types),
+        Type::StructType { .. } | Type::NamedStructType { .. } => {
+            let (fields, packed) = resolve_struct(ty, types)?;
+            Ok(struct_layout(&fields, packed, types)?.2)
+        }
+        other => unsup(format!("align of type {other} (Milestone 1+)")),
+    }
+}
+
+/// Resolve a struct type (literal or named) to its field types + packed flag.
+fn resolve_struct(ty: &Type, types: &Types) -> Result<(Vec<llvm_ir::TypeRef>, bool), Error> {
+    match ty {
+        Type::StructType {
+            element_types,
+            is_packed,
+        } => Ok((element_types.clone(), *is_packed)),
+        Type::NamedStructType { name } => match types.named_struct_def(name) {
+            Some(llvm_ir::types::NamedStructDef::Defined(t)) => resolve_struct(t.as_ref(), types),
+            _ => unsup(format!("opaque/undefined struct `{name}`")),
+        },
+        other => unsup(format!("not a struct: {other}")),
+    }
+}
+
+/// The x86-64-SysV/§3d struct layout: each field's byte offset, the total size, and the alignment.
+/// Fields align naturally (offset rounded up to the field's alignment); the struct's size is padded
+/// to its own alignment. A packed struct skips all padding.
+fn struct_layout(
+    fields: &[llvm_ir::TypeRef],
+    packed: bool,
+    types: &Types,
+) -> Result<(Vec<u64>, u64, u64), Error> {
+    let mut offsets = Vec::with_capacity(fields.len());
+    let mut off = 0u64;
+    let mut align = 1u64;
+    for f in fields {
+        let fsz = type_size(f.as_ref(), types)?;
+        let fal = if packed {
+            1
+        } else {
+            type_align(f.as_ref(), types)?
+        };
+        off = off.div_ceil(fal) * fal;
+        offsets.push(off);
+        off += fsz;
+        align = align.max(fal);
+    }
+    if !packed {
+        off = off.div_ceil(align) * align; // tail padding to the struct's alignment
+    }
+    Ok((offsets, off.max(1), align))
 }
 
 /// The integer bit width of an LLVM type, or `None` if it is not an integer.
@@ -371,7 +457,7 @@ fn translate_func(
     let scan = scan_func(f, types)?;
     let live_in = liveness(f, &scan)?;
     let block_params = block_params(f, &scan, &live_in);
-    let (frame, frame_size) = frame_layout(f, &scan)?;
+    let (frame, frame_size) = frame_layout(f, &scan, types)?;
 
     let mut blocks = Vec::with_capacity(f.basic_blocks.len());
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
@@ -402,7 +488,11 @@ fn translate_func(
 /// returning the `alloca`-id → offset map and the frame size (16-aligned, so a callee's frame —
 /// at `sp + frame_size` — stays aligned). A dynamic (`num_elements` non-constant) `alloca` is a
 /// clean `Unsupported` for now.
-fn frame_layout(f: &Function, s: &Scan) -> Result<(HashMap<ValueId, u64>, u64), Error> {
+fn frame_layout(
+    f: &Function,
+    s: &Scan,
+    types: &Types,
+) -> Result<(HashMap<ValueId, u64>, u64), Error> {
     let mut frame = HashMap::new();
     let mut off = 0u64;
     for bb in &f.basic_blocks {
@@ -415,10 +505,10 @@ fn frame_layout(f: &Function, s: &Scan) -> Result<(HashMap<ValueId, u64>, u64), 
                     },
                     _ => return unsup("dynamic alloca (non-constant element count)"),
                 };
-                let size = type_size(a.allocated_type.as_ref())?.saturating_mul(n);
-                // Natural alignment: the larger of the element size (capped at 8) and the
-                // `alloca`'s declared alignment; round the running offset up to it.
-                let align = (type_size(a.allocated_type.as_ref())?.min(8))
+                let size = type_size(a.allocated_type.as_ref(), types)?.saturating_mul(n);
+                // Natural alignment: the larger of the type's alignment and the `alloca`'s declared
+                // alignment; round the running offset up to it.
+                let align = type_align(a.allocated_type.as_ref(), types)?
                     .max(a.alignment as u64)
                     .max(1);
                 off = off.div_ceil(align) * align;
@@ -1476,6 +1566,8 @@ fn load_op(ty: &Type) -> Result<svm_ir::LoadOp, Error> {
         Type::IntegerType { bits } if *bits <= 32 => Ok(L::I32),
         Type::IntegerType { bits } if *bits == 64 => Ok(L::I64),
         Type::PointerType { .. } => Ok(L::I64),
+        Type::FPType(FPType::Single) => Ok(L::F32),
+        Type::FPType(FPType::Double) => Ok(L::F64),
         other => unsup(format!("load of type {other} (Milestone 1+)")),
     }
 }
@@ -1489,14 +1581,16 @@ fn store_op(ty: &Type) -> Result<svm_ir::StoreOp, Error> {
         Type::IntegerType { bits } if *bits <= 32 => Ok(S::I32),
         Type::IntegerType { bits } if *bits == 64 => Ok(S::I64),
         Type::PointerType { .. } => Ok(S::I64),
+        Type::FPType(FPType::Single) => Ok(S::F32),
+        Type::FPType(FPType::Double) => Ok(S::F64),
         other => unsup(format!("store of type {other} (Milestone 1+)")),
     }
 }
 
-/// Lower a `getelementptr` to an `i64` address: `base + Σ index_k · stride_k`, where the first
-/// index strides by the pointee size and each later index walks into an array element (struct/
-/// vector indexing is a later slice). Constant indices fold into one offset add; variable indices
-/// emit a `mul`+`add` (the index sign-extended to `i64`).
+/// Lower a `getelementptr` to an `i64` address: `base + Σ offset_k`. Index 0 strides by the pointee
+/// size; each later index walks *into* the current type — an array/vector element (stride =
+/// element size) or a **struct field** (a constant index → the field's byte offset). Constant
+/// indices fold into one offset add; variable indices emit a `mul`+`add` (sign-extended to `i64`).
 fn translate_gep(
     ctx: &mut BlockCtx,
     g: &llvm_ir::instruction::GetElementPtr,
@@ -1506,12 +1600,36 @@ fn translate_gep(
     let mut cur = g.source_element_type.clone();
     let mut const_off: i64 = 0;
     for (k, idx) in g.indices.iter().enumerate() {
+        // A struct field index (k ≥ 1, current type is a struct): always a constant; add the
+        // field's offset and descend into the field's type — no stride.
+        if k > 0
+            && matches!(
+                cur.as_ref(),
+                Type::StructType { .. } | Type::NamedStructType { .. }
+            )
+        {
+            let (fields, packed) = resolve_struct(cur.as_ref(), types)?;
+            let fidx = match idx {
+                Operand::ConstantOperand(c) => match c.as_ref() {
+                    Constant::Int { value, .. } => *value as usize,
+                    _ => return unsup("struct GEP with non-constant field index"),
+                },
+                _ => return unsup("struct GEP with non-constant field index"),
+            };
+            let (offsets, _, _) = struct_layout(&fields, packed, types)?;
+            const_off += *offsets
+                .get(fidx)
+                .ok_or_else(|| Error::Unsupported("struct field index out of range".into()))?
+                as i64;
+            cur = fields[fidx].clone();
+            continue;
+        }
         let stride = if k == 0 {
-            type_size(cur.as_ref())?
+            type_size(cur.as_ref(), types)?
         } else {
             match cur.as_ref() {
                 Type::ArrayType { element_type, .. } => {
-                    let s = type_size(element_type.as_ref())?;
+                    let s = type_size(element_type.as_ref(), types)?;
                     cur = element_type.clone();
                     s
                 }
