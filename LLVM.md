@@ -8,9 +8,9 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–I (control flow, memory, calls, switch, globals, floats, indirect
-calls, struct aggregates, memory intrinsics) done — a broad swath of scalar C from `clang -O2`
-translates and runs on both backends (30 tests).** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–J (control flow, memory, calls, switch, globals, floats, indirect
+calls, struct aggregates, memory intrinsics, by-value aggregates) done — a broad swath of scalar C
+from `clang -O2` translates and runs on both backends (35 tests).** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -23,10 +23,10 @@ collatz loops, if-converted select, a stack-array sum, recursive `fib`, a cross-
 dense switch, `even`/`odd` mutual recursion, a const lookup table, a mutable global counter,
 indexed string reads, a gapped switch (a global jump table), double arithmetic/compares/
 conversions, `fabs`/`floor`, an indirect call through a function pointer, struct field access
-(global/array-of-struct/stack), and a struct `memcpy` + `memset` — run **interp == JIT ==
-hand-computed** (30 tests).
-Remaining M1: by-value aggregate args/returns (`sret`/`byval`), libc/math function calls,
-function-pointer global tables (relocations), then the demo Lane C. Section numbers like "§3d"
+(global/array-of-struct/stack), a struct `memcpy` + `memset`, and by-value struct args/returns
+(small-coerced + `byval`/`sret`) — run **interp == JIT == hand-computed** (35 tests).
+Remaining M1: libc/math function calls, function-pointer global tables (relocations), then the
+demo Lane C. Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
@@ -368,10 +368,17 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       global's page (D40 protects RO segments page-granularly — the bug a struct-`memcpy`-into-stack
       test surfaced). Tested on a struct `memcpy` from a const global and a `memset` fill.
 
+**Slice J (DONE) — by-value aggregate args/returns (`sret`/`byval`).**
+- [x] Works with **no dedicated translator code** — the anticipated-gnarly slice turned out free,
+      because clang does the x86-64-SysV register-classification *in the IR*: a small struct is
+      coerced to scalar register(s) (`{i32,i32}`→`i64`, three-int→`(i64,i32)`, SSE→`double`s) and the
+      body packs/unpacks via a stack slot; a large struct passes via a `byval`/`sret` pointer (the
+      caller `alloca`s + `memcpy`s + passes the pointer). So slices A–I (scalar params, memory,
+      calls, struct GEP, **memcpy** — the actual prerequisite) already cover it. Tested through calls
+      so the call-site coercion is exercised: small `byval`/return, two-eightbyte `(i64,i32)`, an SSE
+      `(double,double)`, and a large `mkBig` (`sret`) + `sumBig` (`byval`).
+
 **Remaining slices.**
-- [ ] **By-value aggregate args/returns** (`sret`/`byval`, D39) — passing/returning structs by value.
-      The gnarly part is clang's SysV register-classification (small structs coerced to int/array
-      params, large via `byval`/`sret` pointers); the IR must reconstruct/forward those.
 - [ ] Libc/math **function** calls (e.g. `sqrt` keeps errno semantics → a real `@sqrt` call) — bind
       to a guest libc / capability, or recognize the named libc-math calls as intrinsics under
       `-fno-math-errno`.

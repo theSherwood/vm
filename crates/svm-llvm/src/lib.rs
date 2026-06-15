@@ -10,8 +10,9 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slices A–I):** multi-block scalar functions with stack memory, calls,
-//! `switch`, global variables, floats, indirect calls, struct aggregates, and memory intrinsics.
+//! **Scope (Milestone 1, slices A–J):** multi-block scalar functions with stack memory, calls,
+//! `switch`, globals, floats, indirect calls, struct aggregates, memory intrinsics, and by-value
+//! aggregate args/returns.
 //! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
 //!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
 //!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
@@ -47,10 +48,15 @@
 //!   chunked load/stores (widest-first 8/4/2/1, the `svm-wasm` plan); copies load-all-then-store-all
 //!   (overlap-safe); `memset` replicates the fill byte across an `i64`. The data stack is page-aligned
 //!   above the globals so a stack write never faults on a read-only global's page (D40).
+//! - **J — by-value aggregates (`sret`/`byval`).** Works with **no dedicated code**: clang does the
+//!   x86-64-SysV classification *in the IR* — a small struct is coerced to scalar register(s)
+//!   (`{i32,i32}`→`i64`, `{int×3}`→`(i64,i32)`, SSE→`double`s), a large one passes via a `byval`/
+//!   `sret` pointer (the caller `alloca`s + `memcpy`s + passes the pointer). So slices A–I (scalar
+//!   params, memory, calls, struct GEP, memcpy) already cover it; this slice is the test lock-in.
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): by-value aggregate args/returns
-//! (`sret`/`byval`), variable-length `mem*`, libc/math *function* calls (e.g. `sqrt` with errno),
-//! pointer-valued globals (relocations — incl. function-pointer tables), SIMD vectors, `i33`.
+//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `mem*`, libc/math
+//! *function* calls (e.g. `sqrt` with errno), pointer-valued globals (relocations — incl.
+//! function-pointer tables), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

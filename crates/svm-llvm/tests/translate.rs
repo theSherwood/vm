@@ -121,6 +121,80 @@ fn check_traps(name: &str, src: &str, args: &[Value]) {
 }
 
 #[test]
+fn byval_small_struct_arg() {
+    // A small struct passed by value — clang coerces it to an `i64` register. `run` packs {a,b}
+    // and calls `sumP(i64)`; the callee unpacks the fields.
+    let src = "struct P { int x; int y; }; int sumP(struct P); \
+               int run(int a, int b){ struct P p = {a, b}; return sumP(p); } \
+               __attribute__((noinline)) int sumP(struct P p){ return p.x + p.y; }";
+    check(
+        "bvarg",
+        src,
+        &[Value::I32(3), Value::I32(4)],
+        &[Value::I32(7)],
+    );
+}
+
+#[test]
+fn byval_small_struct_return() {
+    // A small struct returned by value — coerced to an `i64` return. `run` calls `mkP` and reads
+    // the returned fields.
+    let src = "struct P { int x; int y; }; struct P mkP(int, int); \
+               int run(int a, int b){ struct P p = mkP(a, b); return p.x * 10 + p.y; } \
+               __attribute__((noinline)) struct P mkP(int a, int b){ struct P p = {a, b}; return p; }";
+    check(
+        "bvret",
+        src,
+        &[Value::I32(3), Value::I32(4)],
+        &[Value::I32(34)],
+    );
+}
+
+#[test]
+fn byval_two_eightbyte_struct() {
+    // A 12-byte struct coerced to *two* registers `(i64, i32)` (two eightbytes).
+    let src = "struct Q { int x; int y; int z; }; int sumQ(struct Q); \
+               int run(int a, int b, int c){ struct Q q = {a, b, c}; return sumQ(q); } \
+               __attribute__((noinline)) int sumQ(struct Q q){ return q.x + q.y + q.z; }";
+    check(
+        "bvq",
+        src,
+        &[Value::I32(1), Value::I32(2), Value::I32(3)],
+        &[Value::I32(6)],
+    );
+}
+
+#[test]
+fn byval_sse_struct() {
+    // A `{double, double}` struct — two SSE eightbytes, coerced to `(double, double)`.
+    let src = "struct DD { double a; double b; }; double useDD(struct DD); \
+               double run(double x, double y){ struct DD d = {x, y}; return useDD(d); } \
+               __attribute__((noinline)) double useDD(struct DD d){ return d.a * d.b; }";
+    check(
+        "bvdd",
+        src,
+        &[Value::F64(3.0), Value::F64(4.0)],
+        &[Value::F64(12.0)],
+    );
+}
+
+#[test]
+fn byval_and_sret_large_struct() {
+    // A large struct returned via `sret` (`mkBig`) and passed via `byval` (`sumBig`) — both are
+    // hidden caller-allocated pointers in the IR.
+    let src = "struct Big { int a[8]; }; long sumBig(struct Big); struct Big mkBig(int); \
+               long run(int v, int i){ struct Big b = mkBig(v); return sumBig(b) + b.a[i & 7]; } \
+               __attribute__((noinline)) struct Big mkBig(int v){ struct Big b; for(int i=0;i<8;i++) b.a[i]=v+i; return b; } \
+               __attribute__((noinline)) long sumBig(struct Big b){ long s=0; for(int i=0;i<8;i++) s+=b.a[i]; return s; }";
+    check(
+        "bvbig",
+        src,
+        &[Value::I32(10), Value::I32(0)],
+        &[Value::I64(118)],
+    ); // sum 10..17 + 10
+}
+
+#[test]
 fn memcpy_struct_copy() {
     // `struct Big q = G` → `llvm.memcpy` (32 bytes) from a const global into a stack struct; we
     // lower it to chunked load/stores. A runtime field read keeps the alloca + copy.
