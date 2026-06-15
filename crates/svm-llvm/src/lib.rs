@@ -94,6 +94,8 @@ pub fn translate(m: &LModule) -> Result<Module, Error> {
         funcs,
         memory,
         data: Vec::new(),
+        // §7 named capability imports — the LLVM on-ramp emits none yet.
+        imports: Vec::new(),
     })
 }
 

@@ -86,6 +86,15 @@ const WASM_PAGE: u64 = 1 << 16;
 /// `wasmtime-wasi-threads` expects, so the same bytes run on both engines.
 const WASI_THREAD_MODULE: &str = "wasi";
 const WASI_THREAD_SPAWN_NAME: &str = "thread-spawn";
+/// Sentinel `type_id` marking a **§7 named import** in the internal `imports` table (one whose
+/// `module`/`name` are *not* the numeric host-ABI convention — e.g. a real WASI import like
+/// `("wasi_snapshot_preview1", "fd_write")`). Such an import lowers to an `Inst::CallImport` (the
+/// `op` field carries its index into the module's import table) rather than an inline `cap.call`; the
+/// embedder resolves the name to a concrete `(type_id, op)` at load (e.g. an `svm-wasi` shim). It is
+/// distinct from the `wasi:thread/spawn` placeholder (`u32::MAX`) and, being `!= u32::MAX`, it counts
+/// as a handle-using capability import in the existing one-handle / one-interface checks — so all
+/// named imports share the single threaded handle (the host grants one capability behind them).
+const NAMED_IMPORT: u32 = u32::MAX - 1;
 /// The export the host calls on a freshly spawned thread: `(func (param $tid i32) (param $start_arg
 /// i32))`. The synthesized spawn shim adapts SVM's `(i64 sp, i64 arg)` thread-entry ABI to it.
 const WASI_THREAD_START_EXPORT: &str = "wasi_thread_start";
@@ -143,6 +152,18 @@ fn val_type(w: W) -> Result<ValType, Error> {
 /// the size cell only governs the `size`/`grow` *return values*. A module that never grows is
 /// unchanged (no cell, the tight initial-sized window, `memory.size` a constant).
 pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
+    // Fail-closed on malformed / invalid wasm *before* any lowering. The lowering pass below indexes
+    // attacker-controlled type/function/global/local/table/branch indices and derives operand-stack
+    // heights straight from the byte stream; on hostile-but-decodable input those raw `[...]` accesses
+    // and `len() - k` subtractions would panic, and an oversized locals/table declaration would
+    // allocate unboundedly (a host-side OOM / `abort`). A full validation pass up front guarantees wasm
+    // validity — in-range indices, well-typed and arity-correct operands, and wasmparser's
+    // implementation limits (≤50 000 locals/function, ≤10 000 000 table entries, …) — so every such
+    // hostile input becomes a clean `Error` here instead. The default feature set covers exactly the
+    // proposals we lower (mutable-global, bulk-memory, SIMD, threads, multi-value, …); anything we do
+    // not support is still rejected later by an `Unsupported` bail or, ultimately, the IR verifier.
+    wasmparser::Validator::new().validate_all(wasm)?;
+
     let mut types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
     let mut func_type_idx: Vec<u32> = Vec::new();
     let mut bodies: Vec<wasmparser::FunctionBody> = Vec::new();
@@ -156,6 +177,10 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                                                          // convention (`module` = decimal type_id, `name` = decimal op) and lowers to a `cap.call`. The
                                                          // function index space puts imports first, so a wasm index `< imports.len()` is an import.
     let mut imports: Vec<(u32, u32, FuncType)> = Vec::new();
+    // §7 named imports (non-numeric module/name, e.g. real WASI): the module-level import table the
+    // `Inst::CallImport`s reference, resolved to concrete capabilities at load. Empty for the numeric
+    // host-ABI convention. Parallel to `imports` (a `NAMED_IMPORT` entry's `op` indexes this).
+    let mut named_imports: Vec<svm_ir::Import> = Vec::new();
     // §12 wasm threads: the wasm function index of the `wasi:thread/spawn` import, if present. Its
     // `call` lowers to `thread.spawn` (not a cap.call); see the spawn-shim synthesis.
     let mut spawn_import: Option<u32> = None;
@@ -223,26 +248,24 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                         imports.push((u32::MAX, 0, sig)); // placeholder (type_id unused; never cap-called)
                         continue;
                     }
-                    // The binding convention: `module` is the decimal capability type_id and `name`
-                    // the decimal op. This keeps the transpiler pure mechanism — it never interprets
-                    // the host semantics; the embedder grants the matching capability and the
-                    // (type_id, op) just select an interface/method. A non-numeric name is a clear
-                    // error rather than a silent mis-binding.
-                    let type_id: u32 = imp.module.parse().map_err(|_| {
-                        Error::Unsupported(format!(
-                            "import module {:?} is not a decimal capability type_id (the host-ABI \
-                             convention: module = type_id, name = op)",
-                            imp.module
-                        ))
-                    })?;
-                    let op: u32 = imp.name.parse().map_err(|_| {
-                        Error::Unsupported(format!(
-                            "import name {:?} is not a decimal capability op (the host-ABI \
-                             convention: module = type_id, name = op)",
-                            imp.name
-                        ))
-                    })?;
-                    imports.push((type_id, op, sig));
+                    // The binding convention has two forms. (a) **Numeric**: `module` is the decimal
+                    // capability type_id and `name` the decimal op — a pure-mechanism inline
+                    // `cap.call` (the transpiler never interprets host semantics). (b) **Named** (§7):
+                    // anything else (e.g. a real WASI `("wasi_snapshot_preview1", "fd_write")`) becomes
+                    // a `CallImport "<module>.<name>"` the embedder resolves to a concrete capability
+                    // at load — so the transpiler still stays pure mechanism, just deferring the bind.
+                    match (imp.module.parse::<u32>(), imp.name.parse::<u32>()) {
+                        (Ok(type_id), Ok(op)) => imports.push((type_id, op, sig)),
+                        _ => {
+                            let name = format!("{}.{}", imp.module, imp.name);
+                            let idx = named_imports.len() as u32;
+                            named_imports.push(svm_ir::Import {
+                                name,
+                                sig: sig.clone(),
+                            });
+                            imports.push((NAMED_IMPORT, idx, sig));
+                        }
+                    }
                 }
                 // v1 threads a single capability handle, so every **capability** import must share one
                 // type_id (one interface, methods distinguished by op); the `wasi:thread/spawn` import
@@ -593,6 +616,9 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             funcs,
             memory,
             data,
+            // §7 named imports (real WASI etc.): the host resolves these to concrete capabilities at
+            // load (`resolve_imports`). Empty for the numeric host-ABI convention (inline `cap.call`).
+            imports: named_imports,
         },
         exports,
     })
@@ -1367,16 +1393,26 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
         args.reverse(); // stack top is the last argument
         let handle = lo.handle.expect("import call requires a threaded handle");
         let results = sig.results.clone();
-        let res = lo.emit_call(
+        // §7 named import (`type_id == NAMED_IMPORT`): emit a `CallImport` (the host binds the name to
+        // a concrete capability at load); `op` carries the index into the module's import table.
+        // Otherwise the numeric host-ABI convention → an inline `cap.call`.
+        let inst = if type_id == NAMED_IMPORT {
+            Inst::CallImport {
+                import: op,
+                sig,
+                handle,
+                args,
+            }
+        } else {
             Inst::CapCall {
                 type_id,
                 op,
                 sig,
                 handle,
                 args,
-            },
-            results.len(),
-        );
+            }
+        };
+        let res = lo.emit_call(inst, results.len());
         for (v, t) in res.into_iter().zip(results.iter()) {
             lo.push(v, *t);
         }

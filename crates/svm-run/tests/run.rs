@@ -579,3 +579,60 @@ fn quota_contains_a_powerbox_thread_bomb() {
         "the default quota must run the program, got {r:?}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// §7 named capability imports (late binding): a frontend declares `extern`-style
+// capability imports by name; the host resolves each to a concrete `cap.call` at load.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn named_imports_resolve_and_run_like_inline_capcalls() {
+    // The same program as `writes_to_stdout_and_returns`/`exit_capability_sets_code`, but the
+    // capabilities are reached by NAME (`write`, `exit`) instead of inline `cap.call 0 1`/`1 0`.
+    // The handle is still supplied by the call site (v0 = stdout, v2 = exit); the host policy
+    // binds only the (type_id, op). resolve_capability_imports lowers them to the same cap.calls.
+    let src = "memory 16\n\
+        import 0 \"write\" (i64, i64) -> (i64)\n\
+        import 1 \"exit\" (i32) -> ()\n\
+        data 16 \"hi\\n\"\n\
+        func (i32, i32, i32) -> (i32) {\n\
+        block0(v0: i32, v1: i32, v2: i32):\n\
+        \x20 v3 = i64.const 16\n\
+        \x20 v4 = i64.const 3\n\
+        \x20 v5 = call.import 0 v0 (v3, v4)\n\
+        \x20 v6 = i32.const 0\n\
+        \x20 call.import 1 v2 (v6)\n\
+        \x20 unreachable\n\
+        }\n";
+    let m = parse_module(src).expect("parse text IR with imports");
+    assert_eq!(m.imports.len(), 2, "two named imports declared");
+    // Resolve under the reference host policy, then verify + run.
+    let resolved = svm_run::resolve_capability_imports(m).expect("resolve imports");
+    assert!(resolved.imports.is_empty(), "imports must be lowered away");
+    verify_module(&resolved).expect("verify resolved module");
+    assert!(is_powerbox_entry(&resolved));
+    let run = run_powerbox(&resolved, b"").expect("run");
+    assert_eq!(run.stdout, b"hi\n", "write import produced stdout");
+    assert_eq!(run.outcome, Outcome::Exited(0), "exit import set the code");
+}
+
+#[test]
+fn unknown_named_import_fails_closed() {
+    // A capability name the host policy doesn't know is a clean load error — never a silent
+    // no-op or a wrong call.
+    let src = "func (i32, i32, i32) -> (i32) {\n\
+        block0(v0: i32, v1: i32, v2: i32):\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4 = call.import 0 v0 (v3)\n\
+        \x20 v5 = i32.const 0\n\
+        \x20 return v5\n\
+        }\n";
+    // Declare the unknown import at the top.
+    let src = format!("import 0 \"frobnicate\" (i64) -> (i64)\n{src}");
+    let m = parse_module(&src).expect("parse");
+    let err = svm_run::resolve_capability_imports(m).expect_err("unknown import must fail closed");
+    assert!(
+        err.contains("frobnicate"),
+        "error names the bad import: {err}"
+    );
+}

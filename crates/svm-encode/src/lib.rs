@@ -87,6 +87,8 @@ mod op {
     pub const PTR_TO_INT: u8 = 0x77;
     pub const PTR_ADD: u8 = 0x78; // (i64, i64) -> i64
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
+    pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
+    pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -237,6 +239,19 @@ fn encode_func(out: &mut Vec<u8>, f: &Func) {
 
 fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
     match inst {
+        // §7 named imports have no wire opcode: the binary form is always import-free
+        // (resolution to `cap.call` precedes encoding). Reaching here is a toolchain bug
+        // — encoding an unresolved module — not an untrusted-input path (decode never
+        // produces a `CallImport`).
+        Inst::CallImport { .. } => {
+            unreachable!("encode: resolve_imports must run before binary encoding")
+        }
+        // §7 capability reflection intrinsics.
+        Inst::CapSelfCount => out.push(op::CAP_SELF_COUNT),
+        Inst::CapSelfGet { idx } => {
+            out.push(op::CAP_SELF_GET);
+            write_uleb(out, *idx as u64);
+        }
         Inst::ConstI32(c) => {
             out.push(op::CONST_I32);
             write_sleb(out, *c as i64);
@@ -910,6 +925,8 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         funcs,
         memory,
         data,
+        // The binary form is always import-free (§7 imports are resolved before encoding).
+        imports: Vec::new(),
     })
 }
 
@@ -1025,6 +1042,8 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             handle: c.idx()?,
             args: decode_idxs(c)?,
         },
+        op::CAP_SELF_COUNT => Inst::CapSelfCount,
+        op::CAP_SELF_GET => Inst::CapSelfGet { idx: c.idx()? },
 
         op::CONST_F32 => Inst::ConstF32(c.u32_le()?),
         op::CONST_F64 => Inst::ConstF64(c.u64_le()?),
@@ -1337,6 +1356,13 @@ impl<'a> Cursor<'a> {
             if shift >= 64 {
                 return Err(DecodeError::LebOverflow);
             }
+            // At shift 63 only the sign bit (bit 63) still fits, so the final group's value bits must
+            // be a pure sign extension: `0x00` (non-negative) or `0x7f` (negative). Any other value
+            // has bits that do not fit `i64` — reject it as overflow (mirrors `uleb`'s `low > 1` check),
+            // rather than silently dropping the over-wide bits.
+            if shift == 63 && byte & 0x7f != 0x00 && byte & 0x7f != 0x7f {
+                return Err(DecodeError::LebOverflow);
+            }
             result |= ((byte & 0x7f) as i64) << shift;
             shift += 7;
             if byte & 0x80 == 0 {
@@ -1383,5 +1409,62 @@ impl<'a> Cursor<'a> {
             return Err(DecodeError::CountTooLarge);
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod leb_tests {
+    use super::*;
+
+    /// `sleb` must round-trip every boundary value the encoder emits, including the 10-byte extremes.
+    #[test]
+    fn sleb_roundtrips_boundaries() {
+        for v in [
+            0i64,
+            1,
+            -1,
+            63,
+            -64,
+            i32::MIN as i64,
+            i32::MAX as i64,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            let mut out = Vec::new();
+            write_sleb(&mut out, v);
+            let mut c = Cursor::new(&out);
+            assert_eq!(c.sleb().unwrap(), v, "sleb round-trip for {v}");
+        }
+    }
+
+    /// An over-wide final group (value bits beyond bit 63 that are not a pure sign extension) must be
+    /// rejected as `LebOverflow`, not silently truncated — the L3 fidelity fix mirroring `uleb`.
+    #[test]
+    fn sleb_rejects_overwide_final_group() {
+        // Nine 0x80 continuation bytes carry shift to 63; the 10th byte is the final group.
+        let nine = [0x80u8; 9];
+        // 0x00 / 0x7f are the only valid final groups (sign extension) — accepted.
+        for last in [0x00u8, 0x7f] {
+            let mut bytes = nine.to_vec();
+            bytes.push(last);
+            assert!(
+                Cursor::new(&bytes).sleb().is_ok(),
+                "valid final group {last:#x}"
+            );
+        }
+        // Anything else has bits that don't fit i64 — rejected.
+        for last in [0x01u8, 0x40, 0x3f, 0x7e] {
+            let mut bytes = nine.to_vec();
+            bytes.push(last);
+            assert_eq!(
+                Cursor::new(&bytes).sleb(),
+                Err(DecodeError::LebOverflow),
+                "over-wide final group {last:#x} must be rejected"
+            );
+        }
+        // A continuation bit past the 10th byte is still overflow.
+        let mut bytes = [0x80u8; 10].to_vec();
+        bytes.push(0x00);
+        assert_eq!(Cursor::new(&bytes).sleb(), Err(DecodeError::LebOverflow));
     }
 }

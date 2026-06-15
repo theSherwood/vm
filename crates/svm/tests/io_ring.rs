@@ -761,3 +761,37 @@ block2(v23: i32):
         "submit_async returns the count submitted"
     );
 }
+
+/// Regression for the H1 host-DoS: a guest-supplied SQE count is clamped to a bounded batch ceiling
+/// before any allocation or loop. Without the clamp, `submit` with `n = i64::MAX` would
+/// `with_capacity`-allocate ~`n * size_of::<Pending>()` bytes → an uncatchable allocator `abort()`
+/// (a guest crashing the host, §5) and otherwise spin the submit loop `n` times. With it, the call
+/// returns promptly with the clamped count (`MAX_RING_BATCH == 1 << 16`) on **both** backends, and the
+/// test completing at all is the proof it neither aborted nor hung. The SQ/CQ pointers are placed far
+/// out of the window so every clamped iteration is a cheap out-of-window read (no per-SQE dispatch),
+/// isolating the count-clamp behaviour.
+#[test]
+fn ring_submit_clamps_a_forged_entry_count() {
+    // `cap.call 9 0` = IoRing.submit(sq_ptr, n, cq_ptr); sq_ptr/cq_ptr 1e9 are well past the 128 KiB
+    // window, so each SQE read EFAULTs (a no-op completion) — pure clamp/loop-bound exercise.
+    let src = "memory 17
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.const 1000000000
+  v3 = i64.const 9223372036854775807
+  v4 = i64.const 1000000000
+  v5 = cap.call 9 0 (i64, i64, i64) -> (i64) v0 (v2, v3, v4)
+  return v5
+}
+";
+    let (ival, _imem, jo, _jmem) = both(src);
+    assert_eq!(
+        ival,
+        Value::I64(1 << 16),
+        "interp: a forged submit count must clamp to MAX_RING_BATCH (1 << 16), not abort/hang"
+    );
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[1 << 16]),
+        "jit: a forged submit count must clamp to MAX_RING_BATCH; got {jo:?}"
+    );
+}
