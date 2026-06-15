@@ -3100,7 +3100,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let (target, claimed) = registry.claim(kh)?;
                     let new_frames = match claimed {
                         Claimed::Start { func: funcref, sp } => {
-                            let callee = table_lookup(fs, funcref, &fiber_sig())?;
+                            // A forged / wrong-type fiber funcref is a **fiber** fault, not a
+                            // generic `IndirectCallType`: the fault arises from a `cont.*` op, so it
+                            // joins the forged-handle / dead / bomb family and matches the JIT, which
+                            // raises `FiberFault` from its first-resume type-check (`fiber_rt`). The
+                            // claim already took the slot to `Running`, so this fiber stays inert.
+                            let callee = table_lookup(fs, funcref, &fiber_sig())
+                                .map_err(|_| Trap::FiberFault)?;
                             // First entry: call `func(sp, arg)` on the fiber's data stack. Fibers
                             // are module-0 only (a unit cannot use `cont.*`, gated at compile).
                             vec![Frame {

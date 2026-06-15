@@ -217,6 +217,29 @@ fn fiber_handle_values_match_across_backends() {
     );
 }
 
+/// `cont.new` over a **wrong-type funcref** (the funcref names a function whose signature is not the
+/// fiber entry type `(i64, i64) -> i64`) faults on first resume on *both* backends → `FiberFault`. The
+/// verifier only checks the funcref is an `i32` (§12 — the type is a runtime use-site check), so this
+/// path is reachable; both backends type-check lazily at first resume, and the fault is a *fiber* fault
+/// (the forged-handle / dead / bomb family), not a generic `IndirectCallType`.
+#[test]
+fn fiber_wrong_type_funcref_traps() {
+    let src = "func () -> (i32, i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 1\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 return v4 v5\n\
+        }\n\
+        func (i32) -> (i32) {\n\
+        block0(v0: i32):\n\
+        \x20 return v0\n\
+        }\n";
+    assert_jit_matches_interp(src);
+}
+
 /// A fiber whose body actually uses the **data stack** (its `sp`) and shared memory: it stores `arg`
 /// to `mem[sp]`, suspends, then reloads and returns it — exercising the two-stack split end to end and
 /// the `mem_base`/`sp` threading into the fiber entry.
