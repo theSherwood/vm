@@ -434,6 +434,70 @@ Two derived invariants the fuzzer checks directly:
 2. **Identity-gated:** restore against a mismatched instrumented-module digest
    refuses cleanly (never partial state) — R5.
 
+### 12.7 Shadow-frame layout
+
+The transform's spill/reload code and the suspended representation meet here. Two
+properties drive the whole design:
+
+- **The shadow stack is in-window**, so the §12.3 window image captures it verbatim.
+  The serializer never walks frames — it copies the byte range `[base, shadow_SP)`
+  and records the extent. Frame *internals* are re-interpreted only by the same
+  instrumented code on thaw, so the frame need only be self-consistent for **rewind**,
+  not for a generic external reader.
+- **Resume-point liveness is the continuation block's params** (§2), whose types are
+  statically known per resume id. So a frame stores *raw value bytes only* — never
+  type tags; the resume id selects the layout.
+
+**Stacks per fiber (D39/D41 extended).** A non-durable fiber owns the D41 *pair*:
+out-of-band control stack (native, not serialized) + in-window guard-paged data stack
+(data-SP). A **durable** fiber owns a *triple* — add an in-window, guard-paged,
+quota-charged **shadow stack** (shadow-SP), swapped alongside the others on fiber
+switch. The shadow stack is allocated **only under instrumentation**, so non-durable
+modules keep the pair and pay nothing (§6).
+
+**Frame format** (grows upward; `shadow_SP` points just past the live top frame):
+
+```
+  ┌─ frame base (16-byte aligned) ───────────────────────────┐
+  │ live values, packed in continuation-block param order:   │
+  │   i32/f32 → 4B   i64/f64 → 8B   v128 → 16B (nat. aligned) │
+  │ … pad to keep the resume id in the top word …            │
+  │ resume_id : u32        ← always the top 4 bytes of frame  │
+  └──────────────────────────────────────────── shadow_SP ───┘
+```
+
+`resume_id` lives at a **fixed offset from `shadow_SP` (`−4`)** so rewind can read it
+*before* knowing the frame size — which resolves the circularity (frame size depends
+on resume id depends on reading the frame). `resume_id = 0` is reserved ("no in-flight
+resume"). Frames are 16-byte aligned (v128). Per-resume-id frame size is a transform
+compile-time constant; nothing stores it.
+
+**Unwind (freeze), after a may-suspend call, if `UNWINDING`:** push live values, push
+`resume_id` on top, `shadow_SP += frame_size(rid)`, `return` (propagates out to host).
+
+**Rewind (thaw), function prologue, if `REWINDING`:**
+`rid = load_u32(shadow_SP − 4); br_table rid` → arm reloads its params from the known
+offsets, `shadow_SP −= frame_size(rid)`, then:
+- if `shadow_SP == base` (this was the deepest frame — the actual safepoint): flip the
+  state word to `NORMAL` and continue forward from the resume point;
+- else: re-issue the in-flight call (which re-enters the callee, whose own prologue
+  sees `REWINDING` and pops the next frame).
+
+**State word** (`NORMAL | UNWINDING | REWINDING`): per-vCPU, in-window (§2); every
+poll/prologue reads it. Freeze sets all to `UNWINDING` and drives each fiber to drain
+its native stack into its shadow stack; thaw sets `REWINDING` and re-enters.
+
+**Host-side control state (§12.4) per durable fiber** therefore reduces to: the
+shadow-stack region's window offset + `shadow_SP` extent (the bytes themselves are in
+the window image). Optional integrity aids (a per-frame `func_id` tag checked on pop)
+are *recommended in checked builds* but not normative — correctness needs only
+`resume_id` + values.
+
+> **Iteration note.** The exact intra-frame padding and the deepest-frame flip are the
+> parts most likely to shift once the Phase 1 transform is real; the
+> resume-id-at-`SP−4` rule and the in-window triple-stack placement are the load-
+> bearing commitments and should be stable.
+
 ---
 
 ## Proposed decision record
