@@ -22,9 +22,10 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
-    Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
-    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
+    FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module,
+    Ordering, StoreOp, Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType,
+    VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -82,7 +83,40 @@ pub fn print_module(m: &Module) -> String {
         }
         print_func(&mut s, f, &fn_results);
     }
+    print_debug_info(&mut s, m);
     s
+}
+
+/// Print the frontend-neutral debug-info waist (DEBUGGING.md §6) as module-level directives after
+/// the functions: `debug.file <idx> "<path>"`, `debug.loc <fn> <bb> <i> <file> <line> <col>`,
+/// `debug.var <fn> "<name>" win|ssa <n> "<type>"`. Absent ⇒ nothing printed.
+fn print_debug_info(s: &mut String, m: &Module) {
+    let Some(di) = &m.debug_info else { return };
+    if di.files.is_empty() && di.locs.is_empty() && di.vars.is_empty() {
+        return;
+    }
+    s.push('\n');
+    for (i, f) in di.files.iter().enumerate() {
+        let _ = writeln!(s, "debug.file {i} \"{f}\"");
+    }
+    for l in &di.locs {
+        let _ = writeln!(
+            s,
+            "debug.loc {} {} {} {} {} {}",
+            l.func, l.block, l.inst, l.file, l.line, l.col
+        );
+    }
+    for v in &di.vars {
+        let (kind, n) = match v.loc {
+            VarLoc::Window { off } => ("win", off),
+            VarLoc::Ssa { value } => ("ssa", value as i64),
+        };
+        let _ = writeln!(
+            s,
+            "debug.var {} \"{}\" {kind} {n} \"{}\"",
+            v.func, v.name, v.ty
+        );
+    }
 }
 
 /// Escape data-segment bytes for the text form: printable ASCII verbatim (except `\` and `"`),
@@ -663,8 +697,62 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     let mut funcs = Vec::new();
     let mut memory = None;
     let mut data: Vec<Data> = Vec::new();
+    let mut dbg_files: Vec<String> = Vec::new();
+    let mut dbg_locs: Vec<Loc> = Vec::new();
+    let mut dbg_vars: Vec<VarInfo> = Vec::new();
     while !p.at_end() {
         match p.peek() {
+            // Debug-info waist (DEBUGGING.md §6) — strippable tooling, parsed into `Module::
+            // debug_info`. `debug.file <idx> "<path>"` (dense indices); `debug.loc <fn> <bb> <i>
+            // <file> <line> <col>`; `debug.var <fn> "<name>" win|ssa <n> "<type>"`.
+            Some(Tok::Ident(s)) if s == "debug.file" => {
+                p.next()?;
+                let idx = p.parse_int()?;
+                if idx < 0 || idx as usize != dbg_files.len() {
+                    return err("debug.file indices must be dense and in declaration order");
+                }
+                let path = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.file path is not valid UTF-8".into()))?;
+                dbg_files.push(path);
+            }
+            Some(Tok::Ident(s)) if s == "debug.loc" => {
+                p.next()?;
+                dbg_locs.push(Loc {
+                    func: p.parse_u32()?,
+                    block: p.parse_u32()?,
+                    inst: p.parse_u32()?,
+                    file: p.parse_u32()?,
+                    line: p.parse_u32()?,
+                    col: p.parse_u32()?,
+                });
+            }
+            Some(Tok::Ident(s)) if s == "debug.var" => {
+                p.next()?;
+                let func = p.parse_u32()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.var name is not valid UTF-8".into()))?;
+                let loc = match p.parse_ident()?.as_str() {
+                    "win" => VarLoc::Window {
+                        off: p.parse_int()?,
+                    },
+                    "ssa" => VarLoc::Ssa {
+                        value: p.parse_u32()?,
+                    },
+                    k => {
+                        return err(format!(
+                            "debug.var location kind must be win or ssa, got {k}"
+                        ))
+                    }
+                };
+                let ty = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.var type is not valid UTF-8".into()))?;
+                dbg_vars.push(VarInfo {
+                    func,
+                    name,
+                    ty,
+                    loc,
+                });
+            }
             // Module-level `memory <size_log2>` declaration.
             Some(Tok::Ident(s)) if s == "memory" => {
                 p.next()?;
@@ -711,11 +799,21 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
             _ => funcs.push(p.parse_func()?),
         }
     }
+    let debug_info = if dbg_files.is_empty() && dbg_locs.is_empty() && dbg_vars.is_empty() {
+        None
+    } else {
+        Some(DebugInfo {
+            files: dbg_files,
+            locs: dbg_locs,
+            vars: dbg_vars,
+        })
+    };
     Ok(Module {
         funcs,
         memory,
         data,
         imports: std::mem::take(&mut p.imports),
+        debug_info,
     })
 }
 
@@ -767,6 +865,27 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                         _ => {}
                     }
                 }
+            }
+            // Debug-info directives (DEBUGGING.md §6) — skip in the header prescan; they carry no
+            // function arities. Consume exactly each directive's tokens to stay aligned.
+            Some(Tok::Ident(s)) if s == "debug.file" => {
+                p.next()?;
+                p.parse_int()?;
+                p.parse_str()?;
+            }
+            Some(Tok::Ident(s)) if s == "debug.loc" => {
+                p.next()?;
+                for _ in 0..6 {
+                    p.parse_int()?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.var" => {
+                p.next()?;
+                p.parse_int()?; // func
+                p.parse_str()?; // name
+                p.next()?; // location kind (win|ssa)
+                p.parse_int()?; // n
+                p.parse_str()?; // type
             }
             _ => return err("expected `func` or `memory`"),
         }
@@ -1705,6 +1824,20 @@ impl<'a> Parser<'a> {
         match self.next()? {
             Tok::Int(v) => Ok(*v),
             other => err(format!("expected integer, found {other:?}")),
+        }
+    }
+
+    /// Parse a non-negative integer that fits in `u32` (debug-info indices/lines).
+    fn parse_u32(&mut self) -> Result<u32, ParseError> {
+        let v = self.parse_int()?;
+        u32::try_from(v).map_err(|_| ParseError(format!("expected a u32, found {v}")))
+    }
+
+    /// Parse a bare identifier token (e.g. a `debug.var` location kind).
+    fn parse_ident(&mut self) -> Result<String, ParseError> {
+        match self.next()? {
+            Tok::Ident(s) => Ok(s.clone()),
+            other => err(format!("expected an identifier, found {other:?}")),
         }
     }
 

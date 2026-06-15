@@ -1616,6 +1616,62 @@ pub struct Module {
     /// backend is a fail-closed error (resolution is mandatory first). Empty for modules that
     /// inline their capability calls (the legacy `cap.call`-only form).
     pub imports: Vec<Import>,
+    /// **Debug info — the frontend-neutral waist** (`DEBUGGING.md` §6 / D-DBG-7). Strippable
+    /// tooling, **untrusted for escape** (§2a): the verifier never reads it and neither backend's
+    /// safety depends on it; `None` ⇒ no debug info, zero cost. Populated by a frontend *during
+    /// lowering* (only it knows which source produced which op); consumed host-side by the
+    /// interpreter debugger and (later) DWARF/DAP. Slice 1 carries the neutral core (source
+    /// locations + variables); the per-producer rich blob is a later field.
+    pub debug_info: Option<DebugInfo>,
+}
+
+/// The neutral core of the debug-info waist (`DEBUGGING.md` §6): everything the interpreter
+/// stepper and backtraces need, in a form **every** frontend can populate (chibicc tokens, LLVM
+/// `!DILocation`/`dbg.value`, wasm DWARF). Positions key on `(func, block, inst)` — module 0, the
+/// guest's own program (installed §22 units have no source). Format-specific richness (full DWARF
+/// DIEs / LLVM DI) is a later opaque per-producer blob the middle never parses.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct DebugInfo {
+    /// Source file paths, referenced by index from [`Loc::file`].
+    pub files: Vec<String>,
+    /// Source location of individual ops. An op with no entry inherits nothing (unmapped).
+    pub locs: Vec<Loc>,
+    /// Source variables and where their value lives (the §6 neutral `VarLoc` = S2).
+    pub vars: Vec<VarInfo>,
+}
+
+/// A source location for one op (`DEBUGGING.md` §6 neutral core). `col == 0` means "no column"
+/// (wasm DWARF often omits columns).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Loc {
+    pub func: u32,
+    pub block: u32,
+    pub inst: u32,
+    pub file: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// A source variable and its value location (`DEBUGGING.md` §6 / S2). `ty` is a neutral render
+/// name for slice 1 (a structured `TypeRef` — encoding + size + a rich-blob handle — is a later
+/// refinement). Function-scoped for slice 1; lexical `IrPc`-range scopes are a later refinement.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VarInfo {
+    pub func: u32,
+    pub name: String,
+    pub ty: String,
+    pub loc: VarLoc,
+}
+
+/// Where a source variable's value lives at runtime (the S2 value-location model, IR form). The
+/// `Machine` (Cranelift register/stack) variant for debugging JIT-optimized code is a later field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VarLoc {
+    /// An address-taken / aggregate / narrow local: window data-stack slot at `data-SP + off`.
+    Window { off: i64 },
+    /// A promoted scalar: the SSA value index that holds it (resolved directly from the frame's
+    /// values by the interpreter — no debug-build mode needed).
+    Ssa { value: u32 },
 }
 
 /// A named capability import (§7). `name` is the symbolic tag the host resolves at
@@ -1760,6 +1816,7 @@ mod import_tests {
                     sig: sig_exit,
                 },
             ],
+            debug_info: None,
         }
     }
 
