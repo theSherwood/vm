@@ -60,9 +60,13 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 
 ### 🟡 Fail-closed feature gaps (clean `Unsupported`)
 
-- [ ] **Tail calls** (`return_call` / `return_call_indirect`). LLVM `-mtail-call` + functional-language
-  frontends. **Likely a quick win** — the IR already has `Terminator::ReturnCall`/`ReturnCallIndirect`
-  (interp + JIT), so the transpiler mostly needs the two operator arms.
+- [x] **Tail calls** (`return_call` / `return_call_indirect`) — **DONE.** Lower to the IR's
+  `Terminator::ReturnCall`/`ReturnCallIndirect`, which both backends execute as **true** tail calls
+  (interp replaces the frame; JIT emits Cranelift `return_call`/`return_call_indirect`). Direct tail
+  call to a defined function (true tail call), indirect via the §3c table dispatch, and a capability
+  import degrades to `cap.call` + `return` (correct, not tail-optimized; wasi:thread/spawn rejected).
+  `tests/tailcall.rs`: 200k-deep tail recursion (would overflow a non-tail call), table dispatch,
+  mutual even/odd recursion.
 - [ ] **Passive data/element segments + the rest of bulk memory**: `memory.init`, `data.drop`,
   `elem.drop`, `table.init`, `table.copy`, `table.fill`, `table.grow`, `table.size`. (Only
   `memory.copy`/`memory.fill` done.) clang `-O2` occasionally emits `memory.init` for large data.

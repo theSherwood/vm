@@ -1523,6 +1523,94 @@ fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result
     Ok(())
 }
 
+/// `return_call $f` (the tail-call proposal): a **block-terminating** direct call — the callee
+/// replaces the current frame and its results become this function's results. A defined `$f` lowers
+/// to the IR `Terminator::ReturnCall` (a true tail call, no stack growth). A capability import can't
+/// be a terminator, so a tail call to one degrades to `cap.call` + `return` (correct, not
+/// tail-optimized); a tail call to `wasi:thread/spawn` is nonsensical and rejected.
+fn return_call_op(lo: &mut Lower, func: u32, fn_results: &[ValType]) -> Result<(), Error> {
+    if lo.threads.spawn_import == Some(func) {
+        return unsup("return_call to wasi:thread/spawn");
+    }
+    if (func as usize) < lo.n_imp {
+        // Tail call to a capability import: do the cap.call, then return its results.
+        call_op(lo, func)?;
+        let n = fn_results.len();
+        let args: Vec<ValIdx> = lo.stack[lo.stack.len() - n..]
+            .iter()
+            .map(|(v, _)| *v)
+            .collect();
+        lo.set_term(Terminator::Return(args));
+        return Ok(());
+    }
+    let ir_idx = func - lo.n_imp as u32;
+    let (params, _) = lo
+        .func_sigs
+        .get(ir_idx as usize)
+        .ok_or_else(|| Error::Parse(format!("return_call to unknown function {func}")))?
+        .clone();
+    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    for _ in 0..params.len() {
+        args.push(lo.pop()?.0);
+    }
+    args.reverse();
+    if let Some(h) = lo.handle {
+        args.insert(0, h); // the callee's leading handle param
+    }
+    lo.set_term(Terminator::ReturnCall { func: ir_idx, args });
+    Ok(())
+}
+
+/// `return_call_indirect (type $t)`: the indirect tail call — like [`call_indirect_op`] but emits the
+/// `Terminator::ReturnCallIndirect` (block-terminating, §3c masked + type-checked dispatch).
+fn return_call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result<(), Error> {
+    if table_index != 0 {
+        return unsup("return_call_indirect on a non-zero table");
+    }
+    let (params, results) = lo.types[type_index as usize].clone();
+    // table[index] → function index, at window byte `table_base + index*4` (same as call_indirect).
+    let (widx, _) = lo.pop()?;
+    let idx64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: widx,
+    });
+    let four = lo.emit(Inst::ConstI64(4));
+    let byte_off = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a: idx64,
+        b: four,
+    });
+    let funcref = lo.emit(Inst::Load {
+        op: LoadOp::I32,
+        addr: byte_off,
+        offset: lo.table_base,
+        align: 2,
+    });
+    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    for _ in 0..params.len() {
+        args.push(lo.pop()?.0);
+    }
+    args.reverse();
+    // The handle is a leading param of every defined function, so it rides both the args and the
+    // §3c type-check signature (matching the targets that carry it — same as `call_indirect`).
+    let mut ty_params = params;
+    if let Some(h) = lo.handle {
+        args.insert(0, h);
+        ty_params.insert(0, ValType::I32);
+    }
+    let ty = FuncType {
+        params: ty_params,
+        results,
+    };
+    lo.set_term(Terminator::ReturnCallIndirect {
+        ty,
+        idx: funcref,
+        args,
+    });
+    Ok(())
+}
+
 fn mem_store(lo: &mut Lower, op: StoreOp, m: MemArg) -> Result<(), Error> {
     let (value, _) = lo.pop()?;
     let addr = pop_addr(lo)?;
@@ -2463,6 +2551,12 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             type_index,
             table_index,
         } => call_indirect_op(lo, type_index, table_index)?,
+        // ---- tail calls (the tail-call proposal): a block-terminating call ----
+        O::ReturnCall { function_index } => return_call_op(lo, function_index, fn_results)?,
+        O::ReturnCallIndirect {
+            type_index,
+            table_index,
+        } => return_call_indirect_op(lo, type_index, table_index)?,
         // ---- structured control flow ----
         O::Block { blockty } => {
             let (p, r) = block_sig(blockty, lo.types)?;
