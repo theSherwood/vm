@@ -307,6 +307,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         }),
         data: Vec::new(),
         imports: Vec::new(),
+        debug_info: None,
     }
 }
 
