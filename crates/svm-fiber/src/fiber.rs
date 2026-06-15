@@ -14,6 +14,7 @@ use crate::switch::{jump, make, Transfer};
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::abort;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// AddressSanitizer **fiber-switch annotations** (`feature = "asan"`). ASan tracks each thread's
 /// current stack (shadow + fake-stack bookkeeping), so every manual stack switch must be bracketed:
@@ -82,6 +83,14 @@ struct Control {
     resumer: Cell<*mut u8>,
     /// Set by the body when it returns (vs. suspends).
     done: Cell<bool>,
+    /// **Single-owner tripwire** (escape-TCB defense-in-depth): `true` while this fiber's native stack
+    /// is executing under a [`Fiber::resume`]. The whole crate's `Cell`-based soundness rests on the
+    /// caller never resuming one fiber from two threads at once (the §23 single-owner protocol the
+    /// `svm-jit` arbiter enforces). This is the only cross-thread-visible field, so a violation of that
+    /// contract — an aliased `*mut Fiber` resumed concurrently — is caught here and `abort`s loudly
+    /// *before* any `Cell` is raced, instead of becoming silent UB. Costs one relaxed-ish atomic swap
+    /// per resume.
+    running: AtomicBool,
     /// Whether the entry closure has been moved into the running body yet (for drop-before-start).
     taken: Cell<bool>,
     /// The entry closure, type-erased as `*mut F`; reclaimed by the body (`take`) or by `Drop`.
@@ -221,6 +230,7 @@ impl Fiber {
             resumer: Cell::new(std::ptr::null_mut()),
             done: Cell::new(false),
             taken: Cell::new(false),
+            running: AtomicBool::new(false),
             closure: Cell::new(Box::into_raw(Box::new(f)) as *mut ()),
             drop_closure: drop_closure_impl::<F>,
             #[cfg(feature = "asan")]
@@ -254,6 +264,15 @@ impl Fiber {
     /// Panics if the fiber has already completed.
     pub fn resume(&mut self, val: u64) -> State {
         assert!(!self.done, "resumed a finished fiber");
+        // Single-owner tripwire (see `Control::running`): claim exclusive execution of this fiber's
+        // stack before touching any `Cell`. If another thread is already inside this fiber's body
+        // (an aliased `*mut Fiber` resumed concurrently — the catastrophe the §23 protocol forbids),
+        // this swap sees `true` and we abort loudly rather than race the `Cell`s into UB. `Acquire`
+        // pairs with the `Release` clear below so a (buggy) second resumer observes the first's writes.
+        if self.control.running.swap(true, Ordering::Acquire) {
+            eprintln!("svm-fiber: fiber resumed while already running (single-owner violation)");
+            std::process::abort();
+        }
         self.control.value.set(val);
         let cptr = &*self.control as *const Control as u64;
         // ASan: leaving this (the resumer's) stack for the fiber's stack.
@@ -279,6 +298,10 @@ impl Fiber {
             );
         }
         self.ctx = t.fctx; // the fiber's new suspended context
+                           // Control is back on the resumer's stack: release the single-owner claim
+                           // (the fiber's stack is no longer executing). `Release` publishes our writes
+                           // to any subsequent claimant.
+        self.control.running.store(false, Ordering::Release);
         if self.control.done.get() {
             self.done = true;
             State::Complete(self.control.value.get())

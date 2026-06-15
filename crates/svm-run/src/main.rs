@@ -11,9 +11,11 @@
 //! or `main`'s return value). A bare kernel (a non-powerbox entry) is run with zero args and its
 //! result printed. A guest that traps is detect-and-killed (§5) and reported on stderr.
 
+use std::hash::{BuildHasher, RandomState};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
 use svm_ir::Module;
@@ -153,24 +155,50 @@ fn load_module(path: &Path) -> Result<Module, String> {
 /// whatever the frontend emits.
 fn compile_c(path: &Path) -> Result<String, String> {
     let chibicc = locate_chibicc()?;
-    let ir_out = env::temp_dir().join(format!("svm_run_{}.svm", process::id()));
-    let ok = Command::new(&chibicc)
-        .args([
-            "-cc1",
-            "--emit-ir",
-            "-cc1-input",
-            path.to_str().ok_or("non-UTF-8 input path")?,
-            "-cc1-output",
-            ir_out.to_str().ok_or("non-UTF-8 temp path")?,
-            path.to_str().unwrap(),
-        ])
-        .status()
-        .map_err(|e| format!("run chibicc ({}): {e}", chibicc.display()))?
-        .success();
-    if !ok {
-        return Err("chibicc failed to compile the C source".into());
-    }
-    fs::read_to_string(&ir_out).map_err(|e| format!("read frontend IR: {e}"))
+    let ir_out = fresh_temp_ir()?;
+    let result = (|| {
+        let ok = Command::new(&chibicc)
+            .args([
+                "-cc1",
+                "--emit-ir",
+                "-cc1-input",
+                path.to_str().ok_or("non-UTF-8 input path")?,
+                "-cc1-output",
+                ir_out.to_str().ok_or("non-UTF-8 temp path")?,
+                path.to_str().unwrap(),
+            ])
+            .status()
+            .map_err(|e| format!("run chibicc ({}): {e}", chibicc.display()))?
+            .success();
+        if !ok {
+            return Err("chibicc failed to compile the C source".into());
+        }
+        fs::read_to_string(&ir_out).map_err(|e| format!("read frontend IR: {e}"))
+    })();
+    // Don't leak the intermediate IR file regardless of outcome.
+    let _ = fs::remove_file(&ir_out);
+    result
+}
+
+/// Create a fresh, **unpredictably-named** temp file for the frontend's IR output and return its path.
+/// The previous `svm_run_<pid>.svm` name was predictable, so a local attacker could pre-plant a symlink
+/// there and redirect chibicc's write. The name now carries an OS-RNG-seeded suffix (via `RandomState`,
+/// whose seed is process-secret), and the file is created with `create_new` (`O_EXCL`), which fails
+/// rather than following a pre-existing path. `$SVM_CHIBICC`/`.c` compilation is a trusted-operator
+/// path (the binary it runs is operator-chosen); this just removes the predictable-temp footgun.
+fn fresh_temp_ir() -> Result<PathBuf, String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let rnd = RandomState::new().hash_one((process::id(), nanos));
+    let out = env::temp_dir().join(format!("svm_run_{rnd:016x}.svm"));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&out)
+        .map_err(|e| format!("create temp IR file: {e}"))?;
+    Ok(out)
 }
 
 /// Find the chibicc binary: `$SVM_CHIBICC`, else the in-repo `frontend/chibicc/chibicc` (built
