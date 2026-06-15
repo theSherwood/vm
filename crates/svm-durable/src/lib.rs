@@ -71,18 +71,34 @@ pub const STATE_UNWINDING: i32 = 1;
 /// Thaw in progress: every prologue rebuilds its frame from the shadow stack.
 pub const STATE_REWINDING: i32 = 2;
 
-// ---- Durable runtime region layout (Phase 1: low window addresses) ----
+// ---- Durable runtime region layout ----
 //
-// Real placement is per-fiber, guard-paged, quota-charged (DURABILITY.md §12.7). For
-// Phase 1 (single vCPU, no fibers) we carve a fixed low region and require instrumented
-// modules not to use `[0, SHADOW_BASE)` themselves.
+// The control state + shadow stack occupy a fixed **reserved low slice** `[0,
+// DURABLE_RESERVE)` of the domain's *own* window; the guest's memory is `[DURABLE_RESERVE,
+// window)`. This is the wasm shadow-stack convention (runtime metadata + call stack below
+// `__heap_base`, the program's heap above it): the durable reserve is part of the guest's
+// memory allotment, and a cooperating toolchain bases the guest's data/heap at
+// `DURABLE_RESERVE` so the two never overlap (see `transform_module_assume_confined`).
+//
+// This is *placement*, not an isolation boundary: the window is per-domain and the runtime
+// masks every access into it, so a guest that writes the reserve can only corrupt its own
+// durability — never another domain or the host — and that fails safe (a forged resume id
+// hits the `br_table` default → `Unreachable`; a wild shadow-SP stays masked in-window; the
+// host validates the artifact on restore). Hardening the reserve against an *adversarial*
+// guest (a guard-paged, per-fiber placement, DURABILITY.md §12.7) is optional
+// defense-in-depth, not required for a cooperating toolchain.
 
 /// Window byte offset of the `i32` state word.
 pub const STATE_OFF: u64 = 0;
 /// Window byte offset of the `i64` shadow-stack pointer (a window byte offset itself).
 pub const SHADOW_SP_OFF: u64 = 8;
-/// Window byte offset where the shadow stack begins (grows upward).
+/// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
 pub const SHADOW_BASE: u64 = 64;
+/// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the
+/// state word, shadow-SP, and shadow stack; the guest's memory is `[DURABLE_RESERVE, window)`.
+/// A durable module's declared window must be at least this large (it is counted against the
+/// guest's memory budget). A policy default — embedders may standardize a different value.
+pub const DURABLE_RESERVE: u64 = 1 << 16;
 
 // Block layout of an instrumented function with `S` forward segments (each original
 // block is split at its suspend ops into `points+1` segments; non-suspend blocks are one
@@ -109,15 +125,13 @@ pub enum TransformError {
     /// A prefix instruction's result type isn't modelled by the Phase-1 transform
     /// (e.g. SIMD, conversions, concurrency ops before the call).
     UnsupportedInst,
-    /// The module is being instrumented but a (any) function contains a guest
-    /// linear-memory instruction (load/store/atomic). The durable region (state word +
-    /// shadow stack) shares the window at fixed low addresses (`[0, SHADOW_BASE)` and up),
-    /// and nothing confines a guest access away from it, so a guest memory op could
-    /// silently corrupt the freeze/thaw state — and vice versa (R9). Until the durable
-    /// region is relocated out of the guest's reach (the per-fiber, guard-paged §12.7
-    /// placement), instrumented modules must not touch linear memory themselves; this
-    /// fails closed instead of corrupting. (Cap-mediated window effects — e.g. a Memory
-    /// capability's map/unmap — are a separate facet the embedder must withhold.)
+    /// The module is being instrumented via the strict [`transform_module`] path but a
+    /// function uses a guest linear-memory instruction (load/store/atomic), which could
+    /// alias the reserved durable region `[0, DURABLE_RESERVE)` (R9). The strict path fails
+    /// closed for *untrusted* modules. A durable module from a cooperating toolchain that
+    /// reserves `[0, DURABLE_RESERVE)` (basing the guest's data/heap at `DURABLE_RESERVE`)
+    /// should instead use [`transform_module_assume_confined`]. (Cap-mediated window effects
+    /// — e.g. a Memory capability's map/unmap — are a separate facet the embedder withholds.)
     GuestUsesMemory,
 }
 
@@ -128,11 +142,17 @@ pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
     transform_module_inner(m, true)
 }
 
-/// Like [`transform_module`], but **skips the R9 guest-memory rejection**. For callers that
-/// confine the guest away from the durable region by other means — the per-fiber,
-/// guard-paged §12.7 placement, or a test that simulates a host-driven freeze (the host,
-/// not the guest, writes the state word). The caller takes responsibility for that
-/// confinement; prefer [`transform_module`], which fails closed.
+/// Like [`transform_module`], but **allows the guest to use linear memory**, on the caller's
+/// guarantee that the guest is confined to its usable region `[DURABLE_RESERVE, window)` and
+/// never touches the reserved durable slice `[0, DURABLE_RESERVE)`.
+///
+/// This is the intended path for durable modules produced by a **cooperating toolchain**:
+/// just as a wasm toolchain reserves low memory for the shadow stack and bases the heap at
+/// `__heap_base`, the producer reserves `[0, DURABLE_RESERVE)` and bases the guest's
+/// data/heap at `DURABLE_RESERVE`. The reserve is budget-accounted (the declared window must
+/// be ≥ `DURABLE_RESERVE`). The contract is *not* statically enforced here — a guest that
+/// violates it can corrupt only its own durability, and fails safe (see the region notes) —
+/// so prefer [`transform_module`] (fails closed, no memory) for *untrusted* modules.
 pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformError> {
     transform_module_inner(m, false)
 }
@@ -167,11 +187,12 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
 
     if any_instrumented {
         let mem = out.memory.ok_or(TransformError::NoMemory)?;
-        // The check guarantees room for the durable region + the *largest single* frame.
-        // A live call chain stacks one frame per suspended activation, so the window must
-        // be sized for the deepest expected chain (a true guard-paged, quota-charged
-        // shadow stack with overflow trapping is DURABILITY.md §12.7 / R9 future work).
-        if mem.size() < SHADOW_BASE + max_frame {
+        // The reserved region `[0, DURABLE_RESERVE)` must fit in the declared window (it is
+        // part of the guest's allotment; guest memory is the remainder `[DURABLE_RESERVE,
+        // window)`), and a single shadow frame must fit in `[SHADOW_BASE, DURABLE_RESERVE)`.
+        // A live call chain stacks one frame per suspended activation; the reserve bounds the
+        // total depth (overflow-trapping the shadow stack is DURABILITY.md §12.7 future work).
+        if mem.size() < DURABLE_RESERVE || SHADOW_BASE + max_frame > DURABLE_RESERVE {
             return Err(TransformError::MemoryTooSmall);
         }
     }
