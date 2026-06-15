@@ -8,16 +8,18 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A+B (control flow + memory) done — multi-block integer functions
-with stack memory translate and run on both backends.** `crates/svm-llvm` does the **SSA →
-block-argument conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness;
-loops/joins/critical edges, no edge splitting), the integer scalar op set, and the **§3d
-data-stack**: `alloca` → window frame slots, `load`/`store` (incl. narrow widths), and
-`getelementptr` → address arithmetic. Real `clang -O2` programs (popcount/collatz loops,
-if-converted select, a stack-array sum with GEP/store/load) run **interp == JIT == hand-computed**
-(10 tests). Remaining M1 slices: calls (+ the threaded data-SP for per-activation frames),
-aggregates/`sret`, floats, intrinsics, `switch`, then the demo Lane C. Section numbers like
-"§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
+**Status: Milestone 1 slices A–C (control flow + memory + calls) done — multi-block integer
+functions with stack memory and (recursive) calls translate and run on both backends.**
+`crates/svm-llvm` does the **SSA → block-argument conversion** (LLVM dominance SSA + φ-nodes →
+SVM's block-local form via liveness; loops/joins/critical edges, no edge splitting), the integer
+scalar op set, the **§3d data-stack** (`alloca` → window frame slots, `load`/`store` incl. narrow
+widths, `getelementptr` → address arithmetic), and **direct calls with the threaded data-SP**
+(every function takes a leading `sp`; a call passes `sp + frame_size`, so recursion is sound).
+Real `clang -O2` programs — popcount/collatz loops, if-converted select, a stack-array sum
+(GEP/store/load), recursive `fib`, a cross-function call — run **interp == JIT == hand-computed**
+(12 tests). Remaining M1: `switch` (clang lowers loops/mutual-recursion onto it), floats,
+indirect calls (funcref), aggregates/`sret`, more intrinsics, then the demo Lane C. Section
+numbers like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
 
@@ -282,10 +284,8 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       collatz, classify, …). Non-byte widths (`i33`) are a clean `Unsupported`.
 
 **Slice B (DONE) — the §3d data stack (scalar memory).** Address-taken locals via `alloca`.
-- [x] `alloca` → a window data-stack frame slot at an absolute offset from `FRAME_BASE` (natural-
-      aligned; the module declares a window sized to the largest frame). Dynamic (non-constant
-      count) `alloca` is a clean `Unsupported`. *Absolute offsets suffice with no calls; the §3d
-      threaded data-SP for per-activation frames lands with calls.*
+- [x] `alloca` → a window data-stack frame slot at an `sp`-relative offset (natural-aligned;
+      frame size 16-aligned). Dynamic (non-constant count) `alloca` is a clean `Unsupported`.
 - [x] `load`/`store` incl. narrow widths (`i8`/`i16` → the `i32`-container load/store ops; narrow
       loads zero-extend, signedness via the following `sext`/`zext`, §3b). Pointers are `i64`.
 - [x] `getelementptr` → `i64` address arithmetic: `base + Σ idx·stride` (pointee + array element
@@ -295,9 +295,17 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       intrinsics dropped. Tested on a `clang -O2` stack-array sum/reverse (GEP + store/load over the
       frame), interp == JIT == hand-computed.
 
+**Slice C (DONE) — calls + the threaded data-SP.** Direct calls; per-activation frames.
+- [x] Every function takes a leading `sp` parameter (§3d), threaded as block-local index 0 of every
+      block (like chibicc's `v0`); each branch passes it through. A direct `call` resolves the
+      target by name → IR function index, and passes the callee `sp + frame_size` (so frames never
+      overlap; recursion is sound), then the mapped arguments; the result threads back. Tested on
+      `clang -O2` recursive `fib` and a `noinline` cross-function call, interp == JIT == hand-computed.
+
 **Remaining slices.**
-- [ ] Direct + indirect `call` (funcref §3c) **+ the threaded data-SP** (§3d per-activation frames);
-      `switch` → `br_table`/compare-chain.
+- [ ] `switch` → `br_table`/compare-chain. *(Now the top need: `-O2` lowers counted loops and
+      mutual recursion onto `switch` — e.g. an `even`/`odd` pair becomes a switch-driven parity loop.)*
+- [ ] Indirect `call` (funcref §3c — `call` through a function pointer; needs `ref.func` + the table).
 - [ ] Floats (`f32`/`f64`: `fadd`/…/`fcmp`/`fptosi`/`sitofp`/…).
 - [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline.
 - [ ] Struct/vector GEP + by-value aggregates via `sret`/hidden pointer (D39).

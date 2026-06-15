@@ -67,11 +67,16 @@ fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
     svm_verify::verify_module(&module).expect("verify translated IR");
     let results = module.funcs[0].results.clone();
 
+    // The IR signature prepends the data-SP (§3d): the entry takes `(sp, c-args…)`. Pass the
+    // initial data-stack base, then the C arguments.
+    let mut full: Vec<Value> = vec![Value::I64(svm_llvm::FRAME_BASE as i64)];
+    full.extend_from_slice(args);
+
     let mut fuel = 10_000_000u64;
-    let interp = svm_interp::run(&module, 0, args, &mut fuel).expect("interp run");
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
     assert_eq!(interp, expect, "{name}: interp result");
 
-    let slots: Vec<i64> = args.iter().map(to_slot).collect();
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
     let jit = match svm_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
         JitOutcome::Returned(s) => s
             .iter()
@@ -172,6 +177,26 @@ fn stack_array_reverse() {
     let src = "int revsum(int n){ int a[8]; for(int i=0;i<n;i++) a[i]=i+1; int s=0; for(int i=n-1;i>=0;i--) s=s*10+a[i]; return s; }";
     check("rev_4", src, &[Value::I32(4)], &[Value::I32(4321)]);
     check("rev_3", src, &[Value::I32(3)], &[Value::I32(321)]);
+}
+
+#[test]
+fn recursive_call_fib() {
+    // Self-recursion: the call survives `-O2` (can't fully inline), exercising direct `call` by
+    // index, the threaded data-SP, and result/argument marshalling. fib(0..) = 0,1,1,2,3,5,8,...
+    let src = "int fib(int n){ if (n < 2) return n; return fib(n-1) + fib(n-2); }";
+    check("fib_10", src, &[Value::I32(10)], &[Value::I32(55)]);
+    check("fib_1", src, &[Value::I32(1)], &[Value::I32(1)]);
+    check("fib_0", src, &[Value::I32(0)], &[Value::I32(0)]);
+}
+
+#[test]
+fn cross_function_call() {
+    // A call to a *different* function (kept distinct by `noinline`), so the entry (`g`, index 0)
+    // calls `add1` (index 1) — exercises the name→index resolution and a non-recursive call.
+    let src = "int add1(int x); int g(int x){ return add1(x) + add1(x + 10); } \
+               __attribute__((noinline)) int add1(int x){ return x + 1; }";
+    check("g_5", src, &[Value::I32(5)], &[Value::I32(22)]); // (5+1)+(15+1)=22
+    check("g_0", src, &[Value::I32(0)], &[Value::I32(12)]); // 1 + 11
 }
 
 #[test]

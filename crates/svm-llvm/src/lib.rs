@@ -10,17 +10,23 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slice A — control flow + scalar SSA):** multi-block integer functions.
-//! The headline is the **SSA → block-argument conversion**: LLVM's dominance-based SSA (a value
-//! defined in one block is usable in any dominated block, and φ-nodes merge across edges) becomes
-//! SVM's block-local form (§3a: a value never crosses a block boundary except as a typed block
-//! parameter). We compute liveness, make every value live across a block's entry a parameter (φ
-//! results included), and have each branch supply the matching arguments — so loops, joins, and
-//! critical edges all work without edge splitting. Covered: integer arithmetic/bitwise/shift/
-//! div-rem, `icmp`, `i1`/`i8`/`i16`/`i32`/`i64` `trunc`/`zext`/`sext`, `select`, and the
-//! `br`/`br_if`/`return`/`unreachable` terminators. Out of slice A (clean [`Error::Unsupported`]):
-//! floats, memory (`alloca`/`load`/`store`/GEP), `call`, `switch`, aggregates, and non-byte
-//! integer widths (e.g. `i33`).
+//! **Scope (Milestone 1, slices A–C):** multi-block integer functions with stack memory and calls.
+//! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
+//!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
+//!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
+//!   entry a parameter (φ-results included); each branch supplies the args — loops, joins, and
+//!   critical edges all work without edge splitting. Integer arith/bitwise/shift/div-rem, `icmp`,
+//!   `i1`/`i8`/`i16`/`i32`/`i64` `trunc`/`zext`/`sext`, `select`, `br`/`br_if`/`return`/`unreachable`.
+//! - **B — the §3d data stack.** `alloca` → an `sp`-relative window frame slot, `load`/`store`
+//!   (incl. narrow widths), `getelementptr` → address arithmetic. `undef`/`poison`/`null` → 0;
+//!   `llvm.lifetime`/`dbg`/`assume` dropped. Pointers are `i64`.
+//! - **C — calls + the threaded data-SP.** Every function takes a leading `sp` parameter (§3d),
+//!   threaded as block-local index 0 of every block; a direct `call` passes the callee `sp +
+//!   frame_size`, so activations get fresh frames and recursion is sound.
+//!
+//! Out of the current subset (clean [`Error::Unsupported`]): floats, `switch`, indirect calls
+//! (funcref), struct/vector GEP, by-value aggregates, intrinsics beyond the dropped ones, and
+//! non-byte integer widths (e.g. `i33`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -57,26 +63,32 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Module, Error> {
 
 /// Translate an already-parsed `llvm-ir` module.
 pub fn translate(m: &LModule) -> Result<Module, Error> {
-    let mut funcs = Vec::with_capacity(m.functions.len());
-    let mut frame_end = 0u64; // high-water mark of any function's data-stack frame
-    for f in &m.functions {
-        // Declaration-only functions (e.g. an undefined extern / intrinsic prototype) have no
-        // body to translate; skip them. A *call* to one needs call support (a later slice).
-        if f.basic_blocks.is_empty() {
-            continue;
-        }
-        let (func, end) = translate_func(f, &m.types)?;
-        frame_end = frame_end.max(end);
+    // Pass 0: assign each *defined* function an IR index (its position among defined functions),
+    // so a `call` can resolve its target by name. Declaration-only functions (extern/intrinsic
+    // prototypes) have no body and are skipped — a call to one needs import support (a later slice).
+    let defined: Vec<&Function> = m
+        .functions
+        .iter()
+        .filter(|f| !f.basic_blocks.is_empty())
+        .collect();
+    let mut name2idx: HashMap<String, u32> = HashMap::new();
+    for (i, f) in defined.iter().enumerate() {
+        name2idx.insert(f.name.clone(), i as u32);
+    }
+
+    let mut funcs = Vec::with_capacity(defined.len());
+    let mut any_frame = false; // does any function use the data stack (`alloca`)?
+    for f in &defined {
+        let (func, frame_size) = translate_func(f, &m.types, &name2idx)?;
+        any_frame |= frame_size > 0;
         funcs.push(func);
     }
-    // A window is declared only if some function uses the data stack (`alloca`). Functions lay
-    // their frames at absolute offsets from `FRAME_BASE`; with no calls yet, only one function is
-    // ever active, so the frames may overlap — the window need only fit the largest (calls will
-    // introduce the §3d threaded data-SP for per-activation frames).
-    let memory = (frame_end > 0).then(|| {
-        let need = frame_end.max(1);
-        let log2 = (64 - (need - 1).leading_zeros()).max(16) as u8;
-        svm_ir::Memory { size_log2: log2 }
+    // A window is declared only if some function uses the data stack. Frames are `sp`-relative
+    // (§3d): each call passes `sp + frame_size`, so activations get fresh frames and recursion is
+    // sound. The reserve is a fixed stack window; deep recursion overflows into the guard region
+    // (detect-and-kill, §5) — matching chibicc. (No calls cross a window yet; one domain, one stack.)
+    let memory = any_frame.then_some(svm_ir::Memory {
+        size_log2: STACK_LOG2,
     });
     Ok(Module {
         funcs,
@@ -85,9 +97,15 @@ pub fn translate(m: &LModule) -> Result<Module, Error> {
     })
 }
 
-/// The low window offset where data-stack frames begin (keeps `alloca` addresses away from a
-/// null-like 0). §3d will replace these absolute offsets with a threaded data-SP once calls land.
-const FRAME_BASE: u64 = 16;
+/// The initial data-SP the entry must be invoked with (the base of the data stack; keeps `alloca`
+/// addresses away from a null-like 0). The entry's first IR parameter is this `sp`; callees
+/// receive `sp + caller_frame`. Exposed so a host/test driver passes the right initial value.
+pub const FRAME_BASE: u64 = 16;
+/// The data-stack window size (`log2`): a fixed 1 MiB reserve when any `alloca` is present.
+const STACK_LOG2: u8 = 20;
+/// The data-SP's synthetic value id — threaded as block-local index 0 of *every* block (§3d),
+/// like chibicc's `v0`. It carries no LLVM name; it is supplied positionally.
+const SP: ValueId = usize::MAX;
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
 /// are memory widths only, not SSA value types); `i64` stays `i64`. Non-byte widths (`i33`,
@@ -154,18 +172,23 @@ struct Scan {
     block_name: Vec<Name>,
 }
 
-fn translate_func(f: &Function, types: &Types) -> Result<(Func, u64), Error> {
+fn translate_func(
+    f: &Function,
+    types: &Types,
+    name2idx: &HashMap<String, u32>,
+) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
         return unsup(format!("varargs function `{}`", f.name));
     }
     if f.basic_blocks.is_empty() {
         return unsup(format!("declaration-only function `{}`", f.name));
     }
-    let params: Vec<ValType> = f
-        .parameters
-        .iter()
-        .map(|p| val_type(&p.ty))
-        .collect::<Result<_, _>>()?;
+    // The IR signature prepends the data-SP (§3d): `(sp:i64, c-params…) -> results`. The data-SP
+    // is threaded as block-local index 0 of every block; a call passes `sp + frame_size`.
+    let mut params: Vec<ValType> = vec![ValType::I64];
+    for p in &f.parameters {
+        params.push(val_type(&p.ty)?);
+    }
     let results = match f.return_type.as_ref() {
         Type::VoidType => Vec::new(),
         t => vec![val_type(t)?],
@@ -174,7 +197,7 @@ fn translate_func(f: &Function, types: &Types) -> Result<(Func, u64), Error> {
     let scan = scan_func(f, types)?;
     let live_in = liveness(f, &scan)?;
     let block_params = block_params(f, &scan, &live_in);
-    let (frame, frame_end) = frame_layout(f, &scan)?;
+    let (frame, frame_size) = frame_layout(f, &scan)?;
 
     let mut blocks = Vec::with_capacity(f.basic_blocks.len());
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
@@ -186,6 +209,8 @@ fn translate_func(f: &Function, types: &Types) -> Result<(Func, u64), Error> {
             &scan,
             &block_params,
             &frame,
+            frame_size,
+            name2idx,
         )?);
     }
     Ok((
@@ -194,17 +219,17 @@ fn translate_func(f: &Function, types: &Types) -> Result<(Func, u64), Error> {
             results,
             blocks,
         },
-        frame_end,
+        frame_size,
     ))
 }
 
-/// Lay out every `alloca`'s data-stack slot at an absolute window offset (from [`FRAME_BASE`],
-/// natural-aligned), returning the `alloca`-id → offset map and the frame's high-water mark (so
-/// the module can size its window). A dynamic (`num_elements` non-constant) `alloca` is a clean
-/// `Unsupported` for now.
+/// Lay out every `alloca`'s data-stack slot at a `sp`-relative offset (from 0, natural-aligned),
+/// returning the `alloca`-id → offset map and the frame size (16-aligned, so a callee's frame —
+/// at `sp + frame_size` — stays aligned). A dynamic (`num_elements` non-constant) `alloca` is a
+/// clean `Unsupported` for now.
 fn frame_layout(f: &Function, s: &Scan) -> Result<(HashMap<ValueId, u64>, u64), Error> {
     let mut frame = HashMap::new();
-    let mut off = FRAME_BASE;
+    let mut off = 0u64;
     for bb in &f.basic_blocks {
         for instr in &bb.instrs {
             if let Instruction::Alloca(a) = instr {
@@ -229,7 +254,7 @@ fn frame_layout(f: &Function, s: &Scan) -> Result<(HashMap<ValueId, u64>, u64), 
             }
         }
     }
-    Ok((frame, off))
+    Ok((frame, off.div_ceil(16) * 16))
 }
 
 /// Pass 1a: assign a `ValueId` to every SSA value (parameters first, then per block the φ-results
@@ -319,13 +344,37 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
             v
         }
         // A droppable intrinsic (`llvm.lifetime`/`dbg`/`assume`) contributes no real uses — it is
-        // a no-op (below). Any other call needs call support (a later slice).
+        // a no-op. A real (direct) call uses its argument operands; the data-SP it threads is the
+        // §3d positional parameter, not an LLVM value, so it is not counted here.
         I::Call(c) if is_droppable_call(c) => Vec::new(),
+        I::Call(c) => c
+            .arguments
+            .iter()
+            .filter_map(|(o, _)| match o {
+                Operand::LocalOperand { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect(),
         // A φ's operands are edge uses, handled in liveness via `PhiUses`.
         I::Phi(_) => Vec::new(),
         other => return unsup(format!("instruction {other:?}")),
     };
     Ok(r)
+}
+
+/// The name of a direct call's target (a `@global` function reference). An indirect call (the
+/// callee is a computed value) or inline asm is a clean `Unsupported` for now.
+fn call_target_name(c: &llvm_ir::instruction::Call) -> Result<String, Error> {
+    match c.function.as_ref().right() {
+        Some(Operand::ConstantOperand(cr)) => match cr.as_ref() {
+            Constant::GlobalReference {
+                name: Name::Name(s),
+                ..
+            } => Ok(s.to_string()),
+            other => unsup(format!("call target {other:?}")),
+        },
+        _ => unsup("indirect call (Milestone 1+ — needs funcref support)"),
+    }
 }
 
 /// Whether a `call` is a droppable intrinsic with no guest-visible effect for our subset —
@@ -485,11 +534,16 @@ fn block_params(f: &Function, s: &Scan, live_in: &[HashSet<ValueId>]) -> Vec<Vec
     let mut out = Vec::with_capacity(f.basic_blocks.len());
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
         if bi == 0 {
-            // Entry: exactly the function parameters, in declaration order (ids 0..nparams).
-            out.push((0..f.parameters.len()).collect());
+            // Entry: the data-SP then the function parameters (ids 0..nparams), matching the
+            // prepended IR signature `(sp, c-params…)`.
+            let mut params = vec![SP];
+            params.extend(0..f.parameters.len());
+            out.push(params);
             continue;
         }
-        let mut params: Vec<ValueId> = Vec::new();
+        // Every non-entry block carries the data-SP as its first parameter (§3d), then its
+        // φ-results and threaded live-ins.
+        let mut params: Vec<ValueId> = vec![SP];
         let mut phi_set: HashSet<ValueId> = HashSet::new();
         for instr in &bb.instrs {
             if let Instruction::Phi(p) = instr {
@@ -515,8 +569,12 @@ fn block_params(f: &Function, s: &Scan, live_in: &[HashSet<ValueId>]) -> Vec<Vec
 /// (seeded with the block's parameters), and the running block-local value counter.
 struct BlockCtx<'a> {
     s: &'a Scan,
-    /// `alloca` value-id → its absolute window offset (the data-stack frame layout).
+    /// `alloca` value-id → its `sp`-relative window offset (the data-stack frame layout).
     frame: &'a HashMap<ValueId, u64>,
+    /// This function's 16-aligned frame size — a callee receives `sp + frame_size`.
+    frame_size: u64,
+    /// Defined LLVM function name → its IR function index (for resolving a direct `call`).
+    name2idx: &'a HashMap<String, u32>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     next_val: ValIdx,
@@ -528,6 +586,11 @@ impl<'a> BlockCtx<'a> {
         let i = self.next_val;
         self.next_val += 1;
         i
+    }
+
+    /// The data-SP's block-local index (always parameter 0 of every block, §3d).
+    fn sp(&self) -> Result<ValIdx, Error> {
+        self.id(SP)
     }
 
     /// Append an instruction that produces **no** SSA value (e.g. `store`). It must not consume a
@@ -610,12 +673,20 @@ fn translate_block(
     s: &Scan,
     block_params: &[Vec<ValueId>],
     frame: &HashMap<ValueId, u64>,
+    frame_size: u64,
+    name2idx: &HashMap<String, u32>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
-    let params: Vec<ValType> = param_ids.iter().map(|&v| s.ty[v]).collect();
+    // The data-SP (`SP` sentinel) types as `i64`; every other param reads its scanned type.
+    let params: Vec<ValType> = param_ids
+        .iter()
+        .map(|&v| if v == SP { ValType::I64 } else { s.ty[v] })
+        .collect();
     let mut ctx = BlockCtx {
         s,
         frame,
+        frame_size,
+        name2idx,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         next_val: 0,
@@ -663,12 +734,35 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         if is_droppable_call(c) {
             return Ok(()); // a no-op intrinsic (lifetime/dbg/assume)
         }
-        return unsup("call (Milestone 1+ — needs call support)");
+        // Direct call only (indirect/funcref is a later slice). Pass the callee its own data-stack
+        // frame at `sp + frame_size` (§3d), then the mapped arguments. The IR signature is
+        // `(sp, c-args…)`, so the callee's frame never overlaps ours.
+        let name = call_target_name(c)?;
+        let func = *ctx.name2idx.get(&name).ok_or_else(|| {
+            Error::Unsupported(format!("call to external/undefined function `{name}`"))
+        })?;
+        let sp = ctx.sp()?;
+        let fs = ctx.const_i64(ctx.frame_size as i64);
+        let callee_sp = ctx.add_i64(sp, fs);
+        let mut args = vec![callee_sp];
+        for (a, _attrs) in &c.arguments {
+            args.push(ctx.operand(a)?);
+        }
+        match &c.dest {
+            Some(dest) => {
+                let idx = ctx.push(Inst::Call { func, args });
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            None => ctx.push_effect(Inst::Call { func, args }), // void call: no SSA result
+        }
+        return Ok(());
     }
 
     let (dest, idx) = match instr {
         I::Alloca(a) => {
-            // The slot's absolute window offset (laid out by `frame_layout`).
+            // The slot's `sp`-relative offset (laid out by `frame_layout`): address = `sp + off`.
             let vid = *ctx
                 .s
                 .name2id
@@ -678,7 +772,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 .frame
                 .get(&vid)
                 .ok_or_else(|| Error::Unsupported("alloca missing frame slot".into()))?;
-            (&a.dest, ctx.const_i64(off as i64))
+            let sp = ctx.sp()?;
+            let c = ctx.const_i64(off as i64);
+            (&a.dest, ctx.add_i64(sp, c))
         }
         I::Load(l) => {
             let addr = ctx.operand(&l.address)?;
