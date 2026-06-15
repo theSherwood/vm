@@ -1145,6 +1145,13 @@ const MAX_FIBERS: usize = 1 << 16;
 /// only simultaneous liveness is bounded.
 const MAX_VCPUS: usize = 1 << 16;
 
+/// Hard ceiling on the number of SQEs one async-ring `submit`/`submit_async` (§9/§12) will process in
+/// a single call. The entry count comes straight from a guest register, so an unclamped value would
+/// let a guest drive an unbounded host-side allocation (an uncatchable allocator `abort()`) and loop;
+/// clamping here bounds both. Any real ring batch is far below this — a guest needing more issues
+/// multiple submits. Mirrors the [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings.
+const MAX_RING_BATCH: u64 = 1 << 16;
+
 /// §15 **spawn quota** — host-configurable ceilings on how many fibers / concurrently-live vCPUs a run
 /// may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings. The embedder sets it
 /// on the [`Host`] ([`Host::set_quota`]); a guest that exceeds it traps cleanly ([`Trap::FiberFault`] /
@@ -5683,7 +5690,12 @@ impl Host {
             None => return Ok(vec![EFAULT]),
         };
         let sq_ptr = *args.first().unwrap_or(&0) as u64;
-        let n = (*args.get(1).unwrap_or(&0)).max(0) as u64;
+        // Clamp the guest-supplied entry count to a bounded batch ceiling. Without this a forged `n`
+        // (e.g. `i64::MAX`) would both `with_capacity`-allocate ~`n * size_of::<Pending>()` bytes (an
+        // uncatchable allocator `abort()` — a host crash from a guest, defeating §5) and spin the
+        // submit loop `n` times. Any real ring batch fits well under this; a guest needing more issues
+        // multiple submits. The clamped value is what we report submitted.
+        let n = ((*args.get(1).unwrap_or(&0)).max(0) as u64).min(MAX_RING_BATCH);
         let cq_ptr = *args.get(2).unwrap_or(&0) as u64;
 
         // One pending completion per SQE we managed to read; filled inline now, or by the pool below.
@@ -5825,7 +5837,9 @@ impl Host {
             None => return Ok(vec![EFAULT]),
         };
         let sq_ptr = *args.first().unwrap_or(&0) as u64;
-        let n = (*args.get(1).unwrap_or(&0)).max(0) as u64;
+        // Bounded batch ceiling, as in `io_ring_submit` — a forged `n` must not drive an unbounded
+        // allocation or loop on the host.
+        let n = ((*args.get(1).unwrap_or(&0)).max(0) as u64).min(MAX_RING_BATCH);
         let counter_addr = *args.get(2).unwrap_or(&0) as u64;
 
         // The backend must expose the futex counter handle + the wake hook, else there is no async
