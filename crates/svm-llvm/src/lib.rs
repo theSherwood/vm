@@ -10,8 +10,8 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slices A–E):** multi-block integer functions with stack memory, calls,
-//! `switch`, and global variables.
+//! **Scope (Milestone 1, slices A–F):** multi-block scalar functions with stack memory, calls,
+//! `switch`, global variables, and floats.
 //! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
 //!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
 //!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
@@ -30,21 +30,28 @@
 //!   read-only, D40); a `@global` reference is its window address. The data stack starts just
 //!   above them and grows up toward the window's guard region, so a stack overflow faults (§5)
 //!   rather than corrupting globals. Int/array/string/zero initializers serialize to bytes.
+//! - **F — floats.** `f32`/`f64` arithmetic/`fneg`/`fcmp`/`select`, the int↔float and f32↔f64
+//!   conversions (`fptosi`/`sitofp`/`fpext`/`fptrunc`, float→int saturating per §3b), `bitcast`,
+//!   and the common float math intrinsics (`fmuladd`/`fma` unfused, `sqrt`/`fabs`/`floor`/…) lowered
+//!   inline. (Ordered/unordered fcmp collapse — the NaN corner is a documented fidelity gap.)
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): floats, indirect calls (funcref),
-//! pointer-valued globals (relocations), struct/vector GEP + aggregates, intrinsics beyond the
-//! dropped ones, and non-byte integer widths (e.g. `i33`).
+//! Out of the current subset (clean [`Error::Unsupported`]): indirect calls (funcref), libc/math
+//! *function* calls (e.g. `sqrt` with errno), pointer-valued globals (relocations), struct/vector
+//! GEP + aggregates, SIMD vectors, and non-byte integer widths (e.g. `i33`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use llvm_ir::instruction::Instruction;
 use llvm_ir::terminator::Terminator as LTerm;
-use llvm_ir::types::{Type, Typed, Types};
-use llvm_ir::IntPredicate;
-use llvm_ir::{constant::Constant, BasicBlock, Function, Module as LModule, Name, Operand};
+use llvm_ir::types::{FPType, Type, Typed, Types};
+use llvm_ir::{constant::Constant, constant::Float, BasicBlock, Function, Module as LModule};
+use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
 
-use svm_ir::{BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, Module, Terminator, ValIdx, ValType};
+use svm_ir::{
+    BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
+    IntTy, Module, Terminator, ValIdx, ValType,
+};
 
 /// Why a translation could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,8 +230,64 @@ fn val_type(ty: &Type) -> Result<ValType, Error> {
         Type::IntegerType { bits } => unsup(format!("integer width i{bits} (Milestone 1+)")),
         // Pointers are an erasable refinement of `i64` (§3a/§10) — a window offset.
         Type::PointerType { .. } => Ok(ValType::I64),
+        Type::FPType(FPType::Single) => Ok(ValType::F32),
+        Type::FPType(FPType::Double) => Ok(ValType::F64),
         other => unsup(format!("type {other} (Milestone 1+)")),
     }
+}
+
+/// The `FloatTy` (`f32`/`f64`) of a float-typed SVM value.
+fn float_ty(v: ValType) -> Result<FloatTy, Error> {
+    match v {
+        ValType::F32 => Ok(FloatTy::F32),
+        ValType::F64 => Ok(FloatTy::F64),
+        other => unsup(format!("non-float type {}", other.as_str())),
+    }
+}
+
+/// The saturating float→int conversion variant (§3b: `trunc_sat`, total — out-of-range saturates
+/// rather than the C UB of `fptosi`).
+fn ftoi_op(src: FloatTy, dst: IntTy, signed: bool) -> FToI {
+    match (src, dst, signed) {
+        (FloatTy::F32, IntTy::I32, true) => FToI::F32I32S,
+        (FloatTy::F32, IntTy::I32, false) => FToI::F32I32U,
+        (FloatTy::F32, IntTy::I64, true) => FToI::F32I64S,
+        (FloatTy::F32, IntTy::I64, false) => FToI::F32I64U,
+        (FloatTy::F64, IntTy::I32, true) => FToI::F64I32S,
+        (FloatTy::F64, IntTy::I32, false) => FToI::F64I32U,
+        (FloatTy::F64, IntTy::I64, true) => FToI::F64I64S,
+        (FloatTy::F64, IntTy::I64, false) => FToI::F64I64U,
+    }
+}
+
+/// The int→float conversion variant.
+fn itof_op(src: IntTy, dst: FloatTy, signed: bool) -> IToF {
+    match (src, dst, signed) {
+        (IntTy::I32, FloatTy::F32, true) => IToF::I32F32S,
+        (IntTy::I32, FloatTy::F32, false) => IToF::I32F32U,
+        (IntTy::I64, FloatTy::F32, true) => IToF::I64F32S,
+        (IntTy::I64, FloatTy::F32, false) => IToF::I64F32U,
+        (IntTy::I32, FloatTy::F64, true) => IToF::I32F64S,
+        (IntTy::I32, FloatTy::F64, false) => IToF::I32F64U,
+        (IntTy::I64, FloatTy::F64, true) => IToF::I64F64S,
+        (IntTy::I64, FloatTy::F64, false) => IToF::I64F64U,
+    }
+}
+
+/// Map an LLVM float compare predicate to the SVM op. Ordered and unordered forms collapse to the
+/// same op (the NaN-distinguishing `o`/`u` corner is a documented fidelity gap until needed);
+/// `ord`/`uno`/`true`/`false` are `Unsupported`.
+fn fcmp_op(p: FPPredicate) -> Result<FCmpOp, Error> {
+    use FPPredicate as P;
+    Ok(match p {
+        P::OEQ | P::UEQ => FCmpOp::Eq,
+        P::ONE | P::UNE => FCmpOp::Ne,
+        P::OLT | P::ULT => FCmpOp::Lt,
+        P::OLE | P::ULE => FCmpOp::Le,
+        P::OGT | P::UGT => FCmpOp::Gt,
+        P::OGE | P::UGE => FCmpOp::Ge,
+        other => return unsup(format!("float compare predicate {other:?}")),
+    })
 }
 
 /// The size in bytes of an LLVM type (the SysV/§3d layout for the subset we lower). Used to lay
@@ -439,6 +502,20 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         I::Trunc(x) => locals(&[&x.operand]),
         I::ZExt(x) => locals(&[&x.operand]),
         I::SExt(x) => locals(&[&x.operand]),
+        // Floats.
+        I::FAdd(x) => locals(&[&x.operand0, &x.operand1]),
+        I::FSub(x) => locals(&[&x.operand0, &x.operand1]),
+        I::FMul(x) => locals(&[&x.operand0, &x.operand1]),
+        I::FDiv(x) => locals(&[&x.operand0, &x.operand1]),
+        I::FCmp(x) => locals(&[&x.operand0, &x.operand1]),
+        I::FNeg(x) => locals(&[&x.operand]),
+        I::FPToSI(x) => locals(&[&x.operand]),
+        I::FPToUI(x) => locals(&[&x.operand]),
+        I::SIToFP(x) => locals(&[&x.operand]),
+        I::UIToFP(x) => locals(&[&x.operand]),
+        I::FPExt(x) => locals(&[&x.operand]),
+        I::FPTrunc(x) => locals(&[&x.operand]),
+        I::BitCast(x) => locals(&[&x.operand]),
         // Memory (§3d two-stack: address-taken locals live on the in-window data stack).
         I::Alloca(a) => locals(&[&a.num_elements]),
         I::Load(l) => locals(&[&l.address]),
@@ -483,6 +560,103 @@ fn call_target_name(c: &llvm_ir::instruction::Call) -> Result<String, Error> {
         },
         _ => unsup("indirect call (Milestone 1+ — needs funcref support)"),
     }
+}
+
+/// The callee name of a direct call, or `None` for an indirect/inline-asm call.
+fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
+    match c.function.as_ref().right()? {
+        Operand::ConstantOperand(cr) => match cr.as_ref() {
+            Constant::GlobalReference {
+                name: Name::Name(s),
+                ..
+            } => Some(s.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Lower a float math intrinsic call to inline float ops, returning its result index. `fmuladd`/
+/// `fma` lower to `fmul`+`fadd` (unfused — a defined IEEE approximation; both backends agree).
+/// Returns `Ok(None)` if the call is not a recognized float intrinsic.
+fn lower_float_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    types: &Types,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    // Strip the `.f32`/`.f64` overload suffix to match the base intrinsic.
+    let base = name.rsplit_once('.').map_or(name.as_str(), |(b, _)| b);
+    // Recognize the intrinsic *before* inspecting operand types — a non-float call (e.g. a normal
+    // function) must fall through to the call path, not error on `float_ty`.
+    let recognized = matches!(
+        base,
+        "llvm.sqrt"
+            | "llvm.fabs"
+            | "llvm.floor"
+            | "llvm.ceil"
+            | "llvm.trunc"
+            | "llvm.rint"
+            | "llvm.nearbyint"
+            | "llvm.roundeven"
+            | "llvm.minnum"
+            | "llvm.minimum"
+            | "llvm.maxnum"
+            | "llvm.maximum"
+            | "llvm.copysign"
+            | "llvm.fmuladd"
+            | "llvm.fma"
+    );
+    if !recognized {
+        return Ok(None);
+    }
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let ty = match args.first() {
+        Some(a) => float_ty(val_type(a.get_type(types).as_ref())?)?,
+        None => return Ok(None),
+    };
+    let un = |ctx: &mut BlockCtx, op: FUnOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        Ok(ctx.push(Inst::FUn { ty, op, a }))
+    };
+    let bin2 = |ctx: &mut BlockCtx, op: FBinOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        let b = ctx.operand(args[1])?;
+        Ok(ctx.push(Inst::FBin { ty, op, a, b }))
+    };
+    let idx = match base {
+        "llvm.sqrt" => un(ctx, FUnOp::Sqrt)?,
+        "llvm.fabs" => un(ctx, FUnOp::Abs)?,
+        "llvm.floor" => un(ctx, FUnOp::Floor)?,
+        "llvm.ceil" => un(ctx, FUnOp::Ceil)?,
+        "llvm.trunc" => un(ctx, FUnOp::Trunc)?,
+        "llvm.rint" | "llvm.nearbyint" | "llvm.roundeven" => un(ctx, FUnOp::Nearest)?,
+        "llvm.minnum" | "llvm.minimum" => bin2(ctx, FBinOp::Min)?,
+        "llvm.maxnum" | "llvm.maximum" => bin2(ctx, FBinOp::Max)?,
+        "llvm.copysign" => bin2(ctx, FBinOp::Copysign)?,
+        // fmuladd(a,b,c) = a*b + c, lowered unfused.
+        "llvm.fmuladd" | "llvm.fma" => {
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            let prod = ctx.push(Inst::FBin {
+                ty,
+                op: FBinOp::Mul,
+                a,
+                b,
+            });
+            let cc = ctx.operand(args[2])?;
+            ctx.push(Inst::FBin {
+                ty,
+                op: FBinOp::Add,
+                a: prod,
+                b: cc,
+            })
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(idx))
 }
 
 /// Whether a `call` is a droppable intrinsic with no guest-visible effect for our subset —
@@ -766,6 +940,8 @@ impl<'a> BlockCtx<'a> {
                 Constant::Int { bits, value } if *bits == 64 => {
                     Ok(self.push(Inst::ConstI64(*value as i64)))
                 }
+                Constant::Float(Float::Single(f)) => Ok(self.push(Inst::ConstF32(f.to_bits()))),
+                Constant::Float(Float::Double(d)) => Ok(self.push(Inst::ConstF64(d.to_bits()))),
                 // `undef`/`poison`/`null` resolve to a defined zero of the type — the IR is total
                 // (§3c), so no UB reaches it (the value is unused or its use is defined-on-zero).
                 Constant::Undef(t) | Constant::Poison(t) | Constant::Null(t) => {
@@ -845,6 +1021,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     // The op's integer width, from operand0 (both operands share a type in LLVM binops).
     let bin_ty =
         |o: &Operand| -> Result<IntTy, Error> { int_ty(val_type(o.get_type(types).as_ref())?) };
+    // The op's float width (f32/f64), likewise.
+    let fty =
+        |o: &Operand| -> Result<FloatTy, Error> { float_ty(val_type(o.get_type(types).as_ref())?) };
 
     // No-result instructions (effects only): handle and return early.
     if let I::Store(st) = instr {
@@ -863,6 +1042,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     if let I::Call(c) = instr {
         if is_droppable_call(c) {
             return Ok(()); // a no-op intrinsic (lifetime/dbg/assume)
+        }
+        // Float math intrinsics lower to inline float ops (not a call).
+        if let Some(idx) = lower_float_intrinsic(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
         }
         // Direct call only (indirect/funcref is a later slice). Pass the callee its own data-stack
         // frame at `sp + frame_size` (§3d), then the mapped arguments. The IR signature is
@@ -1061,6 +1249,98 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             let v = ctx.operand(&x.operand)?;
             (&x.dest, emit_ext(ctx, v, from, to, true))
         }
+        // Floats (f32/f64) — IEEE 754, no traps (§3b).
+        I::FAdd(x) => fbin(
+            ctx,
+            &x.dest,
+            fty(&x.operand0)?,
+            FBinOp::Add,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::FSub(x) => fbin(
+            ctx,
+            &x.dest,
+            fty(&x.operand0)?,
+            FBinOp::Sub,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::FMul(x) => fbin(
+            ctx,
+            &x.dest,
+            fty(&x.operand0)?,
+            FBinOp::Mul,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::FDiv(x) => fbin(
+            ctx,
+            &x.dest,
+            fty(&x.operand0)?,
+            FBinOp::Div,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::FNeg(x) => {
+            let ty = fty(&x.operand)?;
+            let a = ctx.operand(&x.operand)?;
+            (
+                &x.dest,
+                ctx.push(Inst::FUn {
+                    ty,
+                    op: FUnOp::Neg,
+                    a,
+                }),
+            )
+        }
+        I::FCmp(x) => {
+            let ty = fty(&x.operand0)?;
+            let op = fcmp_op(x.predicate)?;
+            let a = ctx.operand(&x.operand0)?;
+            let b = ctx.operand(&x.operand1)?;
+            (&x.dest, ctx.push(Inst::FCmp { ty, op, a, b }))
+        }
+        I::FPToSI(x) => (&x.dest, ftoi(ctx, &x.operand, &x.to_type, types, true)?),
+        I::FPToUI(x) => (&x.dest, ftoi(ctx, &x.operand, &x.to_type, types, false)?),
+        I::SIToFP(x) => (&x.dest, itof(ctx, &x.operand, &x.to_type, types, true)?),
+        I::UIToFP(x) => (&x.dest, itof(ctx, &x.operand, &x.to_type, types, false)?),
+        I::FPExt(x) => {
+            // f32 → f64.
+            let a = ctx.operand(&x.operand)?;
+            (
+                &x.dest,
+                ctx.push(Inst::Cast {
+                    op: CastOp::Promote,
+                    a,
+                }),
+            )
+        }
+        I::FPTrunc(x) => {
+            // f64 → f32.
+            let a = ctx.operand(&x.operand)?;
+            (
+                &x.dest,
+                ctx.push(Inst::Cast {
+                    op: CastOp::Demote,
+                    a,
+                }),
+            )
+        }
+        I::BitCast(x) => {
+            let from = val_type(x.operand.get_type(types).as_ref())?;
+            let to = val_type(x.to_type.as_ref())?;
+            let a = ctx.operand(&x.operand)?;
+            let op = match (from, to) {
+                (ValType::I32, ValType::F32) => CastOp::ReinterpI32F32,
+                (ValType::F32, ValType::I32) => CastOp::ReinterpF32I32,
+                (ValType::I64, ValType::F64) => CastOp::ReinterpI64F64,
+                (ValType::F64, ValType::I64) => CastOp::ReinterpF64I64,
+                (f, t) if f == t => return finish(ctx, &x.dest, a), // no-op bitcast
+                (f, t) => return unsup(format!("bitcast {} → {}", f.as_str(), t.as_str())),
+            };
+            (&x.dest, ctx.push(Inst::Cast { op, a }))
+        }
         other => return unsup(format!("instruction {other:?}")),
     };
     if let Some(&vid) = ctx.s.name2id.get(dest) {
@@ -1081,6 +1361,62 @@ fn bin<'d>(
     let a = ctx.operand(a)?;
     let b = ctx.operand(b)?;
     Ok((dest, ctx.push(Inst::IntBin { ty, op, a, b })))
+}
+
+/// Emit a binary float op and return `(dest, result-index)`.
+fn fbin<'d>(
+    ctx: &mut BlockCtx,
+    dest: &'d Name,
+    ty: FloatTy,
+    op: FBinOp,
+    a: &Operand,
+    b: &Operand,
+) -> Result<(&'d Name, ValIdx), Error> {
+    let a = ctx.operand(a)?;
+    let b = ctx.operand(b)?;
+    Ok((dest, ctx.push(Inst::FBin { ty, op, a, b })))
+}
+
+/// Emit a (saturating) float→int conversion, returning its result index.
+fn ftoi(
+    ctx: &mut BlockCtx,
+    operand: &Operand,
+    to_type: &llvm_ir::TypeRef,
+    types: &Types,
+    signed: bool,
+) -> Result<ValIdx, Error> {
+    let src = float_ty(val_type(operand.get_type(types).as_ref())?)?;
+    let dst = int_ty(val_type(to_type.as_ref())?)?;
+    let a = ctx.operand(operand)?;
+    Ok(ctx.push(Inst::FToISat {
+        op: ftoi_op(src, dst, signed),
+        a,
+    }))
+}
+
+/// Emit an int→float conversion, returning its result index.
+fn itof(
+    ctx: &mut BlockCtx,
+    operand: &Operand,
+    to_type: &llvm_ir::TypeRef,
+    types: &Types,
+    signed: bool,
+) -> Result<ValIdx, Error> {
+    let src = int_ty(val_type(operand.get_type(types).as_ref())?)?;
+    let dst = float_ty(val_type(to_type.as_ref())?)?;
+    let a = ctx.operand(operand)?;
+    Ok(ctx.push(Inst::IToFConv {
+        op: itof_op(src, dst, signed),
+        a,
+    }))
+}
+
+/// Record `dest`'s value as an existing index (an alias, e.g. a no-op bitcast) and return.
+fn finish(ctx: &mut BlockCtx, dest: &Name, idx: ValIdx) -> Result<(), Error> {
+    if let Some(&vid) = ctx.s.name2id.get(dest) {
+        ctx.idx_of.insert(vid, idx);
+    }
+    Ok(())
 }
 
 /// The `LoadOp` (width + result container) for an LLVM loaded type. Narrow loads zero-extend

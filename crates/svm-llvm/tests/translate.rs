@@ -44,6 +44,8 @@ fn to_slot(v: &Value) -> i64 {
     match v {
         Value::I32(x) => *x as i64,
         Value::I64(x) => *x,
+        Value::F32(x) => x.to_bits() as i64,
+        Value::F64(x) => x.to_bits() as i64,
         other => panic!("unsupported arg {other:?}"),
     }
 }
@@ -52,6 +54,8 @@ fn from_slot(t: ValType, s: i64) -> Value {
     match t {
         ValType::I32 => Value::I32(s as i32),
         ValType::I64 => Value::I64(s),
+        ValType::F32 => Value::F32(f32::from_bits(s as u32)),
+        ValType::F64 => Value::F64(f64::from_bits(s as u64)),
         other => panic!("unsupported result type {other:?}"),
     }
 }
@@ -303,10 +307,97 @@ fn switch_with_gaps_via_global_table() {
 }
 
 #[test]
+fn float_arithmetic_and_fmuladd() {
+    // a*b + a/b - b — `-O2` contracts `a*b + (a/b)` into `llvm.fmuladd`, which we lower unfused.
+    let src = "double fa(double a, double b){ return a*b + a/b - b; }";
+    check(
+        "fa",
+        src,
+        &[Value::F64(6.0), Value::F64(2.0)],
+        &[Value::F64(13.0)],
+    );
+}
+
+#[test]
+fn float_compare() {
+    let src = "int cmp(double a, double b){ return a < b ? 1 : (a == b ? 0 : -1); }";
+    check(
+        "cmp_lt",
+        src,
+        &[Value::F64(1.0), Value::F64(2.0)],
+        &[Value::I32(1)],
+    );
+    check(
+        "cmp_eq",
+        src,
+        &[Value::F64(2.0), Value::F64(2.0)],
+        &[Value::I32(0)],
+    );
+    check(
+        "cmp_gt",
+        src,
+        &[Value::F64(3.0), Value::F64(2.0)],
+        &[Value::I32(-1)],
+    );
+}
+
+#[test]
+fn float_int_conversions() {
+    check(
+        "i2d",
+        "double i2d(int n){ return (double)n + 0.5; }",
+        &[Value::I32(3)],
+        &[Value::F64(3.5)],
+    );
+    check(
+        "d2i",
+        "int d2i(double x){ return (int)(x * 2.0); }",
+        &[Value::F64(3.5)],
+        &[Value::I32(7)],
+    );
+}
+
+#[test]
+fn float_promote_demote() {
+    // f32 → f64 (fpext), arithmetic, then f64 → f32 (fptrunc).
+    let src = "float fp(float a, double b){ return (float)(a + b); }";
+    check(
+        "fp",
+        src,
+        &[Value::F32(1.5), Value::F64(2.25)],
+        &[Value::F32(3.75)],
+    );
+}
+
+#[test]
+fn float_intrinsics_abs_floor() {
+    // `fabs`/`floor` lower to `llvm.fabs`/`llvm.floor` (errno-free, so real intrinsics at -O2,
+    // unlike `sqrt` which stays a libc call pending the libc-binding slice).
+    check(
+        "ab",
+        "double ab(double x){ return __builtin_fabs(x); }",
+        &[Value::F64(-3.5)],
+        &[Value::F64(3.5)],
+    );
+    check(
+        "fl",
+        "double fl(double x){ return __builtin_floor(x); }",
+        &[Value::F64(3.7)],
+        &[Value::F64(3.0)],
+    );
+    check(
+        "fl_neg",
+        "double fl(double x){ return __builtin_floor(x); }",
+        &[Value::F64(-2.1)],
+        &[Value::F64(-3.0)],
+    );
+}
+
+#[test]
 fn unsupported_is_fail_closed() {
-    // A float return is outside slice A — it must be a clean `Unsupported`, never a silent
+    // A 128-bit integer is outside the subset — it must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).
-    let Some(bc) = compile_to_bc("float", "float h(void){ return 1.5f; }") else {
+    let Some(bc) = compile_to_bc("i128", "__int128 big(__int128 a){ return a + 1; }") else {
         return;
     };
     match svm_llvm::translate_bc_path(&bc) {

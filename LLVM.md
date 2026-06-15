@@ -8,20 +8,22 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–E (control flow + memory + calls + switch + globals) done —
-multi-block integer functions with stack memory, (recursive) calls, `switch`, and global
-variables translate and run on both backends.** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–F (control flow + memory + calls + switch + globals + floats)
+done — multi-block scalar functions with stack memory, (recursive) calls, `switch`, global
+variables, and `f32`/`f64` translate and run on both backends.** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
 **direct calls with the threaded data-SP** (every function takes a leading `sp`; a call passes
-`sp + frame_size`, so recursion is sound), **`switch` → `br_table`**, and **global variables**
-(a fixed high window region as `data` segments, constants read-only D40; a `@global` ref is its
-window address). Real `clang -O2` programs — popcount/collatz loops, if-converted select, a
-stack-array sum, recursive `fib`, a cross-function call, a dense switch, `even`/`odd` mutual
-recursion, a static const lookup table, a mutable global counter, indexed string-literal reads,
-and a gapped switch (a global jump table) — run **interp == JIT == hand-computed** (18 tests).
-Remaining M1: floats, indirect calls (funcref), aggregates/`sret`, more intrinsics, then the demo
+`sp + frame_size`, so recursion is sound), **`switch` → `br_table`**, **global variables**
+(low in the window as `data` segments, constants read-only D40, with a stack guard above; a
+`@global` ref is its window address), and **`f32`/`f64`** (arithmetic/compare/conversions +
+the common float intrinsics, `fmuladd` lowered unfused). Real `clang -O2` programs — popcount/
+collatz loops, if-converted select, a stack-array sum, recursive `fib`, a cross-function call, a
+dense switch, `even`/`odd` mutual recursion, a const lookup table, a mutable global counter,
+indexed string reads, a gapped switch (a global jump table), double arithmetic/compares/
+conversions, and `fabs`/`floor` — run **interp == JIT == hand-computed** (24 tests).
+Remaining M1: indirect calls (funcref), aggregates/`sret`, libc/math function calls, then the demo
 Lane C. Section numbers like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
@@ -327,10 +329,20 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 - [x] **API:** `translate`/`translate_bc_path` now return `Translated { module, entry_sp }` — the
       host/driver invokes the entry with `entry_sp` as its first (`sp`) argument.
 
+**Slice F (DONE) — floats.**
+- [x] `f32`/`f64` arithmetic (`fadd`/`fsub`/`fmul`/`fdiv`/`fneg`), `fcmp` (ordered/unordered collapse
+      to the SVM op — NaN corner is a documented fidelity gap), `select`, the int↔float conversions
+      (`sitofp`/`uitofp`/`fptosi`/`fptoui`, float→int **saturating** per §3b), `fpext`/`fptrunc`,
+      `bitcast`, and the common float math intrinsics (`fmuladd`/`fma` lowered **unfused**;
+      `sqrt`/`fabs`/`floor`/`ceil`/`trunc`/`rint`/`copysign`/`min`/`maxnum`) lowered inline. Float
+      constants and `f32`/`f64` params/results in the slot ABI. Tested on `clang -O2` double
+      arithmetic (incl. the `fmuladd` contraction), compares, int↔float, promote/demote, `fabs`/`floor`.
+
 **Remaining slices.**
-- [ ] Floats (`f32`/`f64`: `fadd`/…/`fcmp`/`fptosi`/`sitofp`/…). *Likely the top remaining need —
-      the demo corpus has float-heavy programs (perlin), and `double` math is common.*
 - [ ] Indirect `call` (funcref §3c — `call` through a function pointer; needs `ref.func` + the table).
+- [ ] Libc/math **function** calls (e.g. `sqrt` keeps errno semantics → a real `@sqrt` call) — bind
+      to a guest libc / capability, or recognize the named libc-math calls as intrinsics under
+      `-fno-math-errno`.
 - [ ] Pointer-valued global initializers (relocations — a global holding `&other_global`/a string
       pointer; resolve addresses after layout).
 - [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline.
