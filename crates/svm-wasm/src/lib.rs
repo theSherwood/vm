@@ -27,9 +27,13 @@
 //! `call_indirect` loads the entry and feeds it to our `CallIndirect`'s §3c type-id check) ·
 //! **function imports** (a wasm `call` to an import → a `cap.call` on a threaded capability handle;
 //! the host-ABI convention binds each import's `module`/`name` to a capability `type_id`/`op` — see
-//! [`transpile`]). Still a clean [`Error::Unsupported`] (added in slices): `memory.init`/`data.drop` +
-//! the `table.*` bulk ops, passive data/element segments, table/memory/global imports, imports across
-//! multiple capability interfaces, SIMD, reference types.
+//! [`transpile`]) · **§17/D58 SIMD** (`v128` → the IR's first-class fixed-128 vector type: const,
+//! masked load/store, splat, extract/replace_lane, integer-/float-lane arithmetic, bitwise +
+//! `bitselect`, `shuffle`/`swizzle` — a real `clang -msimd128 -O2` saxpy transpiles to verified
+//! SIMD IR, `tests/simd.rs`). Still a clean [`Error::Unsupported`] (the niche features typical clang
+//! output doesn't emit): `memory.init`/`data.drop` + the `table.*` bulk ops, passive data/element
+//! segments, table/memory/global imports, imports across multiple capability interfaces, reference
+//! types, multi-memory/multi-table.
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,

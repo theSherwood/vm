@@ -98,7 +98,8 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > A **second frontend, `svm-wasm`**, transpiles **core wasm → IR** (reconstructing SSA from the
 > stack machine) and runs real clang-compiled programs and **real C libraries** — the jsmn JSON
 > tokenizer and B-Con SHA-256 — byte-identically to native, including bulk memory
-> (`memory.copy`/`fill`), `memory.grow`, and **function imports** (a wasm `call` → a `cap.call`); it
+> (`memory.copy`/`fill`), `memory.grow`, **function imports** (a wasm `call` → a `cap.call`), and
+> **v128 SIMD** (a real `clang -msimd128 -O2` saxpy → first-class `v128` IR, ~1.0× Wasmtime); it
 > benches the §1a thesis on the *same bytes* Wasmtime runs. The host-call boundary is now
 > **devirtualized** (D45): a `cap.call` to a statically-known capability op is a register-to-register
 > direct call, taking `hostcall` from ~parity to ~1.5× faster than Wasmtime. And **§15 spawn
@@ -119,8 +120,9 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > serializes compiles while execution stays parallel), with full platform parity. All on **both backends,
 > differentially identical**.
 > Still ahead:
-> narrow-scalar promotion, honoring *weak* memory orderings (both backends seq-cst today), SIMD
-> (v128), isolation tiers, Spectre hardening, and the LLVM-bitcode on-ramp.
+> narrow-scalar promotion, honoring *weak* memory orderings (both backends seq-cst today), wider SIMD
+> (`v256`/`v512` — fixed-128 `v128` is done across all backends, D58), isolation tiers, Spectre
+> hardening, and the LLVM-bitcode on-ramp.
 > This is a research build; "appears to work" is reachable, "is certified secure" is an explicit
 > post-MVP workstream (see `DESIGN.md` §2a/§18).
 
