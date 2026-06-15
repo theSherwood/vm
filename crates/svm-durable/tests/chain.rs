@@ -9,8 +9,8 @@
 //! continue" branch that the single-frame transform never hit.
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
-    STATE_REWINDING, STATE_UNWINDING,
+    init_durable_window, read_state, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
+    STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -20,19 +20,33 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 
 fn instrument(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
-    m.memory = Some(Memory { size_log2: SIZE_LOG2 });
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
     let inst = transform_module(&m).expect("transform");
     svm_verify::verify_module(&inst).expect("instrumented IR must verify");
     inst
 }
 
 /// Run the entry (func 0) against `window` with the clock seeded to `clock_ns`.
-fn run(inst: &Module, clock_ns: i64, window: &[u8]) -> (Result<Vec<Value>, svm_interp::Trap>, Vec<u8>) {
+fn run(
+    inst: &Module,
+    clock_ns: i64,
+    window: &[u8],
+) -> (Result<Vec<Value>, svm_interp::Trap>, Vec<u8>) {
     let mut host = Host::new();
     host.clock_ns = clock_ns;
     let clk = host.grant_clock();
     let mut fuel = 1_000_000u64;
-    run_capture_reserved_with_host(inst, 0, &[Value::I32(clk)], &mut fuel, window, SIZE_LOG2, &mut host)
+    run_capture_reserved_with_host(
+        inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        window,
+        SIZE_LOG2,
+        &mut host,
+    )
 }
 
 /// Drive the full property for `inst`: baseline (clock 42) vs. freeze→thaw on a fresh
@@ -58,7 +72,11 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
     let mut win = snapshot.clone();
     write_state(&mut win, STATE_REWINDING);
     let (thawed, final_win) = run(inst, 0, &win);
-    assert_eq!(thawed, Ok(baseline.clone()), "thaw equals the uninterrupted run");
+    assert_eq!(
+        thawed,
+        Ok(baseline.clone()),
+        "thaw equals the uninterrupted run"
+    );
     assert_eq!(
         read_state(&final_win),
         STATE_NORMAL,
@@ -86,7 +104,11 @@ block0(v0: i32):
 #[test]
 fn dead_values_across_cap_call_are_dropped() {
     let inst = instrument(DEAD_VALUES);
-    assert_eq!(assert_roundtrips(&inst), vec![Value::I64(52)], "42 + 10; dead consts dropped");
+    assert_eq!(
+        assert_roundtrips(&inst),
+        vec![Value::I64(52)],
+        "42 + 10; dead consts dropped"
+    );
 }
 
 // A → B(leaf). A adds 1000 to B's result; B adds 100 to the clock. Baseline: 1142.
@@ -111,7 +133,11 @@ block0(v0: i32):
 #[test]
 fn two_level_chain_round_trips() {
     let inst = instrument(TWO_LEVEL);
-    assert_eq!(assert_roundtrips(&inst), vec![Value::I64(1142)], "1000 + (100 + 42)");
+    assert_eq!(
+        assert_roundtrips(&inst),
+        vec![Value::I64(1142)],
+        "1000 + (100 + 42)"
+    );
 }
 
 // A → B → C(leaf), each adding a distinct constant, so a dropped or doubly-applied frame
@@ -144,7 +170,11 @@ block0(v0: i32):
 #[test]
 fn three_level_chain_round_trips() {
     let inst = instrument(THREE_LEVEL);
-    assert_eq!(assert_roundtrips(&inst), vec![Value::I64(363)], "42 + 1 + 20 + 300");
+    assert_eq!(
+        assert_roundtrips(&inst),
+        vec![Value::I64(363)],
+        "42 + 1 + 20 + 300"
+    );
 }
 
 // A propagated frame with a non-empty pre-call live set: A computes a value *before* the
@@ -172,5 +202,9 @@ block0(v0: i32):
 #[test]
 fn live_value_across_propagated_call_survives() {
     let inst = instrument(LIVE_ACROSS_CALL);
-    assert_eq!(assert_roundtrips(&inst), vec![Value::I64(61)], "(42+5) + (7+7)");
+    assert_eq!(
+        assert_roundtrips(&inst),
+        vec![Value::I64(61)],
+        "(42+5) + (7+7)"
+    );
 }

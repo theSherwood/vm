@@ -60,7 +60,11 @@ fn freeze_serialize_restore_thaw_equals_uninterrupted_run() {
         SIZE_LOG2,
         &mut host,
     );
-    assert_eq!(baseline, Ok(vec![Value::I64(142)]), "uninterrupted: 42 + 100");
+    assert_eq!(
+        baseline,
+        Ok(vec![Value::I64(142)]),
+        "uninterrupted: 42 + 100"
+    );
 
     // ---- Freeze: seed UNWINDING; the poll after the call unwinds out to the host. ----
     let mut host = Host::new();
@@ -79,7 +83,11 @@ fn freeze_serialize_restore_thaw_equals_uninterrupted_run() {
         &mut host,
     );
     // The entry returned a placeholder while still UNWINDING — it froze, it did not finish.
-    assert_eq!(frozen, Ok(vec![Value::I64(0)]), "freeze returns a placeholder");
+    assert_eq!(
+        frozen,
+        Ok(vec![Value::I64(0)]),
+        "freeze returns a placeholder"
+    );
     assert_eq!(
         read_state(&snapshot),
         STATE_UNWINDING,
@@ -133,5 +141,9 @@ fn normal_run_of_instrumented_module_matches_unmodified_behavior() {
         SIZE_LOG2,
         &mut host,
     );
-    assert_eq!(r, Ok(vec![Value::I64(107)]), "7 + 100, instrumentation inert");
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(107)]),
+        "7 + 100, instrumentation inert"
+    );
 }

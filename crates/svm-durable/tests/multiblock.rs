@@ -14,8 +14,8 @@
 //! while the frozen reading is reloaded.
 
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
-    STATE_REWINDING, STATE_UNWINDING,
+    init_durable_window, read_state, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
+    STATE_UNWINDING,
 };
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
@@ -25,7 +25,9 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 
 fn instrument(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
-    m.memory = Some(Memory { size_log2: SIZE_LOG2 });
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
     let inst = transform_module(&m).expect("transform");
     svm_verify::verify_module(&inst).expect("instrumented IR must verify");
     inst
@@ -36,8 +38,15 @@ fn run(inst: &Module, clock_ns: i64, window: &[u8]) -> (Vec<Value>, Vec<u8>, i64
     host.clock_ns = clock_ns;
     let clk = host.grant_clock();
     let mut fuel = 1_000_000u64;
-    let (r, win) =
-        run_capture_reserved_with_host(inst, 0, &[Value::I32(clk)], &mut fuel, window, SIZE_LOG2, &mut host);
+    let (r, win) = run_capture_reserved_with_host(
+        inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        window,
+        SIZE_LOG2,
+        &mut host,
+    );
     (r.expect("runs to completion"), win, host.clock_ns)
 }
 
@@ -51,12 +60,19 @@ fn assert_roundtrips(src: &str, expected: i64) {
     let mut win = init_durable_window(WINDOW);
     write_state(&mut win, STATE_UNWINDING);
     let (_, snapshot, clock_after) = run(&inst, 42, &win);
-    assert_eq!(read_state(&snapshot), STATE_UNWINDING, "froze, did not complete");
+    assert_eq!(
+        read_state(&snapshot),
+        STATE_UNWINDING,
+        "froze, did not complete"
+    );
 
     let mut win = snapshot.clone();
     write_state(&mut win, STATE_REWINDING);
     let (thawed, final_win, _) = run(&inst, clock_after, &win);
-    assert_eq!(thawed, baseline, "thaw of a non-entry-block freeze equals the oracle");
+    assert_eq!(
+        thawed, baseline,
+        "thaw of a non-entry-block freeze equals the oracle"
+    );
     assert_eq!(read_state(&final_win), STATE_NORMAL, "thaw ends NORMAL");
 }
 

@@ -51,8 +51,8 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::{
-    BinOp, Block, BlockIdx, CmpOp, Func, FuncIdx, Inst, IntTy, LoadOp, Module, StoreOp,
-    Terminator, ValIdx, ValType,
+    BinOp, Block, BlockIdx, CmpOp, Func, FuncIdx, Inst, IntTy, LoadOp, Module, StoreOp, Terminator,
+    ValIdx, ValType,
 };
 
 // `FuncIdx` is used by `SuspendKind::Propagated` below.
@@ -164,7 +164,9 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
     // the relocation that would lift this restriction is §12.7 future work.)
     if enforce_r9
         && any_instrumented
-        && m.funcs.iter().any(|f| f.blocks.iter().any(|b| b.insts.iter().any(is_guest_mem_op)))
+        && m.funcs
+            .iter()
+            .any(|f| f.blocks.iter().any(|b| b.insts.iter().any(is_guest_mem_op)))
     {
         return Err(TransformError::GuestUsesMemory);
     }
@@ -219,8 +221,13 @@ fn is_guest_mem_op(inst: &Inst) -> bool {
 fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
     use Inst::*;
     Some(match i {
-        ConstI32(_) | ConstI64(_) | ConstF32(_) | ConstF64(_) | ConstV128(_) | RefFunc { .. } => vec![],
-        IntBin { a, b, .. } | IntCmp { a, b, .. } | FBin { a, b, .. } | FCmp { a, b, .. }
+        ConstI32(_) | ConstI64(_) | ConstF32(_) | ConstF64(_) | ConstV128(_) | RefFunc { .. } => {
+            vec![]
+        }
+        IntBin { a, b, .. }
+        | IntCmp { a, b, .. }
+        | FBin { a, b, .. }
+        | FCmp { a, b, .. }
         | PtrAdd { a, b } => vec![*a, *b],
         IntUn { a, .. } | FUn { a, .. } | Eqz { a, .. } | PtrCast { a, .. } => vec![*a],
         Select { cond, a, b } => vec![*cond, *a, *b],
@@ -229,9 +236,19 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
         | AtomicStore { addr, value, .. }
         | AtomicRmw { addr, value, .. }
         | V128Store { addr, value, .. } => vec![*addr, *value],
-        AtomicCmpxchg { addr, expected, replacement, .. } => vec![*addr, *expected, *replacement],
+        AtomicCmpxchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => vec![*addr, *expected, *replacement],
         AtomicFence { .. } => vec![],
-        MemoryWait { addr, expected, timeout, .. } => vec![*addr, *expected, *timeout],
+        MemoryWait {
+            addr,
+            expected,
+            timeout,
+            ..
+        } => vec![*addr, *expected, *timeout],
         MemoryNotify { addr, count } => vec![*addr, *count],
         Call { args, .. } => args.clone(),
         CapCall { handle, args, .. } => {
@@ -254,13 +271,22 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
 fn term_operands(t: &Terminator) -> Vec<ValIdx> {
     match t {
         Terminator::Br { args, .. } => args.clone(),
-        Terminator::BrIf { cond, then_args, else_args, .. } => {
+        Terminator::BrIf {
+            cond,
+            then_args,
+            else_args,
+            ..
+        } => {
             let mut v = vec![*cond];
             v.extend_from_slice(then_args);
             v.extend_from_slice(else_args);
             v
         }
-        Terminator::BrTable { idx, targets, default } => {
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
             let mut v = vec![*idx];
             for (_, a) in targets {
                 v.extend_from_slice(a);
@@ -286,9 +312,10 @@ fn term_operands(t: &Terminator) -> Vec<ValIdx> {
 fn compute_may_suspend(m: &Module) -> Vec<bool> {
     let mut ms = vec![false; m.funcs.len()];
     for (i, f) in m.funcs.iter().enumerate() {
-        if f.blocks.iter().any(|b| {
-            b.insts.iter().any(|x| matches!(x, Inst::CapCall { .. }))
-        }) {
+        if f.blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|x| matches!(x, Inst::CapCall { .. })))
+        {
             ms[i] = true;
         }
     }
@@ -338,7 +365,7 @@ struct PointPlan {
     frame_offsets: Vec<u64>,  // window offset of each spilled value (parallel to `spilled`)
     frame_size: u64,
     rid_off: u64,
-    cont_seg: u32,            // new block index of the continuation segment (after the op)
+    cont_seg: u32, // new block index of the continuation segment (after the op)
 }
 
 /// Per-original-block analysis: value types, the value count after each instruction, and
@@ -393,7 +420,12 @@ fn transform_func(
             })
             .map(|(pos, _)| pos)
             .collect();
-        binfo.push(BlockInfo { types, vend, scs, plen: blk.params.len() });
+        binfo.push(BlockInfo {
+            types,
+            vend,
+            scs,
+            plen: blk.params.len(),
+        });
     }
 
     let total_points: usize = binfo.iter().map(|bi| bi.scs.len()).sum();
@@ -423,15 +455,28 @@ fn transform_func(
     let seg0 = |t: BlockIdx| seg_base[t as usize];
     let remap = |term: &Terminator| -> Terminator {
         match term {
-            Terminator::Br { target, args } => Terminator::Br { target: seg0(*target), args: args.clone() },
-            Terminator::BrIf { cond, then_blk, then_args, else_blk, else_args } => Terminator::BrIf {
+            Terminator::Br { target, args } => Terminator::Br {
+                target: seg0(*target),
+                args: args.clone(),
+            },
+            Terminator::BrIf {
+                cond,
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+            } => Terminator::BrIf {
                 cond: *cond,
                 then_blk: seg0(*then_blk),
                 then_args: then_args.clone(),
                 else_blk: seg0(*else_blk),
                 else_args: else_args.clone(),
             },
-            Terminator::BrTable { idx, targets, default } => Terminator::BrTable {
+            Terminator::BrTable {
+                idx,
+                targets,
+                default,
+            } => Terminator::BrTable {
                 idx: *idx,
                 targets: targets.iter().map(|(t, a)| (seg0(*t), a.clone())).collect(),
                 default: (seg0(default.0), default.1.clone()),
@@ -462,7 +507,13 @@ fn transform_func(
         let bi = &binfo[b];
         let m = bi.scs.len();
         // segment k's incoming value count: block params for k==0, else the previous op's out
-        let in_of = |k: usize| if k == 0 { bi.plen } else { bi.vend[bi.scs[k - 1]] };
+        let in_of = |k: usize| {
+            if k == 0 {
+                bi.plen
+            } else {
+                bi.vend[bi.scs[k - 1]]
+            }
+        };
         for k in 0..=m {
             let mut sb = Bb::new(bi.types[0..in_of(k)].to_vec());
             if k < m {
@@ -489,12 +540,17 @@ fn transform_func(
                 // resume plan for this point
                 let kind = match &blk.insts[pos] {
                     Inst::CapCall { .. } => SuspendKind::Leaf,
-                    Inst::Call { func, args } => SuspendKind::Propagated { callee: *func, args: args.clone() },
+                    Inst::Call { func, args } => SuspendKind::Propagated {
+                        callee: *func,
+                        args: args.clone(),
+                    },
                     _ => unreachable!("suspend position is a cap.call or call"),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
                     (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => sig.results.len(),
-                    (SuspendKind::Propagated { callee, .. }, _) => func_results[*callee as usize].len(),
+                    (SuspendKind::Propagated { callee, .. }, _) => {
+                        func_results[*callee as usize].len()
+                    }
                     _ => unreachable!(),
                 };
                 // Spillable range: values `[0, save_end)`. A leaf reloads its own result too
@@ -586,7 +642,11 @@ fn transform_func(
     for g in 0..p_total {
         targets.push((arm_base + g, vec![]));
     }
-    let dispatch = db.finish(Terminator::BrTable { idx: rid, targets, default: (trap_blk, vec![]) });
+    let dispatch = db.finish(Terminator::BrTable {
+        idx: rid,
+        targets,
+        default: (trap_blk, vec![]),
+    });
 
     // ---- UNWIND (check + spill pair) / ARM_g, per resume point ----
     let mut unwind_blocks: Vec<Block> = Vec::with_capacity(2 * total_points);
@@ -620,7 +680,12 @@ fn transform_func(
         let sp_a = ub.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
         let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
         for (j, &i) in pt.spilled.iter().enumerate() {
-            ub.zero(store(store_op(pt.slot_types[i]), sp, i as u32, pt.frame_offsets[j]));
+            ub.zero(store(
+                store_op(pt.slot_types[i]),
+                sp,
+                i as u32,
+                pt.frame_offsets[j],
+            ));
         }
         let rid = ub.one(Inst::ConstI32(gid as i32 + 1));
         ub.zero(store(StoreOp::I32, sp, rid, pt.rid_off));
@@ -654,9 +719,17 @@ fn transform_func(
                 vec![]
             }
             SuspendKind::Propagated { callee, args } => {
-                let mapped: Vec<ValIdx> =
-                    args.iter().map(|&a| reloaded[spill_slot(a as usize).expect("call arg spilled")]).collect();
-                ab.many(Inst::Call { func: *callee, args: mapped }, pt.nres)
+                let mapped: Vec<ValIdx> = args
+                    .iter()
+                    .map(|&a| reloaded[spill_slot(a as usize).expect("call arg spilled")])
+                    .collect();
+                ab.many(
+                    Inst::Call {
+                        func: *callee,
+                        args: mapped,
+                    },
+                    pt.nres,
+                )
             }
         };
 
@@ -673,11 +746,18 @@ fn transform_func(
                 }
             })
             .collect();
-        arm_blocks.push(ab.finish(Terminator::Br { target: pt.cont_seg, args: cont_args }));
+        arm_blocks.push(ab.finish(Terminator::Br {
+            target: pt.cont_seg,
+            args: cont_args,
+        }));
     }
 
     // ---- TRAP — br_table default / forged resume id ----
-    let trap = Block { params: vec![], insts: vec![], term: Terminator::Unreachable };
+    let trap = Block {
+        params: vec![],
+        insts: vec![],
+        term: Terminator::Unreachable,
+    };
 
     // Assemble in the order the index layout assumes.
     let mut blocks = Vec::with_capacity((2 + s_total + 2 * p_total + 1) as usize);
@@ -908,7 +988,11 @@ mod tests {
         );
         let out = transform_module(&m).expect("transform");
         svm_verify::verify_module(&out).expect("instrumented IR must verify");
-        assert_eq!(out.funcs[0].blocks.len(), 8, "one point: 4n+4 blocks with n=1");
+        assert_eq!(
+            out.funcs[0].blocks.len(),
+            8,
+            "one point: 4n+4 blocks with n=1"
+        );
     }
 
     #[test]
@@ -920,7 +1004,11 @@ mod tests {
         );
         let out = transform_module(&m).expect("two resume points are in scope");
         svm_verify::verify_module(&out).expect("instrumented IR must verify");
-        assert_eq!(out.funcs[0].blocks.len(), 12, "two-point layout: 4n+4 with n=2");
+        assert_eq!(
+            out.funcs[0].blocks.len(),
+            12,
+            "two-point layout: 4n+4 with n=2"
+        );
     }
 
     #[test]
@@ -933,7 +1021,11 @@ mod tests {
         );
         let out = transform_module(&m).expect("transform");
         svm_verify::verify_module(&out).expect("instrumented chain must verify");
-        assert_eq!(out.funcs[0].blocks.len(), 8, "caller (propagated) instrumented");
+        assert_eq!(
+            out.funcs[0].blocks.len(),
+            8,
+            "caller (propagated) instrumented"
+        );
         assert_eq!(out.funcs[1].blocks.len(), 8, "callee (leaf) instrumented");
     }
 
@@ -950,7 +1042,10 @@ mod tests {
         let out = transform_module(&m).expect("transform");
         svm_verify::verify_module(&out).expect("verify");
         assert_eq!(out.funcs[0].blocks.len(), 8, "leaf instrumented");
-        assert_eq!(out.funcs[1], helper_before, "non-suspending helper untouched");
+        assert_eq!(
+            out.funcs[1], helper_before,
+            "non-suspending helper untouched"
+        );
     }
 
     #[test]

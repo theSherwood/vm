@@ -117,7 +117,13 @@ enum Suspend {
 
 /// Append a few i64 consts / total binops to `insts`, tracking value indices in
 /// `i64_vals` / `next`. Used for both the prefix and the inter-/post-suspend suffixes.
-fn gen_straightline(g: &mut Gen, insts: &mut Vec<Inst>, i64_vals: &mut Vec<u32>, next: &mut u32, acc: u32) {
+fn gen_straightline(
+    g: &mut Gen,
+    insts: &mut Vec<Inst>,
+    i64_vals: &mut Vec<u32>,
+    next: &mut u32,
+    acc: u32,
+) {
     for _ in 0..g.below(4) {
         let b = if i64_vals.len() < 2 || g.below(2) == 0 {
             insts.push(Inst::ConstI64(g.u64v() as i64));
@@ -128,7 +134,12 @@ fn gen_straightline(g: &mut Gen, insts: &mut Vec<Inst>, i64_vals: &mut Vec<u32>,
         } else {
             i64_vals[g.below(i64_vals.len() as u32) as usize]
         };
-        insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b });
+        insts.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: total_binop(g),
+            a: acc,
+            b,
+        });
         let r = *next;
         *next += 1;
         i64_vals.push(r);
@@ -155,14 +166,22 @@ fn emit_suspend_body(
                 insts.push(Inst::CapCall {
                     type_id: CLOCK_TYPE_ID,
                     op: CLOCK_OP,
-                    sig: FuncType { params: vec![ValType::I32], results: vec![ValType::I64] },
+                    sig: FuncType {
+                        params: vec![ValType::I32],
+                        results: vec![ValType::I64],
+                    },
                     handle: 0,
                     args: vec![arg],
                 });
                 let cap_result = *next;
                 *next += 1;
                 i64_vals.push(cap_result);
-                insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b: cap_result });
+                insts.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: total_binop(g),
+                    a: acc,
+                    b: cap_result,
+                });
                 acc = *next;
                 *next += 1;
                 i64_vals.push(acc);
@@ -171,11 +190,19 @@ fn emit_suspend_body(
             }
         }
         Suspend::Call(callee) => {
-            insts.push(Inst::Call { func: callee, args: vec![0] }); // pass the handle down
+            insts.push(Inst::Call {
+                func: callee,
+                args: vec![0],
+            }); // pass the handle down
             let call_result = *next;
             *next += 1;
             i64_vals.push(call_result);
-            insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b: call_result });
+            insts.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: total_binop(g),
+                a: acc,
+                b: call_result,
+            });
             acc = *next;
             *next += 1;
             i64_vals.push(acc);
@@ -225,7 +252,10 @@ fn gen_func(g: &mut Gen, suspend: Suspend, split: bool) -> Func {
     let entry = Block {
         params: vec![ValType::I32],
         insts: b0,
-        term: Terminator::Br { target: 1, args: vec![0, acc] },
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, acc],
+        },
     };
 
     // block1(handle: i32, acc: i64): the suspend body, then return. Value indices restart:
@@ -240,7 +270,11 @@ fn gen_func(g: &mut Gen, suspend: Suspend, split: bool) -> Func {
         term: Terminator::Return(vec![acc1]),
     };
 
-    Func { params: vec![ValType::I32], results: vec![ValType::I64], blocks: vec![entry, body] }
+    Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I64],
+        blocks: vec![entry, body],
+    }
 }
 
 /// Build an in-scope durable module: a call chain `func0 → func1 → … → leaf`, of a
@@ -253,7 +287,9 @@ pub fn gen_module(g: &mut Gen) -> Module {
     let funcs: Vec<Func> = (0..depth)
         .map(|i| {
             let suspend = if i == depth - 1 {
-                Suspend::Cap { npoints: leaf_points }
+                Suspend::Cap {
+                    npoints: leaf_points,
+                }
             } else {
                 Suspend::Call(i + 1)
             };

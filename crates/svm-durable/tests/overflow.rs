@@ -29,7 +29,9 @@ block0(v0: i32):
 
 fn instrument() -> Module {
     let mut m = svm_text::parse_module(LEAF).expect("parse");
-    m.memory = Some(Memory { size_log2: SIZE_LOG2 });
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
     let inst = transform_module(&m).expect("transform");
     svm_verify::verify_module(&inst).expect("verify");
     inst
@@ -44,8 +46,15 @@ fn freeze_with_sp(inst: &Module, sp: u64) -> Result<Vec<Value>, Trap> {
     host.clock_ns = 42;
     let clk = host.grant_clock();
     let mut fuel = 1_000_000u64;
-    let (r, _) =
-        run_capture_reserved_with_host(inst, 0, &[Value::I32(clk)], &mut fuel, &win, SIZE_LOG2, &mut host);
+    let (r, _) = run_capture_reserved_with_host(
+        inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut host,
+    );
     r
 }
 

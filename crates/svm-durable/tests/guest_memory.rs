@@ -20,7 +20,9 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 
 fn module(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
-    m.memory = Some(Memory { size_log2: SIZE_LOG2 });
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
     m
 }
 
@@ -29,8 +31,15 @@ fn run(inst: &Module, clock_ns: i64, window: &[u8]) -> (Vec<Value>, Vec<u8>) {
     host.clock_ns = clock_ns;
     let clk = host.grant_clock();
     let mut fuel = 1_000_000u64;
-    let (r, win) =
-        run_capture_reserved_with_host(inst, 0, &[Value::I32(clk)], &mut fuel, window, SIZE_LOG2, &mut host);
+    let (r, win) = run_capture_reserved_with_host(
+        inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        window,
+        SIZE_LOG2,
+        &mut host,
+    );
     (r.expect("runs to completion"), win)
 }
 
@@ -69,14 +78,21 @@ fn guest_memory_survives_freeze_thaw_via_confined_path() {
     let mut win = init_durable_window(WINDOW);
     write_state(&mut win, STATE_UNWINDING);
     let (_, snapshot) = run(&inst, 42, &win);
-    assert_eq!(read_state(&snapshot), STATE_UNWINDING, "froze, did not complete");
+    assert_eq!(
+        read_state(&snapshot),
+        STATE_UNWINDING,
+        "froze, did not complete"
+    );
 
     // Thaw on a fresh host: the guest's stored 77 rides the restored window image, the cap
     // result (42) is reloaded, and the post-call reload reads 77 back.
     let mut win = snapshot.clone();
     write_state(&mut win, STATE_REWINDING);
     let (thawed, final_win) = run(&inst, 0, &win);
-    assert_eq!(thawed, baseline, "guest memory + durable state round-tripped");
+    assert_eq!(
+        thawed, baseline,
+        "guest memory + durable state round-tripped"
+    );
     assert_eq!(read_state(&final_win), STATE_NORMAL, "thaw ends NORMAL");
 }
 

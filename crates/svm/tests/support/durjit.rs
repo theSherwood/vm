@@ -62,13 +62,24 @@ fn window_with(state: i32) -> Vec<u8> {
 /// `clock_v`. Returns the result and the post-run window snapshot.
 /// Returns the result, the post-run window snapshot, and the host's final `clock_ns`
 /// (how far the monotonic clock advanced — used to seed the continuation host on thaw).
-fn interp_run(inst: &Module, clock_v: i64, window: &[u8]) -> (Result<Vec<Value>, Trap>, Vec<u8>, i64) {
+fn interp_run(
+    inst: &Module,
+    clock_v: i64,
+    window: &[u8],
+) -> (Result<Vec<Value>, Trap>, Vec<u8>, i64) {
     let mut h = Host::new();
     let clk = h.grant_clock();
     h.clock_ns = clock_v;
     let mut fuel = 1_000_000u64;
-    let (r, win) =
-        run_capture_reserved_with_host(inst, 0, &[Value::I32(clk)], &mut fuel, window, SIZE_LOG2, &mut h);
+    let (r, win) = run_capture_reserved_with_host(
+        inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        window,
+        SIZE_LOG2,
+        &mut h,
+    );
     (r, win, h.clock_ns)
 }
 
@@ -100,7 +111,11 @@ fn assert_returned_eq(inst: &Module, want: &[Value], got: JitOutcome, phase: &st
     match got {
         JitOutcome::Returned(slots) => {
             let results = &inst.funcs[0].results;
-            assert_eq!(slots.len(), results.len(), "{phase}: result arity\n{inst:#?}");
+            assert_eq!(
+                slots.len(),
+                results.len(),
+                "{phase}: result arity\n{inst:#?}"
+            );
             for (i, (t, s)) in results.iter().zip(slots).enumerate() {
                 assert_eq!(
                     from_slot(*t, s),

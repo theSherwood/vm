@@ -26,7 +26,9 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 
 fn instrument(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
-    m.memory = Some(Memory { size_log2: SIZE_LOG2 });
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
     // These guests deliberately store to the state word to simulate a host-requested freeze
     // at an interior point, which the R9 check would otherwise reject — so use the
     // confinement-assuming entry. (A real freeze trigger comes from the host, not the guest.)
@@ -43,8 +45,15 @@ fn run(inst: &Module, clock_ns: i64, window: &[u8]) -> (Vec<Value>, Vec<u8>, i64
     host.clock_ns = clock_ns;
     let clk = host.grant_clock();
     let mut fuel = 1_000_000u64;
-    let (r, win) =
-        run_capture_reserved_with_host(inst, 0, &[Value::I32(clk)], &mut fuel, window, SIZE_LOG2, &mut host);
+    let (r, win) = run_capture_reserved_with_host(
+        inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        window,
+        SIZE_LOG2,
+        &mut host,
+    );
     (r.expect("runs to completion"), win, host.clock_ns)
 }
 
@@ -74,7 +83,10 @@ fn assert_resume_at_point(oracle: &str, freezable: &str, expected: i64) {
     let mut win = snapshot.clone();
     write_state(&mut win, STATE_REWINDING);
     let (thawed, final_win, _) = run(&freezable, clock_after, &win);
-    assert_eq!(thawed, baseline, "thaw at the frozen resume point equals the oracle");
+    assert_eq!(
+        thawed, baseline,
+        "thaw at the frozen resume point equals the oracle"
+    );
     assert_eq!(read_state(&final_win), STATE_NORMAL, "thaw ends NORMAL");
 }
 

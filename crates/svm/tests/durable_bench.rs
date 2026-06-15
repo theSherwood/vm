@@ -10,7 +10,10 @@
 
 use std::time::Instant;
 
-use svm_durable::{init_durable_window, transform_module_assume_confined, write_state, STATE_REWINDING, STATE_UNWINDING};
+use svm_durable::{
+    init_durable_window, transform_module_assume_confined, write_state, STATE_REWINDING,
+    STATE_UNWINDING,
+};
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_ir::{Memory, Module};
 
@@ -37,14 +40,20 @@ fn dead_heavy_src(k: usize) -> String {
 
 fn instrument(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
-    m.memory = Some(Memory { size_log2: SIZE_LOG2 });
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
     let inst = transform_module_assume_confined(&m).expect("transform");
     svm_verify::verify_module(&inst).expect("verify");
     inst
 }
 
 fn inst_count(m: &Module) -> usize {
-    m.funcs.iter().flat_map(|f| f.blocks.iter()).map(|b| b.insts.len()).sum()
+    m.funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .map(|b| b.insts.len())
+        .sum()
 }
 
 fn time<F: FnMut()>(iters: u32, mut f: F) -> f64 {
@@ -66,7 +75,9 @@ fn durable_overhead_probe() {
 
         // transform time (the svm-durable pass itself)
         let mut m = svm_text::parse_module(&src).unwrap();
-        m.memory = Some(Memory { size_log2: SIZE_LOG2 });
+        m.memory = Some(Memory {
+            size_log2: SIZE_LOG2,
+        });
         let t_transform = time(2000, || {
             let _ = std::hint::black_box(transform_module_assume_confined(&m).unwrap());
         });
@@ -102,15 +113,31 @@ fn durable_overhead_probe() {
             let mut win = init_durable_window(WINDOW);
             write_state(&mut win, STATE_UNWINDING);
             let mut fuel = 1_000_000u64;
-            let (_, snap) = run_capture_reserved_with_host(&inst, 0, &[Value::I32(clk)], &mut fuel, &win, SIZE_LOG2, &mut h);
+            let (_, snap) = run_capture_reserved_with_host(
+                &inst,
+                0,
+                &[Value::I32(clk)],
+                &mut fuel,
+                &win,
+                SIZE_LOG2,
+                &mut h,
+            );
             let mut win = snap;
             write_state(&mut win, STATE_REWINDING);
             let mut h2 = Host::new();
             h2.clock_ns = h.clock_ns;
             let clk2 = h2.grant_clock();
             let mut fuel = 1_000_000u64;
-            let r = run_capture_reserved_with_host(&inst, 0, &[Value::I32(clk2)], &mut fuel, &win, SIZE_LOG2, &mut h2);
-            std::hint::black_box(r);
+            let r = run_capture_reserved_with_host(
+                &inst,
+                0,
+                &[Value::I32(clk2)],
+                &mut fuel,
+                &win,
+                SIZE_LOG2,
+                &mut h2,
+            );
+            let _ = std::hint::black_box(r);
         });
 
         println!(
