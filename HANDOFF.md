@@ -1536,8 +1536,10 @@ regressions one commit old"):
 >    (numeric + control + if/else + memory + grow + bulk-memory + imports + **v128 SIMD** + **threads**:
 >    atomics, shared/imported memory, wasi-threads spawn → native `thread.spawn`; 63 tests + the
 >    `bench --threads` concurrency comparison vs Wasmtime+wasi-threads).
->    Remaining `Unsupported` arms are niche (narrow atomics, passive segments, multi-interface imports, reference types,
->    multi-memory/table) — see the missing-features note below. Not the active frontier; LLVM is (item 1).
+>    Remaining gaps are tracked in **`WASM.md`** (the full coverage roadmap — the standout is a 🔴
+>    *silent* one: the `(start $f)` section is ignored, not run; plus the WASI import-name mapping that
+>    blocks real I/O programs, tail calls, passive/bulk-memory, reference types, the SIMD remainder,
+>    narrow-atomic CAS emulation, EH; GC is a non-goal). Not the active frontier; LLVM is (item 1).
 >    A second frontend after chibicc, chosen *before* the LLVM on-ramp because it's smaller and directly
 >    serves the §1a benchmark thesis: take *any* wasm and run it on SVM vs Wasmtime on the *same bytes*,
 >    instead of hand-writing IR+WAT kernel pairs. The interesting part is the **stack→SSA reconstruction**

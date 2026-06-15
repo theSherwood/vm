@@ -86,6 +86,10 @@ pub enum VerifyError {
     /// A lane-wise op was given a shape of the wrong category — an integer op on a float shape
     /// or a float op on an integer shape (§17).
     BadSimdShape { func: u32, block: u32 },
+    /// A [`Inst::CallImport`] reached the verifier (§7). Named imports must be lowered to
+    /// concrete `cap.call`s by `svm_ir::resolve_imports` at instantiation *before*
+    /// verification; an unresolved import in a module presented for execution is fail-closed.
+    UnresolvedImport { func: u32, block: u32, import: u32 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -228,6 +232,15 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.extend_from_slice(&sig.results);
                 continue;
             }
+            // §7 named imports must be resolved to `cap.call`s before verification — reject
+            // a stray `CallImport` fail-closed (it carries no `type_id`/`op` to check).
+            if let Inst::CallImport { import, .. } = inst {
+                return Err(VerifyError::UnresolvedImport {
+                    func: fi,
+                    block: bi,
+                    import: *import,
+                });
+            }
             // §12 `cont.resume` appends two results `(status: i32, value: i64)`, so —
             // like `call` — it is checked here rather than in `check_inst`.
             if let Inst::ContResume { k, arg } = inst {
@@ -240,6 +253,24 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 cx.expect(*arg, ValType::I64)?;
                 types.push(ValType::I32); // status
                 types.push(ValType::I64); // value
+                continue;
+            }
+            // §7 reflection: `cap.self.count` appends an `i32`; `cap.self.get` reads an `i32`
+            // index and appends `(handle: i32, type_id: i32)`. Always valid (no module/memory
+            // dependency) — the runtime bounds the index against the live table.
+            if let Inst::CapSelfCount = inst {
+                types.push(ValType::I32);
+                continue;
+            }
+            if let Inst::CapSelfGet { idx } = inst {
+                let cx = Cx {
+                    fi,
+                    bi,
+                    types: &types,
+                };
+                cx.expect(*idx, ValType::I32)?;
+                types.push(ValType::I32); // handle
+                types.push(ValType::I32); // type_id
                 continue;
             }
             // §12 `thread.spawn` resolves a static `funcidx` whose signature must be the fixed
@@ -349,6 +380,14 @@ fn check_inst(
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
+        // §7 named imports are rejected above (the multi-result/call section); unreachable here.
+        Inst::CallImport { .. } => {
+            unreachable!("CallImport handled before check_inst's value match")
+        }
+        // §7 reflection appends its results in the multi-result section above; unreachable here.
+        Inst::CapSelfCount | Inst::CapSelfGet { .. } => {
+            unreachable!("cap.self.* handled before check_inst's value match")
+        }
         Inst::IntBin { ty, a, b, .. } => {
             let t = ty.val();
             cx.expect(*a, t)?;

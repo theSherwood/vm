@@ -1053,7 +1053,7 @@ domain's egress = the transitive closure of its granted capabilities).
   backends already emit — so C/Rust/non-OO toolchains target it with no
   impedance mismatch.
 
-### Host-defined capabilities & discoverability  [SETTLED] (registry DEFERRED)
+### Host-defined capabilities & discoverability  [SETTLED] (late binding + `cap.self` reflection SETTLED; runtime `Resolver` = host-layer)
 The set of capabilities is **open and host-extensible by construction** — the VM,
 verifier, and TCB enumerate *no* fixed list. The §3e MVP four are ordinary
 instances of this mechanism. A capability interface is just **data + host code**:
@@ -1080,23 +1080,47 @@ binds it into the powerbox in declared order. Instantiation **validates the
 implementation's signature against the import's declared signature** (structural
 compare, fail-closed) — type-safety across the boundary **without an IDL**.
 
-**Discoverability is static by default — and that is load-bearing, not just
-simple.** The powerbox is fixed at instantiation; the guest holds exactly what it
-imported and was granted; a missing required import **fails closed**. There is
-deliberately **no "list all capabilities" call** — that would be ambient authority
-(forbidden above), and the §9 egress analysis ("egress = the transitive closure of
-granted capabilities") *requires* the grant set to be statically bounded;
-unrestricted dynamic discovery would void it. Introspection is also unnecessary in
-the core: handles are statically typed `handle<I>`, so the guest already knows each
-handle's interface and ops — nothing to discover about a held handle.
+**Discoverability — reflection is ambient, acquisition is a capability.** The
+**static-binding** baseline stands: the powerbox is fixed at instantiation; the guest
+holds exactly what it imported and was granted; each handle is statically typed
+`handle<I>`, so its interface and ops are already known; a missing required import
+**fails closed** — nothing to discover. Two refinements extend this without weakening
+no-ambient-authority, organized by one line — **knowing what you hold is free; obtaining
+something new is a capability**:
 
-- **Optional discovery = a capability** (DEFERRED, host-layer): when genuine late
-  binding is needed (plugin host, service mesh), the ocap-correct answer is a
-  granted **`Resolver`/registry capability** — an ordinary interface, e.g.
-  `lookup(name) -> handle<…>`. You can only discover via a capability you were
-  granted, you only get back what that registry is scoped to offer, and it lives
-  **above the VM, outside the TCB** (like cross-domain channels). It does not widen
-  ambient authority — it is just another node in the grant graph. Not built now.
+- **Late binding (instantiation-time) is the general form of the powerbox.** A module
+  declares its capability imports by **name** and the host's instantiation policy resolves
+  each to a registered implementation + handle ("Binding happens once," above) — so the
+  frontend no longer hardcodes a fixed grant set. A C frontend emits `extern` capability
+  references; a wasm frontend emits named imports; both resolve against the same
+  `name → (type_id, op)` table. The grant set is still **statically bounded per instance**
+  (fixed once instantiation completes), so the §9 egress closure is unaffected — only the
+  *binding* moved from compile-time to instantiation-time.
+
+- **Reflection = an always-available intrinsic** (`cap.self`), read-only over the domain's
+  **own** handle table: it returns the count and, per live entry, the `type_id` + op-schema
+  of the capabilities **this domain has actually been granted**. This is *not* ambient
+  authority and does **not** void §9: reflecting the held set confers nothing (the guest
+  could already invoke every one of those handles), adds no edge to the grant graph, and
+  reveals exactly the leaves of the egress closure — never anything the host did not grant.
+  It reads **live generation state** (revoked handles drop out) and is a per-domain view, so
+  a nested child (§14) reflects only its *attenuated* carve — discovery attenuates for free,
+  like `AddressSpace.sub`. It earns its keep precisely under **late binding**, where the
+  guest may no longer statically know its full set. *Consequence (accepted):* there are **no
+  deniable grants** — a guest can always audit its exact authority. We treat that as a
+  transparency feature (a domain can always prove its own least-authority footprint), not a
+  leak. The boundary is sharp: enumerating **your own** granted set is fine; there is still
+  **no "list everything the host could offer" call** — *that* would be ambient authority.
+
+- **Acquisition = a granted `Resolver` capability** (host-layer, outside the TCB). When a
+  guest must *obtain* a not-yet-held capability at runtime (plugin host, service mesh), the
+  ocap-correct answer is unchanged: a granted registry interface, e.g.
+  `lookup(name) -> handle<…>`, that mints handles through the host table (the same
+  handle-minting `AddressSpace.sub`/`Instantiator.instantiate`/`Jit.compile` already do).
+  You can only discover-to-acquire via a `Resolver` you were granted, you get back only what
+  that registry is scoped to offer, and it is just another node in the grant graph — so the
+  egress closure still bounds it. (Distinct from the filesystem `Directory` capability
+  below.) Not built now.
 
 ### Calling convention  [SETTLED]
 The whole platform-level ABI is three things:
@@ -1324,9 +1348,11 @@ requirement.
   vs. capabilities-live-until-close for v1.
 - **Cross-domain channels** (§7 DEFERRED): host-layer feature; zero-copy
   self-describing format; designed later, above the VM layer.
-- **Registry / discovery capability** (§7 DEFERRED): optional `Resolver`
-  (`lookup(name) -> handle`) for late binding; host-layer, outside the TCB; not
-  ambient authority. Core stays static-import-only (egress analysis needs it).
+- **Runtime acquisition `Resolver`** (§7, host-layer — not built): optional
+  `lookup(name) -> handle` registry; host-layer, outside the TCB; not ambient
+  authority. (Late binding at instantiation and the always-available `cap.self`
+  *reflection* intrinsic are now SETTLED in §7 — only runtime *acquisition* of a
+  not-yet-held capability remains a deferred host-layer feature.)
 - **MTE** (§10): optional probabilistic intra-guest detection in the §5 hardened
   tier (CHERI settled — host-hardening only, never the guest value model).
 - **Type system / value model / binary encoding** — now settled in **§3a**.
@@ -2411,7 +2437,7 @@ as open-ended, not a byproduct of the build.
 | D43 | MVP capability set = `Stream` (stdio via 3 handles), `Exit`, `Clock`, `Memory`; stdio reuses one `Stream` interface (not a bespoke Console) so files/sockets compose later | Settled | First concrete handle-table interfaces (§3c) + C-runtime targets (§3d); orthogonal, one interface to verify (§3e) |
 | D44 | Powerbox = `entry(stdin, stdout, stderr, exit, clock, memory, args_buffer)`; args buffer = `{argc,envc}` + packed NUL-terminated strings | Settled | Concrete instantiation grant + C `main` wrapper contract (§3b/§3d/§3e) |
 | D45 | `cap.call` dispatch is **per-entry** (vtable in the `HandleEntry`), not per-type — generally an indirect call (retpoline/eIBRS), devirtualized to direct/inline when the binding is statically known. **Devirtualization is deferred — cost recorded in §3c** (authority-TCB in codegen, fights compile⊥instantiate, sound only for stable handles, only half the measured cost; scalar `cap.call` ~1.24× wasm but the zero-copy buffer win needs none of it) | Settled (devirt deferred) | Corrects §3c over-claim; one interface type has many implementations per handle, and §14 virtualization (pass-through vs parent-emulated) needs per-handle dispatch; forgery checks unchanged. Deferral is a recorded trade, not an oversight — don't relitigate without a measured workload |
-| D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **discovery is static by default**, optional `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; static imports keep no-ambient-authority + the §9 egress-closure analysis intact; registry stays outside the TCB |
+| D46 | Capability set is **open/host-extensible** (interface signature in the module type section + host-registered vtable, bound by named import at instantiation, signature-validated fail-closed); **binding may be late** (names resolved at instantiation; the general form of the powerbox), **reflection over the domain's *own* granted set is an always-available `cap.self` intrinsic** (read-only; authority-neutral), and runtime *acquisition* of a not-yet-held cap is a granted `Resolver` registry deferred to a host layer | Settled | The §3e four are just instances; late binding keeps the per-instance grant set statically bounded; `cap.self` confers nothing (reflection ≠ amplification) so the §9 egress-closure analysis stays intact; only acquisition (`Resolver`) widens the grant graph, and it stays a gated host-layer cap outside the TCB |
 | D47 | Escape-freedom is the **conjunction** `Verified ∧ Correct(JIT) ∧ Correct(runtime) ∧ Correct(host/HW)`, not "verified ⇒ safe"; TCB split into **escape-TCB vs authority-TCB**; decomposed into invariants **I1–I5** (owner + validation each); written as a **structured-prose contract**, not a proof | Settled | Puts risk where it lives (JIT dominates, not the verifier); makes host-extensible caps safe (authority-TCB ≠ escape-TCB); anchors the security work; matches the "as secure as wasm" bar (§2a) |
 | D48 | **Availability / DoS is a non-goal** — bounded by metering (fuel/quota/preemption) + the kill path, contained not prevented (incl. §17 GPU); hardware fault injection below the trust line; trust boundary is **verified IR**, frontend untrusted for escape (eBPF model) | Settled | Honest scope; avoids claims the metering/preemption story (and GPU) can't back; verifier makes the frontend untrusted for escape (§2a) |
 | D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |
