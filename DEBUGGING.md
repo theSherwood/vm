@@ -289,8 +289,8 @@ new **strippable debug section** fits the format without touching the hot path.
 
 **Open questions.**
 - *Granularity*: per-op locs (precise, larger) vs per-statement (smaller). Start per-statement.
-- *Variable scoping* with SSA promotion (W6 tension) — `VarLoc` must express "this source
-  variable is a promoted SSA value here, a window slot there."
+- *Variable scoping* with SSA promotion (W6 tension) — `VarLoc` (designed in §13/S2) expresses
+  this: `Window{off}` for memory locals, a PC-keyed `Ssa(LocList)` for promoted ones.
 - *Text-format ergonomics*: keep debug info in the text IR (agent-friendly, D33) vs binary-only.
   Lean text-first for the build, per D33.
 
@@ -431,8 +431,8 @@ design pass that fixes the shared debug core (§2a) so the bodies don't pinch.
 S2 (`VarLoc`), S3 (logical-time clock), S4 (interpreter instrumentation seam), S5 (Inspector
 control model), S6 (Cranelift emission layer), and the S7/S8 invariants; resolve the
 cross-cutting decisions (§12) that gate them (D-DBG-3/4/6 especially). Cheap, and it prevents
-the rework §2a identifies. **S1/S3/S4/S5 are drafted in §13** (designing S4/S5 pinned S1/S3);
-S2 and S6 remain.
+the rework §2a identifies. **S1–S5 are drafted in §13** (S4/S5 pinned S1/S3; S2 follows from the
+frontend's local classification); only S6 (JIT-tier) remains.
 
 **Milestone A — "debug a single-threaded guest on the interpreter" (cheap, high value):**
 1. **W8 shell** (the capability to hang verbs on).
@@ -478,13 +478,14 @@ When these are settled, fold the resolved ones into `DESIGN.md` §19 / the decis
 
 ---
 
-## 13. Milestone-0 designs — S4 (instrumentation seam) + S5 (Inspector)
+## 13. Milestone-0 designs — S4, S5 (+ S1/S3 pinned, S2)
 
-First detailed pass of the two highest-leverage shared-core items (§2a). Grounded in the
-interpreter as built (`crates/svm-interp/src/lib.rs`); line refs are to the state on this
-branch. **Designing these two pins S1 and S3** as a consequence (see "Cascade" below), so four
-of the six core items are settled here; only S2 (`VarLoc`) and S6 (Cranelift emission) remain,
-and both belong to the later JIT/source tiers.
+Detailed pass of the shared-core items (§2a) on the **interpreter path**. Grounded in the
+interpreter as built (`crates/svm-interp/src/lib.rs`) and the frontend (`codegen_ir.c`); line
+refs are to the state on this branch. Designing the two highest-leverage items (S4, S5)
+**pinned S1 and S3** as a consequence (see "Cascade"), and S2 (`VarLoc`) follows from the
+frontend's existing local classification — so **five of the six core items are settled here**;
+only S6 (Cranelift value-locations) remains, and it is JIT-tier (W5/W6).
 
 ### S4 — interpreter instrumentation seam
 
@@ -561,10 +562,58 @@ authority; attach/detach under `ObsMode::Off` is behavior-identical.
 - **S3 (logical-time clock)** = the probe's monotonic **event index** — because `seek`,
   step-back, and `SchedTape` keys must all reference the same stream the probe emits.
 
-So S1, S3, S4, S5 are settled by this pass; **remaining Milestone-0 work = S2 (`VarLoc`) and S6
-(Cranelift emission)**, both deferrable to the JIT/source tiers (W4/W5/W6).
+So S1, S3, S4, S5 are settled by this pass; with **S2 drafted below**, the only remaining
+Milestone-0 item is **S6 (Cranelift value-locations)**, which is JIT-tier (W5/W6).
 
-### Open questions (S4/S5)
+### S2 — value-location model (`VarLoc`)
+
+**The frontend already classifies every local two ways** at lowering (`codegen_ir.c`,
+`is_promoted(v) = v->offset < 0`, line 189) — S2 only fixes how that classification is
+*recorded* for inspection:
+
+- **Memory local** — address-taken, narrow (`char`/`short`/`_Bool`), or array/struct/union → a
+  window **data-stack slot** at `sp + offset` (non-negative `offset`). Address = the data-SP
+  (block param `v0`) `+ offset`, **constant over the function**.
+- **Promoted local** — never-address-taken full-width scalar → a real **SSA value**, threaded as
+  block parameter `v(s+1)` of every block; the slot's current value is tracked per block in
+  `curval[s]` and is **reassigned within a block** on each write (`codegen_ir.c:174-185`).
+
+Two interpreter shapes, plus a deferred JIT shape:
+
+```
+enum VarLoc {
+    Window { off: i32 },     // addr = vals[0] (data-SP) + off; constant over the function
+    Ssa(LocList),            // promoted: PC-keyed list of which SSA value holds the slot
+    // Machine(CraneliftValueLocList)   // JIT-optimized; deferred to S6/W5
+}
+struct LocList(Vec<(IrPcRange, ValueIdx)>);   // IrPcRange keys on S1's IrPc
+```
+
+**Resolution at an `IrPc` is trivial on the interpreter**, which holds every block-local SSA
+value by index in `Frame::vals` (`lib.rs:938`):
+- `Window{off}` → read `Frame::vals[0]` (data-SP), add `off`, read `len` window bytes. Constant.
+- `Ssa(loclist)` → find the range covering the `IrPc`, read `Frame::vals[value_idx]`. **No
+  Cranelift machinery, even in optimized builds.**
+
+Three consequences:
+1. **List, not a single id** — a promoted slot's SSA value changes within a block (each write
+   makes a fresh value, updates `curval[s]`), so "where is `x` at this op" varies by PC — the
+   DWARF location-list problem. The frontend *already computes* `curval[s]` per op, so emitting
+   the list records what it knows; W4 packages it, S2 fixes only the shape.
+2. **The interpreter sidesteps W6** — `Ssa` resolves straight from `Frame::vals`, so
+   interpreter source-variable inspection needs **no** debug-build / disable-promotion mode
+   (confirming the W2/W6 note). W6 and `VarLoc::Machine` matter only for debugging
+   *JIT-optimized* code, where a promoted local is in a Cranelift register/stack slot (S6/W5;
+   honest `<optimized out>` where unavailable).
+3. **The common case is the easy one** — only never-address-taken full-width scalars hit `Ssa`;
+   every struct/array/union and every address-taken or narrow local is `Window`. "Inspect this
+   struct" is always the constant-location path; location-list complexity is confined to the
+   minority of hot promoted scalars.
+
+This pins S2 against S1 (`IrPcRange` keys on `IrPc`) and **closes the interpreter-path core:
+S1–S5 settled, only S6 (JIT-tier) remains.**
+
+### Open questions (S4/S5/S2)
 
 - *Probe dispatch in the hot loop*: monomorphized generic (`Probe` type param on `run_inner`)
   vs `&mut dyn Probe` behind the `ObsMode::Debug` gate. Lean generic so `Off`/`Memop` keep the
@@ -575,3 +624,8 @@ So S1, S3, S4, S5 are settled by this pass; **remaining Milestone-0 work = S2 (`
 - *`SchedulePoint` stops*: whether the Inspector exposes scheduler-seam decisions as stoppable
   events (useful for "step the scheduler") or only op-seam events. Default op-seam; gate
   scheduler stepping behind a flag.
+- *`LocList` granularity (S2)*: per-op entries (precise, larger) vs coalesced PC ranges
+  (smaller; recompute the boundaries where `curval[s]` changes). Start coalesced — the frontend
+  knows exactly where each slot's value changes.
+- *Uninitialized / out-of-scope (S2)*: a `LocList` gap (no range covers the `IrPc`) reports
+  `<not yet live>`; reuse the same honest-unavailable path as JIT `<optimized out>`.
