@@ -53,6 +53,8 @@
 //! +26%; losing SSA promotion would be far larger). `--check`/`--save-baseline` default to
 //! `--reps 5` (best-of, to stabilise the comparison); plain/`--csv` use one pass for speed.
 
+mod threads;
+
 use std::ffi::c_void;
 use std::hint::black_box;
 use std::time::Instant;
@@ -1213,10 +1215,20 @@ fn main() {
         });
 
     // Enable the memory64 proposal so `(memory i64 …)` modules compile; it does not change
-    // how wasm32 modules are lowered, so the wasm32 numbers stay comparable.
+    // how wasm32 modules are lowered, so the wasm32 numbers stay comparable. `wasm_threads` enables
+    // shared memory + atomics for the `--threads` concurrency comparison.
     let mut config = Config::new();
     config.wasm_memory64(true);
+    config.wasm_threads(true);
+    config.shared_memory(true);
     let engine = Engine::new(&config).expect("engine");
+
+    // `--threads`: the concurrency comparison (SVM native thread.spawn vs Wasmtime+wasi-threads on the
+    // same bytes) instead of the per-kernel compute table.
+    if args.iter().any(|a| a == "--threads") {
+        threads::run(&engine, if reps > 1 { reps as usize } else { 5 });
+        return;
+    }
 
     let results: Vec<(Resolved, Raw)> = resolve_kernels(from_wasm)
         .into_iter()
