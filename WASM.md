@@ -42,12 +42,13 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 
 ### 🔴 Not fail-closed — fix first
 
-- [ ] **Start section (`(start $f)`) is silently ignored.** Falls into the default `_ => {}` section
-  arm (`lib.rs`, with custom sections/datacount), so a module's start function **never runs** and
-  there is **no error** — a silent miscompile (skips C++ static ctors / runtime init). Fix: at minimum
-  a clean `Unsupported`; ideally *run it* (synthesize "call `f` before the entry" — SVM controls the
-  entry path, so this is cheap). *Note: wasm-ld usually emits an exported `_start`/`_initialize`, not a
-  start section, so it may not bite typical clang output — but the silence is the real problem.*
+- [x] **Start section (`(start $f)`) — DONE (runs it).** Was silently ignored (the default `_ => {}`
+  section arm), so a module's start function never ran. Now the transpiler remaps each **exported**
+  function to a synthesized wrapper that calls `start` then the real export, so `start` runs once
+  before the chosen entry (data/element segments are already materialized when the run begins);
+  internal `call`s reach the export directly and don't re-run it. The start function is validated
+  `() -> ()`. `tests/start.rs` (runs-before-export, param/result threading, runs-once/internal-bypass,
+  bad-signature rejection). A non-`(start)` module is byte-identical to before.
 
 ### 🟠 Host-ABI — blocks real WASI programs
 
@@ -59,9 +60,13 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 
 ### 🟡 Fail-closed feature gaps (clean `Unsupported`)
 
-- [ ] **Tail calls** (`return_call` / `return_call_indirect`). LLVM `-mtail-call` + functional-language
-  frontends. **Likely a quick win** — the IR already has `Terminator::ReturnCall`/`ReturnCallIndirect`
-  (interp + JIT), so the transpiler mostly needs the two operator arms.
+- [x] **Tail calls** (`return_call` / `return_call_indirect`) — **DONE.** Lower to the IR's
+  `Terminator::ReturnCall`/`ReturnCallIndirect`, which both backends execute as **true** tail calls
+  (interp replaces the frame; JIT emits Cranelift `return_call`/`return_call_indirect`). Direct tail
+  call to a defined function (true tail call), indirect via the §3c table dispatch, and a capability
+  import degrades to `cap.call` + `return` (correct, not tail-optimized; wasi:thread/spawn rejected).
+  `tests/tailcall.rs`: 200k-deep tail recursion (would overflow a non-tail call), table dispatch,
+  mutual even/odd recursion.
 - [ ] **Passive data/element segments + the rest of bulk memory**: `memory.init`, `data.drop`,
   `elem.drop`, `table.init`, `table.copy`, `table.fill`, `table.grow`, `table.size`. (Only
   `memory.copy`/`memory.fill` done.) clang `-O2` occasionally emits `memory.init` for large data.

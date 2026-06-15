@@ -171,6 +171,10 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // §12 wasm threads: the wasm function index of the `wasi:thread/spawn` import, if present. Its
     // `call` lowers to `thread.spawn` (not a cap.call); see the spawn-shim synthesis.
     let mut spawn_import: Option<u32> = None;
+    // The `(start $f)` function index, if the module has a start section: it runs once at
+    // instantiation, before any export. SVM has no instantiation hook (a run calls one entry over a
+    // fresh window), so each export is wrapped to run `start` first — see the start-wrapper synthesis.
+    let mut start: Option<u32> = None;
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -375,6 +379,10 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     }
                 }
             }
+            Payload::StartSection { func, .. } => {
+                // At most one start section per spec; record it (run via the per-export wrappers below).
+                start = Some(func);
+            }
             _ => {} // version header, custom sections, datacount, ends, etc. — ignore
         }
     }
@@ -541,6 +549,35 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             .map(|(_, i)| *i)
             .expect("validated above");
         funcs.push(build_spawn_shim(wts));
+    }
+
+    // `(start $f)`: run the start function once before any export. SVM has no instantiation hook (a
+    // run calls one entry over a fresh window, with data/element segments already materialized), so
+    // each **exported** function is remapped to a synthesized wrapper that calls `start` then the real
+    // export. Internal `call`s (by function index) still reach the real export directly, so `start`
+    // runs exactly once, before the chosen entry — and a non-`(start)` module is unchanged.
+    if let Some(start_wasm) = start {
+        let n_imp = imports.len() as u32;
+        let start_ir = start_wasm.checked_sub(n_imp).ok_or_else(|| {
+            Error::Unsupported("start function is an import (must be a defined function)".into())
+        })?;
+        let (sp, sr) = func_sigs.get(start_ir as usize).ok_or_else(|| {
+            Error::Parse(format!("start function index {start_wasm} out of range"))
+        })?;
+        if !sp.is_empty() || !sr.is_empty() {
+            return unsup("start function must have type () -> ()");
+        }
+        let has_handle = imports.iter().any(|(t, _, _)| *t != u32::MAX);
+        for (_, ir_idx) in exports.iter_mut() {
+            if *ir_idx == start_ir {
+                continue; // exporting the start function itself: don't double-run it
+            }
+            let params = funcs[*ir_idx as usize].params.clone();
+            let results = funcs[*ir_idx as usize].results.clone();
+            let wrap = build_start_wrapper(start_ir, *ir_idx, params, results, has_handle);
+            *ir_idx = funcs.len() as u32;
+            funcs.push(wrap);
+        }
     }
 
     // Our window is a power-of-two byte range (masking confines to it); size it to hold the linear
@@ -948,6 +985,45 @@ fn build_spawn_shim(wts: u32) -> Func {
             params: vec![ValType::I64, ValType::I64],
             insts,
             term: Terminator::Return(vec![6]),
+        }],
+    }
+}
+
+/// Synthesize a start wrapper for an exported function (`(start $f)` support): a function with the
+/// **same IR signature** as `target` that first calls `start` (which is `() -> ()` in wasm, so
+/// `(handle?) -> ()` here) and then `target` with all params, returning its results. The embedder
+/// runs this in place of the bare export, so the start function runs once before the entry; internal
+/// calls reach `target` directly and don't re-run it.
+fn build_start_wrapper(
+    start_ir: u32,
+    target: u32,
+    params: Vec<ValType>,
+    results: Vec<ValType>,
+    has_handle: bool,
+) -> Func {
+    let nparams = params.len() as ValIdx;
+    let insts = vec![
+        // call start() — thread the handle if the module has capability imports (start produces no
+        // value, so it doesn't advance the value counter).
+        Inst::Call {
+            func: start_ir,
+            args: if has_handle { vec![0] } else { vec![] },
+        },
+        // call the real export with every param in order (handle? ++ wasm params = values 0..nparams);
+        // its results land at values nparams.. .
+        Inst::Call {
+            func: target,
+            args: (0..nparams).collect(),
+        },
+    ];
+    let ret: Vec<ValIdx> = (nparams..nparams + results.len() as ValIdx).collect();
+    Func {
+        params: params.clone(),
+        results,
+        blocks: vec![Block {
+            params,
+            insts,
+            term: Terminator::Return(ret),
         }],
     }
 }
@@ -1456,6 +1532,94 @@ fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result
     for (v, t) in res.into_iter().zip(results.iter()) {
         lo.push(v, *t);
     }
+    Ok(())
+}
+
+/// `return_call $f` (the tail-call proposal): a **block-terminating** direct call — the callee
+/// replaces the current frame and its results become this function's results. A defined `$f` lowers
+/// to the IR `Terminator::ReturnCall` (a true tail call, no stack growth). A capability import can't
+/// be a terminator, so a tail call to one degrades to `cap.call` + `return` (correct, not
+/// tail-optimized); a tail call to `wasi:thread/spawn` is nonsensical and rejected.
+fn return_call_op(lo: &mut Lower, func: u32, fn_results: &[ValType]) -> Result<(), Error> {
+    if lo.threads.spawn_import == Some(func) {
+        return unsup("return_call to wasi:thread/spawn");
+    }
+    if (func as usize) < lo.n_imp {
+        // Tail call to a capability import: do the cap.call, then return its results.
+        call_op(lo, func)?;
+        let n = fn_results.len();
+        let args: Vec<ValIdx> = lo.stack[lo.stack.len() - n..]
+            .iter()
+            .map(|(v, _)| *v)
+            .collect();
+        lo.set_term(Terminator::Return(args));
+        return Ok(());
+    }
+    let ir_idx = func - lo.n_imp as u32;
+    let (params, _) = lo
+        .func_sigs
+        .get(ir_idx as usize)
+        .ok_or_else(|| Error::Parse(format!("return_call to unknown function {func}")))?
+        .clone();
+    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    for _ in 0..params.len() {
+        args.push(lo.pop()?.0);
+    }
+    args.reverse();
+    if let Some(h) = lo.handle {
+        args.insert(0, h); // the callee's leading handle param
+    }
+    lo.set_term(Terminator::ReturnCall { func: ir_idx, args });
+    Ok(())
+}
+
+/// `return_call_indirect (type $t)`: the indirect tail call — like [`call_indirect_op`] but emits the
+/// `Terminator::ReturnCallIndirect` (block-terminating, §3c masked + type-checked dispatch).
+fn return_call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result<(), Error> {
+    if table_index != 0 {
+        return unsup("return_call_indirect on a non-zero table");
+    }
+    let (params, results) = lo.types[type_index as usize].clone();
+    // table[index] → function index, at window byte `table_base + index*4` (same as call_indirect).
+    let (widx, _) = lo.pop()?;
+    let idx64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: widx,
+    });
+    let four = lo.emit(Inst::ConstI64(4));
+    let byte_off = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a: idx64,
+        b: four,
+    });
+    let funcref = lo.emit(Inst::Load {
+        op: LoadOp::I32,
+        addr: byte_off,
+        offset: lo.table_base,
+        align: 2,
+    });
+    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    for _ in 0..params.len() {
+        args.push(lo.pop()?.0);
+    }
+    args.reverse();
+    // The handle is a leading param of every defined function, so it rides both the args and the
+    // §3c type-check signature (matching the targets that carry it — same as `call_indirect`).
+    let mut ty_params = params;
+    if let Some(h) = lo.handle {
+        args.insert(0, h);
+        ty_params.insert(0, ValType::I32);
+    }
+    let ty = FuncType {
+        params: ty_params,
+        results,
+    };
+    lo.set_term(Terminator::ReturnCallIndirect {
+        ty,
+        idx: funcref,
+        args,
+    });
     Ok(())
 }
 
@@ -2399,6 +2563,12 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             type_index,
             table_index,
         } => call_indirect_op(lo, type_index, table_index)?,
+        // ---- tail calls (the tail-call proposal): a block-terminating call ----
+        O::ReturnCall { function_index } => return_call_op(lo, function_index, fn_results)?,
+        O::ReturnCallIndirect {
+            type_index,
+            table_index,
+        } => return_call_indirect_op(lo, type_index, table_index)?,
         // ---- structured control flow ----
         O::Block { blockty } => {
             let (p, r) = block_sig(blockty, lo.types)?;
