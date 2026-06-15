@@ -65,6 +65,10 @@ fn try_main() -> Result<(), String> {
     };
 
     let module = load_module(Path::new(&file))?;
+    // §7: lower any named capability imports to concrete `cap.call`s under the reference host
+    // policy *before* verification (fail-closed on an unknown name). A no-op for modules that
+    // inline their capability calls (the legacy form).
+    let module = svm_run::resolve_capability_imports(module)?;
     verify_module(&module).map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
 
     if is_powerbox_entry(&module) {

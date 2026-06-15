@@ -50,13 +50,23 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `() -> ()`. `tests/start.rs` (runs-before-export, param/result threading, runs-once/internal-bypass,
   bad-signature rejection). A non-`(start)` module is byte-identical to before.
 
-### 🟠 Host-ABI — blocks real WASI programs
+### 🟠 Host-ABI — named import binding
 
-- [ ] **Non-numeric WASI imports.** The import convention requires decimal `module`/`name`
-  (`type_id`/`op`); a real program importing `("wasi_snapshot_preview1", "fd_write")` is a clean
-  `Unsupported` (`lib.rs` import parse). Real I/O programs need a **WASI→capability shim** binding the
-  named imports to capability `(type_id, op)`s. Arguably the biggest "run real programs" blocker.
-  (The `wasi:thread/spawn` import is already special-cased; this generalizes named-import binding.)
+- [x] **Named import binding — DONE (single-handle).** A non-numeric import (e.g. a real WASI
+  `("wasi_snapshot_preview1", "fd_write")`) now lowers to a §7 `Inst::CallImport "<module>.<name>"`
+  (declared in `Module.imports`); the embedder binds the name to a concrete `(type_id, op)` at load via
+  `svm_ir::resolve_imports`. The numeric `module`=type_id / `name`=op convention still lowers to an
+  inline `cap.call`. svm-wasm stays pure mechanism — it never interprets host semantics. The
+  **`svm-wasi`** crate is the worked example: a minimal preview1 shim (`fd_write`/`proc_exit`) as an
+  embedder `HostFn` capability (`svm_interp::iface::HOST_FN`, registered with `Host::grant_host_fn` —
+  WASI semantics live outside both svm-wasm and the interp TCB), plus a `resolve` policy. A real WASI
+  "hello world" runs end-to-end (`crates/svm-wasi/src/lib.rs` tests). WASI's specific fd/clock/random
+  *semantics* stay a ⚪ non-goal — the shim is a host-layer subset, not conformant preview1.
+- [ ] **Multi-*handle* import binding (remaining).** Still **one** capability handle threaded (a single
+  leading param; `has_handle` is module-wide), so all named imports must share one interface — fine for
+  WASI (one `HostFn` handle, many ops) but a module spanning **distinct** capability interfaces is
+  rejected. Work: thread **N** handles via reserved slots (the chibicc multi-handle powerbox pattern)
+  instead of one leading param. (The `wasi:thread/spawn` import remains separately special-cased.)
 
 ### 🟡 Fail-closed feature gaps (clean `Unsupported`)
 
@@ -93,8 +103,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   within a function it lowers to branches, but cross-frame propagation needs an exception channel (a
   generalization of the existing per-call trap-cell check) — a perf tax + calling-convention change,
   and clang/Rust only emit it under opt-in (`-fwasm-exceptions`). Low ROI.
-- [ ] **SVM host-ABI**: imports spanning multiple capability interfaces (one handle threaded today);
-  `wasi:thread/spawn` *alongside* capability imports (needs the per-thread handle stash).
+- [ ] **`wasi:thread/spawn` *alongside* capability imports** (needs the per-thread handle stash). The
+  broader "imports spanning multiple capability interfaces" limitation is tracked as the 🟠
+  *named multi-capability import binding* item above.
 
 ### ⚪ Non-goal (by design)
 
@@ -116,7 +127,10 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 ## Recommended order (for "handle more real programs")
 
 1. **Start section** 🔴 — kill the silent footgun (cheap; fail-closed at minimum, ideally run it).
-2. **WASI import name mapping** 🟠 — unlocks real I/O programs; the single biggest real-program blocker.
+2. **Named multi-capability import binding** 🟠 — let the embedder bind symbolic import names to
+   `(type_id, op)` and thread N capability handles (the chibicc powerbox pattern). The general
+   mechanism for "host provides arbitrary capabilities, guest uses them"; the single biggest
+   real-program blocker. (WASI *semantics* stay ⚪ — a host binds its own caps to whatever names.)
 3. **Tail calls** 🟡 — common LLVM output, likely near-free (IR terminators exist).
 4. **Passive segments + `memory.init`/`table.*` bulk ops** 🟡 — moderate, evidence-driven.
 5. **Reference types** 🟡 (externref→handle, funcref→index), then the **SIMD remainder** 🟡 (breadth),

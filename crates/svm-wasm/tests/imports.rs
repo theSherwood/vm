@@ -204,14 +204,19 @@ fn err(wat: &str) -> svm_wasm::Error {
     }
 }
 
-/// A non-numeric import name is a clean error (caught, not silently mis-bound) — the convention needs
-/// `module` = decimal type_id, `name` = decimal op.
+/// A non-numeric import name is now a §7 **named import** (resolved to a capability at load by the
+/// embedder, e.g. an `svm-wasi` shim), not an error: the module declares it in its import table —
+/// `"<module>.<name>"` — and call sites lower to `CallImport`. The numeric `module`=type_id /
+/// `name`=op convention still produces an inline `cap.call`.
 #[test]
-fn import_non_numeric_name_is_clean_error() {
-    let e = err(
+fn import_non_numeric_name_is_a_named_import() {
+    let wasm = wat::parse_str(
         r#"(module (import "env" "host_fn" (func (result i64))) (func (export "f") (result i64) (call 0)))"#,
-    );
-    assert!(matches!(e, svm_wasm::Error::Unsupported(_)), "{e:?}");
+    )
+    .expect("assemble wat");
+    let t = svm_wasm::transpile(&wasm).expect("non-numeric import is a named import, not an error");
+    assert_eq!(t.module.imports.len(), 1, "one §7 named import declared");
+    assert_eq!(t.module.imports[0].name, "env.host_fn");
 }
 
 /// Imports spanning two distinct capability interfaces (type_ids) is unsupported in v1 (one handle is
