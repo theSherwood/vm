@@ -62,14 +62,22 @@ fn breakpoint_stops_at_the_loop_body_each_iteration() {
     let m = parse_module(LOOP_SUM).expect("parse");
     let mut insp = Inspector::attach(&m, 0, &[Value::I32(3)], 1_000_000);
     // Break at the accumulate op (block1, inst 0: `v4 = i32.add v3 v2`).
-    let bp = IrPc { module: 0, func: 0, block: 1, inst: 0 };
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 1,
+        inst: 0,
+    };
     insp.set_breakpoint(bp);
 
     // N = 3 ⇒ the loop body runs three times, so we hit the breakpoint three times.
     let mut accs = Vec::new();
     for _ in 0..3 {
         match insp.run_until_stop() {
-            Stop::Break { reason: StopReason::Breakpoint, pc } => {
+            Stop::Break {
+                reason: StopReason::Breakpoint,
+                pc,
+            } => {
                 assert_eq!(pc, bp);
                 // v2 (counter) and v3 (running accumulator) are this block's params: vals[0], vals[1].
                 let v2 = insp.read_ir_value(0, 0).expect("v2");
@@ -104,12 +112,27 @@ fn single_step_advances_exactly_one_op_and_ticks_the_clock() {
     // const and the branch, landing before block1's first op. The clock counts non-terminator ops.
     let before = insp.clock();
     match insp.step() {
-        Stop::Break { reason: StopReason::Step, pc } => {
-            assert_eq!(pc, IrPc { module: 0, func: 0, block: 1, inst: 0 });
+        Stop::Break {
+            reason: StopReason::Step,
+            pc,
+        } => {
+            assert_eq!(
+                pc,
+                IrPc {
+                    module: 0,
+                    func: 0,
+                    block: 1,
+                    inst: 0
+                }
+            );
         }
         other => panic!("expected step stop, got {other:?}"),
     }
-    assert_eq!(insp.clock(), before + 1, "exactly one (non-terminator) op executed");
+    assert_eq!(
+        insp.clock(),
+        before + 1,
+        "exactly one (non-terminator) op executed"
+    );
     // In block1 the frame's values are its params v2 (counter) and v3 (accumulator) = N, 0.
     assert_eq!(insp.read_ir_value(0, 1), Some(Value::I32(0)));
 
@@ -130,7 +153,12 @@ fn backtrace_shows_both_frames_inside_the_callee() {
     let m = parse_module(CALLER).expect("parse");
     let mut insp = Inspector::attach(&m, 0, &[Value::I32(5)], 1_000_000);
     // Break on the callee's add (func 1, block0, inst1: `v2 = i32.add v0 v1`).
-    let bp = IrPc { module: 0, func: 1, block: 0, inst: 1 };
+    let bp = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 1,
+    };
     insp.set_breakpoint(bp);
     match insp.run_until_stop() {
         Stop::Break { pc, .. } => assert_eq!(pc, bp),
@@ -194,9 +222,20 @@ fn write_watchpoint_stops_before_the_store_then_step_applies_it() {
 
     // Pauses *before* the store; the watched bytes are still the initial zeros.
     match insp.run_until_stop() {
-        Stop::Break { reason: StopReason::Watchpoint { addr, write }, pc } => {
+        Stop::Break {
+            reason: StopReason::Watchpoint { addr, write },
+            pc,
+        } => {
             assert_eq!((addr, write), (0, true));
-            assert_eq!(pc, IrPc { module: 0, func: 0, block: 0, inst: 2 });
+            assert_eq!(
+                pc,
+                IrPc {
+                    module: 0,
+                    func: 0,
+                    block: 0,
+                    inst: 2
+                }
+            );
         }
         other => panic!("expected write watchpoint, got {other:?}"),
     }
@@ -231,7 +270,10 @@ block0():
     let mut insp = Inspector::attach(&m, 0, &[], 1_000_000);
     insp.set_watchpoint(0, 8, WatchKind::Read);
     match insp.run_until_stop() {
-        Stop::Break { reason: StopReason::Watchpoint { addr, write }, .. } => {
+        Stop::Break {
+            reason: StopReason::Watchpoint { addr, write },
+            ..
+        } => {
             assert_eq!((addr, write), (0, false));
         }
         other => panic!("expected read watchpoint, got {other:?}"),
@@ -299,13 +341,19 @@ fn cap_call_stop_pauses_at_the_host_boundary_before_the_effect() {
 
     // Stops *before* the write (Stream = type_id 0, write = op 1); the handle is live as v0.
     match insp.run_until_stop() {
-        Stop::Break { reason: StopReason::CapCall { type_id, op }, .. } => {
+        Stop::Break {
+            reason: StopReason::CapCall { type_id, op },
+            ..
+        } => {
             assert_eq!((type_id, op), (0, 1));
         }
         other => panic!("expected cap.call stop, got {other:?}"),
     }
     assert_eq!(insp.read_ir_value(0, 0), Some(Value::I32(stdout)));
-    assert!(insp.host().stdout.is_empty(), "effect not applied before the boundary stop");
+    assert!(
+        insp.host().stdout.is_empty(),
+        "effect not applied before the boundary stop"
+    );
 
     // Step performs the call: now the bytes are captured and the count is returned.
     let _ = insp.step();
@@ -351,21 +399,36 @@ debug.var 0 "acc" ssa 1 "int"
 fn source_location_and_named_vars_at_a_breakpoint() {
     let m = parse_module(LOOP_SUM_DBG).expect("parse");
     let mut insp = Inspector::attach(&m, 0, &[Value::I32(3)], 1_000_000);
-    let bp = IrPc { module: 0, func: 0, block: 1, inst: 0 };
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 1,
+        inst: 0,
+    };
     insp.set_breakpoint(bp);
     assert!(matches!(insp.run_until_stop(), Stop::Break { .. }));
 
     // The IR location resolves to source (sum.c:7:5).
     assert_eq!(
         insp.source_loc(bp),
-        Some(SourceLoc { file: "sum.c".into(), line: 7, col: 5 })
+        Some(SourceLoc {
+            file: "sum.c".into(),
+            line: 7,
+            col: 5
+        })
     );
     // The backtrace frame carries the source location too.
     assert_eq!(insp.backtrace()[0].source.as_ref().map(|s| s.line), Some(7));
 
     // Named source variables resolve to their live values: first iteration i = 3, acc = 0.
-    assert_eq!(insp.read_var(0, "i", 4), Some(VarValue::Value(Value::I32(3))));
-    assert_eq!(insp.read_var(0, "acc", 4), Some(VarValue::Value(Value::I32(0))));
+    assert_eq!(
+        insp.read_var(0, "i", 4),
+        Some(VarValue::Value(Value::I32(3)))
+    );
+    assert_eq!(
+        insp.read_var(0, "acc", 4),
+        Some(VarValue::Value(Value::I32(0)))
+    );
     assert_eq!(insp.read_var(0, "nope", 4), None);
 }
 
@@ -399,7 +462,12 @@ debug.var 0 "buf" win 16 "char"
 fn no_debug_info_means_none_and_the_inspector_still_works() {
     let m = parse_module(LOOP_SUM).expect("parse");
     assert!(m.debug_info.is_none());
-    let bp = IrPc { module: 0, func: 0, block: 1, inst: 0 };
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 1,
+        inst: 0,
+    };
     let mut insp = Inspector::attach(&m, 0, &[Value::I32(2)], 1_000_000);
     insp.set_breakpoint(bp);
     let _ = insp.run_until_stop();

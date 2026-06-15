@@ -411,7 +411,12 @@ impl Inspector {
         let d = self.dbg();
         let id = WatchId(d.next_watch);
         d.next_watch += 1;
-        d.watchpoints.push(Watch { id, addr, len, kind });
+        d.watchpoints.push(Watch {
+            id,
+            addr,
+            len,
+            kind,
+        });
         id
     }
 
@@ -528,7 +533,9 @@ impl Inspector {
             VarLoc::Window { off } => {
                 // Address = data-SP (block param v0) + off; read `width` raw bytes.
                 let base = as_i64(*frame.vals.first()?).ok()? as u64;
-                let bytes = self.read_window(base.wrapping_add(off as u64), width).ok()?;
+                let bytes = self
+                    .read_window(base.wrapping_add(off as u64), width)
+                    .ok()?;
                 Some(VarValue::Bytes(bytes))
             }
         }
@@ -3385,7 +3392,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     return Err(Trap::FiberFault)
                                 }
                                 // A co-fiber child never carries `debug`, so it cannot pause (S4).
-                                Ok(Inner::Pause(..)) => unreachable!("debug pause in a coroutine child"),
+                                Ok(Inner::Pause(..)) => {
+                                    unreachable!("debug pause in a coroutine child")
+                                }
                                 Err(t) => return Err(t), // a child trap propagates to the parent
                             }
                         }

@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, Loc, LoadOp, Memory, Module,
+    FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module,
     Ordering, StoreOp, Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType,
     VarInfo, VarLoc,
 };
@@ -111,7 +111,11 @@ fn print_debug_info(s: &mut String, m: &Module) {
             VarLoc::Window { off } => ("win", off),
             VarLoc::Ssa { value } => ("ssa", value as i64),
         };
-        let _ = writeln!(s, "debug.var {} \"{}\" {kind} {n} \"{}\"", v.func, v.name, v.ty);
+        let _ = writeln!(
+            s,
+            "debug.var {} \"{}\" {kind} {n} \"{}\"",
+            v.func, v.name, v.ty
+        );
     }
 }
 
@@ -734,7 +738,11 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     "ssa" => VarLoc::Ssa {
                         value: p.parse_u32()?,
                     },
-                    k => return err(format!("debug.var location kind must be win or ssa, got {k}")),
+                    k => {
+                        return err(format!(
+                            "debug.var location kind must be win or ssa, got {k}"
+                        ))
+                    }
                 };
                 let ty = String::from_utf8(p.parse_str()?)
                     .map_err(|_| ParseError("debug.var type is not valid UTF-8".into()))?;

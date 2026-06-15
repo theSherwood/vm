@@ -2608,18 +2608,34 @@ int compute(int a, int b) {
 }
 "#;
     let ir = c_to_ir_g(src);
-    assert!(ir.contains("debug.var 0 \"s\" win"), "emits a debug.var for s:\n{ir}");
+    assert!(
+        ir.contains("debug.var 0 \"s\" win"),
+        "emits a debug.var for s:\n{ir}"
+    );
     let m = parse_module(&ir).expect("parse");
 
     // Drive `compute(5, 3)` directly: v0 is the data-SP (a window base with frame headroom),
     // then the two i32 params.
     let sp = 32768i64;
-    let mut insp = Inspector::attach(&m, 0, &[Value::I64(sp), Value::I32(5), Value::I32(3)], 1_000_000);
+    let mut insp = Inspector::attach(
+        &m,
+        0,
+        &[Value::I64(sp), Value::I32(5), Value::I32(3)],
+        1_000_000,
+    );
 
     // Break at the last op of the single block (all local stores have happened by then).
     let last = m.funcs[0].blocks[0].insts.len() - 1;
-    insp.set_breakpoint(IrPc { module: 0, func: 0, block: 0, inst: last });
-    assert!(matches!(insp.run_until_stop(), svm_interp::Stop::Break { .. }));
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: last,
+    });
+    assert!(matches!(
+        insp.run_until_stop(),
+        svm_interp::Stop::Break { .. }
+    ));
 
     // Read the C locals by their source names: s = a + b = 8, t = s + 100 = 108.
     assert_eq!(as_i32_var(insp.read_var(0, "s", 4)), 8);
