@@ -69,6 +69,8 @@
 
 #include "chibicc.h"
 
+extern bool opt_g; // -g: emit the debug-info section (DEBUGGING.md §6 waist)
+
 static FILE *o;
 static int nv;    // next SSA value index in the *current block* (resets per block; the only
                   // values crossing a block are its parameters — the data-SP + promoted locals)
@@ -2086,7 +2088,11 @@ static void prepare_func(Obj *fn) {
 
   int slot = 0, off = 0;
   for (Obj *v = fn->locals; v; v = v->next) {
-    bool promote = promotable_ty(v->ty) && !is_ataken(v) && !is_synthetic(v) &&
+    // `-g` is `-Og`: disable SSA promotion so every local keeps a stable window data-stack slot
+    // (DEBUGGING.md W6 / §19). A promoted scalar's value index varies by block/PC (it needs the
+    // S2 per-block LocList), but a window slot has one constant offset, so `debug.var ... win`
+    // resolves correctly function-wide. The classic optimized-vs-debuggable trade.
+    bool promote = !opt_g && promotable_ty(v->ty) && !is_ataken(v) && !is_synthetic(v) &&
                    v != fn->va_area && v != fn->alloca_bottom && slot < MAXPROMO;
     if (promote) {
       v->offset = -(slot + 1); // sentinel: a promoted local has no frame slot
@@ -2379,6 +2385,56 @@ static void emit_start(Obj *main_fn) {
   fprintf(o, "}\n\n");
 }
 
+// --- Debug info (DEBUGGING.md §6 waist, producer side) --------------------------------------
+//
+// `-g` emits the frontend-neutral debug-info section. Slice 1: `debug.var` only — one entry per
+// named local, mapping its C name to the §6 `VarLoc` our promote pass already chose:
+//   * a promoted scalar (offset sentinel `< 0`) lives in SSA value `v(slot+1)` — the data-SP is
+//     `v0` and each promoted local is block parameter `v(slot+1)` of *every* block, so the
+//     frame-value index is constant function-wide (matches `VarLoc::Ssa{value}`);
+//   * a memory local lives at data-stack offset `v->offset` (matches `VarLoc::Window{off}`).
+// `debug.loc` (per-op source lines) needs per-op inst counting and is a later slice.
+
+// A neutral render-name for a C type (the §6 `TypeRef` simplified to a string for slice 1).
+static const char *dbg_typename(Type *ty) {
+  switch (ty->kind) {
+  case TY_VOID:    return "void";
+  case TY_BOOL:    return "_Bool";
+  case TY_CHAR:    return ty->is_unsigned ? "unsigned char" : "char";
+  case TY_SHORT:   return ty->is_unsigned ? "unsigned short" : "short";
+  case TY_INT:     return ty->is_unsigned ? "unsigned int" : "int";
+  case TY_LONG:    return ty->is_unsigned ? "unsigned long" : "long";
+  case TY_FLOAT:   return "float";
+  case TY_DOUBLE:  return "double";
+  case TY_LDOUBLE: return "long double";
+  case TY_ENUM:    return "enum";
+  case TY_PTR:     return "ptr";
+  case TY_ARRAY:   return "array";
+  case TY_STRUCT:  return "struct";
+  case TY_UNION:   return "union";
+  case TY_FUNC:    return "func";
+  default:         return "opaque";
+  }
+}
+
+// Emit a `debug.var` for each named local of `fn` (its module index is `start_off + idx`).
+static void emit_debug_vars(Obj *fn, int func_idx) {
+  if (!fn->is_definition)
+    return;
+  for (Obj *v = fn->locals; v; v = v->next) {
+    if (!v->is_local || !v->name || v->name[0] == '\0')
+      continue; // skip the data-SP, sret, and other synthetic/unnamed slots
+    if (v == fn->va_area || v == fn->alloca_bottom)
+      continue;
+    const char *ty = dbg_typename(v->ty);
+    if (is_promoted(v))
+      fprintf(o, "debug.var %d \"%s\" ssa %d \"%s\"\n", func_idx, v->name,
+              slot_of(v) + 1, ty);
+    else
+      fprintf(o, "debug.var %d \"%s\" win %d \"%s\"\n", func_idx, v->name, v->offset, ty);
+  }
+}
+
 void codegen_ir(Obj *prog, FILE *out) {
   o = out;
 
@@ -2427,4 +2483,10 @@ void codegen_ir(Obj *prog, FILE *out) {
     emit_start(funcs[0]);
   for (int i = 0; i < nfuncs; i++)
     gen_func(funcs[i]);
+
+  // `-g`: the §6 debug-info section, after the functions (module-level, strippable). Slice 1
+  // emits `debug.var` only; `funcs[i]` has module index `start_off + i` (matching `func_index`).
+  if (opt_g)
+    for (int i = 0; i < nfuncs; i++)
+      emit_debug_vars(funcs[i], start_off + i);
 }

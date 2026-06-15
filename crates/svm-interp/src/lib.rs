@@ -15,9 +15,10 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator,
-    VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
+    AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
+    FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
+    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType, VarLoc,
+    DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -94,6 +95,470 @@ pub fn run(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Result<
     // No capabilities granted: an empty powerbox (any `cap.call` is inert → `CapFault`).
     let mut host = Host::new();
     run_with_host(m, func, args, fuel, &mut host)
+}
+
+// ===========================================================================================
+// Debugging — interpreter-rooted stepping/breakpoints (DEBUGGING.md W2/W8, Milestone A slice 1).
+// Designs: S1 (location model = `IrPc`), S3 (logical-time = the probe's op count), S4 (the per-op
+// seam in `run_inner`), S5 (driver-style `Inspector`). Single-threaded guests only for now; debug
+// of multithreaded guests is Milestone B (it rides the `Policy` scheduler seam — S4).
+// ===========================================================================================
+
+/// A program location (DEBUGGING.md S1): which op of which block of which function, in which
+/// module space (`0` = the guest's own program; `≥1` = an installed `Jit` unit, §22). This is the
+/// granularity breakpoints and backtraces use; mapping it to source is W4 (the §3a debug-info
+/// side-table), not yet built.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct IrPc {
+    pub module: u32,
+    pub func: FuncIdx,
+    pub block: usize,
+    pub inst: usize,
+}
+
+/// Why an [`Inspector`] paused the guest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StopReason {
+    /// Reached an op carrying a breakpoint.
+    Breakpoint,
+    /// Completed a single-step (`Inspector::step`).
+    Step,
+    /// About to execute an op that accesses a watched window range. Reported *before* the access
+    /// takes effect (`addr`/`write` describe the access); `step` once to apply it and observe the
+    /// new bytes. `addr` is the confined window offset the op touches.
+    Watchpoint { addr: u64, write: bool },
+    /// About to execute a capability call (§3c) — the host-boundary stop, enabled by
+    /// [`Inspector::set_cap_call_stops`]. The handle/args are live in the frame (read them via
+    /// [`Inspector::read_ir_value`]); `step` once to perform the call and see its results. This is
+    /// the boundary W1 record/replay will hook (DEBUGGING.md S5).
+    CapCall { type_id: u32, op: u32 },
+}
+
+/// Which accesses a watchpoint fires on (`Inspector::set_watchpoint`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WatchKind {
+    /// Reads only.
+    Read,
+    /// Writes / RMW / `notify` only (the common case — "what changes this?").
+    Write,
+    /// Either.
+    ReadWrite,
+}
+
+impl WatchKind {
+    fn fires_on(self, write: bool) -> bool {
+        match self {
+            WatchKind::Read => !write,
+            WatchKind::Write => write,
+            WatchKind::ReadWrite => true,
+        }
+    }
+}
+
+/// Handle for a set watchpoint, used to clear it (`Inspector::clear_watchpoint`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct WatchId(u32);
+
+/// The outcome of resuming an [`Inspector`] ([`Inspector::run_until_stop`] / [`Inspector::step`]).
+#[derive(Clone, Debug)]
+pub enum Stop {
+    /// Paused *before* the op at `pc`; the guest state is live and inspectable.
+    Break { reason: StopReason, pc: IrPc },
+    /// The guest ran to completion (or trapped); no more stepping is possible.
+    Finished(Result<Vec<Value>, Trap>),
+    /// The (single-threaded) guest parked on `thread.join`/`atomic.wait` with nothing to wake it —
+    /// out of scope for slice 1 (multithreaded debugging is Milestone B).
+    Blocked,
+}
+
+/// One activation on the paused guest's call stack (innermost first), as reported by
+/// [`Inspector::backtrace`]. `vals` are the frame's live SSA values by index — the interpreter
+/// holds them directly (DEBUGGING.md S2), so a promoted local resolves to `vals[value_idx]` with no
+/// Cranelift machinery.
+#[derive(Clone, Debug)]
+pub struct FrameInfo {
+    pub pc: IrPc,
+    pub vals: Vec<Value>,
+    /// The source location of `pc`, if the module carries debug info (DEBUGGING.md §6/W4).
+    pub source: Option<SourceLoc>,
+}
+
+/// A watched window range (DEBUGGING.md W2). Stop when an op accesses `[addr, addr+len)` with a
+/// matching read/write kind.
+struct Watch {
+    id: WatchId,
+    addr: u64,
+    len: u64,
+    kind: WatchKind,
+}
+
+/// Per-vCPU debug state, consulted by the per-op hook in [`run_inner`] (DEBUGGING.md S4). Present
+/// only while an [`Inspector`] drives the vCPU.
+struct DebugCtx {
+    breakpoints: BTreeSet<IrPc>,
+    /// Window-range watchpoints. Empty in the common case, so the hot loop skips the (confining)
+    /// `access_of` computation entirely when none are armed (S4 cost gating).
+    watchpoints: Vec<Watch>,
+    next_watch: u32,
+    /// S3 logical time: the number of ops this vCPU has executed. Monotonic; the coordinate a
+    /// future `seek` (W1) and step-back will target.
+    clock: u64,
+    /// `clock` value at the most recent stop. Suppresses an immediate re-trigger at the op we just
+    /// paused on, so a `continue`/`step` first *steps off* the current breakpoint.
+    resume_clock: u64,
+    /// When `Some(t)`, stop once `clock` reaches `t` (a pending single-step).
+    step_target: Option<u64>,
+    /// Pause before every `cap.call` (the host boundary, DEBUGGING.md S5).
+    cap_stops: bool,
+}
+
+impl DebugCtx {
+    fn new() -> DebugCtx {
+        DebugCtx {
+            breakpoints: BTreeSet::new(),
+            watchpoints: Vec::new(),
+            next_watch: 0,
+            clock: 0,
+            resume_clock: u64::MAX, // nothing stopped yet, so the first op may itself break
+            step_target: None,
+            cap_stops: false,
+        }
+    }
+
+    fn watches_armed(&self) -> bool {
+        !self.watchpoints.is_empty()
+    }
+
+    /// A `cap.call`-boundary stop, if armed and `inst` is one.
+    fn cap_stop(&self, inst: &Inst) -> Option<StopReason> {
+        match inst {
+            Inst::CapCall { type_id, op, .. } if self.cap_stops => Some(StopReason::CapCall {
+                type_id: *type_id,
+                op: *op,
+            }),
+            _ => None,
+        }
+    }
+
+    /// First watchpoint the `access` hits (overlapping bytes + matching read/write kind), if any.
+    fn watch_hit(&self, access: MemAccess) -> Option<(u64, bool)> {
+        let MemAccess::Range { base, width, write } = access else {
+            return None;
+        };
+        let end = base.saturating_add(width as u64);
+        self.watchpoints.iter().find_map(|w| {
+            let w_end = w.addr.saturating_add(w.len);
+            let overlaps = base < w_end && w.addr < end;
+            (overlaps && w.kind.fires_on(write)).then_some((base, write))
+        })
+    }
+
+    /// Decide whether to pause *before* the op at `pc`. `access` is the op's memory effect (only
+    /// computed by the caller when watchpoints are armed; [`MemAccess::None`] otherwise); `inst` is
+    /// the op itself (for the `cap.call` boundary stop). `Some(reason)` pauses (the op has not run,
+    /// `clock` unchanged, so the continuation re-enters here); `None` charges one tick of logical
+    /// time and lets the op run. The `resume_clock` guard makes resume step off the current op.
+    fn before_op(&mut self, pc: IrPc, inst: &Inst, access: MemAccess) -> Option<StopReason> {
+        let just_resumed = self.clock == self.resume_clock;
+        let reason = if just_resumed {
+            None
+        } else if self.breakpoints.contains(&pc) {
+            Some(StopReason::Breakpoint)
+        } else if let Some((addr, write)) = self.watch_hit(access) {
+            Some(StopReason::Watchpoint { addr, write })
+        } else if let Some(r) = self.cap_stop(inst) {
+            Some(r)
+        } else if self.step_target == Some(self.clock) {
+            Some(StopReason::Step)
+        } else {
+            None
+        };
+        match reason {
+            Some(r) => {
+                self.resume_clock = self.clock;
+                self.step_target = None;
+                Some(r)
+            }
+            None => {
+                self.clock += 1;
+                None
+            }
+        }
+    }
+}
+
+/// A host-side, **observe-only** debugger for a single-threaded guest on the reference interpreter
+/// (DEBUGGING.md W8/S5). It *owns and pumps* the run — `run_until_stop`/`step` drive the guest to
+/// the next breakpoint/step, then `backtrace`/`read_ir_value`/`read_window` inspect the paused
+/// state. It is a *host* capability shaped like §15 `Monitor`: it never widens the guest's
+/// authority, and attaching with no breakpoints is behavior-identical to [`run`] (S7).
+///
+/// Single vCPU (multithreaded guests are Milestone B). The module must be **import-resolved** (no
+/// `CallImport` left — run `svm_run::resolve_capability_imports` first), as the interpreter only
+/// runs concrete `cap.call`s. The §3a source mapping (W4) and time-travel (W1) are later slices.
+pub struct Inspector {
+    v: Box<VCpu>,
+    /// The shared powerbox: capabilities the guest may call. The driver owns it for the run; while
+    /// the guest is paused it is uncontended, so [`host`](Inspector::host) can lock it to read
+    /// effects (captured stdout, clock, grants).
+    host: Arc<Mutex<Host>>,
+    /// The frontend-neutral debug-info waist (DEBUGGING.md §6), cloned from the module. `None` ⇒
+    /// the debugger reports IR locations only ([`IrPc`]/SSA indices); present ⇒ it can resolve
+    /// source locations and named variables.
+    debug_info: Option<DebugInfo>,
+    finished: Option<Result<Vec<Value>, Trap>>,
+}
+
+/// A resolved source location ([`Inspector::source_loc`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SourceLoc {
+    pub file: String,
+    pub line: u32,
+    /// 0 means "no column".
+    pub col: u32,
+}
+
+/// The value of a source variable ([`Inspector::read_var`]). A promoted scalar resolves to a live
+/// SSA [`Value`]; a window-resident variable resolves to its raw little-endian bytes (the S2
+/// `Window` location — the caller interprets them per the variable's type).
+#[derive(Clone, PartialEq, Debug)]
+pub enum VarValue {
+    Value(Value),
+    Bytes(Vec<u8>),
+}
+
+impl Inspector {
+    /// Attach to `m`'s `func(args)` with `fuel` and an **empty powerbox** (any `cap.call` faults),
+    /// paused before the first op. Set breakpoints, then
+    /// [`run_until_stop`](Inspector::run_until_stop) or [`step`](Inspector::step).
+    pub fn attach(m: &Module, func: FuncIdx, args: &[Value], fuel: u64) -> Inspector {
+        Inspector::attach_with_host(m, func, args, fuel, Host::new())
+    }
+
+    /// Like [`attach`](Inspector::attach), but with a caller-prepared [`Host`] (the powerbox):
+    /// `grant_*` the capabilities the guest needs, pass their handle indices in `args`, then debug a
+    /// capability-using guest (§3c/§3e). Read effects back through [`host`](Inspector::host) while
+    /// paused or after [`Stop::Finished`]. `m` must be import-resolved (see the type docs).
+    pub fn attach_with_host(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+    ) -> Inspector {
+        let funcs: Arc<[Func]> = m.funcs.to_vec().into();
+        let mem = m.memory.map(|mc| {
+            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+            mm.init_data(&m.data);
+            mm
+        });
+        let host = Arc::new(Mutex::new(host));
+        let quota = Quota::default();
+        // A scheduler is required to construct a vCPU, but no workers ever run: a single-threaded
+        // guest executes entirely on this driver's `v.run` pumps.
+        let sched = Arc::new(Scheduler::new(quota.max_vcpus, MAX_WORKERS));
+        let dt = Arc::new(DomainTable::new(&funcs, 0));
+        let mut root = VCpu::new(
+            funcs,
+            func,
+            args,
+            mem,
+            Arc::clone(&host),
+            fuel,
+            0,
+            0,
+            SchedRef::Real(sched),
+            quota,
+            dt,
+        );
+        root.debug = Some(Box::new(DebugCtx::new()));
+        Inspector {
+            v: Box::new(root),
+            host,
+            debug_info: m.debug_info.clone(),
+            finished: None,
+        }
+    }
+
+    /// Lock the powerbox to inspect host-side effects (e.g. `host().stdout`). Safe while the guest
+    /// is paused or finished — it is not executing, so the lock is uncontended.
+    pub fn host(&self) -> std::sync::MutexGuard<'_, Host> {
+        self.host.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn dbg(&mut self) -> &mut DebugCtx {
+        self.v
+            .debug
+            .as_mut()
+            .expect("an Inspector-driven vCPU always carries debug state")
+    }
+
+    /// Add a breakpoint at `pc` (idempotent).
+    pub fn set_breakpoint(&mut self, pc: IrPc) {
+        self.dbg().breakpoints.insert(pc);
+    }
+
+    /// Remove a breakpoint; returns whether one was present.
+    pub fn clear_breakpoint(&mut self, pc: IrPc) -> bool {
+        self.dbg().breakpoints.remove(&pc)
+    }
+
+    /// Watch window range `[addr, addr+len)` for accesses of `kind`; the run pauses *before* the
+    /// op that accesses it ([`StopReason::Watchpoint`]). Because the window is one contiguous buffer
+    /// (DEBUGGING.md W2), this catches every code path — no per-op instrumentation needed. Returns a
+    /// handle for [`clear_watchpoint`](Inspector::clear_watchpoint). A zero-length watch never fires.
+    pub fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> WatchId {
+        let d = self.dbg();
+        let id = WatchId(d.next_watch);
+        d.next_watch += 1;
+        d.watchpoints.push(Watch {
+            id,
+            addr,
+            len,
+            kind,
+        });
+        id
+    }
+
+    /// Remove a watchpoint; returns whether one was present.
+    pub fn clear_watchpoint(&mut self, id: WatchId) -> bool {
+        let w = &mut self.dbg().watchpoints;
+        let before = w.len();
+        w.retain(|x| x.id != id);
+        w.len() != before
+    }
+
+    /// Enable/disable pausing before every `cap.call` ([`StopReason::CapCall`]) — the host-boundary
+    /// stop. Useful for tracing a guest's capability use and the boundary W1 record/replay hooks.
+    pub fn set_cap_call_stops(&mut self, on: bool) {
+        self.dbg().cap_stops = on;
+    }
+
+    /// Resume until the next breakpoint, completion, or block.
+    pub fn run_until_stop(&mut self) -> Stop {
+        if let Some(r) = &self.finished {
+            return Stop::Finished(r.clone());
+        }
+        match self.v.run(u64::MAX) {
+            Step::Pause(reason, pc) => Stop::Break { reason, pc },
+            Step::Done(r) => {
+                self.finished = Some(r.clone());
+                Stop::Finished(r)
+            }
+            Step::Park(_) | Step::Yield => Stop::Blocked,
+        }
+    }
+
+    /// Execute exactly one op, then pause before the next (or finish/block).
+    pub fn step(&mut self) -> Stop {
+        if self.finished.is_some() {
+            return self.run_until_stop();
+        }
+        let d = self.dbg();
+        d.step_target = Some(d.clock + 1);
+        self.run_until_stop()
+    }
+
+    /// The guest's result once it has [`Stop::Finished`]; `None` while still running.
+    pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
+        self.finished.as_ref()
+    }
+
+    /// Logical time (DEBUGGING.md S3): ops executed so far on this vCPU.
+    pub fn clock(&self) -> u64 {
+        self.v.debug.as_ref().map(|d| d.clock).unwrap_or(0)
+    }
+
+    /// The current call stack, innermost frame first. Empty once the guest has finished. Each frame
+    /// carries its source location when the module has debug info (DEBUGGING.md §6/W4).
+    pub fn backtrace(&self) -> Vec<FrameInfo> {
+        self.v
+            .frames
+            .iter()
+            .rev()
+            .map(|f| {
+                let pc = IrPc {
+                    module: f.module,
+                    func: f.func,
+                    block: f.block,
+                    inst: f.inst,
+                };
+                FrameInfo {
+                    pc,
+                    vals: f.vals.clone(),
+                    source: self.source_loc(pc),
+                }
+            })
+            .collect()
+    }
+
+    /// The source location of an [`IrPc`], if the module carries debug info (DEBUGGING.md §6/W4).
+    /// Only the guest's own program (module 0) has source; installed §22 units return `None`.
+    pub fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
+        if pc.module != 0 {
+            return None;
+        }
+        let di = self.debug_info.as_ref()?;
+        let l = di.locs.iter().find(|l| {
+            l.func == pc.func && l.block as usize == pc.block && l.inst as usize == pc.inst
+        })?;
+        let file = di.files.get(l.file as usize)?.clone();
+        Some(SourceLoc {
+            file,
+            line: l.line,
+            col: l.col,
+        })
+    }
+
+    /// Resolve a source variable by `name` in the frame `frame_from_top` levels up (0 = innermost)
+    /// and read its current value — the W4→S2 bridge: `Ssa` reads the frame's value table, `Window`
+    /// reads `width` bytes from `data-SP + off`. Returns `None` if there is no debug info, no such
+    /// variable in that frame's function, or the read is out of range. `width` is the byte width to
+    /// read for a window variable (its type size); ignored for SSA variables.
+    pub fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue> {
+        let di = self.debug_info.as_ref()?;
+        let n = self.v.frames.len();
+        let idx = n.checked_sub(1 + frame_from_top)?;
+        let frame = self.v.frames.get(idx)?;
+        // A var belongs to a function; match on the frame's function (module-0 program only).
+        if frame.module != 0 {
+            return None;
+        }
+        let var = di
+            .vars
+            .iter()
+            .find(|v| v.func == frame.func && v.name == name)?;
+        match var.loc {
+            VarLoc::Ssa { value } => frame.vals.get(value as usize).copied().map(VarValue::Value),
+            VarLoc::Window { off } => {
+                // Address = data-SP (block param v0) + off; read `width` raw bytes.
+                let base = as_i64(*frame.vals.first()?).ok()? as u64;
+                let bytes = self
+                    .read_window(base.wrapping_add(off as u64), width)
+                    .ok()?;
+                Some(VarValue::Bytes(bytes))
+            }
+        }
+    }
+
+    /// Read SSA value `value_idx` of the frame `frame_from_top` levels up (0 = innermost). This is
+    /// the S2 `Ssa` resolution: the interpreter holds block-local SSA values by index, so a promoted
+    /// local is a direct lookup — no debug-build mode needed (DEBUGGING.md W6).
+    pub fn read_ir_value(&self, frame_from_top: usize, value_idx: usize) -> Option<Value> {
+        let n = self.v.frames.len();
+        let idx = n.checked_sub(1 + frame_from_top)?;
+        self.v.frames.get(idx)?.vals.get(value_idx).copied()
+    }
+
+    /// Read `len` bytes from confined window address `addr` (the S2 `Window` resolution + raw
+    /// inspection). Uses the same confinement as a guest load, so an out-of-window read faults
+    /// rather than escaping. Empty if the guest declared no memory.
+    pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
+        match &self.v.mem {
+            Some(m) => m.read_window(addr, len),
+            None => Ok(Vec::new()),
+        }
+    }
 }
 
 /// Like [`run`], but with a caller-provided [`Host`] (the powerbox): grant the entry
@@ -1259,6 +1724,10 @@ enum Step {
     /// Ran out its scheduling quantum mid-execution (deterministic-explorer preemption); re-enqueue
     /// and continue later. The real executor uses an unbounded quantum and never yields.
     Yield,
+    /// **Debug pause** (DEBUGGING.md W2/S4): a breakpoint/step hit, before the op at this [`IrPc`].
+    /// Only produced when an [`Inspector`] drives the vCPU; the [`VCpu`] continuation is intact, so
+    /// the next `run` resumes exactly here. Carries the reason + location for the driver to report.
+    Pause(StopReason, IrPc),
 }
 
 /// Internal `?`-friendly driver result; [`VCpu::run`] folds an `Err` into `Step::Done(Err)`.
@@ -1276,6 +1745,9 @@ enum Inner {
     /// been rewound; the parent's `resume` supplies the page and re-runs it (userfaultfd-style lazy
     /// paging). Like `CoYield`, only produced for an inline-driven coroutine.
     CoFault(u64),
+    /// A **debug pause** (DEBUGGING.md W2/S4): the per-op hook stopped before the op at this
+    /// [`IrPc`]. Folded to [`Step::Pause`] by [`VCpu::run`]; never produced unless `debug` is set.
+    Pause(StopReason, IrPc),
 }
 
 /// The **M:N executor** (§12): a bounded pool of worker OS threads runs many vCPUs (green threads)
@@ -1506,6 +1978,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             s.runnable.push_back(v);
             sched.work.notify_one();
         }
+        // Only an `Inspector`-driven vCPU pauses, and those are never on the executor (DEBUGGING.md S4).
+        Step::Pause(..) => unreachable!("debug pause on a pooled vCPU"),
     }
 }
 
@@ -1833,6 +2307,8 @@ fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
                 }
                 det.lock().runnable.push(v);
             }
+            // The deterministic explorer never sets `debug`, so a pause is impossible here (S4).
+            Step::Pause(..) => unreachable!("debug pause in the deterministic explorer"),
         }
     }
 }
@@ -2105,6 +2581,11 @@ struct VCpu {
     /// resolved as module [`INVOKE_MODULE`] — kept out of the shared `dt.units` so it is never
     /// installed/`call_indirect`-reachable and never collides with a concurrent install.
     invoked: Option<Arc<[Func]>>,
+    /// **Debug seam** (DEBUGGING.md W2/S4): `Some` only when an [`Inspector`] drives this vCPU.
+    /// `None` is the production hot path — the per-op hook in [`run_inner`] is gated on it, so an
+    /// undebugged run pays a single null check per op and is otherwise byte-identical (S7). Not
+    /// inherited across `thread.spawn` (slice 1 debugs single-threaded guests).
+    debug: Option<Box<DebugCtx>>,
 }
 
 impl VCpu {
@@ -2154,6 +2635,7 @@ impl VCpu {
             dt,
             units: Vec::new(),
             invoked: None,
+            debug: None,
         }
     }
 
@@ -2208,6 +2690,7 @@ impl VCpu {
             dt,
             units: Vec::new(),
             invoked: Some(unit),
+            debug: None,
         }
     }
 
@@ -2276,6 +2759,7 @@ impl VCpu {
             // A `Yielder` cap.call / fault-driven yield on a vCPU the *executor* runs has no resumer to
             // yield to (a coroutine child is driven inline by `resume`, never enqueued here) — inert.
             Ok(Inner::CoYield(_)) | Ok(Inner::CoFault(_)) => Step::Done(Err(Trap::FiberFault)),
+            Ok(Inner::Pause(r, pc)) => Step::Pause(r, pc),
             Err(t) => Step::Done(Err(t)),
         }
     }
@@ -2373,6 +2857,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         dt,
         units,
         invoked,
+        debug,
     } = v;
     let depth = *depth;
     let memop = *memop;
@@ -2401,6 +2886,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
 
         // Execute the remaining instructions of this block.
         while frames[top].inst < block.insts.len() {
+            // Debug seam (DEBUGGING.md W2/S4): before each op, consult the inspector's probe. A
+            // breakpoint/step hit returns `Inner::Pause` with the op not yet advanced, so the
+            // continuation is intact and the next `run` resumes exactly here. Gated on `debug`
+            // being `Some`, so an undebugged run is unaffected (S7). The `clock` it maintains is
+            // the S3 logical-time coordinate (ops executed on this vCPU).
+            if let Some(dbg) = debug.as_mut() {
+                let pc = IrPc {
+                    module: frames[top].module,
+                    func: frames[top].func,
+                    block: frames[top].block,
+                    inst: frames[top].inst,
+                };
+                // Watchpoints reuse `access_of` — the same confined-range analysis the DPOR
+                // explorer uses — but only when armed (it confines, so it isn't free). Breakpoints,
+                // stepping, and the cap.call stop need no memory analysis.
+                let inst = &block.insts[frames[top].inst];
+                let access = if dbg.watches_armed() {
+                    access_of(inst, &frames[top].vals, &*mem)
+                } else {
+                    MemAccess::None
+                };
+                if let Some(reason) = dbg.before_op(pc, inst, access) {
+                    return Ok(Inner::Pause(reason, pc));
+                }
+            }
             // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
             // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`.
             // In `memop` mode the budget counts only **visible** (shared-state / sync) ops, so
@@ -2880,6 +3390,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // executor driving it) — unsupported; surface as a fault.
                                 Ok(Inner::Park(_)) | Ok(Inner::Yield) => {
                                     return Err(Trap::FiberFault)
+                                }
+                                // A co-fiber child never carries `debug`, so it cannot pause (S4).
+                                Ok(Inner::Pause(..)) => {
+                                    unreachable!("debug pause in a coroutine child")
                                 }
                                 Err(t) => return Err(t), // a child trap propagates to the parent
                             }
@@ -6361,6 +6875,19 @@ impl Mem {
             Some(end) if end <= self.window.reserved() => Ok(abs),
             _ => Err(Trap::MemoryFault),
         }
+    }
+
+    /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds
+    /// it through the same `confine_checked` a guest load uses, so a read past the reserved window
+    /// faults instead of escaping; uncommitted in-window pages read as zero (demand-zeroed backing).
+    fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let abs = self.confine_checked(addr, 0, len as u32)?;
+        let mut out = vec![0u8; len];
+        self.back.read_into(abs, &mut out);
+        Ok(out)
     }
 
     fn load(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Value, Trap> {

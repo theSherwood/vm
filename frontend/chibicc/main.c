@@ -8,6 +8,7 @@ StringArray include_paths;
 bool opt_fcommon = true;
 bool opt_fpic;
 bool opt_emit_ir; // emit SVM text IR instead of x86-64 assembly
+bool opt_g;       // -g: also emit the SVM debug-info section (DEBUGGING.md §6 waist)
 
 static FileType opt_x;
 static StringArray opt_include;
@@ -135,6 +136,14 @@ static void parse_args(int argc, char **argv) {
 
     if (!strcmp(argv[i], "--emit-ir")) {
       opt_emit_ir = true;
+      continue;
+    }
+
+    // `-g`: emit the SVM debug-info section alongside the IR (only meaningful with --emit-ir).
+    // Caught here before the generic "-g*" ignore block below so it sets our flag; `-ggdb` etc.
+    // still fall through to be ignored.
+    if (!strcmp(argv[i], "-g")) {
+      opt_g = true;
       continue;
     }
 

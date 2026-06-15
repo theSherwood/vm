@@ -619,6 +619,9 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             // §7 named imports (real WASI etc.): the host resolves these to concrete capabilities at
             // load (`resolve_imports`). Empty for the numeric host-ABI convention (inline `cap.call`).
             imports: named_imports,
+            // Debug info — wasm's embedded DWARF will map into the §6 waist (DEBUGGING.md
+            // D-DBG-7); none yet.
+            debug_info: None,
         },
         exports,
     })

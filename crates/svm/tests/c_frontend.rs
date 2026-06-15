@@ -22,7 +22,9 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_scheduled, run_with_host, Host, StreamRole, Trap, Value};
+use svm_interp::{
+    run_scheduled, run_with_host, Host, Inspector, IrPc, StreamRole, Trap, Value, VarValue,
+};
 use svm_ir::ValType;
 use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind};
 use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§9)
@@ -118,6 +120,33 @@ fn c_to_ir(src: &str) -> String {
         .status()
         .expect("run chibicc");
     assert!(status.success(), "chibicc failed on:\n{src}");
+    std::fs::read_to_string(&irfile).unwrap()
+}
+
+/// Like [`c_to_ir`] but with `-g`: emit the debug-info section (and, as `-Og`, disable SSA
+/// promotion so locals keep stable window slots — DEBUGGING.md §6/W6).
+fn c_to_ir_g(src: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("svm_cfeg_{}_{id}", std::process::id()));
+    let cfile = base.with_extension("c");
+    let irfile = base.with_extension("svm");
+    std::fs::write(&cfile, src).unwrap();
+    let status = Command::new(chibicc())
+        .args([
+            "-cc1",
+            "--emit-ir",
+            "-g",
+            "-cc1-input",
+            cfile.to_str().unwrap(),
+            "-cc1-output",
+            irfile.to_str().unwrap(),
+            cfile.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run chibicc");
+    assert!(status.success(), "chibicc -g failed on:\n{src}");
     std::fs::read_to_string(&irfile).unwrap()
 }
 
@@ -2555,4 +2584,64 @@ fn reflection_enumerates_granted_capabilities() {
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
+}
+
+// ---- W4 chibicc debug emission: read C locals by name on real frontend output ----
+
+/// Decode a little-endian i32 from a window-located variable's bytes.
+fn as_i32_var(v: Option<VarValue>) -> i32 {
+    match v {
+        Some(VarValue::Bytes(b)) => i32::from_le_bytes(b.try_into().expect("4 bytes")),
+        other => panic!("expected window bytes, got {other:?}"),
+    }
+}
+
+#[test]
+fn chibicc_g_emits_named_locals_resolved_by_the_inspector() {
+    // No `main` ⇒ no `_start`/powerbox; `compute` is function 0. With `-g` (= `-Og`) every local
+    // is a window slot, so its `debug.var ... win <off>` resolves function-wide.
+    let src = r#"
+int compute(int a, int b) {
+  int s = a + b;
+  int t = s + 100;
+  return t;
+}
+"#;
+    let ir = c_to_ir_g(src);
+    assert!(
+        ir.contains("debug.var 0 \"s\" win"),
+        "emits a debug.var for s:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+
+    // Drive `compute(5, 3)` directly: v0 is the data-SP (a window base with frame headroom),
+    // then the two i32 params.
+    let sp = 32768i64;
+    let mut insp = Inspector::attach(
+        &m,
+        0,
+        &[Value::I64(sp), Value::I32(5), Value::I32(3)],
+        1_000_000,
+    );
+
+    // Break at the last op of the single block (all local stores have happened by then).
+    let last = m.funcs[0].blocks[0].insts.len() - 1;
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: last,
+    });
+    assert!(matches!(
+        insp.run_until_stop(),
+        svm_interp::Stop::Break { .. }
+    ));
+
+    // Read the C locals by their source names: s = a + b = 8, t = s + 100 = 108.
+    assert_eq!(as_i32_var(insp.read_var(0, "s", 4)), 8);
+    assert_eq!(as_i32_var(insp.read_var(0, "t", 4)), 108);
+    // The params are window locals too under -Og.
+    assert_eq!(as_i32_var(insp.read_var(0, "a", 4)), 5);
+    assert_eq!(as_i32_var(insp.read_var(0, "b", 4)), 3);
+    assert_eq!(insp.read_var(0, "nonesuch", 4), None);
 }
