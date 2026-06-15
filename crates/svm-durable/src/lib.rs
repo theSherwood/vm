@@ -46,11 +46,12 @@
 //! cannot resolve the target, so such a call is treated as non-suspending. Durable
 //! modules must reach suspension through direct calls (the generator only emits those).
 //!
-//! Two Phase-1 simplifications are called out where they occur: the durable runtime
-//! region is carved at **low** window addresses (real placement is per-fiber and
-//! guard-paged, §12.7), and the captured **live set is over-approximated** to "all
-//! values defined before the call" (correct, just spills more than the minimal live
-//! set — the §12.7 optimization).
+//! Each resume point spills only its **minimal live set** — the values used after the op
+//! (block-local SSA makes this a backward scan within the block), plus a propagated call's
+//! own operands. An unmodelled instruction in the tail falls back to spilling the whole
+//! range, so the analysis never under-spills. One Phase-1 simplification remains: the
+//! durable runtime region is carved at **low** window addresses (real placement is
+//! per-fiber and guard-paged, §12.7; guest memory use is rejected meanwhile, R9).
 
 #![forbid(unsafe_code)]
 
@@ -195,6 +196,73 @@ fn is_guest_mem_op(inst: &Inst) -> bool {
     )
 }
 
+/// The value operands an instruction reads, or `None` for a variant this pass does not
+/// model — in which case liveness conservatively assumes it uses everything (so we never
+/// drop a still-live value). Covers the set `result_types` admits (anything else is already
+/// rejected as `UnsupportedInst` before liveness runs).
+fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
+    use Inst::*;
+    Some(match i {
+        ConstI32(_) | ConstI64(_) | ConstF32(_) | ConstF64(_) | ConstV128(_) | RefFunc { .. } => vec![],
+        IntBin { a, b, .. } | IntCmp { a, b, .. } | FBin { a, b, .. } | FCmp { a, b, .. }
+        | PtrAdd { a, b } => vec![*a, *b],
+        IntUn { a, .. } | FUn { a, .. } | Eqz { a, .. } | PtrCast { a, .. } => vec![*a],
+        Select { cond, a, b } => vec![*cond, *a, *b],
+        Load { addr, .. } | AtomicLoad { addr, .. } | V128Load { addr, .. } => vec![*addr],
+        Store { addr, value, .. }
+        | AtomicStore { addr, value, .. }
+        | AtomicRmw { addr, value, .. }
+        | V128Store { addr, value, .. } => vec![*addr, *value],
+        AtomicCmpxchg { addr, expected, replacement, .. } => vec![*addr, *expected, *replacement],
+        AtomicFence { .. } => vec![],
+        MemoryWait { addr, expected, timeout, .. } => vec![*addr, *expected, *timeout],
+        MemoryNotify { addr, count } => vec![*addr, *count],
+        Call { args, .. } => args.clone(),
+        CapCall { handle, args, .. } => {
+            let mut v = Vec::with_capacity(args.len() + 1);
+            v.push(*handle);
+            v.extend_from_slice(args);
+            v
+        }
+        CallIndirect { idx, args, .. } => {
+            let mut v = Vec::with_capacity(args.len() + 1);
+            v.push(*idx);
+            v.extend_from_slice(args);
+            v
+        }
+        _ => return None,
+    })
+}
+
+/// The value operands a terminator reads (a closed set, all handled).
+fn term_operands(t: &Terminator) -> Vec<ValIdx> {
+    match t {
+        Terminator::Br { args, .. } => args.clone(),
+        Terminator::BrIf { cond, then_args, else_args, .. } => {
+            let mut v = vec![*cond];
+            v.extend_from_slice(then_args);
+            v.extend_from_slice(else_args);
+            v
+        }
+        Terminator::BrTable { idx, targets, default } => {
+            let mut v = vec![*idx];
+            for (_, a) in targets {
+                v.extend_from_slice(a);
+            }
+            v.extend_from_slice(&default.1);
+            v
+        }
+        Terminator::Return(vals) => vals.clone(),
+        Terminator::ReturnCall { args, .. } => args.clone(),
+        Terminator::ReturnCallIndirect { idx, args, .. } => {
+            let mut v = vec![*idx];
+            v.extend_from_slice(args);
+            v
+        }
+        Terminator::Unreachable => vec![],
+    }
+}
+
 /// Mark each function that can suspend: it contains a `cap.call`, or (transitively) a
 /// direct `Call` to a may-suspend function. A least-fixed-point over the direct-call
 /// graph. `call_indirect` targets are unresolved and treated as non-suspending (see the
@@ -247,9 +315,11 @@ enum SuspendKind {
 struct PointPlan {
     kind: SuspendKind,        // leaf cap.call or propagated call
     nres: usize,              // result count of the suspend op
-    live_types: Vec<ValType>, // values visible at the poll (UNWIND params; arg count = len)
-    saved_len: usize,         // first `saved_len` of `live_types` are spilled
-    frame_offsets: Vec<u64>,  // window offset of each saved value
+    out: usize,               // value count after the op (= continuation param count)
+    save_end: usize,          // spillable range `[0, save_end)` (excludes a call's results)
+    slot_types: Vec<ValType>, // types of values `0..out` (continuation params / dead-slot zeros)
+    spilled: Vec<usize>,      // block-local indices actually spilled (sorted, live ∪ call-args)
+    frame_offsets: Vec<u64>,  // window offset of each spilled value (parallel to `spilled`)
     frame_size: u64,
     rid_off: u64,
     cont_seg: u32,            // new block index of the continuation segment (after the op)
@@ -409,30 +479,69 @@ fn transform_func(
                     (SuspendKind::Propagated { callee, .. }, _) => func_results[*callee as usize].len(),
                     _ => unreachable!(),
                 };
-                // Over-capture: spill *all* values visible at the op (block params + locals).
-                // A leaf reloads its own result too; a propagated frame re-issues its call,
-                // so the call's results are recomputed, not spilled.
-                let live_types = bi.types[0..out].to_vec();
-                let saved_len = match kind {
+                // Spillable range: values `[0, save_end)`. A leaf reloads its own result too
+                // (`save_end == out`); a propagated frame re-issues its call, so the call's
+                // results `[save_end, out)` are recomputed, not spilled.
+                let save_end = match kind {
                     SuspendKind::Leaf => out,
                     SuspendKind::Propagated { .. } => out - nres,
                 };
-                if live_types[0..saved_len].contains(&ValType::V128) {
+                let slot_types = bi.types[0..out].to_vec();
+
+                // Minimal live-set: spill only values used *after* the op (block-local SSA ⇒
+                // a value's whole live range is in this block, so "live across" = referenced
+                // by a later instruction or the terminator), plus a propagated call's own
+                // operands (needed to re-issue it). An unrecognized instruction in the tail ⇒
+                // fall back to spilling the whole spillable range (never under-spill).
+                let mut used = vec![false; out];
+                let mut conservative = false;
+                for inst in &blk.insts[pos + 1..] {
+                    match inst_operands(inst) {
+                        Some(ops) => ops.iter().for_each(|&o| {
+                            if (o as usize) < out {
+                                used[o as usize] = true;
+                            }
+                        }),
+                        None => {
+                            conservative = true;
+                            break;
+                        }
+                    }
+                }
+                for o in term_operands(&blk.term) {
+                    if (o as usize) < out {
+                        used[o as usize] = true;
+                    }
+                }
+                if let SuspendKind::Propagated { args, .. } = &kind {
+                    for &a in args {
+                        used[a as usize] = true; // operands of the re-issued call
+                    }
+                }
+                let spilled: Vec<usize> = if conservative {
+                    (0..save_end).collect()
+                } else {
+                    (0..save_end).filter(|&i| used[i]).collect()
+                };
+                if spilled.iter().any(|&i| slot_types[i] == ValType::V128) {
                     return Err(TransformError::UnsupportedInst); // v128 spill/reload: future work
                 }
-                let mut frame_offsets = Vec::with_capacity(saved_len);
+                // Frame layout (DURABILITY.md §12.7): packed spilled values, resume id on top.
+                let mut frame_offsets = Vec::with_capacity(spilled.len());
                 let mut off = 0u64;
-                for &t in &live_types[0..saved_len] {
-                    off = align_up(off, vsize(t));
+                for &i in &spilled {
+                    off = align_up(off, vsize(slot_types[i]));
                     frame_offsets.push(off);
-                    off += vsize(t);
+                    off += vsize(slot_types[i]);
                 }
                 let frame_size = align_up(off + 4, 16);
                 points.push(PointPlan {
                     kind,
                     nres,
-                    live_types,
-                    saved_len,
+                    out,
+                    save_end,
+                    slot_types,
+                    spilled,
                     frame_offsets,
                     rid_off: frame_size - 4,
                     frame_size,
@@ -465,12 +574,15 @@ fn transform_func(
     let mut unwind_blocks: Vec<Block> = Vec::with_capacity(total_points);
     let mut arm_blocks: Vec<Block> = Vec::with_capacity(total_points);
     for (gid, pt) in points.iter().enumerate() {
-        // UNWIND: spill the saved prefix of the live set + the resume id, push the frame.
-        let mut ub = Bb::new(pt.live_types.clone());
+        // index in `pt.spilled` (and thus the reloaded vec) of a block-local value, if spilled
+        let spill_slot = |i: usize| pt.spilled.binary_search(&i).ok();
+
+        // UNWIND: spill the live (∪ call-arg) values + the resume id, push the frame.
+        let mut ub = Bb::new(pt.slot_types.clone());
         let sp_a = ub.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
         let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
-        for (j, &t) in pt.live_types[0..pt.saved_len].iter().enumerate() {
-            ub.zero(store(store_op(t), sp, j as u32, pt.frame_offsets[j])); // value j is block-local idx j
+        for (j, &i) in pt.spilled.iter().enumerate() {
+            ub.zero(store(store_op(pt.slot_types[i]), sp, i as u32, pt.frame_offsets[j]));
         }
         let rid = ub.one(Inst::ConstI32(gid as i32 + 1));
         ub.zero(store(StoreOp::I32, sp, rid, pt.rid_off));
@@ -480,38 +592,50 @@ fn transform_func(
         let ret: Vec<ValIdx> = f.results.iter().map(|&t| ub.one(zero_const(t))).collect();
         unwind_blocks.push(ub.finish(Terminator::Return(ret)));
 
-        // ARM: reload the saved set (self-contained — no incoming params), pop, resume.
+        // ARM: reload the spilled set (self-contained — no incoming params), pop, resume.
         let mut ab = Bb::new(vec![]);
         let sp_a = ab.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
         let sp = ab.one(load(LoadOp::I64, sp_a, 0));
         let fsz = ab.one(Inst::ConstI64(pt.frame_size as i64));
         let base = ab.one(ibin(IntTy::I64, BinOp::Sub, sp, fsz));
-        let mut reloaded = Vec::with_capacity(pt.saved_len);
-        for (j, &t) in pt.live_types[0..pt.saved_len].iter().enumerate() {
-            reloaded.push(ab.one(load(load_op(t), base, pt.frame_offsets[j])));
-        }
+        let reloaded: Vec<ValIdx> = pt
+            .spilled
+            .iter()
+            .enumerate()
+            .map(|(j, &i)| ab.one(load(load_op(pt.slot_types[i]), base, pt.frame_offsets[j])))
+            .collect();
         ab.zero(store(StoreOp::I64, sp_a, base, 0)); // pop: SP = frame base
 
-        // The continuation segment expects the full live set (reloaded), then the op's
-        // results (reloaded for a leaf, re-issued for a propagated call).
-        let mut cont_args: Vec<ValIdx> = reloaded.clone();
-        let arm = match &pt.kind {
+        // For a propagated call, re-issue it (its operands were all spilled). For a leaf,
+        // flip the state word back to NORMAL.
+        let op_results: Vec<ValIdx> = match &pt.kind {
             SuspendKind::Leaf => {
                 let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
                 let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
                 ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
-                ab.finish(Terminator::Br { target: pt.cont_seg, args: cont_args })
+                vec![]
             }
             SuspendKind::Propagated { callee, args } => {
-                // Operands of the original call index into the saved set (all defined before
-                // the call), so they map straight onto `reloaded`.
-                let mapped: Vec<ValIdx> = args.iter().map(|&a| reloaded[a as usize]).collect();
-                let results = ab.many(Inst::Call { func: *callee, args: mapped }, pt.nres);
-                cont_args.extend(results);
-                ab.finish(Terminator::Br { target: pt.cont_seg, args: cont_args })
+                let mapped: Vec<ValIdx> =
+                    args.iter().map(|&a| reloaded[spill_slot(a as usize).expect("call arg spilled")]).collect();
+                ab.many(Inst::Call { func: *callee, args: mapped }, pt.nres)
             }
         };
-        arm_blocks.push(arm);
+
+        // Assemble the continuation's `out` args slot-by-slot: a reloaded value, a re-issued
+        // call result (`[save_end, out)`), or a zero placeholder for a dead-but-present slot.
+        let cont_args: Vec<ValIdx> = (0..pt.out)
+            .map(|i| {
+                if let Some(j) = spill_slot(i) {
+                    reloaded[j]
+                } else if i >= pt.save_end {
+                    op_results[i - pt.save_end]
+                } else {
+                    ab.one(zero_const(pt.slot_types[i])) // dead across the op; value unused
+                }
+            })
+            .collect();
+        arm_blocks.push(ab.finish(Terminator::Br { target: pt.cont_seg, args: cont_args }));
     }
 
     // ---- TRAP — br_table default / forged resume id ----

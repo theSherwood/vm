@@ -291,11 +291,12 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     `chain.rs`, `multipoint.rs`, `multiblock.rs`), plus the interp (`durable_fuzz`) and
     cross-backend interp-vs-JIT (`durable_jit`) generative properties over a generator
     that emits multi-frame, multi-point, multi-block modules.
-  - **Remaining Phase-1 work**: minimal live-set instead of the current over-capture (an
-    optimization — correctness is unaffected). The structural extensions (call-chain
-    propagation, multiple resume points, multi-block CFGs) are **done**. Out of scope and
-    rejected/ignored: `call_indirect` (and indirect tail calls) to may-suspend targets;
-    direct tail calls into may-suspend callees.
+  - **Phase-1 transform complete.** The structural extensions (call-chain propagation,
+    multiple resume points, multi-block CFGs) plus the **minimal live-set** spill
+    (block-local liveness; ~28–40% smaller instrumented IR and up to ~57% less JIT
+    compile time on spill-heavy guests, `tests/durable_bench.rs`) are **done**. Out of
+    scope and rejected/ignored: `call_indirect` (and indirect tail calls) to may-suspend
+    targets; direct tail calls into may-suspend callees; guest linear-memory use (R9).
   - **Hazards introduced by the as-built transform: R8–R11 (§11).** R9 now **fails
     closed** — the transform refuses to instrument a module whose guest uses linear
     memory (which could alias the durable region); relocating the region to *enable*

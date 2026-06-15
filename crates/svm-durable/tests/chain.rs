@@ -67,6 +67,28 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
     baseline
 }
 
+// Dead values across a `cap.call`: `v2`/`v3` are computed before the call but never used
+// after it, while `v1` is. The minimal live-set must spill only `v1` (+ the call result)
+// and drop `v2`/`v3`, yet the thaw must still reproduce the run. Baseline: 42 + 10 = 52.
+const DEAD_VALUES: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 10
+  v2 = i64.const 20
+  v3 = i64.const 30
+  v4 = i32.const 0
+  v5 = cap.call 2 0 (i32) -> (i64) v0 (v4)
+  v6 = i64.add v5 v1
+  return v6
+}
+"#;
+
+#[test]
+fn dead_values_across_cap_call_are_dropped() {
+    let inst = instrument(DEAD_VALUES);
+    assert_eq!(assert_roundtrips(&inst), vec![Value::I64(52)], "42 + 10; dead consts dropped");
+}
+
 // A → B(leaf). A adds 1000 to B's result; B adds 100 to the clock. Baseline: 1142.
 const TWO_LEVEL: &str = r#"
 func (i32) -> (i64) {
