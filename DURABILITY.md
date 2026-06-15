@@ -266,8 +266,9 @@ hash (see §1 / R5). Scope v1 handle durability to re-grantable handles only.
 
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-- **[ ] Phase 0 — Spec.** One-page snapshot-format + handle-durability spec.
+- **[~] Phase 0 — Spec.** One-page snapshot-format + handle-durability spec.
   Format carries instrumented-module hash. v1 = re-grantable handles only.
+  **Drafted in §12.**
 - **[ ] Phase 1 — Transform + interp round-trip.** Single vCPU → `cap.call` →
   unwind → serialize window → restore → rewind → finish. No STW/JIT/fibers.
   **Go/no-go gate.** Risk: low (most predictable part).
@@ -301,6 +302,136 @@ extra mechanism beyond snapshot/restore.
 | R5 | Snapshot-format identity: artifact is coupled to the *instrumented-module* hash, not just backend-independent. Must be pinned in the format. | §1, §9 | open |
 | R6 | v1 latency bound includes "longest poll-free path" until back-edge polls (phase 4); a tight direct-call compute loop is un-preemptable in v1. | §5, §6 | open |
 | R7 | Breadth of instrumentation: "any indirect call = may-suspend" instruments more ordinary C than "compute is free" suggests. Validate on `svm-bench`. | §6 | open |
+
+---
+
+## 12. v1 snapshot format & handle durability (Phase 0 spec)
+
+> **Status: draft.** This is the stable target the §7 fuzz property is written
+> against. Open decisions are flagged **[DECISION]** inline; resolve before Phase 1.
+
+### 12.0 What is and isn't guest state
+
+The transform (§2) keeps the **state word and the shadow stacks in the window**.
+So a quiesced durable domain is described almost entirely by its **window image** —
+the shadow stacks, spilled live values, and per-vCPU state words are all guest-
+resident bytes. At a safepoint every native stack is empty and every register-
+resident value has been spilled to a shadow frame (in-window). What remains
+*host-side* and must be captured separately is small:
+
+1. the **set** of vCPUs and fibers and their relationships (not their stacks),
+2. the §3c **dispatch table** (`DomainTable`, `call_indirect` slots),
+3. the **handle table** (`Host::table` — authority, not the resources it names).
+
+**[DECISION D-scope] Guest state only; host resources are the embedder's.** A v1
+snapshot does *not* capture host-side resource state — `Host::stdin`/`stdout`/
+`stderr` buffers, `clock_ns`, the offload pool, async rings. Restore re-grants the
+*authority* (the handle) and the restoring embedder supplies fresh resources behind
+it. Rationale: that state is host-environment, not guest, and capturing it pulls
+arbitrary host objects into the artifact. (Confirm — this is the main scoping call.)
+
+### 12.1 Container
+
+A sectioned binary, LEB128 varints, same conventions as `svm-encode`. Sections are
+TLV (`tag: uleb`, `len: uleb`, body) so a restore-side reader can skip unknown tags
+(forward-compatible). **Canonical form is required** — sparse entries ascending by
+index, no redundant entries, fixed varint widths — so "re-serialize after restore at
+the same point is byte-identical" is a plain `==`, which is what the fuzz property
+needs.
+
+### 12.2 Section 0 — Header
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| magic | `b"SVMD"` | SVM-Durable |
+| format version | u16 | bump on incompatible change |
+| instrumented-module digest | 32 bytes | digest of the `svm-encode` bytes of the **instrumented** module (R5). Restore refuses on mismatch — this is the durability boundary from §1. |
+| window geometry | `reserved_log2: u8`, `mapped: u64` | matches `Module::memory` / `svm_mask::Window`; stored for a fail-fast check |
+| host page size at capture | u32 | page granularity of §12.3 |
+| vCPU count, fiber count | uleb, uleb | sizes §12.4 |
+
+**[DECISION D-hash] Digest algorithm.** Identity = the encoded instrumented-module
+bytes; the header stores a 32-byte digest of them. Pick the algorithm (the tree has
+no crypto-hash dep today — candidates: vendor a small BLAKE3/SHA-256, or accept a
+non-cryptographic 256-bit hash since this guards *accidental* mismatch, not an
+adversary — a guest can't forge its way past confinement here). Recommend the
+non-crypto route for +0 deps unless we want tamper-evidence.
+
+### 12.3 Section 1 — Window image (sparse)
+
+Captured at the quiescent point. Sparse over **committed** pages, with zero-page
+elision. Per entry:
+
+- `page_index: uleb` (window offset ÷ page)
+- `prot: u8` — `Rw=0, Ro=1, Unmapped=2` (mirrors `PageProt`, `svm-interp` `:5962`)
+- if `prot ∈ {Rw, Ro}`: page bytes (run-length / zero-eliding to keep it small)
+
+The in-window shadow stacks + state words ride along in this image for free (§12.0).
+
+**[DECISION D-region] No `PageProt::Backed` in v1.** §13 `SharedRegion`-aliased pages
+name a host backing shared across the nesting tree — that's the cross-tree-sharing
+edge (R4). v1 **freeze refuses** if `Mem::has_regions` is set for any domain in the
+subtree. (Lifting this is the R4 work: co-snapshot the sharing group.)
+
+*Optimization (not v1):* diff against the post-instantiation image (`Module::data`
+segments) instead of storing all committed pages. Correctness doesn't need it.
+
+### 12.4 Section 2 — Control state
+
+Native stacks are gone (drained, §5), so per-vCPU register/stack state is empty by
+construction. What's stored:
+
+- **Per vCPU:** logical id + role (root vs `thread.spawn` child). Re-entry on thaw is
+  `REWINDING` re-entry; the shadow stack (in-window) drives the rebuild.
+- **Per fiber** (`ContNew`'d): its handle value `(generation, slot)` so guest-held
+  fiber/funcref handles stay valid across restore; its in-window shadow-stack
+  location; and `suspended | runnable` status. The pending `Suspend`/`ContResume`
+  value is already spilled in-window at the resume point, so it is *not* stored here.
+- **Dispatch table** (`DomainTable`, `:984`): the `call_indirect` slot contents as
+  funcref indices (small ints into module funcs). **v1 stores plain module funcrefs
+  only**; installed guest-JIT native funcrefs are not durable (consistent with the
+  `JitDomain`/`JitCode` exclusion in §12.5).
+
+### 12.5 Section 3 — Handle table (durability classification)
+
+Per **live** slot (`Slot.entry.is_some()`, `svm-interp` `:4427`), sparse:
+
+- `slot_index: uleb`, `generation: u32`, `type_id: u32`, durable binding descriptor.
+
+**Durable (re-grantable) in v1** — entire state is value-typed:
+
+| `Binding` | Stored | Re-grant path |
+| --- | --- | --- |
+| `Stream(role)` | role | `grant_stream` |
+| `Exit` / `Clock` / `Memory` / `Yielder` | — | `grant_exit`/`grant_clock`/`grant_memory`/`grant_yielder` |
+| `AddressSpace { base, size }` | base, size | `grant_address_space` |
+| `Instantiator { base, size }` | base, size | `grant_instantiator` |
+
+**Not durable in v1** — carry out-of-line host state or native pointers; their
+presence in a live, non-drainable state makes the subtree non-snapshottable, so
+**freeze refuses** unless they're closed/drained first:
+
+`SharedRegion(u32)` (R4), `Module(u32)`, `IoRing(u32)` (drain residue §5),
+`Blocking(u32)` (§5 + cancellation R2), `JitDomain(u32)`, `JitCode{domain,unit}`.
+
+**Generation/slot pinning.** Restore must reinstate the **same `(slot, generation)`**
+so guest-held handle values stay valid — the auto-allocating `grant`/`grant_*`
+(`:4858`+) advance generation and pick a slot. v1 adds one host helper,
+`grant_at(slot, generation, type_id, binding)`, that pins both. (`Host` is not
+escape-TCB; the verifier/mask hinge is untouched — §3.)
+
+### 12.6 Round-trip / equivalence contract
+
+The format exists to make this testable (extends §7, `jit_diff.rs` / `fuzz/diff.rs`):
+
+> freeze → serialize → (drop domain) → restore → run-to-end  ≡  uninterrupted run,
+> on interp, on JIT, and cross-backend.
+
+Two derived invariants the fuzzer checks directly:
+1. **Canonical:** re-serializing a freshly-restored domain at the same safepoint is
+   byte-identical to the original artifact (§12.1).
+2. **Identity-gated:** restore against a mismatched instrumented-module digest
+   refuses cleanly (never partial state) — R5.
 
 ---
 
