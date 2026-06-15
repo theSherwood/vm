@@ -49,7 +49,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded; multithread pending) |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
-| Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Missing — design settled** (D-DBG-7/§6; IR has no loc fields) | `svm-ir`, `svm-encode`, `svm-text`, `codegen_ir.c` |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
 | DWARF emission + DAP server | **Missing** | — |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -716,8 +716,23 @@ module must be import-resolved (`svm_run::resolve_capability_imports`) per the n
 model on `main`; the interpreter runs only concrete `cap.call`s. Three tests: end-to-end stdout
 capture, a boundary stop with the effect deferred until `step`, and the toggle defaulting off.
 
-**Not yet (next slices):** multithreaded debugging (the `Policy` scheduler seam, Milestone B),
-and the source mapping (W4).
+**Slice 4 — W4 debug-info waist, neutral core (text).** The frontend-neutral waist (D-DBG-7/§6)
+landed as `svm_ir::DebugInfo { files, locs, vars }` on `Module::debug_info: Option<DebugInfo>`,
+with `VarLoc ∈ { Window{off}, Ssa{value} }` (= S2). The **text** form round-trips it
+(`debug.file` / `debug.loc` / `debug.var` directives, `svm-text`); the binary form stays
+debug-stripped for now (like the import-free rule — a follow-up). The verifier never reads it
+(§2a). The `Inspector` consumes it: `source_loc(IrPc) -> SourceLoc`, source-enriched `backtrace`
+frames, and `read_var(frame, name, width) -> VarValue` (the W4→S2 bridge — `Ssa` reads
+`Frame::vals`, `Window` reads `data-SP + off`). Three tests: source location + named-var reads at
+a breakpoint, text round-trip (incl. a window var), and the no-debug path. *Slice-1 limits (noted
+for later):* `VarInfo` is function-scoped with a single `VarLoc` (proper SSA vars need S2's
+per-block `LocList`); `ty` is a render-name string (structured `TypeRef` later); no per-producer
+rich blob yet. **Frontend emission is separate:** chibicc populating the core from its `Token`s,
+and the LLVM/wasm ingest sides, are their own slices targeting this same waist.
+
+**Not yet (next slices):** chibicc debug emission (`codegen_ir.c`), binary serialization of the
+debug section, multithreaded debugging (the `Policy` scheduler seam, Milestone B), and the W4
+refinements above (per-block `LocList`, structured `TypeRef`, rich blob).
 
 ### Open questions (S4/S5/S2)
 

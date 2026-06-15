@@ -927,6 +927,9 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         data,
         // The binary form is always import-free (§7 imports are resolved before encoding).
         imports: Vec::new(),
+        // Debug info is text-only for now (DEBUGGING.md §6 slice 1); the binary form is
+        // debug-stripped, like the import-free rule above. Binary serialization is a follow-up.
+        debug_info: None,
     })
 }
 

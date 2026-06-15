@@ -15,9 +15,10 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator,
-    VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
+    AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
+    FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
+    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType, VarLoc,
+    DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -178,6 +179,8 @@ pub enum Stop {
 pub struct FrameInfo {
     pub pc: IrPc,
     pub vals: Vec<Value>,
+    /// The source location of `pc`, if the module carries debug info (DEBUGGING.md §6/W4).
+    pub source: Option<SourceLoc>,
 }
 
 /// A watched window range (DEBUGGING.md W2). Stop when an op accesses `[addr, addr+len)` with a
@@ -299,7 +302,29 @@ pub struct Inspector {
     /// the guest is paused it is uncontended, so [`host`](Inspector::host) can lock it to read
     /// effects (captured stdout, clock, grants).
     host: Arc<Mutex<Host>>,
+    /// The frontend-neutral debug-info waist (DEBUGGING.md §6), cloned from the module. `None` ⇒
+    /// the debugger reports IR locations only ([`IrPc`]/SSA indices); present ⇒ it can resolve
+    /// source locations and named variables.
+    debug_info: Option<DebugInfo>,
     finished: Option<Result<Vec<Value>, Trap>>,
+}
+
+/// A resolved source location ([`Inspector::source_loc`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SourceLoc {
+    pub file: String,
+    pub line: u32,
+    /// 0 means "no column".
+    pub col: u32,
+}
+
+/// The value of a source variable ([`Inspector::read_var`]). A promoted scalar resolves to a live
+/// SSA [`Value`]; a window-resident variable resolves to its raw little-endian bytes (the S2
+/// `Window` location — the caller interprets them per the variable's type).
+#[derive(Clone, PartialEq, Debug)]
+pub enum VarValue {
+    Value(Value),
+    Bytes(Vec<u8>),
 }
 
 impl Inspector {
@@ -350,6 +375,7 @@ impl Inspector {
         Inspector {
             v: Box::new(root),
             host,
+            debug_info: m.debug_info.clone(),
             finished: None,
         }
     }
@@ -438,22 +464,74 @@ impl Inspector {
         self.v.debug.as_ref().map(|d| d.clock).unwrap_or(0)
     }
 
-    /// The current call stack, innermost frame first. Empty once the guest has finished.
+    /// The current call stack, innermost frame first. Empty once the guest has finished. Each frame
+    /// carries its source location when the module has debug info (DEBUGGING.md §6/W4).
     pub fn backtrace(&self) -> Vec<FrameInfo> {
         self.v
             .frames
             .iter()
             .rev()
-            .map(|f| FrameInfo {
-                pc: IrPc {
+            .map(|f| {
+                let pc = IrPc {
                     module: f.module,
                     func: f.func,
                     block: f.block,
                     inst: f.inst,
-                },
-                vals: f.vals.clone(),
+                };
+                FrameInfo {
+                    pc,
+                    vals: f.vals.clone(),
+                    source: self.source_loc(pc),
+                }
             })
             .collect()
+    }
+
+    /// The source location of an [`IrPc`], if the module carries debug info (DEBUGGING.md §6/W4).
+    /// Only the guest's own program (module 0) has source; installed §22 units return `None`.
+    pub fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
+        if pc.module != 0 {
+            return None;
+        }
+        let di = self.debug_info.as_ref()?;
+        let l = di.locs.iter().find(|l| {
+            l.func == pc.func && l.block as usize == pc.block && l.inst as usize == pc.inst
+        })?;
+        let file = di.files.get(l.file as usize)?.clone();
+        Some(SourceLoc {
+            file,
+            line: l.line,
+            col: l.col,
+        })
+    }
+
+    /// Resolve a source variable by `name` in the frame `frame_from_top` levels up (0 = innermost)
+    /// and read its current value — the W4→S2 bridge: `Ssa` reads the frame's value table, `Window`
+    /// reads `width` bytes from `data-SP + off`. Returns `None` if there is no debug info, no such
+    /// variable in that frame's function, or the read is out of range. `width` is the byte width to
+    /// read for a window variable (its type size); ignored for SSA variables.
+    pub fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue> {
+        let di = self.debug_info.as_ref()?;
+        let n = self.v.frames.len();
+        let idx = n.checked_sub(1 + frame_from_top)?;
+        let frame = self.v.frames.get(idx)?;
+        // A var belongs to a function; match on the frame's function (module-0 program only).
+        if frame.module != 0 {
+            return None;
+        }
+        let var = di
+            .vars
+            .iter()
+            .find(|v| v.func == frame.func && v.name == name)?;
+        match var.loc {
+            VarLoc::Ssa { value } => frame.vals.get(value as usize).copied().map(VarValue::Value),
+            VarLoc::Window { off } => {
+                // Address = data-SP (block param v0) + off; read `width` raw bytes.
+                let base = as_i64(*frame.vals.first()?).ok()? as u64;
+                let bytes = self.read_window(base.wrapping_add(off as u64), width).ok()?;
+                Some(VarValue::Bytes(bytes))
+            }
+        }
     }
 
     /// Read SSA value `value_idx` of the frame `frame_from_top` levels up (0 = innermost). This is

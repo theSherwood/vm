@@ -2,8 +2,10 @@
 //! stepping, IR-value / window inspection, and a backtrace across a call — driven through the
 //! host-side `Inspector`. These pin the S4 per-op seam + S5 driver model end-to-end.
 
-use svm_interp::{Host, Inspector, IrPc, Stop, StopReason, StreamRole, Value, WatchKind};
-use svm_text::parse_module;
+use svm_interp::{
+    Host, Inspector, IrPc, SourceLoc, Stop, StopReason, StreamRole, Value, VarValue, WatchKind,
+};
+use svm_text::{parse_module, print_module};
 
 // sum = 1 + 2 + ... + N via a back-edge loop with block parameters (same shape as pipeline.rs).
 const LOOP_SUM: &str = r#"
@@ -319,4 +321,88 @@ fn cap_call_stops_off_by_default() {
     let stdout = host.grant_stream(StreamRole::Out);
     let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(stdout)], 100_000, host);
     assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I64(2)]);
+}
+
+// ---- W4: the frontend-neutral debug-info waist (source locations + named variables) ----
+
+// LOOP_SUM with a hand-written debug-info section: a source location at the loop body and the two
+// loop variables mapped to their block-relative SSA value indices (i = v2, acc = v3 in block1).
+const LOOP_SUM_DBG: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 0
+  br block1(v0, v1)
+block1(v2: i32, v3: i32):
+  v4 = i32.add v3 v2
+  v5 = i32.const -1
+  v6 = i32.add v2 v5
+  br_if v6 block1(v6, v4) block2(v4)
+block2(v7: i32):
+  return v7
+}
+
+debug.file 0 "sum.c"
+debug.loc 0 1 0 0 7 5
+debug.var 0 "i" ssa 0 "int"
+debug.var 0 "acc" ssa 1 "int"
+"#;
+
+#[test]
+fn source_location_and_named_vars_at_a_breakpoint() {
+    let m = parse_module(LOOP_SUM_DBG).expect("parse");
+    let mut insp = Inspector::attach(&m, 0, &[Value::I32(3)], 1_000_000);
+    let bp = IrPc { module: 0, func: 0, block: 1, inst: 0 };
+    insp.set_breakpoint(bp);
+    assert!(matches!(insp.run_until_stop(), Stop::Break { .. }));
+
+    // The IR location resolves to source (sum.c:7:5).
+    assert_eq!(
+        insp.source_loc(bp),
+        Some(SourceLoc { file: "sum.c".into(), line: 7, col: 5 })
+    );
+    // The backtrace frame carries the source location too.
+    assert_eq!(insp.backtrace()[0].source.as_ref().map(|s| s.line), Some(7));
+
+    // Named source variables resolve to their live values: first iteration i = 3, acc = 0.
+    assert_eq!(insp.read_var(0, "i", 4), Some(VarValue::Value(Value::I32(3))));
+    assert_eq!(insp.read_var(0, "acc", 4), Some(VarValue::Value(Value::I32(0))));
+    assert_eq!(insp.read_var(0, "nope", 4), None);
+}
+
+#[test]
+fn debug_info_round_trips_through_text() {
+    // Includes a window-located variable to exercise that VarLoc on the wire.
+    let src = r#"
+func () -> (i32) {
+block0():
+  v0 = i32.const 0
+  return v0
+}
+
+debug.file 0 "a.c"
+debug.loc 0 0 0 0 1 1
+debug.var 0 "x" ssa 0 "int"
+debug.var 0 "buf" win 16 "char"
+"#;
+    let m = parse_module(src).expect("parse");
+    let di = m.debug_info.as_ref().expect("debug info present");
+    assert_eq!(di.files, vec!["a.c".to_string()]);
+    assert_eq!(di.locs.len(), 1);
+    assert_eq!(di.vars.len(), 2);
+
+    // parse → print → parse is stable (the debug section round-trips).
+    let m2 = parse_module(&print_module(&m)).expect("reparse");
+    assert_eq!(m, m2);
+}
+
+#[test]
+fn no_debug_info_means_none_and_the_inspector_still_works() {
+    let m = parse_module(LOOP_SUM).expect("parse");
+    assert!(m.debug_info.is_none());
+    let bp = IrPc { module: 0, func: 0, block: 1, inst: 0 };
+    let mut insp = Inspector::attach(&m, 0, &[Value::I32(2)], 1_000_000);
+    insp.set_breakpoint(bp);
+    let _ = insp.run_until_stop();
+    assert_eq!(insp.source_loc(bp), None);
+    assert_eq!(insp.read_var(0, "i", 4), None);
 }

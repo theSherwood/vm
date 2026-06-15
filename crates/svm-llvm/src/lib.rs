@@ -60,6 +60,9 @@ pub fn translate(m: &LModule) -> Result<Module, Error> {
         data: Vec::new(),
         // §7 named capability imports — the LLVM on-ramp emits none yet.
         imports: Vec::new(),
+        // Debug info — the LLVM on-ramp will map `!DILocation`/`dbg.value` into the §6 waist
+        // (DEBUGGING.md D-DBG-7); none yet.
+        debug_info: None,
     })
 }
 
