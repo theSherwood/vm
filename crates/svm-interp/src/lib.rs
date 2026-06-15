@@ -192,41 +192,30 @@ struct Watch {
     kind: WatchKind,
 }
 
-/// Per-vCPU debug state, consulted by the per-op hook in [`run_inner`] (DEBUGGING.md S4). Present
-/// only while an [`Inspector`] drives the vCPU.
-struct DebugCtx {
+/// Debug state **shared by every vCPU** of a debugged run (DEBUGGING.md W2/Milestone B):
+/// breakpoints and watchpoints are global — a breakpoint fires in whichever thread reaches it, a
+/// watchpoint on whichever thread touches the range. (Logical time and the pending single-step are
+/// *per-vCPU*; they live in [`DebugCtx`].) Behind a `Mutex` only because a vCPU must stay `Send`
+/// for the real worker pool; a debugged run is driven cooperatively on one thread, so the lock is
+/// always uncontended.
+struct DebugShared {
     breakpoints: BTreeSet<IrPc>,
     /// Window-range watchpoints. Empty in the common case, so the hot loop skips the (confining)
     /// `access_of` computation entirely when none are armed (S4 cost gating).
     watchpoints: Vec<Watch>,
     next_watch: u32,
-    /// S3 logical time: the number of ops this vCPU has executed. Monotonic; the coordinate a
-    /// future `seek` (W1) and step-back will target.
-    clock: u64,
-    /// `clock` value at the most recent stop. Suppresses an immediate re-trigger at the op we just
-    /// paused on, so a `continue`/`step` first *steps off* the current breakpoint.
-    resume_clock: u64,
-    /// When `Some(t)`, stop once `clock` reaches `t` (a pending single-step).
-    step_target: Option<u64>,
     /// Pause before every `cap.call` (the host boundary, DEBUGGING.md S5).
     cap_stops: bool,
 }
 
-impl DebugCtx {
-    fn new() -> DebugCtx {
-        DebugCtx {
+impl DebugShared {
+    fn new() -> DebugShared {
+        DebugShared {
             breakpoints: BTreeSet::new(),
             watchpoints: Vec::new(),
             next_watch: 0,
-            clock: 0,
-            resume_clock: u64::MAX, // nothing stopped yet, so the first op may itself break
-            step_target: None,
             cap_stops: false,
         }
-    }
-
-    fn watches_armed(&self) -> bool {
-        !self.watchpoints.is_empty()
     }
 
     /// A `cap.call`-boundary stop, if armed and `inst` is one.
@@ -252,6 +241,41 @@ impl DebugCtx {
             (overlaps && w.kind.fires_on(write)).then_some((base, write))
         })
     }
+}
+
+/// Per-vCPU debug state, consulted by the per-op hook in [`run_inner`] (DEBUGGING.md S4). Present
+/// only while an [`Inspector`] drives the vCPU. The breakpoint/watchpoint sets it consults are
+/// **shared** across the run's vCPUs (see [`DebugShared`]); `clock`/`step_target` are this vCPU's.
+struct DebugCtx {
+    /// The run-wide breakpoint/watchpoint state (shared with the [`Inspector`] and sibling vCPUs).
+    shared: Arc<Mutex<DebugShared>>,
+    /// S3 logical time: the number of ops this vCPU has executed. Monotonic; the coordinate a
+    /// future `seek` (W1) and step-back will target.
+    clock: u64,
+    /// `clock` value at the most recent stop. Suppresses an immediate re-trigger at the op we just
+    /// paused on, so a `continue`/`step` first *steps off* the current breakpoint.
+    resume_clock: u64,
+    /// When `Some(t)`, stop once `clock` reaches `t` (a pending single-step).
+    step_target: Option<u64>,
+}
+
+impl DebugCtx {
+    fn new(shared: Arc<Mutex<DebugShared>>) -> DebugCtx {
+        DebugCtx {
+            shared,
+            clock: 0,
+            resume_clock: u64::MAX, // nothing stopped yet, so the first op may itself break
+            step_target: None,
+        }
+    }
+
+    fn shared(&self) -> std::sync::MutexGuard<'_, DebugShared> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn watches_armed(&self) -> bool {
+        !self.shared().watchpoints.is_empty()
+    }
 
     /// Decide whether to pause *before* the op at `pc`. `access` is the op's memory effect (only
     /// computed by the caller when watchpoints are armed; [`MemAccess::None`] otherwise); `inst` is
@@ -262,16 +286,19 @@ impl DebugCtx {
         let just_resumed = self.clock == self.resume_clock;
         let reason = if just_resumed {
             None
-        } else if self.breakpoints.contains(&pc) {
-            Some(StopReason::Breakpoint)
-        } else if let Some((addr, write)) = self.watch_hit(access) {
-            Some(StopReason::Watchpoint { addr, write })
-        } else if let Some(r) = self.cap_stop(inst) {
-            Some(r)
-        } else if self.step_target == Some(self.clock) {
-            Some(StopReason::Step)
         } else {
-            None
+            let sh = self.shared();
+            if sh.breakpoints.contains(&pc) {
+                Some(StopReason::Breakpoint)
+            } else if let Some((addr, write)) = sh.watch_hit(access) {
+                Some(StopReason::Watchpoint { addr, write })
+            } else if let Some(r) = sh.cap_stop(inst) {
+                Some(r)
+            } else if self.step_target == Some(self.clock) {
+                Some(StopReason::Step)
+            } else {
+                None
+            }
         };
         match reason {
             Some(r) => {
@@ -297,7 +324,14 @@ impl DebugCtx {
 /// `CallImport` left — run `svm_run::resolve_capability_imports` first), as the interpreter only
 /// runs concrete `cap.call`s. The §3a source mapping (W4) and time-travel (W1) are later slices.
 pub struct Inspector {
-    v: Box<VCpu>,
+    /// The vCPU under inspection in **single-threaded** mode (`attach`/`attach_with_host`). `None`
+    /// in scheduled mode, where the threads live in the scheduler and the stopped one is held by the
+    /// [`SchedDriver`] — see [`Inspector::cur`].
+    v: Option<Box<VCpu>>,
+    /// Present in **scheduled** (multithreaded) mode (`attach_scheduled`): the cooperative driver +
+    /// its deterministic schedule, owned across `run_until_stop`/`step` calls (DEBUGGING.md
+    /// Milestone B).
+    sched: Option<SchedState>,
     /// The shared powerbox: capabilities the guest may call. The driver owns it for the run; while
     /// the guest is paused it is uncontended, so [`host`](Inspector::host) can lock it to read
     /// effects (captured stdout, clock, grants).
@@ -306,7 +340,25 @@ pub struct Inspector {
     /// the debugger reports IR locations only ([`IrPc`]/SSA indices); present ⇒ it can resolve
     /// source locations and named variables.
     debug_info: Option<DebugInfo>,
+    /// The run-wide breakpoint/watchpoint state, shared with every driven vCPU (so a breakpoint
+    /// fires in whichever thread reaches it — DEBUGGING.md Milestone B). The [`Inspector`] mutates
+    /// it through `set_breakpoint`/`set_watchpoint`/`set_cap_call_stops`.
+    shared: Arc<Mutex<DebugShared>>,
     finished: Option<Result<Vec<Value>, Trap>>,
+}
+
+/// Scheduled (multithreaded) execution state owned by an [`Inspector`] across pumps (Milestone B).
+struct SchedState {
+    /// The deterministic cooperative scheduler holding every vCPU not currently selected.
+    det: Arc<DetSched>,
+    /// The schedule source, reused as the picker: an empty plan ⇒ the deterministic default order
+    /// (smallest runnable `TaskId` each turn); a `Witness::plan` ⇒ replay that exact interleaving.
+    dpor: Dpor,
+    /// The re-entrant driver; while stopped, the offending vCPU is parked in `driver.held` and is
+    /// the inspection target ([`Inspector::cur`]).
+    driver: SchedDriver,
+    /// The root vCPU's id, whose outcome is the guest's result.
+    root_id: TaskId,
 }
 
 /// A resolved source location ([`Inspector::source_loc`]).
@@ -371,13 +423,106 @@ impl Inspector {
             quota,
             dt,
         );
-        root.debug = Some(Box::new(DebugCtx::new()));
+        let shared = Arc::new(Mutex::new(DebugShared::new()));
+        root.debug = Some(Box::new(DebugCtx::new(Arc::clone(&shared))));
         Inspector {
-            v: Box::new(root),
+            v: Some(Box::new(root)),
+            sched: None,
             host,
             debug_info: m.debug_info.clone(),
+            shared,
             finished: None,
         }
+    }
+
+    /// Attach to a **multithreaded** guest and debug a chosen interleaving (DEBUGGING.md Milestone
+    /// B). The run is driven cooperatively on this thread under a fixed `schedule` — a
+    /// [`Witness::plan`] from [`find_schedule`] to step a specific (e.g. failing) interleaving, or an
+    /// empty `Vec` for the deterministic default order (smallest runnable thread each turn). Unlike
+    /// the single-threaded [`attach`](Inspector::attach), this drives every `thread.spawn`ed vCPU on
+    /// one OS thread, so the schedule is reproducible and breakpoints/steps are exact and
+    /// race-free. Breakpoints fire in whichever thread reaches them; [`stopped_task`] reports which.
+    /// Inspection becomes available after the first [`run_until_stop`]/[`step`]. `m` must be
+    /// import-resolved.
+    ///
+    /// [`stopped_task`]: Inspector::stopped_task
+    pub fn attach_scheduled(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        schedule: Vec<u64>,
+    ) -> Inspector {
+        let funcs: Arc<[Func]> = m.funcs.to_vec().into();
+        let mem = m.memory.map(|mc| {
+            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+            mm.init_data(&m.data);
+            mm
+        });
+        let host = Arc::new(Mutex::new(Host::new()));
+        let shared = Arc::new(Mutex::new(DebugShared::new()));
+        let det = Arc::new(DetSched::new(0, MAX_VCPUS));
+        let root_id = {
+            let mut s = det.lock();
+            let id = s.next_task;
+            s.next_task += 1;
+            s.live += 1;
+            let dt = Arc::new(DomainTable::new(&funcs, 0));
+            let mut root = VCpu::new(
+                Arc::clone(&funcs),
+                func,
+                args,
+                mem,
+                Arc::clone(&host),
+                fuel,
+                0,
+                id,
+                SchedRef::Det(Arc::clone(&det)),
+                Quota::default(),
+                dt,
+            );
+            root.memop = true; // one visible op per turn — the granularity steps/breakpoints align to
+            root.debug = Some(Box::new(DebugCtx::new(Arc::clone(&shared))));
+            s.runnable.push(Box::new(root));
+            id
+        };
+        Inspector {
+            v: None,
+            sched: Some(SchedState {
+                det,
+                dpor: Dpor::new(schedule, Vec::new()),
+                driver: SchedDriver::default(),
+                root_id,
+            }),
+            host,
+            debug_info: m.debug_info.clone(),
+            shared,
+            finished: None,
+        }
+    }
+
+    /// The vCPU currently under inspection (the paused thread in scheduled mode, the sole vCPU in
+    /// single-threaded mode). `None` in scheduled mode before the first stop, or once finished.
+    fn cur(&self) -> Option<&VCpu> {
+        match &self.sched {
+            Some(s) => s.driver.held.as_ref().map(|h| h.v.as_ref()),
+            None => self.v.as_deref(),
+        }
+    }
+
+    fn cur_mut(&mut self) -> Option<&mut VCpu> {
+        match &mut self.sched {
+            Some(s) => s.driver.held.as_mut().map(|h| h.v.as_mut()),
+            None => self.v.as_deref_mut(),
+        }
+    }
+
+    /// The id of the thread (vCPU) currently stopped, in scheduled mode (DEBUGGING.md Milestone B).
+    /// `None` in single-threaded mode, before the first stop, or once finished.
+    pub fn stopped_task(&self) -> Option<u64> {
+        self.sched
+            .as_ref()
+            .and_then(|s| s.driver.held.as_ref().map(|h| h.v.id))
     }
 
     /// Lock the powerbox to inspect host-side effects (e.g. `host().stdout`). Safe while the guest
@@ -387,20 +532,24 @@ impl Inspector {
     }
 
     fn dbg(&mut self) -> &mut DebugCtx {
-        self.v
-            .debug
-            .as_mut()
+        self.cur_mut()
+            .and_then(|v| v.debug.as_mut())
             .expect("an Inspector-driven vCPU always carries debug state")
     }
 
-    /// Add a breakpoint at `pc` (idempotent).
+    /// The run-wide (cross-vCPU) breakpoint/watchpoint state. Uncontended while the guest is paused.
+    fn shared(&self) -> std::sync::MutexGuard<'_, DebugShared> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Add a breakpoint at `pc` (idempotent). Applies to every thread (DEBUGGING.md Milestone B).
     pub fn set_breakpoint(&mut self, pc: IrPc) {
-        self.dbg().breakpoints.insert(pc);
+        self.shared().breakpoints.insert(pc);
     }
 
     /// Remove a breakpoint; returns whether one was present.
     pub fn clear_breakpoint(&mut self, pc: IrPc) -> bool {
-        self.dbg().breakpoints.remove(&pc)
+        self.shared().breakpoints.remove(&pc)
     }
 
     /// Watch window range `[addr, addr+len)` for accesses of `kind`; the run pauses *before* the
@@ -408,7 +557,7 @@ impl Inspector {
     /// (DEBUGGING.md W2), this catches every code path — no per-op instrumentation needed. Returns a
     /// handle for [`clear_watchpoint`](Inspector::clear_watchpoint). A zero-length watch never fires.
     pub fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> WatchId {
-        let d = self.dbg();
+        let mut d = self.shared();
         let id = WatchId(d.next_watch);
         d.next_watch += 1;
         d.watchpoints.push(Watch {
@@ -422,16 +571,16 @@ impl Inspector {
 
     /// Remove a watchpoint; returns whether one was present.
     pub fn clear_watchpoint(&mut self, id: WatchId) -> bool {
-        let w = &mut self.dbg().watchpoints;
-        let before = w.len();
-        w.retain(|x| x.id != id);
-        w.len() != before
+        let mut d = self.shared();
+        let before = d.watchpoints.len();
+        d.watchpoints.retain(|x| x.id != id);
+        d.watchpoints.len() != before
     }
 
     /// Enable/disable pausing before every `cap.call` ([`StopReason::CapCall`]) — the host-boundary
     /// stop. Useful for tracing a guest's capability use and the boundary W1 record/replay hooks.
     pub fn set_cap_call_stops(&mut self, on: bool) {
-        self.dbg().cap_stops = on;
+        self.shared().cap_stops = on;
     }
 
     /// Resume until the next breakpoint, completion, or block.
@@ -439,7 +588,10 @@ impl Inspector {
         if let Some(r) = &self.finished {
             return Stop::Finished(r.clone());
         }
-        match self.v.run(u64::MAX) {
+        if self.sched.is_some() {
+            return self.pump_sched();
+        }
+        match self.v.as_mut().unwrap().run(u64::MAX) {
             Step::Pause(reason, pc) => Stop::Break { reason, pc },
             Step::Done(r) => {
                 self.finished = Some(r.clone());
@@ -449,9 +601,37 @@ impl Inspector {
         }
     }
 
-    /// Execute exactly one op, then pause before the next (or finish/block).
+    /// Drive the cooperative multithreaded scheduler to the next stop (DEBUGGING.md Milestone B).
+    fn pump_sched(&mut self) -> Stop {
+        // `Done` means scheduler quiescence: read the root's outcome (a result ⇒ finished; absent ⇒
+        // a join-deadlock / all-asleep, i.e. blocked). A `Paused` keeps the offending vCPU held.
+        let outcome = {
+            let s = self.sched.as_mut().unwrap();
+            let SchedState {
+                det,
+                dpor,
+                driver,
+                root_id,
+            } = s;
+            let mut policy = Policy::Dpor(dpor);
+            match driver.run(det, &mut policy) {
+                DriverStop::Paused { reason, pc, .. } => return Stop::Break { reason, pc },
+                DriverStop::Done => det.lock().results.remove(root_id),
+            }
+        };
+        match outcome {
+            Some(o) => {
+                self.finished = Some(o.result.clone());
+                Stop::Finished(o.result)
+            }
+            None => Stop::Blocked,
+        }
+    }
+
+    /// Execute exactly one op of the currently-stopped thread, then pause before the next (or
+    /// finish/block). In scheduled mode before the first stop, resumes to the first stop instead.
     pub fn step(&mut self) -> Stop {
-        if self.finished.is_some() {
+        if self.finished.is_some() || self.cur().is_none() {
             return self.run_until_stop();
         }
         let d = self.dbg();
@@ -464,16 +644,22 @@ impl Inspector {
         self.finished.as_ref()
     }
 
-    /// Logical time (DEBUGGING.md S3): ops executed so far on this vCPU.
+    /// Logical time (DEBUGGING.md S3): ops executed so far on the stopped thread.
     pub fn clock(&self) -> u64 {
-        self.v.debug.as_ref().map(|d| d.clock).unwrap_or(0)
+        self.cur()
+            .and_then(|v| v.debug.as_ref())
+            .map(|d| d.clock)
+            .unwrap_or(0)
     }
 
-    /// The current call stack, innermost frame first. Empty once the guest has finished. Each frame
-    /// carries its source location when the module has debug info (DEBUGGING.md §6/W4).
+    /// The stopped thread's call stack, innermost frame first. Empty once the guest has finished (or,
+    /// in scheduled mode, before the first stop). Each frame carries its source location when the
+    /// module has debug info (DEBUGGING.md §6/W4).
     pub fn backtrace(&self) -> Vec<FrameInfo> {
-        self.v
-            .frames
+        let Some(v) = self.cur() else {
+            return Vec::new();
+        };
+        v.frames
             .iter()
             .rev()
             .map(|f| {
@@ -517,9 +703,10 @@ impl Inspector {
     /// read for a window variable (its type size); ignored for SSA variables.
     pub fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue> {
         let di = self.debug_info.as_ref()?;
-        let n = self.v.frames.len();
+        let v = self.cur()?;
+        let n = v.frames.len();
         let idx = n.checked_sub(1 + frame_from_top)?;
-        let frame = self.v.frames.get(idx)?;
+        let frame = v.frames.get(idx)?;
         // A var belongs to a function; match on the frame's function (module-0 program only).
         if frame.module != 0 {
             return None;
@@ -545,16 +732,17 @@ impl Inspector {
     /// the S2 `Ssa` resolution: the interpreter holds block-local SSA values by index, so a promoted
     /// local is a direct lookup — no debug-build mode needed (DEBUGGING.md W6).
     pub fn read_ir_value(&self, frame_from_top: usize, value_idx: usize) -> Option<Value> {
-        let n = self.v.frames.len();
+        let v = self.cur()?;
+        let n = v.frames.len();
         let idx = n.checked_sub(1 + frame_from_top)?;
-        self.v.frames.get(idx)?.vals.get(value_idx).copied()
+        v.frames.get(idx)?.vals.get(value_idx).copied()
     }
 
     /// Read `len` bytes from confined window address `addr` (the S2 `Window` resolution + raw
     /// inspection). Uses the same confinement as a guest load, so an out-of-window read faults
     /// rather than escaping. Empty if the guest declared no memory.
     pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        match &self.v.mem {
+        match self.cur().and_then(|v| v.mem.as_ref()) {
             Some(m) => m.read_window(addr, len),
             None => Ok(Vec::new()),
         }
@@ -2259,145 +2447,206 @@ fn run_det(det: &Arc<DetSched>) {
 }
 
 fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
-    loop {
-        // Choose the next vCPU + quantum under the lock; release it before running (run_inner may
-        // re-enter via `spawn`/`notify`).
-        let (mut v, quantum) = {
-            let mut s = det.lock();
-            if s.runnable.is_empty() {
-                if s.live == 0 {
-                    return; // all done
-                }
-                // No one runnable: fire the earliest timeout (or deadlock if none).
-                let Some(idx) =
-                    (0..s.wait_waiters.len()).min_by_key(|&i| s.wait_waiters[i].deadline)
-                else {
-                    return; // live > 0 but nothing runnable/waiting: a guest join-deadlock
-                };
-                let mut w = s.wait_waiters.remove(idx);
-                s.clock = s.clock.max(w.deadline);
-                w.vcpu.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
-                s.runnable.push(w.vcpu);
-                continue;
-            }
-            let n = s.runnable.len();
-            // One visible op per turn (`memop` vCPUs) so every shared-state access is a decision.
-            let (pick, quantum) = match &mut policy {
-                Policy::Seeded => ((s.rng() as usize) % n, 1 + s.rng() % MAX_QUANTUM),
-                Policy::Brute(c) => (c.pick(n), 1),
-                Policy::Dpor(d) => {
-                    // Address by `TaskId` (the runnable order is reshuffled by `swap_remove`), so the
-                    // plan replays identically. `enabled` sorted ⇒ a stable default (smallest id). A
-                    // `None` pick means every runnable vCPU is asleep ⇒ stop this redundant schedule.
-                    let mut enabled: Vec<TaskId> = s.runnable.iter().map(|v| v.id).collect();
-                    enabled.sort_unstable();
-                    match d.pick(&enabled) {
-                        Some(tid) => {
-                            let idx = s
-                                .runnable
-                                .iter()
-                                .position(|v| v.id == tid)
-                                .expect("planned tid is runnable");
-                            (idx, 1)
+    match SchedDriver::default().run(det, &mut policy) {
+        DriverStop::Done => {}
+        // The deterministic explorer never sets `debug`, so a pause is impossible here (S4).
+        DriverStop::Paused { .. } => unreachable!("debug pause in the deterministic explorer"),
+    }
+}
+
+/// Outcome of one [`SchedDriver::run`] pump.
+enum DriverStop {
+    /// A debugged vCPU paused *before* an op (breakpoint/step/watchpoint/cap.call). The vCPU is held
+    /// inside the driver (`driver.held`) so the next pump resumes its turn without re-deciding the
+    /// schedule; the held vCPU's id is the stopped thread ([`Inspector::stopped_task`]).
+    Paused { reason: StopReason, pc: IrPc },
+    /// The run reached a scheduler quiescence: every vCPU finished, or a join-deadlock, or (under a
+    /// plan) every runnable vCPU is asleep. The caller reads outcomes from `det`.
+    Done,
+}
+
+/// A vCPU whose turn a debug stop interrupted (the op has not run). Resumed verbatim on the next
+/// pump — same quantum, same spin-detection baseline — so the schedule decision for the turn stands.
+struct HeldTurn {
+    v: Box<VCpu>,
+    quantum: u64,
+    pre_fp: u64,
+    writes_before: u64,
+    spin_capable: bool,
+}
+
+/// The cooperative single-thread multi-vCPU scheduler loop, made **re-entrant** so a debugger can
+/// pause it at a breakpoint and resume (DEBUGGING.md Milestone B). [`run_with_policy`] is the
+/// non-pausing wrapper used by the model-checker/explorer (whose vCPUs carry no `debug`, so
+/// [`DriverStop::Paused`] never occurs); the [`Inspector`] drives the same loop and stops on it.
+#[derive(Default)]
+struct SchedDriver {
+    held: Option<HeldTurn>,
+}
+
+impl SchedDriver {
+    /// Pump turns until a debug stop or scheduler quiescence. On `Paused`, the interrupted vCPU is
+    /// retained in `self.held` and the next `run` resumes exactly there.
+    fn run(&mut self, det: &Arc<DetSched>, policy: &mut Policy) -> DriverStop {
+        loop {
+            // Resume an interrupted turn verbatim, else pick the next vCPU + quantum under the lock
+            // (release it before running — run_inner may re-enter via `spawn`/`notify`).
+            let (mut v, quantum, pre_fp, writes_before, spin_capable) = match self.held.take() {
+                Some(h) => (h.v, h.quantum, h.pre_fp, h.writes_before, h.spin_capable),
+                None => {
+                    let (v, quantum) = {
+                        let mut s = det.lock();
+                        if s.runnable.is_empty() {
+                            if s.live == 0 {
+                                return DriverStop::Done; // all done
+                            }
+                            // No one runnable: fire the earliest timeout (or deadlock if none).
+                            let Some(idx) = (0..s.wait_waiters.len())
+                                .min_by_key(|&i| s.wait_waiters[i].deadline)
+                            else {
+                                return DriverStop::Done; // live > 0 but quiescent: a join-deadlock
+                            };
+                            let mut w = s.wait_waiters.remove(idx);
+                            s.clock = s.clock.max(w.deadline);
+                            w.vcpu.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
+                            s.runnable.push(w.vcpu);
+                            continue;
                         }
-                        None => return,
-                    }
+                        let n = s.runnable.len();
+                        // One visible op per turn (`memop` vCPUs) so every shared access is a decision.
+                        let (pick, quantum) = match &mut *policy {
+                            Policy::Seeded => ((s.rng() as usize) % n, 1 + s.rng() % MAX_QUANTUM),
+                            Policy::Brute(c) => (c.pick(n), 1),
+                            Policy::Dpor(d) => {
+                                // Address by `TaskId` (runnable order is reshuffled by `swap_remove`),
+                                // so the plan replays identically. `enabled` sorted ⇒ stable default
+                                // (smallest id). `None` ⇒ every runnable vCPU is asleep: stop here.
+                                let mut enabled: Vec<TaskId> =
+                                    s.runnable.iter().map(|v| v.id).collect();
+                                enabled.sort_unstable();
+                                match d.pick(&enabled) {
+                                    Some(tid) => {
+                                        let idx = s
+                                            .runnable
+                                            .iter()
+                                            .position(|v| v.id == tid)
+                                            .expect("planned tid is runnable");
+                                        (idx, 1)
+                                    }
+                                    None => return DriverStop::Done,
+                                }
+                            }
+                        };
+                        let v = s.runnable.swap_remove(pick);
+                        (v, quantum)
+                    };
+                    // Spin-loop detection (memop explorer only): snapshot the vCPU's local
+                    // configuration and write count so a post-turn busy-wait retry (same config, no
+                    // memory changed) is distinguishable from real progress.
+                    let spin_capable = v.memop;
+                    let pre_fp = if spin_capable {
+                        v.local_fingerprint()
+                    } else {
+                        0
+                    };
+                    let writes_before = v.mem.as_ref().map_or(0, |m| m.writes);
+                    (v, quantum, pre_fp, writes_before, spin_capable)
                 }
             };
-            let v = s.runnable.swap_remove(pick);
-            (v, quantum)
-        };
-        // Spin-loop detection (memop explorer only): snapshot the vCPU's local configuration and its
-        // memory-write count so that, after the turn, a pure busy-wait retry (same config, no memory
-        // changed) is distinguishable from real progress.
-        let spin_capable = v.memop;
-        let pre_fp = if spin_capable {
-            v.local_fingerprint()
-        } else {
-            0
-        };
-        let writes_before = v.mem.as_ref().map_or(0, |m| m.writes);
 
-        let step = v.run(quantum);
+            let step = v.run(quantum);
 
-        let acc = v.acc.take();
-        // DPOR: finalize this decision's trace entry now that the step's accessed object is known.
-        if let Policy::Dpor(d) = &mut policy {
-            d.finish(acc.unwrap_or(MemAccess::None));
-        }
-        // A turn that actually changed a byte may unblock spinners parked on that address — wake them
-        // to re-check (they re-park if still stuck). Memory change is the only thing that can, under
-        // sequential consistency, alter a parked spinner's read.
-        let mem_changed = v.mem.as_ref().map_or(0, |m| m.writes) != writes_before;
-        if mem_changed {
-            if let Some(MemAccess::Range { base, width, .. }) = acc {
-                det.lock().wake_spins(base, width);
+            // A debug stop interrupts the turn before the op runs: hold the vCPU (its continuation is
+            // intact) and hand control back. The DPOR decision isn't finalized — `d.finish` waits for
+            // the turn to actually complete on a later pump.
+            if let Step::Pause(reason, pc) = step {
+                self.held = Some(HeldTurn {
+                    v,
+                    quantum,
+                    pre_fp,
+                    writes_before,
+                    spin_capable,
+                });
+                return DriverStop::Paused { reason, pc };
             }
-        }
-        match step {
-            Step::Done(result) => {
-                let id = v.id;
-                let outcome = Outcome {
-                    result,
-                    mem: v.mem.take(),
-                    fuel: v.fuel,
-                };
-                drop(v);
-                let mut s = det.lock();
-                if let Some(parent) = s.join_waiters.remove(&id) {
-                    s.runnable.push(parent);
-                }
-                s.results.insert(id, outcome);
-                s.live -= 1;
+
+            let acc = v.acc.take();
+            // DPOR: finalize this decision's trace entry now that the step's accessed object is known.
+            if let Policy::Dpor(d) = &mut *policy {
+                d.finish(acc.unwrap_or(MemAccess::None));
             }
-            Step::Park(Blocked::Join { child }) => {
-                let mut s = det.lock();
-                if s.results.contains_key(&child) {
-                    s.runnable.push(v); // already done (pending already set)
-                } else {
-                    s.join_waiters.insert(child, v);
+            // A turn that actually changed a byte may unblock spinners parked on that address — wake
+            // them to re-check (they re-park if still stuck). Memory change is the only thing that
+            // can, under sequential consistency, alter a parked spinner's read.
+            let mem_changed = v.mem.as_ref().map_or(0, |m| m.writes) != writes_before;
+            if mem_changed {
+                if let Some(MemAccess::Range { base, width, .. }) = acc {
+                    det.lock().wake_spins(base, width);
                 }
             }
-            Step::Park(Blocked::Wait {
-                key,
-                expected,
-                width,
-                timeout_ns,
-            }) => {
-                let mut s = det.lock();
-                if v.atomic_value(key, width) != expected {
-                    v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
-                    s.runnable.push(v);
-                } else {
-                    let deadline = s.clock.saturating_add(timeout_ns);
-                    s.wait_waiters.push(DetWaiter {
-                        key,
-                        deadline,
-                        vcpu: v,
-                    });
+            match step {
+                Step::Done(result) => {
+                    let id = v.id;
+                    let outcome = Outcome {
+                        result,
+                        mem: v.mem.take(),
+                        fuel: v.fuel,
+                    };
+                    drop(v);
+                    let mut s = det.lock();
+                    if let Some(parent) = s.join_waiters.remove(&id) {
+                        s.runnable.push(parent);
+                    }
+                    s.results.insert(id, outcome);
+                    s.live -= 1;
                 }
-            }
-            Step::Yield => {
-                // Spin-park: the turn ran one visible op, changed no memory, and returned the vCPU to
-                // the same local configuration — a busy-wait whose only way forward is another vCPU
-                // writing what it just read. Park it off the runnable set (so the spin doesn't multiply
-                // the interleaving tree, and an unfair "spin forever" schedule can't starve the writer)
-                // until such a write wakes it. Anything else re-enqueues normally.
-                if spin_capable && !mem_changed && v.local_fingerprint() == pre_fp {
-                    if let Some(MemAccess::Range { base, width, .. }) = acc {
-                        let mut s = det.lock();
-                        s.spin_waiters.push(SpinWaiter {
-                            vcpu: v,
-                            base,
-                            width,
-                        });
-                        continue;
+                Step::Park(Blocked::Join { child }) => {
+                    let mut s = det.lock();
+                    if s.results.contains_key(&child) {
+                        s.runnable.push(v); // already done (pending already set)
+                    } else {
+                        s.join_waiters.insert(child, v);
                     }
                 }
-                det.lock().runnable.push(v);
+                Step::Park(Blocked::Wait {
+                    key,
+                    expected,
+                    width,
+                    timeout_ns,
+                }) => {
+                    let mut s = det.lock();
+                    if v.atomic_value(key, width) != expected {
+                        v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
+                        s.runnable.push(v);
+                    } else {
+                        let deadline = s.clock.saturating_add(timeout_ns);
+                        s.wait_waiters.push(DetWaiter {
+                            key,
+                            deadline,
+                            vcpu: v,
+                        });
+                    }
+                }
+                Step::Yield => {
+                    // Spin-park: the turn ran one visible op, changed no memory, and returned the vCPU
+                    // to the same local configuration — a busy-wait whose only way forward is another
+                    // vCPU writing what it just read. Park it off the runnable set until such a write
+                    // wakes it. Anything else re-enqueues normally.
+                    if spin_capable && !mem_changed && v.local_fingerprint() == pre_fp {
+                        if let Some(MemAccess::Range { base, width, .. }) = acc {
+                            let mut s = det.lock();
+                            s.spin_waiters.push(SpinWaiter {
+                                vcpu: v,
+                                base,
+                                width,
+                            });
+                            continue;
+                        }
+                    }
+                    det.lock().runnable.push(v);
+                }
+                Step::Pause(..) => unreachable!("handled above"),
             }
-            // The deterministic explorer never sets `debug`, so a pause is impossible here (S4).
-            Step::Pause(..) => unreachable!("debug pause in the deterministic explorer"),
         }
     }
 }
@@ -3793,6 +4042,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                               // the child can resume fibers the parent (or a sibling) created and suspended.
                     let creg = Arc::clone(registry);
                     let csched = sched.clone();
+                    // A debugged run shares one breakpoint/watchpoint set across all threads
+                    // (DEBUGGING.md Milestone B): the child gets its own per-vCPU `DebugCtx` (fresh
+                    // logical clock) over the same shared state, so a breakpoint fires in it too.
+                    let cdebug = debug.as_ref().map(|d| Arc::clone(&d.shared));
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
                             cfuncs,
@@ -3809,6 +4062,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         );
                         child.registry = creg;
                         child.memop = memop; // inherit the explorer's memory-op granularity
+                        child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         Box::new(child)
                     });
                     match made {

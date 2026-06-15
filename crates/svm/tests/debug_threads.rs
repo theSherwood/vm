@@ -1,0 +1,124 @@
+//! Multithreaded interpreter debugging (DEBUGGING.md Milestone B): drive a `thread.spawn` guest
+//! under a fixed, reproducible schedule on one OS thread, with breakpoints that fire per-thread —
+//! and replay a failing interleaving (a W7 `find_schedule` witness) under the debugger.
+
+use svm_interp::{find_schedule, Inspector, IrPc, Stop, Value};
+use svm_text::parse_module;
+
+// Two threads each do a non-atomic load/add/store on mem[0] (the lost-update race). func 0 is the
+// root (spawns + joins); func 1 is the worker:
+//   block0(vsp, varg): vaddr=const 0 [0]; vc=load vaddr [1]; vn=add vc varg [2];
+//                      store vaddr vn [3]; vz=const 0 [4]; return vz
+const RACY_COUNTER: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 1
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.load vaddr
+  return vr
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vaddr = i64.const 0
+  vc = i64.load vaddr
+  vn = i64.add vc varg
+  i64.store vaddr vn
+  vz = i64.const 0
+  return vz
+}
+"#;
+
+/// A breakpoint in the worker fires once per spawned thread, and the debugger reports *which*
+/// thread (a distinct vCPU) is stopped, with that thread's backtrace live.
+#[test]
+fn breakpoint_fires_in_each_spawned_thread() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    // Empty schedule ⇒ the deterministic default order; reproducible, no real OS threads.
+    let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
+    let bp = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 1,
+    }; // the `vc = load` in the worker
+    insp.set_breakpoint(bp);
+
+    // The first worker thread reaches the load.
+    assert!(matches!(insp.run_until_stop(), Stop::Break { pc, .. } if pc == bp));
+    let t1 = insp.stopped_task().expect("a thread is stopped");
+    let bt = insp.backtrace();
+    assert_eq!(
+        bt.first().map(|f| f.pc),
+        Some(bp),
+        "innermost frame is at the breakpoint"
+    );
+
+    // Continue → the *other* worker thread hits the same breakpoint (a different vCPU).
+    assert!(matches!(insp.run_until_stop(), Stop::Break { pc, .. } if pc == bp));
+    let t2 = insp.stopped_task().expect("a thread is stopped");
+    assert_ne!(t1, t2, "the two workers are distinct threads");
+
+    // No more breakpoint hits (each worker runs the load once); the guest finishes.
+    match insp.run_until_stop() {
+        Stop::Finished(r) => assert!(r.is_ok(), "guest finished: {r:?}"),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+}
+
+/// The headline Milestone B capability: take a *failing* interleaving found by the model checker
+/// (W7 `find_schedule`) and replay it **under the debugger**, deterministically, on one thread —
+/// reproducing the lost update (1 instead of 2).
+#[test]
+fn debugger_replays_a_race_witness() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    let raced = Ok(vec![Value::I64(1)]);
+    let w = find_schedule(&m, 0, &[], 50_000_000, 200_000, |o| *o == raced)
+        .expect("a lost-update schedule exists");
+
+    // Drive that exact interleaving under the Inspector (no breakpoints ⇒ run to completion).
+    let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, w.plan.clone());
+    loop {
+        match insp.run_until_stop() {
+            Stop::Finished(r) => {
+                assert_eq!(r, raced, "the debugger reproduced the failing interleaving");
+                break;
+            }
+            Stop::Break { .. } => continue,
+            Stop::Blocked => panic!("unexpected block"),
+        }
+    }
+}
+
+/// Single-stepping the stopped thread advances it one op at a time (logical clock ticks), while the
+/// schedule stays fixed.
+#[test]
+fn stepping_a_stopped_thread_advances_one_op() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, vec![]);
+    let bp = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 1,
+    };
+    insp.set_breakpoint(bp);
+    assert!(matches!(insp.run_until_stop(), Stop::Break { pc, .. } if pc == bp));
+
+    let who = insp.stopped_task().unwrap();
+    let c0 = insp.clock();
+    // Step one op of this thread: the inner pc advances to inst 2 (the add), same thread.
+    match insp.step() {
+        Stop::Break { pc, .. } => {
+            assert_eq!(pc.inst, 2, "stepped from the load to the add");
+            assert_eq!(insp.stopped_task(), Some(who), "still the same thread");
+            assert_eq!(insp.clock(), c0 + 1, "one logical tick elapsed");
+        }
+        other => panic!("expected a step stop, got {other:?}"),
+    }
+}
