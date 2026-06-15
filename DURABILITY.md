@@ -266,9 +266,9 @@ hash (see §1 / R5). Scope v1 handle durability to re-grantable handles only.
 
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-- **[~] Phase 0 — Spec.** One-page snapshot-format + handle-durability spec.
-  Format carries instrumented-module hash. v1 = re-grantable handles only.
-  **Drafted in §12.**
+- **[x] Phase 0 — Spec.** Snapshot-format + handle-durability spec **complete in
+  §12** (D-scope/D-hash/D-region resolved). Format carries instrumented-module
+  digest; v1 = re-grantable handles only.
 - **[ ] Phase 1 — Transform + interp round-trip.** Single vCPU → `cap.call` →
   unwind → serialize window → restore → rewind → finish. No STW/JIT/fibers.
   **Go/no-go gate.** Risk: low (most predictable part).
@@ -307,8 +307,9 @@ extra mechanism beyond snapshot/restore.
 
 ## 12. v1 snapshot format & handle durability (Phase 0 spec)
 
-> **Status: draft.** This is the stable target the §7 fuzz property is written
-> against. Open decisions are flagged **[DECISION]** inline; resolve before Phase 1.
+> **Status: spec'd (Phase 0 complete).** This is the stable target the §7 fuzz
+> property is written against. All three open decisions are **RESOLVED** (D-scope,
+> D-hash, D-region), flagged inline.
 
 ### 12.0 What is and isn't guest state
 
@@ -323,12 +324,12 @@ resident value has been spilled to a shadow frame (in-window). What remains
 2. the §3c **dispatch table** (`DomainTable`, `call_indirect` slots),
 3. the **handle table** (`Host::table` — authority, not the resources it names).
 
-**[DECISION D-scope] Guest state only; host resources are the embedder's.** A v1
-snapshot does *not* capture host-side resource state — `Host::stdin`/`stdout`/
-`stderr` buffers, `clock_ns`, the offload pool, async rings. Restore re-grants the
-*authority* (the handle) and the restoring embedder supplies fresh resources behind
-it. Rationale: that state is host-environment, not guest, and capturing it pulls
-arbitrary host objects into the artifact. (Confirm — this is the main scoping call.)
+**[DECISION D-scope — RESOLVED: guest + authority only.]** A v1 snapshot does *not*
+capture host-side resource state — `Host::stdin`/`stdout`/`stderr` buffers,
+`clock_ns`, the offload pool, async rings. Restore re-grants the *authority* (the
+handle) and the restoring embedder supplies fresh resources behind it. Rationale:
+that state is host-environment, not guest, and capturing it would pull arbitrary host
+objects into the artifact.
 
 ### 12.1 Container
 
@@ -350,12 +351,12 @@ needs.
 | host page size at capture | u32 | page granularity of §12.3 |
 | vCPU count, fiber count | uleb, uleb | sizes §12.4 |
 
-**[DECISION D-hash] Digest algorithm.** Identity = the encoded instrumented-module
-bytes; the header stores a 32-byte digest of them. Pick the algorithm (the tree has
-no crypto-hash dep today — candidates: vendor a small BLAKE3/SHA-256, or accept a
-non-cryptographic 256-bit hash since this guards *accidental* mismatch, not an
-adversary — a guest can't forge its way past confinement here). Recommend the
-non-crypto route for +0 deps unless we want tamper-evidence.
+**[DECISION D-hash — RESOLVED: non-cryptographic 256-bit hash, +0 deps.]** Identity =
+the encoded instrumented-module bytes; the header stores a 256-bit non-cryptographic
+digest of them. This guards *accidental* restore-into-wrong-module mismatch, not an
+adversary (a guest can't forge its way past confinement here — §3), so no crypto-hash
+dependency is added to the toolchain crate. The digest function is a snapshot-format
+detail; pin the exact one in the implementing crate.
 
 ### 12.3 Section 1 — Window image (sparse)
 
@@ -368,7 +369,7 @@ elision. Per entry:
 
 The in-window shadow stacks + state words ride along in this image for free (§12.0).
 
-**[DECISION D-region] No `PageProt::Backed` in v1.** §13 `SharedRegion`-aliased pages
+**[DECISION D-region — RESOLVED: no `PageProt::Backed` in v1.]** §13 `SharedRegion`-aliased pages
 name a host backing shared across the nesting tree — that's the cross-tree-sharing
 edge (R4). v1 **freeze refuses** if `Mem::has_regions` is set for any domain in the
 subtree. (Lifting this is the R4 work: co-snapshot the sharing group.)
