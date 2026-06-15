@@ -8,9 +8,11 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: not started — this commit is the design + scaffolding plan only.** No
-translator code exists yet. Section numbers like "§3d" refer to `DESIGN.md`; "D54" etc.
-are its Decision Log.
+**Status: Milestone 0 done — the skeleton crate builds, links libLLVM, and the first-light
+differential is green.** `crates/svm-llvm` translates `clang -O2 -emit-llvm` bitcode for the
+single-block integer subset, verifies it, and runs it on the interpreter matching native
+clang (4 tests). Milestone 1 (the real scalar+memory+call subset) is next. Section numbers
+like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
 
@@ -248,15 +250,19 @@ dep) are the first things to settle with the maintainer before code lands.
 Severity/coverage key mirrors `WASM.md`: **🟢 MVP**, **🟡 fail-closed gap (widen on
 demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 
-### Milestone 0 — scaffold & first light 🟢
+### Milestone 0 — scaffold & first light 🟢 — DONE
 - [x] Binding decided: `llvm-ir` 0.11.3 / `llvm-18` (§6, §8 Q1). Legalize out-of-process
       via `clang -O2 -emit-llvm` (+ `opt` as needed) (§4, §8 Q2).
-- [ ] CI gating: make `svm-llvm` an opt-in **Linux-dev-only** lane; confirm the cross-OS
-      runtime matrix still builds without libLLVM (§8 Q4).
-- [ ] `crates/svm-llvm` skeleton: ingest a `.bc`, walk functions/blocks, emit a trivial
-      `ret`-only Module; verify it.
-- [ ] Hand-written `.ll` → IR unit tests for arithmetic + `ret` (the `translate.rs` oracle).
-- [ ] First demo green on Lane C: a pure-compute `fib`/`calc` (`int`-only, no aggregates).
+- [x] CI gating: `svm-llvm` **excluded from the workspace** (root `Cargo.toml`, alongside
+      `fuzz`/`bench`), so `cargo build/test --workspace` never links libLLVM — confirmed via
+      `cargo metadata` (svm-llvm is not a member). The cross-OS runtime matrix is untouched.
+- [x] `crates/svm-llvm` skeleton: ingest a `.bc` (`translate_bc_path`), walk functions/blocks,
+      emit a `Module`, verify it. Builds + links libLLVM dynamically (see §8 Q4 for prereqs).
+- [x] First light green: `clang -O2 -emit-llvm` of `return 42`, an `i32` `add` over params, and
+      `i64` arithmetic → translate → verify → interp, matching native semantics; plus a
+      fail-closed test (float return → clean `Unsupported`). `tests/translate.rs`, 4 tests.
+- [ ] Hand-written `.ll` → IR unit tests (`from_ir_path`) — defer to Milestone 1 alongside the
+      richer instruction set; the bitcode lane already covers the M0 surface.
 
 ### Milestone 1 — the chibicc-proven scalar+memory+call subset 🟢 (the D54 MVP)
 - [ ] φ → block parameters (+ critical-edge splitting).
@@ -317,18 +323,33 @@ of the MVP. We never run an in-process pass manager or reimplement `mem2reg` (th
 **Q3 — Pin mechanics (open):** how strictly to reject off-version bitcode, and where the
 frozen-subset allow-list lives (a single `unsup(...)`-style chokepoint, like `svm-wasm`).
 
-**Q4 — CI gating (open, but direction set):** make `svm-llvm` an **opt-in, Linux-dev-only
-test lane** — the translator is AOT/dev-time and off the runtime path (D54), so the cross-OS
-runtime matrix (`svm-jit`/`svm-interp` on Linux+macOS+Windows) never links libLLVM. This
-defuses the `llvm-sys`-on-Windows pain regardless of binding. Confirm the default workspace
-build stays libLLVM-free.
+**Q4 — CI gating (DONE for the build story; the CI yaml lane is the remaining piece):**
+`svm-llvm` is **excluded from the workspace** (root `Cargo.toml`, with `fuzz`/`bench`), so the
+default `cargo build/test --workspace` never resolves or links libLLVM and the cross-OS
+runtime matrix (`svm-jit`/`svm-interp` on Linux+macOS+Windows) is untouched (D54 off-the-
+runtime-path). The opt-in lane runs `cd crates/svm-llvm && cargo test`. **Build prerequisites
+found at first light (document these for the CI lane):**
+- **`llvm-18-dev`** (headers + the `.so`), not just `llvm-18`/`libllvm18` (runtime only). The
+  runtime package ships `libLLVM.so` but no `llvm-c/*.h`, which `llvm-sys`'s build script needs.
+- **Dynamic linking**: distros ship `libLLVM.so` without the static `.a`s (no `libPolly.a`),
+  and `llvm-sys` defaults to static. We depend on `llvm-sys` directly with feature
+  **`prefer-dynamic`** (feature-unifies onto the `llvm-sys` `llvm-ir` pulls in) so it links the
+  dylib. `clang`/`llvm-config` 18 must be on `PATH` (they are in this container + the existing
+  wasm/cc CI lanes).
+
+**Q5 — remaining CI yaml (open):** add the Linux-only `svm-llvm` job to `ci.yml` (install
+`llvm-18-dev`, `cd crates/svm-llvm && cargo test`); a maintainer one-liner like the §10 miri/
+ASan items in HANDOFF.
 
 ---
 
-## 9. Code map (fill in as code lands)
-- Translator + frozen-subset chokepoint: `crates/svm-llvm/src/lib.rs` (TBD).
-- Unit oracle (hand-written `.ll`): `crates/svm-llvm/tests/translate.rs` (TBD).
-- Demo differential (Lane C): extend `crates/svm-run/tests/run.rs` `assert_demo_matches_cc`
-  pattern, or a dedicated test in `svm-llvm/tests/`.
-- The oracle to diff against: chibicc `frontend/chibicc/codegen_ir.c` (Lane B) + the running
-  demos in `demos/`.
+## 9. Code map
+- Translator + frozen-subset chokepoint: `crates/svm-llvm/src/lib.rs` — `translate`/
+  `translate_bc_path`, `val_type`/`operand_int_ty` (the §3b narrow-int collapse), `BlockCtx`
+  (block-local SSA numbering, §3a), and the `unsup(...)` fail-closed chokepoint.
+- First-light differential: `crates/svm-llvm/tests/translate.rs` — `compile_to_bc` runs the
+  pinned `clang -O2 -emit-llvm` pipeline; `run` does translate→verify→interp.
+- Crate config + build prereqs: `crates/svm-llvm/Cargo.toml` (the `llvm-ir`/`llvm-sys`
+  `prefer-dynamic` deps); workspace exclusion in the root `Cargo.toml`.
+- The oracle to diff against (Lane B): chibicc `frontend/chibicc/codegen_ir.c` + the running
+  demos in `demos/` — wired in at Milestone 1.
