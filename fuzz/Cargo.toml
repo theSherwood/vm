@@ -59,5 +59,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "durable_jit"
+path = "fuzz_targets/durable_jit.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

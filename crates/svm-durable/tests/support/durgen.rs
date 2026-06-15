@@ -22,8 +22,8 @@ use svm_durable::{
 use svm_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use svm_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, Memory, Module, Terminator, ValType};
 
-const SIZE_LOG2: u8 = 18;
-const WINDOW: usize = 1 << SIZE_LOG2;
+pub const SIZE_LOG2: u8 = 18;
+pub const WINDOW: usize = 1 << SIZE_LOG2;
 
 // Clock capability (type_id 2, op 0): `(i32) -> (i64)`, deterministic per host.
 const CLOCK_TYPE_ID: u32 = 2;
@@ -73,7 +73,7 @@ impl Gen {
             (self.raw() & 0xff) as u8
         }
     }
-    fn u64v(&mut self) -> u64 {
+    pub fn u64v(&mut self) -> u64 {
         let mut v = 0u64;
         for _ in 0..8 {
             v = (v << 8) | self.byte() as u64;
