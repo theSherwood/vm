@@ -2499,3 +2499,28 @@ fn c_guest_async_work_stealing() {
     );
     assert_eq!(jit, expected, "jit total must be Σ mix(i) for i in 0..16");
 }
+
+/// §7 slice 3b — a brand-new host capability reached as a plain `extern`, no frontend special-case.
+/// chibicc's builtins are `__vm_*`, but the host policy keys are `vm_*`, so `vm_page_size` is *not*
+/// a recognized builtin: it flows through the GENERIC undefined-extern → `call.import` path, with
+/// the capability handle obtained via `__vm_cap`. The default policy still binds the name to
+/// (Memory, page_size), so the generic-import result must equal the hardcoded `__vm_page_size()`
+/// builtin — proving the late-binding extern path is correct end-to-end (frontend + host + run).
+#[test]
+fn generic_extern_capability_import_equals_builtin() {
+    let src = r#"
+        extern long vm_page_size(int h);   /* undefined extern -> call.import "vm_page_size" */
+        long __vm_page_size(void);         /* recognized builtin -> inline Memory.page_size  */
+        int __vm_cap(int i);
+        int main(void) {
+          long viaextern  = vm_page_size(__vm_cap(3)); /* slot 3 = the Memory handle */
+          long viabuiltin = __vm_page_size();
+          return (viaextern == viabuiltin && viaextern > 0) ? 42 : 0;
+        }
+    "#;
+    assert_eq!(
+        i32_of(src),
+        42,
+        "the generic extern-import path must equal the hardcoded builtin"
+    );
+}

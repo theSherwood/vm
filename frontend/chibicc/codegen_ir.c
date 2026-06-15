@@ -879,6 +879,80 @@ static int gen_builtin_blocking_handle(Node *node) {
   return load_handle(BLOCKING_SLOT);
 }
 
+// `__vm_cap(i)` returns the i-th stashed powerbox handle (an `i32`) — the reserved-region slot at
+// byte offset `i*4` (i in 0..7: stdout, stdin, exit, memory, addrspace, ioring, blocking, jit; see
+// the VM_CAP_* macros in include/svm.h). This is how C code obtains a capability handle to pass as
+// the first argument of a §7 named-import capability call (`gen_builtin_import`) — so a *new* host
+// capability is reachable as a plain `extern` with no frontend change.
+static int gen_builtin_cap(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_cap(i) expects 1 argument");
+  int i = widen_i64(gen_expr(a), a->ty);
+  int four = nv++;
+  fprintf(o, "  v%d = i64.const 4\n", four);
+  int off = nv++;
+  fprintf(o, "  v%d = i64.mul v%d v%d\n", off, i, four);
+  int h = nv++;
+  fprintf(o, "  v%d = i32.load v%d\n", h, off);
+  return h;
+}
+
+// §7 generic capability import: a call to a function that is *declared but not defined* (an
+// `extern` with no body) and is not a recognized builtin is a **named host capability**. Lower it
+// to `call.import "<name>"`: the first C argument is the capability **handle** (an `i32`, e.g. from
+// `__vm_cap`), the rest are the operation arguments, and the op signature is the C signature minus
+// the handle. The host binds the name to a concrete `(type_id, op)` at load (the §7 late binding,
+// `svm_run::default_cap_resolver`), so a brand-new capability needs no frontend change — just an
+// `extern` declaration and a host that knows the name. Args are simple expressions (no branching),
+// like the other capability builtins.
+static int gen_builtin_import(Node *node) {
+  char *name = node->lhs->var->name;
+  Node *a = node->args;
+  if (!a)
+    error_tok(node->tok,
+              "codegen_ir: capability extern '%s' needs a handle as its first argument", name);
+  int handle = gen_expr(a); // arg0 = the i32 capability handle
+  // Operation args (after the handle): keep each one's IR type for the call's signature.
+  int argv[64];
+  const char *argty[64];
+  int n = 0;
+  for (Node *p = a->next; p; p = p->next) {
+    if (n == 64)
+      error_tok(node->tok, "codegen_ir: too many capability arguments");
+    if (is_flt(p->ty)) {
+      argv[n] = gen_expr(p);
+      argty[n] = is64(p->ty) ? "f64" : "f32";
+    } else {
+      argv[n] = widen_i64(gen_expr(p), p->ty); // ints/pointers widen to i64 (the host-ABI word)
+      argty[n] = "i64";
+    }
+    n++;
+  }
+  bool is_void = node->ty->kind == TY_VOID;
+  const char *resty = is_void ? "" : is_flt(node->ty) ? (is64(node->ty) ? "f64" : "f32") : "i64";
+  int r = is_void ? 0 : nv++;
+  if (is_void)
+    fprintf(o, "  call.import \"%s\" (", name);
+  else
+    fprintf(o, "  v%d = call.import \"%s\" (", r, name);
+  for (int i = 0; i < n; i++)
+    fprintf(o, "%s%s", i ? ", " : "", argty[i]);
+  fprintf(o, ") -> (%s) v%d (", resty, handle);
+  for (int i = 0; i < n; i++)
+    fprintf(o, "%sv%d", i ? ", " : "", argv[i]);
+  fprintf(o, ")\n");
+  if (is_void)
+    return 0;
+  // Narrow integer return → wrap i64 down to i32 to match the C type (like gen_builtin_stream).
+  if (!is_flt(node->ty) && !is64(node->ty)) {
+    int w = nv++;
+    fprintf(o, "  v%d = i32.wrap_i64 v%d\n", w, r);
+    return w;
+  }
+  return r;
+}
+
 // Guest-driven JIT builtins (iface 11, DESIGN.md §22) on the stashed Jit handle:
 //
 //   long __vm_jit_compile(void *blob, long len);          // submit serialized IR -> code | -errno
@@ -1375,6 +1449,8 @@ static int gen_expr(Node *node) {
           return gen_builtin_io_reap(node);
         if (!strcmp(fname, "__vm_blocking_handle"))
           return gen_builtin_blocking_handle(node);
+        if (!strcmp(fname, "__vm_cap"))
+          return gen_builtin_cap(node);
         if (!strcmp(fname, "__vm_jit_compile"))
           return gen_builtin_jit_compile(node);
         if (!strcmp(fname, "__vm_jit_invoke2"))
@@ -1385,6 +1461,12 @@ static int gen_expr(Node *node) {
           return gen_builtin_jit_install(node);
         if (!strcmp(fname, "__vm_jit_uninstall"))
           return gen_builtin_jit_uninstall(node);
+        // §7 generic capability import: any *other* direct call to an undefined extern (no body,
+        // not a recognized builtin above) is a named host capability — lower it to `call.import`
+        // with arg0 as the handle. The host resolves the name at load (fail-closed if unknown), so
+        // a new capability needs no frontend change. (Defined functions fall through to `call`.)
+        if (!node->lhs->var->is_definition)
+          return gen_builtin_import(node);
       }
     }
     // Evaluate the arguments (already cast to parameter types / default-promoted by the
