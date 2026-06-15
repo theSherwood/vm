@@ -1910,6 +1910,66 @@ pub fn is_powerbox_entry(module: &Module) -> bool {
     )
 }
 
+/// The reference host's capability-import name policy (§7 "Host-defined capabilities &
+/// discoverability"): the standard `name → (type_id, op)` binding that a frontend's `extern`
+/// capability names resolve to at load. This is the default "powerbox ABI" the bundled toolchain
+/// agrees on; a *different* host is free to supply its own resolver to `svm_ir::resolve_imports`,
+/// binding these (or entirely new) names to its own capabilities — that is the §7 late binding.
+///
+/// Names are the bare operation names (no `__vm_` prefix); the capability **handle** is supplied
+/// by the call site (the frontend's powerbox stash), never by this policy — so two names can share
+/// an interface and differ only by which handle the guest passes (e.g. `write`/`read` are both
+/// `Stream`, distinguished by the stdout vs stdin handle).
+pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
+    use svm_interp::iface;
+    let (type_id, op): (u32, u32) = match name {
+        // Stream — the *handle* (stdout/stdin) selects the endpoint, not the name.
+        "write" => (iface::STREAM, 1),
+        "read" => (iface::STREAM, 0),
+        // Exit (noreturn).
+        "exit" => (iface::EXIT, 0),
+        // Memory management (§3e/§4).
+        "vm_map" => (iface::MEMORY, 0),
+        "vm_unmap" => (iface::MEMORY, 1),
+        "vm_protect" => (iface::MEMORY, 2),
+        "vm_page_size" => (iface::MEMORY, 3),
+        // AddressSpace / SharedRegion aliasing (§13/§14).
+        "vm_region_create" => (iface::ADDRESS_SPACE, 5),
+        "vm_region_map" => (iface::SHARED_REGION, 0),
+        "vm_region_unmap" => (iface::SHARED_REGION, 1),
+        "vm_region_page_size" => (iface::SHARED_REGION, 3),
+        // IoRing submit/complete (§9/§12).
+        "vm_io_submit_async" => (iface::IO_RING, 1),
+        "vm_io_reap" => (iface::IO_RING, 2),
+        // Guest-driven JIT (§22).
+        "vm_jit_compile" => (iface::JIT, 0),
+        "vm_jit_invoke2" => (iface::JIT, 1),
+        "vm_jit_release" => (iface::JIT, 2),
+        "vm_jit_install" => (iface::JIT, 3),
+        "vm_jit_uninstall" => (iface::JIT, 4),
+        _ => return None,
+    };
+    Some(svm_ir::ResolvedCap { type_id, op })
+}
+
+/// Lower a module's §7 named capability imports to concrete `cap.call`s using the reference host
+/// policy ([`default_cap_resolver`]), to be called **before** `verify_module` (the resolved module
+/// is what the verifier and backends run). A module with no imports is returned unchanged, so this
+/// is a no-op for the legacy inline-`cap.call` form. Fails closed on an unknown import name.
+pub fn resolve_capability_imports(module: Module) -> Result<Module, String> {
+    if module.imports.is_empty() {
+        return Ok(module);
+    }
+    svm_ir::resolve_imports(&module, default_cap_resolver).map_err(|e| match e {
+        svm_ir::ImportError::Unresolved(n) => {
+            format!("unresolved capability import `{n}` (no binding in the host policy)")
+        }
+        svm_ir::ImportError::BadImportIndex(i) => {
+            format!("call.import references out-of-range import index {i}")
+        }
+    })
+}
+
 fn typed(t: ValType, v: i64) -> Value {
     match t {
         ValType::I32 => Value::I32(v as i32),
