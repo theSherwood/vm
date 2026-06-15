@@ -3061,25 +3061,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(slot_to_val(*ty, *s));
                     }
                 }
-                // §7 reflection: how many capabilities this domain holds (live handle-table
-                // entries). Read-only over the shared powerbox — authority-neutral.
+                // §7 reflection (`cap.self.count`): how many capabilities this domain holds. Routed
+                // through `self_dispatch` (op 0) — the same path the JIT's thunk takes, so they agree.
                 Inst::CapSelfCount => {
                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                    let n = hg.self_caps().len() as i32;
-                    frames[top].vals.push(Value::I32(n));
+                    let r = hg.self_dispatch(0, &[])?;
+                    frames[top].vals.push(Value::I32(r[0] as i32));
                 }
-                // §7 reflection: the `idx`-th held capability as `(handle, type_id)`. An
-                // out-of-range index is fail-closed (the guest bounds it by `cap.self.count`).
+                // §7 reflection (`cap.self.get`): the `idx`-th held capability as `(handle, type_id)`
+                // (op 1). An out-of-range index is fail-closed (the guest bounds it by the count).
                 Inst::CapSelfGet { idx } => {
-                    let i = as_i32(get(&frames[top].vals, *idx)?)?;
+                    let i = as_i32(get(&frames[top].vals, *idx)?)? as i64;
                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                    let (handle, type_id) = usize::try_from(i)
-                        .ok()
-                        .and_then(|i| hg.self_caps().get(i).copied())
-                        .ok_or(Trap::Malformed)?;
+                    let r = hg.self_dispatch(1, &[i])?;
                     drop(hg);
-                    frames[top].vals.push(Value::I32(handle));
-                    frames[top].vals.push(Value::I32(type_id as i32));
+                    frames[top].vals.push(Value::I32(r[0] as i32));
+                    frames[top].vals.push(Value::I32(r[1] as i32));
                 }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
@@ -4928,6 +4925,26 @@ impl Host {
     /// discovers. Read-only and authority-neutral — every handle is one the domain already holds,
     /// so this confers nothing and reveals nothing the host did not grant. The `Host` *is* the
     /// domain's table (a nested §14 child gets a fresh one), so this auto-scopes to the caller.
+    /// §7 reflection dispatch (`cap.self.*`), shared by both backends: op 0 `count() -> [n]`; op 1
+    /// `get(idx) -> [handle, type_id]` (out-of-range index is fail-closed). The interpreter calls this
+    /// for its `CapSelf*` ops, and the JIT routes them through the `cap.call` thunk with the reserved
+    /// [`CAP_SELF_TYPE_ID`] — so the two stay in lockstep over one implementation.
+    fn self_dispatch(&self, op: u32, args: &[i64]) -> Result<Vec<i64>, Trap> {
+        let caps = self.self_caps();
+        match op {
+            0 => Ok(vec![caps.len() as i64]),
+            1 => {
+                let idx = *args.first().ok_or(Trap::Malformed)?;
+                let (handle, type_id) = usize::try_from(idx)
+                    .ok()
+                    .and_then(|i| caps.get(i).copied())
+                    .ok_or(Trap::Malformed)?;
+                Ok(vec![handle as i64, type_id as i64])
+            }
+            _ => Err(Trap::Malformed),
+        }
+    }
+
     fn self_caps(&self) -> Vec<(i32, u32)> {
         self.table
             .iter()
@@ -5395,6 +5412,11 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
+        // §7 reflection: the reserved pseudo-`type_id` has no handle to resolve — service it directly
+        // (read-only over this domain's own table). This is the JIT's entry point for `cap.self.*`.
+        if type_id == svm_ir::CAP_SELF_TYPE_ID {
+            return self.self_dispatch(op, args);
+        }
         match self.resolve(handle, type_id)? {
             Binding::Stream(role) => self.stream_op(role, op, args, mem),
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it

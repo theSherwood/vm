@@ -23,6 +23,14 @@ pub type BlockIdx = u32;
 /// Index of a function within a module.
 pub type FuncIdx = u32;
 
+/// Reserved pseudo-`type_id` for §7 capability **reflection** (`cap.self.*`). It is not a real
+/// capability (no handle ever carries it): both backends lower `cap.self.count`/`cap.self.get` to a
+/// host `cap.call` with this `type_id` (op 0 = count, op 1 = get), which the host's dispatch services
+/// directly — read-only over the calling domain's own table — instead of resolving a handle. Sharing
+/// one host entry point keeps the interpreter and JIT in lockstep. (Equivalent to issuing the
+/// intrinsic, since reflection is ambient/authority-neutral; `u32::MAX` collides with no interface.)
+pub const CAP_SELF_TYPE_ID: u32 = u32::MAX;
+
 /// SSA value types. `i8`/`i16` are memory access *widths*, not value types (§3a).
 /// `v128` is the fixed-128 SIMD vector (§17/D58): a first-class value carrying 16
 /// raw bytes whose lane interpretation is per-op, never per-value.

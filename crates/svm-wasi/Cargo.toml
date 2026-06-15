@@ -16,4 +16,8 @@ svm-interp = { path = "../svm-interp" }
 [dev-dependencies]
 svm-wasm = { path = "../svm-wasm" }
 svm-verify = { path = "../svm-verify" }
+# The JIT + its host bridge (`cap_thunk`), so the WASI demo runs on **both** backends — the HostFn
+# capability dispatches through the same `cap_dispatch_slots` the JIT's `cap.call` thunk calls.
+svm-jit = { path = "../svm-jit" }
+svm-run = { path = "../svm-run" }
 wat = "1"

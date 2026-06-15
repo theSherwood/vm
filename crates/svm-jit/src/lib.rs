@@ -2400,6 +2400,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Shuffle { .. }
                 | Inst::Swizzle { .. }
                 | Inst::SimdWidthBytes => {}
+                // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
+                // serviced host-side like any cap op — so it matches the interpreter.
+                Inst::CapSelfCount | Inst::CapSelfGet { .. } => {}
                 // `i8x16.mul` has no single-instruction lowering on the target ISAs, so Cranelift
                 // can't legalize it; bail to `Unsupported` (the interp oracle still covers it).
                 Inst::VIntBin { shape, op, .. }
@@ -2873,11 +2876,48 @@ fn lower_block(
                 // host fn the resolver claimed for this `(type_id, op)`.
                 lower_cap_call_fast(module, b, lower, target, sig, *handle, args, &mut vals)?;
             } else {
-                lower_cap_call(
-                    module, b, lower, *type_id, *op, sig, *handle, args, &mut vals,
-                )?;
+                let h = get(&vals, *handle)?;
+                lower_cap_call(module, b, lower, *type_id, *op, sig, h, args, &mut vals)?;
             }
             ubs.resize(vals.len(), UB_TOP); // cap-call results are unknown
+            continue;
+        }
+        // §7 capability reflection: lower to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`
+        // (op 0 = count, op 1 = get) — the host services it directly, matching the interpreter. The
+        // handle is unused there, so pass a constant 0.
+        if matches!(inst, Inst::CapSelfCount | Inst::CapSelfGet { .. }) {
+            let h0 = b.ins().iconst(I32, 0);
+            let (op, sig, call_args): (u32, FuncType, &[u32]) = match inst {
+                Inst::CapSelfCount => (
+                    0,
+                    FuncType {
+                        params: vec![],
+                        results: vec![ValType::I32],
+                    },
+                    &[],
+                ),
+                Inst::CapSelfGet { idx } => (
+                    1,
+                    FuncType {
+                        params: vec![ValType::I32],
+                        results: vec![ValType::I32, ValType::I32],
+                    },
+                    std::slice::from_ref(idx),
+                ),
+                _ => unreachable!(),
+            };
+            lower_cap_call(
+                module,
+                b,
+                lower,
+                svm_ir::CAP_SELF_TYPE_ID,
+                op,
+                &sig,
+                h0,
+                call_args,
+                &mut vals,
+            )?;
+            ubs.resize(vals.len(), UB_TOP);
             continue;
         }
         // §12 fibers: lower `cont.*` to indirect calls to the host fiber thunks (addresses baked into
@@ -3712,7 +3752,9 @@ fn lower_cap_call(
     type_id: u32,
     op: u32,
     sig: &FuncType,
-    handle: u32,
+    // The already-resolved `i32` handle value (the caller does `get(vals, handle_idx)`; §7 reflection
+    // passes a constant 0 — the `CAP_SELF_TYPE_ID` dispatch ignores it).
+    h: Value,
     args: &[u32],
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
@@ -3769,7 +3811,6 @@ fn lower_cap_call(
     let mem_reserved = b.ins().iconst(I64, reserved as i64);
     let tid = b.ins().iconst(I32, type_id as i64);
     let opc = b.ins().iconst(I32, op as i64);
-    let h = get(vals, handle)?;
     let na = b.ins().iconst(I64, n_args as i64);
     let nr = b.ins().iconst(I64, n_res as i64);
     let trap_out = b.use_var(lower.trap_var);

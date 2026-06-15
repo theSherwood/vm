@@ -673,6 +673,8 @@ version = "0.0.0"
 dependencies = [
  "svm-interp",
  "svm-ir",
+ "svm-jit",
+ "svm-run",
  "svm-verify",
  "svm-wasm",
  "wat",

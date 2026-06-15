@@ -148,11 +148,35 @@ mod tests {
             .expect("_start export")
             .1;
         let mut fuel = 10_000_000u64;
-        run_with_host(&m, entry, &[Value::I32(handle)], &mut fuel, &mut host).expect("run");
+        run_with_host(&m, entry, &[Value::I32(handle)], &mut fuel, &mut host).expect("interp run");
         assert_eq!(
             &*out.stdout.lock().unwrap(),
             b"hello\n",
-            "WASI fd_write reached the captured stdout"
+            "WASI fd_write reached the captured stdout (interp)"
+        );
+
+        // JIT parity: the same resolved module + WASI grant, driven through the production cap thunk.
+        // The HostFn capability dispatches through the same `cap_dispatch_slots` the thunk calls, so
+        // the demo runs on the production backend unchanged.
+        let mut hj = Host::new();
+        let (jhandle, jout) = grant(&mut hj);
+        assert_eq!(handle, jhandle, "handle encoding matches across hosts");
+        let outcome = svm_jit::compile_and_run_with_host(
+            &m,
+            entry,
+            &[jhandle as i64],
+            svm_run::cap_thunk,
+            &mut hj as *mut Host as *mut core::ffi::c_void,
+        )
+        .expect("jit compile");
+        assert!(
+            matches!(outcome, svm_jit::JitOutcome::Returned(_)),
+            "jit did not return: {outcome:?}"
+        );
+        assert_eq!(
+            &*jout.stdout.lock().unwrap(),
+            b"hello\n",
+            "WASI fd_write reached the captured stdout (JIT)"
         );
     }
 
