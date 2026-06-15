@@ -1779,40 +1779,65 @@ browser — good enough here.
 
 ---
 
-## 19. Debugging & observability  [DESIGN — new]
+## 19. Debugging & observability  [DESIGN — foundations built; debug surfaces staged]
 
 Good debugging is a **first-class ergonomics goal**, not an afterthought. The architecture
 yields three debugging pillars cheaply, plus one that is real work — pursue all three cheap
 ones as pillars and stage the expensive one.
 
-1. **Record/replay & time-travel — nearly free, a genuine differentiator.** With no ambient
-   authority (§7), *all* guest nondeterminism enters through capabilities. Logging
-   `cap.call` inputs/outputs and seeding the deterministic mode (§12) yields a fully
-   **replayable** trace — the capability boundary *is* the recording boundary. Time-travel
-   (step backward) follows from deterministic replay to any prior point.
-2. **Trustworthy backtraces even after corruption — free.** The out-of-band control stack
-   (D5/§5) holds return addresses the guest cannot forge or smash, so unwinding yields a
-   reliable stack trace even when the in-window data stack is corrupted — the inverse of
-   native debugging, where a smashed stack destroys the backtrace.
-3. **Reference interpreter as a debug engine — cheap.** Single-step / breakpoint /
-   watchpoint over a masked, contiguous window is straightforward and deterministic with no
-   JIT plumbing; address watchpoints are trivial (the window is one buffer).
+**Status (2026-06).** The *architectural premises* these pillars rest on are now built and
+cross-platform-validated — the out-of-band control stack + per-fiber two-stack split (§5/§3d,
+`svm-fiber`), the deterministic interpreter oracle (§12, `run_scheduled`/`explore_all`),
+capabilities (§3c/§7), and SSA promotion (§3d). The *debug surfaces themselves* — a `cap.call`
+record log, an interpreter stepping API, the §3a IR debug-info side-table, DWARF/DAP — are not
+yet built. So the pillars have moved from "promised" to "grounded but unimplemented"; nothing
+built since has invalidated them.
+
+1. **Record/replay & time-travel — nearly free *in deterministic mode*, a genuine
+   differentiator.** With no ambient authority (§7), guest nondeterminism enters through
+   capabilities; logging `cap.call` inputs/outputs and seeding the deterministic mode (§12)
+   yields a fully **replayable** trace — the capability boundary *is* the recording boundary.
+   Time-travel (step backward) follows from deterministic replay to any prior point.
+   **Caveat (inherited from §12):** "all nondeterminism via capabilities" holds *only in
+   single-vCPU/deterministic mode*. Under the now-built concurrency (threads, relaxed atomics,
+   work-stealing fibers — §12/§23) shared-memory **race outcomes** are a nondeterminism source
+   that bypasses the capability boundary, so faithful replay there must also record schedule +
+   memory-order choices — exactly what the interpreter's DPOR `explore_all` already reifies (a
+   stronger substrate than plain seed-replay). The `cap.call` I/O log itself is not yet built.
+2. **Trustworthy backtraces even after corruption — integrity free, materialization cheap.**
+   The out-of-band control stack (D5/§5, now built) holds return addresses the guest cannot
+   forge or smash, so a corrupted in-window data stack cannot destroy the trace — the inverse
+   of native debugging, where a smashed stack destroys the backtrace. The *integrity* is free;
+   *materializing* a backtrace still needs frame/unwind metadata from Cranelift to walk the
+   machine stack, and with migratable fibers (D57/§23) the walk is **per-fiber**, not
+   per-thread (each fiber owns its control+data pair).
+3. **Reference interpreter as a debug engine — cheap; vehicle mature, surface unbuilt.**
+   Single-step / breakpoint / watchpoint over a masked, contiguous window is straightforward
+   and deterministic with no JIT plumbing; address watchpoints are trivial (the window is one
+   buffer). The interpreter (`svm-interp`) is mature and is already the deterministic oracle,
+   but exposes only `run*`/`explore_all` — no stepping API yet.
 4. **Source-level debugging (the real work, staged).** Preserve source-location +
    variable-location info **frontend → an IR debug-info side-table (§3a) → Cranelift →
    DWARF**, so gdb/lldb and VS Code (via **DAP**) set breakpoints and inspect variables in
    the *source* language. Cranelift already emits DWARF for JIT code (Wasmtime precedent);
-   the new piece is threading debug info through *our* IR.
+   the new piece is threading debug info through *our* IR. **The dependency is still step
+   zero:** the IR (`svm-ir`) carries no source-location fields and chibicc's `codegen_ir.c`
+   discards them, so the §3a side-table comes first. A cheap intermediate before full
+   DWARF/DAP: a source↔IR-position side-table consumed by the interpreter (pillar 3), which
+   needs no Cranelift work.
 
 **Debugger = a host-side capability** (an `Inspector`/`Debugger`, shaped like the §15
 `Monitor`): it *observes* a guest from outside, so it never widens the guest's authority and
-fits the ocap model. Debug info is **tooling, untrusted for escape** (§2a) — strippable, and
-the verifier never trusts it.
+fits the ocap model. (§15's metering *properties* — fuel/quota — exist on `Host` today, but
+`Monitor`/`Inspector` is still a **pattern**, not a built type.) Debug info is **tooling,
+untrusted for escape** (§2a) — strippable, and the verifier never trusts it.
 
-**Tension to record (it entangles the §3d perf pass):** SSA promotion gives a promoted local
-**no memory address**, so it is not inspectable as a variable. A debug build therefore either
-**disables promotion** (locals stay in-window, addressable) or emits **Cranelift
-value-location lists** so the debugger finds the register/stack slot — the classic
-`-O0`-vs-optimized-debug trade, here tangled with our headline optimization.
+**Tension to record (it entangles the §3d perf pass — now concrete, not hypothetical):** SSA
+promotion (the implemented headline perf win, §3d) gives a promoted local **no memory
+address**, so it is not inspectable as a variable. A debug build therefore either **disables
+promotion** (locals stay in-window, addressable) or emits **Cranelift value-location lists**
+so the debugger finds the register/stack slot — the classic `-O0`-vs-optimized-debug trade,
+here tangled with our headline optimization.
 
 ---
 
@@ -2389,8 +2414,8 @@ as open-ended, not a byproduct of the build.
 | D49 | Host (escape-TCB) in **Rust**; frontend in **C**; backend **Cranelift** | Settled | Backend is Rust-native (coupled to D36); Rust gives memory-safe TCB + best fuzzing (`arbitrary`) + compiler safety net for an expert-less agent build; frontend's language is safety-irrelevant (§2a), so C/chibicc is free; compile-time tax accepted |
 | D50 | **Accept the mask cost on unbounded-base accesses; do not pursue 32-bit window addressing.** Mask elision (§4 guard-when-bounded) covers *provably-bounded* addresses; for an unbounded base (the threaded data-SP in C locals) we keep the single AND mask (`locals_c` ~2.26× wasm32, still < wasm64) rather than lower window addresses as 32-bit | Settled | The 64-bit address space is a core goal (D36/§1a); the only sound way to elide an unbounded-base access is the wasm32 trick (32-bit address arithmetic, address `< 2^32` by construction so it matches the interp and elides) — masking the i64 data-SP alone is un-elidable or diverges from the interp (an escape). That trick caps the elided window at 4 GiB and reworks the frontend's pointer model for one benchmark; not worth trading the clean 64-bit model. Revisit only if a real workload makes the data-SP mask a measured bottleneck |
 | D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement masking stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere. Scheduled as **Phase 3.5** (§18): port Windows, then hold Linux/Windows/macOS parity via a gating three-OS CI matrix | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
-| D52 | **Capability-boundary record/replay** as the primary debugging differentiator: all nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + deterministic mode (§12) gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5) | Proposed | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary; the control stack survives heap corruption |
-| D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`) | Proposed | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
+| D52 | **Capability-boundary record/replay** as the primary debugging differentiator: in deterministic mode (§12) nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + seeding that mode gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5). **Caveat:** under multicore + relaxed atomics (§12/§23) race outcomes bypass the cap boundary, so faithful replay must also record schedule/memory-order choices (the interp's DPOR `explore_all` already reifies these) | Proposed (premises built; surfaces unbuilt) | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary *in single-vCPU mode*; the control stack survives heap corruption |
+| D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`). **Status:** premises built (control stack, deterministic interp, SSA promotion); no stepping API, cap.call log, or §3a debug side-table yet — the side-table is step zero for DWARF | Proposed (premises built; surfaces unbuilt) | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
 | D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset) and wasm→IR bridge (compat) — vehicle priority deferred.** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | Open (strategy settled) | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
 | D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
 | D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |
