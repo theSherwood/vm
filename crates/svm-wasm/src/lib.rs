@@ -36,10 +36,10 @@
 //! import becomes a real OS-thread vCPU over the shared window via a synthesized shim (concurrency in
 //! the VM, DESIGN §1a; the same bytes `wasmtime-wasi-threads` runs — `tests/threads.rs`). Still a
 //! clean [`Error::Unsupported`] (the niche features typical clang output doesn't emit): **narrow**
-//! atomics (`*.atomic.rmw8`/`load16_u`/… — SVM atomics are 32/64-bit only), `memory.init`/`data.drop`
-//! + the `table.*` bulk ops, passive data/element segments, imported table/global/tag, imports across
-//! multiple capability interfaces (incl. wasi:thread/spawn *alongside* capability imports — the
-//! per-thread handle stash), reference types, multi-memory/multi-table.
+//! atomics (`*.atomic.rmw8`/`load16_u`/… — SVM atomics are 32/64-bit only); the `memory.init`/
+//! `data.drop`/`table.*` bulk ops; passive data/element segments; imported table/global/tag; imports
+//! across multiple capability interfaces (incl. wasi:thread/spawn *alongside* capability imports — the
+//! per-thread handle stash); reference types; multi-memory/multi-table.
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
