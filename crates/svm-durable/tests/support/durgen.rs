@@ -106,53 +106,66 @@ fn total_binop(g: &mut Gen) -> BinOp {
     }
 }
 
-/// Build an in-scope durable module: `func (i32) -> (i64)` with a randomized
-/// straight-line i64 prefix, one `cap.call` to the clock, then a suffix whose result
-/// chains off the call result (so the saved value is genuinely exercised), and a
-/// `return`.
-pub fn gen_module(g: &mut Gen) -> Module {
-    let mut insts: Vec<Inst> = Vec::new();
-    // v0 is the i32 clock handle (the function param). i64 values start empty.
-    let mut i64_vals: Vec<u32> = Vec::new();
-    let mut next: u32 = 1; // v0 is the param
+/// The single may-suspend op a generated function suspends on.
+enum Suspend {
+    /// Leaf: `cap.call` to the clock (the deepest frame).
+    Cap,
+    /// Propagated: a `call` to function `callee` (a deeper may-suspend function).
+    Call(u32),
+}
 
-    // Prefix: a few i64 consts / total binops.
+/// Build one `func (i32) -> (i64)`: a randomized i64 prefix, the `suspend` op (whose i64
+/// result is `cap_result`), then a suffix whose result chains off `cap_result` — so the
+/// saved/reloaded value is genuinely exercised — and a `return`. The single param `v0` is
+/// the clock handle, threaded down the chain as the call/`cap.call` argument.
+fn gen_func(g: &mut Gen, suspend: Suspend) -> Func {
+    let mut insts: Vec<Inst> = Vec::new();
+    let mut i64_vals: Vec<u32> = Vec::new();
+    let mut next: u32 = 1; // v0 is the i32 handle param
+
+    // Prefix: a few i64 consts / total binops (live across the suspend op for a wrapper).
     for _ in 0..g.below(6) {
         if i64_vals.len() < 2 || g.below(3) == 0 {
             insts.push(Inst::ConstI64(g.u64v() as i64));
         } else {
             let a = i64_vals[g.below(i64_vals.len() as u32) as usize];
             let b = i64_vals[g.below(i64_vals.len() as u32) as usize];
-            insts.push(Inst::IntBin {
-                ty: IntTy::I64,
-                op: total_binop(g),
-                a,
-                b,
-            });
+            insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a, b });
         }
         i64_vals.push(next);
         next += 1;
     }
 
-    // The i32 argument to the clock op, then the cap.call.
-    insts.push(Inst::ConstI32(g.u64v() as i32));
-    let arg = next;
-    next += 1;
-    insts.push(Inst::CapCall {
-        type_id: CLOCK_TYPE_ID,
-        op: CLOCK_OP,
-        sig: FuncType {
-            params: vec![ValType::I32],
-            results: vec![ValType::I64],
-        },
-        handle: 0,
-        args: vec![arg],
-    });
-    let cap_result = next;
-    next += 1;
+    // The may-suspend op, producing an i64 in `cap_result`.
+    let cap_result = match suspend {
+        Suspend::Cap => {
+            insts.push(Inst::ConstI32(g.u64v() as i32)); // the i32 clock arg
+            let arg = next;
+            next += 1;
+            insts.push(Inst::CapCall {
+                type_id: CLOCK_TYPE_ID,
+                op: CLOCK_OP,
+                sig: FuncType {
+                    params: vec![ValType::I32],
+                    results: vec![ValType::I64],
+                },
+                handle: 0,
+                args: vec![arg],
+            });
+            let r = next;
+            next += 1;
+            r
+        }
+        Suspend::Call(callee) => {
+            insts.push(Inst::Call { func: callee, args: vec![0] }); // pass the handle down
+            let r = next;
+            next += 1;
+            r
+        }
+    };
     i64_vals.push(cap_result);
 
-    // Suffix: chain off the call result so `return` depends on the saved value.
+    // Suffix: chain off the call result so `return` depends on the resumed value.
     let mut acc = cap_result;
     for _ in 0..g.below(6) {
         let b = if g.below(2) == 0 {
@@ -163,27 +176,42 @@ pub fn gen_module(g: &mut Gen) -> Module {
         } else {
             i64_vals[g.below(i64_vals.len() as u32) as usize]
         };
-        insts.push(Inst::IntBin {
-            ty: IntTy::I64,
-            op: total_binop(g),
-            a: acc,
-            b,
-        });
+        insts.push(Inst::IntBin { ty: IntTy::I64, op: total_binop(g), a: acc, b });
         acc = next;
         next += 1;
         i64_vals.push(acc);
     }
 
-    Module {
-        funcs: vec![Func {
+    Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
             params: vec![ValType::I32],
-            results: vec![ValType::I64],
-            blocks: vec![Block {
-                params: vec![ValType::I32],
-                insts,
-                term: Terminator::Return(vec![acc]),
-            }],
+            insts,
+            term: Terminator::Return(vec![acc]),
         }],
+    }
+}
+
+/// Build an in-scope durable module: a call chain `func0 → func1 → … → leaf`, of a
+/// randomized depth `1..=4`. The entry (func 0) and every wrapper propagates the suspend
+/// through a `call`; only the deepest function holds the `cap.call`. At depth 1 this is
+/// the original single-frame leaf shape.
+pub fn gen_module(g: &mut Gen) -> Module {
+    let depth = 1 + g.below(4); // 1..=4 stacked frames
+    let funcs: Vec<Func> = (0..depth)
+        .map(|i| {
+            let suspend = if i == depth - 1 {
+                Suspend::Cap
+            } else {
+                Suspend::Call(i + 1)
+            };
+            gen_func(g, suspend)
+        })
+        .collect();
+
+    Module {
+        funcs,
         memory: Some(Memory {
             size_log2: SIZE_LOG2,
         }),

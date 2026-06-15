@@ -16,20 +16,33 @@
 //! * **rewind** = in the prologue, if `REWINDING`, `br_table` on the saved resume id,
 //!   reload the live values, and continue from the resume point.
 //!
-//! # Phase 1 scope (deliberately narrow — the go/no-go gate)
+//! # Scope (single-block, single suspend point — the go/no-go gate, now with chains)
 //!
-//! The transform here handles the canonical shape: a **single-block** function with a
-//! **single `cap.call`** and a `return` terminator. That is enough to prove the core
-//! risk end-to-end on the real interpreter (`tests/roundtrip.rs`): does an in-window
-//! shadow stack + `br_table` rewind actually round-trip a frozen domain? Everything
-//! else is a mechanical extension tracked in DURABILITY.md §9:
+//! The transform handles a **single-block** function with a `return` terminator and
+//! **exactly one may-suspend operation**, which is either:
+//!
+//! * a **leaf** `cap.call` — the host performs the operation; on thaw the deepest frame
+//!   reloads the saved result and flips the state word back to `NORMAL`; or
+//! * a **propagated** `Call` to a may-suspend callee (a function that transitively
+//!   reaches a `cap.call`) — frames stack up across the call chain. On thaw a non-deepest
+//!   frame reloads its pre-call live set and **re-issues the call** (leaving the state
+//!   `REWINDING` so the callee rewinds in turn); only the innermost leaf flips to
+//!   `NORMAL`. This is the DURABILITY.md §12.7 "re-issue vs. continue" branch (R8).
+//!
+//! A function is **may-suspend** iff it contains a `cap.call` or (transitively) a `Call`
+//! to a may-suspend function; only may-suspend functions are instrumented. Everything
+//! else is enough to prove the core risk end-to-end on the real interpreter
+//! (`tests/roundtrip.rs`, `tests/chain.rs`): does an in-window shadow stack + `br_table`
+//! rewind round-trip a frozen *call chain*? The remaining extensions (DURABILITY.md §9):
 //!
 //! * multiple resume points per function (more `br_table` arms) — the dispatch and
 //!   frame machinery already generalize;
 //! * multi-block CFGs (split any block at its may-suspend calls);
-//! * call-chain propagation (a poll after `Call` to a may-suspend callee, so frames
-//!   stack up) — Phase 1 single-frame always hits the "deepest frame" rewind case;
 //! * fibers / multi-vCPU / STW (Phase 3).
+//!
+//! A `call_indirect` whose runtime target may suspend is **out of scope**: the closure
+//! cannot resolve the target, so such a call is treated as non-suspending. Durable
+//! modules must reach suspension through direct calls (the generator only emits those).
 //!
 //! Two Phase-1 simplifications are called out where they occur: the durable runtime
 //! region is carved at **low** window addresses (real placement is per-fiber and
@@ -43,6 +56,8 @@ use svm_ir::{
     BinOp, Block, BlockIdx, CmpOp, Func, FuncIdx, Inst, IntTy, LoadOp, Module, StoreOp,
     Terminator, ValIdx, ValType,
 };
+
+// `FuncIdx` is used by `SuspendKind::Propagated` below.
 
 // ---- State word values (the §2 state machine) ----
 
@@ -91,17 +106,19 @@ pub enum TransformError {
     UnsupportedInst,
 }
 
-/// Instrument every `cap.call`-bearing function in `m` for freeze/thaw. Functions with
-/// no `cap.call` are returned unchanged. The result is ordinary IR; run it through
+/// Instrument every may-suspend function in `m` for freeze/thaw. Functions that can
+/// never suspend are returned unchanged. The result is ordinary IR; run it through
 /// `svm_verify::verify_module` before executing.
 pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
     let func_results: Vec<Vec<ValType>> = m.funcs.iter().map(|f| f.results.clone()).collect();
+    let may_suspend = compute_may_suspend(m);
     let mut out = m.clone();
     let mut max_frame = 0u64;
     let mut any_instrumented = false;
 
     for (i, f) in m.funcs.iter().enumerate() {
-        if let Some((nf, frame_size)) = transform_func(f, &func_results)? {
+        if may_suspend[i] {
+            let (nf, frame_size) = transform_func(f, &func_results, &may_suspend)?;
             out.funcs[i] = nf;
             max_frame = max_frame.max(frame_size);
             any_instrumented = true;
@@ -110,6 +127,10 @@ pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
 
     if any_instrumented {
         let mem = out.memory.ok_or(TransformError::NoMemory)?;
+        // The check guarantees room for the durable region + the *largest single* frame.
+        // A live call chain stacks one frame per suspended activation, so the window must
+        // be sized for the deepest expected chain (a true guard-paged, quota-charged
+        // shadow stack with overflow trapping is DURABILITY.md §12.7 / R9 future work).
         if mem.size() < SHADOW_BASE + max_frame {
             return Err(TransformError::MemoryTooSmall);
         }
@@ -117,52 +138,111 @@ pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
     Ok(out)
 }
 
-/// Instrument one function. Returns `Ok(None)` if it has no `cap.call` (left as-is),
-/// `Ok(Some((func, frame_size)))` if instrumented, or an error for an out-of-scope shape.
+/// Mark each function that can suspend: it contains a `cap.call`, or (transitively) a
+/// direct `Call` to a may-suspend function. A least-fixed-point over the direct-call
+/// graph. `call_indirect` targets are unresolved and treated as non-suspending (see the
+/// module-level scope note).
+fn compute_may_suspend(m: &Module) -> Vec<bool> {
+    let mut ms = vec![false; m.funcs.len()];
+    for (i, f) in m.funcs.iter().enumerate() {
+        if f.blocks.iter().any(|b| {
+            b.insts.iter().any(|x| matches!(x, Inst::CapCall { .. }))
+        }) {
+            ms[i] = true;
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (i, f) in m.funcs.iter().enumerate() {
+            if ms[i] {
+                continue;
+            }
+            let calls_ms = f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|x| matches!(x, Inst::Call { func, .. } if ms[*func as usize]))
+            });
+            if calls_ms {
+                ms[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    ms
+}
+
+/// The single may-suspend operation in an instrumented block.
+enum SuspendKind {
+    /// `cap.call`: the host performs the op; the deepest frame reloads its result.
+    Leaf,
+    /// `Call` to a may-suspend callee: re-issued on thaw so the callee rewinds in turn.
+    Propagated { callee: FuncIdx, args: Vec<ValIdx> },
+}
+
+/// Instrument one may-suspend function. `Ok((func, frame_size))` on success, or an error
+/// for an out-of-scope shape. (Non-may-suspend functions are not passed here.)
 fn transform_func(
     f: &Func,
     func_results: &[Vec<ValType>],
-) -> Result<Option<(Func, u64)>, TransformError> {
-    let has_cap = f
-        .blocks
-        .iter()
-        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::CapCall { .. })));
-    if !has_cap {
-        return Ok(None);
-    }
-
-    // Phase-1 shape: single block, single cap.call, `return` terminator.
+    may_suspend: &[bool],
+) -> Result<(Func, u64), TransformError> {
+    // Shape: single block, `return` terminator.
     if f.blocks.len() != 1 {
         return Err(TransformError::UnsupportedShape);
     }
     let b = &f.blocks[0];
-    let cap_positions: Vec<usize> = b
-        .insts
-        .iter()
-        .enumerate()
-        .filter(|(_, i)| matches!(i, Inst::CapCall { .. }))
-        .map(|(p, _)| p)
-        .collect();
-    if cap_positions.len() != 1 {
-        return Err(TransformError::UnsupportedShape);
-    }
     if !matches!(b.term, Terminator::Return(_)) {
         return Err(TransformError::UnsupportedShape);
     }
-    let cc = cap_positions[0];
 
-    // Build the value-type vector for everything defined up to & including the call.
-    // `split` = number of values live just after the call; saved set = the non-param
-    // ones (params are reconstructed from the re-entry args on thaw).
+    // Exactly one may-suspend op: a `cap.call` (leaf) or a `Call` to a may-suspend callee.
+    let mut suspend: Option<(usize, SuspendKind)> = None;
+    for (pos, inst) in b.insts.iter().enumerate() {
+        let kind = match inst {
+            Inst::CapCall { .. } => Some(SuspendKind::Leaf),
+            Inst::Call { func, args } if may_suspend[*func as usize] => Some(SuspendKind::Propagated {
+                callee: *func,
+                args: args.clone(),
+            }),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            if suspend.is_some() {
+                return Err(TransformError::UnsupportedShape); // >1 resume point: future work
+            }
+            suspend = Some((pos, kind));
+        }
+    }
+    let (sc, kind) = suspend.ok_or(TransformError::UnsupportedShape)?;
+
+    // Value types up to & including the suspend op. `split` = values live just after it
+    // (the CONT param count). The suspend op's own results occupy the last `nres`.
     let p = f.params.len();
     let mut types = f.params.clone();
-    for inst in &b.insts[..=cc] {
+    for inst in &b.insts[..=sc] {
         types.extend(result_types(inst, &types, func_results)?);
     }
     let split = types.len();
-    let saved_types: Vec<ValType> = types[p..split].to_vec();
-    if saved_types.iter().any(|t| *t == ValType::V128) {
-        return Err(TransformError::UnsupportedInst); // v128 spill/reload: Phase 1+
+    let nres = match &kind {
+        SuspendKind::Leaf => match &b.insts[sc] {
+            Inst::CapCall { sig, .. } => sig.results.len(),
+            _ => unreachable!("leaf suspend op is a cap.call"),
+        },
+        SuspendKind::Propagated { callee, .. } => func_results[*callee as usize].len(),
+    };
+    // Saved (spilled) set: live values *before* the suspend op. A leaf reloads its
+    // `cap.call` result too (the host already produced it); a propagated frame re-issues
+    // the call instead, so its result is recomputed, not saved.
+    let save_end = match kind {
+        SuspendKind::Leaf => split,
+        SuspendKind::Propagated { .. } => split - nres,
+    };
+    let saved_types: Vec<ValType> = types[p..save_end].to_vec();
+    if saved_types.contains(&ValType::V128) {
+        return Err(TransformError::UnsupportedInst); // v128 spill/reload: future work
     }
 
     // Frame layout (DURABILITY.md §12.7): packed values, then resume id in the top word.
@@ -192,9 +272,9 @@ fn transform_func(
         else_args: (0..p as u32).collect(),
     });
 
-    // ---- block 1: NORMAL — original prefix + the poll after the call ----
+    // ---- block 1: NORMAL — original prefix + the poll after the suspend op ----
     let mut nb = Bb::new(f.params.clone());
-    nb.insts.extend_from_slice(&b.insts[..=cc]);
+    nb.insts.extend_from_slice(&b.insts[..=sc]);
     nb.next = split as u32;
     let st_a = nb.one(Inst::ConstI64(STATE_OFF as i64));
     let st = nb.one(load(LoadOp::I32, st_a, 0));
@@ -208,19 +288,19 @@ fn transform_func(
         else_args: all_args.clone(),
     });
 
-    // ---- block 2: CONT — original tail (post-call insts + the real return) ----
+    // ---- block 2: CONT — original tail (post-suspend insts + the real return) ----
     let cont = Block {
         params: types[0..split].to_vec(),
-        insts: b.insts[cc + 1..].to_vec(),
+        insts: b.insts[sc + 1..].to_vec(),
         term: b.term.clone(),
     };
 
-    // ---- block 3: UNWIND — spill the live set + resume id, return a placeholder ----
+    // ---- block 3: UNWIND — spill the saved set + resume id, return a placeholder ----
     let mut ub = Bb::new(types[0..split].to_vec());
     let sp_a = ub.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
-    let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // frame base (first/only push)
+    let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
     for (j, &t) in saved_types.iter().enumerate() {
-        // the saved value is param index `p + j` of this block
+        // the saved value is block-local index `p + j` (saved set is contiguous [p, save_end))
         ub.zero(store(store_op(t), sp, (p + j) as u32, frame_offsets[j]));
     }
     let rid = ub.one(Inst::ConstI32(1)); // single resume point ⇒ id 1
@@ -245,7 +325,7 @@ fn transform_func(
         default: (TRAP, vec![]),
     });
 
-    // ---- block 5: ARM0 — reload the live set, flip to NORMAL, continue ----
+    // ---- block 5: ARM0 — reload the saved set, pop, then resume the suspend op ----
     let mut ab = Bb::new(f.params.clone());
     let sp_a = ab.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
     let sp = ab.one(load(LoadOp::I64, sp_a, 0));
@@ -256,18 +336,48 @@ fn transform_func(
         reloaded.push(ab.one(load(load_op(t), base, frame_offsets[j])));
     }
     ab.zero(store(StoreOp::I64, sp_a, base, 0)); // pop: SP = frame base
-                                                 // Phase 1 is always the deepest frame (single function, single frame), so we
-                                                 // unconditionally return to NORMAL here. Multi-frame propagation will instead
-                                                 // re-issue the in-flight call when `base != SHADOW_BASE` (DURABILITY.md §12.7).
-    let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
-    let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
-    ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+
+    // CONT expects `split` args: params, then every value defined up to & including the
+    // suspend op. The first `save_end` come from params + the reloaded set; the suspend
+    // op's `nres` results are produced here per kind.
     let mut cont_args: Vec<ValIdx> = (0..p as u32).collect();
-    cont_args.extend(reloaded);
-    let arm0 = ab.finish(Terminator::Br {
-        target: CONT,
-        args: cont_args,
-    });
+    cont_args.extend(reloaded.iter().copied());
+
+    let arm0 = match kind {
+        SuspendKind::Leaf => {
+            // Deepest frame: the host already performed the `cap.call`, whose result is in
+            // the reloaded set. Flip the state word back to NORMAL and fall into CONT.
+            let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+            let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+            ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+            ab.finish(Terminator::Br {
+                target: CONT,
+                args: cont_args,
+            })
+        }
+        SuspendKind::Propagated { callee, args } => {
+            // Non-deepest frame (R8): the in-flight op was a call into a may-suspend callee.
+            // Leave the state word REWINDING and *re-issue the call*, so the callee runs
+            // its own prologue→dispatch and rewinds. Map the call's original operands to
+            // their reloaded values (params map to themselves; saved values to `reloaded`).
+            let mapped: Vec<ValIdx> = args
+                .iter()
+                .map(|&a| {
+                    if (a as usize) < p {
+                        a
+                    } else {
+                        reloaded[a as usize - p]
+                    }
+                })
+                .collect();
+            let results = ab.many(Inst::Call { func: callee, args: mapped }, nres);
+            cont_args.extend(results);
+            ab.finish(Terminator::Br {
+                target: CONT,
+                args: cont_args,
+            })
+        }
+    };
 
     // ---- block 6: TRAP — br_table default / forged resume id ----
     let trap = Block {
@@ -281,7 +391,7 @@ fn transform_func(
         results: f.results.clone(),
         blocks: vec![prologue, normal, cont, unwind, dispatch, arm0, trap],
     };
-    Ok(Some((func, frame_size)))
+    Ok((func, frame_size))
 }
 
 // ---- window helpers for freeze/thaw drivers and tests ----
@@ -331,6 +441,13 @@ impl Bb {
         self.insts.push(i);
         self.next += 1;
         idx
+    }
+    /// Push an instruction that defines `nres` consecutive values; returns their indices.
+    fn many(&mut self, i: Inst, nres: usize) -> Vec<ValIdx> {
+        let start = self.next;
+        self.insts.push(i);
+        self.next += nres as u32;
+        (start..self.next).collect()
     }
     /// Push a zero-result instruction (a store).
     fn zero(&mut self, i: Inst) {
@@ -459,10 +576,6 @@ fn load_result_ty(op: LoadOp) -> ValType {
     }
 }
 
-// Keep `FuncIdx` referenced for readers grepping the public surface; the transform
-// indexes funcs by position above.
-const _: fn(FuncIdx) = |_| {};
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +615,36 @@ mod tests {
             18,
         );
         assert_eq!(transform_module(&m), Err(TransformError::UnsupportedShape));
+    }
+
+    #[test]
+    fn propagated_chain_instruments_each_frame() {
+        // A two-level chain: the caller suspends on its `call` to the leaf, the leaf on
+        // its `cap.call`. Both are may-suspend, so both get the 7-block instrumentation.
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = call 1 (v0)\n  return v1\n}\nfunc (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n}\n",
+            18,
+        );
+        let out = transform_module(&m).expect("transform");
+        svm_verify::verify_module(&out).expect("instrumented chain must verify");
+        assert_eq!(out.funcs[0].blocks.len(), 7, "caller (propagated) instrumented");
+        assert_eq!(out.funcs[1].blocks.len(), 7, "callee (leaf) instrumented");
+    }
+
+    #[test]
+    fn non_suspending_callee_is_left_unchanged() {
+        // func 0 (leaf cap.call) calls func 1 (a pure helper) as a *prefix* op. The helper
+        // never suspends, so it is not instrumented and func 0's only suspend point is its
+        // own cap.call; the helper's result is spilled/reloaded, never re-issued.
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = call 1 (v0)\n  v2 = i32.const 0\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v2)\n  v4 = i64.add v1 v3\n  return v4\n}\nfunc (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 5\n  return v1\n}\n",
+            18,
+        );
+        let helper_before = m.funcs[1].clone();
+        let out = transform_module(&m).expect("transform");
+        svm_verify::verify_module(&out).expect("verify");
+        assert_eq!(out.funcs[0].blocks.len(), 7, "leaf instrumented");
+        assert_eq!(out.funcs[1], helper_before, "non-suspending helper untouched");
     }
 
     #[test]

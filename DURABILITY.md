@@ -288,13 +288,13 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     `cap.call`, `return`); the §12.7 frame layout; the round-trip + inert-instrumentation
     + verifier tests.
   - **Remaining Phase-1 work** (mechanical extensions): multiple resume points per
-    function (more `br_table` arms); multi-block CFGs; call-chain propagation (poll
-    after `Call` to a may-suspend callee → real multi-frame stacks, exercising the
-    non-deepest rewind path); minimal live-set instead of the current over-capture.
+    function (more `br_table` arms); multi-block CFGs; minimal live-set instead of the
+    current over-capture. *(Call-chain propagation — poll after `Call` to a may-suspend
+    callee, real multi-frame stacks, the non-deepest re-issue rewind path — is **done**:
+    R8 below.)*
   - **Hazards introduced by the as-built transform: R8–R11 (§11).** Notably R9 —
     **do not run real guests through the Phase-1 transform** (the durable region at
-    `[0, SHADOW_BASE)` is unenforced) — and R8 (the deepest-frame assumption that
-    call-chain propagation must revisit).
+    `[0, SHADOW_BASE)` is unenforced).
 - **[ ] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT;
   `svm-mem` page+prot snapshot/**restore**. Risk: low (oracle does the work);
   Windows placeholder semantics the known annoyance. *(escape-TCB touch — restore.)*
@@ -332,7 +332,7 @@ than miscompiling, so these are latent/extension hazards, not silent-miscompile 
 
 | # | Risk / question | Where | Status |
 | --- | --- | --- | --- |
-| R8 | **Deepest-frame assumption.** `ARM0` unconditionally flips to `NORMAL` on rewind because the Phase-1 scope guarantees a single shadow frame. Correct today, but **wrong the moment call-chain propagation lands** without the non-deepest branch (re-issue vs. continue). Needs a multi-frame test when extended. | §2, §12.7, `svm-durable` | open |
+| R8 | **Call-chain propagation landed; deepest-frame assumption resolved.** The transform now instruments any may-suspend function (transitive `cap.call` closure over the direct-call graph) whose single block suspends on one op: a leaf `cap.call` (reload result + flip `NORMAL`) **or** a propagated `Call` (reload pre-call live set + **re-issue the call**, leaving the state `REWINDING` so the callee rewinds). Real multi-frame stacks; only the innermost leaf flips to `NORMAL`. Covered by `tests/chain.rs` (2-/3-level chains, live-value-across-call) and the generator now emits depth-`1..=4` chains, so the interp (`durable_fuzz`) and cross-backend (`durable_jit`) properties exercise it. Remaining: multiple resume points / multi-block (still `UnsupportedShape`); `call_indirect` to a may-suspend target is out of scope (treated non-suspending); a deep chain needs a window sized for the summed frames (true guard-paged shadow stack is R9/§12.7). | §2, §12.7, `svm-durable` | addressed (Phase-1 scope) |
 | R9 | **Unenforced low-address durable region.** The state word + shadow stack sit at `[0, SHADOW_BASE)` and nothing checks an instrumented guest doesn't use that range → silent mutual corruption on a real guest. Phase-1 only; the per-fiber guard-paged placement (§12.7) is the fix. **Do not run real guests through the Phase-1 transform.** | §12.7, `svm-durable` | open |
 | R10 | **No concurrency protection on the in-window control state** (state word, shadow-SP). Fine at single-vCPU; a hazard once fibers/multi-vCPU arrive (relates to R1, but specifically about the control words racing). | §3, §12.7 | open |
 | R11 | **Equivalence now fuzzed (Phase-1 scope), both single-backend and cross-backend.** The §7/§12.6 property runs over a generator of **in-scope** durable modules: (a) interpreter-only — *inert in `NORMAL`* (instrumented == un-instrumented) and *round-trip* (freeze→serialize→restore→thaw ≡ uninterrupted, reload-not-reissue) — `crates/svm-durable/tests/durable_fuzz.rs` + libFuzzer `fuzz/fuzz_targets/durable.rs`; (b) cross-backend — interp vs Cranelift JIT agree on the NORMAL result, leave a **byte-identical freeze artifact**, and a JIT thaw of the **interpreter-frozen** artifact under a different host clock reproduces the result — `crates/svm/tests/durable_jit.rs` + libFuzzer `fuzz/fuzz_targets/durable_jit.rs`. Both stable drivers run in CI without nightly. Coverage broadens automatically as the transform generalizes (R8). | §7, §12.6 | addressed (Phase-1 scope) |
