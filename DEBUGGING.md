@@ -47,7 +47,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
 | `cap.call` I/O record log | **Missing** | — |
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
-| Interpreter stepping / breakpoint / watchpoint API | **Missing** | — |
+| Interpreter stepping / breakpoint / backtrace / value+window read | **Built — slice 1** | `svm-interp` `Inspector` (single-threaded; watchpoints + multithread pending) |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | `§3a` IR debug-info side-table (source locations in IR) | **Missing** (IR has no loc fields) | `svm-ir`, frontend `codegen_ir.c` |
 | DWARF emission + DAP server | **Missing** | — |
@@ -612,6 +612,30 @@ Three consequences:
 
 This pins S2 against S1 (`IrPcRange` keys on `IrPc`) and **closes the interpreter-path core:
 S1–S5 settled, only S6 (JIT-tier) remains.**
+
+### Built — Milestone A slice 1 (`svm-interp::Inspector`)
+
+First implementation landed against these designs (`crates/svm-interp/src/lib.rs`, tests in
+`crates/svm/tests/debug.rs`):
+
+- **S4 seam** — `VCpu` gained `debug: Option<Box<DebugCtx>>`; the per-op hook in `run_inner`
+  consults `DebugCtx::before_op(IrPc)` and returns the new `Inner::Pause`/`Step::Pause` on a
+  hit. `None` is the untouched hot path (S7); the scheduler/coroutine paths assert the pause is
+  unreachable (only an `Inspector`-driven vCPU carries `debug`).
+- **S5 driver** — `Inspector::attach` → `run_until_stop` / `step`, with `set_breakpoint` /
+  `clear_breakpoint`, `backtrace`, `read_ir_value` (S2 `Ssa` resolution straight from
+  `Frame::vals`), and `read_window` (S2 `Window` resolution via a new `Mem::read_window`).
+- **S1/S3 confirmed in code** — `IrPc { module, func, block, inst }`; `clock` = ops executed
+  (non-terminator granularity — terminators live in `Block::terminator`, not `insts`, so they
+  are not step points).
+
+Five tests cover run-to-completion transparency, per-iteration breakpoints with value reads, a
+single-step that advances exactly one op + ticks the clock, a two-frame backtrace inside a
+callee, and a window read-back. Full workspace suite stays green.
+
+**Not yet (next slices):** watchpoints (the S4 `access_of` extension), capability-using guests
+(grant into the Inspector's `Host`), multithreaded debugging (the `Policy` scheduler seam,
+Milestone B), and the source mapping (W4).
 
 ### Open questions (S4/S5/S2)
 
