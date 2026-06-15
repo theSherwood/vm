@@ -156,6 +156,25 @@ fn shifts_and_divrem() {
 }
 
 #[test]
+fn stack_array_sum() {
+    // An address-taken stack array indexed by a loop variable — `-O2` keeps it in memory
+    // (`alloca [N x i32]`, GEP, store/load), exercising the §3d data-stack frame. n ≤ 8 (array
+    // bound). sum of i*i for i in 0..n.
+    let src = "int sumsq(int n){ int a[8]; for(int i=0;i<n;i++) a[i]=i*i; int s=0; for(int i=0;i<n;i++) s+=a[i]; return s; }";
+    check("sumsq_5", src, &[Value::I32(5)], &[Value::I32(30)]); // 0+1+4+9+16
+    check("sumsq_8", src, &[Value::I32(8)], &[Value::I32(140)]); // +25+36+49
+    check("sumsq_0", src, &[Value::I32(0)], &[Value::I32(0)]);
+}
+
+#[test]
+fn stack_array_reverse() {
+    // Write then read in reverse — distinct store and load address arithmetic over the frame.
+    let src = "int revsum(int n){ int a[8]; for(int i=0;i<n;i++) a[i]=i+1; int s=0; for(int i=n-1;i>=0;i--) s=s*10+a[i]; return s; }";
+    check("rev_4", src, &[Value::I32(4)], &[Value::I32(4321)]);
+    check("rev_3", src, &[Value::I32(3)], &[Value::I32(321)]);
+}
+
+#[test]
 fn unsupported_is_fail_closed() {
     // A float return is outside slice A — it must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).

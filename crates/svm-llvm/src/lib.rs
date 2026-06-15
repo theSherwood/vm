@@ -58,20 +58,36 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Module, Error> {
 /// Translate an already-parsed `llvm-ir` module.
 pub fn translate(m: &LModule) -> Result<Module, Error> {
     let mut funcs = Vec::with_capacity(m.functions.len());
+    let mut frame_end = 0u64; // high-water mark of any function's data-stack frame
     for f in &m.functions {
         // Declaration-only functions (e.g. an undefined extern / intrinsic prototype) have no
         // body to translate; skip them. A *call* to one needs call support (a later slice).
         if f.basic_blocks.is_empty() {
             continue;
         }
-        funcs.push(translate_func(f, &m.types)?);
+        let (func, end) = translate_func(f, &m.types)?;
+        frame_end = frame_end.max(end);
+        funcs.push(func);
     }
+    // A window is declared only if some function uses the data stack (`alloca`). Functions lay
+    // their frames at absolute offsets from `FRAME_BASE`; with no calls yet, only one function is
+    // ever active, so the frames may overlap — the window need only fit the largest (calls will
+    // introduce the §3d threaded data-SP for per-activation frames).
+    let memory = (frame_end > 0).then(|| {
+        let need = frame_end.max(1);
+        let log2 = (64 - (need - 1).leading_zeros()).max(16) as u8;
+        svm_ir::Memory { size_log2: log2 }
+    });
     Ok(Module {
         funcs,
-        memory: None,
+        memory,
         data: Vec::new(),
     })
 }
+
+/// The low window offset where data-stack frames begin (keeps `alloca` addresses away from a
+/// null-like 0). §3d will replace these absolute offsets with a threaded data-SP once calls land.
+const FRAME_BASE: u64 = 16;
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
 /// are memory widths only, not SSA value types); `i64` stays `i64`. Non-byte widths (`i33`,
@@ -81,7 +97,24 @@ fn val_type(ty: &Type) -> Result<ValType, Error> {
         Type::IntegerType { bits } if *bits <= 32 => Ok(ValType::I32),
         Type::IntegerType { bits } if *bits == 64 => Ok(ValType::I64),
         Type::IntegerType { bits } => unsup(format!("integer width i{bits} (Milestone 1+)")),
+        // Pointers are an erasable refinement of `i64` (§3a/§10) — a window offset.
+        Type::PointerType { .. } => Ok(ValType::I64),
         other => unsup(format!("type {other} (Milestone 1+)")),
+    }
+}
+
+/// The size in bytes of an LLVM type (the SysV/§3d layout for the subset we lower). Used to lay
+/// out `alloca` frames and compute GEP strides. Aggregates beyond arrays (structs/vectors) and
+/// odd scalars are a clean `Unsupported` until a later slice.
+fn type_size(ty: &Type) -> Result<u64, Error> {
+    match ty {
+        Type::IntegerType { bits } => Ok((*bits as u64).div_ceil(8).max(1)),
+        Type::PointerType { .. } => Ok(8),
+        Type::ArrayType {
+            element_type,
+            num_elements,
+        } => Ok(*num_elements as u64 * type_size(element_type.as_ref())?),
+        other => unsup(format!("size of type {other} (Milestone 1+)")),
     }
 }
 
@@ -121,7 +154,7 @@ struct Scan {
     block_name: Vec<Name>,
 }
 
-fn translate_func(f: &Function, types: &Types) -> Result<Func, Error> {
+fn translate_func(f: &Function, types: &Types) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
         return unsup(format!("varargs function `{}`", f.name));
     }
@@ -141,16 +174,62 @@ fn translate_func(f: &Function, types: &Types) -> Result<Func, Error> {
     let scan = scan_func(f, types)?;
     let live_in = liveness(f, &scan)?;
     let block_params = block_params(f, &scan, &live_in);
+    let (frame, frame_end) = frame_layout(f, &scan)?;
 
     let mut blocks = Vec::with_capacity(f.basic_blocks.len());
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
-        blocks.push(translate_block(bb, bi, f, types, &scan, &block_params)?);
+        blocks.push(translate_block(
+            bb,
+            bi,
+            f,
+            types,
+            &scan,
+            &block_params,
+            &frame,
+        )?);
     }
-    Ok(Func {
-        params,
-        results,
-        blocks,
-    })
+    Ok((
+        Func {
+            params,
+            results,
+            blocks,
+        },
+        frame_end,
+    ))
+}
+
+/// Lay out every `alloca`'s data-stack slot at an absolute window offset (from [`FRAME_BASE`],
+/// natural-aligned), returning the `alloca`-id → offset map and the frame's high-water mark (so
+/// the module can size its window). A dynamic (`num_elements` non-constant) `alloca` is a clean
+/// `Unsupported` for now.
+fn frame_layout(f: &Function, s: &Scan) -> Result<(HashMap<ValueId, u64>, u64), Error> {
+    let mut frame = HashMap::new();
+    let mut off = FRAME_BASE;
+    for bb in &f.basic_blocks {
+        for instr in &bb.instrs {
+            if let Instruction::Alloca(a) = instr {
+                let n = match &a.num_elements {
+                    Operand::ConstantOperand(c) => match c.as_ref() {
+                        Constant::Int { value, .. } => *value,
+                        _ => return unsup("dynamic alloca (non-constant element count)"),
+                    },
+                    _ => return unsup("dynamic alloca (non-constant element count)"),
+                };
+                let size = type_size(a.allocated_type.as_ref())?.saturating_mul(n);
+                // Natural alignment: the larger of the element size (capped at 8) and the
+                // `alloca`'s declared alignment; round the running offset up to it.
+                let align = (type_size(a.allocated_type.as_ref())?.min(8))
+                    .max(a.alignment as u64)
+                    .max(1);
+                off = off.div_ceil(align) * align;
+                if let Some(&vid) = s.name2id.get(&a.dest) {
+                    frame.insert(vid, off);
+                }
+                off += size.max(1);
+            }
+        }
+    }
+    Ok((frame, off))
 }
 
 /// Pass 1a: assign a `ValueId` to every SSA value (parameters first, then per block the φ-results
@@ -227,11 +306,46 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         I::Trunc(x) => locals(&[&x.operand]),
         I::ZExt(x) => locals(&[&x.operand]),
         I::SExt(x) => locals(&[&x.operand]),
+        // Memory (§3d two-stack: address-taken locals live on the in-window data stack).
+        I::Alloca(a) => locals(&[&a.num_elements]),
+        I::Load(l) => locals(&[&l.address]),
+        I::Store(st) => locals(&[&st.address, &st.value]),
+        I::GetElementPtr(g) => {
+            let mut v = locals(&[&g.address]);
+            v.extend(g.indices.iter().filter_map(|o| match o {
+                Operand::LocalOperand { name, .. } => Some(name.clone()),
+                _ => None,
+            }));
+            v
+        }
+        // A droppable intrinsic (`llvm.lifetime`/`dbg`/`assume`) contributes no real uses — it is
+        // a no-op (below). Any other call needs call support (a later slice).
+        I::Call(c) if is_droppable_call(c) => Vec::new(),
         // A φ's operands are edge uses, handled in liveness via `PhiUses`.
         I::Phi(_) => Vec::new(),
         other => return unsup(format!("instruction {other:?}")),
     };
     Ok(r)
+}
+
+/// Whether a `call` is a droppable intrinsic with no guest-visible effect for our subset —
+/// `llvm.lifetime.*` (stack-slot liveness markers), `llvm.dbg.*` (debug info), `llvm.assume`.
+/// These are lowered to nothing.
+fn is_droppable_call(c: &llvm_ir::instruction::Call) -> bool {
+    let Some(Operand::ConstantOperand(cr)) = c.function.as_ref().right() else {
+        return false;
+    };
+    if let Constant::GlobalReference {
+        name: Name::Name(s),
+        ..
+    } = cr.as_ref()
+    {
+        return s.starts_with("llvm.lifetime")
+            || s.starts_with("llvm.dbg")
+            || s.starts_with("llvm.assume")
+            || s.starts_with("llvm.invariant");
+    }
+    false
 }
 
 /// The local value operands a terminator uses (the branch condition / returned value). Validates
@@ -401,6 +515,8 @@ fn block_params(f: &Function, s: &Scan, live_in: &[HashSet<ValueId>]) -> Vec<Vec
 /// (seeded with the block's parameters), and the running block-local value counter.
 struct BlockCtx<'a> {
     s: &'a Scan,
+    /// `alloca` value-id → its absolute window offset (the data-stack frame layout).
+    frame: &'a HashMap<ValueId, u64>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     next_val: ValIdx,
@@ -412,6 +528,34 @@ impl<'a> BlockCtx<'a> {
         let i = self.next_val;
         self.next_val += 1;
         i
+    }
+
+    /// Append an instruction that produces **no** SSA value (e.g. `store`). It must not consume a
+    /// block-local value index — the verifier/interpreter number only value-producing insts (§3a).
+    fn push_effect(&mut self, inst: Inst) {
+        self.insts.push(inst);
+    }
+
+    fn const_i64(&mut self, v: i64) -> ValIdx {
+        self.push(Inst::ConstI64(v))
+    }
+
+    fn add_i64(&mut self, a: ValIdx, b: ValIdx) -> ValIdx {
+        self.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Add,
+            a,
+            b,
+        })
+    }
+
+    fn mul_i64(&mut self, a: ValIdx, b: ValIdx) -> ValIdx {
+        self.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Mul,
+            a,
+            b,
+        })
     }
 
     /// Resolve a value-id already available in this block (a parameter or an earlier result).
@@ -441,6 +585,15 @@ impl<'a> BlockCtx<'a> {
                 Constant::Int { bits, value } if *bits == 64 => {
                     Ok(self.push(Inst::ConstI64(*value as i64)))
                 }
+                // `undef`/`poison`/`null` resolve to a defined zero of the type — the IR is total
+                // (§3c), so no UB reaches it (the value is unused or its use is defined-on-zero).
+                Constant::Undef(t) | Constant::Poison(t) | Constant::Null(t) => {
+                    match val_type(t.as_ref())? {
+                        ValType::I32 => Ok(self.push(Inst::ConstI32(0))),
+                        ValType::I64 => Ok(self.push(Inst::ConstI64(0))),
+                        other => unsup(format!("undef/poison/null of type {}", other.as_str())),
+                    }
+                }
                 other => unsup(format!("constant operand {other:?}")),
             },
             Operand::MetadataOperand => unsup("metadata operand"),
@@ -448,6 +601,7 @@ impl<'a> BlockCtx<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_block(
     bb: &BasicBlock,
     bi: usize,
@@ -455,11 +609,13 @@ fn translate_block(
     types: &Types,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    frame: &HashMap<ValueId, u64>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     let params: Vec<ValType> = param_ids.iter().map(|&v| s.ty[v]).collect();
     let mut ctx = BlockCtx {
         s,
+        frame,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         next_val: 0,
@@ -489,7 +645,58 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     let bin_ty =
         |o: &Operand| -> Result<IntTy, Error> { int_ty(val_type(o.get_type(types).as_ref())?) };
 
+    // No-result instructions (effects only): handle and return early.
+    if let I::Store(st) = instr {
+        let addr = ctx.operand(&st.address)?;
+        let value = ctx.operand(&st.value)?;
+        let op = store_op(st.value.get_type(types).as_ref())?;
+        ctx.push_effect(Inst::Store {
+            op,
+            addr,
+            value,
+            offset: 0,
+            align: 0,
+        });
+        return Ok(());
+    }
+    if let I::Call(c) = instr {
+        if is_droppable_call(c) {
+            return Ok(()); // a no-op intrinsic (lifetime/dbg/assume)
+        }
+        return unsup("call (Milestone 1+ — needs call support)");
+    }
+
     let (dest, idx) = match instr {
+        I::Alloca(a) => {
+            // The slot's absolute window offset (laid out by `frame_layout`).
+            let vid = *ctx
+                .s
+                .name2id
+                .get(&a.dest)
+                .ok_or_else(|| Error::Unsupported("alloca without result".into()))?;
+            let off = *ctx
+                .frame
+                .get(&vid)
+                .ok_or_else(|| Error::Unsupported("alloca missing frame slot".into()))?;
+            (&a.dest, ctx.const_i64(off as i64))
+        }
+        I::Load(l) => {
+            let addr = ctx.operand(&l.address)?;
+            let op = load_op(l.loaded_ty.as_ref())?;
+            (
+                &l.dest,
+                ctx.push(Inst::Load {
+                    op,
+                    addr,
+                    offset: 0,
+                    align: 0,
+                }),
+            )
+        }
+        I::GetElementPtr(g) => {
+            let addr = translate_gep(ctx, g, types)?;
+            (&g.dest, addr)
+        }
         I::Add(x) => bin(
             ctx,
             &x.dest,
@@ -648,6 +855,84 @@ fn bin<'d>(
     let a = ctx.operand(a)?;
     let b = ctx.operand(b)?;
     Ok((dest, ctx.push(Inst::IntBin { ty, op, a, b })))
+}
+
+/// The `LoadOp` (width + result container) for an LLVM loaded type. Narrow loads zero-extend
+/// into the `i32` container; a following `sext`/`zext` (the §3b discipline) fixes signedness.
+fn load_op(ty: &Type) -> Result<svm_ir::LoadOp, Error> {
+    use svm_ir::LoadOp as L;
+    match ty {
+        Type::IntegerType { bits } if *bits <= 8 => Ok(L::I32_8U),
+        Type::IntegerType { bits } if *bits <= 16 => Ok(L::I32_16U),
+        Type::IntegerType { bits } if *bits <= 32 => Ok(L::I32),
+        Type::IntegerType { bits } if *bits == 64 => Ok(L::I64),
+        Type::PointerType { .. } => Ok(L::I64),
+        other => unsup(format!("load of type {other} (Milestone 1+)")),
+    }
+}
+
+/// The `StoreOp` (width) for an LLVM stored value type.
+fn store_op(ty: &Type) -> Result<svm_ir::StoreOp, Error> {
+    use svm_ir::StoreOp as S;
+    match ty {
+        Type::IntegerType { bits } if *bits <= 8 => Ok(S::I32_8),
+        Type::IntegerType { bits } if *bits <= 16 => Ok(S::I32_16),
+        Type::IntegerType { bits } if *bits <= 32 => Ok(S::I32),
+        Type::IntegerType { bits } if *bits == 64 => Ok(S::I64),
+        Type::PointerType { .. } => Ok(S::I64),
+        other => unsup(format!("store of type {other} (Milestone 1+)")),
+    }
+}
+
+/// Lower a `getelementptr` to an `i64` address: `base + Σ index_k · stride_k`, where the first
+/// index strides by the pointee size and each later index walks into an array element (struct/
+/// vector indexing is a later slice). Constant indices fold into one offset add; variable indices
+/// emit a `mul`+`add` (the index sign-extended to `i64`).
+fn translate_gep(
+    ctx: &mut BlockCtx,
+    g: &llvm_ir::instruction::GetElementPtr,
+    types: &Types,
+) -> Result<ValIdx, Error> {
+    let mut addr = ctx.operand(&g.address)?;
+    let mut cur = g.source_element_type.clone();
+    let mut const_off: i64 = 0;
+    for (k, idx) in g.indices.iter().enumerate() {
+        let stride = if k == 0 {
+            type_size(cur.as_ref())?
+        } else {
+            match cur.as_ref() {
+                Type::ArrayType { element_type, .. } => {
+                    let s = type_size(element_type.as_ref())?;
+                    cur = element_type.clone();
+                    s
+                }
+                other => return unsup(format!("GEP into type {other} (Milestone 1+)")),
+            }
+        };
+        // Constant index → fold into the running byte offset.
+        if let Operand::ConstantOperand(c) = idx {
+            if let Constant::Int { value, .. } = c.as_ref() {
+                const_off += (*value as i64).wrapping_mul(stride as i64);
+                continue;
+            }
+        }
+        // Variable index → `addr += sext_i64(idx) * stride`.
+        let bits = src_bits(idx, types)?;
+        let iv = ctx.operand(idx)?;
+        let iv64 = if bits >= 64 {
+            iv
+        } else {
+            emit_ext(ctx, iv, bits, 64, true)
+        };
+        let sv = ctx.const_i64(stride as i64);
+        let term = ctx.mul_i64(iv64, sv);
+        addr = ctx.add_i64(addr, term);
+    }
+    if const_off != 0 {
+        let c = ctx.const_i64(const_off);
+        addr = ctx.add_i64(addr, c);
+    }
+    Ok(addr)
 }
 
 fn icmp_op(p: IntPredicate) -> CmpOp {
