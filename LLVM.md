@@ -165,10 +165,15 @@ The MVP target is the subset the chibicc demos already exercise. Mapping sketch 
 `llvm.trap` → `trap`; `llvm.*.with.overflow`, `llvm.ctlz/cttz/ctpop` → the `clz/ctz/popcnt`
 ops or expansions. **Everything else → fail-closed `Unsupported`.**
 
-**Ingest pass pipeline (the "legalize to the subset" step, PNaCl `abi-simplify` analog):**
-run `mem2reg`+SROA (force the two-stack split, §3a), split critical edges (φ→block-param),
-expand unsupported intrinsics where a legal expansion exists, and lower `switch` if needed
-— *then* translate. This pipeline is where "pin a frozen subset" is enforced in practice.
+**Ingest pass pipeline (the "legalize to the subset" step, PNaCl `abi-simplify` analog) —
+run out-of-process (DECIDED, §8 Q1/Q2):** `clang -O2 -emit-llvm -fno-vectorize
+-fno-slp-vectorize` already runs `mem2reg`+SROA, so the bitcode arrives with scalars
+promoted to SSA and only address-taken `alloca`s left — *the two-stack split (§3a) for
+free* — while `-fno-*-vectorize` keeps SIMD out of the MVP. For anything more (critical-edge
+splitting for φ→block-param, intrinsic/`switch` lowering) shell out to `opt -passes=...`.
+We **never run an in-process pass manager and never reimplement `mem2reg`** (PNaCl shipped
+`pnacl-opt`; same model). This pipeline is where "pin a frozen subset" is enforced in
+practice; the translator then ingests the legalized `.bc` read-only (§6).
 
 ---
 
@@ -219,13 +224,16 @@ A new workspace crate **`crates/svm-llvm`**, modeled on `svm-wasm`:
 
 - **Deps:** `svm-ir` (produce the Module). **Dev-deps:** `svm-text`/`svm-verify`/
   `svm-interp`/`svm-jit`/`svm-run` (the differential lanes), mirroring `svm-wasm/Cargo.toml`.
-- **LLVM ingest binding — recommended `llvm-ir` (which parses bitcode via `llvm-sys`) or
-  `inkwell`, pinned to the LLVM-18 feature.** `llvm-ir` gives an owned Rust AST that is
-  pleasant to walk for a translator; `inkwell` is the safe wrapper if we need to *run* the
-  legalize passes (§4) in-process. **Open: pick one** (§8). Either way the libLLVM link is
-  build/dev-time only — gated so it never enters `svm-jit`/`svm-interp` (the D54 "off the
-  runtime path" rule). If the binding proves heavy, the fallback is to shell out to
-  `clang`/`opt` for legalization and parse the result, keeping libLLVM out of the Rust build.
+- **LLVM ingest binding — `llvm-ir` 0.11.3, feature `llvm-18` (DECIDED, §8 Q1).** It reads
+  the legalized `.bc` via `llvm-sys` and hands the translator an **owned, pure-Rust AST**
+  (`enum Instruction`), so the translator is a boring pattern-match-and-emit walk — no
+  lifetimes, no `unsafe`, no LLVM context juggling (AGENTS.md "boring obvious"). It is *not*
+  asked to run passes (legalization is out-of-process, §4), so its read-only nature is no
+  loss. The libLLVM link it pulls in (via `llvm-sys`) is **build/dev-time only** and gated
+  so it never enters `svm-jit`/`svm-interp` (the D54 "off the runtime path" rule). Fallbacks
+  if it bites: `inkwell` (the maintained, version-tracking wrapper — same C-API limits) →
+  then a hand-rolled `.ll` parser over `opt -S` output (zero libLLVM link, but a rot-prone
+  parser we'd own). See §8 Q1 for why `llvm-ir` won.
 - **Output:** verifier-checked IR `Module`, re-verified in tests (untrusted-frontend, §2a).
 - **Tests:** `crates/svm-llvm/tests/` — a `translate.rs` (hand-written `.ll` snippets, the
   unit oracle) and the demo differential lane (Lane C above).
@@ -241,7 +249,10 @@ Severity/coverage key mirrors `WASM.md`: **🟢 MVP**, **🟡 fail-closed gap (w
 demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 
 ### Milestone 0 — scaffold & first light 🟢
-- [ ] Settle §6 decisions (binding, LLVM-18 pin, CI gating). 
+- [x] Binding decided: `llvm-ir` 0.11.3 / `llvm-18` (§6, §8 Q1). Legalize out-of-process
+      via `clang -O2 -emit-llvm` (+ `opt` as needed) (§4, §8 Q2).
+- [ ] CI gating: make `svm-llvm` an opt-in **Linux-dev-only** lane; confirm the cross-OS
+      runtime matrix still builds without libLLVM (§8 Q4).
 - [ ] `crates/svm-llvm` skeleton: ingest a `.bc`, walk functions/blocks, emit a trivial
       `ret`-only Module; verify it.
 - [ ] Hand-written `.ll` → IR unit tests for arithmetic + `ret` (the `translate.rs` oracle).
@@ -279,20 +290,38 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 
 ---
 
-## 8. Open questions (settle as we go)
+## 8. Decisions & open questions
 
-1. **Ingest binding:** `llvm-ir` (owned AST, easy walk) vs `inkwell` (run passes in-process)
-   vs shell-out to `clang`/`opt` + parse. Leaning `llvm-ir` for the translator + shelling
-   out `clang -emit-llvm`/`opt` for legalization, to keep libLLVM out of the Rust link if we
-   can. **First decision to make.**
-2. **Optimization level of ingested bitcode:** `-O1`/`-O2` (LLVM runs `mem2reg` for us, but
-   brings vectorization + more intrinsics) vs `-O0` + our own `mem2reg` pass. Leaning
-   *opt-but-no-vectorize* (`-O2 -fno-vectorize -fno-slp-vectorize`) so the two-stack split is
-   free, while keeping SIMD out of the MVP.
-3. **Pin mechanics:** how strictly to reject off-version bitcode, and where the frozen-subset
-   allow-list lives (a single `unsup(...)`-style chokepoint, like `svm-wasm`).
-4. **CI gating:** the libLLVM dep must not bloat or break the default workspace build —
-   feature-gate the crate / make it an opt-in test lane, confirm cross-OS CI still builds.
+**Q1 — Ingest binding (DECIDED): `llvm-ir` 0.11.3, feature `llvm-18`.** The decision splits
+into two independent sub-questions, and separating them is what makes it clear:
+*(a) how to legalize* (Q2) and *(b) how to read the module*. The binding question is only
+(b). Because legalization is out-of-process (Q2), the binding never needs an in-process pass
+manager — which removes the main reason to reach for the full `inkwell`/`llvm-sys` API. That
+leaves "what's the nicest way to *read* a module": `llvm-ir`'s **owned, pure-Rust AST** wins
+on translator ergonomics (pattern-match-and-emit, no lifetimes/`unsafe`) — the boring,
+obvious code AGENTS.md asks for. Verified for this repo: `llvm-ir` 0.11.3 supports LLVM
+9–19, so the **`llvm-18` feature matches our pin**; its only representation gaps are debug
+metadata (we drop `llvm.dbg.*` regardless) and a few C-API-only getters (which constrain
+`inkwell` equally — both are LLVM-C-API-bound), neither of which touches the scalar+memory+
+call MVP. No mature *pure-Rust* bitcode reader exists, so any programmatic read links
+libLLVM; D54 sanctions that as a build/dev-time dep (Q4 keeps it off the runtime path).
+**Fallback order if `llvm-ir` bites:** `inkwell` (maintained, version-tracking wrapper) →
+hand-rolled `.ll` parser over `opt -S` (zero libLLVM link, but a rot-prone parser we own).
+
+**Q2 — Legalization & opt level (DECIDED): out-of-process, `clang -O2 -emit-llvm
+-fno-vectorize -fno-slp-vectorize`** (+ `opt -passes=...` for any extra legalization). `-O2`
+gives `mem2reg`/SROA (the two-stack split for free, §3a); `-fno-*-vectorize` keeps SIMD out
+of the MVP. We never run an in-process pass manager or reimplement `mem2reg` (the PNaCl
+`pnacl-opt` model). See §4 "Ingest pass pipeline".
+
+**Q3 — Pin mechanics (open):** how strictly to reject off-version bitcode, and where the
+frozen-subset allow-list lives (a single `unsup(...)`-style chokepoint, like `svm-wasm`).
+
+**Q4 — CI gating (open, but direction set):** make `svm-llvm` an **opt-in, Linux-dev-only
+test lane** — the translator is AOT/dev-time and off the runtime path (D54), so the cross-OS
+runtime matrix (`svm-jit`/`svm-interp` on Linux+macOS+Windows) never links libLLVM. This
+defuses the `llvm-sys`-on-Windows pain regardless of binding. Confirm the default workspace
+build stays libLLVM-free.
 
 ---
 
