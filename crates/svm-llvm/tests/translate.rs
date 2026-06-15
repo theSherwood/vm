@@ -93,6 +93,48 @@ fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
     assert_eq!(jit, expect, "{name}: JIT result (interp said {interp:?})");
 }
 
+/// Compile `src` (which defines `int run(int)` first and an `int main(){ return run(SEED); }`)
+/// with native `cc`, run it, and assert the SVM translation of `run(SEED)` matches the native exit
+/// code on **both** backends. The native compiler is the strongest oracle (the chibicc Tier-2
+/// pattern); `run` returns a byte so the full result survives the 8-bit Unix exit code.
+fn check_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let exe = std::env::temp_dir().join(format!("svm_llvm_native_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    let jit = match svm_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => Value::I32(s[0] as i32),
+        other => panic!("{name}: unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, vec![jit], "{name}: interp vs JIT");
+    let svm = match jit {
+        Value::I32(x) => x as u8,
+        _ => panic!("expected i32"),
+    };
+    assert_eq!(svm, native, "{name}: svm={svm} vs native cc={native}");
+}
+
 /// Translate + verify + run on both backends, asserting both **trap** (neither returns a value).
 /// Used for the data-stack guard: a deep recursion with a real frame must fault past the window's
 /// mapped region, not corrupt globals or return garbage.
@@ -632,6 +674,49 @@ fn stack_struct() {
                long f(int a){ volatile struct Point p; p.x = a; p.y = a * 2; p.tag = a; \
                return p.x + p.y + p.tag; }";
     check("sstruct", src, &[Value::I32(5)], &[Value::I64(20)]); // 5+10+5
+}
+
+#[test]
+fn kitchen_sink_vs_native() {
+    // A large self-contained program exercising the whole translator at once — structs by value
+    // (Vec3 → byval), a function-pointer table (`ops`, a relocation + indirect call), floats +
+    // libm (`sqrt`/`fabs`), recursion (`fib`), loops + an array copy (→ memcpy), a const global
+    // array, `switch`, and the int min/max + bit intrinsics — folded to a byte and checked against
+    // native `cc`. `run` is defined first (func 0); `seed` is runtime so clang can't constant-fold.
+    let src = "\
+struct Vec3 { double x; double y; double z; }; \
+double dot(struct Vec3, struct Vec3); int fib(int); int add(int,int); int mul(int,int); \
+typedef int (*op)(int,int); static op ops[2] = { add, mul }; int apply(int,int,int); \
+static const int squares[8] = { 0,1,4,9,16,25,36,49 }; \
+int run(int seed){ \
+    unsigned h = 2166136261u ^ (unsigned)seed; \
+    struct Vec3 a = { 1.5, 2.0, (double)(3 + seed) }, b = { 4.0, 0.5, 2.0 }; \
+    double d = dot(a, b); \
+    h ^= (unsigned)(d * 8.0); h *= 16777619u; \
+    double s = __builtin_sqrt(d * d) + __builtin_fabs((double)(-seed)); \
+    h ^= (unsigned)s; h *= 16777619u; \
+    h ^= (unsigned)fib(12 + (seed & 1)); \
+    h ^= (unsigned)apply(0, seed, 4); h ^= (unsigned)apply(1, seed, 3); \
+    int arr[16]; for (int i=0;i<16;i++) arr[i] = i*i + seed; \
+    int arr2[16]; for (int i=0;i<16;i++) arr2[i] = arr[i]; \
+    int sum = 0; for (int i=0;i<16;i++) sum += arr2[i]; \
+    h ^= (unsigned)sum; \
+    for (int i=0;i<8;i++){ int v; \
+        switch ((i + seed) & 3){ \
+            case 0: v = __builtin_popcount((unsigned)(i+1)); break; \
+            case 1: v = (i > 4 ? i : 4); break; \
+            case 2: v = __builtin_clz((unsigned)(i+1)); break; \
+            default: v = squares[i] - i; break; } \
+        h += (unsigned)v; } \
+    return (int)((h ^ (h>>8) ^ (h>>16) ^ (h>>24)) & 0xFF); \
+} \
+int main(void){ return run(7); } \
+double dot(struct Vec3 a, struct Vec3 b){ return a.x*b.x + a.y*b.y + a.z*b.z; } \
+int fib(int n){ if (n < 2) return n; return fib(n-1) + fib(n-2); } \
+int add(int a, int b){ return a + b; } \
+int mul(int a, int b){ return a * b; } \
+int apply(int sel, int a, int b){ return ops[sel & 1](a, b); }";
+    check_vs_native("kitchen", src, 7);
 }
 
 #[test]

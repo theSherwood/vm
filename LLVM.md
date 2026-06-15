@@ -11,7 +11,10 @@ the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDU
 **Status: Milestone 1 slices A–M (control flow, memory, calls, switch, globals, floats, indirect
 calls, struct aggregates, memory intrinsics, by-value aggregates, relocations, libm math, int
 min/max+bit intrinsics) done — a broad swath of scalar C from `clang -O2` runs on both backends
-(39 tests). Next: a libc/powerbox `main` entry, then a full demo (Lane C).** `crates/svm-llvm` does the **SSA → block-argument
+(40 tests). A **kitchen-sink capstone** exercises everything at once (structs by-value, a
+function-pointer table, floats+libm, recursion, loops, an array `memcpy`, a global array, `switch`,
+bit intrinsics) and matches **native `cc`** end to end (`check_vs_native`). Next: a libc/powerbox
+`main` entry (`write`/`malloc`), then a real-library demo (Lane C).** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -26,8 +29,9 @@ indexed string reads, a gapped switch (a global jump table), double arithmetic/c
 conversions, `fabs`/`floor`, an indirect call through a function pointer, struct field access
 (global/array-of-struct/stack), a struct `memcpy` + `memset`, and by-value struct args/returns
 (small-coerced + `byval`/`sret`), and pointer-valued global relocations (a function-pointer table,
-a struct string-pointer member), and libm math calls (`sqrt`/`fmin`) — run **interp == JIT ==
-hand-computed** (38 tests).
+a struct string-pointer member), libm math calls (`sqrt`/`fmin`), and int min/max + bit intrinsics
+(`smax`/`ctlz`/`popcount`) — run **interp == JIT == hand-computed** (40 tests, incl. a kitchen-sink
+program checked against native `cc`).
 Remaining M1: a libc/powerbox `main` entry (`write`/`malloc`), then the
 demo Lane C. Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
