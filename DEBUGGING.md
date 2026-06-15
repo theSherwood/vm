@@ -431,7 +431,8 @@ design pass that fixes the shared debug core (§2a) so the bodies don't pinch.
 S2 (`VarLoc`), S3 (logical-time clock), S4 (interpreter instrumentation seam), S5 (Inspector
 control model), S6 (Cranelift emission layer), and the S7/S8 invariants; resolve the
 cross-cutting decisions (§12) that gate them (D-DBG-3/4/6 especially). Cheap, and it prevents
-the rework §2a identifies.
+the rework §2a identifies. **S1/S3/S4/S5 are drafted in §13** (designing S4/S5 pinned S1/S3);
+S2 and S6 remain.
 
 **Milestone A — "debug a single-threaded guest on the interpreter" (cheap, high value):**
 1. **W8 shell** (the capability to hang verbs on).
@@ -474,3 +475,103 @@ the genuinely expensive, deferrable production tooling.
 
 When these are settled, fold the resolved ones into `DESIGN.md` §19 / the decision log as
 `D54+` so DESIGN stays the canonical record.
+
+---
+
+## 13. Milestone-0 designs — S4 (instrumentation seam) + S5 (Inspector)
+
+First detailed pass of the two highest-leverage shared-core items (§2a). Grounded in the
+interpreter as built (`crates/svm-interp/src/lib.rs`); line refs are to the state on this
+branch. **Designing these two pins S1 and S3** as a consequence (see "Cascade" below), so four
+of the six core items are settled here; only S2 (`VarLoc`) and S6 (Cranelift emission) remain,
+and both belong to the later JIT/source tiers.
+
+### S4 — interpreter instrumentation seam
+
+**Key finding: the seam already exists, hard-wired to DPOR.** The interpreter has two extension
+points the debug hooks should *widen* rather than replace:
+
+1. **Scheduler seam** — `run_with_policy` (`lib.rs:1691`) + the `Policy` enum (`lib.rs:1675`)
+   already choose *which vCPU, what quantum*. `Policy::Dpor(plan)` / `Seeded` are already
+   plan/seed-driven schedule control.
+2. **Per-op seam** — inside `run_inner` (`lib.rs:2396-2424`), the `memop`/`is_visible`/`acc`/
+   `budget` block is already a per-op "observe this op, record what it touched, optionally
+   yield" hook — just bound to DPOR and visible-ops-only.
+
+**Design.**
+- Generalize `VCpu::memop: bool` (`lib.rs:2081`) → `obs: ObsMode ∈ {Off, Memop, Debug}`.
+  `Off` = today's hot path byte-for-byte (the `else` at 2416); `Memop` = today's DPOR; `Debug`
+  = consult a probe per op. The single-discriminant gate is the shape the loop already pays, so
+  **S7** (behavior-preserving, differential-safe) holds — the differential harness runs `Off`.
+- **Per-op hook** at the existing decision point (2402-2424): before executing, build the
+  context the loop already has in scope — `cx = { vcpu_id, fiber: cur, ir_pc: (module, func,
+  block, inst), mem }` — and call `probe.before_op(cx) -> Flow`. `Flow::Run` continues;
+  `Flow::Pause(reason)` returns a **new `Inner::Pause(Stop)` → `Step::Pause`** variant, sibling
+  to the existing `Inner::Yield` (2405). A `VCpu` is already a self-contained, movable
+  continuation (Frames hold no borrows, `lib.rs:922`), so "pause" = "stop pumping, hand the
+  VCpu back."
+- **Watchpoints** reuse `access_of` (`lib.rs:496`) — it already computes the confined address
+  for visible ops; extend to loads/stores generally and range-check the watch set. "Break when
+  any fiber writes `addr`" is one check in the masked access path (the window is one buffer).
+- **Schedule record/replay** is a new `Policy` variant — `Policy::Record(&mut SchedTape)` /
+  `Policy::Replay(&SchedTape)` — structurally identical to `Dpor(plan)`. No new seam; W1's
+  schedule tape and W7's replay both ride `Policy`.
+- **S8 (metering-pause)** falls out: `step(fuel)?` (`lib.rs:2423`) is the only fuel decrement
+  and it is *inside* the pump. A paused guest is one the driver isn't pumping, so fuel can't
+  advance and the undisableable preemption (a scheduler-loop property) still governs every
+  *unpaused* guest — the host-only "inspector-paused" state of D-DBG-6, with no hole.
+
+### S5 — Inspector control/session model
+
+**Key constraint: a driver, not a callback** — forced by the interpreter being single-OS-thread
+cooperative (`run_with_policy` pumps vCPUs, returning at Yield/Park/Done). The `Inspector` *owns
+and pumps* the run, regaining control at stop points:
+
+```
+inspector.run_until_stop() -> Stop { reason, fiber, ir_pc }
+    reason ∈ { Breakpoint, Watchpoint{addr}, Step, CapCall, Trap, Exit, SchedulePoint }
+// stopped: backtrace(fiber) / read_window(a,len) / read_ir_value(id) / locals()
+// loop: run_until_stop()
+```
+
+One verb subsumes all four control models S5 had to span:
+- **W2 stepping** — probe pauses after one op / at a breakpoint.
+- **W1 record** — probe logs a `CapTape`/`SchedTape`; stop only at `Exit`.
+- **W1 replay / time-travel** — built with `Policy::Replay(tape)` + `CapTape`; `seek(t)` =
+  stateless re-run from the nearest checkpoint to logical time `t` (what `explore_all` already
+  does per schedule).
+- **W3 read** — when stopped, read frames/window/values.
+- **W7 many-runs** — a higher verb `model_check() -> Exhaustive` wraps `explore_all`; on a bad
+  outcome it returns a `SchedTape` the *same* Inspector can `replay()` then step (the
+  W7→W1→W2 bridge in one object).
+
+**Honest boundary: the driver model is interpreter-only.** The JIT runs real OS threads and
+can't be pumped op-by-op, so it gets a thinner, separate `JitInspector` profile — attach +
+read-at-stop (trap-time backtrace W3, async-notify observation), point-in-time only, no
+stepping. DAP (W5) binds to the interpreter `Inspector`; the JIT profile is for production trap
+diagnostics. This *is* "interpreter is the debug engine, JIT is production," made concrete.
+
+The session is host-side and **observe-only** (S5/S7): it holds run state, never guest
+authority; attach/detach under `ObsMode::Off` is behavior-identical.
+
+### Cascade — S4/S5 determine S1 and S3
+
+- **S1 (location model)** = `IrPc { module, func, block, inst }`, per-op granularity — exactly
+  the tuple the per-op hook has in scope (`lib.rs:920-936`). Source mapping stays deferred to W4.
+- **S3 (logical-time clock)** = the probe's monotonic **event index** — because `seek`,
+  step-back, and `SchedTape` keys must all reference the same stream the probe emits.
+
+So S1, S3, S4, S5 are settled by this pass; **remaining Milestone-0 work = S2 (`VarLoc`) and S6
+(Cranelift emission)**, both deferrable to the JIT/source tiers (W4/W5/W6).
+
+### Open questions (S4/S5)
+
+- *Probe dispatch in the hot loop*: monomorphized generic (`Probe` type param on `run_inner`)
+  vs `&mut dyn Probe` behind the `ObsMode::Debug` gate. Lean generic so `Off`/`Memop` keep the
+  current codegen; revisit if it bloats `run_inner`.
+- *Checkpoint cadence for `seek`*: pure stateless re-run (cheapest, O(t) per seek) vs periodic
+  window snapshots (bounds seek cost, costs memory). Start stateless; add snapshots if REPL-scale
+  traces need it (interacts with §22 `JitSession`).
+- *`SchedulePoint` stops*: whether the Inspector exposes scheduler-seam decisions as stoppable
+  events (useful for "step the scheduler") or only op-seam events. Default op-seam; gate
+  scheduler stepping behind a flag.
