@@ -26,8 +26,19 @@ use svm_interp::{run_scheduled, run_with_host, Host, StreamRole, Trap, Value};
 use svm_ir::ValType;
 use svm_jit::{compile_and_run_with_host, JitOutcome, TrapKind};
 use svm_run::cap_thunk; // the shared JIT-CapThunk → reference-Host bridge (§9)
-use svm_text::parse_module;
+use svm_text::parse_module as parse_module_raw;
 use svm_verify::verify_module;
+
+/// Parse frontend (chibicc) text IR and resolve its §7 named capability imports under the
+/// reference host policy ([`svm_run::resolve_capability_imports`]). The frontend now emits
+/// `call.import "<name>"` for capabilities instead of inline `cap.call`, so every harness parses
+/// through this — the *resolved* (import-free) module is what verifies and runs. A no-op for
+/// hand-written test IR that has no imports; an unresolved name is a frontend bug, so it panics.
+fn parse_module(ir: &str) -> Result<svm_ir::Module, svm_text::ParseError> {
+    let m = parse_module_raw(ir)?;
+    Ok(svm_run::resolve_capability_imports(m)
+        .unwrap_or_else(|e| panic!("resolve capability imports: {e}")))
+}
 
 fn to_slot(v: Value) -> i64 {
     match v {

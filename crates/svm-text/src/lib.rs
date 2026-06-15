@@ -1161,19 +1161,45 @@ impl<'a> Parser<'a> {
             let args = self.parse_value_list(names)?;
             return Ok(Inst::Call { func, args });
         }
-        // §7 named import call: `call.import <idx> v<handle> (args)`. The op signature is
-        // taken from the module's `import <idx>` declaration (imports precede all funcs).
+        // §7 named import call, two forms:
+        //   indexed:     `call.import <idx> v<handle> (args)`          — sig from the `import` decl
+        //   name-inline: `call.import "name" (params)->(results) v<h> (args)` — interned on the fly
+        // The name-inline form lets a streaming frontend (chibicc) emit a capability call per site
+        // with no pre-collected import table; the parser interns the name into `imports`.
         if op == "call.import" {
-            let n = self.parse_int()?;
-            let import = u32::try_from(n)
-                .map_err(|_| ParseError(format!("import index out of range: {n}")))?;
-            let sig = self
-                .imports
-                .get(import as usize)
-                .map(|imp| imp.sig.clone())
-                .ok_or_else(|| {
-                    ParseError(format!("call.import references undeclared import {import}"))
-                })?;
+            let (import, sig) = if matches!(self.peek(), Some(Tok::Str(_))) {
+                let name = String::from_utf8(self.parse_str()?)
+                    .map_err(|_| ParseError("call.import name is not valid UTF-8".into()))?;
+                let params = self.parse_type_list()?;
+                self.expect(&Tok::Arrow)?;
+                let results = self.parse_type_list()?;
+                let sig = FuncType { params, results };
+                // Intern: reuse an existing import of the same (name, sig), else append.
+                let idx = self
+                    .imports
+                    .iter()
+                    .position(|imp| imp.name == name && imp.sig == sig)
+                    .unwrap_or_else(|| {
+                        self.imports.push(Import {
+                            name,
+                            sig: sig.clone(),
+                        });
+                        self.imports.len() - 1
+                    });
+                (idx as u32, sig)
+            } else {
+                let n = self.parse_int()?;
+                let import = u32::try_from(n)
+                    .map_err(|_| ParseError(format!("import index out of range: {n}")))?;
+                let sig = self
+                    .imports
+                    .get(import as usize)
+                    .map(|imp| imp.sig.clone())
+                    .ok_or_else(|| {
+                        ParseError(format!("call.import references undeclared import {import}"))
+                    })?;
+                (import, sig)
+            };
             let handle = self.value(names)?;
             let args = self.parse_value_list(names)?;
             return Ok(Inst::CallImport {
@@ -1781,5 +1807,45 @@ block0(v0: i32):
             })
             .collect();
         assert_eq!(caps, vec![(0, 1), (1, 0)]);
+    }
+}
+
+#[cfg(test)]
+mod import_inline_tests {
+    use super::*;
+    use svm_ir::Inst;
+
+    // Name-inline `call.import "name" (sig) v<h> (args)` needs no `import` declaration: the
+    // parser interns the name. Two sites with the same name+sig share one import index.
+    #[test]
+    fn name_inline_interns_imports() {
+        let src = "\
+func (i32) -> () {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 3
+  v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v5 = i32.const 0
+  call.import \"exit\" (i32) -> () v0 (v5)
+  return
+}
+";
+        let m = parse_module(src).expect("parse name-inline imports");
+        // Two distinct names → two interned imports; the repeated "write" reuses index 0.
+        assert_eq!(m.imports.len(), 2);
+        assert_eq!(m.imports[0].name, "write");
+        assert_eq!(m.imports[1].name, "exit");
+        let idxs: Vec<u32> = m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::CallImport { import, .. } => Some(*import),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(idxs, vec![0, 0, 1], "repeated write shares index 0");
+        // Canonical print → re-parse is identity (printer emits the indexed form + decls).
+        assert_eq!(parse_module(&print_module(&m)).unwrap(), m);
     }
 }

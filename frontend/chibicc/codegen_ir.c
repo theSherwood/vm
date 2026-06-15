@@ -29,9 +29,14 @@
 // target's window offset (or funcref index, §3c) + addend, written little-endian into the
 // data image. A synthetic **`_start`** (function 0) takes the powerbox capability handles,
 // stashes them in a reserved region, then calls `main` with the initial
-// data-SP. **Stdio over the powerbox** (§3e):
-// `write`/`read`/`exit` are recognized builtins lowered to `cap.call` on the stashed
-// Stream/Exit handles — so real C reaches stdout/stdin and terminates with an exit code.
+// data-SP. **Stdio over the powerbox** (§3e): `write`/`read`/`exit` are recognized builtins
+// lowered to a §7 **named import** (`call.import "write"/"read"/"exit"`) on the stashed
+// Stream/Exit handle — the host binds each name to its (type_id, op) at load (see
+// `svm_run::default_cap_resolver`), so real C reaches stdout/stdin and terminates with an exit
+// code without the frontend hardcoding the capability's interface id. (Likewise every `__vm_*`
+// capability builtin below: the frontend emits `call.import "<name>"` + the handle; the host
+// resolves the operation. The non-capability `__vm_*` ops — atomics/fibers/threads — stay IR
+// primitives, not imports.)
 // **Floats** (`float`=f32, `double`/`long double`=f64) work too: arithmetic, compares,
 // `-`/`!`, literals, and all int<->float / float<->float conversions (float->int is
 // saturating, §3b). **`break`/`continue`** (a loop-context stack) and **`switch`** (a
@@ -767,7 +772,11 @@ static int gen_builtin_stream(Node *node, int slot, int op) {
   int len = widen_i64(lenv, a->next->next->ty);
   int h = load_handle(slot);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 0 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, buf, len);
+  // §7: reach the Stream op by *name* (host-resolved to (type_id, op) at load), not an inlined
+  // cap.call. The handle still selects the endpoint (stdout vs stdin).
+  const char *name = (op == 1) ? "write" : "read";
+  fprintf(o, "  v%d = call.import \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, buf,
+          len);
   if (node->ty->kind == TY_VOID)
     return 0;
   if (is64(node->ty))
@@ -782,7 +791,7 @@ static int gen_builtin_exit(Node *node) {
     error_tok(node->tok, "codegen_ir: exit(code) expects 1 argument");
   int code = gen_expr(node->args);
   int h = load_handle(EXIT_SLOT);
-  fprintf(o, "  cap.call 1 0 (i32) -> () v%d (v%d)\n", h, code);
+  fprintf(o, "  call.import \"exit\" (i32) -> () v%d (v%d)\n", h, code);
   fprintf(o, "  unreachable\n"); // Exit is noreturn (§3e)
   term = true;
   return 0;
@@ -806,11 +815,13 @@ static int gen_builtin_memory(Node *node, int op, int want) {
   int prot = (want == 3) ? gen_expr(a->next->next) : 0;
   int h = load_handle(MEMORY_SLOT);
   int r = nv++;
+  const char *name = op == 0 ? "vm_map" : op == 1 ? "vm_unmap" : "vm_protect";
   if (want == 3)
-    fprintf(o, "  v%d = cap.call 3 %d (i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d)\n", r, op, h,
-            off, len, prot);
+    fprintf(o, "  v%d = call.import \"%s\" (i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d)\n", r, name,
+            h, off, len, prot);
   else
-    fprintf(o, "  v%d = cap.call 3 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, off, len);
+    fprintf(o, "  v%d = call.import \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, off,
+            len);
   return r;
 }
 
@@ -823,7 +834,7 @@ static int gen_builtin_page_size(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_page_size takes no arguments");
   int h = load_handle(MEMORY_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 3 3 () -> (i64) v%d ()\n", r, h);
+  fprintf(o, "  v%d = call.import \"vm_page_size\" () -> (i64) v%d ()\n", r, h);
   return r;
 }
 
@@ -843,7 +854,8 @@ static int gen_builtin_io_submit_async(Node *node) {
   int ctr = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int h = load_handle(IORING_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 9 1 (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r, h, sq, n, ctr);
+  fprintf(o, "  v%d = call.import \"vm_io_submit_async\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n",
+          r, h, sq, n, ctr);
   return r;
 }
 
@@ -855,7 +867,7 @@ static int gen_builtin_io_reap(Node *node) {
   int mx = widen_i64(gen_expr(a->next), a->next->ty);
   int h = load_handle(IORING_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 9 2 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, cq, mx);
+  fprintf(o, "  v%d = call.import \"vm_io_reap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, cq, mx);
   return r;
 }
 
@@ -885,7 +897,8 @@ static int gen_builtin_jit_compile(Node *node) {
   int len = widen_i64(gen_expr(a->next), a->next->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 11 0 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, blob, len);
+  fprintf(o, "  v%d = call.import \"vm_jit_compile\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, blob,
+          len);
   return r;
 }
 
@@ -898,8 +911,8 @@ static int gen_builtin_jit_invoke2(Node *node) {
   int y = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 11 1 (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r, h, code,
-          x, y);
+  fprintf(o, "  v%d = call.import \"vm_jit_invoke2\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r,
+          h, code, x, y);
   return r;
 }
 
@@ -910,7 +923,7 @@ static int gen_builtin_jit_release(Node *node) {
   int code = widen_i64(gen_expr(a), a->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 11 2 (i64) -> (i64) v%d (v%d)\n", r, h, code);
+  fprintf(o, "  v%d = call.import \"vm_jit_release\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
   return r;
 }
 
@@ -924,7 +937,7 @@ static int gen_builtin_jit_install(Node *node) {
   int code = widen_i64(gen_expr(a), a->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 11 3 (i64) -> (i64) v%d (v%d)\n", r, h, code);
+  fprintf(o, "  v%d = call.import \"vm_jit_install\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
   return r;
 }
 
@@ -937,7 +950,7 @@ static int gen_builtin_jit_uninstall(Node *node) {
   int slot = widen_i64(gen_expr(a), a->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 11 4 (i64) -> (i64) v%d (v%d)\n", r, h, slot);
+  fprintf(o, "  v%d = call.import \"vm_jit_uninstall\" (i64) -> (i64) v%d (v%d)\n", r, h, slot);
   return r;
 }
 
@@ -960,7 +973,7 @@ static int gen_builtin_region_create(Node *node) {
   int len = widen_i64(gen_expr(a), a->ty);
   int h = load_handle(ADDRSPACE_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 5 5 (i64) -> (i64) v%d (v%d)\n", r, h, len);
+  fprintf(o, "  v%d = call.import \"vm_region_create\" (i64) -> (i64) v%d (v%d)\n", r, h, len);
   return r;
 }
 
@@ -977,8 +990,8 @@ static int gen_builtin_region_map(Node *node) {
   int len = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
   int prot = gen_expr(a->next->next->next->next);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 4 0 (i64, i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d, v%d)\n", r,
-          rh, win, roff, len, prot);
+  fprintf(o, "  v%d = call.import \"vm_region_map\" (i64, i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d, v%d)\n",
+          r, rh, win, roff, len, prot);
   return r;
 }
 
@@ -993,7 +1006,8 @@ static int gen_builtin_region_unmap(Node *node) {
   int win = widen_i64(gen_expr(a->next), a->next->ty);
   int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 4 1 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, win, len);
+  fprintf(o, "  v%d = call.import \"vm_region_unmap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, win,
+          len);
   return r;
 }
 
@@ -1003,7 +1017,7 @@ static int gen_builtin_region_page_size(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_region_page_size(r) expects 1 argument");
   int rh = gen_expr(a);
   int r = nv++;
-  fprintf(o, "  v%d = cap.call 4 3 () -> (i64) v%d ()\n", r, rh);
+  fprintf(o, "  v%d = call.import \"vm_region_page_size\" () -> (i64) v%d ()\n", r, rh);
   return r;
 }
 
