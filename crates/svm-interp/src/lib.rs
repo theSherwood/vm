@@ -4981,6 +4981,59 @@ enum Binding {
     HostFn(u32),
 }
 
+/// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
+/// (DURABILITY.md §12.5). Every variant's entire state is value-typed — no out-of-line host
+/// objects (`Host::regions`/`modules`/`rings`/…) and no native pointers — so re-granting it
+/// into a fresh `Host` reconstructs the exact authority. The non-value bindings
+/// (`SharedRegion`, `Module`, `IoRing`, `Blocking`, `JitDomain`, `JitCode`, `HostFn`) are
+/// **not** durable: a live one makes the domain non-snapshottable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DurableBinding {
+    Stream(StreamRole),
+    Exit,
+    Clock,
+    Memory,
+    Yielder,
+    AddressSpace { base: u64, size: u64 },
+    Instantiator { base: u64, size: u64 },
+}
+
+/// One live, re-grantable handle-table entry captured for snapshot/restore (DURABILITY.md
+/// §12.5 Section 3). The `(slot, generation)` pin is what keeps a **guest-held handle value**
+/// valid across restore: the guest names `(generation << CAP_LOG2) | slot`, so restore must
+/// reinstate the same pair. `type_id` is the interface the slot was granted under (the
+/// resolve check is `type_id` + `generation`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DurableHandle {
+    pub slot: u32,
+    pub generation: u32,
+    pub type_id: u32,
+    pub binding: DurableBinding,
+}
+
+/// Why a handle table can't be snapshotted in v1: a live slot holds a binding that carries
+/// out-of-line host state or native pointers, so it isn't re-grantable (DURABILITY.md §12.5).
+/// Freeze refuses with this rather than silently dropping authority, so restore is
+/// all-or-nothing. Such handles must be closed/drained (§5) before a freeze can proceed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NonDurableHandle {
+    pub slot: u32,
+    pub type_id: u32,
+    pub kind: NonDurableKind,
+}
+
+/// Which non-re-grantable binding kind a live slot held (the [`NonDurableHandle`] reason).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NonDurableKind {
+    SharedRegion,
+    Module,
+    IoRing,
+    Blocking,
+    JitDomain,
+    JitCode,
+    HostFn,
+}
+
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
 /// per-slot and only advances on (re)grant, so a closed handle's value can never
 /// alias a later grant of the same slot (ABA-safe use-after-close detection, D37).
@@ -5491,6 +5544,94 @@ impl Host {
     fn grant(&mut self, type_id: u32, binding: Binding) -> i32 {
         self.try_grant(type_id, binding)
             .expect("handle table full during host powerbox setup (bounded by construction)")
+    }
+
+    /// Classify the **live** handle table for a snapshot (DURABILITY.md §12.5 Section 3). On
+    /// success, the re-grantable handles in ascending slot order. Refuses — `Err` naming the
+    /// **first** offending slot — if any live slot holds a non-durable binding, so freeze is
+    /// all-or-nothing rather than dropping authority on restore.
+    pub fn capture_durable_handles(&self) -> Result<Vec<DurableHandle>, NonDurableHandle> {
+        let mut out = Vec::new();
+        for (slot, s) in self.table.iter().enumerate() {
+            let Some(binding) = s.entry else { continue };
+            let binding = match binding {
+                Binding::Stream(role) => DurableBinding::Stream(role),
+                Binding::Exit => DurableBinding::Exit,
+                Binding::Clock => DurableBinding::Clock,
+                Binding::Memory => DurableBinding::Memory,
+                Binding::Yielder => DurableBinding::Yielder,
+                Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
+                Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
+                Binding::SharedRegion(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
+                }
+                Binding::Module(_) => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                Binding::IoRing(_) => return Err(self.non_durable(slot, NonDurableKind::IoRing)),
+                Binding::Blocking(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::Blocking))
+                }
+                Binding::JitDomain(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::JitDomain))
+                }
+                Binding::JitCode { .. } => {
+                    return Err(self.non_durable(slot, NonDurableKind::JitCode))
+                }
+                Binding::HostFn(_) => return Err(self.non_durable(slot, NonDurableKind::HostFn)),
+            };
+            out.push(DurableHandle {
+                slot: slot as u32,
+                generation: s.generation,
+                type_id: s.type_id,
+                binding,
+            });
+        }
+        Ok(out)
+    }
+
+    fn non_durable(&self, slot: usize, kind: NonDurableKind) -> NonDurableHandle {
+        NonDurableHandle {
+            slot: slot as u32,
+            type_id: self.table[slot].type_id,
+            kind,
+        }
+    }
+
+    /// Reinstate a captured durable set into this table (DURABILITY.md §12.5), pinning each
+    /// `(slot, generation)` so guest-held handle values stay valid across restore. Intended
+    /// for the restore path on a **fresh** table; entries already at those slots are
+    /// overwritten. Slots must be in range (the snapshot codec validates that against
+    /// [`Host::handle_capacity`] before calling).
+    pub fn restore_durable_handles(&mut self, handles: &[DurableHandle]) {
+        for h in handles {
+            let binding = match h.binding {
+                DurableBinding::Stream(role) => Binding::Stream(role),
+                DurableBinding::Exit => Binding::Exit,
+                DurableBinding::Clock => Binding::Clock,
+                DurableBinding::Memory => Binding::Memory,
+                DurableBinding::Yielder => Binding::Yielder,
+                DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
+                DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
+            };
+            self.grant_at(h.slot, h.generation, h.type_id, binding);
+        }
+    }
+
+    /// The handle-table capacity (`CAP`): valid slot indices are `0..handle_capacity()`. The
+    /// snapshot codec validates a captured slot against this before [`Host::restore_durable_handles`].
+    pub fn handle_capacity() -> u32 {
+        CAP as u32
+    }
+
+    /// Pin `binding` at an exact `(slot, generation)` — the restore primitive behind
+    /// [`Host::restore_durable_handles`] (DURABILITY.md §12.5). Unlike [`Host::grant`], it
+    /// neither picks a free slot nor advances the generation: the snapshot already fixed both,
+    /// and the guest holds handle values that encode them. Panics on an out-of-range slot (a
+    /// codec bug, not reachable from guest code — like `grant`'s table-full panic).
+    fn grant_at(&mut self, slot: u32, generation: u32, type_id: u32, binding: Binding) {
+        let s = &mut self.table[slot as usize];
+        s.generation = generation;
+        s.entry = Some(binding);
+        s.type_id = type_id;
     }
 
     /// Grant a `Stream` capability bound to `role` (a powerbox stdio grant, §3e).

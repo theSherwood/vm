@@ -467,6 +467,16 @@ so guest-held handle values stay valid — the auto-allocating `grant`/`grant_*`
 `grant_at(slot, generation, type_id, binding)`, that pins both. (`Host` is not
 escape-TCB; the verifier/mask hinge is untouched — §3.)
 
+**Status: Host primitives landed.** `svm-interp` now implements the §12.5 classification
+and pinning on `Host` (`crates/svm-interp/tests/handle_durability.rs`):
+`capture_durable_handles() -> Result<Vec<DurableHandle>, NonDurableHandle>` (the
+re-grantable set in ascending slot order, or a clean refusal naming the first non-durable
+slot — freeze is all-or-nothing), `restore_durable_handles` + the `grant_at` pin, and
+`handle_capacity()` for the codec's bounds check. The value-typed descriptors
+(`DurableBinding`/`DurableHandle`) are public; `Binding` stays private. Still pending (the
+snapshot-codec slice): the byte-level **Section 3** TLV serialization of `DurableHandle`s
+and wiring it into the container + a real freeze→restore run.
+
 ### 12.6 Round-trip / equivalence contract
 
 The format exists to make this testable (extends §7, `jit_diff.rs` / `fuzz/diff.rs`):
