@@ -137,3 +137,107 @@ block0(v0: i32):
         }
     )));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Milestone 1: the static linker — concatenate *separate* units into one program (svm_ir::link).
+// ---------------------------------------------------------------------------------------------
+
+use svm_ir::{link, LinkUnit};
+
+/// Run entry `idx` of an already-verified module on interp + JIT, assert they agree, return the i32.
+fn run_entry(m: &svm_ir::Module, idx: u32, args: &[i32]) -> i64 {
+    let ivals: Vec<Value> = args.iter().map(|&x| Value::I32(x)).collect();
+    let mut fuel = 10_000_000u64;
+    let interp = svm_interp::run(m, idx, &ivals, &mut fuel).expect("interp run");
+    let jargs: Vec<i64> = args.iter().map(|&x| x as i64).collect();
+    let jit = match svm_jit::compile_and_run(m, idx, &jargs).expect("jit compile") {
+        svm_jit::JitOutcome::Returned(v) => v,
+        other => panic!("jit did not return: {other:?}"),
+    };
+    let iv = match interp[0] {
+        Value::I32(x) => x as i64,
+        other => panic!("unexpected interp value {other:?}"),
+    };
+    assert_eq!(iv as u32 as u64, jit[0] as u32 as u64, "interp != jit");
+    iv
+}
+
+fn unit(src: &str, exports: &[(&str, u32)]) -> LinkUnit {
+    LinkUnit {
+        module: svm_text::parse_module(src).expect("parse unit"),
+        exports: exports.iter().map(|(n, i)| (n.to_string(), *i)).collect(),
+    }
+}
+
+const MATH_UNIT: &str = "\
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.add v0 v1
+  return v2
+}
+";
+
+/// `app` calls `add` by name; it lives in a **separate** unit (`math`). The linker concatenates them
+/// (app's functions reindexed after math's) and resolves the import to a direct call.
+const APP_UNIT: &str = "\
+func (i32, i32) -> (i32) {
+block0(v0: i32, v1: i32):
+  v2 = i32.const 0
+  v3 = call.import \"add\" (i32, i32) -> (i32) v2 (v0, v1)
+  return v3
+}
+";
+
+#[test]
+fn links_two_separate_units_into_one_program() {
+    let linked = link(&[unit(MATH_UNIT, &[("add", 0)]), unit(APP_UNIT, &[])]).expect("link");
+    // math's `add` is function 0; app's `main` is function 1 (reindexed after math).
+    assert_eq!(linked.funcs.len(), 2);
+    assert!(linked.imports.is_empty(), "all imports resolved");
+    svm_verify::verify_module(&linked).expect("verify linked program");
+    // app's main (entry 1) calls into math's add across the unit boundary.
+    assert_eq!(run_entry(&linked, 1, &[3, 4]), 7);
+    assert_eq!(run_entry(&linked, 1, &[40, 2]), 42);
+}
+
+/// A three-unit chain proves reindexing across more than two units: `app` → `add`, where `add` itself
+/// lives after an unrelated `pad` unit, so its global index is shifted and the import still resolves.
+#[test]
+fn links_across_a_reindexing_offset() {
+    let pad = "\
+func (i32) -> (i32) {
+block0(v0: i32):
+  return v0
+}
+"; // an unrelated unit so `math` lands at a non-zero base
+    let linked = link(&[
+        unit(pad, &[("pad", 0)]),
+        unit(MATH_UNIT, &[("add", 0)]), // global index 1
+        unit(APP_UNIT, &[]),            // global index 2; its "add" → 1
+    ])
+    .expect("link");
+    svm_verify::verify_module(&linked).expect("verify");
+    assert_eq!(
+        run_entry(&linked, 2, &[10, 5]),
+        15,
+        "app(entry 2) → add at global index 1"
+    );
+}
+
+/// An import no unit exports is fail-closed.
+#[test]
+fn link_unresolved_symbol_fails_closed() {
+    let err = link(&[unit(APP_UNIT, &[])]).expect_err("nothing exports add");
+    assert_eq!(err, svm_ir::LinkError::Unresolved("add".into()));
+}
+
+/// Two units exporting the same symbol is fail-closed.
+#[test]
+fn link_duplicate_symbol_fails_closed() {
+    let err = link(&[
+        unit(MATH_UNIT, &[("add", 0)]),
+        unit(MATH_UNIT, &[("add", 0)]),
+    ])
+    .expect_err("two `add`s");
+    assert_eq!(err, svm_ir::LinkError::DuplicateSymbol("add".into()));
+}

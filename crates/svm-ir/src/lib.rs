@@ -1792,6 +1792,116 @@ pub fn resolve_imports_with(
     Ok(out)
 }
 
+/// One unit to statically link: a module plus the function symbols it **exports** (name → its local
+/// function index). A unit's named imports (`Module::imports`) are resolved against the other units'
+/// exports by [`link`].
+#[derive(Clone, Debug)]
+pub struct LinkUnit {
+    pub module: Module,
+    pub exports: Vec<(String, FuncIdx)>,
+}
+
+/// Why [`link`] failed (fail-closed; the linked module is also re-verified before it runs).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LinkError {
+    /// Two units export the same symbol.
+    DuplicateSymbol(String),
+    /// An export names a function index past its unit's `funcs`.
+    BadExport { symbol: String, index: FuncIdx },
+    /// A unit imports a symbol no unit exports.
+    Unresolved(String),
+    /// A `CallImport` referenced an out-of-range import (a malformed unit).
+    BadImportIndex(u32),
+}
+
+/// **Statically link** units into one module — the compile-time loader (dynamic-linking milestone 1).
+///
+/// Concatenate the units' functions into one list, **reindexing** each unit's internal function
+/// references by its base offset; build a symbol table from all exports; and resolve every unit's
+/// named imports to a **direct call** against that table ([`resolve_imports_with`] with
+/// [`Resolved::Func`]). The result is one import-free module — re-verify it before running, since a
+/// unit is untrusted like any frontend output (a cross-unit signature mismatch is caught there).
+///
+/// Scope: function symbols and code (the milestone-0 mechanism, now across *separate* units). Data
+/// symbols / per-unit data relocation are a follow-up — units with overlapping active data segments
+/// would collide, so this is for code (or non-overlapping-data) units.
+pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
+    // Each unit's functions occupy `[base, base + n_funcs)` in the merged list.
+    let mut bases = Vec::with_capacity(units.len());
+    let mut total: u32 = 0;
+    for u in units {
+        bases.push(total);
+        total += u.module.funcs.len() as u32;
+    }
+    // Symbol table: exported name → global function index.
+    let mut symtab: std::collections::HashMap<String, FuncIdx> = std::collections::HashMap::new();
+    for (u, &base) in units.iter().zip(&bases) {
+        for (name, local) in &u.exports {
+            if *local as usize >= u.module.funcs.len() {
+                return Err(LinkError::BadExport {
+                    symbol: name.clone(),
+                    index: *local,
+                });
+            }
+            if symtab.insert(name.clone(), base + local).is_some() {
+                return Err(LinkError::DuplicateSymbol(name.clone()));
+            }
+        }
+    }
+    // Per unit: shift internal function references to global indices, then resolve its named imports
+    // to direct calls at their global indices, and append.
+    let mut funcs: Vec<Func> = Vec::with_capacity(total as usize);
+    for (u, &base) in units.iter().zip(&bases) {
+        let mut m = u.module.clone();
+        offset_func_indices(&mut m, base);
+        let resolved =
+            resolve_imports_with(&m, |name| symtab.get(name).copied().map(Resolved::Func))
+                .map_err(|e| match e {
+                    ImportError::Unresolved(n) => LinkError::Unresolved(n),
+                    ImportError::BadImportIndex(i) => LinkError::BadImportIndex(i),
+                })?;
+        funcs.extend(resolved.funcs);
+    }
+    Ok(Module {
+        funcs,
+        // The merged window is the largest any unit declared (they share one linear memory).
+        memory: units
+            .iter()
+            .filter_map(|u| u.module.memory)
+            .max_by_key(|m| m.size_log2),
+        // Code-only units have no data; concatenated as-is (data relocation is a follow-up).
+        data: units.iter().flat_map(|u| u.module.data.clone()).collect(),
+        imports: Vec::new(),
+        // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
+        debug_info: None,
+    })
+}
+
+/// Add `offset` to every **static function index** in `m` (the merged-module reindex): `call`,
+/// `ref.func`, `thread.spawn`, and the `return_call` terminator. `call_indirect`/`cont.*` dispatch on
+/// runtime funcref *values*, not static indices, so they are untouched. `call.import` carries an
+/// import index (not a function index) and is likewise untouched — it is resolved separately.
+fn offset_func_indices(m: &mut Module, offset: u32) {
+    if offset == 0 {
+        return;
+    }
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                match inst {
+                    Inst::Call { func, .. }
+                    | Inst::RefFunc { func }
+                    | Inst::ThreadSpawn { func, .. } => *func += offset,
+                    _ => {}
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &mut b.term {
+                *func += offset;
+            }
+        }
+    }
+}
+
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`
 /// at instantiation; `readonly` ones are protected after the copy so guest writes fault.
 #[derive(Clone, PartialEq, Eq, Debug)]
