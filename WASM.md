@@ -50,13 +50,22 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `() -> ()`. `tests/start.rs` (runs-before-export, param/result threading, runs-once/internal-bypass,
   bad-signature rejection). A non-`(start)` module is byte-identical to before.
 
-### 🟠 Host-ABI — blocks real WASI programs
+### 🟠 Host-ABI — named multi-capability import binding
 
-- [ ] **Non-numeric WASI imports.** The import convention requires decimal `module`/`name`
-  (`type_id`/`op`); a real program importing `("wasi_snapshot_preview1", "fd_write")` is a clean
-  `Unsupported` (`lib.rs` import parse). Real I/O programs need a **WASI→capability shim** binding the
-  named imports to capability `(type_id, op)`s. Arguably the biggest "run real programs" blocker.
-  (The `wasi:thread/spawn` import is already special-cased; this generalizes named-import binding.)
+- [ ] **Named, multi-capability import binding.** *This is the in-scope mechanism, not WASI itself.*
+  The capability model is already fully general: `cap.call` (`Inst::CapCall { type_id, op, sig, handle,
+  args }`) + the host-owned handle table (`Host::try_grant`/`grant_*` → i32 handles, masked + type_id +
+  generation checked) lets a host expose *any* interface, and chibicc already threads a **multi-handle
+  powerbox** (7 caps) into the guest. The gap is purely svm-wasm frontend plumbing:
+    - imports must use **decimal** `module`/`name` (= `type_id`/`op`); there's no symbolic
+      `name → (type_id, op)` binding, so `("env", "now")` is a clean `Unsupported` (`lib.rs` import parse);
+    - only **one** capability handle is threaded (a single leading param; `has_handle` is module-wide),
+      so a module importing across **multiple** capability interfaces is rejected.
+  Work: (a) let the embedder supply a `name → (type_id, op)` table on `transpile`/`Transpiled`; (b)
+  thread **N** handles via reserved slots (the chibicc pattern) instead of one leading param. WASI's
+  specific fd/clock/random *semantics* stay a ⚪ non-goal — a host is free to bind WASI-shaped names to
+  its own capabilities through this mechanism, but svm-wasm doesn't ship the preview1 surface.
+  (The `wasi:thread/spawn` import is already special-cased; this generalizes it to arbitrary names.)
 
 ### 🟡 Fail-closed feature gaps (clean `Unsupported`)
 
@@ -93,8 +102,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   within a function it lowers to branches, but cross-frame propagation needs an exception channel (a
   generalization of the existing per-call trap-cell check) — a perf tax + calling-convention change,
   and clang/Rust only emit it under opt-in (`-fwasm-exceptions`). Low ROI.
-- [ ] **SVM host-ABI**: imports spanning multiple capability interfaces (one handle threaded today);
-  `wasi:thread/spawn` *alongside* capability imports (needs the per-thread handle stash).
+- [ ] **`wasi:thread/spawn` *alongside* capability imports** (needs the per-thread handle stash). The
+  broader "imports spanning multiple capability interfaces" limitation is tracked as the 🟠
+  *named multi-capability import binding* item above.
 
 ### ⚪ Non-goal (by design)
 
@@ -116,7 +126,10 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 ## Recommended order (for "handle more real programs")
 
 1. **Start section** 🔴 — kill the silent footgun (cheap; fail-closed at minimum, ideally run it).
-2. **WASI import name mapping** 🟠 — unlocks real I/O programs; the single biggest real-program blocker.
+2. **Named multi-capability import binding** 🟠 — let the embedder bind symbolic import names to
+   `(type_id, op)` and thread N capability handles (the chibicc powerbox pattern). The general
+   mechanism for "host provides arbitrary capabilities, guest uses them"; the single biggest
+   real-program blocker. (WASI *semantics* stay ⚪ — a host binds its own caps to whatever names.)
 3. **Tail calls** 🟡 — common LLVM output, likely near-free (IR terminators exist).
 4. **Passive segments + `memory.init`/`table.*` bulk ops** 🟡 — moderate, evidence-driven.
 5. **Reference types** 🟡 (externref→handle, funcref→index), then the **SIMD remainder** 🟡 (breadth),
