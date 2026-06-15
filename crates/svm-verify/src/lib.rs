@@ -533,6 +533,26 @@ fn check_inst(
             cx.expect(*value, ValType::I64)?;
             ValType::I64
         }
+        // §GC conservative root enumeration: i64 heap_lo, heap_hi, buf, cap ⇒ i64 count. Writes the
+        // candidate words into guest memory at `buf`, so it requires a declared window.
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            buf,
+            cap,
+        } => {
+            if !has_memory {
+                return Err(VerifyError::MemoryNotDeclared {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*heap_lo, ValType::I64)?;
+            cx.expect(*heap_hi, ValType::I64)?;
+            cx.expect(*buf, ValType::I64)?;
+            cx.expect(*cap, ValType::I64)?;
+            ValType::I64
+        }
         // §12 thread join: an i32 thread handle in, the joined vCPU's i64 result out. (The handle
         // is forgeable; safety is the runtime use-site check, like a fiber/capability handle.)
         Inst::ThreadJoin { handle } => {

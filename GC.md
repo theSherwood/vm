@@ -61,16 +61,40 @@ helper wrapping the futex barrier; it is a convenience, not a mechanism.
 
 ## 3. The one new svm primitive: range-filtered root enumeration
 
-A capability-gated op the trusted GC calls during STW:
+An **ambient introspection op** (not a capability — see §3.0) the GC calls during STW. It
+writes the candidate words into a guest-provided buffer and returns the total count:
 
 ```
-gc.roots(heap_lo, heap_hi) -> buffer<u64>      // candidate root values
-// (or roots_begin / roots_next, if streaming is preferred)
+gc.roots(heap_lo, heap_hi, buf, cap) -> count   // count = total candidates found
+//   writes min(count, cap) distinct words, ascending, as u64 at byte offset `buf`;
+//   count > cap ⇒ retry with a larger buffer
 ```
 
 `heap_lo`/`heap_hi` are **window offsets** bounding the guest heap; svm walks every
 fiber's live control-stack extent (incl. the saved-register block the switch routine
-writes on suspend, §3d), and returns the words that fall inside `[heap_lo, heap_hi)`.
+writes on suspend, §3d) plus the caller's own live frames (§3.1), and returns the
+deduplicated words that fall inside `[heap_lo, heap_hi)`.
+
+### 3.0. Why ambient, not a capability (decision)
+
+The earlier draft proposed a capability-gated handle. We chose an **ambient IR op** instead —
+the same family as `cont.*`/`suspend`, and authority-neutral like `cap.self` reflection:
+
+- **It conveys ~no authority.** Every word it returns is an in-window value the guest's own
+  heap already encodes; out-of-window words (host return addresses, frame pointers, host
+  pointers) are filtered *inside* svm and never returned (§3, property 1). It cannot read
+  out-of-window memory and writes only to a guest-provided, masked buffer — **zero
+  escape-TCB**, nothing to gate.
+- **svm treats a domain as one trust principal.** Capabilities gate the inter-domain / host
+  boundary, not code *within* a domain. Gating `gc.roots` would protect a boundary that does
+  not exist intra-domain.
+- **Mechanism reality.** Reaching the fiber registry requires special-casing in the execution
+  loop either way (a generic `HostFn` capability handler cannot see fibers), so a real
+  capability would add `Binding`/grant/handle-validation plumbing for no security gain.
+
+The one honest caveat: unlike `cap.self`, `gc.roots` does read *control-stack* words the guest
+cannot otherwise name — but filtered to the guest's own heap range, so no host/ASLR leak and no
+cross-principal boundary is crossed.
 
 ### Required properties
 
@@ -96,12 +120,12 @@ writes on suspend, §3d), and returns the words that fall inside `[heap_lo, heap
 > fibers **+ the caller of `gc.roots`**. Under STW (all other vCPUs parked) that is
 > *every* fiber.
 
-The caller is covered because `gc.roots` is a `cap.call`, which is **call-clobbering**:
-when the handler runs, the calling (collector) fiber is frozen at the call site with
-all live-across-call roots already spilled to its control stack. svm walks the caller
-from the `gc.roots` call frame down, exactly like a parked fiber. So **the collector
-never reads its own out-of-band control stack** (it cannot) — svm reads it on the
-collector's behalf, and *asking is what made it safe to read*: the call is the
+The caller is covered because `gc.roots` is a **call-clobbering** control op (like
+`cont.resume`/`suspend`): when it executes, the calling (collector) fiber's live-across
+roots are already spilled to its control stack (JIT) / present in its current frames
+(interp). svm walks the caller from the `gc.roots` site down, exactly like a parked fiber.
+So **the collector never reads its own out-of-band control stack** (it cannot) — svm reads
+it on the collector's behalf, and *asking is what made it safe to read*: the op is the
 collector's own safepoint.
 
 The collector handles by itself only its **in-window GC structures** (mark stack,
@@ -170,10 +194,17 @@ general (the interp has no spill words to match).
 
 ## 7. Build order
 
-1. **This RFC** (`GC.md`) — the contract above. No code-behavior change.
-2. Reserve `ref` `ValType` — cheap, uncontroversial, no runtime effect.
-3. `gc.roots` range-filtered enumeration capability (interp + JIT, backend-uniform
-   *semantics* per §3.2). The largest piece.
+1. **This RFC** (`GC.md`) — the contract above. No code-behavior change. *(done)*
+2. Reserve `ref` `ValType` — cheap, uncontroversial, no runtime effect. *(done — opaque i64,
+   threaded through ir/text/encode/jit/interp; round-trip + interp/JIT identity tests.)*
+3. `gc.roots` ambient range-filtered enumeration op. *(interp done — registry + caller-frame
+   walk, range-filter, dedup, buffer write; functional + round-trip tests. **JIT staged**: it
+   bails `Unsupported` for now, like `atomic.fence`, so the differential harness skips it.)*
+4. **Follow-up — `gc.roots` on the JIT** (the intricate, unsafe piece): new `svm-fiber`
+   accessors for a suspended fiber's `[sp, base)` extent; a baked thunk reading `CURRENT_RT`'s
+   `SharedFiberTable`; raw control-stack word scanning; and the resume-chain-ancestor /
+   physical-stack-identification logic for the collector's own live stack. Backend-uniform
+   *semantics* per §3.2 (not bit-identical candidate sets).
 
 No world-stop primitive, no register capture, no stack-map work.
 

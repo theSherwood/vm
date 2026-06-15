@@ -266,6 +266,13 @@ fn print_inst(inst: &Inst) -> String {
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
         Inst::Suspend { value } => format!("suspend v{value}"),
+        // §GC conservative root enumeration.
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            buf,
+            cap,
+        } => format!("gc.roots v{heap_lo} v{heap_hi} v{buf} v{cap}"),
         // §12 real threads (OS-thread vCPUs over shared memory).
         Inst::ThreadSpawn { func, sp, arg } => format!("thread.spawn {func} v{sp} v{arg}"),
         Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
@@ -1293,6 +1300,18 @@ impl<'a> Parser<'a> {
         if op == "suspend" {
             return Ok(Inst::Suspend {
                 value: self.value(names)?,
+            });
+        }
+        if op == "gc.roots" {
+            let heap_lo = self.value(names)?;
+            let heap_hi = self.value(names)?;
+            let buf = self.value(names)?;
+            let cap = self.value(names)?;
+            return Ok(Inst::GcRoots {
+                heap_lo,
+                heap_hi,
+                buf,
+                cap,
             });
         }
         // §12 real threads.
