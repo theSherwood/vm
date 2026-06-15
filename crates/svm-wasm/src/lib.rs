@@ -73,6 +73,16 @@ fn unsup<T>(what: impl Into<String>) -> Result<T, Error> {
 
 /// A wasm linear-memory page is 64 KiB.
 const WASM_PAGE: u64 = 1 << 16;
+/// The standard **wasi-threads** spawn import — `(import "wasi" "thread-spawn" (func (param i32)
+/// (result i32)))` — which the host implements by starting a new thread over the shared memory and
+/// calling the `wasi_thread_start` export. SVM lowers it to the native `thread.spawn` (§12) instead of
+/// a `cap.call`: concurrency lives *in* the VM, not bolted onto the host (DESIGN §1a). Matches what
+/// `wasmtime-wasi-threads` expects, so the same bytes run on both engines.
+const WASI_THREAD_MODULE: &str = "wasi";
+const WASI_THREAD_SPAWN_NAME: &str = "thread-spawn";
+/// The export the host calls on a freshly spawned thread: `(func (param $tid i32) (param $start_arg
+/// i32))`. The synthesized spawn shim adapts SVM's `(i64 sp, i64 arg)` thread-entry ABI to it.
+const WASI_THREAD_START_EXPORT: &str = "wasi_thread_start";
 /// `memory.grow` on an **unbounded** wasm memory may extend up to this many pages. The window must
 /// hold the whole growable span (SVM masks accesses into the window rather than bounds-checking-and-
 /// trapping — the documented confinement difference), so for unbounded memory this is a modest cap
@@ -140,6 +150,9 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                                                          // convention (`module` = decimal type_id, `name` = decimal op) and lowers to a `cap.call`. The
                                                          // function index space puts imports first, so a wasm index `< imports.len()` is an import.
     let mut imports: Vec<(u32, u32, FuncType)> = Vec::new();
+    // §12 wasm threads: the wasm function index of the `wasi:thread/spawn` import, if present. Its
+    // `call` lowers to `thread.spawn` (not a cap.call); see the spawn-shim synthesis.
+    let mut spawn_import: Option<u32> = None;
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
@@ -172,6 +185,24 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                         wasmparser::TypeRef::Global(_) => return unsup("imported global"),
                         wasmparser::TypeRef::Tag(_) => return unsup("imported tag"),
                     };
+                    let (p, r) = &types[type_idx as usize];
+                    let sig = FuncType {
+                        params: p.clone(),
+                        results: r.clone(),
+                    };
+                    // §12 wasm threads (wasi-threads): the `wasi:thread/spawn` import is special — it
+                    // lowers to the native `thread.spawn` (a new vCPU over the shared window), **not** a
+                    // `cap.call`. It occupies a function-index slot like any import (so a placeholder
+                    // keeps later indices aligned), but it is excluded from the capability-handle logic
+                    // and the one-interface check below. See the spawn-shim synthesis after lowering.
+                    if imp.module == WASI_THREAD_MODULE && imp.name == WASI_THREAD_SPAWN_NAME {
+                        if spawn_import.is_some() {
+                            return unsup("multiple wasi:thread/spawn imports");
+                        }
+                        spawn_import = Some(imports.len() as u32);
+                        imports.push((u32::MAX, 0, sig)); // placeholder (type_id unused; never cap-called)
+                        continue;
+                    }
                     // The binding convention: `module` is the decimal capability type_id and `name`
                     // the decimal op. This keeps the transpiler pure mechanism — it never interprets
                     // the host semantics; the embedder grants the matching capability and the
@@ -191,27 +222,23 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                             imp.name
                         ))
                     })?;
-                    let (p, r) = &types[type_idx as usize];
-                    imports.push((
-                        type_id,
-                        op,
-                        FuncType {
-                            params: p.clone(),
-                            results: r.clone(),
-                        },
-                    ));
+                    imports.push((type_id, op, sig));
                 }
-                // v1 threads a single capability handle, so every import must share one type_id (one
-                // capability interface, methods distinguished by op). Distinct interfaces would need
-                // one handle each — a later slice. (Real WASI, whose imports are non-numeric, hits the
-                // parse error above regardless and needs a dedicated shim.)
-                if let Some((first, _, _)) = imports.first() {
-                    let first = *first;
-                    if imports.iter().any(|(t, _, _)| *t != first) {
-                        return unsup(
-                            "imports spanning multiple capability interfaces (one handle is \
-                             threaded in v1 — give every import the same module/type_id)",
-                        );
+                // v1 threads a single capability handle, so every **capability** import must share one
+                // type_id (one interface, methods distinguished by op); the `wasi:thread/spawn` import
+                // (placeholder `type_id == u32::MAX`) is excluded — it is the native spawn, not a
+                // cap.call. Distinct interfaces would need one handle each — a later slice.
+                let mut cap_type_id: Option<u32> = None;
+                for (t, _, _) in imports.iter().filter(|(t, _, _)| *t != u32::MAX) {
+                    match cap_type_id {
+                        None => cap_type_id = Some(*t),
+                        Some(first) if *t != first => {
+                            return unsup(
+                                "imports spanning multiple capability interfaces (one handle is \
+                                 threaded in v1 — give every import the same module/type_id)",
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -414,12 +441,48 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         });
     }
     let table_end = table_base + tsize * 4;
+    // §12 wasm threads: a 4-byte reserved unique-tid counter just past the function table (a fresh
+    // window reads 0, so the first spawned tid is 1). Only consumed when `wasi:thread/spawn` is used.
+    let tid_slot = table_end.div_ceil(4) * 4;
+
+    // §12 wasm threads validation + the spawn shim's IR index (it is appended right after the defined
+    // functions, so its index is `bodies.len()`). The shim adapts SVM's thread-entry ABI to the
+    // `wasi_thread_start` export.
+    let spawn_shim = bodies.len() as u32;
+    if spawn_import.is_some() {
+        if imports.iter().any(|(t, _, _)| *t != u32::MAX) {
+            return unsup(
+                "wasi:thread/spawn alongside capability imports — needs the per-thread handle stash \
+                 (threads-only modules are supported in this slice)",
+            );
+        }
+        // The host calls `wasi_thread_start(tid, start_arg)` on each spawned thread; require the export
+        // and that it is `(i32, i32) -> ()` (with no capability handle, since threads-only).
+        let wts = exports
+            .iter()
+            .find(|(n, _)| n == WASI_THREAD_START_EXPORT)
+            .map(|(_, i)| *i)
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "wasi:thread/spawn import without a `{WASI_THREAD_START_EXPORT}` export"
+                ))
+            })?;
+        let (p, r) = &types[func_type_idx[wts as usize] as usize];
+        if p.as_slice() != [ValType::I32, ValType::I32] || !r.is_empty() {
+            return unsup("wasi_thread_start must have type (i32 tid, i32 start_arg) -> ()");
+        }
+    }
+    let threads = ThreadCfg {
+        spawn_import,
+        spawn_shim,
+        tid_slot,
+    };
 
     let func_sigs: Vec<(Vec<ValType>, Vec<ValType>)> = func_type_idx
         .iter()
         .map(|&ti| types[ti as usize].clone())
         .collect();
-    let mut funcs = Vec::with_capacity(bodies.len());
+    let mut funcs = Vec::with_capacity(bodies.len() + spawn_import.is_some() as usize);
     for (i, body) in bodies.into_iter().enumerate() {
         let ty = &types[func_type_idx[i] as usize];
         funcs.push(lower_func(
@@ -439,14 +502,32 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                 max_pages,
                 initial_pages,
             },
+            threads,
         )?);
+    }
+    // Append the spawn shim (its `thread.spawn` target) for a threaded module.
+    if spawn_import.is_some() {
+        let wts = exports
+            .iter()
+            .find(|(n, _)| n == WASI_THREAD_START_EXPORT)
+            .map(|(_, i)| *i)
+            .expect("validated above");
+        funcs.push(build_spawn_shim(wts));
     }
 
     // Our window is a power-of-two byte range (masking confines to it); size it to hold the linear
     // memory (its full growable span) **and** the size cell + globals + function-table regions. (wasm
     // bounds-checks-and-traps on out-of-range access while we mask-confine to the ≥ power-of-two
     // window — identical for in-bounds accesses.) Globals/table-only modules still need a window.
-    let needed = table_end.max(globals_end).max(after_mem).max(mem_bytes);
+    let needed = table_end
+        .max(globals_end)
+        .max(after_mem)
+        .max(mem_bytes)
+        .max(if spawn_import.is_some() {
+            tid_slot + 4
+        } else {
+            0
+        });
     let memory = if mem.is_some() || !globals.is_empty() || tsize > 0 {
         let size_log2 = needed.max(1).next_power_of_two().trailing_zeros().max(16) as u8;
         Some(svm_ir::Memory { size_log2 })
@@ -555,6 +636,21 @@ struct MemGrow {
     initial_pages: u64,
 }
 
+/// §12 wasm threads config (wasi-threads). Absent (`spawn_import == None`) for non-threaded modules,
+/// in which case nothing here is referenced and the lowering is byte-identical to before.
+#[derive(Clone, Copy)]
+struct ThreadCfg {
+    /// The wasm function index of the `wasi:thread/spawn` import — its `call` lowers to `thread.spawn`.
+    spawn_import: Option<u32>,
+    /// IR index of the synthesized spawn shim (`thread.spawn`'s target — a `(i64 sp, i64 arg) -> i64`
+    /// adapter that unpacks `(tid, start_arg)` and calls `wasi_thread_start`).
+    spawn_shim: u32,
+    /// Window byte offset of the unique-TID counter: an i32 atomically `add`-incremented per spawn so
+    /// each thread gets a unique positive tid (avoiding the spawn-handle circularity). Reads 0 in a
+    /// fresh window, so the first tid is 1.
+    tid_slot: u64,
+}
+
 struct Lower<'a> {
     blocks: Vec<BlockB>,
     cur: usize,
@@ -598,6 +694,9 @@ struct Lower<'a> {
     /// Number of imported functions: a wasm function index `< n_imp` is an import (→ `cap.call`), else
     /// a defined function at IR index `idx - n_imp`.
     n_imp: usize,
+    /// §12 wasm threads config — the `wasi:thread/spawn` lowering (the spawn import index, the shim,
+    /// the unique-tid slot). `spawn_import` is `None` for non-threaded modules.
+    threads: ThreadCfg,
 }
 
 impl Lower<'_> {
@@ -785,6 +884,46 @@ impl Lower<'_> {
     }
 }
 
+/// Synthesize the §12 spawn shim: a `(i64 sp, i64 arg) -> (i64)` IR function (the `thread.spawn`
+/// entry ABI) that unpacks `(tid, start_arg)` from its packed `arg` and calls the module's
+/// `wasi_thread_start(tid, start_arg)` export (IR index `wts`), then returns 0. The data-SP `sp` is
+/// unused (svm-wasm keeps the C stack in linear memory). `wasi_thread_start` is `(i32, i32) -> ()`
+/// here — threads-only modules thread no capability handle, so it carries no leading handle param.
+fn build_spawn_shim(wts: u32) -> Func {
+    // values: v0=sp v1=arg | v2..  (a 0-result `call` appends no value)
+    let insts = vec![
+        Inst::ConstI64(32), // v2
+        Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::ShrU,
+            a: 1, // arg
+            b: 2, // 32
+        }, // v3 = arg >> 32
+        Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: 3,
+        }, // v4 = tid (i32)
+        Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: 1,
+        }, // v5 = start_arg (i32, low 32 of arg)
+        Inst::Call {
+            func: wts,
+            args: vec![4, 5],
+        }, // no result
+        Inst::ConstI64(0),  // v6
+    ];
+    Func {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64, ValType::I64],
+            insts,
+            term: Terminator::Return(vec![6]),
+        }],
+    }
+}
+
 /// Block-type → (param types, result types).
 fn block_sig(
     bt: BlockType,
@@ -813,6 +952,7 @@ fn lower_func(
     mem64: bool,
     imports: &[(u32, u32, FuncType)],
     mg: MemGrow,
+    threads: ThreadCfg,
 ) -> Result<Func, Error> {
     // Locals = params (with their incoming param values) then declared locals (default 0).
     let mut local_types: Vec<ValType> = params.to_vec();
@@ -824,18 +964,21 @@ fn lower_func(
         }
     }
 
-    // When the module has imports we thread one capability handle (i32) as the leading param of every
-    // function/block (the data-SP trick): the IR signature is `(i32 handle, wasm-params...) -> results`
-    // and param 0 is the handle. A no-import module is unchanged (no prefix), so its IR is identical.
-    let has_imports = !imports.is_empty();
+    // When the module has **capability** imports we thread one capability handle (i32) as the leading
+    // param of every function/block (the data-SP trick): the IR signature is `(i32 handle,
+    // wasm-params...) -> results` and param 0 is the handle. A module whose only import is
+    // `wasi:thread/spawn` (placeholder `type_id == u32::MAX`, lowered to the native `thread.spawn`, not
+    // a cap.call) needs no handle — so it is byte-identical to a no-import module. A no-import module
+    // is likewise unchanged.
+    let has_handle = imports.iter().any(|(t, _, _)| *t != u32::MAX);
     let n_imp = imports.len();
-    let mut entry_params: Vec<ValType> = Vec::with_capacity(has_imports as usize + params.len());
-    if has_imports {
+    let mut entry_params: Vec<ValType> = Vec::with_capacity(has_handle as usize + params.len());
+    if has_handle {
         entry_params.push(ValType::I32);
     }
     entry_params.extend_from_slice(params);
     let nparams = params.len() as ValIdx;
-    let base = has_imports as ValIdx; // value index of wasm param 0 (after the handle, if present)
+    let base = has_handle as ValIdx; // value index of wasm param 0 (after the handle, if present)
 
     let entry = BlockB {
         params: entry_params.clone(),
@@ -859,9 +1002,10 @@ fn lower_func(
         table_base,
         mem64,
         mg,
-        handle: has_imports.then_some(0),
+        handle: has_handle.then_some(0),
         imports,
         n_imp,
+        threads,
     };
     // Initialize declared locals to zero (params already bound to block params), extending `locals`.
     for t in &local_types[params.len()..] {
@@ -1118,6 +1262,10 @@ fn store_op(ty: ValType) -> StoreOp {
 /// at IR index `func - n_imp`; prepend the handle (when threaded) to its args so the callee's leading
 /// handle param is supplied.
 fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
+    // §12 wasm threads: a `call` to the `wasi:thread/spawn` import → the native `thread.spawn`.
+    if lo.threads.spawn_import == Some(func) {
+        return spawn_op(lo);
+    }
     if (func as usize) < lo.n_imp {
         let (type_id, op, sig) = lo.imports[func as usize].clone();
         let mut args = Vec::with_capacity(sig.params.len());
@@ -1160,6 +1308,69 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
     for (v, t) in res.into_iter().zip(results.iter()) {
         lo.push(v, *t);
     }
+    Ok(())
+}
+
+/// `call $wasi_thread_spawn` (stack: `[start_arg: i32]`) → the native `thread.spawn` (§12): a new
+/// vCPU over the shared window running the spawn shim. Returns the new thread's **tid** (a unique
+/// positive i32), matching the wasi-threads ABI. The tid is allocated by an atomic increment of the
+/// reserved `tid_slot` counter (avoiding the spawn-handle circularity), then packed with `start_arg`
+/// into the single i64 `thread.spawn` carries: `arg = (tid << 32) | start_arg`. The shim
+/// ([`build_spawn_shim`]) unpacks it and calls `wasi_thread_start(tid, start_arg)`.
+fn spawn_op(lo: &mut Lower) -> Result<(), Error> {
+    let (start_arg, _) = lo.pop()?; // i32
+    let shim = lo.threads.spawn_shim;
+    // tid = atomic_add(tid_slot, 1) + 1  ⇒ first spawn gets tid 1 (a fresh window reads 0).
+    let slot = lo.emit(Inst::ConstI64(lo.threads.tid_slot as i64));
+    let one = lo.emit(Inst::ConstI32(1));
+    let old = lo.emit(Inst::AtomicRmw {
+        ty: IntTy::I32,
+        op: AtomicRmwOp::Add,
+        addr: slot,
+        value: one,
+        offset: 0,
+        order: Ordering::SeqCst,
+    });
+    let one2 = lo.emit(Inst::ConstI32(1));
+    let tid = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Add,
+        a: old,
+        b: one2,
+    });
+    // arg = (zext(tid) << 32) | zext(start_arg)
+    let tid64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: tid,
+    });
+    let shift = lo.emit(Inst::ConstI64(32));
+    let hi = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Shl,
+        a: tid64,
+        b: shift,
+    });
+    let lo64 = lo.emit(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: start_arg,
+    });
+    let packed = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Or,
+        a: hi,
+        b: lo64,
+    });
+    // The shim ignores its data-SP (svm-wasm keeps the C stack in linear memory via `__stack_pointer`),
+    // so any constant works.
+    let sp0 = lo.emit(Inst::ConstI64(0));
+    // `thread.spawn` yields an i32 join handle; wasi-libc manages join itself (futex on the thread
+    // state), so we discard it and return the tid as the wasi:thread/spawn result.
+    let _join = lo.emit(Inst::ThreadSpawn {
+        func: shim,
+        sp: sp0,
+        arg: packed,
+    });
+    lo.push(tid, ValType::I32);
     Ok(())
 }
 
