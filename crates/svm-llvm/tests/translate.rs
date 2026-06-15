@@ -195,6 +195,24 @@ fn byval_and_sret_large_struct() {
 }
 
 #[test]
+fn libm_math_calls() {
+    // `sqrt`/`fmin` stay external libm calls at -O2 (errno) — we recognize the named function and
+    // lower it to the SVM float op inline.
+    check(
+        "sq",
+        "double sq(double x){ return __builtin_sqrt(x); }",
+        &[Value::F64(16.0)],
+        &[Value::F64(4.0)],
+    );
+    check(
+        "mn",
+        "double mn(double a, double b){ return __builtin_fmin(a, b); }",
+        &[Value::F64(3.0), Value::F64(5.0)],
+        &[Value::F64(3.0)],
+    );
+}
+
+#[test]
 fn function_pointer_table_global() {
     // A global `static fp tbl[2] = {inc, dec}` — a relocation: each element serializes to the
     // function's funcref index. `viafp` indexes the table at runtime and calls indirectly.

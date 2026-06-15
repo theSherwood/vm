@@ -8,9 +8,9 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–K (control flow, memory, calls, switch, globals, floats, indirect
-calls, struct aggregates, memory intrinsics, by-value aggregates, relocations) done — a broad swath
-of scalar C from `clang -O2` translates and runs on both backends (37 tests).** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–L (control flow, memory, calls, switch, globals, floats, indirect
+calls, struct aggregates, memory intrinsics, by-value aggregates, relocations, libm math) done — a
+broad swath of scalar C from `clang -O2` translates and runs on both backends (38 tests).** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -25,8 +25,9 @@ indexed string reads, a gapped switch (a global jump table), double arithmetic/c
 conversions, `fabs`/`floor`, an indirect call through a function pointer, struct field access
 (global/array-of-struct/stack), a struct `memcpy` + `memset`, and by-value struct args/returns
 (small-coerced + `byval`/`sret`), and pointer-valued global relocations (a function-pointer table,
-a struct string-pointer member) — run **interp == JIT == hand-computed** (37 tests).
-Remaining M1: libc/math function calls, a libc/powerbox `main` entry, then the
+a struct string-pointer member), and libm math calls (`sqrt`/`fmin`) — run **interp == JIT ==
+hand-computed** (38 tests).
+Remaining M1: a libc/powerbox `main` entry (`write`/`malloc`), then the
 demo Lane C. Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
@@ -390,11 +391,16 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       sizing must use the serialized length, not `type_size(g.ty)`, or the window mis-sizes.)
       *Deferred: `llvm.load.relative` (clang's relative-offset string tables) and GEP-constexprs.*
 
+**Slice L (DONE) — libm math calls.**
+- [x] A call to an *external* `sqrt`/`fabs`/`floor`/`ceil`/`trunc`/`rint`/`nearbyint`/`copysign`/
+      `fmin`/`fmax` (and the `…f` f32 variants) lowers to the matching SVM float op inline —
+      `lower_libm_call`, gated on the name not being a guest-defined function. `round`
+      (half-away-from-zero) and transcendentals (`sin`/`cos`/`exp`/`log`/`pow`) have no SVM op, so
+      they stay calls (`Unsupported` for now). Tested on `sqrt` and `fmin`.
+
 **Remaining slices.**
-- [ ] Libc/math **function** calls (e.g. `sqrt` keeps errno semantics → a real `@sqrt` call) — bind
-      to a guest libc / capability, or recognize the named libc-math calls as intrinsics under
-      `-fno-math-errno`.
-- [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline; `llvm.load.relative`.
+- [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/`cttz`/`ctpop`/…) lowered inline;
+      `llvm.load.relative`; transcendental math (needs a guest libm).
 - [ ] Libc/powerbox entry (`write`/`exit`/`malloc` via §7 named imports) + a `main` wrapper.
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
       (the same corpus chibicc passes — clay, jsmn, sha256, xxhash, tinfl, perlin, regex,

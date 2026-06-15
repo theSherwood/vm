@@ -10,9 +10,9 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slices A–K):** multi-block scalar functions with stack memory, calls,
+//! **Scope (Milestone 1, slices A–L):** multi-block scalar functions with stack memory, calls,
 //! `switch`, globals, floats, indirect calls, struct aggregates, memory intrinsics, by-value
-//! aggregates, and pointer-valued global relocations.
+//! aggregates, pointer-valued global relocations, and libm math calls.
 //! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
 //!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
 //!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
@@ -58,10 +58,13 @@
 //!   → address/funcref, `ptrtoint`/`sub`/`add`/`trunc`). The globals layout is two-phase (assign all
 //!   addresses, then serialize — forward references resolve). Covers function-pointer tables and
 //!   struct/array pointer members.
+//! - **L — libm math calls.** A call to an *external* `sqrt`/`fabs`/`floor`/`ceil`/`trunc`/`rint`/
+//!   `copysign`/`fmin`/`fmax` (and `…f` f32 variants) lowers to the matching SVM float op inline —
+//!   unless the guest defines its own. (`round` and transcendentals have no SVM op → still a call.)
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `mem*`, libc/math
-//! *function* calls (e.g. `sqrt` with errno), `llvm.load.relative` (clang's relative-offset string
-//! tables) and GEP-constexpr relocations (`&arr[k]`), SIMD vectors, `i33`.
+//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `mem*`, libc/host
+//! *function* calls (`write`/`malloc`/`printf`/transcendental math), `llvm.load.relative` (clang's
+//! relative-offset string tables) and GEP-constexpr relocations (`&arr[k]`), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -855,6 +858,55 @@ fn const_int(op: &Operand) -> Option<u64> {
     }
 }
 
+/// Lower a call to an external **libm math** function that has a direct SVM float op (`sqrt`,
+/// `fabs`, `floor`, `ceil`, `trunc`, `rint`/`nearbyint`, `copysign`, `fmin`, `fmax` and their `…f`
+/// f32 variants) to that op inline. Skipped if the guest *defines* a function of that name (then
+/// it's an ordinary direct call). `round` (half-away-from-zero) and transcendentals (`sin`/`exp`/…)
+/// have no SVM op, so they fall through to the call path (currently `Unsupported`).
+fn lower_libm_call(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    types: &Types,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    if ctx.name2idx.contains_key(&name) {
+        return Ok(None); // a guest-defined function — not the libm intrinsic
+    }
+    let base = name.strip_suffix('f').unwrap_or(&name); // the f32 variant drops a trailing `f`
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let ty = match args.first() {
+        Some(a) => match val_type(a.get_type(types).as_ref()) {
+            Ok(ValType::F32) | Ok(ValType::F64) => float_ty(val_type(a.get_type(types).as_ref())?)?,
+            _ => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    let un = |ctx: &mut BlockCtx, op: FUnOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        Ok(ctx.push(Inst::FUn { ty, op, a }))
+    };
+    let bin = |ctx: &mut BlockCtx, op: FBinOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        let b = ctx.operand(args[1])?;
+        Ok(ctx.push(Inst::FBin { ty, op, a, b }))
+    };
+    let idx = match base {
+        "sqrt" => un(ctx, FUnOp::Sqrt)?,
+        "fabs" => un(ctx, FUnOp::Abs)?,
+        "floor" => un(ctx, FUnOp::Floor)?,
+        "ceil" => un(ctx, FUnOp::Ceil)?,
+        "trunc" => un(ctx, FUnOp::Trunc)?,
+        "rint" | "nearbyint" => un(ctx, FUnOp::Nearest)?,
+        "copysign" => bin(ctx, FBinOp::Copysign)?,
+        "fmin" => bin(ctx, FBinOp::Min)?,
+        "fmax" => bin(ctx, FBinOp::Max)?,
+        _ => return Ok(None),
+    };
+    Ok(Some(idx))
+}
+
 /// Lower `llvm.memcpy`/`memmove`/`memset` (constant length) to inline chunked load/stores, the way
 /// `svm-wasm` lowers `memory.copy`/`fill`. Copies **load all chunks then store all** (overlap-safe,
 /// so `memmove` and `memcpy` share a path); `memset` replicates the fill byte across an `i64` and
@@ -1432,6 +1484,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `llvm.memcpy`/`memmove`/`memset` lower to inline chunked load/stores (constant length).
         if lower_mem_intrinsic(ctx, c)? {
             return Ok(()); // void — no SSA result
+        }
+        // A call to an external libm-math function with a direct SVM op (`sqrt`/`floor`/…) lowers
+        // inline (only when the guest hasn't defined its own function of that name).
+        if let Some(idx) = lower_libm_call(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
         }
         // Pass the callee its own data-stack frame at `sp + frame_size` (§3d), then the mapped
         // arguments. The IR signature is `(sp, c-args…)`, so the callee's frame never overlaps ours.
