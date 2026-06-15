@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [decode_verify, diff, mask]
+        target: [decode_verify, diff, mask, wasm_transpile]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -89,4 +89,30 @@ jobs:
         run: cargo test -p svm-jit --lib loom
         env:
           RUSTFLAGS: "--cfg loom"
+  miri:
+    # Run the unsafe memory substrate under Miri's UB/provenance + data-race checkers. svm-mem is
+    # Miri-aware (a heap-backed fallback replaces the mmap FFI under `cfg(miri)`), so its raw-pointer
+    # atomics and the Mapped-vs-Paged differential get provenance/race-checked — complementing loom
+    # (which models the protocol atomics) and TSan.
+    name: miri (svm-mem unsafe substrate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with: { components: miri }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly miri test -p svm-mem
+  supply-chain:
+    # Scan the dependency tree against the RustSec advisory DB. Gated off pull_request so a
+    # newly-published advisory on a transitive dep surfaces on main / nightly without blocking
+    # unrelated feature PRs (same posture as the fuzz/bench jobs).
+    name: cargo-audit (advisory scan)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
 
