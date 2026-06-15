@@ -8,11 +8,15 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 0 done — the skeleton crate builds, links libLLVM, and the first-light
-differential is green.** `crates/svm-llvm` translates `clang -O2 -emit-llvm` bitcode for the
-single-block integer subset, verifies it, and runs it on the interpreter matching native
-clang (4 tests). Milestone 1 (the real scalar+memory+call subset) is next. Section numbers
-like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
+**Status: Milestone 1 slice A done — multi-block integer control flow translates and runs on
+both backends.** `crates/svm-llvm` does the **SSA → block-argument conversion** (LLVM dominance
+SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/critical edges, no edge
+splitting), plus integer arith/shift/div-rem, `icmp`, `i1`/`i8`/`i16`/`i32`/`i64` `trunc`/`zext`/
+`sext`, `select`, and `br`/`br_if`/`return`/`unreachable`. Real `clang -O2` branchy/looping
+functions (popcount, collatz, if-converted select) run **interp == JIT == hand-computed**
+(8 tests). Remaining M1 slices: memory (`alloca`/`load`/`store`/GEP), calls, aggregates/`sret`,
+intrinsics, `switch`, then the demo Lane C. Section numbers like "§3d" refer to `DESIGN.md`;
+"D54" etc. are its Decision Log.
 
 ---
 
@@ -265,11 +269,23 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       richer instruction set; the bitcode lane already covers the M0 surface.
 
 ### Milestone 1 — the chibicc-proven scalar+memory+call subset 🟢 (the D54 MVP)
-- [ ] φ → block parameters (+ critical-edge splitting).
+**Slice A (DONE) — control flow + scalar SSA.** Multi-block integer functions on both backends.
+- [x] φ → block parameters — done as a general **SSA → block-argument conversion** (liveness-based:
+      every value live across a block entry becomes a parameter, φ-results included; each branch
+      supplies the args). Critical edges need **no splitting** — args are evaluated in the
+      predecessor. Loops/joins/back-edges all covered.
+- [x] Integer arith/bitwise/`shl`/`lshr`/`ashr`/`udiv`/`sdiv`/`urem`/`srem`; `icmp` (all 10
+      predicates); `select`; `i1`/`i8`/`i16`/`i32`/`i64` `trunc`/`zext`/`sext` (narrow-int collapse
+      to `i32`, §3b — sign-extend via the shift pair Cranelift folds); `br`/`br_if`/`return`/
+      `unreachable`. Tested interp == JIT == hand-computed on real `clang -O2` output (popcount,
+      collatz, classify, …). Non-byte widths (`i33`) are a clean `Unsupported`.
+
+**Remaining slices.**
 - [ ] `mem2reg`/SROA ingest pass → two-stack split (§3a); remaining `alloca` → data stack.
-- [ ] Narrow-int collapse to `i32` with `extend8_s`/`16_s` discipline (§3b).
 - [ ] GEP → `ptr.add` via `DataLayout`; loads/stores incl. narrow widths.
 - [ ] Direct + indirect `call` (funcref §3c); `switch` → `br_table`/compare-chain.
+- [ ] Floats (`f32`/`f64`: `fadd`/…/`fcmp`/`fptosi`/`sitofp`/…) — deferred with memory.
+- [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline.
 - [ ] By-value aggregates via `sret`/hidden pointer (D39).
 - [ ] `memcpy`/`memset`/`memmove` intrinsics; libc/powerbox entry (`write`/`exit`/`malloc`).
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**

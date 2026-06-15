@@ -10,21 +10,28 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 0):** the absolute floor — a single-basic-block function over `i32`/`i64`
-//! integer arithmetic, terminated by `ret`/`unreachable`. Everything outside this frozen subset
-//! is a fail-closed [`Error::Unsupported`] (the `unsup` chokepoint, mirroring `svm-wasm`). The
-//! scalar+memory+call MVP (φ→block-params, GEP, loads/stores, calls) lands in Milestone 1.
+//! **Scope (Milestone 1, slice A — control flow + scalar SSA):** multi-block integer functions.
+//! The headline is the **SSA → block-argument conversion**: LLVM's dominance-based SSA (a value
+//! defined in one block is usable in any dominated block, and φ-nodes merge across edges) becomes
+//! SVM's block-local form (§3a: a value never crosses a block boundary except as a typed block
+//! parameter). We compute liveness, make every value live across a block's entry a parameter (φ
+//! results included), and have each branch supply the matching arguments — so loops, joins, and
+//! critical edges all work without edge splitting. Covered: integer arithmetic/bitwise/shift/
+//! div-rem, `icmp`, `i1`/`i8`/`i16`/`i32`/`i64` `trunc`/`zext`/`sext`, `select`, and the
+//! `br`/`br_if`/`return`/`unreachable` terminators. Out of slice A (clean [`Error::Unsupported`]):
+//! floats, memory (`alloca`/`load`/`store`/GEP), `call`, `switch`, aggregates, and non-byte
+//! integer widths (e.g. `i33`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use llvm_ir::constant::Constant;
 use llvm_ir::instruction::Instruction;
 use llvm_ir::terminator::Terminator as LTerm;
-use llvm_ir::types::Type;
-use llvm_ir::{Module as LModule, Name, Operand};
+use llvm_ir::types::{Type, Typed, Types};
+use llvm_ir::IntPredicate;
+use llvm_ir::{constant::Constant, BasicBlock, Function, Module as LModule, Name, Operand};
 
-use svm_ir::{BinOp, Block, Func, Inst, IntTy, Module, Terminator, ValIdx, ValType};
+use svm_ir::{BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, Module, Terminator, ValIdx, ValType};
 
 /// Why a translation could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +59,12 @@ pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Module, Error> {
 pub fn translate(m: &LModule) -> Result<Module, Error> {
     let mut funcs = Vec::with_capacity(m.functions.len());
     for f in &m.functions {
-        funcs.push(translate_func(f)?);
+        // Declaration-only functions (e.g. an undefined extern / intrinsic prototype) have no
+        // body to translate; skip them. A *call* to one needs call support (a later slice).
+        if f.basic_blocks.is_empty() {
+            continue;
+        }
+        funcs.push(translate_func(f, &m.types)?);
     }
     Ok(Module {
         funcs,
@@ -62,8 +74,8 @@ pub fn translate(m: &LModule) -> Result<Module, Error> {
 }
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
-/// are memory widths only, not SSA value types); `i64` stays `i64`. Wider/other types are
-/// outside the Milestone-0 subset.
+/// are memory widths only, not SSA value types); `i64` stays `i64`. Non-byte widths (`i33`,
+/// `i128`), floats, pointers, and aggregates are outside the slice-A subset.
 fn val_type(ty: &Type) -> Result<ValType, Error> {
     match ty {
         Type::IntegerType { bits } if *bits <= 32 => Ok(ValType::I32),
@@ -73,29 +85,48 @@ fn val_type(ty: &Type) -> Result<ValType, Error> {
     }
 }
 
-/// The `IntTy` an integer operand is computed at (drives the typed `iN.*` op). Read straight
-/// off the operand — a local carries its `TypeRef`, a constant its bit width — so we never need
-/// an `llvm-ir` type-inference context.
-fn operand_int_ty(op: &Operand) -> Result<IntTy, Error> {
-    let from_val = |ty: ValType| match ty {
-        ValType::I32 => Ok(IntTy::I32),
-        ValType::I64 => Ok(IntTy::I64),
-        other => unsup(format!("non-integer operand type {}", other.as_str())),
-    };
-    match op {
-        Operand::LocalOperand { ty, .. } => from_val(val_type(ty.as_ref())?),
-        Operand::ConstantOperand(c) => match c.as_ref() {
-            Constant::Int { bits, .. } if *bits <= 32 => Ok(IntTy::I32),
-            Constant::Int { bits, .. } if *bits == 64 => Ok(IntTy::I64),
-            other => unsup(format!("constant operand type {other:?}")),
-        },
-        Operand::MetadataOperand => unsup("metadata operand type"),
+/// The integer bit width of an LLVM type, or `None` if it is not an integer.
+fn int_bits(ty: &Type) -> Option<u32> {
+    match ty {
+        Type::IntegerType { bits } => Some(*bits),
+        _ => None,
     }
 }
 
-fn translate_func(f: &llvm_ir::Function) -> Result<Func, Error> {
+/// The `IntTy` (`i32`/`i64`) a value of this SVM type is computed at.
+fn int_ty(v: ValType) -> Result<IntTy, Error> {
+    match v {
+        ValType::I32 => Ok(IntTy::I32),
+        ValType::I64 => Ok(IntTy::I64),
+        other => unsup(format!("non-integer type {}", other.as_str())),
+    }
+}
+
+/// A unique id for every SSA value in a function (parameters, then each block's φ-results and
+/// instruction results, in scan order). The translation works in terms of these; SVM block-local
+/// indices are derived per block.
+type ValueId = usize;
+
+/// Per-function scan tables: the value↔id maps and the block index map.
+struct Scan {
+    /// LLVM value name → its `ValueId`.
+    name2id: HashMap<Name, ValueId>,
+    /// `ValueId` → its SVM type.
+    ty: Vec<ValType>,
+    /// `ValueId` → the block it is defined in (parameters are defined in the entry block, 0).
+    def_block: Vec<usize>,
+    /// Block name → block index (entry is 0).
+    block_idx: HashMap<Name, usize>,
+    /// Block index → block name (for looking up φ incoming-by-predecessor).
+    block_name: Vec<Name>,
+}
+
+fn translate_func(f: &Function, types: &Types) -> Result<Func, Error> {
     if f.is_var_arg {
         return unsup(format!("varargs function `{}`", f.name));
+    }
+    if f.basic_blocks.is_empty() {
+        return unsup(format!("declaration-only function `{}`", f.name));
     }
     let params: Vec<ValType> = f
         .parameters
@@ -106,71 +137,303 @@ fn translate_func(f: &llvm_ir::Function) -> Result<Func, Error> {
         Type::VoidType => Vec::new(),
         t => vec![val_type(t)?],
     };
-    // Milestone 0: single basic block only (φ → block params is Milestone 1).
-    if f.basic_blocks.len() != 1 {
-        return unsup(format!(
-            "function `{}` has {} basic blocks (multi-block / control flow is Milestone 1)",
-            f.name,
-            f.basic_blocks.len()
-        ));
-    }
-    let bb = &f.basic_blocks[0];
 
-    // SSA value numbering is block-local (§3a): params occupy `0..params.len()`, then each
-    // value-producing instruction (incl. materialized constants) takes the next index.
-    let mut map: HashMap<Name, ValIdx> = HashMap::new();
-    for (i, p) in f.parameters.iter().enumerate() {
-        map.insert(p.name.clone(), i as ValIdx);
-    }
-    let mut ctx = BlockCtx {
-        insts: Vec::new(),
-        map,
-        next_val: params.len() as ValIdx,
-    };
+    let scan = scan_func(f, types)?;
+    let live_in = liveness(f, &scan)?;
+    let block_params = block_params(f, &scan, &live_in);
 
-    for instr in &bb.instrs {
-        ctx.translate_inst(instr)?;
+    let mut blocks = Vec::with_capacity(f.basic_blocks.len());
+    for (bi, bb) in f.basic_blocks.iter().enumerate() {
+        blocks.push(translate_block(bb, bi, f, types, &scan, &block_params)?);
     }
-    let term = ctx.translate_term(&bb.term)?;
-
     Ok(Func {
-        params: params.clone(),
+        params,
         results,
-        // The entry block's params must equal the function signature's params (§3b).
-        blocks: vec![Block {
-            params,
-            insts: ctx.insts,
-            term,
-        }],
+        blocks,
     })
 }
 
-/// A block under construction: the straight-line body, the LLVM-name → SSA-index map, and the
-/// running block-local value counter.
-struct BlockCtx {
+/// Pass 1a: assign a `ValueId` to every SSA value (parameters first, then per block the φ-results
+/// and instruction results), recording each one's SVM type and defining block. Also validates that
+/// every instruction is in the slice-A subset (so later passes can assume support).
+fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
+    let mut s = Scan {
+        name2id: HashMap::new(),
+        ty: Vec::new(),
+        def_block: Vec::new(),
+        block_idx: HashMap::new(),
+        block_name: Vec::new(),
+    };
+    for (bi, bb) in f.basic_blocks.iter().enumerate() {
+        s.block_idx.insert(bb.name.clone(), bi);
+        s.block_name.push(bb.name.clone());
+    }
+    // Parameters are values defined at entry.
+    for p in &f.parameters {
+        let id = s.ty.len();
+        s.name2id.insert(p.name.clone(), id);
+        s.ty.push(val_type(&p.ty)?);
+        s.def_block.push(0);
+    }
+    for (bi, bb) in f.basic_blocks.iter().enumerate() {
+        if bi != 0 {
+            // (entry φ is impossible — entry has no predecessors)
+        }
+        for instr in &bb.instrs {
+            // Validate support + collect uses now so liveness can rely on it.
+            let _ = local_uses(instr)?;
+            if let Some(dest) = instr.try_get_result() {
+                let id = s.ty.len();
+                s.name2id.insert(dest.clone(), id);
+                s.ty.push(val_type(instr.get_type(types).as_ref())?);
+                s.def_block.push(bi);
+            }
+        }
+        term_local_uses(&bb.term)?; // validate terminator support
+    }
+    Ok(s)
+}
+
+/// The local (non-constant) value operands an instruction *uses*, and — as a side effect — the
+/// slice-A support check (an unsupported instruction is a fail-closed [`Error::Unsupported`]).
+/// φ incoming values are **edge** uses (counted per-predecessor in liveness), so a `Phi` reports
+/// no direct uses here.
+fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
+    use Instruction as I;
+    let locals = |ops: &[&Operand]| -> Vec<Name> {
+        ops.iter()
+            .filter_map(|o| match o {
+                Operand::LocalOperand { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let r = match instr {
+        I::Add(x) => locals(&[&x.operand0, &x.operand1]),
+        I::Sub(x) => locals(&[&x.operand0, &x.operand1]),
+        I::Mul(x) => locals(&[&x.operand0, &x.operand1]),
+        I::UDiv(x) => locals(&[&x.operand0, &x.operand1]),
+        I::SDiv(x) => locals(&[&x.operand0, &x.operand1]),
+        I::URem(x) => locals(&[&x.operand0, &x.operand1]),
+        I::SRem(x) => locals(&[&x.operand0, &x.operand1]),
+        I::And(x) => locals(&[&x.operand0, &x.operand1]),
+        I::Or(x) => locals(&[&x.operand0, &x.operand1]),
+        I::Xor(x) => locals(&[&x.operand0, &x.operand1]),
+        I::Shl(x) => locals(&[&x.operand0, &x.operand1]),
+        I::LShr(x) => locals(&[&x.operand0, &x.operand1]),
+        I::AShr(x) => locals(&[&x.operand0, &x.operand1]),
+        I::ICmp(x) => locals(&[&x.operand0, &x.operand1]),
+        I::Select(x) => locals(&[&x.condition, &x.true_value, &x.false_value]),
+        I::Trunc(x) => locals(&[&x.operand]),
+        I::ZExt(x) => locals(&[&x.operand]),
+        I::SExt(x) => locals(&[&x.operand]),
+        // A φ's operands are edge uses, handled in liveness via `PhiUses`.
+        I::Phi(_) => Vec::new(),
+        other => return unsup(format!("instruction {other:?}")),
+    };
+    Ok(r)
+}
+
+/// The local value operands a terminator uses (the branch condition / returned value). Validates
+/// terminator support. Branch *arguments* are synthesized from block parameters, not from here.
+fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
+    let one = |o: &Operand| match o {
+        Operand::LocalOperand { name, .. } => vec![name.clone()],
+        _ => Vec::new(),
+    };
+    match term {
+        LTerm::Ret(r) => Ok(r.return_operand.as_ref().map(one).unwrap_or_default()),
+        LTerm::Br(_) => Ok(Vec::new()),
+        LTerm::CondBr(c) => Ok(one(&c.condition)),
+        LTerm::Unreachable(_) => Ok(Vec::new()),
+        other => unsup(format!("terminator {other:?}")),
+    }
+}
+
+/// Pass 1b: SSA liveness (backward fixpoint). Returns each block's **live-in** set — the values
+/// defined elsewhere that are live at the block's entry (used here or threaded to a successor).
+/// These become the block's threaded parameters (φ-results are added separately). φ semantics:
+/// a φ in `S` taking `v` from predecessor `B` makes `v` live-*out* of `B` (an edge use), not
+/// live-in of `S`.
+fn liveness(f: &Function, s: &Scan) -> Result<Vec<HashSet<ValueId>>, Error> {
+    let n = f.basic_blocks.len();
+    // Per-block precomputed sets.
+    let mut defs: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut uevar: Vec<HashSet<ValueId>> = vec![HashSet::new(); n]; // upward-exposed direct uses
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut phi_defs: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    // phi_uses[b] = values that some successor's φ pulls from predecessor `b`.
+    let mut phi_uses: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+
+    let id = |name: &Name| -> Option<ValueId> { s.name2id.get(name).copied() };
+
+    for (bi, bb) in f.basic_blocks.iter().enumerate() {
+        for instr in &bb.instrs {
+            if let Some(d) = instr.try_get_result() {
+                if let Some(vid) = id(d) {
+                    defs[bi].insert(vid);
+                    if matches!(instr, Instruction::Phi(_)) {
+                        phi_defs[bi].insert(vid);
+                    }
+                }
+            }
+            // A direct use of a value defined in another block is upward-exposed.
+            for u in local_uses(instr)? {
+                if let Some(vid) = id(&u) {
+                    if s.def_block[vid] != bi {
+                        uevar[bi].insert(vid);
+                    }
+                }
+            }
+        }
+        for u in term_local_uses(&bb.term)? {
+            if let Some(vid) = id(&u) {
+                if s.def_block[vid] != bi {
+                    uevar[bi].insert(vid);
+                }
+            }
+        }
+        for t in term_succs(&bb.term, s)? {
+            succ[bi].push(t);
+        }
+    }
+    // φ edge-uses: attribute each φ incoming to its named predecessor.
+    for bb in &f.basic_blocks {
+        for instr in &bb.instrs {
+            if let Instruction::Phi(p) = instr {
+                for (op, pred) in &p.incoming_values {
+                    if let Operand::LocalOperand { name, .. } = op {
+                        if let (Some(vid), Some(&pb)) = (id(name), s.block_idx.get(pred)) {
+                            phi_uses[pb].insert(vid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut live_out: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in (0..n).rev() {
+            // live_out(B) = ∪_succ [ (live_in(S) \ PhiDefs(S)) ∪ PhiUses(B,S-via-edge) ]
+            let mut new_out: HashSet<ValueId> = phi_uses[bi].clone();
+            for &sblk in &succ[bi] {
+                for &v in &live_in[sblk] {
+                    if !phi_defs[sblk].contains(&v) {
+                        new_out.insert(v);
+                    }
+                }
+            }
+            // live_in(B) = UEVar(B) ∪ (live_out(B) \ Defs(B))
+            let mut new_in = uevar[bi].clone();
+            for &v in &new_out {
+                if !defs[bi].contains(&v) {
+                    new_in.insert(v);
+                }
+            }
+            if new_out != live_out[bi] {
+                live_out[bi] = new_out;
+                changed = true;
+            }
+            if new_in != live_in[bi] {
+                live_in[bi] = new_in;
+                changed = true;
+            }
+        }
+    }
+    Ok(live_in)
+}
+
+/// The successor block indices of a terminator.
+fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
+    let b = |name: &Name| -> Result<usize, Error> {
+        s.block_idx
+            .get(name)
+            .copied()
+            .ok_or_else(|| Error::Unsupported(format!("branch to unknown block {name:?}")))
+    };
+    match term {
+        LTerm::Br(x) => Ok(vec![b(&x.dest)?]),
+        LTerm::CondBr(x) => Ok(vec![b(&x.true_dest)?, b(&x.false_dest)?]),
+        LTerm::Ret(_) | LTerm::Unreachable(_) => Ok(Vec::new()),
+        other => unsup(format!("terminator {other:?}")),
+    }
+}
+
+/// Pass 1c: the ordered parameter value-ids of each block. Entry's parameters are the function's
+/// parameters (§3b). Every other block's are its φ-results (in φ order) followed by its threaded
+/// live-in values (sorted by id for a deterministic order shared by the block header and every
+/// branch into it).
+fn block_params(f: &Function, s: &Scan, live_in: &[HashSet<ValueId>]) -> Vec<Vec<ValueId>> {
+    let mut out = Vec::with_capacity(f.basic_blocks.len());
+    for (bi, bb) in f.basic_blocks.iter().enumerate() {
+        if bi == 0 {
+            // Entry: exactly the function parameters, in declaration order (ids 0..nparams).
+            out.push((0..f.parameters.len()).collect());
+            continue;
+        }
+        let mut params: Vec<ValueId> = Vec::new();
+        let mut phi_set: HashSet<ValueId> = HashSet::new();
+        for instr in &bb.instrs {
+            if let Instruction::Phi(p) = instr {
+                if let Some(&vid) = s.name2id.get(&p.dest) {
+                    params.push(vid);
+                    phi_set.insert(vid);
+                }
+            }
+        }
+        let mut threaded: Vec<ValueId> = live_in[bi]
+            .iter()
+            .copied()
+            .filter(|v| !phi_set.contains(v))
+            .collect();
+        threaded.sort_unstable();
+        params.extend(threaded);
+        out.push(params);
+    }
+    out
+}
+
+/// A block under construction: the straight-line body, the value-id → block-local-index map
+/// (seeded with the block's parameters), and the running block-local value counter.
+struct BlockCtx<'a> {
+    s: &'a Scan,
     insts: Vec<Inst>,
-    map: HashMap<Name, ValIdx>,
+    idx_of: HashMap<ValueId, ValIdx>,
     next_val: ValIdx,
 }
 
-impl BlockCtx {
-    /// Append a value-producing instruction and return its block-local index.
+impl<'a> BlockCtx<'a> {
     fn push(&mut self, inst: Inst) -> ValIdx {
         self.insts.push(inst);
-        let idx = self.next_val;
+        let i = self.next_val;
         self.next_val += 1;
-        idx
+        i
     }
 
-    /// Resolve an operand to an SSA value index, materializing a constant as a `const` instruction
+    /// Resolve a value-id already available in this block (a parameter or an earlier result).
+    fn id(&self, vid: ValueId) -> Result<ValIdx, Error> {
+        self.idx_of
+            .get(&vid)
+            .copied()
+            .ok_or_else(|| Error::Unsupported(format!("value {vid} not available in block")))
+    }
+
+    /// Resolve an operand to a block-local index, materializing a constant as a `const` inst
     /// (SVM has no constant pool — constants are instructions, §3b).
     fn operand(&mut self, op: &Operand) -> Result<ValIdx, Error> {
         match op {
-            Operand::LocalOperand { name, .. } => self
-                .map
-                .get(name)
-                .copied()
-                .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}"))),
+            Operand::LocalOperand { name, .. } => {
+                let vid = *self
+                    .s
+                    .name2id
+                    .get(name)
+                    .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}")))?;
+                self.id(vid)
+            }
             Operand::ConstantOperand(c) => match c.as_ref() {
                 Constant::Int { bits, value } if *bits <= 32 => {
                     Ok(self.push(Inst::ConstI32(*value as u32 as i32)))
@@ -183,46 +446,392 @@ impl BlockCtx {
             Operand::MetadataOperand => unsup("metadata operand"),
         }
     }
+}
 
-    fn translate_inst(&mut self, instr: &Instruction) -> Result<(), Error> {
-        // Milestone 0: integer binary arithmetic/bitwise only. `nsw`/`nuw`/`exact` flags are
-        // ignored — SVM defines wrapping semantics (§3b), and the flags only license LLVM UB we
-        // do not reproduce (the §3c totality discipline).
-        use Instruction as I;
-        let (op0, op1, dest, binop) = match instr {
-            I::Add(x) => (&x.operand0, &x.operand1, &x.dest, BinOp::Add),
-            I::Sub(x) => (&x.operand0, &x.operand1, &x.dest, BinOp::Sub),
-            I::Mul(x) => (&x.operand0, &x.operand1, &x.dest, BinOp::Mul),
-            I::And(x) => (&x.operand0, &x.operand1, &x.dest, BinOp::And),
-            I::Or(x) => (&x.operand0, &x.operand1, &x.dest, BinOp::Or),
-            I::Xor(x) => (&x.operand0, &x.operand1, &x.dest, BinOp::Xor),
-            other => return unsup(format!("instruction {other:?}")),
-        };
-        let ty = operand_int_ty(op0)?;
-        let a = self.operand(op0)?;
-        let b = self.operand(op1)?;
-        let idx = self.push(Inst::IntBin {
-            ty,
-            op: binop,
-            a,
-            b,
-        });
-        self.map.insert(dest.clone(), idx);
-        Ok(())
+fn translate_block(
+    bb: &BasicBlock,
+    bi: usize,
+    f: &Function,
+    types: &Types,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+) -> Result<Block, Error> {
+    let param_ids = &block_params[bi];
+    let params: Vec<ValType> = param_ids.iter().map(|&v| s.ty[v]).collect();
+    let mut ctx = BlockCtx {
+        s,
+        insts: Vec::new(),
+        idx_of: HashMap::new(),
+        next_val: 0,
+    };
+    for (pos, &vid) in param_ids.iter().enumerate() {
+        ctx.idx_of.insert(vid, pos as ValIdx);
     }
+    ctx.next_val = param_ids.len() as ValIdx;
 
-    fn translate_term(&mut self, term: &LTerm) -> Result<Terminator, Error> {
-        match term {
-            LTerm::Ret(r) => match &r.return_operand {
-                None => Ok(Terminator::Return(Vec::new())),
-                Some(op) => {
-                    let v = self.operand(op)?;
-                    Ok(Terminator::Return(vec![v]))
-                }
-            },
-            // `unreachable` after UB → a defined trap to the host (§3b/§3c totality).
-            LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
-            other => unsup(format!("terminator {other:?}")),
+    for instr in &bb.instrs {
+        if matches!(instr, Instruction::Phi(_)) {
+            continue; // φ-results are block parameters, supplied by predecessors
+        }
+        translate_inst(&mut ctx, instr, types)?;
+    }
+    let term = translate_term(&mut ctx, &bb.term, bi, f, s, block_params)?;
+    Ok(Block {
+        params,
+        insts: ctx.insts,
+        term,
+    })
+}
+
+fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<(), Error> {
+    use Instruction as I;
+    // The op's integer width, from operand0 (both operands share a type in LLVM binops).
+    let bin_ty =
+        |o: &Operand| -> Result<IntTy, Error> { int_ty(val_type(o.get_type(types).as_ref())?) };
+
+    let (dest, idx) = match instr {
+        I::Add(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::Add,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::Sub(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::Sub,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::Mul(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::Mul,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::UDiv(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::DivU,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::SDiv(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::DivS,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::URem(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::RemU,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::SRem(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::RemS,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::And(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::And,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::Or(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::Or,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::Xor(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::Xor,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::Shl(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::Shl,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::LShr(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::ShrU,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::AShr(x) => bin(
+            ctx,
+            &x.dest,
+            bin_ty(&x.operand0)?,
+            BinOp::ShrS,
+            &x.operand0,
+            &x.operand1,
+        )?,
+        I::ICmp(x) => {
+            let ty = bin_ty(&x.operand0)?;
+            let op = icmp_op(x.predicate);
+            let a = ctx.operand(&x.operand0)?;
+            let b = ctx.operand(&x.operand1)?;
+            (&x.dest, ctx.push(Inst::IntCmp { ty, op, a, b }))
+        }
+        I::Select(x) => {
+            let cond = ctx.operand(&x.condition)?;
+            let a = ctx.operand(&x.true_value)?;
+            let b = ctx.operand(&x.false_value)?;
+            (&x.dest, ctx.push(Inst::Select { cond, a, b }))
+        }
+        I::Trunc(x) => {
+            let from = src_bits(&x.operand, types)?;
+            let to = int_bits(x.to_type.as_ref())
+                .ok_or_else(|| Error::Unsupported("trunc to non-int".into()))?;
+            let v = ctx.operand(&x.operand)?;
+            (&x.dest, emit_trunc(ctx, v, from, to))
+        }
+        I::ZExt(x) => {
+            let from = src_bits(&x.operand, types)?;
+            let to = int_bits(x.to_type.as_ref())
+                .ok_or_else(|| Error::Unsupported("zext to non-int".into()))?;
+            let v = ctx.operand(&x.operand)?;
+            (&x.dest, emit_ext(ctx, v, from, to, false))
+        }
+        I::SExt(x) => {
+            let from = src_bits(&x.operand, types)?;
+            let to = int_bits(x.to_type.as_ref())
+                .ok_or_else(|| Error::Unsupported("sext to non-int".into()))?;
+            let v = ctx.operand(&x.operand)?;
+            (&x.dest, emit_ext(ctx, v, from, to, true))
+        }
+        other => return unsup(format!("instruction {other:?}")),
+    };
+    if let Some(&vid) = ctx.s.name2id.get(dest) {
+        ctx.idx_of.insert(vid, idx);
+    }
+    Ok(())
+}
+
+/// Emit a binary integer op and return `(dest, result-index)`.
+fn bin<'d>(
+    ctx: &mut BlockCtx,
+    dest: &'d Name,
+    ty: IntTy,
+    op: BinOp,
+    a: &Operand,
+    b: &Operand,
+) -> Result<(&'d Name, ValIdx), Error> {
+    let a = ctx.operand(a)?;
+    let b = ctx.operand(b)?;
+    Ok((dest, ctx.push(Inst::IntBin { ty, op, a, b })))
+}
+
+fn icmp_op(p: IntPredicate) -> CmpOp {
+    match p {
+        IntPredicate::EQ => CmpOp::Eq,
+        IntPredicate::NE => CmpOp::Ne,
+        IntPredicate::UGT => CmpOp::GtU,
+        IntPredicate::UGE => CmpOp::GeU,
+        IntPredicate::ULT => CmpOp::LtU,
+        IntPredicate::ULE => CmpOp::LeU,
+        IntPredicate::SGT => CmpOp::GtS,
+        IntPredicate::SGE => CmpOp::GeS,
+        IntPredicate::SLT => CmpOp::LtS,
+        IntPredicate::SLE => CmpOp::LeS,
+    }
+}
+
+fn src_bits(op: &Operand, types: &Types) -> Result<u32, Error> {
+    int_bits(op.get_type(types).as_ref())
+        .ok_or_else(|| Error::Unsupported("conversion of non-integer".into()))
+}
+
+/// Lower a `trunc from→to`. Narrow values are carried in their `i32`/`i64` container; truncation
+/// drops the high bits, so we mask to `to` bits (within `i32`) or `wrap` (`i64`→`i32`).
+fn emit_trunc(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32) -> ValIdx {
+    if from <= 32 {
+        // i32 container → i32 container: mask to the low `to` bits.
+        mask_to(ctx, v, to)
+    } else if to <= 32 {
+        let w = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: v,
+        });
+        mask_to(ctx, w, to)
+    } else {
+        v // i64 → i64 (no-op)
+    }
+}
+
+/// Lower a `zext`/`sext from→to`. Produces a value whose low `to` bits are the (zero- or sign-)
+/// extended result, in the destination container.
+fn emit_ext(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32, signed: bool) -> ValIdx {
+    // First make a clean i32 holding the value extended from `from` bits (if `from < 32`).
+    let i32v = if from >= 32 {
+        v
+    } else if signed {
+        sext_in_i32(ctx, v, from)
+    } else {
+        mask_to(ctx, v, from)
+    };
+    if to <= 32 {
+        i32v
+    } else if signed {
+        ctx.push(Inst::Convert {
+            op: ConvOp::ExtendI32S,
+            a: i32v,
+        })
+    } else {
+        ctx.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: i32v,
+        })
+    }
+}
+
+/// Mask an `i32`-container value to its low `bits` (no-op for `bits >= 32`).
+fn mask_to(ctx: &mut BlockCtx, v: ValIdx, bits: u32) -> ValIdx {
+    if bits >= 32 {
+        return v;
+    }
+    let m = ctx.push(Inst::ConstI32(((1u64 << bits) - 1) as i32));
+    ctx.push(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::And,
+        a: v,
+        b: m,
+    })
+}
+
+/// Sign-extend the low `from` bits of an `i32`-container value to fill the `i32` (`shl` then
+/// arithmetic `shr` by `32 - from`). Handles `i1` too; `extend8_s`/`extend16_s` would fold the
+/// 8/16 cases, but Cranelift folds the shift pair, so one general path keeps the TCB small (§3b).
+fn sext_in_i32(ctx: &mut BlockCtx, v: ValIdx, from: u32) -> ValIdx {
+    debug_assert!(from < 32);
+    let sh = ctx.push(Inst::ConstI32((32 - from) as i32));
+    let up = ctx.push(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Shl,
+        a: v,
+        b: sh,
+    });
+    let sh2 = ctx.push(Inst::ConstI32((32 - from) as i32));
+    ctx.push(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::ShrS,
+        a: up,
+        b: sh2,
+    })
+}
+
+fn translate_term(
+    ctx: &mut BlockCtx,
+    term: &LTerm,
+    bi: usize,
+    f: &Function,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+) -> Result<Terminator, Error> {
+    match term {
+        LTerm::Ret(r) => match &r.return_operand {
+            None => Ok(Terminator::Return(Vec::new())),
+            Some(op) => {
+                let v = ctx.operand(op)?;
+                Ok(Terminator::Return(vec![v]))
+            }
+        },
+        LTerm::Br(x) => {
+            let target = s.block_idx[&x.dest];
+            let args = branch_args(ctx, bi, target, f, s, block_params)?;
+            Ok(Terminator::Br {
+                target: target as u32,
+                args,
+            })
+        }
+        LTerm::CondBr(x) => {
+            let cond = ctx.operand(&x.condition)?;
+            let then_blk = s.block_idx[&x.true_dest];
+            let else_blk = s.block_idx[&x.false_dest];
+            let then_args = branch_args(ctx, bi, then_blk, f, s, block_params)?;
+            let else_args = branch_args(ctx, bi, else_blk, f, s, block_params)?;
+            Ok(Terminator::BrIf {
+                cond,
+                then_blk: then_blk as u32,
+                then_args,
+                else_blk: else_blk as u32,
+                else_args,
+            })
+        }
+        LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
+        other => unsup(format!("terminator {other:?}")),
+    }
+}
+
+/// Build the argument list for a branch from `from` to `target`: for each of `target`'s
+/// parameters (φ-results then threaded live-ins), supply — from the *source* block `from` —
+/// the φ's incoming value for this predecessor, or the threaded value itself.
+fn branch_args(
+    ctx: &mut BlockCtx,
+    from: usize,
+    target: usize,
+    f: &Function,
+    s: &Scan,
+    block_params: &[Vec<ValueId>],
+) -> Result<Vec<ValIdx>, Error> {
+    // Map each φ-result id in `target` to its incoming operand from predecessor `from`.
+    let from_name = &s.block_name[from];
+    let target_bb = &f.basic_blocks[target];
+    let mut phi_incoming: HashMap<ValueId, &Operand> = HashMap::new();
+    for instr in &target_bb.instrs {
+        if let Instruction::Phi(p) = instr {
+            if let Some(&vid) = s.name2id.get(&p.dest) {
+                let inc = p
+                    .incoming_values
+                    .iter()
+                    .find(|(_, pred)| pred == from_name)
+                    .map(|(op, _)| op)
+                    .ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "φ {:?} has no incoming for predecessor {from_name:?}",
+                            p.dest
+                        ))
+                    })?;
+                phi_incoming.insert(vid, inc);
+            }
         }
     }
+    let mut args = Vec::with_capacity(block_params[target].len());
+    for &pv in &block_params[target] {
+        if let Some(op) = phi_incoming.get(&pv) {
+            args.push(ctx.operand(op)?);
+        } else {
+            // A threaded live-in: it is live-out of `from`, so available in this block.
+            args.push(ctx.id(pv)?);
+        }
+    }
+    Ok(args)
 }
