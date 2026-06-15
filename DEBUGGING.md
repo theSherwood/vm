@@ -47,6 +47,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
 | `cap.call` I/O record log | **Missing** | — |
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
+| W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `svm-interp` `find_schedule` / `replay_schedule` / `Witness` |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded; multithread pending) |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
@@ -442,6 +443,21 @@ Mazurkiewicz trace, so the witness is already near-minimal).
 
 **Acceptance.** A one-command "model-check this concurrent entry" reports the set of outcomes
 and, on a failure, hands back a schedule that `run_scheduled` reproduces and W2 can step.
+
+**Built — slice 1 (witness find + replay).** `svm-interp` now exposes the model checker as a
+debugging tool: `find_schedule(m, func, args, fuel, max, pred) -> Option<Witness>` model-checks
+across interleavings (DPOR) and returns the **first** schedule whose outcome matches `pred`
+(deadlock / trap / specific bad result) as a replayable `Witness { plan, outcome,
+schedule_index }`; `replay_schedule(m, func, args, fuel, &plan)` re-runs that exact interleaving
+deterministically (the W7 → W1 bridge). Implemented by extracting the DPOR loop into a private
+`explore_core` with an `on_outcome(idx, &outcome, &plan)` callback that `explore_all` (collect the
+outcome set) and `find_schedule` (capture a witness, stop early) share; the witness is the
+executed `trace` tids, and replay forces them through `Dpor::pick`. Tests (`concurrency_debug.rs`,
+the racy lost-update counter): a `→ 1` witness is found and replays deterministically 5×, the
+serial `→ 2` witness replays, and an impossible outcome returns `None`. Full workspace green.
+
+*Not yet:* CLI verbs over these functions; stepping a witness interleaving (needs the
+multithreaded `Inspector` — Milestone B, the `Policy` scheduler seam); the DRF-or-trap tier.
 
 ---
 

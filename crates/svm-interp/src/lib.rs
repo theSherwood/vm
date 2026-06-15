@@ -1142,19 +1142,116 @@ pub fn explore_all(
     fuel: u64,
     max_schedules: u64,
 ) -> Exhaustive {
+    let mut outcomes: Vec<Result<Vec<Value>, Trap>> = Vec::new();
+    let (schedules, complete) =
+        explore_core(m, func, args, fuel, max_schedules, |_idx, result, _plan| {
+            if !outcomes.contains(result) {
+                outcomes.push(result.clone());
+            }
+            false // never stop early: enumerate the whole (reduced) interleaving tree
+        });
+    Exhaustive {
+        outcomes,
+        schedules,
+        complete,
+    }
+}
+
+/// A replayable witness schedule (DEBUGGING.md W7): the exact sequence of scheduling choices
+/// (`TaskId` per visible-op decision point) that produced `outcome`, recovered from the DPOR
+/// explorer. Feed `plan` to [`replay_schedule`] to reproduce `outcome` deterministically (or, later,
+/// to a multithreaded `Inspector` to *step* that interleaving — Milestone B).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Witness {
+    /// The scheduling choice (`TaskId`) at each decision point, in order.
+    pub plan: Vec<u64>,
+    /// The terminal outcome this schedule produced.
+    pub outcome: Result<Vec<Value>, Trap>,
+    /// Which explored schedule (1-based) yielded it.
+    pub schedule_index: u64,
+}
+
+/// Model-check `func` across interleavings and return the **first** schedule whose outcome
+/// satisfies `pred`, as a replayable [`Witness`] (DEBUGGING.md W7) — e.g. find a deadlock
+/// (`|o| matches!(o, Err(Trap::ThreadFault))`), any trap, or a specific bad result. Explores with
+/// DPOR (sound reduction) up to `max_schedules`. `None` means no explored schedule matched — and if
+/// the search ran to completion (didn't hit `max_schedules`), no such schedule exists. Unlike
+/// [`explore_all`] (which reports the *set* of outcomes), this hands back a concrete, reproducible
+/// interleaving you can replay and inspect.
+pub fn find_schedule(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    max_schedules: u64,
+    pred: impl Fn(&Result<Vec<Value>, Trap>) -> bool,
+) -> Option<Witness> {
+    let mut found: Option<Witness> = None;
+    explore_core(m, func, args, fuel, max_schedules, |idx, result, plan| {
+        if pred(result) {
+            found = Some(Witness {
+                plan: plan.to_vec(),
+                outcome: result.clone(),
+                schedule_index: idx,
+            });
+            true // stop: we have our witness
+        } else {
+            false
+        }
+    });
+    found
+}
+
+/// Re-run a witness schedule deterministically (DEBUGGING.md W7 → W1): drive the interpreter with
+/// `plan` (a [`Witness::plan`]) so the same interleaving — hence the same outcome — is reproduced.
+/// A failing interleaving found by [`find_schedule`] is thus replayable on demand.
+pub fn replay_schedule(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    plan: &[u64],
+) -> Result<Vec<Value>, Trap> {
     if m.funcs.get(func as usize).is_none() {
-        return Exhaustive {
-            outcomes: vec![Err(Trap::Malformed)],
-            schedules: 1,
-            complete: true,
-        };
+        return Err(Trap::Malformed);
+    }
+    let funcs: Arc<[Func]> = m.funcs.clone().into();
+    // The plan forces each scheduling choice (`Dpor::pick`); an empty `prior` is fine — sleep sets
+    // only affect *exploration*, never a forced replay.
+    let mut dpor = Dpor::new(plan.to_vec(), Vec::new());
+    run_one_schedule(
+        &funcs,
+        &m.memory,
+        &m.data,
+        func,
+        args,
+        fuel,
+        Policy::Dpor(&mut dpor),
+    )
+}
+
+/// The DPOR exploration engine shared by [`explore_all`] and [`find_schedule`] (DEBUGGING.md W7).
+/// Runs schedules under dynamic partial-order reduction; for each non-redundant (non-sleep-blocked)
+/// schedule it calls `on_outcome(schedule_index, &outcome, &executed_plan)`, where `executed_plan`
+/// is the sequence of `TaskId` choices that produced `outcome` — a replayable witness (feed it to
+/// [`replay_schedule`]). Returning `true` stops the search early (so `complete` is then `false`).
+/// Returns `(schedules_run, complete)`.
+fn explore_core(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: u64,
+    max_schedules: u64,
+    mut on_outcome: impl FnMut(u64, &Result<Vec<Value>, Trap>, &[TaskId]) -> bool,
+) -> (u64, bool) {
+    if m.funcs.get(func as usize).is_none() {
+        on_outcome(1, &Err(Trap::Malformed), &[]);
+        return (1, true);
     }
     let funcs: Arc<[Func]> = m.funcs.clone().into();
 
     let mut stack: Vec<DporSlot> = Vec::new();
-    let mut outcomes: Vec<Result<Vec<Value>, Trap>> = Vec::new();
     let mut schedules = 0u64;
-    let complete;
 
     loop {
         // Replay the current path (`chosen` per depth), extending with the default choice past its end.
@@ -1174,11 +1271,15 @@ pub fn explore_all(
         );
         schedules += 1;
         // A sleep-blocked run is a redundant prefix (its completions were reached elsewhere): keep its
-        // trace for race/backtrack bookkeeping, but don't record an outcome from its truncated tail.
-        if !dpor.blocked && !outcomes.contains(&result) {
-            outcomes.push(result);
-        }
+        // trace for race/backtrack bookkeeping, but don't surface an outcome from its truncated tail.
+        let blocked = dpor.blocked;
         let trace = dpor.trace;
+        if !blocked {
+            let executed: Vec<TaskId> = trace.iter().map(|e| e.tid).collect();
+            if on_outcome(schedules, &result, &executed) {
+                return (schedules, false); // caller asked to stop (e.g. found a witness)
+            }
+        }
 
         // Sync the path stack with the trace just produced. Slots for the replayed prefix already
         // exist (their `chosen` matches by construction); push fresh slots for newly reached depths;
@@ -1242,21 +1343,9 @@ pub fn explore_all(
                 stack[d].chosen = p;
                 stack.truncate(d + 1);
             }
-            Some(_) => {
-                complete = false;
-                break;
-            }
-            None => {
-                complete = true;
-                break;
-            }
+            Some(_) => return (schedules, false), // hit `max_schedules` with work left
+            None => return (schedules, true),     // interleaving tree exhausted
         }
-    }
-
-    Exhaustive {
-        outcomes,
-        schedules,
-        complete,
     }
 }
 
