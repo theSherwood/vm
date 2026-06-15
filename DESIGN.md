@@ -1781,6 +1781,9 @@ browser — good enough here.
 
 ## 19. Debugging & observability  [DESIGN — foundations built; debug surfaces staged]
 
+> **Work-breakdown & detailed designs:** `DEBUGGING.md` (workstreams W1–W8, sequencing,
+> open decisions). This section stays the canonical *rationale*; that doc is the *plan*.
+
 Good debugging is a **first-class ergonomics goal**, not an afterthought. The architecture
 yields three debugging pillars cheaply, plus one that is real work — pursue all three cheap
 ones as pillars and stage the expensive one.
