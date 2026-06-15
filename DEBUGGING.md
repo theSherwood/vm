@@ -730,9 +730,23 @@ per-block `LocList`); `ty` is a render-name string (structured `TypeRef` later);
 rich blob yet. **Frontend emission is separate:** chibicc populating the core from its `Token`s,
 and the LLVM/wasm ingest sides, are their own slices targeting this same waist.
 
-**Not yet (next slices):** chibicc debug emission (`codegen_ir.c`), binary serialization of the
-debug section, multithreaded debugging (the `Policy` scheduler seam, Milestone B), and the W4
-refinements above (per-block `LocList`, structured `TypeRef`, rich blob).
+**Slice 5 — chibicc `-g` emission (the producer side, end-to-end).** `chibicc --emit-ir -g`
+now emits the §6 waist from real C: a `debug.var` per named local mapping its C name to a
+`VarLoc`. Crucially, **`-g` is `-Og`** — it disables SSA promotion (the W6 / §19 debuggable-vs-
+optimized trade), so every local keeps a *stable* window data-stack slot and resolves
+function-wide as `VarLoc::Window{off}`. (Promoted scalars would need S2's per-block `LocList`
+since their value index varies by block/PC — deferred.) `main.c` gains a 2-line `-g` flag
+(intercepted before chibicc's generic `-g*`-ignore block); everything else is in `codegen_ir.c`
+(the project's "ours" file). End-to-end test (`c_frontend.rs`, behind the unix toolchain gate):
+compile C → parse → `Inspector` reads `s`, `t`, `a`, `b` by their **C names** with correct
+values. Default (non-`-g`) output is unchanged, so all 78 existing c_frontend tests are
+untouched. `debug.loc` (per-op source lines) needs per-op inst counting in the emitter — a later
+slice.
+
+**Not yet (next slices):** `debug.loc` source-line emission (chibicc + the LLVM/wasm ingest
+sides), binary serialization of the debug section, multithreaded debugging (the `Policy`
+scheduler seam, Milestone B), and the W4 refinements (per-block `LocList`, structured `TypeRef`,
+rich blob).
 
 ### Open questions (S4/S5/S2)
 
