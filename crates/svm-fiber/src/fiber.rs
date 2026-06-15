@@ -12,9 +12,9 @@
 use crate::stack::Stack;
 use crate::switch::{jump, make, Transfer};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::abort;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// AddressSanitizer **fiber-switch annotations** (`feature = "asan"`). ASan tracks each thread's
 /// current stack (shadow + fake-stack bookkeeping), so every manual stack switch must be bracketed:
