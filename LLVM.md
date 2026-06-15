@@ -8,9 +8,8 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–F (control flow + memory + calls + switch + globals + floats)
-done — multi-block scalar functions with stack memory, (recursive) calls, `switch`, global
-variables, and `f32`/`f64` translate and run on both backends.** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–G (control flow, memory, calls, switch, globals, floats, indirect
+calls) done — a broad swath of scalar C from `clang -O2` translates and runs on both backends.** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -22,9 +21,10 @@ the common float intrinsics, `fmuladd` lowered unfused). Real `clang -O2` progra
 collatz loops, if-converted select, a stack-array sum, recursive `fib`, a cross-function call, a
 dense switch, `even`/`odd` mutual recursion, a const lookup table, a mutable global counter,
 indexed string reads, a gapped switch (a global jump table), double arithmetic/compares/
-conversions, and `fabs`/`floor` — run **interp == JIT == hand-computed** (24 tests).
-Remaining M1: indirect calls (funcref), aggregates/`sret`, libc/math function calls, then the demo
-Lane C. Section numbers like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
+conversions, `fabs`/`floor`, and an indirect call through a function pointer — run
+**interp == JIT == hand-computed** (25 tests). Remaining M1: aggregates/`sret` + struct GEP,
+libc/math function calls, function-pointer global tables (relocations), then the demo Lane C.
+Section numbers like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
 
@@ -338,8 +338,15 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       constants and `f32`/`f64` params/results in the slot ABI. Tested on `clang -O2` double
       arithmetic (incl. the `fmuladd` contraction), compares, int↔float, promote/demote, `fabs`/`floor`.
 
+**Slice G (DONE) — indirect calls (funcref §3c).**
+- [x] Taking a function's address → its funcref index (`ref.func`, the function-table index)
+      widened to the `i64` pointer rep. An indirect `call` (callee is a function-pointer value)
+      truncates it back to the `i32` funcref and lowers to `call_indirect <sig>` — the runtime masks
+      the index and checks the type-id (§3c). The signature is the callee's function type plus the
+      prepended data-SP, so it matches the callee's IR signature. Tested on a `noinline` pointer-
+      returning `pick` whose result `run` calls indirectly (a genuine `-O2` `call_indirect`).
+
 **Remaining slices.**
-- [ ] Indirect `call` (funcref §3c — `call` through a function pointer; needs `ref.func` + the table).
 - [ ] Libc/math **function** calls (e.g. `sqrt` keeps errno semantics → a real `@sqrt` call) — bind
       to a guest libc / capability, or recognize the named libc-math calls as intrinsics under
       `-fno-math-errno`.

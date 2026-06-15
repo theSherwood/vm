@@ -34,10 +34,14 @@
 //!   conversions (`fptosi`/`sitofp`/`fpext`/`fptrunc`, float→int saturating per §3b), `bitcast`,
 //!   and the common float math intrinsics (`fmuladd`/`fma` unfused, `sqrt`/`fabs`/`floor`/…) lowered
 //!   inline. (Ordered/unordered fcmp collapse — the NaN corner is a documented fidelity gap.)
+//! - **G — indirect calls.** Taking a function's address yields its §3c funcref index (widened to
+//!   the `i64` pointer rep); an indirect `call` truncates the function-pointer value to the `i32`
+//!   funcref and lowers to `call_indirect <sig>` (the runtime masks + type-id-checks it). The
+//!   signature is the callee's function type plus the prepended data-SP, matching the IR signature.
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): indirect calls (funcref), libc/math
-//! *function* calls (e.g. `sqrt` with errno), pointer-valued globals (relocations), struct/vector
-//! GEP + aggregates, SIMD vectors, and non-byte integer widths (e.g. `i33`).
+//! Out of the current subset (clean [`Error::Unsupported`]): libc/math *function* calls (e.g.
+//! `sqrt` with errno), pointer-valued globals (relocations — incl. function-pointer tables),
+//! struct/vector GEP + aggregates, SIMD vectors, and non-byte integer widths (e.g. `i33`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -529,17 +533,21 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
             v
         }
         // A droppable intrinsic (`llvm.lifetime`/`dbg`/`assume`) contributes no real uses — it is
-        // a no-op. A real (direct) call uses its argument operands; the data-SP it threads is the
-        // §3d positional parameter, not an LLVM value, so it is not counted here.
+        // a no-op. A real call uses its argument operands plus — for an indirect call — the
+        // function-pointer callee; the data-SP it threads is the §3d positional parameter, not an
+        // LLVM value, so it is not counted here.
         I::Call(c) if is_droppable_call(c) => Vec::new(),
-        I::Call(c) => c
-            .arguments
-            .iter()
-            .filter_map(|(o, _)| match o {
+        I::Call(c) => {
+            let mut v: Vec<Name> = match c.function.as_ref().right() {
+                Some(Operand::LocalOperand { name, .. }) => vec![name.clone()],
+                _ => Vec::new(),
+            };
+            v.extend(c.arguments.iter().filter_map(|(o, _)| match o {
                 Operand::LocalOperand { name, .. } => Some(name.clone()),
                 _ => None,
-            })
-            .collect(),
+            }));
+            v
+        }
         // A φ's operands are edge uses, handled in liveness via `PhiUses`.
         I::Phi(_) => Vec::new(),
         other => return unsup(format!("instruction {other:?}")),
@@ -549,16 +557,29 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
 
 /// The name of a direct call's target (a `@global` function reference). An indirect call (the
 /// callee is a computed value) or inline asm is a clean `Unsupported` for now.
-fn call_target_name(c: &llvm_ir::instruction::Call) -> Result<String, Error> {
-    match c.function.as_ref().right() {
-        Some(Operand::ConstantOperand(cr)) => match cr.as_ref() {
-            Constant::GlobalReference {
-                name: Name::Name(s),
-                ..
-            } => Ok(s.to_string()),
-            other => unsup(format!("call target {other:?}")),
-        },
-        _ => unsup("indirect call (Milestone 1+ — needs funcref support)"),
+/// The SVM signature of an indirect call's callee — the function type plus the prepended data-SP
+/// param (§3d), so the runtime type-id check matches the callee's IR signature (§3c).
+fn indirect_sig(c: &llvm_ir::instruction::Call) -> Result<svm_ir::FuncType, Error> {
+    match c.function_ty.as_ref() {
+        Type::FuncType {
+            result_type,
+            param_types,
+            is_var_arg,
+        } => {
+            if *is_var_arg {
+                return unsup("indirect varargs call");
+            }
+            let mut params = vec![ValType::I64]; // the prepended data-SP
+            for p in param_types {
+                params.push(val_type(p.as_ref())?);
+            }
+            let results = match result_type.as_ref() {
+                Type::VoidType => Vec::new(),
+                t => vec![val_type(t)?],
+            };
+            Ok(svm_ir::FuncType { params, results })
+        }
+        other => unsup(format!("indirect call through non-function type {other}")),
     }
 }
 
@@ -952,13 +973,20 @@ impl<'a> BlockCtx<'a> {
                     }
                 }
                 // A reference to a global variable is its window address (a constant `i64`). A
-                // reference to a *function* (a function pointer) is not in the globals map → it is
-                // funcref territory (a later slice), so a clean `Unsupported`.
+                // reference to a *function* is its §3c funcref index (the function-table index),
+                // widened to the `i64` pointer representation (a function pointer is `ptr`/`i64`).
                 Constant::GlobalReference { name, .. } => {
                     let n = name_str(name);
-                    match self.globals.get(&n) {
-                        Some(&a) => Ok(self.push(Inst::ConstI64(a as i64))),
-                        None => unsup(format!("reference to `@{n}` (function/undefined global)")),
+                    if let Some(&a) = self.globals.get(&n) {
+                        Ok(self.push(Inst::ConstI64(a as i64)))
+                    } else if let Some(&func) = self.name2idx.get(&n) {
+                        let r = self.push(Inst::RefFunc { func });
+                        Ok(self.push(Inst::Convert {
+                            op: ConvOp::ExtendI32U,
+                            a: r,
+                        }))
+                    } else {
+                        unsup(format!("reference to `@{n}` (undefined/external global)"))
                     }
                 }
                 other => unsup(format!("constant operand {other:?}")),
@@ -1052,13 +1080,8 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
             return Ok(());
         }
-        // Direct call only (indirect/funcref is a later slice). Pass the callee its own data-stack
-        // frame at `sp + frame_size` (§3d), then the mapped arguments. The IR signature is
-        // `(sp, c-args…)`, so the callee's frame never overlaps ours.
-        let name = call_target_name(c)?;
-        let func = *ctx.name2idx.get(&name).ok_or_else(|| {
-            Error::Unsupported(format!("call to external/undefined function `{name}`"))
-        })?;
+        // Pass the callee its own data-stack frame at `sp + frame_size` (§3d), then the mapped
+        // arguments. The IR signature is `(sp, c-args…)`, so the callee's frame never overlaps ours.
         let sp = ctx.sp()?;
         let fs = ctx.const_i64(ctx.frame_size as i64);
         let callee_sp = ctx.add_i64(sp, fs);
@@ -1066,14 +1089,38 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         for (a, _attrs) in &c.arguments {
             args.push(ctx.operand(a)?);
         }
+        // A direct call (named, defined function) lowers to `call <idx>`; an indirect call (through
+        // a function-pointer value) lowers to `call_indirect <sig>` (§3c: mask + type-id check).
+        let inst = match callee_name(c) {
+            Some(name) => {
+                let func = *ctx.name2idx.get(&name).ok_or_else(|| {
+                    Error::Unsupported(format!("call to external/undefined function `{name}`"))
+                })?;
+                Inst::Call { func, args }
+            }
+            None => {
+                let op = c
+                    .function
+                    .as_ref()
+                    .right()
+                    .ok_or_else(|| Error::Unsupported("inline-asm call".into()))?;
+                let fref64 = ctx.operand(op)?; // the function pointer (i64)
+                let idx = ctx.push(Inst::Convert {
+                    op: ConvOp::WrapI64,
+                    a: fref64,
+                }); // → i32 funcref index
+                let ty = indirect_sig(c)?;
+                Inst::CallIndirect { ty, idx, args }
+            }
+        };
         match &c.dest {
             Some(dest) => {
-                let idx = ctx.push(Inst::Call { func, args });
+                let r = ctx.push(inst);
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
-                    ctx.idx_of.insert(vid, idx);
+                    ctx.idx_of.insert(vid, r);
                 }
             }
-            None => ctx.push_effect(Inst::Call { func, args }), // void call: no SSA result
+            None => ctx.push_effect(inst), // void call: no SSA result
         }
         return Ok(());
     }

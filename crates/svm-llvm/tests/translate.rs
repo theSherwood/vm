@@ -394,6 +394,30 @@ fn float_intrinsics_abs_floor() {
 }
 
 #[test]
+fn indirect_call_via_function_pointer() {
+    // `pick` (noinline) returns a function pointer; `run` calls it indirectly — `-O2` keeps it a
+    // real `call_indirect`. Exercises taking a function's address (funcref), threading it as an
+    // i64 pointer through a `select`/return, and the §3c masked + type-checked indirect dispatch.
+    let src = "int inc(int); int dec(int); typedef int(*fp)(int); fp pick(int); \
+               int run(int sel, int x){ return pick(sel)(x); } \
+               __attribute__((noinline)) fp pick(int sel){ return sel ? inc : dec; } \
+               __attribute__((noinline)) int inc(int x){ return x + 1; } \
+               __attribute__((noinline)) int dec(int x){ return x - 1; }";
+    check(
+        "run_inc",
+        src,
+        &[Value::I32(1), Value::I32(10)],
+        &[Value::I32(11)],
+    );
+    check(
+        "run_dec",
+        src,
+        &[Value::I32(0), Value::I32(10)],
+        &[Value::I32(9)],
+    );
+}
+
+#[test]
 fn unsupported_is_fail_closed() {
     // A 128-bit integer is outside the subset — it must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).
