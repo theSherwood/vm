@@ -1792,13 +1792,41 @@ pub fn resolve_imports_with(
     Ok(out)
 }
 
-/// One unit to statically link: a module plus the function symbols it **exports** (name → its local
-/// function index). A unit's named imports (`Module::imports`) are resolved against the other units'
-/// exports by [`link`].
-#[derive(Clone, Debug)]
+/// One unit to statically link: a module plus the symbols it **exports** and the **relocations** its
+/// own data references need. Function symbols (`exports`) and its named `Module::imports` are resolved
+/// against the other units by [`link`]; `data_exports` name window offsets within the unit's data; and
+/// `relocations` patch the unit's address constants once its data is placed (see [`DataReloc`]).
+#[derive(Clone, Debug, Default)]
 pub struct LinkUnit {
     pub module: Module,
+    /// Function symbols this unit provides: `name → local function index`.
     pub exports: Vec<(String, FuncIdx)>,
+    /// Data symbols this unit provides: `name → byte offset within the unit's (un-relocated) data`.
+    pub data_exports: Vec<(String, u64)>,
+    /// Relocations the unit's data references need after the linker places its data (§ELF-style).
+    pub relocations: Vec<DataReloc>,
+}
+
+/// A relocation: at link time, patch the **constant** at `(func, block, inst)` — which must be a
+/// `ConstI64`/`ConstI32` (an address the frontend left at a unit-local value) — by **adding** a base
+/// resolved from `kind`; the const's current value is the **addend** (so `&g + 4` works). This is how
+/// a unit's data references survive relocation into the one shared window — no IR change, no value
+/// renumbering, just a const edit. `func`/`block`/`inst` are unit-local (applied before concatenation).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DataReloc {
+    pub func: u32,
+    pub block: u32,
+    pub inst: u32,
+    pub kind: RelocKind,
+}
+
+/// What base a [`DataReloc`] adds.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RelocKind {
+    /// This unit's own assigned data base — the const holds a unit-local data offset (an own-data ref).
+    SelfData,
+    /// The resolved address of an exported **data** symbol (a cross-unit data import).
+    DataSymbol(String),
 }
 
 /// Why [`link`] failed (fail-closed; the linked module is also re-verified before it runs).
@@ -1812,30 +1840,45 @@ pub enum LinkError {
     Unresolved(String),
     /// A `CallImport` referenced an out-of-range import (a malformed unit).
     BadImportIndex(u32),
+    /// A relocation pointed at a missing instruction, or one that isn't an address constant.
+    BadReloc(DataReloc),
 }
 
-/// **Statically link** units into one module — the compile-time loader (dynamic-linking milestone 1).
-///
-/// Concatenate the units' functions into one list, **reindexing** each unit's internal function
-/// references by its base offset; build a symbol table from all exports; and resolve every unit's
-/// named imports to a **direct call** against that table ([`resolve_imports_with`] with
-/// [`Resolved::Func`]). The result is one import-free module — re-verify it before running, since a
-/// unit is untrusted like any frontend output (a cross-unit signature mismatch is caught there).
-///
-/// Scope: function symbols and code (the milestone-0 mechanism, now across *separate* units). Data
-/// symbols / per-unit data relocation are a follow-up — units with overlapping active data segments
-/// would collide, so this is for code (or non-overlapping-data) units.
+/// **Statically link** units into one module — the compile-time loader (dynamic-linking milestones
+/// 1–2). Concatenate the units' functions into one list, **reindexing** each unit's internal function
+/// references by its base offset; place each unit's **data** in a non-overlapping window region and
+/// apply its **relocations** so its address constants follow; build function + data symbol tables from
+/// all exports; and resolve every unit's named imports — a `call` symbol to a **direct call**, a data
+/// symbol to a **constant address** — against them. The result is one import-free, relocated module —
+/// re-verify it before running, since a unit is untrusted like any frontend output (a cross-unit
+/// signature mismatch is caught there).
 pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
-    // Each unit's functions occupy `[base, base + n_funcs)` in the merged list.
-    let mut bases = Vec::with_capacity(units.len());
-    let mut total: u32 = 0;
+    // Function and data layout: each unit's functions occupy `[fbase, fbase + n_funcs)` in the merged
+    // list, and its data occupies the window region `[dbase, dbase + data_span)` (16-byte aligned, so
+    // units never overlap). `data_span` is the high-water mark of the unit's own (un-relocated) data.
+    let align16 = |x: u64| (x + 15) & !15;
+    let mut fbases = Vec::with_capacity(units.len());
+    let mut dbases = Vec::with_capacity(units.len());
+    let (mut ftotal, mut dtotal): (u32, u64) = (0, 0);
     for u in units {
-        bases.push(total);
-        total += u.module.funcs.len() as u32;
+        fbases.push(ftotal);
+        ftotal += u.module.funcs.len() as u32;
+        let dbase = align16(dtotal);
+        dbases.push(dbase);
+        let span = u
+            .module
+            .data
+            .iter()
+            .map(|d| d.offset + d.bytes.len() as u64)
+            .max()
+            .unwrap_or(0);
+        dtotal = dbase + span;
     }
-    // Symbol table: exported name → global function index.
-    let mut symtab: std::collections::HashMap<String, FuncIdx> = std::collections::HashMap::new();
-    for (u, &base) in units.iter().zip(&bases) {
+    // Symbol tables: exported name → global function index, and exported data name → window address.
+    let mut funcs_tab: std::collections::HashMap<String, FuncIdx> =
+        std::collections::HashMap::new();
+    let mut data_tab: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
         for (name, local) in &u.exports {
             if *local as usize >= u.module.funcs.len() {
                 return Err(LinkError::BadExport {
@@ -1843,24 +1886,48 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
                     index: *local,
                 });
             }
-            if symtab.insert(name.clone(), base + local).is_some() {
+            if funcs_tab.insert(name.clone(), fbase + local).is_some()
+                || data_tab.contains_key(name)
+            {
+                return Err(LinkError::DuplicateSymbol(name.clone()));
+            }
+        }
+        for (name, local_off) in &u.data_exports {
+            if data_tab.insert(name.clone(), dbase + local_off).is_some()
+                || funcs_tab.contains_key(name)
+            {
                 return Err(LinkError::DuplicateSymbol(name.clone()));
             }
         }
     }
-    // Per unit: shift internal function references to global indices, then resolve its named imports
-    // to direct calls at their global indices, and append.
-    let mut funcs: Vec<Func> = Vec::with_capacity(total as usize);
-    for (u, &base) in units.iter().zip(&bases) {
+    // Per unit: place its data, apply its relocations, reindex its functions, resolve its imports.
+    let mut funcs: Vec<Func> = Vec::with_capacity(ftotal as usize);
+    let mut data: Vec<Data> = Vec::new();
+    for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
         let mut m = u.module.clone();
-        offset_func_indices(&mut m, base);
+        // Relocate this unit's data segments into its assigned window region…
+        for d in &mut m.data {
+            d.offset += dbase;
+        }
+        // …and patch its address constants so they point at the relocated data (own or imported).
+        for r in &u.relocations {
+            let base = match &r.kind {
+                RelocKind::SelfData => dbase,
+                RelocKind::DataSymbol(name) => *data_tab
+                    .get(name)
+                    .ok_or_else(|| LinkError::Unresolved(name.clone()))?,
+            };
+            apply_reloc(&mut m, r, base)?;
+        }
+        offset_func_indices(&mut m, fbase);
         let resolved =
-            resolve_imports_with(&m, |name| symtab.get(name).copied().map(Resolved::Func))
+            resolve_imports_with(&m, |name| funcs_tab.get(name).copied().map(Resolved::Func))
                 .map_err(|e| match e {
                     ImportError::Unresolved(n) => LinkError::Unresolved(n),
                     ImportError::BadImportIndex(i) => LinkError::BadImportIndex(i),
                 })?;
         funcs.extend(resolved.funcs);
+        data.extend(resolved.data);
     }
     Ok(Module {
         funcs,
@@ -1869,12 +1936,28 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
             .iter()
             .filter_map(|u| u.module.memory)
             .max_by_key(|m| m.size_log2),
-        // Code-only units have no data; concatenated as-is (data relocation is a follow-up).
-        data: units.iter().flat_map(|u| u.module.data.clone()).collect(),
+        data,
         imports: Vec::new(),
         // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
         debug_info: None,
     })
+}
+
+/// Apply one [`DataReloc`]: add `base` to the addend held in the constant it points at (a `ConstI64`/
+/// `ConstI32`). A reloc pointing at a missing or non-constant instruction is fail-closed.
+fn apply_reloc(m: &mut Module, r: &DataReloc, base: u64) -> Result<(), LinkError> {
+    let inst = m
+        .funcs
+        .get_mut(r.func as usize)
+        .and_then(|f| f.blocks.get_mut(r.block as usize))
+        .and_then(|b| b.insts.get_mut(r.inst as usize))
+        .ok_or_else(|| LinkError::BadReloc(r.clone()))?;
+    match inst {
+        Inst::ConstI64(c) => *c = c.wrapping_add(base as i64),
+        Inst::ConstI32(c) => *c = (*c as i64).wrapping_add(base as i64) as i32,
+        _ => return Err(LinkError::BadReloc(r.clone())),
+    }
+    Ok(())
 }
 
 /// Add `offset` to every **static function index** in `m` (the merged-module reindex): `call`,

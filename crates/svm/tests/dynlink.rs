@@ -166,6 +166,7 @@ fn unit(src: &str, exports: &[(&str, u32)]) -> LinkUnit {
     LinkUnit {
         module: svm_text::parse_module(src).expect("parse unit"),
         exports: exports.iter().map(|(n, i)| (n.to_string(), *i)).collect(),
+        ..Default::default()
     }
 }
 
@@ -240,4 +241,118 @@ fn link_duplicate_symbol_fails_closed() {
     ])
     .expect_err("two `add`s");
     assert_eq!(err, svm_ir::LinkError::DuplicateSymbol("add".into()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Milestone 2: data symbols + per-unit data relocation (LinkUnit data_exports + relocations).
+// ---------------------------------------------------------------------------------------------
+
+use svm_ir::{DataReloc, RelocKind};
+
+/// 16 bytes of padding data so the unit that follows lands at a **non-zero** data base — making the
+/// relocation observable (a coincidental base of 0 would prove nothing).
+const PAD16: &str = "\
+memory 16
+data 0 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"
+func (i32) -> (i32) {
+block0(v0: i32):
+  return v0
+}
+";
+
+/// A **cross-unit data symbol**: `store` exports the byte 42 as data symbol "answer"; `load` reads it
+/// by name. The linker places `store`'s data at a non-zero base (after `pad`), records "answer" at
+/// that window address, and patches `load`'s address constant (left at 0) to it — so `load` reads the
+/// byte wherever the linker put it. Proves the data moved and the reference followed.
+#[test]
+fn cross_unit_data_symbol_is_relocated() {
+    let store = LinkUnit {
+        module: svm_text::parse_module(
+            "memory 16\ndata 0 \"\\x2a\"\nfunc (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n",
+        )
+        .unwrap(),
+        data_exports: vec![("answer".into(), 0)],
+        ..Default::default()
+    };
+    let load = LinkUnit {
+        module: svm_text::parse_module(
+            "memory 16\n\
+             func (i32) -> (i32) {\n\
+             block0(v0: i32):\n\
+             \x20 v1 = i64.const 0\n\
+             \x20 v2 = i32.load8_u v1\n\
+             \x20 return v2\n\
+             }\n",
+        )
+        .unwrap(),
+        // The address const (func 0, block 0, inst 0) is the address of "answer".
+        relocations: vec![DataReloc {
+            func: 0,
+            block: 0,
+            inst: 0,
+            kind: RelocKind::DataSymbol("answer".into()),
+        }],
+        ..Default::default()
+    };
+    let linked = link(&[unit(PAD16, &[]), store, load]).expect("link");
+    svm_verify::verify_module(&linked).expect("verify");
+    // `load` is the 3rd unit's function → global index 2.
+    assert_eq!(
+        run_entry(&linked, 2, &[0]),
+        42,
+        "read the relocated cross-unit datum"
+    );
+}
+
+/// **Self-data relocation**: a unit references its *own* data by a unit-local offset; linked after
+/// `pad`, its data moves to a non-zero base and its own address const is shifted by the same base
+/// (`SelfData`), so the reference still lands on its data. The const here is the local offset 0, so a
+/// passing read proves the `+ base` was applied to both the segment and the reference identically.
+#[test]
+fn self_data_is_relocated() {
+    let me = LinkUnit {
+        module: svm_text::parse_module(
+            "memory 16\n\
+             data 0 \"\\x07\"\n\
+             func (i32) -> (i32) {\n\
+             block0(v0: i32):\n\
+             \x20 v1 = i64.const 0\n\
+             \x20 v2 = i32.load8_u v1\n\
+             \x20 return v2\n\
+             }\n",
+        )
+        .unwrap(),
+        relocations: vec![DataReloc {
+            func: 0,
+            block: 0,
+            inst: 0,
+            kind: RelocKind::SelfData,
+        }],
+        ..Default::default()
+    };
+    let linked = link(&[unit(PAD16, &[]), me]).expect("link");
+    svm_verify::verify_module(&linked).expect("verify");
+    assert_eq!(
+        run_entry(&linked, 1, &[0]),
+        7,
+        "own data ref follows the relocation"
+    );
+}
+
+/// A relocation that points at a non-constant instruction is fail-closed.
+#[test]
+fn bad_relocation_fails_closed() {
+    let u = LinkUnit {
+        module: svm_text::parse_module("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n")
+            .unwrap(),
+        // inst 0 of an empty block body doesn't exist → BadReloc.
+        relocations: vec![DataReloc {
+            func: 0,
+            block: 0,
+            inst: 0,
+            kind: RelocKind::SelfData,
+        }],
+        ..Default::default()
+    };
+    assert!(matches!(link(&[u]), Err(svm_ir::LinkError::BadReloc(_))));
 }
