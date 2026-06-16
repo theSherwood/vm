@@ -103,6 +103,13 @@ fn jit_run(inst: &Module, clock_v: i64, window: &[u8]) -> Option<(JitOutcome, Ve
     ) {
         Ok((o, win)) => Some((o, win, h.clock_ns)),
         Err(JitError::Unsupported(_)) => None,
+        // A transient host **allocation** failure — e.g. Windows `ERROR_COMMITMENT_LIMIT`
+        // (os error 1455) under the cumulative compile/window-commit churn of `cargo test
+        // --workspace` — is an environment condition, not a backend divergence. Skip the
+        // case (like an unsupported op) rather than fail the equivalence property. The marker
+        // is Cranelift's `ModuleError::Allocation` Display ("Allocation error: …"), specific
+        // to memory exhaustion, so a genuine codegen/lowering bug still panics below.
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => None,
         Err(e) => panic!("JIT failed to compile a verified instrumented module: {e:?}\n{inst:#?}"),
     }
 }
