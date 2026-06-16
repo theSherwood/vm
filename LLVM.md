@@ -8,16 +8,19 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–N (control flow, memory, calls, switch, globals, floats, indirect
+**Status: Milestone 1 slices A–O (control flow, memory, calls, switch, globals, floats, indirect
 calls, struct aggregates, memory intrinsics, by-value aggregates, relocations, libm math, int
-min/max+bit intrinsics, and the powerbox libc on-ramp) done — a broad swath of scalar C from
-`clang -O2` runs on both backends (44 tests). A **kitchen-sink capstone** exercises everything at
-once (structs by-value, a function-pointer table, floats+libm, recursion, loops, an array `memcpy`,
-a global array, `switch`, bit intrinsics) and matches **native `cc`** end to end. **Slice N** binds
-libc I/O to host capabilities (`write`/`read` → `Stream`, `exit` → `Exit`) via §7 named imports and
-a synthesized powerbox `_start`: a real I/O program now runs through the reference powerbox with
-**stdout + exit code matching native** (`check_powerbox_vs_native`). Next: more libc surface
-(`malloc`/`printf`), then the real-library demo corpus (Lane C).** `crates/svm-llvm` does the **SSA → block-argument
+min/max+bit intrinsics, the powerbox libc on-ramp, and the stdio output surface) done — a broad
+swath of scalar C from `clang -O2` runs on both backends (49 tests). A **kitchen-sink capstone**
+exercises everything at once (structs by-value, a function-pointer table, floats+libm, recursion,
+loops, an array `memcpy`, a global array, `switch`, bit intrinsics) and matches **native `cc`** end
+to end. **Slice N** binds the raw I/O primitives (`write`/`read` → `Stream`, `exit` → `Exit`) via §7
+named imports + a synthesized powerbox `_start`; **slice O** adds the non-varargs **stdio** output
+family (`puts`/`putchar`/`putc`/`fputc`/`fwrite`/`fputs`/`fflush`, and `clang`'s `printf("…\n")`→
+`puts` / `printf("%c")`→`putc` lowering) — all funnelling to `Stream.write` on stdout. A real I/O
+program runs through the reference powerbox with **stdout + exit code matching native**
+(`check_powerbox_vs_native`). Next: varargs `printf` (formatting), `malloc`/heap, then the
+real-library demo corpus (Lane C).** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -33,10 +36,10 @@ conversions, `fabs`/`floor`, an indirect call through a function pointer, struct
 (global/array-of-struct/stack), a struct `memcpy` + `memset`, and by-value struct args/returns
 (small-coerced + `byval`/`sret`), and pointer-valued global relocations (a function-pointer table,
 a struct string-pointer member), libm math calls (`sqrt`/`fmin`), and int min/max + bit intrinsics
-(`smax`/`ctlz`/`popcount`) — run **interp == JIT == hand-computed** (44 tests, incl. a kitchen-sink
-program checked against native `cc`, plus a `write`/`exit`/`read`-echo powerbox program checked
-against native stdout + exit code).
-Remaining M1: more libc surface (`malloc`/`printf`), then the
+(`smax`/`ctlz`/`popcount`) — run **interp == JIT == hand-computed** (49 tests, incl. a kitchen-sink
+program checked against native `cc`, plus `write`/`exit`/`read`-echo and `puts`/`printf`/`putchar`/
+`fwrite`/`fputs` powerbox programs checked against native stdout + exit code).
+Remaining M1: varargs `printf` (formatting) + `malloc`/heap, then the
 demo Lane C. Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
@@ -431,12 +434,26 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       native `cc` build. Tests: a `write`+return hello, an `exit(code)`, a stdin→stdout echo loop,
       and a computed stack-buffer string (composing the data frame + I/O).
 
+**Slice O (DONE) — the stdio output surface.**
+- [x] The non-varargs libc output family funnels to `Stream.write` on stdout (`lower_io_call`):
+      `puts` (the literal's bytes + a newline — length from the string-literal global, no runtime
+      strlen), `putchar`/`putc`/`fputc` (one byte staged through the stash scratch `[12,16)`),
+      `fwrite`/`fputs` (a `size×nmemb` slice / a string), `fflush` (a no-op — unbuffered `Stream`).
+      The libc `FILE*` stream argument is ignored (the handle is the endpoint). Several libc names
+      share one `write` import (`collect_cap_imports` now keys the table by *import* name).
+- [x] `clang -O2` rewrites `printf("…\n")` → `puts` and `printf("%c",c)` → `putc`, so format-free
+      `printf` rides this path with no varargs. Result fidelity: the *stdout bytes* are exact; the
+      return values are best-effort (`putc`→char, `fwrite`→`nmemb`, `puts`/`fputs`/`fflush`→`0`).
+- [x] Tests (`check_powerbox_vs_native`): `puts`, two-line `printf` (→`puts`), a `putchar` range
+      loop, `fwrite`+`fputs` mixed, and stdio composed with `exit(42)`.
+
 **Remaining slices.**
 - [ ] `llvm.load.relative` (relative-offset string tables); transcendental math (needs a guest libm);
       `llvm.bswap`/`bitreverse`/`fshl`.
-- [ ] More libc surface: `malloc`/`free` (→ the `Memory` capability + a guest allocator), `printf`
-      (formatting), `argc`/`argv` `main`. The §7 import mechanism (slice N) is the hard part; these
-      are additional bindings on it.
+- [ ] Varargs `printf`/`fprintf`/`snprintf` (the varargs ABI on the data stack + a format engine) —
+      the headline gap for numeric output; `puts`/`fputs` of a *non-literal* string (a runtime
+      strlen loop). `malloc`/`free` (→ the `Memory` capability + a guest allocator), `argc`/`argv`
+      `main`. The §7 import mechanism (slices N/O) is the hard part; these build on it.
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
       (the same corpus chibicc passes — clay, jsmn, sha256, xxhash, tinfl, perlin, regex,
       heapgrow). This is the D54 "matches native clang" exit criterion.

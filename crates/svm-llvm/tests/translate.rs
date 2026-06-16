@@ -818,6 +818,51 @@ fn powerbox_computed_output() {
 }
 
 #[test]
+fn stdio_puts() {
+    // `puts(s)` writes the string + a newline. clang keeps it as a `puts` call (the on-ramp supplies
+    // the literal's length + the newline) — stdout must match native byte-for-byte.
+    let src = "#include <stdio.h>\nint main(void){ puts(\"hello, stdio\"); return 0; }";
+    check_powerbox_vs_native("pb_puts", src, b"");
+}
+
+#[test]
+fn stdio_printf_constant_string() {
+    // clang -O2 rewrites `printf("literal\n")` → `puts("literal")` — so a format-free printf works
+    // through the same path (no varargs). Two lines exercise repeated calls.
+    let src = "#include <stdio.h>\n\
+               int main(void){ printf(\"first line\\n\"); printf(\"second line\\n\"); return 0; }";
+    check_powerbox_vs_native("pb_printf_str", src, b"");
+}
+
+#[test]
+fn stdio_putchar_loop() {
+    // `putchar` (clang lowers it to `putc(c, stdout)`) writing each char of a computed range — a
+    // single byte staged through the stash scratch per call.
+    let src = "#include <stdio.h>\n\
+               int main(void){ for (int c = 'A'; c <= 'F'; c++) putchar(c); putchar('\\n'); return 0; }";
+    check_powerbox_vs_native("pb_putchar", src, b"");
+}
+
+#[test]
+fn stdio_fwrite_and_fputs() {
+    // `fwrite(buf, 1, n, stdout)` writes a byte slice; `fputs(s, stdout)` (clang lowers it to
+    // `fwrite`) writes a string with no newline. Mix both, plus a trailing newline via putchar.
+    let src = "#include <stdio.h>\n#include <string.h>\n\
+               int main(void){ const char* a = \"abc\"; fwrite(a, 1, 3, stdout); \
+               fputs(\"-def\", stdout); putchar('\\n'); return 0; }";
+    check_powerbox_vs_native("pb_fwrite", src, b"");
+}
+
+#[test]
+fn stdio_mixed_then_exit() {
+    // Compose stdio output with the `exit` capability: print via puts/printf, then exit(non-zero) —
+    // both the stdout bytes and the exit code must match the native build.
+    let src = "#include <stdio.h>\n#include <stdlib.h>\n\
+               int main(void){ puts(\"goodbye\"); printf(\"done\\n\"); exit(42); }";
+    check_powerbox_vs_native("pb_mixed_exit", src, b"");
+}
+
+#[test]
 fn unsupported_is_fail_closed() {
     // A 128-bit integer is outside the subset — it must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).
