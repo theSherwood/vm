@@ -47,7 +47,10 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
 | `cap.call` I/O record log | **Missing** | — |
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
-| Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded; multithread pending) |
+| W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `svm-interp` `find_schedule` / `replay_schedule` / `Witness` |
+| W1 time-travel — `seek(t)` / `step_back` via stateless re-execution (single-threaded, deterministic) | **Built — slice 1** | `svm-interp` `Inspector::seek` / `step_back` |
+| Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
+| Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`) | **Built — Milestone B slice 1–2** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
 | DWARF emission + DAP server | **Missing** | — |
@@ -177,6 +180,20 @@ this is where the cost lives; keep it out of v1.
 identical final window; a recorded interpreter-scheduled concurrent run replays to the same
 outcome; `seek(t)` returns the guest state at logical time `t`.
 
+**Built — slice 1 (time-travel via stateless re-execution).** `Inspector::seek(t)` re-executes a
+single-threaded run from `clock 0` to logical time `t` and pauses there, restoring the exact frame
+state (pc + live SSA values) so `backtrace`/`read_*` show the guest as it was; `step_back()` is
+`seek(clock-1)`. Implemented with the §18 explorer's own trick — the attach inputs (funcs, func,
+args, fuel, memory, data) are kept as cheap-to-clone `Arc`s in a `SeekInit`, and a `seek_target`
+on `DebugCtx` fast-forwards a fresh re-run past breakpoints to `t`. This is **exact for a
+deterministic guest** (the common algorithmic-debugging case); the re-run uses a fresh empty
+powerbox, so a guest whose `cap.call`s carry real side effects or nondeterminism needs the
+`CapTape` (next slice) to seek faithfully. Tests (`debug.rs`): out-of-order `seek` restores the
+exact frame state recorded while stepping forward; `step_back` decrements the clock; `seek(0)` then
+resume reproduces the result; seek-past-end finishes. *Not yet:* the `CapTape` (cap-I/O record →
+feed on replay) and `SchedTape`, scheduled-mode (multithreaded) seek, and snapshot/checkpoint
+cadence to bound re-execution cost.
+
 ---
 
 ## 4. W2 — Interpreter stepping / breakpoints / watchpoints
@@ -222,6 +239,27 @@ forbid(unsafe) preserved. No backend or ABI changes.
 **Acceptance.** Set a breakpoint and a write-watchpoint on a concurrent guest; run under
 `run_scheduled`; the debugger stops at the right op on the right fiber; stepping advances one
 fiber while others stay parked; window + IR-value reads are correct.
+
+**Built — Milestone B slice 1 (multithreaded stepping under a fixed schedule).** `Inspector::
+attach_scheduled(m, func, args, fuel, schedule)` drives a `thread.spawn` guest cooperatively on
+one OS thread under a fixed, reproducible `schedule` — an empty `Vec` for the deterministic
+default order, or a `Witness::plan` from W7 [`find_schedule`] to **step a specific (e.g. failing)
+interleaving**. The enabling refactor: (1) the per-op debug seam's breakpoint/watchpoint set moved
+into a run-shared `DebugShared` (`Arc<Mutex>`) so a breakpoint fires in *whichever* thread reaches
+it — `clock`/`step_target` stay per-vCPU; `thread.spawn` children inherit the shared set; (2) the
+cooperative scheduler loop became a **re-entrant `SchedDriver`** that pauses on a debug stop
+(holding the interrupted vCPU's turn intact) and resumes without re-deciding the schedule —
+`run_with_policy` is now its non-pausing wrapper, so the model-checker path is unchanged.
+`stopped_task()` reports which thread is paused. `threads()` lists every live thread and
+`select_task(id)` focuses read-inspection (`backtrace`/`read_var`/`read_window`/`clock`) on **any**
+of them — found wherever the scheduler parks it (runnable / join / wait / spin) — so you can stand
+at a breakpoint in one thread and examine another's stack; the focus resets on the next resume,
+and stepping always drives the *stopped* thread. Tests (`debug_threads.rs`): a worker breakpoint
+fires once per spawned thread (distinct vCPUs); a W7 race witness replays to the lost update (1)
+*under the debugger*; single-stepping advances the stopped thread one op; `select_task` inspects a
+second live thread mid-stop and switches back. *Not yet:* watchpoints across threads as a headline
+test, and stepping that crosses a scheduler decision point (step-over-a-spawn). Those, plus W1
+record/replay, are the rest of Milestone B.
 
 ---
 
@@ -442,6 +480,21 @@ Mazurkiewicz trace, so the witness is already near-minimal).
 
 **Acceptance.** A one-command "model-check this concurrent entry" reports the set of outcomes
 and, on a failure, hands back a schedule that `run_scheduled` reproduces and W2 can step.
+
+**Built — slice 1 (witness find + replay).** `svm-interp` now exposes the model checker as a
+debugging tool: `find_schedule(m, func, args, fuel, max, pred) -> Option<Witness>` model-checks
+across interleavings (DPOR) and returns the **first** schedule whose outcome matches `pred`
+(deadlock / trap / specific bad result) as a replayable `Witness { plan, outcome,
+schedule_index }`; `replay_schedule(m, func, args, fuel, &plan)` re-runs that exact interleaving
+deterministically (the W7 → W1 bridge). Implemented by extracting the DPOR loop into a private
+`explore_core` with an `on_outcome(idx, &outcome, &plan)` callback that `explore_all` (collect the
+outcome set) and `find_schedule` (capture a witness, stop early) share; the witness is the
+executed `trace` tids, and replay forces them through `Dpor::pick`. Tests (`concurrency_debug.rs`,
+the racy lost-update counter): a `→ 1` witness is found and replays deterministically 5×, the
+serial `→ 2` witness replays, and an impossible outcome returns `None`. Full workspace green.
+
+*Not yet:* CLI verbs over these functions; stepping a witness interleaving (needs the
+multithreaded `Inspector` — Milestone B, the `Policy` scheduler seam); the DRF-or-trap tier.
 
 ---
 

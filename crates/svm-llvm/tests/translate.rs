@@ -93,6 +93,48 @@ fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
     assert_eq!(jit, expect, "{name}: JIT result (interp said {interp:?})");
 }
 
+/// Compile `src` (which defines `int run(int)` first and an `int main(){ return run(SEED); }`)
+/// with native `cc`, run it, and assert the SVM translation of `run(SEED)` matches the native exit
+/// code on **both** backends. The native compiler is the strongest oracle (the chibicc Tier-2
+/// pattern); `run` returns a byte so the full result survives the 8-bit Unix exit code.
+fn check_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let exe = std::env::temp_dir().join(format!("svm_llvm_native_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    let jit = match svm_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => Value::I32(s[0] as i32),
+        other => panic!("{name}: unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, vec![jit], "{name}: interp vs JIT");
+    let svm = match jit {
+        Value::I32(x) => x as u8,
+        _ => panic!("expected i32"),
+    };
+    assert_eq!(svm, native, "{name}: svm={svm} vs native cc={native}");
+}
+
 /// Translate + verify + run on both backends, asserting both **trap** (neither returns a value).
 /// Used for the data-stack guard: a deep recursion with a real frame must fault past the window's
 /// mapped region, not corrupt globals or return garbage.
@@ -118,6 +160,192 @@ fn check_traps(name: &str, src: &str, args: &[Value]) {
         JitOutcome::Trapped(_) => {}
         other => panic!("{name}: JIT should trap, got {other:?}"),
     }
+}
+
+#[test]
+fn byval_small_struct_arg() {
+    // A small struct passed by value — clang coerces it to an `i64` register. `run` packs {a,b}
+    // and calls `sumP(i64)`; the callee unpacks the fields.
+    let src = "struct P { int x; int y; }; int sumP(struct P); \
+               int run(int a, int b){ struct P p = {a, b}; return sumP(p); } \
+               __attribute__((noinline)) int sumP(struct P p){ return p.x + p.y; }";
+    check(
+        "bvarg",
+        src,
+        &[Value::I32(3), Value::I32(4)],
+        &[Value::I32(7)],
+    );
+}
+
+#[test]
+fn byval_small_struct_return() {
+    // A small struct returned by value — coerced to an `i64` return. `run` calls `mkP` and reads
+    // the returned fields.
+    let src = "struct P { int x; int y; }; struct P mkP(int, int); \
+               int run(int a, int b){ struct P p = mkP(a, b); return p.x * 10 + p.y; } \
+               __attribute__((noinline)) struct P mkP(int a, int b){ struct P p = {a, b}; return p; }";
+    check(
+        "bvret",
+        src,
+        &[Value::I32(3), Value::I32(4)],
+        &[Value::I32(34)],
+    );
+}
+
+#[test]
+fn byval_two_eightbyte_struct() {
+    // A 12-byte struct coerced to *two* registers `(i64, i32)` (two eightbytes).
+    let src = "struct Q { int x; int y; int z; }; int sumQ(struct Q); \
+               int run(int a, int b, int c){ struct Q q = {a, b, c}; return sumQ(q); } \
+               __attribute__((noinline)) int sumQ(struct Q q){ return q.x + q.y + q.z; }";
+    check(
+        "bvq",
+        src,
+        &[Value::I32(1), Value::I32(2), Value::I32(3)],
+        &[Value::I32(6)],
+    );
+}
+
+#[test]
+fn byval_sse_struct() {
+    // A `{double, double}` struct — two SSE eightbytes, coerced to `(double, double)`.
+    let src = "struct DD { double a; double b; }; double useDD(struct DD); \
+               double run(double x, double y){ struct DD d = {x, y}; return useDD(d); } \
+               __attribute__((noinline)) double useDD(struct DD d){ return d.a * d.b; }";
+    check(
+        "bvdd",
+        src,
+        &[Value::F64(3.0), Value::F64(4.0)],
+        &[Value::F64(12.0)],
+    );
+}
+
+#[test]
+fn byval_and_sret_large_struct() {
+    // A large struct returned via `sret` (`mkBig`) and passed via `byval` (`sumBig`) — both are
+    // hidden caller-allocated pointers in the IR.
+    let src = "struct Big { int a[8]; }; long sumBig(struct Big); struct Big mkBig(int); \
+               long run(int v, int i){ struct Big b = mkBig(v); return sumBig(b) + b.a[i & 7]; } \
+               __attribute__((noinline)) struct Big mkBig(int v){ struct Big b; for(int i=0;i<8;i++) b.a[i]=v+i; return b; } \
+               __attribute__((noinline)) long sumBig(struct Big b){ long s=0; for(int i=0;i<8;i++) s+=b.a[i]; return s; }";
+    check(
+        "bvbig",
+        src,
+        &[Value::I32(10), Value::I32(0)],
+        &[Value::I64(118)],
+    ); // sum 10..17 + 10
+}
+
+#[test]
+fn int_minmax_bit_intrinsics() {
+    // `a > b ? a : b` → `llvm.smax`; the bit builtins → `llvm.ctlz`/`ctpop`; `abs` → `llvm.abs`.
+    check(
+        "imax",
+        "int imax(int a, int b){ return a > b ? a : b; }",
+        &[Value::I32(3), Value::I32(7)],
+        &[Value::I32(7)],
+    );
+    check(
+        "clz",
+        "int clz(unsigned x){ return __builtin_clz(x); }",
+        &[Value::I32(1)],
+        &[Value::I32(31)],
+    );
+    check(
+        "pc",
+        "int pc(unsigned x){ return __builtin_popcount(x); }",
+        &[Value::I32(0xFF)],
+        &[Value::I32(8)],
+    );
+    check(
+        "absn",
+        "int ab(int x){ return x < 0 ? -x : x; }",
+        &[Value::I32(-5)],
+        &[Value::I32(5)],
+    );
+}
+
+#[test]
+fn libm_math_calls() {
+    // `sqrt`/`fmin` stay external libm calls at -O2 (errno) — we recognize the named function and
+    // lower it to the SVM float op inline.
+    check(
+        "sq",
+        "double sq(double x){ return __builtin_sqrt(x); }",
+        &[Value::F64(16.0)],
+        &[Value::F64(4.0)],
+    );
+    check(
+        "mn",
+        "double mn(double a, double b){ return __builtin_fmin(a, b); }",
+        &[Value::F64(3.0), Value::F64(5.0)],
+        &[Value::F64(3.0)],
+    );
+}
+
+#[test]
+fn function_pointer_table_global() {
+    // A global `static fp tbl[2] = {inc, dec}` — a relocation: each element serializes to the
+    // function's funcref index. `viafp` indexes the table at runtime and calls indirectly.
+    let src = "int inc(int); int dec(int); typedef int(*fp)(int); \
+               static fp tbl[2] = {inc, dec}; \
+               int viafp(int sel, int x){ return tbl[sel & 1](x); } \
+               __attribute__((noinline)) int inc(int x){ return x + 1; } \
+               __attribute__((noinline)) int dec(int x){ return x - 1; }";
+    check(
+        "fpt_inc",
+        src,
+        &[Value::I32(0), Value::I32(10)],
+        &[Value::I32(11)],
+    );
+    check(
+        "fpt_dec",
+        src,
+        &[Value::I32(1), Value::I32(10)],
+        &[Value::I32(9)],
+    );
+}
+
+#[test]
+fn struct_with_string_pointer_global() {
+    // A global struct holding a string pointer — the pointer field is a relocation (`@.str`
+    // address). The runtime reads the pointed-to char.
+    let src = "struct S { const char *name; int v; }; \
+               static const struct S g = { \"hi\", 7 }; \
+               int f(int i){ return g.name[i] + g.v; }";
+    check(
+        "sws_h",
+        src,
+        &[Value::I32(0)],
+        &[Value::I32('h' as i32 + 7)],
+    );
+    check(
+        "sws_i",
+        src,
+        &[Value::I32(1)],
+        &[Value::I32('i' as i32 + 7)],
+    );
+}
+
+#[test]
+fn memcpy_struct_copy() {
+    // `struct Big q = G` → `llvm.memcpy` (32 bytes) from a const global into a stack struct; we
+    // lower it to chunked load/stores. A runtime field read keeps the alloca + copy.
+    let src = "struct Big { int a[8]; }; \
+               static const struct Big G = { {1,2,3,4,5,6,7,8} }; \
+               int pick(int i){ struct Big q = G; q.a[0] += 100; return q.a[i & 7]; }";
+    check("pick_0", src, &[Value::I32(0)], &[Value::I32(101)]); // modified field
+    check("pick_3", src, &[Value::I32(3)], &[Value::I32(4)]);
+    check("pick_7", src, &[Value::I32(7)], &[Value::I32(8)]);
+}
+
+#[test]
+fn memset_fill() {
+    // `__builtin_memset(b, 0xAB, 16)` → `llvm.memset`; the fill byte is replicated across the
+    // chunked stores. A signed-char read sign-extends 0xAB to -85.
+    let src = "int hset(int i){ char b[16]; __builtin_memset(b, 0xAB, 16); return b[i & 15]; }";
+    check("hset_0", src, &[Value::I32(0)], &[Value::I32(-85)]);
+    check("hset_9", src, &[Value::I32(9)], &[Value::I32(-85)]);
 }
 
 #[test]
@@ -446,6 +674,147 @@ fn stack_struct() {
                long f(int a){ volatile struct Point p; p.x = a; p.y = a * 2; p.tag = a; \
                return p.x + p.y + p.tag; }";
     check("sstruct", src, &[Value::I32(5)], &[Value::I64(20)]); // 5+10+5
+}
+
+#[test]
+fn kitchen_sink_vs_native() {
+    // A large self-contained program exercising the whole translator at once — structs by value
+    // (Vec3 → byval), a function-pointer table (`ops`, a relocation + indirect call), floats +
+    // libm (`sqrt`/`fabs`), recursion (`fib`), loops + an array copy (→ memcpy), a const global
+    // array, `switch`, and the int min/max + bit intrinsics — folded to a byte and checked against
+    // native `cc`. `run` is defined first (func 0); `seed` is runtime so clang can't constant-fold.
+    let src = "\
+struct Vec3 { double x; double y; double z; }; \
+double dot(struct Vec3, struct Vec3); int fib(int); int add(int,int); int mul(int,int); \
+typedef int (*op)(int,int); static op ops[2] = { add, mul }; int apply(int,int,int); \
+static const int squares[8] = { 0,1,4,9,16,25,36,49 }; \
+int run(int seed){ \
+    unsigned h = 2166136261u ^ (unsigned)seed; \
+    struct Vec3 a = { 1.5, 2.0, (double)(3 + seed) }, b = { 4.0, 0.5, 2.0 }; \
+    double d = dot(a, b); \
+    h ^= (unsigned)(d * 8.0); h *= 16777619u; \
+    double s = __builtin_sqrt(d * d) + __builtin_fabs((double)(-seed)); \
+    h ^= (unsigned)s; h *= 16777619u; \
+    h ^= (unsigned)fib(12 + (seed & 1)); \
+    h ^= (unsigned)apply(0, seed, 4); h ^= (unsigned)apply(1, seed, 3); \
+    int arr[16]; for (int i=0;i<16;i++) arr[i] = i*i + seed; \
+    int arr2[16]; for (int i=0;i<16;i++) arr2[i] = arr[i]; \
+    int sum = 0; for (int i=0;i<16;i++) sum += arr2[i]; \
+    h ^= (unsigned)sum; \
+    for (int i=0;i<8;i++){ int v; \
+        switch ((i + seed) & 3){ \
+            case 0: v = __builtin_popcount((unsigned)(i+1)); break; \
+            case 1: v = (i > 4 ? i : 4); break; \
+            case 2: v = __builtin_clz((unsigned)(i+1)); break; \
+            default: v = squares[i] - i; break; } \
+        h += (unsigned)v; } \
+    return (int)((h ^ (h>>8) ^ (h>>16) ^ (h>>24)) & 0xFF); \
+} \
+int main(void){ return run(7); } \
+double dot(struct Vec3 a, struct Vec3 b){ return a.x*b.x + a.y*b.y + a.z*b.z; } \
+int fib(int n){ if (n < 2) return n; return fib(n-1) + fib(n-2); } \
+int add(int a, int b){ return a + b; } \
+int mul(int a, int b){ return a * b; } \
+int apply(int sel, int a, int b){ return ops[sel & 1](a, b); }";
+    check_vs_native("kitchen", src, 7);
+}
+
+/// Compile a **powerbox program** (one that does real I/O via libc), translate it, resolve its §7
+/// capability imports against the reference host policy, verify, and run it end-to-end through the
+/// reference powerbox — then assert its stdout **and** exit code match the *native* build of the
+/// same C (the strongest oracle). This exercises the whole Lane C on-ramp: the synthesized `_start`,
+/// the handle stash, and `write`/`exit` bound to the `Stream`/`Exit` capabilities.
+fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    // Native oracle: build with `cc`, run, capture stdout + exit code.
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native")
+    };
+    let native_code = native.status.code().unwrap_or(-1) as u8;
+
+    // The on-ramp: translate → resolve §7 imports to concrete capabilities → verify → run.
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: a libc program must produce a powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run = svm_run::run_powerbox(&module, stdin).expect("powerbox run");
+
+    assert_eq!(
+        run.stdout, native.stdout,
+        "{name}: svm stdout {:?} vs native {:?}",
+        run.stdout, native.stdout
+    );
+    let svm_code = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(
+        svm_code, native_code,
+        "{name}: svm exit {svm_code} vs native {native_code}"
+    );
+}
+
+#[test]
+fn powerbox_hello_write() {
+    // The headline Lane C demo: write a string to stdout, then return an exit code. The synthesized
+    // `_start` grants the handles, `write(1, …)` lowers to the `Stream` capability, `main`'s return
+    // is the exit code — all matching the native build byte-for-byte.
+    let src = "#include <unistd.h>\n\
+               int main(void){ write(1, \"hello, on-ramp!\\n\", 16); return 3; }";
+    check_powerbox_vs_native("pb_hello", src, b"");
+}
+
+#[test]
+fn powerbox_exit_capability() {
+    // `exit(code)` lowers to the `Exit` capability (terminal): the program writes, then exits with a
+    // non-zero code — the SVM `Outcome::Exited` must match the native process exit code.
+    let src = "#include <unistd.h>\n#include <stdlib.h>\n\
+               int main(void){ write(1, \"bye\\n\", 4); exit(7); }";
+    check_powerbox_vs_native("pb_exit", src, b"");
+}
+
+#[test]
+fn powerbox_echo_stdin() {
+    // A stdin → stdout round-trip through the `Stream` capability (read on the stdin handle, write on
+    // stdout), driven by a loop — exercises `read`, `write`, the handle stash, and a real data frame.
+    let src = "#include <unistd.h>\n\
+               int main(void){ char buf[64]; long n; \
+               while ((n = read(0, buf, sizeof buf)) > 0) write(1, buf, n); return 0; }";
+    check_powerbox_vs_native("pb_echo", src, b"ping pong\n");
+}
+
+#[test]
+fn powerbox_computed_output() {
+    // Compose the on-ramp's existing machinery with I/O: build a string in a stack buffer (a real
+    // data frame + stores), then write it out — the byte-exact stdout must match native.
+    let src = "#include <unistd.h>\n\
+               int main(void){ char buf[16]; for (int i = 0; i < 10; i++) buf[i] = '0' + i; \
+               buf[10] = '\\n'; write(1, buf, 11); return 0; }";
+    check_powerbox_vs_native("pb_computed", src, b"");
 }
 
 #[test]
