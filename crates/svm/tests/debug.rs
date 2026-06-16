@@ -596,3 +596,52 @@ fn captape_replays_clock_inputs_for_faithful_seek() {
     let mut insp2 = Inspector::attach_with_host(&m, 0, &[Value::I32(c2)], 100_000, h2);
     assert_eq!(finished_ok(insp2.run_until_stop()), vec![Value::I64(1)]);
 }
+
+// Reads 2 bytes from a stdin stream (iface 0, op 0 `read`) into window[0..2], then returns the
+// first byte. The bytes are a nondeterministic input that crosses via *guest memory* (the read
+// fills the buffer), so faithful replay needs the captured buffer write, not just a result slot.
+const STDIN_FIRST: &str = r#"
+memory 16
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 2
+  v3 = cap.call 0 0 (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = i64.const 0
+  v5 = i32.load8_u v4
+  return v5
+}
+"#;
+
+#[test]
+fn captape_replays_stdin_read_into_the_buffer_for_faithful_seek() {
+    let m = parse_module(STDIN_FIRST).expect("parse");
+    let mut host = Host::new();
+    host.stdin = b"Hi".to_vec();
+    let stdin = host.grant_stream(StreamRole::In);
+    let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(stdin)], 100_000, host);
+
+    // Forward: read "Hi" into the buffer, return buf[0] = 'H' = 72.
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(72)]);
+
+    // The tape captured the read, including the bytes it wrote into the guest window.
+    let tape = insp.cap_tape();
+    assert_eq!(tape.records.len(), 1);
+    assert_eq!(tape.records[0].result, Ok(vec![2])); // 2 bytes read
+    assert_eq!(tape.records[0].mem_writes, vec![(0u64, b"Hi".to_vec())]);
+
+    // Time-travel to the start and replay: the read's buffer write is re-applied from the tape, so
+    // we reproduce 72 — even though the replay host has empty stdin.
+    insp.seek(0);
+    assert_eq!(
+        finished_ok(insp.run_until_stop()),
+        vec![Value::I32(72)],
+        "stdin read replays its buffer bytes on seek"
+    );
+
+    // Contrast: a fresh host with empty stdin reads 0 bytes, so buf[0] stays 0.
+    let mut h2 = Host::new();
+    let s2 = h2.grant_stream(StreamRole::In);
+    let mut insp2 = Inspector::attach_with_host(&m, 0, &[Value::I32(s2)], 100_000, h2);
+    assert_eq!(finished_ok(insp2.run_until_stop()), vec![Value::I32(0)]);
+}

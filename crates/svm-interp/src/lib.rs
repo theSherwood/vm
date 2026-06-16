@@ -427,12 +427,16 @@ pub struct CapRecord {
     pub args: Vec<i64>,
     /// The result slots the host returned (`Err` for a cap that trapped, e.g. `exit`).
     pub result: Result<Vec<i64>, Trap>,
+    /// Bytes the cap wrote **into the guest window** as `(ptr, bytes)` — e.g. a stdin `read` filling
+    /// its buffer. Re-applied on replay so a buffer-filling input cap reproduces faithfully. Empty
+    /// for slot-only caps (`Clock`).
+    pub mem_writes: Vec<(u64, Vec<u8>)>,
 }
 
 /// An append-only log of the capability **inputs** crossing into a guest, captured during a run so a
-/// later re-execution reproduces them without a live host (DEBUGGING.md W1). Slice 1 records the
-/// slot-only input caps (`Clock`); buffer-filling input caps (stdin `read`) and the `SchedTape` are
-/// follow-ups.
+/// later re-execution reproduces them without a live host (DEBUGGING.md W1). Records the slot-only
+/// input caps (`Clock`) and buffer-filling ones (stdin `read`); RNG / host-fns and the `SchedTape`
+/// are follow-ups.
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct CapTape {
     pub records: Vec<CapRecord>,
@@ -440,10 +444,61 @@ pub struct CapTape {
 
 /// Whether a capability is a **nondeterministic input** whose result a re-execution must replay
 /// (rather than re-derive). Deterministic / structural caps (window `Memory` ops, `SharedRegion`,
-/// `Stream` *write*) re-run faithfully on a fresh powerbox, so they are left live. Slice 1: `Clock`
-/// (the canonical slot-only nondeterminism source); stdin `read`, RNG, and host-fns extend this.
-fn is_recorded_input(type_id: u32) -> bool {
-    type_id == iface::CLOCK
+/// `Stream` *write*) re-run faithfully on a fresh powerbox, so they are left live. Inputs: `Clock`
+/// (op 0 `now`) and `Stream` op 0 (stdin `read`); RNG and host-fns extend this.
+fn is_recorded_input(type_id: u32, op: u32) -> bool {
+    type_id == iface::CLOCK || (type_id == iface::STREAM && op == 0)
+}
+
+/// A [`GuestMem`] wrapper that records every `write_bytes` a capability makes into the guest window
+/// (DEBUGGING.md W1), so a buffer-filling input cap (stdin `read`) can be replayed by re-applying the
+/// captured bytes. Every other operation delegates unchanged to the real window.
+struct RecordingMem<'a> {
+    inner: &'a mut dyn GuestMem,
+    writes: Vec<(u64, Vec<u8>)>,
+}
+
+impl GuestMem for RecordingMem<'_> {
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        self.inner.read_bytes(ptr, len)
+    }
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        let r = self.inner.write_bytes(ptr, data);
+        if r.is_some() {
+            self.writes.push((ptr, data.to_vec()));
+        }
+        r
+    }
+    fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        self.inner.map(offset, len, prot)
+    }
+    fn unmap(&mut self, offset: u64, len: u64) -> i64 {
+        self.inner.unmap(offset, len)
+    }
+    fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        self.inner.protect(offset, len, prot)
+    }
+    fn map_region(
+        &mut self,
+        win_off: u64,
+        region_off: u64,
+        len: u64,
+        prot: i32,
+        region: u32,
+        backing: RegionBacking,
+    ) -> i64 {
+        self.inner
+            .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn page_size(&self) -> i64 {
+        self.inner.page_size()
+    }
+    fn region_page_size(&self) -> i64 {
+        self.inner.region_page_size()
+    }
+    fn async_counter(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
+        self.inner.async_counter(counter_addr)
+    }
 }
 
 impl Inspector {
@@ -6731,7 +6786,7 @@ impl Host {
     ) -> Result<Vec<i64>, Trap> {
         // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
         // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
-        if is_recorded_input(type_id) {
+        if is_recorded_input(type_id, op) {
             // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
             // re-execution diverged before this point — fall through to live as a best effort).
             let served = if let Some((tape, pos)) = &mut self.cap_replay {
@@ -6743,18 +6798,45 @@ impl Host {
                             && rec.args == args =>
                     {
                         *pos += 1;
-                        Some(rec.result.clone())
+                        Some(rec.clone())
                     }
                     _ => None,
                 }
             } else {
                 None
             };
-            if let Some(result) = served {
-                return result;
+            if let Some(rec) = served {
+                // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
+                // return the recorded result slots — no live host needed.
+                if let Some(m) = mem {
+                    for (ptr, bytes) in &rec.mem_writes {
+                        m.write_bytes(*ptr, bytes);
+                    }
+                }
+                return rec.result;
             }
-            // Record: run live, then log the crossing for a future replay.
-            let result = self.cap_dispatch_slots_inner(type_id, op, handle, args, mem);
+            // Record: run live through a `RecordingMem` so any guest-window writes are captured,
+            // then log the crossing for a future replay.
+            let (result, mem_writes) = match mem {
+                Some(m) => {
+                    let mut rec_mem = RecordingMem {
+                        inner: m,
+                        writes: Vec::new(),
+                    };
+                    let r = self.cap_dispatch_slots_inner(
+                        type_id,
+                        op,
+                        handle,
+                        args,
+                        Some(&mut rec_mem),
+                    );
+                    (r, rec_mem.writes)
+                }
+                None => (
+                    self.cap_dispatch_slots_inner(type_id, op, handle, args, None),
+                    Vec::new(),
+                ),
+            };
             if let Some(rec) = &mut self.cap_record {
                 rec.push(CapRecord {
                     type_id,
@@ -6762,6 +6844,7 @@ impl Host {
                     handle,
                     args: args.to_vec(),
                     result: result.clone(),
+                    mem_writes,
                 });
             }
             return result;

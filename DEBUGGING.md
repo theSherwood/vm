@@ -45,7 +45,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Interp↔JIT differential testing of concurrency | **Built** | `jit_fuzz.rs`, `concurrent_fuzz.rs`, `fiber_fuzz.rs` |
 | SSA promotion (the inspectability-tension source) | **Built** | §3d, frontend promote pass |
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
-| `cap.call` I/O record log (`CapTape`) — nondeterministic input caps (`Clock`); replayed for faithful `seek` | **Built — W1 slice 2** | `svm-interp` `Host::record_caps` / `CapTape` |
+| `cap.call` I/O record log (`CapTape`) — input caps `Clock` + stdin `read` (slots **and** buffer writes); replayed for faithful `seek` | **Built — W1 slice 2** | `svm-interp` `Host::record_caps` / `CapTape` / `RecordingMem` |
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
 | W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `svm-interp` `find_schedule` / `replay_schedule` / `Witness` |
 | W1 time-travel — `seek(t)` / `step_back` via stateless re-execution; faithful for `Clock`-input guests via `CapTape` | **Built — slices 1–2** | `svm-interp` `Inspector::seek` / `step_back` / `cap_tape` |
@@ -197,15 +197,18 @@ capability **inputs** crossing into the guest (`Inspector::cap_tape() -> CapTape
 and `seek` re-executes against a fresh powerbox seeded to **replay** that tape — so time-travel is
 faithful even when the guest's result depends on a host input a fresh re-run couldn't reproduce.
 The hook is the single `cap_dispatch_slots` chokepoint: it records/serves only the *nondeterministic
-input* caps (`is_recorded_input`; slice 2 = `Clock`), leaving deterministic / structural caps
-(`Memory` ops, `SharedRegion`, `Stream` *write*) to re-run live on the fresh powerbox — which
-reproduces them exactly, so they need no tape. Replay verifies each served crossing matches the live
-`(type_id, op, handle, args)` (divergence detection). Test (`debug.rs`): a guest summing two `Clock`
-reads (host clock seeded to 1000) tapes `1000`/`1001`, and `seek(0)` + resume reproduces `2001` —
-versus `1` on a fresh clock with no tape, proving the tape (not luck) carried the inputs. *Not yet:*
-buffer-filling input caps (stdin `read`, which write guest memory — needs write capture via the
-`GuestMem` boundary), RNG / host-fns, the `SchedTape`, scheduled-mode (multithreaded) seek, and
-snapshot/checkpoint cadence to bound re-execution cost.
+input* caps (`is_recorded_input`: `Clock` op 0, and `Stream` op 0 = stdin `read`), leaving
+deterministic / structural caps (`Memory` ops, `SharedRegion`, `Stream` *write*) to re-run live on
+the fresh powerbox — which reproduces them exactly, so they need no tape. Both directions cross: a
+`CapRecord` keeps the result slots **and** the bytes a buffer-filling input wrote into the guest
+window (captured via a `RecordingMem` `GuestMem` wrapper that logs `write_bytes`), re-applied on
+replay. Replay verifies each served crossing matches the live `(type_id, op, handle, args)`
+(divergence detection). Tests (`debug.rs`): a guest summing two `Clock` reads (host clock seeded to
+1000) replays to `2001` after `seek(0)` (vs `1` on a fresh clock); a guest reading 2 stdin bytes
+into its buffer and returning `buf[0]` replays to `'H'` (72) — the captured buffer write re-applied
+— vs `0` on a fresh empty-stdin host. *Not yet:* RNG / host-fn inputs, the `SchedTape` (schedule
+record for concurrent replay), scheduled-mode (multithreaded) seek, and snapshot/checkpoint cadence
+to bound re-execution cost.
 
 ---
 
