@@ -41,6 +41,13 @@ pub enum ValType {
     F32,
     F64,
     V128,
+    /// An opaque 64-bit **reference** (§GC.md §6 forward-compat reservation). Reserved now so
+    /// future *precise* GC (stack maps + value-location metadata) can name pointer-typed slots
+    /// without a format break. Today it is a pure reservation: no instruction produces a `ref`
+    /// literal, and wherever a `ref` value does flow (a `ref`-typed param/result/block-arg) it is
+    /// indistinguishable from an `i64` — it lowers as `i64` in the JIT and as the opaque
+    /// `Value::Ref` in the interp. Conservative GC needs none of this; it scans raw words.
+    Ref,
 }
 
 impl ValType {
@@ -52,6 +59,7 @@ impl ValType {
             ValType::F32 => "f32",
             ValType::F64 => "f64",
             ValType::V128 => "v128",
+            ValType::Ref => "ref",
         }
     }
 
@@ -64,6 +72,7 @@ impl ValType {
             "f32" => ValType::F32,
             "f64" => ValType::F64,
             "v128" => ValType::V128,
+            "ref" => ValType::Ref,
             _ => return None,
         })
     }
@@ -1303,6 +1312,25 @@ pub enum Inst {
     /// [`Inst::ContResume`] this is a call-clobbering control op.
     Suspend {
         value: ValIdx,
+    },
+    /// §GC (`GC.md`) **conservative root enumeration** (`gc.roots`): scan every fiber of the
+    /// domain — parked fibers, resume-chain ancestors, and the calling computation's own live
+    /// frames (the op is **call-clobbering**, so the caller's roots are already spilled to its
+    /// control stack, exactly like `cont.resume`/`suspend`) — for candidate pointer words that
+    /// fall in the half-open guest-window range `[heap_lo, heap_hi)` (`i64` window offsets).
+    /// Writes up to `cap` **distinct (deduplicated)** `i64`-width candidate words, ascending,
+    /// into guest memory at byte offset `buf`, and yields the **total** number found (`i64`); if
+    /// that exceeds `cap` the guest retries with a larger buffer (only the first `cap` are
+    /// written). An **ambient introspection op** — authority-neutral like `cap.self` reflection:
+    /// every candidate is an in-window word the guest's own heap already encodes, while
+    /// out-of-window words (host return addresses, frame pointers, host pointers) are filtered
+    /// *inside* the VM and never cross the boundary, so no host layout leaks (GC.md §3, §6).
+    /// Interp-only for now; the JIT bails `Unsupported` (like `atomic.fence`).
+    GcRoots {
+        heap_lo: ValIdx,
+        heap_hi: ValIdx,
+        buf: ValIdx,
+        cap: ValIdx,
     },
     /// §12 thread spawn (`thread.spawn`): start a new vCPU — **one real OS thread** (1:1; the VM
     /// provides the thread + futex as *primitives*, not a scheduler — any M:N model is built by the

@@ -43,6 +43,7 @@ fn from_slot(t: ValType, s: i64) -> Value {
             b[..8].copy_from_slice(&s.to_le_bytes());
             Value::V128(b)
         }
+        ValType::Ref => Value::Ref(s as u64),
     }
 }
 

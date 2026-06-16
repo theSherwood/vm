@@ -231,6 +231,9 @@ impl<'g> BB<'g> {
             ValType::F32 => Inst::ConstF32(self.g.f32bits()),
             ValType::F64 => Inst::ConstF64(self.g.f64bits()),
             ValType::V128 => Inst::ConstV128(self.g.v128bytes()),
+            // The generator never produces `ref`-typed values (it's an svm GC reservation, not in
+            // `valtype()`); there is no const-ref instruction to synthesize one.
+            ValType::Ref => unreachable!("irgen does not generate ref-typed values"),
         };
         self.push(inst, ty)
     }
@@ -1019,6 +1022,7 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<svm_interp::Value> {
             ValType::F32 => Value::F32(f32::from_bits(g.f32bits())),
             ValType::F64 => Value::F64(f64::from_bits(g.f64bits())),
             ValType::V128 => Value::V128(g.v128bytes()),
+            ValType::Ref => unreachable!("irgen does not generate ref-typed params"),
         })
         .collect()
 }
@@ -1047,6 +1051,7 @@ fn to_slot(v: Value) -> i64 {
         // The entry signature never returns a v128 (the generator's entry results are scalar), so
         // this is a total fall-through, not a live path.
         Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => x as i64,
     }
 }
 fn from_slot(t: ValType, s: i64) -> Value {
@@ -1060,6 +1065,7 @@ fn from_slot(t: ValType, s: i64) -> Value {
             b[..8].copy_from_slice(&s.to_le_bytes());
             Value::V128(b)
         }
+        ValType::Ref => Value::Ref(s as u64),
     }
 }
 fn values_equal(a: &Value, b: &Value) -> bool {

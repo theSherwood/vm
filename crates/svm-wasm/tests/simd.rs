@@ -29,6 +29,7 @@ fn eval(wat: &str, entry: &str, args: &[Value]) -> Value {
             Value::F32(x) => x.to_bits() as i64,
             Value::F64(x) => x.to_bits() as i64,
             Value::V128(b) => i64::from_le_bytes(b[..8].try_into().unwrap()),
+            Value::Ref(x) => *x as i64,
         })
         .collect();
     let jit = match svm_jit::compile_and_run(&t.module, idx, &jit_args).expect("jit") {

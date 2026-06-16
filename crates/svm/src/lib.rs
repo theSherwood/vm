@@ -72,6 +72,7 @@ pub fn default_args(params: &[ValType]) -> Vec<Value> {
             ValType::F32 => Value::F32(0.0),
             ValType::F64 => Value::F64(0.0),
             ValType::V128 => Value::V128([0; 16]),
+            ValType::Ref => Value::Ref(0),
         })
         .collect()
 }

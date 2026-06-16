@@ -49,6 +49,7 @@ mod op {
     pub const T_F32: u8 = 2;
     pub const T_F64: u8 = 3;
     pub const T_V128: u8 = 4;
+    pub const T_REF: u8 = 5; // opaque 64-bit reference (GC forward-compat reservation)
 
     // Constants.
     pub const CONST_I32: u8 = 0x10;
@@ -133,6 +134,9 @@ mod op {
     pub const ITOF_END: u8 = 0xE7;
     pub const ATOMIC_NOTIFY: u8 = 0xE8; // addr, count -> i32 woken
     pub const ATOMIC_FENCE: u8 = 0xE9; // order byte
+
+    // §GC (GC.md) conservative root enumeration.
+    pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, buf, cap -> i64 count
 
     // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
     // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
@@ -472,6 +476,18 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::Suspend { value } => {
             out.push(op::SUSPEND);
             write_uleb(out, *value as u64);
+        }
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            buf,
+            cap,
+        } => {
+            out.push(op::GC_ROOTS);
+            write_uleb(out, *heap_lo as u64);
+            write_uleb(out, *heap_hi as u64);
+            write_uleb(out, *buf as u64);
+            write_uleb(out, *cap as u64);
         }
         Inst::ThreadSpawn { func, sp, arg } => {
             out.push(op::THREAD_SPAWN);
@@ -842,6 +858,7 @@ fn type_tag(t: ValType) -> u8 {
         ValType::F32 => op::T_F32,
         ValType::F64 => op::T_F64,
         ValType::V128 => op::T_V128,
+        ValType::Ref => op::T_REF,
     }
 }
 
@@ -1124,6 +1141,12 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             arg: c.idx()?,
         },
         op::SUSPEND => Inst::Suspend { value: c.idx()? },
+        op::GC_ROOTS => Inst::GcRoots {
+            heap_lo: c.idx()?,
+            heap_hi: c.idx()?,
+            buf: c.idx()?,
+            cap: c.idx()?,
+        },
 
         op::THREAD_SPAWN => Inst::ThreadSpawn {
             func: c.idx()?,
@@ -1280,6 +1303,7 @@ fn decode_type(c: &mut Cursor) -> Result<ValType, DecodeError> {
         op::T_F32 => ValType::F32,
         op::T_F64 => ValType::F64,
         op::T_V128 => ValType::V128,
+        op::T_REF => ValType::Ref,
         other => return Err(DecodeError::BadType(other)),
     })
 }
