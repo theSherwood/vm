@@ -415,6 +415,37 @@ pub enum VarValue {
     Bytes(Vec<u8>),
 }
 
+/// One recorded crossing of the capability boundary (DEBUGGING.md W1 `CapTape`): the inputs the
+/// guest passed and the result slots the host returned, for a **nondeterministic input** capability
+/// (e.g. `Clock`). Replayed verbatim so a re-execution (time-travel `seek`) sees identical host
+/// inputs without a live host.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CapRecord {
+    pub type_id: u32,
+    pub op: u32,
+    pub handle: i32,
+    pub args: Vec<i64>,
+    /// The result slots the host returned (`Err` for a cap that trapped, e.g. `exit`).
+    pub result: Result<Vec<i64>, Trap>,
+}
+
+/// An append-only log of the capability **inputs** crossing into a guest, captured during a run so a
+/// later re-execution reproduces them without a live host (DEBUGGING.md W1). Slice 1 records the
+/// slot-only input caps (`Clock`); buffer-filling input caps (stdin `read`) and the `SchedTape` are
+/// follow-ups.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct CapTape {
+    pub records: Vec<CapRecord>,
+}
+
+/// Whether a capability is a **nondeterministic input** whose result a re-execution must replay
+/// (rather than re-derive). Deterministic / structural caps (window `Memory` ops, `SharedRegion`,
+/// `Stream` *write*) re-run faithfully on a fresh powerbox, so they are left live. Slice 1: `Clock`
+/// (the canonical slot-only nondeterminism source); stdin `read`, RNG, and host-fns extend this.
+fn is_recorded_input(type_id: u32) -> bool {
+    type_id == iface::CLOCK
+}
+
 impl Inspector {
     /// Attach to `m`'s `func(args)` with `fuel` and an **empty powerbox** (any `cap.call` faults),
     /// paused before the first op. Set breakpoints, then
@@ -432,11 +463,12 @@ impl Inspector {
         func: FuncIdx,
         args: &[Value],
         fuel: u64,
-        host: Host,
+        mut host: Host,
     ) -> Inspector {
         let funcs: Arc<[Func]> = m.funcs.to_vec().into();
         let args: Arc<[Value]> = args.into();
         let data: Arc<[Data]> = m.data.clone().into();
+        host.record_caps(); // W1: tape the cap inputs so `seek` can re-execute faithfully
         let host = Arc::new(Mutex::new(host));
         let shared = Arc::new(Mutex::new(DebugShared::new()));
         let root = Self::fresh_single_root(
@@ -591,8 +623,14 @@ impl Inspector {
         let Some(init) = self.seek_init.clone() else {
             return Stop::Blocked;
         };
-        // A fresh empty powerbox: re-execution reproduces the guest's own computation up to `t`.
-        let host = Arc::new(Mutex::new(Host::new()));
+        // A fresh powerbox seeded to *replay* the recorded cap inputs (W1): re-execution reproduces
+        // the guest's computation up to `t` even for nondeterministic inputs (e.g. `Clock`), and
+        // keeps recording so the tape stays complete if the seek runs past what was taped.
+        let tape: Arc<[CapRecord]> = self.cap_tape().records.into();
+        let mut fresh = Host::new();
+        fresh.replay_caps(tape);
+        fresh.record_caps();
+        let host = Arc::new(Mutex::new(fresh));
         let root = Self::fresh_single_root(
             init.funcs,
             init.func,
@@ -708,6 +746,14 @@ impl Inspector {
     /// is paused or finished — it is not executing, so the lock is uncontended.
     pub fn host(&self) -> std::sync::MutexGuard<'_, Host> {
         self.host.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The recorded capability-input trace so far (DEBUGGING.md W1) — the `Clock` (and, later, other
+    /// input) crossings this run has made. This is what [`seek`](Inspector::seek) replays to
+    /// re-execute a nondeterministic guest faithfully, and the artifact a host can capture from a
+    /// live run.
+    pub fn cap_tape(&self) -> CapTape {
+        self.host().cap_tape()
     }
 
     fn dbg(&mut self) -> &mut DebugCtx {
@@ -5912,6 +5958,12 @@ pub struct Host {
     /// JIT's `table_reserve_log2` for the backends to agree on slot indices. `0` ⇒ natural size
     /// (no install room).
     jit_table_log2: u8,
+    /// W1 record/replay (DEBUGGING.md): when `Some`, every nondeterministic-input `cap.call`
+    /// ([`is_recorded_input`]) is appended here as it crosses, so a later re-execution can replay it.
+    cap_record: Option<Vec<CapRecord>>,
+    /// W1 replay: when `Some`, serve nondeterministic-input `cap.call`s from this tape (cursor) in
+    /// order instead of the live host, so a fresh-powerbox re-execution reproduces the guest's inputs.
+    cap_replay: Option<(Arc<[CapRecord]>, usize)>,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -6006,7 +6058,31 @@ impl Host {
             jit_domains: Vec::new(),
             jit_validator: None,
             jit_table_log2: 0,
+            cap_record: None,
+            cap_replay: None,
         }
+    }
+
+    /// Begin recording the nondeterministic capability **inputs** crossing into the guest, so a
+    /// re-execution can replay them (DEBUGGING.md W1). Idempotent; keeps any records already logged.
+    pub fn record_caps(&mut self) {
+        if self.cap_record.is_none() {
+            self.cap_record = Some(Vec::new());
+        }
+    }
+
+    /// The capability inputs recorded so far (empty if [`record_caps`](Host::record_caps) was never
+    /// called).
+    pub fn cap_tape(&self) -> CapTape {
+        CapTape {
+            records: self.cap_record.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Serve nondeterministic-input `cap.call`s from `tape` (from the start) instead of the live host
+    /// — used by re-execution / time-travel so it sees identical inputs without a live powerbox.
+    fn replay_caps(&mut self, tape: Arc<[CapRecord]>) {
+        self.cap_replay = Some((tape, 0));
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
@@ -6646,6 +6722,56 @@ impl Host {
     /// — the interpreter converts its `Value`s, a JIT passes its slots directly. `mem`
     /// is `None` when the module declares no memory (buffer ops then return `-EFAULT`).
     pub fn cap_dispatch_slots(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
+        // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
+        if is_recorded_input(type_id) {
+            // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
+            // re-execution diverged before this point — fall through to live as a best effort).
+            let served = if let Some((tape, pos)) = &mut self.cap_replay {
+                match tape.get(*pos) {
+                    Some(rec)
+                        if rec.type_id == type_id
+                            && rec.op == op
+                            && rec.handle == handle
+                            && rec.args == args =>
+                    {
+                        *pos += 1;
+                        Some(rec.result.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(result) = served {
+                return result;
+            }
+            // Record: run live, then log the crossing for a future replay.
+            let result = self.cap_dispatch_slots_inner(type_id, op, handle, args, mem);
+            if let Some(rec) = &mut self.cap_record {
+                rec.push(CapRecord {
+                    type_id,
+                    op,
+                    handle,
+                    args: args.to_vec(),
+                    result: result.clone(),
+                });
+            }
+            return result;
+        }
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem)
+    }
+
+    /// The live capability dispatch (§3c) — resolve the handle in the host table and run the op. The
+    /// public [`cap_dispatch_slots`](Host::cap_dispatch_slots) wraps this with W1 record/replay.
+    fn cap_dispatch_slots_inner(
         &mut self,
         type_id: u32,
         op: u32,
