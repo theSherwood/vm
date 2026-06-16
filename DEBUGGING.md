@@ -48,6 +48,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | `cap.call` I/O record log | **Missing** | — |
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
 | W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `svm-interp` `find_schedule` / `replay_schedule` / `Witness` |
+| W1 time-travel — `seek(t)` / `step_back` via stateless re-execution (single-threaded, deterministic) | **Built — slice 1** | `svm-interp` `Inspector::seek` / `step_back` |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`) | **Built — Milestone B slice 1–2** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
@@ -178,6 +179,20 @@ this is where the cost lives; keep it out of v1.
 **Acceptance.** A recorded sequential run replays to a byte-identical cap-I/O trace and
 identical final window; a recorded interpreter-scheduled concurrent run replays to the same
 outcome; `seek(t)` returns the guest state at logical time `t`.
+
+**Built — slice 1 (time-travel via stateless re-execution).** `Inspector::seek(t)` re-executes a
+single-threaded run from `clock 0` to logical time `t` and pauses there, restoring the exact frame
+state (pc + live SSA values) so `backtrace`/`read_*` show the guest as it was; `step_back()` is
+`seek(clock-1)`. Implemented with the §18 explorer's own trick — the attach inputs (funcs, func,
+args, fuel, memory, data) are kept as cheap-to-clone `Arc`s in a `SeekInit`, and a `seek_target`
+on `DebugCtx` fast-forwards a fresh re-run past breakpoints to `t`. This is **exact for a
+deterministic guest** (the common algorithmic-debugging case); the re-run uses a fresh empty
+powerbox, so a guest whose `cap.call`s carry real side effects or nondeterminism needs the
+`CapTape` (next slice) to seek faithfully. Tests (`debug.rs`): out-of-order `seek` restores the
+exact frame state recorded while stepping forward; `step_back` decrements the clock; `seek(0)` then
+resume reproduces the result; seek-past-end finishes. *Not yet:* the `CapTape` (cap-I/O record →
+feed on replay) and `SchedTape`, scheduled-mode (multithreaded) seek, and snapshot/checkpoint
+cadence to bound re-execution cost.
 
 ---
 

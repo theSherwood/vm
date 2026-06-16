@@ -257,6 +257,10 @@ struct DebugCtx {
     resume_clock: u64,
     /// When `Some(t)`, stop once `clock` reaches `t` (a pending single-step).
     step_target: Option<u64>,
+    /// Time-travel seek (DEBUGGING.md W1): when `Some(t)`, fast-forward this fresh re-execution to
+    /// logical time `t` — pausing exactly at `clock == t` and **ignoring** breakpoints/watchpoints
+    /// along the way (we are replaying to a known coordinate, not hunting for stops).
+    seek_target: Option<u64>,
 }
 
 impl DebugCtx {
@@ -266,6 +270,7 @@ impl DebugCtx {
             clock: 0,
             resume_clock: u64::MAX, // nothing stopped yet, so the first op may itself break
             step_target: None,
+            seek_target: None,
         }
     }
 
@@ -283,6 +288,16 @@ impl DebugCtx {
     /// `clock` unchanged, so the continuation re-enters here); `None` charges one tick of logical
     /// time and lets the op run. The `resume_clock` guard makes resume step off the current op.
     fn before_op(&mut self, pc: IrPc, inst: &Inst, access: MemAccess) -> Option<StopReason> {
+        // Time-travel seek (W1): replay straight to logical time `t`, past any breakpoints.
+        if let Some(t) = self.seek_target {
+            if self.clock >= t {
+                self.seek_target = None;
+                self.resume_clock = self.clock; // a subsequent step/continue first steps off here
+                return Some(StopReason::Step);
+            }
+            self.clock += 1;
+            return None;
+        }
         let just_resumed = self.clock == self.resume_clock;
         let reason = if just_resumed {
             None
@@ -349,7 +364,23 @@ pub struct Inspector {
     /// thread the user `select_task`ed. Reset to `None` on each resume. Stepping always drives the
     /// stopped thread, regardless of focus.
     focus: Option<TaskId>,
+    /// The recorded inputs needed to **re-execute** the run from scratch for time-travel `seek` (W1).
+    /// Present in single-threaded mode; `None` in scheduled mode (seek pending there).
+    seek_init: Option<SeekInit>,
     finished: Option<Result<Vec<Value>, Trap>>,
+}
+
+/// The inputs a single-threaded run was started with, kept so [`Inspector::seek`] can re-execute it
+/// deterministically from `clock 0` (DEBUGGING.md W1 stateless re-execution). All fields are cheap
+/// to clone (shared `Arc`s + `Copy`), so a `seek`/`step_back` per keystroke is fine.
+#[derive(Clone)]
+struct SeekInit {
+    funcs: Arc<[Func]>,
+    func: FuncIdx,
+    args: Arc<[Value]>,
+    fuel: u64,
+    memory: Option<Memory>,
+    data: Arc<[Data]>,
 }
 
 /// Scheduled (multithreaded) execution state owned by an [`Inspector`] across pumps (Milestone B).
@@ -404,15 +435,62 @@ impl Inspector {
         host: Host,
     ) -> Inspector {
         let funcs: Arc<[Func]> = m.funcs.to_vec().into();
-        let mem = m.memory.map(|mc| {
+        let args: Arc<[Value]> = args.into();
+        let data: Arc<[Data]> = m.data.clone().into();
+        let host = Arc::new(Mutex::new(host));
+        let shared = Arc::new(Mutex::new(DebugShared::new()));
+        let root = Self::fresh_single_root(
+            Arc::clone(&funcs),
+            func,
+            &args,
+            fuel,
+            m.memory,
+            &data,
+            Arc::clone(&host),
+            Arc::clone(&shared),
+            None,
+        );
+        Inspector {
+            v: Some(root),
+            sched: None,
+            host,
+            debug_info: m.debug_info.clone(),
+            shared,
+            focus: None,
+            seek_init: Some(SeekInit {
+                funcs,
+                func,
+                args,
+                fuel,
+                memory: m.memory,
+                data,
+            }),
+            finished: None,
+        }
+    }
+
+    /// Build a fresh single-threaded root vCPU over `funcs`/`func`/`args` with its own scheduler (no
+    /// workers run — the driver pumps it directly). `seek_target` fast-forwards a time-travel replay
+    /// to a logical time and pauses there (W1); `None` for a normal attach. Shared by `attach` and
+    /// `seek` so both build identical initial state.
+    #[allow(clippy::too_many_arguments)]
+    fn fresh_single_root(
+        funcs: Arc<[Func]>,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        memory: Option<Memory>,
+        data: &[Data],
+        host: Arc<Mutex<Host>>,
+        shared: Arc<Mutex<DebugShared>>,
+        seek_target: Option<u64>,
+    ) -> Box<VCpu> {
+        let mem = memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
-            mm.init_data(&m.data);
+            mm.init_data(data);
             mm
         });
-        let host = Arc::new(Mutex::new(host));
         let quota = Quota::default();
-        // A scheduler is required to construct a vCPU, but no workers ever run: a single-threaded
-        // guest executes entirely on this driver's `v.run` pumps.
         let sched = Arc::new(Scheduler::new(quota.max_vcpus, MAX_WORKERS));
         let dt = Arc::new(DomainTable::new(&funcs, 0));
         let mut root = VCpu::new(
@@ -420,7 +498,7 @@ impl Inspector {
             func,
             args,
             mem,
-            Arc::clone(&host),
+            host,
             fuel,
             0,
             0,
@@ -428,17 +506,10 @@ impl Inspector {
             quota,
             dt,
         );
-        let shared = Arc::new(Mutex::new(DebugShared::new()));
-        root.debug = Some(Box::new(DebugCtx::new(Arc::clone(&shared))));
-        Inspector {
-            v: Some(Box::new(root)),
-            sched: None,
-            host,
-            debug_info: m.debug_info.clone(),
-            shared,
-            focus: None,
-            finished: None,
-        }
+        let mut d = DebugCtx::new(shared);
+        d.seek_target = seek_target;
+        root.debug = Some(Box::new(d));
+        Box::new(root)
     }
 
     /// Attach to a **multithreaded** guest and debug a chosen interleaving (DEBUGGING.md Milestone
@@ -504,8 +575,57 @@ impl Inspector {
             debug_info: m.debug_info.clone(),
             shared,
             focus: None,
+            seek_init: None, // scheduled-mode time-travel is a later W1 slice
             finished: None,
         }
+    }
+
+    /// Time-travel to logical time `t` (DEBUGGING.md W1): re-execute the run from the start to the op
+    /// at `clock == t` and pause there, so `backtrace`/`read_*` show the guest exactly **as it was**.
+    /// This is stateless re-execution (the §18 explorer's own trick) — exact for a deterministic
+    /// guest; capabilities re-run against a fresh empty powerbox, so a guest whose `cap.call`s carry
+    /// real side effects or nondeterminism needs the (pending) W1 `CapTape` to seek faithfully.
+    /// Breakpoints are preserved but ignored *during* the fast-forward. Single-threaded mode only for
+    /// now (scheduled-mode seek is pending); returns [`Stop::Blocked`] otherwise.
+    pub fn seek(&mut self, t: u64) -> Stop {
+        let Some(init) = self.seek_init.clone() else {
+            return Stop::Blocked;
+        };
+        // A fresh empty powerbox: re-execution reproduces the guest's own computation up to `t`.
+        let host = Arc::new(Mutex::new(Host::new()));
+        let root = Self::fresh_single_root(
+            init.funcs,
+            init.func,
+            &init.args,
+            init.fuel,
+            init.memory,
+            &init.data,
+            Arc::clone(&host),
+            Arc::clone(&self.shared),
+            Some(t),
+        );
+        self.host = host;
+        self.v = Some(root);
+        self.finished = None;
+        self.focus = None;
+        match self.v.as_mut().unwrap().run(u64::MAX) {
+            Step::Pause(_, pc) => Stop::Break {
+                reason: StopReason::Step,
+                pc,
+            },
+            Step::Done(r) => {
+                self.finished = Some(r.clone());
+                Stop::Finished(r)
+            }
+            Step::Park(_) | Step::Yield => Stop::Blocked,
+        }
+    }
+
+    /// Step **backward** one op: time-travel to `clock - 1` (DEBUGGING.md W1). At `clock 0` this
+    /// re-seeks to the initial state (a no-op move).
+    pub fn step_back(&mut self) -> Stop {
+        let t = self.clock().saturating_sub(1);
+        self.seek(t)
     }
 
     /// The vCPU currently under inspection (the paused thread in scheduled mode, the sole vCPU in
