@@ -507,9 +507,12 @@ TCB; depends on `svm-ir`/`svm-encode`/`svm-interp`, **not** `svm-durable`) imple
 (D-hash); the window image is sparse with zero-page elision (the shadow state rides along);
 Section 3 is the handle table. `crates/svm-snapshot/tests/roundtrip.rs` drives the real
 freeze→serialize→restore→thaw on the interpreter and asserts both invariants above plus the
-non-durable freeze refusal. Still ahead: §12.4 fiber/dispatch control state, `svm-mem`
-page-prot restore (Phase 2, escape-TCB), and folding the codec into the cross-backend §7
-property (currently interp-only here; `durable_jit` still exercises the manual path).
+non-durable freeze refusal. The **cross-backend** property (`crates/svm/tests/durable_jit.rs`
++ the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
+backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
+canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
+Still ahead: §12.4 fiber/dispatch control state and `svm-mem` page-prot restore (Phase 2,
+escape-TCB).
 
 ### 12.7 Shadow-frame layout
 
