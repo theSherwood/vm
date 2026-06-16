@@ -28,8 +28,16 @@ fn gc_roots_round_trips() {
         }\n";
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
-    assert_eq!(parse_module(&print_module(&m)), Ok(m.clone()), "text round-trip");
-    assert_eq!(decode_module(&encode_module(&m)), Ok(m.clone()), "binary round-trip");
+    assert_eq!(
+        parse_module(&print_module(&m)),
+        Ok(m.clone()),
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)),
+        Ok(m.clone()),
+        "binary round-trip"
+    );
 }
 
 fn run_i64s(src: &str) -> Vec<i64> {
