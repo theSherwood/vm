@@ -719,6 +719,104 @@ int apply(int sel, int a, int b){ return ops[sel & 1](a, b); }";
     check_vs_native("kitchen", src, 7);
 }
 
+/// Compile a **powerbox program** (one that does real I/O via libc), translate it, resolve its §7
+/// capability imports against the reference host policy, verify, and run it end-to-end through the
+/// reference powerbox — then assert its stdout **and** exit code match the *native* build of the
+/// same C (the strongest oracle). This exercises the whole Lane C on-ramp: the synthesized `_start`,
+/// the handle stash, and `write`/`exit` bound to the `Stream`/`Exit` capabilities.
+fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    // Native oracle: build with `cc`, run, capture stdout + exit code.
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native")
+    };
+    let native_code = native.status.code().unwrap_or(-1) as u8;
+
+    // The on-ramp: translate → resolve §7 imports to concrete capabilities → verify → run.
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: a libc program must produce a powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run = svm_run::run_powerbox(&module, stdin).expect("powerbox run");
+
+    assert_eq!(
+        run.stdout, native.stdout,
+        "{name}: svm stdout {:?} vs native {:?}",
+        run.stdout, native.stdout
+    );
+    let svm_code = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(
+        svm_code, native_code,
+        "{name}: svm exit {svm_code} vs native {native_code}"
+    );
+}
+
+#[test]
+fn powerbox_hello_write() {
+    // The headline Lane C demo: write a string to stdout, then return an exit code. The synthesized
+    // `_start` grants the handles, `write(1, …)` lowers to the `Stream` capability, `main`'s return
+    // is the exit code — all matching the native build byte-for-byte.
+    let src = "#include <unistd.h>\n\
+               int main(void){ write(1, \"hello, on-ramp!\\n\", 16); return 3; }";
+    check_powerbox_vs_native("pb_hello", src, b"");
+}
+
+#[test]
+fn powerbox_exit_capability() {
+    // `exit(code)` lowers to the `Exit` capability (terminal): the program writes, then exits with a
+    // non-zero code — the SVM `Outcome::Exited` must match the native process exit code.
+    let src = "#include <unistd.h>\n#include <stdlib.h>\n\
+               int main(void){ write(1, \"bye\\n\", 4); exit(7); }";
+    check_powerbox_vs_native("pb_exit", src, b"");
+}
+
+#[test]
+fn powerbox_echo_stdin() {
+    // A stdin → stdout round-trip through the `Stream` capability (read on the stdin handle, write on
+    // stdout), driven by a loop — exercises `read`, `write`, the handle stash, and a real data frame.
+    let src = "#include <unistd.h>\n\
+               int main(void){ char buf[64]; long n; \
+               while ((n = read(0, buf, sizeof buf)) > 0) write(1, buf, n); return 0; }";
+    check_powerbox_vs_native("pb_echo", src, b"ping pong\n");
+}
+
+#[test]
+fn powerbox_computed_output() {
+    // Compose the on-ramp's existing machinery with I/O: build a string in a stack buffer (a real
+    // data frame + stores), then write it out — the byte-exact stdout must match native.
+    let src = "#include <unistd.h>\n\
+               int main(void){ char buf[16]; for (int i = 0; i < 10; i++) buf[i] = '0' + i; \
+               buf[10] = '\\n'; write(1, buf, 11); return 0; }";
+    check_powerbox_vs_native("pb_computed", src, b"");
+}
+
 #[test]
 fn unsupported_is_fail_closed() {
     // A 128-bit integer is outside the subset — it must be a clean `Unsupported`, never a silent

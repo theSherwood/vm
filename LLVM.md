@@ -8,13 +8,16 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–M (control flow, memory, calls, switch, globals, floats, indirect
+**Status: Milestone 1 slices A–N (control flow, memory, calls, switch, globals, floats, indirect
 calls, struct aggregates, memory intrinsics, by-value aggregates, relocations, libm math, int
-min/max+bit intrinsics) done — a broad swath of scalar C from `clang -O2` runs on both backends
-(40 tests). A **kitchen-sink capstone** exercises everything at once (structs by-value, a
-function-pointer table, floats+libm, recursion, loops, an array `memcpy`, a global array, `switch`,
-bit intrinsics) and matches **native `cc`** end to end (`check_vs_native`). Next: a libc/powerbox
-`main` entry (`write`/`malloc`), then a real-library demo (Lane C).** `crates/svm-llvm` does the **SSA → block-argument
+min/max+bit intrinsics, and the powerbox libc on-ramp) done — a broad swath of scalar C from
+`clang -O2` runs on both backends (44 tests). A **kitchen-sink capstone** exercises everything at
+once (structs by-value, a function-pointer table, floats+libm, recursion, loops, an array `memcpy`,
+a global array, `switch`, bit intrinsics) and matches **native `cc`** end to end. **Slice N** binds
+libc I/O to host capabilities (`write`/`read` → `Stream`, `exit` → `Exit`) via §7 named imports and
+a synthesized powerbox `_start`: a real I/O program now runs through the reference powerbox with
+**stdout + exit code matching native** (`check_powerbox_vs_native`). Next: more libc surface
+(`malloc`/`printf`), then the real-library demo corpus (Lane C).** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -30,9 +33,10 @@ conversions, `fabs`/`floor`, an indirect call through a function pointer, struct
 (global/array-of-struct/stack), a struct `memcpy` + `memset`, and by-value struct args/returns
 (small-coerced + `byval`/`sret`), and pointer-valued global relocations (a function-pointer table,
 a struct string-pointer member), libm math calls (`sqrt`/`fmin`), and int min/max + bit intrinsics
-(`smax`/`ctlz`/`popcount`) — run **interp == JIT == hand-computed** (40 tests, incl. a kitchen-sink
-program checked against native `cc`).
-Remaining M1: a libc/powerbox `main` entry (`write`/`malloc`), then the
+(`smax`/`ctlz`/`popcount`) — run **interp == JIT == hand-computed** (44 tests, incl. a kitchen-sink
+program checked against native `cc`, plus a `write`/`exit`/`read`-echo powerbox program checked
+against native stdout + exit code).
+Remaining M1: more libc surface (`malloc`/`printf`), then the
 demo Lane C. Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
@@ -409,10 +413,30 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       `llvm.abs` → `select(x<0, -x, x)` (`lower_int_intrinsic`). Tested on `smax` (a `?:` max),
       `ctlz`, `ctpop`, and an `abs`.
 
+**Slice N (DONE) — the powerbox on-ramp (libc → capabilities, "Lane C").**
+- [x] A program that does I/O gets a **synthesized powerbox entry** (`_start`, function 0):
+      `(stdout, stdin, exit)` `i32` handles (§3e, `is_powerbox_entry`), stored into the **handle
+      stash** — the reserved low window `[0, DATA_BASE)`, **page-isolated** from the globals (which
+      now start a page up, `STACK_PAGE`, so a read-only global's D40 page-protection never catches
+      `_start`'s handle stores). `_start` then calls `main(entry_sp)` and returns its exit code.
+- [x] An external libc call bound to a host capability lowers to `Inst::CallImport "<name>"` the
+      embedder resolves at load (§7, `default_cap_resolver`): `write`/`read` → `Stream`
+      (`(i64 buf, i64 len) -> (i64)`, the POSIX `fd` dropped — the handle selects the endpoint),
+      `exit` → `Exit`. The handle is reloaded from the stash at each call site, so it threads through
+      arbitrary call depth with no viral parameter. A guest-*defined* function of the same name
+      shadows the binding (mirrors the libm rule). `collect_cap_imports` builds the import table;
+      `synth_start` builds the entry; `Module.imports` carries them to `resolve_capability_imports`.
+- [x] **End-to-end vs native:** `check_powerbox_vs_native` translates → resolves §7 imports →
+      verifies → runs through the reference powerbox, asserting **stdout *and* exit code** match the
+      native `cc` build. Tests: a `write`+return hello, an `exit(code)`, a stdin→stdout echo loop,
+      and a computed stack-buffer string (composing the data frame + I/O).
+
 **Remaining slices.**
 - [ ] `llvm.load.relative` (relative-offset string tables); transcendental math (needs a guest libm);
       `llvm.bswap`/`bitreverse`/`fshl`.
-- [ ] Libc/powerbox entry (`write`/`exit`/`malloc` via §7 named imports) + a `main` wrapper.
+- [ ] More libc surface: `malloc`/`free` (→ the `Memory` capability + a guest allocator), `printf`
+      (formatting), `argc`/`argv` `main`. The §7 import mechanism (slice N) is the hard part; these
+      are additional bindings on it.
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
       (the same corpus chibicc passes — clay, jsmn, sha256, xxhash, tinfl, perlin, regex,
       heapgrow). This is the D54 "matches native clang" exit criterion.
