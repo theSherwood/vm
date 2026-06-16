@@ -10,8 +10,9 @@
 //! and only address-taken `alloca`s remain. This crate ingests the legalized bitcode read-only
 //! and walks it; it never runs an in-process pass manager.
 //!
-//! **Scope (Milestone 1, slices A–H):** multi-block scalar functions with stack memory, calls,
-//! `switch`, global variables, floats, indirect calls, and struct aggregates.
+//! **Scope (Milestone 1, slices A–M):** multi-block scalar functions with stack memory, calls,
+//! `switch`, globals, floats, indirect calls, struct aggregates, memory intrinsics, by-value
+//! aggregates, pointer-valued global relocations, libm math calls, and integer min/max+bit intrinsics.
 //! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
 //!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
 //!   edges) becomes SVM's block-local form (§3a). Liveness makes every value live across a block's
@@ -43,10 +44,36 @@
 //!   byte offset); struct `alloca`s (struct-sized frame slots) and struct global initializers
 //!   serialize with field padding. Covers structs accessed via pointers/locals/globals — *not* the
 //!   by-value pass/return ABI (`sret`/`byval`), which is a follow-up.
+//! - **I — memory intrinsics.** `llvm.memcpy`/`memmove`/`memset` (constant length) lower to inline
+//!   chunked load/stores (widest-first 8/4/2/1, the `svm-wasm` plan); copies load-all-then-store-all
+//!   (overlap-safe); `memset` replicates the fill byte across an `i64`. The data stack is page-aligned
+//!   above the globals so a stack write never faults on a read-only global's page (D40).
+//! - **J — by-value aggregates (`sret`/`byval`).** Works with **no dedicated code**: clang does the
+//!   x86-64-SysV classification *in the IR* — a small struct is coerced to scalar register(s)
+//!   (`{i32,i32}`→`i64`, `{int×3}`→`(i64,i32)`, SSE→`double`s), a large one passes via a `byval`/
+//!   `sret` pointer (the caller `alloca`s + `memcpy`s + passes the pointer). So slices A–I (scalar
+//!   params, memory, calls, struct GEP, memcpy) already cover it; this slice is the test lock-in.
+//! - **K — relocations (pointer-valued globals).** A global initializer holding a function pointer,
+//!   `&other_global`, or arithmetic over those resolves via a constexpr evaluator (`GlobalReference`
+//!   → address/funcref, `ptrtoint`/`sub`/`add`/`trunc`). The globals layout is two-phase (assign all
+//!   addresses, then serialize — forward references resolve). Covers function-pointer tables and
+//!   struct/array pointer members.
+//! - **L — libm math calls.** A call to an *external* `sqrt`/`fabs`/`floor`/`ceil`/`trunc`/`rint`/
+//!   `copysign`/`fmin`/`fmax` (and `…f` f32 variants) lowers to the matching SVM float op inline —
+//!   unless the guest defines its own. (`round` and transcendentals have no SVM op → still a call.)
+//! - **M — integer min/max + bit intrinsics.** `llvm.smax`/`smin`/`umax`/`umin` → `icmp`+`select`;
+//!   `llvm.ctlz`/`cttz`/`ctpop` → `clz`/`ctz`/`popcnt`; `llvm.abs` → `select(x<0,-x,x)`.
+//! - **N — the powerbox on-ramp (libc → capabilities, "Lane C").** A program that does I/O gets a
+//!   synthesized **powerbox entry** (`_start`, function 0): it takes the granted `(stdout, stdin,
+//!   exit)` handles (§3e), stashes them in the reserved low window (page-isolated from the globals),
+//!   then calls `main`. An external libc call bound to a host capability (`write`/`read` → `Stream`,
+//!   `exit` → `Exit`) lowers to an `Inst::CallImport` the embedder resolves at load (§7); the handle
+//!   is reloaded from the stash (the POSIX `fd` is dropped — the handle selects the endpoint). Runs
+//!   end-to-end through the reference powerbox with stdout + exit code matching the native build.
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): by-value aggregate args/returns
-//! (`sret`/`byval`), libc/math *function* calls (e.g. `sqrt` with errno), pointer-valued globals
-//! (relocations — incl. function-pointer tables), SIMD vectors, and non-byte integer widths (`i33`).
+//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `mem*`, the rest of
+//! libc (`malloc`/`printf`/transcendental math), `llvm.load.relative` (clang's relative-offset
+//! string tables) and GEP-constexpr relocations (`&arr[k]`), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -59,7 +86,7 @@ use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
-    IntTy, Module, Terminator, ValIdx, ValType,
+    IntTy, IntUnOp, Module, Terminator, ValIdx, ValType,
 };
 
 /// Why a translation could not be produced.
@@ -104,27 +131,53 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         .iter()
         .filter(|f| !f.basic_blocks.is_empty())
         .collect();
+    let mut defined_names: HashMap<String, u32> = HashMap::new();
+    for (i, f) in defined.iter().enumerate() {
+        defined_names.insert(f.name.clone(), i as u32);
+    }
+    // §7 capability imports: external libc calls bound to host capabilities (`write`/`read`/`exit`).
+    // A program that uses any of them gets a synthesized powerbox entry (`_start`, function 0); the
+    // other functions then sit at index `base..` so `main` can be called from `_start`.
+    let (imports, caps) = collect_cap_imports(m, &defined_names);
+    let synth = !imports.is_empty() && defined_names.contains_key("main");
+    let base: u32 = synth as u32;
     let mut name2idx: HashMap<String, u32> = HashMap::new();
     for (i, f) in defined.iter().enumerate() {
-        name2idx.insert(f.name.clone(), i as u32);
+        name2idx.insert(f.name.clone(), i as u32 + base);
     }
-    // Globals live low (from `DATA_BASE`); the data stack starts just above them.
-    let (globals, data, globals_end) = globals_layout(m)?;
-    let entry_sp = globals_end.div_ceil(16) * 16;
+    // Globals live low (from `DATA_BASE`); the data stack starts just above them. For a powerbox
+    // program the writable **handle stash** occupies the reserved low scratch (`[0, DATA_BASE)`), so
+    // start the globals one page up (`STACK_PAGE`): a *read-only* global (D40, protected
+    // page-granularly) must never share a page with the stash, or `_start`'s handle stores would
+    // fault on the read-only page (the same page-isolation the data stack already gets above globals).
+    let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
+    let (globals, data, globals_end) = globals_layout(m, &name2idx, globals_base)?;
+    // Page-align the data stack above the globals so it never shares a page with a *read-only*
+    // global (D40 protects RO segments page-granularly — a stack write into a shared page would
+    // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
+    // writable global sharing a page is a separate latent issue — page-isolating those is a follow-up.)
+    let entry_sp = globals_end.div_ceil(STACK_PAGE) * STACK_PAGE;
 
-    let mut funcs = Vec::with_capacity(defined.len());
+    let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
     for f in &defined {
-        let (func, frame_size) = translate_func(f, &m.types, &name2idx, &globals)?;
+        let (func, frame_size) = translate_func(f, &m.types, &name2idx, &globals, &caps)?;
         any_frame |= frame_size > 0;
         funcs.push(func);
     }
-    // A window is declared if any function uses the data stack *or* the module has globals. Layout
-    // (§3d): globals `[DATA_BASE, globals_end)` low, then the data stack from `entry_sp` growing up.
-    // `mapped` covers the globals plus a stack reserve; the runtime leaves a faulting guard beyond
-    // `mapped` (reserved > mapped), so a stack overflow faults (detect-and-kill, §5) instead of
-    // corrupting the globals below it.
-    let need_window = any_frame || !globals.is_empty();
+    // Prepend the synthesized powerbox entry (`_start`) at function 0: it receives the granted
+    // capability handles, stashes them, then calls `main(entry_sp)` (§3e / `is_powerbox_entry`).
+    if synth {
+        let main_idx = name2idx["main"];
+        let main_results = funcs[(main_idx - base) as usize].results.clone();
+        funcs.insert(0, synth_start(main_idx, &main_results, entry_sp));
+    }
+    // A window is declared if any function uses the data stack, the module has globals, *or* it uses
+    // host capabilities (the handle stash lives in the reserved low window). Layout (§3d): globals
+    // `[DATA_BASE, globals_end)` low, then the data stack from `entry_sp` growing up. `mapped` covers
+    // the globals plus a stack reserve; the runtime leaves a faulting guard beyond `mapped` (reserved
+    // > mapped), so a stack overflow faults (detect-and-kill, §5) instead of corrupting the globals.
+    let need_window = any_frame || !globals.is_empty() || synth;
     let memory = need_window.then(|| {
         let top = if any_frame {
             entry_sp + STACK_RESERVE
@@ -140,8 +193,9 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
             funcs,
             memory,
             data,
-            // §7 named capability imports — the LLVM on-ramp emits none yet.
-            imports: Vec::new(),
+            // §7 named capability imports (`write`/`read`/`exit` …) the host resolves at load
+            // (`resolve_capability_imports`); empty for a pure-compute (kernel) module.
+            imports,
             // Debug info — the LLVM on-ramp will map `!DILocation`/`dbg.value` into the §6 waist
             // (DEBUGGING.md D-DBG-7); none yet.
             debug_info: None,
@@ -152,6 +206,9 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
 
 /// The low window offset where globals begin (kept off a null-like 0).
 const DATA_BASE: u64 = 16;
+/// The page granularity the data stack is aligned to above the globals (≥ the largest OS page so
+/// a stack write never lands in a read-only global's protected page, D40).
+const STACK_PAGE: u64 = 16384;
 /// The data-stack reserve (bytes) above the entry SP before the guard region — a stack overflow
 /// past this faults rather than escaping the window.
 const STACK_RESERVE: u64 = 1 << 20;
@@ -168,10 +225,85 @@ fn name_str(n: &Name) -> String {
     }
 }
 
+/// Evaluate an integer/pointer **constexpr** to its window value (a relocation): a global's
+/// address, a function's funcref index, or arithmetic over those (`sub`/`add`/`ptrtoint`/`trunc`…).
+/// This is what lets a global hold `&other_global`, a function pointer, or clang's relative-offset
+/// table (`@.str − @table`). GEP-constexprs (`&arr[k]`) are a later addition.
+fn const_eval(
+    c: &Constant,
+    globals: &HashMap<String, u64>,
+    funcs: &HashMap<String, u32>,
+) -> Result<i64, Error> {
+    use Constant as K;
+    let bin = |a: &Constant, b: &Constant| -> Result<(i64, i64), Error> {
+        Ok((
+            const_eval(a, globals, funcs)?,
+            const_eval(b, globals, funcs)?,
+        ))
+    };
+    match c {
+        K::Int { value, .. } => Ok(*value as i64),
+        K::Null(_) => Ok(0),
+        K::GlobalReference { name, .. } => {
+            let n = name_str(name);
+            if let Some(&a) = globals.get(&n) {
+                Ok(a as i64) // a data global's window address
+            } else if let Some(&f) = funcs.get(&n) {
+                Ok(f as i64) // a function's §3c funcref index
+            } else {
+                unsup(format!("constexpr reference to `@{n}`"))
+            }
+        }
+        // Pointer/width casts pass the value through; the byte width is the *consumer*'s job.
+        K::PtrToInt(x) => const_eval(x.operand.as_ref(), globals, funcs),
+        K::IntToPtr(x) => const_eval(x.operand.as_ref(), globals, funcs),
+        K::BitCast(x) => const_eval(x.operand.as_ref(), globals, funcs),
+        K::Trunc(x) => const_eval(x.operand.as_ref(), globals, funcs),
+        K::Add(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_add(b)),
+        K::Sub(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_sub(b)),
+        K::Mul(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_mul(b)),
+        other => unsup(format!("constexpr initializer {other:?}")),
+    }
+}
+
+/// The serialized byte length of a constant initializer — identical to `const_bytes(…).len()`, but
+/// computed *without* resolving relocations (a pointer is 8 bytes whatever it points to). Used in
+/// the globals layout's phase A (assign addresses) before phase B can serialize the actual bytes.
+fn const_size(c: &Constant, types: &Types) -> Result<u64, Error> {
+    match c {
+        Constant::Int { bits, .. } if *bits <= 64 => Ok((*bits as u64).div_ceil(8).max(1)),
+        Constant::Float(Float::Single(_)) => Ok(4),
+        Constant::Float(Float::Double(_)) => Ok(8),
+        Constant::Array { elements, .. } | Constant::Vector(elements) => {
+            let mut n = 0;
+            for e in elements {
+                n += const_size(e.as_ref(), types)?;
+            }
+            Ok(n)
+        }
+        Constant::Struct {
+            values, is_packed, ..
+        } => {
+            let fields: Vec<llvm_ir::TypeRef> = values.iter().map(|v| v.get_type(types)).collect();
+            Ok(struct_layout(&fields, *is_packed, types)?.1)
+        }
+        Constant::AggregateZero(t) | Constant::Undef(t) | Constant::Poison(t) => {
+            type_size(t.as_ref(), types)
+        }
+        // A pointer / constexpr scalar leaf — its width is its type's size (8 for a pointer).
+        other => type_size(other.get_type(types).as_ref(), types),
+    }
+}
+
 /// Serialize a constant initializer to its little-endian window bytes (the §3d/x86-64 layout).
-/// Integers (incl. the `i8`s of a C string), floats, arrays, structs (with field padding), and
-/// zero/null aggregates are covered; pointer-valued globals (relocations) are a later slice.
-fn const_bytes(c: &Constant, types: &Types) -> Result<Vec<u8>, Error> {
+/// Aggregates recurse structurally (arrays/structs with field padding); a scalar leaf that is a
+/// pointer or constexpr is resolved via [`const_eval`] (relocations) and emitted at its type width.
+fn const_bytes(
+    c: &Constant,
+    types: &Types,
+    globals: &HashMap<String, u64>,
+    funcs: &HashMap<String, u32>,
+) -> Result<Vec<u8>, Error> {
     match c {
         Constant::Int { bits, value } if *bits <= 64 => {
             let n = (*bits as usize).div_ceil(8).max(1);
@@ -182,7 +314,7 @@ fn const_bytes(c: &Constant, types: &Types) -> Result<Vec<u8>, Error> {
         Constant::Array { elements, .. } | Constant::Vector(elements) => {
             let mut out = Vec::new();
             for e in elements {
-                out.extend(const_bytes(e.as_ref(), types)?);
+                out.extend(const_bytes(e.as_ref(), types, globals, funcs)?);
             }
             Ok(out)
         }
@@ -194,15 +326,25 @@ fn const_bytes(c: &Constant, types: &Types) -> Result<Vec<u8>, Error> {
             let (offsets, size, _) = struct_layout(&fields, *is_packed, types)?;
             let mut out = vec![0u8; size as usize];
             for (v, &off) in values.iter().zip(&offsets) {
-                let b = const_bytes(v.as_ref(), types)?;
+                let b = const_bytes(v.as_ref(), types, globals, funcs)?;
                 out[off as usize..off as usize + b.len()].copy_from_slice(&b);
             }
             Ok(out)
         }
-        Constant::AggregateZero(t) | Constant::Null(t) => {
+        Constant::AggregateZero(t) | Constant::Undef(t) | Constant::Poison(t) => {
             Ok(vec![0u8; type_size(t.as_ref(), types)? as usize])
         }
-        other => unsup(format!("global initializer {other:?}")),
+        // A pointer / constexpr scalar leaf (a relocation): resolve its value, emit at type width.
+        other => {
+            let width = type_size(other.get_type(types).as_ref(), types)?;
+            if width > 8 {
+                return unsup(format!(
+                    "constexpr initializer wider than 8 bytes ({width})"
+                ));
+            }
+            let v = const_eval(other, globals, funcs)?;
+            Ok(v.to_le_bytes()[..width as usize].to_vec())
+        }
     }
 }
 
@@ -210,38 +352,49 @@ fn const_bytes(c: &Constant, types: &Types) -> Result<Vec<u8>, Error> {
 /// globals region's end offset (for window sizing).
 type Globals = (HashMap<String, u64>, Vec<svm_ir::Data>, u64);
 
-/// Lay out the module's global variables in the window's globals region (from [`GLOBALS_BASE`],
-/// each natural-aligned), returning the name → window-address map, the `data` segments to emit
+/// Lay out the module's global variables in the window's globals region (from `base`, each
+/// natural-aligned), returning the name → window-address map, the `data` segments to emit
 /// (constants read-only, §3a/D40; all-zero/BSS globals just reserve space in the zero-init
 /// window), and the region's end (for window sizing).
-fn globals_layout(m: &LModule) -> Result<Globals, Error> {
+fn globals_layout(
+    m: &LModule,
+    name2idx: &HashMap<String, u32>,
+    base: u64,
+) -> Result<Globals, Error> {
+    // Phase A: assign every global a window address (from its declared type size), so a relocation
+    // in any initializer can resolve a forward/backward reference to another global in phase B.
     let mut addr = HashMap::new();
-    let mut segs = Vec::new();
-    let mut off = DATA_BASE;
-    for g in &m.global_vars {
-        let (bytes, size) = match &g.initializer {
-            Some(init) => {
-                let b = const_bytes(init.as_ref(), &m.types)?;
-                let n = b.len() as u64;
-                (Some(b), n.max(1))
-            }
-            None => (None, type_size(g.ty.as_ref(), &m.types)?.max(1)),
-        };
+    let mut off = base;
+    let mut placed: Vec<(usize, u64)> = Vec::with_capacity(m.global_vars.len());
+    for (gi, g) in m.global_vars.iter().enumerate() {
+        // Size from the initializer's serialized length (matches phase B exactly); BSS/extern
+        // globals have no initializer, so fall back to the declared type size.
+        let size = match &g.initializer {
+            Some(init) => const_size(init.as_ref(), &m.types)?,
+            None => type_size(g.ty.as_ref(), &m.types)?,
+        }
+        .max(1);
         let align = (g.alignment as u64).max(1);
         off = off.div_ceil(align) * align;
         addr.insert(name_str(&g.name), off);
-        // Emit a segment only for non-zero initialized data (the window is zero-init, so BSS and
-        // explicit zeros need none). A read-only segment is protected (D40), so a guest write faults.
-        if let Some(b) = bytes {
-            if g.is_constant || b.iter().any(|&x| x != 0) {
-                segs.push(svm_ir::Data {
-                    offset: off,
-                    readonly: g.is_constant,
-                    bytes: b,
-                });
-            }
-        }
+        placed.push((gi, off));
         off += size;
+    }
+    // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
+    let mut segs = Vec::new();
+    for (gi, at) in placed {
+        let g = &m.global_vars[gi];
+        let Some(init) = &g.initializer else { continue }; // BSS / extern → zero-init window
+        let bytes = const_bytes(init.as_ref(), &m.types, &addr, name2idx)?;
+        // Emit a segment only for non-zero initialized data (the window is zero-init). A read-only
+        // segment is protected (D40), so a guest write to it faults.
+        if g.is_constant || bytes.iter().any(|&x| x != 0) {
+            segs.push(svm_ir::Data {
+                offset: at,
+                readonly: g.is_constant,
+                bytes,
+            });
+        }
     }
     Ok((addr, segs, off))
 }
@@ -438,6 +591,7 @@ fn translate_func(
     types: &Types,
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
+    caps: &HashMap<String, u32>,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
         return unsup(format!("varargs function `{}`", f.name));
@@ -474,6 +628,7 @@ fn translate_func(
             frame_size,
             name2idx,
             globals,
+            caps,
         )?);
     }
     Ok((
@@ -687,6 +842,424 @@ fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
         },
         _ => None,
     }
+}
+
+// --- §7 capability imports / the powerbox on-ramp (LLVM.md §9 "Lane C") --------------------------
+//
+// A C program that does I/O calls libc (`write`/`read`/`exit`); clang leaves those as
+// declaration-only externals. The on-ramp binds each to a **host capability** (§7 named import): a
+// call lowers to an `Inst::CallImport "<name>"` the embedder resolves at load (`default_cap_resolver`
+// → `(type_id, op)`). The capability **handle** is not a C argument — it is granted to the powerbox
+// entry and threaded to every call site through the *handle stash*, the reserved low window
+// (`[0, DATA_BASE)`): `_start` stores the granted handles there and each call site reloads the one
+// it needs (so a handle reaches arbitrary call depth without a viral extra parameter). This keeps
+// the translator pure mechanism — it never interprets host semantics, just defers the bind (§2a).
+
+/// Window offsets of the **powerbox handle stash** (the reserved low scratch `[0, DATA_BASE)` — four
+/// `i32` slots). `_start` stores the granted handles here; each capability call site reloads its own.
+const STASH_STDOUT: u64 = 0;
+const STASH_STDIN: u64 = 4;
+const STASH_EXIT: u64 = 8;
+
+/// Which stash slot a capability call reads its handle from.
+#[derive(Clone, Copy)]
+enum HandleSlot {
+    Stdout,
+    Stdin,
+    Exit,
+}
+
+/// A libc/POSIX function the on-ramp binds to a host capability: the import `name` the host resolves
+/// (via `default_cap_resolver`), the op `sig` (the **capability ABI**, not the C prototype), the
+/// stash slot its handle comes from, and how many leading C args to drop (the POSIX `fd`, which the
+/// capability handle subsumes — the endpoint is selected by the handle, not the fd).
+struct CapSpec {
+    name: &'static str,
+    sig: svm_ir::FuncType,
+    handle: HandleSlot,
+    drop_args: usize,
+}
+
+/// The reference powerbox binding for a libc/POSIX function name, or `None` if it is not a bound
+/// capability (so it stays an ordinary direct call / a fail-closed `Unsupported`). The op signatures
+/// match `svm-run`'s `default_cap_resolver`: `write`/`read` are `Stream` (`(i64 buf, i64 len) ->
+/// (i64)`, the `fd` dropped — the handle is the endpoint), `exit` is `Exit` (`(i32) -> ()`).
+fn cap_spec(name: &str) -> Option<CapSpec> {
+    use ValType::{I32, I64};
+    let ft = |params: Vec<ValType>, results: Vec<ValType>| svm_ir::FuncType { params, results };
+    Some(match name {
+        "write" => CapSpec {
+            name: "write",
+            sig: ft(vec![I64, I64], vec![I64]),
+            handle: HandleSlot::Stdout,
+            drop_args: 1,
+        },
+        "read" => CapSpec {
+            name: "read",
+            sig: ft(vec![I64, I64], vec![I64]),
+            handle: HandleSlot::Stdin,
+            drop_args: 1,
+        },
+        "exit" | "_exit" | "_Exit" => CapSpec {
+            name: "exit",
+            sig: ft(vec![I32], vec![]),
+            handle: HandleSlot::Exit,
+            drop_args: 0,
+        },
+        _ => return None,
+    })
+}
+
+/// Scan the module for calls to external (not guest-defined) functions bound to a host capability,
+/// building the module's §7 import table (deduplicated by import name) and a `C-callee-name → import
+/// index` map the call lowering uses. A name the guest *defines* is never treated as a capability
+/// (it shadows the libc symbol), mirroring the libm-intrinsic rule.
+fn collect_cap_imports(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+) -> (Vec<svm_ir::Import>, HashMap<String, u32>) {
+    let mut imports: Vec<svm_ir::Import> = Vec::new();
+    let mut by_import_name: HashMap<String, u32> = HashMap::new();
+    let mut cap_idx: HashMap<String, u32> = HashMap::new();
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if defined.contains_key(&name) || cap_idx.contains_key(&name) {
+                    continue;
+                }
+                if let Some(spec) = cap_spec(&name) {
+                    let idx = *by_import_name
+                        .entry(spec.name.to_string())
+                        .or_insert_with(|| {
+                            let i = imports.len() as u32;
+                            imports.push(svm_ir::Import {
+                                name: spec.name.to_string(),
+                                sig: spec.sig.clone(),
+                            });
+                            i
+                        });
+                    cap_idx.insert(name, idx);
+                }
+            }
+        }
+    }
+    (imports, cap_idx)
+}
+
+/// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
+/// capabilities. It takes the granted handles `(stdout, stdin, exit)` as `i32` params (the §3e
+/// powerbox shape `is_powerbox_entry` recognizes — no threaded data-SP, since it is the root),
+/// stores them into the handle stash so every capability call site can reload its handle, then calls
+/// the C `main(sp)` at the page-aligned data-stack base and returns its exit code.
+fn synth_start(main_idx: u32, main_results: &[ValType], entry_sp: u64) -> Func {
+    use svm_ir::StoreOp;
+    let mut insts: Vec<Inst> = Vec::new();
+    // params: v0 = stdout, v1 = stdin, v2 = exit (i32 capability handles).
+    let mut next: ValIdx = 3;
+    for (off, handle) in [(STASH_STDOUT, 0), (STASH_STDIN, 1), (STASH_EXIT, 2)] {
+        insts.push(Inst::ConstI64(off as i64));
+        let addr = next;
+        next += 1;
+        insts.push(Inst::Store {
+            op: StoreOp::I32,
+            addr,
+            value: handle,
+            offset: 0,
+            align: 0,
+        });
+    }
+    // sp = entry_sp (constant); call main(sp). `main` carries the threaded data-SP as param 0.
+    insts.push(Inst::ConstI64(entry_sp as i64));
+    let sp = next;
+    next += 1;
+    insts.push(Inst::Call {
+        func: main_idx,
+        args: vec![sp],
+    });
+    let term = if main_results.is_empty() {
+        Terminator::Return(vec![])
+    } else {
+        Terminator::Return(vec![next]) // main's single result, appended by the call
+    };
+    let params = vec![ValType::I32, ValType::I32, ValType::I32];
+    Func {
+        results: main_results.to_vec(),
+        blocks: vec![Block {
+            params: params.clone(),
+            insts,
+            term,
+        }],
+        params,
+    }
+}
+
+/// The largest constant byte length we unroll a `memcpy`/`memset` into chunked load/stores; a
+/// larger one would need a runtime loop (synthetic blocks), a later slice. clang's struct/array
+/// bulk ops carry small constant sizes.
+const MAX_MEM_UNROLL: u64 = 4096;
+
+/// Split `len` bytes into `(offset, width)` chunks, widest first (8/4/2/1) — the same unroll plan
+/// `svm-wasm` uses for `memory.copy`/`fill`.
+fn mem_chunks(len: u64) -> Vec<(u64, u8)> {
+    let mut out = Vec::new();
+    let mut off = 0u64;
+    let mut rem = len;
+    for w in [8u64, 4, 2, 1] {
+        while rem >= w {
+            out.push((off, w as u8));
+            off += w;
+            rem -= w;
+        }
+    }
+    out
+}
+
+fn load_w(w: u8) -> svm_ir::LoadOp {
+    use svm_ir::LoadOp as L;
+    match w {
+        8 => L::I64,
+        4 => L::I32,
+        2 => L::I32_16U,
+        _ => L::I32_8U,
+    }
+}
+
+fn store_w(w: u8) -> svm_ir::StoreOp {
+    use svm_ir::StoreOp as S;
+    match w {
+        8 => S::I64,
+        4 => S::I32,
+        2 => S::I32_16,
+        _ => S::I32_8,
+    }
+}
+
+/// The constant integer value of an operand, if it is one.
+fn const_int(op: &Operand) -> Option<u64> {
+    match op {
+        Operand::ConstantOperand(c) => match c.as_ref() {
+            Constant::Int { value, .. } => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Lower an integer min/max or bit intrinsic to inline ops: `llvm.smax`/`smin`/`umax`/`umin` →
+/// `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` → the `clz`/`ctz`/`popcnt` unary op (the trailing
+/// `is_*_poison` `i1` arg is ignored — SVM defines the zero case); `llvm.abs` → `select(x<0,-x,x)`.
+/// Returns `Ok(None)` for any other call.
+fn lower_int_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    types: &Types,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    let base = name.rsplit_once('.').map_or(name.as_str(), |(b, _)| b); // drop the `.iN` suffix
+    if !matches!(
+        base,
+        "llvm.smax"
+            | "llvm.smin"
+            | "llvm.umax"
+            | "llvm.umin"
+            | "llvm.ctlz"
+            | "llvm.cttz"
+            | "llvm.ctpop"
+            | "llvm.abs"
+    ) {
+        return Ok(None);
+    }
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
+    let cmp_select = |ctx: &mut BlockCtx, op: CmpOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        let b = ctx.operand(args[1])?;
+        let cond = ctx.push(Inst::IntCmp { ty, op, a, b });
+        Ok(ctx.push(Inst::Select { cond, a, b }))
+    };
+    let unop = |ctx: &mut BlockCtx, op: IntUnOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        Ok(ctx.push(Inst::IntUn { ty, op, a }))
+    };
+    let idx = match base {
+        "llvm.smax" => cmp_select(ctx, CmpOp::GtS)?,
+        "llvm.smin" => cmp_select(ctx, CmpOp::LtS)?,
+        "llvm.umax" => cmp_select(ctx, CmpOp::GtU)?,
+        "llvm.umin" => cmp_select(ctx, CmpOp::LtU)?,
+        "llvm.ctlz" => unop(ctx, IntUnOp::Clz)?,
+        "llvm.cttz" => unop(ctx, IntUnOp::Ctz)?,
+        "llvm.ctpop" => unop(ctx, IntUnOp::Popcnt)?,
+        // abs(x) = select(x < 0, 0 - x, x).
+        "llvm.abs" => {
+            let x = ctx.operand(args[0])?;
+            let zero = ctx.push(if ty == IntTy::I64 {
+                Inst::ConstI64(0)
+            } else {
+                Inst::ConstI32(0)
+            });
+            let cond = ctx.push(Inst::IntCmp {
+                ty,
+                op: CmpOp::LtS,
+                a: x,
+                b: zero,
+            });
+            let neg = ctx.push(Inst::IntBin {
+                ty,
+                op: BinOp::Sub,
+                a: zero,
+                b: x,
+            });
+            ctx.push(Inst::Select { cond, a: neg, b: x })
+        }
+        _ => unreachable!(),
+    };
+    Ok(Some(idx))
+}
+
+/// Lower a call to an external **libm math** function that has a direct SVM float op (`sqrt`,
+/// `fabs`, `floor`, `ceil`, `trunc`, `rint`/`nearbyint`, `copysign`, `fmin`, `fmax` and their `…f`
+/// f32 variants) to that op inline. Skipped if the guest *defines* a function of that name (then
+/// it's an ordinary direct call). `round` (half-away-from-zero) and transcendentals (`sin`/`exp`/…)
+/// have no SVM op, so they fall through to the call path (currently `Unsupported`).
+fn lower_libm_call(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    types: &Types,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    if ctx.name2idx.contains_key(&name) {
+        return Ok(None); // a guest-defined function — not the libm intrinsic
+    }
+    let base = name.strip_suffix('f').unwrap_or(&name); // the f32 variant drops a trailing `f`
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let ty = match args.first() {
+        Some(a) => match val_type(a.get_type(types).as_ref()) {
+            Ok(ValType::F32) | Ok(ValType::F64) => float_ty(val_type(a.get_type(types).as_ref())?)?,
+            _ => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    let un = |ctx: &mut BlockCtx, op: FUnOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        Ok(ctx.push(Inst::FUn { ty, op, a }))
+    };
+    let bin = |ctx: &mut BlockCtx, op: FBinOp| -> Result<ValIdx, Error> {
+        let a = ctx.operand(args[0])?;
+        let b = ctx.operand(args[1])?;
+        Ok(ctx.push(Inst::FBin { ty, op, a, b }))
+    };
+    let idx = match base {
+        "sqrt" => un(ctx, FUnOp::Sqrt)?,
+        "fabs" => un(ctx, FUnOp::Abs)?,
+        "floor" => un(ctx, FUnOp::Floor)?,
+        "ceil" => un(ctx, FUnOp::Ceil)?,
+        "trunc" => un(ctx, FUnOp::Trunc)?,
+        "rint" | "nearbyint" => un(ctx, FUnOp::Nearest)?,
+        "copysign" => bin(ctx, FBinOp::Copysign)?,
+        "fmin" => bin(ctx, FBinOp::Min)?,
+        "fmax" => bin(ctx, FBinOp::Max)?,
+        _ => return Ok(None),
+    };
+    Ok(Some(idx))
+}
+
+/// Lower `llvm.memcpy`/`memmove`/`memset` (constant length) to inline chunked load/stores, the way
+/// `svm-wasm` lowers `memory.copy`/`fill`. Copies **load all chunks then store all** (overlap-safe,
+/// so `memmove` and `memcpy` share a path); `memset` replicates the fill byte across an `i64` and
+/// stores it chunk-wide. Returns `Ok(true)` if it handled a (void) mem intrinsic, `Ok(false)`
+/// otherwise. A variable or too-large length is a clean `Unsupported`.
+fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<bool, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(false);
+    };
+    let is_copy = name.starts_with("llvm.memcpy") || name.starts_with("llvm.memmove");
+    let is_set = name.starts_with("llvm.memset");
+    if !is_copy && !is_set {
+        return Ok(false);
+    }
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let len = const_int(args[2])
+        .ok_or_else(|| Error::Unsupported("variable-length mem intrinsic".into()))?;
+    if len == 0 {
+        return Ok(true);
+    }
+    if len > MAX_MEM_UNROLL {
+        return unsup(format!(
+            "mem intrinsic length {len} > {MAX_MEM_UNROLL} (needs a loop)"
+        ));
+    }
+    let chunks = mem_chunks(len);
+    if is_copy {
+        let dst = ctx.operand(args[0])?;
+        let src = ctx.operand(args[1])?;
+        // Load every chunk first (overlap-safe), then store them all.
+        let loaded: Vec<(u64, u8, ValIdx)> = chunks
+            .iter()
+            .map(|&(off, w)| {
+                let v = ctx.push(Inst::Load {
+                    op: load_w(w),
+                    addr: src,
+                    offset: off,
+                    align: 0,
+                });
+                (off, w, v)
+            })
+            .collect();
+        for (off, w, v) in loaded {
+            ctx.push_effect(Inst::Store {
+                op: store_w(w),
+                addr: dst,
+                value: v,
+                offset: off,
+                align: 0,
+            });
+        }
+    } else {
+        let dst = ctx.operand(args[0])?;
+        let val = ctx.operand(args[1])?; // i8 fill, carried as i32
+                                         // rep64 = (val & 0xFF) * 0x0101010101010101 — the fill byte replicated across 8 bytes.
+        let mask = ctx.push(Inst::ConstI32(0xFF));
+        let vb = ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::And,
+            a: val,
+            b: mask,
+        });
+        let vb64 = ctx.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: vb,
+        });
+        let magic = ctx.push(Inst::ConstI64(0x0101_0101_0101_0101u64 as i64));
+        let rep64 = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Mul,
+            a: vb64,
+            b: magic,
+        });
+        let rep32 = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: rep64,
+        });
+        for &(off, w) in &chunks {
+            let value = if w == 8 { rep64 } else { rep32 };
+            ctx.push_effect(Inst::Store {
+                op: store_w(w),
+                addr: dst,
+                value,
+                offset: off,
+                align: 0,
+            });
+        }
+    }
+    Ok(true)
 }
 
 /// Lower a float math intrinsic call to inline float ops, returning its result index. `fmuladd`/
@@ -980,6 +1553,8 @@ struct BlockCtx<'a> {
     name2idx: &'a HashMap<String, u32>,
     /// Global variable name → its window address (for resolving a `@global` reference).
     globals: &'a HashMap<String, u64>,
+    /// External libc name → its §7 import index (for lowering a capability call to `CallImport`).
+    caps: &'a HashMap<String, u32>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     next_val: ValIdx,
@@ -996,6 +1571,17 @@ impl<'a> BlockCtx<'a> {
     /// The data-SP's block-local index (always parameter 0 of every block, §3d).
     fn sp(&self) -> Result<ValIdx, Error> {
         self.id(SP)
+    }
+
+    /// Load a powerbox capability handle (`i32`) from its stash slot in the reserved low window.
+    fn stash_load(&mut self, off: u64) -> ValIdx {
+        let addr = self.const_i64(off as i64);
+        self.push(Inst::Load {
+            op: svm_ir::LoadOp::I32,
+            addr,
+            offset: 0,
+            align: 0,
+        })
     }
 
     /// Append an instruction that produces **no** SSA value (e.g. `store`). It must not consume a
@@ -1100,6 +1686,7 @@ fn translate_block(
     frame_size: u64,
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
+    caps: &HashMap<String, u32>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // The data-SP (`SP` sentinel) types as `i64`; every other param reads its scanned type.
@@ -1113,6 +1700,7 @@ fn translate_block(
         frame_size,
         name2idx,
         globals,
+        caps,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         next_val: 0,
@@ -1171,6 +1759,65 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 }
             }
             return Ok(());
+        }
+        // `llvm.memcpy`/`memmove`/`memset` lower to inline chunked load/stores (constant length).
+        if lower_mem_intrinsic(ctx, c)? {
+            return Ok(()); // void — no SSA result
+        }
+        // A call to an external libm-math function with a direct SVM op (`sqrt`/`floor`/…) lowers
+        // inline (only when the guest hasn't defined its own function of that name).
+        if let Some(idx) = lower_libm_call(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // Integer min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/`ctpop`/`abs`/…) lower inline.
+        if let Some(idx) = lower_int_intrinsic(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // A call to an external libc function bound to a host capability (§7) lowers to a
+        // `CallImport` the embedder resolves at load: the handle comes from the powerbox stash (the
+        // `fd` arg is dropped — the handle selects the endpoint), the args are mapped per the
+        // capability ABI. A guest-*defined* function of the same name is never a capability (handled
+        // by the direct-call path below, since `caps` excludes defined names).
+        if let Some(name) = callee_name(c) {
+            if let Some(&import) = ctx.caps.get(&name) {
+                let spec = cap_spec(&name).expect("caps only holds capability names");
+                let off = match spec.handle {
+                    HandleSlot::Stdout => STASH_STDOUT,
+                    HandleSlot::Stdin => STASH_STDIN,
+                    HandleSlot::Exit => STASH_EXIT,
+                };
+                let handle = ctx.stash_load(off);
+                let mut args = Vec::new();
+                for (a, _attrs) in c.arguments.iter().skip(spec.drop_args) {
+                    args.push(ctx.operand(a)?);
+                }
+                let inst = Inst::CallImport {
+                    import,
+                    sig: spec.sig,
+                    handle,
+                    args,
+                };
+                match &c.dest {
+                    Some(dest) => {
+                        let r = ctx.push(inst);
+                        if let Some(&vid) = ctx.s.name2id.get(dest) {
+                            ctx.idx_of.insert(vid, r);
+                        }
+                    }
+                    None => ctx.push_effect(inst),
+                }
+                return Ok(());
+            }
         }
         // Pass the callee its own data-stack frame at `sp + frame_size` (§3d), then the mapped
         // arguments. The IR signature is `(sp, c-args…)`, so the callee's frame never overlaps ours.

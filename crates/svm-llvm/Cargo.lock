@@ -615,6 +615,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "svm-encode"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
+]
+
+[[package]]
 name = "svm-fiber"
 version = "0.0.0"
 dependencies = [
@@ -662,6 +669,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-run",
  "svm-text",
  "svm-verify",
 ]
@@ -675,6 +683,20 @@ name = "svm-mem"
 version = "0.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "svm-run"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "svm-encode",
+ "svm-interp",
+ "svm-ir",
+ "svm-jit",
+ "svm-text",
+ "svm-verify",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

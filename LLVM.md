@@ -8,9 +8,16 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–H (control flow, memory, calls, switch, globals, floats, indirect
-calls, struct aggregates) done — a broad swath of scalar C from `clang -O2` translates and runs
-on both backends.** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–N (control flow, memory, calls, switch, globals, floats, indirect
+calls, struct aggregates, memory intrinsics, by-value aggregates, relocations, libm math, int
+min/max+bit intrinsics, and the powerbox libc on-ramp) done — a broad swath of scalar C from
+`clang -O2` runs on both backends (44 tests). A **kitchen-sink capstone** exercises everything at
+once (structs by-value, a function-pointer table, floats+libm, recursion, loops, an array `memcpy`,
+a global array, `switch`, bit intrinsics) and matches **native `cc`** end to end. **Slice N** binds
+libc I/O to host capabilities (`write`/`read` → `Stream`, `exit` → `Exit`) via §7 named imports and
+a synthesized powerbox `_start`: a real I/O program now runs through the reference powerbox with
+**stdout + exit code matching native** (`check_powerbox_vs_native`). Next: more libc surface
+(`malloc`/`printf`), then the real-library demo corpus (Lane C).** `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -22,10 +29,15 @@ the common float intrinsics, `fmuladd` lowered unfused). Real `clang -O2` progra
 collatz loops, if-converted select, a stack-array sum, recursive `fib`, a cross-function call, a
 dense switch, `even`/`odd` mutual recursion, a const lookup table, a mutable global counter,
 indexed string reads, a gapped switch (a global jump table), double arithmetic/compares/
-conversions, `fabs`/`floor`, an indirect call through a function pointer, and struct field
-access (global/array-of-struct/stack) — run **interp == JIT == hand-computed** (28 tests).
-Remaining M1: by-value aggregate args/returns (`sret`/`byval`), libc/math function calls,
-function-pointer global tables (relocations), then the demo Lane C. Section numbers like "§3d"
+conversions, `fabs`/`floor`, an indirect call through a function pointer, struct field access
+(global/array-of-struct/stack), a struct `memcpy` + `memset`, and by-value struct args/returns
+(small-coerced + `byval`/`sret`), and pointer-valued global relocations (a function-pointer table,
+a struct string-pointer member), libm math calls (`sqrt`/`fmin`), and int min/max + bit intrinsics
+(`smax`/`ctlz`/`popcount`) — run **interp == JIT == hand-computed** (44 tests, incl. a kitchen-sink
+program checked against native `cc`, plus a `write`/`exit`/`read`-echo powerbox program checked
+against native stdout + exit code).
+Remaining M1: more libc surface (`malloc`/`printf`), then the
+demo Lane C. Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
@@ -357,18 +369,74 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       array-of-structs (`arr[i].field`), and a `volatile` stack struct (store/load via field GEP).
       Covers structs via pointers/locals/globals — **not** the by-value pass/return ABI.
 
+**Slice I (DONE) — memory intrinsics.**
+- [x] `llvm.memcpy`/`memmove`/`memset` (constant length) lower to inline **chunked load/stores**
+      (widest-first 8/4/2/1, the plan `svm-wasm` uses for `memory.copy`/`fill`). Copies
+      **load-all-then-store-all** (overlap-safe → `memcpy` and `memmove` share a path); `memset`
+      replicates the fill byte across an `i64` (`val·0x01010101_01010101`) and stores it chunk-wide.
+      Variable-length / `> 4 KiB` is a clean `Unsupported` (needs a runtime loop). Also **page-aligned
+      the data stack** above the globals (16 KiB) so a stack write never faults on a read-only
+      global's page (D40 protects RO segments page-granularly — the bug a struct-`memcpy`-into-stack
+      test surfaced). Tested on a struct `memcpy` from a const global and a `memset` fill.
+
+**Slice J (DONE) — by-value aggregate args/returns (`sret`/`byval`).**
+- [x] Works with **no dedicated translator code** — the anticipated-gnarly slice turned out free,
+      because clang does the x86-64-SysV register-classification *in the IR*: a small struct is
+      coerced to scalar register(s) (`{i32,i32}`→`i64`, three-int→`(i64,i32)`, SSE→`double`s) and the
+      body packs/unpacks via a stack slot; a large struct passes via a `byval`/`sret` pointer (the
+      caller `alloca`s + `memcpy`s + passes the pointer). So slices A–I (scalar params, memory,
+      calls, struct GEP, **memcpy** — the actual prerequisite) already cover it. Tested through calls
+      so the call-site coercion is exercised: small `byval`/return, two-eightbyte `(i64,i32)`, an SSE
+      `(double,double)`, and a large `mkBig` (`sret`) + `sumBig` (`byval`).
+
+**Slice K (DONE) — relocations (pointer-valued global initializers).**
+- [x] A global initializer holding a function pointer, `&other_global`, or arithmetic over those
+      resolves via a constexpr evaluator (`const_eval`): `GlobalReference` → a data global's address
+      or a function's funcref index, plus `ptrtoint`/`inttoptr`/`bitcast`/`trunc`/`sub`/`add`/`mul`.
+      The globals layout is **two-phase** — assign every global an address (sizing via `const_size`,
+      which matches the serialized length), then serialize each initializer (so a forward/backward
+      reference to another global resolves). Tested on a function-pointer table (`{inc,dec}`, called
+      indirectly) and a struct with a string-pointer member. (A regression caught here: phase-A
+      sizing must use the serialized length, not `type_size(g.ty)`, or the window mis-sizes.)
+      *Deferred: `llvm.load.relative` (clang's relative-offset string tables) and GEP-constexprs.*
+
+**Slice L (DONE) — libm math calls.**
+- [x] A call to an *external* `sqrt`/`fabs`/`floor`/`ceil`/`trunc`/`rint`/`nearbyint`/`copysign`/
+      `fmin`/`fmax` (and the `…f` f32 variants) lowers to the matching SVM float op inline —
+      `lower_libm_call`, gated on the name not being a guest-defined function. `round`
+      (half-away-from-zero) and transcendentals (`sin`/`cos`/`exp`/`log`/`pow`) have no SVM op, so
+      they stay calls (`Unsupported` for now). Tested on `sqrt` and `fmin`.
+
+**Slice M (DONE) — integer min/max + bit intrinsics.**
+- [x] `llvm.smax`/`smin`/`umax`/`umin` → `icmp`+`select`; `llvm.ctlz`/`cttz`/`ctpop` →
+      `clz`/`ctz`/`popcnt` (the trailing `is_*_poison` `i1` ignored — SVM defines the zero case);
+      `llvm.abs` → `select(x<0, -x, x)` (`lower_int_intrinsic`). Tested on `smax` (a `?:` max),
+      `ctlz`, `ctpop`, and an `abs`.
+
+**Slice N (DONE) — the powerbox on-ramp (libc → capabilities, "Lane C").**
+- [x] A program that does I/O gets a **synthesized powerbox entry** (`_start`, function 0):
+      `(stdout, stdin, exit)` `i32` handles (§3e, `is_powerbox_entry`), stored into the **handle
+      stash** — the reserved low window `[0, DATA_BASE)`, **page-isolated** from the globals (which
+      now start a page up, `STACK_PAGE`, so a read-only global's D40 page-protection never catches
+      `_start`'s handle stores). `_start` then calls `main(entry_sp)` and returns its exit code.
+- [x] An external libc call bound to a host capability lowers to `Inst::CallImport "<name>"` the
+      embedder resolves at load (§7, `default_cap_resolver`): `write`/`read` → `Stream`
+      (`(i64 buf, i64 len) -> (i64)`, the POSIX `fd` dropped — the handle selects the endpoint),
+      `exit` → `Exit`. The handle is reloaded from the stash at each call site, so it threads through
+      arbitrary call depth with no viral parameter. A guest-*defined* function of the same name
+      shadows the binding (mirrors the libm rule). `collect_cap_imports` builds the import table;
+      `synth_start` builds the entry; `Module.imports` carries them to `resolve_capability_imports`.
+- [x] **End-to-end vs native:** `check_powerbox_vs_native` translates → resolves §7 imports →
+      verifies → runs through the reference powerbox, asserting **stdout *and* exit code** match the
+      native `cc` build. Tests: a `write`+return hello, an `exit(code)`, a stdin→stdout echo loop,
+      and a computed stack-buffer string (composing the data frame + I/O).
+
 **Remaining slices.**
-- [ ] **By-value aggregate args/returns** (`sret`/`byval`, D39) — passing/returning structs by value.
-      The gnarly part is clang's SysV register-classification (small structs coerced to int/array
-      params, large via `byval`/`sret` pointers); the IR must reconstruct/forward those.
-- [ ] Libc/math **function** calls (e.g. `sqrt` keeps errno semantics → a real `@sqrt` call) — bind
-      to a guest libc / capability, or recognize the named libc-math calls as intrinsics under
-      `-fno-math-errno`.
-- [ ] Pointer-valued global initializers (relocations — a global holding `&other_global`/a string
-      pointer; resolve addresses after layout).
-- [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline.
-- [ ] Struct/vector GEP + by-value aggregates via `sret`/hidden pointer (D39).
-- [ ] `memcpy`/`memset`/`memmove` intrinsics; libc/powerbox entry (`write`/`exit`/`malloc`).
+- [ ] `llvm.load.relative` (relative-offset string tables); transcendental math (needs a guest libm);
+      `llvm.bswap`/`bitreverse`/`fshl`.
+- [ ] More libc surface: `malloc`/`free` (→ the `Memory` capability + a guest allocator), `printf`
+      (formatting), `argc`/`argv` `main`. The §7 import mechanism (slice N) is the hard part; these
+      are additional bindings on it.
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
       (the same corpus chibicc passes — clay, jsmn, sha256, xxhash, tinfl, perlin, regex,
       heapgrow). This is the D54 "matches native clang" exit criterion.
