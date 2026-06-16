@@ -2084,3 +2084,124 @@ block0(v0: i32):
         );
     }
 }
+
+/// Directed differential for **NaN canonicalization in `min`/`max`** (finding M1). The reference
+/// interpreter forces a canonical quiet NaN (`0x7FC0_0000` / `0x7FF8_..`) on any NaN min/max input;
+/// Cranelift's `fmin`/`fmax` otherwise *propagate* the input NaN's payload and sign. That difference is
+/// invisible to result comparison (`values_equal` treats NaNs as equal) but would diverge the
+/// byte-exact escape-oracle memory window the moment a guest stores a min/max result — so here we
+/// assert the two backends produce the **bit-identical** canonical NaN (not the NaN-tolerant compare).
+#[test]
+fn min_max_canonicalize_nan_bit_exactly() {
+    const CANON32: u32 = 0x7FC0_0000;
+    const CANON64: u64 = 0x7FF8_0000_0000_0000;
+    // Assorted NaN bit patterns: signaling, payload-carrying, sign-bit-set — all must canonicalize.
+    let nans32: [u32; 4] = [0x7F80_0001, 0x7FC1_2345, 0xFFC0_0000, 0xFF80_0001];
+    let nans64: [u64; 4] = [
+        0x7FF0_0000_0000_0001,
+        0x7FF8_0000_0DEF_0000,
+        0xFFF8_0000_0000_0000,
+        0xFFF0_0000_0000_0001,
+    ];
+    let one32 = 1.0f32.to_bits();
+    let one64 = 1.0f64.to_bits();
+
+    for op in ["min", "max"] {
+        // ---- scalar f32 ----
+        let src = format!(
+            "func (f32, f32) -> (f32) {{\nblock0(v0: f32, v1: f32):\n  v2 = f32.{op} v0 v1\n  return v2\n}}\n"
+        );
+        let m = parse_module(&src).unwrap();
+        verify_module(&m).unwrap();
+        for &na in &nans32 {
+            for (a, bb) in [(na, one32), (one32, na), (na, na)] {
+                let mut fuel = 100_000u64;
+                let iv = run(
+                    &m,
+                    0,
+                    &[
+                        Value::F32(f32::from_bits(a)),
+                        Value::F32(f32::from_bits(bb)),
+                    ],
+                    &mut fuel,
+                )
+                .unwrap();
+                let ibits = match iv[0] {
+                    Value::F32(x) => x.to_bits(),
+                    _ => unreachable!(),
+                };
+                let jbits = match compile_and_run(&m, 0, &[a as i64, bb as i64]).unwrap() {
+                    JitOutcome::Returned(s) => s[0] as u32,
+                    o => panic!("jit: {o:?}"),
+                };
+                assert_eq!(
+                    ibits, jbits,
+                    "f32.{op}({a:#x},{bb:#x}): interp vs jit NaN bits"
+                );
+                assert_eq!(ibits, CANON32, "f32.{op} must yield the canonical NaN");
+            }
+        }
+        // ---- scalar f64 ----
+        let src = format!(
+            "func (f64, f64) -> (f64) {{\nblock0(v0: f64, v1: f64):\n  v2 = f64.{op} v0 v1\n  return v2\n}}\n"
+        );
+        let m = parse_module(&src).unwrap();
+        verify_module(&m).unwrap();
+        for &na in &nans64 {
+            for (a, bb) in [(na, one64), (one64, na), (na, na)] {
+                let mut fuel = 100_000u64;
+                let iv = run(
+                    &m,
+                    0,
+                    &[
+                        Value::F64(f64::from_bits(a)),
+                        Value::F64(f64::from_bits(bb)),
+                    ],
+                    &mut fuel,
+                )
+                .unwrap();
+                let ibits = match iv[0] {
+                    Value::F64(x) => x.to_bits(),
+                    _ => unreachable!(),
+                };
+                let jbits = match compile_and_run(&m, 0, &[a as i64, bb as i64]).unwrap() {
+                    JitOutcome::Returned(s) => s[0] as u64,
+                    o => panic!("jit: {o:?}"),
+                };
+                assert_eq!(
+                    ibits, jbits,
+                    "f64.{op}({a:#x},{bb:#x}): interp vs jit NaN bits"
+                );
+                assert_eq!(ibits, CANON64, "f64.{op} must yield the canonical NaN");
+            }
+        }
+    }
+
+    // ---- v128 lane (the same canonicalization must apply per-lane) ----
+    // Lane 0 of the constant is the payload NaN 0x7FC12345 (LE bytes 45 23 C1 7F); min/max against a
+    // 1.0 splat must canonicalize that lane on both backends. Observe lane 0 as f32.
+    for op in ["min", "max"] {
+        let src = format!(
+            "func () -> (f32) {{\nblock0():\n  \
+             v0 = v128.const 69 35 193 127 0 0 128 63 0 0 128 63 0 0 128 63\n  \
+             v1 = f32.const 1.0\n  \
+             v2 = f32x4.splat v1\n  \
+             v3 = f32x4.{op} v0 v2\n  \
+             v4 = f32x4.extract_lane 0 v3\n  \
+             return v4\n}}\n"
+        );
+        let m = parse_module(&src).unwrap();
+        verify_module(&m).unwrap();
+        let mut fuel = 100_000u64;
+        let ibits = match run(&m, 0, &[], &mut fuel).unwrap()[0] {
+            Value::F32(x) => x.to_bits(),
+            _ => unreachable!(),
+        };
+        let jbits = match compile_and_run(&m, 0, &[]).unwrap() {
+            JitOutcome::Returned(s) => s[0] as u32,
+            o => panic!("jit: {o:?}"),
+        };
+        assert_eq!(ibits, jbits, "f32x4.{op} lane 0: interp vs jit NaN bits");
+        assert_eq!(ibits, CANON32, "f32x4.{op} must canonicalize the NaN lane");
+    }
+}

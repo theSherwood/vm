@@ -1644,6 +1644,62 @@ pub struct Module {
     /// backend is a fail-closed error (resolution is mandatory first). Empty for modules that
     /// inline their capability calls (the legacy `cap.call`-only form).
     pub imports: Vec<Import>,
+    /// **Debug info — the frontend-neutral waist** (`DEBUGGING.md` §6 / D-DBG-7). Strippable
+    /// tooling, **untrusted for escape** (§2a): the verifier never reads it and neither backend's
+    /// safety depends on it; `None` ⇒ no debug info, zero cost. Populated by a frontend *during
+    /// lowering* (only it knows which source produced which op); consumed host-side by the
+    /// interpreter debugger and (later) DWARF/DAP. Slice 1 carries the neutral core (source
+    /// locations + variables); the per-producer rich blob is a later field.
+    pub debug_info: Option<DebugInfo>,
+}
+
+/// The neutral core of the debug-info waist (`DEBUGGING.md` §6): everything the interpreter
+/// stepper and backtraces need, in a form **every** frontend can populate (chibicc tokens, LLVM
+/// `!DILocation`/`dbg.value`, wasm DWARF). Positions key on `(func, block, inst)` — module 0, the
+/// guest's own program (installed §22 units have no source). Format-specific richness (full DWARF
+/// DIEs / LLVM DI) is a later opaque per-producer blob the middle never parses.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct DebugInfo {
+    /// Source file paths, referenced by index from [`Loc::file`].
+    pub files: Vec<String>,
+    /// Source location of individual ops. An op with no entry inherits nothing (unmapped).
+    pub locs: Vec<Loc>,
+    /// Source variables and where their value lives (the §6 neutral `VarLoc` = S2).
+    pub vars: Vec<VarInfo>,
+}
+
+/// A source location for one op (`DEBUGGING.md` §6 neutral core). `col == 0` means "no column"
+/// (wasm DWARF often omits columns).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Loc {
+    pub func: u32,
+    pub block: u32,
+    pub inst: u32,
+    pub file: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// A source variable and its value location (`DEBUGGING.md` §6 / S2). `ty` is a neutral render
+/// name for slice 1 (a structured `TypeRef` — encoding + size + a rich-blob handle — is a later
+/// refinement). Function-scoped for slice 1; lexical `IrPc`-range scopes are a later refinement.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VarInfo {
+    pub func: u32,
+    pub name: String,
+    pub ty: String,
+    pub loc: VarLoc,
+}
+
+/// Where a source variable's value lives at runtime (the S2 value-location model, IR form). The
+/// `Machine` (Cranelift register/stack) variant for debugging JIT-optimized code is a later field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VarLoc {
+    /// An address-taken / aggregate / narrow local: window data-stack slot at `data-SP + off`.
+    Window { off: i64 },
+    /// A promoted scalar: the SSA value index that holds it (resolved directly from the frame's
+    /// values by the interpreter — no debug-build mode needed).
+    Ssa { value: u32 },
 }
 
 /// A named capability import (§7). `name` is the symbolic tag the host resolves at
@@ -1666,6 +1722,31 @@ pub struct ResolvedCap {
     pub op: u32,
 }
 
+/// What an import **name** binds to when [`resolve_imports_with`] lowers it. The §7 capability
+/// case (`Cap`) is the host-ABI binding; `Func` is the **compile-time (static) linking** case — the
+/// name resolved to a concrete function index, so the call lowers to a direct [`Inst::Call`]. (A
+/// data-symbol binding — lowering to a constant window offset — is a natural follow-up.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Resolved {
+    /// A host capability: lower to a `cap.call` on the import's handle operand (§7).
+    Cap(ResolvedCap),
+    /// Another function in the **same** linked module (by index): lower to a direct `call`. The
+    /// static-linking case — a symbol resolved to a function merged into this module at link time.
+    Func(FuncIdx),
+    /// A function reached through the shared `call_indirect` **table slot** (the *dynamic*-linking
+    /// case): lower to `call_indirect <slot>`, so a separately-compiled unit can call a function it
+    /// doesn't share an index space with (e.g. a plugin calling the host program it was loaded into).
+    /// The import's handle operand must be a `ConstI32` placeholder — it is patched to `slot` and
+    /// reused as the `call_indirect` index (a 1:1 rewrite, no value renumbering).
+    Slot(u32),
+}
+
+impl From<ResolvedCap> for Resolved {
+    fn from(c: ResolvedCap) -> Self {
+        Resolved::Cap(c)
+    }
+}
+
 /// Why [`resolve_imports`] failed (fail-closed: a missing/garbled import never silently
 /// becomes a no-op or a wrong call).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1674,6 +1755,10 @@ pub enum ImportError {
     Unresolved(String),
     /// A `CallImport` referenced an import index past the module's [`Module::imports`].
     BadImportIndex(u32),
+    /// A [`Resolved::Slot`] binding's import had a handle operand that is **not** a `ConstI32`
+    /// placeholder (the frontend must emit one for a dynamic/slot import, since it is patched to the
+    /// slot and reused as the `call_indirect` index).
+    SlotHandleNotConst,
 }
 
 /// Lower every [`Inst::CallImport`] to a concrete [`Inst::CapCall`] using `resolve` (the
@@ -1688,40 +1773,286 @@ pub fn resolve_imports(
     module: &Module,
     mut resolve: impl FnMut(&str) -> Option<ResolvedCap>,
 ) -> Result<Module, ImportError> {
+    resolve_imports_with(module, |name| resolve(name).map(Resolved::Cap))
+}
+
+/// The general §7 import-lowering pass: like [`resolve_imports`], but a name may bind to **either**
+/// a host capability ([`Resolved::Cap`] → `cap.call`) **or** another function in the linked module
+/// ([`Resolved::Func`] → a direct `call`). The latter is the compile-time (static) linking step the
+/// in-window loader builds on: a symbol resolved to a concrete function index. Each `CallImport`
+/// rewrites **1:1** (no value renumbering) — a `Func` binding drops the unused handle operand.
+/// Fails closed on an unresolved name. The result is import-free (verifier/both backends accept it).
+pub fn resolve_imports_with(
+    module: &Module,
+    mut resolve: impl FnMut(&str) -> Option<Resolved>,
+) -> Result<Module, ImportError> {
     // Resolve each declared import once, up front (so a name binds consistently and a
     // missing one fails before any rewriting).
-    let bound: Vec<ResolvedCap> = module
+    let bound: Vec<Resolved> = module
         .imports
         .iter()
         .map(|imp| resolve(&imp.name).ok_or_else(|| ImportError::Unresolved(imp.name.clone())))
         .collect::<Result<_, _>>()?;
     let mut out = module.clone();
+    let fn_results: Vec<usize> = out.funcs.iter().map(|f| f.results.len()).collect();
     for f in &mut out.funcs {
         for b in &mut f.blocks {
-            for inst in &mut b.insts {
-                if let Inst::CallImport {
-                    import,
-                    sig,
-                    handle,
-                    args,
-                } = inst
-                {
-                    let cap = *bound
-                        .get(*import as usize)
-                        .ok_or(ImportError::BadImportIndex(*import))?;
-                    *inst = Inst::CapCall {
+            // Map each value index to its defining instruction (block params → `None`) — a `Slot`
+            // import patches the `ConstI32` that defines its handle operand, so we may need to reach
+            // a *different* instruction than the `CallImport` we're rewriting.
+            let mut def_of: Vec<Option<usize>> = vec![None; b.params.len()];
+            for (p, inst) in b.insts.iter().enumerate() {
+                for _ in 0..inst.result_count(&fn_results) {
+                    def_of.push(Some(p));
+                }
+            }
+            for i in 0..b.insts.len() {
+                let (import, handle) = match &b.insts[i] {
+                    Inst::CallImport { import, handle, .. } => (*import, *handle),
+                    _ => continue,
+                };
+                let bind = *bound
+                    .get(import as usize)
+                    .ok_or(ImportError::BadImportIndex(import))?;
+                // Pull the call's pieces out of the placeholder so we can rebuild it.
+                let (sig, args) = match &mut b.insts[i] {
+                    Inst::CallImport { sig, args, .. } => {
+                        (std::mem::take(sig), std::mem::take(args))
+                    }
+                    _ => unreachable!(),
+                };
+                b.insts[i] = match bind {
+                    Resolved::Cap(cap) => Inst::CapCall {
                         type_id: cap.type_id,
                         op: cap.op,
-                        sig: std::mem::take(sig),
-                        handle: *handle,
-                        args: std::mem::take(args),
-                    };
-                }
+                        sig,
+                        handle,
+                        args,
+                    },
+                    // Static-link a function symbol → a direct call (handle unused; sig re-checked).
+                    Resolved::Func(func) => Inst::Call { func, args },
+                    // Dynamic-link a function symbol → a `call_indirect` through the table slot: patch
+                    // the handle's `ConstI32` placeholder to `slot` and reuse it as the index.
+                    Resolved::Slot(slot) => {
+                        let def = def_of
+                            .get(handle as usize)
+                            .copied()
+                            .flatten()
+                            .ok_or(ImportError::SlotHandleNotConst)?;
+                        match &mut b.insts[def] {
+                            Inst::ConstI32(c) => *c = slot as i32,
+                            _ => return Err(ImportError::SlotHandleNotConst),
+                        }
+                        Inst::CallIndirect {
+                            ty: sig,
+                            idx: handle,
+                            args,
+                        }
+                    }
+                };
             }
         }
     }
     out.imports.clear();
     Ok(out)
+}
+
+/// One unit to statically link: a module plus the symbols it **exports** and the **relocations** its
+/// own data references need. Function symbols (`exports`) and its named `Module::imports` are resolved
+/// against the other units by [`link`]; `data_exports` name window offsets within the unit's data; and
+/// `relocations` patch the unit's address constants once its data is placed (see [`DataReloc`]).
+#[derive(Clone, Debug, Default)]
+pub struct LinkUnit {
+    pub module: Module,
+    /// Function symbols this unit provides: `name → local function index`.
+    pub exports: Vec<(String, FuncIdx)>,
+    /// Data symbols this unit provides: `name → byte offset within the unit's (un-relocated) data`.
+    pub data_exports: Vec<(String, u64)>,
+    /// Relocations the unit's data references need after the linker places its data (§ELF-style).
+    pub relocations: Vec<DataReloc>,
+}
+
+/// A relocation: at link time, patch the **constant** at `(func, block, inst)` — which must be a
+/// `ConstI64`/`ConstI32` (an address the frontend left at a unit-local value) — by **adding** a base
+/// resolved from `kind`; the const's current value is the **addend** (so `&g + 4` works). This is how
+/// a unit's data references survive relocation into the one shared window — no IR change, no value
+/// renumbering, just a const edit. `func`/`block`/`inst` are unit-local (applied before concatenation).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DataReloc {
+    pub func: u32,
+    pub block: u32,
+    pub inst: u32,
+    pub kind: RelocKind,
+}
+
+/// What base a [`DataReloc`] adds.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RelocKind {
+    /// This unit's own assigned data base — the const holds a unit-local data offset (an own-data ref).
+    SelfData,
+    /// The resolved address of an exported **data** symbol (a cross-unit data import).
+    DataSymbol(String),
+}
+
+/// Why [`link`] failed (fail-closed; the linked module is also re-verified before it runs).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LinkError {
+    /// Two units export the same symbol.
+    DuplicateSymbol(String),
+    /// An export names a function index past its unit's `funcs`.
+    BadExport { symbol: String, index: FuncIdx },
+    /// A unit imports a symbol no unit exports.
+    Unresolved(String),
+    /// A `CallImport` referenced an out-of-range import (a malformed unit).
+    BadImportIndex(u32),
+    /// A relocation pointed at a missing instruction, or one that isn't an address constant.
+    BadReloc(DataReloc),
+}
+
+/// **Statically link** units into one module — the compile-time loader (dynamic-linking milestones
+/// 1–2). Concatenate the units' functions into one list, **reindexing** each unit's internal function
+/// references by its base offset; place each unit's **data** in a non-overlapping window region and
+/// apply its **relocations** so its address constants follow; build function + data symbol tables from
+/// all exports; and resolve every unit's named imports — a `call` symbol to a **direct call**, a data
+/// symbol to a **constant address** — against them. The result is one import-free, relocated module —
+/// re-verify it before running, since a unit is untrusted like any frontend output (a cross-unit
+/// signature mismatch is caught there).
+pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
+    // Function and data layout: each unit's functions occupy `[fbase, fbase + n_funcs)` in the merged
+    // list, and its data occupies the window region `[dbase, dbase + data_span)` (16-byte aligned, so
+    // units never overlap). `data_span` is the high-water mark of the unit's own (un-relocated) data.
+    let align16 = |x: u64| (x + 15) & !15;
+    let mut fbases = Vec::with_capacity(units.len());
+    let mut dbases = Vec::with_capacity(units.len());
+    let (mut ftotal, mut dtotal): (u32, u64) = (0, 0);
+    for u in units {
+        fbases.push(ftotal);
+        ftotal += u.module.funcs.len() as u32;
+        let dbase = align16(dtotal);
+        dbases.push(dbase);
+        let span = u
+            .module
+            .data
+            .iter()
+            .map(|d| d.offset + d.bytes.len() as u64)
+            .max()
+            .unwrap_or(0);
+        dtotal = dbase + span;
+    }
+    // Symbol tables: exported name → global function index, and exported data name → window address.
+    let mut funcs_tab: std::collections::HashMap<String, FuncIdx> =
+        std::collections::HashMap::new();
+    let mut data_tab: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
+        for (name, local) in &u.exports {
+            if *local as usize >= u.module.funcs.len() {
+                return Err(LinkError::BadExport {
+                    symbol: name.clone(),
+                    index: *local,
+                });
+            }
+            if funcs_tab.insert(name.clone(), fbase + local).is_some()
+                || data_tab.contains_key(name)
+            {
+                return Err(LinkError::DuplicateSymbol(name.clone()));
+            }
+        }
+        for (name, local_off) in &u.data_exports {
+            if data_tab.insert(name.clone(), dbase + local_off).is_some()
+                || funcs_tab.contains_key(name)
+            {
+                return Err(LinkError::DuplicateSymbol(name.clone()));
+            }
+        }
+    }
+    // Per unit: place its data, apply its relocations, reindex its functions, resolve its imports.
+    let mut funcs: Vec<Func> = Vec::with_capacity(ftotal as usize);
+    let mut data: Vec<Data> = Vec::new();
+    for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
+        let mut m = u.module.clone();
+        // Relocate this unit's data segments into its assigned window region…
+        for d in &mut m.data {
+            d.offset += dbase;
+        }
+        // …and patch its address constants so they point at the relocated data (own or imported).
+        for r in &u.relocations {
+            let base = match &r.kind {
+                RelocKind::SelfData => dbase,
+                RelocKind::DataSymbol(name) => *data_tab
+                    .get(name)
+                    .ok_or_else(|| LinkError::Unresolved(name.clone()))?,
+            };
+            apply_reloc(&mut m, r, base)?;
+        }
+        offset_func_indices(&mut m, fbase);
+        let resolved =
+            resolve_imports_with(&m, |name| funcs_tab.get(name).copied().map(Resolved::Func))
+                .map_err(|e| match e {
+                    ImportError::Unresolved(n) => LinkError::Unresolved(n),
+                    ImportError::BadImportIndex(i) => LinkError::BadImportIndex(i),
+                    // `link` only ever resolves to `Func` (static merge), never `Slot`, so a
+                    // slot-handle error cannot arise here.
+                    ImportError::SlotHandleNotConst => {
+                        unreachable!("static link never resolves to a Slot")
+                    }
+                })?;
+        funcs.extend(resolved.funcs);
+        data.extend(resolved.data);
+    }
+    Ok(Module {
+        funcs,
+        // The merged window is the largest any unit declared (they share one linear memory).
+        memory: units
+            .iter()
+            .filter_map(|u| u.module.memory)
+            .max_by_key(|m| m.size_log2),
+        data,
+        imports: Vec::new(),
+        // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
+        debug_info: None,
+    })
+}
+
+/// Apply one [`DataReloc`]: add `base` to the addend held in the constant it points at (a `ConstI64`/
+/// `ConstI32`). A reloc pointing at a missing or non-constant instruction is fail-closed.
+fn apply_reloc(m: &mut Module, r: &DataReloc, base: u64) -> Result<(), LinkError> {
+    let inst = m
+        .funcs
+        .get_mut(r.func as usize)
+        .and_then(|f| f.blocks.get_mut(r.block as usize))
+        .and_then(|b| b.insts.get_mut(r.inst as usize))
+        .ok_or_else(|| LinkError::BadReloc(r.clone()))?;
+    match inst {
+        Inst::ConstI64(c) => *c = c.wrapping_add(base as i64),
+        Inst::ConstI32(c) => *c = (*c as i64).wrapping_add(base as i64) as i32,
+        _ => return Err(LinkError::BadReloc(r.clone())),
+    }
+    Ok(())
+}
+
+/// Add `offset` to every **static function index** in `m` (the merged-module reindex): `call`,
+/// `ref.func`, `thread.spawn`, and the `return_call` terminator. `call_indirect`/`cont.*` dispatch on
+/// runtime funcref *values*, not static indices, so they are untouched. `call.import` carries an
+/// import index (not a function index) and is likewise untouched — it is resolved separately.
+fn offset_func_indices(m: &mut Module, offset: u32) {
+    if offset == 0 {
+        return;
+    }
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                match inst {
+                    Inst::Call { func, .. }
+                    | Inst::RefFunc { func }
+                    | Inst::ThreadSpawn { func, .. } => *func += offset,
+                    _ => {}
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &mut b.term {
+                *func += offset;
+            }
+        }
+    }
 }
 
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`
@@ -1788,6 +2119,7 @@ mod import_tests {
                     sig: sig_exit,
                 },
             ],
+            debug_info: None,
         }
     }
 

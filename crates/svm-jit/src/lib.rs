@@ -1685,10 +1685,19 @@ impl CompiledModule {
                     let (start, end) = (lo as usize, hi as usize);
                     rw[start..end].copy_from_slice(&d.bytes[..end - start]);
                 }
-            }
-            for d in &t.data {
-                if d.readonly && !d.bytes.is_empty() {
-                    window.protect_ro(t.sub_base + d.offset, d.bytes.len() as u64);
+                // Map the `readonly` segments RO (so a guest write to const data faults into the guard,
+                // §4/§5). Clamp the range to `[0, size)` exactly as the copy loop above: the verifier
+                // already bounds every data segment into the window, so this is defensive consistency —
+                // an out-of-window segment must never `mprotect` past the backed region.
+                for d in &t.data {
+                    if !d.readonly {
+                        continue;
+                    }
+                    let lo = d.offset.min(size);
+                    let hi = d.offset.saturating_add(d.bytes.len() as u64).min(size);
+                    if hi > lo {
+                        window.protect_ro(t.sub_base + lo, hi - lo);
+                    }
                 }
             }
             let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
@@ -4254,9 +4263,52 @@ fn float_bin(b: &mut FunctionBuilder, op: FBinOp, x: Value, y: Value) -> Value {
         FBinOp::Sub => b.ins().fsub(x, y),
         FBinOp::Mul => b.ins().fmul(x, y),
         FBinOp::Div => b.ins().fdiv(x, y),
-        FBinOp::Min => b.ins().fmin(x, y),
-        FBinOp::Max => b.ins().fmax(x, y),
+        // The IR defines `min`/`max` to yield a **canonical** NaN on any NaN input — the reference
+        // interpreter's `fmin`/`fmax` force `0x7FC0_0000` / `0x7FF8_..` (§18 oracle). Cranelift's
+        // `fmin`/`fmax` instead *propagate* the input NaN's payload and sign, so without a fixup the
+        // JIT and interp would store different NaN bits and the byte-exact escape-oracle window
+        // comparison would diverge. (Add/Sub/Mul/Div need no fixup: both backends emit the same host
+        // float instruction, so their NaN results already match — only the hand-written min/max
+        // canonicalizes.) Canonicalize scalar and per-lane v128 alike.
+        FBinOp::Min => {
+            let r = b.ins().fmin(x, y);
+            canonicalize_nan(b, r)
+        }
+        FBinOp::Max => {
+            let r = b.ins().fmax(x, y);
+            canonicalize_nan(b, r)
+        }
         FBinOp::Copysign => b.ins().fcopysign(x, y),
+    }
+}
+
+/// Replace any NaN in `r` with the IR's canonical quiet NaN — `0x7FC0_0000` (f32) /
+/// `0x7FF8_0000_0000_0000` (f64) — matching the reference interpreter. Works for a scalar float and,
+/// lane-wise, for a `v128` float vector (`Unordered(r, r)` is true exactly on the NaN lanes).
+fn canonicalize_nan(b: &mut FunctionBuilder, r: Value) -> Value {
+    let ty = b.func.dfg.value_type(r);
+    // `Unordered(r, r)` is true exactly where `r` is NaN (a per-lane mask for vectors).
+    let is_nan = b.ins().fcmp(FloatCC::Unordered, r, r);
+    if ty.is_vector() {
+        // Blend in the integer-vector domain so the fcmp mask and the operands share a type
+        // (`bitselect` requires it): fcmp on F32X4 / F64X2 yields the I32X4 / I64X2 lane mask.
+        let (ity, bits): (Type, i64) = if ty.lane_type() == F32 {
+            (I32X4, 0x7FC0_0000)
+        } else {
+            (I64X2, 0x7FF8_0000_0000_0000u64 as i64)
+        };
+        let canon_lane = b.ins().iconst(ity.lane_type(), bits);
+        let canon = b.ins().splat(ity, canon_lane);
+        let ri = vcast(b, r, ity);
+        let sel = b.ins().bitselect(is_nan, canon, ri);
+        vcast(b, sel, ty)
+    } else {
+        let canon = if ty == F32 {
+            b.ins().f32const(f32::from_bits(0x7FC0_0000))
+        } else {
+            b.ins().f64const(f64::from_bits(0x7FF8_0000_0000_0000))
+        };
+        b.ins().select(is_nan, canon, r)
     }
 }
 

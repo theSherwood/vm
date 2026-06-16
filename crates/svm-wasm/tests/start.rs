@@ -101,8 +101,11 @@ fn start_with_bad_signature_rejected() {
         Err(_) => return, // some assemblers reject this at parse time — that's also fine
     };
     match svm_wasm::transpile(&wasm) {
-        Err(svm_wasm::Error::Unsupported(_)) => {}
-        Err(e) => panic!("expected Unsupported, got {e:?}"),
+        // A bad start signature is invalid wasm, so the up-front validator rejects it as `Parse`
+        // ("invalid start function type"); a frontend without validation would instead bail
+        // `Unsupported` from the start-section lowering. Both are clean errors — not a panic /
+        // miscompile — which is all this test guards.
+        Err(svm_wasm::Error::Unsupported(_) | svm_wasm::Error::Parse(_)) => {}
         Ok(_) => panic!("expected a bad-start-signature error"),
     }
 }

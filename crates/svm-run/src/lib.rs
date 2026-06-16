@@ -1972,6 +1972,10 @@ pub fn resolve_capability_imports(module: Module) -> Result<Module, String> {
         svm_ir::ImportError::BadImportIndex(i) => {
             format!("call.import references out-of-range import index {i}")
         }
+        // `resolve_imports` only ever resolves to capabilities (`Resolved::Cap`), never a slot.
+        svm_ir::ImportError::SlotHandleNotConst => {
+            "call.import resolved to a table slot with a non-constant handle".into()
+        }
     })
 }
 

@@ -1,0 +1,15 @@
+[package]
+name = "svm-durable"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+svm-ir.workspace = true
+
+[dev-dependencies]
+svm-text.workspace = true
+svm-verify.workspace = true
+svm-interp.workspace = true

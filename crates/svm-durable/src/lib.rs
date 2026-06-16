@@ -1,0 +1,1082 @@
+//! `svm-durable` — the IR→IR freeze/thaw transform (DESIGN.md / DURABILITY.md D60).
+//!
+//! A **tooling-tier, non-TCB** crate (like `svm-text`): it depends only on `svm-ir`
+//! and emits ordinary, verifier-passing IR — no new instructions, no escape-TCB
+//! surface. An embedder running pre-instrumented modules links none of it.
+//!
+//! This is the **Phase 1** slice of the plan (DURABILITY.md §9): it instruments a
+//! function so an in-flight may-suspend op (a `cap.call`, or a `Call` into a suspended
+//! chain) can be *unwound* into guest-resident shadow state and later *rewound* back into
+//! execution, byte-for-byte. The codec is exactly the §2 mechanism:
+//!
+//! * a **state word** (`NORMAL | UNWINDING | REWINDING`) in the window,
+//! * a per-fiber **shadow stack** in the window (DURABILITY.md §12.7),
+//! * **unwind** = after a may-suspend call, if `UNWINDING`, spill the live values +
+//!   resume id and return out to the host;
+//! * **rewind** = in the prologue, if `REWINDING`, `br_table` on the saved resume id,
+//!   reload the live values, and continue from the resume point.
+//!
+//! # Scope (arbitrary single-vCPU CFGs)
+//!
+//! The transform handles an arbitrary-CFG function (branches, loops, joins) with any
+//! number of may-suspend operations, each either:
+//!
+//! * a **leaf** `cap.call` — the host performs the operation; on thaw the deepest frame
+//!   reloads the saved result and flips the state word back to `NORMAL`; or
+//! * a **propagated** `Call` to a may-suspend callee (a function that transitively
+//!   reaches a `cap.call`) — frames stack up across the call chain. On thaw a non-deepest
+//!   frame reloads its pre-call live set and **re-issues the call** (leaving the state
+//!   `REWINDING` so the callee rewinds in turn); only the innermost leaf flips to
+//!   `NORMAL`. This is the DURABILITY.md §12.7 "re-issue vs. continue" branch (R8).
+//!
+//! Each original block is split at its suspend ops into forward segments; branch targets
+//! are remapped to the target block's first segment; a `br_table` in the prologue dispatch
+//! routes a thaw to the resume point that was in flight (one arm per point). A function is
+//! **may-suspend** iff it contains a `cap.call` or (transitively) a `Call` to a may-suspend
+//! function; only may-suspend functions are instrumented. Covered end-to-end on the real
+//! interpreter (`tests/roundtrip.rs`, `chain.rs`, `multipoint.rs`, `multiblock.rs`) and
+//! across the interp/JIT differential (`crates/svm/tests/durable_jit.rs`).
+//!
+//! Each resume point spills only its **minimal live set** — the values used after the op
+//! (block-local SSA makes this a backward scan within the block), plus a propagated call's
+//! own operands. An unmodelled instruction in the tail falls back to spilling the whole
+//! range, so the analysis never under-spills.
+//!
+//! Out of scope (rejected / treated non-suspending): `call_indirect` and indirect tail
+//! calls to a may-suspend target (unresolved); a direct tail call into a may-suspend
+//! callee (the frame is replaced — no poll to unwind at).
+//!
+//! The remaining extensions (DURABILITY.md §9) are fibers / multi-vCPU / STW (Phase 3).
+
+#![forbid(unsafe_code)]
+
+use svm_ir::{
+    BinOp, Block, BlockIdx, CmpOp, Func, FuncIdx, Inst, IntTy, LoadOp, Module, StoreOp, Terminator,
+    ValIdx, ValType,
+};
+
+// `FuncIdx` is used by `SuspendKind::Propagated` below.
+
+// ---- State word values (the §2 state machine) ----
+
+/// Normal forward execution; polls and prologues fall straight through.
+pub const STATE_NORMAL: i32 = 0;
+/// Freeze in progress: every poll after a may-suspend call unwinds out to the host.
+pub const STATE_UNWINDING: i32 = 1;
+/// Thaw in progress: every prologue rebuilds its frame from the shadow stack.
+pub const STATE_REWINDING: i32 = 2;
+
+// ---- Durable runtime region layout ----
+//
+// The control state + shadow stack occupy a fixed **reserved low slice** `[0,
+// DURABLE_RESERVE)` of the domain's *own* window; the guest's memory is `[DURABLE_RESERVE,
+// window)`. This is the wasm shadow-stack convention (runtime metadata + call stack below
+// `__heap_base`, the program's heap above it): the durable reserve is part of the guest's
+// memory allotment, and a cooperating toolchain bases the guest's data/heap at
+// `DURABLE_RESERVE` so the two never overlap (see `transform_module_assume_confined`).
+//
+// This is *placement*, not an isolation boundary: the window is per-domain and the runtime
+// masks every access into it, so a guest that writes the reserve can only corrupt its own
+// durability — never another domain or the host — and that fails safe (a forged resume id
+// hits the `br_table` default → `Unreachable`; a wild shadow-SP stays masked in-window; the
+// host validates the artifact on restore). Hardening the reserve against an *adversarial*
+// guest (a guard-paged, per-fiber placement, DURABILITY.md §12.7) is optional
+// defense-in-depth, not required for a cooperating toolchain.
+
+/// Window byte offset of the `i32` state word.
+pub const STATE_OFF: u64 = 0;
+/// Window byte offset of the `i64` shadow-stack pointer (a window byte offset itself).
+pub const SHADOW_SP_OFF: u64 = 8;
+/// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
+pub const SHADOW_BASE: u64 = 64;
+/// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the
+/// state word, shadow-SP, and shadow stack; the guest's memory is `[DURABLE_RESERVE, window)`.
+/// A durable module's declared window must be at least this large (it is counted against the
+/// guest's memory budget). A policy default — embedders may standardize a different value.
+pub const DURABLE_RESERVE: u64 = 1 << 16;
+
+// Block layout of an instrumented function with `S` forward segments (each original
+// block is split at its suspend ops into `points+1` segments; non-suspend blocks are one
+// segment) and `P` resume points total (an 8-block shape for one block / one point):
+//   0                  PROLOGUE  — dispatch on the state word, then enter segment 0 of blk 0
+//   1 ..= S            forward segments (each original block's segments, in block order)
+//   1+S                DISPATCH  — read resume id, br_table to an arm
+//   2+S ..= 1+S+2P     UNWIND_g  — a (check, spill) pair per point: trap if the push would
+//                                  overflow the reserve, else spill + return placeholder
+//   2+S+2P ..= 1+S+3P  ARM_g     — reload + resume, per resume point
+//   2+S+3P             TRAP      — forged/reserved resume id, or shadow-stack overflow
+
+/// Reasons the Phase-1 transform declines a module.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TransformError {
+    /// A function uses `cap.call` but the module declares no memory window — the
+    /// shadow stack and state word have nowhere to live.
+    NoMemory,
+    /// The declared window is too small to hold the durable region + a shadow frame.
+    MemoryTooSmall,
+    /// A `cap.call`-bearing function is outside the Phase-1 shape (not a single block,
+    /// not exactly one `cap.call`, or not a `return` terminator).
+    UnsupportedShape,
+    /// A prefix instruction's result type isn't modelled by the Phase-1 transform
+    /// (e.g. SIMD, conversions, concurrency ops before the call).
+    UnsupportedInst,
+    /// The module is being instrumented via the strict [`transform_module`] path but a
+    /// function uses a guest linear-memory instruction (load/store/atomic), which could
+    /// alias the reserved durable region `[0, DURABLE_RESERVE)` (R9). The strict path fails
+    /// closed for *untrusted* modules. A durable module from a cooperating toolchain that
+    /// reserves `[0, DURABLE_RESERVE)` (basing the guest's data/heap at `DURABLE_RESERVE`)
+    /// should instead use [`transform_module_assume_confined`]. (Cap-mediated window effects
+    /// — e.g. a Memory capability's map/unmap — are a separate facet the embedder withholds.)
+    GuestUsesMemory,
+}
+
+/// Instrument every may-suspend function in `m` for freeze/thaw. Functions that can
+/// never suspend are returned unchanged. The result is ordinary IR; run it through
+/// `svm_verify::verify_module` before executing.
+pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
+    transform_module_inner(m, true)
+}
+
+/// Like [`transform_module`], but **allows the guest to use linear memory**, on the caller's
+/// guarantee that the guest is confined to its usable region `[DURABLE_RESERVE, window)` and
+/// never touches the reserved durable slice `[0, DURABLE_RESERVE)`.
+///
+/// This is the intended path for durable modules produced by a **cooperating toolchain**:
+/// just as a wasm toolchain reserves low memory for the shadow stack and bases the heap at
+/// `__heap_base`, the producer reserves `[0, DURABLE_RESERVE)` and bases the guest's
+/// data/heap at `DURABLE_RESERVE`. The reserve is budget-accounted (the declared window must
+/// be ≥ `DURABLE_RESERVE`). The contract is *not* statically enforced here — a guest that
+/// violates it can corrupt only its own durability, and fails safe (see the region notes) —
+/// so prefer [`transform_module`] (fails closed, no memory) for *untrusted* modules.
+pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformError> {
+    transform_module_inner(m, false)
+}
+
+fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, TransformError> {
+    let func_results: Vec<Vec<ValType>> = m.funcs.iter().map(|f| f.results.clone()).collect();
+    let may_suspend = compute_may_suspend(m);
+    let any_instrumented = may_suspend.iter().any(|&s| s);
+
+    // R9 enforcement: the durable region shares the window with guest memory at fixed low
+    // addresses, with nothing confining the guest away from it. Rather than risk silent
+    // mutual corruption, refuse to instrument a module any of whose functions touch linear
+    // memory. (The generated/tested durable guests are pure SSA + `cap.call`, so they pass;
+    // the relocation that would lift this restriction is §12.7 future work.)
+    if enforce_r9
+        && any_instrumented
+        && m.funcs
+            .iter()
+            .any(|f| f.blocks.iter().any(|b| b.insts.iter().any(is_guest_mem_op)))
+    {
+        return Err(TransformError::GuestUsesMemory);
+    }
+
+    let mut out = m.clone();
+    let mut max_frame = 0u64;
+
+    for (i, f) in m.funcs.iter().enumerate() {
+        if may_suspend[i] {
+            let (nf, frame_size) = transform_func(f, &func_results, &may_suspend)?;
+            out.funcs[i] = nf;
+            max_frame = max_frame.max(frame_size);
+        }
+    }
+
+    if any_instrumented {
+        let mem = out.memory.ok_or(TransformError::NoMemory)?;
+        // The reserved region `[0, DURABLE_RESERVE)` must fit in the declared window (it is
+        // part of the guest's allotment; guest memory is the remainder `[DURABLE_RESERVE,
+        // window)`), and a single shadow frame must fit in `[SHADOW_BASE, DURABLE_RESERVE)`.
+        // A live call chain stacks one frame per suspended activation; the reserve bounds the
+        // total depth (overflow-trapping the shadow stack is DURABILITY.md §12.7 future work).
+        if mem.size() < DURABLE_RESERVE || SHADOW_BASE + max_frame > DURABLE_RESERVE {
+            return Err(TransformError::MemoryTooSmall);
+        }
+    }
+    Ok(out)
+}
+
+/// A guest linear-memory instruction (one that reads or writes a window address). These
+/// can alias the durable region, so they are rejected in an instrumented module (R9). An
+/// `AtomicFence` carries no address and so is not included.
+fn is_guest_mem_op(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::Load { .. }
+            | Inst::Store { .. }
+            | Inst::AtomicLoad { .. }
+            | Inst::AtomicStore { .. }
+            | Inst::AtomicRmw { .. }
+            | Inst::AtomicCmpxchg { .. }
+            | Inst::V128Load { .. }
+            | Inst::V128Store { .. }
+            | Inst::MemoryWait { .. } // reads the window value at `addr`
+    )
+}
+
+/// The value operands an instruction reads, or `None` for a variant this pass does not
+/// model — in which case liveness conservatively assumes it uses everything (so we never
+/// drop a still-live value). Covers the set `result_types` admits (anything else is already
+/// rejected as `UnsupportedInst` before liveness runs).
+fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
+    use Inst::*;
+    Some(match i {
+        ConstI32(_) | ConstI64(_) | ConstF32(_) | ConstF64(_) | ConstV128(_) | RefFunc { .. } => {
+            vec![]
+        }
+        IntBin { a, b, .. }
+        | IntCmp { a, b, .. }
+        | FBin { a, b, .. }
+        | FCmp { a, b, .. }
+        | PtrAdd { a, b } => vec![*a, *b],
+        IntUn { a, .. } | FUn { a, .. } | Eqz { a, .. } | PtrCast { a, .. } => vec![*a],
+        Select { cond, a, b } => vec![*cond, *a, *b],
+        Load { addr, .. } | AtomicLoad { addr, .. } | V128Load { addr, .. } => vec![*addr],
+        Store { addr, value, .. }
+        | AtomicStore { addr, value, .. }
+        | AtomicRmw { addr, value, .. }
+        | V128Store { addr, value, .. } => vec![*addr, *value],
+        AtomicCmpxchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => vec![*addr, *expected, *replacement],
+        AtomicFence { .. } => vec![],
+        MemoryWait {
+            addr,
+            expected,
+            timeout,
+            ..
+        } => vec![*addr, *expected, *timeout],
+        MemoryNotify { addr, count } => vec![*addr, *count],
+        Call { args, .. } => args.clone(),
+        CapCall { handle, args, .. } => {
+            let mut v = Vec::with_capacity(args.len() + 1);
+            v.push(*handle);
+            v.extend_from_slice(args);
+            v
+        }
+        CallIndirect { idx, args, .. } => {
+            let mut v = Vec::with_capacity(args.len() + 1);
+            v.push(*idx);
+            v.extend_from_slice(args);
+            v
+        }
+        _ => return None,
+    })
+}
+
+/// The value operands a terminator reads (a closed set, all handled).
+fn term_operands(t: &Terminator) -> Vec<ValIdx> {
+    match t {
+        Terminator::Br { args, .. } => args.clone(),
+        Terminator::BrIf {
+            cond,
+            then_args,
+            else_args,
+            ..
+        } => {
+            let mut v = vec![*cond];
+            v.extend_from_slice(then_args);
+            v.extend_from_slice(else_args);
+            v
+        }
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
+            let mut v = vec![*idx];
+            for (_, a) in targets {
+                v.extend_from_slice(a);
+            }
+            v.extend_from_slice(&default.1);
+            v
+        }
+        Terminator::Return(vals) => vals.clone(),
+        Terminator::ReturnCall { args, .. } => args.clone(),
+        Terminator::ReturnCallIndirect { idx, args, .. } => {
+            let mut v = vec![*idx];
+            v.extend_from_slice(args);
+            v
+        }
+        Terminator::Unreachable => vec![],
+    }
+}
+
+/// Mark each function that can suspend: it contains a `cap.call`, or (transitively) a
+/// direct `Call` to a may-suspend function. A least-fixed-point over the direct-call
+/// graph. `call_indirect` targets are unresolved and treated as non-suspending (see the
+/// module-level scope note).
+fn compute_may_suspend(m: &Module) -> Vec<bool> {
+    let mut ms = vec![false; m.funcs.len()];
+    for (i, f) in m.funcs.iter().enumerate() {
+        if f.blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|x| matches!(x, Inst::CapCall { .. })))
+        {
+            ms[i] = true;
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (i, f) in m.funcs.iter().enumerate() {
+            if ms[i] {
+                continue;
+            }
+            let calls_ms = f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|x| matches!(x, Inst::Call { func, .. } if ms[*func as usize]))
+                    // a direct tail call into a may-suspend callee also suspends (rejected
+                    // by `transform_func` as out of scope, but it must be marked so the
+                    // module fails closed rather than leaving the caller uninstrumented)
+                    || matches!(&b.term, Terminator::ReturnCall { func, .. } if ms[*func as usize])
+            });
+            if calls_ms {
+                ms[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    ms
+}
+
+/// The single may-suspend operation in an instrumented block.
+enum SuspendKind {
+    /// `cap.call`: the host performs the op; the deepest frame reloads its result.
+    Leaf,
+    /// `Call` to a may-suspend callee: re-issued on thaw so the callee rewinds in turn.
+    Propagated { callee: FuncIdx, args: Vec<ValIdx> },
+}
+
+/// One resume point's metadata across the whole function (global id by vector order).
+struct PointPlan {
+    kind: SuspendKind,        // leaf cap.call or propagated call
+    nres: usize,              // result count of the suspend op
+    out: usize,               // value count after the op (= continuation param count)
+    save_end: usize,          // spillable range `[0, save_end)` (excludes a call's results)
+    slot_types: Vec<ValType>, // types of values `0..out` (continuation params / dead-slot zeros)
+    spilled: Vec<usize>,      // block-local indices actually spilled (sorted, live ∪ call-args)
+    frame_offsets: Vec<u64>,  // window offset of each spilled value (parallel to `spilled`)
+    frame_size: u64,
+    rid_off: u64,
+    cont_seg: u32, // new block index of the continuation segment (after the op)
+}
+
+/// Per-original-block analysis: value types, the value count after each instruction, and
+/// the positions of its may-suspend ops.
+struct BlockInfo {
+    types: Vec<ValType>,
+    vend: Vec<usize>,
+    scs: Vec<usize>,
+    plen: usize,
+}
+
+/// Instrument one may-suspend function. `Ok((func, max_frame_size))` on success, or an
+/// error for an out-of-scope shape. (Non-may-suspend functions are not passed here.)
+///
+/// Each original block is split at its may-suspend ops into forward segments; a poll after
+/// each op unwinds (per-point spill + resume id) or continues to the next segment, and the
+/// prologue's `br_table` dispatch routes a thaw to the in-flight point's arm, which reloads
+/// and resumes into the continuation segment. Branch targets are remapped to segment 0 of
+/// the target block. See the block-layout map near the constants.
+fn transform_func(
+    f: &Func,
+    func_results: &[Vec<ValType>],
+    may_suspend: &[bool],
+) -> Result<(Func, u64), TransformError> {
+    // Out of scope: a direct tail call into a may-suspend callee (the frame is replaced, so
+    // there is no poll to unwind at). An *indirect* tail call is treated as non-suspending
+    // (its target is unresolved — same stance as `call_indirect`, see the module doc).
+    for blk in &f.blocks {
+        if matches!(&blk.term, Terminator::ReturnCall { func, .. } if may_suspend[*func as usize]) {
+            return Err(TransformError::UnsupportedShape);
+        }
+    }
+
+    let nb = f.blocks.len();
+    // Per-block analysis (value types / counts / suspend positions).
+    let mut binfo: Vec<BlockInfo> = Vec::with_capacity(nb);
+    for blk in &f.blocks {
+        let mut types = blk.params.clone();
+        let mut vend = Vec::with_capacity(blk.insts.len());
+        for inst in &blk.insts {
+            types.extend(result_types(inst, &types, func_results)?);
+            vend.push(types.len());
+        }
+        let scs: Vec<usize> = blk
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| match inst {
+                Inst::CapCall { .. } => true,
+                Inst::Call { func, .. } => may_suspend[*func as usize],
+                _ => false,
+            })
+            .map(|(pos, _)| pos)
+            .collect();
+        binfo.push(BlockInfo {
+            types,
+            vend,
+            scs,
+            plen: blk.params.len(),
+        });
+    }
+
+    let total_points: usize = binfo.iter().map(|bi| bi.scs.len()).sum();
+    if total_points == 0 {
+        return Err(TransformError::UnsupportedShape); // may-suspend, but no in-block op
+    }
+
+    // Block-index layout (see the map near the constants).
+    let mut seg_base = Vec::with_capacity(nb);
+    let mut acc = 1u32; // segment indices start right after the PROLOGUE
+    for bi in &binfo {
+        seg_base.push(acc);
+        acc += bi.scs.len() as u32 + 1; // points + 1 segments
+    }
+    let s_total = acc - 1;
+    let seg = |b: usize, k: usize| seg_base[b] + k as u32;
+    let p_total = total_points as u32;
+    let dispatch_blk = 1 + s_total;
+    // Each resume point has a UNWIND *pair*: a check block (traps if the push would exceed
+    // the reserve) and a spill block. `check_blk(g) = unwind_base + 2g`, spill is +1.
+    let unwind_base = 2 + s_total;
+    let arm_base = unwind_base + 2 * p_total;
+    let trap_blk = arm_base + p_total;
+    let p = f.params.len();
+
+    // Remap a terminator's block targets to segment 0 of each target block.
+    let seg0 = |t: BlockIdx| seg_base[t as usize];
+    let remap = |term: &Terminator| -> Terminator {
+        match term {
+            Terminator::Br { target, args } => Terminator::Br {
+                target: seg0(*target),
+                args: args.clone(),
+            },
+            Terminator::BrIf {
+                cond,
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+            } => Terminator::BrIf {
+                cond: *cond,
+                then_blk: seg0(*then_blk),
+                then_args: then_args.clone(),
+                else_blk: seg0(*else_blk),
+                else_args: else_args.clone(),
+            },
+            Terminator::BrTable {
+                idx,
+                targets,
+                default,
+            } => Terminator::BrTable {
+                idx: *idx,
+                targets: targets.iter().map(|(t, a)| (seg0(*t), a.clone())).collect(),
+                default: (seg0(default.0), default.1.clone()),
+            },
+            // Return / Unreachable / (in)direct tail calls carry no block targets.
+            other => other.clone(),
+        }
+    };
+
+    // ---- PROLOGUE — dispatch on the state word ----
+    let mut pb = Bb::new(f.params.clone());
+    let st_a = pb.one(Inst::ConstI64(STATE_OFF as i64));
+    let st = pb.one(load(LoadOp::I32, st_a, 0));
+    let rw = pb.one(Inst::ConstI32(STATE_REWINDING));
+    let is_rw = pb.one(icmp(IntTy::I32, CmpOp::Eq, st, rw));
+    let prologue = pb.finish(Terminator::BrIf {
+        cond: is_rw,
+        then_blk: dispatch_blk,
+        then_args: vec![], // the arm reloads everything from the frame
+        else_blk: seg(0, 0),
+        else_args: (0..p as u32).collect(),
+    });
+
+    // ---- forward segments + collect the per-point resume plans (global order) ----
+    let mut seg_blocks: Vec<Block> = Vec::with_capacity(s_total as usize);
+    let mut points: Vec<PointPlan> = Vec::with_capacity(total_points);
+    for (b, blk) in f.blocks.iter().enumerate() {
+        let bi = &binfo[b];
+        let m = bi.scs.len();
+        // segment k's incoming value count: block params for k==0, else the previous op's out
+        let in_of = |k: usize| {
+            if k == 0 {
+                bi.plen
+            } else {
+                bi.vend[bi.scs[k - 1]]
+            }
+        };
+        for k in 0..=m {
+            let mut sb = Bb::new(bi.types[0..in_of(k)].to_vec());
+            if k < m {
+                // segment body up to & including the suspend op, then the poll
+                let pos = bi.scs[k];
+                let seg_start = if k == 0 { 0 } else { bi.scs[k - 1] + 1 };
+                sb.insts.extend_from_slice(&blk.insts[seg_start..=pos]);
+                let out = bi.vend[pos];
+                sb.next = out as u32;
+                let st_a = sb.one(Inst::ConstI64(STATE_OFF as i64));
+                let st = sb.one(load(LoadOp::I32, st_a, 0));
+                let unw = sb.one(Inst::ConstI32(STATE_UNWINDING));
+                let is_unw = sb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
+                let gid = points.len() as u32;
+                let live: Vec<ValIdx> = (0..out as u32).collect();
+                seg_blocks.push(sb.finish(Terminator::BrIf {
+                    cond: is_unw,
+                    then_blk: unwind_base + 2 * gid, // the point's UNWIND check block
+                    then_args: live.clone(),
+                    else_blk: seg(b, k + 1),
+                    else_args: live,
+                }));
+
+                // resume plan for this point
+                let kind = match &blk.insts[pos] {
+                    Inst::CapCall { .. } => SuspendKind::Leaf,
+                    Inst::Call { func, args } => SuspendKind::Propagated {
+                        callee: *func,
+                        args: args.clone(),
+                    },
+                    _ => unreachable!("suspend position is a cap.call or call"),
+                };
+                let nres = match (&kind, &blk.insts[pos]) {
+                    (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => sig.results.len(),
+                    (SuspendKind::Propagated { callee, .. }, _) => {
+                        func_results[*callee as usize].len()
+                    }
+                    _ => unreachable!(),
+                };
+                // Spillable range: values `[0, save_end)`. A leaf reloads its own result too
+                // (`save_end == out`); a propagated frame re-issues its call, so the call's
+                // results `[save_end, out)` are recomputed, not spilled.
+                let save_end = match kind {
+                    SuspendKind::Leaf => out,
+                    SuspendKind::Propagated { .. } => out - nres,
+                };
+                let slot_types = bi.types[0..out].to_vec();
+
+                // Minimal live-set: spill only values used *after* the op (block-local SSA ⇒
+                // a value's whole live range is in this block, so "live across" = referenced
+                // by a later instruction or the terminator), plus a propagated call's own
+                // operands (needed to re-issue it). An unrecognized instruction in the tail ⇒
+                // fall back to spilling the whole spillable range (never under-spill).
+                let mut used = vec![false; out];
+                let mut conservative = false;
+                for inst in &blk.insts[pos + 1..] {
+                    match inst_operands(inst) {
+                        Some(ops) => ops.iter().for_each(|&o| {
+                            if (o as usize) < out {
+                                used[o as usize] = true;
+                            }
+                        }),
+                        None => {
+                            conservative = true;
+                            break;
+                        }
+                    }
+                }
+                for o in term_operands(&blk.term) {
+                    if (o as usize) < out {
+                        used[o as usize] = true;
+                    }
+                }
+                if let SuspendKind::Propagated { args, .. } = &kind {
+                    for &a in args {
+                        used[a as usize] = true; // operands of the re-issued call
+                    }
+                }
+                let spilled: Vec<usize> = if conservative {
+                    (0..save_end).collect()
+                } else {
+                    (0..save_end).filter(|&i| used[i]).collect()
+                };
+                if spilled.iter().any(|&i| slot_types[i] == ValType::V128) {
+                    return Err(TransformError::UnsupportedInst); // v128 spill/reload: future work
+                }
+                // Frame layout (DURABILITY.md §12.7): packed spilled values, resume id on top.
+                let mut frame_offsets = Vec::with_capacity(spilled.len());
+                let mut off = 0u64;
+                for &i in &spilled {
+                    off = align_up(off, vsize(slot_types[i]));
+                    frame_offsets.push(off);
+                    off += vsize(slot_types[i]);
+                }
+                let frame_size = align_up(off + 4, 16);
+                points.push(PointPlan {
+                    kind,
+                    nres,
+                    out,
+                    save_end,
+                    slot_types,
+                    spilled,
+                    frame_offsets,
+                    rid_off: frame_size - 4,
+                    frame_size,
+                    cont_seg: seg(b, k + 1),
+                });
+            } else {
+                // last segment: the tail after the final suspend op + the remapped terminator
+                let seg_start = if m == 0 { 0 } else { bi.scs[m - 1] + 1 };
+                sb.insts.extend_from_slice(&blk.insts[seg_start..]);
+                seg_blocks.push(sb.finish(remap(&blk.term)));
+            }
+        }
+    }
+
+    // ---- DISPATCH — read the resume id at SP-4 and br_table to the matching arm ----
+    let mut db = Bb::new(vec![]);
+    let sp_a = db.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+    let sp = db.one(load(LoadOp::I64, sp_a, 0));
+    let four = db.one(Inst::ConstI64(4));
+    let sp_m4 = db.one(ibin(IntTy::I64, BinOp::Sub, sp, four));
+    let rid = db.one(load(LoadOp::I32, sp_m4, 0));
+    // id 0 is reserved ("no resume" ⇒ trap); id g+1 selects ARM_g.
+    let mut targets: Vec<(BlockIdx, Vec<ValIdx>)> = vec![(trap_blk, vec![])];
+    for g in 0..p_total {
+        targets.push((arm_base + g, vec![]));
+    }
+    let dispatch = db.finish(Terminator::BrTable {
+        idx: rid,
+        targets,
+        default: (trap_blk, vec![]),
+    });
+
+    // ---- UNWIND (check + spill pair) / ARM_g, per resume point ----
+    let mut unwind_blocks: Vec<Block> = Vec::with_capacity(2 * total_points);
+    let mut arm_blocks: Vec<Block> = Vec::with_capacity(total_points);
+    for (gid, pt) in points.iter().enumerate() {
+        // index in `pt.spilled` (and thus the reloaded vec) of a block-local value, if spilled
+        let spill_slot = |i: usize| pt.spilled.binary_search(&i).ok();
+
+        // UNWIND check: a push of this frame must not run past the reserve into guest memory
+        // (R9 / DURABILITY.md §12.7). The shadow stack mirrors the call stack, so this only
+        // trips for a chain deeper than `DURABLE_RESERVE` holds — a clean trap, never silent
+        // corruption. It lives on the (cold) freeze path, not the per-call path.
+        let mut cb = Bb::new(pt.slot_types.clone());
+        let sp_a = cb.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+        let sp = cb.one(load(LoadOp::I64, sp_a, 0));
+        let fsz = cb.one(Inst::ConstI64(pt.frame_size as i64));
+        let newsp = cb.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
+        let reserve = cb.one(Inst::ConstI64(DURABLE_RESERVE as i64));
+        let over = cb.one(icmp(IntTy::I64, CmpOp::GtU, newsp, reserve));
+        let live: Vec<ValIdx> = (0..pt.out as u32).collect();
+        unwind_blocks.push(cb.finish(Terminator::BrIf {
+            cond: over,
+            then_blk: trap_blk,
+            then_args: vec![],
+            else_blk: unwind_base + 2 * gid as u32 + 1, // the spill block
+            else_args: live,
+        }));
+
+        // UNWIND spill: spill the live (∪ call-arg) values + the resume id, commit the new SP.
+        let mut ub = Bb::new(pt.slot_types.clone());
+        let sp_a = ub.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+        let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
+        for (j, &i) in pt.spilled.iter().enumerate() {
+            ub.zero(store(
+                store_op(pt.slot_types[i]),
+                sp,
+                i as u32,
+                pt.frame_offsets[j],
+            ));
+        }
+        let rid = ub.one(Inst::ConstI32(gid as i32 + 1));
+        ub.zero(store(StoreOp::I32, sp, rid, pt.rid_off));
+        let fsz = ub.one(Inst::ConstI64(pt.frame_size as i64));
+        let newsp = ub.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
+        ub.zero(store(StoreOp::I64, sp_a, newsp, 0));
+        let ret: Vec<ValIdx> = f.results.iter().map(|&t| ub.one(zero_const(t))).collect();
+        unwind_blocks.push(ub.finish(Terminator::Return(ret)));
+
+        // ARM: reload the spilled set (self-contained — no incoming params), pop, resume.
+        let mut ab = Bb::new(vec![]);
+        let sp_a = ab.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
+        let sp = ab.one(load(LoadOp::I64, sp_a, 0));
+        let fsz = ab.one(Inst::ConstI64(pt.frame_size as i64));
+        let base = ab.one(ibin(IntTy::I64, BinOp::Sub, sp, fsz));
+        let reloaded: Vec<ValIdx> = pt
+            .spilled
+            .iter()
+            .enumerate()
+            .map(|(j, &i)| ab.one(load(load_op(pt.slot_types[i]), base, pt.frame_offsets[j])))
+            .collect();
+        ab.zero(store(StoreOp::I64, sp_a, base, 0)); // pop: SP = frame base
+
+        // For a propagated call, re-issue it (its operands were all spilled). For a leaf,
+        // flip the state word back to NORMAL.
+        let op_results: Vec<ValIdx> = match &pt.kind {
+            SuspendKind::Leaf => {
+                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                vec![]
+            }
+            SuspendKind::Propagated { callee, args } => {
+                let mapped: Vec<ValIdx> = args
+                    .iter()
+                    .map(|&a| reloaded[spill_slot(a as usize).expect("call arg spilled")])
+                    .collect();
+                ab.many(
+                    Inst::Call {
+                        func: *callee,
+                        args: mapped,
+                    },
+                    pt.nres,
+                )
+            }
+        };
+
+        // Assemble the continuation's `out` args slot-by-slot: a reloaded value, a re-issued
+        // call result (`[save_end, out)`), or a zero placeholder for a dead-but-present slot.
+        let cont_args: Vec<ValIdx> = (0..pt.out)
+            .map(|i| {
+                if let Some(j) = spill_slot(i) {
+                    reloaded[j]
+                } else if i >= pt.save_end {
+                    op_results[i - pt.save_end]
+                } else {
+                    ab.one(zero_const(pt.slot_types[i])) // dead across the op; value unused
+                }
+            })
+            .collect();
+        arm_blocks.push(ab.finish(Terminator::Br {
+            target: pt.cont_seg,
+            args: cont_args,
+        }));
+    }
+
+    // ---- TRAP — br_table default / forged resume id ----
+    let trap = Block {
+        params: vec![],
+        insts: vec![],
+        term: Terminator::Unreachable,
+    };
+
+    // Assemble in the order the index layout assumes.
+    let mut blocks = Vec::with_capacity((2 + s_total + 2 * p_total + 1) as usize);
+    blocks.push(prologue);
+    blocks.extend(seg_blocks);
+    blocks.push(dispatch);
+    blocks.extend(unwind_blocks);
+    blocks.extend(arm_blocks);
+    blocks.push(trap);
+
+    let max_frame = points.iter().map(|pt| pt.frame_size).max().unwrap_or(0);
+    let func = Func {
+        params: f.params.clone(),
+        results: f.results.clone(),
+        blocks,
+    };
+    Ok((func, max_frame))
+}
+
+// ---- window helpers for freeze/thaw drivers and tests ----
+
+/// A fresh durable window of `size` bytes: state = `NORMAL`, shadow-SP = `SHADOW_BASE`.
+pub fn init_durable_window(size: usize) -> Vec<u8> {
+    let mut w = vec![0u8; size];
+    write_state(&mut w, STATE_NORMAL);
+    w[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]
+        .copy_from_slice(&SHADOW_BASE.to_le_bytes());
+    w
+}
+
+/// Overwrite the state word in a window image (used to drive freeze/thaw).
+pub fn write_state(window: &mut [u8], state: i32) {
+    window[STATE_OFF as usize..STATE_OFF as usize + 4].copy_from_slice(&state.to_le_bytes());
+}
+
+/// Read the state word from a window image.
+pub fn read_state(window: &[u8]) -> i32 {
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&window[STATE_OFF as usize..STATE_OFF as usize + 4]);
+    i32::from_le_bytes(b)
+}
+
+// ---- small IR construction helpers ----
+
+/// A block under construction that tracks the next block-local value index.
+struct Bb {
+    params: Vec<ValType>,
+    insts: Vec<Inst>,
+    next: u32,
+}
+
+impl Bb {
+    fn new(params: Vec<ValType>) -> Self {
+        let next = params.len() as u32;
+        Bb {
+            params,
+            insts: Vec::new(),
+            next,
+        }
+    }
+    /// Push a single-result instruction; returns its value index.
+    fn one(&mut self, i: Inst) -> ValIdx {
+        let idx = self.next;
+        self.insts.push(i);
+        self.next += 1;
+        idx
+    }
+    /// Push an instruction that defines `nres` consecutive values; returns their indices.
+    fn many(&mut self, i: Inst, nres: usize) -> Vec<ValIdx> {
+        let start = self.next;
+        self.insts.push(i);
+        self.next += nres as u32;
+        (start..self.next).collect()
+    }
+    /// Push a zero-result instruction (a store).
+    fn zero(&mut self, i: Inst) {
+        self.insts.push(i);
+    }
+    fn finish(self, term: Terminator) -> Block {
+        Block {
+            params: self.params,
+            insts: self.insts,
+            term,
+        }
+    }
+}
+
+fn load(op: LoadOp, addr: ValIdx, offset: u64) -> Inst {
+    Inst::Load {
+        op,
+        addr,
+        offset,
+        align: 0,
+    }
+}
+
+fn store(op: StoreOp, addr: ValIdx, value: ValIdx, offset: u64) -> Inst {
+    Inst::Store {
+        op,
+        addr,
+        value,
+        offset,
+        align: 0,
+    }
+}
+
+fn ibin(ty: IntTy, op: BinOp, a: ValIdx, b: ValIdx) -> Inst {
+    Inst::IntBin { ty, op, a, b }
+}
+
+fn icmp(ty: IntTy, op: CmpOp, a: ValIdx, b: ValIdx) -> Inst {
+    Inst::IntCmp { ty, op, a, b }
+}
+
+fn zero_const(t: ValType) -> Inst {
+    match t {
+        ValType::I32 => Inst::ConstI32(0),
+        ValType::I64 => Inst::ConstI64(0),
+        ValType::F32 => Inst::ConstF32(0),
+        ValType::F64 => Inst::ConstF64(0),
+        ValType::V128 => Inst::ConstV128([0; 16]),
+    }
+}
+
+fn vsize(t: ValType) -> u64 {
+    match t {
+        ValType::I32 | ValType::F32 => 4,
+        ValType::I64 | ValType::F64 => 8,
+        ValType::V128 => 16,
+    }
+}
+
+fn align_up(x: u64, a: u64) -> u64 {
+    (x + a - 1) & !(a - 1)
+}
+
+fn store_op(t: ValType) -> StoreOp {
+    match t {
+        ValType::I32 => StoreOp::I32,
+        ValType::I64 => StoreOp::I64,
+        ValType::F32 => StoreOp::F32,
+        ValType::F64 => StoreOp::F64,
+        ValType::V128 => unreachable!("v128 spill rejected earlier"),
+    }
+}
+
+fn load_op(t: ValType) -> LoadOp {
+    match t {
+        ValType::I32 => LoadOp::I32,
+        ValType::I64 => LoadOp::I64,
+        ValType::F32 => LoadOp::F32,
+        ValType::F64 => LoadOp::F64,
+        ValType::V128 => unreachable!("v128 reload rejected earlier"),
+    }
+}
+
+/// Result types of an instruction, given the types of all earlier values in the block
+/// and each function's result types. Covers the scalar/memory/call subset a Phase-1
+/// prefix can use; returns `UnsupportedInst` for anything else (SIMD, conversions,
+/// concurrency ops), so the transform fails closed rather than mis-typing a frame.
+fn result_types(
+    inst: &Inst,
+    types: &[ValType],
+    func_results: &[Vec<ValType>],
+) -> Result<Vec<ValType>, TransformError> {
+    use Inst::*;
+    Ok(match inst {
+        ConstI32(_) => vec![ValType::I32],
+        ConstI64(_) => vec![ValType::I64],
+        ConstF32(_) => vec![ValType::F32],
+        ConstF64(_) => vec![ValType::F64],
+        ConstV128(_) => vec![ValType::V128],
+        IntBin { ty, .. } | IntUn { ty, .. } => vec![ty.val()],
+        FBin { ty, .. } | FUn { ty, .. } => vec![ty.val()],
+        IntCmp { .. } | FCmp { .. } | Eqz { .. } => vec![ValType::I32],
+        AtomicLoad { ty, .. } | AtomicRmw { ty, .. } | AtomicCmpxchg { ty, .. } => vec![ty.val()],
+        Store { .. } | AtomicStore { .. } | AtomicFence { .. } => vec![],
+        Select { a, .. } => vec![types[*a as usize]],
+        Load { op, .. } => vec![load_result_ty(*op)],
+        Call { func, .. } => func_results
+            .get(*func as usize)
+            .cloned()
+            .ok_or(TransformError::UnsupportedShape)?,
+        CapCall { sig, .. } => sig.results.clone(),
+        CallIndirect { ty, .. } => ty.results.clone(),
+        PtrAdd { .. } | PtrCast { .. } => vec![ValType::I64],
+        RefFunc { .. } => vec![ValType::I32],
+        _ => return Err(TransformError::UnsupportedInst),
+    })
+}
+
+fn load_result_ty(op: LoadOp) -> ValType {
+    use LoadOp::*;
+    match op {
+        I32 | I32_8S | I32_8U | I32_16S | I32_16U => ValType::I32,
+        I64 | I64_8S | I64_8U | I64_16S | I64_16U | I64_32S | I64_32U => ValType::I64,
+        F32 => ValType::F32,
+        F64 => ValType::F64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use svm_ir::Memory;
+
+    fn parse_with_mem(src: &str, size_log2: u8) -> Module {
+        let mut m = svm_text::parse_module(src).expect("parse");
+        m.memory = Some(Memory { size_log2 });
+        m
+    }
+
+    #[test]
+    fn no_cap_call_is_left_unchanged() {
+        let m = parse_with_mem(
+            "func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n",
+            12,
+        );
+        let out = transform_module(&m).expect("transform");
+        assert_eq!(out.funcs, m.funcs, "function without cap.call is untouched");
+    }
+
+    #[test]
+    fn instrumented_function_verifies() {
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n}\n",
+            18,
+        );
+        let out = transform_module(&m).expect("transform");
+        svm_verify::verify_module(&out).expect("instrumented IR must verify");
+        assert_eq!(
+            out.funcs[0].blocks.len(),
+            8,
+            "one point: 4n+4 blocks with n=1"
+        );
+    }
+
+    #[test]
+    fn two_cap_calls_become_two_resume_points() {
+        // Two suspend points in one block ⇒ two br_table arms ⇒ 3·2 + 4 = 10 blocks.
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v4 = i64.add v2 v3\n  return v4\n}\n",
+            18,
+        );
+        let out = transform_module(&m).expect("two resume points are in scope");
+        svm_verify::verify_module(&out).expect("instrumented IR must verify");
+        assert_eq!(
+            out.funcs[0].blocks.len(),
+            12,
+            "two-point layout: 4n+4 with n=2"
+        );
+    }
+
+    #[test]
+    fn propagated_chain_instruments_each_frame() {
+        // A two-level chain: the caller suspends on its `call` to the leaf, the leaf on
+        // its `cap.call`. Both are may-suspend, so both get the 7-block instrumentation.
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = call 1 (v0)\n  return v1\n}\nfunc (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n}\n",
+            18,
+        );
+        let out = transform_module(&m).expect("transform");
+        svm_verify::verify_module(&out).expect("instrumented chain must verify");
+        assert_eq!(
+            out.funcs[0].blocks.len(),
+            8,
+            "caller (propagated) instrumented"
+        );
+        assert_eq!(out.funcs[1].blocks.len(), 8, "callee (leaf) instrumented");
+    }
+
+    #[test]
+    fn non_suspending_callee_is_left_unchanged() {
+        // func 0 (leaf cap.call) calls func 1 (a pure helper) as a *prefix* op. The helper
+        // never suspends, so it is not instrumented and func 0's only suspend point is its
+        // own cap.call; the helper's result is spilled/reloaded, never re-issued.
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = call 1 (v0)\n  v2 = i32.const 0\n  v3 = cap.call 2 0 (i32) -> (i64) v0 (v2)\n  v4 = i64.add v1 v3\n  return v4\n}\nfunc (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 5\n  return v1\n}\n",
+            18,
+        );
+        let helper_before = m.funcs[1].clone();
+        let out = transform_module(&m).expect("transform");
+        svm_verify::verify_module(&out).expect("verify");
+        assert_eq!(out.funcs[0].blocks.len(), 8, "leaf instrumented");
+        assert_eq!(
+            out.funcs[1], helper_before,
+            "non-suspending helper untouched"
+        );
+    }
+
+    #[test]
+    fn instrumented_module_with_guest_memory_op_is_rejected() {
+        // A guest store could alias the durable region at `[0, SHADOW_BASE)` → R9 fails closed.
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 7\n  i64.store v1 v3\n  return v2\n}\n",
+            18,
+        );
+        assert_eq!(transform_module(&m), Err(TransformError::GuestUsesMemory));
+    }
+
+    #[test]
+    fn guest_memory_op_in_uninstrumented_module_is_fine() {
+        // No `cap.call` anywhere ⇒ nothing is instrumented ⇒ no durable region ⇒ the
+        // guest's own memory use is left untouched.
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i64.const 7\n  i64.store v0 v1\n  v2 = i64.load v0\n  return v2\n}\n",
+            18,
+        );
+        let out = transform_module(&m).expect("no instrumentation, memory use is fine");
+        assert_eq!(out.funcs, m.funcs, "left unchanged");
+    }
+
+    #[test]
+    fn cap_call_without_memory_is_rejected() {
+        let mut m = svm_text::parse_module(
+            "func (i32) -> (i64) {\nblock0(v0: i32):\n  v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n}\n",
+        )
+        .unwrap();
+        m.memory = None;
+        assert_eq!(transform_module(&m), Err(TransformError::NoMemory));
+    }
+}

@@ -573,11 +573,22 @@ name = "svm"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "svm-durable",
  "svm-encode",
  "svm-interp",
  "svm-ir",
  "svm-jit",
  "svm-run",
+ "svm-text",
+ "svm-verify",
+]
+
+[[package]]
+name = "svm-durable"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
  "svm-text",
  "svm-verify",
 ]
@@ -651,6 +662,18 @@ dependencies = [
  "svm-text",
  "svm-verify",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "svm-snapshot"
+version = "0.0.0"
+dependencies = [
+ "svm-durable",
+ "svm-encode",
+ "svm-interp",
+ "svm-ir",
+ "svm-text",
+ "svm-verify",
 ]
 
 [[package]]

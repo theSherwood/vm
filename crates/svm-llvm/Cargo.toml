@@ -28,3 +28,5 @@ llvm-sys = { version = "181", features = ["prefer-dynamic"] }
 svm-text = { path = "../svm-text" }
 svm-verify = { path = "../svm-verify" }
 svm-interp = { path = "../svm-interp" }
+# The JIT, so every translation test is also an interp↔JIT differential (the §18 oracle).
+svm-jit = { path = "../svm-jit" }

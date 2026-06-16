@@ -8,11 +8,25 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 0 done — the skeleton crate builds, links libLLVM, and the first-light
-differential is green.** `crates/svm-llvm` translates `clang -O2 -emit-llvm` bitcode for the
-single-block integer subset, verifies it, and runs it on the interpreter matching native
-clang (4 tests). Milestone 1 (the real scalar+memory+call subset) is next. Section numbers
-like "§3d" refer to `DESIGN.md`; "D54" etc. are its Decision Log.
+**Status: Milestone 1 slices A–H (control flow, memory, calls, switch, globals, floats, indirect
+calls, struct aggregates) done — a broad swath of scalar C from `clang -O2` translates and runs
+on both backends.** `crates/svm-llvm` does the **SSA → block-argument
+conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
+critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
+window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
+**direct calls with the threaded data-SP** (every function takes a leading `sp`; a call passes
+`sp + frame_size`, so recursion is sound), **`switch` → `br_table`**, **global variables**
+(low in the window as `data` segments, constants read-only D40, with a stack guard above; a
+`@global` ref is its window address), and **`f32`/`f64`** (arithmetic/compare/conversions +
+the common float intrinsics, `fmuladd` lowered unfused). Real `clang -O2` programs — popcount/
+collatz loops, if-converted select, a stack-array sum, recursive `fib`, a cross-function call, a
+dense switch, `even`/`odd` mutual recursion, a const lookup table, a mutable global counter,
+indexed string reads, a gapped switch (a global jump table), double arithmetic/compares/
+conversions, `fabs`/`floor`, an indirect call through a function pointer, and struct field
+access (global/array-of-struct/stack) — run **interp == JIT == hand-computed** (28 tests).
+Remaining M1: by-value aggregate args/returns (`sret`/`byval`), libc/math function calls,
+function-pointer global tables (relocations), then the demo Lane C. Section numbers like "§3d"
+refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
 
@@ -265,12 +279,95 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       richer instruction set; the bitcode lane already covers the M0 surface.
 
 ### Milestone 1 — the chibicc-proven scalar+memory+call subset 🟢 (the D54 MVP)
-- [ ] φ → block parameters (+ critical-edge splitting).
-- [ ] `mem2reg`/SROA ingest pass → two-stack split (§3a); remaining `alloca` → data stack.
-- [ ] Narrow-int collapse to `i32` with `extend8_s`/`16_s` discipline (§3b).
-- [ ] GEP → `ptr.add` via `DataLayout`; loads/stores incl. narrow widths.
-- [ ] Direct + indirect `call` (funcref §3c); `switch` → `br_table`/compare-chain.
-- [ ] By-value aggregates via `sret`/hidden pointer (D39).
+**Slice A (DONE) — control flow + scalar SSA.** Multi-block integer functions on both backends.
+- [x] φ → block parameters — done as a general **SSA → block-argument conversion** (liveness-based:
+      every value live across a block entry becomes a parameter, φ-results included; each branch
+      supplies the args). Critical edges need **no splitting** — args are evaluated in the
+      predecessor. Loops/joins/back-edges all covered.
+- [x] Integer arith/bitwise/`shl`/`lshr`/`ashr`/`udiv`/`sdiv`/`urem`/`srem`; `icmp` (all 10
+      predicates); `select`; `i1`/`i8`/`i16`/`i32`/`i64` `trunc`/`zext`/`sext` (narrow-int collapse
+      to `i32`, §3b — sign-extend via the shift pair Cranelift folds); `br`/`br_if`/`return`/
+      `unreachable`. Tested interp == JIT == hand-computed on real `clang -O2` output (popcount,
+      collatz, classify, …). Non-byte widths (`i33`) are a clean `Unsupported`.
+
+**Slice B (DONE) — the §3d data stack (scalar memory).** Address-taken locals via `alloca`.
+- [x] `alloca` → a window data-stack frame slot at an `sp`-relative offset (natural-aligned;
+      frame size 16-aligned). Dynamic (non-constant count) `alloca` is a clean `Unsupported`.
+- [x] `load`/`store` incl. narrow widths (`i8`/`i16` → the `i32`-container load/store ops; narrow
+      loads zero-extend, signedness via the following `sext`/`zext`, §3b). Pointers are `i64`.
+- [x] `getelementptr` → `i64` address arithmetic: `base + Σ idx·stride` (pointee + array element
+      strides from the type sizes), constant indices folded, variable indices `mul`+`add` (index
+      sign-extended to `i64`). Struct/vector GEP is a later slice.
+- [x] `undef`/`poison`/`null` → defined `0` (totality, §3c); `llvm.lifetime`/`dbg`/`assume`
+      intrinsics dropped. Tested on a `clang -O2` stack-array sum/reverse (GEP + store/load over the
+      frame), interp == JIT == hand-computed.
+
+**Slice C (DONE) — calls + the threaded data-SP.** Direct calls; per-activation frames.
+- [x] Every function takes a leading `sp` parameter (§3d), threaded as block-local index 0 of every
+      block (like chibicc's `v0`); each branch passes it through. A direct `call` resolves the
+      target by name → IR function index, and passes the callee `sp + frame_size` (so frames never
+      overlap; recursion is sound), then the mapped arguments; the result threads back. Tested on
+      `clang -O2` recursive `fib` and a `noinline` cross-function call, interp == JIT == hand-computed.
+
+**Slice D (DONE) — `switch`.**
+- [x] `switch` → `br_table` (§3b): the `i32` operand is biased by the minimum case value, then
+      indexes a target vector spanning `[min, max]` with gaps filled by the default edge; each edge
+      carries its destination's block args (computed once per distinct target). Too-sparse switches
+      (span > 4096) and i64-operand switches are a clean `Unsupported`. Tested on a dense switch and
+      the `even`/`odd` mutual recursion `-O2` lowers onto a switch-loop.
+
+**Slice E (DONE) — global variables + the data-stack guard.**
+- [x] Globals laid out **low** in the window (`[DATA_BASE, globals_end)`), each natural-aligned.
+      Emitted as IR `data` segments — constants **read-only** (D40), BSS/zero globals just reserve
+      space in the zero-init window. A `@global` reference resolves to its window address (a
+      constant `i64`); int/array/string/zero initializers serialize to little-endian bytes. Tested
+      on a const lookup table, a mutable counter, indexed string reads, and the gapped switch
+      (a global jump table).
+- [x] **Guard:** the data stack now starts **just above** the globals (`entry_sp = align(globals_end)`)
+      and grows up toward the window's mapped top; `mapped` is sized for the globals + a 1 MiB stack
+      reserve, and the runtime leaves a faulting guard beyond `mapped` (reserved > mapped). So a
+      stack overflow **faults** (§5) instead of corrupting the globals below — tested by a deep
+      recursion with a 32 KiB frame that traps on both backends (a shallow call returns).
+- [x] **API:** `translate`/`translate_bc_path` now return `Translated { module, entry_sp }` — the
+      host/driver invokes the entry with `entry_sp` as its first (`sp`) argument.
+
+**Slice F (DONE) — floats.**
+- [x] `f32`/`f64` arithmetic (`fadd`/`fsub`/`fmul`/`fdiv`/`fneg`), `fcmp` (ordered/unordered collapse
+      to the SVM op — NaN corner is a documented fidelity gap), `select`, the int↔float conversions
+      (`sitofp`/`uitofp`/`fptosi`/`fptoui`, float→int **saturating** per §3b), `fpext`/`fptrunc`,
+      `bitcast`, and the common float math intrinsics (`fmuladd`/`fma` lowered **unfused**;
+      `sqrt`/`fabs`/`floor`/`ceil`/`trunc`/`rint`/`copysign`/`min`/`maxnum`) lowered inline. Float
+      constants and `f32`/`f64` params/results in the slot ABI. Tested on `clang -O2` double
+      arithmetic (incl. the `fmuladd` contraction), compares, int↔float, promote/demote, `fabs`/`floor`.
+
+**Slice G (DONE) — indirect calls (funcref §3c).**
+- [x] Taking a function's address → its funcref index (`ref.func`, the function-table index)
+      widened to the `i64` pointer rep. An indirect `call` (callee is a function-pointer value)
+      truncates it back to the `i32` funcref and lowers to `call_indirect <sig>` — the runtime masks
+      the index and checks the type-id (§3c). The signature is the callee's function type plus the
+      prepended data-SP, so it matches the callee's IR signature. Tested on a `noinline` pointer-
+      returning `pick` whose result `run` calls indirectly (a genuine `-O2` `call_indirect`).
+
+**Slice H (DONE) — aggregates (struct memory).**
+- [x] Struct layout (x86-64-SysV: natural field alignment + tail padding to the struct's alignment;
+      named structs resolved via the type table), **struct GEP** (a constant field index → the
+      field's byte offset, descending into the field type — composes with array indices), struct
+      `alloca`s (struct-sized, struct-aligned frame slots), and struct global initializers serialized
+      with field padding (read-only D40). Tested on a global struct read field-by-field, an
+      array-of-structs (`arr[i].field`), and a `volatile` stack struct (store/load via field GEP).
+      Covers structs via pointers/locals/globals — **not** the by-value pass/return ABI.
+
+**Remaining slices.**
+- [ ] **By-value aggregate args/returns** (`sret`/`byval`, D39) — passing/returning structs by value.
+      The gnarly part is clang's SysV register-classification (small structs coerced to int/array
+      params, large via `byval`/`sret` pointers); the IR must reconstruct/forward those.
+- [ ] Libc/math **function** calls (e.g. `sqrt` keeps errno semantics → a real `@sqrt` call) — bind
+      to a guest libc / capability, or recognize the named libc-math calls as intrinsics under
+      `-fno-math-errno`.
+- [ ] Pointer-valued global initializers (relocations — a global holding `&other_global`/a string
+      pointer; resolve addresses after layout).
+- [ ] Min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/…) lowered inline.
+- [ ] Struct/vector GEP + by-value aggregates via `sret`/hidden pointer (D39).
 - [ ] `memcpy`/`memset`/`memmove` intrinsics; libc/powerbox entry (`write`/`exit`/`malloc`).
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
       (the same corpus chibicc passes — clay, jsmn, sha256, xxhash, tinfl, perlin, regex,
