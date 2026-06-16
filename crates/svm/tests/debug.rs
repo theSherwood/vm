@@ -474,3 +474,76 @@ fn no_debug_info_means_none_and_the_inspector_still_works() {
     assert_eq!(insp.source_loc(bp), None);
     assert_eq!(insp.read_var(0, "i", 4), None);
 }
+
+// --- W1 time-travel: seek / step_back via stateless re-execution (DEBUGGING.md W1) -------------
+
+/// `seek(t)` re-executes the run to logical time `t` and restores the *exact* frame state there;
+/// `step_back` walks the clock down. Verified against snapshots taken while stepping forward.
+#[test]
+fn seek_and_step_back_time_travel() {
+    let m = parse_module(LOOP_SUM).expect("parse");
+    let mut insp = Inspector::attach(&m, 0, &[Value::I32(3)], 100_000);
+
+    // Full frame state (pc + live SSA values per frame) — the thing time-travel must reproduce.
+    fn snap(i: &Inspector) -> Vec<(IrPc, Vec<Value>)> {
+        i.backtrace()
+            .iter()
+            .map(|f| (f.pc, f.vals.clone()))
+            .collect()
+    }
+
+    // Walk forward, recording (logical time → state) at each stop.
+    let mut at: std::collections::BTreeMap<u64, Vec<(IrPc, Vec<Value>)>> = Default::default();
+    at.insert(insp.clock(), snap(&insp)); // clock 0, before the first op
+    for _ in 0..6 {
+        match insp.step() {
+            Stop::Break { .. } => {
+                at.insert(insp.clock(), snap(&insp));
+            }
+            Stop::Finished(_) => break,
+            Stop::Blocked => panic!("unexpected block"),
+        }
+    }
+    assert!(at.len() >= 4, "stepped through several ops: {}", at.len());
+
+    // Time-travel to each recorded instant (out of order) and verify exact restoration.
+    for (&t, want) in at.iter().rev() {
+        match insp.seek(t) {
+            Stop::Break { .. } => {}
+            other => panic!("seek({t}) should land at a paused op, got {other:?}"),
+        }
+        assert_eq!(insp.clock(), t, "seek({t}) lands at logical time {t}");
+        assert_eq!(
+            &snap(&insp),
+            want,
+            "seek({t}) restores the exact frame state"
+        );
+    }
+
+    // step_back decrements the clock one op at a time.
+    insp.seek(3);
+    assert!(matches!(insp.step_back(), Stop::Break { .. }));
+    assert_eq!(insp.clock(), 2, "step_back from clock 3 lands at 2");
+    assert_eq!(snap(&insp), at[&2], "and restores that state");
+
+    // After time-traveling, resuming forward still runs to the correct result (sum 1+2+3 = 6).
+    insp.seek(0);
+    match insp.run_until_stop() {
+        Stop::Finished(Ok(vs)) => assert_eq!(vs, vec![Value::I32(6)]),
+        other => panic!("expected Finished(6), got {other:?}"),
+    }
+}
+
+/// Seeking past the end of the run lands on the finished result, not a pause.
+#[test]
+fn seek_past_the_end_finishes() {
+    let m = parse_module(LOOP_SUM).expect("parse");
+    let mut insp = Inspector::attach(&m, 0, &[Value::I32(2)], 100_000);
+    match insp.seek(u64::MAX) {
+        Stop::Finished(Ok(vs)) => assert_eq!(vs, vec![Value::I32(3)]), // 1+2
+        other => panic!("expected Finished, got {other:?}"),
+    }
+    // And we can still seek back to the start afterward.
+    assert!(matches!(insp.seek(0), Stop::Break { .. }));
+    assert_eq!(insp.clock(), 0);
+}
