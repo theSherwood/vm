@@ -665,6 +665,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-snapshot"
+version = "0.0.0"
+dependencies = [
+ "svm-durable",
+ "svm-encode",
+ "svm-interp",
+ "svm-ir",
+ "svm-text",
+ "svm-verify",
+]
+
+[[package]]
 name = "svm-text"
 version = "0.0.0"
 dependencies = [
