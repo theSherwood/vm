@@ -4,9 +4,11 @@ Handoff + tracker for **dynamic linking in SVM**: loading separately-authored/co
 and resolving cross-unit references (functions, data) by **name** — the foundation for plugins,
 **dynamic class loading in GC'd-language runtimes**, a stateful REPL, and shared runtime libraries.
 
-Status: **merged to `main`** (via PR #11, branch `claude/dynamic-linking`). All work is `svm-ir` +
-tests; no TCB-backend changes. Fold the settled parts into `DESIGN.md` and drop this file once the
-loader lands (repo convention, cf. the former `SCHEDULING.md`/`AUDIT.md`).
+Status: M0–M3 **merged to `main`** (via PR #11, branch `claude/dynamic-linking`) — those are `svm-ir`
++ tests, no TCB-backend changes. **C1 (host-assisted resolve)** then extended the binary codec
+(`svm-encode`, which *is* untrusted-input TCB — re-verification still gates it) and added the host
+resolving-compile primitive in `svm-run`. Fold the settled parts into `DESIGN.md` and drop this file
+once the loader lands (repo convention, cf. the former `SCHEDULING.md`/`AUDIT.md`).
 
 ---
 
@@ -99,7 +101,20 @@ These already prove old code reaching newly-loaded code; the dynlink work adds t
 - [x] **M1** — static linker: concatenate separate units → one program (`link`, FuncIdx reindex).
 - [x] **M2** — data symbols + per-unit data relocation (`DataReloc`, `RelocKind`, data symbol table).
 - [x] **M3** — dynamic: symbol → table slot → `call_indirect` (`Resolved::Slot`), both runtime demos.
-- [ ] **The capstone: a guest-side `dlopen`/`dlsym` loader** — see below.
+- [x] **C1 (capstone, host-assisted resolve)** — the wire format carries **unresolved** imports + the
+      host resolves them before verify. Two parts:
+  - **svm-encode v2**: the binary form now round-trips the §7 import section (name + op sig) and the
+    `call.import` opcode (`0x7C`), so a separately-compiled unit can be **serialized with its symbols
+    still unresolved** — a `.so` with undefined references (was: `encode` `unreachable!`d on imports,
+    `decode` always returned `imports: []`). `VERSION` 1→2; the three guest-side C IR emitters
+    (`demos/jit/*.c`) emit v2 (a `0` import-count byte; they ship self-contained units).
+  - **`svm_run::jit_resolve_and_validate`**: decode → `resolve_imports_with(symtab)` → verify → the
+    existing fail-closed gate. The resolve (rewrite) runs **before** verify, so a mis-link (unknown
+    name, wrong sig) is caught by re-verification, never trusted. `jit_blob_validator` is now the
+    empty-symtab special case (a closed blob with imports fails closed). Tests:
+    `crates/svm/tests/dynlink_resolve.rs` (3 + a codec round-trip).
+- [ ] **The capstone: a guest-side `dlopen`/`dlsym` loader** — see below. (C1 settled the design and
+      built the host half; what remains is the *guest* delivering the symbol table + driving it.)
 - [ ] GOT / late-binding variant (so *old* code calls *not-yet-loaded* code by name without recompiling
       the caller: the caller does `call_indirect (load GOT[i])`; the loader writes the resolved slot
       into the GOT at load — pure data writes via `Memory` + `memory.init`, reusing M2's reloc). The
@@ -128,11 +143,22 @@ data: `name → slot | address`) with `resolve_imports_with` (`Slot`/`Data`); pl
 + `memory.init` applying `DataReloc`s; `Jit.compile` (re-verifies + compiles into the same window);
 `Jit.install` each export → slots; record new exports. `vm_dlsym` is a symbol-table lookup.
 
-**Design question to settle:** where does the import-resolution rewrite run — guest-side (the guest
-reimplements/loads a rewrite, then submits a *closed* blob to `Jit.compile`) or host-assisted
-(`Jit.compile` takes a guest-provided symbol table and resolves before verify)? Host-assisted is
-simpler and still safe (rewrite-then-verify); the symbol table stays guest-controlled. Recommend
-starting host-assisted.
+**Design question — SETTLED (C1): host-assisted.** The import-resolution rewrite runs **host-side**:
+`Jit.compile` takes a guest-provided symbol table and resolves *before* verify (rewrite-then-verify),
+so the symbol table stays guest-controlled but a mis-link can't escape — it fails verification. This
+is simpler than a guest-side rewrite (no in-guest IR-rewriter to load/trust) and equally safe. The
+host primitive ([`svm_run::jit_resolve_and_validate`]) and the serializable import section (svm-encode
+v2) are done; what remains is the **guest delivery path**.
+
+**Remaining for the capstone (next slices):**
+- A `Jit` cap op (e.g. op 4 `compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len)`) that reads the
+  blob **and** a guest symbol-table buffer from guest memory, calls `jit_resolve_and_validate` with a
+  resolver backed by that buffer, then `define_extra` — mirrored on the interpreter so the differential
+  holds. Needs a small wire format for the symbol table (`name → Slot | Cap`), decoded host-side.
+- The C surface (`vm_dlopen`/`vm_dlsym`/`vm_dlclose`) over that op + `Memory` (for data placement /
+  `DataReloc`s) — the guest builds the symbol table from its own loaded-unit registry.
+- (Later) data-symbol resolution — today C1 resolves *function* imports → slots; data imports still go
+  through M2's `DataReloc` at link time, not a runtime `vm_dlsym` address.
 
 **Why SVM's `dlopen` is *better* than POSIX** (the selling point): the "shared object" is serialized
 SVM IR; `dlsym` returns an **unforgeable funcref slot** (§3c-checked at the call), not a raw pointer;
@@ -146,7 +172,12 @@ arrive through the powerbox — no ambient "load any file"). Safe dynamic loadin
 
 - Primitives live in `crates/svm-ir/src/lib.rs` (`resolve_imports_with`, `link`, `Resolved`,
   `LinkUnit`, `DataReloc`). Read `dynlink.rs` for IR-level usage, `dynlink_runtime.rs` for the
-  guest-JIT (`CompiledModule::compile`/`define_extra`/`install`/`run_extra`) usage.
+  guest-JIT (`CompiledModule::compile`/`define_extra`/`install`/`run_extra`) usage, and
+  `dynlink_resolve.rs` for the C1 host-assisted path (serialize an unresolved unit →
+  `svm_run::jit_resolve_and_validate` → `define_extra`).
+- The wire format (`crates/svm-encode/src/lib.rs`, v2) carries the import section + `call.import`
+  (`op::CALL_IMPORT = 0x7C`); the three guest-side C emitters in `crates/svm-run/demos/jit/*.c`
+  hand-write it, so a layout change there must be matched in all three (a `0` import count, etc.).
 - Run: `cargo test -p svm --test dynlink --test dynlink_runtime`. Full gate:
   `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`.
 - Text-IR string escapes are `\xHH` (not WAT's `\HH`) — bit us in the M2 data tests.

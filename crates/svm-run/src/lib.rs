@@ -21,7 +21,7 @@ use svm_interp::{
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
 use svm_interp::SharedBacking;
-use svm_ir::{Module, ValType};
+use svm_ir::{Module, Resolved, ValType};
 
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
@@ -465,8 +465,33 @@ unsafe fn jit_native_op(
 /// backends accept/reject identically. All failures are `-EINVAL` (guest-visible, non-fatal,
 /// nothing installed).
 pub fn jit_blob_validator(bytes: &[u8], mem_log2: Option<u8>) -> Result<Arc<[svm_ir::Func]>, i64> {
+    // A closed blob: no symbol table, so any declared import is unresolvable and the unit fails
+    // closed at resolution (an import-free unit — every prior caller — is unaffected). The
+    // resolving path ([`jit_resolve_and_validate`]) is the host-assisted dynamic-link entry.
+    jit_resolve_and_validate(bytes, mem_log2, |_| None)
+}
+
+/// Host-assisted dynamic-link resolve — the host-assisted half of the DYNLINK.md capstone. Decode
+/// a serialized unit that may carry **unresolved §7 imports** (the v2 wire form), bind each import
+/// name through `resolve` (a *guest-controlled* symbol table: name → a `call_indirect` table slot,
+/// or a host capability), then run the **same** fail-closed gate as [`jit_blob_validator`]. Crucially
+/// the resolve is a source-to-source rewrite that runs *before* `verify_module`, so a mis-link — an
+/// unknown name, a wrong import signature, a non-const slot handle — is caught by re-verification and
+/// never trusted (DYNLINK.md "rewrite-then-verify"; the symbol table stays guest-controlled, the
+/// loader cannot forge a binding the verifier would reject). All failures are `-EINVAL` (guest-visible,
+/// non-fatal, nothing installed).
+pub fn jit_resolve_and_validate(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    resolve: impl FnMut(&str) -> Option<Resolved>,
+) -> Result<Arc<[svm_ir::Func]>, i64> {
     const EINVAL: i64 = -22;
     let Ok(m) = svm_encode::decode_module(bytes) else {
+        return Err(EINVAL);
+    };
+    // Bind every named import to a concrete `call`/`call_indirect`/`cap.call` (fail-closed on an
+    // unresolved or ill-typed binding), yielding an import-free module the verifier accepts unchanged.
+    let Ok(m) = svm_ir::resolve_imports_with(&m, resolve) else {
         return Err(EINVAL);
     };
     if svm_verify::verify_module(&m).is_err() {
