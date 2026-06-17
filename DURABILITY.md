@@ -1,7 +1,7 @@
 # Durable Domains — Snapshot / Restore / Clone
 
-> **Status: Phases 1–2 landed + Phase 3.1 (single-fiber freeze/thaw) complete on the
-> interpreter; 3.2/3.3 ahead.** This file is the single source of truth for the *design and
+> **Status: Phases 1–2 landed + Phase 3.1 (single-fiber freeze/thaw) complete on the interpreter
+> + Phase 3.3 (JIT parity) complete single-vCPU; 3.2 (multi-vCPU) ahead.** This file is the single source of truth for the *design and
 > implementation status* of durable domains. Built so far: the `svm-durable` IR→IR transform
 > (arbitrary single-vCPU CFGs **+ the §12 fiber control ops**), the `svm-interp` handle-table
 > durability primitives (§12.5) **+ the per-fiber shadow-SP swap / freeze driver (D-fiber-cont
@@ -703,7 +703,7 @@ complete on the interpreter, and now generatively fuzzed**: `durable_fuzz`'s
 drive a root+fiber generator — varying suspend counts, values live across each suspend, multi-point
 resume/suspend — through the freeze→thaw round-trip (R11).
 
-**3.3 — JIT parity (in progress).** The JIT already runs the transform's instrumented IR, so the
+**3.3 — JIT parity (COMPLETE, single-vCPU).** The JIT already runs the transform's instrumented IR, so the
 *thaw arms* (re-issue / re-park) work for free; parity is about porting the *runtime* pieces. Slice
 **3.3.1 landed**: the JIT maintains the per-fiber **shadow-SP swap** in `fiber_resume` (which
 brackets a fiber's residency — entry swaps in, exit swaps back, so `fiber_suspend` needs no change),
@@ -718,10 +718,20 @@ before any guest code runs, so it unwinds with zero forward progress and its `Fi
 runs host-side and unguarded — a flattening fiber touches only the committed reserve, so no guard
 page can fault. Tested by a **cross-backend freeze comparison** (`jit_freeze_driver_flattens_a_fiber_matching_interp`):
 interp and JIT freeze the same instrumented fiber module into a **byte-identical durable reserve**.
-Still ahead: **3.3.3** the `FrozenFiber` residue export + the full cross-backend fiber freeze→thaw
-property (the active-resume-chain case — a fiber on the chain at freeze, marked done rather than
-flattened — is the shared interp/JIT gap to close there). 3.2 — multi-vCPU quiesce + per-context
-layout. Phase 4 — back-edge polls for bounded latency.
+Slice **3.3.3 landed**, closing JIT parity: the freeze driver **exports** a `svm_jit::FrozenFiber`
+residue per flattened fiber (entry funcref + data-SP retained in the `FiberSlot` at `cont.new`,
+flattened shadow-SP read after), and a thaw **re-seeds** those fibers into the run-shared table
+before re-entering under `REWINDING` (`fiber_rt::seed_frozen_fibers` builds each via the shared
+`make_fiber`, so a thaw `cont.resume` re-enters its entry → rewinds → re-parks). The durable entry
+(`compile_and_run_capture_reserved_with_host_durable`) takes a `seed` and returns the residue.
+`durable_fibers_jit.rs` proves both cross-backend directions: interp and JIT freeze a fiber'd domain
+to a **byte-identical §12 artifact** (window image + Section-2 residue), and an **interpreter-frozen
+fiber artifact** restored through the codec **thaws on the JIT** to the uninterrupted result (107).
+So a fiber'd durable domain now freezes, serializes, restores, and thaws **on either backend, in
+either direction**. Remaining JIT-parity-adjacent gaps: the **active-resume-chain** case (a fiber on
+an active chain at the freeze instant, marked done rather than flattened — a shared interp/JIT
+limitation) and multi-vCPU spawned-fiber durability. 3.2 — multi-vCPU quiesce + per-context layout.
+Phase 4 — back-edge polls for bounded latency.
 
 #### 3.1 implementation plan (next-session pickup)
 

@@ -157,6 +157,11 @@ pub(crate) struct FiberSlot {
     /// resume. Touched only by the claimant (serialized by the `own` claim/publish), so `Relaxed`
     /// suffices; unused on a non-durable run.
     shadow_sp: AtomicU64,
+    /// **Durable**: the fiber's entry funcref and data-stack base (the `cont.new` operands),
+    /// retained so the freeze driver can export them in this fiber's [`crate::FrozenFiber`] residue
+    /// (a thaw re-creates the fiber from them). Immutable after creation.
+    func: i32,
+    sp: i64,
 }
 
 /// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
@@ -195,7 +200,7 @@ impl SharedFiberTable {
 
     /// Allocate the next slot for a fresh (`OWNED`) fiber; the returned slot index is the guest
     /// handle. `None` if a racing allocation filled the domain quota since [`Self::has_room`].
-    fn create(&self, fiber: Box<Fiber>) -> Option<i32> {
+    fn create(&self, fiber: Box<Fiber>, func: i32, sp: i64) -> Option<i32> {
         let mut t = self.lock();
         if t.len() + 1 >= self.max_fibers {
             return None;
@@ -207,8 +212,28 @@ impl SharedFiberTable {
             fiber: Mutex::new(Some(fiber)),
             // Fresh fiber: its shadow region starts empty (SP at the region base).
             shadow_sp: AtomicU64::new(fiber_region_base(slot)),
+            func,
+            sp,
         }));
         Some(slot as i32)
+    }
+
+    /// Durable **thaw** re-seeding (DURABILITY.md §12.8 slice 3.3.3): re-create a frozen fiber at
+    /// the next slot (dense, matching the freeze) as a fresh `OWNED` fiber — so a thaw `cont.resume`
+    /// claims it (`Start`) and re-enters its entry under `REWINDING`, rebuilding then re-parking it —
+    /// with its flattened shadow-SP restored so the swap re-points the active word to its region.
+    fn seed_frozen(&self, fiber: Box<Fiber>, func: i32, sp: i64, shadow_sp: u64) -> usize {
+        let mut t = self.lock();
+        let slot = t.len();
+        t.push(Arc::new(FiberSlot {
+            own: Ownership::new_owned(),
+            running_on: AtomicU64::new(NOT_RUNNING),
+            fiber: Mutex::new(Some(fiber)),
+            shadow_sp: AtomicU64::new(shadow_sp),
+            func,
+            sp,
+        }));
+        slot
     }
 
     /// Resolve a (forgeable) handle: **masked** into the power-of-two-padded table (Spectre-safe,
@@ -337,6 +362,49 @@ unsafe fn fault(trap_out: u64) {
 // loses the claim — and slots are separate heap allocations from the table vec, so a re-entrant
 // `cont.new` growing the table never moves a fiber being resumed.
 
+/// Build a suspended native fiber that, on first resume, runs guest `funcref(sp, arg)` through the
+/// call-trampoline — resolving + type-checking the funcref against the function table on that first
+/// resume, like the interpreter. Shared by `cont.new` ([`fiber_new`]) and durable thaw re-seeding
+/// ([`SharedFiberTable::seed_frozen`]), so a thawed fiber re-enters its entry identically.
+///
+/// # Safety
+/// `fn_table_base`/`mem_base`/`trap_out`/`call_tramp` are this run's threaded context (live for the
+/// fiber's lifetime); the body reads [`CURRENT_RT`] dynamically at each use (3c migration).
+#[allow(clippy::too_many_arguments)]
+unsafe fn make_fiber(
+    funcref: i32,
+    sp: u64,
+    mem_base: u64,
+    fn_table_base: u64,
+    trap_out: u64,
+    mask: u64,
+    type_id: u32,
+    call_tramp: FiberCallTramp,
+) -> Fiber {
+    Fiber::new(FIBER_STACK, move |y: &Yielder, arg: u64| -> u64 {
+        // The *resuming* vCPU's runtime — read dynamically at **each** use, never carried across
+        // a potential suspension: the body's start and its return may run on different OS threads
+        // (3c migration), and the yielder push/pop must each target the thread actually running
+        // the fiber at that moment (a push/pop pairs within one residency on one thread).
+        // SAFETY: a fiber only runs under a resume, so `current()` is that thread's live runtime;
+        // each `&mut` deref here is momentary and single-threaded.
+        unsafe {
+            (*current()).yielders.push(y as *const Yielder);
+            // Resolve + type-check the funcref now (first resume), like the interpreter.
+            let slot = (funcref as u32 as usize) & (mask as usize);
+            let entry = (fn_table_base as *const FnEntry).add(slot);
+            let result = if (*entry).type_id() != type_id {
+                fault(trap_out);
+                0u64
+            } else {
+                call_tramp((*entry).code(), mem_base, fn_table_base, trap_out, sp, arg)
+            };
+            (*current()).yielders.pop();
+            result
+        }
+    })
+}
+
 /// `cont.new` thunk: allocate a suspended fiber that, on first resume, calls guest `funcref(sp, arg)`.
 /// Returns the fiber handle (the domain-shared table's slot index — the same numbering as the interp
 /// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** §15 quota).
@@ -374,31 +442,19 @@ pub(crate) unsafe extern "C" fn fiber_new(
         )
     };
 
-    let fiber = Fiber::new(FIBER_STACK, move |y: &Yielder, arg: u64| -> u64 {
-        // The *resuming* vCPU's runtime — read dynamically at **each** use, never carried across
-        // a potential suspension: the body's start and its return may run on different OS threads
-        // (3c migration), and the yielder push/pop must each target the thread actually running
-        // the fiber at that moment (a push/pop pairs within one residency on one thread).
-        // SAFETY: a fiber only runs under a resume, so `current()` is that thread's live runtime;
-        // each `&mut` deref here is momentary and single-threaded.
-        unsafe {
-            (*current()).yielders.push(y as *const Yielder);
-            // Resolve + type-check the funcref now (first resume), like the interpreter.
-            let slot = (funcref as u32 as usize) & (mask as usize);
-            let entry = (fn_table_base as *const FnEntry).add(slot);
-            let result = if (*entry).type_id() != type_id {
-                fault(trap_out);
-                0u64
-            } else {
-                call_tramp((*entry).code(), mem_base, fn_table_base, trap_out, sp, arg)
-            };
-            (*current()).yielders.pop();
-            result
-        }
-    });
+    let fiber = make_fiber(
+        funcref,
+        sp,
+        mem_base,
+        fn_table_base,
+        trap_out,
+        mask,
+        type_id,
+        call_tramp,
+    );
 
     let rt = &*rt;
-    match rt.table.create(Box::new(fiber)) {
+    match rt.table.create(Box::new(fiber), funcref, sp as i64) {
         Some(handle) => handle,
         None => {
             fault(trap_out); // a sibling vCPU filled the domain quota since the pre-check
@@ -592,17 +648,72 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
 /// # Safety
 /// `rt` is the live root runtime (its `mem_base`/`durable` armed for this run); `trap_out` is the
 /// live trap cell. Called at a quiescent safepoint (the root returned), so the table is at rest.
-pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, trap_out: u64) {
+pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, trap_out: u64) -> Vec<crate::FrozenFiber> {
     // The entry path already published `rt` as CURRENT_RT and hasn't restored it yet, but set it
     // explicitly so the driver is correct independent of caller ordering.
     let prev = set_current(rt);
     let table = Arc::clone(&(*rt).table);
     let mut status: i64 = 0;
+    let mut out = Vec::new();
     for handle in table.runnable_handles() {
-        // Resume under the in-progress UNWINDING state word: the fiber flattens itself and returns.
+        // Read the fiber's identity (immutable) before flattening; resume under the in-progress
+        // UNWINDING state word so it flattens itself and returns; then read its flattened shadow-SP.
+        let slot = table.resolve(handle).expect("a runnable handle resolves");
+        let (func, sp) = (slot.func, slot.sp);
         fiber_resume(handle, 0, &mut status as *mut i64, trap_out);
+        out.push(crate::FrozenFiber {
+            slot: handle as usize,
+            func,
+            sp,
+            shadow_sp: slot.shadow_sp.load(Ordering::Relaxed),
+        });
     }
     set_current(prev);
+    out
+}
+
+/// Durable **thaw** re-seeding (slice 3.3.3): re-create each frozen fiber in the run-shared table
+/// before the root re-enters under `REWINDING`. Builds a fiber that re-enters its recorded entry
+/// (`make_fiber`, the same path as `cont.new`) at its dense slot, with its flattened shadow-SP
+/// restored. The seed is sorted/dense by slot, so handles match the freeze (`cont.resume k` resolves
+/// the same fiber). `rt` supplies the per-run threaded context; `mem_base`/`fn_table_base`/`trap_out`
+/// are this run's window/table/trap cell.
+///
+/// # Safety
+/// `rt` is the live runtime (its `call_tramp`/`mask`/`type_id` set); the addresses are this run's.
+pub(crate) unsafe fn seed_frozen_fibers(
+    rt: *mut FiberRuntime,
+    seed: &[crate::FrozenFiber],
+    mem_base: u64,
+    fn_table_base: u64,
+    trap_out: u64,
+) {
+    let r = &*rt;
+    let (mask, type_id, call_tramp) = (
+        r.fn_table_mask,
+        r.fiber_type_id,
+        r.call_tramp
+            .expect("call-trampoline set before seeding thawed fibers"),
+    );
+    let mut seed = seed.to_vec();
+    seed.sort_by_key(|f| f.slot);
+    for (expected, f) in seed.iter().enumerate() {
+        let fiber = make_fiber(
+            f.func,
+            f.sp as u64,
+            mem_base,
+            fn_table_base,
+            trap_out,
+            mask,
+            type_id,
+            call_tramp,
+        );
+        let got = r
+            .table
+            .seed_frozen(Box::new(fiber), f.func, f.sp, f.shadow_sp);
+        debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
+        debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
+    }
 }
 
 /// This frame's stack pointer (approximately): the address of a local, slightly **below** the

@@ -18,14 +18,54 @@
 
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex};
-use svm_durable::{init_durable_window, transform_module, write_state, STATE_UNWINDING};
-use svm_interp::{
-    run_capture_reserved_with_host, Host, DURABLE_RESERVE, SHADOW_BASE, SHADOW_SP_OFF,
-    SHADOW_STRIDE,
+use svm_durable::{
+    init_durable_window, transform_module, write_state, STATE_REWINDING, STATE_UNWINDING,
 };
-use svm_jit::{compile_and_run_capture_reserved_with_host_durable, JitOutcome};
+use svm_interp::{
+    run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value, DURABLE_RESERVE,
+    SHADOW_BASE, SHADOW_SP_OFF, SHADOW_STRIDE,
+};
+use svm_jit::{
+    compile_and_run_capture_reserved_with_host_durable, FrozenFiber as JitFrozen, JitOutcome,
+};
+use svm_snapshot::{freeze, restore};
 use svm_text::parse_module;
 use svm_verify::verify_module;
+
+/// A pure-arithmetic fiber module the cross-backend freeze/thaw tests share: root resumes a fiber
+/// twice (the fiber suspends once, yielding 42, then returns 7 + 100 = 107). No caps ⇒ deterministic.
+const FIBER_SRC: &str = "memory 17\n\
+    func () -> (i64) {\n\
+    block0():\n\
+    \x20 v0 = ref.func 1\n\
+    \x20 v1 = i64.const 4096\n\
+    \x20 v2 = cont.new v0 v1\n\
+    \x20 v3 = i64.const 0\n\
+    \x20 v4, v5 = cont.resume v2 v3\n\
+    \x20 v6 = i64.const 7\n\
+    \x20 v7, v8 = cont.resume v2 v6\n\
+    \x20 return v8\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block0(v0: i64, v1: i64):\n\
+    \x20 v2 = i64.const 42\n\
+    \x20 v3 = suspend v2\n\
+    \x20 v4 = i64.const 100\n\
+    \x20 v5 = i64.add v3 v4\n\
+    \x20 return v5\n\
+    }\n";
+
+fn jit_seed(interp: &[InterpFrozen]) -> Vec<JitFrozen> {
+    interp
+        .iter()
+        .map(|f| JitFrozen {
+            slot: f.slot,
+            func: f.func,
+            sp: f.sp,
+            shadow_sp: f.shadow_sp,
+        })
+        .collect()
+}
 
 const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ DURABLE_RESERVE (64 KiB)
 const WINDOW: usize = 1 << WINDOW_LOG2;
@@ -76,12 +116,13 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     init[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]
         .copy_from_slice(&SHADOW_BASE.to_le_bytes());
 
-    let (outcome, _win) = compile_and_run_capture_reserved_with_host_durable(
+    let (outcome, _win, _residue) = compile_and_run_capture_reserved_with_host_durable(
         &m,
         0,
         &[hf as i64],
         &init,
         &[], // freeze-style: no page protections to re-establish
+        &[], // no fibers to re-seed (a probe run, not a thaw)
         WINDOW_LOG2,
         svm_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
@@ -165,12 +206,13 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW);
     write_state(&mut jwin, STATE_UNWINDING);
-    let (jout, jsnap) = compile_and_run_capture_reserved_with_host_durable(
+    let (jout, jsnap, _residue) = compile_and_run_capture_reserved_with_host_durable(
         &inst,
         0,
         &[],
         &jwin,
         &[],
+        &[], // freeze: no seed
         WINDOW_LOG2,
         svm_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
@@ -189,4 +231,134 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
         &jsnap[..reserve],
         "interp/JIT freeze the parked fiber into a byte-identical durable reserve"
     );
+}
+
+/// Phase-3 slice 3.3.3 (export): the JIT **freeze** exports the same `FrozenFiber` residue the
+/// interpreter does, so a JIT-frozen fiber domain serializes to a **byte-identical §12 artifact**
+/// (window image + Section-2 fiber residue) — the artifact is backend-independent for fibers too.
+#[test]
+fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
+    let m = parse_module(FIBER_SRC).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+
+    // Interp freeze → artifact_i.
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW);
+    write_state(&mut iwin, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok());
+    let artifact_i = freeze(&inst, &isnap, &ihost).expect("interp artifact");
+
+    // JIT freeze → residue; serialize through the same codec (set the JIT residue on a host).
+    let mut jhost = Host::new();
+    let mut jwin = init_durable_window(WINDOW);
+    write_state(&mut jwin, STATE_UNWINDING);
+    let (_jout, jsnap, residue) = compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[],
+        &jwin,
+        &[],
+        &[],
+        WINDOW_LOG2,
+        svm_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+    )
+    .expect("JIT freeze");
+    assert_eq!(
+        residue.len(),
+        1,
+        "the JIT freeze exported the flattened fiber"
+    );
+    // Re-state the JIT's residue (as interp `FrozenFiber`) on a host and serialize identically.
+    let mut jhost2 = Host::new();
+    jhost2.set_frozen_fibers(
+        residue
+            .iter()
+            .map(|f| InterpFrozen {
+                slot: f.slot,
+                func: f.func,
+                sp: f.sp,
+                shadow_sp: f.shadow_sp,
+            })
+            .collect(),
+    );
+    let artifact_j = freeze(&inst, &jsnap, &jhost2).expect("JIT artifact");
+
+    assert_eq!(
+        artifact_i, artifact_j,
+        "interp/JIT freeze a fiber'd domain to a byte-identical §12 artifact (incl. Section 2)"
+    );
+}
+
+/// Phase-3 slice 3.3.3 (thaw): an **interpreter-frozen** fiber artifact, restored through the §12
+/// codec, **resumes on the JIT** and reproduces the uninterrupted result — the JIT re-seeds the
+/// fiber from Section 2 and re-enters it under REWINDING (rewind → re-park → run forward). This
+/// crosses both the backend boundary and the serialize/restore one, for fibers.
+#[test]
+fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
+    let m = parse_module(FIBER_SRC).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+
+    // Uninterrupted baseline (interp NORMAL): 7 + 100 = 107.
+    let mut bhost = Host::new();
+    let mut bfuel = 1_000_000u64;
+    let (base, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[],
+        &mut bfuel,
+        &init_durable_window(WINDOW),
+        WINDOW_LOG2,
+        &mut bhost,
+    );
+    assert_eq!(base, Ok(vec![Value::I64(107)]), "uninterrupted: 7 + 100");
+
+    // Interp freeze → serialize.
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW);
+    write_state(&mut iwin, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok());
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
+
+    // Restore (re-seeds the frozen fibers into a fresh host) → bridge the residue to the JIT.
+    let mut thost = Host::new();
+    let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
+    write_state(&mut thaw_win, STATE_REWINDING);
+    let seed = jit_seed(thost.frozen_fibers());
+    assert_eq!(seed.len(), 1, "the artifact carried one frozen fiber");
+
+    // Thaw on the JIT: re-seed the fiber, re-enter under REWINDING, run to completion.
+    let mut jhost = Host::new();
+    let (jout, _win, _res) = compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[],
+        &thaw_win,
+        &[],
+        &seed,
+        WINDOW_LOG2,
+        svm_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+    )
+    .expect("JIT thaw");
+    match jout {
+        JitOutcome::Returned(slots) => {
+            assert_eq!(
+                slots,
+                vec![107],
+                "JIT thaw of the fiber artifact reproduces 107"
+            )
+        }
+        other => panic!("JIT thaw: expected Returned([107]), got {other:?}"),
+    }
 }
