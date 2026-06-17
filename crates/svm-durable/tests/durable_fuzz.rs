@@ -15,3 +15,14 @@ fn freeze_thaw_equivalence_over_generated_modules() {
         durgen::fuzz_one(&mut g);
     }
 }
+
+#[test]
+fn fiber_freeze_thaw_equivalence_over_generated_modules() {
+    // The §12.8 single-fiber freeze/thaw property over generated root+fiber modules (varying
+    // suspend counts, live-across-suspend values, multi-point resume/suspend). The libFuzzer
+    // target `durable_fiber` does the heavy continuous run.
+    for seed in 0..400u64 {
+        let mut g = durgen::Gen::from_seed(seed);
+        durgen::fuzz_fiber_one(&mut g);
+    }
+}

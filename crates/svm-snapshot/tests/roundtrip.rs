@@ -37,6 +37,31 @@ block0(v0: i32):
 }
 "#;
 
+// A fiber'd module (slice 3.1.5): root resumes a fiber that suspends once, then resumes it again;
+// the fiber returns 7 + 100. Freezing between the two resumes parks the fiber, so the artifact
+// must carry the fiber's continuation (window shadow region) + its residue (Section 2).
+const SRC_FIBER: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.const 7
+  v7, v8 = cont.resume v2 v6
+  return v8
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 42
+  v3 = suspend v2
+  v4 = i64.const 100
+  v5 = i64.add v3 v4
+  return v5
+}
+"#;
+
 fn instrument(src: &str) -> Module {
     let mut m = svm_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
@@ -130,6 +155,74 @@ fn freeze_serialize_restore_thaw_through_the_codec() {
         thawed,
         Ok(vec![Value::I64(142)]),
         "saved cap result (42) reloaded, not re-issued (which would give 100)"
+    );
+}
+
+#[test]
+fn fiber_freeze_serialize_restore_thaw_through_the_codec() {
+    let inst = instrument(SRC_FIBER);
+
+    // Baseline: uninterrupted run → 107.
+    let mut host = Host::new();
+    let mut fuel = 100_000u64;
+    let (baseline, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[],
+        &mut fuel,
+        &init_durable_window(WINDOW),
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(
+        baseline,
+        Ok(vec![Value::I64(107)]),
+        "uninterrupted: 7 + 100"
+    );
+
+    // Freeze run: UNWINDING from the start unwinds the root at resume #1 (fiber parked), then the
+    // freeze driver flattens the parked fiber into its shadow region and exports its residue.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 100_000u64;
+    let (frozen, snapshot) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
+    assert!(frozen.is_ok(), "freeze returns a placeholder: {frozen:?}");
+    assert_eq!(fhost.frozen_fibers().len(), 1, "one fiber flattened");
+
+    // Serialize the real artifact (now carrying Section 2 — the fiber residue).
+    let artifact = freeze(&inst, &snapshot, &fhost).expect("freeze");
+
+    // Restore into a FRESH host: re-grants handles (none here) and re-seeds the frozen fibers.
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let window = restore(&artifact, &inst, &mut thost).expect("restore");
+    assert_eq!(
+        thost.frozen_fibers().len(),
+        1,
+        "restore re-seeded the frozen fiber"
+    );
+
+    // §12.6 invariant 1 — canonical: re-serializing the restored domain at the same safepoint
+    // reproduces the artifact byte-for-byte (Section 2 included).
+    assert_eq!(
+        freeze(&inst, &window, &thost).expect("re-freeze"),
+        artifact,
+        "re-serialize of a restored fiber'd domain is byte-identical"
+    );
+
+    // Thaw: flip to REWINDING and re-enter. The root rewinds and re-issues cont.resume; the
+    // re-seeded fiber re-enters its entry, rewinds, re-parks; forward execution then completes.
+    let mut win = window;
+    write_state(&mut win, STATE_REWINDING);
+    let mut fuel = 100_000u64;
+    let (thawed, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut thost);
+    assert_eq!(
+        thawed, baseline,
+        "thawed fiber'd run equals the uninterrupted run"
     );
 }
 

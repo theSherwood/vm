@@ -24,19 +24,22 @@
 //!
 //! # Scope
 //!
-//! Single vCPU, no fibers. The window image is sparse with **zero-page elision** and carries
-//! per-page protection (`Rw`/`Ro`/`Unmapped`, §12.3) — see [`freeze_with_prots`] /
-//! [`restore_with_prots`]; the flat [`freeze`]/[`restore`] treat the whole window as `Rw`.
-//! Control state is just the header's `vcpu_count = 1` / `fiber_count = 0` (the state word is
-//! in the window image). Capturing real protections from a running backend and re-establishing
-//! them on the runtime window (escape-TCB) is the next Phase-2 slice; §12.4 fiber/dispatch
-//! state is later. A `Backed` (§13 shared-region) page is out of scope — D-region: freeze
-//! refuses a domain holding shared regions. The TLV container is forward-compatible.
+//! Single vCPU. The window image is sparse with **zero-page elision** and carries per-page
+//! protection (`Rw`/`Ro`/`Unmapped`, §12.3) — see [`freeze_with_prots`] / [`restore_with_prots`];
+//! the flat [`freeze`]/[`restore`] treat the whole window as `Rw`. **Fibers** ride along (§12.4 /
+//! slice 3.1.5): a freeze flattens each parked fiber's continuation into the window image and
+//! records its small residue (`svm_interp::FrozenFiber`) in a **control section** (tag 2), which
+//! `restore` re-seeds into the `Host`; the section is elided when there are no fibers, so a
+//! no-fiber artifact is byte-identical to the pre-fiber format. Capturing real protections from a
+//! running backend and re-establishing them on the runtime window (escape-TCB) is the next Phase-2
+//! slice; the dispatch table stays a module-derived no-op (§12.4). A `Backed` (§13 shared-region)
+//! page is out of scope — D-region: freeze refuses a domain holding shared regions. The TLV
+//! container is forward-compatible.
 
 #![forbid(unsafe_code)]
 
 use svm_encode::encode_module;
-use svm_interp::{DurableBinding, DurableHandle, Host, NonDurableHandle, StreamRole};
+use svm_interp::{DurableBinding, DurableHandle, FrozenFiber, Host, NonDurableHandle, StreamRole};
 use svm_ir::Module;
 
 /// Container magic (§12.2): "SVM-Durable".
@@ -49,9 +52,12 @@ const FORMAT_VERSION: u16 = 1;
 pub const PAGE: usize = 4096;
 const _: () = assert!(PAGE as u64 == svm_interp::DURABLE_SNAPSHOT_PAGE);
 
-// ---- Section tags (ascending, §12.2-12.5). Tag 2 (control state) is unused in Phase 1. ----
+// ---- Section tags (ascending, §12.2-12.5). ----
 const TAG_HEADER: u64 = 0;
 const TAG_WINDOW: u64 = 1;
+/// Control state (§12.4) — the freeze/thaw fiber residue (slice 3.1.5). Emitted only when the
+/// domain has frozen fibers, so a single-vCPU/no-fiber artifact is byte-identical to before.
+const TAG_CONTROL: u64 = 2;
 const TAG_HANDLES: u64 = 3;
 
 // ---- Binding descriptors (§12.5). One tag byte + value-typed payload. ----
@@ -105,7 +111,8 @@ pub enum RestoreError {
     Truncated,
     /// A section body was malformed (bad varint, unknown binding tag, leftover bytes, …).
     Malformed,
-    /// Required section (header / window / handles) missing.
+    /// A required section is missing (header / window / handles, or the control section when the
+    /// header declares fibers).
     MissingSection(u64),
     /// The artifact's instrumented-module digest doesn't match the module restore was handed
     /// (R5 / §12.6 invariant 2 — the durability boundary).
@@ -148,6 +155,9 @@ pub fn freeze_with_prots(
     let handles = host
         .capture_durable_handles()
         .map_err(FreezeError::NonDurableHandle)?;
+    // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
+    let mut fibers = host.frozen_fibers().to_vec();
+    fibers.sort_by_key(|f| f.slot);
     let digest = digest256(&encode_module(module));
     let reserved_log2 = window.len().trailing_zeros() as u8;
 
@@ -162,7 +172,7 @@ pub fn freeze_with_prots(
         write_uleb(b, window.len() as u64); // mapped
         write_uleb(b, PAGE as u64); // host page size at capture
         write_uleb(b, 1); // vcpu_count (single-vCPU Phase 1)
-        write_uleb(b, 0); // fiber_count
+        write_uleb(b, fibers.len() as u64); // fiber_count (§12.4)
     });
 
     // Section 1 — Window image (§12.3): sparse + zero-eliding, ascending page index. A page is
@@ -193,6 +203,22 @@ pub fn freeze_with_prots(
             }
         }
     });
+
+    // Section 2 — Control state (§12.4): the frozen-fiber residue. Each fiber's continuation lives
+    // in its in-window shadow region (already in the window image); this records the small
+    // host-side residue needed to re-enter it on thaw. Emitted only when there are fibers, so a
+    // no-fiber artifact is byte-identical to the pre-fiber format.
+    if !fibers.is_empty() {
+        section(&mut out, TAG_CONTROL, |b| {
+            write_uleb(b, fibers.len() as u64);
+            for f in &fibers {
+                write_uleb(b, f.slot as u64);
+                write_uleb(b, f.func as u32 as u64);
+                write_uleb(b, f.sp as u64);
+                write_uleb(b, f.shadow_sp);
+            }
+        });
+    }
 
     // Section 3 — Handle table (§12.5): ascending slot (capture already orders it).
     section(&mut out, TAG_HANDLES, |b| {
@@ -234,7 +260,7 @@ pub fn restore_with_prots(
         return Err(RestoreError::UnsupportedVersion(version));
     }
 
-    let (mut header, mut win_body, mut handles_body) = (None, None, None);
+    let (mut header, mut win_body, mut handles_body, mut control_body) = (None, None, None, None);
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -242,6 +268,7 @@ pub fn restore_with_prots(
         match tag {
             TAG_HEADER => header = Some(body),
             TAG_WINDOW => win_body = Some(body),
+            TAG_CONTROL => control_body = Some(body),
             TAG_HANDLES => handles_body = Some(body),
             _ => {} // forward-compatible: skip unknown sections
         }
@@ -257,7 +284,7 @@ pub fn restore_with_prots(
     let mapped = h.uleb()? as usize;
     let page_size = h.uleb()? as usize;
     let _vcpu_count = h.uleb()?;
-    let _fiber_count = h.uleb()?;
+    let fiber_count = h.uleb()?;
     if digest != digest256(&encode_module(module)) {
         return Err(RestoreError::ModuleMismatch);
     }
@@ -327,7 +354,50 @@ pub fn restore_with_prots(
     }
     host.restore_durable_handles(&handles);
 
+    // ---- Control state (§12.4): decode the frozen-fiber residue and seed it for the thaw. The
+    // section is present iff the header's fiber_count is non-zero (canonical); restore re-seeds the
+    // Host so the next (REWINDING) run re-creates the fibers in the registry. ----
+    let fibers = decode_control(control_body, fiber_count)?;
+    host.set_frozen_fibers(fibers);
+
     Ok((window, prots))
+}
+
+/// Decode Section 2's frozen-fiber residue, enforcing the header's `fiber_count` and canonical
+/// ascending-slot order. `None` body is valid only for zero fibers (the section is elided then).
+fn decode_control(body: Option<&[u8]>, fiber_count: u64) -> Result<Vec<FrozenFiber>, RestoreError> {
+    let body = match (body, fiber_count) {
+        (None, 0) => return Ok(Vec::new()), // no fibers ⇒ no section (canonical)
+        (None, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
+        (Some(b), _) => b,
+    };
+    let mut cr = Reader::new(body);
+    let n = cr.uleb()?;
+    if n != fiber_count {
+        return Err(RestoreError::Malformed); // header and section must agree
+    }
+    let mut fibers = Vec::with_capacity(n as usize);
+    let mut last: Option<u64> = None;
+    for _ in 0..n {
+        let slot = cr.uleb()?;
+        if last.is_some_and(|p| slot <= p) {
+            return Err(RestoreError::Malformed); // non-canonical: slots must ascend
+        }
+        last = Some(slot);
+        let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
+        let sp = cr.uleb()? as i64;
+        let shadow_sp = cr.uleb()?;
+        fibers.push(FrozenFiber {
+            slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
+            func,
+            sp,
+            shadow_sp,
+        });
+    }
+    if !cr.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok(fibers)
 }
 
 // ---- Binding (de)serialization (§12.5) ----

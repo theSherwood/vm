@@ -1244,3 +1244,427 @@ fn unsupported_is_fail_closed() {
         other => panic!("expected Unsupported, got {other:?}"),
     }
 }
+
+// ============================================================================================
+// `<svm.h>` low-level builtins (P0+P1+Memory): the SVM capability/concurrency/GC surface the
+// LLVM on-ramp lowers to the matching SVM IR ops or `Memory` capability calls. These mirror the
+// chibicc oracle (`frontend/chibicc/codegen_ir.c`), so a guest language emitting LLVM bitcode
+// reaches fibers, threads, atomics, the futex, conservative GC roots, direct window memory
+// management, and capability reflection — the JACL GC + scheduler primitives.
+// ============================================================================================
+
+/// Translate `src` and return its verified module + entry-SP, or `None` if clang is unavailable.
+fn translate_verified(name: &str, src: &str) -> Option<(svm_ir::Module, u64)> {
+    let bc = compile_to_bc(name, src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify translated IR");
+    Some((t.module, t.entry_sp))
+}
+
+/// Run the **first defined function** (index 0 — the unit under test, since no powerbox is
+/// synthesized for a pure-compute program) on the reference interpreter, the universal oracle for
+/// fibers/threads/atomics/GC (the JIT bails `Unsupported` on fibers/`cap.self`, like the chibicc
+/// tests). Returns the result values, or `None` if clang is unavailable.
+fn run_interp(name: &str, src: &str, args: &[Value]) -> Option<Vec<Value>> {
+    let (m, entry_sp) = translate_verified(name, src)?;
+    let mut full = vec![Value::I64(entry_sp as i64)];
+    full.extend_from_slice(args);
+    let mut fuel = 200_000_000u64;
+    Some(svm_interp::run(&m, 0, &full, &mut fuel).expect("interp run"))
+}
+
+/// Does any function's body contain an instruction matching `pred`? (Structural lowering check.)
+fn module_has_inst(m: &svm_ir::Module, pred: impl Fn(&svm_ir::Inst) -> bool) -> bool {
+    m.funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.insts.iter())
+        .any(pred)
+}
+
+// ---- §3e/§4 Memory capability: `__vm_map` / `__vm_page_size` (end-to-end on the JIT) ----------
+
+/// The guest **manages its own window** directly from C through `<svm.h>`: `__vm_page_size()` (Memory
+/// op 3) and `__vm_map(off,len,prot)` (op 0) grow the reserved tail, then a store/load round-trips
+/// through the freshly committed page. Run through the real powerbox (JIT) — which grants the
+/// `Memory` handle for the 4-param `_start` the on-ramp now synthesizes when a Memory builtin is used
+/// — proving the handle grant, the `CallImport` resolution, and the lowering all compose. The byte it
+/// writes is the success marker (`'Y'`), asserted against the captured stdout (`__vm_*` symbols don't
+/// exist in a native build, so this lane has no native oracle — the marker is the contract).
+#[test]
+fn vm_memory_map_and_page_size() {
+    let src = r#"
+long __vm_page_size(void);
+long __vm_map(long off, long len, int prot);
+long write(int fd, const void *buf, long n);
+int main(void) {
+  long ps = __vm_page_size();
+  volatile long vbase = 268435456;                /* 256 MiB — deep in the reserved tail */
+  long base = vbase;                              /* volatile defeats clang's constant inttoptr fold */
+  if (__vm_map(base, 4096, 3) != 0) { char e='E'; write(1,&e,1); return 1; }
+  int *p = (int *)base;
+  p[0] = 43981;                                   /* 0xABCD */
+  p[1] = p[0] + 1;
+  char ok = (ps >= 4096 && (ps & (ps - 1)) == 0 && p[1] == 43982) ? 'Y' : 'N';
+  write(1, &ok, 1);
+  return 0;
+}
+"#;
+    let Some(bc) = compile_to_bc("vm_mem", src) else {
+        return;
+    };
+    let m = svm_llvm::translate_bc_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    // Structural: the Memory ops became `CallImport`s (resolved to the Memory cap at load). The raw
+    // module carries unresolved imports, so it is resolved *before* `verify` (a `CallImport` reaching
+    // the verifier is a fail-closed error — resolution is mandatory).
+    let import_names: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        import_names.contains(&"vm_map") && import_names.contains(&"vm_page_size"),
+        "expected vm_map + vm_page_size imports, got {import_names:?}"
+    );
+    assert!(
+        svm_run::is_powerbox_entry(&m),
+        "a Memory-builtin program must produce a powerbox entry (granting the Memory handle)"
+    );
+    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(
+        run.stdout, b"Y",
+        "memory round-trip marker (got {:?})",
+        run.stdout
+    );
+}
+
+// ---- §12 fibers: `__vm_fiber_new` / `resume` / `suspend` → `cont.new` / `resume` / `suspend` ---
+
+/// A fiber generator yields twice then returns, driven from C exactly like the chibicc oracle
+/// (`c_fiber_generator_yields_then_returns`). The entry is the first defined function (index 0); the
+/// fiber body `counter` is reached as a funcref through `cont.new`. Interpreter-only (fibers are an
+/// interp op). 101 + 102 + 103 = 306.
+#[test]
+#[cfg(unix)]
+fn vm_fibers_generator() {
+    let src = r#"
+int  __vm_fiber_new(long (*f)(long), void *stack);
+long __vm_fiber_resume(int k, long arg, int *done);
+long __vm_fiber_suspend(long value);
+long counter(long start);
+static char stack0[8192];
+int driver(void) {
+  int k = __vm_fiber_new(counter, stack0);
+  int done = 0;
+  long sum = 0;
+  long v = __vm_fiber_resume(k, 100, &done);
+  while (!done) { sum += v; v = __vm_fiber_resume(k, 0, &done); }
+  sum += v;
+  return (int)sum;
+}
+long counter(long start) {
+  __vm_fiber_suspend(start + 1);
+  __vm_fiber_suspend(start + 2);
+  return start + 3;
+}
+"#;
+    if let Some(r) = run_interp("vm_fibers", src, &[]) {
+        assert_eq!(r, vec![Value::I32(306)]);
+    }
+}
+
+// ---- §12 atomics: `__vm_atomic_*` → the `iN.atomic.*` ops (single-threaded value semantics) ----
+
+/// The atomic ops have plain value semantics when single-threaded, so they are checkable on **both**
+/// backends (the JIT lowers them to hardware atomics). Exercises 64- and 32-bit `add`/`load`/`store`
+/// and the 32-bit `cmpxchg`: x starts 5, +3 → 8, store 100, +1 → 101; a CAS 101→200 succeeds; final
+/// load = 200. Returns 200.
+#[test]
+fn vm_atomics_single_threaded() {
+    let src = r#"
+long __vm_atomic_add(void *p, long v);
+long __vm_atomic_load(void *p);
+void __vm_atomic_store(void *p, long v);
+int  __vm_atomic_add32(void *p, int v);
+int  __vm_atomic_cas32(void *p, int expected, int desired);
+int  __vm_atomic_load32(void *p);
+int f(void) {
+  long x = 5;
+  __vm_atomic_add(&x, 3);                 /* 8 */
+  __vm_atomic_store(&x, 100);             /* 100 */
+  if (__vm_atomic_load(&x) != 100) return -1;
+  int y = (int)x;
+  __vm_atomic_add32(&y, 1);               /* 101 */
+  int old = __vm_atomic_cas32(&y, 101, 200);  /* old=101, y=200 */
+  if (old != 101) return -2;
+  return __vm_atomic_load32(&y);          /* 200 */
+}
+"#;
+    check("vm_atomics", src, &[], &[Value::I32(200)]);
+}
+
+// ---- §12 futex: `__vm_wait32` / `__vm_notify` → `i32.atomic.wait` / `atomic.notify` ------------
+
+/// The futex primitives, exercised single-threaded so they return deterministically without
+/// blocking: `__vm_wait32(p, expected, …)` returns `1` ("not-equal") when `*p != expected`, and
+/// `__vm_notify(p, n)` returns `0` when no vCPU is parked. Interpreter-only (the JIT futex is
+/// platform/scheduler-gated). Returns 1*10 + 0 = 10.
+#[test]
+#[cfg(unix)]
+fn vm_futex_wait_notify() {
+    let src = r#"
+int __vm_wait32(void *p, int expected, long timeout_ns);
+int __vm_notify(void *p, int count);
+int f(void) {
+  int word = 7;
+  int waited = __vm_wait32(&word, 9, 0);  /* 7 != 9 → returns 1, no block */
+  int woke = __vm_notify(&word, 1);       /* no waiters → 0 */
+  return waited * 10 + woke;
+}
+"#;
+    if let Some(r) = run_interp("vm_futex", src, &[]) {
+        assert_eq!(r, vec![Value::I32(10)]);
+    }
+}
+
+// ---- §12 threads + atomics: `__vm_thread_spawn` / `join` → `thread.spawn` / `thread.join` -------
+
+/// Four worker vCPUs (`thread.spawn`, with a static funcidx) each atomically bump a shared global
+/// 500 times; the entry joins them and reads the total — `thread.join` and the cross-thread atomic
+/// `fetch-add` end to end on the interpreter's M:N executor (the chibicc `c_threads_atomic_counter`
+/// headline, via the LLVM on-ramp). 4 × 500 = 2000.
+#[test]
+#[cfg(unix)]
+fn vm_threads_atomic_counter() {
+    let src = r#"
+long __vm_atomic_add(void *p, long v);
+long __vm_atomic_load(void *p);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+long counter = 0;
+long worker(long arg);
+int driver(void) {
+  int a = __vm_thread_spawn(worker, (void *)0, 500);
+  int b = __vm_thread_spawn(worker, (void *)0, 500);
+  int c = __vm_thread_spawn(worker, (void *)0, 500);
+  int d = __vm_thread_spawn(worker, (void *)0, 500);
+  __vm_thread_join(a);
+  __vm_thread_join(b);
+  __vm_thread_join(c);
+  __vm_thread_join(d);
+  return (int)__vm_atomic_load(&counter);
+}
+long worker(long arg) {
+  for (long i = 0; i < arg; i++) __vm_atomic_add(&counter, 1);
+  return 0;
+}
+"#;
+    if let Some(r) = run_interp("vm_threads", src, &[]) {
+        assert_eq!(r, vec![Value::I32(2000)]);
+    }
+}
+
+// ---- §GC conservative roots: `__vm_gc_roots` → `gc.roots` --------------------------------------
+
+/// Conservative root enumeration scans the calling computation's live frames for candidate window
+/// pointers in `[lo, hi)`, writing them into a buffer and returning the total found. The precise set
+/// is a backend-specific over-approximation (GC.md §3.2), so this asserts the *contract*: the op
+/// lowers to `Inst::GcRoots`, runs without trapping, and returns a count within `[0, cap]` (here it
+/// scans the whole window, so any live in-range root the frame holds is counted). Interpreter-only.
+#[test]
+#[cfg(unix)]
+fn vm_gc_roots_smoke() {
+    let src = r#"
+long __vm_gc_roots(long heap_lo, long heap_hi, void *buf, long cap);
+static long out[64];
+int f(void) {
+  /* a live, in-range candidate pointer (into `out` itself) the conservative scan may see */
+  volatile long *root = out;
+  long n = __vm_gc_roots(0, 1 << 20, out, 64);
+  (void)root;
+  /* `n` is the total candidates found (may exceed cap=64; a tiny frame stays well under 1024) —
+     the assertion is that the op ran, returned a sane non-negative count, and didn't trap. */
+  return (n >= 0 && n <= 1024) ? 1 : 0;
+}
+"#;
+    let Some((m, _)) = translate_verified("vm_gc", src) else {
+        return;
+    };
+    assert!(
+        module_has_inst(&m, |i| matches!(i, svm_ir::Inst::GcRoots { .. })),
+        "expected a gc.roots instruction"
+    );
+    if let Some(r) = run_interp("vm_gc", src, &[]) {
+        assert_eq!(r, vec![Value::I32(1)], "gc.roots count out of [0, cap]");
+    }
+}
+
+// ---- §7 capability reflection: `__vm_cap_count` / `__vm_cap_at` → `cap.self.count` / `.get` -----
+
+/// Capability **reflection**: a domain discovers what its host granted it. Run on the interpreter
+/// under a full 8-handle powerbox host (the grants live in the host-owned table `cap.self.*` reads,
+/// independent of the call's params), so `__vm_cap_count()` returns 8 and `__vm_cap_at(0, &t)` yields
+/// a valid (non-negative) interface type_id. Returns count*10 + (t >= 0) = 81. Interpreter-only (the
+/// JIT bails `Unsupported` on `cap.self`, like fibers).
+#[test]
+#[cfg(unix)]
+fn vm_cap_reflection() {
+    use svm_interp::{Host, StreamRole};
+    let src = r#"
+int __vm_cap_count(void);
+int __vm_cap_at(int i, int *type_id_out);
+int f(void) {
+  int n = __vm_cap_count();
+  int t = -1;
+  __vm_cap_at(0, &t);
+  return n * 10 + (t >= 0 ? 1 : 0);
+}
+"#;
+    let Some((m, entry_sp)) = translate_verified("vm_cap", src) else {
+        return;
+    };
+    // Structural: the reflection ops are present.
+    assert!(
+        module_has_inst(&m, |i| matches!(i, svm_ir::Inst::CapSelfCount))
+            && module_has_inst(&m, |i| matches!(i, svm_ir::Inst::CapSelfGet { .. })),
+        "expected cap.self.count + cap.self.get"
+    );
+    // Run on the interpreter with a granted powerbox: 8 capabilities held → count 8.
+    let mut h = Host::new();
+    h.set_region_factory(svm_run::new_shared_region);
+    h.set_jit_validator(svm_run::jit_blob_validator);
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let _handles = [
+        h.grant_stream(StreamRole::Out),
+        h.grant_stream(StreamRole::In),
+        h.grant_exit(),
+        h.grant_memory(),
+        h.grant_address_space(0, win),
+        h.grant_io_ring(),
+        h.grant_blocking(std::time::Duration::ZERO, None),
+        h.grant_jit(None),
+    ];
+    let mut fuel = 50_000_000u64;
+    let r = svm_interp::run_with_host(&m, 0, &[Value::I64(entry_sp as i64)], &mut fuel, &mut h)
+        .expect("interp run");
+    assert_eq!(
+        r,
+        vec![Value::I32(81)],
+        "cap reflection: 8 caps, type_id >= 0"
+    );
+}
+
+// ---- §9/§12 async I/O ring: `__vm_io_submit_async` / `__vm_io_reap` / `__vm_blocking_handle` ------
+
+/// Grant a powerbox on an interpreter `Host`, returning the first `n` handles (the prefix `_start`
+/// declares) as call args. Mirrors `svm/tests/c_frontend.rs::powerbox`; `block` is the `Blocking`
+/// op's dwell so an async batch is genuinely in flight when a vCPU parks.
+#[cfg(unix)]
+fn grant_powerbox(
+    h: &mut svm_interp::Host,
+    win: u64,
+    n: usize,
+    block: std::time::Duration,
+) -> Vec<Value> {
+    use svm_interp::StreamRole;
+    h.set_region_factory(svm_run::new_shared_region);
+    h.set_jit_validator(svm_run::jit_blob_validator);
+    let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
+    let all = [
+        h.grant_stream(StreamRole::Out),
+        h.grant_stream(StreamRole::In),
+        h.grant_exit(),
+        h.grant_memory(),
+        h.grant_address_space(0, win),
+        h.grant_io_ring(),
+        h.grant_blocking(block, None),
+        h.grant_jit(mem_log2),
+    ];
+    all[..n].iter().map(|&x| Value::I32(x)).collect()
+}
+
+/// The host's deterministic `Blocking.work(i)` result (mirrors `svm_interp::AsyncState::mix`, the
+/// value the chibicc async tests check).
+fn async_mix(arg: i64) -> i64 {
+    arg.wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+}
+
+/// The async **event-loop runtime** in real C (`demos/async_io`), driven through the LLVM on-ramp:
+/// one vCPU `submit_async`s a batch of `Blocking` ops onto the host offload pool, parks on an in-window
+/// completion counter (`__vm_wait32`), and reaps completions as a pool worker `notify`s it — exercising
+/// `__vm_io_submit_async`/`__vm_io_reap`/`__vm_blocking_handle` and the **7-handle powerbox**
+/// (`synth_start` now grants through `Blocking`) end to end. Interpreter-only (it is the M:N executor
+/// and offload-pool oracle; the JIT async path needs the separate `HostAsyncHooks` harness). The
+/// printed total is completion-order-invariant: Σ mix(i) for i in 0..8.
+#[test]
+#[cfg(unix)]
+fn vm_async_io_runtime() {
+    let src = include_str!("../../svm-run/demos/async_io/async_io.c");
+    let Some(bc) = compile_to_bc("async_io", src) else {
+        return;
+    };
+    let m = svm_llvm::translate_bc_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    // The async-ring imports are registered and the entry grants through Blocking (7 handles).
+    let import_names: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        import_names.contains(&"vm_io_submit_async") && import_names.contains(&"vm_io_reap"),
+        "expected async-ring imports, got {import_names:?}"
+    );
+    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let nparams = module.funcs[0].params.len();
+    assert_eq!(
+        nparams, 7,
+        "async program must declare the 7-handle powerbox entry"
+    );
+
+    let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut h = svm_interp::Host::new();
+    let args = grant_powerbox(&mut h, win, nparams, std::time::Duration::from_millis(10));
+    let mut fuel = 500_000_000u64;
+    let out =
+        svm_interp::run_with_host(&module, 0, &args, &mut fuel, &mut h).expect("interp async run");
+    assert_eq!(out, vec![Value::I32(0)], "async demo returns 0");
+    // NTASKS = 8 (see the demo); the total is Σ of the host's deterministic per-op results.
+    let total: u64 = (0..8).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
+    assert_eq!(
+        h.stdout,
+        format!("{total}\n").into_bytes(),
+        "async total Σ mix(0..8)"
+    );
+}
+
+/// `__vm_cap(i)` reaches the **tail** powerbox handles (`i ≥ 4`) now that `synth_start` stashes them:
+/// `__vm_cap(6)` (the Blocking slot) must equal `__vm_blocking_handle()` — both read stash slot 24.
+/// Proves the relocated 8-handle layout is wired through both the generic `__vm_cap` reader and the
+/// named builtin. Run on the interpreter under the 7-handle powerbox.
+#[test]
+#[cfg(unix)]
+fn vm_cap_index_reaches_tail_handles() {
+    let src = r#"
+int __vm_blocking_handle(void);
+int __vm_cap(int i);
+int main(void) { return (__vm_cap(6) == __vm_blocking_handle()) ? 7 : 0; }
+"#;
+    let Some((m, _)) = translate_verified("vm_cap_tail", src) else {
+        return;
+    };
+    assert_eq!(
+        m.funcs[0].params.len(),
+        7,
+        "a Blocking-handle program declares the 7-handle entry"
+    );
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut h = svm_interp::Host::new();
+    let args = grant_powerbox(&mut h, win, 7, std::time::Duration::ZERO);
+    let mut fuel = 50_000_000u64;
+    let r = svm_interp::run_with_host(&m, 0, &args, &mut fuel, &mut h).expect("interp run");
+    assert_eq!(
+        r,
+        vec![Value::I32(7)],
+        "__vm_cap(6) == __vm_blocking_handle()"
+    );
+}

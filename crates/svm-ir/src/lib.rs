@@ -2198,8 +2198,83 @@ pub struct DebugInfo {
     pub files: Vec<String>,
     /// Source location of individual ops. An op with no entry inherits nothing (unmapped).
     pub locs: Vec<Loc>,
+    /// Structured source types, referenced by index ([`TypeId`]) from [`VarInfo::type_id`] and
+    /// [`Field::ty`]. The §6 `TypeRef` enriched with the field offsets / element strides that
+    /// aggregate inspection needs (struct/array expansion, `a.b` / `arr[i]`). Optional: a module
+    /// can carry `vars` with only render-name `ty` strings and no `types` table at all.
+    pub types: Vec<TypeDef>,
     /// Source variables and where their value lives (the §6 neutral `VarLoc` = S2).
     pub vars: Vec<VarInfo>,
+}
+
+/// An index into [`DebugInfo::types`].
+pub type TypeId = u32;
+
+/// How to interpret the bytes of a [`TypeDef::Base`] scalar (the §6 neutral encoding).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Encoding {
+    Signed,
+    Unsigned,
+    Float,
+    Bool,
+}
+
+/// A structured source type (`DEBUGGING.md` §6 `TypeRef`, enriched for aggregate inspection). The
+/// `name` each variant carries is the neutral render name; aggregates additionally carry the
+/// layout (field offsets, element count) a debugger needs to expand them. The middle never reads
+/// this — it is host-side tooling, strippable and untrusted-for-escape (§2a).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TypeDef {
+    /// A scalar primitive: `int`, `char`, `_Bool`, `double`, …
+    Base {
+        name: String,
+        encoding: Encoding,
+        size: u32,
+    },
+    /// `T *` — `pointee` indexes the pointed-to type; `size` is the pointer width.
+    Pointer {
+        name: String,
+        pointee: TypeId,
+        size: u32,
+    },
+    /// `T[count]` — `elem` indexes the element type; the stride is the element's size.
+    Array {
+        name: String,
+        elem: TypeId,
+        count: u32,
+    },
+    /// A `struct` (distinct field offsets) or `union` (overlapping offsets); `size` is `sizeof`.
+    Aggregate {
+        name: String,
+        size: u32,
+        fields: Vec<Field>,
+    },
+    /// A type whose structure isn't carried (function, VLA, …): render name + `sizeof` only.
+    Opaque { name: String, size: u32 },
+}
+
+impl TypeDef {
+    /// The `sizeof` of this type (the array stride for [`TypeDef::Array`] is `elem`'s size, which
+    /// the consumer resolves through the table).
+    pub fn size(&self) -> u32 {
+        match self {
+            TypeDef::Base { size, .. }
+            | TypeDef::Pointer { size, .. }
+            | TypeDef::Opaque { size, .. }
+            | TypeDef::Aggregate { size, .. } => *size,
+            // An array's size isn't stored; it's `count * elem.size`, resolved by the consumer.
+            TypeDef::Array { .. } => 0,
+        }
+    }
+}
+
+/// One member of a [`TypeDef::Aggregate`]: its source name, byte `offset` from the aggregate's
+/// base, and the [`TypeId`] of its type.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Field {
+    pub name: String,
+    pub offset: u32,
+    pub ty: TypeId,
 }
 
 /// A source location for one op (`DEBUGGING.md` §6 neutral core). `col == 0` means "no column"
@@ -2214,15 +2289,20 @@ pub struct Loc {
     pub col: u32,
 }
 
-/// A source variable and its value location (`DEBUGGING.md` §6 / S2). `ty` is a neutral render
-/// name for slice 1 (a structured `TypeRef` — encoding + size + a rich-blob handle — is a later
-/// refinement). Function-scoped for slice 1; lexical `IrPc`-range scopes are a later refinement.
+/// A source variable and its value location (`DEBUGGING.md` §6 / S2). Carries a neutral render
+/// name (`ty`) and, when known, a [`TypeId`] into [`DebugInfo::types`] for its structured layout
+/// (`type_id`). Function-scoped for slice 1; lexical `IrPc`-range scopes are a later refinement.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct VarInfo {
     pub func: u32,
     pub name: String,
+    /// Neutral render name (e.g. `"int"`, `"struct"`). Kept for the scalar common case and
+    /// as the always-present human label; aggregate *layout* lives in [`VarInfo::type_id`].
     pub ty: String,
     pub loc: VarLoc,
+    /// The structured type ([`DebugInfo::types`] index) when this var's layout is carried — set for
+    /// aggregates (and, when emitted, scalars). `None` ⇒ render via `ty` only (no expansion).
+    pub type_id: Option<TypeId>,
 }
 
 /// Where a source variable's value lives at runtime (the S2 value-location model, IR form). The

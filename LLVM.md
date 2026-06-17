@@ -647,8 +647,64 @@ and `guest_libm_transcendental` (a guest `exp` + the `sqrt` op over a damped wav
   own (this slice). Adding a *bundled* guest `libm` header the on-ramp injects automatically (so
   unmodified code that calls `sin` links against guest poly code) is the natural follow-up.
 
-**Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native). Beyond
-this: Milestone 2 (tail calls, real Rust/C++ without EH) and a bundled guest `libm` header.
+**Slice AC (DONE) — the `<svm.h>` capability/concurrency/GC builtins (P0+P1+Memory).** The
+low-level SVM surface the chibicc frontend exposes through `<svm.h>` (`frontend/chibicc/codegen_ir.c`,
+the oracle) now lowers on the LLVM on-ramp too, so a guest *language* emitting LLVM bitcode (e.g. a
+JACL runtime) reaches the VM's fibers, threads, atomics, futex, conservative GC roots, direct window
+memory management, and capability reflection — **no host math/scheduler capability, just the existing
+primitives**. Each builtin is a call to a declared-only `extern` of a fixed name (`lower_vm_builtin`,
+gated on the name being external so a guest definition shadows it, like the libc/libm rules) and
+mirrors the chibicc lowering exactly:
+- **§3e/§4 Memory** — `__vm_map`/`__vm_unmap`/`__vm_protect`/`__vm_page_size` → `CallImport` on the
+  stashed `Memory` handle (slot 12; imports `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size`, resolved
+  by `default_cap_resolver`). The synthesized `_start` now grants the 4th (`Memory`) handle when a
+  program uses **either** `malloc` **or** a direct Memory builtin — the heap is seeded only for
+  `malloc`, so the powerbox **contract/stash layout is unchanged** (existing demos byte-identical).
+- **§12 fibers** — `__vm_fiber_new`/`resume`/`suspend` → `cont.new`/`cont.resume`/`suspend` (the
+  funcref is `i32.wrap`'d; `resume` stores its `(status, value)` status through `*done`).
+- **§12 threads** — `__vm_thread_spawn` (a *direct* funcref → the static `thread.spawn` funcidx) /
+  `__vm_thread_join`; **atomics** — `__vm_atomic_{add,load,store}`(`32`)/`cas32` → the `iN.atomic.*`
+  ops (seq-cst); **futex** — `__vm_wait32`/`__vm_notify` → `i32.atomic.wait`/`atomic.notify`.
+- **§GC** — `__vm_gc_roots(lo, hi, buf, cap)` → `gc.roots` (conservative root enumeration).
+- **§7 reflection** — `__vm_cap(i)` reads the handle stash (`i32.load` at `i*4`); `__vm_cap_count`/
+  `__vm_cap_at` → `cap.self.count`/`cap.self.get`.
+Tests (`translate.rs`): `vm_memory_map_and_page_size` (map a page at 256 MiB + page-size, end-to-end
+on the JIT powerbox), `vm_fibers_generator`, `vm_atomics_single_threaded` (both backends),
+`vm_futex_wait_notify`, `vm_threads_atomic_counter` (4×500 = 2000 on the M:N executor),
+`vm_gc_roots_smoke`, and `vm_cap_reflection` (8 granted caps) — interpreter-only where the JIT bails
+`Unsupported` on fibers/`cap.self` (mirrors the chibicc test split).
+- **Stash layout locked to 8 handles (done — follow-up).** The handle stash is now the fixed region
+  `[0, HANDLE_REGION_END) = [0, 32)` — one `i32` slot per `VM_CAP_*` index — with the allocator's
+  heap state, the `putc` scratch, and the `printf` format buffer all relocated **above** it
+  (`HEAP_BRK`=32/`HEAP_TOP`=40/`STASH_SCRATCH`=48; `FMT_BUF` unchanged at 64). So offsets `16/20/24/28`
+  are reserved for the AddressSpace/IoRing/Blocking/Jit tail and granting it later needs **no further
+  relocation** — the one-time fix that forecloses the recurring "new handle collides with heap state"
+  bug. All six demos + the malloc/printf paths re-verified byte-identical (the offsets are referenced
+  by named constant, so the move is transparent).
+**Slice AD (DONE) — the async-I/O ring (P2; the STW-safe blocking path JACL's GC needs, GC.md §5.2).**
+The §9/§12 submit/complete ring now lowers on the on-ramp, so a guest event-loop / work-stealing
+runtime built on LLVM bitcode drives many concurrent blocking I/Os from one parked vCPU:
+- `__vm_io_submit_async(sq, n, counter)` / `__vm_io_reap(cq, max)` → `CallImport` on the stashed
+  `IoRing` handle (slot 5; imports `vm_io_submit_async`/`vm_io_reap` → `IoRing` ops 1/2). The SQE/CQE
+  wire format is guest-built in the window; only the ring indices cross the boundary.
+- `__vm_blocking_handle()` → a stash read of the `Blocking` handle (slot 6) the guest names in an SQE.
+- **`synth_start` generalized to grant a contiguous handle prefix.** It now grants `n_handles` —
+  sized to the highest `VM_CAP_*` index the program uses (exit→3, memory→4, ioring→6, blocking→7) —
+  and stashes each at `i*4` with a uniform loop (the old 3/4-handle special-case is gone; existing
+  I/O and malloc programs still get exactly 3/4, demos byte-identical). This also lights up
+  `__vm_cap(i)` for `i ≥ 4`: the tail handles are now stashed, so the generic reader reaches them
+  (`vm_cap_index_reaches_tail_handles`: `__vm_cap(6) == __vm_blocking_handle()`).
+- Tests: `vm_async_io_runtime` runs `demos/async_io/async_io.c` through Lane C on the interpreter's
+  M:N executor + offload pool (the 7-handle powerbox, futex parking, completion-order-invariant total
+  Σ mix(0..8)) — interpreter-only, as the JIT async path needs the separate `HostAsyncHooks` harness
+  (mirrors the chibicc `run_async_demo` split). 86 translate tests green, fmt + clippy clean.
+- *Still deferred:* the §13/§14 `__vm_region_*` (SharedRegion) and §22 `__vm_jit_*` builtins stay
+  `Unsupported` until a workload needs them — the reserved AddressSpace(4)/Jit(7) slots are ready.
+
+**Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native), the
+`<svm.h>` P0+P1+P2 capability/concurrency/GC builtins are in, and the powerbox stash is locked to the
+full 8-handle layout. Beyond this: the SharedRegion/Jit builtins (on demand), Milestone 2 (tail calls,
+real Rust/C++ without EH), and a bundled guest `libm` header.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
