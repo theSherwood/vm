@@ -258,6 +258,50 @@ impl VICmpOp {
     }
 }
 
+/// Lane-wise **float** comparison ops on a `v128` (§17): each lane yields an all-ones (true) or
+/// all-zeros (false) mask of the lane width → result `v128`. Defined for the float [`VShape`]s
+/// (`f32x4`/`f64x2`). `eq`/`lt`/`gt`/`le`/`ge` are **ordered** (a NaN operand ⇒ false); `ne` is the
+/// **unordered** negation (a NaN operand ⇒ true) — exactly the wasm (and Rust `==`/`!=`/`<`/…) rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VFCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+impl VFCmpOp {
+    pub const ALL: [VFCmpOp; 6] = [
+        VFCmpOp::Eq,
+        VFCmpOp::Ne,
+        VFCmpOp::Lt,
+        VFCmpOp::Gt,
+        VFCmpOp::Le,
+        VFCmpOp::Ge,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VFCmpOp::Eq => "eq",
+            VFCmpOp::Ne => "ne",
+            VFCmpOp::Lt => "lt",
+            VFCmpOp::Gt => "gt",
+            VFCmpOp::Le => "le",
+            VFCmpOp::Ge => "ge",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VFCmpOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VFCmpOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
 /// Lane-wise binary float ops on a `v128` (§17, IEEE 754, no traps). `Min`/`Max` are the
 /// IEEE `minimum`/`maximum` (NaN-propagating, `-0 < +0`) matching the scalar [`FBinOp`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1514,6 +1558,14 @@ pub enum Inst {
     VIntCmp {
         shape: VShape,
         op: VICmpOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise float comparison (see [`VFCmpOp`]); `a`/`b`/result are `v128` (per-lane all-ones or
+    /// all-zeros mask of the lane width).
+    VFloatCmp {
+        shape: VShape,
+        op: VFCmpOp,
         a: ValIdx,
         b: ValIdx,
     },

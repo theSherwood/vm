@@ -519,3 +519,89 @@ fn diff_i8x16_and_i16x8_min_max() {
     );
     assert_eq!(i16("min_u", 0xFFFF, 1), 1, "min_u(65535, 1)");
 }
+
+// ---------------------------------------------------------------------------
+// Float lane comparisons (VFloatCmp) — ordered (ne unordered) → mask.
+// ---------------------------------------------------------------------------
+
+/// Float lane compares round-trip through text + binary.
+#[test]
+fn float_lane_compare_roundtrip() {
+    let src = "func (f32, f64) -> (i32) {\n\
+        block0(v0: f32, v1: f64):\n\
+          v2 = f32x4.splat v0\n\
+          v3 = f64x2.splat v1\n\
+          v4 = f32x4.eq v2 v2\n\
+          v5 = f32x4.ne v2 v2\n\
+          v6 = f32x4.lt v2 v2\n\
+          v7 = f32x4.ge v2 v2\n\
+          v8 = f64x2.le v3 v3\n\
+          v9 = f64x2.gt v3 v3\n\
+          v10 = i32x4.extract_lane 0 v4\n\
+          return v10\n\
+        }\n";
+    let m = build(src);
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
+}
+
+/// `f32x4.<cmp>` of two splatted scalars; the lane-0 mask read back via `i32x4.extract_lane` (`-1`
+/// true / `0` false). Oracle = Rust's float operators (which share wasm's ordered/`ne`-unordered rule).
+fn f32x4_cmp(op: &str, a: f32, b: f32) -> i32 {
+    let s = format!(
+        "func (f32, f32) -> (i32) {{\nblock0(v0: f32, v1: f32):\n\
+         \x20 v2 = f32x4.splat v0\n  v3 = f32x4.splat v1\n  v4 = f32x4.{op} v2 v3\n\
+         \x20 v5 = i32x4.extract_lane 0 v4\n  return v5\n}}\n"
+    );
+    diff1(&s, &[Value::F32(a), Value::F32(b)]) as i32
+}
+
+#[test]
+fn diff_f32x4_lane_compares() {
+    let mask = |t: bool| if t { -1 } else { 0 };
+    let nan = f32::NAN;
+    for (a, b) in [
+        (1.0, 2.0),
+        (2.0, 2.0),
+        (3.0, 1.0),
+        (nan, 1.0),
+        (1.0, nan),
+        (nan, nan),
+        (-0.0, 0.0),
+    ] {
+        assert_eq!(f32x4_cmp("eq", a, b), mask(a == b), "eq {a} {b}");
+        assert_eq!(f32x4_cmp("ne", a, b), mask(a != b), "ne {a} {b}");
+        assert_eq!(f32x4_cmp("lt", a, b), mask(a < b), "lt {a} {b}");
+        assert_eq!(f32x4_cmp("gt", a, b), mask(a > b), "gt {a} {b}");
+        assert_eq!(f32x4_cmp("le", a, b), mask(a <= b), "le {a} {b}");
+        assert_eq!(f32x4_cmp("ge", a, b), mask(a >= b), "ge {a} {b}");
+    }
+}
+
+#[test]
+fn diff_f64x2_lane_compares() {
+    let f64x2 = |op: &str, a: f64, b: f64| -> i64 {
+        let s = format!(
+            "func (f64, f64) -> (i64) {{\nblock0(v0: f64, v1: f64):\n\
+             \x20 v2 = f64x2.splat v0\n  v3 = f64x2.splat v1\n  v4 = f64x2.{op} v2 v3\n\
+             \x20 v5 = i64x2.extract_lane 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::F64(a), Value::F64(b)])
+    };
+    let mask = |t: bool| if t { -1i64 } else { 0 };
+    let nan = f64::NAN;
+    for (a, b) in [(1.0, 2.0), (2.0, 2.0), (nan, 1.0), (nan, nan)] {
+        assert_eq!(f64x2("eq", a, b), mask(a == b), "eq {a} {b}");
+        assert_eq!(f64x2("ne", a, b), mask(a != b), "ne {a} {b}");
+        assert_eq!(f64x2("lt", a, b), mask(a < b), "lt {a} {b}");
+        assert_eq!(f64x2("ge", a, b), mask(a >= b), "ge {a} {b}");
+    }
+}

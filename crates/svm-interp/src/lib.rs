@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
-    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValIdx, ValType,
-    VarLoc, DEFAULT_RESERVED_LOG2,
+    Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValIdx,
+    ValType, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -5157,6 +5157,12 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_v128(get(vals, *b)?)?,
         )),
+        Inst::VFloatCmp { shape, op, a, b } => Value::V128(simd_vfloat_cmp(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
         Inst::VFloatBin { shape, op, a, b } => Value::V128(simd_vfloat_bin(
             *shape,
             *op,
@@ -5358,6 +5364,47 @@ fn vf_un(op: VFloatUnOp) -> FUnOp {
         VFloatUnOp::Neg => FUnOp::Neg,
         VFloatUnOp::Sqrt => FUnOp::Sqrt,
     }
+}
+
+/// `<f-shape>.<cmp>`: per-lane float comparison → an all-ones (true) / all-zeros (false) mask of the
+/// lane width. Rust's `==`/`!=`/`<`/… already match wasm's ordered (`ne` unordered) NaN behaviour.
+fn simd_vfloat_cmp(shape: VShape, op: VFCmpOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let t = match op {
+                    VFCmpOp::Eq => x == y,
+                    VFCmpOp::Ne => x != y,
+                    VFCmpOp::Lt => x < y,
+                    VFCmpOp::Gt => x > y,
+                    VFCmpOp::Le => x <= y,
+                    VFCmpOp::Ge => x >= y,
+                };
+                lane_write(&mut o, i, 4, if t { u64::MAX } else { 0 });
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let t = match op {
+                    VFCmpOp::Eq => x == y,
+                    VFCmpOp::Ne => x != y,
+                    VFCmpOp::Lt => x < y,
+                    VFCmpOp::Gt => x > y,
+                    VFCmpOp::Le => x <= y,
+                    VFCmpOp::Ge => x >= y,
+                };
+                lane_write(&mut o, i, 8, if t { u64::MAX } else { 0 });
+            }
+        }
+        // Verifier rejects an integer shape here; total fall-through returns zero.
+        _ => {}
+    }
+    o
 }
 
 fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {

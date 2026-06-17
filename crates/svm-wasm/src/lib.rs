@@ -45,7 +45,7 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
-    VBitBinOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValIdx, ValType,
+    VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1306,6 +1306,13 @@ fn v_icmp(lo: &mut Lower, shape: VShape, op: VICmpOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VIntCmp { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_fcmp(lo: &mut Lower, shape: VShape, op: VFCmpOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VFloatCmp { shape, op, a, b });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -2895,6 +2902,19 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::F64x2Abs => v_fun(lo, VShape::F64x2, VFloatUnOp::Abs)?,
         O::F64x2Neg => v_fun(lo, VShape::F64x2, VFloatUnOp::Neg)?,
         O::F64x2Sqrt => v_fun(lo, VShape::F64x2, VFloatUnOp::Sqrt)?,
+        // float lane comparisons → a per-lane all-ones/all-zeros mask (ordered; `ne` unordered).
+        O::F32x4Eq => v_fcmp(lo, VShape::F32x4, VFCmpOp::Eq)?,
+        O::F32x4Ne => v_fcmp(lo, VShape::F32x4, VFCmpOp::Ne)?,
+        O::F32x4Lt => v_fcmp(lo, VShape::F32x4, VFCmpOp::Lt)?,
+        O::F32x4Gt => v_fcmp(lo, VShape::F32x4, VFCmpOp::Gt)?,
+        O::F32x4Le => v_fcmp(lo, VShape::F32x4, VFCmpOp::Le)?,
+        O::F32x4Ge => v_fcmp(lo, VShape::F32x4, VFCmpOp::Ge)?,
+        O::F64x2Eq => v_fcmp(lo, VShape::F64x2, VFCmpOp::Eq)?,
+        O::F64x2Ne => v_fcmp(lo, VShape::F64x2, VFCmpOp::Ne)?,
+        O::F64x2Lt => v_fcmp(lo, VShape::F64x2, VFCmpOp::Lt)?,
+        O::F64x2Gt => v_fcmp(lo, VShape::F64x2, VFCmpOp::Gt)?,
+        O::F64x2Le => v_fcmp(lo, VShape::F64x2, VFCmpOp::Le)?,
+        O::F64x2Ge => v_fcmp(lo, VShape::F64x2, VFCmpOp::Ge)?,
         // whole-vector bitwise
         O::V128And => v_bitbin(lo, VBitBinOp::And)?,
         O::V128Or => v_bitbin(lo, VBitBinOp::Or)?,

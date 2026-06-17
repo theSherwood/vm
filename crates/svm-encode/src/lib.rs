@@ -17,8 +17,8 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering,
-    StoreOp, Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValIdx,
-    ValType,
+    StoreOp, Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape,
+    ValIdx, ValType,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -160,6 +160,7 @@ mod op {
         pub const SWIZZLE: u8 = 0x0D; // a, b
         pub const WIDTH_BYTES: u8 = 0x0E; // (no payload) -> i32
         pub const VINT_CMP: u8 = 0x0F; // shape, op, a, b
+        pub const VFLOAT_CMP: u8 = 0x10; // shape, op, a, b
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -622,6 +623,14 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
+        Inst::VFloatCmp { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VFLOAT_CMP);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
         Inst::VFloatBin { shape, op: o, a, b } => {
             out.push(op::SIMD);
             out.push(op::simd::VFLOAT_BIN);
@@ -738,6 +747,16 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             Inst::VIntCmp {
                 shape,
                 op: VICmpOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VFLOAT_CMP => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VFloatCmp {
+                shape,
+                op: VFCmpOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
                 a: c.idx()?,
                 b: c.idx()?,
             }

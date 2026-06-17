@@ -71,7 +71,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValType, DEFAULT_RESERVED_LOG2,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -2573,8 +2573,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                                     | VIntBinOp::MaxU
                             )
                     ) => {}
-                // Lane compares lower to a single Cranelift `icmp` (legalizes on every target).
-                Inst::VIntCmp { .. } => {}
+                // Lane compares lower to a single Cranelift `icmp`/`fcmp` (legalize on every target).
+                Inst::VIntCmp { .. } | Inst::VFloatCmp { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3590,6 +3590,27 @@ fn lower_block(
                     VICmpOp::GeU => IntCC::UnsignedGreaterThanOrEqual,
                 };
                 let r = b.ins().icmp(cc, x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VFloatCmp {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Vector `fcmp` yields a per-lane all-ones/all-zeros mask — the wasm/interp semantics.
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let cc = match op {
+                    VFCmpOp::Eq => FloatCC::Equal,
+                    VFCmpOp::Ne => FloatCC::NotEqual,
+                    VFCmpOp::Lt => FloatCC::LessThan,
+                    VFCmpOp::Gt => FloatCC::GreaterThan,
+                    VFCmpOp::Le => FloatCC::LessThanOrEqual,
+                    VFCmpOp::Ge => FloatCC::GreaterThanOrEqual,
+                };
+                let r = b.ins().fcmp(cc, x, y);
                 vcast(b, r, I8X16)
             }
             Inst::VFloatBin {

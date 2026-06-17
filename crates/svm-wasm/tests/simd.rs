@@ -280,3 +280,33 @@ fn i32x4_clamp_via_min_max() {
         assert_eq!(got, x.clamp(lo, hi), "clamp({x}, {lo}, {hi})");
     }
 }
+
+/// Float lane comparisons through the wasm bridge, incl. the NaN behaviour (`eq`/`lt`/… ordered →
+/// false, `ne` unordered → true). The mask is read out with `i32x4.extract_lane`.
+#[test]
+fn f32x4_lane_compare_masks() {
+    let cmp = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $a f32) (param $b f32) (result i32)
+               (i32x4.extract_lane 0
+                 ({op} (f32x4.splat (local.get $a)) (f32x4.splat (local.get $b))))))"
+        )
+    };
+    assert_eq!(
+        eval(&cmp("f32x4.lt"), "f", &[Value::F32(1.0), Value::F32(2.0)]),
+        Value::I32(-1)
+    );
+    assert_eq!(
+        eval(&cmp("f32x4.eq"), "f", &[Value::F32(2.0), Value::F32(2.0)]),
+        Value::I32(-1)
+    );
+    assert_eq!(
+        eval(&cmp("f32x4.ge"), "f", &[Value::F32(2.0), Value::F32(5.0)]),
+        Value::I32(0)
+    );
+    // NaN: ordered compares are false; `ne` is true.
+    let nan = [Value::F32(f32::NAN), Value::F32(1.0)];
+    assert_eq!(eval(&cmp("f32x4.eq"), "f", &nan), Value::I32(0));
+    assert_eq!(eval(&cmp("f32x4.lt"), "f", &nan), Value::I32(0));
+    assert_eq!(eval(&cmp("f32x4.ne"), "f", &nan), Value::I32(-1));
+}
