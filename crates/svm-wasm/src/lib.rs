@@ -43,12 +43,18 @@
 //! are supported (a constant-offset init unrolls to const-stores of the segment's known bytes).
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
-    Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
-    VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
-    VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, Edge, FBinOp, FCmpOp, FToI, FUnOp,
+    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering, StoreOp,
+    Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
+    VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
+
+mod dwarf_line;
+
+/// Per-operator debug records from lowering: `(code-relative offset, block, inst index)` for the
+/// first IR instruction each wasm operator emits (DEBUGGING.md §6/W4 — mapped onto DWARF line rows).
+type OpLocs = Vec<(u32, u32, u32)>;
 
 /// Why a wasm module couldn't be transpiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +175,11 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
     let mut func_type_idx: Vec<u32> = Vec::new();
     let mut bodies: Vec<wasmparser::FunctionBody> = Vec::new();
+    // Debug-info on-ramp (DEBUGGING.md §6/W4): the file offset where the code section's content
+    // begins (operator offsets are file-absolute, DWARF addresses are code-relative — the delta),
+    // and the raw embedded `.debug_line` DWARF, if any.
+    let mut code_content_start = 0usize;
+    let mut debug_line: Option<Vec<u8>> = None;
     let mut exports: Vec<(String, u32)> = Vec::new();
     let mut mem: Option<wasmparser::MemoryType> = None;
     let mut data: Vec<svm_ir::Data> = Vec::new();
@@ -375,7 +386,14 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     }
                 }
             }
+            // The code section's content start — the base for converting file-absolute operator
+            // offsets to the code-relative addresses DWARF line entries use.
+            Payload::CodeSectionStart { range, .. } => code_content_start = range.start,
             Payload::CodeSectionEntry(body) => bodies.push(body),
+            // Capture embedded DWARF line info (`.debug_line`) for the §6 debug-info on-ramp.
+            Payload::CustomSection(reader) if reader.name() == ".debug_line" => {
+                debug_line = Some(reader.data().to_vec());
+            }
             Payload::DataSection(reader) => {
                 for seg in reader {
                     let seg = seg?;
@@ -539,10 +557,14 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         .iter()
         .map(|&ti| types[ti as usize].clone())
         .collect();
+    let want_locs = debug_line.is_some();
+    // Global `(code-relative offset, func, block, inst)` map for the DWARF→IR pc resolution below.
+    let mut op_locs: Vec<(u32, u32, u32, u32)> = Vec::new();
     let mut funcs = Vec::with_capacity(bodies.len() + spawn_import.is_some() as usize);
     for (i, body) in bodies.into_iter().enumerate() {
         let ty = &types[func_type_idx[i] as usize];
-        funcs.push(lower_func(
+        let func_idx = funcs.len() as u32; // defined funcs come first, so this is the IR index
+        let (f, flocs) = lower_func(
             &ty.0,
             &ty.1,
             &types,
@@ -561,7 +583,13 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                 initial_pages,
             },
             threads,
-        )?);
+            code_content_start,
+            want_locs,
+        )?;
+        funcs.push(f);
+        for (off, block, inst) in flocs {
+            op_locs.push((off, func_idx, block, inst));
+        }
     }
     // Append the spawn shim (its `thread.spawn` target) for a threaded module.
     if spawn_import.is_some() {
@@ -630,11 +658,62 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             // §7 named imports (real WASI etc.): the host resolves these to concrete capabilities at
             // load (`resolve_imports`). Empty for the numeric host-ABI convention (inline `cap.call`).
             imports: named_imports,
-            // Debug info — wasm's embedded DWARF will map into the §6 waist (DEBUGGING.md
-            // D-DBG-7); none yet.
-            debug_info: None,
+            // Debug info — map wasm's embedded DWARF `.debug_line` into the §6 waist (D-DBG-7).
+            debug_info: debug_line.and_then(|dl| build_debug_info(&dl, op_locs)),
         },
         exports,
+    })
+}
+
+/// Map an embedded DWARF `.debug_line` (parsed by [`dwarf_line`]) onto the §6 debug-info waist:
+/// each line row's code-relative address resolves to the IR pc of the first operator at-or-after it
+/// (`op_locs`, which the lowering recorded). Best-effort: returns `None` if the DWARF is malformed
+/// or nothing maps. The verifier ignores this section (§2a).
+fn build_debug_info(
+    debug_line: &[u8],
+    mut op_locs: Vec<(u32, u32, u32, u32)>,
+) -> Option<DebugInfo> {
+    let prog = dwarf_line::parse(debug_line)?;
+    if prog.files.len() <= 1 {
+        return None; // only the index-0 placeholder ⇒ no usable file table
+    }
+    // DWARF file indices are 1-based; flatten to a 0-based table for `Loc::file`.
+    let files: Vec<String> = prog.files[1..].to_vec();
+    op_locs.sort_by_key(|e| e.0);
+
+    let mut locs: Vec<Loc> = Vec::new();
+    for row in &prog.rows {
+        if row.end_sequence || row.file == 0 || row.file as usize > files.len() {
+            continue;
+        }
+        // The line starts at the first recorded instruction at-or-after its address.
+        let addr = row.address as u32;
+        let idx = op_locs.partition_point(|e| e.0 < addr);
+        let Some(&(_, func, block, inst)) = op_locs.get(idx) else {
+            continue;
+        };
+        // Coalesce: skip a row that lands on the same pc as the previous one (the earlier/lower
+        // address wins, matching `source_loc`'s nearest-preceding resolution).
+        if locs
+            .last()
+            .is_some_and(|l| (l.func, l.block, l.inst) == (func, block, inst))
+        {
+            continue;
+        }
+        locs.push(Loc {
+            func,
+            block,
+            inst,
+            file: (row.file - 1) as u32,
+            line: row.line,
+            col: row.col,
+        });
+    }
+    (!locs.is_empty()).then_some(DebugInfo {
+        files,
+        locs,
+        types: Vec::new(),
+        vars: Vec::new(),
     })
 }
 
@@ -792,6 +871,13 @@ struct Lower<'a> {
     /// §12 wasm threads config — the `wasi:thread/spawn` lowering (the spawn import index, the shim,
     /// the unique-tid slot). `spawn_import` is `None` for non-threaded modules.
     threads: ThreadCfg,
+    /// Debug-info collection (DEBUGGING.md §6/W4): when a `.debug_line` is present, each operator
+    /// that emits an instruction records `(code-relative offset, block, inst index)` so the DWARF
+    /// line rows can be mapped to IR pcs. The file offset where the code section content begins (to
+    /// turn file-absolute operator offsets into code-relative ones); 0 ⇒ collection off.
+    locs: Vec<(u32, u32, u32)>,
+    code_content_start: usize,
+    want_locs: bool,
 }
 
 impl Lower<'_> {
@@ -1088,7 +1174,9 @@ fn lower_func(
     data_segments: &[Vec<u8>],
     mg: MemGrow,
     threads: ThreadCfg,
-) -> Result<Func, Error> {
+    code_content_start: usize,
+    want_locs: bool,
+) -> Result<(Func, OpLocs), Error> {
     // Locals = params (with their incoming param values) then declared locals (default 0).
     let mut local_types: Vec<ValType> = params.to_vec();
     for decl in body.get_locals_reader()? {
@@ -1142,6 +1230,9 @@ fn lower_func(
         n_imp,
         data_segments,
         threads,
+        locs: Vec::new(),
+        code_content_start,
+        want_locs,
     };
     // Initialize declared locals to zero (params already bound to block params), extending `locals`.
     for t in &local_types[params.len()..] {
@@ -1168,10 +1259,20 @@ fn lower_func(
         dead: false,
     });
 
-    for op in body.get_operators_reader()? {
-        lower_op(&mut lo, op?, results)?;
+    for item in body.get_operators_reader()?.into_iter_with_offsets() {
+        let (op, off) = item?;
+        // Record where this operator's first IR instruction lands, for the DWARF→IR pc mapping.
+        // (Control ops emit a terminator, not an `insts` entry, so they add nothing here.)
+        let (blk, n) = (lo.cur, lo.blocks[lo.cur].insts.len());
+        lower_op(&mut lo, op, results)?;
+        if lo.want_locs && lo.blocks[blk].insts.len() > n {
+            if let Some(rel) = off.checked_sub(lo.code_content_start) {
+                lo.locs.push((rel as u32, blk as u32, n as u32));
+            }
+        }
     }
 
+    let locs = std::mem::take(&mut lo.locs);
     let blocks = lo
         .blocks
         .into_iter()
@@ -1182,11 +1283,14 @@ fn lower_func(
             term: b.term.unwrap_or(Terminator::Unreachable),
         })
         .collect();
-    Ok(Func {
-        params: entry_params,
-        results: results.to_vec(),
-        blocks,
-    })
+    Ok((
+        Func {
+            params: entry_params,
+            results: results.to_vec(),
+            blocks,
+        },
+        locs,
+    ))
 }
 
 fn int_bin(lo: &mut Lower, ty: IntTy, op: BinOp) -> Result<(), Error> {

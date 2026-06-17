@@ -53,7 +53,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
-| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits `debug.var` + `debug.loc` + `debug.type`/`debug.field`; DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c` |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF `.debug_line` → `debug.loc`** (2nd producer); DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm` |
 | DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
@@ -1060,10 +1060,26 @@ verifier still ignores the section (§2a). Tests (`svm-encode`): a module exerci
 `TypeDef` variant + `VarLoc` + `type_id` round-trips; the no-debug case stays a byte-prefix; a
 corrupted section fails to decode without panicking.
 
-**Not yet (next slices):** the LLVM/wasm `debug.loc` + type ingest sides (a second producer — the
-real frontend-neutrality proof); and the remaining W4 refinement (per-block `LocList` so promoted
-scalars are debuggable without `-Og`, per-producer rich blob). (Multithreaded debugging and the
-interpreter-backed DAP server are already built — Milestone B and W5 slices 1–6.)
+**Slice 15 — wasm DWARF → `debug.loc` (the second producer; frontend-neutrality demonstrated).**
+`svm-wasm` now ingests a guest's embedded DWARF `.debug_line` and maps it onto the **same neutral
+`DebugInfo` waist** chibicc populates — so a *second*, independent frontend produces source
+locations the interpreter/DAP consume unchanged. A small hand-rolled DWARF v2–v4 line-program
+reader (`dwarf_line.rs`, no `gimli` dep — matching the crate's lean ethos) decodes the
+`(address → file, line, col)` rows; the translator threads each wasm operator's byte offset and
+records where its first IR instruction lands, so a line row's code-relative address resolves to an
+IR pc (`func, block, inst`). The wasm-DWARF address convention (offsets relative to the code
+section content) is handled by subtracting the code section's start. Best-effort and strippable:
+malformed DWARF ⇒ no debug info, and the verifier ignores the section (§2a). Test (`debug_line.rs`):
+a clang-built `dline.c` wasm fixture transpiles with the C source's body lines (2, 3) mapped to
+in-range IR pcs, and still verifies. *Scope:* source lines only — variable ingest needs the
+per-block `LocList` (wasm/LLVM locals are SSA values that vary by block), and the LLVM bitcode
+metadata path is its own slice.
+
+**Not yet (next slices):** wasm/LLVM **variable** ingest, gated on the per-block `LocList`
+refinement (so the SSA-valued locals both producers use are representable — also lets chibicc debug
+without `-Og`); the LLVM `!DILocation` → `debug.loc` path; and a per-producer rich blob. (The
+chibicc producer, both DAP consumers, binary serialization, and now a second producer's source
+lines are all built.)
 
 ### Open questions (S4/S5/S2)
 
