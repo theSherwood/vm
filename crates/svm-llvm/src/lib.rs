@@ -255,10 +255,10 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         name2idx.insert(f.name.clone(), i as u32 + base);
     }
     // Globals live low (from `DATA_BASE`); the data stack starts just above them. For a powerbox
-    // program the writable **handle stash** occupies the reserved low scratch (`[0, DATA_BASE)`), so
-    // start the globals one page up (`STACK_PAGE`): a *read-only* global (D40, protected
-    // page-granularly) must never share a page with the stash, or `_start`'s handle stores would
-    // fault on the read-only page (the same page-isolation the data stack already gets above globals).
+    // program the writable **handle stash + allocator/format state** occupies the reserved low scratch
+    // (page 0, below `STACK_PAGE`), so start the globals one page up (`STACK_PAGE`): a *read-only*
+    // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
+    // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
     let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
     let (globals, data, globals_end, cstrs, gbytes) = globals_layout(m, &name2idx, globals_base)?;
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
@@ -1252,28 +1252,42 @@ fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
 // declaration-only externals. The on-ramp binds each to a **host capability** (§7 named import): a
 // call lowers to an `Inst::CallImport "<name>"` the embedder resolves at load (`default_cap_resolver`
 // → `(type_id, op)`). The capability **handle** is not a C argument — it is granted to the powerbox
-// entry and threaded to every call site through the *handle stash*, the reserved low window
-// (`[0, DATA_BASE)`): `_start` stores the granted handles there and each call site reloads the one
-// it needs (so a handle reaches arbitrary call depth without a viral extra parameter). This keeps
+// entry and threaded to every call site through the *handle stash*, the reserved handle region
+// (`[0, HANDLE_REGION_END)`): `_start` stores the granted handles there and each call site reloads the
+// one it needs (so a handle reaches arbitrary call depth without a viral extra parameter). This keeps
 // the translator pure mechanism — it never interprets host semantics, just defers the bind (§2a).
 
 /// Window offsets of the **powerbox handle stash + allocator state** (the reserved low scratch on
 /// page 0, which is writable — for a powerbox program the globals start a page up). `_start` stores
 /// the granted handles here; each call site reloads what it needs. The heap allocator (slice S) keeps
 /// its bump pointer + committed boundary here too.
+///
+/// **Layout (locked to the full §3e powerbox).** The handle region is `[0, HANDLE_REGION_END)` =
+/// `[0, 32)` — eight `i32` slots, one per `VM_CAP_*` index (`<svm.h>`): stdout, stdin, exit, memory,
+/// addrspace, ioring, blocking, jit. `_start` stashes a *prefix* of these (today 3 or 4 — stdout,
+/// stdin, exit, `[memory]`); offsets `16/20/24/28` are **reserved** for the AddressSpace/IoRing/
+/// Blocking/Jit tail so granting it later (the P2 async-I/O work) needs **no stash relocation**. The
+/// allocator/scratch/format state lives strictly **above** the handle region, so it never collides
+/// with a newly-granted handle (the bug this layout forecloses).
 const STASH_STDOUT: u64 = 0;
 const STASH_STDIN: u64 = 4;
 const STASH_EXIT: u64 = 8;
-/// The `Memory` capability handle (`i32`) — present only when the program uses `malloc` (then `_start`
-/// takes a 4th granted handle). The bump allocator reloads it to `vm_map`-commit reserved pages.
+/// The `Memory` capability handle (`i32`) — present when the program uses `malloc` *or* a direct
+/// `<svm.h>` Memory builtin (then `_start` takes a 4th granted handle). The bump allocator + the
+/// `__vm_map`/… builtins reload it to drive `Memory` capability calls.
 const STASH_MEMORY: u64 = 12;
-/// The guest heap's bump pointer and committed boundary (`i64` each) — the allocator's only state.
-const HEAP_BRK: u64 = 16;
-const HEAP_TOP: u64 = 24;
+/// End of the reserved 8-handle region (slots 4–7, offsets `16/20/24/28`, are the AddressSpace/
+/// IoRing/Blocking/Jit tail — named + granted when a builtin that consumes them lands, P2). The
+/// allocator/scratch/format state begins here, so it is collision-proof against the full handle set.
+const HANDLE_REGION_END: u64 = 32;
+/// The guest heap's bump pointer and committed boundary (`i64` each) — the allocator's only state,
+/// placed just above the 8-handle region.
+const HEAP_BRK: u64 = HANDLE_REGION_END; // 32
+const HEAP_TOP: u64 = HEAP_BRK + 8; // 40
 /// A 1-byte writable scratch used by `putc`/`puts` to stage a single byte (a char, a newline) the
 /// `Stream` capability writes (its ABI is a `(buf, len)` window slice, so a scalar char must transit
 /// memory). Reused per call — single-threaded, fully produced-then-consumed within one lowering.
-const STASH_SCRATCH: u64 = 32;
+const STASH_SCRATCH: u64 = HEAP_TOP + 8; // 48
 /// The `prot` bits a guest passes to `Memory.map` for a read-write commit (`PROT_READ|PROT_WRITE`).
 const PROT_RW: i32 = 3;
 /// A scratch buffer (`[FMT_BUF, FMT_BUF_END)`, on the writable page 0) where `printf` formats one

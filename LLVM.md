@@ -673,11 +673,19 @@ on the JIT powerbox), `vm_fibers_generator`, `vm_atomics_single_threaded` (both 
 `vm_futex_wait_notify`, `vm_threads_atomic_counter` (4×500 = 2000 on the M:N executor),
 `vm_gc_roots_smoke`, and `vm_cap_reflection` (8 granted caps) — interpreter-only where the JIT bails
 `Unsupported` on fibers/`cap.self` (mirrors the chibicc test split).
-- *Deferred (P2, additive — needs the stash relocation):* `__vm_io_submit_async`/`__vm_io_reap`/
-  `__vm_blocking_handle` and full `__vm_cap(i)` for `i ≥ 4` (AddressSpace/IoRing/Blocking handles),
-  which require granting `_start` the 5th–7th handles (they collide with the heap state at the current
-  stash offsets). The §13/§14 `__vm_region_*` and §22 `__vm_jit_*` builtins likewise stay
-  `Unsupported` until a workload needs them.
+- **Stash layout locked to 8 handles (done — follow-up).** The handle stash is now the fixed region
+  `[0, HANDLE_REGION_END) = [0, 32)` — one `i32` slot per `VM_CAP_*` index — with the allocator's
+  heap state, the `putc` scratch, and the `printf` format buffer all relocated **above** it
+  (`HEAP_BRK`=32/`HEAP_TOP`=40/`STASH_SCRATCH`=48; `FMT_BUF` unchanged at 64). So offsets `16/20/24/28`
+  are reserved for the AddressSpace/IoRing/Blocking/Jit tail and granting it later needs **no further
+  relocation** — the one-time fix that forecloses the recurring "new handle collides with heap state"
+  bug. All six demos + the malloc/printf paths re-verified byte-identical (the offsets are referenced
+  by named constant, so the move is transparent).
+- *Deferred (P2, additive — now unblocked by the relocation):* `__vm_io_submit_async`/`__vm_io_reap`/
+  `__vm_blocking_handle` and full `__vm_cap(i)` for `i ≥ 4`. These now only need `synth_start` to grant
+  the 5th–7th handles into the reserved slots (no layout change) plus the call-site lowerings — the
+  STW-safe blocking path JACL's GC needs (GC.md §5.2). The §13/§14 `__vm_region_*` and §22
+  `__vm_jit_*` builtins likewise stay `Unsupported` until a workload needs them.
 
 **Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native) and the
 `<svm.h>` P0+P1+Memory builtins are in. Beyond this: the P2 async-I/O tail (above), Milestone 2 (tail
