@@ -40,6 +40,38 @@ fn compile_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     }
 }
 
+/// Compile a C snippet to legalized bitcode **with debug info** (`-g`). Uses `-Og` (optimize for
+/// debugging): mem2reg/SROA still run — so scalars arrive promoted, the legalized shape the on-ramp
+/// needs — while the per-statement line table is preserved (`-O2` collapses a tiny function's lines
+/// onto one). So the §6 source-line ingest can be exercised against real, multi-line clang debug
+/// metadata. `None` (skip) if clang is unavailable.
+fn compile_to_bc_g(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_g_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_g_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args([
+            "-Og",
+            "-g",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
 fn to_slot(v: &Value) -> i64 {
     match v {
         Value::I32(x) => *x as i64,
@@ -2226,4 +2258,89 @@ fn rust_no_std_matches_native() {
             "compute({n}): on-ramp {svm} vs native rustc {native} (i33 wrap mismatch?)"
         );
     }
+}
+
+// ---- §6 / D-DBG-7: the debug-info waist (LLVM as the third producer) -------------------------
+
+/// The LLVM on-ramp populates the §6 frontend-neutral debug-info waist's **source-line half** from
+/// each instruction's `!DILocation` — the third independent frontend (after chibicc and the wasm
+/// DWARF producer) to feed the *same* neutral core, the cross-check that the waist isn't coupled to
+/// any one frontend (DEBUGGING.md §6). The variable/type half is blocked on the `llvm-ir` metadata
+/// reader (`MetadataOperand` is payloadless) — its own effort.
+#[test]
+fn llvm_dilocation_maps_into_the_debug_info_waist() {
+    // A chain of dependent statements over a runtime input: each keeps its own source line and
+    // lowers to a real (non-terminator) arithmetic op, so several distinct lines reach the IR pcs
+    // (clang can't constant-fold the chain away, and nothing collapses onto one line).
+    let src = "\
+int chain(int n) {
+  int a = n + 1;
+  int b = a * 3;
+  int c = b - 2;
+  int d = c * c;
+  return d + a;
+}
+";
+    let Some(bc) = compile_to_bc_g("dilocation", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    // The debug section is strippable / untrusted-for-escape — it must not affect verification.
+    svm_verify::verify_module(&t.module).expect("verify");
+
+    let di = t
+        .module
+        .debug_info
+        .as_ref()
+        .expect("debug info populated from !DILocation");
+
+    // The file table names the C source (clang records its compile path).
+    assert!(
+        di.files.iter().any(|f| f.ends_with(".c")),
+        "file table names the C source: {:?}",
+        di.files
+    );
+    // Source lines are mapped onto IR pcs; the variable/type half is empty on this path.
+    assert!(!di.locs.is_empty(), "some source locations were mapped");
+    assert!(
+        di.vars.is_empty(),
+        "variable ingest is blocked on the metadata reader"
+    );
+    assert!(
+        di.types.is_empty(),
+        "type ingest is blocked on the metadata reader"
+    );
+
+    // Every loc resolves to an in-range IR `(func, block, inst)` — the cross-check that the
+    // LLVM-instruction → SVM-op mapping is self-consistent.
+    for l in &di.locs {
+        assert!((l.file as usize) < di.files.len(), "loc file in range");
+        let f = l.func as usize;
+        assert!(f < t.module.funcs.len(), "loc func {f} in range");
+        let b = l.block as usize;
+        assert!(b < t.module.funcs[f].blocks.len(), "loc block in range");
+        assert!(
+            (l.inst as usize) < t.module.funcs[f].blocks[b].insts.len(),
+            "loc inst in range"
+        );
+        assert!(l.line >= 1, "a real source line");
+    }
+
+    // The body spans several source lines (the multiply/add at line 4, the return at line 5) — not
+    // everything collapsed onto the function's opening line.
+    let lines: std::collections::BTreeSet<u32> = di.locs.iter().map(|l| l.line).collect();
+    assert!(
+        lines.len() >= 3,
+        "the statement chain maps several distinct source lines: {lines:?}"
+    );
+}
+
+/// A non-`-g` build carries **no** debug section — the waist is absent (zero cost), byte-identical
+/// to before this producer existed.
+#[test]
+fn llvm_without_g_has_no_debug_info() {
+    let Some((m, _)) = translate_verified("no_g", "int id(int x) { return x; }") else {
+        return;
+    };
+    assert!(m.debug_info.is_none(), "no -g ⇒ no debug section");
 }

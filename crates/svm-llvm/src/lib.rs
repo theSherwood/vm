@@ -161,6 +161,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use llvm_ir::debugloc::{DebugLoc, HasDebugLoc};
 use llvm_ir::instruction::Instruction;
 use llvm_ir::terminator::Terminator as LTerm;
 use llvm_ir::types::{FPType, Type, Typed, Types};
@@ -168,8 +169,8 @@ use llvm_ir::{constant::Constant, constant::Float, BasicBlock, Function, Module 
 use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
 
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
-    IntTy, IntUnOp, Module, Terminator, ValIdx, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
+    IToF, Inst, IntTy, IntUnOp, Loc, Module, Terminator, ValIdx, ValType,
 };
 
 /// Why a translation could not be produced.
@@ -333,9 +334,22 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
-    for f in &defined {
+                               // §6 debug-info: each defined function's final index is `base + i` (the synth `_start`, inserted
+                               // at 0 below, shifts them up by `base`; the appended helpers carry no source). Source positions
+                               // come from each LLVM instruction's `!DILocation`.
+    let mut dbg = DebugAcc::default();
+    for (i, f) in defined.iter().enumerate() {
         let (func, frame_size) = translate_func(
-            f, &m.types, &name2idx, &globals, &caps, &cstrs, &gbytes, &helpers,
+            f,
+            base + i as u32,
+            &m.types,
+            &name2idx,
+            &globals,
+            &caps,
+            &cstrs,
+            &gbytes,
+            &helpers,
+            &mut dbg,
         )?;
         any_frame |= frame_size > 0;
         funcs.push(func);
@@ -413,9 +427,10 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
             // §7 named capability imports (`write`/`read`/`exit` …) the host resolves at load
             // (`resolve_capability_imports`); empty for a pure-compute (kernel) module.
             imports,
-            // Debug info — the LLVM on-ramp will map `!DILocation`/`dbg.value` into the §6 waist
-            // (DEBUGGING.md D-DBG-7); none yet.
-            debug_info: None,
+            // §6 debug-info waist: the source-line half, mapped from each LLVM `!DILocation` (the
+            // variable/type half is blocked on the `llvm-ir` metadata reader — see `DebugAcc`).
+            // `None` for a non-`-g` build (no instruction carried a location).
+            debug_info: dbg.finish(),
         },
         entry_sp,
     })
@@ -433,6 +448,76 @@ const STACK_RESERVE: u64 = 1 << 20;
 /// The data-SP's synthetic value id — threaded as block-local index 0 of *every* block (§3d),
 /// like chibicc's `v0`. It carries no LLVM name; it is supplied positionally.
 const SP: ValueId = usize::MAX;
+
+/// Accumulates the §6 debug-info **neutral core** as functions are lowered — the LLVM on-ramp as a
+/// third independent producer feeding the frontend-neutral waist (DEBUGGING.md §6 / D-DBG-7).
+///
+/// Source positions come straight from each LLVM instruction's `!DILocation` (`HasDebugLoc`), keyed
+/// onto the SVM `(func, block, inst)` pc it lowered to. This is the **source-line half** of the
+/// waist — the analog of the wasm producer's `.debug_line` ingest (W4 slice 15), demonstrating the
+/// waist is genuinely frontend-neutral across a third frontend.
+///
+/// The **variable / type half** (`llvm.dbg.value` → `VarLoc` location lists, the DI type graph →
+/// `TypeDef`) is *not* reachable here: the pinned `llvm-ir` reader (0.11.3) leaves the structured
+/// metadata graph unimplemented (`Metadata::from_llvm_ref` is `unimplemented!`, `MetadataOperand`
+/// is payloadless), so the `DILocalVariable`/`DIType` nodes never reach this crate. Recovering them
+/// needs a metadata-capable reader (a direct `llvm-sys` DI walk) — its own effort (see `LLVM.md`).
+#[derive(Default)]
+struct DebugAcc {
+    files: Vec<String>,
+    file_idx: HashMap<String, u32>,
+    locs: Vec<Loc>,
+}
+
+impl DebugAcc {
+    /// Intern a `DebugLoc`'s file path (directory + filename joined, mirroring `DebugLoc`'s own
+    /// display join) into the `files` table, returning its index.
+    fn intern_file(&mut self, dl: &DebugLoc) -> u32 {
+        let path = match &dl.directory {
+            Some(d) if !d.is_empty() && !dl.filename.starts_with('/') => {
+                format!("{d}/{}", dl.filename)
+            }
+            _ => dl.filename.clone(),
+        };
+        if let Some(&i) = self.file_idx.get(&path) {
+            return i;
+        }
+        let i = self.files.len() as u32;
+        self.file_idx.insert(path.clone(), i);
+        self.files.push(path);
+        i
+    }
+
+    /// Record that the SVM ops at `func`/`block`/`inst in [start, end)` came from `dl`'s source
+    /// position (one `Loc` per op — the per-op granularity the `Loc` table models).
+    fn map_range(&mut self, func: u32, block: u32, start: usize, end: usize, dl: &DebugLoc) {
+        let file = self.intern_file(dl);
+        for inst in start..end {
+            self.locs.push(Loc {
+                func,
+                block,
+                inst: inst as u32,
+                file,
+                line: dl.line,
+                col: dl.col.unwrap_or(0),
+            });
+        }
+    }
+
+    /// The populated waist, or `None` when no instruction carried a `!DILocation` (a non-`-g`
+    /// build) — so a debug-free module stays `debug_info: None`, byte-identical to before.
+    fn finish(self) -> Option<DebugInfo> {
+        if self.locs.is_empty() {
+            None
+        } else {
+            Some(DebugInfo {
+                files: self.files,
+                locs: self.locs,
+                ..Default::default()
+            })
+        }
+    }
+}
 
 /// An LLVM value/global name as a `String` key (named or numbered).
 fn name_str(n: &Name) -> String {
@@ -1020,6 +1105,7 @@ struct Scan {
 #[allow(clippy::too_many_arguments)]
 fn translate_func(
     f: &Function,
+    func_idx: u32,
     types: &Types,
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
@@ -1027,6 +1113,7 @@ fn translate_func(
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
+    dbg: &mut DebugAcc,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
         return unsup(format!("varargs function `{}`", f.name));
@@ -1053,6 +1140,7 @@ fn translate_func(
         blocks.push(translate_block(
             bb,
             bi,
+            func_idx,
             f,
             types,
             &scan,
@@ -1065,6 +1153,7 @@ fn translate_func(
             cstrs,
             gbytes,
             helpers,
+            dbg,
         )?);
     }
     Ok((
@@ -4459,6 +4548,7 @@ impl<'a> BlockCtx<'a> {
 fn translate_block(
     bb: &BasicBlock,
     bi: usize,
+    func_idx: u32,
     f: &Function,
     types: &Types,
     s: &Scan,
@@ -4471,6 +4561,7 @@ fn translate_block(
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
+    dbg: &mut DebugAcc,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // The data-SP (`SP` sentinel) types as `i64`; every other param reads its scanned type.
@@ -4503,7 +4594,12 @@ fn translate_block(
         if matches!(instr, Instruction::Phi(_)) {
             continue; // φ-results are block parameters, supplied by predecessors
         }
+        // §6 source map: the SVM ops this LLVM instruction lowers to inherit its `!DILocation`.
+        let start = ctx.insts.len();
         translate_inst(&mut ctx, instr, types)?;
+        if let Some(dl) = instr.get_debug_loc() {
+            dbg.map_range(func_idx, bi as u32, start, ctx.insts.len(), dl);
+        }
     }
     let term = translate_term(&mut ctx, &bb.term, bi, f, s, block_params)?;
     Ok(Block {
