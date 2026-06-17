@@ -339,6 +339,9 @@ struct Type {
   Token *name;
   Token *name_pos;
 
+  // Struct/union tag for debug info (DEBUGGING.md §6 render names), or NULL if anonymous.
+  Token *tag;
+
   // Array
   int array_len;
 

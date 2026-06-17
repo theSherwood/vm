@@ -2205,6 +2205,19 @@ pub struct DebugInfo {
     pub types: Vec<TypeDef>,
     /// Source variables and where their value lives (the §6 neutral `VarLoc` = S2).
     pub vars: Vec<VarInfo>,
+    /// Opaque per-producer debug blobs (the §6 / D-DBG-7 "rich blob"): a frontend's native debug
+    /// info (DWARF sections, LLVM DI metadata) carried through the IR verbatim. The middle never
+    /// parses it — only a future DWARF/DI re-emitter (W5) does — and the verifier ignores it (§2a,
+    /// strippable / untrusted-for-escape). Empty for the common case.
+    pub blobs: Vec<ProducerBlob>,
+}
+
+/// An opaque per-producer debug blob (DEBUGGING.md §6 rich blob). `producer` tags the format so a
+/// consumer can dispatch (e.g. `".debug_info"`, `".debug_str"`, `"llvm-di"`); `bytes` is verbatim.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProducerBlob {
+    pub producer: String,
+    pub bytes: Vec<u8>,
 }
 
 /// An index into [`DebugInfo::types`].
@@ -2307,13 +2320,31 @@ pub struct VarInfo {
 
 /// Where a source variable's value lives at runtime (the S2 value-location model, IR form). The
 /// `Machine` (Cranelift register/stack) variant for debugging JIT-optimized code is a later field.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum VarLoc {
     /// An address-taken / aggregate / narrow local: window data-stack slot at `data-SP + off`.
     Window { off: i64 },
-    /// A promoted scalar: the SSA value index that holds it (resolved directly from the frame's
-    /// values by the interpreter — no debug-build mode needed).
+    /// A promoted scalar with a single function-wide SSA value index (resolved directly from the
+    /// frame's values by the interpreter — no debug-build mode needed). Valid when the holding value
+    /// never changes (e.g. a parameter, or chibicc `-Og` window-free scalars).
     Ssa { value: u32 },
+    /// A promoted scalar whose holding SSA value **varies through the function** — the DWARF
+    /// location-list case (S2). Each [`SsaLoc`] says "from this `(block, inst)` onward (within the
+    /// block) the var is held by this block-local value index"; resolution is nearest-preceding
+    /// within the stopped block (a block with no covering entry ⇒ the var is not live there). This
+    /// is what lets promoted scalars — and wasm/LLVM SSA-valued locals, which change per block — be
+    /// inspected without a window slot.
+    SsaList(Vec<SsaLoc>),
+}
+
+/// One entry of a [`VarLoc::SsaList`] location list: within block `block`, from instruction `inst`
+/// onward (until a later entry in the same block), the variable is held by block-local SSA value
+/// index `value`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SsaLoc {
+    pub block: u32,
+    pub inst: u32,
+    pub value: u32,
 }
 
 /// A named capability import (§7). `name` is the symbolic tag the host resolves at

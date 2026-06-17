@@ -24,9 +24,9 @@ use std::fmt::Write as _;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, FBinOp, FCmpOp,
     FToI, FUnOp, Field, FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc,
-    Memory, Module, Ordering, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp,
-    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp,
-    VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
+    Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -94,7 +94,12 @@ pub fn print_module(m: &Module) -> String {
 /// `debug.var <fn> "<name>" win|ssa <n> "<type>" [<type_id>]`. Absent ⇒ nothing printed.
 fn print_debug_info(s: &mut String, m: &Module) {
     let Some(di) = &m.debug_info else { return };
-    if di.files.is_empty() && di.locs.is_empty() && di.types.is_empty() && di.vars.is_empty() {
+    if di.files.is_empty()
+        && di.locs.is_empty()
+        && di.types.is_empty()
+        && di.vars.is_empty()
+        && di.blobs.is_empty()
+    {
         return;
     }
     s.push('\n');
@@ -147,19 +152,37 @@ fn print_debug_info(s: &mut String, m: &Module) {
         }
     }
     for v in &di.vars {
-        let (kind, n) = match v.loc {
-            VarLoc::Window { off } => ("win", off),
-            VarLoc::Ssa { value } => ("ssa", value as i64),
-        };
-        let _ = write!(
-            s,
-            "debug.var {} \"{}\" {kind} {n} \"{}\"",
-            v.func, v.name, v.ty
-        );
+        // `debug.var <fn> "<name>" <loc> "<ty>" [<type_id>]`, where `<loc>` is `win <off>`,
+        // `ssa <value>`, or `ssalist <n> <b0> <i0> <v0> …` (the location list, S2).
+        let _ = write!(s, "debug.var {} \"{}\" ", v.func, v.name);
+        match &v.loc {
+            VarLoc::Window { off } => {
+                let _ = write!(s, "win {off}");
+            }
+            VarLoc::Ssa { value } => {
+                let _ = write!(s, "ssa {value}");
+            }
+            VarLoc::SsaList(locs) => {
+                let _ = write!(s, "ssalist {}", locs.len());
+                for l in locs {
+                    let _ = write!(s, " {} {} {}", l.block, l.inst, l.value);
+                }
+            }
+        }
+        let _ = write!(s, " \"{}\"", v.ty);
         if let Some(tid) = v.type_id {
             let _ = write!(s, " {tid}");
         }
         s.push('\n');
+    }
+    // Opaque per-producer rich blobs (§6): `debug.blob "<producer>" "<escaped bytes>"`.
+    for b in &di.blobs {
+        let _ = writeln!(
+            s,
+            "debug.blob \"{}\" \"{}\"",
+            b.producer,
+            escape_bytes(&b.bytes)
+        );
     }
 }
 
@@ -788,6 +811,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     let mut dbg_locs: Vec<Loc> = Vec::new();
     let mut dbg_types: Vec<TypeDef> = Vec::new();
     let mut dbg_vars: Vec<VarInfo> = Vec::new();
+    let mut dbg_blobs: Vec<ProducerBlob> = Vec::new();
     while !p.at_end() {
         match p.peek() {
             // Debug-info waist (DEBUGGING.md §6) — strippable tooling, parsed into `Module::
@@ -891,9 +915,21 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     "ssa" => VarLoc::Ssa {
                         value: p.parse_u32()?,
                     },
+                    "ssalist" => {
+                        let n = p.parse_u32()?;
+                        let mut locs = Vec::new();
+                        for _ in 0..n {
+                            locs.push(svm_ir::SsaLoc {
+                                block: p.parse_u32()?,
+                                inst: p.parse_u32()?,
+                                value: p.parse_u32()?,
+                            });
+                        }
+                        VarLoc::SsaList(locs)
+                    }
                     k => {
                         return err(format!(
-                            "debug.var location kind must be win or ssa, got {k}"
+                            "debug.var location kind must be win, ssa, or ssalist, got {k}"
                         ))
                     }
                 };
@@ -913,6 +949,14 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     loc,
                     type_id,
                 });
+            }
+            // Opaque per-producer rich blob (§6): `debug.blob "<producer>" "<bytes>"`.
+            Some(Tok::Ident(s)) if s == "debug.blob" => {
+                p.next()?;
+                let producer = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.blob producer is not valid UTF-8".into()))?;
+                let bytes = p.parse_str()?;
+                dbg_blobs.push(ProducerBlob { producer, bytes });
             }
             // Module-level `memory <size_log2>` declaration.
             Some(Tok::Ident(s)) if s == "memory" => {
@@ -964,6 +1008,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
         && dbg_locs.is_empty()
         && dbg_types.is_empty()
         && dbg_vars.is_empty()
+        && dbg_blobs.is_empty()
     {
         None
     } else {
@@ -972,6 +1017,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
             locs: dbg_locs,
             types: dbg_types,
             vars: dbg_vars,
+            blobs: dbg_blobs,
         })
     };
     Ok(Module {
@@ -1077,12 +1123,25 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.next()?;
                 p.parse_int()?; // func
                 p.parse_str()?; // name
-                p.next()?; // location kind (win|ssa)
-                p.parse_int()?; // n
+                                // Location: `win <off>` / `ssa <value>` (one int), or `ssalist <n>` + 3n ints.
+                let kind = p.parse_ident()?;
+                if kind == "ssalist" {
+                    let n = p.parse_int()?;
+                    for _ in 0..n.max(0) * 3 {
+                        p.parse_int()?;
+                    }
+                } else {
+                    p.parse_int()?; // win off / ssa value
+                }
                 p.parse_str()?; // type
                 if matches!(p.peek(), Some(Tok::Int(_))) {
                     p.parse_int()?; // optional structured type id
                 }
+            }
+            Some(Tok::Ident(s)) if s == "debug.blob" => {
+                p.next()?;
+                p.parse_str()?; // producer
+                p.parse_str()?; // bytes
             }
             _ => return err("expected `func` or `memory`"),
         }

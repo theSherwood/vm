@@ -53,8 +53,8 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
-| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text); chibicc `-g` emits `debug.var` + `debug.loc` + `debug.type`/`debug.field`** (D-DBG-7/§6; binary section pending; DAP consumer of types pending) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-interp`, `codegen_ir.c` |
-| DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF `.debug_line` → `debug.loc`** (2nd producer); DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm` |
+| DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -588,9 +588,8 @@ window and formatted per their `TypeDef` (signed/unsigned/float/`_Bool`/pointer-
 come from the frame's data-SP (`read_ir_value(frame, 0)`) plus the `Window` offset; `seek`/resume
 clear the place table (the addresses go stale). Test (`dap.rs`): a guest fills a `struct {int x,y}`
 and an `int[3]`, and the scripted conversation expands `p` → `x=11, y=22` and `row` → `[0]=100,
-[1]=200, [2]=300`. The `evaluate` member/index half landed in slice 10 (below); still open:
-pointer-deref *expansion* in the Variables pane and richer render names (the C tag, e.g.
-`"struct Point"`).
+[1]=200, [2]=300`. The `evaluate` member/index half landed in slice 10 and pointer-deref
+expansion in slice 11; richer render names (the C tag) in slice 12 (all below).
 
 **Built — `evaluate` member / index / arrow access (W4 slice 10, the consumer half completed).**
 `evaluate` now resolves `a.b`, `arr[i]`, and `p->x` (and combinations like `p.x + arr[i]`,
@@ -601,9 +600,9 @@ integer coercion) are a callback the caller implements. `svm-dap`'s `EvalEnv` is
 pure address arithmetic over `TypeDef` + window reads, no `svm-ir`/frontend types in `expr`
 itself. `eval_int` (conditional breakpoints) is unchanged, now a thin wrapper over the same core.
 Tests (`dap.rs`): member/index/mixed arithmetic over a struct+array, and `->`/pointer-indexing
-through a pointer; bad accesses (`p.nope`, `p.x.y`, `pp->x->y`) fail cleanly. *Not yet:*
-pointer-deref expansion (Variables pane), floats / short-circuit `&&`/`||`, and richer render
-names.
+through a pointer; bad accesses (`p.nope`, `p.x.y`, `pp->x->y`) fail cleanly. (Pointer-deref
+*expansion* landed in slice 11, richer render names in slice 12, and floats / short-circuit in
+slice 13.)
 
 **Built — frontend-neutrality cleanup (W4 slice 9).** Scalar read widths now come from the
 structured type's `size` (`scalar_width` → `TypeDef.size`), not the variable's *name*; the old
@@ -982,10 +981,10 @@ and the LLVM/wasm ingest sides, are their own slices targeting this same waist.
 
 **Slice 5 — chibicc `-g` emission (the producer side, end-to-end).** `chibicc --emit-ir -g`
 now emits the §6 waist from real C: a `debug.var` per named local mapping its C name to a
-`VarLoc`. Crucially, **`-g` is `-Og`** — it disables SSA promotion (the W6 / §19 debuggable-vs-
-optimized trade), so every local keeps a *stable* window data-stack slot and resolves
-function-wide as `VarLoc::Window{off}`. (Promoted scalars would need S2's per-block `LocList`
-since their value index varies by block/PC — deferred.) `main.c` gains a 2-line `-g` flag
+`VarLoc`. At first, **`-g` was `-Og`** — it disabled SSA promotion (the W6 / §19 debuggable-vs-
+optimized trade), so every local kept a *stable* window data-stack slot resolving function-wide as
+`VarLoc::Window{off}` (promoted scalars would need S2's per-block `LocList`). **Superseded by slice
+17**, which keeps promotion and emits a location list instead — debugging the optimized build. `main.c` gains a 2-line `-g` flag
 (intercepted before chibicc's generic `-g*`-ignore block); everything else is in `codegen_ir.c`
 (the project's "ours" file). End-to-end test (`c_frontend.rs`, behind the unix toolchain gate):
 compile C → parse → `Inspector` reads `s`, `t`, `a`, `b` by their **C names** with correct
@@ -1012,8 +1011,8 @@ text form adds `debug.type` / `debug.field` and an optional trailing id on `debu
 old name-only `debug.var` still valid (back-compat: `type_id = None`). chibicc `-g` interns each
 named local's C `Type` (by pointer identity to bound recursive aggregates, plus structural dedup
 of base scalars) and emits the table. This is the **producer + ABI** half (the §7 W5 note). The
-binary section is still stripped (`svm-encode` sets `debug_info: None`), and render names are
-still generic (`"struct"`, not `"struct Point"` — the C tag isn't on chibicc's `Type`).
+binary section was text-only until slice 14 (below); render names were generic until slice 12
+(below) gave them the C tag.
 
 **Slice 8 — DAP Variables-pane aggregate expansion (first consumer of the type table).** A
 struct/array local expands in the editor: the server hands back a nonzero `variablesReference`
@@ -1021,17 +1020,108 @@ naming a `Place` (thread + window address + `TypeId`), and a `variables` request
 fields/elements — recursively for nested aggregates, scalar leaves read from the window and
 formatted per `TypeDef`. Full design in §7.
 
-**Slice 10 — `evaluate` member / index / arrow.** Completes the consumer half: `evaluate` resolves
+**Slice 10 — `evaluate` member / index / arrow.** Completes the `evaluate` half: `evaluate` resolves
 `a.b` / `arr[i]` / `p->x` (and mixes like `p.x + arr[i]`) over the structured types. The `expr`
 evaluator grew a frontend-agnostic `Resolver` trait + a `Value` (`Int | Place`); `svm-dap`'s
 `EvalEnv` implements the navigation as address arithmetic over `TypeDef` + window reads. Full
 design in §7.
 
-**Not yet (next slices):** pointer-deref *expansion* in the Variables pane; richer type render
-names; the LLVM/wasm `debug.loc` + type ingest sides; binary serialization of the debug
-section; and the remaining W4 refinement (per-block `LocList` so promoted scalars are debuggable
-without `-Og`, per-producer rich blob). (Multithreaded debugging and the interpreter-backed DAP
-server are already built — Milestone B and W5 slices 1–6.)
+**Slice 11 — pointer-deref expansion (Variables pane).** A pointer local/field is now expandable:
+its row shows the address (`0x…`, read from the window) and expands to a single synthetic `*`
+child — the pointee at the dereferenced address, itself expandable if it's a struct/array/pointer.
+A null pointer shows a `<null>` leaf, an unreadable one `<unreadable>` (lazy, so a self-referential
+`struct Node { Node *next; }` walks one level per click). `is_expandable` now covers `Pointer`, and
+an expandable row's summary comes from a memory-aware `place_summary`. Test (`dap.rs`): a `pp`
+→ `struct Point *` expands `pp` (`0x410`) → `*` (`{...}`) → `x=7, y=9`.
+
+**Slice 12 — richer type render names.** Derived types now render readably: `struct Point` (the C
+tag, carried on a new `Type::tag` field in chibicc), `int *`, `int[4]` — built compositely in
+`dbg_typename`, so both the `debug.var` name and the type-table name show the type a programmer
+would write rather than a bare kind. Anonymous structs stay `"struct"`.
+
+**Slice 13 — `evaluate` floats + short-circuit `&&`/`||`.** The `expr` evaluator gained float
+literals (`1.5`, `2e3`), a `Value::Float`, and C numeric promotion (an internal `Num`: arithmetic
+and comparisons run in `f64` when either side is float; `% << >> & | ^ ~` stay integer-only).
+`Resolver::coerce_int` became `load` (a scalar `Place` reads as `Float` for a float base type, else
+`Int`). `&&`/`||` now **short-circuit**: the dead operand is parsed (for position) but evaluated
+with a `live = false` flag that suppresses resolver calls and errors — so `b != 0 && a/b > 0` no
+longer trips integer division-by-zero. The bare-variable `evaluate`/Variables scalar path also now
+formats window bytes through the structured type, so a `double` reads as `2.5`, not its bit
+pattern. Tests: `expr` unit tests (promotion, short-circuit) + a DAP test over a window `double`.
+
+**Slice 14 — binary serialization of the debug section.** `svm-encode` now encodes/decodes the
+full `DebugInfo` (files, locs, the structured type table, vars) as a strippable section appended
+after the funcs, so debug info survives the binary IR form, not just text. It's **append-only and
+back-compatible**: a module with no debug info encodes byte-identically to before (the decoder
+treats "no bytes after the funcs" as `None`), so existing blobs and `svm-snapshot` digests are
+unchanged — verified by a prefix assertion. The decoder keeps the untrusted-input discipline
+(bounded counts, UTF-8-checked strings, validated discriminants → typed `DecodeError`s) and the
+verifier still ignores the section (§2a). Tests (`svm-encode`): a module exercising every
+`TypeDef` variant + `VarLoc` + `type_id` round-trips; the no-debug case stays a byte-prefix; a
+corrupted section fails to decode without panicking.
+
+**Slice 15 — wasm DWARF → `debug.loc` (the second producer; frontend-neutrality demonstrated).**
+`svm-wasm` now ingests a guest's embedded DWARF `.debug_line` and maps it onto the **same neutral
+`DebugInfo` waist** chibicc populates — so a *second*, independent frontend produces source
+locations the interpreter/DAP consume unchanged. A small hand-rolled DWARF v2–v4 line-program
+reader (`dwarf_line.rs`, no `gimli` dep — matching the crate's lean ethos) decodes the
+`(address → file, line, col)` rows; the translator threads each wasm operator's byte offset and
+records where its first IR instruction lands, so a line row's code-relative address resolves to an
+IR pc (`func, block, inst`). The wasm-DWARF address convention (offsets relative to the code
+section content) is handled by subtracting the code section's start. Best-effort and strippable:
+malformed DWARF ⇒ no debug info, and the verifier ignores the section (§2a). Test (`debug_line.rs`):
+a clang-built `dline.c` wasm fixture transpiles with the C source's body lines (2, 3) mapped to
+in-range IR pcs, and still verifies. *Scope:* source lines only — variable ingest needs the
+per-block `LocList` (wasm/LLVM locals are SSA values that vary by block), and the LLVM bitcode
+metadata path is its own slice.
+
+**Slice 16 — per-block `LocList` ABI + interpreter resolution (S2, the location-list case).**
+`VarLoc` gained an `SsaList(Vec<SsaLoc>)` variant: a DWARF-style location list where each entry
+(`block, inst, value`) says "from this pc onward within the block, the var is this block-local SSA
+value". The interpreter's `read_var` resolves it **nearest-preceding within the stopped block**
+(like `source_loc`), so a promoted scalar whose holding value changes — across a block boundary
+(its block-param index differs per block) or mid-block (a reassignment makes a fresh SSA value) —
+reads correctly at any stopped pc. This is the representation SSA-valued locals need: it unblocks
+**wasm/LLVM variable ingest** and lets **chibicc debug without `-Og`**. The text (`debug.var …
+ssalist <n> <b> <i> <v>…`) and binary forms round-trip it; `Window`/`Ssa` are unchanged
+(back-compat). The DAP `EvalEnv` resolves an `SsaList` name through `read_var` at the frame pc.
+Tests: an interpreter test reads `x` at three pcs (block boundary + intra-block transition) getting
+the right value each time; text + binary round-trips. *This is the ABI + consumer; producers
+emitting location lists (chibicc promotion, wasm locals) are follow-up slices, per the slice-4→5
+pattern.*
+
+**Slice 17 — chibicc emits location lists (debug the optimized build; no more `-Og`).** `-g` no
+longer disables SSA promotion (superseding slice 5's `-g = -Og`): a promoted scalar now keeps its
+SSA value and `-g` emits a **location list** (`debug.var … ssalist …`) recording the holding
+block-local value as it changes — across blocks (a fresh block parameter each block, e.g. a loop's
+iteration variable) and on each write. The emitter records every `set_curval` (block entry, the
+entry block's param/zero-init bindings, and writes) as a `(func, slot, block, inst, value)` and
+emits the list; memory locals still emit `win`. So you debug the **actually-optimized** code — the
+value-location-list tier of the W6/§19 trade — and the interpreter resolves a var to the right SSA
+value at each pc. (Honest optimized-debug consequence: a variable assigned by a block's *last* op
+is only live at the following step point, since the interpreter breaks before an op, not at the
+terminator.) Tests (`c_frontend.rs`): named locals read by C name at a breakpoint (now via
+`ssalist`), source-line mapping, structured types, and a **loop accumulator** whose `(i, acc)` read
+correctly across iterations — chibicc debugging promoted code end-to-end.
+
+**Slice 18 — per-producer rich blob (the §6 waist's opaque half).** `DebugInfo` gained
+`blobs: Vec<ProducerBlob{producer, bytes}>` — a frontend's **native** debug info carried through the
+IR verbatim (the middle never parses it; only a future DWARF/DI re-emitter (W5) will; the verifier
+ignores it, §2a). Text (`debug.blob "<producer>" "<escaped bytes>"`, reusing the data-segment byte
+escaping) and binary forms round-trip it (incl. non-UTF-8 / NUL bytes); the no-debug encoding stays
+a byte-prefix. The **wasm** producer now passes every embedded `.debug_*` section through as a blob
+(tagged by section name), so a guest's full DWARF survives transpilation — and `.debug_info` (the
+variable-bearing section the core doesn't yet parse) is preserved for later. This freezes the §6
+schema's rich-blob slot, as the doc recommended. Tests: wasm carries `.debug_info`/`.debug_line`
+blobs verbatim; text + binary round-trips; a truncated debug section errors without panicking.
+
+**Not yet (next slices):** wasm/LLVM **variable** ingest — the large, design-heavy piece: it needs
+full `.debug_info`/`.debug_abbrev` DIE parsing **and** a location model for DWARF's frame-base /
+`DW_OP_fbreg` memory locations (clang `-O0` describes C-frame memory, not our SSA/window values, so
+neither `Ssa`/`SsaList` nor `Window` maps directly — a runtime `__stack_pointer`-relative base). The
+LLVM `!DILocation` → `debug.loc` bitcode-metadata path is its own effort. (The chibicc producer
+(incl. optimized-build location lists), both DAP consumers, binary serialization, a second
+producer's source lines, the location-list ABI, and now the rich-blob pass-through are all built.)
 
 ### Open questions (S4/S5/S2)
 
