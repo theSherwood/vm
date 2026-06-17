@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue};
 use svm_ir::{DebugInfo, ValType};
 
+mod expr;
 mod json;
 pub use json::{parse, Json};
 
@@ -42,6 +43,10 @@ struct Session {
     line_index: BTreeMap<(u32, u32), IrPc>,
     /// IR pcs currently set as breakpoints (so `setBreakpoints` can replace them per the protocol).
     breakpoints: Vec<IrPc>,
+    /// Conditional breakpoints (DAP `condition`): an IR pc → an integer expression that must be
+    /// nonzero in the stopped frame for the breakpoint to actually stop (DEBUGGING.md W5). Absent ⇒
+    /// unconditional. Evaluated by [`expr::eval_int`] over the frame's source variables.
+    conditions: BTreeMap<IrPc, String>,
     /// DAP `frameId` → `(thread id, frame index)`, assigned during `stackTrace` and consumed by
     /// `scopes`/`variables`/`evaluate`, so a reference names a specific thread's frame (multithreaded
     /// DAP). Cleared whenever execution resumes (old frames become stale).
@@ -49,6 +54,23 @@ struct Session {
     /// Multithreaded run (`attach_scheduled[_seeded]`)? Selects the time-travel coordinate: the
     /// global scheduler `turn` when scheduled, the op `clock` single-threaded.
     scheduled: bool,
+}
+
+impl Session {
+    /// Resolve a source variable `name` (declared in function `func`) to an `i64`, in the frame
+    /// `frame_idx` levels up the focused thread — the binding the expression evaluator and
+    /// conditional breakpoints use. `None` if there is no such variable or its value isn't integral.
+    fn resolve_var(&self, frame_idx: usize, func: u32, name: &str) -> Option<i64> {
+        let ty = self
+            .debug
+            .as_ref()?
+            .vars
+            .iter()
+            .find(|v| v.func == func && v.name == name)?
+            .ty
+            .clone();
+        var_to_i64(&self.inspector.read_var(frame_idx, name, ty_width(&ty))?)
+    }
 }
 
 /// An event to emit after a response: `(event-name, body)`.
@@ -150,6 +172,8 @@ impl DapServer {
             ("supportsStepBack", Json::Bool(true)),
             // Resolve a variable on hover, not just in the Variables pane.
             ("supportsEvaluateForHovers", Json::Bool(true)),
+            // Conditional breakpoints (DEBUGGING.md W5): stop only when the `condition` is nonzero.
+            ("supportsConditionalBreakpoints", Json::Bool(true)),
         ]);
         // The client now sends breakpoints, then `configurationDone`.
         (true, caps, vec![("initialized", Json::obj(vec![]))])
@@ -212,6 +236,7 @@ impl DapServer {
             debug,
             line_index,
             breakpoints: Vec::new(),
+            conditions: BTreeMap::new(),
             frame_refs: Vec::new(),
             scheduled,
         });
@@ -232,9 +257,11 @@ impl DapServer {
         let file_idx = files.and_then(|fs| match_file(fs, path));
 
         // Per DAP, setBreakpoints *replaces* this source's breakpoints — clear the old set first.
+        // (Conditions are keyed by pc; clearing the whole map is fine since slice 1 is single-source.)
         for pc in session.breakpoints.drain(..) {
             session.inspector.clear_breakpoint(pc);
         }
+        session.conditions.clear();
 
         let requested = args
             .and_then(|a| a.get("breakpoints"))
@@ -248,6 +275,12 @@ impl DapServer {
                 Some((actual_line, pc)) => {
                     session.inspector.set_breakpoint(pc);
                     session.breakpoints.push(pc);
+                    // A `condition` (an integer expression) only stops when it evaluates nonzero.
+                    if let Some(cond) = bp.get("condition").and_then(|c| c.as_str()) {
+                        if !cond.trim().is_empty() {
+                            session.conditions.insert(pc, cond.to_string());
+                        }
+                    }
                     out.push(Json::obj(vec![
                         ("verified", Json::Bool(true)),
                         ("line", Json::i(actual_line as i64)),
@@ -269,11 +302,10 @@ impl DapServer {
         if self.stop_on_entry {
             let ev = stopped_event("entry", 1);
             (true, Json::Null, vec![ev])
+        } else if self.session.is_none() {
+            (false, Json::Null, vec![])
         } else {
-            let stop = match self.session.as_mut() {
-                Some(s) => s.inspector.run_until_stop(),
-                None => return (false, Json::Null, vec![]),
-            };
+            let stop = self.run_with_conditions();
             (true, Json::Null, self.stop_events(stop))
         }
     }
@@ -428,10 +460,10 @@ impl DapServer {
     }
 
     fn on_continue(&mut self) -> (bool, Json, Vec<Event>) {
-        let stop = match self.session.as_mut() {
-            Some(s) => s.inspector.run_until_stop(),
-            None => return (false, Json::Null, vec![]),
-        };
+        if self.session.is_none() {
+            return (false, Json::Null, vec![]);
+        }
+        let stop = self.run_with_conditions();
         (
             true,
             Json::obj(vec![("allThreadsContinued", Json::Bool(true))]),
@@ -439,17 +471,103 @@ impl DapServer {
         )
     }
 
+    /// Resume until a stop, transparently skipping conditional breakpoints whose condition is false
+    /// (DEBUGGING.md W5) — so `continue` lands only on breakpoints that actually fire.
+    fn run_with_conditions(&mut self) -> Stop {
+        loop {
+            let stop = match self.session.as_mut() {
+                Some(s) => s.inspector.run_until_stop(),
+                None => return Stop::Blocked,
+            };
+            match stop {
+                Stop::Break {
+                    reason: StopReason::Breakpoint,
+                    pc,
+                } if !self.condition_holds(pc) => continue, // condition false: keep going
+                other => return other,
+            }
+        }
+    }
+
+    /// Whether a stop at `pc` should surface: `true` for an unconditional breakpoint or a condition
+    /// that evaluates nonzero in the stopped (innermost) frame. A malformed/unresolvable condition
+    /// also stops (so the user notices rather than silently skipping).
+    fn condition_holds(&self, pc: IrPc) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return true;
+        };
+        let Some(cond) = session.conditions.get(&pc) else {
+            return true; // unconditional
+        };
+        let func = match session.inspector.backtrace().first() {
+            Some(f) => f.pc.func,
+            None => return true,
+        };
+        let resolve = |name: &str| session.resolve_var(0, func, name);
+        match expr::eval_int(cond, &resolve) {
+            Some(v) => v != 0,
+            None => true,
+        }
+    }
+
     fn on_step(&mut self, kind: StepKind) -> (bool, Json, Vec<Event>) {
         // `stepIn` descends into calls (single op); `next` runs over them; `stepOut` runs to return.
-        let stop = match self.session.as_mut() {
-            Some(s) => match kind {
-                StepKind::In => s.inspector.step(),
-                StepKind::Over => s.inspector.step_over(),
-                StepKind::Out => s.inspector.step_out(),
-            },
+        // With debug info, `next`/`stepIn` step a whole *source line* (op-stepping until the frame's
+        // line changes) so the editor advances a line at a time, not an op at a time; `stepOut`
+        // already lands in the caller. Without debug info, all three stay op-level (IR debugging).
+        let has_debug = match self.session.as_ref() {
+            Some(s) => s.debug.is_some(),
             None => return (false, Json::Null, vec![]),
         };
+        let stop = match kind {
+            StepKind::Out => self.session.as_mut().unwrap().inspector.step_out(),
+            StepKind::In | StepKind::Over if has_debug => self.step_source_line(kind),
+            StepKind::In => self.session.as_mut().unwrap().inspector.step(),
+            StepKind::Over => self.session.as_mut().unwrap().inspector.step_over(),
+        };
         (true, Json::Null, self.stop_events(stop))
+    }
+
+    /// Op-step (in / over) until the focused frame's *source line* changes — so DAP `next`/`stepIn`
+    /// advance one source line, not one IR op (DEBUGGING.md W5). Stops early on a breakpoint, a
+    /// finish, or a generous op cap (defensive against unmapped code). Skips ops with no source line
+    /// and ops still on the starting line.
+    fn step_source_line(&mut self, kind: StepKind) -> Stop {
+        const CAP: usize = 1_000_000;
+        let start = self.current_source_line();
+        let mut last = Stop::Blocked;
+        for _ in 0..CAP {
+            last = match self.session.as_mut() {
+                Some(s) => match kind {
+                    StepKind::In => s.inspector.step(),
+                    _ => s.inspector.step_over(),
+                },
+                None => return Stop::Blocked,
+            };
+            match last {
+                Stop::Break {
+                    reason: StopReason::Step,
+                    ..
+                } => {
+                    let now = self.current_source_line();
+                    if now.is_some() && now != start {
+                        return last; // reached a different source line
+                    }
+                    // else: same line or an unmapped op — keep stepping
+                }
+                _ => return last, // a real breakpoint, finish, or block preempts the line-step
+            }
+        }
+        last
+    }
+
+    /// The `(file, line)` of the focused thread's innermost frame, if it maps to source.
+    fn current_source_line(&self) -> Option<(String, u32)> {
+        let s = self.session.as_ref()?;
+        s.inspector
+            .backtrace()
+            .first()
+            .and_then(|f| f.source.as_ref().map(|src| (src.file.clone(), src.line)))
     }
 
     fn on_step_back(&mut self) -> (bool, Json, Vec<Event>) {
@@ -500,9 +618,10 @@ impl DapServer {
     }
 
     fn on_evaluate(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
-        // Resolve a watch/hover/REPL expression. Slice 1 supports a bare source-variable name in the
-        // given frame (read through `read_var`); richer expressions (`a.b`, `arr[i]`, arithmetic) are
-        // a follow-up. Failure ⇒ `success:false`, which the client shows as "not available".
+        // Watch / hover / REPL / breakpoint-condition expression. A bare known variable keeps its
+        // rich form (declared type + formatted value); anything else is an integer expression over
+        // the frame's source variables (`expr::eval_int`). Member/index access (`a.b`, `arr[i]`)
+        // needs structured type layout — the W4 `TypeRef` follow-up. Failure ⇒ `success:false`.
         let fail = (false, Json::Null, vec![]);
         let expr = args
             .and_then(|a| a.get("expression"))
@@ -511,7 +630,7 @@ impl DapServer {
             .trim()
             .to_string();
         let Some(frame_id) = args.and_then(|a| a.get("frameId")).and_then(|v| v.as_i64()) else {
-            return fail; // no frame context to resolve a name in
+            return fail; // no frame context to resolve names in
         };
         let Some(session) = self.session.as_mut() else {
             return fail;
@@ -522,32 +641,48 @@ impl DapServer {
         else {
             return fail;
         };
-        session.inspector.select_task(tid);
+        session.inspector.select_task(tid); // focus the requested thread, then read it immutably
+        let session = self.session.as_ref().unwrap();
         let frames = session.inspector.backtrace();
         let Some(func) = frames.get(frame_idx).map(|f| f.pc.func) else {
             return fail;
         };
-        // The variable's declared type (for the read width); also confirms `expr` is a known local.
-        let ty = session
+
+        // A bare known variable: return its declared type + formatted value (richer than a raw i64).
+        let bare = session
             .debug
             .as_ref()
-            .and_then(|d| d.vars.iter().find(|v| v.func == func && v.name == expr))
-            .map(|v| v.ty.clone());
-        let (Some(ty), Some(val)) = (
-            ty.clone(),
-            ty.and_then(|t| session.inspector.read_var(frame_idx, &expr, ty_width(&t))),
-        ) else {
-            return fail;
-        };
-        (
-            true,
-            Json::obj(vec![
-                ("result", Json::s(fmt_var(&val))),
-                ("type", Json::s(ty)),
-                ("variablesReference", Json::i(0)),
-            ]),
-            vec![],
-        )
+            .and_then(|d| d.vars.iter().find(|v| v.func == func && v.name == expr));
+        if let Some(var) = bare {
+            if let Some(val) = session
+                .inspector
+                .read_var(frame_idx, &expr, ty_width(&var.ty))
+            {
+                return (
+                    true,
+                    Json::obj(vec![
+                        ("result", Json::s(fmt_var(&val))),
+                        ("type", Json::s(var.ty.clone())),
+                        ("variablesReference", Json::i(0)),
+                    ]),
+                    vec![],
+                );
+            }
+        }
+
+        // Otherwise evaluate as an integer expression over the frame's variables.
+        let resolve = |name: &str| session.resolve_var(frame_idx, func, name);
+        match expr::eval_int(&expr, &resolve) {
+            Some(v) => (
+                true,
+                Json::obj(vec![
+                    ("result", Json::s(v.to_string())),
+                    ("variablesReference", Json::i(0)),
+                ]),
+                vec![],
+            ),
+            None => fail,
+        }
     }
 
     fn on_disconnect(&mut self) -> (bool, Json, Vec<Event>) {
@@ -676,6 +811,25 @@ fn fmt_var(v: &VarValue) -> String {
             }
         }
     }
+}
+
+/// A source variable's value as an `i64`, for the expression evaluator: scalars directly, a window
+/// byte range as a little-endian integer, a float truncated. `None` for a non-integral value.
+fn var_to_i64(v: &VarValue) -> Option<i64> {
+    Some(match v {
+        VarValue::Value(Value::I32(n)) => *n as i64,
+        VarValue::Value(Value::I64(n)) => *n,
+        VarValue::Value(Value::F32(x)) => *x as i64,
+        VarValue::Value(Value::F64(x)) => *x as i64,
+        VarValue::Value(_) => return None,
+        VarValue::Bytes(b) => {
+            let mut x = 0u64;
+            for (i, &byte) in b.iter().take(8).enumerate() {
+                x |= (byte as u64) << (8 * i);
+            }
+            x as i64
+        }
+    })
 }
 
 /// Coerce a JSON array of integers to entry-function arguments, one per declared parameter type.

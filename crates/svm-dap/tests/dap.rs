@@ -726,3 +726,181 @@ fn dap_next_steps_over_a_call() {
     );
     assert_eq!(frames.as_array().unwrap()[0].get("line"), Some(&Json::i(6)));
 }
+
+// Two source lines, the first spanning two ops (so op-stepping would stutter on it).
+const TWO_LINES_DBG: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 10
+  v2 = i32.add v0 v1
+  v3 = i32.const 1
+  v4 = i32.add v2 v3
+  return v4
+}
+
+debug.file 0 "f.c"
+debug.loc 0 0 0 0 1 1
+debug.loc 0 0 2 0 2 1
+"#;
+
+/// DAP `next` advances a whole *source line*, not one IR op: from f.c:1 (two ops) a single `next`
+/// lands on f.c:2.
+#[test]
+fn dap_next_steps_a_whole_source_line() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(TWO_LINES_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(5)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("f.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(1))])]),
+            ),
+        ]),
+    ));
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let line = |s: &mut DapServer| -> i64 {
+        let out = s.handle(&req(
+            99,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        response(&out)
+            .get("body")
+            .unwrap()
+            .get("stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("line")
+            .unwrap()
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(line(&mut s), 1, "stopped on f.c:1");
+    s.handle(&req(5, "next", Json::obj(vec![("threadId", Json::i(1))])));
+    assert_eq!(
+        line(&mut s),
+        2,
+        "one `next` advanced the whole line to f.c:2"
+    );
+}
+
+/// A conditional breakpoint stops only when its expression is nonzero: `i == 1` skips the i=3 and
+/// i=2 iterations of the loop and stops at i=1.
+#[test]
+fn dap_conditional_breakpoint_stops_only_when_true() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("sum.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![
+                    ("line", Json::i(7)),
+                    ("condition", Json::s("i == 1")),
+                ])]),
+            ),
+        ]),
+    ));
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("breakpoint"))
+    );
+    // It skipped i=3 and i=2 and stopped where the condition held: i = 1, acc = 5.
+    let l = locals(&mut s);
+    assert_eq!((l["i"].as_str(), l["acc"].as_str()), ("1", "5"));
+}
+
+/// `evaluate` computes an integer expression over the frame's variables (watch / REPL / condition).
+#[test]
+fn dap_evaluate_computes_an_expression() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("sum.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(7))])]),
+            ),
+        ]),
+    ));
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let out = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let fid = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let eval = |s: &mut DapServer, e: &str| -> Vec<Json> {
+        s.handle(&req(
+            6,
+            "evaluate",
+            Json::obj(vec![("expression", Json::s(e)), ("frameId", Json::i(fid))]),
+        ))
+    };
+    // First iteration: i = 3, acc = 0.
+    let out = eval(&mut s, "i * 2 + acc");
+    assert_eq!(
+        response(&out).get("body").unwrap().get("result"),
+        Some(&Json::s("6"))
+    );
+    let out = eval(&mut s, "i > acc");
+    assert_eq!(
+        response(&out).get("body").unwrap().get("result"),
+        Some(&Json::s("1"))
+    );
+    // A divide-by-zero (acc = 0) fails cleanly.
+    let out = eval(&mut s, "i / acc");
+    assert_eq!(response(&out).get("success"), Some(&Json::Bool(false)));
+}
