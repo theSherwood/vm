@@ -1331,6 +1331,24 @@ fn v_intun(lo: &mut Lower, shape: VShape, op: VIntUnOp) -> Result<(), Error> {
     lo.push(v, ValType::V128);
     Ok(())
 }
+fn v_anytrue(lo: &mut Lower) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VAnyTrue { a });
+    lo.push(v, ValType::I32);
+    Ok(())
+}
+fn v_alltrue(lo: &mut Lower, shape: VShape) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VAllTrue { shape, a });
+    lo.push(v, ValType::I32);
+    Ok(())
+}
+fn v_bitmask(lo: &mut Lower, shape: VShape) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VBitmask { shape, a });
+    lo.push(v, ValType::I32);
+    Ok(())
+}
 fn v_fbin(lo: &mut Lower, shape: VShape, op: VFloatBinOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
@@ -2920,6 +2938,16 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I32x4Neg => v_intun(lo, VShape::I32x4, VIntUnOp::Neg)?,
         O::I64x2Abs => v_intun(lo, VShape::I64x2, VIntUnOp::Abs)?,
         O::I64x2Neg => v_intun(lo, VShape::I64x2, VIntUnOp::Neg)?,
+        // boolean reductions (v128 → i32): any_true (whole-vector), all_true / bitmask (per shape)
+        O::V128AnyTrue => v_anytrue(lo)?,
+        O::I8x16AllTrue => v_alltrue(lo, VShape::I8x16)?,
+        O::I16x8AllTrue => v_alltrue(lo, VShape::I16x8)?,
+        O::I32x4AllTrue => v_alltrue(lo, VShape::I32x4)?,
+        O::I64x2AllTrue => v_alltrue(lo, VShape::I64x2)?,
+        O::I8x16Bitmask => v_bitmask(lo, VShape::I8x16)?,
+        O::I16x8Bitmask => v_bitmask(lo, VShape::I16x8)?,
+        O::I32x4Bitmask => v_bitmask(lo, VShape::I32x4)?,
+        O::I64x2Bitmask => v_bitmask(lo, VShape::I64x2)?,
         // float lane arithmetic
         O::F32x4Add => v_fbin(lo, VShape::F32x4, VFloatBinOp::Add)?,
         O::F32x4Sub => v_fbin(lo, VShape::F32x4, VFloatBinOp::Sub)?,

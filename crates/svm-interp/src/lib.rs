@@ -5172,6 +5172,11 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         Inst::VIntUn { shape, op, a } => {
             Value::V128(simd_vint_un(*shape, *op, as_v128(get(vals, *a)?)?))
         }
+        Inst::VAnyTrue { a } => {
+            Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
+        }
+        Inst::VAllTrue { shape, a } => Value::I32(simd_all_true(*shape, as_v128(get(vals, *a)?)?)),
+        Inst::VBitmask { shape, a } => Value::I32(simd_bitmask(*shape, as_v128(get(vals, *a)?)?)),
         Inst::VFloatBin { shape, op, a, b } => Value::V128(simd_vfloat_bin(
             *shape,
             *op,
@@ -5433,6 +5438,23 @@ fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
         lane_write(&mut o, i, bytes, r);
     }
     o
+}
+
+/// `<shape>.all_true`: `1` iff every lane is non-zero.
+fn simd_all_true(shape: VShape, a: [u8; 16]) -> i32 {
+    let bytes = shape.lane_bytes() as usize;
+    (0..shape.lanes() as usize).all(|i| lane_read(&a, i, bytes) != 0) as i32
+}
+
+/// `<shape>.bitmask`: lane `i`'s high (sign) bit → bit `i` of the result.
+fn simd_bitmask(shape: VShape, a: [u8; 16]) -> i32 {
+    let bytes = shape.lane_bytes() as usize;
+    let top = bytes as u32 * 8 - 1;
+    let mut m = 0i32;
+    for i in 0..shape.lanes() as usize {
+        m |= (((lane_read(&a, i, bytes) >> top) & 1) as i32) << i;
+    }
+    m
 }
 
 /// `<i-shape>.{abs,neg}`: per-lane two's-complement `|x|` / `0 - x` (both wrapping at the lane

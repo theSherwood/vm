@@ -163,6 +163,9 @@ mod op {
         pub const VFLOAT_CMP: u8 = 0x10; // shape, op, a, b
         pub const VSHIFT: u8 = 0x11; // shape, op, a (v128), amt (i32)
         pub const VINT_UN: u8 = 0x12; // shape, op, a
+        pub const VANY_TRUE: u8 = 0x13; // a -> i32
+        pub const VALL_TRUE: u8 = 0x14; // shape, a -> i32
+        pub const VBITMASK: u8 = 0x15; // shape, a -> i32
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -668,6 +671,23 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(o.index());
             write_uleb(out, *a as u64);
         }
+        Inst::VAnyTrue { a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VANY_TRUE);
+            write_uleb(out, *a as u64);
+        }
+        Inst::VAllTrue { shape, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VALL_TRUE);
+            out.push(shape.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VBitmask { shape, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VBITMASK);
+            out.push(shape.index());
+            write_uleb(out, *a as u64);
+        }
         Inst::VBitBin { op: o, a, b } => {
             out.push(op::SIMD);
             out.push(op::simd::VBIT_BIN);
@@ -821,6 +841,15 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
                 a: c.idx()?,
             }
         }
+        op::simd::VANY_TRUE => Inst::VAnyTrue { a: c.idx()? },
+        op::simd::VALL_TRUE => Inst::VAllTrue {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+        },
+        op::simd::VBITMASK => Inst::VBitmask {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+        },
         op::simd::VBIT_BIN => {
             let ob = c.byte()?;
             Inst::VBitBin {

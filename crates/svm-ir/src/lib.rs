@@ -1641,6 +1641,23 @@ pub enum Inst {
         op: VIntUnOp,
         a: ValIdx,
     },
+    /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
+    /// (shape-agnostic). `a` is `v128`, result `i32`.
+    VAnyTrue {
+        a: ValIdx,
+    },
+    /// `<shape>.all_true`: `i32` `1` if **every** lane (of `shape`) is non-zero, else `0`. `a` is
+    /// `v128`, result `i32`.
+    VAllTrue {
+        shape: VShape,
+        a: ValIdx,
+    },
+    /// `<shape>.bitmask`: gather the **high (sign) bit** of each lane into the low bits of an `i32`
+    /// (lane `i` → bit `i`). `a` is `v128`, result `i32`.
+    VBitmask {
+        shape: VShape,
+        a: ValIdx,
+    },
     /// Lane-wise binary float op (see [`VFloatBinOp`]); `a`/`b`/result are `v128`.
     VFloatBin {
         shape: VShape,

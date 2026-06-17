@@ -2581,6 +2581,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VShift { .. } => {}
                 // Lane `abs`/`neg` lower to vector `iabs`/`ineg`; Cranelift legalizes every shape.
                 Inst::VIntUn { .. } => {}
+                // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
+                Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3620,6 +3622,22 @@ fn lower_block(
                     VIntUnOp::Neg => b.ins().ineg(x),
                 };
                 vcast(b, r, I8X16)
+            }
+            // Boolean reductions → an `i32`. `vany_true`/`vall_true` yield an `I8` bool (zero/one),
+            // widened to `i32`; `vhigh_bits` produces the bitmask directly into an `i32`.
+            Inst::VAnyTrue { a } => {
+                let x = get(&vals, *a)?; // shape-agnostic; the canonical I8X16 view is fine
+                let t = b.ins().vany_true(x);
+                b.ins().uextend(I32, t)
+            }
+            Inst::VAllTrue { shape, a } => {
+                let x = vcast(b, get(&vals, *a)?, vec_ty(*shape));
+                let t = b.ins().vall_true(x);
+                b.ins().uextend(I32, t)
+            }
+            Inst::VBitmask { shape, a } => {
+                let x = vcast(b, get(&vals, *a)?, vec_ty(*shape));
+                b.ins().vhigh_bits(I32, x)
             }
             Inst::VFloatCmp {
                 shape,

@@ -363,6 +363,9 @@ fn print_inst(inst: &Inst) -> String {
         Inst::Bitselect { a, b, mask } => format!("v128.bitselect v{a} v{b} v{mask}"),
         Inst::Shuffle { lanes, a, b } => format!("i8x16.shuffle{} v{a} v{b}", byte_list(lanes)),
         Inst::Swizzle { a, b } => format!("i8x16.swizzle v{a} v{b}"),
+        Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
+        Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
+        Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
         Inst::SimdWidthBytes => "simd.width_bytes".to_string(),
     }
 }
@@ -1545,6 +1548,11 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
+        if op == "v128.any_true" {
+            return Ok(Inst::VAnyTrue {
+                a: self.value(names)?,
+            });
+        }
         if op == "v128.bitselect" {
             let a = self.value(names)?;
             let b = self.value(names)?;
@@ -1603,6 +1611,18 @@ impl<'a> Parser<'a> {
     ) -> Result<Inst, ParseError> {
         if suffix == "splat" {
             return Ok(Inst::Splat {
+                shape,
+                a: self.value(names)?,
+            });
+        }
+        if suffix == "all_true" {
+            return Ok(Inst::VAllTrue {
+                shape,
+                a: self.value(names)?,
+            });
+        }
+        if suffix == "bitmask" {
+            return Ok(Inst::VBitmask {
                 shape,
                 a: self.value(names)?,
             });

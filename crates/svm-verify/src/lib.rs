@@ -696,6 +696,22 @@ fn check_inst(
             cx.expect(*a, ValType::V128)?;
             ValType::V128
         }
+        // Boolean reductions: a `v128` → an `i32`. `all_true`/`bitmask` carry an integer shape;
+        // `any_true` is shape-agnostic.
+        Inst::VAnyTrue { a } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::I32
+        }
+        Inst::VAllTrue { shape, a } | Inst::VBitmask { shape, a } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::I32
+        }
         Inst::VBitBin { a, b, .. } => {
             cx.expect(*a, ValType::V128)?;
             cx.expect(*b, ValType::V128)?;

@@ -360,3 +360,44 @@ fn i32x4_abs_neg() {
         assert_eq!(f("i32x4.neg", x), x.wrapping_neg(), "neg {x}");
     }
 }
+
+/// A real "does this vector contain X?" idiom (the SIMD `memchr` shape): compare a constant vector
+/// against a splatted needle, then `v128.any_true`. Exercises a reduction fed by a lane compare.
+#[test]
+fn i8x16_any_match() {
+    let wat = r#"
+    (module
+      (func (export "has") (param $needle i32) (result i32)
+        (v128.any_true
+          (i8x16.eq
+            (v128.const i8x16 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+            (i8x16.splat (local.get $needle))))))
+    "#;
+    let has = |n: i32| match eval(wat, "has", &[Value::I32(n)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(has(5), 1, "5 is present");
+    assert_eq!(has(16), 1, "16 is present");
+    assert_eq!(has(0), 0, "0 is absent");
+    assert_eq!(has(99), 0, "99 is absent");
+}
+
+/// `i32x4.bitmask` through the wasm bridge: the sign bit of each lane gathered into an i32 — the
+/// move-mask used to branch on a lane compare. Compare [1,2,3,4] < splat(3) → lanes [T,T,F,F] → 0b0011.
+#[test]
+fn i32x4_bitmask_of_compare() {
+    let wat = r#"
+    (module
+      (func (export "mask") (param $t i32) (result i32)
+        (i32x4.bitmask
+          (i32x4.lt_s (v128.const i32x4 1 2 3 4) (i32x4.splat (local.get $t))))))
+    "#;
+    let mask = |t: i32| match eval(wat, "mask", &[Value::I32(t)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(mask(3), 0b0011, "lanes 1 and 2 are < 3");
+    assert_eq!(mask(5), 0b1111, "all < 5");
+    assert_eq!(mask(0), 0b0000, "none < 0");
+}

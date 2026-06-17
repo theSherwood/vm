@@ -732,3 +732,76 @@ fn diff_lane_abs_neg() {
     assert_eq!(i64("abs", i64::MIN), i64::MIN, "i64 abs(MIN) wraps");
     assert_eq!(i64("neg", 7), -7, "i64 neg(7)");
 }
+
+// ---------------------------------------------------------------------------
+// Boolean reductions (VAnyTrue / VAllTrue / VBitmask) — v128 → i32.
+// ---------------------------------------------------------------------------
+
+/// Build `() -> i32` from a body and run it on both backends (interp == JIT), returning the result.
+fn reduce_i32(body: &str) -> i32 {
+    diff1(
+        &format!("func () -> (i32) {{\nblock0():\n{body}\n}}\n"),
+        &[],
+    ) as i32
+}
+
+#[test]
+fn diff_bool_reductions() {
+    // i32x4.bitmask: lanes 0 and 2 have the sign bit set (byte 3 = 0x80) → bits 0 and 2 → 0b0101.
+    assert_eq!(
+        reduce_i32("  v0 = v128.const 0 0 0 128 0 0 0 0 0 0 0 128 0 0 0 0\n  v1 = i32x4.bitmask v0\n  return v1\n"),
+        0b0101
+    );
+    // i8x16.bitmask: high bit set at byte indices 0, 1, 7, 15.
+    assert_eq!(
+        reduce_i32("  v0 = v128.const 128 128 0 0 0 0 0 128 0 0 0 0 0 0 0 128\n  v1 = i8x16.bitmask v0\n  return v1\n"),
+        (1 << 0) | (1 << 1) | (1 << 7) | (1 << 15)
+    );
+    // i32x4.all_true: every lane non-zero → 1; a zero lane → 0.
+    assert_eq!(
+        reduce_i32("  v0 = v128.const 1 0 0 0 2 0 0 0 3 0 0 0 4 0 0 0\n  v1 = i32x4.all_true v0\n  return v1\n"),
+        1
+    );
+    assert_eq!(
+        reduce_i32("  v0 = v128.const 1 0 0 0 0 0 0 0 3 0 0 0 4 0 0 0\n  v1 = i32x4.all_true v0\n  return v1\n"),
+        0
+    );
+    // v128.any_true: any bit set → 1; all-zero → 0.
+    assert_eq!(
+        reduce_i32("  v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 7 0 0 0\n  v1 = v128.any_true v0\n  return v1\n"),
+        1
+    );
+    assert_eq!(
+        reduce_i32("  v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n  v1 = v128.any_true v0\n  return v1\n"),
+        0
+    );
+    // i64x2.all_true / bitmask.
+    assert_eq!(
+        reduce_i32("  v0 = v128.const 0 0 0 0 0 0 0 128 0 0 0 0 0 0 0 0\n  v1 = i64x2.bitmask v0\n  return v1\n"),
+        0b01
+    );
+}
+
+/// `bitmask` round-trips through text + binary; `all_true`/`any_true` too.
+#[test]
+fn reduction_roundtrip() {
+    let src = "func () -> (i32) {\nblock0():\n\
+        v0 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
+        v1 = v128.any_true v0\n\
+        v2 = i8x16.all_true v0\n\
+        v3 = i16x8.bitmask v0\n\
+        v4 = i32x4.all_true v0\n\
+        v5 = i64x2.bitmask v0\n\
+        v6 = i32.add v1 v3\n  return v6\n}\n";
+    let m = build(src);
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
+}
