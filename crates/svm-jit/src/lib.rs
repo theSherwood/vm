@@ -71,8 +71,8 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp,
-    VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
+    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -2590,6 +2590,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VWiden { .. } | Inst::VNarrow { .. } => {}
                 // Int↔float / float↔float conversions → Cranelift `fcvt_*` / `fvdemote`/`fvpromote_low`.
                 Inst::VConvert { .. } => {}
+                // pmin/pmax lower to a single `fcmp` plus `bitselect` (both legalize on every target).
+                Inst::VPMinMax { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3763,6 +3765,29 @@ fn lower_block(
                 let x = vcast(b, get(&vals, *a)?, ty);
                 let r = float_un(b, vf_un(*op), x);
                 vcast(b, r, I8X16)
+            }
+            Inst::VPMinMax {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // pmin(a,b) = b < a ? b : a ; pmax(a,b) = a < b ? b : a.
+                // Both select the second operand `b` where a one-sided `<` holds — only the
+                // compare operand order differs. `fcmp` yields the lane mask (`I32X4`/`I64X2`),
+                // which we blend in the canonical `I8X16` domain so `bitselect`'s three args
+                // share a type. This matches the interp's NaN/-0 propagation (no IEEE min/max).
+                let ty = vec_ty(*shape);
+                let xc = get(&vals, *a)?;
+                let yc = get(&vals, *rb)?;
+                let x = vcast(b, xc, ty);
+                let y = vcast(b, yc, ty);
+                let mask = match op {
+                    VPMinMaxOp::Pmin => b.ins().fcmp(FloatCC::LessThan, y, x),
+                    VPMinMaxOp::Pmax => b.ins().fcmp(FloatCC::LessThan, x, y),
+                };
+                let m = vcast(b, mask, I8X16);
+                b.ins().bitselect(m, yc, xc)
             }
             Inst::VBitBin { op, a, b: rb } => {
                 // Whole-vector — operate on the canonical I8X16 directly.

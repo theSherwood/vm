@@ -18,7 +18,7 @@ use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
     Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarLoc,
+    VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarLoc,
     DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
@@ -5233,6 +5233,12 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *b)?)?,
         )),
         Inst::VConvert { op, a } => Value::V128(simd_convert(*op, as_v128(get(vals, *a)?)?)),
+        Inst::VPMinMax { shape, op, a, b } => Value::V128(simd_pminmax(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
         Inst::VAnyTrue { a } => {
             Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
         }
@@ -5670,6 +5676,66 @@ fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> 
                 let x = f64::from_bits(lane_read(&a, i, 8));
                 let y = f64::from_bits(lane_read(&b, i, 8));
                 lane_write(&mut o, i, 8, fbin64(vf_bin(op), x, y).to_bits());
+            }
+        }
+        // Verifier rejects an integer shape here; total fall-through returns zero.
+        _ => {}
+    }
+    o
+}
+
+fn simd_pminmax(shape: VShape, op: VPMinMaxOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    // wasm pmin/pmax: pseudo-min/max defined as a one-sided compare-and-select.
+    //   pmin(a, b) = b < a ? b : a
+    //   pmax(a, b) = a < b ? b : a
+    // This propagates NaN from the second operand and returns -0/+0 per the
+    // chosen operand (no IEEE min/max canonicalization).
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let r = match op {
+                    VPMinMaxOp::Pmin => {
+                        if y < x {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                    VPMinMaxOp::Pmax => {
+                        if x < y {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                };
+                lane_write(&mut o, i, 4, r.to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let r = match op {
+                    VPMinMaxOp::Pmin => {
+                        if y < x {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                    VPMinMaxOp::Pmax => {
+                        if x < y {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                };
+                lane_write(&mut o, i, 8, r.to_bits());
             }
         }
         // Verifier rejects an integer shape here; total fall-through returns zero.

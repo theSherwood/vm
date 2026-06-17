@@ -25,8 +25,8 @@ use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module,
     Ordering, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
-    VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo,
-    VarLoc,
+    VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType,
+    VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -356,6 +356,7 @@ fn print_inst(inst: &Inst) -> String {
             format!("{}.{} v{a} v{amt}", shape.name(), op.name())
         }
         Inst::VFloatCmp { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VPMinMax { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
         Inst::VIntUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
@@ -1685,6 +1686,11 @@ impl<'a> Parser<'a> {
                 let a = self.value(names)?;
                 let b = self.value(names)?;
                 return Ok(Inst::VFloatCmp { shape, op: o, a, b });
+            }
+            if let Some(o) = VPMinMaxOp::from_name(suffix) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VPMinMax { shape, op: o, a, b });
             }
         } else if let Some(o) = VIntBinOp::from_name(suffix) {
             let a = self.value(names)?;

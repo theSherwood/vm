@@ -665,7 +665,9 @@ fn check_inst(
             cx.expect(*amt, ValType::I32)?;
             ValType::V128
         }
-        Inst::VFloatBin { shape, a, b, .. } | Inst::VFloatCmp { shape, a, b, .. } => {
+        Inst::VFloatBin { shape, a, b, .. }
+        | Inst::VFloatCmp { shape, a, b, .. }
+        | Inst::VPMinMax { shape, a, b, .. } => {
             if !shape.is_float() {
                 return Err(VerifyError::BadSimdShape {
                     func: fi,

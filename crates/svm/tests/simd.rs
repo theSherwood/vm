@@ -88,6 +88,8 @@ fn simd_text_and_binary_roundtrip() {
           v12 = f32x4.sqrt v8\n\
           v13 = f32x4.abs v4\n\
           v14 = f32x4.neg v4\n\
+          v140 = f32x4.pmin v4 v4\n\
+          v141 = f32x4.pmax v4 v4\n\
           v15 = v128.and v2 v3\n\
           v16 = v128.or v2 v3\n\
           v17 = v128.xor v2 v3\n\
@@ -247,6 +249,109 @@ fn diff_f64x2_min_max_sqrt() {
           v7 = f64x2.extract_lane 1 v6\n  return v7\n}\n";
     for (a, b) in [(4.0f64, 9.0), (16.0, 2.0), (1.0, 100.0)] {
         diff1(s, &[Value::F64(a), Value::F64(b)]);
+    }
+}
+
+// Pseudo-min/max (`f32x4`/`f64x2` pmin/pmax) — VPMinMaxOp. Unlike `min`/`max` these are a
+// one-sided compare-and-select: `pmin(a,b) = b<a ? b : a`, `pmax(a,b) = a<b ? b : a`. The oracle
+// is that exact select (NaN and signed-zero behaviour falls out of `<`, which is what wasm wants).
+
+/// `f32x4.{pmin,pmax}` of two splatted scalars, lane 0 read back as f32.
+fn f32x4_pminmax(op: &str, a: f32, b: f32) -> f32 {
+    let s = format!(
+        "func (f32, f32) -> (f32) {{\n\
+        block0(v0: f32, v1: f32):\n\
+          v2 = f32x4.splat v0\n\
+          v3 = f32x4.splat v1\n\
+          v4 = f32x4.{op} v2 v3\n\
+          v5 = f32x4.extract_lane 0 v4\n  return v5\n}}\n"
+    );
+    f32::from_bits(diff1(&s, &[Value::F32(a), Value::F32(b)]) as u32)
+}
+
+/// `f64x2.{pmin,pmax}` of two splatted scalars, lane 1 read back as f64.
+fn f64x2_pminmax(op: &str, a: f64, b: f64) -> f64 {
+    let s = format!(
+        "func (f64, f64) -> (f64) {{\n\
+        block0(v0: f64, v1: f64):\n\
+          v2 = f64x2.splat v0\n\
+          v3 = f64x2.splat v1\n\
+          v4 = f64x2.{op} v2 v3\n\
+          v5 = f64x2.extract_lane 1 v4\n  return v5\n}}\n"
+    );
+    f64::from_bits(diff1(&s, &[Value::F64(a), Value::F64(b)]) as u64)
+}
+
+#[test]
+fn diff_f32x4_pmin_pmax() {
+    for (a, b) in [
+        (1.0f32, 2.0),
+        (2.0, 1.0),
+        (-0.0, 0.0),
+        (0.0, -0.0),
+        (-5.0, -5.0),
+        (3.5, -3.5),
+    ] {
+        // pmin(a,b) = b<a ? b : a ; pmax(a,b) = a<b ? b : a.
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            f32x4_pminmax("pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin {a} {b}"
+        );
+        assert_eq!(
+            f32x4_pminmax("pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax {a} {b}"
+        );
+    }
+}
+
+#[test]
+fn diff_f64x2_pmin_pmax() {
+    for (a, b) in [
+        (1.0f64, 2.0),
+        (2.0, 1.0),
+        (-0.0, 0.0),
+        (0.0, -0.0),
+        (-5.0, -5.0),
+        (3.5, -3.5),
+    ] {
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            f64x2_pminmax("pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin {a} {b}"
+        );
+        assert_eq!(
+            f64x2_pminmax("pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax {a} {b}"
+        );
+    }
+}
+
+/// NaN propagation: pmin/pmax with a NaN second operand return the *first* operand (since every
+/// `<` against NaN is false), and with a NaN first operand return the second. Verify the bit
+/// pattern matches the select oracle exactly (interp == JIT enforced by `diff1`).
+#[test]
+fn diff_f32x4_pminmax_nan() {
+    let nan = f32::NAN;
+    for (a, b) in [(nan, 1.0f32), (1.0, nan), (nan, nan)] {
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            f32x4_pminmax("pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin nan {a} {b}"
+        );
+        assert_eq!(
+            f32x4_pminmax("pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax nan {a} {b}"
+        );
     }
 }
 

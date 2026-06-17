@@ -544,6 +544,34 @@ impl VCvtOp {
     }
 }
 
+/// Lane-wise **pseudo** min/max on a float `v128` (§17). Unlike the IEEE [`VFloatBinOp::Min`]/`Max`,
+/// these are the wasm `pmin`/`pmax`: a plain compare-and-select — `pmin(a,b) = b < a ? b : a`,
+/// `pmax(a,b) = a < b ? b : a` — so a NaN operand (and `±0`) follow the select, not IEEE rules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VPMinMaxOp {
+    Pmin,
+    Pmax,
+}
+
+impl VPMinMaxOp {
+    pub const ALL: [VPMinMaxOp; 2] = [VPMinMaxOp::Pmin, VPMinMaxOp::Pmax];
+    pub fn name(self) -> &'static str {
+        match self {
+            VPMinMaxOp::Pmin => "pmin",
+            VPMinMaxOp::Pmax => "pmax",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VPMinMaxOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VPMinMaxOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
 /// Lane-wise binary float ops on a `v128` (§17, IEEE 754, no traps). `Min`/`Max` are the
 /// IEEE `minimum`/`maximum` (NaN-propagating, `-0 < +0`) matching the scalar [`FBinOp`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1852,6 +1880,13 @@ pub enum Inst {
     VConvert {
         op: VCvtOp,
         a: ValIdx,
+    },
+    /// Lane-wise float pseudo-min/max (see [`VPMinMaxOp`]); `a`/`b`/result are `v128`. Float shapes.
+    VPMinMax {
+        shape: VShape,
+        op: VPMinMaxOp,
+        a: ValIdx,
+        b: ValIdx,
     },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.

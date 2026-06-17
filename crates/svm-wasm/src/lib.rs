@@ -46,7 +46,7 @@ use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
     VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
-    VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1379,6 +1379,13 @@ fn v_fbin(lo: &mut Lower, shape: VShape, op: VFloatBinOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VFloatBin { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_pminmax(lo: &mut Lower, shape: VShape, op: VPMinMaxOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VPMinMax { shape, op, a, b });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -3021,6 +3028,10 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::F64x2Div => v_fbin(lo, VShape::F64x2, VFloatBinOp::Div)?,
         O::F64x2Min => v_fbin(lo, VShape::F64x2, VFloatBinOp::Min)?,
         O::F64x2Max => v_fbin(lo, VShape::F64x2, VFloatBinOp::Max)?,
+        O::F32x4PMin => v_pminmax(lo, VShape::F32x4, VPMinMaxOp::Pmin)?,
+        O::F32x4PMax => v_pminmax(lo, VShape::F32x4, VPMinMaxOp::Pmax)?,
+        O::F64x2PMin => v_pminmax(lo, VShape::F64x2, VPMinMaxOp::Pmin)?,
+        O::F64x2PMax => v_pminmax(lo, VShape::F64x2, VPMinMaxOp::Pmax)?,
         O::F32x4Abs => v_fun(lo, VShape::F32x4, VFloatUnOp::Abs)?,
         O::F32x4Neg => v_fun(lo, VShape::F32x4, VFloatUnOp::Neg)?,
         O::F32x4Sqrt => v_fun(lo, VShape::F32x4, VFloatUnOp::Sqrt)?,

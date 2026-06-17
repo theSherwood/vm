@@ -65,6 +65,13 @@ fn f32(v: Value) -> f32 {
     }
 }
 
+fn f64(v: Value) -> f64 {
+    match v {
+        Value::F64(x) => x,
+        other => panic!("expected f64, got {other:?}"),
+    }
+}
+
 /// A 4-wide f32 dot product: `v128.load` two vectors, `f32x4.mul`, horizontal-sum via
 /// `extract_lane`. x = [1,2,3,4], y = [4,3,2,1] ⇒ 1·4+2·3+3·2+4·1 = 20.
 #[test]
@@ -309,6 +316,62 @@ fn f32x4_lane_compare_masks() {
     assert_eq!(eval(&cmp("f32x4.eq"), "f", &nan), Value::I32(0));
     assert_eq!(eval(&cmp("f32x4.lt"), "f", &nan), Value::I32(0));
     assert_eq!(eval(&cmp("f32x4.ne"), "f", &nan), Value::I32(-1));
+}
+
+/// Pseudo-min/max through the wasm bridge. `pmin`/`pmax` are a one-sided compare-and-select
+/// (`pmin(a,b)=b<a?b:a`, `pmax(a,b)=a<b?b:a`), so a NaN operand and signed zeros propagate by the
+/// `<` rule rather than IEEE min/max canonicalization. `eval` enforces interp == JIT lane-for-lane.
+#[test]
+fn f32x4_pmin_pmax() {
+    let pm = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $a f32) (param $b f32) (result f32)
+               (f32x4.extract_lane 0 ({op} (f32x4.splat (local.get $a)) (f32x4.splat (local.get $b))))))"
+        )
+    };
+    let run = |op: &str, a: f32, b: f32| f32(eval(&pm(op), "f", &[Value::F32(a), Value::F32(b)]));
+    for (a, b) in [(1.0f32, 2.0), (2.0, 1.0), (-0.0, 0.0), (3.5, -3.5)] {
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            run("f32x4.pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin {a} {b}"
+        );
+        assert_eq!(
+            run("f32x4.pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax {a} {b}"
+        );
+    }
+    // NaN second operand: every `<` is false, so both return the first operand `a`.
+    assert!(run("f32x4.pmin", 1.0, f32::NAN).to_bits() == 1.0f32.to_bits());
+    assert!(run("f32x4.pmax", 1.0, f32::NAN).to_bits() == 1.0f32.to_bits());
+}
+
+#[test]
+fn f64x2_pmin_pmax() {
+    let pm = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $a f64) (param $b f64) (result f64)
+               (f64x2.extract_lane 1 ({op} (f64x2.splat (local.get $a)) (f64x2.splat (local.get $b))))))"
+        )
+    };
+    let run = |op: &str, a: f64, b: f64| f64(eval(&pm(op), "f", &[Value::F64(a), Value::F64(b)]));
+    for (a, b) in [(1.0f64, 2.0), (2.0, 1.0), (-0.0, 0.0), (3.5, -3.5)] {
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            run("f64x2.pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin {a} {b}"
+        );
+        assert_eq!(
+            run("f64x2.pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax {a} {b}"
+        );
+    }
 }
 
 /// Integer lane shifts through the wasm bridge: one scalar amount (taken mod the lane width) shifts

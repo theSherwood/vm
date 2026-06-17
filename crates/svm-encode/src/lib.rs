@@ -18,7 +18,7 @@ use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering,
     StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
-    VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -170,6 +170,7 @@ mod op {
         pub const VWIDEN: u8 = 0x17; // shape (result), op, a
         pub const VNARROW: u8 = 0x18; // shape (result), op, a, b
         pub const VCONVERT: u8 = 0x19; // op, a
+        pub const VPMINMAX: u8 = 0x1A; // shape, op, a, b
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -704,6 +705,14 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(o.index());
             write_uleb(out, *a as u64);
         }
+        Inst::VPMinMax { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VPMINMAX);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
         Inst::VAnyTrue { a } => {
             out.push(op::SIMD);
             out.push(op::simd::VANY_TRUE);
@@ -908,6 +917,16 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             Inst::VConvert {
                 op: VCvtOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
                 a: c.idx()?,
+            }
+        }
+        op::simd::VPMINMAX => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VPMinMax {
+                shape,
+                op: VPMinMaxOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
             }
         }
         op::simd::VANY_TRUE => Inst::VAnyTrue { a: c.idx()? },

@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (89 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (91 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -95,7 +95,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [ ] **SIMD remainder** (~68 of the v128 proposal): dot product, `i8x16.popcnt`, pmin/pmax,
+- [ ] **SIMD remainder** (~68 of the v128 proposal): dot product, `i8x16.popcnt`,
   the f64↔i32 conversions (`convert_low`/`trunc_sat_*_zero`), extadd/extmul, avgr, q15mulr, etc.
   Mechanical breadth over the proven 5-step
   pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops have
@@ -137,6 +137,11 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     `fcvt_from_{s,u}int`/`fcvt_to_{s,u}int_sat`/`fvdemote`/`fvpromote_low`). Rust's `as` casts are the
     oracle — they already match wasm's round-to-nearest + `trunc_sat` (NaN→0, clamp). The **f64↔i32**
     `convert_low`/`trunc_sat_*_zero` four remain (lane-count mismatch → multi-instruction lowering).
+  - [x] **Pseudo-min/max (pmin/pmax) — DONE.** `f32x4`/`f64x2` `{pmin,pmax}` (`Inst::VPMinMax`, a
+    float-only family the verifier restricts to the two float shapes). Unlike IEEE `min`/`max` these
+    are a one-sided compare-and-select — `pmin(a,b)=b<a?b:a`, `pmax(a,b)=a<b?b:a` — so a NaN operand
+    and signed zeros propagate by the `<` rule (what wasm/LLVM want for `fmin`/`fmax` reductions). JIT
+    lowers to one `fcmp` + `bitselect`; oracle = that exact select, tests incl. NaN/-0 cases.
 - [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
   atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
   in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR
@@ -183,9 +188,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 3. **Tail calls** 🟡 — common LLVM output, likely near-free (IR terminators exist).
 4. **Passive *data* segments + `memory.init`/`data.drop`** 🟡 — DONE. (The *table* bulk ops + passive
    *element* segments remain — they need a mutable runtime table; lower audience.)
-5. **SIMD remainder** 🟡 — **mostly landed** (10 of ~17 op families: compares (int+float), min/max,
+5. **SIMD remainder** 🟡 — **mostly landed** (11 of ~17 op families: compares (int+float), min/max,
    shifts, abs/neg, the boolean reductions, saturating add/sub, widen, narrow, the i32↔f32 + demote/
-   promote conversions). The **tail** remains: `pmin`/`pmax`, dot product, `avgr_u`, `i8x16.popcnt`,
+   promote conversions, pmin/pmax). The **tail** remains: dot product, `avgr_u`, `i8x16.popcnt`,
    extadd/extmul, `q15mulr_sat`, and the f64↔i32 conversions. Same proven 5-step pattern.
 6. **Reference types** 🟡 (externref→handle, funcref→index), then the **narrow-atomic CAS-loop** 🟡.
 7. EH, relaxed SIMD, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
