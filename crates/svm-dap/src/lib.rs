@@ -43,9 +43,12 @@ struct Session {
     /// IR pcs currently set as breakpoints (so `setBreakpoints` can replace them per the protocol).
     breakpoints: Vec<IrPc>,
     /// DAP `frameId` → `(thread id, frame index)`, assigned during `stackTrace` and consumed by
-    /// `scopes`/`variables`, so a variable reference names a specific thread's frame (multithreaded
+    /// `scopes`/`variables`/`evaluate`, so a reference names a specific thread's frame (multithreaded
     /// DAP). Cleared whenever execution resumes (old frames become stale).
     frame_refs: Vec<(u64, usize)>,
+    /// Multithreaded run (`attach_scheduled[_seeded]`)? Selects the time-travel coordinate: the
+    /// global scheduler `turn` when scheduled, the op `clock` single-threaded.
+    scheduled: bool,
 }
 
 /// An event to emit after a response: `(event-name, body)`.
@@ -85,6 +88,7 @@ impl DapServer {
             "next" | "stepIn" | "stepOut" => self.on_step(),
             "stepBack" => self.on_step_back(),
             "reverseContinue" => self.on_reverse_continue(),
+            "evaluate" => self.on_evaluate(args),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -135,6 +139,8 @@ impl DapServer {
             // Reverse debugging (DEBUGGING.md W1 time-travel): tells the client to enable its
             // step-back / reverse-continue controls, backed by `Inspector::step_back`/`seek`.
             ("supportsStepBack", Json::Bool(true)),
+            // Resolve a variable on hover, not just in the Variables pane.
+            ("supportsEvaluateForHovers", Json::Bool(true)),
         ]);
         // The client now sends breakpoints, then `configurationDone`.
         (true, caps, vec![("initialized", Json::obj(vec![]))])
@@ -179,6 +185,7 @@ impl DapServer {
         // (possibly empty) ⇒ a fixed multithreaded interleaving (a witness, or the deterministic
         // default); neither ⇒ single-threaded. Multithreaded debugging surfaces every `thread.spawn`
         // vCPU as a DAP thread.
+        let scheduled = args.get("seed").is_some() || args.get("schedule").is_some();
         let inspector = if let Some(seed) = args.get("seed").and_then(|v| v.as_i64()) {
             Inspector::attach_scheduled_seeded(&module, func, &call_args, fuel, seed as u64)
         } else if let Some(plan) = args.get("schedule").and_then(|v| v.as_array()) {
@@ -197,6 +204,7 @@ impl DapServer {
             line_index,
             breakpoints: Vec::new(),
             frame_refs: Vec::new(),
+            scheduled,
         });
         (true, Json::Null, vec![])
     }
@@ -450,11 +458,15 @@ impl DapServer {
             return (false, Json::Null, vec![]);
         };
         session.frame_refs.clear();
-        let target = session.inspector.clock();
+        // The time-travel coordinate: the global scheduler `turn` when multithreaded, the op `clock`
+        // single-threaded.
+        let scheduled = session.scheduled;
+        let pos = |i: &Inspector| if scheduled { i.turn() } else { i.clock() };
+        let target = pos(&session.inspector);
         session.inspector.seek(0);
         let mut prev: Option<u64> = None;
         while let Stop::Break { .. } = session.inspector.run_until_stop() {
-            let t = session.inspector.clock();
+            let t = pos(&session.inspector);
             if t < target {
                 prev = Some(t);
             } else {
@@ -472,6 +484,57 @@ impl DapServer {
             .map(|t| t as i64 + 1)
             .unwrap_or(1);
         (true, Json::Null, vec![stopped_event(reason, tid)])
+    }
+
+    fn on_evaluate(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        // Resolve a watch/hover/REPL expression. Slice 1 supports a bare source-variable name in the
+        // given frame (read through `read_var`); richer expressions (`a.b`, `arr[i]`, arithmetic) are
+        // a follow-up. Failure ⇒ `success:false`, which the client shows as "not available".
+        let fail = (false, Json::Null, vec![]);
+        let expr = args
+            .and_then(|a| a.get("expression"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let Some(frame_id) = args.and_then(|a| a.get("frameId")).and_then(|v| v.as_i64()) else {
+            return fail; // no frame context to resolve a name in
+        };
+        let Some(session) = self.session.as_mut() else {
+            return fail;
+        };
+        let Some(&(tid, frame_idx)) = usize::try_from(frame_id)
+            .ok()
+            .and_then(|i| session.frame_refs.get(i))
+        else {
+            return fail;
+        };
+        session.inspector.select_task(tid);
+        let frames = session.inspector.backtrace();
+        let Some(func) = frames.get(frame_idx).map(|f| f.pc.func) else {
+            return fail;
+        };
+        // The variable's declared type (for the read width); also confirms `expr` is a known local.
+        let ty = session
+            .debug
+            .as_ref()
+            .and_then(|d| d.vars.iter().find(|v| v.func == func && v.name == expr))
+            .map(|v| v.ty.clone());
+        let (Some(ty), Some(val)) = (
+            ty.clone(),
+            ty.and_then(|t| session.inspector.read_var(frame_idx, &expr, ty_width(&t))),
+        ) else {
+            return fail;
+        };
+        (
+            true,
+            Json::obj(vec![
+                ("result", Json::s(fmt_var(&val))),
+                ("type", Json::s(ty)),
+                ("variablesReference", Json::i(0)),
+            ]),
+            vec![],
+        )
     }
 
     fn on_disconnect(&mut self) -> (bool, Json, Vec<Event>) {

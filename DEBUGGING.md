@@ -53,7 +53,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
-| DAP server (interpreter-backed: source breakpoints, frames, locals, stepping, **reverse debugging**, **multithreaded** per-thread stacks) | **Built — W5 slices 1–3** | `svm-dap` (`DapServer` / `run_stdio`) |
+| DAP server (interpreter-backed: source breakpoints, frames, locals, stepping, **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`**/hover) | **Built — W5 slices 1–4** | `svm-dap` (`DapServer` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -527,8 +527,16 @@ counter, a source breakpoint at `worker.c:4` fires in one worker (the `stopped` 
 the root), `threads` lists root + workers, the worker's `stackTrace`/`variables` show `worker.c:4`
 with `delta = 1`, and `continue` stops in the *other* worker. So the headline multithread debugger —
 per-thread breakpoints, thread selection, deterministic interleavings — is now usable from an editor.
-*Not yet:* multithreaded `reverseContinue` (would switch from the op `clock` to the global `turn`
-coordinate), `evaluate`/watch expressions, proper step-over/step-out (vs single-op), and the
+
+**Built — slice 4 (`evaluate` + multithreaded reverse-continue).** `evaluate` resolves a watch /
+hover / REPL expression — slice 1 a bare source-variable name in the given frame, read through
+`read_var` (advertised via `supportsEvaluateForHovers`; an unknown name fails so the client shows
+"not available"); richer expressions are a follow-up. And `reverseContinue` now picks its time-travel
+coordinate by mode — the global scheduler `turn` when multithreaded, the op `clock` single-threaded —
+so reverse debugging works for concurrent guests too. Tests (`dap.rs`): `evaluate("i")`/`("acc")`
+return `3`/`0` at the loop breakpoint (`"nope"` fails); and a two-worker run's `reverseContinue`
+walks back through the per-thread breakpoint hits, then to the start. *Not yet:* richer `evaluate`
+expressions (`a.b`, `arr[i]`, arithmetic), proper step-over/step-out (vs single-op), and the
 JIT/DWARF tier for gdb/lldb on native code.
 
 ---

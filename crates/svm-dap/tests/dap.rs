@@ -498,3 +498,140 @@ fn dap_multithreaded_threads_per_thread_stacks_and_which_stopped() {
         .unwrap();
     assert_ne!(first, second, "the second hit is a different worker thread");
 }
+
+/// `evaluate` resolves a source variable by name in a frame (watch / hover), via `read_var`.
+#[test]
+fn dap_evaluate_resolves_a_variable_in_a_frame() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("sum.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(7))])]),
+            ),
+        ]),
+    ));
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+
+    let out = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let fid = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+
+    let eval = |s: &mut DapServer, seq: i64, expr: &str| -> Vec<Json> {
+        s.handle(&req(
+            seq,
+            "evaluate",
+            Json::obj(vec![
+                ("expression", Json::s(expr)),
+                ("frameId", Json::i(fid)),
+                ("context", Json::s("watch")),
+            ]),
+        ))
+    };
+
+    // Known locals resolve to their live values (first iteration: i = 3, acc = 0).
+    let out = eval(&mut s, 6, "i");
+    assert_eq!(response(&out).get("success"), Some(&Json::Bool(true)));
+    assert_eq!(
+        response(&out).get("body").unwrap().get("result"),
+        Some(&Json::s("3"))
+    );
+    let out = eval(&mut s, 7, "acc");
+    assert_eq!(
+        response(&out).get("body").unwrap().get("result"),
+        Some(&Json::s("0"))
+    );
+
+    // An unknown name fails (the client shows "not available").
+    let out = eval(&mut s, 8, "nope");
+    assert_eq!(response(&out).get("success"), Some(&Json::Bool(false)));
+}
+
+/// Multithreaded reverse debugging: `reverseContinue` over the global scheduler `turn` walks back
+/// through the per-thread breakpoint hits, then to the start.
+#[test]
+fn dap_multithreaded_reverse_continue_walks_back_through_hits() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(WORKERS_DBG)),
+            ("function", Json::i(0)),
+            ("schedule", Json::Arr(vec![])), // deterministic multithreaded
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("worker.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(4))])]),
+            ),
+        ]),
+    ));
+
+    // First worker hit, then continue to the second worker hit.
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let out = s.handle(&req(5, "continue", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("breakpoint")),
+        "second worker hits the breakpoint"
+    );
+
+    // reverseContinue → back to the earlier (first) hit; again → no earlier hit, rewind to start.
+    let out = s.handle(&req(6, "reverseContinue", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("breakpoint")),
+        "reverses to the earlier worker hit (over the global turn)"
+    );
+    let out = s.handle(&req(7, "reverseContinue", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("entry")),
+        "no earlier hit → rewinds to the start"
+    );
+}
