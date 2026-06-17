@@ -1,4 +1,4 @@
-// Guest-side **dynamic linking** in C (DYNLINK.md C3): a guest program that loads a separately
+// Guest-side **dynamic linking** in C (DESIGN.md §22): a guest program that loads a separately
 // "compiled" code unit which references another unit **by name**, and links them at runtime — the
 // `dlopen`/`dlsym` story, done entirely inside the sandbox over the `Jit` capability.
 //

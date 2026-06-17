@@ -1006,7 +1006,7 @@ static int gen_builtin_jit_compile(Node *node) {
 }
 
 // `__vm_jit_compile_linked(ir, ir_len, symtab, symtab_len) -> code | -errno` (iface 11 op 5,
-// DYNLINK.md): like `compile`, but the unit may carry unresolved §7 imports, bound by name against
+// DESIGN.md §22): like `compile`, but the unit may carry unresolved §7 imports, bound by name against
 // the guest-provided symbol-table buffer before verify (host-assisted dynamic linking). The
 // rewrite precedes verification, so a mis-link is caught by re-verification, never trusted.
 static int gen_builtin_jit_compile_linked(Node *node) {

@@ -1,4 +1,4 @@
-// **Hot reload / live patching** over the in-guest dynamic linker (DYNLINK.md C3b edge): redefining a
+// **Hot reload / live patching** over the in-guest dynamic linker (DESIGN.md §22): redefining a
 // symbol gives it a *new* slot, but units already linked to the *old* one keep their binding — old
 // callers stay pinned to the old version, new callers bind to the new. This is the slot model's
 // live-patch behaviour, made concrete.

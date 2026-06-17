@@ -5980,7 +5980,7 @@ pub struct Host {
 /// identically (`svm-run` provides the canonical one).
 ///
 /// The third argument is the **symbol-table bytes** for host-assisted dynamic linking
-/// (DYNLINK.md): a guest-provided `name → slot | capability` table the validator resolves the
+/// (DESIGN.md §22): a guest-provided `name → slot | capability` table the validator resolves the
 /// unit's §7 imports against *before* verify (rewrite-then-verify). It is empty (`&[]`) for the
 /// ordinary closed-blob `compile` op — an empty table resolves nothing, so a unit with imports
 /// fails closed — and carries the guest's table only for the `compile_linked` op.
@@ -6509,7 +6509,7 @@ impl Host {
 
     /// Like [`Self::jit_compile`], but the unit's §7 imports are resolved against the
     /// guest-provided **symbol-table bytes** before verify — host-assisted dynamic linking
-    /// (DYNLINK.md). The `compile_linked` op routes here; `compile` routes here with an empty
+    /// (DESIGN.md §22). The `compile_linked` op routes here; `compile` routes here with an empty
     /// table. The validator does the resolve-then-verify, so the symbol table stays
     /// guest-controlled yet a mis-link can never escape (it fails re-verification, `-EINVAL`).
     pub fn jit_compile_linked(
@@ -6937,7 +6937,7 @@ impl Host {
                 }
                 5 => {
                     // compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len) -> code_handle |
-                    // -errno (DYNLINK.md host-assisted dynamic linking). Like op 0 `compile`, but
+                    // -errno (DESIGN.md §22 host-assisted dynamic linking). Like op 0 `compile`, but
                     // the unit may carry unresolved §7 imports, bound by name against the guest's
                     // symbol-table buffer before verify. Both buffers are borrowed from the
                     // window; with no window there is nothing to read (-EFAULT, like op 0).

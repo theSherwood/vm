@@ -173,7 +173,7 @@ mod op {
 const MAGIC: [u8; 4] = *b"SVM\x00";
 // v2 adds the §7 import section (name + op signature per import) and the `call.import` opcode, so a
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
-// for host-assisted dynamic linking (DYNLINK.md: the loader resolves a guest-shipped blob's imports
+// for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
 const VERSION: u8 = 2;
 
@@ -230,7 +230,7 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
     // §7 import section (v2): count, then each import's `name` and op `sig`. Usually empty — an
     // import-free module (every prior frontend's output, and any unit whose symbols were already
     // resolved) writes a single `0` here. A non-empty section is a unit shipped with **unresolved**
-    // symbols, for a loader to bind by name (DYNLINK.md host-assisted resolve).
+    // symbols, for a loader to bind by name (DESIGN.md §22 host-assisted resolve).
     write_uleb(&mut out, m.imports.len() as u64);
     for imp in &m.imports {
         write_str(&mut out, &imp.name);
@@ -262,7 +262,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
     match inst {
         // §7 named import (v2 wire form), mirroring `cap.call` but carrying an import *index*
         // (into the module's import section) instead of a bound `(type_id, op)`: the import stays
-        // unresolved on the wire so a loader can bind it by name (DYNLINK.md host-assisted resolve).
+        // unresolved on the wire so a loader can bind it by name (DESIGN.md §22 host-assisted resolve).
         Inst::CallImport {
             import,
             sig,

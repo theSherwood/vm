@@ -1,4 +1,4 @@
-//! Guest-driven **host-assisted dynamic linking** (DYNLINK.md C2): the `Jit` capability's new
+//! Guest-driven **host-assisted dynamic linking** (DESIGN.md §22): the `Jit` capability's new
 //! `compile_linked` op (op 5). A guest submits a serialized unit that still carries **unresolved §7
 //! imports** plus a **symbol-table buffer** (`name → slot`); the host resolves the imports by name
 //! against that table, re-verifies, and compiles — all in-sandbox, driven by guest code. This is the

@@ -1,5 +1,5 @@
 //! A **stateful REPL** built on in-window dynamic linking — the flagship use case made concrete
-//! (DYNLINK.md). Each "prompt" defines a function that may **call earlier definitions by name**; the
+//! (DESIGN.md §22). Each "prompt" defines a function that may **call earlier definitions by name**; the
 //! REPL keeps a **symbol table** (`name → installed table slot`) that grows with every definition,
 //! resolves each new unit's imports against it, compiles + installs the unit, and registers its name.
 //! Later prompts then reach it through the shared `call_indirect` table.

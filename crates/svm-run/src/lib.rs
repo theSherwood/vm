@@ -448,7 +448,7 @@ unsafe fn jit_native_op(
         }
         5 => {
             // compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len) -> code_handle | -errno
-            // (DYNLINK.md host-assisted dynamic linking). Like op 0, but the unit may carry
+            // (DESIGN.md §22 host-assisted dynamic linking). Like op 0, but the unit may carry
             // unresolved §7 imports bound by name against the guest's symbol-table buffer before
             // verify+compile. Any failure leaves nothing installed.
             let Ok(domain) = host.resolve_jit_domain(handle) else {
@@ -529,7 +529,7 @@ pub fn jit_blob_validator(
     jit_resolve_and_validate(bytes, mem_log2, |name| table.get(name).copied())
 }
 
-/// Decode the guest-provided **symbol table** for `compile_linked` (DYNLINK.md): a `name →
+/// Decode the guest-provided **symbol table** for `compile_linked` (DESIGN.md §22): a `name →
 /// [`Resolved`]` map the loader binds a unit's §7 imports against. Untrusted-input-facing and
 /// fail-closed (`None` on any malformation) — but note the *values* are guest-chosen by design:
 /// a forged slot confers no authority (the resolved `call_indirect` is masked + `type_id`-checked
@@ -632,13 +632,14 @@ impl SymCursor<'_> {
     }
 }
 
-/// Host-assisted dynamic-link resolve — the host-assisted half of the DYNLINK.md capstone. Decode
+/// Host-assisted dynamic-link resolve — the host-assisted half of in-window dynamic linking
+/// (DESIGN.md §22). Decode
 /// a serialized unit that may carry **unresolved §7 imports** (the v2 wire form), bind each import
 /// name through `resolve` (a *guest-controlled* symbol table: name → a `call_indirect` table slot,
 /// or a host capability), then run the **same** fail-closed gate as [`jit_blob_validator`]. Crucially
 /// the resolve is a source-to-source rewrite that runs *before* `verify_module`, so a mis-link — an
 /// unknown name, a wrong import signature, a non-const slot handle — is caught by re-verification and
-/// never trusted (DYNLINK.md "rewrite-then-verify"; the symbol table stays guest-controlled, the
+/// never trusted (DESIGN.md §22 "rewrite-then-verify"; the symbol table stays guest-controlled, the
 /// loader cannot forge a binding the verifier would reject). All failures are `-EINVAL` (guest-visible,
 /// non-fatal, nothing installed).
 pub fn jit_resolve_and_validate(

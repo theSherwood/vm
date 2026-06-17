@@ -83,7 +83,7 @@ long __vm_jit_compile(void *blob, long len);
 
 // Like `__vm_jit_compile`, but the unit may carry **unresolved imports** (`call.import "name"`):
 // the host binds each by name against the guest-provided **symbol table** before verify
-// (host-assisted dynamic linking, DYNLINK.md). `symtab`/`symtab_len` is a buffer the guest builds
+// (host-assisted dynamic linking, DESIGN.md §22). `symtab`/`symtab_len` is a buffer the guest builds
 // — `count` (uleb), then per entry `name` (uleb len + bytes), a `kind` byte (`0` = a table slot
 // from `__vm_jit_install`, `1` = a capability), and its payload (`Slot`: uleb slot). A mis-link
 // (unknown name, wrong signature) is caught by re-verification: `-22`, nothing installed. This is

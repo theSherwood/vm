@@ -2258,7 +2258,7 @@ fn c_guest_jit_demo() {
     );
 }
 
-/// Guest-side **dynamic linking** in C (DYNLINK.md C3, `demos/jit/jit_link.c`): a guest emits two
+/// Guest-side **dynamic linking** in C (DESIGN.md §22, `demos/jit/jit_link.c`): a guest emits two
 /// units — a self-contained `service` it installs, and a `client` that references the service **by
 /// name** (an unresolved import `F`) — builds a symbol table binding `"F"` to the install slot, and
 /// `__vm_jit_compile_linked`s the client against it. The host resolves the import by name and
@@ -2276,7 +2276,7 @@ fn c_guest_jit_link_demo() {
     );
 }
 
-/// The guest-side **`vm_dlopen` loader** in C (DYNLINK.md C3b, `demos/jit/jit_dlopen.c`): the
+/// The guest-side **`vm_dlopen` loader** in C (DESIGN.md §22, `demos/jit/jit_dlopen.c`): the
 /// ergonomic `vm_dlopen`/`vm_dlsym`/`vm_dlclose` library (`<vm_dl.h>` — a name→slot registry over the
 /// `Jit` cap) used to build functions that compose **by name**. The guest loads `add` and `mul`, then
 /// `poly = add(mul(a,a), b)` which imports both by name; `poly(5,2)=27`, `poly(3,4)=13`; then
@@ -2296,7 +2296,7 @@ fn c_guest_jit_dlopen_demo() {
     );
 }
 
-/// **Hot reload** over the guest `vm_dlopen` loader (DYNLINK.md C3b edge, `demos/jit/jit_hotreload.c`):
+/// **Hot reload** over the guest `vm_dlopen` loader (DESIGN.md §22, `demos/jit/jit_hotreload.c`):
 /// redefining a symbol gives it a new slot, but units already linked to the old one keep their
 /// binding. The guest loads `f` (a+100), then `g` calling `f` by name, hot-reloads `f` (a+200), then
 /// loads `h` calling `f` by name: `g(5)=105` (pinned to the old `f`), `h(5)=205` (sees the new one).

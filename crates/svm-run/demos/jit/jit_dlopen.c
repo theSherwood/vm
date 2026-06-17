@@ -1,4 +1,4 @@
-// A guest-side **linking loader** in C (DYNLINK.md C3b): build up a set of functions at runtime where
+// A guest-side **linking loader** in C (DESIGN.md §22): build up a set of functions at runtime where
 // each one may call earlier ones **by name**, using the `vm_dlopen`/`vm_dlsym`/`vm_dlclose` library
 // (`<vm_dl.h>`) over the `Jit` capability. This is the guest-C twin of the `dynlink_repl.rs` harness:
 // a growing symbol table where definitions persist and compose by name — `dlopen` for SVM, in-sandbox.

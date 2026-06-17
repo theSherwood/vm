@@ -1,7 +1,7 @@
 #ifndef VM_DL_H
 #define VM_DL_H
 // In-guest dynamic-linking loader — `vm_dlopen`/`vm_dlsym`/`vm_dlclose` over the `Jit` capability
-// (DYNLINK.md C3b). A "shared object" is serialized SVM IR; a symbol is an installed `call_indirect`
+// (DESIGN.md §22). A "shared object" is serialized SVM IR; a symbol is an installed `call_indirect`
 // slot (an **unforgeable funcref**, §3c-checked at the call). This header is the ergonomic layer over
 // the raw `__vm_jit_compile_linked` / `__vm_jit_install` primitives: it keeps a `name → slot` registry
 // and marshals it into the symbol-table buffer the host resolves against, so a loaded unit can

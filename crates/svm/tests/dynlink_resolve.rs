@@ -1,4 +1,4 @@
-//! Host-assisted dynamic linking, end to end over a **serialized** unit (DYNLINK.md capstone, the
+//! Host-assisted dynamic linking, end to end over a **serialized** unit (DESIGN.md §22 dynamic linking, the
 //! host-assisted resolve path). The companion `dynlink_runtime.rs` resolves an *in-memory* `Module`
 //! with `resolve_imports_with` inside the test harness; here the plugin is **serialized to bytes
 //! while its symbol is still unresolved** (a `.so` with an undefined reference), and the *host's*
