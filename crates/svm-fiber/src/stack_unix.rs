@@ -18,7 +18,7 @@ unsafe impl Send for Stack {}
 impl Stack {
     /// Allocate a stack with at least `size` usable bytes (rounded up to whole pages), plus one
     /// `PROT_NONE` guard page below it.
-    pub fn new(size: usize) -> Stack {
+    pub fn new(size: usize) -> Option<Stack> {
         // SAFETY: standard anonymous mmap; we check for MAP_FAILED and own the result.
         unsafe {
             let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
@@ -32,16 +32,20 @@ impl Stack {
                 -1,
                 0,
             );
-            assert!(base != libc::MAP_FAILED, "fiber stack mmap failed");
+            // A failed reservation is **recoverable** (the caller turns it into a `FiberFault`), not
+            // an abort — a guest creating many fibers must never crash the host (ISSUES.md I1).
+            if base == libc::MAP_FAILED {
+                return None;
+            }
             // Guard the lowest page: the stack grows down toward it, so an overflow hits PROT_NONE.
-            assert!(
-                libc::mprotect(base, page, libc::PROT_NONE) == 0,
-                "fiber stack guard mprotect failed"
-            );
-            Stack {
+            if libc::mprotect(base, page, libc::PROT_NONE) != 0 {
+                libc::munmap(base, len); // undo the reservation; fail closed
+                return None;
+            }
+            Some(Stack {
                 base: base as *mut u8,
                 len,
-            }
+            })
         }
     }
 

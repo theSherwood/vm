@@ -1905,6 +1905,12 @@ impl CompiledModule {
         #[cfg(not(fiber_rt))]
         let _ = &async_hooks;
 
+        // Set if a durable thaw re-seed (below) hit a control-stack alloc failure (I1): the trap cell
+        // already carries the `FiberFault`, so we skip the root re-entry and report it post-run.
+        // (Only the `fiber_rt` build re-seeds, so it's never mutated otherwise.)
+        #[cfg_attr(not(fiber_rt), allow(unused_mut))]
+        let mut seed_faulted = false;
+
         // Publish the root fiber runtime (when the module uses `cont.*`) so its thunks find it via the
         // thread-local for the duration of the entry; spawned vCPUs publish their own.
         #[cfg(fiber_rt)]
@@ -1927,7 +1933,11 @@ impl CompiledModule {
                 // window base is known now. (Spawned vCPUs are multi-vCPU durability, Phase 3.2.)
                 rt.set_durable_env(mem_base as u64, durable);
                 if durable && !seed.is_empty() {
-                    fiber_rt::seed_frozen_fibers(
+                    // A thaw re-seed that the OS refuses (I1) writes a `FiberFault` to the trap cell
+                    // and returns false; the post-run trap read below reports it. We still publish
+                    // the runtime and fall through — the guest re-entry simply won't resolve the
+                    // missing fibers — rather than abort the host.
+                    seed_faulted = !fiber_rt::seed_frozen_fibers(
                         &mut **rt as *mut fiber_rt::FiberRuntime,
                         &seed,
                         mem_base as u64,
@@ -1950,15 +1960,20 @@ impl CompiledModule {
         // the guard page), reads `fn_table`, and writes `trap_cell`. All buffers outlive the call;
         // the module owns the executable pages until `*this` drops (after every spawned vCPU is
         // joined below).
-        let faulted = mem::run_guarded(
-            &window,
-            code,
-            args.as_ptr(),
-            results.as_mut_ptr(),
-            mem_base,
-            fn_table_ptr,
-            trap_cell.as_ptr(),
-        );
+        let faulted = if seed_faulted {
+            // A thaw re-seed already failed and wrote the trap; don't re-enter with missing fibers.
+            false
+        } else {
+            mem::run_guarded(
+                &window,
+                code,
+                args.as_ptr(),
+                results.as_mut_ptr(),
+                mem_base,
+                fn_table_ptr,
+                trap_cell.as_ptr(),
+            )
+        };
 
         // Durable freeze driver (DURABILITY.md §12.8 slice 3.3.2): on a durable **freeze** run
         // (state word UNWINDING) the root has now unwound into context 0's shadow region; flatten

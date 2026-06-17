@@ -28,7 +28,7 @@ unsafe impl Send for Stack {}
 impl Stack {
     /// Allocate a stack with at least `size` usable bytes (rounded up to whole pages), plus one
     /// `PAGE_NOACCESS` guard page below it.
-    pub fn new(size: usize) -> Stack {
+    pub fn new(size: usize) -> Option<Stack> {
         let usable = size.max(PAGE).div_ceil(PAGE) * PAGE;
         let len = usable + PAGE; // + one guard page at the low end
         unsafe {
@@ -39,12 +39,21 @@ impl Stack {
                 MEM_RESERVE | MEM_COMMIT,
                 PAGE_READWRITE,
             ) as *mut u8;
-            assert!(!base.is_null(), "fiber stack VirtualAlloc failed");
+            // A failed reservation is **recoverable** (the caller turns it into a `FiberFault`), not
+            // an abort — a guest creating many fibers must never crash the host (ISSUES.md I1).
+            // Windows eager-commits the whole reservation here, so this is the path that exhausts
+            // first under fiber pressure.
+            if base.is_null() {
+                return None;
+            }
             // Guard the lowest page: the stack grows down toward it, so an overflow hits PAGE_NOACCESS.
             let mut old: PAGE_PROTECTION_FLAGS = 0;
             let ok = VirtualProtect(base as *const c_void, PAGE, PAGE_NOACCESS, &mut old);
-            assert!(ok != 0, "fiber stack guard VirtualProtect failed");
-            Stack { base, len }
+            if ok == 0 {
+                VirtualFree(base as *mut c_void, 0, MEM_RELEASE); // undo the reservation; fail closed
+                return None;
+            }
+            Some(Stack { base, len })
         }
     }
 
