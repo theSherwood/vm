@@ -231,3 +231,144 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
         "the fiber's live heap pointer 0x7050 must be enumerated; got buf=[{buf0:#x}, {buf1:#x}]"
     );
 }
+
+/// **End-to-end cross-vCPU stop-the-world root scan** (GC.md §2 + §3) — the motivating case the op
+/// exists for. A *collector* vCPU (the root) enumerates the roots of a *mutator* fiber that is parked
+/// on a **different** vCPU, over the domain-shared fiber table, synchronized by a real futex
+/// handshake (the §2 STW barrier realized at N=2 with `memory.wait`/`memory.notify`):
+///
+/// 1. The root spawns a mutator vCPU (`thread.spawn`) and waits on a `READY` window flag.
+/// 2. The mutator creates a fiber, resumes it once so it `suspend`s holding the heap pointer `0x7050`
+///    (its `arg`, kept live across the suspend → spilled onto the fiber's control stack), then sets
+///    `READY` + `notify`s and parks itself on a `GO` flag — alive but quiescent, the real STW state.
+/// 3. The root, now under STW (the only other vCPU is parked, its fiber `RUNNABLE`), calls `gc.roots`
+///    over `[0x7000, 0x8000)`. The walker must reach across to the *other vCPU's* parked fiber's stack
+///    and recover `0x7050` — the part neither the guest nor the collector's own vCPU can see.
+/// 4. The root releases the mutator (`GO` + `notify`) and `thread.join`s it.
+///
+/// `0x7050` lives **only** on the mutator fiber's control stack (the root passes it to nothing; the
+/// mutator passes it only as the immediately-dead `cont.resume` arg), so its presence proves the
+/// cross-vCPU scan. The §3.3 sanity check (refuse if another vCPU holds a *running* fiber) must **not**
+/// fire here — the mutator's fiber is `RUNNABLE`, not `RUNNING` — proving it does not false-refuse a
+/// legitimately-parked sibling. Both backends share the fiber registry/table across vCPUs, so this is
+/// asserted on each (soundness per §3.2, not interp↔JIT equality).
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn gc_roots_cross_vcpu_stop_the_world_scan() {
+    // Window flags: READY at 128, GO at 136 (i32). gc.roots buffer at offset 0, cap 8. Heap range
+    // [0x7000, 0x8000); the mutator fiber holds 0x7050 (28752). `sp` args are unused parameters.
+    let src = "memory 16\n\
+        func () -> (i64, i64, i64) {\n\
+        block0():\n\
+        \x20 v0 = i64.const 0\n\
+        \x20 v1 = i64.const 0\n\
+        \x20 v2 = thread.spawn 1 v0 v1\n\
+        \x20 br block1(v2)\n\
+        block1(v3: i32):\n\
+        \x20 v4 = i64.const 128\n\
+        \x20 v5 = i32.atomic.load.acquire v4\n\
+        \x20 v6 = i32.const 0\n\
+        \x20 v7 = i32.ne v5 v6\n\
+        \x20 br_if v7 block3(v3) block2(v3)\n\
+        block2(v8: i32):\n\
+        \x20 v9 = i64.const 128\n\
+        \x20 v10 = i32.const 0\n\
+        \x20 v11 = i64.const 1000000000\n\
+        \x20 v12 = i32.atomic.wait v9 v10 v11\n\
+        \x20 br block1(v8)\n\
+        block3(v13: i32):\n\
+        \x20 v14 = i64.const 28672\n\
+        \x20 v15 = i64.const 32768\n\
+        \x20 v16 = i64.const 0\n\
+        \x20 v17 = i64.const 8\n\
+        \x20 v18 = gc.roots v14 v15 v16 v17\n\
+        \x20 v19 = i64.const 136\n\
+        \x20 v20 = i32.const 1\n\
+        \x20 i32.atomic.store.release v19 v20\n\
+        \x20 v21 = i64.const 136\n\
+        \x20 v22 = i32.const 1\n\
+        \x20 v23 = atomic.notify v21 v22\n\
+        \x20 v24 = thread.join v13\n\
+        \x20 v25 = i64.const 0\n\
+        \x20 v26 = i64.load v25\n\
+        \x20 v27 = i64.const 8\n\
+        \x20 v28 = i64.load v27\n\
+        \x20 return v18 v26 v28\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = ref.func 2\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4 = cont.new v2 v3\n\
+        \x20 v5 = i64.const 28752\n\
+        \x20 v6, v7 = cont.resume v4 v5\n\
+        \x20 v8 = i64.const 128\n\
+        \x20 v9 = i32.const 1\n\
+        \x20 i32.atomic.store.release v8 v9\n\
+        \x20 v10 = i64.const 128\n\
+        \x20 v11 = i32.const 1\n\
+        \x20 v12 = atomic.notify v10 v11\n\
+        \x20 br block1()\n\
+        block1():\n\
+        \x20 v13 = i64.const 136\n\
+        \x20 v14 = i32.atomic.load.acquire v13\n\
+        \x20 v15 = i32.const 0\n\
+        \x20 v16 = i32.ne v14 v15\n\
+        \x20 br_if v16 block3() block2()\n\
+        block2():\n\
+        \x20 v17 = i64.const 136\n\
+        \x20 v18 = i32.const 0\n\
+        \x20 v19 = i64.const 1000000000\n\
+        \x20 v20 = i32.atomic.wait v17 v18 v19\n\
+        \x20 br block1()\n\
+        block3():\n\
+        \x20 v21 = i64.const 0\n\
+        \x20 return v21\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 v3 = suspend v2\n\
+        \x20 return v1\n\
+        }\n";
+    let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
+    verify_module(&m).expect("verify");
+
+    // Assert the cross-vCPU root is found on a given backend's (count, buf0, buf1) result.
+    let check = |slots: &[i64], backend: &str| {
+        let (count, buf0, buf1) = (slots[0], slots[1], slots[2]);
+        assert!(
+            count >= 1 && count <= 2,
+            "{backend}: expected 1-2 in-window roots (0x7000/0x7050), got count {count}"
+        );
+        assert!(
+            buf0 == 0x7050 || buf1 == 0x7050,
+            "{backend}: the mutator fiber's heap pointer 0x7050 must be enumerated across vCPUs; \
+             got buf=[{buf0:#x}, {buf1:#x}]"
+        );
+    };
+
+    // Interpreter (M:N executor; shares the run registry across spawned vCPUs).
+    let mut fuel = 100_000_000u64;
+    let interp: Vec<i64> = run(&m, 0, &[], &mut fuel)
+        .unwrap_or_else(|t| panic!("interp trapped: {t:?}"))
+        .iter()
+        .map(|v| match v {
+            Value::I64(x) => *x,
+            other => panic!("expected i64, got {other:?}"),
+        })
+        .collect();
+    check(&interp, "interp");
+
+    // JIT (real 1:1 OS threads; domain-shared fiber table).
+    use svm_jit::{compile_and_run, JitOutcome};
+    let jit = match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+        JitOutcome::Returned(s) => s,
+        other => panic!("jit did not return: {other:?}"),
+    };
+    check(&jit, "jit");
+}

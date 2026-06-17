@@ -497,14 +497,17 @@ unsafe fn scan_words(low: usize, high: usize, heap_lo: u64, heap_hi: u64, out: &
 /// (documented; a register-flush shim is a future follow-up) — but the call boundary to this thunk
 /// itself forces the `gc.roots` *caller* to spill, so its roots are covered.
 ///
-/// **Concurrency.** Scanning a running fiber's / another vCPU's stack is sound only at a
-/// stop-the-world safepoint (every other vCPU paused), exactly as the interpreter scans the shared
-/// registry; the current vCPU's own resume chain is quiescent while this synchronous thunk runs.
+/// **Concurrency (GC.md §3.3).** The scan is sound only at a stop-the-world safepoint — every other
+/// vCPU parked, exactly as the interpreter scans the shared registry. We enforce the cheap sanity
+/// check the contract permits: if any fiber is `RUNNING` on a vCPU *other than this one*, the caller
+/// is not under STW, so the op **refuses** (`FiberFault`) rather than read a racing stack. The
+/// current vCPU's own resume chain is quiescent while this synchronous thunk runs, so its `RUNNING`
+/// fibers are scanned normally.
 ///
 /// # Safety
 /// `mem_base`/`mask`/`mapped`/`sub_base`/`trap_out` are the threaded guest-window context (as for
-/// `cap.call`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime or an
-/// out-of-window `buf` faults (`FiberFault`).
+/// `cap.call`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
+/// out-of-window `buf`, or a non-STW call (a fiber running on another vCPU) faults (`FiberFault`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn gc_roots(
     heap_lo: u64,
@@ -534,6 +537,15 @@ pub(crate) unsafe extern "C" fn gc_roots(
             let guard = slot.fiber.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(fib) = guard.as_ref() {
                 let (lo, hi) = if slot.own.is_running() {
+                    // §3.3 stop-the-world sanity check: a fiber running on *another* vCPU means the
+                    // caller is **not** under STW — scanning its live, mutating native stack would be
+                    // a data race. Refuse (fail closed with `FiberFault`) rather than read it. A
+                    // fiber running on *this* vCPU is the caller's own resume chain (quiescent while
+                    // this synchronous thunk runs) and is scanned as a superset.
+                    if slot.running_on.load(Ordering::Relaxed) != rt.me {
+                        fault(trap_out);
+                        return 0;
+                    }
                     fib.full_extent()
                 } else {
                     fib.parked_extent()
