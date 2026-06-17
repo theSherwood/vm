@@ -104,6 +104,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-18-dev clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: install Rust 1.81 (LLVM 18) for the Rust on-ramp lane
+        # `rustc +1.81.0` emits LLVM-18 bitcode the pinned `llvm-ir` reader accepts (the default
+        # stable toolchain bundles a newer LLVM, which the reader rejects). Without this the Rust
+        # breadth test (`rust_no_std_matches_native`) skips; with it, it runs vs native `rustc`.
+        run: rustup toolchain install 1.81.0 --profile minimal
       - name: fmt · clippy · test
         working-directory: crates/svm-llvm
         run: |
