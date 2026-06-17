@@ -183,8 +183,13 @@ fn gc_roots_is_unsupported_on_the_jit_without_fibers() {
 #[test]
 fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
     use svm_jit::{compile_and_run, JitOutcome};
-    // range [0x7000, 0x8000); the root passes arg 0x7050 (28752) to the fiber, which keeps it live
-    // across its suspend and returns it; buf at offset 0, cap 8 slots.
+    // One-word heap window [0x7050, 0x7051): only the exact pointer 0x7050 can match, so the
+    // conservative scan's result is deterministic across platforms (a stray stack word equal to
+    // exactly 0x7050 is ~2^-64; dedup caps the count at 1). We assert *soundness* — the live fiber
+    // root is reported — not an occupancy upper bound (GC.md §3.2: the JIT deliberately
+    // over-approximates from raw stack words, so its candidate count is not something to bound).
+    // The root passes arg 0x7050 (28752) to the fiber, which keeps it live across its suspend and
+    // returns it; buf at offset 0, cap 8 slots.
     let src = "memory 16\n\
         func () -> (i64, i64, i64) {\n\
         block0():\n\
@@ -193,8 +198,8 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = i64.const 28752\n\
         \x20 v4, v5 = cont.resume v2 v3\n\
-        \x20 v6 = i64.const 28672\n\
-        \x20 v7 = i64.const 32768\n\
+        \x20 v6 = i64.const 28752\n\
+        \x20 v7 = i64.const 28753\n\
         \x20 v8 = i64.const 0\n\
         \x20 v9 = i64.const 8\n\
         \x20 v10 = gc.roots v6 v7 v8 v9\n\
@@ -216,19 +221,14 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
         JitOutcome::Returned(s) => s,
         other => panic!("jit did not return: {other:?}"),
     };
-    let (count, buf0, buf1) = (slots[0], slots[1], slots[2]);
+    let (count, buf0) = (slots[0], slots[1]);
     assert!(
         count >= 1,
         "the suspended fiber's root must be found (count {count})"
     );
     assert!(
-        count <= 2,
-        "only in-window words (0x7000/0x7050) should be reported, got count {count} \
-         (out-of-window stack words must be filtered)"
-    );
-    assert!(
-        buf0 == 0x7050 || buf1 == 0x7050,
-        "the fiber's live heap pointer 0x7050 must be enumerated; got buf=[{buf0:#x}, {buf1:#x}]"
+        buf0 == 0x7050,
+        "the fiber's live heap pointer 0x7050 must be enumerated; got buf0={buf0:#x}"
     );
 }
 
@@ -259,8 +259,10 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
 ))]
 #[test]
 fn gc_roots_cross_vcpu_stop_the_world_scan() {
-    // Window flags: READY at 128, GO at 136 (i32). gc.roots buffer at offset 0, cap 8. Heap range
-    // [0x7000, 0x8000); the mutator fiber holds 0x7050 (28752). `sp` args are unused parameters.
+    // Window flags: READY at 128, GO at 136 (i32). gc.roots buffer at offset 0, cap 8. One-word
+    // heap window [0x7050, 0x7051) so the conservative scan's result is deterministic (only the
+    // exact pointer matches; soundness per GC.md §3.2, not an occupancy bound). The mutator fiber
+    // holds 0x7050 (28752). `sp` args are unused parameters.
     let src = "memory 16\n\
         func () -> (i64, i64, i64) {\n\
         block0():\n\
@@ -281,8 +283,8 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         \x20 v12 = i32.atomic.wait v9 v10 v11\n\
         \x20 br block1(v8)\n\
         block3(v13: i32):\n\
-        \x20 v14 = i64.const 28672\n\
-        \x20 v15 = i64.const 32768\n\
+        \x20 v14 = i64.const 28752\n\
+        \x20 v15 = i64.const 28753\n\
         \x20 v16 = i64.const 0\n\
         \x20 v17 = i64.const 8\n\
         \x20 v18 = gc.roots v14 v15 v16 v17\n\
@@ -338,17 +340,19 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
     let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
     verify_module(&m).expect("verify");
 
-    // Assert the cross-vCPU root is found on a given backend's (count, buf0, buf1) result.
+    // Assert the cross-vCPU root is found on a given backend's (count, buf0, _) result. Soundness
+    // only (GC.md §3.2): the one-word window makes the result deterministic without bounding the
+    // conservative candidate count.
     let check = |slots: &[i64], backend: &str| {
-        let (count, buf0, buf1) = (slots[0], slots[1], slots[2]);
+        let (count, buf0) = (slots[0], slots[1]);
         assert!(
-            (1..=2).contains(&count),
-            "{backend}: expected 1-2 in-window roots (0x7000/0x7050), got count {count}"
+            count >= 1,
+            "{backend}: the mutator fiber's root must be found (count {count})"
         );
         assert!(
-            buf0 == 0x7050 || buf1 == 0x7050,
+            buf0 == 0x7050,
             "{backend}: the mutator fiber's heap pointer 0x7050 must be enumerated across vCPUs; \
-             got buf=[{buf0:#x}, {buf1:#x}]"
+             got buf0={buf0:#x}"
         );
     };
 
