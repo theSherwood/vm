@@ -1553,3 +1553,118 @@ int f(void) {
         "cap reflection: 8 caps, type_id >= 0"
     );
 }
+
+// ---- §9/§12 async I/O ring: `__vm_io_submit_async` / `__vm_io_reap` / `__vm_blocking_handle` ------
+
+/// Grant a powerbox on an interpreter `Host`, returning the first `n` handles (the prefix `_start`
+/// declares) as call args. Mirrors `svm/tests/c_frontend.rs::powerbox`; `block` is the `Blocking`
+/// op's dwell so an async batch is genuinely in flight when a vCPU parks.
+#[cfg(unix)]
+fn grant_powerbox(
+    h: &mut svm_interp::Host,
+    win: u64,
+    n: usize,
+    block: std::time::Duration,
+) -> Vec<Value> {
+    use svm_interp::StreamRole;
+    h.set_region_factory(svm_run::new_shared_region);
+    h.set_jit_validator(svm_run::jit_blob_validator);
+    let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
+    let all = [
+        h.grant_stream(StreamRole::Out),
+        h.grant_stream(StreamRole::In),
+        h.grant_exit(),
+        h.grant_memory(),
+        h.grant_address_space(0, win),
+        h.grant_io_ring(),
+        h.grant_blocking(block, None),
+        h.grant_jit(mem_log2),
+    ];
+    all[..n].iter().map(|&x| Value::I32(x)).collect()
+}
+
+/// The host's deterministic `Blocking.work(i)` result (mirrors `svm_interp::AsyncState::mix`, the
+/// value the chibicc async tests check).
+fn async_mix(arg: i64) -> i64 {
+    arg.wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+}
+
+/// The async **event-loop runtime** in real C (`demos/async_io`), driven through the LLVM on-ramp:
+/// one vCPU `submit_async`s a batch of `Blocking` ops onto the host offload pool, parks on an in-window
+/// completion counter (`__vm_wait32`), and reaps completions as a pool worker `notify`s it — exercising
+/// `__vm_io_submit_async`/`__vm_io_reap`/`__vm_blocking_handle` and the **7-handle powerbox**
+/// (`synth_start` now grants through `Blocking`) end to end. Interpreter-only (it is the M:N executor
+/// and offload-pool oracle; the JIT async path needs the separate `HostAsyncHooks` harness). The
+/// printed total is completion-order-invariant: Σ mix(i) for i in 0..8.
+#[test]
+#[cfg(unix)]
+fn vm_async_io_runtime() {
+    let src = include_str!("../../svm-run/demos/async_io/async_io.c");
+    let Some(bc) = compile_to_bc("async_io", src) else {
+        return;
+    };
+    let m = svm_llvm::translate_bc_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    // The async-ring imports are registered and the entry grants through Blocking (7 handles).
+    let import_names: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        import_names.contains(&"vm_io_submit_async") && import_names.contains(&"vm_io_reap"),
+        "expected async-ring imports, got {import_names:?}"
+    );
+    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let nparams = module.funcs[0].params.len();
+    assert_eq!(
+        nparams, 7,
+        "async program must declare the 7-handle powerbox entry"
+    );
+
+    let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut h = svm_interp::Host::new();
+    let args = grant_powerbox(&mut h, win, nparams, std::time::Duration::from_millis(10));
+    let mut fuel = 500_000_000u64;
+    let out =
+        svm_interp::run_with_host(&module, 0, &args, &mut fuel, &mut h).expect("interp async run");
+    assert_eq!(out, vec![Value::I32(0)], "async demo returns 0");
+    // NTASKS = 8 (see the demo); the total is Σ of the host's deterministic per-op results.
+    let total: u64 = (0..8).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
+    assert_eq!(
+        h.stdout,
+        format!("{total}\n").into_bytes(),
+        "async total Σ mix(0..8)"
+    );
+}
+
+/// `__vm_cap(i)` reaches the **tail** powerbox handles (`i ≥ 4`) now that `synth_start` stashes them:
+/// `__vm_cap(6)` (the Blocking slot) must equal `__vm_blocking_handle()` — both read stash slot 24.
+/// Proves the relocated 8-handle layout is wired through both the generic `__vm_cap` reader and the
+/// named builtin. Run on the interpreter under the 7-handle powerbox.
+#[test]
+#[cfg(unix)]
+fn vm_cap_index_reaches_tail_handles() {
+    let src = r#"
+int __vm_blocking_handle(void);
+int __vm_cap(int i);
+int main(void) { return (__vm_cap(6) == __vm_blocking_handle()) ? 7 : 0; }
+"#;
+    let Some((m, _)) = translate_verified("vm_cap_tail", src) else {
+        return;
+    };
+    assert_eq!(
+        m.funcs[0].params.len(),
+        7,
+        "a Blocking-handle program declares the 7-handle entry"
+    );
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut h = svm_interp::Host::new();
+    let args = grant_powerbox(&mut h, win, 7, std::time::Duration::ZERO);
+    let mut fuel = 50_000_000u64;
+    let r = svm_interp::run_with_host(&m, 0, &args, &mut fuel, &mut h).expect("interp run");
+    assert_eq!(
+        r,
+        vec![Value::I32(7)],
+        "__vm_cap(6) == __vm_blocking_handle()"
+    );
+}

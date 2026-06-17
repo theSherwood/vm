@@ -681,15 +681,30 @@ on the JIT powerbox), `vm_fibers_generator`, `vm_atomics_single_threaded` (both 
   relocation** — the one-time fix that forecloses the recurring "new handle collides with heap state"
   bug. All six demos + the malloc/printf paths re-verified byte-identical (the offsets are referenced
   by named constant, so the move is transparent).
-- *Deferred (P2, additive — now unblocked by the relocation):* `__vm_io_submit_async`/`__vm_io_reap`/
-  `__vm_blocking_handle` and full `__vm_cap(i)` for `i ≥ 4`. These now only need `synth_start` to grant
-  the 5th–7th handles into the reserved slots (no layout change) plus the call-site lowerings — the
-  STW-safe blocking path JACL's GC needs (GC.md §5.2). The §13/§14 `__vm_region_*` and §22
-  `__vm_jit_*` builtins likewise stay `Unsupported` until a workload needs them.
+**Slice AD (DONE) — the async-I/O ring (P2; the STW-safe blocking path JACL's GC needs, GC.md §5.2).**
+The §9/§12 submit/complete ring now lowers on the on-ramp, so a guest event-loop / work-stealing
+runtime built on LLVM bitcode drives many concurrent blocking I/Os from one parked vCPU:
+- `__vm_io_submit_async(sq, n, counter)` / `__vm_io_reap(cq, max)` → `CallImport` on the stashed
+  `IoRing` handle (slot 5; imports `vm_io_submit_async`/`vm_io_reap` → `IoRing` ops 1/2). The SQE/CQE
+  wire format is guest-built in the window; only the ring indices cross the boundary.
+- `__vm_blocking_handle()` → a stash read of the `Blocking` handle (slot 6) the guest names in an SQE.
+- **`synth_start` generalized to grant a contiguous handle prefix.** It now grants `n_handles` —
+  sized to the highest `VM_CAP_*` index the program uses (exit→3, memory→4, ioring→6, blocking→7) —
+  and stashes each at `i*4` with a uniform loop (the old 3/4-handle special-case is gone; existing
+  I/O and malloc programs still get exactly 3/4, demos byte-identical). This also lights up
+  `__vm_cap(i)` for `i ≥ 4`: the tail handles are now stashed, so the generic reader reaches them
+  (`vm_cap_index_reaches_tail_handles`: `__vm_cap(6) == __vm_blocking_handle()`).
+- Tests: `vm_async_io_runtime` runs `demos/async_io/async_io.c` through Lane C on the interpreter's
+  M:N executor + offload pool (the 7-handle powerbox, futex parking, completion-order-invariant total
+  Σ mix(0..8)) — interpreter-only, as the JIT async path needs the separate `HostAsyncHooks` harness
+  (mirrors the chibicc `run_async_demo` split). 86 translate tests green, fmt + clippy clean.
+- *Still deferred:* the §13/§14 `__vm_region_*` (SharedRegion) and §22 `__vm_jit_*` builtins stay
+  `Unsupported` until a workload needs them — the reserved AddressSpace(4)/Jit(7) slots are ready.
 
-**Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native) and the
-`<svm.h>` P0+P1+Memory builtins are in. Beyond this: the P2 async-I/O tail (above), Milestone 2 (tail
-calls, real Rust/C++ without EH), and a bundled guest `libm` header.
+**Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native), the
+`<svm.h>` P0+P1+P2 capability/concurrency/GC builtins are in, and the powerbox stash is locked to the
+full 8-handle layout. Beyond this: the SharedRegion/Jit builtins (on demand), Milestone 2 (tail calls,
+real Rust/C++ without EH), and a bundled guest `libm` header.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
