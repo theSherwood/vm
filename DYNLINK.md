@@ -113,8 +113,15 @@ These already prove old code reaching newly-loaded code; the dynlink work adds t
     name, wrong sig) is caught by re-verification, never trusted. `jit_blob_validator` is now the
     empty-symtab special case (a closed blob with imports fails closed). Tests:
     `crates/svm/tests/dynlink_resolve.rs` (3 + a codec round-trip).
+- [x] **Grounding demo — a stateful REPL with by-name definitions** (`crates/svm/tests/dynlink_repl.rs`).
+      The flagship use case made concrete on the C1 primitives: a `Repl` keeps a growing symbol table
+      (`name → installed slot`); each `define` resolves the unit's `call.import`s against it, compiles
+      + installs, and registers the name; later definitions reach earlier ones by name (`sq` → `quad =
+      sq(sq(x))` → `quad_plus = quad(x)+sq(x)`). The symbol table **is** the dlopen registry — this is
+      the **executable spec** for the guest-side `vm_dlopen`/`vm_dlsym` surface (runs today, no cap op).
 - [ ] **The capstone: a guest-side `dlopen`/`dlsym` loader** — see below. (C1 settled the design and
-      built the host half; what remains is the *guest* delivering the symbol table + driving it.)
+      built the host half; the REPL demo specs the guest API; what remains is the *guest* delivering
+      the symbol table + driving it — the `compile_linked` cap op, then the C surface.)
 - [ ] GOT / late-binding variant (so *old* code calls *not-yet-loaded* code by name without recompiling
       the caller: the caller does `call_indirect (load GOT[i])`; the loader writes the resolved slot
       into the GOT at load — pure data writes via `Memory` + `memory.init`, reusing M2's reloc). The
@@ -123,6 +130,25 @@ These already prove old code reaching newly-loaded code; the dynlink work adds t
 - [ ] Frontend support: have chibicc/svm-wasm emit `call.import` for *defined-elsewhere* symbols +
       the `data_exports`/`relocations` metadata, so real separately-compiled C/Rust units link (today
       tests hand-build `LinkUnit`s).
+
+### Who actually uses this (real consumer programs)
+
+To keep the work grounded — the programs that motivate by-name linking, and what each needs:
+- **Stateful REPL with persistent definitions** — definitions compose by name across prompts; the
+  symbol table is the dlopen registry. *Demoed today* at the harness level (`dynlink_repl.rs`); the
+  guest-C version (evolving `demos/jit/jit_repl.c`, which today JITs standalone throwaway units) needs
+  the `compile_linked` cap op. **The chosen flagship.**
+- **Plugin host** — a host with a stable API loads a separately-shipped plugin from the powerbox; the
+  plugin calls host services by name and exports an entry the host `vm_dlsym`s. The clearest "this is
+  `dlopen`" story + the security pitch (re-verified, capability-gated, unforgeable funcref). Needs the
+  cap op + the C surface.
+- **Shared runtime library** (`libm`-shape) — one copy resolved by name from many clients. The static
+  case is `link()` today (M1/M2); the load-time-shared case needs the cap op.
+- **Hot reload / live patching** — install a new version at a new slot, rebind the name; new callers
+  resolve to it, in-flight calls finish on the old. The REPL demo already shows the redefinition shape.
+- **Dynamic class loading in a managed runtime** (the headline motivation) — a guest mini-language VM
+  whose `load_class` compiles methods that link to runtime support + superclass methods by name. The
+  most ambitious; needs the cap op + C surface + GC integration.
 
 ---
 
