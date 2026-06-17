@@ -71,8 +71,8 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape,
-    VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
+    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp,
+    VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -2588,6 +2588,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VSatBin { .. } => {}
                 // Widen lowers to `swiden_low`/`uwiden_low`/`*_high`; narrow to `snarrow`/`unarrow`.
                 Inst::VWiden { .. } | Inst::VNarrow { .. } => {}
+                // Int↔float / float↔float conversions → Cranelift `fcvt_*` / `fvdemote`/`fvpromote_low`.
+                Inst::VConvert { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3672,6 +3674,36 @@ fn lower_block(
                 let r = match op {
                     VNarrowOp::S => b.ins().snarrow(x, y),
                     VNarrowOp::U => b.ins().unarrow(x, y),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VConvert { op, a } => {
+                let raw = get(&vals, *a)?;
+                let r = match op {
+                    VCvtOp::F32x4ConvertI32x4S => {
+                        let x = vcast(b, raw, I32X4);
+                        b.ins().fcvt_from_sint(F32X4, x)
+                    }
+                    VCvtOp::F32x4ConvertI32x4U => {
+                        let x = vcast(b, raw, I32X4);
+                        b.ins().fcvt_from_uint(F32X4, x)
+                    }
+                    VCvtOp::I32x4TruncSatF32x4S => {
+                        let x = vcast(b, raw, F32X4);
+                        b.ins().fcvt_to_sint_sat(I32X4, x)
+                    }
+                    VCvtOp::I32x4TruncSatF32x4U => {
+                        let x = vcast(b, raw, F32X4);
+                        b.ins().fcvt_to_uint_sat(I32X4, x)
+                    }
+                    VCvtOp::F32x4DemoteF64x2Zero => {
+                        let x = vcast(b, raw, F64X2);
+                        b.ins().fvdemote(x)
+                    }
+                    VCvtOp::F64x2PromoteLowF32x4 => {
+                        let x = vcast(b, raw, F32X4);
+                        b.ins().fvpromote_low(x)
+                    }
                 };
                 vcast(b, r, I8X16)
             }

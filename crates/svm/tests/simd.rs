@@ -1093,3 +1093,106 @@ fn narrow_roundtrip_and_shape_reject() {
         "narrowing to i32x4 is not a wasm op — must reject"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lane int↔float / float↔float conversions (VConvert).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn diff_int_float_conversions() {
+    // i32 → f32 (observe the f32 bits via i32x4.extract_lane).
+    let cvt = |op: &str, x: i32| -> i32 {
+        let s = format!(
+            "func (i32) -> (i32) {{\nblock0(v0: i32):\n  v1 = i32x4.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane 0 v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::I32(x)]) as i32
+    };
+    for x in [0, -5, 1_000_000, i32::MAX, i32::MIN, -1] {
+        assert_eq!(
+            cvt("f32x4.convert_i32x4_s", x),
+            (x as f32).to_bits() as i32,
+            "conv_s {x}"
+        );
+        assert_eq!(
+            cvt("f32x4.convert_i32x4_u", x),
+            ((x as u32) as f32).to_bits() as i32,
+            "conv_u {x}"
+        );
+    }
+
+    // f32 → i32 saturating (NaN → 0, clamp to the int range) — exactly Rust's `as`.
+    let ts = |op: &str, x: f32| -> i32 {
+        let s = format!(
+            "func (f32) -> (i32) {{\nblock0(v0: f32):\n  v1 = f32x4.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane 0 v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::F32(x)]) as i32
+    };
+    for x in [
+        3.9f32,
+        -3.9,
+        0.0,
+        1e10,
+        -1e10,
+        f32::NAN,
+        f32::INFINITY,
+        -f32::INFINITY,
+    ] {
+        assert_eq!(ts("i32x4.trunc_sat_f32x4_s", x), x as i32, "trunc_s {x}");
+        assert_eq!(
+            ts("i32x4.trunc_sat_f32x4_u", x),
+            (x as u32) as i32,
+            "trunc_u {x}"
+        );
+    }
+}
+
+#[test]
+fn diff_demote_promote() {
+    // f64 → f32 demote (lanes 0/1; lanes 2/3 zeroed). Observe f32 bits.
+    let demote = |x: f64, lane: u8| -> i32 {
+        let s = format!(
+            "func (f64) -> (i32) {{\nblock0(v0: f64):\n  v1 = f64x2.splat v0\n\
+             \x20 v2 = f32x4.demote_f64x2_zero v1\n  v3 = i32x4.extract_lane {lane} v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::F64(x)]) as i32
+    };
+    for x in [1.5f64, -2.25, 1e300, 0.1] {
+        assert_eq!(demote(x, 0), (x as f32).to_bits() as i32, "demote {x}");
+    }
+    assert_eq!(demote(1.5, 2), 0, "demote zeroes the high lanes");
+
+    // f32 → f64 promote_low. Observe f64 bits.
+    let promote = |x: f32| -> i64 {
+        let s = "func (f32) -> (i64) {\nblock0(v0: f32):\n  v1 = f32x4.splat v0\n\
+                 \x20 v2 = f64x2.promote_low_f32x4 v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}\n";
+        diff1(s, &[Value::F32(x)])
+    };
+    for x in [1.5f32, -2.25, 0.1, f32::INFINITY] {
+        assert_eq!(promote(x), (x as f64).to_bits() as i64, "promote {x}");
+    }
+}
+
+/// Conversions round-trip through text + binary (whole-instruction mnemonics).
+#[test]
+fn conversion_roundtrip() {
+    let src = "func (i32) -> (i32) {\nblock0(v0: i32):\n\
+        v1 = i32x4.splat v0\n\
+        v2 = f32x4.convert_i32x4_s v1\n\
+        v3 = i32x4.trunc_sat_f32x4_u v2\n\
+        v4 = f64x2.promote_low_f32x4 v2\n\
+        v5 = f32x4.demote_f64x2_zero v4\n\
+        v6 = i32x4.extract_lane 0 v3\n  return v6\n}\n";
+    let m = build(src);
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
+}

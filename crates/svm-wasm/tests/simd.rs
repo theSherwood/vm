@@ -459,3 +459,31 @@ fn i8x16_narrow_u() {
     assert_eq!(pack(-5), 0, "(i16)-5 clamps to 0");
     assert_eq!(pack(200), 200, "200 stays");
 }
+
+/// Int↔float conversions through the wasm bridge: convert an i32 vector to f32, scale, and
+/// `trunc_sat` back — the "do float math on integer pixels/samples" pattern. Also pins the
+/// saturating NaN/overflow behaviour.
+#[test]
+fn i32x4_convert_trunc_roundtrip() {
+    // (i32) -> i32: round x through f32, multiply by 2.0, truncate back (saturating).
+    let wat = r#"
+    (module
+      (func (export "f") (param $x i32) (result i32)
+        (i32x4.extract_lane 0
+          (i32x4.trunc_sat_f32x4_s
+            (f32x4.mul
+              (f32x4.convert_i32x4_s (i32x4.splat (local.get $x)))
+              (f32x4.splat (f32.const 2.0)))))))
+    "#;
+    let f = |x: i32| match eval(wat, "f", &[Value::I32(x)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(f(10), 20, "10 → 20.0 → 20");
+    assert_eq!(f(-7), -14, "-7 → -14");
+    assert_eq!(
+        f(2_000_000_000),
+        i32::MAX,
+        "2e9*2 overflows i32 → saturates to MAX"
+    );
+}

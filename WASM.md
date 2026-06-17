@@ -95,8 +95,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [ ] **SIMD remainder** (~74 of the v128 proposal): dot product, `i8x16.popcnt`, pmin/pmax,
-  int↔float conversions, extadd/extmul, avgr, q15mulr, etc. Mechanical breadth over the proven 5-step
+- [ ] **SIMD remainder** (~68 of the v128 proposal): dot product, `i8x16.popcnt`, pmin/pmax,
+  the f64↔i32 conversions (`convert_low`/`trunc_sat_*_zero`), extadd/extmul, avgr, q15mulr, etc.
+  Mechanical breadth over the proven 5-step
   pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops have
   no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
   - [x] **Integer lane compares — DONE.** `i8x16`/`i16x8`/`i32x4` `{eq,ne,lt,gt,le,ge}` s/u + the
@@ -130,6 +131,12 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     one narrow vector, `a` then `b` (`Inst::VNarrow`; Cranelift `snarrow`/`unarrow`; verifier restricts
     to the two narrow result shapes). Source read as signed, `s`/`u` pick the clamp range; tests incl.
     a clamp-pack idiom.
+  - [x] **int↔float / float↔float conversions (i32↔f32 + demote/promote) — DONE.**
+    `f32x4.convert_i32x4_{s,u}`, `i32x4.trunc_sat_f32x4_{s,u}`, `f32x4.demote_f64x2_zero`,
+    `f64x2.promote_low_f32x4` (`Inst::VConvert`, whole-instruction mnemonics; Cranelift
+    `fcvt_from_{s,u}int`/`fcvt_to_{s,u}int_sat`/`fvdemote`/`fvpromote_low`). Rust's `as` casts are the
+    oracle — they already match wasm's round-to-nearest + `trunc_sat` (NaN→0, clamp). The **f64↔i32**
+    `convert_low`/`trunc_sat_*_zero` four remain (lane-count mismatch → multi-instruction lowering).
 - [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
   atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
   in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR

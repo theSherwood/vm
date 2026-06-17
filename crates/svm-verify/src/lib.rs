@@ -731,6 +731,11 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
+        // Lane conversions: `v128` → `v128`, fully described by the op.
+        Inst::VConvert { a, .. } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
         // Boolean reductions: a `v128` → an `i32`. `all_true`/`bitmask` carry an integer shape;
         // `any_true` is shape-agnostic.
         Inst::VAnyTrue { a } => {

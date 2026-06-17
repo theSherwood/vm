@@ -494,6 +494,56 @@ impl VNarrowOp {
     }
 }
 
+/// Lane **int↔float / float↔float conversions** (§17). Each is a whole-instruction mnemonic (the
+/// source and result lane shapes differ, so unlike the lane-op families these don't share a
+/// `shape.suffix` form). `a`/result are `v128`. `trunc_sat` is the non-trapping float→int (NaN→0,
+/// clamp to the integer range); `demote`/`promote` change float width (low 2 lanes, high zeroed).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VCvtOp {
+    /// `f32x4.convert_i32x4_s`: each `i32` lane → `f32`.
+    F32x4ConvertI32x4S,
+    /// `f32x4.convert_i32x4_u`: each `u32` lane → `f32`.
+    F32x4ConvertI32x4U,
+    /// `i32x4.trunc_sat_f32x4_s`: each `f32` lane → saturating `i32`.
+    I32x4TruncSatF32x4S,
+    /// `i32x4.trunc_sat_f32x4_u`: each `f32` lane → saturating `u32`.
+    I32x4TruncSatF32x4U,
+    /// `f32x4.demote_f64x2_zero`: the two `f64` lanes → `f32` (lanes 0/1); lanes 2/3 = 0.
+    F32x4DemoteF64x2Zero,
+    /// `f64x2.promote_low_f32x4`: the low two `f32` lanes → `f64`.
+    F64x2PromoteLowF32x4,
+}
+
+impl VCvtOp {
+    pub const ALL: [VCvtOp; 6] = [
+        VCvtOp::F32x4ConvertI32x4S,
+        VCvtOp::F32x4ConvertI32x4U,
+        VCvtOp::I32x4TruncSatF32x4S,
+        VCvtOp::I32x4TruncSatF32x4U,
+        VCvtOp::F32x4DemoteF64x2Zero,
+        VCvtOp::F64x2PromoteLowF32x4,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VCvtOp::F32x4ConvertI32x4S => "f32x4.convert_i32x4_s",
+            VCvtOp::F32x4ConvertI32x4U => "f32x4.convert_i32x4_u",
+            VCvtOp::I32x4TruncSatF32x4S => "i32x4.trunc_sat_f32x4_s",
+            VCvtOp::I32x4TruncSatF32x4U => "i32x4.trunc_sat_f32x4_u",
+            VCvtOp::F32x4DemoteF64x2Zero => "f32x4.demote_f64x2_zero",
+            VCvtOp::F64x2PromoteLowF32x4 => "f64x2.promote_low_f32x4",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VCvtOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VCvtOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
 /// Lane-wise binary float ops on a `v128` (§17, IEEE 754, no traps). `Min`/`Max` are the
 /// IEEE `minimum`/`maximum` (NaN-propagating, `-0 < +0`) matching the scalar [`FBinOp`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1797,6 +1847,11 @@ pub enum Inst {
         op: VNarrowOp,
         a: ValIdx,
         b: ValIdx,
+    },
+    /// Lane int↔float / float↔float conversion (see [`VCvtOp`]); `a`/result are `v128`.
+    VConvert {
+        op: VCvtOp,
+        a: ValIdx,
     },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
-    Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
+    Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
     VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarLoc,
     DEFAULT_RESERVED_LOG2,
 };
@@ -5188,6 +5188,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_v128(get(vals, *b)?)?,
         )),
+        Inst::VConvert { op, a } => Value::V128(simd_convert(*op, as_v128(get(vals, *a)?)?)),
         Inst::VAnyTrue { a } => {
             Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
         }
@@ -5452,6 +5453,53 @@ fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
             VShiftOp::ShrS => (lane_sext(x, bytes) >> sh) as u64,
         };
         lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// Lane int↔float / float↔float conversions. Rust's `as` casts already match wasm: int→float is
+/// round-to-nearest, float→int is `trunc_sat` (NaN→0, clamp to the int range), and `f64 as f32` is
+/// the IEEE round demote. `demote`/`promote_low` touch the low 2 lanes; demote zeroes lanes 2/3.
+fn simd_convert(op: VCvtOp, a: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match op {
+        VCvtOp::F32x4ConvertI32x4S => {
+            for i in 0..4 {
+                let x = lane_read(&a, i, 4) as u32 as i32;
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+        }
+        VCvtOp::F32x4ConvertI32x4U => {
+            for i in 0..4 {
+                let x = lane_read(&a, i, 4) as u32;
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+        }
+        VCvtOp::I32x4TruncSatF32x4S => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, (x as i32) as u32 as u64);
+            }
+        }
+        VCvtOp::I32x4TruncSatF32x4U => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, (x as u32) as u64);
+            }
+        }
+        VCvtOp::F32x4DemoteF64x2Zero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
+        VCvtOp::F64x2PromoteLowF32x4 => {
+            for i in 0..2 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
     }
     o
 }

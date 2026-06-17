@@ -24,8 +24,9 @@ use std::fmt::Write as _;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module,
-    Ordering, StoreOp, Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
-    VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
+    Ordering, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
+    VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo,
+    VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -361,6 +362,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::VSatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VWiden { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
         Inst::VNarrow { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VConvert { op, a } => format!("{} v{a}", op.name()),
         Inst::VBitBin { op, a, b } => format!("v128.{} v{a} v{b}", op.name()),
         Inst::VNot { a } => format!("v128.not v{a}"),
         Inst::Bitselect { a, b, mask } => format!("v128.bitselect v{a} v{b} v{mask}"),
@@ -1553,6 +1555,13 @@ impl<'a> Parser<'a> {
         }
         if op == "v128.any_true" {
             return Ok(Inst::VAnyTrue {
+                a: self.value(names)?,
+            });
+        }
+        // Conversions are whole-instruction mnemonics (source/result shapes differ).
+        if let Some(o) = VCvtOp::from_name(op.as_str()) {
+            return Ok(Inst::VConvert {
+                op: o,
                 a: self.value(names)?,
             });
         }
