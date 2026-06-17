@@ -728,15 +728,44 @@ AddressSpace). This is the magic-ring-buffer / zero-copy parent↔child data pla
   (then `unmap`s), on the real JIT powerbox (true shared-memory aliasing via the host region factory);
   the `'Y'` success marker is checked against stdout. 89 translate tests green, fmt + clippy clean.
 
-**Next:** the `<svm.h>` capability/concurrency/GC/JIT/region surface is now **complete** — the LLVM
-on-ramp has full capability parity with the chibicc frontend. Remaining: Milestone 2 (tail calls, real
-Rust/C++ without EH — the D54 breadth proof) and a bundled guest `libm` header.
+The `<svm.h>` capability/concurrency/GC/JIT/region surface is **complete** (full chibicc parity). The
+next frontier is the D54 **breadth proof** (Milestone 2): the on-ramp consumes *any* LLVM frontend's
+bitcode.
+
+**Slice AH (DONE) — Rust through the on-ramp + non-power-of-two integers (`iN`).** A `no_std`/
+`panic=abort` Rust crate now runs **byte-identical to native `rustc`** — the second frontend, proving
+the D54 thesis past C/C++.
+- **Toolchain pin (a §2 "pin, don't drift" decision).** `rustc` bundles its own LLVM, so the bitcode
+  version must match our pinned reader (LLVM 18). The container's default `rustc` ships **LLVM 21**
+  (rejected by `llvm-ir`'s `llvm-18`), and re-pinning the *reader* to 21 is blocked here (no
+  `llvm-21-dev`/`llvm-config-21`; `llvm-ir` tops out at LLVM 19). The resolution is the reverse: pin a
+  **Rust 1.81 toolchain (LLVM 18.1)**, which emits bitcode the existing reader accepts — *no re-pin*.
+  (CI must `rustup toolchain install 1.81.0`, as it installs `llvm-18-dev` for the bitcode lane.)
+- **The one real gap, closed: non-power-of-two integers (`iN`).** `clang`/`rustc -O2` SCEV closes a
+  counted loop into a **polynomial with `i33` intermediates** (holding `n·(n-1)·(2n-1)` before a
+  magic-constant divide); slice A had deferred these. Now `val_type` maps `iN` (`33..=64`) to an `i64`
+  container, `operand` materializes `iN` constants canonicalized, and `bin` **masks the result of the
+  de-normalizing ops** (`add`/`sub`/`mul`/`shl`) back to `N` bits — so every `iN` value stays canonical
+  (`mod 2ᴺ` = the exact wrap semantics) and downstream `lshr`/`trunc`/unsigned-compare see clean bits
+  (the §3b widen-and-mask discipline, generalized from the existing `i8`/`i16` narrow collapse).
+  `i128`+ stays a clean `Unsupported`; signed `iN` ops needing a sign-extended container
+  (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) are not yet emitted by the corpus — add on
+  demand. This benefits **optimized C/C++ too** (any frontend's `-O2` produces `iN`).
+- Test: `rust_no_std_matches_native` — the same `compute` (a sum-of-squares, which LLVM closes into the
+  `i33` polynomial) compiled both as a `no_std` lib (→ bitcode → on-ramp, interp == JIT) and as a
+  native std binary (the oracle), agreeing for `n` in `{5, 1000, 46341, 200000, -7}` — values chosen so
+  the `i33` intermediate **overflows 33 bits and wraps**, which only the native differential validates
+  (interp == JIT alone would agree even on a wrong mask). 90 translate tests green, fmt + clippy clean.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
+- [x] **C++ without EH/RTTI** — first light (PR: classes, vtables/virtual dispatch, `new`/`delete`,
+      virtual dtors, templates, static init via `@llvm.global_ctors`).
+- [x] **Rust** (`no_std`/panic=abort) — runs vs native (slice AH), via the pinned Rust 1.81 (LLVM 18)
+      toolchain + `iN` support. Broaden to slices (`core` data structures, `Option`/`Result`, traits →
+      vtables) as gaps surface.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
-- [ ] Real Rust/C++ *without* EH/unwinding: `rustc --emit=llvm-bc` of a `no_std`/panic=abort
-      crate; a C++ TU compiled `-fno-exceptions -fno-rtti`. The breadth proof.
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
+- [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand.
 
 ### Deferred / hard (name them, don't hide them — DESIGN §20) ⚪
 - [ ] **C++ exceptions / unwinding** — `invoke`/`landingpad`/`resume` + `.eh_frame` unwind
