@@ -2491,7 +2491,8 @@ static void emit_start(Obj *main_fn) {
 //   * a memory local lives at data-stack offset `v->offset` (matches `VarLoc::Window{off}`).
 // `debug.loc` (per-op source lines) needs per-op inst counting and is a later slice.
 
-// A neutral render-name for a C type (the §6 `TypeRef` simplified to a string for slice 1).
+// A neutral render-name for a C type (the §6 `TypeRef`). Composite for derived types
+// (`int *`, `int[4]`, `struct Point`) so the debugger shows a readable type, not just a kind.
 static const char *dbg_typename(Type *ty) {
   switch (ty->kind) {
   case TY_VOID:    return "void";
@@ -2504,10 +2505,13 @@ static const char *dbg_typename(Type *ty) {
   case TY_DOUBLE:  return "double";
   case TY_LDOUBLE: return "long double";
   case TY_ENUM:    return "enum";
-  case TY_PTR:     return "ptr";
-  case TY_ARRAY:   return "array";
-  case TY_STRUCT:  return "struct";
-  case TY_UNION:   return "union";
+  case TY_PTR:     return format("%s *", dbg_typename(ty->base));
+  case TY_ARRAY:   return format("%s[%d]", dbg_typename(ty->base), ty->array_len);
+  case TY_STRUCT:
+  case TY_UNION: {
+    const char *kw = ty->kind == TY_STRUCT ? "struct" : "union";
+    return ty->tag ? format("%s %.*s", kw, ty->tag->len, ty->tag->loc) : kw;
+  }
   case TY_FUNC:    return "func";
   default:         return "opaque";
   }

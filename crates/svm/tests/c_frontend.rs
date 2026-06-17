@@ -2778,8 +2778,8 @@ int dist(int ax, int ay) {
     let ir = c_to_ir_g(src);
     // Producer side: the structured directives are present in the text.
     assert!(
-        ir.contains("debug.type") && ir.contains(" agg \"struct\""),
-        "emits an aggregate type for the struct:\n{ir}"
+        ir.contains("debug.type") && ir.contains(" agg \"struct Point\""),
+        "emits an aggregate type named by its tag:\n{ir}"
     );
     assert!(
         ir.contains("debug.field") && ir.contains("\"y\" 4"),
@@ -2810,7 +2810,7 @@ int dist(int ax, int ay) {
     let TypeDef::Aggregate { name, size, fields } = resolve("p") else {
         panic!("p is a struct");
     };
-    assert_eq!(name, "struct"); // render name; the C tag ("Point") is a later enrichment
+    assert_eq!(name, "struct Point"); // render name carries the C tag
     assert_eq!(*size, 8);
     assert_eq!(fields.len(), 2);
     assert_eq!((fields[0].name.as_str(), fields[0].offset), ("x", 0));
@@ -2823,22 +2823,29 @@ int dist(int ax, int ay) {
     }
 
     // `int row[4]` — an array of 4 elements; element resolves to a 4-byte int.
-    let TypeDef::Array { elem, count, .. } = resolve("row") else {
+    let TypeDef::Array { elem, count, name } = resolve("row") else {
         panic!("row is an array");
     };
+    assert_eq!(name, "int[4]", "composite array render name");
     assert_eq!(*count, 4);
     assert!(matches!(
         &di.types[*elem as usize],
         TypeDef::Base { size: 4, .. }
     ));
 
-    // `struct Point *pp` — a pointer whose pointee is the same aggregate as `p`.
-    let TypeDef::Pointer { pointee, size, .. } = resolve("pp") else {
+    // `struct Point *pp` — a pointer (named `struct Point *`) whose pointee is the same aggregate.
+    let TypeDef::Pointer {
+        pointee,
+        size,
+        name,
+    } = resolve("pp")
+    else {
         panic!("pp is a pointer");
     };
+    assert_eq!(name, "struct Point *", "composite pointer render name");
     assert_eq!(*size, 8, "pointer width");
     assert!(
-        matches!(&di.types[*pointee as usize], TypeDef::Aggregate { name, .. } if name == "struct"),
+        matches!(&di.types[*pointee as usize], TypeDef::Aggregate { name, .. } if name == "struct Point"),
         "pp points at the struct"
     );
 }

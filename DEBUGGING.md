@@ -589,8 +589,7 @@ come from the frame's data-SP (`read_ir_value(frame, 0)`) plus the `Window` offs
 clear the place table (the addresses go stale). Test (`dap.rs`): a guest fills a `struct {int x,y}`
 and an `int[3]`, and the scripted conversation expands `p` → `x=11, y=22` and `row` → `[0]=100,
 [1]=200, [2]=300`. The `evaluate` member/index half landed in slice 10 and pointer-deref
-expansion in slice 11 (both below); still open: richer render names (the C tag, e.g.
-`"struct Point"`).
+expansion in slice 11; richer render names (the C tag) in slice 12 (all below).
 
 **Built — `evaluate` member / index / arrow access (W4 slice 10, the consumer half completed).**
 `evaluate` now resolves `a.b`, `arr[i]`, and `p->x` (and combinations like `p.x + arr[i]`,
@@ -602,8 +601,8 @@ pure address arithmetic over `TypeDef` + window reads, no `svm-ir`/frontend type
 itself. `eval_int` (conditional breakpoints) is unchanged, now a thin wrapper over the same core.
 Tests (`dap.rs`): member/index/mixed arithmetic over a struct+array, and `->`/pointer-indexing
 through a pointer; bad accesses (`p.nope`, `p.x.y`, `pp->x->y`) fail cleanly. *Not yet:*
-floats / short-circuit `&&`/`||`, and richer render names. (Pointer-deref *expansion* in the
-Variables pane landed in slice 11.)
+floats / short-circuit `&&`/`||`. (Pointer-deref *expansion* landed in slice 11, richer render
+names in slice 12.)
 
 **Built — frontend-neutrality cleanup (W4 slice 9).** Scalar read widths now come from the
 structured type's `size` (`scalar_width` → `TypeDef.size`), not the variable's *name*; the old
@@ -1012,8 +1011,8 @@ text form adds `debug.type` / `debug.field` and an optional trailing id on `debu
 old name-only `debug.var` still valid (back-compat: `type_id = None`). chibicc `-g` interns each
 named local's C `Type` (by pointer identity to bound recursive aggregates, plus structural dedup
 of base scalars) and emits the table. This is the **producer + ABI** half (the §7 W5 note). The
-binary section is still stripped (`svm-encode` sets `debug_info: None`), and render names are
-still generic (`"struct"`, not `"struct Point"` — the C tag isn't on chibicc's `Type`).
+binary section is still stripped (`svm-encode` sets `debug_info: None`); render names were
+generic until slice 12 (below) gave them the C tag.
 
 **Slice 8 — DAP Variables-pane aggregate expansion (first consumer of the type table).** A
 struct/array local expands in the editor: the server hands back a nonzero `variablesReference`
@@ -1035,11 +1034,16 @@ A null pointer shows a `<null>` leaf, an unreadable one `<unreadable>` (lazy, so
 an expandable row's summary comes from a memory-aware `place_summary`. Test (`dap.rs`): a `pp`
 → `struct Point *` expands `pp` (`0x410`) → `*` (`{...}`) → `x=7, y=9`.
 
-**Not yet (next slices):** richer type render names (the C tag, e.g. `"struct Point"`); the
-LLVM/wasm `debug.loc` + type ingest sides; binary serialization of the debug section; and the
-remaining W4 refinement (per-block `LocList` so promoted scalars are debuggable without `-Og`,
-per-producer rich blob). (Multithreaded debugging and the interpreter-backed DAP
-server are already built — Milestone B and W5 slices 1–6.)
+**Slice 12 — richer type render names.** Derived types now render readably: `struct Point` (the C
+tag, carried on a new `Type::tag` field in chibicc), `int *`, `int[4]` — built compositely in
+`dbg_typename`, so both the `debug.var` name and the type-table name show the type a programmer
+would write rather than a bare kind. Anonymous structs stay `"struct"`.
+
+**Not yet (next slices):** `evaluate` floats / short-circuit `&&`/`||`; binary serialization of
+the debug section; the LLVM/wasm `debug.loc` + type ingest sides; and the remaining W4 refinement
+(per-block `LocList` so promoted scalars are debuggable without `-Og`, per-producer rich blob).
+(Multithreaded debugging and the interpreter-backed DAP server are already built — Milestone B and
+W5 slices 1–6.)
 
 ### Open questions (S4/S5/S2)
 
