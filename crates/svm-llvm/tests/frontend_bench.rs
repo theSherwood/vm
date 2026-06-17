@@ -15,7 +15,8 @@ const ALU: &str = "long run(long n){\n  long acc = 0;\n  for (long i = 0; i < n;
 const LOCALS: &str = "long run(long n){\n  volatile long a[256];\n  long acc = 0;\n  \
     for (long i = 0; i < n; i++) { a[i & 255] = i; acc += a[i & 255]; }\n  return acc;\n}\n\
     int main(){ return (int)run(0); }\n";
-const IRRED: &str = "long long run(long long n){\n  long long a=0,b=0,i=0;\n  if (n & 1) goto odd;\n  \
+const IRRED: &str =
+    "long long run(long long n){\n  long long a=0,b=0,i=0;\n  if (n & 1) goto odd;\n  \
     while (i < n) {\n    a += i; i++;\n  odd:\n    b += i*3; i++;\n  }\n  return a + b;\n}\n\
     int main(){ return (int)run(0); }\n";
 // A complex kernel: the loop calls a small pure helper each iteration. `clang -O2` INLINES `mix`
@@ -36,7 +37,12 @@ fn chibicc_ir(name: &str, src: &str) -> (svm_ir::Module, u32, Vec<i64>) {
         .unwrap()
         .to_path_buf();
     let dir = root.join("frontend/chibicc");
-    assert!(Command::new("make").arg("-s").current_dir(&dir).status().unwrap().success());
+    assert!(Command::new("make")
+        .arg("-s")
+        .current_dir(&dir)
+        .status()
+        .unwrap()
+        .success());
     let base = std::env::temp_dir().join(format!("fb_chi_{name}"));
     let cf = base.with_extension("c");
     let irf = base.with_extension("svm");
@@ -62,7 +68,13 @@ fn llvm_ir(name: &str, src: &str) -> (svm_ir::Module, u32, Vec<i64>) {
     let bc = base.with_extension("bc");
     std::fs::write(&cf, src).unwrap();
     assert!(Command::new("clang")
-        .args(["-O2", "-emit-llvm", "-c", "-fno-vectorize", "-fno-slp-vectorize"])
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize"
+        ])
         .arg(&cf)
         .arg("-o")
         .arg(&bc)
@@ -120,7 +132,10 @@ fn ns(m: &svm_ir::Module, e: u32, lead: &[i64]) -> f64 {
 #[ignore = "benchmark; run explicitly with --nocapture --ignored"]
 fn chibicc_vs_llvm_jit() {
     println!("\nSVM JIT, same C, two frontends (ns/iter; ratio = chibicc / llvm):");
-    println!("{:<12} {:>10} {:>10} {:>8}", "kernel", "chibicc", "llvm", "ratio");
+    println!(
+        "{:<12} {:>10} {:>10} {:>8}",
+        "kernel", "chibicc", "llvm", "ratio"
+    );
     for (name, src) in [
         ("alu", ALU),
         ("locals", LOCALS),
@@ -130,7 +145,11 @@ fn chibicc_vs_llvm_jit() {
         let (cm, ce, cl) = chibicc_ir(name, src);
         let (lm, le, ll) = llvm_ir(name, src);
         // sanity: both frontends agree on the result
-        assert_eq!(call(&cm, ce, &cl, 1000), call(&lm, le, &ll, 1000), "{name}: frontends disagree");
+        assert_eq!(
+            call(&cm, ce, &cl, 1000),
+            call(&lm, le, &ll, 1000),
+            "{name}: frontends disagree"
+        );
         let c = ns(&cm, ce, &cl);
         let l = ns(&lm, le, &ll);
         println!("{name:<12} {c:>10.3} {l:>10.3} {:>7.2}x", c / l);
