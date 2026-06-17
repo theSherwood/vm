@@ -241,3 +241,79 @@ fn jit_re_establishes_ro_so_a_thawed_write_faults() {
         "without the Ro protection the JIT store succeeds, got {ok:?}"
     );
 }
+
+#[test]
+fn jit_capture_matches_interp_for_a_readonly_segment() {
+    use core::ffi::c_void;
+    use svm_jit::compile_and_run_capture_reserved_with_host_prots;
+
+    let mut m = svm_text::parse_module(SRC).expect("parse"); // `data ro 20480 "ABCD"`
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let npages = WINDOW / PAGE;
+    let init = vec![0u8; WINDOW];
+
+    // Interpreter capture (reads its software page map).
+    let mut hi = Host::new();
+    let _ = hi.grant_clock();
+    let mut fuel = 100_000u64;
+    let (_, _, caps_i) = run_capture_reserved_with_host_prots(
+        &m,
+        0,
+        &[Value::I32(0)],
+        &mut fuel,
+        &init,
+        None,
+        SIZE_LOG2,
+        &mut hi,
+    );
+
+    // JIT capture: run, then reconstruct the protections from the host (data segments + cap map).
+    let mut hj = Host::new();
+    let _ = hj.grant_clock();
+    let _ = compile_and_run_capture_reserved_with_host_prots(
+        &m,
+        0,
+        &[0i64],
+        &init,
+        &[],
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+    let caps_j = hj.capture_window_prots(&m.data, WINDOW as u64, npages);
+
+    assert_eq!(caps_i[RO_OFF / PAGE], CapturedProt::Ro);
+    assert_eq!(
+        caps_j[RO_OFF / PAGE],
+        CapturedProt::Ro,
+        "JIT capture reports the readonly segment as Ro"
+    );
+    assert_eq!(
+        caps_i, caps_j,
+        "interp and JIT capture the same protection map"
+    );
+}
+
+#[test]
+fn jit_capture_overlays_runtime_protect_over_the_default() {
+    // The runtime page-state map (`cap_pages`, populated by Memory-cap map/unmap/protect)
+    // overrides the default — exercised directly here (page 0 → Unmapped) so the merge is
+    // covered without a Memory-cap-using guest. Page 0 maps to host page 0 on any host page size.
+    let mut h = Host::new();
+    let map = h.cap_window_pages(0);
+    map.lock().unwrap().insert(0, 3); // code 3 = Unmapped
+    let caps = h.capture_window_prots(&[], WINDOW as u64, WINDOW / PAGE);
+    assert_eq!(
+        caps[0],
+        CapturedProt::Unmapped,
+        "a runtime cap_pages entry overrides the page default"
+    );
+    assert_eq!(
+        caps[WINDOW / PAGE - 1],
+        CapturedProt::Rw,
+        "untouched pages stay Rw"
+    );
+}

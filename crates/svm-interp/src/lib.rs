@@ -6150,6 +6150,64 @@ impl Host {
         }
     }
 
+    /// Capture the window's per-page protections for a durable freeze of a **JIT** run
+    /// (DURABILITY.md §12.3). The JIT keeps protections in the OS page tables, so — unlike the
+    /// interpreter, where [`run_capture_reserved_with_host_prots`] reads its software map — a
+    /// freeze reconstructs them here from the two host-side sources, mirroring the interpreter's
+    /// `snapshot_prots` so the backends agree page-for-page:
+    ///
+    /// * the module's `readonly` data segments → `Ro` (applied to the window at instantiation but
+    ///   not recorded in `cap_pages`), and
+    /// * the runtime page-state map the Memory cap maintained (`cap_pages`: `map`/`unmap`/`protect`)
+    ///   — which **overrides** the segment/default for any page the guest changed.
+    ///
+    /// One [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page over `npages`; `mapped` is the
+    /// backed-prefix byte length (pages beyond it default `Unmapped`). A `Backed` (§13) page can't
+    /// arise here — a domain holding a shared region isn't freezable (its handle is non-durable).
+    pub fn capture_window_prots(
+        &self,
+        data: &[Data],
+        mapped: u64,
+        npages: usize,
+    ) -> Vec<CapturedProt> {
+        // Default: Rw in the backed prefix, Unmapped in the reserved tail.
+        let mut out: Vec<CapturedProt> = (0..npages as u64)
+            .map(|p| {
+                if p * DURABLE_SNAPSHOT_PAGE < mapped {
+                    CapturedProt::Rw
+                } else {
+                    CapturedProt::Unmapped
+                }
+            })
+            .collect();
+        // `readonly` data segments → Ro (page-granular, like the runtime's `protect_ro`).
+        for d in data {
+            if !d.readonly || d.bytes.is_empty() {
+                continue;
+            }
+            let lo = d.offset / DURABLE_SNAPSHOT_PAGE;
+            let hi = (d.offset + d.bytes.len() as u64).div_ceil(DURABLE_SNAPSHOT_PAGE);
+            for p in lo..hi.min(npages as u64) {
+                out[p as usize] = CapturedProt::Ro;
+            }
+        }
+        // Runtime map/unmap/protect (host-page-indexed) override the defaults.
+        if let Some((_, map)) = &self.cap_pages {
+            let host_page = host_page_size();
+            let m = map.lock().unwrap();
+            for (p, slot) in out.iter_mut().enumerate() {
+                let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host_page;
+                match m.get(&hp) {
+                    Some(1) => *slot = CapturedProt::Rw,
+                    Some(2) => *slot = CapturedProt::Ro,
+                    Some(3) => *slot = CapturedProt::Unmapped,
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
     /// Install the §9/§12 async-completion `notify` hook (the executor that owns the wake mechanism
     /// wires it at run start; see [`Host::async_notify`]). The interp's `drive` calls this with the M:N
     /// `Scheduler::notify`; the JIT wires its futex via the same seam (`svm_jit::AsyncHostHooks`).

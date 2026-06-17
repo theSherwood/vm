@@ -527,8 +527,14 @@ it to the freshly-seeded window (`protect_ro` / new `protect_none` via real
 `mprotect`/`VirtualProtect`) before the run, so a thawed `Ro`/`Unmapped` page faults on the JIT
 exactly as on the interpreter (`durable_prot_capture.rs` asserts both). Note module-defined
 `readonly` segments already re-apply on every JIT instantiation; this adds the *runtime*-captured
-map. Still ahead: JIT-side **capture** (reading `GuestWindow` protections out, via the `svm-run`
-`CapPageMap`) so a JIT-frozen artifact records prots too; then §12.4 fiber/dispatch control state.
+map. **JIT-side capture** also landed: `Host::capture_window_prots(data, mapped, npages)`
+reconstructs the window's protection map from the two host-side sources — the module's `readonly`
+data segments (`Ro`) merged with the runtime page-state map (`cap_pages`, populated by Memory-cap
+`map`/`unmap`/`protect`) — mirroring the interpreter's `snapshot_prots`. `durable_prot_capture.rs`
+asserts interp and JIT capture the **same** map for a readonly-segment module, and that a runtime
+`cap_pages` entry overrides the default. So page protections now round-trip on **both** backends,
+both directions. The page-protection story is complete; remaining Phase-2/3 work is §12.4
+fiber/dispatch control state (multi-vCPU / fibers).
 
 ### 12.7 Shadow-frame layout
 
