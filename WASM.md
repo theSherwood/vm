@@ -95,7 +95,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [ ] **SIMD remainder** (~125 of the v128 proposal): lane shifts, int abs, sat add/sub, narrow/widen,
+- [ ] **SIMD remainder** (~115 of the v128 proposal): int abs/neg, sat add/sub, narrow/widen,
   `all_true`/`bitmask`, dot product, etc. Mechanical breadth over the proven 5-step
   pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops have
   no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
@@ -109,6 +109,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   - [x] **Float lane compares — DONE.** `f32x4`/`f64x2` `{eq,ne,lt,gt,le,ge}` → mask (`Inst::VFloatCmp`,
     one Cranelift `fcmp`; ordered, `ne` unordered — matches Rust's float operators, the test oracle,
     incl. NaN). `crates/svm/tests/simd.rs` + `svm-wasm/tests/simd.rs`.
+  - [x] **Lane shifts — DONE.** `i8x16`/`i16x8`/`i32x4`/`i64x2` `{shl,shr_s,shr_u}` by a scalar `i32`
+    amount mod the lane width (`Inst::VShift`; vector `ishl`/`ushr`/`sshr` — Cranelift legalizes every
+    shape incl. `i8x16`). Oracle = Rust's scalar shifts at the lane width.
 - [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
   atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
   in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR

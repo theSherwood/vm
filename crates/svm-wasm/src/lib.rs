@@ -45,7 +45,8 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
-    VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValIdx, ValType,
+    VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, VShiftOp, ValIdx,
+    ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1313,6 +1314,14 @@ fn v_fcmp(lo: &mut Lower, shape: VShape, op: VFCmpOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VFloatCmp { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_shift(lo: &mut Lower, shape: VShape, op: VShiftOp) -> Result<(), Error> {
+    // Stack: [vector, amount] — pop the i32 amount, then the v128.
+    let (amt, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VShift { shape, op, a, amt });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -2883,6 +2892,19 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I32x4MinU => v_intbin(lo, VShape::I32x4, VIntBinOp::MinU)?,
         O::I32x4MaxS => v_intbin(lo, VShape::I32x4, VIntBinOp::MaxS)?,
         O::I32x4MaxU => v_intbin(lo, VShape::I32x4, VIntBinOp::MaxU)?,
+        // integer lane shifts (one scalar i32 amount, taken mod the lane bit-width)
+        O::I8x16Shl => v_shift(lo, VShape::I8x16, VShiftOp::Shl)?,
+        O::I8x16ShrS => v_shift(lo, VShape::I8x16, VShiftOp::ShrS)?,
+        O::I8x16ShrU => v_shift(lo, VShape::I8x16, VShiftOp::ShrU)?,
+        O::I16x8Shl => v_shift(lo, VShape::I16x8, VShiftOp::Shl)?,
+        O::I16x8ShrS => v_shift(lo, VShape::I16x8, VShiftOp::ShrS)?,
+        O::I16x8ShrU => v_shift(lo, VShape::I16x8, VShiftOp::ShrU)?,
+        O::I32x4Shl => v_shift(lo, VShape::I32x4, VShiftOp::Shl)?,
+        O::I32x4ShrS => v_shift(lo, VShape::I32x4, VShiftOp::ShrS)?,
+        O::I32x4ShrU => v_shift(lo, VShape::I32x4, VShiftOp::ShrU)?,
+        O::I64x2Shl => v_shift(lo, VShape::I64x2, VShiftOp::Shl)?,
+        O::I64x2ShrS => v_shift(lo, VShape::I64x2, VShiftOp::ShrS)?,
+        O::I64x2ShrU => v_shift(lo, VShape::I64x2, VShiftOp::ShrU)?,
         // float lane arithmetic
         O::F32x4Add => v_fbin(lo, VShape::F32x4, VFloatBinOp::Add)?,
         O::F32x4Sub => v_fbin(lo, VShape::F32x4, VFloatBinOp::Sub)?,

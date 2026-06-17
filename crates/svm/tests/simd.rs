@@ -605,3 +605,87 @@ fn diff_f64x2_lane_compares() {
         assert_eq!(f64x2("ge", a, b), mask(a >= b), "ge {a} {b}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Integer lane shifts (VShift) — one scalar amount, mod the lane bit-width.
+// ---------------------------------------------------------------------------
+
+/// `<shape>.<shift>` of a splatted scalar by an i32 amount; lane 0 read back. Oracle = the scalar
+/// shift in Rust at the lane width.
+fn vshift(shape: &str, op: &str, ext: &str, val: i64, amt: i32) -> i64 {
+    let (ity, splat, vty) = if shape == "i64x2" {
+        ("i64", "i64x2.splat", "i64")
+    } else {
+        ("i32", &format!("{shape}.splat")[..], "i32")
+    };
+    let s = format!(
+        "func ({ity}, i32) -> ({vty}) {{\nblock0(v0: {ity}, v1: i32):\n\
+         \x20 v2 = {splat} v0\n  v3 = {shape}.{op} v2 v1\n  v4 = {shape}.{ext} v3\n  return v4\n}}\n"
+    );
+    let arg0 = if shape == "i64x2" {
+        Value::I64(val)
+    } else {
+        Value::I32(val as i32)
+    };
+    diff1(&s, &[arg0, Value::I32(amt)])
+}
+
+#[test]
+fn diff_lane_shifts() {
+    // i32x4: shl/shr_s/shr_u, incl. amount ≥ lane width (mod 32) and a negative (sign) value.
+    for amt in [0, 1, 3, 31, 33, 40] {
+        let m = amt & 31;
+        assert_eq!(
+            vshift("i32x4", "shl", "extract_lane 0", 0x1234_5678, amt) as i32,
+            0x1234_5678i32.wrapping_shl(m as u32),
+            "i32 shl {amt}"
+        );
+        assert_eq!(
+            vshift("i32x4", "shr_u", "extract_lane 0", -1, amt) as i32,
+            (0xFFFF_FFFFu32 >> m) as i32,
+            "i32 shr_u {amt}"
+        );
+        assert_eq!(
+            vshift("i32x4", "shr_s", "extract_lane 0", -8, amt) as i32,
+            (-8i32) >> m,
+            "i32 shr_s {amt}"
+        );
+    }
+    // i16x8 / i8x16: observe via signed extract; mod 16 / mod 8.
+    assert_eq!(
+        vshift("i16x8", "shr_s", "extract_lane_s 0", 0xFFF0, 4) as i32,
+        ((0xFFF0u16 as i16) >> 4) as i32,
+        "i16 shr_s 4"
+    );
+    assert_eq!(
+        vshift("i16x8", "shr_u", "extract_lane_s 0", 0xFF00, 4) as i32,
+        ((0xFF00u16 >> 4) as i16) as i32,
+        "i16 shr_u 4"
+    );
+    assert_eq!(
+        vshift("i8x16", "shl", "extract_lane_s 0", 0x03, 2) as i32,
+        ((0x03u8 << 2) as i8) as i32,
+        "i8 shl 2"
+    );
+    assert_eq!(
+        vshift("i8x16", "shr_s", "extract_lane_s 0", 0x80, 1) as i32,
+        ((0x80u8 as i8) >> 1) as i32,
+        "i8 shr_s 1"
+    );
+    assert_eq!(
+        vshift("i8x16", "shr_u", "extract_lane_s 0", 0x80, 1) as i32,
+        ((0x80u8 >> 1) as i8) as i32,
+        "i8 shr_u 1"
+    );
+    // i64x2.
+    assert_eq!(
+        vshift("i64x2", "shl", "extract_lane 0", 1, 40),
+        1i64 << 40,
+        "i64 shl 40"
+    );
+    assert_eq!(
+        vshift("i64x2", "shr_s", "extract_lane 0", -256, 4),
+        -256i64 >> 4,
+        "i64 shr_s 4"
+    );
+}

@@ -302,6 +302,36 @@ impl VFCmpOp {
     }
 }
 
+/// Lane-wise integer **shift** ops on a `v128` (§17): every lane is shifted by the **same** scalar
+/// `i32` amount, taken **modulo the lane bit-width** (the wasm rule). `ShrS` is arithmetic
+/// (sign-replicating); `Shl`/`ShrU` are logical. Defined for every integer [`VShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VShiftOp {
+    Shl,
+    ShrS,
+    ShrU,
+}
+
+impl VShiftOp {
+    pub const ALL: [VShiftOp; 3] = [VShiftOp::Shl, VShiftOp::ShrS, VShiftOp::ShrU];
+    pub fn name(self) -> &'static str {
+        match self {
+            VShiftOp::Shl => "shl",
+            VShiftOp::ShrS => "shr_s",
+            VShiftOp::ShrU => "shr_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VShiftOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VShiftOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
 /// Lane-wise binary float ops on a `v128` (§17, IEEE 754, no traps). `Min`/`Max` are the
 /// IEEE `minimum`/`maximum` (NaN-propagating, `-0 < +0`) matching the scalar [`FBinOp`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1568,6 +1598,14 @@ pub enum Inst {
         op: VFCmpOp,
         a: ValIdx,
         b: ValIdx,
+    },
+    /// Lane-wise integer shift by a scalar amount (see [`VShiftOp`]): `a`/result are `v128`, `amt`
+    /// is an `i32` (taken modulo the lane bit-width).
+    VShift {
+        shape: VShape,
+        op: VShiftOp,
+        a: ValIdx,
+        amt: ValIdx,
     },
     /// Lane-wise binary float op (see [`VFloatBinOp`]); `a`/`b`/result are `v128`.
     VFloatBin {

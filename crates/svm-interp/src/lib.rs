@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
-    Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValIdx,
-    ValType, VarLoc, DEFAULT_RESERVED_LOG2,
+    Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, VShiftOp,
+    ValIdx, ValType, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -5163,6 +5163,12 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_v128(get(vals, *b)?)?,
         )),
+        Inst::VShift { shape, op, a, amt } => Value::V128(simd_vshift(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_i32(get(vals, *amt)?)? as u32,
+        )),
         Inst::VFloatBin { shape, op, a, b } => Value::V128(simd_vfloat_bin(
             *shape,
             *op,
@@ -5403,6 +5409,25 @@ fn simd_vfloat_cmp(shape: VShape, op: VFCmpOp, a: [u8; 16], b: [u8; 16]) -> [u8;
         }
         // Verifier rejects an integer shape here; total fall-through returns zero.
         _ => {}
+    }
+    o
+}
+
+/// `<i-shape>.{shl,shr_s,shr_u}`: shift every lane by the same scalar amount, taken modulo the lane
+/// bit-width (the wasm rule). `shl`/`shr_u` are logical on the zero-extended lane; `shr_s` is
+/// arithmetic on the sign-extended lane.
+fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let sh = amt & (bytes as u32 * 8 - 1);
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_read(&a, i, bytes);
+        let r = match op {
+            VShiftOp::Shl => x << sh,
+            VShiftOp::ShrU => x >> sh,
+            VShiftOp::ShrS => (lane_sext(x, bytes) >> sh) as u64,
+        };
+        lane_write(&mut o, i, bytes, r);
     }
     o
 }

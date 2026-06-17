@@ -71,7 +71,8 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValType, DEFAULT_RESERVED_LOG2,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, VShiftOp, ValType,
+    DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -2575,6 +2576,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                     ) => {}
                 // Lane compares lower to a single Cranelift `icmp`/`fcmp` (legalize on every target).
                 Inst::VIntCmp { .. } | Inst::VFloatCmp { .. } => {}
+                // Lane shifts lower to vector `ishl`/`ushr`/`sshr`; Cranelift legalizes every shape
+                // (incl. `i8x16`, which has no native per-byte shift on x86 — it emits a sequence).
+                Inst::VShift { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3590,6 +3594,20 @@ fn lower_block(
                     VICmpOp::GeU => IntCC::UnsignedGreaterThanOrEqual,
                 };
                 let r = b.ins().icmp(cc, x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VShift { shape, op, a, amt } => {
+                // One scalar shift amount, masked to the lane bit-width (the wasm rule), broadcast
+                // across the lanes by Cranelift's vector `ishl`/`ushr`/`sshr`.
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let bits = (shape.lane_bytes() * 8) as i64;
+                let sh = b.ins().band_imm(get(&vals, *amt)?, bits - 1);
+                let r = match op {
+                    VShiftOp::Shl => b.ins().ishl(x, sh),
+                    VShiftOp::ShrU => b.ins().ushr(x, sh),
+                    VShiftOp::ShrS => b.ins().sshr(x, sh),
+                };
                 vcast(b, r, I8X16)
             }
             Inst::VFloatCmp {

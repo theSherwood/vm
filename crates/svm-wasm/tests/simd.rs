@@ -310,3 +310,34 @@ fn f32x4_lane_compare_masks() {
     assert_eq!(eval(&cmp("f32x4.lt"), "f", &nan), Value::I32(0));
     assert_eq!(eval(&cmp("f32x4.ne"), "f", &nan), Value::I32(-1));
 }
+
+/// Integer lane shifts through the wasm bridge: one scalar amount (taken mod the lane width) shifts
+/// every lane. Covers `shl`/`shr_s`/`shr_u` and an amount ≥ the lane width.
+#[test]
+fn i32x4_lane_shifts() {
+    let sh = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $x i32) (param $amt i32) (result i32)
+               (i32x4.extract_lane 0 ({op} (i32x4.splat (local.get $x)) (local.get $amt)))))"
+        )
+    };
+    let i32 = |w: &str, x: i32, amt: i32| match eval(&sh(w), "f", &[Value::I32(x), Value::I32(amt)])
+    {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    for amt in [0, 1, 5, 31, 34] {
+        let m = (amt & 31) as u32;
+        assert_eq!(
+            i32("i32x4.shl", 0x0011_2233, amt),
+            0x0011_2233i32.wrapping_shl(m),
+            "shl {amt}"
+        );
+        assert_eq!(
+            i32("i32x4.shr_u", -1, amt),
+            (0xFFFF_FFFFu32 >> m) as i32,
+            "shr_u {amt}"
+        );
+        assert_eq!(i32("i32x4.shr_s", -16, amt), -16i32 >> m, "shr_s {amt}");
+    }
+}
