@@ -6190,7 +6190,8 @@ impl Host {
                 continue;
             }
             let lo = (d.offset / host) * host / DURABLE_SNAPSHOT_PAGE;
-            let hi = (d.offset + d.bytes.len() as u64).div_ceil(host) * host / DURABLE_SNAPSHOT_PAGE;
+            let hi =
+                (d.offset + d.bytes.len() as u64).div_ceil(host) * host / DURABLE_SNAPSHOT_PAGE;
             for p in lo..hi.min(npages as u64) {
                 out[p as usize] = CapturedProt::Ro;
             }
