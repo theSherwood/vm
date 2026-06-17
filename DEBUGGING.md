@@ -53,7 +53,8 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
-| DWARF emission + DAP server | **Missing** | — |
+| DAP server (interpreter-backed: source breakpoints, frames, locals, stepping over DAP) | **Built — W5 slice 1** | `svm-dap` (`DapServer` / `run_stdio`) |
+| DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
 
@@ -488,6 +489,24 @@ the source-level loop on the interpreter.
 
 **Acceptance.** Set a breakpoint in VS Code on a `.c` line; it binds; hitting it shows the
 source frame and inspectable locals.
+
+**Built — slice 1 (interpreter-backed DAP server).** A new `svm-dap` crate translates Debug Adapter
+Protocol requests onto the `Inspector` — so the **interpreter is the stepping engine** and source
+mapping comes straight from the §6/W4 debug info, with **no DWARF and no JIT** (the doc's recommended
+first tier; optimized-code inspection is sidestepped entirely). `DapServer::handle(request) ->
+[messages]` covers the acceptance loop: `initialize` (+ `initialized` event), `launch` (parse IR,
+attach the `Inspector`), `setBreakpoints` (source line → IR pc via a reverse `(file,line)→pc` index
+over `debug.loc`, snapping forward to the next line with code), `configurationDone`,
+`threads`/`stackTrace`/`scopes`/`variables` (frames carry the source location; locals enumerate
+`debug.var` and resolve through `read_var`), `continue`/`next`/`stepIn`/`stepOut`, `disconnect`, and
+the `stopped`/`terminated` events. JSON is hand-rolled (no serde — matching the workspace's
+dependency ethos); `run_stdio` is the `Content-Length`-framed wire loop a real client (VS Code)
+connects to, and the `svm-dap` binary is the server. Test (`dap.rs`): a scripted conversation sets a
+breakpoint on `sum.c:7`, hits it, and reads back the source frame plus `i = 3` / `acc = 0` — the
+acceptance, no editor needed. *Not yet:* multithreaded DAP (map `thread.spawn` vCPUs to DAP threads
++ `select_task`), `evaluate`/watch expressions, time-travel verbs (`stepBack`/`reverseContinue` over
+`Inspector::step_back`), proper step-over/step-out (vs single-op), and the JIT/DWARF tier for
+gdb/lldb on native code.
 
 ---
 

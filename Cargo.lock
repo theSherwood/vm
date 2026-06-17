@@ -585,6 +585,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-dap"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+ "svm-text",
+]
+
+[[package]]
 name = "svm-durable"
 version = "0.0.0"
 dependencies = [
