@@ -818,10 +818,16 @@ impl DapServer {
         if let Some((debug, var)) = bare {
             let width = scalar_width(&debug.types, var.type_id, &var.ty);
             if let Some(val) = session.inspector.read_var(frame_idx, &expr, width) {
+                // Format window bytes through the structured type (so a `double` reads as 2.5, a
+                // pointer as 0x…), falling back to the raw integer/value rendering otherwise.
+                let rendered = match (&val, var.type_id) {
+                    (VarValue::Bytes(b), Some(tid)) => fmt_scalar(&debug.types, tid, b),
+                    _ => fmt_var(&val),
+                };
                 return (
                     true,
                     Json::obj(vec![
-                        ("result", Json::s(fmt_var(&val))),
+                        ("result", Json::s(rendered)),
                         ("type", Json::s(var.ty.clone())),
                         ("variablesReference", Json::i(0)),
                     ]),
@@ -845,6 +851,7 @@ impl DapServer {
         };
         let (result, ty) = match expr::eval(&expr, &mut env) {
             Some(expr::Value::Int(n)) => (n.to_string(), String::new()),
+            Some(expr::Value::Float(x)) => (x.to_string(), String::new()),
             Some(expr::Value::Place { addr, type_id }) => {
                 if matches!(
                     types.get(type_id as usize),
@@ -1279,15 +1286,27 @@ impl expr::Resolver for EvalEnv<'_> {
         }
     }
 
-    fn coerce_int(&mut self, v: &expr::Value) -> Option<i64> {
-        match v {
-            expr::Value::Int(n) => Some(*n),
-            &expr::Value::Place { addr, type_id } => {
-                let size = type_size(self.types, type_id) as usize;
-                let bytes = self.inspector.read_window(addr, size).ok()?;
-                scalar_to_i64(self.types, type_id, &bytes)
-            }
+    fn load(&mut self, v: &expr::Value) -> Option<expr::Value> {
+        let &expr::Value::Place { addr, type_id } = v else {
+            return Some(*v); // an Int/Float literal resolves to itself
+        };
+        let size = type_size(self.types, type_id) as usize;
+        let bytes = self.inspector.read_window(addr, size).ok()?;
+        // A float base type loads as a float; everything else (ints, bools, pointers) as an i64.
+        if let Some(TypeDef::Base {
+            encoding: Encoding::Float,
+            size: sz,
+            ..
+        }) = self.types.get(type_id as usize)
+        {
+            let f = if *sz == 4 {
+                f32::from_bits(le_uint(&bytes, 4) as u32) as f64
+            } else {
+                f64::from_bits(le_uint(&bytes, 8))
+            };
+            return Some(expr::Value::Float(f));
         }
+        scalar_to_i64(self.types, type_id, &bytes).map(expr::Value::Int)
     }
 }
 

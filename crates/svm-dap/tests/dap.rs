@@ -1394,3 +1394,51 @@ fn dap_expands_a_pointer_to_its_pointee() {
     assert_eq!(fields.get("x").map(|(v, _)| v.as_str()), Some("7"));
     assert_eq!(fields.get("y").map(|(v, _)| v.as_str()), Some("9"));
 }
+
+// A `double d = 2.5` stored in the window (typed via the structured table). Param v0 is data-SP;
+// the break (line 3) is after the store.
+const FLOAT_DBG: &str = r#"
+memory 17
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = f64.const 2.5
+  f64.store v0 v1
+  v2 = i32.const 0
+  return v2
+}
+
+debug.file 0 "f.c"
+debug.loc 0 0 2 0 3 1
+debug.type 0 base "double" float 8
+debug.var 0 "d" win 0 "double" 0
+"#;
+
+#[test]
+fn dap_evaluate_floats_and_short_circuit() {
+    let mut s = DapServer::new();
+    let fid = launch_and_break(&mut s, FLOAT_DBG, "/work/f.c", 3);
+    let mut seq = 10;
+    let mut eval = |s: &mut DapServer, e: &str| -> (bool, Option<String>) {
+        seq += 1;
+        let out = s.handle(&req(
+            seq,
+            "evaluate",
+            Json::obj(vec![("expression", Json::s(e)), ("frameId", Json::i(fid))]),
+        ));
+        eval_result(&out)
+    };
+
+    // A bare `double` reads as its value (not the raw 64-bit pattern), via the structured type.
+    assert_eq!(eval(&mut s, "d"), (true, Some("2.5".into())));
+    // Float arithmetic with int promotion; a fractional result stays a float.
+    assert_eq!(eval(&mut s, "d + 0.25"), (true, Some("2.75".into())));
+    assert_eq!(eval(&mut s, "d * 2"), (true, Some("5".into())));
+    // Comparisons over floats yield 0/1.
+    assert_eq!(eval(&mut s, "d > 2"), (true, Some("1".into())));
+    assert_eq!(eval(&mut s, "d < 2"), (true, Some("0".into())));
+    // A bitwise op on a float is rejected.
+    assert!(!eval(&mut s, "d & 1").0, "bitwise on a float fails");
+    // Short-circuit: the dead branch isn't evaluated, so `1/0` never traps.
+    assert_eq!(eval(&mut s, "d < 2 && 1 / 0"), (true, Some("0".into())));
+    assert_eq!(eval(&mut s, "d > 2 || 1 / 0"), (true, Some("1".into())));
+}

@@ -600,9 +600,9 @@ integer coercion) are a callback the caller implements. `svm-dap`'s `EvalEnv` is
 pure address arithmetic over `TypeDef` + window reads, no `svm-ir`/frontend types in `expr`
 itself. `eval_int` (conditional breakpoints) is unchanged, now a thin wrapper over the same core.
 Tests (`dap.rs`): member/index/mixed arithmetic over a struct+array, and `->`/pointer-indexing
-through a pointer; bad accesses (`p.nope`, `p.x.y`, `pp->x->y`) fail cleanly. *Not yet:*
-floats / short-circuit `&&`/`||`. (Pointer-deref *expansion* landed in slice 11, richer render
-names in slice 12.)
+through a pointer; bad accesses (`p.nope`, `p.x.y`, `pp->x->y`) fail cleanly. (Pointer-deref
+*expansion* landed in slice 11, richer render names in slice 12, and floats / short-circuit in
+slice 13.)
 
 **Built — frontend-neutrality cleanup (W4 slice 9).** Scalar read widths now come from the
 structured type's `size` (`scalar_width` → `TypeDef.size`), not the variable's *name*; the old
@@ -1039,11 +1039,20 @@ tag, carried on a new `Type::tag` field in chibicc), `int *`, `int[4]` — built
 `dbg_typename`, so both the `debug.var` name and the type-table name show the type a programmer
 would write rather than a bare kind. Anonymous structs stay `"struct"`.
 
-**Not yet (next slices):** `evaluate` floats / short-circuit `&&`/`||`; binary serialization of
-the debug section; the LLVM/wasm `debug.loc` + type ingest sides; and the remaining W4 refinement
-(per-block `LocList` so promoted scalars are debuggable without `-Og`, per-producer rich blob).
-(Multithreaded debugging and the interpreter-backed DAP server are already built — Milestone B and
-W5 slices 1–6.)
+**Slice 13 — `evaluate` floats + short-circuit `&&`/`||`.** The `expr` evaluator gained float
+literals (`1.5`, `2e3`), a `Value::Float`, and C numeric promotion (an internal `Num`: arithmetic
+and comparisons run in `f64` when either side is float; `% << >> & | ^ ~` stay integer-only).
+`Resolver::coerce_int` became `load` (a scalar `Place` reads as `Float` for a float base type, else
+`Int`). `&&`/`||` now **short-circuit**: the dead operand is parsed (for position) but evaluated
+with a `live = false` flag that suppresses resolver calls and errors — so `b != 0 && a/b > 0` no
+longer trips integer division-by-zero. The bare-variable `evaluate`/Variables scalar path also now
+formats window bytes through the structured type, so a `double` reads as `2.5`, not its bit
+pattern. Tests: `expr` unit tests (promotion, short-circuit) + a DAP test over a window `double`.
+
+**Not yet (next slices):** binary serialization of the debug section; the LLVM/wasm `debug.loc` +
+type ingest sides; and the remaining W4 refinement (per-block `LocList` so promoted scalars are
+debuggable without `-Og`, per-producer rich blob). (Multithreaded debugging and the
+interpreter-backed DAP server are already built — Milestone B and W5 slices 1–6.)
 
 ### Open questions (S4/S5/S2)
 
