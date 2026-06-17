@@ -18,7 +18,8 @@ use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
     Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarLoc, DEFAULT_RESERVED_LOG2,
+    VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarLoc,
+    DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -5181,6 +5182,12 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         Inst::VWiden { shape, op, a } => {
             Value::V128(simd_widen(*shape, *op, as_v128(get(vals, *a)?)?))
         }
+        Inst::VNarrow { shape, op, a, b } => Value::V128(simd_narrow(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
         Inst::VAnyTrue { a } => {
             Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
         }
@@ -5445,6 +5452,30 @@ fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
             VShiftOp::ShrS => (lane_sext(x, bytes) >> sh) as u64,
         };
         lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// `<narrow>.narrow_{s,u}`: saturate every lane of two wide sources to the narrow width and
+/// concatenate (`a` then `b`). The source is read as **signed**; `S`/`U` pick the saturation range.
+fn simd_narrow(out: VShape, op: VNarrowOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let out_bytes = out.lane_bytes() as usize;
+    let src = out.wider().expect("verifier ensures a wider source");
+    let src_bytes = src.lane_bytes() as usize;
+    let src_lanes = src.lanes() as usize; // = out.lanes() / 2
+    let bits = out_bytes as u32 * 8;
+    let (min, max) = match op {
+        VNarrowOp::S => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
+        VNarrowOp::U => (0i128, (1i128 << bits) - 1),
+    };
+    let mut o = [0u8; 16];
+    for i in 0..src_lanes {
+        let s = lane_sext(lane_read(&a, i, src_bytes), src_bytes) as i128;
+        lane_write(&mut o, i, out_bytes, s.clamp(min, max) as u64);
+    }
+    for i in 0..src_lanes {
+        let s = lane_sext(lane_read(&b, i, src_bytes), src_bytes) as i128;
+        lane_write(&mut o, src_lanes + i, out_bytes, s.clamp(min, max) as u64);
     }
     o
 }

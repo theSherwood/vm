@@ -719,6 +719,18 @@ fn check_inst(
             cx.expect(*a, ValType::V128)?;
             ValType::V128
         }
+        // Narrow: `i8x16`/`i16x8` results only (the wasm spec has no wider narrow).
+        Inst::VNarrow { shape, a, b, .. } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
         // Boolean reductions: a `v128` → an `i32`. `all_true`/`bitmask` carry an integer shape;
         // `any_true` is shape-agnostic.
         Inst::VAnyTrue { a } => {

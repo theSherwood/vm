@@ -1017,3 +1017,79 @@ fn widen_roundtrip_and_shape_reject() {
         "widening to i8x16 has no source — must reject"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lane narrowing (VNarrow) — saturate two wide vectors into one narrow vector.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn diff_narrow() {
+    // i8x16.narrow_i16x8: a lane0=300, lane1=-200; b lane0=5. Result = [sat(a..), sat(b..)].
+    let a = "44 1 56 255 0 0 0 0 0 0 0 0 0 0 0 0"; // i16 [300, -200, 0, ...]
+    let b = "5 0 6 0 0 0 0 0 0 0 0 0 0 0 0 0"; // i16 [5, 6, 0, ...]
+    let n8 = |op: &str, ext: &str, lane: u8| -> i32 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {a}\n  v1 = v128.const {b}\n\
+             \x20 v2 = i8x16.{op} v0 v1\n  v3 = i8x16.{ext} {lane} v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[]) as i32
+    };
+    assert_eq!(n8("narrow_s", "extract_lane_s", 0), 127, "300 →_s 127");
+    assert_eq!(n8("narrow_s", "extract_lane_s", 1), -128, "-200 →_s -128");
+    assert_eq!(
+        n8("narrow_s", "extract_lane_s", 8),
+        5,
+        "b lane0 lands at result lane 8"
+    );
+    assert_eq!(n8("narrow_u", "extract_lane_u", 0), 255, "300 →_u 255");
+    assert_eq!(n8("narrow_u", "extract_lane_u", 1), 0, "-200 →_u 0");
+
+    // i16x8.narrow_i32x4: a lane0 = 100000 → sat_s 32767; narrow_u of -1 → 0.
+    let a32 = "160 134 1 0 0 0 0 0 0 0 0 0 0 0 0 0"; // i32 [100000, 0, ...]
+    let neg = "255 255 255 255 0 0 0 0 0 0 0 0 0 0 0 0"; // i32 [-1, 0, ...]
+    let n16 = |aa: &str, op: &str, ext: &str| -> i32 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {aa}\n  v1 = v128.const {aa}\n\
+             \x20 v2 = i16x8.{op} v0 v1\n  v3 = i16x8.{ext} 0 v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[]) as i32
+    };
+    assert_eq!(
+        n16(a32, "narrow_s", "extract_lane_s"),
+        32767,
+        "100000 →_s i16 max"
+    );
+    assert_eq!(n16(neg, "narrow_u", "extract_lane_u"), 0, "-1 →_u 0");
+}
+
+/// Narrow round-trips; the verifier rejects narrowing to `i32x4`.
+#[test]
+fn narrow_roundtrip_and_shape_reject() {
+    let src = "func () -> (i32) {\nblock0():\n\
+        v0 = v128.const 1 0 2 0 3 0 4 0 5 0 6 0 7 0 8 0\n\
+        v1 = i8x16.narrow_s v0 v0\n\
+        v2 = i16x8.narrow_u v0 v0\n\
+        v3 = i8x16.extract_lane_s 0 v1\n  return v3\n}\n";
+    let m = build(src);
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
+
+    let bad = parse_module(
+        "func () -> () {\nblock0():\n\
+         v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         v1 = i32x4.narrow_s v0 v0\n  return\n}\n",
+    )
+    .expect("parses");
+    assert!(
+        verify_module(&bad).is_err(),
+        "narrowing to i32x4 is not a wasm op — must reject"
+    );
+}

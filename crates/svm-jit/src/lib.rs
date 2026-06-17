@@ -71,8 +71,8 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VSatBinOp, VShape, VShiftOp,
-    ValType, DEFAULT_RESERVED_LOG2,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape,
+    VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -2586,8 +2586,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
                 // `sadd_sat`/`uadd_sat`/`ssub_sat`/`usub_sat`.
                 Inst::VSatBin { .. } => {}
-                // Widen lowers to `swiden_low`/`uwiden_low`/`*_high`.
-                Inst::VWiden { .. } => {}
+                // Widen lowers to `swiden_low`/`uwiden_low`/`*_high`; narrow to `snarrow`/`unarrow`.
+                Inst::VWiden { .. } | Inst::VNarrow { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3655,6 +3655,23 @@ fn lower_block(
                     (false, true) => b.ins().swiden_high(x),
                     (true, false) => b.ins().uwiden_low(x),
                     (false, false) => b.ins().uwiden_high(x),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VNarrow {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // The sources are the wider shape; `snarrow`/`unarrow` saturate `a`'s lanes then
+                // `b`'s into the narrow result.
+                let src_ty = vec_ty(shape.wider().expect("verifier ensures a wider source"));
+                let x = vcast(b, get(&vals, *a)?, src_ty);
+                let y = vcast(b, get(&vals, *rb)?, src_ty);
+                let r = match op {
+                    VNarrowOp::S => b.ins().snarrow(x, y),
+                    VNarrowOp::U => b.ins().unarrow(x, y),
                 };
                 vcast(b, r, I8X16)
             }

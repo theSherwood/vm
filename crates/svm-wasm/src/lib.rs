@@ -45,8 +45,8 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
-    VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VSatBinOp, VShape,
-    VShiftOp, VWidenOp, ValIdx, ValType,
+    VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
+    VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1341,6 +1341,13 @@ fn v_satbin(lo: &mut Lower, shape: VShape, op: VSatBinOp) -> Result<(), Error> {
 fn v_widen(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VWiden { shape, op, a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_narrow(lo: &mut Lower, shape: VShape, op: VNarrowOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VNarrow { shape, op, a, b });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -2951,6 +2958,11 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I16x8AddSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::AddU)?,
         O::I16x8SubSatS => v_satbin(lo, VShape::I16x8, VSatBinOp::SubS)?,
         O::I16x8SubSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::SubU)?,
+        // lane narrowing (saturating): result shape is the narrower one
+        O::I8x16NarrowI16x8S => v_narrow(lo, VShape::I8x16, VNarrowOp::S)?,
+        O::I8x16NarrowI16x8U => v_narrow(lo, VShape::I8x16, VNarrowOp::U)?,
+        O::I16x8NarrowI32x4S => v_narrow(lo, VShape::I16x8, VNarrowOp::S)?,
+        O::I16x8NarrowI32x4U => v_narrow(lo, VShape::I16x8, VNarrowOp::U)?,
         // lane widening (extend): result shape is the wider one
         O::I16x8ExtendLowI8x16S => v_widen(lo, VShape::I16x8, VWidenOp::LowS)?,
         O::I16x8ExtendHighI8x16S => v_widen(lo, VShape::I16x8, VWidenOp::HighS)?,

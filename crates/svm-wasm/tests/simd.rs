@@ -440,3 +440,22 @@ fn i8x16_widen_low() {
     assert_eq!(lane0(5), 5, "5 widens to 5");
     assert_eq!(lane0(0x80), -128, "(i8)0x80 = -128");
 }
+
+/// Narrow through the wasm bridge: clamp-pack two i16 vectors to u8 (the "convert 16-bit samples to
+/// bytes with saturation" idiom). `i8x16.narrow_i16x8_u` of splat(x) — every lane clamps to [0,255].
+#[test]
+fn i8x16_narrow_u() {
+    let wat = r#"
+    (module
+      (func (export "pack") (param $x i32) (result i32)
+        (i8x16.extract_lane_u 0
+          (i8x16.narrow_i16x8_u (i16x8.splat (local.get $x)) (i16x8.splat (local.get $x))))))
+    "#;
+    let pack = |x: i32| match eval(wat, "pack", &[Value::I32(x)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(pack(300), 255, "300 clamps to 255");
+    assert_eq!(pack(-5), 0, "(i16)-5 clamps to 0");
+    assert_eq!(pack(200), 200, "200 stays");
+}

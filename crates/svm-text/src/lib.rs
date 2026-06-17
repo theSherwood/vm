@@ -25,7 +25,7 @@ use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module,
     Ordering, StoreOp, Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
-    VIntUnOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
+    VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -360,6 +360,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::VIntUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
         Inst::VSatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VWiden { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VNarrow { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VBitBin { op, a, b } => format!("v128.{} v{a} v{b}", op.name()),
         Inst::VNot { a } => format!("v128.not v{a}"),
         Inst::Bitselect { a, b, mask } => format!("v128.bitselect v{a} v{b} v{mask}"),
@@ -1709,6 +1710,10 @@ impl<'a> Parser<'a> {
                 op: o,
                 a: self.value(names)?,
             });
+        } else if let Some(o) = VNarrowOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VNarrow { shape, op: o, a, b });
         }
         err(format!("unknown opcode `{op}`"))
     }

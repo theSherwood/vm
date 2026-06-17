@@ -466,6 +466,34 @@ impl VWidenOp {
     }
 }
 
+/// Lane **narrowing**: take two source vectors (each the wider shape), saturate every lane to the
+/// narrow width, and concatenate (`a`'s lanes then `b`'s). `S`/`U` pick the *saturation* range; the
+/// source is always read as **signed** (the wasm rule). `i8x16`/`i16x8` results only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VNarrowOp {
+    S,
+    U,
+}
+
+impl VNarrowOp {
+    pub const ALL: [VNarrowOp; 2] = [VNarrowOp::S, VNarrowOp::U];
+    pub fn name(self) -> &'static str {
+        match self {
+            VNarrowOp::S => "narrow_s",
+            VNarrowOp::U => "narrow_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VNarrowOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VNarrowOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
 /// Lane-wise binary float ops on a `v128` (§17, IEEE 754, no traps). `Min`/`Max` are the
 /// IEEE `minimum`/`maximum` (NaN-propagating, `-0 < +0`) matching the scalar [`FBinOp`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1761,6 +1789,14 @@ pub enum Inst {
         shape: VShape,
         op: VWidenOp,
         a: ValIdx,
+    },
+    /// Lane **narrow** (see [`VNarrowOp`]); `shape` is the **result** (narrow) shape, the source is
+    /// its [`VShape::wider`]. `a`/`b`/result are `v128`. `i8x16`/`i16x8` only (verifier-enforced).
+    VNarrow {
+        shape: VShape,
+        op: VNarrowOp,
+        a: ValIdx,
+        b: ValIdx,
     },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.
