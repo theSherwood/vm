@@ -232,6 +232,9 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // they raise the powerbox arity to grant the `IoRing`/`Blocking` handles.
     let uses_vm_io = register_vm_io_imports(m, &defined_names, &mut imports, &mut caps);
     let uses_blocking = calls_external(m, &defined_names, "__vm_blocking_handle") && has_main;
+    // §22 guest-driven-JIT builtins (`__vm_jit_*`): register their `Jit` imports; the program then
+    // needs the full 8-handle powerbox (the `Jit` handle is the last `VM_CAP_*` index).
+    let uses_vm_jit = register_vm_jit_imports(m, &defined_names, &mut imports, &mut caps);
     // `realloc` is a synthesized helper built on `malloc` + `memcpy`, so it forces both on.
     let need_realloc = calls_external(m, &defined_names, "realloc") && has_main;
     let need_malloc = (needs_malloc(m, &defined_names) || need_realloc) && has_main;
@@ -244,8 +247,11 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
     // declared arity), sized to the highest capability index the program uses: exit(2) always,
     // memory(3) for `malloc`/Memory builtins, ioring(5) for the async ring, blocking(6) for
-    // `__vm_blocking_handle`. (AddressSpace(4)/Jit(7) come with the §13/§14 region + §22 jit builtins.)
-    let max_cap_index = if uses_blocking {
+    // `__vm_blocking_handle`, jit(7) for the guest-driven-JIT builtins. (AddressSpace(4) comes with
+    // the §13/§14 region builtins, not yet lowered.)
+    let max_cap_index = if uses_vm_jit {
+        7
+    } else if uses_blocking {
         6
     } else if uses_vm_io {
         5
@@ -1293,10 +1299,14 @@ const STASH_EXIT: u64 = 8;
 const STASH_MEMORY: u64 = 12;
 /// The `IoRing` (slot 5) and `Blocking` (slot 6) handles — granted when the program uses the §9/§12
 /// async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap` drive `IoRing`; `__vm_blocking_handle`
-/// returns the `Blocking` handle a guest names in an SQE). Slot 4 (`AddressSpace`) and slot 7 (`Jit`)
-/// stay reserved (offsets 16/28) for the §13/§14 region + §22 jit builtins, not yet lowered.
+/// returns the `Blocking` handle a guest names in an SQE).
 const STASH_IORING: u64 = 20;
 const STASH_BLOCKING: u64 = 24;
+/// The `Jit` handle (slot 7) — granted when the program uses the §22 guest-driven-JIT builtins
+/// (`__vm_jit_compile`/`invoke2`/`release`/`install`/`uninstall`/`compile_linked`): a guest submits
+/// serialized SVM IR built in its own window and the host verifies + Cranelift-compiles it into THIS
+/// domain. Slot 4 (`AddressSpace`) stays reserved (offset 16) for the §13/§14 region builtins.
+const STASH_JIT: u64 = 28;
 /// End of the reserved 8-handle region (`[0, 32)`, one `i32` slot per `VM_CAP_*` index). The
 /// allocator/scratch/format state begins here, so it is collision-proof against the full handle set.
 const HANDLE_REGION_END: u64 = 32;
@@ -1397,6 +1407,13 @@ fn import_sig(import: &str) -> svm_ir::FuncType {
         // (op 1) / reap ready completions (op 2). `(sq, n, counter)` / `(cq, max)`, returning a count.
         "vm_io_submit_async" => ft(vec![I64, I64, I64], vec![I64]),
         "vm_io_reap" => ft(vec![I64, I64], vec![I64]),
+        // §22 guest-driven JIT (`Jit`): submit serialized IR → code handle (op 0) / call a compiled
+        // `(i64,i64)->(i64)` unit (op 1) / release (op 2) / install into the call_indirect table (op 3)
+        // / uninstall a slot (op 4) / compile against a guest symbol table (op 5). All return an `i64`.
+        "vm_jit_compile" => ft(vec![I64, I64], vec![I64]),
+        "vm_jit_invoke2" => ft(vec![I64, I64, I64], vec![I64]),
+        "vm_jit_release" | "vm_jit_install" | "vm_jit_uninstall" => ft(vec![I64], vec![I64]),
+        "vm_jit_compile_linked" => ft(vec![I64, I64, I64, I64], vec![I64]),
         _ => ft(vec![I64, I64], vec![I64]), // write / read (Stream)
     }
 }
@@ -1522,6 +1539,57 @@ fn register_vm_io_imports(
                     continue;
                 }
                 if let Some(import) = vm_io_builtin_import(&name) {
+                    used = true;
+                    caps.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
+                        });
+                        i
+                    });
+                }
+            }
+        }
+    }
+    used
+}
+
+/// The §7 import a §22 guest-driven-JIT builtin needs (`__vm_jit_compile` → `vm_jit_compile`, …), or
+/// `None`. All reach the `Jit` (slot 7) handle; the host verifies + Cranelift-compiles the submitted IR.
+fn vm_jit_builtin_import(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__vm_jit_compile" => "vm_jit_compile",
+        "__vm_jit_invoke2" => "vm_jit_invoke2",
+        "__vm_jit_release" => "vm_jit_release",
+        "__vm_jit_install" => "vm_jit_install",
+        "__vm_jit_uninstall" => "vm_jit_uninstall",
+        "__vm_jit_compile_linked" => "vm_jit_compile_linked",
+        _ => return None,
+    })
+}
+
+/// Scan for the guest-driven-JIT builtins, registering each one's §7 import. Returns whether any were
+/// used — the signal that `_start` must be granted up through the `Jit` handle (the full 8-handle
+/// powerbox). A guest-*defined* function of the same name shadows the builtin.
+fn register_vm_jit_imports(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    imports: &mut Vec<svm_ir::Import>,
+    caps: &mut HashMap<String, u32>,
+) -> bool {
+    let mut used = false;
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if defined.contains_key(&name) {
+                    continue;
+                }
+                if let Some(import) = vm_jit_builtin_import(&name) {
                     used = true;
                     caps.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;
@@ -2531,6 +2599,33 @@ fn lower_vm_builtin(
         // names in an SQE's `handle` field when building a `Blocking.work` request. Just a stash read.
         "__vm_blocking_handle" => {
             let r = ctx.stash_load(STASH_BLOCKING);
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // ---- §22 guest-driven JIT: `cap.call` on the stashed Jit handle (slot 7) ----
+        // Each builtin marshals its `i64` args (a blob/symtab pointer+len, a code/slot handle, two
+        // invoke args) and lowers to `CallImport` on the `Jit` handle. The host verifies the submitted
+        // IR and compiles it into THIS domain (verification, not isolation, is the boundary — §2a).
+        "__vm_jit_compile"
+        | "__vm_jit_invoke2"
+        | "__vm_jit_release"
+        | "__vm_jit_install"
+        | "__vm_jit_uninstall"
+        | "__vm_jit_compile_linked" => {
+            let import = vm_jit_builtin_import(name).expect("jit builtin");
+            let imp = ctx.import_of(import)?;
+            let argc = import_sig(import).params.len();
+            let mut args = Vec::with_capacity(argc);
+            for i in 0..argc {
+                args.push(ctx.operand_i64(vm_arg(c, i)?)?);
+            }
+            let handle = ctx.stash_load(STASH_JIT);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig(import),
+                handle,
+                args,
+            });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }

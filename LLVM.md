@@ -698,13 +698,31 @@ runtime built on LLVM bitcode drives many concurrent blocking I/Os from one park
   M:N executor + offload pool (the 7-handle powerbox, futex parking, completion-order-invariant total
   Σ mix(0..8)) — interpreter-only, as the JIT async path needs the separate `HostAsyncHooks` harness
   (mirrors the chibicc `run_async_demo` split). 86 translate tests green, fmt + clippy clean.
-- *Still deferred:* the §13/§14 `__vm_region_*` (SharedRegion) and §22 `__vm_jit_*` builtins stay
-  `Unsupported` until a workload needs them — the reserved AddressSpace(4)/Jit(7) slots are ready.
+- *Still deferred:* the §13/§14 `__vm_region_*` (SharedRegion) builtins stay `Unsupported` until a
+  workload needs them — the reserved AddressSpace(4) slot is ready.
 
-**Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native), the
-`<svm.h>` P0+P1+P2 capability/concurrency/GC builtins are in, and the powerbox stash is locked to the
-full 8-handle layout. Beyond this: the SharedRegion/Jit builtins (on demand), Milestone 2 (tail calls,
-real Rust/C++ without EH), and a bundled guest `libm` header.
+**Slice AE (DONE) — guest-driven JIT (§22).** The `Jit` capability now lowers on the on-ramp, so a
+guest that emits serialized SVM IR at runtime (a language runtime accelerating its own bytecode)
+reaches it from LLVM bitcode: `__vm_jit_compile`/`invoke2`/`release`/`install`/`uninstall`/
+`compile_linked` → `CallImport` on the stashed `Jit` handle (slot 7; imports `vm_jit_*` → `Jit` ops
+0/1/2/3/4/5). A JIT-using program is granted the **full 8-handle powerbox** (`Jit` is the last
+`VM_CAP_*` index; `synth_start`'s contiguous prefix now reaches 8, so `run_powerbox` grants `Jit` with
+its validator + call_indirect table). The host verifies + Cranelift-compiles the submitted blob into
+*this* domain — same window, same powerbox; verification, not isolation, is the boundary (§2a).
+- Tests: `vm_jit_builtins_lower_and_grant_full_powerbox` (structural — every builtin → its `Jit`
+  `CallImport`, 8-handle entry); `vm_jit_guest_self_jit_demo` runs the real `demos/jit/jit_demo.c`
+  through Lane C on the JIT powerbox — the guest emits IR byte-by-byte, `compile`s + `invoke2`s a raw
+  unit **and** an `install`ed unit reached via a C function pointer (`call_indirect`), agreeing with
+  its own bytecode interpreter on a 49-input grid. The validator's memory-match is exact, so the test
+  probes svm-llvm's parent `size_log2` and patches the demo's blob descriptor to it (no magic
+  constant). 88 translate tests green, fmt + clippy clean.
+- *Still deferred:* the §13/§14 `__vm_region_*` (SharedRegion) builtins — the reserved AddressSpace(4)
+  slot is ready; on demand.
+
+**Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native), and the
+`<svm.h>` capability/concurrency/GC/JIT builtins are in **except** the §13/§14 SharedRegion family —
+the only remaining `<svm.h>` surface. Beyond that: Milestone 2 (tail calls, real Rust/C++ without EH)
+and a bundled guest `libm` header.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
