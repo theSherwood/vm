@@ -263,6 +263,9 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
             v.extend_from_slice(args);
             v
         }
+        ContNew { func, sp } => vec![*func, *sp],
+        ContResume { k, arg } => vec![*k, *arg],
+        Suspend { value } => vec![*value],
         _ => return None,
     })
 }
@@ -312,10 +315,16 @@ fn term_operands(t: &Terminator) -> Vec<ValIdx> {
 fn compute_may_suspend(m: &Module) -> Vec<bool> {
     let mut ms = vec![false; m.funcs.len()];
     for (i, f) in m.funcs.iter().enumerate() {
-        if f.blocks
-            .iter()
-            .any(|b| b.insts.iter().any(|x| matches!(x, Inst::CapCall { .. })))
-        {
+        if f.blocks.iter().any(|b| {
+            b.insts.iter().any(|x| {
+                // `cap.call` suspends to the host; a fiber `cont.resume`/`suspend` switches
+                // stacks and is a freeze safepoint too (`cont.new` alone merely allocates).
+                matches!(
+                    x,
+                    Inst::CapCall { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                )
+            })
+        }) {
             ms[i] = true;
         }
     }
@@ -352,6 +361,12 @@ enum SuspendKind {
     Leaf,
     /// `Call` to a may-suspend callee: re-issued on thaw so the callee rewinds in turn.
     Propagated { callee: FuncIdx, args: Vec<ValIdx> },
+    /// `cont.resume` (resumer side): like a propagated call, re-issued on thaw so the fiber
+    /// rewinds in turn. Yields `(status: i32, value: i64)`. *Thaw not yet wired (Phase 3.1).*
+    Resume { k: ValIdx, arg: ValIdx },
+    /// `suspend` (fiber side): unwinds the fiber's stack like a leaf, but thaw must **re-park**
+    /// the fiber (await a future `cont.resume`), not continue. *Thaw not yet wired (Phase 3.1).*
+    Yield,
 }
 
 /// One resume point's metadata across the whole function (global id by vector order).
@@ -414,7 +429,7 @@ fn transform_func(
             .iter()
             .enumerate()
             .filter(|(_, inst)| match inst {
-                Inst::CapCall { .. } => true,
+                Inst::CapCall { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => true,
                 Inst::Call { func, .. } => may_suspend[*func as usize],
                 _ => false,
             })
@@ -544,13 +559,17 @@ fn transform_func(
                         callee: *func,
                         args: args.clone(),
                     },
-                    _ => unreachable!("suspend position is a cap.call or call"),
+                    Inst::ContResume { k, arg } => SuspendKind::Resume { k: *k, arg: *arg },
+                    Inst::Suspend { .. } => SuspendKind::Yield,
+                    _ => unreachable!("suspend position is a cap.call / call / fiber op"),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
                     (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => sig.results.len(),
                     (SuspendKind::Propagated { callee, .. }, _) => {
                         func_results[*callee as usize].len()
                     }
+                    (SuspendKind::Resume { .. }, _) => 2, // (status, value)
+                    (SuspendKind::Yield, _) => 1,         // the resume arg
                     _ => unreachable!(),
                 };
                 // Spillable range: values `[0, save_end)`. A leaf reloads its own result too
@@ -558,7 +577,11 @@ fn transform_func(
                 // results `[save_end, out)` are recomputed, not spilled.
                 let save_end = match kind {
                     SuspendKind::Leaf => out,
-                    SuspendKind::Propagated { .. } => out - nres,
+                    // The op's results are recomputed (re-issue) or redelivered (resume), so
+                    // they aren't spilled — same as a propagated call.
+                    SuspendKind::Propagated { .. }
+                    | SuspendKind::Resume { .. }
+                    | SuspendKind::Yield => out - nres,
                 };
                 let slot_types = bi.types[0..out].to_vec();
 
@@ -591,6 +614,10 @@ fn transform_func(
                     for &a in args {
                         used[a as usize] = true; // operands of the re-issued call
                     }
+                }
+                if let SuspendKind::Resume { k, arg } = &kind {
+                    used[*k as usize] = true; // operands of the re-issued cont.resume
+                    used[*arg as usize] = true;
                 }
                 let spilled: Vec<usize> = if conservative {
                     (0..save_end).collect()
@@ -695,6 +722,20 @@ fn transform_func(
         let ret: Vec<ValIdx> = f.results.iter().map(|&t| ub.one(zero_const(t))).collect();
         unwind_blocks.push(ub.finish(Terminator::Return(ret)));
 
+        // Fiber resume points (`cont.resume`/`suspend`) unwind into the shadow stack like any
+        // other point (the UNWIND above), but their *thaw* — re-issuing the resume / re-parking
+        // the fiber — is not wired yet (Phase 3.1 follow-up). Fail closed: route the arm to the
+        // trap so a fiber thaw traps rather than miscomputes. NORMAL execution never reaches an
+        // arm, so a fiber'd module stays fully inert under instrumentation.
+        if matches!(pt.kind, SuspendKind::Resume { .. } | SuspendKind::Yield) {
+            arm_blocks.push(Block {
+                params: vec![],
+                insts: vec![],
+                term: Terminator::Unreachable,
+            });
+            continue;
+        }
+
         // ARM: reload the spilled set (self-contained — no incoming params), pop, resume.
         let mut ab = Bb::new(vec![]);
         let sp_a = ab.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
@@ -730,6 +771,10 @@ fn transform_func(
                     },
                     pt.nres,
                 )
+            }
+            // Fiber kinds route to the trap arm above and never reach here (Phase 3.1).
+            SuspendKind::Resume { .. } | SuspendKind::Yield => {
+                unreachable!("fiber resume points fail closed in the arm early-out")
             }
         };
 
@@ -947,6 +992,10 @@ fn result_types(
         CallIndirect { ty, .. } => ty.results.clone(),
         PtrAdd { .. } | PtrCast { .. } => vec![ValType::I64],
         RefFunc { .. } => vec![ValType::I32],
+        // Fiber control ops (§12 / Phase 3): a handle, a `(status, value)` pair, a resume arg.
+        ContNew { .. } => vec![ValType::I32],
+        ContResume { .. } => vec![ValType::I32, ValType::I64],
+        Suspend { .. } => vec![ValType::I64],
         _ => return Err(TransformError::UnsupportedInst),
     })
 }

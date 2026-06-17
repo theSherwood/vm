@@ -621,7 +621,7 @@ as a **native stack** (`FiberSlot.fiber`, JIT). Neither is durable, and — unli
 residues — it **must not be run forward** (no `ContResume` is coming; advancing it would
 execute work the guest never requested). So its parked continuation must become
 shadow-stack form *without advancing the computation*. **[DECISION D-fiber-cont —
-OPEN]** three options:
+RESOLVED: option (A).]** Three options were:
 
 - **(A) Fibers always keep their continuation in an in-window shadow stack.** Instrument
   `Suspend`/`ContResume`/`ContNew` so a suspend spills the continuation to the fiber's
@@ -651,11 +651,17 @@ freeze hangs until it exits. Bounded-latency STW needs Phase-4 back-edge polls +
 `Blocking.work` cancellation story. A first cut accepts unbounded latency (cooperative
 guest).
 
-**Sub-phases.** 3.1 — settle D-fiber-cont, then freeze/thaw **one fiber, single vCPU,
-interpreter-only** (isolates "continuation in a shadow stack" from thread coordination).
-3.2 — multi-vCPU quiesce + per-context layout. 3.3 — JIT parity (drive real OS threads
-to safepoints; respect the D57 single-owner protocol). Phase 4 — back-edge polls for
-bounded latency.
+**Sub-phases.** 3.1 — freeze/thaw **one fiber, single vCPU, interpreter-only** (isolates
+"continuation in a shadow stack" from thread coordination). *In progress:* the transform
+now recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'd
+module is **NORMAL-inert** under instrumentation + verifies (`svm-durable/tests/fiber.rs`);
+still to wire — the fiber resume arms (re-issue `cont.resume`; **re-park** a `suspend`),
+per-fiber shadow stacks, and the freeze driver that flattens an idle parked fiber (switch
+into it under `UNWINDING` so its post-suspend poll unwinds it with no forward progress).
+Those arms currently fail closed (trap), so a fiber *thaw* is not yet possible. 3.2 —
+multi-vCPU quiesce + per-context layout. 3.3 — JIT parity (drive real OS threads to
+safepoints; respect the D57 single-owner protocol). Phase 4 — back-edge polls for bounded
+latency.
 
 ---
 
