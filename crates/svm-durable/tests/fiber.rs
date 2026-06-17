@@ -10,7 +10,9 @@
 //! freeze driver flattens it into its shadow stack and the snapshot records its metadata (slices
 //! 3.1.4–5) — so these tests pin verification + NORMAL-inertness + the arm wiring, structurally.
 
-use svm_durable::{init_durable_window, transform_module, write_state, STATE_UNWINDING};
+use svm_durable::{
+    init_durable_window, transform_module, write_state, STATE_REWINDING, STATE_UNWINDING,
+};
 use svm_interp::{
     run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_SP_OFF, SHADOW_STRIDE,
 };
@@ -211,11 +213,20 @@ block0(v0: i64, v1: i64):
         "the root unwound a frame into context 0's region"
     );
 
-    // After the driver, the active shadow-SP points at the (last-driven) fiber's flattened stack.
-    let fiber_sp = le_u64(&snap[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]);
+    // The freeze run hands back the flattened fiber's metadata; its continuation lives in its own
+    // region, with the active shadow-SP left at the root's (thaw-ready — slice 3.1.5).
+    let frozen = host.frozen_fibers();
+    assert_eq!(frozen.len(), 1, "one fiber was flattened");
+    assert_eq!(frozen[0].slot, 0, "the single fiber holds handle 0");
+    let fiber_sp = frozen[0].shadow_sp;
     assert!(
         fiber_sp > fiber_base && fiber_sp <= fiber_base + SHADOW_STRIDE,
         "the fiber flattened a frame into its own region [{fiber_base}, +stride): sp={fiber_sp}"
+    );
+    let active_sp = le_u64(&snap[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]);
+    assert!(
+        active_sp >= root_base && active_sp < fiber_base,
+        "the active shadow-SP is left at the root's region for thaw: {active_sp}"
     );
     // The fiber unwound *at its suspend point* (resume id 1 = the first/only point), proving the
     // driver made zero forward progress past the `suspend` (it never reached `42 + 7`).
@@ -223,5 +234,74 @@ block0(v0: i64, v1: i64):
     assert_eq!(
         rid, 1,
         "the fiber unwound at its suspend point (zero forward progress)"
+    );
+}
+
+/// Slice 3.1.5 — the **end-to-end single-fiber round-trip**: `freeze → (window + fiber metadata) →
+/// thaw ≡ uninterrupted`, interpreter-only. Root resumes a fiber, which suspends; freezing captures
+/// the root's *and* the fiber's continuations (the latter via the driver + the exported
+/// [`svm_interp::FrozenFiber`] residue). Thawing re-seeds the fiber, re-enters the root under
+/// REWINDING — the resumer re-issues `cont.resume`, the fiber rewinds and re-parks — then runs
+/// forward to completion, matching the uninterrupted result. (Metadata is passed in-memory; the
+/// byte-level snapshot Section-2 codec is the follow-up `svm-snapshot` slice.)
+#[test]
+fn single_fiber_freeze_thaw_round_trips() {
+    const SRC3: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.const 7
+  v7, v8 = cont.resume v2 v6
+  return v8
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 42
+  v3 = suspend v2
+  v4 = i64.const 100
+  v5 = i64.add v3 v4
+  return v5
+}
+"#;
+    let mut m = svm_text::parse_module(SRC3).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = transform_module(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("instrumented IR verifies");
+
+    // Uninterrupted baseline: resume #1 suspends 42; resume #2 (arg 7) returns 7 + 100 = 107.
+    let want = run_normal(&inst).expect("uninterrupted run");
+    assert_eq!(want, vec![Value::I64(107)], "uninterrupted result");
+
+    // Freeze from the start: the run unwinds at resume #1's poll (fiber parked after suspend).
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let mut fuel = 1_000_000u64;
+    let (rf, frozen_win) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
+    assert!(rf.is_ok(), "freeze returns a placeholder: {rf:?}");
+    let frozen = fhost.frozen_fibers().to_vec();
+    assert_eq!(frozen.len(), 1, "the parked fiber was flattened");
+
+    // Thaw: restore the captured window (REWINDING), re-seed the fiber, re-enter the root.
+    let mut thaw_win = frozen_win;
+    write_state(&mut thaw_win, STATE_REWINDING);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.set_frozen_fibers(frozen);
+    let mut tfuel = 1_000_000u64;
+    let (rt, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut tfuel, &thaw_win, SIZE_LOG2, &mut thost);
+    assert_eq!(
+        rt.expect("thaw runs to completion"),
+        want,
+        "freeze → thaw reproduces the uninterrupted result"
     );
 }

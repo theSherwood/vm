@@ -659,12 +659,14 @@ recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'
 `cont.resume` thaw arm** re-issues the resume on rewind (slice 3.1.2), and the **fiber-side
 `suspend` re-park arm** flips to `NORMAL` and re-executes `suspend` on rewind (slice 3.1.3) —
 so **both fiber thaw arms are now wired** (no fiber arm fails closed). The **freeze driver
-flattens idle parked fibers** into their shadow regions (slice 3.1.4): after the root unwinds,
-each still-parked fiber is resumed under `UNWINDING` so its post-suspend poll unwinds it with
-zero forward progress. Still to wire — the snapshot Section-2 fiber metadata + restore (slice
-3.1.5), which records each frozen fiber's handle/region/status and rebuilds the registry so a
-thaw re-enters it. Until that lands, freeze captures a parked fiber's continuation in the window
-but a cross-domain *thaw* can't yet reconstruct the fiber. 3.2 — multi-vCPU quiesce + per-context layout.
+flattens idle parked fibers** into their shadow regions (slice 3.1.4), and the **end-to-end
+single-fiber round-trip works** (slice 3.1.5): freeze exports each flattened fiber's residue
+(`svm_interp::FrozenFiber` via the `Host`), and a thaw re-seeds the registry and re-enters the
+root under `REWINDING` — the resumer re-issues `cont.resume`, the fiber rewinds and re-parks,
+then runs forward to the same result as the uninterrupted run (`svm-durable/tests/fiber.rs`).
+**3.1 is functionally complete on the interpreter.** The remaining follow-up is the byte-level
+snapshot **Section-2 codec** in `svm-snapshot` (serialize/restore the `FrozenFiber` residue, vs.
+today's in-memory hand-off). 3.2 — multi-vCPU quiesce + per-context layout.
 3.3 — JIT parity (drive real OS threads to safepoints; respect the D57 single-owner protocol;
 **replicate the swap** in the JIT's fiber-switch path). Phase 4 — back-edge polls for bounded
 latency.
@@ -751,11 +753,18 @@ each a small reviewable commit on the interpreter only:
    (`svm-durable/tests/fiber.rs`): a parked fiber lands a frame in its **own** region (distinct
    from the root's) and unwinds **at its suspend point** (resume id 1) — a precise zero-forward-progress check.
 
-5. **End-to-end test + snapshot wiring.** One fiber, `freeze → serialize → restore → thaw ≡
-   uninterrupted`, interp-only. The snapshot needs Section 2 to record each fiber's
-   `(slot, generation)` handle + its shadow region offset/extent + `parked|runnable` status
-   (§12.4); restore rebuilds the registry and re-parks. Add to `svm-snapshot` + a
-   `durable`-style test; fold into the `durable_fuzz` generator once stable.
+5. **[DONE (interp round-trip); snapshot codec follow-up] End-to-end test + fiber residue.** The
+   freeze driver records each flattened fiber as a `svm_interp::FrozenFiber` (slot, entry funcref,
+   data-sp, shadow-SP) and hands it back through the `Host`; `freeze_drive` leaves the active
+   shadow-SP at the **root's** region so the captured window is thaw-ready. A thaw re-seeds the
+   registry (`drive` recreates each as a `Pending` fiber at its dense slot, with its shadow-SP in
+   the `shadow` table) and re-enters the root under `REWINDING`: the resumer re-issues
+   `cont.resume`, the seeded fiber re-runs its entry → rewinds → re-parks, then forward execution
+   completes. `svm-durable/tests/fiber.rs::single_fiber_freeze_thaw_round_trips` proves `freeze →
+   (window + residue) → thaw ≡ uninterrupted` (107). **Remaining:** the byte-level **Section-2
+   codec** in `svm-snapshot` — serialize/restore the `FrozenFiber` residue (the §12.4 per-fiber
+   record: `(slot, generation)` handle + shadow region/extent + status) instead of the in-memory
+   hand-off — and folding fiber'd modules into the `durable_fuzz` generator.
 
 Then 3.2 (multi-vCPU) and 3.3 (JIT parity) as above. **Slice-1 sub-questions, now settled:**
 a fiber handle maps to its region by **dense slot index × stride** (`context i = slot+1`,

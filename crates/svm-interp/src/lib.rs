@@ -1303,6 +1303,9 @@ fn drive(
     // Durability is a domain property (DURABILITY.md §12.8): every vCPU of a durable run maintains
     // the per-context shadow-SP swap. Read before the host moves into the shared Arc.
     let durable = host.is_durable();
+    // Thaw seeding (slice 3.1.5): fibers a freeze flattened, to re-create in the registry before the
+    // root re-enters under REWINDING. Taken (cleared) here; empty for a freeze or ordinary run.
+    let thaw_fibers = std::mem::take(&mut host.frozen_fibers);
     let sched = Arc::new(Scheduler::new(quota.max_vcpus, workers));
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
@@ -1344,6 +1347,19 @@ fn drive(
             dt,
         ));
         root.durable = durable;
+        // Thaw seeding (slice 3.1.5): re-create each frozen fiber in the run-shared registry, in
+        // ascending slot order, so the dense handle namespace matches the freeze (the root's
+        // re-issued `cont.resume` names handle 0, …). Each fiber's flattened shadow-SP goes back in
+        // the `shadow` table so the swap re-points to it when the root re-enters it under REWINDING.
+        {
+            let mut seed: Vec<FrozenFiber> = thaw_fibers;
+            seed.sort_by_key(|f| f.slot);
+            for (expected, ff) in seed.into_iter().enumerate() {
+                let got = root.registry.seed_frozen(ff.func, ff.sp, ff.shadow_sp);
+                debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
+                debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
+            }
+        }
         s.runnable.push_back(root);
         id
     };
@@ -2746,7 +2762,17 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 && result.is_ok()
                 && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
             {
-                v.freeze_drive().and(result)
+                let r = v.freeze_drive().and(result);
+                // Hand the flattened fibers back to the embedder via the shared host, so a snapshot
+                // can record them (and a thaw re-seed them). The run is single-vCPU here.
+                if !v.frozen.is_empty() {
+                    let frozen = std::mem::take(&mut v.frozen);
+                    v.host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .frozen_fibers = frozen;
+                }
+                r
             } else {
                 result
             };
@@ -3353,6 +3379,25 @@ fn shadow_switch(
 /// frames (while it is resuming a fiber) live in `VCpu::root_parked`.
 const ROOT_FIBER: usize = usize::MAX;
 
+/// A fiber **flattened for freeze** (DURABILITY.md §12.8 slice 3.1.4–5), as the snapshot carries it
+/// (the eventual §12.4 Section-2 per-fiber record). Its continuation is bytes in its in-window
+/// shadow region `[shadow_region_base(slot+1), shadow_sp)`; this is the small host-side residue:
+/// where it sits and how to re-enter it on thaw. Re-entry recreates it as a `Pending` fiber so a
+/// thaw `cont.resume` runs its entry under `REWINDING`, rebuilding then re-parking it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrozenFiber {
+    /// Registry slot = the guest fiber handle (so re-seeding preserves handle values).
+    pub slot: usize,
+    /// The fiber's entry funcref (== func index; `ref.func`/the identity table), re-entered on thaw.
+    pub func: i32,
+    /// The fiber's data-stack base (the entry's first param). Inert for rewind (the prologue
+    /// dispatches to the resume arm, ignoring params) but recorded for fidelity / forward use.
+    pub sp: i64,
+    /// Window offset of the flattened shadow-SP — the extent of its frozen continuation, restored
+    /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
+    pub shadow_sp: u64,
+}
+
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
 /// continuation is exactly its reified call stack. `cont.new` makes one (`Pending`);
 /// `cont.resume` claims and switches into it; `suspend` parks it back, claimable again
@@ -3543,6 +3588,18 @@ impl FiberRegistry {
             _ => unreachable!("position found a Parked slot"),
         }
     }
+
+    /// Thaw seeding (slice 3.1.5): re-create a frozen fiber at the next slot as `Pending` (so a
+    /// thaw `cont.resume` re-enters its entry under `REWINDING`) with its flattened shadow-SP in the
+    /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
+    /// dense handle namespace; returns the slot, which must equal the recorded one.
+    fn seed_frozen(&self, func: i32, sp: i64, shadow_sp: u64) -> usize {
+        let mut t = self.lock();
+        let slot = t.fibers.len();
+        t.fibers.push(RegFiber::Pending { func, sp });
+        t.shadow.push(shadow_sp);
+        slot
+    }
 }
 
 /// The fixed fiber entry signature (§12): a fiber runs a function of type `(i64 sp, i64
@@ -3626,6 +3683,9 @@ struct VCpu {
     /// — the off-table root's slot in the per-context saved-SP table (a fiber's lives in the
     /// registry's `shadow`). The root is context 0, so this starts at [`SHADOW_BASE`].
     root_shadow_sp: u64,
+    /// Fibers the freeze driver flattened this run (slice 3.1.5), handed back to the embedder via
+    /// the shared [`Host`] so a snapshot can record them and a thaw re-seed them. Empty otherwise.
+    frozen: Vec<FrozenFiber>,
     /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
     mem: Option<Mem>,
     /// The domain's powerbox, **shared** by every vCPU of the run (`Arc<Mutex<Host>>`): a spawned
@@ -3720,6 +3780,7 @@ impl VCpu {
             parked_frames: 0,
             durable: false,
             root_shadow_sp: SHADOW_BASE,
+            frozen: Vec::new(),
             mem,
             host,
             fuel,
@@ -3777,6 +3838,7 @@ impl VCpu {
             parked_frames: 0,
             durable: false,
             root_shadow_sp: SHADOW_BASE,
+            frozen: Vec::new(),
             mem,
             host,
             fuel,
@@ -3881,11 +3943,28 @@ impl VCpu {
     /// progress** and its base-frame return (under `cur == ROOT_FIBER`) ends the sub-run. The fiber's
     /// flattened shadow-SP extent is recorded in the registry's `shadow` table for the snapshot.
     ///
+    /// Each flattened fiber is recorded as a [`FrozenFiber`] in `self.frozen` (handed to the embedder
+    /// via the [`Host`] for the snapshot / a thaw re-seed). The active shadow-SP is left pointing at
+    /// the **root's** region on return, so the captured window is thaw-ready (the root rewinds first;
+    /// each fiber's own SP travels in its `FrozenFiber`, re-seeded into the registry on thaw).
+    ///
     /// Single-vCPU only (slice 3.1); the multi-vCPU stop-the-world choreography is slice 3.2. Handles
     /// idle parked fibers; a fiber still on an active resume chain at freeze unwinds with the root and
     /// is a 3.1.5/3.2 follow-up.
     fn freeze_drive(&mut self) -> Result<(), Trap> {
+        // The root's post-unwind SP (context 0); restored at the end so the window is thaw-ready.
+        let root_sp = self
+            .mem
+            .as_ref()
+            .map(|m| m.durable_get_sp())
+            .unwrap_or(SHADOW_BASE);
         while let Some((slot, mut frames)) = self.registry.take_parked_for_freeze() {
+            // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
+            let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
+            let sp = match frames.first().and_then(|f| f.vals.first()) {
+                Some(Value::I64(x)) => *x,
+                _ => 0,
+            };
             if let Some(f) = frames.last_mut() {
                 f.vals.push(Value::I64(0)); // placeholder resume value (inert; not spilled by Yield)
             }
@@ -3898,12 +3977,22 @@ impl VCpu {
             self.root_parked = None;
             self.parked_frames = 0;
             run_inner(self, u64::MAX)?; // the fiber unwinds; base return (cur == ROOT) ends the sub-run
-            let sp = self
+            let shadow_sp = self
                 .mem
                 .as_ref()
                 .map(|m| m.durable_get_sp())
                 .unwrap_or(SHADOW_BASE);
-            self.registry.set_saved_sp(slot, sp);
+            self.registry.set_saved_sp(slot, shadow_sp);
+            self.frozen.push(FrozenFiber {
+                slot,
+                func,
+                sp,
+                shadow_sp,
+            });
+        }
+        // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
+        if let Some(m) = self.mem.as_mut() {
+            m.durable_set_sp(root_sp);
         }
         Ok(())
     }
@@ -3995,6 +4084,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         parked_frames,
         durable,
         root_shadow_sp,
+        frozen: _, // populated by `freeze_drive` (a `&mut self` method), not the run loop
         mem,
         host,
         fuel,
@@ -6571,6 +6661,10 @@ pub struct Host {
     /// DURABILITY.md §12.8). `false` (the default) ⇒ an ordinary run that never touches the
     /// durable reserve. Set with [`Host::set_durable`] before [`run_with_host`] / friends.
     durable: bool,
+    /// The freeze/thaw fiber residue (slice 3.1.5): **out** of a freeze run (the driver flattens
+    /// each parked fiber and records it here for the snapshot) and **in** to a thaw run (`drive`
+    /// re-seeds the registry from it before re-entering under `REWINDING`). Empty for an ordinary run.
+    frozen_fibers: Vec<FrozenFiber>,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -6668,6 +6762,7 @@ impl Host {
             cap_record: None,
             cap_replay: None,
             durable: false,
+            frozen_fibers: Vec::new(),
         }
     }
 
@@ -6682,6 +6777,19 @@ impl Host {
     /// Whether this domain runs a durable module (see [`Host::set_durable`]). Read by `drive`.
     pub fn is_durable(&self) -> bool {
         self.durable
+    }
+
+    /// The fibers the freeze driver flattened on the last freeze run (slice 3.1.5) — the host-side
+    /// residue a snapshot records (their continuations are in the captured window). Empty otherwise.
+    pub fn frozen_fibers(&self) -> &[FrozenFiber] {
+        &self.frozen_fibers
+    }
+
+    /// Seed the frozen fibers a **thaw** must reconstruct (from a snapshot's Section 2). `drive`
+    /// re-creates each in the registry before re-entering the root under `REWINDING`. Set alongside
+    /// the restored (REWINDING) window and [`Host::set_durable`].
+    pub fn set_frozen_fibers(&mut self, frozen: Vec<FrozenFiber>) {
+        self.frozen_fibers = frozen;
     }
 
     /// Begin recording the nondeterministic capability **inputs** crossing into the guest, so a
