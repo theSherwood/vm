@@ -513,14 +513,17 @@ non-durable freeze refusal. The **cross-backend** property (`crates/svm/tests/du
 + the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
-**Capture** landed for the interpreter: `run_capture_reserved_with_host_prots` returns a
-per-page `CapturedProt` map (`Rw`/`Ro`/`Unmapped`/`Backed`) alongside the window bytes, at the
-fixed `DURABLE_SNAPSHOT_PAGE` (= codec `PAGE`) granularity. `crates/svm/tests/durable_prot_capture.rs`
-shows a D40 `readonly` data segment captured as `Ro` and surviving freeze→restore through the
-codec (where Phase-1's flat all-`Rw` image would have lost it); a `Backed` page maps to a
-freeze refusal (D-region). Still ahead (escape-TCB): **re-establishing** protections on the
-restored runtime window (interp `Mem` then the JIT `GuestWindow` via `mprotect`/`VirtualProtect`)
-so a thawed `Ro` page faults on write; JIT-side capture; then §12.4 fiber/dispatch control state.
+**Capture + re-establish** landed for the interpreter: `run_capture_reserved_with_host_prots`
+both **seeds** an initial per-page protection map (restore) and **returns** the post-run map
+(freeze) — `CapturedProt` (`Rw`/`Ro`/`Unmapped`/`Backed`) at the fixed `DURABLE_SNAPSHOT_PAGE`
+(= codec `PAGE`) granularity. `crates/svm/tests/durable_prot_capture.rs` shows a D40 `readonly`
+data segment captured as `Ro` and surviving freeze→restore through the codec (where Phase-1's
+flat all-`Rw` image would have lost it), **and** that re-establishing the map on a thawed run
+makes a write to a restored `Ro` page fault — while the same window without it writes through. A
+`Backed` page maps to a freeze refusal / is skipped on restore (D-region: the embedder re-grants
+the region). Still ahead (escape-TCB): the **JIT** side — capturing `GuestWindow` protections and
+re-establishing them via `mprotect`/`VirtualProtect` (Windows placeholder semantics); then §12.4
+fiber/dispatch control state.
 
 ### 12.7 Shadow-frame layout
 

@@ -1182,17 +1182,21 @@ pub enum CapturedProt {
     Backed,
 }
 
-/// [`run_capture_reserved_with_host`] that additionally returns the per-page **protection** map
-/// over the same snapshot span (one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page), so
-/// a durable freeze can record real `Ro`/`Unmapped` pages (DURABILITY.md §12.3) rather than
-/// assuming the whole window is `Rw`. Capture-only: re-establishing protections on restore is a
-/// separate step.
+/// [`run_capture_reserved_with_host`] that **seeds** an initial per-page protection map (the
+/// durable-restore step — re-establishing `Ro`/`Unmapped` pages so a thawed guest faults exactly
+/// as the frozen one would) and **returns** the post-run protection map (the durable-freeze step),
+/// both one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). Pass
+/// `init_prots = None` to capture only (every page starts at its default). A `Backed` entry in
+/// `init_prots` is ignored — a §13 shared-region alias is not restorable (D-region; freeze refuses
+/// it), so the embedder re-grants the region instead.
+#[allow(clippy::too_many_arguments)]
 pub fn run_capture_reserved_with_host_prots(
     m: &Module,
     func: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
     init_mem: &[u8],
+    init_prots: Option<&[CapturedProt]>,
     reserved_log2: u8,
     host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>, Vec<CapturedProt>) {
@@ -1203,6 +1207,9 @@ pub fn run_capture_reserved_with_host_prots(
         let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
         mm.seed(init_mem);
         mm.init_data(&m.data);
+        if let Some(prots) = init_prots {
+            mm.apply_prots(prots);
+        }
         mm
     });
     let r = drive(&m.funcs, func, args, fuel, &mut mem, host);
@@ -8177,6 +8184,32 @@ impl Mem {
                 }
             })
             .collect()
+    }
+
+    /// Re-establish a captured protection map on this window (the durable-restore step, the
+    /// inverse of [`snapshot_prots`]): mark each `Ro`/`Unmapped` page so a thawed guest faults
+    /// exactly as the frozen one would. `Rw` is the prefix default (left absent) but is set
+    /// explicitly for a reserved-tail page (a grown commit); `Backed` is skipped — a §13
+    /// shared-region alias isn't restorable here (D-region), the embedder re-grants the region.
+    fn apply_prots(&mut self, prots: &[CapturedProt]) {
+        let mapped = self.window.mapped();
+        let mut space = self.space_write();
+        for (i, &p) in prots.iter().enumerate() {
+            let byte_off = i as u64 * DURABLE_SNAPSHOT_PAGE;
+            let host_page = byte_off / self.page;
+            match p {
+                CapturedProt::Ro => {
+                    space.prot.insert(host_page, PageProt::Ro);
+                }
+                CapturedProt::Unmapped => {
+                    space.prot.insert(host_page, PageProt::Unmapped);
+                }
+                CapturedProt::Rw if byte_off >= mapped => {
+                    space.prot.insert(host_page, PageProt::Rw);
+                }
+                CapturedProt::Rw | CapturedProt::Backed => {}
+            }
+        }
     }
 }
 
