@@ -456,9 +456,14 @@ debug.var 0 "x" ssa 0 "int"
 debug.var 0 "buf" win 16 "char"
 debug.var 0 "p" win 24 "struct" 3
 debug.var 0 "k" ssalist 2 0 0 0 1 1 2 "int"
+debug.blob "x.dw" "ab\x00\xffcd"
 "#;
     let m = parse_module(src).expect("parse");
     let di = m.debug_info.as_ref().expect("debug info present");
+    // The opaque rich blob round-trips its (possibly non-UTF-8) bytes.
+    assert_eq!(di.blobs.len(), 1);
+    assert_eq!(di.blobs[0].producer, "x.dw");
+    assert_eq!(di.blobs[0].bytes, vec![b'a', b'b', 0x00, 0xff, b'c', b'd']);
     assert_eq!(di.files, vec!["a.c".to_string()]);
     assert_eq!(di.locs.len(), 1);
     assert_eq!(di.types.len(), 4);

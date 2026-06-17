@@ -17,9 +17,9 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, FBinOp,
     FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp,
-    LoadOp, Loc, Memory, Module, Ordering, SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp,
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape,
-    VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
+    LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp, Terminator, TypeDef,
+    VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
+    VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -367,6 +367,13 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
                 write_uleb(out, t as u64);
             }
         }
+    }
+    // Opaque per-producer rich blobs (§6): count, then each `(producer, length-prefixed bytes)`.
+    write_uleb(out, di.blobs.len() as u64);
+    for b in &di.blobs {
+        write_str(out, &b.producer);
+        write_uleb(out, b.bytes.len() as u64);
+        out.extend_from_slice(&b.bytes);
     }
 }
 
@@ -1395,11 +1402,21 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
             type_id,
         });
     }
+    // Opaque per-producer rich blobs (§6): bounded count, then producer + length-prefixed bytes.
+    let nblobs = c.count()?;
+    let mut blobs = Vec::new();
+    for _ in 0..nblobs {
+        let producer = c.str()?;
+        let len = c.count()?;
+        let bytes = c.take(len)?.to_vec();
+        blobs.push(ProducerBlob { producer, bytes });
+    }
     Ok(DebugInfo {
         files,
         locs,
         types,
         vars,
+        blobs,
     })
 }
 
@@ -2022,6 +2039,11 @@ mod debug_tests {
                     type_id: Some(0),
                 },
             ],
+            // An opaque per-producer rich blob (incl. non-UTF-8 / NUL bytes — verbatim DWARF).
+            blobs: vec![ProducerBlob {
+                producer: ".debug_info".into(),
+                bytes: vec![0x00, 0x01, 0xff, 0x7f, 0x80, b'd', b'w'],
+            }],
         }
     }
 
@@ -2062,12 +2084,17 @@ mod debug_tests {
     }
 
     #[test]
-    fn rejects_a_corrupt_typedef_kind() {
-        // Corrupting the section must fail to decode, never panic (untrusted-input discipline).
-        let mut bytes = encode_module(&module(Some(sample_debug())));
-        // Flip the last byte (within the vars table) to an unlikely value; decoding should error.
-        *bytes.last_mut().unwrap() = 0xff;
-        assert!(decode_module(&bytes).is_err());
+    fn rejects_a_truncated_debug_section() {
+        // A truncated section must fail to decode, never panic (untrusted-input discipline): a
+        // declared count/length runs past the bytes (a blob's length, a var/type count, …).
+        let bytes = encode_module(&module(Some(sample_debug())));
+        for cut in 1..=8 {
+            let truncated = &bytes[..bytes.len() - cut];
+            assert!(
+                decode_module(truncated).is_err(),
+                "truncating {cut} byte(s) must error, not panic"
+            );
+        }
     }
 }
 

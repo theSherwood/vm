@@ -1104,10 +1104,24 @@ terminator.) Tests (`c_frontend.rs`): named locals read by C name at a breakpoin
 `ssalist`), source-line mapping, structured types, and a **loop accumulator** whose `(i, acc)` read
 correctly across iterations — chibicc debugging promoted code end-to-end.
 
-**Not yet (next slices):** wasm/LLVM **variable** ingest (now representable via `SsaList`); the
-LLVM `!DILocation` → `debug.loc` path; and a per-producer rich blob. (The chibicc producer — now
-incl. location lists for the optimized build — both DAP consumers, binary serialization, a second
-producer's source lines, and the location-list ABI are all built.)
+**Slice 18 — per-producer rich blob (the §6 waist's opaque half).** `DebugInfo` gained
+`blobs: Vec<ProducerBlob{producer, bytes}>` — a frontend's **native** debug info carried through the
+IR verbatim (the middle never parses it; only a future DWARF/DI re-emitter (W5) will; the verifier
+ignores it, §2a). Text (`debug.blob "<producer>" "<escaped bytes>"`, reusing the data-segment byte
+escaping) and binary forms round-trip it (incl. non-UTF-8 / NUL bytes); the no-debug encoding stays
+a byte-prefix. The **wasm** producer now passes every embedded `.debug_*` section through as a blob
+(tagged by section name), so a guest's full DWARF survives transpilation — and `.debug_info` (the
+variable-bearing section the core doesn't yet parse) is preserved for later. This freezes the §6
+schema's rich-blob slot, as the doc recommended. Tests: wasm carries `.debug_info`/`.debug_line`
+blobs verbatim; text + binary round-trips; a truncated debug section errors without panicking.
+
+**Not yet (next slices):** wasm/LLVM **variable** ingest — the large, design-heavy piece: it needs
+full `.debug_info`/`.debug_abbrev` DIE parsing **and** a location model for DWARF's frame-base /
+`DW_OP_fbreg` memory locations (clang `-O0` describes C-frame memory, not our SSA/window values, so
+neither `Ssa`/`SsaList` nor `Window` maps directly — a runtime `__stack_pointer`-relative base). The
+LLVM `!DILocation` → `debug.loc` bitcode-metadata path is its own effort. (The chibicc producer
+(incl. optimized-build location lists), both DAP consumers, binary serialization, a second
+producer's source lines, the location-list ABI, and now the rich-blob pass-through are all built.)
 
 ### Open questions (S4/S5/S2)
 

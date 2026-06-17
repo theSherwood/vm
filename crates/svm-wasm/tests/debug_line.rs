@@ -26,9 +26,23 @@ fn wasm_dwarf_line_maps_into_the_debug_info_waist() {
         "file table names the C source: {:?}",
         di.files
     );
-    // Only source locations are ingested in this slice (no types/vars yet).
+    // Only source locations are ingested as core (no types/vars yet).
     assert!(di.types.is_empty() && di.vars.is_empty());
     assert!(!di.locs.is_empty(), "some source locations were mapped");
+
+    // Every `.debug_*` section is carried through verbatim as a §6 rich blob (for a future DWARF
+    // re-emitter) — including the variable-bearing `.debug_info`, which the core doesn't yet parse.
+    assert!(
+        di.blobs.iter().any(|b| b.producer == ".debug_line"),
+        "passes .debug_line through as a blob: {:?}",
+        di.blobs.iter().map(|b| &b.producer).collect::<Vec<_>>()
+    );
+    let info = di
+        .blobs
+        .iter()
+        .find(|b| b.producer == ".debug_info")
+        .expect("carries .debug_info verbatim");
+    assert!(!info.bytes.is_empty(), "the blob is the raw section bytes");
 
     // The body's source lines (2: `int s = a + b;`, 3: `return s + 1;`) are present, and every loc
     // resolves to an in-range IR pc — the cross-check that the wasm-offset→IR-pc mapping is sane.

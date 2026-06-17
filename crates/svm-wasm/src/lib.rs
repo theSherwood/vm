@@ -180,6 +180,9 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // and the raw embedded `.debug_line` DWARF, if any.
     let mut code_content_start = 0usize;
     let mut debug_line: Option<Vec<u8>> = None;
+    // Every embedded DWARF section (`.debug_*`), passed through verbatim as §6 rich blobs so a
+    // future DWARF re-emitter has the guest's full native debug info (nothing is lost on transpile).
+    let mut debug_blobs: Vec<svm_ir::ProducerBlob> = Vec::new();
     let mut exports: Vec<(String, u32)> = Vec::new();
     let mut mem: Option<wasmparser::MemoryType> = None;
     let mut data: Vec<svm_ir::Data> = Vec::new();
@@ -390,9 +393,16 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             // offsets to the code-relative addresses DWARF line entries use.
             Payload::CodeSectionStart { range, .. } => code_content_start = range.start,
             Payload::CodeSectionEntry(body) => bodies.push(body),
-            // Capture embedded DWARF line info (`.debug_line`) for the §6 debug-info on-ramp.
-            Payload::CustomSection(reader) if reader.name() == ".debug_line" => {
-                debug_line = Some(reader.data().to_vec());
+            // Embedded DWARF: parse `.debug_line` for source locations, and pass every `.debug_*`
+            // section through verbatim as a rich blob (§6 / D-DBG-7) for a future DWARF re-emitter.
+            Payload::CustomSection(reader) if reader.name().starts_with(".debug") => {
+                if reader.name() == ".debug_line" {
+                    debug_line = Some(reader.data().to_vec());
+                }
+                debug_blobs.push(svm_ir::ProducerBlob {
+                    producer: reader.name().to_string(),
+                    bytes: reader.data().to_vec(),
+                });
             }
             Payload::DataSection(reader) => {
                 for seg in reader {
@@ -658,62 +668,69 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             // §7 named imports (real WASI etc.): the host resolves these to concrete capabilities at
             // load (`resolve_imports`). Empty for the numeric host-ABI convention (inline `cap.call`).
             imports: named_imports,
-            // Debug info — map wasm's embedded DWARF `.debug_line` into the §6 waist (D-DBG-7).
-            debug_info: debug_line.and_then(|dl| build_debug_info(&dl, op_locs)),
+            // Debug info — map wasm's embedded DWARF `.debug_line` into the §6 waist (D-DBG-7) and
+            // carry every `.debug_*` section through as a rich blob.
+            debug_info: build_debug_info(debug_line.as_deref(), op_locs, debug_blobs),
         },
         exports,
     })
 }
 
-/// Map an embedded DWARF `.debug_line` (parsed by [`dwarf_line`]) onto the §6 debug-info waist:
-/// each line row's code-relative address resolves to the IR pc of the first operator at-or-after it
-/// (`op_locs`, which the lowering recorded). Best-effort: returns `None` if the DWARF is malformed
-/// or nothing maps. The verifier ignores this section (§2a).
+/// Build the §6 debug-info waist from a wasm guest's embedded DWARF: map `.debug_line` rows onto IR
+/// pcs (each line row's code-relative address resolving to the first operator at-or-after it, via
+/// the `op_locs` the lowering recorded), and carry every `.debug_*` section through as a rich blob.
+/// Best-effort: returns `None` only if neither locations nor blobs are present. The verifier ignores
+/// the section (§2a).
 fn build_debug_info(
-    debug_line: &[u8],
+    debug_line: Option<&[u8]>,
     mut op_locs: Vec<(u32, u32, u32, u32)>,
+    blobs: Vec<svm_ir::ProducerBlob>,
 ) -> Option<DebugInfo> {
-    let prog = dwarf_line::parse(debug_line)?;
-    if prog.files.len() <= 1 {
-        return None; // only the index-0 placeholder ⇒ no usable file table
-    }
-    // DWARF file indices are 1-based; flatten to a 0-based table for `Loc::file`.
-    let files: Vec<String> = prog.files[1..].to_vec();
-    op_locs.sort_by_key(|e| e.0);
-
+    let mut files: Vec<String> = Vec::new();
     let mut locs: Vec<Loc> = Vec::new();
-    for row in &prog.rows {
-        if row.end_sequence || row.file == 0 || row.file as usize > files.len() {
-            continue;
+    if let Some(prog) = debug_line.and_then(dwarf_line::parse) {
+        if prog.files.len() > 1 {
+            // DWARF file indices are 1-based; flatten to a 0-based table for `Loc::file`.
+            files = prog.files[1..].to_vec();
+            op_locs.sort_by_key(|e| e.0);
+            for row in &prog.rows {
+                if row.end_sequence || row.file == 0 || row.file as usize > files.len() {
+                    continue;
+                }
+                // The line starts at the first recorded instruction at-or-after its address.
+                let addr = row.address as u32;
+                let idx = op_locs.partition_point(|e| e.0 < addr);
+                let Some(&(_, func, block, inst)) = op_locs.get(idx) else {
+                    continue;
+                };
+                // Coalesce: skip a row landing on the same pc as the previous one (the earlier/lower
+                // address wins, matching `source_loc`'s nearest-preceding resolution).
+                if locs
+                    .last()
+                    .is_some_and(|l| (l.func, l.block, l.inst) == (func, block, inst))
+                {
+                    continue;
+                }
+                locs.push(Loc {
+                    func,
+                    block,
+                    inst,
+                    file: (row.file - 1) as u32,
+                    line: row.line,
+                    col: row.col,
+                });
+            }
         }
-        // The line starts at the first recorded instruction at-or-after its address.
-        let addr = row.address as u32;
-        let idx = op_locs.partition_point(|e| e.0 < addr);
-        let Some(&(_, func, block, inst)) = op_locs.get(idx) else {
-            continue;
-        };
-        // Coalesce: skip a row that lands on the same pc as the previous one (the earlier/lower
-        // address wins, matching `source_loc`'s nearest-preceding resolution).
-        if locs
-            .last()
-            .is_some_and(|l| (l.func, l.block, l.inst) == (func, block, inst))
-        {
-            continue;
-        }
-        locs.push(Loc {
-            func,
-            block,
-            inst,
-            file: (row.file - 1) as u32,
-            line: row.line,
-            col: row.col,
-        });
     }
-    (!locs.is_empty()).then_some(DebugInfo {
+    if locs.is_empty() && blobs.is_empty() {
+        return None;
+    }
+    Some(DebugInfo {
         files,
         locs,
         types: Vec::new(),
         vars: Vec::new(),
+        blobs,
     })
 }
 

@@ -24,9 +24,9 @@ use std::fmt::Write as _;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, FBinOp, FCmpOp,
     FToI, FUnOp, Field, FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc,
-    Memory, Module, Ordering, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp,
-    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp,
-    VWidenOp, ValType, VarInfo, VarLoc,
+    Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape,
+    VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -94,7 +94,12 @@ pub fn print_module(m: &Module) -> String {
 /// `debug.var <fn> "<name>" win|ssa <n> "<type>" [<type_id>]`. Absent ⇒ nothing printed.
 fn print_debug_info(s: &mut String, m: &Module) {
     let Some(di) = &m.debug_info else { return };
-    if di.files.is_empty() && di.locs.is_empty() && di.types.is_empty() && di.vars.is_empty() {
+    if di.files.is_empty()
+        && di.locs.is_empty()
+        && di.types.is_empty()
+        && di.vars.is_empty()
+        && di.blobs.is_empty()
+    {
         return;
     }
     s.push('\n');
@@ -169,6 +174,15 @@ fn print_debug_info(s: &mut String, m: &Module) {
             let _ = write!(s, " {tid}");
         }
         s.push('\n');
+    }
+    // Opaque per-producer rich blobs (§6): `debug.blob "<producer>" "<escaped bytes>"`.
+    for b in &di.blobs {
+        let _ = writeln!(
+            s,
+            "debug.blob \"{}\" \"{}\"",
+            b.producer,
+            escape_bytes(&b.bytes)
+        );
     }
 }
 
@@ -774,6 +788,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     let mut dbg_locs: Vec<Loc> = Vec::new();
     let mut dbg_types: Vec<TypeDef> = Vec::new();
     let mut dbg_vars: Vec<VarInfo> = Vec::new();
+    let mut dbg_blobs: Vec<ProducerBlob> = Vec::new();
     while !p.at_end() {
         match p.peek() {
             // Debug-info waist (DEBUGGING.md §6) — strippable tooling, parsed into `Module::
@@ -912,6 +927,14 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     type_id,
                 });
             }
+            // Opaque per-producer rich blob (§6): `debug.blob "<producer>" "<bytes>"`.
+            Some(Tok::Ident(s)) if s == "debug.blob" => {
+                p.next()?;
+                let producer = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.blob producer is not valid UTF-8".into()))?;
+                let bytes = p.parse_str()?;
+                dbg_blobs.push(ProducerBlob { producer, bytes });
+            }
             // Module-level `memory <size_log2>` declaration.
             Some(Tok::Ident(s)) if s == "memory" => {
                 p.next()?;
@@ -962,6 +985,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
         && dbg_locs.is_empty()
         && dbg_types.is_empty()
         && dbg_vars.is_empty()
+        && dbg_blobs.is_empty()
     {
         None
     } else {
@@ -970,6 +994,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
             locs: dbg_locs,
             types: dbg_types,
             vars: dbg_vars,
+            blobs: dbg_blobs,
         })
     };
     Ok(Module {
@@ -1089,6 +1114,11 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 if matches!(p.peek(), Some(Tok::Int(_))) {
                     p.parse_int()?; // optional structured type id
                 }
+            }
+            Some(Tok::Ident(s)) if s == "debug.blob" => {
+                p.next()?;
+                p.parse_str()?; // producer
+                p.parse_str()?; // bytes
             }
             _ => return err("expected `func` or `memory`"),
         }

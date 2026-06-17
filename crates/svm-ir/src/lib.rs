@@ -2110,6 +2110,19 @@ pub struct DebugInfo {
     pub types: Vec<TypeDef>,
     /// Source variables and where their value lives (the §6 neutral `VarLoc` = S2).
     pub vars: Vec<VarInfo>,
+    /// Opaque per-producer debug blobs (the §6 / D-DBG-7 "rich blob"): a frontend's native debug
+    /// info (DWARF sections, LLVM DI metadata) carried through the IR verbatim. The middle never
+    /// parses it — only a future DWARF/DI re-emitter (W5) does — and the verifier ignores it (§2a,
+    /// strippable / untrusted-for-escape). Empty for the common case.
+    pub blobs: Vec<ProducerBlob>,
+}
+
+/// An opaque per-producer debug blob (DEBUGGING.md §6 rich blob). `producer` tags the format so a
+/// consumer can dispatch (e.g. `".debug_info"`, `".debug_str"`, `"llvm-di"`); `bytes` is verbatim.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProducerBlob {
+    pub producer: String,
+    pub bytes: Vec<u8>,
 }
 
 /// An index into [`DebugInfo::types`].
