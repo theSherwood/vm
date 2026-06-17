@@ -102,6 +102,11 @@
 //!   `insertvalue`/`extractvalue`/`ret` and multi-result `call`s track the aggregate field-wise in a
 //!   block-local side-table (assumed not to cross blocks — clang's register-coercion pattern). Plus
 //!   `llvm.experimental.noalias.scope.decl` dropped (an alias hint).
+//! - **U — narrow-signed `icmp` fix (lands tinfl).** A **narrow** (`i8`/`i16`) operand of a signed
+//!   `icmp` is sign-extended to `i32` first (§3b: a narrow value sits in an `i32` container with
+//!   unspecified high bits — e.g. a zero-extended `i16` load of a *signed* value, where `< 0` would
+//!   otherwise always be false). This corrects tinfl's Huffman slow-path (`mz_int16` table entry
+//!   `< 0`), which had produced a corrupt back-reference pointer.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): variable-length `memmove` (overlap),
 //! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `realloc`,
@@ -2969,8 +2974,26 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         I::ICmp(x) => {
             let ty = bin_ty(&x.operand0)?;
             let op = icmp_op(x.predicate);
-            let a = ctx.operand(&x.operand0)?;
-            let b = ctx.operand(&x.operand1)?;
+            let mut a = ctx.operand(&x.operand0)?;
+            let mut b = ctx.operand(&x.operand1)?;
+            // A **narrow** (< i32) operand sits in an i32 container whose high bits are unspecified
+            // (e.g. a zero-extended `i16` load of a *signed* value) — the i32 compare needs it
+            // canonically extended: sign-extended for a signed predicate, zero-extended otherwise.
+            // Without this, `icmp slt i16 (zext-loaded), 0` is always false (§3b narrow-int hazard).
+            // (i32/i64/pointer operands are already full-width.)
+            if let Some(w) = int_bits(x.operand0.get_type(types).as_ref()) {
+                if w < 32 {
+                    let signed = matches!(
+                        x.predicate,
+                        IntPredicate::SLT
+                            | IntPredicate::SLE
+                            | IntPredicate::SGT
+                            | IntPredicate::SGE
+                    );
+                    a = emit_ext(ctx, a, w, 32, signed);
+                    b = emit_ext(ctx, b, w, 32, signed);
+                }
+            }
             (&x.dest, ctx.push(Inst::IntCmp { ty, op, a, b }))
         }
         I::Select(x) => {

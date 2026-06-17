@@ -8,17 +8,15 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–T done — a broad swath of scalar C from `clang -O2` runs on both
-backends (60 tests), and **six real corpus libraries run byte-identical to native**: B-Con's
-**SHA-256**, **xxHash**, **stb_perlin**, **tiny-regex-c**, **jsmn**, and **heapgrow**
-(`demo_*_vs_native`). Slice S added **`malloc`/heap** — `malloc`/`calloc` lower to a synthesized bump
-allocator that grows the heap into the window's reserved tail by `vm_map`-committing pages on demand
-via the `Memory` capability (the §1a sparse-address-space win), landing heapgrow. Slice T added
-**multi-value struct returns** (a small by-value struct → an SVM multi-result function, via
-`insertvalue`/`extractvalue` + multi-result `call`s). The two remaining corpus demos need bigger,
-separately-scoped work: **clay** uses real `<2 x float>` **SIMD** (loads/stores/`fadd`/phi — a
-milestone-2 vector slice), and **tinfl** translates+verifies but hits a runtime pointer-corruption
-bug under investigation.
+**Status: Milestone 1 slices A–U done — a broad swath of scalar C from `clang -O2` runs on both
+backends (62 tests), and **seven of the eight corpus libraries run byte-identical to native**:
+B-Con's **SHA-256**, **xxHash**, **stb_perlin**, **tiny-regex-c**, **jsmn**, **heapgrow**, and
+**miniz/tinfl** (`demo_*_vs_native`). Slice T added **multi-value struct returns** (a small by-value
+struct → an SVM multi-result function, via `insertvalue`/`extractvalue` + multi-result `call`s). Slice
+U fixed a **narrow-signed `icmp`** bug (a signed compare of a zero-extended `i8`/`i16` must
+sign-extend first, §3b) — which landed tinfl (its Huffman slow-path tests a `mz_int16 < 0`). The one
+remaining corpus demo, **clay**, uses real `<2 x float>` **SIMD** (loads/stores/`fadd`/phi — a
+milestone-2 vector slice).
 A **kitchen-sink capstone** exercises everything at once (structs by-value, a function-pointer table,
 floats+libm, recursion, loops, an array `memcpy`, a global array, `switch`, bit intrinsics) and
 matches **native `cc`** end to end. **Slice N** binds the raw I/O primitives (`write`/`read` →
@@ -46,12 +44,12 @@ conversions, `fabs`/`floor`, an indirect call through a function pointer, struct
 a struct string-pointer member), libm math calls (`sqrt`/`fmin`), and int min/max + bit intrinsics
 (`smax`/`ctlz`/`popcount`), funnel-shift rotates (`fshl`/`fshr`), and a variable-length `memset`
 loop, `ptr`↔`int`, `freeze`, a constexpr GEP, RO/writable page isolation, `llvm.load.relative`, a
-`vm_map`-growing `malloc`/`calloc`/`free`, multi-value struct returns — run **interp == JIT ==
-hand-computed** (60 tests, incl. a kitchen-sink program checked against native `cc`,
-`write`/`exit`/`read`-echo and `puts`/`printf`/`putchar`/`fwrite`/`fputs` powerbox programs, and the
-**SHA-256 / xxHash / perlin / regex / jsmn / heapgrow corpus demos**, all checked against native stdout).
-Remaining for the full corpus: `<2 x float>` SIMD (clay) and a tinfl runtime-pointer fix; varargs
-`printf` is a general-C follow-up (no corpus demo needs it). Section numbers like "§3d"
+`vm_map`-growing `malloc`/`calloc`/`free`, multi-value struct returns, narrow-signed `icmp` — run
+**interp == JIT == hand-computed** (62 tests, incl. a kitchen-sink program checked against native
+`cc`, `write`/`exit`/`read`-echo and `puts`/`printf`/`putchar`/`fwrite`/`fputs` powerbox programs, and
+the **SHA-256 / xxHash / perlin / regex / jsmn / heapgrow / tinfl corpus demos**, all checked against
+native stdout). Remaining for the full corpus: only `<2 x float>` SIMD (clay); varargs `printf` is a
+general-C follow-up (no corpus demo needs it). Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
@@ -524,19 +522,26 @@ returning a 2-field struct) maps to an SVM **multi-result** function (§3a).
       did, `agg_of` returns `None` → a clean error). Plus `llvm.experimental.noalias.scope.decl`
       dropped. Tested: `multi_value_struct_return` (a `{i64,i64}` return round-trip vs native).
 
+**Slice U (DONE) — narrow-signed `icmp` (lands tinfl).** A signed `icmp` on a **narrow** (`i8`/`i16`)
+operand now sign-extends the operand to `i32` first (`emit_ext` with the predicate's signedness),
+fixing the §3b hazard where a zero-extended narrow value (e.g. an `i16` load of a *signed*
+`mz_int16`) made `< 0` always false.
+- [x] Root-caused from tinfl's runtime fault: the Huffman slow-path `do { temp = tree[~temp + bit]; }
+      while (temp < 0)` compared a zero-extended `i16` table entry against 0 (always false), so `~temp`
+      produced index `-1` → `zext` `0xFFFFFFFF` → `×2` → a bit-33 corrupt back-reference pointer.
+- [x] Lands **tinfl** (`demo_tinfl_vs_native`) — miniz inflate, byte-identical to native. Plus a
+      focused `narrow_signed_compare` regression (summing negative signed-`short` table entries).
+
 **Remaining slices.**
-- [ ] **`<2 x float>` (and small `<N x T>`) SIMD** — the last *corpus* blocker (**clay**: 2D-point
+- [ ] **`<2 x float>` (and small `<N x T>`) SIMD** — the *last corpus blocker* (**clay**: 2D-point
       loads/stores/`fadd`/phi/extractelement). A real vector slice (mirror §17/D58 `v128`, or unpack
       2-lane floats to scalars). Milestone-2-scale.
-- [ ] **tinfl runtime fault** — translates+verifies, but a back-reference base pointer comes out
-      corrupt (bit 33 set; faults at ~`0x2_0000_779e` where the low `0x779e` is a valid dict offset).
-      Localized to one load of a bad pointer; root cause still open.
 - [ ] Varargs `printf`/`fprintf`/`snprintf` (varargs ABI on the data stack + a format engine) — a
       **general-C** follow-up (no corpus demo needs it); `puts`/`fputs` of a non-literal string;
       `realloc`; `argc`/`argv`; transcendental math; `llvm.bswap`/`bitreverse`.
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
-      (clay, jsmn ✅, sha256 ✅, xxhash ✅, tinfl, perlin ✅, regex ✅, heapgrow ✅). The D54 "matches
-      native clang" exit criterion. **6 of 8 land**; remaining: clay (SIMD) + tinfl (the pointer bug).
+      (clay, jsmn ✅, sha256 ✅, xxhash ✅, tinfl ✅, perlin ✅, regex ✅, heapgrow ✅). The D54 "matches
+      native clang" exit criterion. **7 of 8 land**; only clay remains (the `<2 x float>` SIMD slice).
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).

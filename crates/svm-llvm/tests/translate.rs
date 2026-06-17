@@ -1012,6 +1012,27 @@ fn ro_and_writable_global_page_isolation() {
 }
 
 #[test]
+fn demo_tinfl_vs_native() {
+    // miniz's tinfl DEFLATE/zlib inflate engine: a deeply nested coroutine-macro state machine with
+    // Huffman fast/slow lookup tables (`mz_int16`) and a 32 KiB LZ77 dictionary. Inflates an embedded
+    // zlib stream and writes it out — byte-identical to native. (Regression for the narrow-signed
+    // `icmp` fix: the slow Huffman walk tests a sign-extended `i16` table entry `< 0`.)
+    check_demo_vs_native("tinfl", "tinfl/tinfl_demo.c", b"");
+}
+
+#[test]
+fn narrow_signed_compare() {
+    // §3b narrow-int hazard: a *signed* `i16`/`i8` value loaded zero-extended must be sign-extended
+    // before a signed `icmp` (else `< 0` is always false). Sum the negative entries of a signed-short
+    // table — wrong (0) without the fix. Compared to native `cc`.
+    let src = "int run(int n){ static const short t[6] = {-1, -100, 5, -32768, 32767, -7}; \
+               int s = 0; for (int k = 0; k < 6; k++) if (t[k] < 0) s += t[k]; \
+               return (s ^ n) & 0xff; } \
+               int main(void){ return run(0); }";
+    check_vs_native("narrow_signed_cmp", src, 0);
+}
+
+#[test]
 fn multi_value_struct_return() {
     // A small by-value struct returned in two registers — clang coerces it to a `{ i64, i64 }`
     // return (`insertvalue`/`ret`) the caller destructures with `extractvalue`. Exercises the §3a
