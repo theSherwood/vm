@@ -82,12 +82,17 @@
 //!   helper** (`__svm_memset`/`__svm_memcpy`, a real counted byte loop — the first multi-block helper)
 //!   instead of an inline unroll. Together these make B-Con's **SHA-256** run byte-identical to
 //!   native `clang` (`demo_sha256_vs_native`).
+//! - **Q — more corpus demos + the gaps they revealed.** `ptrtoint`/`inttoptr` (a width adjust —
+//!   pointers are `i64`), `freeze` (identity — the IR is total), and **constexpr GEP** (an interior
+//!   pointer into a constant aggregate, `&".."[k]`/`&g.f`, folded to base+offset). Plus a layout fix:
+//!   **read-only globals are page-isolated from writable ones** (a `const` next to a mutable `static`
+//!   would otherwise fault writes on the shared D40-protected page). Lands **xxHash**, **stb_perlin**,
+//!   and **tiny-regex-c** byte-identical to native.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): variable-length `memmove` (overlap),
 //! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `malloc`/heap,
 //! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen),
-//! `llvm.load.relative` (clang's relative-offset string tables) and GEP-constexpr relocations
-//! (`&arr[k]`), SIMD vectors, `i33`.
+//! `llvm.load.relative` (clang's relative-offset string tables), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -265,12 +270,13 @@ fn const_eval(
     c: &Constant,
     globals: &HashMap<String, u64>,
     funcs: &HashMap<String, u32>,
+    types: &Types,
 ) -> Result<i64, Error> {
     use Constant as K;
     let bin = |a: &Constant, b: &Constant| -> Result<(i64, i64), Error> {
         Ok((
-            const_eval(a, globals, funcs)?,
-            const_eval(b, globals, funcs)?,
+            const_eval(a, globals, funcs, types)?,
+            const_eval(b, globals, funcs, types)?,
         ))
     };
     match c {
@@ -287,15 +293,72 @@ fn const_eval(
             }
         }
         // Pointer/width casts pass the value through; the byte width is the *consumer*'s job.
-        K::PtrToInt(x) => const_eval(x.operand.as_ref(), globals, funcs),
-        K::IntToPtr(x) => const_eval(x.operand.as_ref(), globals, funcs),
-        K::BitCast(x) => const_eval(x.operand.as_ref(), globals, funcs),
-        K::Trunc(x) => const_eval(x.operand.as_ref(), globals, funcs),
+        K::PtrToInt(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
+        K::IntToPtr(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
+        K::BitCast(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
+        K::Trunc(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
         K::Add(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_add(b)),
         K::Sub(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_sub(b)),
         K::Mul(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_mul(b)),
+        // An interior pointer into a constant aggregate (`&arr[k]`, `&s.f`, a string-literal tail
+        // `&".."[k]`) — base address plus the type-walked constant byte offset (§3b, like `getelementptr`).
+        K::GetElementPtr(g) => {
+            let base = const_eval(g.address.as_ref(), globals, funcs, types)?;
+            Ok(base.wrapping_add(const_gep_offset(g, types)?))
+        }
         other => unsup(format!("constexpr initializer {other:?}")),
     }
+}
+
+/// The constant byte offset of a **constexpr** `getelementptr` (all indices constant), walking the
+/// pointee type (carried by the base `GlobalReference`) exactly as [`translate_gep`] does for the
+/// instruction form: index 0 strides by the whole pointee, later indices descend array elements /
+/// struct fields.
+fn const_gep_offset(g: &llvm_ir::constant::GetElementPtr, types: &Types) -> Result<i64, Error> {
+    // The pointee type the GEP indexes from — a `GlobalReference` carries it directly.
+    let mut cur = match g.address.as_ref() {
+        Constant::GlobalReference { ty, .. } => ty.clone(),
+        other => return unsup(format!("constexpr GEP base {other:?}")),
+    };
+    let idx_val = |c: &Constant| -> Result<i64, Error> {
+        match c {
+            Constant::Int { value, .. } => Ok(*value as i64),
+            _ => unsup("constexpr GEP with non-constant index"),
+        }
+    };
+    let mut off: i64 = 0;
+    for (k, idx) in g.indices.iter().enumerate() {
+        let iv = idx_val(idx.as_ref())?;
+        if k > 0
+            && matches!(
+                cur.as_ref(),
+                Type::StructType { .. } | Type::NamedStructType { .. }
+            )
+        {
+            let (fields, packed) = resolve_struct(cur.as_ref(), types)?;
+            let (offsets, _, _) = struct_layout(&fields, packed, types)?;
+            off += *offsets
+                .get(iv as usize)
+                .ok_or_else(|| Error::Unsupported("constexpr GEP field out of range".into()))?
+                as i64;
+            cur = fields[iv as usize].clone();
+            continue;
+        }
+        let stride = if k == 0 {
+            type_size(cur.as_ref(), types)?
+        } else {
+            match cur.as_ref() {
+                Type::ArrayType { element_type, .. } => {
+                    let s = type_size(element_type.as_ref(), types)?;
+                    cur = element_type.clone();
+                    s
+                }
+                other => return unsup(format!("constexpr GEP into type {other}")),
+            }
+        };
+        off += iv.wrapping_mul(stride as i64);
+    }
+    Ok(off)
 }
 
 /// The serialized byte length of a constant initializer — identical to `const_bytes(…).len()`, but
@@ -374,7 +437,7 @@ fn const_bytes(
                     "constexpr initializer wider than 8 bytes ({width})"
                 ));
             }
-            let v = const_eval(other, globals, funcs)?;
+            let v = const_eval(other, globals, funcs, types)?;
             Ok(v.to_le_bytes()[..width as usize].to_vec())
         }
     }
@@ -403,24 +466,44 @@ fn globals_layout(
 ) -> Result<Globals, Error> {
     // Phase A: assign every global a window address (from its declared type size), so a relocation
     // in any initializer can resolve a forward/backward reference to another global in phase B.
+    //
+    // **Read-only globals are page-isolated from writable ones** (D40): a constant segment is
+    // protected page-granularly, so if a `const` global shared a page with a writable/BSS global
+    // (e.g. clang's `static char buf[]` next to a string literal), a legitimate write to the
+    // writable one would fault on the read-only page. So lay writable globals first, page-align, then
+    // the read-only globals — the read-only region begins on a fresh page and the writable region's
+    // last page carries no constant. (The data stack is already page-aligned above all of them.)
     let mut addr = HashMap::new();
     let mut off = base;
     let mut placed: Vec<(usize, u64)> = Vec::with_capacity(m.global_vars.len());
-    for (gi, g) in m.global_vars.iter().enumerate() {
-        // Size from the initializer's serialized length (matches phase B exactly); BSS/extern
-        // globals have no initializer, so fall back to the declared type size.
-        let size = match &g.initializer {
-            Some(init) => const_size(init.as_ref(), &m.types)?,
-            None => type_size(g.ty.as_ref(), &m.types)?,
-        }
-        .max(1);
-        let align = (g.alignment as u64).max(1);
-        off = off.div_ceil(align) * align;
-        addr.insert(name_str(&g.name), off);
-        placed.push((gi, off));
-        off += size;
+    let mut place =
+        |off: &mut u64, addr: &mut HashMap<String, u64>, want_const: bool| -> Result<(), Error> {
+            for (gi, g) in m.global_vars.iter().enumerate() {
+                if g.is_constant != want_const {
+                    continue;
+                }
+                // Size from the initializer's serialized length (matches phase B exactly); BSS/extern
+                // globals have no initializer, so fall back to the declared type size.
+                let size = match &g.initializer {
+                    Some(init) => const_size(init.as_ref(), &m.types)?,
+                    None => type_size(g.ty.as_ref(), &m.types)?,
+                }
+                .max(1);
+                let align = (g.alignment as u64).max(1);
+                *off = off.div_ceil(align) * align;
+                addr.insert(name_str(&g.name), *off);
+                placed.push((gi, *off));
+                *off += size;
+            }
+            Ok(())
+        };
+    place(&mut off, &mut addr, false)?; // writable + BSS globals
+    let any_const = m.global_vars.iter().any(|g| g.is_constant);
+    if any_const && off > base {
+        off = off.div_ceil(STACK_PAGE) * STACK_PAGE; // page-isolate the read-only region
     }
-    // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
+    place(&mut off, &mut addr, true)?; // read-only (constant) globals
+                                       // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
     let mut segs = Vec::new();
     let mut cstrs = HashMap::new();
     for (gi, at) in placed {
@@ -802,6 +885,9 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         I::Trunc(x) => locals(&[&x.operand]),
         I::ZExt(x) => locals(&[&x.operand]),
         I::SExt(x) => locals(&[&x.operand]),
+        I::PtrToInt(x) => locals(&[&x.operand]),
+        I::IntToPtr(x) => locals(&[&x.operand]),
+        I::Freeze(x) => locals(&[&x.operand]),
         // Floats.
         I::FAdd(x) => locals(&[&x.operand0, &x.operand1]),
         I::FSub(x) => locals(&[&x.operand0, &x.operand1]),
@@ -1995,6 +2081,8 @@ struct BlockCtx<'a> {
     cstrs: &'a HashMap<String, u64>,
     /// Synthesized mem-loop helper indices (for a variable-length `memset`/`memcpy`).
     helpers: Helpers,
+    /// The module's type table — for resolving a constexpr-GEP operand's strides in [`operand`].
+    types: &'a Types,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     next_val: ValIdx,
@@ -2151,6 +2239,12 @@ impl<'a> BlockCtx<'a> {
                         unsup(format!("reference to `@{n}` (undefined/external global)"))
                     }
                 }
+                // A constexpr interior pointer (`&".str"[k]`, `&g.field`) — fold to its constant
+                // window address (base global + type-walked offset), like the `getelementptr` instr.
+                Constant::GetElementPtr(_) => {
+                    let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
+                    Ok(self.push(Inst::ConstI64(v)))
+                }
                 other => unsup(format!("constant operand {other:?}")),
             },
             Operand::MetadataOperand => unsup("metadata operand"),
@@ -2189,6 +2283,7 @@ fn translate_block(
         caps,
         cstrs,
         helpers: *helpers,
+        types,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         next_val: 0,
@@ -2588,6 +2683,31 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 (f, t) => return unsup(format!("bitcast {} → {}", f.as_str(), t.as_str())),
             };
             (&x.dest, ctx.push(Inst::Cast { op, a }))
+        }
+        // Pointers are an `i64` window offset in our model (§3a/§10), so `ptr`↔`int` is a width
+        // adjust, never a reinterpret: `ptrtoint` truncates the `i64` pointer to the target width
+        // (identity at `i64`); `inttoptr` zero-extends a narrow integer up to the `i64` pointer.
+        I::PtrToInt(x) => {
+            let to = int_bits(x.to_type.as_ref())
+                .ok_or_else(|| Error::Unsupported("ptrtoint to non-int".into()))?;
+            let v = ctx.operand(&x.operand)?;
+            (&x.dest, emit_trunc(ctx, v, 64, to))
+        }
+        I::IntToPtr(x) => {
+            let from = src_bits(&x.operand, types)?;
+            let v = ctx.operand(&x.operand)?;
+            let r = if from >= 64 {
+                v // already i64 — identity
+            } else {
+                emit_ext(ctx, v, from, 64, false)
+            };
+            (&x.dest, r)
+        }
+        // `freeze` pins a would-be poison/undef to a fixed value. Our IR is total — `undef`/`poison`
+        // already resolve to a defined 0 (§3c) and no poison propagates — so `freeze` is an identity.
+        I::Freeze(x) => {
+            let a = ctx.operand(&x.operand)?;
+            (&x.dest, a)
         }
         other => return unsup(format!("instruction {other:?}")),
     };

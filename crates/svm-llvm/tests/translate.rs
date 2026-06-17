@@ -939,6 +939,45 @@ fn demo_sha256_vs_native() {
 }
 
 #[test]
+fn demo_xxhash_vs_native() {
+    // xxHash (XXH32/64) over the same inputs — 32- and 64-bit funnel-shift rotates + wide integer
+    // mixing. Already covered by slices A–P; byte-identical to native `clang`.
+    check_demo_vs_native("xxhash", "xxhash/xxh_demo.c", b"");
+}
+
+#[test]
+fn demo_perlin_vs_native() {
+    // stb_perlin: float-heavy noise (`fmuladd`/`fabs` intrinsics, int↔float, a const gradient table).
+    // The float coverage (slice F) + `llvm.abs` (slice M) carry it — matching native `clang`.
+    check_demo_vs_native("perlin", "perlin/perlin_demo.c", b"");
+}
+
+#[test]
+fn demo_regex_vs_native() {
+    // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
+    // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays
+    // sharing the globals region with read-only string literals (the page-isolation fix), and deep
+    // recursive control flow — byte-identical to native `clang`.
+    check_demo_vs_native("regex", "regex/regex_demo.c", b"");
+}
+
+#[test]
+fn ro_and_writable_global_page_isolation() {
+    // A read-only global (string literal) next to a writable one (a mutable array) must not share a
+    // protected page: a write to the writable global would otherwise fault on the read-only page
+    // (D40 is page-granular). `run` writes the array, reads the constant, returns their combination.
+    let src = "static char buf[8]; static const char msg[] = \"hi\"; \
+               int run(int n){ for (int i = 0; i < 8; i++) buf[i] = (char)(n + i); \
+               return buf[3] + msg[0] + msg[1]; }";
+    // buf[3] = n+3; msg = "hi" → 'h'(104) + 'i'(105). run(10): 13 + 104 + 105 = 222.
+    check_vs_native(
+        "ro_rw_page",
+        &format!("{src} int main(){{ return run(10); }}"),
+        10,
+    );
+}
+
+#[test]
 fn unsupported_is_fail_closed() {
     // A 128-bit integer is outside the subset — it must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).

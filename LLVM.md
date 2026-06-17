@@ -8,9 +8,13 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–P done — a broad swath of scalar C from `clang -O2` runs on both
-backends (52 tests), and the **first real corpus library runs byte-identical to native**: B-Con's
-**SHA-256** (`demo_sha256_vs_native`) hashing `""`/`"abc"`/the pangram, digests printed via `write`.
+**Status: Milestone 1 slices A–Q done — a broad swath of scalar C from `clang -O2` runs on both
+backends (56 tests), and **four real corpus libraries run byte-identical to native**: B-Con's
+**SHA-256**, **xxHash**, **stb_perlin**, and **tiny-regex-c** (`demo_*_vs_native`). Slice Q added the
+gaps they revealed — `ptrtoint`/`inttoptr` (a width adjust; pointers are `i64`), `freeze` (identity),
+**constexpr GEP** (interior pointers into constants, `&".."[k]`), and a layout fix **page-isolating
+read-only globals from writable ones** (a `const` beside a mutable `static` would otherwise fault
+writes on the shared D40-protected page).
 A **kitchen-sink capstone** exercises everything at once (structs by-value, a function-pointer table,
 floats+libm, recursion, loops, an array `memcpy`, a global array, `switch`, bit intrinsics) and
 matches **native `cc`** end to end. **Slice N** binds the raw I/O primitives (`write`/`read` →
@@ -37,9 +41,10 @@ conversions, `fabs`/`floor`, an indirect call through a function pointer, struct
 (small-coerced + `byval`/`sret`), and pointer-valued global relocations (a function-pointer table,
 a struct string-pointer member), libm math calls (`sqrt`/`fmin`), and int min/max + bit intrinsics
 (`smax`/`ctlz`/`popcount`), funnel-shift rotates (`fshl`/`fshr`), and a variable-length `memset`
-loop — run **interp == JIT == hand-computed** (52 tests, incl. a kitchen-sink program checked against
-native `cc`, `write`/`exit`/`read`-echo and `puts`/`printf`/`putchar`/`fwrite`/`fputs` powerbox
-programs, and the **SHA-256 corpus demo**, all checked against native stdout + exit code).
+loop, `ptr`↔`int`, `freeze`, a constexpr GEP, RO/writable page isolation — run **interp == JIT ==
+hand-computed** (56 tests, incl. a kitchen-sink program checked against native `cc`,
+`write`/`exit`/`read`-echo and `puts`/`printf`/`putchar`/`fwrite`/`fputs` powerbox programs, and the
+**SHA-256 / xxHash / perlin / regex corpus demos**, all checked against native stdout + exit code).
 Remaining M1: varargs `printf` (formatting) + `malloc`/heap, then more of the
 demo corpus (Lane C). Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
@@ -465,17 +470,34 @@ driving B-Con's SHA-256 (`sha_demo.c`) through the on-ramp and closing the two g
       byte-identical to native `clang`. Plus focused `funnel_shift_rotate` and
       `variable_length_memset_loop` unit checks.
 
+**Slice Q (DONE) — more corpus demos + the gaps they revealed.** Data-driven: drove xxHash, perlin,
+and tiny-regex-c through the on-ramp. xxHash + perlin needed *no* new code (slices A–P); regex hit a
+cluster of small gaps, all now closed.
+- [x] `ptrtoint`/`inttoptr` (instruction form): pointers are an `i64` window offset, so this is a
+      width adjust (identity at `i64`, `wrap`/`zext` for narrow), never a reinterpret.
+- [x] `freeze`: an identity — the IR is total (`undef`/`poison` → defined 0, no poison propagates).
+- [x] **Constexpr GEP** (`&".."[k]`, `&g.f`): an interior pointer into a constant aggregate, folded
+      to base address + type-walked constant offset (`const_gep_offset`, mirroring `translate_gep`);
+      handled both as an operand and inside an initializer.
+- [x] **Read-only globals are page-isolated from writable ones** (`globals_layout`): lay writable +
+      BSS globals first, page-align, then the read-only ones — so a `const` never shares a
+      D40-protected page with a writable/BSS global (a write to which would otherwise fault). This
+      was a latent layout bug, now exercised by regex's `static` arrays beside string literals.
+- [x] **Demos:** `demo_xxhash_vs_native`, `demo_perlin_vs_native`, `demo_regex_vs_native`, plus a
+      focused `ro_and_writable_global_page_isolation` unit check.
+
 **Remaining slices.**
-- [ ] `llvm.load.relative` (relative-offset string tables); transcendental math (needs a guest libm);
-      `llvm.bswap`/`bitreverse`.
+- [ ] `llvm.load.relative` (relative-offset string tables — blocks **jsmn**); transcendental math
+      (needs a guest libm); `llvm.bswap`/`bitreverse`.
 - [ ] Varargs `printf`/`fprintf`/`snprintf` (the varargs ABI on the data stack + a format engine) —
       the headline gap for numeric output; `puts`/`fputs` of a *non-literal* string (a runtime
-      strlen loop). `malloc`/`free` (→ the `Memory` capability + a guest allocator), `argc`/`argv`
-      `main`. The §7 import mechanism (slices N/O) and the multi-block helper (slice P) are the hard
-      parts; these build on them.
+      strlen loop). `malloc`/`free` (→ the `Memory` capability + a guest allocator — blocks
+      **heapgrow**), `argc`/`argv` `main`. The §7 import mechanism (slices N/O) and the multi-block
+      helper (slice P) are the hard parts; these build on them.
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
-      (the same corpus chibicc passes — clay, jsmn, sha256 ✅, xxhash, tinfl, perlin, regex,
-      heapgrow). This is the D54 "matches native clang" exit criterion. **sha256 lands first.**
+      (the same corpus chibicc passes — clay, jsmn, sha256 ✅, xxhash ✅, tinfl, perlin ✅, regex ✅,
+      heapgrow). This is the D54 "matches native clang" exit criterion. **4 of 8 land.** Remaining:
+      jsmn (needs `llvm.load.relative`), heapgrow (`malloc`), tinfl/clay (likely varargs `printf`).
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
