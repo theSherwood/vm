@@ -4281,6 +4281,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // becomes the next edge's scratch). Lives across the whole `run_inner` call, so the two
     // buffers ping-pong for free once warmed.
     let mut edge_buf: Vec<Value> = Vec::new();
+    // Reusable scratch for `return` results. The common case (a callee returning to a caller in
+    // the same fiber) gathers results here and copies them straight into the caller's value
+    // file, so a call/return pair no longer allocates a results `Vec` per return. The rarer
+    // root/fiber exits read out of the same buffer.
+    let mut ret_buf: Vec<Value> = Vec::new();
 
     // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
     // `return` pops and appends results to the caller (which resumes past the call); a tail
@@ -5322,13 +5327,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 frames[top].inst = 0;
             }
             Terminator::Return(out) => {
-                let results = collect(&frames[top].vals, out)?;
+                collect_into(&mut ret_buf, &frames[top].vals, out)?;
                 let popped = frames.pop();
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
-                    caller.vals.extend(results);
+                    // Copy results straight in — no per-return results `Vec`.
+                    caller.vals.extend_from_slice(&ret_buf);
                 } else if *cur == ROOT_FIBER {
-                    return Ok(Inner::Done(results)); // the root returned: this vCPU is done
+                    return Ok(Inner::Done(std::mem::take(&mut ret_buf))); // the root returned: this vCPU is done
                 } else {
                     // A fiber's function returned: hand its single `i64` back to the resumer
                     // with status RETURNED; the fiber is now `Done` (resuming again traps) —
@@ -5389,7 +5395,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[rtop].vals.push(Value::I32(FIBER_RETURNED));
                     frames[rtop]
                         .vals
-                        .push(results.into_iter().next().unwrap_or(Value::I64(0)));
+                        .push(ret_buf.first().copied().unwrap_or(Value::I64(0)));
                 }
             }
             Terminator::Unreachable => return Err(Trap::Unreachable),
