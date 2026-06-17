@@ -1129,7 +1129,10 @@ something new is a capability**:
   references; a wasm frontend emits named imports; both resolve against the same
   `name → (type_id, op)` table. The grant set is still **statically bounded per instance**
   (fixed once instantiation completes), so the §9 egress closure is unaffected — only the
-  *binding* moved from compile-time to instantiation-time.
+  *binding* moved from compile-time to instantiation-time. The **same named-import mechanism
+  generalizes to cross-unit linking** — a name may bind to another function (a direct `call`) or a
+  table slot (`call_indirect`), not only a capability — which is how in-window dynamic linking
+  (`vm_dlopen`) works; see §22.
 
 - **Reflection = an always-available intrinsic** (`cap.self`), read-only over the domain's
   **own** handle table: it returns the count and, per live entry, the `type_id` + op-schema
@@ -2016,11 +2019,13 @@ domain.**
 | 2 `release` | `(code) -> 0 \| -errno` | revoke the handle (generation bump). Code/slots not freed (see reclaim). |
 | 3 `install` | `(code) -> slot \| -errno` | write the unit into the `call_indirect` table's next reserved slot; returns a funcref index (`-ENOSPC` if full). |
 | 4 `uninstall` | `(slot) -> 0 \| -errno` | clear an installed slot (reusable; stale calls trap). |
+| 5 `compile_linked` | `(ir, ir_len, symtab, symtab_len) -> code \| -errno` | like `compile`, but the unit may carry **unresolved §7 imports** bound by name against the guest-provided symbol table before verify — the dynamic-linking entry (below). Fail-closed. |
 
-C surface (`frontend/chibicc`, `<svm.h>`): `__vm_jit_compile/invoke2/install/uninstall/release`, the
-8th of the fixed chibicc powerbox. Demos in `crates/svm-run/demos/jit/` (`jit_demo.c` self-JITs a
+C surface (`frontend/chibicc`, `<svm.h>`): `__vm_jit_compile/compile_linked/invoke2/install/uninstall/release`,
+the 8th of the fixed chibicc powerbox; the in-guest dynamic-linking loader `vm_dlopen`/`vm_dlsym`/`vm_dlclose`
+(`<vm_dl.h>`) sits on top (below). Demos in `crates/svm-run/demos/jit/` (`jit_demo.c` self-JITs a
 bytecode interpreter; `jit_threads.c` concurrently compiles from worker threads; `jit_repl.c` is the
-auto-compacting REPL driven by `JitSession`).
+auto-compacting REPL driven by `JitSession`; `jit_link.c`/`jit_dlopen.c`/`jit_hotreload.c` link by name).
 
 ### The one structural obstacle — the baked function-table mask
 
@@ -2119,6 +2124,77 @@ thunk on every recompaction, so a multi-threaded guest auto-compacts soundly bet
 
 **Deferred (gated on a measured need):** a coarse-lock→sharded-module optimization if parallel-compile
 *throughput* is ever shown to matter — a pure internal swap, since the guest iface is unchanged.
+
+### In-window dynamic linking (`vm_dlopen`)  [SETTLED — built, differentially tested]
+
+Loading separately-authored/compiled code units and resolving cross-unit references **by name** —
+the foundation for plugins, dynamic class loading in GC'd-language runtimes, a stateful REPL, and
+shared runtime libraries. (Absorbed from the former `DYNLINK.md` when the track completed.)
+
+**The model — linking is a source-to-source rewrite, above the TCB.** A unit carries *named
+placeholders* (`call.import "f"` with a self-describing op signature, the §7 import generalized from
+capabilities to any symbol). The loader resolves each name against a **symbol table** and rewrites the
+placeholder into a concrete instruction; by the time the verifier and both backends see the module it
+is an ordinary **closed** module — indistinguishable from any frontend's output, and **re-verified**
+like it. There is no runtime "linker" and no new IR execution semantics; a mis-link (wrong signature,
+missing symbol) is caught by re-verification, never trusted. Two flavors, both built:
+
+- **Static** (`svm_ir::link`, like `ld`) — merge separate units into **one module** before
+  compilation: function symbols → a **direct `call`**, data symbols → **constant addresses** in one
+  shared, 16-byte-aligned data window. `LinkUnit { module, exports, data_exports, relocations }`;
+  per-unit data is relocated by the unit's data base, `FuncIdx` sites are reindexed by its function
+  base, and a `DataReloc`/`RelocKind` patches an address constant by *adding* a base to its addend (so
+  `&g + 4` works) — no new IR instruction, just a constant edit. Duplicate / cross-namespace symbol
+  collisions, bad exports, and unresolved/non-const relocations all fail closed.
+- **Dynamic** (`Resolved::Slot` + `compile_linked`, like `dlopen`) — a **separately-compiled** unit
+  reaches a function it does not share an index space with through the **shared `call_indirect` table**
+  at a runtime-assigned slot. Both directions work: plugin→host and old/loaded→newly-installed.
+
+**The lowering primitive** is `svm_ir::resolve_imports_with`: each `CallImport` rewrites **1:1** (no
+value renumbering) to `Cap(ResolvedCap)`→`cap.call` (the §7 case), `Func(FuncIdx)`→a direct `call`
+(static), or `Slot(u32)`→`call_indirect <slot>` (dynamic; the import's handle operand must be a
+`ConstI32` placeholder, patched to the slot and reused as the index). Unresolved/ill-typed → fail-closed.
+
+**Serializable imports (codec v2).** So a unit can be shipped as a `.so` with *undefined references*,
+the binary form (`svm-encode`) now round-trips the §7 **import section** (name + op signature) and the
+`call.import` opcode. v1 was always import-free (imports resolved before encoding); decode stays
+untrusted-input TCB and re-verification still gates everything.
+
+**Host-assisted resolve (op 5, both backends).** The design question — does the rewrite run guest-side
+or host-side — is **settled host-assisted**: `compile_linked` takes a guest-provided **symbol-table
+buffer** and resolves *before* verify (`svm_run::jit_resolve_and_validate`: decode → `resolve_imports_with`
+→ verify → the §22 precondition gate). Simpler than a guest-side rewriter (none to load/trust) and
+equally safe. The symbol table is a small LEB128 wire form (`count`, then per entry `name` + `kind` —
+`0`=`Slot(uleb)`, `1`=`Cap(uleb type_id, uleb op)`); its decoder is fail-closed and fuzzed (a new
+untrusted-input surface). The `JitValidator` seam carries the symtab bytes so resolution stays in
+`svm-run`; the closed `compile` op (0) is just the empty-table case.
+
+**Security argument.** Resolution is rewrite-**then**-verify, so a missing name, a wrong import
+signature, or a non-const slot handle fails verification — nothing reaches Cranelift. The symbol
+table's *values* are **guest-chosen by design and confer no authority**: a resolved `Slot` lowers to a
+`call_indirect`, which is masked + `type_id`-checked at the call exactly like any index the guest
+already controls in its own code — binding to a **wrong-typed** slot **traps `IndirectCallType`**, never
+a type-confused dispatch; binding to a forged slot is no worse than a forged index the §3c table check
+already handles. So host-assisted linking adds **no escape-TCB surface** on top of §22 — it is the
+existing intern + dynamic table population, driven by a guest-controlled name map.
+
+**The guest loader (`<vm_dl.h>`).** `vm_dlopen(name, ir, len)` = build the symbol table from a
+`name → {slot, code}` registry → `compile_linked` (host re-verifies) → `install` → record; `vm_dlsym`
+= the registry lookup (a funcref **slot**); `vm_dlclose` = `uninstall` + drop. Re-opening a name is
+**hot reload**: the new version installs at a *new* slot and the registry repoints, so units already
+linked keep their old binding (they baked the old slot) while new resolves see the new one. **Why this
+beats POSIX `dlopen`:** the "shared object" is serialized SVM IR, **re-verified** on load (a malicious
+one can't escape — worst case it corrupts its own window, a §1 non-goal); `dlsym` returns an
+**unforgeable funcref slot** (§3c-checked), not a raw pointer; and loading is **capability-gated** (you
+need the `Jit` handle, and the bytes arrive through the powerbox — no ambient "load any file").
+
+Tests/demos: `dynlink.rs` (IR-level static link, interp==JIT), `dynlink_runtime.rs` (runtime by-name),
+`dynlink_resolve.rs` (host-assisted resolve + the `Cap` kind), `dynlink_repl.rs` (the symbol-table REPL
+spec), `dynlink_cap.rs` (the `compile_linked` op + type-confusion trap, differential), `svm-run`
+`symtab_tests` (decoder fuzz), and the guest-C `jit_link.c`/`jit_dlopen.c`/`jit_hotreload.c`. **Open
+follow-up:** data symbols through `vm_dlsym` (place data via `Memory`+`memory.init` applying a
+`DataReloc`, returning an address) — not yet wired; and a GOT/late-binding variant so *old* code can
+call *not-yet-loaded* code by name without recompiling the caller.
 
 ---
 

@@ -16,8 +16,8 @@
 
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering, StoreOp,
-    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
+    FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering,
+    StoreOp, Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -90,6 +90,7 @@ mod op {
     pub const CAP_CALL: u8 = 0x79; // type_id, op, sig, handle, arg idx-list
     pub const CAP_SELF_COUNT: u8 = 0x7A; // §7 reflection: () -> i32 count
     pub const CAP_SELF_GET: u8 = 0x7B; // §7 reflection: idx -> (i32 handle, i32 type_id)
+    pub const CALL_IMPORT: u8 = 0x7C; // §7 unresolved import: import idx, sig, handle, arg idx-list
 
     // Memory ops. Each carries: address operand, [value operand for stores], an
     // immediate uleb offset, and an alignment-hint byte.
@@ -170,7 +171,11 @@ mod op {
 }
 
 const MAGIC: [u8; 4] = *b"SVM\x00";
-const VERSION: u8 = 1;
+// v2 adds the §7 import section (name + op signature per import) and the `call.import` opcode, so a
+// separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
+// for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
+// against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
+const VERSION: u8 = 2;
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -190,6 +195,8 @@ pub enum DecodeError {
     BadMemoryFlag(u8),
     /// A data segment's `readonly` flag byte was neither 0 nor 1.
     BadDataFlag(u8),
+    /// An import name's length-prefixed bytes were not valid UTF-8.
+    BadUtf8,
     /// Bytes remained after a complete module was decoded.
     TrailingBytes,
 }
@@ -220,6 +227,16 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
         write_uleb(&mut out, d.bytes.len() as u64);
         out.extend_from_slice(&d.bytes);
     }
+    // §7 import section (v2): count, then each import's `name` and op `sig`. Usually empty — an
+    // import-free module (every prior frontend's output, and any unit whose symbols were already
+    // resolved) writes a single `0` here. A non-empty section is a unit shipped with **unresolved**
+    // symbols, for a loader to bind by name (DESIGN.md §22 host-assisted resolve).
+    write_uleb(&mut out, m.imports.len() as u64);
+    for imp in &m.imports {
+        write_str(&mut out, &imp.name);
+        write_types(&mut out, &imp.sig.params);
+        write_types(&mut out, &imp.sig.results);
+    }
     write_uleb(&mut out, m.funcs.len() as u64);
     for f in &m.funcs {
         encode_func(&mut out, f);
@@ -243,12 +260,21 @@ fn encode_func(out: &mut Vec<u8>, f: &Func) {
 
 fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
     match inst {
-        // §7 named imports have no wire opcode: the binary form is always import-free
-        // (resolution to `cap.call` precedes encoding). Reaching here is a toolchain bug
-        // — encoding an unresolved module — not an untrusted-input path (decode never
-        // produces a `CallImport`).
-        Inst::CallImport { .. } => {
-            unreachable!("encode: resolve_imports must run before binary encoding")
+        // §7 named import (v2 wire form), mirroring `cap.call` but carrying an import *index*
+        // (into the module's import section) instead of a bound `(type_id, op)`: the import stays
+        // unresolved on the wire so a loader can bind it by name (DESIGN.md §22 host-assisted resolve).
+        Inst::CallImport {
+            import,
+            sig,
+            handle,
+            args,
+        } => {
+            out.push(op::CALL_IMPORT);
+            write_uleb(out, *import as u64);
+            write_types(out, &sig.params);
+            write_types(out, &sig.results);
+            write_uleb(out, *handle as u64);
+            write_idxs(out, args);
         }
         // §7 capability reflection intrinsics.
         Inst::CapSelfCount => out.push(op::CAP_SELF_COUNT),
@@ -844,6 +870,11 @@ fn write_types(out: &mut Vec<u8>, ts: &[ValType]) {
     }
 }
 
+fn write_str(out: &mut Vec<u8>, s: &str) {
+    write_uleb(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
 fn write_idxs(out: &mut Vec<u8>, idxs: &[u32]) {
     write_uleb(out, idxs.len() as u64);
     for i in idxs {
@@ -930,6 +961,17 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
             bytes,
         });
     }
+    // §7 import section (v2): mirrors the encoder. Grows on demand (the count is attacker-influenced).
+    let nimports = c.count()?;
+    let mut imports = Vec::new();
+    for _ in 0..nimports {
+        let name = c.str()?;
+        let sig = FuncType {
+            params: decode_types(&mut c)?,
+            results: decode_types(&mut c)?,
+        };
+        imports.push(Import { name, sig });
+    }
     let nfuncs = c.count()?;
     let mut funcs = Vec::new();
     for _ in 0..nfuncs {
@@ -942,8 +984,7 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         funcs,
         memory,
         data,
-        // The binary form is always import-free (§7 imports are resolved before encoding).
-        imports: Vec::new(),
+        imports,
         // Debug info is text-only for now (DEBUGGING.md §6 slice 1); the binary form is
         // debug-stripped, like the import-free rule above. Binary serialization is a follow-up.
         debug_info: None,
@@ -1055,6 +1096,15 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::CAP_CALL => Inst::CapCall {
             type_id: c.idx()?,
             op: c.idx()?,
+            sig: FuncType {
+                params: decode_types(c)?,
+                results: decode_types(c)?,
+            },
+            handle: c.idx()?,
+            args: decode_idxs(c)?,
+        },
+        op::CALL_IMPORT => Inst::CallImport {
+            import: c.idx()?,
             sig: FuncType {
                 params: decode_types(c)?,
                 results: decode_types(c)?,
@@ -1436,6 +1486,16 @@ impl<'a> Cursor<'a> {
             return Err(DecodeError::CountTooLarge);
         }
         Ok(n)
+    }
+
+    /// Read a length-prefixed UTF-8 string (an import name). The length is `count`-bounded
+    /// (cannot exceed the remaining bytes), then the bytes must be valid UTF-8.
+    fn str(&mut self) -> Result<String, DecodeError> {
+        let n = self.count()?;
+        let bytes = self.take(n)?;
+        core::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| DecodeError::BadUtf8)
     }
 }
 

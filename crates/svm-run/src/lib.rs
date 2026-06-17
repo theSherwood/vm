@@ -12,7 +12,7 @@
 
 use core::ffi::c_void;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
     iface, AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, StreamRole, Trap,
@@ -21,7 +21,7 @@ use svm_interp::{
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
 use svm_interp::SharedBacking;
-use svm_ir::{Module, ValType};
+use svm_ir::{Module, Resolved, ValType};
 
 // Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
 // `svm-interp`.
@@ -446,7 +446,57 @@ unsafe fn jit_native_op(
             };
             put(results, n_results, v, trap_out);
         }
-        // An op-index outside the Jit interface's defined ops (0..=4) is out of range, so it
+        5 => {
+            // compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len) -> code_handle | -errno
+            // (DESIGN.md §22 host-assisted dynamic linking). Like op 0, but the unit may carry
+            // unresolved §7 imports bound by name against the guest's symbol-table buffer before
+            // verify+compile. Any failure leaves nothing installed.
+            let Ok(domain) = host.resolve_jit_domain(handle) else {
+                return cap_fault(trap_out);
+            };
+            let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
+            if cm.is_null() {
+                return put(results, n_results, EINVAL, trap_out);
+            }
+            let ir_ptr = *args.first().unwrap_or(&0) as u64;
+            let ir_len = *args.get(1).unwrap_or(&0) as u64;
+            let st_ptr = *args.get(2).unwrap_or(&0) as u64;
+            let st_len = *args.get(3).unwrap_or(&0) as u64;
+            let Some(ir) = gm.as_mut().and_then(|m| m.read_bytes(ir_ptr, ir_len)) else {
+                return put(results, n_results, EFAULT, trap_out);
+            };
+            let Some(symtab) = gm.as_mut().and_then(|m| m.read_bytes(st_ptr, st_len)) else {
+                return put(results, n_results, EFAULT, trap_out);
+            };
+            let compiled = match host.jit_compile_linked(handle, &ir, &symtab) {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return put(results, n_results, e, trap_out),
+                Err(_) => return cap_fault(trap_out),
+            };
+            let funcs = host
+                .jit_unit_funcs(compiled.domain, compiled.unit)
+                .expect("unit was just stored");
+            // SAFETY: identical contract to op 0 — `cm` is the in-flight run's CompiledModule and
+            // the guest is suspended in this synchronous cap.call, so the re-entry aliases nothing.
+            match (*cm).define_extra(&funcs) {
+                Ok(defs) => {
+                    let d = defs[0];
+                    host.set_jit_unit_native(
+                        compiled.domain,
+                        compiled.unit,
+                        d.tramp as usize,
+                        d.code as usize,
+                        d.type_id,
+                    );
+                    put(results, n_results, compiled.handle as i64, trap_out);
+                }
+                Err(_) => {
+                    let _ = host.jit_release(compiled.handle);
+                    put(results, n_results, EINVAL, trap_out);
+                }
+            }
+        }
+        // An op-index outside the Jit interface's defined ops (0..=5) is out of range, so it
         // traps (`CapFault`) — matching the interpreter, where an unknown Jit op falls through
         // the explicit op arms to the generic dispatch and faults, and §3c (an out-of-range
         // op-index is a runtime trap, not a non-fatal errno). The defined ops above own their
@@ -464,9 +514,146 @@ unsafe fn jit_native_op(
 /// the interpreter and JIT `Host`s of a differential pair ([`grant_jit`] does), so both
 /// backends accept/reject identically. All failures are `-EINVAL` (guest-visible, non-fatal,
 /// nothing installed).
-pub fn jit_blob_validator(bytes: &[u8], mem_log2: Option<u8>) -> Result<Arc<[svm_ir::Func]>, i64> {
+pub fn jit_blob_validator(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    symtab: &[u8],
+) -> Result<Arc<[svm_ir::Func]>, i64> {
+    const EINVAL: i64 = -22;
+    // Decode the guest's symbol table (empty for the closed `compile` op — every prior caller —
+    // which then resolves nothing, so a unit with imports fails closed). A malformed table is
+    // fail-closed, before any IR is touched.
+    let Some(table) = decode_symbol_table(symtab) else {
+        return Err(EINVAL);
+    };
+    jit_resolve_and_validate(bytes, mem_log2, |name| table.get(name).copied())
+}
+
+/// Decode the guest-provided **symbol table** for `compile_linked` (DESIGN.md §22): a `name →
+/// [`Resolved`]` map the loader binds a unit's §7 imports against. Untrusted-input-facing and
+/// fail-closed (`None` on any malformation) — but note the *values* are guest-chosen by design:
+/// a forged slot confers no authority (the resolved `call_indirect` is masked + `type_id`-checked
+/// at the call, exactly like a slot the guest already controls in its own code), and the whole
+/// unit is re-verified after the rewrite. Wire form (LEB128, mirroring `svm-encode`):
+/// `count`, then per entry `name` (uleb len + UTF-8 bytes), a `kind` byte, and its payload —
+/// `0` = `Slot(uleb)`, `1` = `Cap(uleb type_id, uleb op)`.
+fn decode_symbol_table(bytes: &[u8]) -> Option<HashMap<String, Resolved>> {
+    // The closed-blob `compile` op passes no table at all (`&[]`); treat that as the empty table
+    // (it resolves nothing, so a unit with imports fails closed). `[0]` — an explicit count of 0 —
+    // is the same thing and is handled by the normal path below.
+    if bytes.is_empty() {
+        return Some(HashMap::new());
+    }
+    let mut c = SymCursor { bytes, pos: 0 };
+    let count = c.uleb()?;
+    let mut table = HashMap::new();
+    for _ in 0..count {
+        let name = c.string()?;
+        let resolved = match c.byte()? {
+            0 => Resolved::Slot(c.u32()?),
+            1 => Resolved::Cap(svm_ir::ResolvedCap {
+                type_id: c.u32()?,
+                op: c.u32()?,
+            }),
+            _ => return None, // unknown kind
+        };
+        table.insert(name, resolved);
+    }
+    // Trailing bytes mean a length mismatch — reject rather than silently ignore (fail-closed).
+    (c.pos == bytes.len()).then_some(table)
+}
+
+/// Encode a [`decode_symbol_table`] buffer — the producer side a guest loader (or a test) uses to
+/// build the symbol table it hands `compile_linked`. Only `Slot`/`Cap` bindings are deliverable:
+/// `Func` is the static-link (same-module-index) case, meaningless for a separately-compiled unit.
+pub fn encode_symbol_table(entries: &[(&str, Resolved)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    svm_encode::write_uleb(&mut out, entries.len() as u64);
+    for (name, r) in entries {
+        svm_encode::write_uleb(&mut out, name.len() as u64);
+        out.extend_from_slice(name.as_bytes());
+        match r {
+            Resolved::Slot(slot) => {
+                out.push(0);
+                svm_encode::write_uleb(&mut out, *slot as u64);
+            }
+            Resolved::Cap(cap) => {
+                out.push(1);
+                svm_encode::write_uleb(&mut out, cap.type_id as u64);
+                svm_encode::write_uleb(&mut out, cap.op as u64);
+            }
+            Resolved::Func(_) => panic!("Func is not deliverable via the guest symbol table"),
+        }
+    }
+    out
+}
+
+/// A minimal fail-closed cursor for [`decode_symbol_table`] (the IR codec's `Cursor` is private to
+/// `svm-encode`). Never panics/over-reads on arbitrary bytes.
+struct SymCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl SymCursor<'_> {
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.bytes.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    /// Unsigned LEB128 → `u64` (max 10 bytes; rejects overflow / truncation).
+    fn uleb(&mut self) -> Option<u64> {
+        let (mut result, mut shift) = (0u64, 0u32);
+        loop {
+            let b = self.byte()?;
+            if shift >= 64 || (shift == 63 && b & 0x7f > 1) {
+                return None;
+            }
+            result |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some(result);
+            }
+            shift += 7;
+        }
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        u32::try_from(self.uleb()?).ok()
+    }
+
+    /// Length-prefixed UTF-8 string; the length is bounded by the remaining bytes (anti-OOM).
+    fn string(&mut self) -> Option<String> {
+        let n = usize::try_from(self.uleb()?).ok()?;
+        let end = self.pos.checked_add(n)?;
+        let s = core::str::from_utf8(self.bytes.get(self.pos..end)?).ok()?;
+        self.pos = end;
+        Some(s.to_owned())
+    }
+}
+
+/// Host-assisted dynamic-link resolve — the host-assisted half of in-window dynamic linking
+/// (DESIGN.md §22). Decode
+/// a serialized unit that may carry **unresolved §7 imports** (the v2 wire form), bind each import
+/// name through `resolve` (a *guest-controlled* symbol table: name → a `call_indirect` table slot,
+/// or a host capability), then run the **same** fail-closed gate as [`jit_blob_validator`]. Crucially
+/// the resolve is a source-to-source rewrite that runs *before* `verify_module`, so a mis-link — an
+/// unknown name, a wrong import signature, a non-const slot handle — is caught by re-verification and
+/// never trusted (DESIGN.md §22 "rewrite-then-verify"; the symbol table stays guest-controlled, the
+/// loader cannot forge a binding the verifier would reject). All failures are `-EINVAL` (guest-visible,
+/// non-fatal, nothing installed).
+pub fn jit_resolve_and_validate(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    resolve: impl FnMut(&str) -> Option<Resolved>,
+) -> Result<Arc<[svm_ir::Func]>, i64> {
     const EINVAL: i64 = -22;
     let Ok(m) = svm_encode::decode_module(bytes) else {
+        return Err(EINVAL);
+    };
+    // Bind every named import to a concrete `call`/`call_indirect`/`cap.call` (fail-closed on an
+    // unresolved or ill-typed binding), yielding an import-free module the verifier accepts unchanged.
+    let Ok(m) = svm_ir::resolve_imports_with(&m, resolve) else {
         return Err(EINVAL);
     };
     if svm_verify::verify_module(&m).is_err() {
@@ -1948,6 +2135,7 @@ pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         "vm_io_reap" => (iface::IO_RING, 2),
         // Guest-driven JIT (§22).
         "vm_jit_compile" => (iface::JIT, 0),
+        "vm_jit_compile_linked" => (iface::JIT, 5),
         "vm_jit_invoke2" => (iface::JIT, 1),
         "vm_jit_release" => (iface::JIT, 2),
         "vm_jit_install" => (iface::JIT, 3),
@@ -2225,5 +2413,109 @@ pub fn run_kernel(module: &Module, args: &[i64]) -> Result<Vec<Value>, String> {
         }
         JitOutcome::Exited(code) => Err(format!("kernel called Exit({code})")),
         JitOutcome::Trapped(kind) => Err(format!("kernel trapped ({kind:?})")),
+    }
+}
+
+#[cfg(test)]
+mod symtab_tests {
+    //! The `compile_linked` symbol table is a **new untrusted-input surface** (guest-controlled
+    //! bytes the host decodes). Like the IR decoder it must be fail-closed: never panic / over-read
+    //! / hang on arbitrary bytes — only `Some(table)` or `None`. These tests pin the round-trip with
+    //! the encoder and sweep adversarial bytes through the decoder.
+    use super::*;
+
+    #[test]
+    fn encode_decode_round_trips() {
+        let entries = [
+            ("sq", Resolved::Slot(0)),
+            ("a_longer_name", Resolved::Slot(1234)),
+            (
+                "io",
+                Resolved::Cap(svm_ir::ResolvedCap { type_id: 3, op: 7 }),
+            ),
+            ("", Resolved::Slot(u32::MAX)), // empty name + boundary slot
+        ];
+        let bytes = encode_symbol_table(&entries);
+        let table = decode_symbol_table(&bytes).expect("a well-formed table decodes");
+        assert_eq!(table.len(), entries.len());
+        for (name, want) in entries {
+            assert_eq!(table.get(name), Some(&want), "entry {name:?} round-trips");
+        }
+    }
+
+    #[test]
+    fn empty_buffer_and_explicit_zero_count_are_both_the_empty_table() {
+        // `&[]` (the closed `compile` op) and `[0]` (encode of no entries) both mean "no symbols".
+        assert_eq!(decode_symbol_table(&[]).map(|t| t.len()), Some(0));
+        assert_eq!(decode_symbol_table(&[0]).map(|t| t.len()), Some(0));
+        assert_eq!(
+            decode_symbol_table(&encode_symbol_table(&[])).map(|t| t.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn malformations_fail_closed_without_panicking() {
+        // Each of these is structurally broken in a different way; all must be `None`, never a panic.
+        let cases: &[&[u8]] = &[
+            &[1],                      // count 1, but no entry bytes
+            &[1, 1],                   // count 1, namelen 1, but no name byte
+            &[1, 1, b'F'],             // name present, but no kind byte
+            &[1, 1, b'F', 9],          // unknown kind 9
+            &[1, 1, b'F', 0],          // Slot kind, but no slot value
+            &[1, 1, 0xff, 0, 0],       // a non-UTF-8 name byte
+            &[1, 0x80],                // a truncated LEB128 namelen
+            &[0xff, 0xff, 0xff, 0xff], // a huge count (must fail fast as bytes exhaust, not hang)
+            &[0, 0],                   // count 0 but a trailing byte (length mismatch)
+            &[1, 1, b'F', 0, 0, 0],    // a valid entry plus trailing bytes
+        ];
+        for &c in cases {
+            assert_eq!(
+                decode_symbol_table(c),
+                None,
+                "malformed {c:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn never_panics_on_arbitrary_bytes() {
+        // A deterministic adversarial sweep: every byte string up to length 4, plus a pseudo-random
+        // tail of longer inputs. The decoder must always *return* (Some or None), never panic/hang.
+        for len in 0..=3usize {
+            let mut buf = vec![0u8; len];
+            loop {
+                let _ = decode_symbol_table(&buf); // must not panic
+                                                   // Odometer over [0,256)^len; stop after the most-significant digit wraps.
+                let mut i = 0;
+                while i < len {
+                    if buf[i] == 255 {
+                        buf[i] = 0;
+                        i += 1;
+                    } else {
+                        buf[i] += 1;
+                        break;
+                    }
+                }
+                if i == len {
+                    break; // wrapped around (or len == 0): done.
+                }
+            }
+        }
+        // Longer pseudo-random inputs (xorshift) for breadth past the exhaustive region.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        for _ in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let n = (state % 96) as usize;
+            let mut buf = Vec::with_capacity(n);
+            let mut s = state;
+            for _ in 0..n {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                buf.push((s >> 33) as u8);
+            }
+            let _ = decode_symbol_table(&buf); // must not panic
+        }
     }
 }
