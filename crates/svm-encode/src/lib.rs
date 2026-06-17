@@ -15,10 +15,11 @@
 #![forbid(unsafe_code)]
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering,
-    StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
-    VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, FBinOp,
+    FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp,
+    LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp, Terminator, TypeDef,
+    VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
+    VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -170,6 +171,13 @@ mod op {
         pub const VWIDEN: u8 = 0x17; // shape (result), op, a
         pub const VNARROW: u8 = 0x18; // shape (result), op, a, b
         pub const VCONVERT: u8 = 0x19; // op, a
+        pub const VPMINMAX: u8 = 0x1A; // shape, op, a, b
+        pub const VPOPCNT: u8 = 0x1B; // a (i8x16 implicit)
+        pub const VAVGR: u8 = 0x1C; // shape, a, b
+        pub const VDOT: u8 = 0x1D; // a, b (i16x8 -> i32x4 implicit)
+        pub const VEXTMUL: u8 = 0x1E; // shape (wide), op (VWidenOp), a, b
+        pub const VEXTADD: u8 = 0x1F; // shape (wide), signed (u8), a
+        pub const VQ15MULR: u8 = 0x20; // a, b (i16x8 implicit)
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -211,6 +219,14 @@ pub enum DecodeError {
     BadUtf8,
     /// Bytes remained after a complete module was decoded.
     TrailingBytes,
+    /// A debug-info `TypeDef` kind byte was not one of the known variants.
+    BadTypeDefKind(u8),
+    /// A debug-info base-type encoding byte was out of range.
+    BadEncoding(u8),
+    /// A debug-info `VarLoc` discriminant byte was neither 0 (window) nor 1 (ssa).
+    BadVarLoc(u8),
+    /// A debug-info optional-field flag byte was neither 0 (none) nor 1 (some).
+    BadOptionFlag(u8),
 }
 
 // ----------------------------------------------------------------------------
@@ -253,7 +269,119 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
     for f in &m.funcs {
         encode_func(&mut out, f);
     }
+    // Optional strippable debug section (DEBUGGING.md §6/§2a). Written only when present, so a
+    // module without debug info encodes byte-identically to before (snapshot digests, round-trip
+    // fixtures): the decoder treats "no bytes after the funcs" as no debug info.
+    if let Some(di) = &m.debug_info {
+        encode_debug_info(&mut out, di);
+    }
     out
+}
+
+/// Encode the §6 debug-info waist: the file table, source locations, the structured type table,
+/// and the variable table. Mirrored by [`decode_debug_info`].
+fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
+    write_uleb(out, di.files.len() as u64);
+    for f in &di.files {
+        write_str(out, f);
+    }
+    write_uleb(out, di.locs.len() as u64);
+    for l in &di.locs {
+        for field in [l.func, l.block, l.inst, l.file, l.line, l.col] {
+            write_uleb(out, field as u64);
+        }
+    }
+    write_uleb(out, di.types.len() as u64);
+    for t in &di.types {
+        match t {
+            TypeDef::Base {
+                name,
+                encoding,
+                size,
+            } => {
+                out.push(0);
+                write_str(out, name);
+                out.push(match encoding {
+                    Encoding::Signed => 0,
+                    Encoding::Unsigned => 1,
+                    Encoding::Float => 2,
+                    Encoding::Bool => 3,
+                });
+                write_uleb(out, *size as u64);
+            }
+            TypeDef::Pointer {
+                name,
+                pointee,
+                size,
+            } => {
+                out.push(1);
+                write_str(out, name);
+                write_uleb(out, *pointee as u64);
+                write_uleb(out, *size as u64);
+            }
+            TypeDef::Array { name, elem, count } => {
+                out.push(2);
+                write_str(out, name);
+                write_uleb(out, *elem as u64);
+                write_uleb(out, *count as u64);
+            }
+            TypeDef::Aggregate { name, size, fields } => {
+                out.push(3);
+                write_str(out, name);
+                write_uleb(out, *size as u64);
+                write_uleb(out, fields.len() as u64);
+                for f in fields {
+                    write_str(out, &f.name);
+                    write_uleb(out, f.offset as u64);
+                    write_uleb(out, f.ty as u64);
+                }
+            }
+            TypeDef::Opaque { name, size } => {
+                out.push(4);
+                write_str(out, name);
+                write_uleb(out, *size as u64);
+            }
+        }
+    }
+    write_uleb(out, di.vars.len() as u64);
+    for v in &di.vars {
+        write_uleb(out, v.func as u64);
+        write_str(out, &v.name);
+        write_str(out, &v.ty);
+        match &v.loc {
+            VarLoc::Window { off } => {
+                out.push(0);
+                write_sleb(out, *off);
+            }
+            VarLoc::Ssa { value } => {
+                out.push(1);
+                write_uleb(out, *value as u64);
+            }
+            VarLoc::SsaList(locs) => {
+                out.push(2);
+                write_uleb(out, locs.len() as u64);
+                for l in locs {
+                    write_uleb(out, l.block as u64);
+                    write_uleb(out, l.inst as u64);
+                    write_uleb(out, l.value as u64);
+                }
+            }
+        }
+        match v.type_id {
+            None => out.push(0),
+            Some(t) => {
+                out.push(1);
+                write_uleb(out, t as u64);
+            }
+        }
+    }
+    // Opaque per-producer rich blobs (§6): count, then each `(producer, length-prefixed bytes)`.
+    write_uleb(out, di.blobs.len() as u64);
+    for b in &di.blobs {
+        write_str(out, &b.producer);
+        write_uleb(out, b.bytes.len() as u64);
+        out.extend_from_slice(&b.bytes);
+    }
 }
 
 fn encode_func(out: &mut Vec<u8>, f: &Func) {
@@ -704,6 +832,53 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(o.index());
             write_uleb(out, *a as u64);
         }
+        Inst::VPMinMax { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VPMINMAX);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VPopcnt { a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VPOPCNT);
+            write_uleb(out, *a as u64);
+        }
+        Inst::VAvgr { shape, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VAVGR);
+            out.push(shape.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VDot { a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VDOT);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VExtMul { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VEXTMUL);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VExtAddPairwise { shape, signed, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VEXTADD);
+            out.push(shape.index());
+            out.push(*signed as u8);
+            write_uleb(out, *a as u64);
+        }
+        Inst::VQ15MulrSat { a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VQ15MULR);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
         Inst::VAnyTrue { a } => {
             out.push(op::SIMD);
             out.push(op::simd::VANY_TRUE);
@@ -910,6 +1085,49 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
                 a: c.idx()?,
             }
         }
+        op::simd::VPMINMAX => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VPMinMax {
+                shape,
+                op: VPMinMaxOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VPOPCNT => Inst::VPopcnt { a: c.idx()? },
+        op::simd::VAVGR => Inst::VAvgr {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::VDOT => Inst::VDot {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::VEXTMUL => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VExtMul {
+                shape,
+                op: VWidenOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VEXTADD => {
+            let shape = dec_shape(c)?;
+            let signed = c.byte()? != 0;
+            Inst::VExtAddPairwise {
+                shape,
+                signed,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VQ15MULR => Inst::VQ15MulrSat {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
         op::simd::VANY_TRUE => Inst::VAnyTrue { a: c.idx()? },
         op::simd::VALL_TRUE => Inst::VAllTrue {
             shape: dec_shape(c)?,
@@ -1155,6 +1373,13 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     for _ in 0..nfuncs {
         funcs.push(decode_func(&mut c)?);
     }
+    // Optional strippable debug section (mirrors the encoder): present iff bytes remain after the
+    // funcs. Strippable and untrusted-for-escape (§2a) — the verifier ignores it.
+    let debug_info = if c.at_end() {
+        None
+    } else {
+        Some(decode_debug_info(&mut c)?)
+    };
     if !c.at_end() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -1163,9 +1388,132 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         memory,
         data,
         imports,
-        // Debug info is text-only for now (DEBUGGING.md §6 slice 1); the binary form is
-        // debug-stripped, like the import-free rule above. Binary serialization is a follow-up.
-        debug_info: None,
+        debug_info,
+    })
+}
+
+/// Decode the §6 debug-info waist (untrusted input: counts are bounded, strings UTF-8-checked,
+/// discriminants validated). Mirrors [`encode_debug_info`].
+fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
+    let nfiles = c.count()?;
+    let mut files = Vec::new();
+    for _ in 0..nfiles {
+        files.push(c.str()?);
+    }
+    let nlocs = c.count()?;
+    let mut locs = Vec::new();
+    for _ in 0..nlocs {
+        locs.push(Loc {
+            func: c.idx()?,
+            block: c.idx()?,
+            inst: c.idx()?,
+            file: c.idx()?,
+            line: c.idx()?,
+            col: c.idx()?,
+        });
+    }
+    let ntypes = c.count()?;
+    let mut types = Vec::new();
+    for _ in 0..ntypes {
+        let t = match c.byte()? {
+            0 => {
+                let name = c.str()?;
+                let encoding = match c.byte()? {
+                    0 => Encoding::Signed,
+                    1 => Encoding::Unsigned,
+                    2 => Encoding::Float,
+                    3 => Encoding::Bool,
+                    b => return Err(DecodeError::BadEncoding(b)),
+                };
+                TypeDef::Base {
+                    name,
+                    encoding,
+                    size: c.idx()?,
+                }
+            }
+            1 => TypeDef::Pointer {
+                name: c.str()?,
+                pointee: c.idx()?,
+                size: c.idx()?,
+            },
+            2 => TypeDef::Array {
+                name: c.str()?,
+                elem: c.idx()?,
+                count: c.idx()?,
+            },
+            3 => {
+                let name = c.str()?;
+                let size = c.idx()?;
+                let nfields = c.count()?;
+                let mut fields = Vec::new();
+                for _ in 0..nfields {
+                    fields.push(Field {
+                        name: c.str()?,
+                        offset: c.idx()?,
+                        ty: c.idx()?,
+                    });
+                }
+                TypeDef::Aggregate { name, size, fields }
+            }
+            4 => TypeDef::Opaque {
+                name: c.str()?,
+                size: c.idx()?,
+            },
+            b => return Err(DecodeError::BadTypeDefKind(b)),
+        };
+        types.push(t);
+    }
+    let nvars = c.count()?;
+    let mut vars = Vec::new();
+    for _ in 0..nvars {
+        let func = c.idx()?;
+        let name = c.str()?;
+        let ty = c.str()?;
+        let loc = match c.byte()? {
+            0 => VarLoc::Window { off: c.sleb()? },
+            1 => VarLoc::Ssa { value: c.idx()? },
+            2 => {
+                let n = c.count()?;
+                let mut locs = Vec::new();
+                for _ in 0..n {
+                    locs.push(SsaLoc {
+                        block: c.idx()?,
+                        inst: c.idx()?,
+                        value: c.idx()?,
+                    });
+                }
+                VarLoc::SsaList(locs)
+            }
+            b => return Err(DecodeError::BadVarLoc(b)),
+        };
+        let type_id = match c.byte()? {
+            0 => None,
+            1 => Some(c.idx()?),
+            b => return Err(DecodeError::BadOptionFlag(b)),
+        };
+        vars.push(VarInfo {
+            func,
+            name,
+            ty,
+            loc,
+            type_id,
+        });
+    }
+    // Opaque per-producer rich blobs (§6): bounded count, then producer + length-prefixed bytes.
+    let nblobs = c.count()?;
+    let mut blobs = Vec::new();
+    for _ in 0..nblobs {
+        let producer = c.str()?;
+        let len = c.count()?;
+        let bytes = c.take(len)?.to_vec();
+        blobs.push(ProducerBlob { producer, bytes });
+    }
+    Ok(DebugInfo {
+        files,
+        locs,
+        types,
+        vars,
+        blobs,
     })
 }
 
@@ -1674,6 +2022,176 @@ impl<'a> Cursor<'a> {
         core::str::from_utf8(bytes)
             .map(str::to_owned)
             .map_err(|_| DecodeError::BadUtf8)
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    fn sample_debug() -> DebugInfo {
+        DebugInfo {
+            files: vec!["a.c".into(), "b.c".into()],
+            locs: vec![
+                Loc {
+                    func: 0,
+                    block: 1,
+                    inst: 2,
+                    file: 0,
+                    line: 7,
+                    col: 3,
+                },
+                Loc {
+                    func: 0,
+                    block: 1,
+                    inst: 5,
+                    file: 1,
+                    line: 9,
+                    col: 0,
+                },
+            ],
+            // Every TypeDef variant + encoding.
+            types: vec![
+                TypeDef::Base {
+                    name: "int".into(),
+                    encoding: Encoding::Signed,
+                    size: 4,
+                },
+                TypeDef::Base {
+                    name: "double".into(),
+                    encoding: Encoding::Float,
+                    size: 8,
+                },
+                TypeDef::Pointer {
+                    name: "int *".into(),
+                    pointee: 0,
+                    size: 8,
+                },
+                TypeDef::Array {
+                    name: "int[4]".into(),
+                    elem: 0,
+                    count: 4,
+                },
+                TypeDef::Aggregate {
+                    name: "struct Point".into(),
+                    size: 8,
+                    fields: vec![
+                        Field {
+                            name: "x".into(),
+                            offset: 0,
+                            ty: 0,
+                        },
+                        Field {
+                            name: "y".into(),
+                            offset: 4,
+                            ty: 0,
+                        },
+                    ],
+                },
+                TypeDef::Opaque {
+                    name: "void".into(),
+                    size: 0,
+                },
+            ],
+            // Window (incl. a negative offset → sleb) / Ssa locations, Some/None type ids.
+            vars: vec![
+                VarInfo {
+                    func: 0,
+                    name: "p".into(),
+                    ty: "struct Point".into(),
+                    loc: VarLoc::Window { off: 24 },
+                    type_id: Some(4),
+                },
+                VarInfo {
+                    func: 0,
+                    name: "i".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::Ssa { value: 3 },
+                    type_id: None,
+                },
+                VarInfo {
+                    func: 0,
+                    name: "neg".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::Window { off: -8 },
+                    type_id: Some(0),
+                },
+                // A location list (S2): the holding SSA value varies by pc.
+                VarInfo {
+                    func: 0,
+                    name: "k".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::SsaList(vec![
+                        SsaLoc {
+                            block: 0,
+                            inst: 0,
+                            value: 1,
+                        },
+                        SsaLoc {
+                            block: 1,
+                            inst: 2,
+                            value: 4,
+                        },
+                    ]),
+                    type_id: Some(0),
+                },
+            ],
+            // An opaque per-producer rich blob (incl. non-UTF-8 / NUL bytes — verbatim DWARF).
+            blobs: vec![ProducerBlob {
+                producer: ".debug_info".into(),
+                bytes: vec![0x00, 0x01, 0xff, 0x7f, 0x80, b'd', b'w'],
+            }],
+        }
+    }
+
+    fn module(debug_info: Option<DebugInfo>) -> Module {
+        Module {
+            funcs: vec![],
+            memory: None,
+            data: vec![],
+            imports: vec![],
+            debug_info,
+        }
+    }
+
+    #[test]
+    fn debug_info_round_trips_through_binary() {
+        let m = module(Some(sample_debug()));
+        let back = decode_module(&encode_module(&m)).expect("decode");
+        assert_eq!(
+            back, m,
+            "every files/locs/types/vars detail survives binary round-trip"
+        );
+    }
+
+    #[test]
+    fn no_debug_info_is_back_compatible_and_append_only() {
+        // A module without debug info decodes to `None`, and its encoding is a strict prefix of the
+        // same module *with* debug info — i.e. the section is appended after byte-identical output,
+        // so existing import/debug-free blobs (and snapshot digests) are unchanged.
+        let m_none = module(None);
+        let bytes_none = encode_module(&m_none);
+        assert_eq!(decode_module(&bytes_none).expect("decode"), m_none);
+
+        let bytes_dbg = encode_module(&module(Some(sample_debug())));
+        assert!(
+            bytes_dbg.starts_with(&bytes_none),
+            "debug section is appended after a byte-identical prefix"
+        );
+    }
+
+    #[test]
+    fn rejects_a_truncated_debug_section() {
+        // A truncated section must fail to decode, never panic (untrusted-input discipline): a
+        // declared count/length runs past the bytes (a blob's length, a var/type count, …).
+        let bytes = encode_module(&module(Some(sample_debug())));
+        for cut in 1..=8 {
+            let truncated = &bytes[..bytes.len() - cut];
+            assert!(
+                decode_module(truncated).is_err(),
+                "truncating {cut} byte(s) must error, not panic"
+            );
+        }
     }
 }
 

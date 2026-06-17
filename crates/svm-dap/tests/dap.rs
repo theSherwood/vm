@@ -1338,3 +1338,107 @@ fn dap_evaluate_pointer_arrow_and_index() {
         "arrow through a non-pointer fails"
     );
 }
+
+/// The Locals `variablesReference` for the given frame (`scopes` → first scope).
+fn scope_ref(s: &mut DapServer, fid: i64) -> i64 {
+    let out = s.handle(&req(
+        6,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(fid))]),
+    ));
+    response(&out)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap()
+}
+
+/// `variables` on a reference, as a name → (value, variablesReference) map.
+fn variables(s: &mut DapServer, vref: i64) -> std::collections::HashMap<String, (String, i64)> {
+    let out = s.handle(&req(
+        7,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(vref))]),
+    ));
+    vars_map(&out)
+}
+
+#[test]
+fn dap_expands_a_pointer_to_its_pointee() {
+    // POINTER_DBG: `pp` (at +0) points at a `struct Point {x=7,y=9}` at +16; data-SP arg 1024,
+    // so the stored pointer value is 1040 (= 0x410).
+    let mut s = DapServer::new();
+    let fid = launch_and_break(&mut s, POINTER_DBG, "/work/p.c", 3);
+    let sref = scope_ref(&mut s, fid);
+
+    // The pointer local shows its address and is expandable (not a bare scalar).
+    let locals = variables(&mut s, sref);
+    let (summary, pp_ref) = locals.get("pp").expect("local pp");
+    assert_eq!(summary, "0x410", "pointer shows its hex value");
+    assert!(*pp_ref >= (1 << 20), "pointer is expandable");
+
+    // Expanding the pointer yields a single `*` child — the pointee struct, itself expandable.
+    let deref = variables(&mut s, *pp_ref);
+    let (star_summary, star_ref) = deref.get("*").expect("deref child");
+    assert_eq!(star_summary, "{...}", "pointee is the struct");
+    assert!(*star_ref >= (1 << 20), "pointee struct is expandable");
+
+    // And through it, the struct's fields read correctly.
+    let fields = variables(&mut s, *star_ref);
+    assert_eq!(fields.get("x").map(|(v, _)| v.as_str()), Some("7"));
+    assert_eq!(fields.get("y").map(|(v, _)| v.as_str()), Some("9"));
+}
+
+// A `double d = 2.5` stored in the window (typed via the structured table). Param v0 is data-SP;
+// the break (line 3) is after the store.
+const FLOAT_DBG: &str = r#"
+memory 17
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = f64.const 2.5
+  f64.store v0 v1
+  v2 = i32.const 0
+  return v2
+}
+
+debug.file 0 "f.c"
+debug.loc 0 0 2 0 3 1
+debug.type 0 base "double" float 8
+debug.var 0 "d" win 0 "double" 0
+"#;
+
+#[test]
+fn dap_evaluate_floats_and_short_circuit() {
+    let mut s = DapServer::new();
+    let fid = launch_and_break(&mut s, FLOAT_DBG, "/work/f.c", 3);
+    let mut seq = 10;
+    let mut eval = |s: &mut DapServer, e: &str| -> (bool, Option<String>) {
+        seq += 1;
+        let out = s.handle(&req(
+            seq,
+            "evaluate",
+            Json::obj(vec![("expression", Json::s(e)), ("frameId", Json::i(fid))]),
+        ));
+        eval_result(&out)
+    };
+
+    // A bare `double` reads as its value (not the raw 64-bit pattern), via the structured type.
+    assert_eq!(eval(&mut s, "d"), (true, Some("2.5".into())));
+    // Float arithmetic with int promotion; a fractional result stays a float.
+    assert_eq!(eval(&mut s, "d + 0.25"), (true, Some("2.75".into())));
+    assert_eq!(eval(&mut s, "d * 2"), (true, Some("5".into())));
+    // Comparisons over floats yield 0/1.
+    assert_eq!(eval(&mut s, "d > 2"), (true, Some("1".into())));
+    assert_eq!(eval(&mut s, "d < 2"), (true, Some("0".into())));
+    // A bitwise op on a float is rejected.
+    assert!(!eval(&mut s, "d & 1").0, "bitwise on a float fails");
+    // Short-circuit: the dead branch isn't evaluated, so `1/0` never traps.
+    assert_eq!(eval(&mut s, "d < 2 && 1 / 0"), (true, Some("0".into())));
+    assert_eq!(eval(&mut s, "d > 2 || 1 / 0"), (true, Some("1".into())));
+}

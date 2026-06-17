@@ -268,7 +268,14 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     let n_handles = max_cap_index + 1;
     // A powerbox entry is synthesized when the program needs the handle stash: it uses a named import,
     // `malloc`, or a stash-only builtin (`__vm_blocking_handle`, which adds no import of its own).
-    let synth = (!imports.is_empty() || need_malloc || uses_blocking) && has_main;
+    // C++ static init: a program with `@llvm.global_ctors` needs a `_start` that runs the ctors before
+    // `main` (the on-ramp otherwise jumps straight to `main`), so it forces a powerbox entry too.
+    let has_global_ctors = m
+        .global_vars
+        .iter()
+        .any(|g| name_str(&g.name) == "llvm.global_ctors");
+    let synth =
+        (!imports.is_empty() || need_malloc || uses_blocking || has_global_ctors) && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
     if need_malloc {
@@ -360,9 +367,19 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     if synth {
         let main_idx = name2idx["main"];
         let main_results = funcs[(main_idx - base) as usize].results.clone();
+        // The C++ global constructors (`@llvm.global_ctors`) `_start` runs before `main` (their
+        // funcrefs resolve through `name2idx`, now built).
+        let ctors = collect_global_ctors(m, &name2idx)?;
         funcs.insert(
             0,
-            synth_start(main_idx, &main_results, entry_sp, n_handles, heap_base),
+            synth_start(
+                main_idx,
+                &main_results,
+                entry_sp,
+                n_handles,
+                heap_base,
+                &ctors,
+            ),
         );
     }
     // Append the synthesized helpers in index order (memset, memcpy, malloc, utoa, realloc) —
@@ -644,6 +661,12 @@ fn globals_layout(
         |off: &mut u64, addr: &mut HashMap<String, u64>, want_const: bool| -> Result<(), Error> {
             for (gi, g) in m.global_vars.iter().enumerate() {
                 if g.is_constant != want_const {
+                    continue;
+                }
+                // LLVM-reserved globals (`llvm.global_ctors`/`global_dtors`/`used`/`compiler.used`)
+                // are metadata, never real window data — they are handled out of band (the ctors run
+                // in `_start`, the rest are dropped), so never lay them out / serialize them.
+                if name_str(&g.name).starts_with("llvm.") {
                     continue;
                 }
                 // Size from the initializer's serialized length (matches phase B exactly); BSS/extern
@@ -1673,6 +1696,54 @@ fn register_vm_region_imports(
     used
 }
 
+/// Collect the program's **global constructors** (`@llvm.global_ctors`, the C++ static-init / `__attribute__((constructor))` runners clang emits) as IR function indices in **priority order** (low
+/// runs first). Each entry is `{ i32 priority, ptr ctor, ptr data }`; `data` is ignored (always null
+/// for the cases we accept). `_start` calls these — each a `(i64 sp) -> ()` — before `main`, so static
+/// init runs exactly as it does natively (the on-ramp otherwise jumps straight to `main`). An empty /
+/// absent list is the common C case (no static init). A non-null `data` or an indirect ctor operand is
+/// a clean `Unsupported`.
+fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<Vec<u32>, Error> {
+    let Some(g) = m
+        .global_vars
+        .iter()
+        .find(|g| name_str(&g.name) == "llvm.global_ctors")
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(init) = &g.initializer else {
+        return Ok(Vec::new());
+    };
+    let elements = match init.as_ref() {
+        Constant::Array { elements, .. } => elements,
+        Constant::AggregateZero(_) => return Ok(Vec::new()),
+        other => return unsup(format!("llvm.global_ctors initializer: {other:?}")),
+    };
+    let mut entries: Vec<(u64, u32)> = Vec::new();
+    for e in elements {
+        let Constant::Struct { values, .. } = e.as_ref() else {
+            return unsup("llvm.global_ctors element is not a struct");
+        };
+        let priority = match values.first().map(|v| v.as_ref()) {
+            Some(Constant::Int { value, .. }) => *value,
+            _ => 0,
+        };
+        match values.get(1).map(|v| v.as_ref()) {
+            Some(Constant::GlobalReference { name, .. }) => {
+                let fname = name_str(name);
+                let idx = *name2idx.get(&fname).ok_or_else(|| {
+                    Error::Unsupported(format!("global ctor `{fname}` is not a defined function"))
+                })?;
+                entries.push((priority, idx));
+            }
+            // A null ctor slot (clang sometimes pads) — nothing to run.
+            Some(Constant::Null(_)) => {}
+            other => return unsup(format!("llvm.global_ctors ctor operand: {other:?}")),
+        }
+    }
+    entries.sort_by_key(|&(p, _)| p); // ascending priority: lower runs first (C++ [basic.start])
+    Ok(entries.into_iter().map(|(_, idx)| idx).collect())
+}
+
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
 /// capabilities. It takes the `n_handles` granted handles as `i32` params (the §3e powerbox shape
 /// `is_powerbox_entry` recognizes — no threaded data-SP, since it is the root), in the `VM_CAP_*`
@@ -1686,6 +1757,7 @@ fn synth_start(
     entry_sp: u64,
     n_handles: usize,
     heap_base: Option<u64>,
+    ctors: &[u32],
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
@@ -1726,10 +1798,19 @@ fn synth_start(
             });
         }
     }
-    // sp = entry_sp (constant); call main(sp). `main` carries the threaded data-SP as param 0.
+    // sp = entry_sp (constant). The data-SP `main` (and each ctor) carries as param 0.
     insts.push(Inst::ConstI64(entry_sp as i64));
     let sp = next;
     next += 1;
+    // Run the C++ global constructors (priority order) before `main` — each is `(i64 sp) -> ()`, so
+    // it appends no value (sequential calls, each takes its own frame above `sp`). Static init then
+    // happens exactly as native, before the program proper.
+    for &ctor in ctors {
+        insts.push(Inst::Call {
+            func: ctor,
+            args: vec![sp],
+        });
+    }
     insts.push(Inst::Call {
         func: main_idx,
         args: vec![sp],

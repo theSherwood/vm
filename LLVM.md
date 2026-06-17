@@ -728,13 +728,30 @@ AddressSpace). This is the magic-ring-buffer / zero-copy parent↔child data pla
   (then `unmap`s), on the real JIT powerbox (true shared-memory aliasing via the host region factory);
   the `'Y'` success marker is checked against stdout. 89 translate tests green, fmt + clippy clean.
 
-The `<svm.h>` capability/concurrency/GC/JIT/region surface is **complete** (full chibicc parity). The
-next frontier is the D54 **breadth proof** (Milestone 2): the on-ramp consumes *any* LLVM frontend's
-bitcode.
+The `<svm.h>` capability/concurrency/GC/JIT/region surface is now **complete** — the LLVM on-ramp has
+full capability parity with the chibicc frontend. The next frontier is the D54 **breadth proof**
+(Milestone 2): the on-ramp consumes *any* LLVM frontend's bitcode, so other languages run with no
+translator change beyond what the C corpus proved.
+
+**Slice AG (DONE) — C++ first light (the breadth proof begins).** A freestanding C++ TU compiled
+`clang++ -O2 -fno-exceptions -fno-rtti` runs **byte-identical to native `clang++`** through the on-ramp
+— the first non-C language. Mostly **free** (the C corpus already covers it): classes, inheritance,
+**virtual dispatch** (vtables are function-pointer global initializers, slice K → loaded + `call_indirect`,
+slice G), the `this` pointer, mangled names, **templates** (monomorphize to ordinary functions), and
+heap **`new`/`delete`** (the program defines `operator new`/`delete` over the guest `malloc`/`free`),
+including **virtual destructors** (the deleting-dtor chain through the vtable). The one real gap closed:
+- **C++ static initialization (`@llvm.global_ctors`).** clang emits a `_GLOBAL__sub_I_*` runner for
+  global objects with non-trivial ctors; the on-ramp jumped straight to `main`, so static init never
+  ran. Now `globals_layout` skips the `llvm.*` reserved globals (metadata, not window data) and
+  `collect_global_ctors` extracts the ctor funcrefs in priority order; the synthesized `_start` calls
+  them (each `(i64 sp) -> ()`) **before** `main`, exactly as native ([basic.start]). A program with
+  global ctors now forces a powerbox `_start` even with no other capability use.
+- Tests (`translate.rs`): `cpp_virtual_dispatch_first_light`, `cpp_new_delete_virtual_dtor_templates`
+  (heap `new`/`delete` + virtual dtor + a template), `cpp_global_constructor_runs_before_main` (a
+  side-effecting global ctor prints before `main`) — all vs native `clang++`.
 
 **Slice AH (DONE) — Rust through the on-ramp + non-power-of-two integers (`iN`).** A `no_std`/
-`panic=abort` Rust crate now runs **byte-identical to native `rustc`** — the second frontend, proving
-the D54 thesis past C/C++.
+`panic=abort` Rust crate now runs **byte-identical to native `rustc`** — the second non-C frontend.
 - **Toolchain pin (a §2 "pin, don't drift" decision).** `rustc` bundles its own LLVM, so the bitcode
   version must match our pinned reader (LLVM 18). The container's default `rustc` ships **LLVM 21**
   (rejected by `llvm-ir`'s `llvm-18`), and re-pinning the *reader* to 21 is blocked here (no
@@ -755,14 +772,15 @@ the D54 thesis past C/C++.
   `i33` polynomial) compiled both as a `no_std` lib (→ bitcode → on-ramp, interp == JIT) and as a
   native std binary (the oracle), agreeing for `n` in `{5, 1000, 46341, 200000, -7}` — values chosen so
   the `i33` intermediate **overflows 33 bits and wraps**, which only the native differential validates
-  (interp == JIT alone would agree even on a wrong mask). 90 translate tests green, fmt + clippy clean.
+  (interp == JIT alone would agree even on a wrong mask). 93 translate tests green, fmt + clippy clean.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
-- [x] **C++ without EH/RTTI** — first light (PR: classes, vtables/virtual dispatch, `new`/`delete`,
-      virtual dtors, templates, static init via `@llvm.global_ctors`).
+- [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
+      virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
+      inheritance / `this`-adjusting thunks, references, `static`-local guards, …).
 - [x] **Rust** (`no_std`/panic=abort) — runs vs native (slice AH), via the pinned Rust 1.81 (LLVM 18)
-      toolchain + `iN` support. Broaden to slices (`core` data structures, `Option`/`Result`, traits →
-      vtables) as gaps surface.
+      toolchain + `iN` support. Broaden (`core` data structures, `Option`/`Result`, traits → vtables)
+      as gaps surface.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 - [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand.
@@ -838,3 +856,4 @@ ASan items in HANDOFF.
   `prefer-dynamic` deps); workspace exclusion in the root `Cargo.toml`.
 - The oracle to diff against (Lane B): chibicc `frontend/chibicc/codegen_ir.c` + the running
   demos in `demos/` — wired in at Milestone 1.
+
