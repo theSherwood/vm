@@ -200,3 +200,53 @@ fn clang_saxpy_transpiles_to_verified_simd_ir() {
     assert_eq!(mul, 1, "expected one f32x4.mul (a*x)");
     assert_eq!(add, 1, "expected one f32x4.add (+y)");
 }
+
+/// Integer lane comparisons through the wasm bridge: `iNxM.<cmp>` produces a per-lane all-ones/
+/// all-zeros mask, observed via `extract_lane`. Pins the signed/unsigned distinction (`lt_s` vs
+/// `lt_u`) on the same bytes — exactly where real `-msimd128` mask generation lives.
+#[test]
+fn i32x4_lane_compare_masks() {
+    let cmp = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $a i32) (param $b i32) (result i32)
+               (i32x4.extract_lane 0
+                 ({op} (i32x4.splat (local.get $a)) (i32x4.splat (local.get $b))))))"
+        )
+    };
+    // a = -1 (0xFFFFFFFF), b = 1: signed -1 < 1 (true → -1); unsigned 0xFFFFFFFF < 1 (false → 0).
+    let args = [Value::I32(-1), Value::I32(1)];
+    assert_eq!(eval(&cmp("i32x4.lt_s"), "f", &args), Value::I32(-1));
+    assert_eq!(eval(&cmp("i32x4.lt_u"), "f", &args), Value::I32(0));
+    assert_eq!(
+        eval(&cmp("i32x4.eq"), "f", &[Value::I32(7), Value::I32(7)]),
+        Value::I32(-1)
+    );
+    assert_eq!(
+        eval(&cmp("i32x4.ne"), "f", &[Value::I32(7), Value::I32(7)]),
+        Value::I32(0)
+    );
+    assert_eq!(eval(&cmp("i8x16.eq"), "f", &args), Value::I32(0)); // shape check: distinct opcode
+}
+
+/// A real SIMD idiom: lane-wise signed **max** as `bitselect(a>b, a, b)` — the compare feeds its
+/// mask straight into `v128.bitselect`. Proves the mask interoperates with downstream vector ops,
+/// byte-identical across interp and JIT.
+#[test]
+fn i32x4_max_via_compare_and_bitselect() {
+    let wat = r#"
+    (module
+      (func (export "maxlane") (param $a i32) (param $b i32) (result i32)
+        (i32x4.extract_lane 0
+          (v128.bitselect
+            (i32x4.splat (local.get $a))
+            (i32x4.splat (local.get $b))
+            (i32x4.gt_s (i32x4.splat (local.get $a)) (i32x4.splat (local.get $b)))))))
+    "#;
+    for (a, b) in [(3, 7), (9, 2), (-5, -1), (i32::MIN, i32::MAX), (4, 4)] {
+        let got = match eval(wat, "maxlane", &[Value::I32(a), Value::I32(b)]) {
+            Value::I32(x) => x,
+            _ => unreachable!(),
+        };
+        assert_eq!(got, a.max(b), "max({a}, {b})");
+    }
+}

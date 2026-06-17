@@ -6,8 +6,9 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (63 tests across
-`transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`). Real clang programs + two real C
+**Status: feature-complete for *typical clang/rustc -O2 output*** (79 tests across
+`transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
+Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
 and a wasi-threads parallel kernel run on both backends. `bench --threads`: SVM ~1.35× faster than
 Wasmtime+wasi-threads on spawn-heavy, parity on compute.
@@ -27,7 +28,8 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
   multi-value** block types; `call`; `call_indirect` (§3c type-id check); `memory.size`/`memory.grow`.
 - **memory64** — the 64-bit address path.
 - **Finished proposals**: sign-extension ops; non-trapping float→int (`trunc_sat`); bulk-memory
-  `memory.copy`/`memory.fill`; **fixed-128 SIMD** (a pragmatic ~60-op v128 subset, D58); **threads** —
+  `memory.copy`/`memory.fill`; **fixed-128 SIMD** (a pragmatic v128 subset, D58 — arith/bitwise/shuffle
+  + the **integer lane compares** `iNxM.{eq,ne,lt,gt,le,ge}` s/u → mask, `VIntCmp`); **threads** —
   full-width (i32/i64) `*.atomic.*` + `atomic.fence`, `shared`+imported memory, and the **wasi-threads**
   `wasi:thread/spawn` → native `thread.spawn` (a synthesized shim + unique-tid slot).
 - **Host ABI**: function imports → `cap.call` by the numeric `module`=type_id / `name`=op convention.
@@ -93,10 +95,14 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [ ] **SIMD remainder** (~175 of the v128 proposal): lane compares, lane shifts, int min/max/abs, sat
-  add/sub, narrow/widen, `all_true`/`bitmask`, dot product, etc. Mechanical breadth over the proven
-  5-step pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few
-  ops have no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
+- [ ] **SIMD remainder** (~145 of the v128 proposal): lane shifts, int min/max/abs, sat add/sub,
+  narrow/widen, `all_true`/`bitmask`, dot product, float lane compares, etc. Mechanical breadth over the
+  proven 5-step pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm);
+  a few ops have no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
+  - [x] **Integer lane compares — DONE.** `i8x16`/`i16x8`/`i32x4` `{eq,ne,lt,gt,le,ge}` s/u + the
+    `i64x2` signed set → a per-lane all-ones/all-zeros mask (`Inst::VIntCmp`, one Cranelift `icmp`).
+    `crates/svm/tests/simd.rs` (round-trip + interp==JIT, oracle = Rust's own compares) and
+    `svm-wasm/tests/simd.rs` (the wasm bridge + a real `bitselect`-max idiom).
 - [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
   atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
   in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR

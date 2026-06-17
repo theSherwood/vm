@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
-    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType, VarLoc,
-    DEFAULT_RESERVED_LOG2,
+    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValIdx, ValType,
+    VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -5151,6 +5151,12 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_v128(get(vals, *b)?)?,
         )),
+        Inst::VIntCmp { shape, op, a, b } => Value::V128(simd_vint_cmp(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
         Inst::VFloatBin { shape, op, a, b } => Value::V128(simd_vfloat_bin(
             *shape,
             *op,
@@ -5288,6 +5294,44 @@ fn simd_vint_bin(shape: VShape, op: VIntBinOp, a: [u8; 16], b: [u8; 16]) -> [u8;
             VIntBinOp::Mul => x.wrapping_mul(y),
         };
         lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// Sign-extend the low `bytes` of a zero-extended lane value to a full `i64`.
+fn lane_sext(x: u64, bytes: usize) -> i64 {
+    let bits = bytes * 8;
+    if bits >= 64 {
+        x as i64
+    } else {
+        let shift = 64 - bits;
+        ((x << shift) as i64) >> shift
+    }
+}
+
+/// `<shape>.<cmp>`: per-lane integer comparison → an all-ones (true) / all-zeros (false) mask of the
+/// lane width. `lane_read` zero-extends, so unsigned compares are direct; signed compares
+/// sign-extend each lane first.
+fn simd_vint_cmp(shape: VShape, op: VICmpOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let xu = lane_read(&a, i, bytes);
+        let yu = lane_read(&b, i, bytes);
+        let (xs, ys) = (lane_sext(xu, bytes), lane_sext(yu, bytes));
+        let t = match op {
+            VICmpOp::Eq => xu == yu,
+            VICmpOp::Ne => xu != yu,
+            VICmpOp::LtS => xs < ys,
+            VICmpOp::LtU => xu < yu,
+            VICmpOp::GtS => xs > ys,
+            VICmpOp::GtU => xu > yu,
+            VICmpOp::LeS => xs <= ys,
+            VICmpOp::LeU => xu <= yu,
+            VICmpOp::GeS => xs >= ys,
+            VICmpOp::GeU => xu >= yu,
+        };
+        lane_write(&mut o, i, bytes, if t { u64::MAX } else { 0 });
     }
     o
 }

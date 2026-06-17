@@ -319,3 +319,135 @@ fn diff_replace_lane() {
         assert_eq!(r as i32, b.wrapping_add(a)); // lane2 replaced with b, lane1 still a
     }
 }
+
+// ---------------------------------------------------------------------------
+// Integer lane comparisons (VIntCmp) — a per-lane all-ones/all-zeros mask.
+// ---------------------------------------------------------------------------
+
+/// Text + binary round-trip of every comparison family across the integer shapes.
+#[test]
+fn lane_compare_roundtrip() {
+    let src = "func (i32) -> (i32) {\n\
+        block0(v0: i32):\n\
+          v1 = i8x16.splat v0\n\
+          v2 = i16x8.splat v0\n\
+          v3 = i32x4.splat v0\n\
+          v4 = i8x16.eq v1 v1\n\
+          v5 = i8x16.ne v1 v1\n\
+          v6 = i8x16.lt_s v1 v1\n\
+          v7 = i8x16.lt_u v1 v1\n\
+          v8 = i8x16.gt_s v1 v1\n\
+          v9 = i8x16.gt_u v1 v1\n\
+          v10 = i8x16.le_s v1 v1\n\
+          v11 = i8x16.le_u v1 v1\n\
+          v12 = i8x16.ge_s v1 v1\n\
+          v13 = i8x16.ge_u v1 v1\n\
+          v14 = i16x8.eq v2 v2\n\
+          v15 = i16x8.lt_u v2 v2\n\
+          v16 = i32x4.ne v3 v3\n\
+          v17 = i32x4.ge_s v3 v3\n\
+          v18 = i64x2.eq v3 v3\n\
+          v19 = i64x2.lt_s v3 v3\n\
+          v20 = i32x4.extract_lane 0 v16\n\
+          return v20\n\
+        }\n";
+    let m = build(src);
+    let reparsed = parse_module(&print_module(&m)).expect("reparse");
+    assert_eq!(m, reparsed, "text round-trip changed the module");
+    let decoded = decode_module(&encode_module(&m)).expect("decode");
+    assert_eq!(m, decoded, "binary round-trip changed the module");
+}
+
+/// `i32x4.<cmp>` of two splatted scalars, the lane-0 mask read back as a signed i32 (`-1` true /
+/// `0` false). `diff1` asserts interp == JIT; the expectation is Rust's own comparison (the oracle).
+fn i32x4_cmp(op: &str, a: i32, b: i32) -> i32 {
+    let s = format!(
+        "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+         \x20 v2 = i32x4.splat v0\n  v3 = i32x4.splat v1\n  v4 = i32x4.{op} v2 v3\n\
+         \x20 v5 = i32x4.extract_lane 0 v4\n  return v5\n}}\n"
+    );
+    diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
+}
+
+#[test]
+fn diff_i32x4_lane_compares() {
+    let mask = |t: bool| if t { -1 } else { 0 };
+    for (a, b) in [
+        (5, 5),
+        (5, 7),
+        (7, 5),
+        (-1, 1),
+        (1, -1),
+        (i32::MIN, i32::MAX),
+    ] {
+        let (ua, ub) = (a as u32, b as u32);
+        assert_eq!(i32x4_cmp("eq", a, b), mask(a == b), "eq {a} {b}");
+        assert_eq!(i32x4_cmp("ne", a, b), mask(a != b), "ne {a} {b}");
+        assert_eq!(i32x4_cmp("lt_s", a, b), mask(a < b), "lt_s {a} {b}");
+        assert_eq!(i32x4_cmp("gt_s", a, b), mask(a > b), "gt_s {a} {b}");
+        assert_eq!(i32x4_cmp("le_s", a, b), mask(a <= b), "le_s {a} {b}");
+        assert_eq!(i32x4_cmp("ge_s", a, b), mask(a >= b), "ge_s {a} {b}");
+        assert_eq!(i32x4_cmp("lt_u", a, b), mask(ua < ub), "lt_u {a} {b}");
+        assert_eq!(i32x4_cmp("gt_u", a, b), mask(ua > ub), "gt_u {a} {b}");
+        assert_eq!(i32x4_cmp("le_u", a, b), mask(ua <= ub), "le_u {a} {b}");
+        assert_eq!(i32x4_cmp("ge_u", a, b), mask(ua >= ub), "ge_u {a} {b}");
+    }
+}
+
+/// Narrow lanes: `i8x16.splat` broadcasts the low byte, so this compares `a`/`b` as bytes. The
+/// `0xFF`-vs-`1` case pins the signed/unsigned distinction (`-1 <_s 1` true, `255 <_u 1` false).
+fn i8x16_cmp(op: &str, a: i32, b: i32) -> i32 {
+    let s = format!(
+        "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+         \x20 v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n  v4 = i8x16.{op} v2 v3\n\
+         \x20 v5 = i8x16.extract_lane_s 0 v4\n  return v5\n}}\n"
+    );
+    diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
+}
+
+#[test]
+fn diff_i8x16_lane_compares_signedness() {
+    assert_eq!(i8x16_cmp("eq", 0x102, 2), -1, "low byte 2 == 2");
+    assert_eq!(i8x16_cmp("ne", 0xFF, 1), -1, "255 != 1");
+    assert_eq!(i8x16_cmp("lt_s", 0xFF, 1), -1, "(-1) <_s 1");
+    assert_eq!(i8x16_cmp("lt_u", 0xFF, 1), 0, "255 <_u 1 is false");
+    assert_eq!(i8x16_cmp("gt_s", 0xFF, 1), 0, "(-1) >_s 1 is false");
+    assert_eq!(i8x16_cmp("gt_u", 0xFF, 1), -1, "255 >_u 1");
+    assert_eq!(i8x16_cmp("ge_u", 1, 1), -1, "1 >=_u 1");
+}
+
+/// `i16x8` and `i64x2` shapes (i64x2 is signed-only in the wasm spec). Observed via the
+/// shape-appropriate `extract_lane`.
+#[test]
+fn diff_i16x8_and_i64x2_lane_compares() {
+    let i16x8 = |op: &str, a: i32, b: i32| -> i32 {
+        let s = format!(
+            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+             \x20 v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n  v4 = i16x8.{op} v2 v3\n\
+             \x20 v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
+    };
+    // Low halfword: 0xFFFF → -1 signed / 65535 unsigned.
+    assert_eq!(i16x8("lt_s", 0xFFFF, 1), -1, "(-1) <_s 1");
+    assert_eq!(i16x8("lt_u", 0xFFFF, 1), 0, "65535 <_u 1 is false");
+    assert_eq!(i16x8("eq", 0x10003, 3), -1, "low halfword 3 == 3");
+
+    let i64x2 = |op: &str, a: i64, b: i64| -> i64 {
+        let s = format!(
+            "func (i64, i64) -> (i64) {{\nblock0(v0: i64, v1: i64):\n\
+             \x20 v2 = i64x2.splat v0\n  v3 = i64x2.splat v1\n  v4 = i64x2.{op} v2 v3\n\
+             \x20 v5 = i64x2.extract_lane 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I64(a), Value::I64(b)])
+    };
+    let mask = |t: bool| if t { -1i64 } else { 0 };
+    for (a, b) in [(5i64, 5), (5, 7), (-1, 1), (i64::MIN, i64::MAX)] {
+        assert_eq!(i64x2("eq", a, b), mask(a == b), "i64x2.eq {a} {b}");
+        assert_eq!(i64x2("ne", a, b), mask(a != b), "i64x2.ne {a} {b}");
+        assert_eq!(i64x2("lt_s", a, b), mask(a < b), "i64x2.lt_s {a} {b}");
+        assert_eq!(i64x2("gt_s", a, b), mask(a > b), "i64x2.gt_s {a} {b}");
+        assert_eq!(i64x2("le_s", a, b), mask(a <= b), "i64x2.le_s {a} {b}");
+        assert_eq!(i64x2("ge_s", a, b), mask(a >= b), "i64x2.ge_s {a} {b}");
+    }
+}

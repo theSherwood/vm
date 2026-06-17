@@ -185,6 +185,63 @@ impl VIntBinOp {
     }
 }
 
+/// Lane-wise integer **comparison** ops on a `v128` (§17): each lane yields an all-ones (true) or
+/// all-zeros (false) mask of the lane width, so the result is a `v128`. `s`/`u` select signed vs
+/// unsigned lane ordering (`Eq`/`Ne` are sign-agnostic). Defined for every integer [`VShape`] — the
+/// wasm spec omits unsigned `i64x2` compares, but the op set is total and the transpiler only emits
+/// the shapes wasm defines.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VICmpOp {
+    Eq,
+    Ne,
+    LtS,
+    LtU,
+    GtS,
+    GtU,
+    LeS,
+    LeU,
+    GeS,
+    GeU,
+}
+
+impl VICmpOp {
+    pub const ALL: [VICmpOp; 10] = [
+        VICmpOp::Eq,
+        VICmpOp::Ne,
+        VICmpOp::LtS,
+        VICmpOp::LtU,
+        VICmpOp::GtS,
+        VICmpOp::GtU,
+        VICmpOp::LeS,
+        VICmpOp::LeU,
+        VICmpOp::GeS,
+        VICmpOp::GeU,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VICmpOp::Eq => "eq",
+            VICmpOp::Ne => "ne",
+            VICmpOp::LtS => "lt_s",
+            VICmpOp::LtU => "lt_u",
+            VICmpOp::GtS => "gt_s",
+            VICmpOp::GtU => "gt_u",
+            VICmpOp::LeS => "le_s",
+            VICmpOp::LeU => "le_u",
+            VICmpOp::GeS => "ge_s",
+            VICmpOp::GeU => "ge_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VICmpOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VICmpOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
 /// Lane-wise binary float ops on a `v128` (§17, IEEE 754, no traps). `Min`/`Max` are the
 /// IEEE `minimum`/`maximum` (NaN-propagating, `-0 < +0`) matching the scalar [`FBinOp`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1433,6 +1490,14 @@ pub enum Inst {
     VIntBin {
         shape: VShape,
         op: VIntBinOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise integer comparison (see [`VICmpOp`]); `a`/`b`/result are `v128` (per-lane all-ones
+    /// or all-zeros mask of the lane width).
+    VIntCmp {
+        shape: VShape,
+        op: VICmpOp,
         a: ValIdx,
         b: ValIdx,
     },

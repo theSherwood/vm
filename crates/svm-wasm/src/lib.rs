@@ -45,7 +45,7 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
-    VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
+    VBitBinOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1299,6 +1299,13 @@ fn v_intbin(lo: &mut Lower, shape: VShape, op: VIntBinOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VIntBin { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_icmp(lo: &mut Lower, shape: VShape, op: VICmpOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VIntCmp { shape, op, a, b });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -2818,6 +2825,44 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64x2Add => v_intbin(lo, VShape::I64x2, VIntBinOp::Add)?,
         O::I64x2Sub => v_intbin(lo, VShape::I64x2, VIntBinOp::Sub)?,
         O::I64x2Mul => v_intbin(lo, VShape::I64x2, VIntBinOp::Mul)?,
+        // integer lane comparisons → a per-lane all-ones/all-zeros mask. `i64x2` has signed-only
+        // ordering in the wasm spec (no unsigned lt/gt/le/ge); `eq`/`ne` exist for every shape.
+        O::I8x16Eq => v_icmp(lo, VShape::I8x16, VICmpOp::Eq)?,
+        O::I8x16Ne => v_icmp(lo, VShape::I8x16, VICmpOp::Ne)?,
+        O::I8x16LtS => v_icmp(lo, VShape::I8x16, VICmpOp::LtS)?,
+        O::I8x16LtU => v_icmp(lo, VShape::I8x16, VICmpOp::LtU)?,
+        O::I8x16GtS => v_icmp(lo, VShape::I8x16, VICmpOp::GtS)?,
+        O::I8x16GtU => v_icmp(lo, VShape::I8x16, VICmpOp::GtU)?,
+        O::I8x16LeS => v_icmp(lo, VShape::I8x16, VICmpOp::LeS)?,
+        O::I8x16LeU => v_icmp(lo, VShape::I8x16, VICmpOp::LeU)?,
+        O::I8x16GeS => v_icmp(lo, VShape::I8x16, VICmpOp::GeS)?,
+        O::I8x16GeU => v_icmp(lo, VShape::I8x16, VICmpOp::GeU)?,
+        O::I16x8Eq => v_icmp(lo, VShape::I16x8, VICmpOp::Eq)?,
+        O::I16x8Ne => v_icmp(lo, VShape::I16x8, VICmpOp::Ne)?,
+        O::I16x8LtS => v_icmp(lo, VShape::I16x8, VICmpOp::LtS)?,
+        O::I16x8LtU => v_icmp(lo, VShape::I16x8, VICmpOp::LtU)?,
+        O::I16x8GtS => v_icmp(lo, VShape::I16x8, VICmpOp::GtS)?,
+        O::I16x8GtU => v_icmp(lo, VShape::I16x8, VICmpOp::GtU)?,
+        O::I16x8LeS => v_icmp(lo, VShape::I16x8, VICmpOp::LeS)?,
+        O::I16x8LeU => v_icmp(lo, VShape::I16x8, VICmpOp::LeU)?,
+        O::I16x8GeS => v_icmp(lo, VShape::I16x8, VICmpOp::GeS)?,
+        O::I16x8GeU => v_icmp(lo, VShape::I16x8, VICmpOp::GeU)?,
+        O::I32x4Eq => v_icmp(lo, VShape::I32x4, VICmpOp::Eq)?,
+        O::I32x4Ne => v_icmp(lo, VShape::I32x4, VICmpOp::Ne)?,
+        O::I32x4LtS => v_icmp(lo, VShape::I32x4, VICmpOp::LtS)?,
+        O::I32x4LtU => v_icmp(lo, VShape::I32x4, VICmpOp::LtU)?,
+        O::I32x4GtS => v_icmp(lo, VShape::I32x4, VICmpOp::GtS)?,
+        O::I32x4GtU => v_icmp(lo, VShape::I32x4, VICmpOp::GtU)?,
+        O::I32x4LeS => v_icmp(lo, VShape::I32x4, VICmpOp::LeS)?,
+        O::I32x4LeU => v_icmp(lo, VShape::I32x4, VICmpOp::LeU)?,
+        O::I32x4GeS => v_icmp(lo, VShape::I32x4, VICmpOp::GeS)?,
+        O::I32x4GeU => v_icmp(lo, VShape::I32x4, VICmpOp::GeU)?,
+        O::I64x2Eq => v_icmp(lo, VShape::I64x2, VICmpOp::Eq)?,
+        O::I64x2Ne => v_icmp(lo, VShape::I64x2, VICmpOp::Ne)?,
+        O::I64x2LtS => v_icmp(lo, VShape::I64x2, VICmpOp::LtS)?,
+        O::I64x2GtS => v_icmp(lo, VShape::I64x2, VICmpOp::GtS)?,
+        O::I64x2LeS => v_icmp(lo, VShape::I64x2, VICmpOp::LeS)?,
+        O::I64x2GeS => v_icmp(lo, VShape::I64x2, VICmpOp::GeS)?,
         // float lane arithmetic
         O::F32x4Add => v_fbin(lo, VShape::F32x4, VFloatBinOp::Add)?,
         O::F32x4Sub => v_fbin(lo, VShape::F32x4, VFloatBinOp::Sub)?,

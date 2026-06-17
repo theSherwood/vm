@@ -24,8 +24,8 @@ use std::fmt::Write as _;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module,
-    Ordering, StoreOp, Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType,
-    VarInfo, VarLoc,
+    Ordering, StoreOp, Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape,
+    ValType, VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -350,6 +350,7 @@ fn print_inst(inst: &Inst) -> String {
             format!("{}.replace_lane {lane} v{a} v{b}", shape.name())
         }
         Inst::VIntBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VIntCmp { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
         Inst::VBitBin { op, a, b } => format!("v128.{} v{a} v{b}", op.name()),
@@ -1647,6 +1648,10 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::VIntBin { shape, op: o, a, b });
+        } else if let Some(o) = VICmpOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VIntCmp { shape, op: o, a, b });
         }
         err(format!("unknown opcode `{op}`"))
     }

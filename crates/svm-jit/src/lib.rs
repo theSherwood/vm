@@ -71,7 +71,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType, DEFAULT_RESERVED_LOG2,
+    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -2562,6 +2562,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // can't legalize it; bail to `Unsupported` (the interp oracle still covers it).
                 Inst::VIntBin { shape, op, .. }
                     if !(*shape == VShape::I8x16 && *op == VIntBinOp::Mul) => {}
+                // Lane compares lower to a single Cranelift `icmp` (legalizes on every target).
+                Inst::VIntCmp { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3547,6 +3549,32 @@ fn lower_block(
                     VIntBinOp::Sub => b.ins().isub(x, y),
                     VIntBinOp::Mul => b.ins().imul(x, y),
                 };
+                vcast(b, r, I8X16)
+            }
+            Inst::VIntCmp {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Vector `icmp` yields a per-lane all-ones/all-zeros mask of the lane width — exactly
+                // the wasm/interp semantics — so this is a single instruction on the right vector type.
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let cc = match op {
+                    VICmpOp::Eq => IntCC::Equal,
+                    VICmpOp::Ne => IntCC::NotEqual,
+                    VICmpOp::LtS => IntCC::SignedLessThan,
+                    VICmpOp::LtU => IntCC::UnsignedLessThan,
+                    VICmpOp::GtS => IntCC::SignedGreaterThan,
+                    VICmpOp::GtU => IntCC::UnsignedGreaterThan,
+                    VICmpOp::LeS => IntCC::SignedLessThanOrEqual,
+                    VICmpOp::LeU => IntCC::UnsignedLessThanOrEqual,
+                    VICmpOp::GeS => IntCC::SignedGreaterThanOrEqual,
+                    VICmpOp::GeU => IntCC::UnsignedGreaterThanOrEqual,
+                };
+                let r = b.ins().icmp(cc, x, y);
                 vcast(b, r, I8X16)
             }
             Inst::VFloatBin {

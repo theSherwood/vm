@@ -643,6 +643,17 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
+        Inst::VIntCmp { shape, a, b, .. } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
         Inst::VFloatBin { shape, a, b, .. } => {
             if !shape.is_float() {
                 return Err(VerifyError::BadSimdShape {
