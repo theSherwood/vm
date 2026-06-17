@@ -224,9 +224,15 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // then sit at index `base..` so `main` can be called from `_start`.
     let (mut imports, mut caps) = collect_cap_imports(m, &defined_names);
     let has_main = defined_names.contains_key("main");
+    // Direct `<svm.h>` Memory-capability builtins (`__vm_map`/`unmap`/`protect`/`page_size`): register
+    // their §7 imports and remember the program needs the `Memory` handle granted, even with no `malloc`.
+    let uses_vm_memory = register_vm_memory_imports(m, &defined_names, &mut imports, &mut caps);
     // `realloc` is a synthesized helper built on `malloc` + `memcpy`, so it forces both on.
     let need_realloc = calls_external(m, &defined_names, "realloc") && has_main;
     let need_malloc = (needs_malloc(m, &defined_names) || need_realloc) && has_main;
+    // The `Memory` handle (4th powerbox grant) is needed by the allocator *and* the direct Memory
+    // builtins; the heap is seeded only for `malloc`.
+    let need_memory_cap = (need_malloc || uses_vm_memory) && has_main;
     // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
     // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
@@ -322,7 +328,16 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     if synth {
         let main_idx = name2idx["main"];
         let main_results = funcs[(main_idx - base) as usize].results.clone();
-        funcs.insert(0, synth_start(main_idx, &main_results, entry_sp, heap_base));
+        funcs.insert(
+            0,
+            synth_start(
+                main_idx,
+                &main_results,
+                entry_sp,
+                need_memory_cap,
+                heap_base,
+            ),
+        );
     }
     // Append the synthesized helpers in index order (memset, memcpy, malloc, utoa, realloc) —
     // matching the indices assigned above.
@@ -1339,6 +1354,11 @@ fn import_sig(import: &str) -> svm_ir::FuncType {
         "exit" => ft(vec![I32], vec![]),
         // `Memory.map(offset, len, prot)` (§3e op 0) — the allocator's page-commit primitive.
         "vm_map" => ft(vec![I64, I64, I32], vec![I64]),
+        // `Memory.unmap(offset, len)` (op 1) / `protect(offset, len, prot)` (op 2) /
+        // `page_size()` (op 3) — the rest of the §3e/§4 Memory surface a guest reaches from `<svm.h>`.
+        "vm_unmap" => ft(vec![I64, I64], vec![I64]),
+        "vm_protect" => ft(vec![I64, I64, I32], vec![I64]),
+        "vm_page_size" => ft(vec![], vec![I64]),
         _ => ft(vec![I64, I64], vec![I64]), // write / read (Stream)
     }
 }
@@ -1380,6 +1400,59 @@ fn collect_cap_imports(
     (imports, import_of)
 }
 
+/// The §7 import a `<svm.h>` **Memory-capability** builtin needs (`__vm_map`/`unmap`/`protect`/
+/// `page_size` → `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size`), or `None` if `name` is not one of
+/// them. These reach `Memory` (the 4th powerbox handle, slot 12) — the same cap the bump allocator
+/// uses, exposed directly so a guest manages window pages itself (the §1a sparse-address-space path).
+fn vm_memory_builtin_import(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__vm_map" => "vm_map",
+        "__vm_unmap" => "vm_unmap",
+        "__vm_protect" => "vm_protect",
+        "__vm_page_size" => "vm_page_size",
+        _ => return None,
+    })
+}
+
+/// Scan for direct `<svm.h>` Memory-capability builtin calls (`__vm_map`/…), registering each one's
+/// §7 import into the table (deduplicated, like [`collect_cap_imports`]) so the call lowering's
+/// `import_of` resolves it. Returns whether any were used — the signal that `_start` must be granted
+/// the `Memory` handle even if the program never calls `malloc`. A guest-*defined* function of the
+/// same name shadows the builtin (mirrors the libc/libm rule).
+fn register_vm_memory_imports(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    imports: &mut Vec<svm_ir::Import>,
+    caps: &mut HashMap<String, u32>,
+) -> bool {
+    let mut used = false;
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if defined.contains_key(&name) {
+                    continue;
+                }
+                if let Some(import) = vm_memory_builtin_import(&name) {
+                    used = true;
+                    caps.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
+                        });
+                        i
+                    });
+                }
+            }
+        }
+    }
+    used
+}
+
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
 /// capabilities. It takes the granted handles `(stdout, stdin, exit)` as `i32` params (the §3e
 /// powerbox shape `is_powerbox_entry` recognizes — no threaded data-SP, since it is the root),
@@ -1389,15 +1462,17 @@ fn synth_start(
     main_idx: u32,
     main_results: &[ValType],
     entry_sp: u64,
+    grant_memory: bool,
     heap_base: Option<u64>,
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
     // params: v0 = stdout, v1 = stdin, v2 = exit, [v3 = memory] (i32 capability handles). A program
-    // that uses `malloc` takes the 4th `Memory` handle (the powerbox grants it for a 4-param entry).
+    // that uses `malloc` **or** a direct `<svm.h>` Memory builtin (`__vm_map`/…) takes the 4th
+    // `Memory` handle (the powerbox grants it for a 4-param entry); only `malloc` also seeds the heap.
     let mut handles = vec![(STASH_STDOUT, 0), (STASH_STDIN, 1), (STASH_EXIT, 2)];
     let mut params = vec![ValType::I32, ValType::I32, ValType::I32];
-    if heap_base.is_some() {
+    if grant_memory {
         handles.push((STASH_MEMORY, 3));
         params.push(ValType::I32);
     }
@@ -2282,6 +2357,270 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
         });
     }
     Ok(segs)
+}
+
+/// The `i`-th call argument operand, bounds-checked (a fail-closed error rather than a panic when a
+/// declaration has fewer args than the builtin expects).
+fn vm_arg(c: &llvm_ir::instruction::Call, i: usize) -> Result<&Operand, Error> {
+    c.arguments
+        .get(i)
+        .map(|(o, _)| o)
+        .ok_or_else(|| Error::Unsupported("`__vm_*` builtin: too few arguments".into()))
+}
+
+/// Lower a `<svm.h>` low-level builtin (`crates/.../include/svm.h`, the chibicc oracle in
+/// `frontend/chibicc/codegen_ir.c`) to the matching SVM IR op or `Memory` capability call. Returns
+/// `Ok(true)` if `name` is one of these intrinsics (and it was lowered), `Ok(false)` otherwise so the
+/// caller falls through to the ordinary direct/indirect call path. The caller gates this on `name`
+/// being **external** (not guest-defined), so a guest function of the same name shadows the builtin
+/// (mirrors the libc/libm rule).
+///
+/// Coverage (the P0+P1+Memory surface): the §3e/§4 **Memory** capability (`__vm_map`/`unmap`/
+/// `protect`/`page_size`); §12 **fibers** (`__vm_fiber_new`/`resume`/`suspend` → `cont.new`/`resume`/
+/// `suspend`); §GC conservative **roots** (`__vm_gc_roots` → `gc.roots`); §12 **threads**
+/// (`__vm_thread_spawn`/`join`) and **atomics** (`__vm_atomic_*` → the `iN.atomic.*` ops); the §12
+/// **futex** (`__vm_wait32`/`__vm_notify`); and §7 capability **reflection** (`__vm_cap` reads the
+/// handle stash; `__vm_cap_count`/`__vm_cap_at` → `cap.self.count`/`cap.self.get`). Each mirrors the
+/// chibicc lowering exactly, so a program built through either frontend produces equivalent IR.
+fn lower_vm_builtin(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    use svm_ir::{AtomicRmwOp, LoadOp, Ordering, StoreOp};
+    // All §12 atomics are sequentially consistent (the op makes the JIT emit a hardware atomic).
+    let sc = Ordering::SeqCst;
+    match name {
+        // ---- §3e/§4 Memory capability: `cap.call` on the stashed Memory handle (slot 12) ----
+        "__vm_map" | "__vm_unmap" | "__vm_protect" => {
+            let import = vm_memory_builtin_import(name).expect("memory builtin");
+            let imp = ctx.import_of(import)?;
+            let off = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let len = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let mut args = vec![off, len];
+            if name != "__vm_unmap" {
+                args.push(ctx.operand_i32(vm_arg(c, 2)?)?); // prot
+            }
+            let handle = ctx.stash_load(STASH_MEMORY);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig(import),
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_page_size" => {
+            let imp = ctx.import_of("vm_page_size")?;
+            let handle = ctx.stash_load(STASH_MEMORY);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig("vm_page_size"),
+                handle,
+                args: vec![],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // ---- §12 fibers (stack switching) ----
+        "__vm_fiber_new" => {
+            // arg0 is a function pointer (an `i64` funcref); `cont.new` wants the `i32` funcref.
+            let fn64 = ctx.operand(vm_arg(c, 0)?)?;
+            let func = ctx.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: fn64,
+            });
+            let sp = ctx.operand_i64(vm_arg(c, 1)?)?; // the fiber's own data-stack base
+            let r = ctx.push(Inst::ContNew { func, sp });
+            ctx.bind_dest(&c.dest, r); // i32 fiber handle
+            Ok(true)
+        }
+        "__vm_fiber_resume" => {
+            let k = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let arg = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let done = ctx.operand_i64(vm_arg(c, 2)?)?; // `int *done`
+            let rs = ctx.push_multi(Inst::ContResume { k, arg }, 2); // (status, value)
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I32,
+                addr: done,
+                value: rs[0],
+                offset: 0,
+                align: 0,
+            }); // *done = status (0 suspended / 1 returned)
+            ctx.bind_dest(&c.dest, rs[1]); // the yielded/returned i64
+            Ok(true)
+        }
+        "__vm_fiber_suspend" => {
+            let value = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let r = ctx.push(Inst::Suspend { value });
+            ctx.bind_dest(&c.dest, r); // the next resume's arg
+            Ok(true)
+        }
+        // ---- §GC conservative root enumeration (`gc.roots`) ----
+        "__vm_gc_roots" => {
+            let heap_lo = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let heap_hi = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let buf = ctx.operand_i64(vm_arg(c, 2)?)?;
+            let cap = ctx.operand_i64(vm_arg(c, 3)?)?;
+            let r = ctx.push(Inst::GcRoots {
+                heap_lo,
+                heap_hi,
+                buf,
+                cap,
+            });
+            ctx.bind_dest(&c.dest, r); // total candidate count (i64)
+            Ok(true)
+        }
+        // ---- §12 threads ----
+        "__vm_thread_spawn" => {
+            let func = ctx.direct_func_idx(vm_arg(c, 0)?)?; // a static funcidx
+            let sp = ctx.operand_i64(vm_arg(c, 1)?)?; // the thread's data-stack base
+            let arg = ctx.operand_i64(vm_arg(c, 2)?)?;
+            let r = ctx.push(Inst::ThreadSpawn { func, sp, arg });
+            ctx.bind_dest(&c.dest, r); // i32 thread handle
+            Ok(true)
+        }
+        "__vm_thread_join" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let r = ctx.push(Inst::ThreadJoin { handle });
+            ctx.bind_dest(&c.dest, r); // i64 result
+            Ok(true)
+        }
+        // ---- §12 atomics (linear-memory) ----
+        "__vm_atomic_add" | "__vm_atomic_add32" => {
+            let ty = if name.ends_with("32") {
+                IntTy::I32
+            } else {
+                IntTy::I64
+            };
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let value = if ty == IntTy::I64 {
+                ctx.operand_i64(vm_arg(c, 1)?)?
+            } else {
+                ctx.operand_i32(vm_arg(c, 1)?)?
+            };
+            let r = ctx.push(Inst::AtomicRmw {
+                ty,
+                op: AtomicRmwOp::Add,
+                addr,
+                value,
+                offset: 0,
+                order: sc,
+            });
+            ctx.bind_dest(&c.dest, r); // the old value
+            Ok(true)
+        }
+        "__vm_atomic_load" | "__vm_atomic_load32" => {
+            let ty = if name.ends_with("32") {
+                IntTy::I32
+            } else {
+                IntTy::I64
+            };
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let r = ctx.push(Inst::AtomicLoad {
+                ty,
+                addr,
+                offset: 0,
+                order: sc,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_atomic_store" | "__vm_atomic_store32" => {
+            let ty = if name.ends_with("32") {
+                IntTy::I32
+            } else {
+                IntTy::I64
+            };
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let value = if ty == IntTy::I64 {
+                ctx.operand_i64(vm_arg(c, 1)?)?
+            } else {
+                ctx.operand_i32(vm_arg(c, 1)?)?
+            };
+            ctx.push_effect(Inst::AtomicStore {
+                ty,
+                addr,
+                value,
+                offset: 0,
+                order: sc,
+            });
+            Ok(true) // void
+        }
+        "__vm_atomic_cas32" => {
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let expected = ctx.operand_i32(vm_arg(c, 1)?)?;
+            let replacement = ctx.operand_i32(vm_arg(c, 2)?)?;
+            let r = ctx.push(Inst::AtomicCmpxchg {
+                ty: IntTy::I32,
+                addr,
+                expected,
+                replacement,
+                offset: 0,
+                order: sc,
+            });
+            ctx.bind_dest(&c.dest, r); // the old value (i32)
+            Ok(true)
+        }
+        // ---- §12 futex ----
+        "__vm_wait32" => {
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let expected = ctx.operand_i32(vm_arg(c, 1)?)?;
+            let timeout = ctx.operand_i64(vm_arg(c, 2)?)?; // ns
+            let r = ctx.push(Inst::MemoryWait {
+                ty: IntTy::I32,
+                addr,
+                expected,
+                timeout,
+            });
+            ctx.bind_dest(&c.dest, r); // 0 woken / 1 not-equal / 2 timed-out
+            Ok(true)
+        }
+        "__vm_notify" => {
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let count = ctx.operand_i32(vm_arg(c, 1)?)?;
+            let r = ctx.push(Inst::MemoryNotify { addr, count });
+            ctx.bind_dest(&c.dest, r); // number woken
+            Ok(true)
+        }
+        // ---- §7 capability reflection ----
+        "__vm_cap" => {
+            // The i-th stashed powerbox handle: an `i32.load` at byte offset `i*4` in the reserved
+            // low window (the handle stash), exactly where `_start` stored the granted handles.
+            let i = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let four = ctx.const_i64(4);
+            let off = ctx.mul_i64(i, four);
+            let r = ctx.push(Inst::Load {
+                op: LoadOp::I32,
+                addr: off,
+                offset: 0,
+                align: 0,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_cap_count" => {
+            let r = ctx.push(Inst::CapSelfCount);
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_cap_at" => {
+            let idx = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let type_id_out = ctx.operand_i64(vm_arg(c, 1)?)?; // `int *type_id_out`
+            let rs = ctx.push_multi(Inst::CapSelfGet { idx }, 2); // (handle, type_id)
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I32,
+                addr: type_id_out,
+                value: rs[1],
+                offset: 0,
+                align: 0,
+            }); // *type_id_out = type_id
+            ctx.bind_dest(&c.dest, rs[0]); // the capability handle
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn lower_io_call(
@@ -3557,6 +3896,56 @@ impl<'a> BlockCtx<'a> {
         })
     }
 
+    /// An operand widened to the host word `i64` (the §7/§3e capability-call ABI): a pointer or
+    /// `i64` is already there; a narrow `i32` is zero-extended (addresses/lengths/indices are
+    /// non-negative window quantities). Float/vector operands are a clean `Unsupported`.
+    fn operand_i64(&mut self, op: &Operand) -> Result<ValIdx, Error> {
+        let v = self.operand(op)?;
+        match val_type(op.get_type(self.types).as_ref())? {
+            ValType::I64 => Ok(v),
+            ValType::I32 => Ok(self.push(Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: v,
+            })),
+            other => unsup(format!(
+                "expected an integer/pointer argument, got {}",
+                other.as_str()
+            )),
+        }
+    }
+
+    /// An operand narrowed to `i32` (a capability handle, a 32-bit atomic word, a fiber/thread
+    /// handle): already `i32`, or an `i64` truncated. Float/vector operands are `Unsupported`.
+    fn operand_i32(&mut self, op: &Operand) -> Result<ValIdx, Error> {
+        let v = self.operand(op)?;
+        match val_type(op.get_type(self.types).as_ref())? {
+            ValType::I32 => Ok(v),
+            ValType::I64 => Ok(self.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: v,
+            })),
+            other => unsup(format!(
+                "expected an integer argument, got {}",
+                other.as_str()
+            )),
+        }
+    }
+
+    /// Resolve an operand that must be a **direct function designator** (a `@func` reference) to its
+    /// IR function index — the static `func` immediate `thread.spawn` requires (§12). A computed
+    /// function pointer is a clean `Unsupported` (mirrors the chibicc `__vm_thread_spawn` rule).
+    fn direct_func_idx(&self, op: &Operand) -> Result<u32, Error> {
+        if let Operand::ConstantOperand(c) = op {
+            if let Constant::GlobalReference { name, .. } = c.as_ref() {
+                let n = name_str(name);
+                if let Some(&f) = self.name2idx.get(&n) {
+                    return Ok(f);
+                }
+            }
+        }
+        unsup("`__vm_thread_spawn` requires a direct function name as its first argument")
+    }
+
     /// Resolve a value-id already available in this block (a parameter or an earlier result).
     fn id(&self, vid: ValueId) -> Result<ValIdx, Error> {
         self.idx_of
@@ -3798,6 +4187,14 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 }
             }
             return Ok(());
+        }
+        // A `<svm.h>` low-level builtin (`__vm_map`/`__vm_fiber_*`/`__vm_atomic_*`/`__vm_cap`/…) lowers
+        // to the matching SVM IR op or `Memory` capability call. Gated on the name being external (a
+        // guest-defined function of the same name shadows it), like the libc/libm rules below.
+        if let Some(name) = callee_name(c) {
+            if !ctx.name2idx.contains_key(&name) && lower_vm_builtin(ctx, c, &name)? {
+                return Ok(());
+            }
         }
         // A call to an external libc function bound to a host capability (§7): the primitive
         // `write`/`read`/`exit`, or a stdio output wrapper (`puts`/`putc`/`fwrite`/…). All lower to
