@@ -962,6 +962,15 @@ fn demo_regex_vs_native() {
 }
 
 #[test]
+fn demo_jsmn_vs_native() {
+    // jsmn: a zero-allocation JSON parser. Parses an embedded document into a fixed token array and
+    // prints each token's type/size/text. Exercises `llvm.load.relative` — clang lowers the
+    // type→name `switch` into a relative lookup table (`&str − &table` offsets) — plus struct-array
+    // indexing and interior string pointers. Byte-identical to native `clang`.
+    check_demo_vs_native("jsmn", "jsmn/jsmn_demo.c", b"");
+}
+
+#[test]
 fn ro_and_writable_global_page_isolation() {
     // A read-only global (string literal) next to a writable one (a mutable array) must not share a
     // protected page: a write to the writable global would otherwise fault on the read-only page

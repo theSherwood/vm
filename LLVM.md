@@ -8,13 +8,14 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–Q done — a broad swath of scalar C from `clang -O2` runs on both
-backends (56 tests), and **four real corpus libraries run byte-identical to native**: B-Con's
-**SHA-256**, **xxHash**, **stb_perlin**, and **tiny-regex-c** (`demo_*_vs_native`). Slice Q added the
-gaps they revealed — `ptrtoint`/`inttoptr` (a width adjust; pointers are `i64`), `freeze` (identity),
-**constexpr GEP** (interior pointers into constants, `&".."[k]`), and a layout fix **page-isolating
-read-only globals from writable ones** (a `const` beside a mutable `static` would otherwise fault
-writes on the shared D40-protected page).
+**Status: Milestone 1 slices A–R done — a broad swath of scalar C from `clang -O2` runs on both
+backends (57 tests), and **five real corpus libraries run byte-identical to native**: B-Con's
+**SHA-256**, **xxHash**, **stb_perlin**, **tiny-regex-c**, and **jsmn** (`demo_*_vs_native`). Slice Q
+added `ptrtoint`/`inttoptr` (a width adjust; pointers are `i64`), `freeze` (identity), **constexpr
+GEP** (interior pointers into constants, `&".."[k]`), and a layout fix **page-isolating read-only
+globals from writable ones** (a `const` beside a mutable `static` would otherwise fault writes on the
+shared D40-protected page). Slice R added **`llvm.load.relative`** (clang's relative lookup table for
+a string-returning `switch` — `P + sext_i32(*(i32*)(P+off))`), which lands jsmn.
 A **kitchen-sink capstone** exercises everything at once (structs by-value, a function-pointer table,
 floats+libm, recursion, loops, an array `memcpy`, a global array, `switch`, bit intrinsics) and
 matches **native `cc`** end to end. **Slice N** binds the raw I/O primitives (`write`/`read` →
@@ -41,10 +42,10 @@ conversions, `fabs`/`floor`, an indirect call through a function pointer, struct
 (small-coerced + `byval`/`sret`), and pointer-valued global relocations (a function-pointer table,
 a struct string-pointer member), libm math calls (`sqrt`/`fmin`), and int min/max + bit intrinsics
 (`smax`/`ctlz`/`popcount`), funnel-shift rotates (`fshl`/`fshr`), and a variable-length `memset`
-loop, `ptr`↔`int`, `freeze`, a constexpr GEP, RO/writable page isolation — run **interp == JIT ==
-hand-computed** (56 tests, incl. a kitchen-sink program checked against native `cc`,
-`write`/`exit`/`read`-echo and `puts`/`printf`/`putchar`/`fwrite`/`fputs` powerbox programs, and the
-**SHA-256 / xxHash / perlin / regex corpus demos**, all checked against native stdout + exit code).
+loop, `ptr`↔`int`, `freeze`, a constexpr GEP, RO/writable page isolation, `llvm.load.relative` — run
+**interp == JIT == hand-computed** (57 tests, incl. a kitchen-sink program checked against native
+`cc`, `write`/`exit`/`read`-echo and `puts`/`printf`/`putchar`/`fwrite`/`fputs` powerbox programs, and
+the **SHA-256 / xxHash / perlin / regex / jsmn corpus demos**, all checked against native stdout).
 Remaining M1: varargs `printf` (formatting) + `malloc`/heap, then more of the
 demo corpus (Lane C). Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
@@ -486,18 +487,26 @@ cluster of small gaps, all now closed.
 - [x] **Demos:** `demo_xxhash_vs_native`, `demo_perlin_vs_native`, `demo_regex_vs_native`, plus a
       focused `ro_and_writable_global_page_isolation` unit check.
 
+**Slice R (DONE) — `llvm.load.relative` (lands jsmn).** clang lowers a constant-returning `switch`
+(jsmn's token-type → name) into a **relative lookup table**: `@reltable = [i32 (&str − &reltable)…]`,
+and `llvm.load.relative.i64(P, off)` returns `P + sext_i32(*(i32*)(P + off))` — the absolute target.
+- [x] `lower_load_relative`: `add` the offset to the base, `load.i32`, `sext` to i64, `add` to the
+      base. The table initializer (`trunc(sub(ptrtoint(@str), ptrtoint(@table)))`) already folds via
+      `const_eval` (`Trunc`/`Sub`/`PtrToInt`), so no new initializer support was needed.
+- [x] **Demo:** `demo_jsmn_vs_native` — a zero-allocation JSON parser, parsing an embedded document
+      into a fixed token array and printing each token's type/size/text, byte-identical to native.
+
 **Remaining slices.**
-- [ ] `llvm.load.relative` (relative-offset string tables — blocks **jsmn**); transcendental math
-      (needs a guest libm); `llvm.bswap`/`bitreverse`.
+- [ ] Transcendental math (needs a guest libm); `llvm.bswap`/`bitreverse`.
 - [ ] Varargs `printf`/`fprintf`/`snprintf` (the varargs ABI on the data stack + a format engine) —
       the headline gap for numeric output; `puts`/`fputs` of a *non-literal* string (a runtime
       strlen loop). `malloc`/`free` (→ the `Memory` capability + a guest allocator — blocks
       **heapgrow**), `argc`/`argv` `main`. The §7 import mechanism (slices N/O) and the multi-block
       helper (slice P) are the hard parts; these build on them.
 - [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
-      (the same corpus chibicc passes — clay, jsmn, sha256 ✅, xxhash ✅, tinfl, perlin ✅, regex ✅,
-      heapgrow). This is the D54 "matches native clang" exit criterion. **4 of 8 land.** Remaining:
-      jsmn (needs `llvm.load.relative`), heapgrow (`malloc`), tinfl/clay (likely varargs `printf`).
+      (the same corpus chibicc passes — clay, jsmn ✅, sha256 ✅, xxhash ✅, tinfl, perlin ✅, regex ✅,
+      heapgrow). This is the D54 "matches native clang" exit criterion. **5 of 8 land.** Remaining:
+      heapgrow (`malloc`), tinfl/clay (likely varargs `printf` + `malloc`).
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).

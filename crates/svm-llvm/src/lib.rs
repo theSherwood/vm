@@ -88,11 +88,14 @@
 //!   **read-only globals are page-isolated from writable ones** (a `const` next to a mutable `static`
 //!   would otherwise fault writes on the shared D40-protected page). Lands **xxHash**, **stb_perlin**,
 //!   and **tiny-regex-c** byte-identical to native.
+//! - **R — `llvm.load.relative` (clang's relative lookup table).** A `switch` returning constants
+//!   compiles to a table of 32-bit `&target − &table` offsets; `load.relative(P, off)` →
+//!   `P + sext_i32(*(i32*)(P+off))`. The table initializer (`trunc(sub(ptrtoint…))`) already folds via
+//!   the constexpr evaluator. Lands **jsmn** (a zero-alloc JSON parser) byte-identical to native.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): variable-length `memmove` (overlap),
 //! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `malloc`/heap,
-//! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen),
-//! `llvm.load.relative` (clang's relative-offset string tables), SIMD vectors, `i33`.
+//! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1673,6 +1676,36 @@ fn lower_libm_call(
 /// so `memmove` and `memcpy` share a path); `memset` replicates the fill byte across an `i64` and
 /// stores it chunk-wide. Returns `Ok(true)` if it handled a (void) mem intrinsic, `Ok(false)`
 /// otherwise. A variable or too-large length is a clean `Unsupported`.
+/// Lower `llvm.load.relative.iN(ptr P, iN offset)` — clang's **relative lookup table** (used for a
+/// `switch` returning string/function constants): the table at `P` holds 32-bit signed offsets
+/// `&target − &P`, so the absolute target is `P + sext_i32(*(i32*)(P + offset))`. The table itself
+/// (`trunc(sub(ptrtoint …))` initializers) is serialized by [`const_eval`]. Returns the result index.
+fn lower_load_relative(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    if !name.starts_with("llvm.load.relative") {
+        return Ok(None);
+    }
+    let p = ctx.operand(&c.arguments[0].0)?;
+    let off = ctx.operand(&c.arguments[1].0)?;
+    let ea = ctx.add_i64(p, off); // address of the i32 table entry
+    let raw = ctx.push(Inst::Load {
+        op: svm_ir::LoadOp::I32,
+        addr: ea,
+        offset: 0,
+        align: 0,
+    });
+    let delta = ctx.push(Inst::Convert {
+        op: ConvOp::ExtendI32S,
+        a: raw,
+    }); // sign-extend the relative offset
+    Ok(Some(ctx.add_i64(p, delta)))
+}
+
 fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<bool, Error> {
     let Some(name) = callee_name(c) else {
         return Ok(false);
@@ -2359,6 +2392,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         // Integer min/max + bit intrinsics (`llvm.smax`/`umin`/`ctlz`/`ctpop`/`abs`/…) lower inline.
         if let Some(idx) = lower_int_intrinsic(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // `llvm.load.relative` (clang's relative lookup table) → load the 32-bit relative offset and
+        // add it back to the table base.
+        if let Some(idx) = lower_load_relative(ctx, c)? {
             if let Some(dest) = &c.dest {
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
                     ctx.idx_of.insert(vid, idx);
