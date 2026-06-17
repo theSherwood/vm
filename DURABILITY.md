@@ -663,6 +663,58 @@ multi-vCPU quiesce + per-context layout. 3.3 — JIT parity (drive real OS threa
 safepoints; respect the D57 single-owner protocol). Phase 4 — back-edge polls for bounded
 latency.
 
+#### 3.1 implementation plan (next-session pickup)
+
+Done: the transform recognizes the fiber ops + NORMAL-inert (PR #27, branch
+`claude/durable-phase3-design`, commit `4403d41`). The remaining 3.1 slices, in order,
+each a small reviewable commit on the interpreter only:
+
+1. **Per-fiber shadow-stack layout + shadow-SP swap.** Generalize the durable reserve
+   from one shadow stack to one **per fiber/context**. Keep the *active* shadow-SP at the
+   fixed `SHADOW_SP_OFF` (so the transform's existing `SHADOW_SP_OFF` reads are unchanged),
+   and have the fiber switch save/restore it to/from a per-fiber saved slot keyed by the
+   fiber handle (the §12.7 "swapped alongside on fiber switch"). Decide the in-window
+   layout: a per-fiber region `[base_i, base_i+stack_size)` + a saved-`shadow_SP_i` word,
+   indexed by fiber slot, inside `[0, DURABLE_RESERVE)`. The transform emits the
+   save/restore around `cont.resume`/`suspend`; `cont.new` allocates the new fiber's
+   region. Test: existing single-vCPU durable tests still pass (root = context 0), and two
+   fibers get **distinct** shadow regions (no collision). *Touches `svm-durable` (emit the
+   swap) + the interp's `cont.*` execution (allocate/track the region) — `svm-interp`.*
+
+2. **`Resume` thaw arm** (`cont.resume`, resumer side). Mirror `SuspendKind::Propagated`'s
+   re-issue, but emit `Inst::ContResume { k, arg }` (operands reloaded from the spilled
+   slots — already spilled by this slice's `used[k]/used[arg]`) and thread its **two**
+   results `(status, value)` into the continuation. Replace the fail-closed trap arm for
+   `Resume`. Test: a root that resumes a *leaf-ish* fiber freezes/thaws (the fiber side
+   still parked-trap until slice 3, so use a fiber that has already returned, or gate).
+
+3. **`Yield` thaw arm — re-park** (the novel bit). On thaw of a `suspend` point, rewind the
+   fiber's frames from its shadow stack and **return it to the parked state** in the fiber
+   registry (awaiting a future `cont.resume`), *not* continue forward. The deepest-frame
+   "flip to NORMAL and continue" rule (§12.7) becomes, for a fiber's base frame, "re-park
+   the fiber." Needs the interp's `RegFiber`/registry to accept a fiber rebuilt-from-shadow
+   as `Parked`. Replace the fail-closed trap arm for `Yield`.
+
+4. **Freeze driver — flatten idle parked fibers.** Today freeze drives the running vCPU to
+   unwind. Extend it: for each *idle* `RegFiber::Parked` fiber, switch into it with
+   `state = UNWINDING`; because the transform places the poll **immediately** after the
+   suspend point, that poll fires before any guest code runs → the fiber unwinds into its
+   shadow stack with **zero forward progress**, then control returns. Verify that
+   "poll-immediately-after-suspend" guarantee holds in the emitted IR (load-bearing). Drive
+   to quiescence (all fibers flattened), then snapshot. *Host-side driver, not escape-TCB.*
+
+5. **End-to-end test + snapshot wiring.** One fiber, `freeze → serialize → restore → thaw ≡
+   uninterrupted`, interp-only. The snapshot needs Section 2 to record each fiber's
+   `(slot, generation)` handle + its shadow region offset/extent + `parked|runnable` status
+   (§12.4); restore rebuilds the registry and re-parks. Add to `svm-snapshot` + a
+   `durable`-style test; fold into the `durable_fuzz` generator once stable.
+
+Then 3.2 (multi-vCPU) and 3.3 (JIT parity) as above. **Open sub-questions to resolve in
+slice 1:** per-fiber shadow-stack *size* + quota accounting (§6/§12.7); how a fiber handle
+maps to its region offset (dense slot index × stride?); and whether the resume chain depth
+needs explicit recording or falls out of per-fiber rewind (likely the latter — each fiber
+rewinds its own shadow stack independently).
+
 ---
 
 ## Proposed decision record
