@@ -978,6 +978,40 @@ i64` (the `__vm_page_size` frontend builtin) — so a guest allocator can align 
 guest-visible page (decoupled from the host page) for reproducible cross-host
 execution is a later refinement.
 
+### Target dependence (the explicit catalog)
+
+svm aims to be **target-uniform**: a module that verifies runs identically on every supported
+backend/target. The few genuinely target-dependent items are enumerated here so they stay few and
+visible; anything not listed is intended to be byte-for-byte uniform (the interp↔JIT escape oracle
+and differential enforce that for the confinement + codegen surface).
+
+- **Supported targets for native stack-switching** (`svm_fiber::supported()`): x86-64 unix,
+  aarch64 unix (incl. Apple Silicon), x86-64 Windows. The reference JIT derives `cfg(fiber_rt)`
+  from this set.
+- **Features gated to that set** — present on **all three** supported targets; on others the **JIT
+  bails `Unsupported`** (uniformly) while the **interpreter still runs them**, so this is a clean
+  supported-set gate, *not* a behavior difference *between* supported targets: §12 fibers
+  (`cont.*`), threads (`thread.spawn`/`join`), futex (`*.atomic.wait`/`atomic.notify`); §GC
+  `gc.roots` (it walks the fiber runtime's native stacks); §14 nesting (`Instantiator`).
+- **Op-level JIT bails, uniform across all targets** (interpreter covers them): `i8x16.mul` (no
+  single-instruction ISA lowering); a `v128` result inside a many-result signature (see below).
+- **Function results are target-uniform via a return-area (sret).** Cranelift's `Tail` calling
+  convention returns values in registers with a *per-ABI budget* (x86-64 admits more than aarch64).
+  To stop a valid module being accepted on one supported target and rejected on another, the JIT
+  spills results beyond `MAX_REG_RESULTS` (= 4) to a **caller-provided memory return-area pointer**
+  — the technique wasm engines use for multi-value — which is identical codegen on every target, so
+  the result *count* is not target-dependent. (The 8-byte return-area slots can't carry a `v128`, so
+  a `v128` in a `>4`-result signature is the one `Unsupported` bail above; frontends that return many
+  values idiomatically use a guest-memory buffer anyway, e.g. `gc.roots`.)
+- **PAL + page size** (see "Platform support" above): VA reserve/commit/protect/release and
+  guard-fault recovery differ per OS (a non-TCB seam); page granularity is the host MMU page,
+  queried at runtime. The *guarantee* is identical across targets.
+- **Arch/OS-specific code, all behind one seam** (`crates/svm-fiber/`): the register/stack switch
+  (`switch_{x86_64_sysv,aarch64,x86_64_windows}.rs`) and guard-paged stack allocation
+  (`stack_{unix,windows}.rs`). They differ in saved-register frame layout and, on Windows, TEB
+  `StackBase`/`StackLimit`/`DeallocationStack` swaps per switch, but expose one uniform
+  `Fiber`/`Yielder` API.
+
 A window may itself be a power-of-two-aligned **sub-region of a parent window**
 (see §14); confinement is then `base + (offset & (size−1))` with `base`/`size`
 as instantiation constants, so a sub-window is indistinguishable from a
