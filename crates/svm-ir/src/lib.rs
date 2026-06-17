@@ -1893,6 +1893,14 @@ pub enum Inst {
     VPopcnt {
         a: ValIdx,
     },
+    /// Lane-wise unsigned rounding average `(a + b + 1) >> 1` (computed wide, no overflow).
+    /// `a`/`b`/result are `v128`. `i8x16`/`i16x8` only (verifier-enforced — the only shapes wasm
+    /// defines `avgr_u` for), so like [`Inst::VSatBin`] there is no JIT bail list.
+    VAvgr {
+        shape: VShape,
+        a: ValIdx,
+        b: ValIdx,
+    },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.
     VAnyTrue {

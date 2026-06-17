@@ -389,6 +389,26 @@ fn i8x16_popcnt() {
     }
 }
 
+/// `i8x16.avgr_u` through the wasm bridge — the unsigned rounding average that image/blend kernels
+/// emit for "blend two pixels". Splat two byte values, read lane 0; oracle = `(a+b+1)>>1`.
+#[test]
+fn i8x16_avgr_u() {
+    let wat = "(module (func (export \"f\") (param $a i32) (param $b i32) (result i32)
+                 (i8x16.extract_lane_u 0
+                   (i8x16.avgr_u (i8x16.splat (local.get $a)) (i8x16.splat (local.get $b))))))";
+    for (a, b) in [(0u8, 0u8), (255, 255), (3, 4), (255, 1), (100, 101)] {
+        let got = match eval(wat, "f", &[Value::I32(a as i32), Value::I32(b as i32)]) {
+            Value::I32(x) => x,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            got,
+            ((a as u32 + b as u32 + 1) >> 1) as i32,
+            "avgr_u {a} {b}"
+        );
+    }
+}
+
 /// Integer lane shifts through the wasm bridge: one scalar amount (taken mod the lane width) shifts
 /// every lane. Covers `shl`/`shr_s`/`shr_u` and an amount ≥ the lane width.
 #[test]

@@ -172,6 +172,7 @@ mod op {
         pub const VCONVERT: u8 = 0x19; // op, a
         pub const VPMINMAX: u8 = 0x1A; // shape, op, a, b
         pub const VPOPCNT: u8 = 0x1B; // a (i8x16 implicit)
+        pub const VAVGR: u8 = 0x1C; // shape, a, b
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -719,6 +720,13 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(op::simd::VPOPCNT);
             write_uleb(out, *a as u64);
         }
+        Inst::VAvgr { shape, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VAVGR);
+            out.push(shape.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
         Inst::VAnyTrue { a } => {
             out.push(op::SIMD);
             out.push(op::simd::VANY_TRUE);
@@ -936,6 +944,11 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             }
         }
         op::simd::VPOPCNT => Inst::VPopcnt { a: c.idx()? },
+        op::simd::VAVGR => Inst::VAvgr {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+            b: c.idx()?,
+        },
         op::simd::VANY_TRUE => Inst::VAnyTrue { a: c.idx()? },
         op::simd::VALL_TRUE => Inst::VAllTrue {
             shape: dec_shape(c)?,

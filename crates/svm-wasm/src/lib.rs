@@ -1338,6 +1338,13 @@ fn v_satbin(lo: &mut Lower, shape: VShape, op: VSatBinOp) -> Result<(), Error> {
     lo.push(v, ValType::V128);
     Ok(())
 }
+fn v_avgr(lo: &mut Lower, shape: VShape) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VAvgr { shape, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
 fn v_widen(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VWiden { shape, op, a });
@@ -2977,6 +2984,8 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I16x8AddSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::AddU)?,
         O::I16x8SubSatS => v_satbin(lo, VShape::I16x8, VSatBinOp::SubS)?,
         O::I16x8SubSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::SubU)?,
+        O::I8x16AvgrU => v_avgr(lo, VShape::I8x16)?,
+        O::I16x8AvgrU => v_avgr(lo, VShape::I16x8)?,
         // int↔float / float↔float conversions
         O::F32x4ConvertI32x4S => v_convert(lo, VCvtOp::F32x4ConvertI32x4S)?,
         O::F32x4ConvertI32x4U => v_convert(lo, VCvtOp::F32x4ConvertI32x4U)?,

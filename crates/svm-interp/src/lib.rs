@@ -5247,6 +5247,11 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             }
             Value::V128(o)
         }
+        Inst::VAvgr { shape, a, b } => Value::V128(simd_avgr(
+            *shape,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
         Inst::VAnyTrue { a } => {
             Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
         }
@@ -5632,6 +5637,19 @@ fn simd_vsat_bin(shape: VShape, op: VSatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8;
             VSatBinOp::SubS => (xs - ys).clamp(min_s, max_s),
         };
         lane_write(&mut o, i, bytes, r as u64);
+    }
+    o
+}
+
+/// `<i-shape>.avgr_u`: per-lane unsigned rounding average `(a + b + 1) >> 1`, computed wide so the
+/// `+1` can't overflow. `i8x16`/`i16x8`.
+fn simd_avgr(shape: VShape, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_read(&a, i, bytes);
+        let y = lane_read(&b, i, bytes);
+        lane_write(&mut o, i, bytes, (x + y + 1) >> 1);
     }
     o
 }

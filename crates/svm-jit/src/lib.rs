@@ -2584,6 +2584,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // `i8x16.popcnt` lowers to a vector `popcnt` (native `cnt` on aarch64, a byte
                 // shuffle sequence on x86 — Cranelift legalizes both).
                 Inst::VPopcnt { .. } => {}
+                // `avgr_u` (`i8x16`/`i16x8` only, verifier-enforced) → native `avg_round`.
+                Inst::VAvgr { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -3638,6 +3640,13 @@ fn lower_block(
             Inst::VPopcnt { a } => {
                 // Canonical vectors are already I8X16, matching the op's fixed shape.
                 b.ins().popcnt(get(&vals, *a)?)
+            }
+            Inst::VAvgr { shape, a, b: rb } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let r = b.ins().avg_round(x, y);
+                vcast(b, r, I8X16)
             }
             Inst::VSatBin {
                 shape,

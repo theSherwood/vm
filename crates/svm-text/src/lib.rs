@@ -370,6 +370,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::Shuffle { lanes, a, b } => format!("i8x16.shuffle{} v{a} v{b}", byte_list(lanes)),
         Inst::Swizzle { a, b } => format!("i8x16.swizzle v{a} v{b}"),
         Inst::VPopcnt { a } => format!("i8x16.popcnt v{a}"),
+        Inst::VAvgr { shape, a, b } => format!("{}.avgr_u v{a} v{b}", shape.name()),
         Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
         Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
         Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
@@ -1735,6 +1736,10 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::VNarrow { shape, op: o, a, b });
+        } else if suffix == "avgr_u" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VAvgr { shape, a, b });
         }
         err(format!("unknown opcode `{op}`"))
     }

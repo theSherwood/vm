@@ -715,6 +715,18 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
+        // Unsigned rounding average: `i8x16`/`i16x8` only (the only shapes wasm defines `avgr_u`).
+        Inst::VAvgr { shape, a, b } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
         // Widen: the result shape must be an integer shape that has a (half-width) source.
         Inst::VWiden { shape, a, .. } => {
             if shape.narrower().is_none() {

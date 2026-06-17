@@ -91,6 +91,8 @@ fn simd_text_and_binary_roundtrip() {
           v140 = f32x4.pmin v4 v4\n\
           v141 = f32x4.pmax v4 v4\n\
           v142 = i8x16.popcnt v2\n\
+          v143 = i8x16.avgr_u v2 v3\n\
+          v144 = i16x8.avgr_u v2 v3\n\
           v15 = v128.and v2 v3\n\
           v16 = v128.or v2 v3\n\
           v17 = v128.xor v2 v3\n\
@@ -371,6 +373,86 @@ fn diff_i8x16_popcnt() {
         let got = diff1(s, &[Value::I32(byte as i32)]);
         assert_eq!(got, byte.count_ones() as i64, "popcnt 0x{byte:02x}");
     }
+}
+
+// `iNxM.avgr_u` — unsigned rounding average `(a+b+1)>>1` per lane (`Inst::VAvgr`, verifier-restricted
+// to i8x16/i16x8). Splat two scalars, read lane 0 unsigned; oracle computes the same in u32.
+#[test]
+fn diff_i8x16_avgr_u() {
+    let s = "func (i32, i32) -> (i32) {\n\
+        block0(v0: i32, v1: i32):\n\
+          v2 = i8x16.splat v0\n\
+          v3 = i8x16.splat v1\n\
+          v4 = i8x16.avgr_u v2 v3\n\
+          v5 = i8x16.extract_lane_u 0 v4\n  return v5\n}\n";
+    for (a, b) in [(0u8, 0u8), (255, 255), (3, 4), (1, 2), (255, 1), (100, 101)] {
+        let want = ((a as u32 + b as u32 + 1) >> 1) as i64;
+        assert_eq!(
+            diff1(s, &[Value::I32(a as i32), Value::I32(b as i32)]),
+            want,
+            "avgr_u i8 {a} {b}"
+        );
+    }
+}
+
+#[test]
+fn diff_i16x8_avgr_u() {
+    let s = "func (i32, i32) -> (i32) {\n\
+        block0(v0: i32, v1: i32):\n\
+          v2 = i16x8.splat v0\n\
+          v3 = i16x8.splat v1\n\
+          v4 = i16x8.avgr_u v2 v3\n\
+          v5 = i16x8.extract_lane_u 0 v4\n  return v5\n}\n";
+    for (a, b) in [
+        (0u16, 0u16),
+        (65535, 65535),
+        (3, 4),
+        (1, 2),
+        (65535, 1),
+        (40000, 40001),
+    ] {
+        let want = ((a as u32 + b as u32 + 1) >> 1) as i64;
+        assert_eq!(
+            diff1(s, &[Value::I32(a as i32), Value::I32(b as i32)]),
+            want,
+            "avgr_u i16 {a} {b}"
+        );
+    }
+}
+
+/// `avgr_u` round-trips through text + binary, and the verifier rejects a wide shape (wasm defines
+/// it for `i8x16`/`i16x8` only — like saturating add/sub, the restriction lives in the verifier so
+/// there is no JIT bail list).
+#[test]
+fn avgr_roundtrip_and_shape_reject() {
+    let src = "func () -> (i32) {\nblock0():\n\
+        v0 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
+        v1 = i8x16.avgr_u v0 v0\n\
+        v2 = i16x8.avgr_u v0 v0\n\
+        v3 = i8x16.extract_lane_u 0 v1\n  return v3\n}\n";
+    let m = build(src);
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
+
+    // i32x4 avgr_u is not a wasm op and the verifier rejects it.
+    let bad = parse_module(
+        "func () -> () {\nblock0():\n\
+         v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         v1 = i32x4.avgr_u v0 v0\n  return\n}\n",
+    )
+    .expect("parses (shape check is at verify)");
+    assert!(
+        verify_module(&bad).is_err(),
+        "i32x4 avgr_u must fail verification"
+    );
 }
 
 #[test]
