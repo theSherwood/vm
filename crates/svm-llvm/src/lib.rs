@@ -107,11 +107,19 @@
 //!   unspecified high bits — e.g. a zero-extended `i16` load of a *signed* value, where `< 0` would
 //!   otherwise always be false). This corrects tinfl's Huffman slow-path (`mz_int16` table entry
 //!   `< 0`), which had produced a corrupt back-reference pointer.
+//! - **V — 2-lane vectors (`<2 x float>`/`<2 x i32>`), lands clay → the full corpus.** A 2-lane
+//!   32-bit vector (clang's `Clay_Vector2`/2D-point coercion) is **scalarized to a packed `i64`**
+//!   (lane 0 = bits 0–31, lane 1 = 32–63 — its little-endian image), so it flows through
+//!   `phi`/`call`/`ret`/`load`/`store`/block-params as an ordinary `i64`. Only the vector *ops*
+//!   unpack/repack lanes: `extractelement`/`insertelement`, lane-wise `fadd`/`fsub`/`fmul`/`fdiv`,
+//!   `shufflevector` (constant mask), and vector constants; a `bitcast` between 2-lane vectors is a
+//!   no-op (same packed `i64`). Lands **clay** (UI layout) byte-identical to native — the **8th of 8
+//!   corpus demos**, meeting the D54 "matches native clang" exit criterion.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): variable-length `memmove` (overlap),
 //! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `realloc`,
-//! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen), **SIMD vectors**
-//! (`<N x T>` — e.g. clay's `<2 x float>` 2D points), `i33`.
+//! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen), wider/other SIMD
+//! vectors (`<4 x float>`, `<2 x double>`, … — only 2-lane 32-bit vectors are scalarized), `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -583,8 +591,40 @@ fn val_type(ty: &Type) -> Result<ValType, Error> {
         Type::PointerType { .. } => Ok(ValType::I64),
         Type::FPType(FPType::Single) => Ok(ValType::F32),
         Type::FPType(FPType::Double) => Ok(ValType::F64),
+        // A `<2 x float>` (clang's `Clay_Vector2`-style coercion) is **scalarized to a packed `i64`**
+        // (lane 0 = bits 0–31, lane 1 = bits 32–63 — its little-endian memory image). It then flows
+        // through `phi`/`call`/`ret`/block-params as an ordinary `i64`; only the vector *ops*
+        // (`extractelement`/`insertelement`/`fadd`…) unpack/repack the lanes. SIMD-proper is §17 V128.
+        _ if is_vec2(ty) => Ok(ValType::I64),
         other => unsup(format!("type {other} (Milestone 1+)")),
     }
+}
+
+/// The lane type of a **2-lane 32-bit vector** (`<2 x float>` or `<2 x i32>`) — the only vectors the
+/// on-ramp scalarizes (packed into an `i64`, lane 0 low). `None` for any other vector.
+fn vec2_lane_ty(ty: &Type) -> Option<ValType> {
+    match ty {
+        Type::VectorType {
+            element_type,
+            num_elements: 2,
+            scalable: false,
+        } => match element_type.as_ref() {
+            Type::FPType(FPType::Single) => Some(ValType::F32),
+            Type::IntegerType { bits: 32 } => Some(ValType::I32),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Is `ty` a scalarizable 2-lane 32-bit vector (`<2 x float>`/`<2 x i32>`)?
+fn is_vec2(ty: &Type) -> bool {
+    vec2_lane_ty(ty).is_some()
+}
+
+/// Is `ty` specifically `<2 x float>` (the vector that takes the lane-wise float-arith path)?
+fn is_vec2f(ty: &Type) -> bool {
+    vec2_lane_ty(ty) == Some(ValType::F32)
 }
 
 /// The scalar **fields of a small by-value struct** (clang's multi-register return/arg coercion,
@@ -700,6 +740,7 @@ fn type_size(ty: &Type, types: &Types) -> Result<u64, Error> {
             let (fields, packed) = resolve_struct(ty, types)?;
             Ok(struct_layout(&fields, packed, types)?.1)
         }
+        _ if is_vec2(ty) => Ok(8), // `<2 x float>`/`<2 x i32>` — two packed 32-bit lanes
         other => unsup(format!("size of type {other} (Milestone 1+)")),
     }
 }
@@ -716,6 +757,7 @@ fn type_align(ty: &Type, types: &Types) -> Result<u64, Error> {
             let (fields, packed) = resolve_struct(ty, types)?;
             Ok(struct_layout(&fields, packed, types)?.2)
         }
+        _ if is_vec2(ty) => Ok(8), // a 2-lane 32-bit vector is 8-aligned
         other => unsup(format!("align of type {other} (Milestone 1+)")),
     }
 }
@@ -984,6 +1026,10 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         // operand + (for insert) the inserted element.
         I::InsertValue(x) => locals(&[&x.aggregate, &x.element]),
         I::ExtractValue(x) => locals(&[&x.aggregate]),
+        // `<2 x float>` lane access (the vector itself is a scalarized packed `i64`).
+        I::InsertElement(x) => locals(&[&x.vector, &x.element]),
+        I::ExtractElement(x) => locals(&[&x.vector]),
+        I::ShuffleVector(x) => locals(&[&x.operand0, &x.operand1]),
         // Floats.
         I::FAdd(x) => locals(&[&x.operand0, &x.operand1]),
         I::FSub(x) => locals(&[&x.operand0, &x.operand1]),
@@ -2461,6 +2507,72 @@ impl<'a> BlockCtx<'a> {
         self.id(SP)
     }
 
+    /// Extract lane `i` (0 or 1) of a scalarized 2-lane vector (a packed `i64`): the low 32 bits for
+    /// lane 0, the high 32 for lane 1. An `f32` lane reinterprets the `i32` bits as float; an `i32`
+    /// lane returns them directly.
+    fn vec_lane(&mut self, v: ValIdx, i: u64, lane_ty: ValType) -> ValIdx {
+        let bits32 = if i == 0 {
+            self.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: v,
+            })
+        } else {
+            let c32 = self.const_i64(32);
+            let hi = self.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::ShrU,
+                a: v,
+                b: c32,
+            });
+            self.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: hi,
+            })
+        };
+        match lane_ty {
+            ValType::F32 => self.push(Inst::Cast {
+                op: CastOp::ReinterpI32F32,
+                a: bits32,
+            }),
+            _ => bits32, // i32 lane
+        }
+    }
+
+    /// Pack two lanes into a scalarized 2-lane vector (`lane0 | lane1 << 32`, an `i64`); `f32` lanes
+    /// are first reinterpreted to their `i32` bits.
+    fn vec_pack(&mut self, lane0: ValIdx, lane1: ValIdx, lane_ty: ValType) -> ValIdx {
+        let bits = |ctx: &mut Self, lane: ValIdx| match lane_ty {
+            ValType::F32 => ctx.push(Inst::Cast {
+                op: CastOp::ReinterpF32I32,
+                a: lane,
+            }),
+            _ => lane,
+        };
+        let i0 = bits(self, lane0);
+        let i1 = bits(self, lane1);
+        let e0 = self.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: i0,
+        });
+        let e1 = self.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: i1,
+        });
+        let c32 = self.const_i64(32);
+        let hi = self.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Shl,
+            a: e1,
+            b: c32,
+        });
+        self.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Or,
+            a: e0,
+            b: hi,
+        })
+    }
+
     /// Load a powerbox capability handle (`i32`) from its stash slot in the reserved low window.
     fn stash_load(&mut self, off: u64) -> ValIdx {
         let addr = self.const_i64(off as i64);
@@ -2579,8 +2691,27 @@ impl<'a> BlockCtx<'a> {
                     match val_type(t.as_ref())? {
                         ValType::I32 => Ok(self.push(Inst::ConstI32(0))),
                         ValType::I64 => Ok(self.push(Inst::ConstI64(0))),
+                        ValType::F32 => Ok(self.push(Inst::ConstF32(0))),
+                        ValType::F64 => Ok(self.push(Inst::ConstF64(0))),
                         other => unsup(format!("undef/poison/null of type {}", other.as_str())),
                     }
+                }
+                // A `zeroinitializer` of a 2-lane vector (scalarized to `i64`) is the zero word.
+                Constant::AggregateZero(t) if is_vec2(t.as_ref()) => {
+                    Ok(self.push(Inst::ConstI64(0)))
+                }
+                // A `<2 x float>`/`<2 x i32>` literal — pack the two lanes' 32-bit values into the
+                // `i64` (lane 0 low).
+                Constant::Vector(elems) if is_vec2(c.get_type(self.types).as_ref()) => {
+                    let lane = |k: usize| -> u32 {
+                        match elems.get(k).map(|e| e.as_ref()) {
+                            Some(Constant::Float(Float::Single(f))) => f.to_bits(),
+                            Some(Constant::Int { value, .. }) => *value as u32,
+                            _ => 0, // undef/poison lane → 0
+                        }
+                    };
+                    let packed = lane(0) as u64 | ((lane(1) as u64) << 32);
+                    Ok(self.push(Inst::ConstI64(packed as i64)))
                 }
                 // A reference to a global variable is its window address (a constant `i64`). A
                 // reference to a *function* is its §3c funcref index (the function-table index),
@@ -3023,39 +3154,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             let v = ctx.operand(&x.operand)?;
             (&x.dest, emit_ext(ctx, v, from, to, true))
         }
-        // Floats (f32/f64) — IEEE 754, no traps (§3b).
-        I::FAdd(x) => fbin(
-            ctx,
-            &x.dest,
-            fty(&x.operand0)?,
-            FBinOp::Add,
-            &x.operand0,
-            &x.operand1,
-        )?,
-        I::FSub(x) => fbin(
-            ctx,
-            &x.dest,
-            fty(&x.operand0)?,
-            FBinOp::Sub,
-            &x.operand0,
-            &x.operand1,
-        )?,
-        I::FMul(x) => fbin(
-            ctx,
-            &x.dest,
-            fty(&x.operand0)?,
-            FBinOp::Mul,
-            &x.operand0,
-            &x.operand1,
-        )?,
-        I::FDiv(x) => fbin(
-            ctx,
-            &x.dest,
-            fty(&x.operand0)?,
-            FBinOp::Div,
-            &x.operand0,
-            &x.operand1,
-        )?,
+        // Floats (f32/f64) — IEEE 754, no traps (§3b). A `<2 x float>` operand goes lane-wise
+        // (`fp_binop` unpacks the packed-i64 lanes, applies the op per lane, repacks).
+        I::FAdd(x) => fp_binop(ctx, &x.dest, FBinOp::Add, &x.operand0, &x.operand1, types)?,
+        I::FSub(x) => fp_binop(ctx, &x.dest, FBinOp::Sub, &x.operand0, &x.operand1, types)?,
+        I::FMul(x) => fp_binop(ctx, &x.dest, FBinOp::Mul, &x.operand0, &x.operand1, types)?,
+        I::FDiv(x) => fp_binop(ctx, &x.dest, FBinOp::Div, &x.operand0, &x.operand1, types)?,
         I::FNeg(x) => {
             let ty = fty(&x.operand)?;
             let a = ctx.operand(&x.operand)?;
@@ -3140,6 +3244,64 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             let a = ctx.operand(&x.operand)?;
             (&x.dest, a)
         }
+        // `<2 x float>` lane ops (the vector is a packed `i64`). Indices are constant (0/1); a
+        // dynamic lane is `Unsupported`.
+        I::ExtractElement(ee) => {
+            let lane_ty = vec2_lane_ty(ee.vector.get_type(types).as_ref())
+                .ok_or_else(|| Error::Unsupported("extractelement: unsupported vector".into()))?;
+            let i = const_int(&ee.index)
+                .filter(|&i| i < 2)
+                .ok_or_else(|| Error::Unsupported("extractelement: dynamic/oob lane".into()))?;
+            let v = ctx.operand(&ee.vector)?;
+            (&ee.dest, ctx.vec_lane(v, i, lane_ty))
+        }
+        I::InsertElement(ie) => {
+            let lane_ty = vec2_lane_ty(ie.vector.get_type(types).as_ref())
+                .ok_or_else(|| Error::Unsupported("insertelement: unsupported vector".into()))?;
+            let i = const_int(&ie.index)
+                .filter(|&i| i < 2)
+                .ok_or_else(|| Error::Unsupported("insertelement: dynamic/oob lane".into()))?;
+            let v = ctx.operand(&ie.vector)?;
+            let x = ctx.operand(&ie.element)?;
+            let other = ctx.vec_lane(v, 1 - i, lane_ty); // the lane we keep
+            let packed = if i == 0 {
+                ctx.vec_pack(x, other, lane_ty)
+            } else {
+                ctx.vec_pack(other, x, lane_ty)
+            };
+            (&ie.dest, packed)
+        }
+        // `shufflevector` of two 2-lane vectors with a constant mask: each result lane picks a lane
+        // from the `[op0.0, op0.1, op1.0, op1.1]` concatenation (index 0..3; undef → lane 0).
+        I::ShuffleVector(sv) => {
+            let lane_ty = vec2_lane_ty(sv.operand0.get_type(types).as_ref())
+                .ok_or_else(|| Error::Unsupported("shufflevector: unsupported vector".into()))?;
+            let mask: Vec<u64> = match sv.mask.as_ref() {
+                Constant::Vector(m) => m
+                    .iter()
+                    .map(|e| match e.as_ref() {
+                        Constant::Int { value, .. } => *value,
+                        _ => 0, // undef mask lane
+                    })
+                    .collect(),
+                _ => return unsup("shufflevector: non-constant mask"),
+            };
+            if mask.len() != 2 {
+                return unsup("shufflevector: result is not 2-lane");
+            }
+            let v0 = ctx.operand(&sv.operand0)?;
+            let v1 = ctx.operand(&sv.operand1)?;
+            let pick = |ctx: &mut BlockCtx, m: u64| {
+                if m < 2 {
+                    ctx.vec_lane(v0, m, lane_ty)
+                } else {
+                    ctx.vec_lane(v1, m.saturating_sub(2).min(1), lane_ty)
+                }
+            };
+            let l0 = pick(ctx, mask[0]);
+            let l1 = pick(ctx, mask[1]);
+            (&sv.dest, ctx.vec_pack(l0, l1, lane_ty))
+        }
         // `extractvalue` reads a field of a small by-value struct — alias the field's value (§3a).
         I::ExtractValue(ev) => {
             if ev.indices.len() != 1 {
@@ -3187,6 +3349,37 @@ fn fbin<'d>(
     let a = ctx.operand(a)?;
     let b = ctx.operand(b)?;
     Ok((dest, ctx.push(Inst::FBin { ty, op, a, b })))
+}
+
+/// A float binary op that may be scalar (`f32`/`f64`) or a `<2 x float>` vector. The vector case
+/// unpacks the two packed-`i64` lanes, applies `op` per lane (`f32`), and repacks (§3b scalarization).
+fn fp_binop<'d>(
+    ctx: &mut BlockCtx,
+    dest: &'d Name,
+    op: FBinOp,
+    o0: &'d Operand,
+    o1: &'d Operand,
+    types: &Types,
+) -> Result<(&'d Name, ValIdx), Error> {
+    if is_vec2f(o0.get_type(types).as_ref()) {
+        let a = ctx.operand(o0)?;
+        let b = ctx.operand(o1)?;
+        let lanes: Vec<ValIdx> = (0..2)
+            .map(|i| {
+                let la = ctx.vec_lane(a, i, ValType::F32);
+                let lb = ctx.vec_lane(b, i, ValType::F32);
+                ctx.push(Inst::FBin {
+                    ty: FloatTy::F32,
+                    op,
+                    a: la,
+                    b: lb,
+                })
+            })
+            .collect();
+        return Ok((dest, ctx.vec_pack(lanes[0], lanes[1], ValType::F32)));
+    }
+    let ty = float_ty(val_type(o0.get_type(types).as_ref())?)?;
+    fbin(ctx, dest, ty, op, o0, o1)
 }
 
 /// Emit a (saturating) float→int conversion, returning its result index.
@@ -3243,6 +3436,7 @@ fn load_op(ty: &Type) -> Result<svm_ir::LoadOp, Error> {
         Type::PointerType { .. } => Ok(L::I64),
         Type::FPType(FPType::Single) => Ok(L::F32),
         Type::FPType(FPType::Double) => Ok(L::F64),
+        _ if is_vec2(ty) => Ok(L::I64), // `<2 x {float,i32}>` ≡ its packed-i64 image
         other => unsup(format!("load of type {other} (Milestone 1+)")),
     }
 }
@@ -3258,6 +3452,7 @@ fn store_op(ty: &Type) -> Result<svm_ir::StoreOp, Error> {
         Type::PointerType { .. } => Ok(S::I64),
         Type::FPType(FPType::Single) => Ok(S::F32),
         Type::FPType(FPType::Double) => Ok(S::F64),
+        _ if is_vec2(ty) => Ok(S::I64), // `<2 x {float,i32}>` ≡ its packed-i64 image
         other => unsup(format!("store of type {other} (Milestone 1+)")),
     }
 }

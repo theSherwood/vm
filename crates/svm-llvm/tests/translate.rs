@@ -1012,6 +1012,28 @@ fn ro_and_writable_global_page_isolation() {
 }
 
 #[test]
+fn demo_clay_vs_native() {
+    // Clay UI layout: 2D points/dimensions as `<2 x float>`/`<2 x i32>` vectors (loads/stores/`fadd`/
+    // phi/extractelement) plus `{i64,ptr}` array returns — the on-ramp scalarizes each 2-lane vector
+    // to a packed `i64`. Lays out a small UI and prints the render commands, byte-identical to native.
+    // The eighth and final corpus demo (the D54 exit criterion).
+    check_demo_vs_native("clay", "clay/clay_demo.c", b"");
+}
+
+#[test]
+fn vec2_float_struct() {
+    // A `{float,float}` struct passed/returned by value — clang coerces it to `<2 x float>` and does
+    // `extractelement`/`insertelement`/lane-wise `fadd`. Scalarized to a packed i64. addv({1.5,2.5},
+    // {7,0.5}) = {8.5,3.0} → 8.5*10 + 3 = 88.
+    let src = "struct V2 { float x, y; }; struct V2 addv(struct V2 a, struct V2 b); \
+               int run(int n){ struct V2 a = {1.5f, 2.5f}; struct V2 b = {(float)n, 0.5f}; \
+               struct V2 c = addv(a, b); return (int)(c.x * 10.0f + c.y); } \
+               struct V2 addv(struct V2 a, struct V2 b){ struct V2 r = {a.x + b.x, a.y + b.y}; return r; } \
+               int main(void){ return run(7); }";
+    check_vs_native("vec2f", src, 7);
+}
+
+#[test]
 fn demo_tinfl_vs_native() {
     // miniz's tinfl DEFLATE/zlib inflate engine: a deeply nested coroutine-macro state machine with
     // Huffman fast/slow lookup tables (`mz_int16`) and a 32 KiB LZ77 dictionary. Inflates an embedded
