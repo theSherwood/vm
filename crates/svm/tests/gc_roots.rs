@@ -377,22 +377,23 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
     check(&jit, "jit");
 }
 
-/// Number of buffer words the root reads back and returns alongside `count`. Kept at 7 so the root
-/// returns 8 `i64`s — the Tail calling convention caps return values at what fits in registers, and
-/// 9 overflows it. With ≤6 in-window roots plus the `heap_lo` word, every in-window candidate lands
-/// in the first 7 (ascending) slots, so this captures them all.
+/// How many `gc.roots` result words the runner reads back out of captured guest memory (= the `cap`
+/// the root passes). With ≤6 in-window roots plus the `heap_lo` word, every in-window candidate is
+/// well within this; the unused tail of the buffer stays zero.
 #[cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
     all(windows, target_arch = "x86_64")
 ))]
-const READBACK: usize = 7;
+const BUF_WORDS: usize = 16;
 
 /// Build a module whose root creates one parked fiber per value in `roots` (each fiber holds its
 /// value live across a `suspend`, so it is spilled onto that fiber's control stack / lives in its
-/// reified frame), then calls `gc.roots` over `[lo, hi)` (buf at offset 0, cap 16) and returns
-/// `(count, buf[0..READBACK])`. The shared fiber body (func 1) is `(sp, arg) -> arg` across a
-/// suspend. Used to drive the all-slots table walk with many fibers at once.
+/// reified frame), then calls `gc.roots` over `[lo, hi)` writing the deduped candidates to guest
+/// memory at offset 0 (cap `BUF_WORDS`) and **returns just the count**. The result buffer is read
+/// back from *captured memory* (see [`run_multi_fiber_words`]), not returned — the guest's return
+/// arity stays at 1, since the Tail ABI's return-register budget differs across targets (8 values
+/// fit on x86-64 but not aarch64). Shared fiber body (func 1) is `(sp, arg) -> arg` across a suspend.
 #[cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
@@ -400,9 +401,7 @@ const READBACK: usize = 7;
 ))]
 fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> svm_ir::Module {
     use std::fmt::Write as _;
-    let mut src = String::from("memory 16\n");
-    let result_tys = ["i64"; 1 + READBACK].join(", ");
-    writeln!(src, "func () -> ({result_tys}) {{\nblock0():").unwrap();
+    let mut src = String::from("memory 16\nfunc () -> (i64) {\nblock0():\n");
     let mut v: u32 = 0;
     for &r in roots {
         // ref.func 1; sp (unused param); cont.new; arg = the root; resume → fiber parks holding arg.
@@ -424,7 +423,7 @@ fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> svm_ir::Module {
     writeln!(src, "  v{v} = i64.const {lo}").unwrap();
     writeln!(src, "  v{} = i64.const {hi}", v + 1).unwrap();
     writeln!(src, "  v{} = i64.const 0", v + 2).unwrap(); // buf offset
-    writeln!(src, "  v{} = i64.const 16", v + 3).unwrap(); // cap (≥ any plausible in-range count)
+    writeln!(src, "  v{} = i64.const {BUF_WORDS}", v + 3).unwrap(); // cap
     writeln!(
         src,
         "  v{} = gc.roots v{v} v{} v{} v{}",
@@ -434,21 +433,7 @@ fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> svm_ir::Module {
         v + 3
     )
     .unwrap();
-    let count = v + 4;
-    v += 5;
-    // Read back the first READBACK buffer words (ascending, deduped); zero-filled beyond `count`.
-    let mut words = Vec::new();
-    for i in 0..READBACK as i64 {
-        writeln!(src, "  v{v} = i64.const {}", i * 8).unwrap();
-        writeln!(src, "  v{} = i64.load v{v}", v + 1).unwrap();
-        words.push(v + 1);
-        v += 2;
-    }
-    let rets: Vec<String> = std::iter::once(count)
-        .chain(words)
-        .map(|x| format!("v{x}"))
-        .collect();
-    writeln!(src, "  return {}", rets.join(" ")).unwrap();
+    writeln!(src, "  return v{}", v + 4).unwrap();
     src.push_str("}\n");
     // Shared fiber body: keep `arg` (v1) live across the suspend, then return it.
     src.push_str("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
@@ -459,33 +444,37 @@ fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> svm_ir::Module {
     m
 }
 
-/// Run `build_multi_fiber_module`'s output on both backends and return `(count, words)` per backend
-/// (`words` = the 8 read-back buffer slots). Soundness framing (GC.md §3.2): each backend is checked
-/// independently against the *planted* roots, not against each other.
+/// Run `build_multi_fiber_module`'s output on both backends and return the `gc.roots` result buffer
+/// (the first `BUF_WORDS` words written to guest memory at offset 0) per backend — read from
+/// **captured memory**, so it doesn't depend on the guest's return arity. Soundness framing (GC.md
+/// §3.2): each backend is checked independently against the planted roots, not against each other.
 #[cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
     all(windows, target_arch = "x86_64")
 ))]
-fn run_multi_fiber_both(m: &svm_ir::Module) -> [(i64, Vec<i64>); 2] {
+fn run_multi_fiber_words(m: &svm_ir::Module) -> [Vec<i64>; 2] {
+    fn words(mem: &[u8]) -> Vec<i64> {
+        (0..BUF_WORDS)
+            .map(|i| i64::from_le_bytes(mem[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect()
+    }
+    // Seed `BUF_WORDS` words of zeroed memory: the capture APIs snapshot exactly `init_mem.len()`
+    // post-run bytes (escape-oracle convention), so this is what makes the gc.roots buffer at
+    // offset 0 visible (its unwritten tail stays zero, which never matches a planted sentinel).
+    let init_mem = [0u8; BUF_WORDS * 8];
+    // Interp (shares the run registry across spawned vCPUs); capture the final guest memory.
     let mut fuel = 50_000_000u64;
-    let interp: Vec<i64> = run(m, 0, &[], &mut fuel)
-        .unwrap_or_else(|t| panic!("interp trapped: {t:?}"))
-        .iter()
-        .map(|v| match v {
-            Value::I64(x) => *x,
-            other => panic!("expected i64, got {other:?}"),
-        })
-        .collect();
-    use svm_jit::{compile_and_run, JitOutcome};
-    let jit = match compile_and_run(m, 0, &[]).expect("jit compile/run") {
-        JitOutcome::Returned(s) => s,
-        other => panic!("jit did not return: {other:?}"),
-    };
-    [
-        (interp[0], interp[1..].to_vec()),
-        (jit[0], jit[1..].to_vec()),
-    ]
+    let (res, imem) = svm_interp::run_capture(m, 0, &[], &mut fuel, &init_mem);
+    res.unwrap_or_else(|t| panic!("interp trapped: {t:?}"));
+    // JIT (domain-shared fiber table); capture the final guest memory.
+    let (outcome, jmem) =
+        svm_jit::compile_and_run_capture(m, 0, &[], &init_mem).expect("jit compile/run");
+    assert!(
+        matches!(outcome, svm_jit::JitOutcome::Returned(_)),
+        "jit did not return: {outcome:?}"
+    );
+    [words(&imem), words(&jmem)]
 }
 
 /// **`gc.roots` enumerates the roots of EVERY parked fiber, not just one.** Four fibers each park
@@ -505,7 +494,7 @@ fn gc_roots_enumerates_every_parked_fiber() {
     const IN: [i64; 4] = [0x7010, 0x7020, 0x7030, 0x7040];
     const OOR: i64 = 0x9000_0000;
     let m = build_multi_fiber_module(&[IN[0], IN[1], IN[2], IN[3], OOR], 0x7000, 0x7100);
-    for (backend, (_count, words)) in ["interp", "jit"].iter().zip(run_multi_fiber_both(&m)) {
+    for (backend, words) in ["interp", "jit"].iter().zip(run_multi_fiber_words(&m)) {
         for &r in &IN {
             assert!(
                 words.contains(&r),
@@ -564,7 +553,7 @@ fn gc_roots_multi_fiber_soundness_sweep() {
         }
 
         let m = build_multi_fiber_module(&roots, LO, HI);
-        for (backend, (_count, words)) in ["interp", "jit"].iter().zip(run_multi_fiber_both(&m)) {
+        for (backend, words) in ["interp", "jit"].iter().zip(run_multi_fiber_words(&m)) {
             for &r in &in_roots {
                 assert!(
                     words.contains(&r),
