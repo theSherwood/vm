@@ -520,10 +520,12 @@ non-durable freeze refusal. The **cross-backend** property (`crates/svm/tests/du
 + the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
-Still ahead (Phase 2, escape-TCB): **capturing** real page protections from a running backend
-(interp `Mem` / JIT window) into the image and **re-establishing** them on the restored
-window — the codec now carries prots, but no backend yet feeds or applies them. Then §12.4
-fiber/dispatch control state.
+The §12.4 **fiber control state** now rides along too (Section 2 — the `FrozenFiber` residue,
+slice 3.1.5), so a single-fiber domain round-trips through the real artifact. Still ahead
+(Phase 2, escape-TCB): **capturing** real page protections from a running backend (interp `Mem`
+/ JIT window) into the image and **re-establishing** them on the restored window — the codec now
+carries prots, but no backend yet feeds or applies them. (The dispatch table stays a no-op —
+§12.4.)
 
 ### 12.7 Shadow-frame layout
 
@@ -664,9 +666,13 @@ single-fiber round-trip works** (slice 3.1.5): freeze exports each flattened fib
 (`svm_interp::FrozenFiber` via the `Host`), and a thaw re-seeds the registry and re-enters the
 root under `REWINDING` — the resumer re-issues `cont.resume`, the fiber rewinds and re-parks,
 then runs forward to the same result as the uninterrupted run (`svm-durable/tests/fiber.rs`).
-**3.1 is functionally complete on the interpreter.** The remaining follow-up is the byte-level
-snapshot **Section-2 codec** in `svm-snapshot` (serialize/restore the `FrozenFiber` residue, vs.
-today's in-memory hand-off). 3.2 — multi-vCPU quiesce + per-context layout.
+The byte-level snapshot **Section-2 codec** lands too: `svm-snapshot` serializes the
+`FrozenFiber` residue (slot/funcref/sp/shadow-SP) into a TLV control section (elided when there
+are no fibers, so no-fiber artifacts stay byte-identical) and `restore` re-seeds the `Host`, so a
+full `freeze → serialize → restore → thaw ≡ uninterrupted` runs through the **real artifact**
+(`svm-snapshot/tests/roundtrip.rs`, incl. the §12.6 canonical re-serialize invariant). **3.1 is
+complete on the interpreter.** Remaining polish: fold fiber'd modules into the `durable_fuzz`
+generator. 3.2 — multi-vCPU quiesce + per-context layout.
 3.3 — JIT parity (drive real OS threads to safepoints; respect the D57 single-owner protocol;
 **replicate the swap** in the JIT's fiber-switch path). Phase 4 — back-edge polls for bounded
 latency.
@@ -765,6 +771,15 @@ each a small reviewable commit on the interpreter only:
    codec** in `svm-snapshot` — serialize/restore the `FrozenFiber` residue (the §12.4 per-fiber
    record: `(slot, generation)` handle + shadow region/extent + status) instead of the in-memory
    hand-off — and folding fiber'd modules into the `durable_fuzz` generator.
+
+   **[DONE] Section-2 codec.** `svm-snapshot` now carries the fiber residue: `freeze` writes a TLV
+   control section (tag 2) of `(slot, funcref, sp, shadow_sp)` per fiber — ascending slot,
+   header `fiber_count`-gated, **elided when there are no fibers** so the no-fiber artifact is
+   byte-identical to the pre-fiber format — and `restore` decodes it and re-seeds the `Host`
+   (`set_frozen_fibers`). `svm-snapshot/tests/roundtrip.rs::fiber_freeze_serialize_restore_thaw_through_the_codec`
+   drives the full round-trip through the **serialized artifact** (107) and the §12.6 canonical
+   re-serialize invariant. (Per-fiber `generation` is deferred with the JIT shared-registry
+   recycling work; interp slots aren't recycled, so slot alone keys the handle today.)
 
 Then 3.2 (multi-vCPU) and 3.3 (JIT parity) as above. **Slice-1 sub-questions, now settled:**
 a fiber handle maps to its region by **dense slot index × stride** (`context i = slot+1`,
