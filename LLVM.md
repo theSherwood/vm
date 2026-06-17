@@ -30,7 +30,10 @@ the non-varargs **stdio** output family (`puts`/`putchar`/`putc`/`fputc`/`fwrite
 and `clang`'s `printf("…\n")`→`puts` / `printf("%c")`→`putc` lowering); **slice P** adds funnel-shift
 rotates (`llvm.fshl`/`fshr` → `rotl`/`rotr`) and **synthesized runtime mem-loop helpers**
 (`__svm_memset`/`__svm_memcpy` — the first multi-block helper, for a variable-length `memset`/`memcpy`).
-Next: varargs `printf` (formatting), `malloc`/heap, then more of the demo corpus (Lane C).**
+The **demo-driven breadth plan (demos 1–6) is now complete** — `hexdump` (varargs `printf`, slice W),
+`sortvec` (`realloc` + signed `%d`, X), `mat4` (`<4 x float>` SIMD, Y), `crc32` (`llvm.bswap`, Z),
+`lineedit` (overlap-safe `memmove`, AA), and `raytrace` (transcendental libm bundled as guest code,
+AB) all run byte-identical to native.**
 `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
@@ -570,7 +573,7 @@ the dominant general-C gap).
 | 3 ✅ | **`mat4`** — 4×4 matrix × vec4 affine transform, print rows (`demos/mat4`, slice Y) | **128-bit SIMD** (`<4 x float>` → native `v128`) — DONE, byte-identical to native | floats, `printf` |
 | 4 ✅ | **`crc32`** — CRC-32 over stdin + a big-endian `u32` reader (`demos/crc32`, slice Z) | **`llvm.bswap`** (inline byte reversal) — DONE, byte-identical to native | shifts, `printf` |
 | 5 ✅ | **`lineedit`** — read a line, wrap in `[...]` (right shift) + delete middle char (left shift) (`demos/lineedit`, slice AA) | **overlapping `memmove`** (direction-aware runtime loop) — DONE, byte-identical to native | arrays, `read` |
-| 6 | **`raytrace`/`mandelbrot+shading`** or **DSP sine** | **transcendental libm** (`sqrt`/`sin`/`cos`/`pow`/`exp`) — bundle a small **guest `libm`** (poly approximations), like the corpus demos bundle `memset` | floats, `printf` |
+| 6 ✅ | **`raytrace`** — ASCII sphere raytracer: `sqrt` intersection + diffuse/sinusoidal/exp shading (`demos/raytrace`, slice AB) | **transcendental libm** — `sqrt`/`floor` lower to SVM ops; `sin`/`exp` bundled as **guest `libm`** (poly approximations) — DONE, byte-identical to native | floats, `write` |
 
 Notes:
 - **`printf` runs in the guest** (per the capability model): a guest-side format engine parses the
@@ -627,7 +630,25 @@ appended last in the fixed helper-index order (after `realloc`). Constant small 
 inlines (already overlap-safe). Tests: `demo_lineedit_vs_native` (right+left overlapping shifts, with
 stdin) and `memmove_overlap_runtime` (both directions over an 8-byte window vs native).
 
-**Next:** demo 6 (**raytrace / DSP sine** → transcendental libm via a bundled guest `libm`).
+**Slice AB (DONE) — transcendental libm, bundled as guest code (lands `raytrace`).** No new lowering:
+math beyond the SVM float ops (`sin`/`cos`/`exp`/`pow`/…) is supplied *by the program* as ordinary
+guest C (polynomial approximations), exactly as the corpus demos bundle their own `memset`. This is
+deliberate — it keeps math **in the sandbox** (no host math capability), and it is what makes the
+differential clean: native `cc` compiles the *same* guest `libm`, so every value is bit-identical.
+The only machine float ops in play already match across backends — `sqrt`/`floor` lower to SVM ops
+(slices F/L; IEEE-exact, matching native libm), `fmuladd` is unfused on both sides, and `+−*∕` are
+plain IEEE. The `raytrace` demo (one unit sphere, `sqrt` ray-sphere intersection, diffuse +
+`g_sin` surface bands + `g_exp` rim falloff, rendered to a char ramp) comes out byte-identical to
+native. A note on the harness: native links now pass `-lm` so libm-calling demos link (`sqrt`/`floor`
+become real calls at the native build's `-O0`); harmless for the rest. Tests: `demo_raytrace_vs_native`
+and `guest_libm_transcendental` (a guest `exp` + the `sqrt` op over a damped wave's RMS).
+- *Deferred:* a transcendental as an **external** libm call (e.g. linking the system `sin`) stays
+  `Unsupported` — there is no host math capability and no SVM op for it; the program must bring its
+  own (this slice). Adding a *bundled* guest `libm` header the on-ramp injects automatically (so
+  unmodified code that calls `sin` links against guest poly code) is the natural follow-up.
+
+**Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native). Beyond
+this: Milestone 2 (tail calls, real Rust/C++ without EH) and a bundled guest `libm` header.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).

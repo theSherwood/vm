@@ -103,7 +103,14 @@ fn check_vs_native(name: &str, src: &str, seed: i32) {
     };
     let exe = std::env::temp_dir().join(format!("svm_llvm_native_{}_{}", std::process::id(), name));
     let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
-    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+    // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
+    match Command::new("cc")
+        .arg(&c)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("note: skipping {name} (cc unavailable)");
@@ -726,7 +733,14 @@ int apply(int sel, int a, int b){ return ops[sel & 1](a, b); }";
 fn powerbox_diff(name: &str, bc: &std::path::Path, c_src: &std::path::Path, stdin: &[u8]) {
     // Native oracle: build with `cc`, run, capture stdout + exit code.
     let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{}_{}", std::process::id(), name));
-    match Command::new("cc").arg(c_src).arg("-o").arg(&exe).status() {
+    // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
+    match Command::new("cc")
+        .arg(c_src)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("note: skipping {name} (cc unavailable)");
@@ -1037,6 +1051,33 @@ fn demo_crc32_vs_native() {
     // Byte-identical to native.
     let input = b"The quick brown fox jumps over the lazy dog.\nbig-endian!\x00\x01\x02\x03";
     check_demo_vs_native("crc32", "crc32/crc32.c", input);
+}
+
+#[test]
+fn demo_raytrace_vs_native() {
+    // A tiny ASCII sphere raytracer: diffuse lighting + sinusoidal bands + an exponential rim, with
+    // a `libm` bundled as *guest code* (`g_sin`/`g_exp` poly approximations). `sqrt`/`floor` lower to
+    // SVM float ops; the transcendentals run in the guest, so native `cc` compiles the same source
+    // and every value is bit-identical. Byte-identical to native.
+    check_demo_vs_native("raytrace", "raytrace/raytrace.c", b"");
+}
+
+#[test]
+fn guest_libm_transcendental() {
+    // A guest `exp` (range-reduced Taylor) + the IEEE `sqrt` op: compute an RMS over a damped wave.
+    // The transcendental is guest code (native compiles the same), `sqrt` is the shared IEEE op, so
+    // the int-quantized result matches native exactly.
+    let src = "double sqrt(double); double floor(double); \
+               static double g_exp(double x){ const double LN2=0.69314718055994530942; \
+                 double kf=floor(x/LN2+0.5); int k=(int)kf; double r=x-kf*LN2; \
+                 double er=1.0+r*(1.0+r*(0.5+r*(1.0/6+r*(1.0/24+r/120)))); double p=1.0; \
+                 if(k>=0) for(int i=0;i<k;i++) p*=2.0; else for(int i=0;i<-k;i++) p*=0.5; \
+                 return er*p; } \
+               int run(int n){ double acc=0; \
+                 for(int i=0;i<n;i++){ double x=(double)i*0.1; double w=g_exp(-x*0.3); acc+=w*w; } \
+                 double rms=sqrt(acc/(double)n); return (int)(rms*1000.0); } \
+               int main(void){ return run(40); }";
+    check_vs_native("guest_libm", src, 40);
 }
 
 #[test]

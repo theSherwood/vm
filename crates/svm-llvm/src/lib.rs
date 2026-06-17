@@ -144,11 +144,19 @@
 //!   can't do), so overlapping shifts in either direction are correct. (Constant small `memmove`
 //!   still inlines load-all-then-store-all, already overlap-safe.) Lands the **`lineedit`** demo (a
 //!   line editor doing overlapping left/right shifts) byte-identical to native.
+//! - **AB — transcendental libm, bundled as guest code.** Math beyond the SVM float ops (`sin`/
+//!   `cos`/`exp`/`pow`/…) is supplied *by the program* as ordinary guest C (polynomial
+//!   approximations) — no new lowering, and no host math capability (the on-ramp keeps math in the
+//!   sandbox). This is the key to a clean differential: native `cc` compiles the same guest `libm`,
+//!   so every value is bit-identical (the only machine ops in play — `sqrt`/`floor` (slices F/L),
+//!   `fmuladd` (unfused), `+−*∕` — are IEEE on both sides). Lands the **`raytrace`** demo (an ASCII
+//!   sphere raytracer: `sqrt` intersection + guest `g_sin`/`g_exp` shading) byte-identical to native.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): `printf` `%s`/`%f`, zero-padded `%d`,
 //! precision/`*`/`-`+# flags, and non-constant formats; general (non-rotate) funnel shifts,
-//! `llvm.bitreverse`, transcendental math, `puts`/`fputs` of a *non-literal* string (runtime
-//! strlen), other SIMD (`<2 x double>`, `<8 x i16>`, dynamic lanes), `i33`.
+//! `llvm.bitreverse`, transcendental math as *external* libm calls (the program must supply it as
+//! guest code — see slice AB), `puts`/`fputs` of a *non-literal* string (runtime strlen), other
+//! SIMD (`<2 x double>`, `<8 x i16>`, dynamic lanes), `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
