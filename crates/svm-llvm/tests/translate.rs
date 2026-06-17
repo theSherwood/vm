@@ -1012,6 +1012,21 @@ fn ro_and_writable_global_page_isolation() {
 }
 
 #[test]
+fn multi_value_struct_return() {
+    // A small by-value struct returned in two registers — clang coerces it to a `{ i64, i64 }`
+    // return (`insertvalue`/`ret`) the caller destructures with `extractvalue`. Exercises the §3a
+    // multi-result path: `mk` returns two values, `run` reads both. mk(7,14) → 7+14 = 21.
+    // `run` is defined first (the unit at index 0 the harness invokes); `mk` is declared then defined
+    // after, so it stays a real out-of-line multi-result call.
+    let src = "struct Pair { long a; long b; }; \
+               struct Pair mk(long a, long b); \
+               int run(int x){ struct Pair p = mk(x, (long)x * 2); return (int)(p.a + p.b); } \
+               __attribute__((noinline)) struct Pair mk(long a, long b){ struct Pair p = {a, b}; return p; } \
+               int main(void){ return run(7); }";
+    check_vs_native("multival", src, 7);
+}
+
+#[test]
 fn unsupported_is_fail_closed() {
     // A 128-bit integer is outside the subset — it must be a clean `Unsupported`, never a silent
     // mis-translation (LLVM.md §2/§8, the fail-closed chokepoint).

@@ -97,10 +97,16 @@
 //!   `vm_map`-committing pages on demand via the `Memory` capability (a 4th powerbox handle); `free`
 //!   is a no-op and the heap never reuses, so freshly-committed (zeroed) pages make `calloc` ≡
 //!   `malloc`. Lands **heapgrow** (a guest growing past ~16× its initial window) byte-identical to native.
+//! - **T — multi-value struct returns.** A small by-value struct returned in registers (clang coerces
+//!   it to e.g. `{ i64, i64 }` / `{ i64, ptr }`) maps to an SVM **multi-result** function (§3a):
+//!   `insertvalue`/`extractvalue`/`ret` and multi-result `call`s track the aggregate field-wise in a
+//!   block-local side-table (assumed not to cross blocks — clang's register-coercion pattern). Plus
+//!   `llvm.experimental.noalias.scope.decl` dropped (an alias hint).
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): variable-length `memmove` (overlap),
 //! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `realloc`,
-//! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen), SIMD vectors, `i33`.
+//! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen), **SIMD vectors**
+//! (`<N x T>` — e.g. clay's `<2 x float>` 2D points), `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -576,6 +582,48 @@ fn val_type(ty: &Type) -> Result<ValType, Error> {
     }
 }
 
+/// The scalar **fields of a small by-value struct** (clang's multi-register return/arg coercion,
+/// e.g. `{ i64, ptr }`), each mapped to its SVM value type — the components of an SVM **multi-result**
+/// (§3a). Only scalar fields are supported (a nested aggregate is `Unsupported`). `None` if `ty` is
+/// not a struct (the caller handles the scalar/void cases).
+fn struct_field_vtypes(ty: &Type, types: &Types) -> Option<Result<Vec<ValType>, Error>> {
+    match ty {
+        Type::StructType { element_types, .. } => {
+            Some(element_types.iter().map(|t| val_type(t.as_ref())).collect())
+        }
+        Type::NamedStructType { name } => match types.named_struct_def(name) {
+            Some(llvm_ir::types::NamedStructDef::Defined(t)) => {
+                struct_field_vtypes(t.as_ref(), types)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The SVM result list for an LLVM return type: `[]` for `void`, the flattened scalar fields for a
+/// small by-value struct (a multi-result function, §3a), or a single scalar otherwise.
+fn result_types(ty: &Type, types: &Types) -> Result<Vec<ValType>, Error> {
+    match ty {
+        Type::VoidType => Ok(Vec::new()),
+        _ => match struct_field_vtypes(ty, types) {
+            Some(fields) => fields,
+            None => Ok(vec![val_type(ty)?]),
+        },
+    }
+}
+
+/// A typed zero constant (the placeholder for an as-yet-unset aggregate field, before `insertvalue`
+/// overwrites it).
+fn zero_inst(t: ValType) -> Inst {
+    match t {
+        ValType::I32 => Inst::ConstI32(0),
+        ValType::F32 => Inst::ConstF32(0),
+        ValType::F64 => Inst::ConstF64(0),
+        _ => Inst::ConstI64(0), // I64 / pointer (and the unreachable V128)
+    }
+}
+
 /// The `FloatTy` (`f32`/`f64`) of a float-typed SVM value.
 fn float_ty(v: ValType) -> Result<FloatTy, Error> {
     match v {
@@ -768,10 +816,8 @@ fn translate_func(
     for p in &f.parameters {
         params.push(val_type(&p.ty)?);
     }
-    let results = match f.return_type.as_ref() {
-        Type::VoidType => Vec::new(),
-        t => vec![val_type(t)?],
-    };
+    // A small by-value struct return flattens to a multi-result signature (§3a).
+    let results = result_types(f.return_type.as_ref(), types)?;
 
     let scan = scan_func(f, types)?;
     let live_in = liveness(f, &scan)?;
@@ -876,7 +922,15 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
             if let Some(dest) = instr.try_get_result() {
                 let id = s.ty.len();
                 s.name2id.insert(dest.clone(), id);
-                s.ty.push(val_type(instr.get_type(types).as_ref())?);
+                let ty = instr.get_type(types);
+                let vt = match val_type(ty.as_ref()) {
+                    Ok(t) => t,
+                    // A small by-value struct (a call/`insertvalue` result) is tracked field-wise via
+                    // the aggregate side-table, never used as a scalar — record a placeholder type.
+                    Err(_) if struct_field_vtypes(ty.as_ref(), types).is_some() => ValType::I64,
+                    Err(e) => return Err(e),
+                };
+                s.ty.push(vt);
                 s.def_block.push(bi);
             }
         }
@@ -921,6 +975,10 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         I::PtrToInt(x) => locals(&[&x.operand]),
         I::IntToPtr(x) => locals(&[&x.operand]),
         I::Freeze(x) => locals(&[&x.operand]),
+        // Aggregate build/destructure (a small by-value struct, register-coerced): the aggregate
+        // operand + (for insert) the inserted element.
+        I::InsertValue(x) => locals(&[&x.aggregate, &x.element]),
+        I::ExtractValue(x) => locals(&[&x.aggregate]),
         // Floats.
         I::FAdd(x) => locals(&[&x.operand0, &x.operand1]),
         I::FSub(x) => locals(&[&x.operand0, &x.operand1]),
@@ -974,7 +1032,7 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
 /// callee is a computed value) or inline asm is a clean `Unsupported` for now.
 /// The SVM signature of an indirect call's callee — the function type plus the prepended data-SP
 /// param (§3d), so the runtime type-id check matches the callee's IR signature (§3c).
-fn indirect_sig(c: &llvm_ir::instruction::Call) -> Result<svm_ir::FuncType, Error> {
+fn indirect_sig(c: &llvm_ir::instruction::Call, types: &Types) -> Result<svm_ir::FuncType, Error> {
     match c.function_ty.as_ref() {
         Type::FuncType {
             result_type,
@@ -988,10 +1046,7 @@ fn indirect_sig(c: &llvm_ir::instruction::Call) -> Result<svm_ir::FuncType, Erro
             for p in param_types {
                 params.push(val_type(p.as_ref())?);
             }
-            let results = match result_type.as_ref() {
-                Type::VoidType => Vec::new(),
-                t => vec![val_type(t)?],
-            };
+            let results = result_types(result_type.as_ref(), types)?;
             Ok(svm_ir::FuncType { params, results })
         }
         other => unsup(format!("indirect call through non-function type {other}")),
@@ -2155,7 +2210,9 @@ fn is_droppable_call(c: &llvm_ir::instruction::Call) -> bool {
         return s.starts_with("llvm.lifetime")
             || s.starts_with("llvm.dbg")
             || s.starts_with("llvm.assume")
-            || s.starts_with("llvm.invariant");
+            || s.starts_with("llvm.invariant")
+            // Alias-analysis metadata hints (no runtime effect) — e.g. clang's `restrict` scopes.
+            || s.starts_with("llvm.experimental.noalias.scope.decl");
     }
     false
 }
@@ -2359,6 +2416,11 @@ struct BlockCtx<'a> {
     types: &'a Types,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
+    /// Aggregate SSA values (a small by-value struct), tracked field-wise: value-id → its scalar
+    /// fields' block-local indices. Built by a multi-result `call`/`insertvalue`, read by
+    /// `extractvalue`/`ret` (§3a multi-result). Assumed not to cross block boundaries (clang's
+    /// register-coercion pattern produces and consumes them in one block).
+    agg: HashMap<ValueId, Vec<ValIdx>>,
     next_val: ValIdx,
 }
 
@@ -2368,6 +2430,25 @@ impl<'a> BlockCtx<'a> {
         let i = self.next_val;
         self.next_val += 1;
         i
+    }
+
+    /// Append an instruction producing **`n` results** (a multi-result `call`, §3a) and return their
+    /// `n` consecutive block-local indices.
+    fn push_multi(&mut self, inst: Inst, n: usize) -> Vec<ValIdx> {
+        self.insts.push(inst);
+        let start = self.next_val;
+        self.next_val += n as ValIdx;
+        (start..self.next_val).collect()
+    }
+
+    /// The field indices of an aggregate-typed operand (a value built by a multi-result `call` or
+    /// `insertvalue`), or `None` if `op` is not a tracked aggregate value.
+    fn agg_of(&self, op: &Operand) -> Option<Vec<ValIdx>> {
+        if let Operand::LocalOperand { name, .. } = op {
+            let vid = *self.s.name2id.get(name)?;
+            return self.agg.get(&vid).cloned();
+        }
+        None
     }
 
     /// The data-SP's block-local index (always parameter 0 of every block, §3d).
@@ -2560,6 +2641,7 @@ fn translate_block(
         types,
         insts: Vec::new(),
         idx_of: HashMap::new(),
+        agg: HashMap::new(),
         next_val: 0,
     };
     for (pos, &vid) in param_ids.iter().enumerate() {
@@ -2689,18 +2771,60 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     op: ConvOp::WrapI64,
                     a: fref64,
                 }); // → i32 funcref index
-                let ty = indirect_sig(c)?;
+                let ty = indirect_sig(c, types)?;
                 Inst::CallIndirect { ty, idx, args }
             }
         };
-        match &c.dest {
-            Some(dest) => {
+        // The result: a small by-value struct return is a **multi-result** (§3a) recorded field-wise
+        // in the aggregate table; a scalar is one value; `void` is none.
+        let result_ty = match c.function_ty.as_ref() {
+            Type::FuncType { result_type, .. } => result_type.clone(),
+            other => return unsup(format!("call through non-function type {other}")),
+        };
+        let agg_fields = match struct_field_vtypes(result_ty.as_ref(), types) {
+            Some(r) => Some(r?),
+            None => None,
+        };
+        match (&c.dest, agg_fields) {
+            (Some(dest), Some(fields)) => {
+                let rs = ctx.push_multi(inst, fields.len());
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.agg.insert(vid, rs);
+                }
+            }
+            (Some(dest), None) => {
                 let r = ctx.push(inst);
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
                     ctx.idx_of.insert(vid, r);
                 }
             }
-            None => ctx.push_effect(inst), // void call: no SSA result
+            (None, _) => ctx.push_effect(inst), // void call: no SSA result
+        }
+        return Ok(());
+    }
+    // `insertvalue` builds a small by-value struct field-wise (no scalar result) — record/update its
+    // field list in the aggregate side-table. The source is a prior aggregate value or a
+    // poison/undef/zero constant (start from zeroed fields). Single-level only (clang's coercion).
+    if let I::InsertValue(iv) = instr {
+        if iv.indices.len() != 1 {
+            return unsup("nested insertvalue");
+        }
+        let i = iv.indices[0] as usize;
+        let mut fields = match ctx.agg_of(&iv.aggregate) {
+            Some(f) => f,
+            None => {
+                let aty = iv.aggregate.get_type(types);
+                let ftys = struct_field_vtypes(aty.as_ref(), types)
+                    .ok_or_else(|| Error::Unsupported("insertvalue into non-struct".into()))??;
+                ftys.into_iter().map(|t| ctx.push(zero_inst(t))).collect()
+            }
+        };
+        let v = ctx.operand(&iv.element)?;
+        *fields
+            .get_mut(i)
+            .ok_or_else(|| Error::Unsupported("insertvalue index out of range".into()))? = v;
+        if let Some(&vid) = ctx.s.name2id.get(&iv.dest) {
+            ctx.agg.insert(vid, fields);
         }
         return Ok(());
     }
@@ -2992,6 +3116,19 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         I::Freeze(x) => {
             let a = ctx.operand(&x.operand)?;
             (&x.dest, a)
+        }
+        // `extractvalue` reads a field of a small by-value struct — alias the field's value (§3a).
+        I::ExtractValue(ev) => {
+            if ev.indices.len() != 1 {
+                return unsup("nested extractvalue");
+            }
+            let fields = ctx
+                .agg_of(&ev.aggregate)
+                .ok_or_else(|| Error::Unsupported("extractvalue of non-aggregate value".into()))?;
+            let v = *fields
+                .get(ev.indices[0] as usize)
+                .ok_or_else(|| Error::Unsupported("extractvalue index out of range".into()))?;
+            (&ev.dest, v)
         }
         other => return unsup(format!("instruction {other:?}")),
     };
@@ -3286,10 +3423,11 @@ fn translate_term(
     match term {
         LTerm::Ret(r) => match &r.return_operand {
             None => Ok(Terminator::Return(Vec::new())),
-            Some(op) => {
-                let v = ctx.operand(op)?;
-                Ok(Terminator::Return(vec![v]))
-            }
+            // A small by-value struct return yields its fields (§3a multi-result); a scalar, one value.
+            Some(op) => match ctx.agg_of(op) {
+                Some(fields) => Ok(Terminator::Return(fields)),
+                None => Ok(Terminator::Return(vec![ctx.operand(op)?])),
+            },
         },
         LTerm::Br(x) => {
             let target = s.block_idx[&x.dest];
