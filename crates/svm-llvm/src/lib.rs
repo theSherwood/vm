@@ -92,9 +92,14 @@
 //!   compiles to a table of 32-bit `&target − &table` offsets; `load.relative(P, off)` →
 //!   `P + sext_i32(*(i32*)(P+off))`. The table initializer (`trunc(sub(ptrtoint…))`) already folds via
 //!   the constexpr evaluator. Lands **jsmn** (a zero-alloc JSON parser) byte-identical to native.
+//! - **S — `malloc`/heap (the §1a sparse address space).** `malloc`/`calloc` lower to a synthesized
+//!   **bump allocator** (`__svm_malloc`) that grows the heap into the window's reserved tail by
+//!   `vm_map`-committing pages on demand via the `Memory` capability (a 4th powerbox handle); `free`
+//!   is a no-op and the heap never reuses, so freshly-committed (zeroed) pages make `calloc` ≡
+//!   `malloc`. Lands **heapgrow** (a guest growing past ~16× its initial window) byte-identical to native.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): variable-length `memmove` (overlap),
-//! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `malloc`/heap,
+//! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `realloc`,
 //! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
@@ -158,10 +163,25 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         defined_names.insert(f.name.clone(), i as u32);
     }
     // §7 capability imports: external libc calls bound to host capabilities (`write`/`read`/`exit`).
-    // A program that uses any of them gets a synthesized powerbox entry (`_start`, function 0); the
-    // other functions then sit at index `base..` so `main` can be called from `_start`.
-    let (imports, caps) = collect_cap_imports(m, &defined_names);
-    let synth = !imports.is_empty() && defined_names.contains_key("main");
+    // A program that uses any of them — or that allocates (`malloc`, which needs the `Memory`
+    // capability) — gets a synthesized powerbox entry (`_start`, function 0); the other functions
+    // then sit at index `base..` so `main` can be called from `_start`.
+    let (mut imports, mut caps) = collect_cap_imports(m, &defined_names);
+    let has_main = defined_names.contains_key("main");
+    let need_malloc = needs_malloc(m, &defined_names) && has_main;
+    let synth = (!imports.is_empty() || need_malloc) && has_main;
+    // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
+    // `CallImport "vm_map"`, resolved like any other §7 import at load).
+    if need_malloc {
+        caps.entry("vm_map".to_string()).or_insert_with(|| {
+            let i = imports.len() as u32;
+            imports.push(svm_ir::Import {
+                name: "vm_map".to_string(),
+                sig: import_sig("vm_map"),
+            });
+            i
+        });
+    }
     let base: u32 = synth as u32;
     let mut name2idx: HashMap<String, u32> = HashMap::new();
     for (i, f) in defined.iter().enumerate() {
@@ -180,14 +200,15 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // writable global sharing a page is a separate latent issue — page-isolating those is a follow-up.)
     let entry_sp = globals_end.div_ceil(STACK_PAGE) * STACK_PAGE;
 
-    // Synthesized runtime mem-loop helpers (a variable-length `memset`/`memcpy` calls these). They
-    // sit after the defined functions (and after `_start`, which occupies index 0 when `synth`), at
-    // `base + defined.len()` onward — so their indices are fixed before translating the call sites.
+    // Synthesized helpers (mem-loop `memset`/`memcpy`, the `malloc` allocator) sit after the defined
+    // functions and `_start` (index 0 when `synth`), at `base + defined.len()` onward — their indices
+    // are fixed before translating call sites. The allocator references the `vm_map` import index.
     let (need_memset, need_memcpy) = needs_mem_helpers(m);
     let helper_base = base + defined.len() as u32;
     let helpers = Helpers {
         memset: need_memset.then_some(helper_base),
         memcpy: need_memcpy.then_some(helper_base + need_memset as u32),
+        malloc: need_malloc.then_some(helper_base + need_memset as u32 + need_memcpy as u32),
     };
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
@@ -198,25 +219,11 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         any_frame |= frame_size > 0;
         funcs.push(func);
     }
-    // Prepend the synthesized powerbox entry (`_start`) at function 0: it receives the granted
-    // capability handles, stashes them, then calls `main(entry_sp)` (§3e / `is_powerbox_entry`).
-    if synth {
-        let main_idx = name2idx["main"];
-        let main_results = funcs[(main_idx - base) as usize].results.clone();
-        funcs.insert(0, synth_start(main_idx, &main_results, entry_sp));
-    }
-    // Append the mem-loop helpers in index order (memset before memcpy) — matching `helper_base`.
-    if need_memset {
-        funcs.push(synth_memset());
-    }
-    if need_memcpy {
-        funcs.push(synth_memcpy());
-    }
-    // A window is declared if any function uses the data stack, the module has globals, *or* it uses
-    // host capabilities (the handle stash lives in the reserved low window). Layout (§3d): globals
-    // `[DATA_BASE, globals_end)` low, then the data stack from `entry_sp` growing up. `mapped` covers
-    // the globals plus a stack reserve; the runtime leaves a faulting guard beyond `mapped` (reserved
-    // > mapped), so a stack overflow faults (detect-and-kill, §5) instead of corrupting the globals.
+
+    // The window: globals low, then the data stack from `entry_sp` growing up; `mapped` covers the
+    // globals plus a stack reserve, with a faulting guard beyond (reserved > mapped, §5). Declared if
+    // any function uses the data stack, the module has globals, or it uses the powerbox (the handle
+    // stash / heap state live in the reserved low window).
     let need_window = any_frame || !globals.is_empty() || synth;
     let memory = need_window.then(|| {
         let top = if any_frame {
@@ -228,6 +235,29 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         let log2 = (64 - (top - 1).leading_zeros()) as u8;
         svm_ir::Memory { size_log2: log2 }
     });
+    // The guest heap begins at the window's mapped boundary (the first reserved page) and grows up
+    // into the reserved tail as the allocator `vm_map`-commits it (§1a sparse address space).
+    let heap_base = need_malloc
+        .then(|| memory.map(|mc| 1u64 << mc.size_log2))
+        .flatten();
+
+    // Prepend the synthesized powerbox entry (`_start`) at function 0: it receives the granted
+    // capability handles, stashes them (and seeds the heap), then calls `main(entry_sp)`.
+    if synth {
+        let main_idx = name2idx["main"];
+        let main_results = funcs[(main_idx - base) as usize].results.clone();
+        funcs.insert(0, synth_start(main_idx, &main_results, entry_sp, heap_base));
+    }
+    // Append the synthesized helpers in index order (memset, memcpy, malloc) — matching `helper_base`.
+    if need_memset {
+        funcs.push(synth_memset());
+    }
+    if need_memcpy {
+        funcs.push(synth_memcpy());
+    }
+    if need_malloc {
+        funcs.push(synth_malloc(caps["vm_map"]));
+    }
     Ok(Translated {
         module: Module {
             funcs,
@@ -993,16 +1023,25 @@ fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
 // it needs (so a handle reaches arbitrary call depth without a viral extra parameter). This keeps
 // the translator pure mechanism — it never interprets host semantics, just defers the bind (§2a).
 
-/// Window offsets of the **powerbox handle stash** (the reserved low scratch `[0, DATA_BASE)` — four
-/// `i32` slots). `_start` stores the granted handles here; each capability call site reloads its own.
+/// Window offsets of the **powerbox handle stash + allocator state** (the reserved low scratch on
+/// page 0, which is writable — for a powerbox program the globals start a page up). `_start` stores
+/// the granted handles here; each call site reloads what it needs. The heap allocator (slice S) keeps
+/// its bump pointer + committed boundary here too.
 const STASH_STDOUT: u64 = 0;
 const STASH_STDIN: u64 = 4;
 const STASH_EXIT: u64 = 8;
-/// A 1-byte writable scratch in the stash's spare slot (`[12, 16)` — page 0 is writable since the
-/// globals start a page up). Used by `putc`/`puts` to stage a single byte (a char, a newline) the
+/// The `Memory` capability handle (`i32`) — present only when the program uses `malloc` (then `_start`
+/// takes a 4th granted handle). The bump allocator reloads it to `vm_map`-commit reserved pages.
+const STASH_MEMORY: u64 = 12;
+/// The guest heap's bump pointer and committed boundary (`i64` each) — the allocator's only state.
+const HEAP_BRK: u64 = 16;
+const HEAP_TOP: u64 = 24;
+/// A 1-byte writable scratch used by `putc`/`puts` to stage a single byte (a char, a newline) the
 /// `Stream` capability writes (its ABI is a `(buf, len)` window slice, so a scalar char must transit
 /// memory). Reused per call — single-threaded, fully produced-then-consumed within one lowering.
-const STASH_SCRATCH: u64 = 12;
+const STASH_SCRATCH: u64 = 32;
+/// The `prot` bits a guest passes to `Memory.map` for a read-write commit (`PROT_READ|PROT_WRITE`).
+const PROT_RW: i32 = 3;
 
 /// Which stash slot a capability call reads its handle from.
 #[derive(Clone, Copy)]
@@ -1074,6 +1113,8 @@ fn import_sig(import: &str) -> svm_ir::FuncType {
     let ft = |params: Vec<ValType>, results: Vec<ValType>| svm_ir::FuncType { params, results };
     match import {
         "exit" => ft(vec![I32], vec![]),
+        // `Memory.map(offset, len, prot)` (§3e op 0) — the allocator's page-commit primitive.
+        "vm_map" => ft(vec![I64, I64, I32], vec![I64]),
         _ => ft(vec![I64, I64], vec![I64]), // write / read (Stream)
     }
 }
@@ -1120,12 +1161,24 @@ fn collect_cap_imports(
 /// powerbox shape `is_powerbox_entry` recognizes — no threaded data-SP, since it is the root),
 /// stores them into the handle stash so every capability call site can reload its handle, then calls
 /// the C `main(sp)` at the page-aligned data-stack base and returns its exit code.
-fn synth_start(main_idx: u32, main_results: &[ValType], entry_sp: u64) -> Func {
+fn synth_start(
+    main_idx: u32,
+    main_results: &[ValType],
+    entry_sp: u64,
+    heap_base: Option<u64>,
+) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
-    // params: v0 = stdout, v1 = stdin, v2 = exit (i32 capability handles).
-    let mut next: ValIdx = 3;
-    for (off, handle) in [(STASH_STDOUT, 0), (STASH_STDIN, 1), (STASH_EXIT, 2)] {
+    // params: v0 = stdout, v1 = stdin, v2 = exit, [v3 = memory] (i32 capability handles). A program
+    // that uses `malloc` takes the 4th `Memory` handle (the powerbox grants it for a 4-param entry).
+    let mut handles = vec![(STASH_STDOUT, 0), (STASH_STDIN, 1), (STASH_EXIT, 2)];
+    let mut params = vec![ValType::I32, ValType::I32, ValType::I32];
+    if heap_base.is_some() {
+        handles.push((STASH_MEMORY, 3));
+        params.push(ValType::I32);
+    }
+    let mut next: ValIdx = params.len() as ValIdx;
+    for (off, handle) in handles {
         insts.push(Inst::ConstI64(off as i64));
         let addr = next;
         next += 1;
@@ -1136,6 +1189,25 @@ fn synth_start(main_idx: u32, main_results: &[ValType], entry_sp: u64) -> Func {
             offset: 0,
             align: 0,
         });
+    }
+    // Initialize the heap: the bump pointer and the committed boundary both start at `heap_base` (the
+    // window's mapped boundary — the first reserved page); the allocator `vm_map`-commits upward.
+    if let Some(hb) = heap_base {
+        for off in [HEAP_BRK, HEAP_TOP] {
+            insts.push(Inst::ConstI64(off as i64));
+            let addr = next;
+            next += 1;
+            insts.push(Inst::ConstI64(hb as i64));
+            let val = next;
+            next += 1;
+            insts.push(Inst::Store {
+                op: StoreOp::I64,
+                addr,
+                value: val,
+                offset: 0,
+                align: 0,
+            });
+        }
     }
     // sp = entry_sp (constant); call main(sp). `main` carries the threaded data-SP as param 0.
     insts.push(Inst::ConstI64(entry_sp as i64));
@@ -1150,7 +1222,6 @@ fn synth_start(main_idx: u32, main_results: &[ValType], entry_sp: u64) -> Func {
     } else {
         Terminator::Return(vec![next]) // main's single result, appended by the call
     };
-    let params = vec![ValType::I32, ValType::I32, ValType::I32];
     Func {
         results: main_results.to_vec(),
         blocks: vec![Block {
@@ -1159,6 +1230,139 @@ fn synth_start(main_idx: u32, main_results: &[ValType], entry_sp: u64) -> Func {
             term,
         }],
         params,
+    }
+}
+
+/// Synthesize `__svm_malloc(size:i64) -> i64`: an on-demand **bump allocator** that grows the guest
+/// heap into the window's reserved tail by `vm_map`-committing pages as needed (§3e/§4 — the §1a
+/// "grow past the initial window" capability). State is two `i64`s in the low scratch: `HEAP_BRK` (the
+/// next free address) and `HEAP_TOP` (the committed boundary). `free` is a no-op and the heap never
+/// reuses, so every result is freshly `vm_map`-zeroed memory (hence `calloc` ≡ `malloc`).
+///
+/// ```text
+///   block0(size):                              ; align the request to 16, compute the new break
+///     brk = load.i64 [HEAP_BRK]
+///     new = (brk + size + 15) & ~15
+///     top = load.i64 [HEAP_TOP]
+///     grow? = new >u top   → grow(brk,new,top) : commit(brk,new)
+///   grow(brk,new,top):                         ; commit [top, page_up(new)) via the Memory cap
+///     limit = (new + (PAGE-1)) & ~(PAGE-1)
+///     vm_map(mem_handle, top, limit - top, RW)
+///     store.i64 [HEAP_TOP] = limit
+///     → commit(brk,new)
+///   commit(brk,new):                           ; publish the new break, return the old one
+///     store.i64 [HEAP_BRK] = new
+///     return brk
+/// ```
+fn synth_malloc(vm_map_import: u32) -> Func {
+    use svm_ir::{LoadOp, StoreOp};
+    let i64add = |a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let i64and = |a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::And,
+        a,
+        b,
+    };
+
+    let load_i64 = |addr: ValIdx| Inst::Load {
+        op: LoadOp::I64,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let store_i64 = |addr: ValIdx, value: ValIdx| Inst::Store {
+        op: StoreOp::I64,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    // block0(size=0): brk = *HEAP_BRK; new = align16(brk + size); top = *HEAP_TOP; branch on new>top.
+    let b0 = Block {
+        params: vec![ValType::I64], // size = v0
+        insts: vec![
+            Inst::ConstI64(HEAP_BRK as i64), // v1
+            load_i64(1),                     // v2 = brk
+            i64add(2, 0),                    // v3 = brk + size
+            Inst::ConstI64(15),              // v4
+            i64add(3, 4),                    // v5 = brk+size+15
+            Inst::ConstI64(!15i64),          // v6 = ~15
+            i64and(5, 6),                    // v7 = new (aligned)
+            Inst::ConstI64(HEAP_TOP as i64), // v8
+            load_i64(8),                     // v9 = top
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::GtU,
+                a: 7,
+                b: 9,
+            }, // v10 = new > top
+        ],
+        term: Terminator::BrIf {
+            cond: 10,
+            then_blk: 1, // grow(brk=v2, new=v7, top=v9)
+            then_args: vec![2, 7, 9],
+            else_blk: 2, // commit(brk=v2, new=v7)
+            else_args: vec![2, 7],
+        },
+    };
+
+    // grow(brk=0, new=1, top=2): commit [top, page_up(new)) via vm_map, update HEAP_TOP.
+    let page = STACK_PAGE as i64; // commit in ≥-OS-page units (16 KiB covers any real page)
+    let g = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64], // brk, new, top
+        insts: vec![
+            Inst::ConstI64(page - 1),            // v3
+            i64add(1, 3),                        // v4 = new + (PAGE-1)
+            Inst::ConstI64(!(page - 1)),         // v5 = ~(PAGE-1)
+            i64and(4, 5),                        // v6 = limit (page-aligned)
+            Inst::ConstI64(STASH_MEMORY as i64), // v7
+            Inst::Load {
+                op: LoadOp::I32,
+                addr: 7,
+                offset: 0,
+                align: 0,
+            }, // v8 = mem handle
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: 6,
+                b: 2,
+            }, // v9 = limit - top (len)
+            Inst::ConstI32(PROT_RW),             // v10 = prot
+            Inst::CallImport {
+                import: vm_map_import,
+                sig: import_sig("vm_map"),
+                handle: 8,
+                args: vec![2, 9, 10],
+            }, // v11 = map result (ignored)
+            Inst::ConstI64(HEAP_TOP as i64),     // v12
+            store_i64(12, 6),                    // *HEAP_TOP = limit
+        ],
+        term: Terminator::Br {
+            target: 2,
+            args: vec![0, 1],
+        }, // commit(brk, new)
+    };
+
+    // commit(brk=0, new=1): publish the new break, return the old break.
+    let c = Block {
+        params: vec![ValType::I64, ValType::I64], // brk, new
+        insts: vec![
+            Inst::ConstI64(HEAP_BRK as i64), // v2
+            store_i64(2, 1),                 // *HEAP_BRK = new
+        ],
+        term: Terminator::Return(vec![0]), // brk
+    };
+
+    Func {
+        params: vec![ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![b0, g, c],
     }
 }
 
@@ -1172,6 +1376,20 @@ struct Helpers {
     memset: Option<u32>,
     /// `__svm_memcpy(dst:i64, src:i64, len:i64)` — copy `len` bytes `src`→`dst` (forward; no overlap).
     memcpy: Option<u32>,
+    /// `__svm_malloc(size:i64) -> i64` — the `vm_map`-growing bump allocator (`malloc`/`calloc`).
+    malloc: Option<u32>,
+}
+
+/// Does the module call any heap allocator function (`malloc`/`calloc`) not defined by the guest?
+/// (`free` is lowered to a no-op and needs no allocator; `realloc` is still `Unsupported`.)
+fn needs_malloc(m: &LModule, defined: &HashMap<String, u32>) -> bool {
+    m.functions.iter().flat_map(|f| &f.basic_blocks).any(|bb| {
+        bb.instrs.iter().any(|i| {
+            matches!(i, Instruction::Call(c)
+                if callee_name(c).is_some_and(|n| matches!(n.as_str(), "malloc" | "calloc")
+                    && !defined.contains_key(&n)))
+        })
+    })
 }
 
 /// Does any mem intrinsic need the runtime loop helper — a **non-constant** length, or a constant
@@ -1474,6 +1692,29 @@ fn lower_io_call(
             }
             Ok(true)
         }
+        // `malloc(size)` / `calloc(n, size)`: the synthesized `vm_map`-growing bump allocator. The heap
+        // never reuses and freshly-committed pages are zeroed, so returned memory is zero — hence
+        // `calloc` is just `malloc` of `n*size` with no explicit clear.
+        "malloc" | "calloc" => {
+            let Some(f) = ctx.helpers.malloc else {
+                return Ok(false); // no allocator synthesized (e.g. no powerbox entry) → fail-closed
+            };
+            let size = if name == "calloc" {
+                let n = ctx.operand(&c.arguments[0].0)?;
+                let sz = ctx.operand(&c.arguments[1].0)?;
+                ctx.mul_i64(n, sz)
+            } else {
+                ctx.operand(&c.arguments[0].0)?
+            };
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![size],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `free(ptr)`: the bump allocator never reclaims, so this is a no-op.
+        "free" => Ok(true),
         _ => Ok(false),
     }
 }

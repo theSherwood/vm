@@ -971,6 +971,31 @@ fn demo_jsmn_vs_native() {
 }
 
 #[test]
+fn demo_heapgrow_vs_native() {
+    // The §1a headline: a guest **grows its own heap past the initial window** — allocating eight
+    // 128 KiB blocks (~1 MiB, ~16× the initial mapped window) through `malloc`, which commits
+    // reserved-tail pages on demand via the `Memory` capability (`vm_map`). Fills/sums/frees each and
+    // prints running totals — byte-identical to the native `cc` build (which uses the real `malloc`).
+    check_demo_vs_native("heapgrow", "heapgrow/heapgrow.c", b"");
+}
+
+#[test]
+fn heap_malloc_calloc_free() {
+    // The allocator directly: a `malloc` large enough to force `vm_map` growth past the initial
+    // window (filled/summed), a `free` (no-op), then a `calloc` that must read back as zero (freshly
+    // committed pages are zeroed and the bump heap never reuses). Exit code = (s + z) & 0xff vs native.
+    let src = "#include <stdlib.h>\n\
+               int run(void){ int *a = (int*)malloc(300000 * sizeof(int)); \
+               for (int i = 0; i < 300000; i++) a[i] = (i * 3 + 1) & 255; \
+               long s = 0; for (int i = 0; i < 300000; i++) s += a[i]; free(a); \
+               int *b = (int*)calloc(1000, sizeof(int)); \
+               long z = 0; for (int i = 0; i < 1000; i++) z += b[i]; \
+               return (int)((s + z) & 0xff); } \
+               int main(void){ return run(); }";
+    check_powerbox_vs_native("heap_alloc", src, b"");
+}
+
+#[test]
 fn ro_and_writable_global_page_isolation() {
     // A read-only global (string literal) next to a writable one (a mutable array) must not share a
     // protected page: a write to the writable global would otherwise fault on the read-only page
