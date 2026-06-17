@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue};
-use svm_ir::{DebugInfo, Encoding, TypeDef, TypeId, ValType, VarLoc};
+use svm_ir::{DebugInfo, Encoding, TypeDef, TypeId, ValType, VarInfo, VarLoc};
 
 mod expr;
 mod json;
@@ -749,9 +749,10 @@ impl DapServer {
 
     fn on_evaluate(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
         // Watch / hover / REPL / breakpoint-condition expression. A bare known variable keeps its
-        // rich form (declared type + formatted value); anything else is an integer expression over
-        // the frame's source variables (`expr::eval_int`). Member/index access (`a.b`, `arr[i]`)
-        // needs structured type layout — the W4 `TypeRef` follow-up. Failure ⇒ `success:false`.
+        // rich form (declared type + formatted value); anything else is a C expression over the
+        // frame's source variables — including member / index / arrow access (`a.b`, `arr[i]`,
+        // `p->x`) walked over the §6 structured types via an `EvalEnv` resolver. Failure ⇒
+        // `success:false`.
         let fail = (false, Json::Null, vec![]);
         let expr = args
             .and_then(|a| a.get("expression"))
@@ -800,19 +801,53 @@ impl DapServer {
             }
         }
 
-        // Otherwise evaluate as an integer expression over the frame's variables.
-        let resolve = |name: &str| session.resolve_var(frame_idx, func, name);
-        match expr::eval_int(&expr, &resolve) {
-            Some(v) => (
-                true,
-                Json::obj(vec![
-                    ("result", Json::s(v.to_string())),
-                    ("variablesReference", Json::i(0)),
-                ]),
-                vec![],
-            ),
-            None => fail,
-        }
+        // Otherwise evaluate as a C expression (arithmetic + member/index/arrow) over the frame's
+        // variables, walking the structured types through the window.
+        let (types, vars) = match session.debug.as_ref() {
+            Some(d) => (d.types.as_slice(), d.vars.as_slice()),
+            None => (&[][..], &[][..]),
+        };
+        let mut env = EvalEnv {
+            inspector: &session.inspector,
+            types,
+            vars,
+            frame_idx,
+            func,
+        };
+        let (result, ty) = match expr::eval(&expr, &mut env) {
+            Some(expr::Value::Int(n)) => (n.to_string(), String::new()),
+            Some(expr::Value::Place { addr, type_id }) => {
+                if matches!(
+                    types.get(type_id as usize),
+                    Some(TypeDef::Aggregate { .. } | TypeDef::Array { .. })
+                ) {
+                    // An aggregate result renders as a summary (expandable-from-evaluate is a TODO).
+                    (
+                        type_summary(types, type_id),
+                        type_render_name(types, type_id),
+                    )
+                } else {
+                    let size = type_size(types, type_id) as usize;
+                    match session.inspector.read_window(addr, size) {
+                        Ok(bytes) => (
+                            fmt_scalar(types, type_id, &bytes),
+                            type_render_name(types, type_id),
+                        ),
+                        Err(_) => return fail,
+                    }
+                }
+            }
+            None => return fail,
+        };
+        (
+            true,
+            Json::obj(vec![
+                ("result", Json::s(result)),
+                ("type", Json::s(ty)),
+                ("variablesReference", Json::i(0)),
+            ]),
+            vec![],
+        )
     }
 
     fn on_disconnect(&mut self) -> (bool, Json, Vec<Event>) {
@@ -1060,6 +1095,170 @@ fn fmt_scalar(types: &[TypeDef], id: TypeId, bytes: &[u8]) -> String {
         }
         Some(TypeDef::Pointer { .. }) => format!("0x{:x}", le_uint(bytes, 8)),
         _ => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+    }
+}
+
+/// Decode a scalar's window bytes to `i64` for the expression evaluator: signed ints
+/// sign-extended, unsigned/`_Bool` zero-extended, a float truncated, a pointer as its address.
+/// Aggregates/arrays aren't integers ⇒ `None`.
+fn scalar_to_i64(types: &[TypeDef], id: TypeId, bytes: &[u8]) -> Option<i64> {
+    match types.get(id as usize)? {
+        TypeDef::Base { encoding, size, .. } => {
+            let n = *size as usize;
+            Some(match encoding {
+                Encoding::Unsigned | Encoding::Bool => le_uint(bytes, n) as i64,
+                Encoding::Signed => {
+                    let raw = le_uint(bytes, n);
+                    let bits = (n * 8) as u32;
+                    if bits == 0 || bits >= 64 {
+                        raw as i64
+                    } else {
+                        let shift = 64 - bits;
+                        ((raw << shift) as i64) >> shift
+                    }
+                }
+                Encoding::Float => {
+                    if *size == 4 {
+                        f32::from_bits(le_uint(bytes, 4) as u32) as i64
+                    } else {
+                        f64::from_bits(le_uint(bytes, 8)) as i64
+                    }
+                }
+            })
+        }
+        TypeDef::Pointer { .. } => Some(le_uint(bytes, 8) as i64),
+        _ => None,
+    }
+}
+
+/// Coerce an interpreter [`Value`] to `i64` (for reading a promoted SSA scalar).
+fn value_to_i64(v: Value) -> Option<i64> {
+    Some(match v {
+        Value::I32(n) => n as i64,
+        Value::I64(n) => n,
+        Value::F32(x) => x as i64,
+        Value::F64(x) => x as i64,
+        _ => return None,
+    })
+}
+
+/// The [`expr::Resolver`] for `evaluate`: resolves names + member/index/arrow access against a
+/// stopped frame, reading the focused thread's window through the neutral structured types. Holds
+/// only immutable borrows; navigation is pure address arithmetic over `TypeDef` (frontend-neutral).
+struct EvalEnv<'a> {
+    inspector: &'a Inspector,
+    types: &'a [TypeDef],
+    vars: &'a [VarInfo],
+    frame_idx: usize,
+    func: u32,
+}
+
+impl EvalEnv<'_> {
+    /// The frame's data-SP (block param `v0`) — the base address for window locals.
+    fn data_sp(&self) -> Option<u64> {
+        Some(match self.inspector.read_ir_value(self.frame_idx, 0)? {
+            Value::I64(n) => n as u64,
+            Value::I32(n) => n as u64,
+            _ => return None,
+        })
+    }
+
+    /// Read an 8-byte pointer value from the window.
+    fn read_ptr(&self, addr: u64) -> Option<u64> {
+        Some(le_uint(&self.inspector.read_window(addr, 8).ok()?, 8))
+    }
+}
+
+impl expr::Resolver for EvalEnv<'_> {
+    fn ident(&mut self, name: &str) -> Option<expr::Value> {
+        let var = self
+            .vars
+            .iter()
+            .find(|v| v.func == self.func && v.name == name)?;
+        match var.loc {
+            VarLoc::Window { off } => {
+                let addr = self.data_sp()?.wrapping_add(off as u64);
+                match var.type_id {
+                    Some(type_id) => Some(expr::Value::Place { addr, type_id }),
+                    None => {
+                        // Name-only / legacy var: read as a scalar integer (width from the name).
+                        let w = ty_width(&var.ty);
+                        let bytes = self.inspector.read_window(addr, w).ok()?;
+                        Some(expr::Value::Int(le_uint(&bytes, w.min(8)) as i64))
+                    }
+                }
+            }
+            VarLoc::Ssa { value } => value_to_i64(
+                self.inspector
+                    .read_ir_value(self.frame_idx, value as usize)?,
+            )
+            .map(expr::Value::Int),
+        }
+    }
+
+    fn member(&mut self, base: &expr::Value, name: &str) -> Option<expr::Value> {
+        let &expr::Value::Place { addr, type_id } = base else {
+            return None;
+        };
+        match self.types.get(type_id as usize)? {
+            TypeDef::Aggregate { fields, .. } => {
+                let f = fields.iter().find(|f| f.name == name)?;
+                Some(expr::Value::Place {
+                    addr: addr.wrapping_add(f.offset as u64),
+                    type_id: f.ty,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn index(&mut self, base: &expr::Value, index: i64) -> Option<expr::Value> {
+        let &expr::Value::Place { addr, type_id } = base else {
+            return None;
+        };
+        match self.types.get(type_id as usize)? {
+            TypeDef::Array { elem, .. } => {
+                let stride = type_size(self.types, *elem) as u64;
+                Some(expr::Value::Place {
+                    addr: addr.wrapping_add((index as u64).wrapping_mul(stride)),
+                    type_id: *elem,
+                })
+            }
+            // `p[i] == *(p + i)`: dereference, then offset by the element stride.
+            TypeDef::Pointer { pointee, .. } => {
+                let base = self.read_ptr(addr)?;
+                let stride = type_size(self.types, *pointee) as u64;
+                Some(expr::Value::Place {
+                    addr: base.wrapping_add((index as u64).wrapping_mul(stride)),
+                    type_id: *pointee,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn deref(&mut self, base: &expr::Value) -> Option<expr::Value> {
+        let &expr::Value::Place { addr, type_id } = base else {
+            return None;
+        };
+        match self.types.get(type_id as usize)? {
+            TypeDef::Pointer { pointee, .. } => Some(expr::Value::Place {
+                addr: self.read_ptr(addr)?,
+                type_id: *pointee,
+            }),
+            _ => None,
+        }
+    }
+
+    fn coerce_int(&mut self, v: &expr::Value) -> Option<i64> {
+        match v {
+            expr::Value::Int(n) => Some(*n),
+            &expr::Value::Place { addr, type_id } => {
+                let size = type_size(self.types, type_id) as usize;
+                let bytes = self.inspector.read_window(addr, size).ok()?;
+                scalar_to_i64(self.types, type_id, &bytes)
+            }
+        }
     }
 }
 

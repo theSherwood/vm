@@ -1198,3 +1198,140 @@ fn dap_inspects_a_non_c_frontend_by_structured_layout_only() {
         Some(&Json::s("1000"))
     );
 }
+
+/// `(success, result string)` of an `evaluate` response.
+fn eval_result(out: &[Json]) -> (bool, Option<String>) {
+    let r = response(out);
+    let ok = r.get("success") == Some(&Json::Bool(true));
+    let val = r
+        .get("body")
+        .and_then(|b| b.get("result"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (ok, val)
+}
+
+/// Launch `program` (data-SP arg 1024), break at source `line`, and return the stopped frame id.
+fn launch_and_break(s: &mut DapServer, program: &str, path: &str, line: i64) -> i64 {
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(program)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(1024)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s(path))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(line))])]),
+            ),
+        ]),
+    ));
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert!(event(&out, "stopped").is_some(), "stops at the breakpoint");
+    let out = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap()
+}
+
+#[test]
+fn dap_evaluate_member_and_index_access() {
+    // AGGREGATES_DBG: struct p{x=11,y=22} at +0, int row[3]={100,200,300} at +8.
+    let mut s = DapServer::new();
+    let fid = launch_and_break(&mut s, AGGREGATES_DBG, "/work/s.c", 6);
+    let mut seq = 10;
+    let mut eval = |s: &mut DapServer, e: &str| -> (bool, Option<String>) {
+        seq += 1;
+        let out = s.handle(&req(
+            seq,
+            "evaluate",
+            Json::obj(vec![("expression", Json::s(e)), ("frameId", Json::i(fid))]),
+        ));
+        eval_result(&out)
+    };
+
+    // Member access over a struct, index over an array, and mixed arithmetic.
+    assert_eq!(eval(&mut s, "p.x"), (true, Some("11".into())));
+    assert_eq!(eval(&mut s, "p.y"), (true, Some("22".into())));
+    assert_eq!(eval(&mut s, "row[0]"), (true, Some("100".into())));
+    assert_eq!(eval(&mut s, "row[2]"), (true, Some("300".into())));
+    assert_eq!(eval(&mut s, "p.x + row[1]"), (true, Some("211".into())));
+    // The index is itself an expression (resolved to 0 here → row[0]).
+    assert_eq!(eval(&mut s, "row[p.y - 22]"), (true, Some("100".into())));
+    // Errors fail cleanly: unknown member, and member access on a scalar.
+    assert_eq!(eval(&mut s, "p.nope").0, false);
+    assert_eq!(eval(&mut s, "p.x.y").0, false);
+}
+
+// A pointer `pp` (at +0) to a `struct Point {x=7,y=9}` placed at +16. Tests `->` and pointer
+// indexing (`pp[0].y`). data-SP arg is 1024, so the stored pointer value is 1040.
+const POINTER_DBG: &str = r#"
+memory 17
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 16
+  v2 = i64.add v0 v1
+  v3 = i32.const 7
+  i32.store v2 v3
+  v4 = i64.const 20
+  v5 = i64.add v0 v4
+  v6 = i32.const 9
+  i32.store v5 v6
+  i64.store v0 v2
+  v7 = i32.const 0
+  return v7
+}
+
+debug.file 0 "p.c"
+debug.loc 0 0 9 0 3 1
+debug.type 0 base "int" signed 4
+debug.type 1 agg "Point" 8
+debug.field 1 "x" 0 0
+debug.field 1 "y" 4 0
+debug.type 2 ptr "ptr" 1 8
+debug.var 0 "pp" win 0 "ptr" 2
+"#;
+
+#[test]
+fn dap_evaluate_pointer_arrow_and_index() {
+    let mut s = DapServer::new();
+    let fid = launch_and_break(&mut s, POINTER_DBG, "/work/p.c", 3);
+    let mut seq = 10;
+    let mut eval = |s: &mut DapServer, e: &str| -> (bool, Option<String>) {
+        seq += 1;
+        let out = s.handle(&req(
+            seq,
+            "evaluate",
+            Json::obj(vec![("expression", Json::s(e)), ("frameId", Json::i(fid))]),
+        ));
+        eval_result(&out)
+    };
+
+    // `pp->x` = (*pp).x = 7; `pp->y` = 9; `pp[0].y` = *(pp+0) then .y = 9.
+    assert_eq!(eval(&mut s, "pp->x"), (true, Some("7".into())));
+    assert_eq!(eval(&mut s, "pp->y"), (true, Some("9".into())));
+    assert_eq!(eval(&mut s, "pp[0].y"), (true, Some("9".into())));
+    assert_eq!(eval(&mut s, "pp->x + pp->y"), (true, Some("16".into())));
+    // Arrow through a non-pointer fails cleanly.
+    assert_eq!(eval(&mut s, "pp->x->y").0, false);
+}
