@@ -258,11 +258,9 @@ unsafe fn intern_type(
                 }
             };
             let elem_bits = types[elem as usize].size() as u64 * 8;
-            let count = if elem_bits == 0 {
-                0
-            } else {
-                (LLVMDITypeGetSizeInBits(md) / elem_bits) as u32
-            };
+            let count = LLVMDITypeGetSizeInBits(md)
+                .checked_div(elem_bits)
+                .unwrap_or(0) as u32;
             let ename = render_name(&types[elem as usize]);
             TypeDef::Array {
                 name: format!("{ename}[{count}]"),
