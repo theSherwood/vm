@@ -698,8 +698,10 @@ The byte-level snapshot **Section-2 codec** lands too: `svm-snapshot` serializes
 are no fibers, so no-fiber artifacts stay byte-identical) and `restore` re-seeds the `Host`, so a
 full `freeze → serialize → restore → thaw ≡ uninterrupted` runs through the **real artifact**
 (`svm-snapshot/tests/roundtrip.rs`, incl. the §12.6 canonical re-serialize invariant). **3.1 is
-complete on the interpreter.** Remaining polish: fold fiber'd modules into the `durable_fuzz`
-generator. 3.2 — multi-vCPU quiesce + per-context layout.
+complete on the interpreter, and now generatively fuzzed**: `durable_fuzz`'s
+`fiber_freeze_thaw_equivalence_over_generated_modules` (+ the `durable_fiber` libFuzzer target)
+drive a root+fiber generator — varying suspend counts, values live across each suspend, multi-point
+resume/suspend — through the freeze→thaw round-trip (R11). 3.2 — multi-vCPU quiesce + per-context layout.
 3.3 — JIT parity (drive real OS threads to safepoints; respect the D57 single-owner protocol;
 **replicate the swap** in the JIT's fiber-switch path). Phase 4 — back-edge polls for bounded
 latency.
@@ -794,10 +796,10 @@ each a small reviewable commit on the interpreter only:
    the `shadow` table) and re-enters the root under `REWINDING`: the resumer re-issues
    `cont.resume`, the seeded fiber re-runs its entry → rewinds → re-parks, then forward execution
    completes. `svm-durable/tests/fiber.rs::single_fiber_freeze_thaw_round_trips` proves `freeze →
-   (window + residue) → thaw ≡ uninterrupted` (107). **Remaining:** the byte-level **Section-2
-   codec** in `svm-snapshot` — serialize/restore the `FrozenFiber` residue (the §12.4 per-fiber
-   record: `(slot, generation)` handle + shadow region/extent + status) instead of the in-memory
-   hand-off — and folding fiber'd modules into the `durable_fuzz` generator.
+   (window + residue) → thaw ≡ uninterrupted` (107), and the `durable_fuzz` fiber property fuzzes
+   it over a generated root+fiber space (varying suspend counts, live-across-suspend values,
+   multi-point resume/suspend). The byte-level **Section-2 codec** (below) carries the residue
+   through the real artifact too.
 
    **[DONE] Section-2 codec.** `svm-snapshot` now carries the fiber residue: `freeze` writes a TLV
    control section (tag 2) of `(slot, funcref, sp, shadow_sp)` per fiber — ascending slot,
