@@ -1163,12 +1163,25 @@ wasm guest's variables — ingested as `WindowVia` in slice 21 — are now fully
 as chibicc's. Test (`dap.rs`): a `WindowVia` `struct {int x,y}` expands to `x=10, y=20` and
 `evaluate("p.x + p.y") = 30`.
 
-**Not yet:** wasm aggregate/pointer **types** (only base types ingested so far — needs a
-DIE-tree walk in `dwarf_info` for `DW_TAG_structure_type`/members); the LLVM
-`!DILocation`/`dbg.value` bitcode path (its own effort). (The chibicc producer (incl.
-optimized-build location lists), both DAP consumers — now over `Window` *and* `WindowVia` — binary
-serialization, and a second producer's **source lines, DWARF pass-through, and named variables** are
-all built; the W4 debug-info waist is exercised end-to-end by two independent frontends.)
+**Slice 23 — wasm aggregate / pointer / array type ingest (the structured-type half).** The
+`.debug_info` reader is now a proper **DIE-*tree* walk** (a depth stack tracks open
+subprogram/struct/array DIEs) instead of a flat base-type pass, and recovers the full structured-type
+graph: `DW_TAG_structure_type`/`union_type` + `DW_TAG_member` (name + `DW_AT_data_member_location`),
+`DW_TAG_pointer_type` (pointee ref), `DW_TAG_array_type` + `DW_TAG_subrange_type` (`DW_AT_count` /
+`DW_AT_upper_bound + 1`), and `DW_TAG_typedef`/`const`/`volatile` (transparent aliases). A recursive,
+cycle-safe `intern_type` (reserves the `TypeId` with an `Opaque` placeholder before recursing, so a
+`struct Point *` whose pointee is `struct Point` terminates) lowers each `DwarfType` into the §6
+`TypeDef` graph — `Aggregate{fields}`, `Pointer{pointee}`, `Array{elem,count}`, `Base` — with names
+like `struct Point *` / `int[3]`. So a wasm guest's `struct`/array/pointer locals expand in the DAP
+Variables pane the same as chibicc's. Test (`debug_line.rs`, new `agg_clang.wasm` fixture): `struct
+Point p` ingests as an `Aggregate{x@0,y@4,size 8}`, `int row[3]` as `Array{count 3}`, and `struct
+Point *pp` as a `Pointer` whose pointee is the same aggregate — all `WindowVia` into the C frame.
+
+**Not yet:** the LLVM `!DILocation`/`dbg.value` bitcode path (its own frontend effort). (The chibicc
+producer (incl. optimized-build location lists), both DAP consumers — over `Window` *and*
+`WindowVia` — binary serialization, and a second producer's **source lines, DWARF pass-through, named
+variables, and now aggregate/pointer/array types** are all built; the W4 debug-info waist is
+exercised end-to-end by two independent frontends.)
 
 ### Open questions (S4/S5/S2)
 

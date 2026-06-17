@@ -45,10 +45,10 @@
 use std::collections::BTreeMap;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, Edge, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering, SsaLoc,
-    StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
-    VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx,
-    ValType, VarInfo, VarLoc,
+    Field, FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering,
+    SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp,
+    VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp,
+    ValIdx, ValType, VarInfo, VarLoc,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -804,7 +804,7 @@ fn ingest_variables(
             continue;
         }
         for v in &sub.vars {
-            let type_id = intern_base_type(&dw, v.type_ref, &mut types, &mut type_ids);
+            let type_id = intern_type(&dw, v.type_ref, &mut types, &mut type_ids);
             let ty = type_id
                 .and_then(|id| types.get(id as usize))
                 .map(type_render_name)
@@ -831,9 +831,11 @@ fn func_for_pc_range(op_locs: &[(u32, u32, u32, u32)], low: u32, high: u32) -> O
     op_locs.get(idx).filter(|e| e.0 < high).map(|e| e.1)
 }
 
-/// Intern a DWARF `DW_TAG_base_type` (by DIE offset) into the structured type table, returning its
-/// `TypeId`. Non-base types (pointer/struct — not yet ingested for wasm) yield `None`.
-fn intern_base_type(
+/// Intern a DWARF type DIE (by offset) into the structured type table, recursively — base / pointer
+/// / struct+union members / array — returning its `TypeId`. A `typedef` / cv-qualified type is
+/// transparent (resolves to the underlying). Cycle-safe: reserves the id before recursing, so a
+/// self-referential aggregate resolves to itself. `None` for an unmodeled / missing type.
+fn intern_type(
     dw: &dwarf_info::DwarfInfo,
     type_ref: u32,
     types: &mut Vec<TypeDef>,
@@ -842,21 +844,91 @@ fn intern_base_type(
     if let Some(&id) = type_ids.get(&type_ref) {
         return Some(id);
     }
-    let bt = dw.base_types.get(&type_ref)?;
-    let encoding = match bt.encoding {
+    let dt = dw.types.get(&type_ref)?;
+    // A transparent alias forwards straight to its underlying type.
+    if let dwarf_info::DwarfType::Alias { underlying } = dt {
+        let id = intern_type(dw, (*underlying)?, types, type_ids)?;
+        type_ids.insert(type_ref, id);
+        return Some(id);
+    }
+    // Reserve the id before recursing into members/pointees (cycle safety).
+    let id = types.len() as u32;
+    types.push(TypeDef::Opaque {
+        name: String::new(),
+        size: 0,
+    });
+    type_ids.insert(type_ref, id);
+    let name_of =
+        |types: &[TypeDef], i: Option<u32>| i.map(|i| type_render_name(&types[i as usize]));
+    let resolved = match dt {
+        dwarf_info::DwarfType::Base {
+            name,
+            encoding,
+            size,
+        } => TypeDef::Base {
+            name: name.clone(),
+            encoding: dwarf_encoding(*encoding),
+            size: *size,
+        },
+        dwarf_info::DwarfType::Pointer { pointee, size } => {
+            let pid = (*pointee).and_then(|p| intern_type(dw, p, types, type_ids));
+            let pname = name_of(types, pid).unwrap_or_else(|| "void".to_string());
+            TypeDef::Pointer {
+                name: format!("{pname} *"),
+                pointee: pid.unwrap_or(0),
+                size: *size,
+            }
+        }
+        dwarf_info::DwarfType::Aggregate {
+            kw,
+            name,
+            size,
+            members,
+        } => {
+            let fields = members
+                .iter()
+                .filter_map(|m| {
+                    Some(Field {
+                        name: m.name.clone(),
+                        offset: m.offset,
+                        ty: intern_type(dw, m.type_ref, types, type_ids)?,
+                    })
+                })
+                .collect();
+            let rname = if name.is_empty() {
+                kw.to_string()
+            } else {
+                format!("{kw} {name}")
+            };
+            TypeDef::Aggregate {
+                name: rname,
+                size: *size,
+                fields,
+            }
+        }
+        dwarf_info::DwarfType::Array { elem, count } => {
+            let eid = (*elem).and_then(|e| intern_type(dw, e, types, type_ids));
+            let ename = name_of(types, eid).unwrap_or_else(|| "?".to_string());
+            TypeDef::Array {
+                name: format!("{ename}[{count}]"),
+                elem: eid.unwrap_or(0),
+                count: *count,
+            }
+        }
+        dwarf_info::DwarfType::Alias { .. } => unreachable!("handled above"),
+    };
+    types[id as usize] = resolved;
+    Some(id)
+}
+
+/// Map a DWARF `DW_AT_encoding` byte to the neutral [`svm_ir::Encoding`].
+fn dwarf_encoding(e: u8) -> svm_ir::Encoding {
+    match e {
         0x02 => svm_ir::Encoding::Bool,
         0x04 => svm_ir::Encoding::Float,
         0x07 | 0x08 => svm_ir::Encoding::Unsigned, // unsigned, unsigned_char
         _ => svm_ir::Encoding::Signed,             // signed, signed_char, address, …
-    };
-    let id = types.len() as u32;
-    types.push(TypeDef::Base {
-        name: bt.name.clone(),
-        encoding,
-        size: bt.size,
-    });
-    type_ids.insert(type_ref, id);
-    Some(id)
+    }
 }
 
 /// The render name of a structured type (each variant carries one).

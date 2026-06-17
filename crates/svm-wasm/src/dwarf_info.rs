@@ -2,11 +2,12 @@
 //! (name, location, type) from a wasm guest's embedded debug info, for the §6 waist (the wasm
 //! producer's variable-ingest on-ramp, DEBUGGING.md W4).
 //!
-//! It parses `.debug_abbrev` (abbreviation tables) + `.debug_info` (the DIE tree) + `.debug_str`
-//! (string pool), extracting, per `DW_TAG_subprogram`: its PC range, its frame base (a wasm local,
-//! from `DW_OP_WASM_location`), and its `DW_TAG_formal_parameter` / `DW_TAG_variable` children —
-//! each a `(name, DW_OP_fbreg offset, type DIE)`. Base types (`DW_TAG_base_type`) are collected by
-//! DIE offset so the caller can resolve `DW_AT_type`.
+//! It walks `.debug_abbrev` (abbreviation tables) + `.debug_info` (the DIE *tree*, with a depth
+//! stack) + `.debug_str` (string pool), extracting, per `DW_TAG_subprogram`: its PC range, its
+//! frame base (a wasm local, from `DW_OP_WASM_location`), and its `DW_TAG_formal_parameter` /
+//! `DW_TAG_variable` children — each a `(name, DW_OP_fbreg offset, type DIE)`. Type DIEs
+//! (base, pointer, struct/union + members, array, transparent typedef/cv) are collected by DIE
+//! offset so the caller can resolve and intern `DW_AT_type` references.
 //!
 //! Best-effort: any malformed/unsupported input yields `None` and the caller ships no variables
 //! (the debug section is strippable / untrusted-for-escape, §2a). DWARF64, v5's reorganized tables,
@@ -17,8 +18,17 @@ use std::collections::BTreeMap;
 
 // DWARF constants (the subset this reader needs).
 mod tag {
-    pub const SUBPROGRAM: u64 = 0x2e;
+    pub const ARRAY_TYPE: u64 = 0x01;
     pub const FORMAL_PARAMETER: u64 = 0x05;
+    pub const MEMBER: u64 = 0x0d;
+    pub const POINTER_TYPE: u64 = 0x0f;
+    pub const STRUCTURE_TYPE: u64 = 0x13;
+    pub const SUBRANGE_TYPE: u64 = 0x21;
+    pub const UNION_TYPE: u64 = 0x17;
+    pub const TYPEDEF: u64 = 0x16;
+    pub const CONST_TYPE: u64 = 0x26;
+    pub const VOLATILE_TYPE: u64 = 0x35;
+    pub const SUBPROGRAM: u64 = 0x2e;
     pub const VARIABLE: u64 = 0x34;
     pub const BASE_TYPE: u64 = 0x24;
 }
@@ -31,6 +41,9 @@ mod at {
     pub const FRAME_BASE: u64 = 0x40;
     pub const LOCATION: u64 = 0x02;
     pub const TYPE: u64 = 0x49;
+    pub const DATA_MEMBER_LOCATION: u64 = 0x38;
+    pub const COUNT: u64 = 0x37;
+    pub const UPPER_BOUND: u64 = 0x2f;
 }
 mod form {
     pub const ADDR: u64 = 0x01;
@@ -57,7 +70,7 @@ pub struct DwarfVar {
     pub name: String,
     /// `DW_OP_fbreg` byte offset from the subprogram's frame base.
     pub fbreg: i64,
-    /// CU-relative DIE offset of the variable's `DW_AT_type` (resolve via [`DwarfInfo::base_types`]).
+    /// CU-relative DIE offset of the variable's `DW_AT_type` (resolve via [`DwarfInfo::types`]).
     pub type_ref: u32,
 }
 
@@ -70,17 +83,47 @@ pub struct DwarfSub {
     pub vars: Vec<DwarfVar>,
 }
 
-/// A `DW_TAG_base_type`: a primitive's render name, DWARF encoding byte, and byte size.
-pub struct DwarfBaseType {
+/// One `DW_TAG_member` of a struct/union: name, byte offset, and the DIE offset of its type.
+pub struct DwarfMember {
     pub name: String,
-    pub encoding: u8,
-    pub size: u32,
+    pub offset: u32,
+    pub type_ref: u32,
 }
 
-/// The decoded subset: subprograms (in `.debug_info` order) + base types keyed by DIE offset.
+/// A DWARF type DIE (the subset we ingest), keyed by DIE offset in [`DwarfInfo::types`]. `type_ref`
+/// fields are DIE offsets into the same table. A `DW_TAG_typedef`/`const`/`volatile` is transparent
+/// — it resolves to its underlying type.
+pub enum DwarfType {
+    Base {
+        name: String,
+        encoding: u8,
+        size: u32,
+    },
+    Pointer {
+        pointee: Option<u32>,
+        size: u32,
+    },
+    /// A `struct`/`union` (`kw` is the keyword for the render name).
+    Aggregate {
+        kw: &'static str,
+        name: String,
+        size: u32,
+        members: Vec<DwarfMember>,
+    },
+    Array {
+        elem: Option<u32>,
+        count: u32,
+    },
+    /// Transparent: resolves to `underlying` (typedef / cv-qualified).
+    Alias {
+        underlying: Option<u32>,
+    },
+}
+
+/// The decoded subset: subprograms (in `.debug_info` order) + type DIEs keyed by DIE offset.
 pub struct DwarfInfo {
     pub subs: Vec<DwarfSub>,
-    pub base_types: BTreeMap<u32, DwarfBaseType>,
+    pub types: BTreeMap<u32, DwarfType>,
 }
 
 struct Cur<'a> {
@@ -273,16 +316,24 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
     let abbrevs = parse_abbrev(abbrev, abbrev_off)?;
 
     let mut subs: Vec<DwarfSub> = Vec::new();
-    let mut base_types: BTreeMap<u32, DwarfBaseType> = BTreeMap::new();
-    let mut cur_sub: Option<usize> = None; // index into `subs` while walking its children
+    let mut types: BTreeMap<u32, DwarfType> = BTreeMap::new();
+
+    // A proper DIE-tree walk: every `DW_CHILDREN_yes` DIE is pushed; its terminating null DIE pops.
+    // A var attaches to the nearest open subprogram, a member to the nearest aggregate, a subrange
+    // to the nearest array — found by scanning the stack from the top.
+    enum Open {
+        Sub(usize),
+        Agg(u32),
+        Array(u32),
+        Other,
+    }
+    let mut stack: Vec<Open> = Vec::new();
 
     while c.p < unit_end {
         let die_off = c.p as u32;
         let code = c.uleb()?;
         if code == 0 {
-            // A null DIE ends a sibling chain; the next non-null returns to the parent level. We
-            // only nest one level (subprogram → vars), so a null closes the current subprogram.
-            cur_sub = None;
+            stack.pop(); // close the innermost open parent
             continue;
         }
         let ab = abbrevs.get(&code)?;
@@ -290,6 +341,7 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
         // Read every attribute (to advance), capturing the ones we care about.
         let (mut name, mut ty, mut byte_size, mut encoding) = (None, None, None, None);
         let (mut low_pc, mut high_pc, mut frame_base, mut location) = (None, None, None, None);
+        let (mut member_loc, mut count, mut upper_bound) = (None, None, None);
         for &(attr, f) in &ab.attrs {
             let v = read_form(&mut c, str_sec, f, addr_size)?;
             match (attr, v) {
@@ -301,6 +353,9 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
                 (at::HIGH_PC, Val::U(n)) => high_pc = Some(n),
                 (at::FRAME_BASE, Val::Expr(e)) => frame_base = Some(e),
                 (at::LOCATION, Val::Expr(e)) => location = Some(e),
+                (at::DATA_MEMBER_LOCATION, Val::U(n)) => member_loc = Some(n as u32),
+                (at::COUNT, Val::U(n)) => count = Some(n as u32),
+                (at::UPPER_BOUND, Val::U(n)) => upper_bound = Some(n as u32),
                 _ => {}
             }
         }
@@ -315,43 +370,125 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
                     frame_base_local: frame_base.as_deref().and_then(frame_base_local),
                     vars: Vec::new(),
                 });
-                cur_sub = if ab.has_children {
-                    Some(subs.len() - 1)
-                } else {
-                    None
-                };
+                if ab.has_children {
+                    stack.push(Open::Sub(subs.len() - 1));
+                }
             }
             tag::FORMAL_PARAMETER | tag::VARIABLE => {
-                if let (Some(si), Some(name), Some(loc), Some(ty)) = (cur_sub, name, location, ty) {
+                if let (Some(name), Some(loc), Some(ty)) = (name, location, ty) {
                     if let Some(fbreg) = fbreg_offset(&loc) {
-                        subs[si].vars.push(DwarfVar {
-                            name,
-                            fbreg,
-                            type_ref: ty,
-                        });
+                        if let Some(Open::Sub(si)) =
+                            stack.iter().rev().find(|o| matches!(o, Open::Sub(_)))
+                        {
+                            subs[*si].vars.push(DwarfVar {
+                                name,
+                                fbreg,
+                                type_ref: ty,
+                            });
+                        }
                     }
+                }
+                if ab.has_children {
+                    stack.push(Open::Other);
+                }
+            }
+            tag::STRUCTURE_TYPE | tag::UNION_TYPE => {
+                let kw = if ab.tag == tag::UNION_TYPE {
+                    "union"
+                } else {
+                    "struct"
+                };
+                types.insert(
+                    die_off,
+                    DwarfType::Aggregate {
+                        kw,
+                        name: name.unwrap_or_default(),
+                        size: byte_size.unwrap_or(0),
+                        members: Vec::new(),
+                    },
+                );
+                if ab.has_children {
+                    stack.push(Open::Agg(die_off));
+                }
+            }
+            tag::MEMBER => {
+                if let (Some(name), Some(ty)) = (name, ty) {
+                    if let Some(Open::Agg(off)) =
+                        stack.iter().rev().find(|o| matches!(o, Open::Agg(_)))
+                    {
+                        if let Some(DwarfType::Aggregate { members, .. }) = types.get_mut(off) {
+                            members.push(DwarfMember {
+                                name,
+                                offset: member_loc.unwrap_or(0),
+                                type_ref: ty,
+                            });
+                        }
+                    }
+                }
+                if ab.has_children {
+                    stack.push(Open::Other);
+                }
+            }
+            tag::ARRAY_TYPE => {
+                types.insert(die_off, DwarfType::Array { elem: ty, count: 0 });
+                if ab.has_children {
+                    stack.push(Open::Array(die_off));
+                }
+            }
+            tag::SUBRANGE_TYPE => {
+                // `DW_AT_count` (element count) or `DW_AT_upper_bound` (count = upper + 1).
+                let n = count.or_else(|| upper_bound.map(|u| u + 1)).unwrap_or(0);
+                if let Some(Open::Array(off)) =
+                    stack.iter().rev().find(|o| matches!(o, Open::Array(_)))
+                {
+                    if let Some(DwarfType::Array { count, .. }) = types.get_mut(off) {
+                        *count = n;
+                    }
+                }
+                if ab.has_children {
+                    stack.push(Open::Other);
+                }
+            }
+            tag::POINTER_TYPE => {
+                types.insert(
+                    die_off,
+                    DwarfType::Pointer {
+                        pointee: ty,
+                        size: byte_size.unwrap_or(addr_size as u32),
+                    },
+                );
+                if ab.has_children {
+                    stack.push(Open::Other);
                 }
             }
             tag::BASE_TYPE => {
                 if let (Some(name), Some(size)) = (name, byte_size) {
-                    base_types.insert(
+                    types.insert(
                         die_off,
-                        DwarfBaseType {
+                        DwarfType::Base {
                             name,
                             encoding: encoding.unwrap_or(0),
                             size,
                         },
                     );
                 }
+                if ab.has_children {
+                    stack.push(Open::Other);
+                }
+            }
+            tag::TYPEDEF | tag::CONST_TYPE | tag::VOLATILE_TYPE => {
+                types.insert(die_off, DwarfType::Alias { underlying: ty });
+                if ab.has_children {
+                    stack.push(Open::Other);
+                }
             }
             _ => {
-                // A DIE with children we don't model (e.g. a lexical block) would break the
-                // one-level subprogram nesting; clang `-O0` doesn't emit them between a subprogram
-                // and its top-level vars, so this reader stays flat (deeper nesting ⇒ those vars
-                // are simply not attached).
+                if ab.has_children {
+                    stack.push(Open::Other);
+                }
             }
         }
     }
 
-    Some(DwarfInfo { subs, base_types })
+    Some(DwarfInfo { subs, types })
 }

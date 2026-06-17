@@ -100,12 +100,82 @@ fn wasm_dwarf_info_extracts_source_variables() {
     assert_eq!(var("s").fbreg, 4); // `int s = a + b;`
 
     // The variable type resolves to the `int` base type (signed = DW_ATE_signed = 5, 4 bytes).
-    let int_ty = info
-        .base_types
-        .get(&var("s").type_ref)
-        .expect("s's type DIE");
-    assert_eq!(int_ty.name, "int");
-    assert_eq!((int_ty.encoding, int_ty.size), (5, 4));
+    let svm_wasm::dwarf_info::DwarfType::Base {
+        name,
+        encoding,
+        size,
+    } = info.types.get(&var("s").type_ref).expect("s's type DIE")
+    else {
+        panic!("s is a base type");
+    };
+    assert_eq!(name, "int");
+    assert_eq!((*encoding, *size), (5, 4));
+}
+
+// dist(n): struct Point{int x,y} p; int row[3]; struct Point *pp; — exercises aggregate/array/
+// pointer DWARF type DIEs.
+const AGG: &[u8] = include_bytes!("fixtures/agg_clang.wasm");
+
+#[test]
+fn wasm_dwarf_ingests_aggregate_pointer_and_array_types() {
+    use svm_ir::{TypeDef, VarLoc};
+
+    let t = svm_wasm::transpile(AGG).expect("transpile");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+    let types = &di.types;
+    let var = |n: &str| {
+        di.vars
+            .iter()
+            .find(|v| v.name == n)
+            .unwrap_or_else(|| panic!("var {n}"))
+    };
+    let var_type = |n: &str| &types[var(n).type_id.expect("typed") as usize];
+
+    // Every local is a WindowVia into the C frame.
+    for n in ["p", "row", "pp"] {
+        assert!(
+            matches!(var(n).loc, VarLoc::WindowVia { .. }),
+            "{n} is WindowVia"
+        );
+    }
+
+    // `struct Point p` — an aggregate with x@0, y@4, both 4-byte ints, size 8.
+    let TypeDef::Aggregate { name, size, fields } = var_type("p") else {
+        panic!("p is a struct, got {:?}", var_type("p"));
+    };
+    assert_eq!(name, "struct Point");
+    assert_eq!(*size, 8);
+    assert_eq!(
+        fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.offset))
+            .collect::<Vec<_>>(),
+        vec![("x", 0), ("y", 4)]
+    );
+    assert!(matches!(
+        &types[fields[0].ty as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `int row[3]` — array of 3 ints.
+    let TypeDef::Array { elem, count, .. } = var_type("row") else {
+        panic!("row is an array");
+    };
+    assert_eq!(*count, 3);
+    assert!(matches!(
+        &types[*elem as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `struct Point *pp` — pointer whose pointee is the same aggregate as `p`.
+    let TypeDef::Pointer { pointee, name, .. } = var_type("pp") else {
+        panic!("pp is a pointer");
+    };
+    assert_eq!(name, "struct Point *");
+    assert!(
+        matches!(&types[*pointee as usize], TypeDef::Aggregate { name, .. } if name == "struct Point")
+    );
 }
 
 #[test]
