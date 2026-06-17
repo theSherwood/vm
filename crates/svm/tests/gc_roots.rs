@@ -376,3 +376,212 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
     };
     check(&jit, "jit");
 }
+
+/// Number of buffer words the root reads back and returns alongside `count`. Kept at 7 so the root
+/// returns 8 `i64`s — the Tail calling convention caps return values at what fits in registers, and
+/// 9 overflows it. With ≤6 in-window roots plus the `heap_lo` word, every in-window candidate lands
+/// in the first 7 (ascending) slots, so this captures them all.
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+const READBACK: usize = 7;
+
+/// Build a module whose root creates one parked fiber per value in `roots` (each fiber holds its
+/// value live across a `suspend`, so it is spilled onto that fiber's control stack / lives in its
+/// reified frame), then calls `gc.roots` over `[lo, hi)` (buf at offset 0, cap 16) and returns
+/// `(count, buf[0..READBACK])`. The shared fiber body (func 1) is `(sp, arg) -> arg` across a
+/// suspend. Used to drive the all-slots table walk with many fibers at once.
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> svm_ir::Module {
+    use std::fmt::Write as _;
+    let mut src = String::from("memory 16\n");
+    let result_tys = ["i64"; 1 + READBACK].join(", ");
+    writeln!(src, "func () -> ({result_tys}) {{\nblock0():").unwrap();
+    let mut v: u32 = 0;
+    for &r in roots {
+        // ref.func 1; sp (unused param); cont.new; arg = the root; resume → fiber parks holding arg.
+        writeln!(src, "  v{v} = ref.func 1").unwrap();
+        writeln!(src, "  v{} = i64.const 4096", v + 1).unwrap();
+        writeln!(src, "  v{} = cont.new v{v} v{}", v + 2, v + 1).unwrap();
+        writeln!(src, "  v{} = i64.const {r}", v + 3).unwrap();
+        writeln!(
+            src,
+            "  v{}, v{} = cont.resume v{} v{}",
+            v + 4,
+            v + 5,
+            v + 2,
+            v + 3
+        )
+        .unwrap();
+        v += 6;
+    }
+    writeln!(src, "  v{v} = i64.const {lo}").unwrap();
+    writeln!(src, "  v{} = i64.const {hi}", v + 1).unwrap();
+    writeln!(src, "  v{} = i64.const 0", v + 2).unwrap(); // buf offset
+    writeln!(src, "  v{} = i64.const 16", v + 3).unwrap(); // cap (≥ any plausible in-range count)
+    writeln!(
+        src,
+        "  v{} = gc.roots v{v} v{} v{} v{}",
+        v + 4,
+        v + 1,
+        v + 2,
+        v + 3
+    )
+    .unwrap();
+    let count = v + 4;
+    v += 5;
+    // Read back the first READBACK buffer words (ascending, deduped); zero-filled beyond `count`.
+    let mut words = Vec::new();
+    for i in 0..READBACK as i64 {
+        writeln!(src, "  v{v} = i64.const {}", i * 8).unwrap();
+        writeln!(src, "  v{} = i64.load v{v}", v + 1).unwrap();
+        words.push(v + 1);
+        v += 2;
+    }
+    let rets: Vec<String> = std::iter::once(count)
+        .chain(words)
+        .map(|x| format!("v{x}"))
+        .collect();
+    writeln!(src, "  return {}", rets.join(" ")).unwrap();
+    src.push_str("}\n");
+    // Shared fiber body: keep `arg` (v1) live across the suspend, then return it.
+    src.push_str("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
+    src.push_str("  v2 = i64.const 0\n  v3 = suspend v2\n  return v1\n}\n");
+
+    let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
+    m
+}
+
+/// Run `build_multi_fiber_module`'s output on both backends and return `(count, words)` per backend
+/// (`words` = the 8 read-back buffer slots). Soundness framing (GC.md §3.2): each backend is checked
+/// independently against the *planted* roots, not against each other.
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+fn run_multi_fiber_both(m: &svm_ir::Module) -> [(i64, Vec<i64>); 2] {
+    let mut fuel = 50_000_000u64;
+    let interp: Vec<i64> = run(m, 0, &[], &mut fuel)
+        .unwrap_or_else(|t| panic!("interp trapped: {t:?}"))
+        .iter()
+        .map(|v| match v {
+            Value::I64(x) => *x,
+            other => panic!("expected i64, got {other:?}"),
+        })
+        .collect();
+    use svm_jit::{compile_and_run, JitOutcome};
+    let jit = match compile_and_run(m, 0, &[]).expect("jit compile/run") {
+        JitOutcome::Returned(s) => s,
+        other => panic!("jit did not return: {other:?}"),
+    };
+    [
+        (interp[0], interp[1..].to_vec()),
+        (jit[0], jit[1..].to_vec()),
+    ]
+}
+
+/// **`gc.roots` enumerates the roots of EVERY parked fiber, not just one.** Four fibers each park
+/// holding a distinct in-window pointer (`0x7010`..`0x7040`); a fifth parks holding an out-of-window
+/// value (`0x9000_0000`). Scanning `[0x7000, 0x7100)` must report every in-window pointer (soundness
+/// — a superset is fine, GC.md §3.2) and must filter the out-of-window one. This exercises the
+/// all-slots table walk + dedup + range filter across many fibers — the logic a single-fiber test
+/// cannot reach. Asserted independently on each backend (JIT walks native stacks; interp walks
+/// reified frames).
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn gc_roots_enumerates_every_parked_fiber() {
+    const IN: [i64; 4] = [0x7010, 0x7020, 0x7030, 0x7040];
+    const OOR: i64 = 0x9000_0000;
+    let m = build_multi_fiber_module(&[IN[0], IN[1], IN[2], IN[3], OOR], 0x7000, 0x7100);
+    for (backend, (_count, words)) in ["interp", "jit"].iter().zip(run_multi_fiber_both(&m)) {
+        for &r in &IN {
+            assert!(
+                words.contains(&r),
+                "{backend}: in-window root {r:#x} from a parked fiber was not enumerated; \
+                 got {words:#x?}"
+            );
+        }
+        assert!(
+            !words.contains(&OOR),
+            "{backend}: out-of-window value {OOR:#x} must be filtered out; got {words:#x?}"
+        );
+    }
+}
+
+/// **Randomized multi-fiber soundness sweep.** Over many seeds, park a random number (1..=6) of
+/// fibers holding distinct in-window pointers plus a few out-of-window values, then assert `gc.roots`
+/// reports *every* planted in-window root and *no* out-of-window value — on both backends. A
+/// self-contained, hang-proof fuzz (pure fibers, no threads/recursion) that stresses the table walk,
+/// dedup, and range filter across varied fiber counts without entangling the `fiber_fuzz` harness.
+/// Soundness only (a superset is allowed, §3.2), so conservative false positives never flake it.
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn gc_roots_multi_fiber_soundness_sweep() {
+    // Tiny deterministic PRNG (xorshift64*), so any failure replays exactly.
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        s.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+
+    // In-window pointers live in [0x7000, 0x8000); out-of-window decoys sit just below/above it.
+    const LO: i64 = 0x7000;
+    const HI: i64 = 0x8000;
+    let mut checked = 0u64;
+    for _ in 0..64 {
+        let n_in = 1 + (next() % 6) as usize; // 1..=6 in-window roots (≤7 in-range words incl. heap_lo → all in the 8 read-back slots)
+                                              // Distinct in-window pointers, 16-byte spaced so they never collide and stay < HI.
+        let in_roots: Vec<i64> = (0..n_in).map(|i| LO + 0x10 * (i as i64 + 1)).collect();
+        // 0..=2 out-of-window decoys (below LO and above HI).
+        let n_oor = (next() % 3) as usize;
+        let oor: Vec<i64> = (0..n_oor)
+            .map(|i| (if i % 2 == 0 { LO - 0x100 } else { HI + 0x100 }) + i as i64)
+            .collect();
+
+        let mut roots = in_roots.clone();
+        roots.extend(&oor);
+        // Shuffle creation order so the planted roots aren't enumerated in table order by accident.
+        for i in (1..roots.len()).rev() {
+            roots.swap(i, (next() as usize) % (i + 1));
+        }
+
+        let m = build_multi_fiber_module(&roots, LO, HI);
+        for (backend, (_count, words)) in ["interp", "jit"].iter().zip(run_multi_fiber_both(&m)) {
+            for &r in &in_roots {
+                assert!(
+                    words.contains(&r),
+                    "{backend}: in-window root {r:#x} missing (in={in_roots:#x?}); got {words:#x?}"
+                );
+            }
+            for &d in &oor {
+                assert!(
+                    !words.contains(&d),
+                    "{backend}: out-of-window decoy {d:#x} leaked; got {words:#x?}"
+                );
+            }
+        }
+        checked += 1;
+    }
+    assert!(
+        checked == 64,
+        "expected to check 64 random multi-fiber configs"
+    );
+}
