@@ -2702,3 +2702,54 @@ int compute(int a, int b) {
     assert_eq!(as_i32_var(insp.read_var(0, "b", 4)), 3);
     assert_eq!(insp.read_var(0, "nonesuch", 4), None);
 }
+
+#[test]
+fn chibicc_g_maps_breakpoints_to_source_lines() {
+    // Raw string starts with a newline, so: line 2 = signature, 3 = `int s`, 4 = `int t`,
+    // 5 = `return t`.
+    let src = r#"
+int compute(int a, int b) {
+  int s = a + b;
+  int t = s + 100;
+  return t;
+}
+"#;
+    let ir = c_to_ir_g(src);
+    assert!(ir.contains("debug.loc 0 "), "emits debug.loc rows:\n{ir}");
+    assert!(ir.contains("debug.file 0 "), "emits a debug.file");
+    let m = parse_module(&ir).expect("parse");
+
+    let sp = 32768i64;
+    let mut insp = Inspector::attach(
+        &m,
+        0,
+        &[Value::I64(sp), Value::I32(5), Value::I32(3)],
+        1_000_000,
+    );
+
+    // The last op of the single block is the return's value load → the `return t` line (5).
+    let last = m.funcs[0].blocks[0].insts.len() - 1;
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: last,
+    };
+    insp.set_breakpoint(bp);
+    assert!(matches!(
+        insp.run_until_stop(),
+        svm_interp::Stop::Break { .. }
+    ));
+
+    let loc = insp.source_loc(bp).expect("source loc at the return");
+    assert_eq!(loc.line, 5, "last block op maps to `return t`");
+    assert!(
+        loc.file.ends_with(".c"),
+        "file is the C source: {}",
+        loc.file
+    );
+    // The backtrace frame carries the same source line.
+    assert_eq!(insp.backtrace()[0].source.as_ref().map(|s| s.line), Some(5));
+    // And `t` is still readable by name (= s + 100 = 108).
+    assert_eq!(as_i32_var(insp.read_var(0, "t", 4)), 108);
+}

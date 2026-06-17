@@ -72,6 +72,69 @@
 extern bool opt_g; // -g: emit the debug-info section (DEBUGGING.md §6 waist)
 
 static FILE *o;
+
+// --- debug.loc: instruction counting + source-location table (DEBUGGING.md §6/W4) ----------
+// `cg(...)` is the single sink for every IR line, so it can count `block.insts` entries and let
+// `dbg_loc` key source locations by (func, block, inst) *exactly*: a line that starts with two
+// spaces and is not a block terminator is one instruction. Block headers, module directives, and
+// the `br*`/`return`/`unreachable` terminators are not `insts`, so they don't count. (All
+// `cg(…)` sites are mechanically routed through `cg`; continuation `fprintf`s that build
+// up one line don't start with two spaces, so a multi-`fprintf` instruction counts once.)
+static int cur_func_idx;    // module index of the function being emitted
+static int cur_block = -1;  // id of the block currently being emitted into (-1 = none)
+static int cur_inst;        // next instruction index within cur_block (matches the interpreter)
+
+static void cg(const char *fmt, ...) {
+  if (fmt[0] == ' ' && fmt[1] == ' ') {
+    const char *p = fmt + 2;
+    bool is_term = !strncmp(p, "br ", 3) || !strncmp(p, "br_if ", 6) ||
+                   !strncmp(p, "br_table", 8) || !strncmp(p, "return", 6) ||
+                   !strncmp(p, "unreachable", 11);
+    if (!is_term)
+      cur_inst++;
+  }
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(o, fmt, ap);
+  va_end(ap);
+}
+
+// Deduped source-file table, referenced by index from each `debug.loc`.
+static char *dbg_files[256];
+static int n_dbg_files;
+static int file_index(char *name) {
+  for (int i = 0; i < n_dbg_files; i++)
+    if (!strcmp(dbg_files[i], name))
+      return i;
+  if (n_dbg_files < 256)
+    dbg_files[n_dbg_files++] = name;
+  return n_dbg_files - 1;
+}
+
+// Accumulated `debug.loc` rows, flushed after the functions (module-level, strippable).
+typedef struct {
+  int func, block, inst, file, line, col;
+} DbgLoc;
+static DbgLoc *dbg_loc_buf;
+static int n_dbg_loc, cap_dbg_loc;
+
+// Record the source location of the *next* instruction in the current block, from `tok`. Skips a
+// duplicate at the same (func,block,inst) so a statement emitting no new instruction adds no row.
+static void dbg_loc(Token *tok) {
+  if (!opt_g || !tok || !tok->file || cur_block < 0)
+    return;
+  if (n_dbg_loc && dbg_loc_buf[n_dbg_loc - 1].func == cur_func_idx &&
+      dbg_loc_buf[n_dbg_loc - 1].block == cur_block &&
+      dbg_loc_buf[n_dbg_loc - 1].inst == cur_inst)
+    return;
+  if (n_dbg_loc == cap_dbg_loc) {
+    cap_dbg_loc = cap_dbg_loc ? cap_dbg_loc * 2 : 256;
+    dbg_loc_buf = realloc(dbg_loc_buf, cap_dbg_loc * sizeof(DbgLoc));
+  }
+  dbg_loc_buf[n_dbg_loc++] = (DbgLoc){cur_func_idx, cur_block, cur_inst,
+                                      file_index(tok->file->name), tok->line_no, 0};
+}
+
 static int nv;    // next SSA value index in the *current block* (resets per block; the only
                   // values crossing a block are its parameters — the data-SP + promoted locals)
 static int nb;        // next block label number in the current function
@@ -240,11 +303,13 @@ static char *cparams(void) {
 // promoted local as a parameter) and reset per-block state. Block labels resolve by name,
 // so forward references are fine. On entry each promoted slot's value is its parameter.
 static void open_block(int id) {
-  fprintf(o, "block%d(" SP ": i64%s):\n", id, cparams());
+  cg("block%d(" SP ": i64%s):\n", id, cparams());
   nv = npromo + 1; // v0 is the data-SP; v1..vN are the promoted locals
   for (int s = 0; s < npromo; s++)
     curval[s] = s + 1;
   term = false;
+  cur_block = id; // debug.loc keys (DEBUGGING.md §6): track which block we emit into
+  cur_inst = 0;   // ... and the instruction index within it
 }
 
 // The data stack (address-taken locals, §3d) lives in the window. We reserve the low
@@ -315,21 +380,21 @@ static bool has_branch(Node *n) {
 static int spill(int v, char *irt) {
   int idx = spill_top++;
   int off = nv++;
-  fprintf(o, "  v%d = i64.const %d\n", off, cur_scratch + idx * 8);
+  cg("  v%d = i64.const %d\n", off, cur_scratch + idx * 8);
   int a = nv++;
-  fprintf(o, "  v%d = i64.add " SP " v%d\n", a, off);
-  fprintf(o, "  %s.store v%d v%d\n", irt, a, v);
+  cg("  v%d = i64.add " SP " v%d\n", a, off);
+  cg("  %s.store v%d v%d\n", irt, a, v);
   return idx;
 }
 
 // Reload a spilled value from scratch slot `idx`.
 static int reload(int idx, char *irt) {
   int off = nv++;
-  fprintf(o, "  v%d = i64.const %d\n", off, cur_scratch + idx * 8);
+  cg("  v%d = i64.const %d\n", off, cur_scratch + idx * 8);
   int a = nv++;
-  fprintf(o, "  v%d = i64.add " SP " v%d\n", a, off);
+  cg("  v%d = i64.add " SP " v%d\n", a, off);
   int r = nv++;
-  fprintf(o, "  v%d = %s.load v%d\n", r, irt, a);
+  cg("  v%d = %s.load v%d\n", r, irt, a);
   return r;
 }
 
@@ -382,37 +447,37 @@ static int gen_load(Type *ty, int addr) {
   int r = nv++;
   switch (ty->kind) {
   case TY_BOOL:
-    fprintf(o, "  v%d = i32.load8_u v%d\n", r, addr);
+    cg("  v%d = i32.load8_u v%d\n", r, addr);
     break;
   case TY_CHAR:
-    fprintf(o, "  v%d = i32.load8_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+    cg("  v%d = i32.load8_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
     break;
   case TY_SHORT:
-    fprintf(o, "  v%d = i32.load16_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+    cg("  v%d = i32.load16_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
     break;
   case TY_INT:
-    fprintf(o, "  v%d = i32.load v%d\n", r, addr);
+    cg("  v%d = i32.load v%d\n", r, addr);
     break;
   case TY_ENUM:
     // A packed enum (`enum __attribute__((packed))`, parse.c) is 1/2/4 bytes; load at its
     // actual width, then it is an ordinary i32 value. A plain enum is `int`.
     if (ty->size == 1)
-      fprintf(o, "  v%d = i32.load8_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+      cg("  v%d = i32.load8_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
     else if (ty->size == 2)
-      fprintf(o, "  v%d = i32.load16_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
+      cg("  v%d = i32.load16_%s v%d\n", r, ty->is_unsigned ? "u" : "s", addr);
     else
-      fprintf(o, "  v%d = i32.load v%d\n", r, addr);
+      cg("  v%d = i32.load v%d\n", r, addr);
     break;
   case TY_LONG:
   case TY_PTR:
-    fprintf(o, "  v%d = i64.load v%d\n", r, addr);
+    cg("  v%d = i64.load v%d\n", r, addr);
     break;
   case TY_FLOAT:
-    fprintf(o, "  v%d = f32.load v%d\n", r, addr);
+    cg("  v%d = f32.load v%d\n", r, addr);
     break;
   case TY_DOUBLE:
   case TY_LDOUBLE:
-    fprintf(o, "  v%d = f64.load v%d\n", r, addr);
+    cg("  v%d = f64.load v%d\n", r, addr);
     break;
   default:
     error_tok(ty->name, "codegen_ir: unsupported load type");
@@ -426,33 +491,33 @@ static void gen_store(Type *ty, int addr, int val) {
   switch (ty->kind) {
   case TY_BOOL:
   case TY_CHAR:
-    fprintf(o, "  i32.store8 v%d v%d\n", addr, val);
+    cg("  i32.store8 v%d v%d\n", addr, val);
     break;
   case TY_SHORT:
-    fprintf(o, "  i32.store16 v%d v%d\n", addr, val);
+    cg("  i32.store16 v%d v%d\n", addr, val);
     break;
   case TY_INT:
-    fprintf(o, "  i32.store v%d v%d\n", addr, val);
+    cg("  i32.store v%d v%d\n", addr, val);
     break;
   case TY_ENUM:
     // Store a packed enum at its actual width (1/2/4 bytes); a plain enum is `int`.
     if (ty->size == 1)
-      fprintf(o, "  i32.store8 v%d v%d\n", addr, val);
+      cg("  i32.store8 v%d v%d\n", addr, val);
     else if (ty->size == 2)
-      fprintf(o, "  i32.store16 v%d v%d\n", addr, val);
+      cg("  i32.store16 v%d v%d\n", addr, val);
     else
-      fprintf(o, "  i32.store v%d v%d\n", addr, val);
+      cg("  i32.store v%d v%d\n", addr, val);
     break;
   case TY_LONG:
   case TY_PTR:
-    fprintf(o, "  i64.store v%d v%d\n", addr, val);
+    cg("  i64.store v%d v%d\n", addr, val);
     break;
   case TY_FLOAT:
-    fprintf(o, "  f32.store v%d v%d\n", addr, val);
+    cg("  f32.store v%d v%d\n", addr, val);
     break;
   case TY_DOUBLE:
   case TY_LDOUBLE:
-    fprintf(o, "  f64.store v%d v%d\n", addr, val);
+    cg("  f64.store v%d v%d\n", addr, val);
     break;
   default:
     error_tok(ty->name, "codegen_ir: unsupported store type");
@@ -475,14 +540,14 @@ static void gen_memcpy(int dst, int src, int size) {
                : chunk == 2 ? "i32.store16"
                             : "i32.store8";
     int off = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", off, i);
+    cg("  v%d = i64.const %d\n", off, i);
     int sa = nv++;
-    fprintf(o, "  v%d = i64.add v%d v%d\n", sa, src, off);
+    cg("  v%d = i64.add v%d v%d\n", sa, src, off);
     int val = nv++;
-    fprintf(o, "  v%d = %s v%d\n", val, ld, sa);
+    cg("  v%d = %s v%d\n", val, ld, sa);
     int da = nv++;
-    fprintf(o, "  v%d = i64.add v%d v%d\n", da, dst, off);
-    fprintf(o, "  %s v%d v%d\n", st, da, val);
+    cg("  v%d = i64.add v%d v%d\n", da, dst, off);
+    cg("  %s v%d v%d\n", st, da, val);
     i += chunk;
   }
 }
@@ -496,9 +561,9 @@ static int gen_addr(Node *node) {
       // i32 function-table index; widen it to the 8-byte C pointer representation
       // (function pointers are stored as integers in memory, §3d).
       int rf = nv++;
-      fprintf(o, "  v%d = ref.func %d\n", rf, func_index(node->var));
+      cg("  v%d = ref.func %d\n", rf, func_index(node->var));
       int r = nv++;
-      fprintf(o, "  v%d = i64.extend_i32_u v%d\n", r, rf);
+      cg("  v%d = i64.extend_i32_u v%d\n", r, rf);
       return r;
     }
     if (node->var->is_local) {
@@ -507,14 +572,14 @@ static int gen_addr(Node *node) {
       // The local lives at sp + frame-offset (§3d data stack). Emit the const (lower
       // index) before the add that uses it, so value numbering stays monotonic.
       int off = nv++;
-      fprintf(o, "  v%d = i64.const %d\n", off, node->var->offset);
+      cg("  v%d = i64.const %d\n", off, node->var->offset);
       int r = nv++;
-      fprintf(o, "  v%d = i64.add " SP " v%d\n", r, off);
+      cg("  v%d = i64.add " SP " v%d\n", r, off);
       return r;
     }
     // A global lives at a fixed window offset in the data region below the stack.
     int r = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", r, node->var->offset);
+    cg("  v%d = i64.const %d\n", r, node->var->offset);
     return r;
   }
   case ND_DEREF:
@@ -529,9 +594,9 @@ static int gen_addr(Node *node) {
     // &(s.field) = &s + field offset.
     int base = gen_addr(node->lhs);
     int off = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", off, node->member->offset);
+    cg("  v%d = i64.const %d\n", off, node->member->offset);
     int r = nv++;
-    fprintf(o, "  v%d = i64.add v%d v%d\n", r, base, off);
+    cg("  v%d = i64.add v%d v%d\n", r, base, off);
     return r;
   }
   default:
@@ -550,7 +615,7 @@ static int binop(Node *node, char *op) {
   if (shift && is64(node->lhs->ty) != is64(node->rhs->ty))
     b = gen_convert(b, node->rhs->ty, node->lhs->ty);
   int r = nv++;
-  fprintf(o, "  v%d = %s.%s v%d v%d\n", r, irty(node->lhs->ty), op, a, b);
+  cg("  v%d = %s.%s v%d v%d\n", r, irty(node->lhs->ty), op, a, b);
   return r;
 }
 
@@ -563,9 +628,9 @@ static int cmpop(Node *node, char *base, bool sign) {
   Type *ot = node->lhs->ty;
   char *p = irty(ot);
   if (sign && !is_flt(ot))
-    fprintf(o, "  v%d = %s.%s_%s v%d v%d\n", r, p, base, ot->is_unsigned ? "u" : "s", a, b);
+    cg("  v%d = %s.%s_%s v%d v%d\n", r, p, base, ot->is_unsigned ? "u" : "s", a, b);
   else
-    fprintf(o, "  v%d = %s.%s v%d v%d\n", r, p, base, a, b);
+    cg("  v%d = %s.%s v%d v%d\n", r, p, base, a, b);
   return r;
 }
 
@@ -582,17 +647,17 @@ static int narrow_to(int v, Type *to) {
     return v; // i32/i64-width target (int/long/enum) — already at width
   if (to->is_unsigned) { // zero-extend the low byte/halfword: v & 0xFF / 0xFFFF
     int m = nv++;
-    fprintf(o, "  v%d = i32.const %d\n", m, to->size == 1 ? 0xFF : 0xFFFF);
+    cg("  v%d = i32.const %d\n", m, to->size == 1 ? 0xFF : 0xFFFF);
     int r = nv++;
-    fprintf(o, "  v%d = i32.and v%d v%d\n", r, v, m);
+    cg("  v%d = i32.and v%d v%d\n", r, v, m);
     return r;
   }
   int sh = nv++; // sign-extend the low byte/halfword: (v << k) >> k arithmetic
-  fprintf(o, "  v%d = i32.const %d\n", sh, to->size == 1 ? 24 : 16);
+  cg("  v%d = i32.const %d\n", sh, to->size == 1 ? 24 : 16);
   int t = nv++;
-  fprintf(o, "  v%d = i32.shl v%d v%d\n", t, v, sh);
+  cg("  v%d = i32.shl v%d v%d\n", t, v, sh);
   int r = nv++;
-  fprintf(o, "  v%d = i32.shr_s v%d v%d\n", r, t, sh);
+  cg("  v%d = i32.shr_s v%d v%d\n", r, t, sh);
   return r;
 }
 
@@ -611,9 +676,9 @@ static int gen_convert(int a, Type *from, Type *to) {
   if (to->kind == TY_BOOL) {
     char *fp = irty(from); // i32/i64/f32/f64
     int z = nv++;
-    fprintf(o, "  v%d = %s.const 0\n", z, fp);
+    cg("  v%d = %s.const 0\n", z, fp);
     int r = nv++;
-    fprintf(o, "  v%d = %s.ne v%d v%d\n", r, fp, a, z);
+    cg("  v%d = %s.ne v%d v%d\n", r, fp, a, z);
     return r;
   }
   bool ff = is_flt(from), tf = is_flt(to);
@@ -625,16 +690,16 @@ static int gen_convert(int a, Type *from, Type *to) {
     v = nv++;
     if (!ff && !tf) {
       if (is64(to))
-        fprintf(o, "  v%d = i64.extend_i32_%s v%d\n", v, from->is_unsigned ? "u" : "s", a);
+        cg("  v%d = i64.extend_i32_%s v%d\n", v, from->is_unsigned ? "u" : "s", a);
       else
-        fprintf(o, "  v%d = i32.wrap_i64 v%d\n", v, a);
+        cg("  v%d = i32.wrap_i64 v%d\n", v, a);
     } else if (ff && tf) {
-      fprintf(o, "  v%d = %s v%d\n", v, is64(to) ? "f64.promote_f32" : "f32.demote_f64", a);
+      cg("  v%d = %s v%d\n", v, is64(to) ? "f64.promote_f32" : "f32.demote_f64", a);
     } else if (!ff && tf) {
-      fprintf(o, "  v%d = %s.convert_%s_%s v%d\n", v, irty(to), irty(from),
+      cg("  v%d = %s.convert_%s_%s v%d\n", v, irty(to), irty(from),
               from->is_unsigned ? "u" : "s", a);
     } else {
-      fprintf(o, "  v%d = %s.trunc_sat_%s_%s v%d\n", v, irty(to), irty(from),
+      cg("  v%d = %s.trunc_sat_%s_%s v%d\n", v, irty(to), irty(from),
               to->is_unsigned ? "u" : "s", a);
     }
   }
@@ -659,9 +724,9 @@ static int gen_truth(Node *node) {
   int v = gen_expr(node);
   char *p = irty(node->ty);
   int z = nv++;
-  fprintf(o, "  v%d = %s.const 0\n", z, p);
+  cg("  v%d = %s.const 0\n", z, p);
   int r = nv++;
-  fprintf(o, "  v%d = %s.ne v%d v%d\n", r, p, v, z);
+  cg("  v%d = %s.ne v%d v%d\n", r, p, v, z);
   return r;
 }
 
@@ -669,7 +734,7 @@ static int gen_truth(Node *node) {
 // vR follows the promoted locals at index npromo+1, and nv resumes after it.
 #define MERGE_VAL (npromo + 1)
 static void open_merge(int id, char *ty) {
-  fprintf(o, "block%d(" SP ": i64%s, v%d: %s):\n", id, cparams(), MERGE_VAL, ty);
+  cg("block%d(" SP ": i64%s, v%d: %s):\n", id, cparams(), MERGE_VAL, ty);
   nv = npromo + 2;
   for (int s = 0; s < npromo; s++)
     curval[s] = s + 1;
@@ -680,15 +745,15 @@ static void open_merge(int id, char *ty) {
 static int gen_logand(Node *node) {
   int ta = gen_truth(node->lhs);
   int rhs = nb++, fls = nb++, merge = nb++;
-  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", ta, rhs, cvals(), fls,
+  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", ta, rhs, cvals(), fls,
           cvals());
   open_block(rhs);
   int tb = gen_truth(node->rhs);
-  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), tb);
+  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), tb);
   open_block(fls);
   int z = nv++;
-  fprintf(o, "  v%d = i32.const 0\n", z);
-  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), z);
+  cg("  v%d = i32.const 0\n", z);
+  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), z);
   open_merge(merge, "i32");
   return MERGE_VAL;
 }
@@ -696,15 +761,15 @@ static int gen_logand(Node *node) {
 static int gen_logor(Node *node) {
   int ta = gen_truth(node->lhs);
   int tru = nb++, rhs = nb++, merge = nb++;
-  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", ta, tru, cvals(), rhs,
+  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", ta, tru, cvals(), rhs,
           cvals());
   open_block(tru);
   int one = nv++;
-  fprintf(o, "  v%d = i32.const 1\n", one);
-  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), one);
+  cg("  v%d = i32.const 1\n", one);
+  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), one);
   open_block(rhs);
   int tb = gen_truth(node->rhs);
-  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), tb);
+  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), tb);
   open_merge(merge, "i32");
   return MERGE_VAL;
 }
@@ -713,7 +778,7 @@ static int gen_logor(Node *node) {
 static int gen_cond(Node *node) {
   int c = gen_truth(node->cond);
   int th = nb++, el = nb++, merge = nb++;
-  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, th, cvals(), el,
+  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, th, cvals(), el,
           cvals());
 
   if (node->ty->kind == TY_VOID) {
@@ -721,21 +786,21 @@ static int gen_cond(Node *node) {
     open_block(th);
     gen_expr(node->then);
     if (!term)
-      fprintf(o, "  br block%d(" SP "%s)\n", merge, cvals());
+      cg("  br block%d(" SP "%s)\n", merge, cvals());
     open_block(el);
     gen_expr(node->els);
     if (!term)
-      fprintf(o, "  br block%d(" SP "%s)\n", merge, cvals());
+      cg("  br block%d(" SP "%s)\n", merge, cvals());
     open_block(merge);
     return 0;
   }
 
   open_block(th);
   int vt = gen_expr_as(node->then, node->ty);
-  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), vt);
+  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), vt);
   open_block(el);
   int ve = gen_expr_as(node->els, node->ty);
-  fprintf(o, "  br block%d(" SP "%s, v%d)\n", merge, cvals(), ve);
+  cg("  br block%d(" SP "%s, v%d)\n", merge, cvals(), ve);
   // An aggregate-typed `?:` carries the selected arm's *address* (by-address, §3d), so the
   // merge value is an i64 pointer; `pass_irty` maps a struct/union to i64, scalars to their type.
   open_merge(merge, pass_irty(node->ty));
@@ -747,16 +812,16 @@ static int widen_i64(int v, Type *ty) {
   if (is64(ty))
     return v;
   int r = nv++;
-  fprintf(o, "  v%d = i64.extend_i32_%s v%d\n", r, ty->is_unsigned ? "u" : "s", v);
+  cg("  v%d = i64.extend_i32_%s v%d\n", r, ty->is_unsigned ? "u" : "s", v);
   return r;
 }
 
 // Load a stashed capability handle from the reserved region.
 static int load_handle(int slot) {
   int a = nv++;
-  fprintf(o, "  v%d = i64.const %d\n", a, slot);
+  cg("  v%d = i64.const %d\n", a, slot);
   int h = nv++;
-  fprintf(o, "  v%d = i32.load v%d\n", h, a);
+  cg("  v%d = i32.load v%d\n", h, a);
   return h;
 }
 
@@ -777,14 +842,14 @@ static int gen_builtin_stream(Node *node, int slot, int op) {
   // §7: reach the Stream op by *name* (host-resolved to (type_id, op) at load), not an inlined
   // cap.call. The handle still selects the endpoint (stdout vs stdin).
   const char *name = (op == 1) ? "write" : "read";
-  fprintf(o, "  v%d = call.import \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, buf,
+  cg("  v%d = call.import \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, buf,
           len);
   if (node->ty->kind == TY_VOID)
     return 0;
   if (is64(node->ty))
     return r;
   int w = nv++;
-  fprintf(o, "  v%d = i32.wrap_i64 v%d\n", w, r);
+  cg("  v%d = i32.wrap_i64 v%d\n", w, r);
   return w;
 }
 
@@ -793,8 +858,8 @@ static int gen_builtin_exit(Node *node) {
     error_tok(node->tok, "codegen_ir: exit(code) expects 1 argument");
   int code = gen_expr(node->args);
   int h = load_handle(EXIT_SLOT);
-  fprintf(o, "  call.import \"exit\" (i32) -> () v%d (v%d)\n", h, code);
-  fprintf(o, "  unreachable\n"); // Exit is noreturn (§3e)
+  cg("  call.import \"exit\" (i32) -> () v%d (v%d)\n", h, code);
+  cg("  unreachable\n"); // Exit is noreturn (§3e)
   term = true;
   return 0;
 }
@@ -819,10 +884,10 @@ static int gen_builtin_memory(Node *node, int op, int want) {
   int r = nv++;
   const char *name = op == 0 ? "vm_map" : op == 1 ? "vm_unmap" : "vm_protect";
   if (want == 3)
-    fprintf(o, "  v%d = call.import \"%s\" (i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d)\n", r, name,
+    cg("  v%d = call.import \"%s\" (i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d)\n", r, name,
             h, off, len, prot);
   else
-    fprintf(o, "  v%d = call.import \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, off,
+    cg("  v%d = call.import \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, off,
             len);
   return r;
 }
@@ -836,7 +901,7 @@ static int gen_builtin_page_size(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_page_size takes no arguments");
   int h = load_handle(MEMORY_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_page_size\" () -> (i64) v%d ()\n", r, h);
+  cg("  v%d = call.import \"vm_page_size\" () -> (i64) v%d ()\n", r, h);
   return r;
 }
 
@@ -856,7 +921,7 @@ static int gen_builtin_io_submit_async(Node *node) {
   int ctr = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int h = load_handle(IORING_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_io_submit_async\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n",
+  cg("  v%d = call.import \"vm_io_submit_async\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n",
           r, h, sq, n, ctr);
   return r;
 }
@@ -869,7 +934,7 @@ static int gen_builtin_io_reap(Node *node) {
   int mx = widen_i64(gen_expr(a->next), a->next->ty);
   int h = load_handle(IORING_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_io_reap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, cq, mx);
+  cg("  v%d = call.import \"vm_io_reap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, cq, mx);
   return r;
 }
 
@@ -892,11 +957,11 @@ static int gen_builtin_cap(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_cap(i) expects 1 argument");
   int i = widen_i64(gen_expr(a), a->ty);
   int four = nv++;
-  fprintf(o, "  v%d = i64.const 4\n", four);
+  cg("  v%d = i64.const 4\n", four);
   int off = nv++;
-  fprintf(o, "  v%d = i64.mul v%d v%d\n", off, i, four);
+  cg("  v%d = i64.mul v%d v%d\n", off, i, four);
   int h = nv++;
-  fprintf(o, "  v%d = i32.load v%d\n", h, off);
+  cg("  v%d = i32.load v%d\n", h, off);
   return h;
 }
 
@@ -935,21 +1000,21 @@ static int gen_builtin_import(Node *node) {
   const char *resty = is_void ? "" : is_flt(node->ty) ? (is64(node->ty) ? "f64" : "f32") : "i64";
   int r = is_void ? 0 : nv++;
   if (is_void)
-    fprintf(o, "  call.import \"%s\" (", name);
+    cg("  call.import \"%s\" (", name);
   else
-    fprintf(o, "  v%d = call.import \"%s\" (", r, name);
+    cg("  v%d = call.import \"%s\" (", r, name);
   for (int i = 0; i < n; i++)
-    fprintf(o, "%s%s", i ? ", " : "", argty[i]);
-  fprintf(o, ") -> (%s) v%d (", resty, handle);
+    cg("%s%s", i ? ", " : "", argty[i]);
+  cg(") -> (%s) v%d (", resty, handle);
   for (int i = 0; i < n; i++)
-    fprintf(o, "%sv%d", i ? ", " : "", argv[i]);
-  fprintf(o, ")\n");
+    cg("%sv%d", i ? ", " : "", argv[i]);
+  cg(")\n");
   if (is_void)
     return 0;
   // Narrow integer return → wrap i64 down to i32 to match the C type (like gen_builtin_stream).
   if (!is_flt(node->ty) && !is64(node->ty)) {
     int w = nv++;
-    fprintf(o, "  v%d = i32.wrap_i64 v%d\n", w, r);
+    cg("  v%d = i32.wrap_i64 v%d\n", w, r);
     return w;
   }
   return r;
@@ -965,7 +1030,7 @@ static int gen_builtin_cap_count(Node *node) {
   if (node->args)
     error_tok(node->tok, "codegen_ir: __vm_cap_count() takes no arguments");
   int r = nv++;
-  fprintf(o, "  v%d = cap.self.count\n", r);
+  cg("  v%d = cap.self.count\n", r);
   return r;
 }
 
@@ -977,8 +1042,8 @@ static int gen_builtin_cap_at(Node *node) {
   int p = gen_expr(a->next);  // int *type_id_out (an i64 window pointer)
   int h = nv++;               // result 0: the capability handle
   int t = nv++;               // result 1: its interface type_id
-  fprintf(o, "  v%d, v%d = cap.self.get v%d\n", h, t, i);
-  fprintf(o, "  i32.store v%d v%d\n", p, t); // *type_id_out = type_id
+  cg("  v%d, v%d = cap.self.get v%d\n", h, t, i);
+  cg("  i32.store v%d v%d\n", p, t); // *type_id_out = type_id
   return h;
 }
 
@@ -1000,7 +1065,7 @@ static int gen_builtin_jit_compile(Node *node) {
   int len = widen_i64(gen_expr(a->next), a->next->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_jit_compile\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, blob,
+  cg("  v%d = call.import \"vm_jit_compile\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, blob,
           len);
   return r;
 }
@@ -1036,7 +1101,7 @@ static int gen_builtin_jit_invoke2(Node *node) {
   int y = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_jit_invoke2\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r,
+  cg("  v%d = call.import \"vm_jit_invoke2\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n", r,
           h, code, x, y);
   return r;
 }
@@ -1048,7 +1113,7 @@ static int gen_builtin_jit_release(Node *node) {
   int code = widen_i64(gen_expr(a), a->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_jit_release\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
+  cg("  v%d = call.import \"vm_jit_release\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
   return r;
 }
 
@@ -1062,7 +1127,7 @@ static int gen_builtin_jit_install(Node *node) {
   int code = widen_i64(gen_expr(a), a->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_jit_install\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
+  cg("  v%d = call.import \"vm_jit_install\" (i64) -> (i64) v%d (v%d)\n", r, h, code);
   return r;
 }
 
@@ -1075,7 +1140,7 @@ static int gen_builtin_jit_uninstall(Node *node) {
   int slot = widen_i64(gen_expr(a), a->ty);
   int h = load_handle(JIT_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_jit_uninstall\" (i64) -> (i64) v%d (v%d)\n", r, h, slot);
+  cg("  v%d = call.import \"vm_jit_uninstall\" (i64) -> (i64) v%d (v%d)\n", r, h, slot);
   return r;
 }
 
@@ -1098,7 +1163,7 @@ static int gen_builtin_region_create(Node *node) {
   int len = widen_i64(gen_expr(a), a->ty);
   int h = load_handle(ADDRSPACE_SLOT);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_region_create\" (i64) -> (i64) v%d (v%d)\n", r, h, len);
+  cg("  v%d = call.import \"vm_region_create\" (i64) -> (i64) v%d (v%d)\n", r, h, len);
   return r;
 }
 
@@ -1115,7 +1180,7 @@ static int gen_builtin_region_map(Node *node) {
   int len = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
   int prot = gen_expr(a->next->next->next->next);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_region_map\" (i64, i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d, v%d)\n",
+  cg("  v%d = call.import \"vm_region_map\" (i64, i64, i64, i32) -> (i64) v%d (v%d, v%d, v%d, v%d)\n",
           r, rh, win, roff, len, prot);
   return r;
 }
@@ -1131,7 +1196,7 @@ static int gen_builtin_region_unmap(Node *node) {
   int win = widen_i64(gen_expr(a->next), a->next->ty);
   int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_region_unmap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, win,
+  cg("  v%d = call.import \"vm_region_unmap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, win,
           len);
   return r;
 }
@@ -1142,7 +1207,7 @@ static int gen_builtin_region_page_size(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_region_page_size(r) expects 1 argument");
   int rh = gen_expr(a);
   int r = nv++;
-  fprintf(o, "  v%d = call.import \"vm_region_page_size\" () -> (i64) v%d ()\n", r, rh);
+  cg("  v%d = call.import \"vm_region_page_size\" () -> (i64) v%d ()\n", r, rh);
   return r;
 }
 
@@ -1166,9 +1231,9 @@ static int gen_builtin_fiber_new(Node *node) {
   int fnv = gen_expr(a);             // function pointer: i64 funcref (zero-extended)
   int sp = widen_i64(gen_expr(a->next), a->next->ty); // data-stack base (i64)
   int fn32 = nv++;
-  fprintf(o, "  v%d = i32.wrap_i64 v%d\n", fn32, fnv); // cont.new wants the i32 funcref
+  cg("  v%d = i32.wrap_i64 v%d\n", fn32, fnv); // cont.new wants the i32 funcref
   int r = nv++;
-  fprintf(o, "  v%d = cont.new v%d v%d\n", r, fn32, sp);
+  cg("  v%d = cont.new v%d v%d\n", r, fn32, sp);
   return r; // i32 fiber handle
 }
 
@@ -1181,8 +1246,8 @@ static int gen_builtin_fiber_resume(Node *node) {
   int done = gen_expr(a->next->next);                    // int* — where to store the status
   int status = nv++;
   int value = nv++;
-  fprintf(o, "  v%d, v%d = cont.resume v%d v%d\n", status, value, k, arg);
-  fprintf(o, "  i32.store v%d v%d\n", done, status); // *done = 0 suspended / 1 returned
+  cg("  v%d, v%d = cont.resume v%d v%d\n", status, value, k, arg);
+  cg("  i32.store v%d v%d\n", done, status); // *done = 0 suspended / 1 returned
   return value;                                       // the yielded/returned i64
 }
 
@@ -1191,7 +1256,7 @@ static int gen_builtin_fiber_suspend(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_fiber_suspend(value) expects 1 argument");
   int v = widen_i64(gen_expr(node->args), node->args->ty);
   int r = nv++;
-  fprintf(o, "  v%d = suspend v%d\n", r, v);
+  cg("  v%d = suspend v%d\n", r, v);
   return r; // the next resume's arg
 }
 
@@ -1231,7 +1296,7 @@ static int gen_builtin_thread_spawn(Node *node) {
   int sp = widen_i64(gen_expr(a->next), a->next->ty);          // the thread's data-stack base
   int arg = widen_i64(gen_expr(a->next->next), a->next->next->ty); // the thread's i64 argument
   int r = nv++;
-  fprintf(o, "  v%d = thread.spawn %d v%d v%d\n", r, func_index(fn), sp, arg);
+  cg("  v%d = thread.spawn %d v%d v%d\n", r, func_index(fn), sp, arg);
   return r; // i32 thread handle
 }
 
@@ -1240,7 +1305,7 @@ static int gen_builtin_thread_join(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_thread_join(handle) expects 1 argument");
   int h = gen_expr(node->args); // i32 handle
   int r = nv++;
-  fprintf(o, "  v%d = thread.join v%d\n", r, h);
+  cg("  v%d = thread.join v%d\n", r, h);
   return r; // i64 result
 }
 
@@ -1251,7 +1316,7 @@ static int gen_builtin_atomic_add(Node *node) {
   int p = widen_i64(gen_expr(a), a->ty);
   int v = widen_i64(gen_expr(a->next), a->next->ty);
   int r = nv++;
-  fprintf(o, "  v%d = i64.atomic.rmw.add v%d v%d\n", r, p, v);
+  cg("  v%d = i64.atomic.rmw.add v%d v%d\n", r, p, v);
   return r; // old value
 }
 
@@ -1260,7 +1325,7 @@ static int gen_builtin_atomic_load(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_atomic_load(ptr) expects 1 argument");
   int p = widen_i64(gen_expr(node->args), node->args->ty);
   int r = nv++;
-  fprintf(o, "  v%d = i64.atomic.load v%d\n", r, p);
+  cg("  v%d = i64.atomic.load v%d\n", r, p);
   return r;
 }
 
@@ -1270,7 +1335,7 @@ static int gen_builtin_atomic_store(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_atomic_store(ptr, val) expects 2 arguments");
   int p = widen_i64(gen_expr(a), a->ty);
   int v = widen_i64(gen_expr(a->next), a->next->ty);
-  fprintf(o, "  i64.atomic.store v%d v%d\n", p, v);
+  cg("  i64.atomic.store v%d v%d\n", p, v);
   return 0; // void
 }
 
@@ -1279,7 +1344,7 @@ static int gen_builtin_atomic_load32(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_atomic_load32(ptr) expects 1 argument");
   int p = widen_i64(gen_expr(node->args), node->args->ty);
   int r = nv++;
-  fprintf(o, "  v%d = i32.atomic.load v%d\n", r, p);
+  cg("  v%d = i32.atomic.load v%d\n", r, p);
   return r; // i32
 }
 
@@ -1289,7 +1354,7 @@ static int gen_builtin_atomic_store32(Node *node) {
     error_tok(node->tok, "codegen_ir: __vm_atomic_store32(ptr, val) expects 2 arguments");
   int p = widen_i64(gen_expr(a), a->ty);
   int v = gen_expr(a->next); // i32 (a 4-byte store; do not widen)
-  fprintf(o, "  i32.atomic.store v%d v%d\n", p, v);
+  cg("  i32.atomic.store v%d v%d\n", p, v);
   return 0; // void
 }
 
@@ -1300,7 +1365,7 @@ static int gen_builtin_atomic_add32(Node *node) {
   int p = widen_i64(gen_expr(a), a->ty);
   int v = gen_expr(a->next); // i32
   int r = nv++;
-  fprintf(o, "  v%d = i32.atomic.rmw.add v%d v%d\n", r, p, v);
+  cg("  v%d = i32.atomic.rmw.add v%d v%d\n", r, p, v);
   return r; // old (i32)
 }
 
@@ -1312,7 +1377,7 @@ static int gen_builtin_atomic_cas32(Node *node) {
   int exp = gen_expr(a->next);       // i32
   int des = gen_expr(a->next->next); // i32
   int r = nv++;
-  fprintf(o, "  v%d = i32.atomic.cmpxchg v%d v%d v%d\n", r, p, exp, des);
+  cg("  v%d = i32.atomic.cmpxchg v%d v%d v%d\n", r, p, exp, des);
   return r; // old (i32)
 }
 
@@ -1324,7 +1389,7 @@ static int gen_builtin_wait32(Node *node) {
   int exp = gen_expr(a->next); // i32
   int to = widen_i64(gen_expr(a->next->next), a->next->next->ty); // i64 ns
   int r = nv++;
-  fprintf(o, "  v%d = i32.atomic.wait v%d v%d v%d\n", r, p, exp, to);
+  cg("  v%d = i32.atomic.wait v%d v%d v%d\n", r, p, exp, to);
   return r; // 0 woken / 1 not-equal / 2 timed-out
 }
 
@@ -1335,7 +1400,7 @@ static int gen_builtin_notify(Node *node) {
   int p = widen_i64(gen_expr(a), a->ty);
   int c = gen_expr(a->next); // i32
   int r = nv++;
-  fprintf(o, "  v%d = atomic.notify v%d v%d\n", r, p, c);
+  cg("  v%d = atomic.notify v%d v%d\n", r, p, c);
   return r; // number woken
 }
 
@@ -1344,9 +1409,9 @@ static int gen_expr(Node *node) {
   case ND_NUM: {
     int r = nv++;
     if (is_flt(node->ty))
-      fprintf(o, "  v%d = %s.const %.17g\n", r, irty(node->ty), (double)node->fval);
+      cg("  v%d = %s.const %.17g\n", r, irty(node->ty), (double)node->fval);
     else
-      fprintf(o, "  v%d = %s.const %ld\n", r, irty(node->ty), (long)node->val);
+      cg("  v%d = %s.const %ld\n", r, irty(node->ty), (long)node->val);
     return r;
   }
   case ND_ADD:
@@ -1382,12 +1447,12 @@ static int gen_expr(Node *node) {
     char *p = irty(node->ty);
     int r = nv++;
     if (is_flt(node->ty)) {
-      fprintf(o, "  v%d = %s.neg v%d\n", r, p, a);
+      cg("  v%d = %s.neg v%d\n", r, p, a);
     } else {
       // -x  ==  0 - x
       int z = nv++;
-      fprintf(o, "  v%d = %s.const 0\n", z, p);
-      fprintf(o, "  v%d = %s.sub v%d v%d\n", r, p, z, a);
+      cg("  v%d = %s.const 0\n", z, p);
+      cg("  v%d = %s.sub v%d v%d\n", r, p, z, a);
     }
     return r;
   }
@@ -1398,10 +1463,10 @@ static int gen_expr(Node *node) {
     int r = nv++;
     if (is_flt(ot)) {
       int z = nv++;
-      fprintf(o, "  v%d = %s.const 0\n", z, irty(ot));
-      fprintf(o, "  v%d = %s.eq v%d v%d\n", r, irty(ot), a, z);
+      cg("  v%d = %s.const 0\n", z, irty(ot));
+      cg("  v%d = %s.eq v%d v%d\n", r, irty(ot), a, z);
     } else {
-      fprintf(o, "  v%d = %s.eqz v%d\n", r, irty(ot), a);
+      cg("  v%d = %s.eqz v%d\n", r, irty(ot), a);
     }
     return r;
   }
@@ -1410,9 +1475,9 @@ static int gen_expr(Node *node) {
     int a = gen_expr(node->lhs);
     char *p = irty(node->ty);
     int m = nv++;
-    fprintf(o, "  v%d = %s.const -1\n", m, p);
+    cg("  v%d = %s.const -1\n", m, p);
     int r = nv++;
-    fprintf(o, "  v%d = %s.xor v%d v%d\n", r, p, a, m);
+    cg("  v%d = %s.xor v%d v%d\n", r, p, a, m);
     return r;
   }
   case ND_CAST:
@@ -1576,30 +1641,30 @@ static int gen_expr(Node *node) {
       // Marshal the variadic args into a buffer just above our frame (and below the
       // callee's): one promoted 8-byte slot each (§3d).
       int fc = nv++;
-      fprintf(o, "  v%d = i64.const %d\n", fc, cur_frame);
+      cg("  v%d = i64.const %d\n", fc, cur_frame);
       vbuf = nv++;
-      fprintf(o, "  v%d = i64.add " SP " v%d\n", vbuf, fc);
+      cg("  v%d = i64.add " SP " v%d\n", vbuf, fc);
       for (int j = 0; j < nva; j++) {
         int v = argv[nfixed + j];
         Type *t = argt[nfixed + j];
         int addr = vbuf;
         if (j > 0) {
           int o2 = nv++;
-          fprintf(o, "  v%d = i64.const %d\n", o2, j * 8);
+          cg("  v%d = i64.const %d\n", o2, j * 8);
           addr = nv++;
-          fprintf(o, "  v%d = i64.add v%d v%d\n", addr, vbuf, o2);
+          cg("  v%d = i64.add v%d v%d\n", addr, vbuf, o2);
         }
         if (is_flt(t)) {
           if (!is64(t)) { // promote float -> double (defensive; parser usually did)
             int p = nv++;
-            fprintf(o, "  v%d = f64.promote_f32 v%d\n", p, v);
+            cg("  v%d = f64.promote_f32 v%d\n", p, v);
             v = p;
           }
-          fprintf(o, "  f64.store v%d v%d\n", addr, v);
+          cg("  f64.store v%d v%d\n", addr, v);
         } else if (is64(t)) {
-          fprintf(o, "  i64.store v%d v%d\n", addr, v);
+          cg("  i64.store v%d v%d\n", addr, v);
         } else {
-          fprintf(o, "  i32.store v%d v%d\n", addr, v);
+          cg("  i32.store v%d v%d\n", addr, v);
         }
       }
       extra = align_to(nva * 8, 16); // the callee frame sits above the buffer
@@ -1607,9 +1672,9 @@ static int gen_expr(Node *node) {
 
     // The callee gets a fresh frame above ours (and above any varargs buffer).
     int fs = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", fs, cur_frame + extra);
+    cg("  v%d = i64.const %d\n", fs, cur_frame + extra);
     int csp = nv++;
-    fprintf(o, "  v%d = i64.add " SP " v%d\n", csp, fs);
+    cg("  v%d = i64.add " SP " v%d\n", csp, fs);
 
     bool is_void = node->ty->kind == TY_VOID;
     // A struct/union return uses the §3d sret ABI: the caller passes the address of its
@@ -1622,47 +1687,47 @@ static int gen_expr(Node *node) {
     int idx32 = -1;
     if (!direct) {
       idx32 = nv++;
-      fprintf(o, "  v%d = i32.wrap_i64 v%d\n", idx32, fnval);
+      cg("  v%d = i32.wrap_i64 v%d\n", idx32, fnval);
     }
     int sret_addr = 0;
     if (agg_ret) {
       int so = nv++;
-      fprintf(o, "  v%d = i64.const %d\n", so, node->ret_buffer->offset);
+      cg("  v%d = i64.const %d\n", so, node->ret_buffer->offset);
       sret_addr = nv++;
-      fprintf(o, "  v%d = i64.add " SP " v%d\n", sret_addr, so); // buffer in the caller frame
+      cg("  v%d = i64.add " SP " v%d\n", sret_addr, so); // buffer in the caller frame
     }
     bool ir_void = is_void || agg_ret; // a struct-returning call is void at the IR level
     int r = ir_void ? 0 : nv++;
     if (direct) {
       int idx = func_index(node->lhs->var);
       if (ir_void)
-        fprintf(o, "  call %d (v%d", idx, csp);
+        cg("  call %d (v%d", idx, csp);
       else
-        fprintf(o, "  v%d = call %d (v%d", r, idx, csp);
+        cg("  v%d = call %d (v%d", r, idx, csp);
     } else {
       // Indirect dispatch through the function table (§3c): call with the callee's static
       // signature, which must match the target's exactly — leading data-SP i64, then the
       // hidden sret pointer (struct return), the params, and the trailing varargs pointer —
       // or the runtime type-id check traps (a forged or mismatched index is inert).
       if (ir_void)
-        fprintf(o, "  call_indirect (i64");
+        cg("  call_indirect (i64");
       else
-        fprintf(o, "  v%d = call_indirect (i64", r);
+        cg("  v%d = call_indirect (i64", r);
       if (agg_ret)
-        fprintf(o, ", i64"); // the hidden sret pointer
+        cg(", i64"); // the hidden sret pointer
       for (Type *pt = node->func_ty->params; pt; pt = pt->next)
-        fprintf(o, ", %s", pass_irty(pt));
+        cg(", %s", pass_irty(pt));
       if (variadic)
-        fprintf(o, ", i64"); // the hidden varargs-buffer pointer
-      fprintf(o, ") -> (%s) v%d(v%d", ir_void ? "" : irty(node->ty), idx32, csp);
+        cg(", i64"); // the hidden varargs-buffer pointer
+      cg(") -> (%s) v%d(v%d", ir_void ? "" : irty(node->ty), idx32, csp);
     }
     if (agg_ret)
-      fprintf(o, ", v%d", sret_addr); // the hidden sret arg, right after the data-SP
+      cg(", v%d", sret_addr); // the hidden sret arg, right after the data-SP
     for (int i = 0; i < nfixed; i++)
-      fprintf(o, ", v%d", argv[i]);
+      cg(", v%d", argv[i]);
     if (variadic)
-      fprintf(o, ", v%d", vbuf); // the hidden varargs-buffer pointer
-    fprintf(o, ")\n");
+      cg(", v%d", vbuf); // the hidden varargs-buffer pointer
+    cg(")\n");
     // The call's value: a struct return is the sret buffer address; a void call's result is
     // discarded; otherwise the IR result.
     return agg_ret ? sret_addr : r;
@@ -1710,7 +1775,7 @@ static int gen_expr(Node *node) {
     // "Do nothing" (e.g. a non-VLA size computation). Materialize a harmless value so
     // the (always-discarded) result index is still valid.
     int r = nv++;
-    fprintf(o, "  v%d = i32.const 0\n", r);
+    cg("  v%d = i32.const 0\n", r);
     return r;
   }
   case ND_MEMZERO: {
@@ -1718,7 +1783,7 @@ static int gen_expr(Node *node) {
     if (node->var->is_local && is_promoted(node->var)) {
       int s = slot_of(node->var);
       int z = nv++;
-      fprintf(o, "  v%d = %s.const 0\n", z, promo_ty[s]);
+      cg("  v%d = %s.const 0\n", z, promo_ty[s]);
       curval[s] = z;
       return z;
     }
@@ -1728,26 +1793,26 @@ static int gen_expr(Node *node) {
     int base = node->var->offset;
     for (int i = 0; i < sz;) {
       int off = nv++;
-      fprintf(o, "  v%d = i64.const %d\n", off, base + i);
+      cg("  v%d = i64.const %d\n", off, base + i);
       int a = nv++;
-      fprintf(o, "  v%d = i64.add " SP " v%d\n", a, off);
+      cg("  v%d = i64.add " SP " v%d\n", a, off);
       int z = nv++;
       if (sz - i >= 8) {
-        fprintf(o, "  v%d = i64.const 0\n  i64.store v%d v%d\n", z, a, z);
+        cg("  v%d = i64.const 0\n  i64.store v%d v%d\n", z, a, z);
         i += 8;
       } else if (sz - i >= 4) {
-        fprintf(o, "  v%d = i32.const 0\n  i32.store v%d v%d\n", z, a, z);
+        cg("  v%d = i32.const 0\n  i32.store v%d v%d\n", z, a, z);
         i += 4;
       } else if (sz - i >= 2) {
-        fprintf(o, "  v%d = i32.const 0\n  i32.store16 v%d v%d\n", z, a, z);
+        cg("  v%d = i32.const 0\n  i32.store16 v%d v%d\n", z, a, z);
         i += 2;
       } else {
-        fprintf(o, "  v%d = i32.const 0\n  i32.store8 v%d v%d\n", z, a, z);
+        cg("  v%d = i32.const 0\n  i32.store8 v%d v%d\n", z, a, z);
         i += 1;
       }
     }
     int r = nv++;
-    fprintf(o, "  v%d = i32.const 0\n", r); // discarded result
+    cg("  v%d = i32.const 0\n", r); // discarded result
     return r;
   }
   default:
@@ -1761,19 +1826,19 @@ static void gen_stmt(Node *node);
 static void gen_if(Node *node) {
   int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
   int t = nb++, e = nb++, end = nb++;
-  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, t, cvals(), e, cvals());
+  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, t, cvals(), e, cvals());
   term = true;
 
   open_block(t);
   gen_stmt(node->then);
   if (!term)
-    fprintf(o, "  br block%d(" SP "%s)\n", end, cvals());
+    cg("  br block%d(" SP "%s)\n", end, cvals());
 
   open_block(e);
   if (node->els)
     gen_stmt(node->els);
   if (!term)
-    fprintf(o, "  br block%d(" SP "%s)\n", end, cvals());
+    cg("  br block%d(" SP "%s)\n", end, cvals());
 
   open_block(end);
 }
@@ -1785,16 +1850,16 @@ static void gen_for(Node *node) {
   if (node->init)
     gen_stmt(node->init);
   int cond = nb++, body = nb++, cont = nb++, end = nb++;
-  fprintf(o, "  br block%d(" SP "%s)\n", cond, cvals());
+  cg("  br block%d(" SP "%s)\n", cond, cvals());
   term = true;
 
   open_block(cond);
   if (node->cond) {
     int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
-    fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, body, cvals(), end,
+    cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, body, cvals(), end,
             cvals());
   } else {
-    fprintf(o, "  br block%d(" SP "%s)\n", body, cvals()); // `for(;;)` — unconditional
+    cg("  br block%d(" SP "%s)\n", body, cvals()); // `for(;;)` — unconditional
   }
   term = true;
 
@@ -1803,12 +1868,12 @@ static void gen_for(Node *node) {
   gen_stmt(node->then);
   loopsp--;
   if (!term)
-    fprintf(o, "  br block%d(" SP "%s)\n", cont, cvals());
+    cg("  br block%d(" SP "%s)\n", cont, cvals());
 
   open_block(cont);
   if (node->inc)
     gen_expr(node->inc);
-  fprintf(o, "  br block%d(" SP "%s)\n", cond, cvals());
+  cg("  br block%d(" SP "%s)\n", cond, cvals());
 
   open_block(end);
 }
@@ -1816,7 +1881,7 @@ static void gen_for(Node *node) {
 // `do body while (cond)`: body runs once, then `cont` re-tests. `break` → end.
 static void gen_do(Node *node) {
   int body = nb++, cont = nb++, end = nb++;
-  fprintf(o, "  br block%d(" SP "%s)\n", body, cvals());
+  cg("  br block%d(" SP "%s)\n", body, cvals());
   term = true;
 
   open_block(body);
@@ -1824,11 +1889,11 @@ static void gen_do(Node *node) {
   gen_stmt(node->then);
   loopsp--;
   if (!term)
-    fprintf(o, "  br block%d(" SP "%s)\n", cont, cvals());
+    cg("  br block%d(" SP "%s)\n", cont, cvals());
 
   open_block(cont);
   int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
-  fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, body, cvals(), end,
+  cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, body, cvals(), end,
           cvals());
 
   open_block(end);
@@ -1855,7 +1920,7 @@ static void gen_switch(Node *node) {
   // Dispatch: each compare block carries (sp, <promoted locals>, val) and forwards the
   // value (at index MERGE_VAL, after the promoted locals) to the next compare block.
   int check = nb++;
-  fprintf(o, "  br block%d(" SP "%s, v%d)\n", check, cvals(), v);
+  cg("  br block%d(" SP "%s, v%d)\n", check, cvals(), v);
   term = true;
   for (Node *c = node->case_next; c; c = c->case_next) {
     open_merge(check, p);
@@ -1864,25 +1929,25 @@ static void gen_switch(Node *node) {
     int hit = nv++;
     if (c->begin == c->end) {
       int k = nv++;
-      fprintf(o, "  v%d = %s.const %ld\n", k, p, c->begin);
-      fprintf(o, "  v%d = %s.eq v%d v%d\n", hit, p, val, k);
+      cg("  v%d = %s.const %ld\n", k, p, c->begin);
+      cg("  v%d = %s.eq v%d v%d\n", hit, p, val, k);
     } else {
       // [GNU] case range begin..end: (val - begin) <=u (end - begin)
       int kb = nv++;
-      fprintf(o, "  v%d = %s.const %ld\n", kb, p, c->begin);
+      cg("  v%d = %s.const %ld\n", kb, p, c->begin);
       int d = nv++;
-      fprintf(o, "  v%d = %s.sub v%d v%d\n", d, p, val, kb);
+      cg("  v%d = %s.sub v%d v%d\n", d, p, val, kb);
       int kr = nv++;
-      fprintf(o, "  v%d = %s.const %ld\n", kr, p, c->end - c->begin);
-      fprintf(o, "  v%d = %s.le_u v%d v%d\n", hit, p, d, kr);
+      cg("  v%d = %s.const %ld\n", kr, p, c->end - c->begin);
+      cg("  v%d = %s.le_u v%d v%d\n", hit, p, d, kr);
     }
-    fprintf(o, "  br_if v%d block%d(" SP "%s) block%d(" SP "%s, v%d)\n", hit,
+    cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s, v%d)\n", hit,
             case_block_of(c), cvals(), next, cvals(), val);
     check = next;
   }
   // No case matched → default (or break past the switch).
   open_merge(check, p);
-  fprintf(o, "  br block%d(" SP "%s)\n", defblk, cvals());
+  cg("  br block%d(" SP "%s)\n", defblk, cvals());
   term = true;
 
   // The body: ND_CASE labels open their blocks; `break` (cont_label NULL so `continue`
@@ -1891,11 +1956,15 @@ static void gen_switch(Node *node) {
   gen_stmt(node->then);
   loopsp--;
   if (!term)
-    fprintf(o, "  br block%d(" SP "%s)\n", end, cvals());
+    cg("  br block%d(" SP "%s)\n", end, cvals());
   open_block(end);
 }
 
 static void gen_stmt(Node *node) {
+  // Record this statement's source line at the current (block, inst) for `debug.loc` (W4). A
+  // compound block has no line of its own; its children record theirs.
+  if (node->kind != ND_BLOCK)
+    dbg_loc(node->tok);
   switch (node->kind) {
   case ND_BLOCK:
     for (Node *n = node->body; n; n = n->next) {
@@ -1913,7 +1982,7 @@ static void gen_stmt(Node *node) {
     // A case/default label: fall-through from the previous case branches in here.
     int blk = case_block_of(node);
     if (!term)
-      fprintf(o, "  br block%d(" SP "%s)\n", blk, cvals());
+      cg("  br block%d(" SP "%s)\n", blk, cvals());
     open_block(blk);
     gen_stmt(node->lhs);
     return;
@@ -1935,7 +2004,7 @@ static void gen_stmt(Node *node) {
     // preceding statement (if reachable), open it, then emit the labelled statement.
     int blk = label_block_of(node->unique_label);
     if (!term)
-      fprintf(o, "  br block%d(" SP "%s)\n", blk, cvals());
+      cg("  br block%d(" SP "%s)\n", blk, cvals());
     open_block(blk);
     gen_stmt(node->lhs);
     return;
@@ -1945,20 +2014,20 @@ static void gen_stmt(Node *node) {
     for (int i = loopsp - 1; i >= 0; i--) {
       if (node->unique_label && loopstk[i].brk_label &&
           !strcmp(node->unique_label, loopstk[i].brk_label)) {
-        fprintf(o, "  br block%d(" SP "%s)\n", loopstk[i].brk_blk, cvals());
+        cg("  br block%d(" SP "%s)\n", loopstk[i].brk_blk, cvals());
         term = true;
         return;
       }
       if (node->unique_label && loopstk[i].cont_label &&
           !strcmp(node->unique_label, loopstk[i].cont_label)) {
-        fprintf(o, "  br block%d(" SP "%s)\n", loopstk[i].cont_blk, cvals());
+        cg("  br block%d(" SP "%s)\n", loopstk[i].cont_blk, cvals());
         term = true;
         return;
       }
     }
     // A general `goto`: branch to its target label's block (allocated on first reference,
     // so forward gotos resolve). The data-SP + promoted locals thread through as args.
-    fprintf(o, "  br block%d(" SP "%s)\n", label_block_of(node->unique_label), cvals());
+    cg("  br block%d(" SP "%s)\n", label_block_of(node->unique_label), cvals());
     term = true;
     return;
   }
@@ -1969,18 +2038,18 @@ static void gen_stmt(Node *node) {
       // slot — `sret_param` is only valid in the entry block, but a return can be in any.
       int src = gen_expr(node->lhs); // an aggregate yields its address (by_address)
       int so = nv++;
-      fprintf(o, "  v%d = i64.const %d\n", so, sret_slot);
+      cg("  v%d = i64.const %d\n", so, sret_slot);
       int sa = nv++;
-      fprintf(o, "  v%d = i64.add " SP " v%d\n", sa, so);
+      cg("  v%d = i64.add " SP " v%d\n", sa, so);
       int sret = nv++;
-      fprintf(o, "  v%d = i64.load v%d\n", sret, sa);
+      cg("  v%d = i64.load v%d\n", sret, sa);
       gen_memcpy(sret, src, node->lhs->ty->size);
-      fprintf(o, "  return\n");
+      cg("  return\n");
     } else if (node->lhs) {
       int v = gen_expr(node->lhs);
-      fprintf(o, "  return v%d\n", v);
+      cg("  return v%d\n", v);
     } else {
-      fprintf(o, "  return\n");
+      cg("  return\n");
     }
     term = true;
     return;
@@ -2141,6 +2210,7 @@ static void gen_func(Obj *fn) {
   if (!fn->is_definition)
     return;
 
+  cur_func_idx = func_index(fn); // debug.loc rows are keyed by this function's module index (W4)
   nb = 0;
   nlabel = 0;
   cur_frame = fn->stack_size;
@@ -2163,36 +2233,38 @@ static void gen_func(Obj *fn) {
   // is the data-SP; a struct/union-returning function takes a hidden sret pointer right
   // after it and returns `()` (§3d D39); a variadic function takes a trailing pointer to
   // the marshalled args (§3d). A by-value aggregate parameter is passed by pointer (i64).
-  fprintf(o, "func (i64");
+  cg("func (i64");
   if (is_agg(ret))
-    fprintf(o, ", i64"); // the hidden sret pointer
+    cg(", i64"); // the hidden sret pointer
   for (Obj *p = guest_params(fn); p; p = p->next)
-    fprintf(o, ", %s", pass_irty(p->ty));
+    cg(", %s", pass_irty(p->ty));
   if (variadic)
-    fprintf(o, ", i64");
+    cg(", i64");
   if (ret->kind == TY_VOID || is_agg(ret))
-    fprintf(o, ") -> () {\n");
+    cg(") -> () {\n");
   else
-    fprintf(o, ") -> (%s) {\n", irty(ret));
+    cg(") -> (%s) {\n", irty(ret));
 
   // Entry block: params are `sp` (v0), [the sret pointer], the C params, then the va ptr.
-  fprintf(o, "block%d(" SP ": i64", nb++);
+  cg("block%d(" SP ": i64", nb++);
   int np = 1;
   sret_param = -1;
   sret_slot = -1;
   if (is_agg(ret)) {
     sret_param = np;
     sret_slot = fn->stack_size - SCRATCH_BYTES - 16; // the slot reserved by prepare_func
-    fprintf(o, ", v%d: i64", np++);
+    cg(", v%d: i64", np++);
   }
   for (Obj *p = guest_params(fn); p; p = p->next)
-    fprintf(o, ", v%d: %s", np++, pass_irty(p->ty));
+    cg(", v%d: %s", np++, pass_irty(p->ty));
   int va_param = np;
   if (variadic)
-    fprintf(o, ", v%d: i64", np++);
-  fprintf(o, "):\n");
+    cg(", v%d: i64", np++);
+  cg("):\n");
   nv = np;
   term = false;
+  cur_block = 0; // the entry block (open_block isn't used for it — it has the param signature)
+  cur_inst = 0;  // so debug.loc (W4) keys off it as the param-prologue instructions are emitted
   // Each C parameter: a promoted param's current value *is* its incoming SSA value (no
   // store); a memory param is spilled to its frame slot (an aggregate param is a pointer
   // to the caller's value, so the callee copies it into its own frame — by-value, §3d).
@@ -2205,9 +2277,9 @@ static void gen_func(Obj *fn) {
       param_slot[s] = true;
     } else {
       int off = nv++;
-      fprintf(o, "  v%d = i64.const %d\n", off, p->offset);
+      cg("  v%d = i64.const %d\n", off, p->offset);
       int addr = nv++;
-      fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
+      cg("  v%d = i64.add " SP " v%d\n", addr, off);
       if (is_agg(p->ty))
         gen_memcpy(addr, pi, p->ty->size); // copy the caller's aggregate into our frame
       else
@@ -2218,19 +2290,19 @@ static void gen_func(Obj *fn) {
   // Stash the va pointer into __va_area__'s slot so va_start can load it.
   if (variadic) {
     int off = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", off, fn->va_area->offset);
+    cg("  v%d = i64.const %d\n", off, fn->va_area->offset);
     int addr = nv++;
-    fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
-    fprintf(o, "  i64.store v%d v%d\n", addr, va_param);
+    cg("  v%d = i64.add " SP " v%d\n", addr, off);
+    cg("  i64.store v%d v%d\n", addr, va_param);
   }
   // Stash the hidden sret pointer into its frame slot, so a `return <aggregate>` from any
   // block (not just the entry, where `sret_param` is the live parameter) can reload it.
   if (sret_slot >= 0) {
     int off = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", off, sret_slot);
+    cg("  v%d = i64.const %d\n", off, sret_slot);
     int addr = nv++;
-    fprintf(o, "  v%d = i64.add " SP " v%d\n", addr, off);
-    fprintf(o, "  i64.store v%d v%d\n", addr, sret_param);
+    cg("  v%d = i64.add " SP " v%d\n", addr, off);
+    cg("  i64.store v%d v%d\n", addr, sret_param);
   }
   // A promoted non-parameter local starts defined (zero) so it is a valid SSA value on
   // every path before its first assignment (and this subsumes its ND_MEMZERO).
@@ -2238,7 +2310,7 @@ static void gen_func(Obj *fn) {
     if (is_promoted(v) && !param_slot[slot_of(v)]) {
       int s = slot_of(v);
       int z = nv++;
-      fprintf(o, "  v%d = %s.const 0\n", z, promo_ty[s]);
+      cg("  v%d = %s.const 0\n", z, promo_ty[s]);
       curval[s] = z;
     }
 
@@ -2247,13 +2319,13 @@ static void gen_func(Obj *fn) {
   // zero is a safe, defined value. Every block needs a terminator (§3b).
   if (!term) {
     if (ret->kind == TY_VOID || is_agg(ret)) {
-      fprintf(o, "  return\n"); // void, or a struct-returning func that wrote via sret
+      cg("  return\n"); // void, or a struct-returning func that wrote via sret
     } else {
       int z = nv++;
-      fprintf(o, "  v%d = %s.const 0\n  return v%d\n", z, irty(ret), z);
+      cg("  v%d = %s.const 0\n  return v%d\n", z, irty(ret), z);
     }
   }
-  fprintf(o, "}\n\n");
+  cg("}\n\n");
 }
 
 // Read-only data is laid out on its own page(s) so a `data ro` segment can be protected without
@@ -2343,19 +2415,19 @@ static void emit_data_segments(Obj *prog) {
       for (int i = 0; i < 8 && r->offset + i < size; i++)
         buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
     }
-    fprintf(o, "data %s%d \"", is_rodata(g) ? "ro " : "", g->offset);
+    cg("data %s%d \"", is_rodata(g) ? "ro " : "", g->offset);
     for (int i = 0; i < size; i++) {
       unsigned char c = buf[i];
       if (c == '\\')
-        fprintf(o, "\\\\");
+        cg("\\\\");
       else if (c == '"')
-        fprintf(o, "\\\"");
+        cg("\\\"");
       else if (c >= 0x20 && c <= 0x7e)
         fputc(c, o);
       else
-        fprintf(o, "\\x%02x", c);
+        cg("\\x%02x", c);
     }
-    fprintf(o, "\"\n");
+    cg("\"\n");
     free(buf);
   }
 }
@@ -2376,37 +2448,37 @@ static void emit_start(Obj *main_fn) {
 #define NHANDLES 8
   int slots[NHANDLES] = {STDOUT_SLOT,    STDIN_SLOT,  EXIT_SLOT,     MEMORY_SLOT,
                          ADDRSPACE_SLOT, IORING_SLOT, BLOCKING_SLOT, JIT_SLOT};
-  fprintf(o, "func (");
+  cg("func (");
   for (int i = 0; i < NHANDLES; i++)
-    fprintf(o, "%si32", i ? ", " : "");
-  fprintf(o, ") -> (%s) {\n", is_void ? "" : irty(mret));
+    cg("%si32", i ? ", " : "");
+  cg(") -> (%s) {\n", is_void ? "" : irty(mret));
   // stdout, stdin, exit, memory, addrspace (§14), ioring, blocking (§9/§12), jit (DESIGN.md §22)
-  fprintf(o, "block0(");
+  cg("block0(");
   for (int i = 0; i < NHANDLES; i++)
-    fprintf(o, "%sv%d: i32", i ? ", " : "", i);
-  fprintf(o, "):\n");
+    cg("%sv%d: i32", i ? ", " : "", i);
+  cg("):\n");
   nv = NHANDLES;
   // Stash each handle in its reserved slot so the builtins can load it.
   for (int i = 0; i < NHANDLES; i++) {
     int a = nv++;
-    fprintf(o, "  v%d = i64.const %d\n", a, slots[i]);
-    fprintf(o, "  i32.store v%d v%d\n", a, i);
+    cg("  v%d = i64.const %d\n", a, slots[i]);
+    cg("  i32.store v%d v%d\n", a, i);
   }
 #undef NHANDLES
   int sp = nv++;
-  fprintf(o, "  v%d = i64.const %d\n", sp, data_end);
+  cg("  v%d = i64.const %d\n", sp, data_end);
   // `int main()` (empty parens) is variadic in chibicc, so it expects the hidden va
   // pointer; main never reads it, so any in-window pointer (the sp) does.
   char va[24] = "";
   if (main_fn->ty->is_variadic)
     snprintf(va, sizeof va, ", v%d", sp);
   if (is_void) {
-    fprintf(o, "  call %d (v%d%s)\n  return\n", func_index(main_fn), sp, va);
+    cg("  call %d (v%d%s)\n  return\n", func_index(main_fn), sp, va);
   } else {
     int r = nv++;
-    fprintf(o, "  v%d = call %d (v%d%s)\n  return v%d\n", r, func_index(main_fn), sp, va, r);
+    cg("  v%d = call %d (v%d%s)\n  return v%d\n", r, func_index(main_fn), sp, va, r);
   }
-  fprintf(o, "}\n\n");
+  cg("}\n\n");
 }
 
 // --- Debug info (DEBUGGING.md §6 waist, producer side) --------------------------------------
@@ -2452,10 +2524,10 @@ static void emit_debug_vars(Obj *fn, int func_idx) {
       continue;
     const char *ty = dbg_typename(v->ty);
     if (is_promoted(v))
-      fprintf(o, "debug.var %d \"%s\" ssa %d \"%s\"\n", func_idx, v->name,
+      cg("debug.var %d \"%s\" ssa %d \"%s\"\n", func_idx, v->name,
               slot_of(v) + 1, ty);
     else
-      fprintf(o, "debug.var %d \"%s\" win %d \"%s\"\n", func_idx, v->name, v->offset, ty);
+      cg("debug.var %d \"%s\" win %d \"%s\"\n", func_idx, v->name, v->offset, ty);
   }
 }
 
@@ -2497,7 +2569,7 @@ void codegen_ir(Obj *prog, FILE *out) {
     int wlog2 = 16;
     while (((long)1 << wlog2) < need)
       wlog2++;
-    fprintf(o, "memory %d\n\n", wlog2);
+    cg("memory %d\n\n", wlog2);
   }
 
   // Global initializers become module-level `data` segments (§3a), placed by the runtime.
@@ -2508,9 +2580,18 @@ void codegen_ir(Obj *prog, FILE *out) {
   for (int i = 0; i < nfuncs; i++)
     gen_func(funcs[i]);
 
-  // `-g`: the §6 debug-info section, after the functions (module-level, strippable). Slice 1
-  // emits `debug.var` only; `funcs[i]` has module index `start_off + i` (matching `func_index`).
-  if (opt_g)
+  // `-g`: the §6 debug-info section, after the functions (module-level, strippable): the source
+  // file table, then `debug.loc` source lines (collected during emission), then `debug.var` per
+  // named local. `funcs[i]` has module index `start_off + i` (matching `func_index`).
+  if (opt_g) {
+    for (int i = 0; i < n_dbg_files; i++)
+      cg("debug.file %d \"%s\"\n", i, dbg_files[i]);
+    for (int i = 0; i < n_dbg_loc; i++) {
+      DbgLoc *l = &dbg_loc_buf[i];
+      cg("debug.loc %d %d %d %d %d %d\n", l->func, l->block, l->inst, l->file, l->line,
+              l->col);
+    }
     for (int i = 0; i < nfuncs; i++)
       emit_debug_vars(funcs[i], start_off + i);
+  }
 }

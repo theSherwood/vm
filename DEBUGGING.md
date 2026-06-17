@@ -51,8 +51,9 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | W1 time-travel — `seek(t)` / `step_back`: single-threaded (op `clock`) **and** multithreaded (global `turn`); faithful via `CapTape` | **Built — slices 1–3** | `svm-interp` `Inspector::seek` / `turn` / `step_back` |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
+| Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
-| Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text); chibicc `-g` emits `debug.var` + `debug.loc`** (D-DBG-7/§6; binary section pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp`, `codegen_ir.c` |
 | DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover) | **Built — W5 slices 1–6** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
@@ -948,10 +949,21 @@ values. Default (non-`-g`) output is unchanged, so all 78 existing c_frontend te
 untouched. `debug.loc` (per-op source lines) needs per-op inst counting in the emitter — a later
 slice.
 
-**Not yet (next slices):** `debug.loc` source-line emission (chibicc + the LLVM/wasm ingest
-sides), binary serialization of the debug section, multithreaded debugging (the `Policy`
-scheduler seam, Milestone B), and the W4 refinements (per-block `LocList`, structured `TypeRef`,
-rich blob).
+**Slice 6 — `debug.loc` source lines (chibicc).** `chibicc -g` now also emits `debug.loc`
+rows, so breakpoints and backtraces resolve to `file:line`, not just named variables. The
+emitter routes every IR line through one sink (`cg(...)`) that counts `block.insts` entries (a
+two-space-prefixed, non-terminator line), so source locations key on `(func, block, inst)`
+*exactly* — no fragile heuristics. Locations are recorded per statement (in `gen_stmt`), and the
+interpreter's `source_loc` uses **nearest-preceding within `(func, block)`** (DWARF line-table
+semantics). `backtrace` frames carry the resolved `SourceLoc`. Tests (`c_frontend.rs`): a
+breakpoint at the last block op resolves to the `return` line, and multi-block control flow
+(a `for` loop) maps each block to its source line. The full source-level loop — *set a breakpoint,
+see the line and the named locals* — now works end-to-end on real C.
+
+**Not yet (next slices):** the LLVM/wasm `debug.loc` ingest sides, binary serialization of the
+debug section, and the W4 refinements (per-block `LocList` so promoted scalars are debuggable
+without `-Og`, structured `TypeRef`, per-producer rich blob). (Multithreaded debugging and the
+interpreter-backed DAP server are already built — Milestone B and W5 slices 1–6.)
 
 ### Open questions (S4/S5/S2)
 

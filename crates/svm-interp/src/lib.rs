@@ -1212,15 +1212,22 @@ impl Inspector {
     }
 
     /// The source location of an [`IrPc`], if the module carries debug info (DEBUGGING.md §6/W4).
-    /// Only the guest's own program (module 0) has source; installed §22 units return `None`.
+    /// Locations are recorded per statement, so this uses **nearest-preceding** within the same
+    /// `(func, block)` — the op's row is the last `debug.loc` at or before it (DWARF line-table
+    /// semantics). Only the guest's own program (module 0) has source; installed §22 units return
+    /// `None`.
     pub fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
         if pc.module != 0 {
             return None;
         }
         let di = self.debug_info.as_ref()?;
-        let l = di.locs.iter().find(|l| {
-            l.func == pc.func && l.block as usize == pc.block && l.inst as usize == pc.inst
-        })?;
+        let l = di
+            .locs
+            .iter()
+            .filter(|l| {
+                l.func == pc.func && l.block as usize == pc.block && l.inst as usize <= pc.inst
+            })
+            .max_by_key(|l| l.inst)?;
         let file = di.files.get(l.file as usize)?.clone();
         Some(SourceLoc {
             file,
