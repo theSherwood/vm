@@ -1031,6 +1031,38 @@ fn demo_hexdump_vs_native() {
 }
 
 #[test]
+fn demo_sortvec_vs_native() {
+    // A growable int vector + insertion sort: 50 pseudo-random signed ints into a `realloc`-doubling
+    // buffer (from `realloc(NULL,…)` ≡ malloc), sorted, printed 10/line via `printf("%d%c")`. Drives
+    // `realloc` (the header-bearing bump allocator: malloc + copy old contents) and signed `%d`.
+    check_demo_vs_native("sortvec", "sortvec/sortvec.c", b"");
+}
+
+#[test]
+fn printf_signed_formats() {
+    // Signed `%d` (incl. negatives) with plain and space-padded fields, mixed with `%u` — checked vs
+    // native. (Zero-padded `%d` is intentionally fail-closed, so it is not exercised here.)
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"%d %d %d %6d\\n\", 0, -7, 12345, -42); \
+                 printf(\"u=%u neg=%d\\n\", 4000000000u, -1); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_d", src, b"");
+}
+
+#[test]
+fn realloc_grow_preserves() {
+    // `realloc` must preserve the old contents across a grow (the header gives the copy length). Push
+    // 20 ints into a doubling buffer, then sum — exit code compared to native.
+    let src = "#include <stdlib.h>\n\
+               int run(int seed){ int *a = (int*)malloc(2 * sizeof(int)); int cap = 2, n = 0; \
+               for (int i = 0; i < 20; i++) { if (n == cap) { cap *= 2; a = (int*)realloc(a, (unsigned long)cap * sizeof(int)); } a[n++] = i * seed; } \
+               long s = 0; for (int i = 0; i < n; i++) s += a[i]; return (int)(s & 0xff); } \
+               int main(void){ return run(3); }";
+    check_powerbox_vs_native("realloc_grow", src, b"");
+}
+
+#[test]
 fn printf_unsigned_formats() {
     // The `printf` engine directly: unsigned decimal/hex with field width + zero/space padding, a
     // 64-bit (`%lx`) arg, `%c`, and `%%` — all in one mixed format (so clang keeps it as `printf`,

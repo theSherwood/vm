@@ -565,7 +565,7 @@ the dominant general-C gap).
 | # | Demo (proposed) | Drives (pending item) | Also exercises |
 |---|---|---|---|
 | 1 ✅ | **`hexdump`** — read stdin, print `%08lx  %02x ×16  \|ascii\|` rows (`demos/hexdump`, slice W) | **varargs `printf`** (unsigned `%u`/`%x`, width, `0`-pad, `l`) — DONE, byte-identical to native | `read`, loops |
-| 2 | **`vector`/`sort`** — read ints into a doubling buffer, qsort, print | **`realloc`** (grow-and-copy) + numeric `printf` (`%d`) | `malloc`, `read` |
+| 2 ✅ | **`sortvec`** — `realloc`-doubling int vector + insertion sort, print `%d` 10/line (`demos/sortvec`, slice X) | **`realloc`** (header-sized grow-and-copy) + signed `printf` (`%d`) — DONE, byte-identical to native | `malloc` |
 | 3 | **`mat4`** — 4×4 matrix × vec4 / 3D transform, print rows | **wider SIMD** (`<4 x float>`) — generalize the 2-lane scalarization | floats, `printf` |
 | 4 | **`crc32` + big-endian TLV reader** | **`llvm.bswap`** (endian) | tables, `printf` |
 | 5 | **`editor`/gap-buffer** — insert/delete in a text buffer | **overlapping `memmove`** (direction-aware runtime loop) | arrays |
@@ -591,11 +591,20 @@ pre-fill of the scratch buffer `[FMT_BUF, FMT_BUF_END)`, then a `max(len,width)`
 modifiers (the LLVM arg carries the real width — `%lx` ⇒ an `i64` arg). All formatting is **guest
 code**; only the bytes cross the boundary. Tests: `demo_hexdump_vs_native` (a `hexdump -C` clone, vs
 native, with stdin) + `printf_unsigned_formats` (mixed widths/pads/`%lx`/`%c`/`%%`).
-- *Deferred to later slices (fail-closed `Unsupported`):* signed `%d`/`%i` (sign + zero-pad combo),
-  `%s` (runtime strlen), `%f`/`%g`/`%e` (float formatting), precision/`*`/`-`/`+`/space/`#`, and
+- *Deferred:* `%s` (runtime strlen), `%f`/`%g`/`%e` (float formatting), precision/`*`/`-`/`+`/space/`#`,
   non-constant format strings.
 
-**Next:** demo 2 (**`vector`/`sort`** → `realloc` + signed `%d`).
+**Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
+16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
+`realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
+the old size from `p-16`, and `__svm_memcpy`s `min(old, n)` bytes (no overlap — the fresh block sits
+above the old). `printf` gains signed `%d`/`%i`: the sign is computed (`-`), the magnitude formatted
+via `__svm_utoa`, the `-` written just below the digits and included only when negative; plain and
+space-padded fields supported (zero-padded `%d` stays fail-closed — sign+pad ordering). Tests:
+`demo_sortvec_vs_native`, `printf_signed_formats`, `realloc_grow_preserves`. (heapgrow/calloc still
+pass — the data region stays freshly-`vm_map`-zeroed below the bump.)
+
+**Next:** demo 3 (**`mat4`** → wider SIMD `<4 x float>`).
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
