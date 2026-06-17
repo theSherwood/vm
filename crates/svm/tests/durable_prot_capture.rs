@@ -5,7 +5,8 @@
 //!   Phase-1's flat all-`Rw` image would have lost it;
 //! * **re-establish** — restoring that protection map and seeding a thawed run with it makes a
 //!   write to a restored `Ro` page fault exactly as the frozen guest would (vs. succeeding when
-//!   the page comes back `Rw`).
+//!   the page comes back `Rw`) — on **both** the interpreter and the JIT (real `mprotect` /
+//!   `VirtualProtect`), so the two backends agree on a thawed protected window.
 
 use svm_interp::{run_capture_reserved_with_host_prots, CapturedProt, Host, Value};
 use svm_ir::Memory;
@@ -170,5 +171,73 @@ fn restore_re_establishes_ro_so_a_thawed_write_faults() {
         ok,
         Ok(vec![Value::I64(0)]),
         "without the Ro protection the store succeeds"
+    );
+}
+
+#[test]
+fn jit_re_establishes_ro_so_a_thawed_write_faults() {
+    use core::ffi::c_void;
+    use svm_jit::{
+        compile_and_run_capture_reserved_with_host_prots, JitOutcome, TrapKind, WindowProt,
+    };
+
+    let mut m = svm_text::parse_module(STORE_SRC).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let mut host = Host::new();
+    let _ = host.grant_clock();
+
+    // Freeze a window whose page 5 is read-only, then restore it.
+    let window = vec![0u8; WINDOW];
+    let mut prots = vec![PageProt::Rw; WINDOW / PAGE];
+    prots[RO_OFF / PAGE] = PageProt::Ro;
+    let art = freeze_with_prots(&m, &window, &prots, &host).expect("freeze");
+    let mut rhost = Host::new();
+    let (rwin, rprots) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
+    let jit_prots: Vec<WindowProt> = rprots
+        .iter()
+        .map(|p| match p {
+            PageProt::Rw => WindowProt::Rw,
+            PageProt::Ro => WindowProt::Ro,
+            PageProt::Unmapped => WindowProt::Unmapped,
+        })
+        .collect();
+
+    // Thaw on the JIT with the restored protections: the store into the Ro page faults (real
+    // mprotect/VirtualProtect → guard → MemoryFault), exactly as on the interpreter above.
+    let mut h = Host::new();
+    let (faulted, _) = compile_and_run_capture_reserved_with_host_prots(
+        &m,
+        0,
+        &[0i64],
+        &rwin,
+        &jit_prots,
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut h as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+    assert!(
+        matches!(faulted, JitOutcome::Trapped(TrapKind::MemoryFault)),
+        "a JIT store to a restored Ro page must fault, got {faulted:?}"
+    );
+
+    // Control: no protections re-established — the same store succeeds on the JIT.
+    let mut h2 = Host::new();
+    let (ok, _) = compile_and_run_capture_reserved_with_host_prots(
+        &m,
+        0,
+        &[0i64],
+        &rwin,
+        &[], // all Rw
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut h2 as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+    assert!(
+        matches!(ok, JitOutcome::Returned(_)),
+        "without the Ro protection the JIT store succeeds, got {ok:?}"
     );
 }

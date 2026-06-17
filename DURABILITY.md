@@ -521,9 +521,14 @@ data segment captured as `Ro` and surviving freeze→restore through the codec (
 flat all-`Rw` image would have lost it), **and** that re-establishing the map on a thawed run
 makes a write to a restored `Ro` page fault — while the same window without it writes through. A
 `Backed` page maps to a freeze refusal / is skipped on restore (D-region: the embedder re-grants
-the region). Still ahead (escape-TCB): the **JIT** side — capturing `GuestWindow` protections and
-re-establishing them via `mprotect`/`VirtualProtect` (Windows placeholder semantics); then §12.4
-fiber/dispatch control state.
+the region). **JIT re-establish parity** also landed:
+`svm_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map and applies
+it to the freshly-seeded window (`protect_ro` / new `protect_none` via real
+`mprotect`/`VirtualProtect`) before the run, so a thawed `Ro`/`Unmapped` page faults on the JIT
+exactly as on the interpreter (`durable_prot_capture.rs` asserts both). Note module-defined
+`readonly` segments already re-apply on every JIT instantiation; this adds the *runtime*-captured
+map. Still ahead: JIT-side **capture** (reading `GuestWindow` protections out, via the `svm-run`
+`CapPageMap`) so a JIT-frozen artifact records prots too; then §12.4 fiber/dispatch control state.
 
 ### 12.7 Shadow-frame layout
 
