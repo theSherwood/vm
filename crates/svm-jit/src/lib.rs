@@ -942,6 +942,43 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
     cm.run(args, Some(init_mem), Some(SNAP_CAP), None)
 }
 
+/// [`compile_and_run_capture_reserved_with_host_prots`] for a **durable** run (DURABILITY.md §12.8):
+/// arms the per-fiber shadow-SP swap so a freeze that lands while a fiber runs spills into that
+/// fiber's own shadow region (D-fiber-cont option A — the runtime keeps the active shadow-SP word
+/// pointing at the running context's region, swapped on every fiber switch). Pass empty `init_prots`
+/// for a freeze run; pass the captured map for a thaw (it also re-establishes page protections).
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host`].
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.durable = true;
+    cm.run(args, Some(init_mem), Some(SNAP_CAP), None)
+}
+
 /// [`compile_and_run_capture_reserved_with_host`] + the §9/§12 **async-ring host seam**
 /// ([`AsyncHostHooks`]): wires this run's futex-`notify` into the embedder's `Host` so an offload-pool
 /// worker can wake a vCPU parked in `IoRing.submit_async`, and drains the pool before teardown. Use it
@@ -1107,6 +1144,10 @@ pub struct CompiledModule {
     /// Per-page protections to re-establish on the window before a run — the durable-restore
     /// step (DURABILITY.md §12.3). Empty ⇒ none (the common path); set per-run by `run_inner`.
     restore_prots: Vec<WindowProt>,
+    /// This run is **durable** (DURABILITY.md §12.8): the fiber runtime keeps the active shadow-SP
+    /// word pointing at the running context's region (swapped on every fiber switch). `false` (the
+    /// default) ⇒ an ordinary run that never touches the durable reserve. Set per-run at entry.
+    durable: bool,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -1524,6 +1565,7 @@ impl CompiledModule {
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
             restore_prots: Vec::new(),
+            durable: false,
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -1845,8 +1887,12 @@ impl CompiledModule {
             let entry_probe = 0u8;
             let entry_sp = std::hint::black_box(&entry_probe as *const u8 as usize);
             let t = &mut *this;
+            let durable = t.durable;
             t.fiber_rt.as_mut().map(|rt| {
                 rt.set_root_entry_sp(entry_sp);
+                // Arm the durable fiber-switch swap for the root vCPU (DURABILITY.md §12.8): the
+                // window base is known now. (Spawned vCPUs are multi-vCPU durability, Phase 3.2.)
+                rt.set_durable_env(mem_base as u64, durable);
                 fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime)
             })
         };

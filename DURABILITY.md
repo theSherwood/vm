@@ -701,10 +701,19 @@ full `freeze → serialize → restore → thaw ≡ uninterrupted` runs through 
 complete on the interpreter, and now generatively fuzzed**: `durable_fuzz`'s
 `fiber_freeze_thaw_equivalence_over_generated_modules` (+ the `durable_fiber` libFuzzer target)
 drive a root+fiber generator — varying suspend counts, values live across each suspend, multi-point
-resume/suspend — through the freeze→thaw round-trip (R11). 3.2 — multi-vCPU quiesce + per-context layout.
-3.3 — JIT parity (drive real OS threads to safepoints; respect the D57 single-owner protocol;
-**replicate the swap** in the JIT's fiber-switch path). Phase 4 — back-edge polls for bounded
-latency.
+resume/suspend — through the freeze→thaw round-trip (R11).
+
+**3.3 — JIT parity (in progress).** The JIT already runs the transform's instrumented IR, so the
+*thaw arms* (re-issue / re-park) work for free; parity is about porting the *runtime* pieces. Slice
+**3.3.1 landed**: the JIT maintains the per-fiber **shadow-SP swap** in `fiber_resume` (which
+brackets a fiber's residency — entry swaps in, exit swaps back, so `fiber_suspend` needs no change),
+keyed off a `durable` flag + window base armed on the root `FiberRuntime` at entry and a per-`FiberSlot`
+saved-SP. Gated by `compile_and_run_capture_reserved_with_host_durable`; tested by
+`crates/svm/tests/durable_fibers_jit.rs` (each context routes to its own region, cross-checked
+against `svm_interp`'s `SHADOW_*`). Still ahead: **3.3.2** the JIT freeze driver (resume each parked
+*native* stack under UNWINDING to flatten it — the materially-harder part) and **3.3.3** the
+`FrozenFiber` residue export + the cross-backend fiber freeze/thaw property. 3.2 — multi-vCPU
+quiesce + per-context layout. Phase 4 — back-edge polls for bounded latency.
 
 #### 3.1 implementation plan (next-session pickup)
 
