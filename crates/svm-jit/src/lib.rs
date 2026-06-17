@@ -309,6 +309,24 @@ pub enum JitOutcome {
     Exited(i32),
 }
 
+/// Per-page protection to re-establish on a guest window before a run — the durable-restore
+/// step (DURABILITY.md §12.3). One entry per [`DURABLE_SNAPSHOT_PAGE`]-byte page of the window's
+/// backed prefix; pages beyond the prefix (or a `Rw` entry) are left at the default RW. Lets a
+/// thawed guest fault on a restored `Ro`/`Unmapped` page exactly as the frozen one would,
+/// matching the interpreter (`svm-interp`'s `apply_prots`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowProt {
+    Rw,
+    Ro,
+    Unmapped,
+}
+
+/// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
+/// `svm-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
+/// bytes. Host-page-independent for artifact portability; a 4 KiB codec page sits within one host
+/// page, so protecting it protects (at most) its host page — exact on a 4 KiB-page host.
+pub const DURABLE_SNAPSHOT_PAGE: usize = 4096;
+
 /// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
 /// match the codes the lowered checks / the host thunk store into the trap cell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -888,6 +906,42 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
     )
 }
 
+/// [`compile_and_run_capture_reserved_with_host`] that first **re-establishes** a captured
+/// per-page protection map on the window — the durable-restore step (DURABILITY.md §12.3): a
+/// thawed guest faults on a restored `Ro`/`Unmapped` page exactly as the frozen one would,
+/// matching `svm-interp`. `init_prots[i]` is the protection of the backed-prefix page at
+/// `[i*DURABLE_SNAPSHOT_PAGE, …)`; pages beyond `init_prots` (or `Rw`) keep the default RW.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host`].
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_prots(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None, // no sub-window
+        None, // no module resolver
+        None, // no interrupt
+        None, // no fast cap resolver
+        Quota::default(),
+        0, // one-shot path: natural table size
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.run(args, Some(init_mem), Some(SNAP_CAP), None)
+}
+
 /// [`compile_and_run_capture_reserved_with_host`] + the §9/§12 **async-ring host seam**
 /// ([`AsyncHostHooks`]): wires this run's futex-`notify` into the embedder's `Host` so an offload-pool
 /// worker can wake a vCPU parked in `IoRing.submit_async`, and drains the pool before teardown. Use it
@@ -1050,6 +1104,9 @@ pub struct CompiledModule {
     /// Initialized data segments, owned so a run can seed a fresh window (the module may
     /// outlive the borrowed `IrModule`).
     data: Vec<Data>,
+    /// Per-page protections to re-establish on the window before a run — the durable-restore
+    /// step (DURABILITY.md §12.3). Empty ⇒ none (the common path); set per-run by `run_inner`.
+    restore_prots: Vec<WindowProt>,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -1465,6 +1522,7 @@ impl CompiledModule {
             win_size,
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
+            restore_prots: Vec::new(),
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -1699,6 +1757,25 @@ impl CompiledModule {
                     if hi > lo {
                         window.protect_ro(t.sub_base + lo, hi - lo);
                     }
+                }
+            }
+            // Durable restore (DURABILITY.md §12.3): re-establish captured per-page protections
+            // on the freshly-seeded window so a thawed guest faults on an `Ro`/`Unmapped` page
+            // exactly as the frozen one would — matching `svm-interp`'s `apply_prots`. Applied
+            // after the init copy + data segments; `Rw` and tail pages keep the default.
+            for (i, &p) in t.restore_prots.iter().enumerate() {
+                let off = (i * DURABLE_SNAPSHOT_PAGE) as u64;
+                if off >= t.win_mapped as u64 {
+                    break;
+                }
+                match p {
+                    WindowProt::Ro => {
+                        window.protect_ro(t.sub_base + off, DURABLE_SNAPSHOT_PAGE as u64)
+                    }
+                    WindowProt::Unmapped => {
+                        window.protect_none(t.sub_base + off, DURABLE_SNAPSHOT_PAGE as u64)
+                    }
+                    WindowProt::Rw => {}
                 }
             }
             let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;

@@ -513,10 +513,28 @@ non-durable freeze refusal. The **cross-backend** property (`crates/svm/tests/du
 + the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
-Still ahead (Phase 2, escape-TCB): **capturing** real page protections from a running backend
-(interp `Mem` / JIT window) into the image and **re-establishing** them on the restored
-window — the codec now carries prots, but no backend yet feeds or applies them. Then §12.4
-fiber/dispatch control state.
+**Capture + re-establish** landed for the interpreter: `run_capture_reserved_with_host_prots`
+both **seeds** an initial per-page protection map (restore) and **returns** the post-run map
+(freeze) — `CapturedProt` (`Rw`/`Ro`/`Unmapped`/`Backed`) at the fixed `DURABLE_SNAPSHOT_PAGE`
+(= codec `PAGE`) granularity. `crates/svm/tests/durable_prot_capture.rs` shows a D40 `readonly`
+data segment captured as `Ro` and surviving freeze→restore through the codec (where Phase-1's
+flat all-`Rw` image would have lost it), **and** that re-establishing the map on a thawed run
+makes a write to a restored `Ro` page fault — while the same window without it writes through. A
+`Backed` page maps to a freeze refusal / is skipped on restore (D-region: the embedder re-grants
+the region). **JIT re-establish parity** also landed:
+`svm_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map and applies
+it to the freshly-seeded window (`protect_ro` / new `protect_none` via real
+`mprotect`/`VirtualProtect`) before the run, so a thawed `Ro`/`Unmapped` page faults on the JIT
+exactly as on the interpreter (`durable_prot_capture.rs` asserts both). Note module-defined
+`readonly` segments already re-apply on every JIT instantiation; this adds the *runtime*-captured
+map. **JIT-side capture** also landed: `Host::capture_window_prots(data, mapped, npages)`
+reconstructs the window's protection map from the two host-side sources — the module's `readonly`
+data segments (`Ro`) merged with the runtime page-state map (`cap_pages`, populated by Memory-cap
+`map`/`unmap`/`protect`) — mirroring the interpreter's `snapshot_prots`. `durable_prot_capture.rs`
+asserts interp and JIT capture the **same** map for a readonly-segment module, and that a runtime
+`cap_pages` entry overrides the default. So page protections now round-trip on **both** backends,
+both directions. The page-protection story is complete; remaining Phase-2/3 work is §12.4
+fiber/dispatch control state (multi-vCPU / fibers).
 
 ### 12.7 Shadow-frame layout
 
