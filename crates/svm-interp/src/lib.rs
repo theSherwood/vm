@@ -4275,6 +4275,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let memop = *memop;
     let fault_yields = *fault_yields;
 
+    // Reusable scratch for branch edge-args (block parameters). Each taken edge gathers its
+    // args here and swaps the buffer into the frame's value slot, so steady-state branching —
+    // notably a loop back-edge, run every iteration — allocates nothing (the displaced buffer
+    // becomes the next edge's scratch). Lives across the whole `run_inner` call, so the two
+    // buffers ping-pong for free once warmed.
+    let mut edge_buf: Vec<Value> = Vec::new();
+
     // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
     // `return` pops and appends results to the caller (which resumes past the call); a tail
     // call replaces the top in place (O(1) frames). `cont.resume`/`suspend` switch which
@@ -5280,7 +5287,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         step(fuel)?;
         match &block.term {
             Terminator::Br { target, args } => {
-                frames[top].vals = collect(&frames[top].vals, args)?;
+                collect_into(&mut edge_buf, &frames[top].vals, args)?;
+                std::mem::swap(&mut frames[top].vals, &mut edge_buf);
                 frames[top].block = *target as usize;
                 frames[top].inst = 0;
             }
@@ -5296,7 +5304,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 } else {
                     (*else_blk, else_args)
                 };
-                frames[top].vals = collect(&frames[top].vals, edge_args)?;
+                collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
+                std::mem::swap(&mut frames[top].vals, &mut edge_buf);
                 frames[top].block = target as usize;
                 frames[top].inst = 0;
             }
@@ -5307,7 +5316,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             } => {
                 let i = as_i32(get(&frames[top].vals, *idx)?)? as u32 as usize;
                 let (target, edge_args) = targets.get(i).unwrap_or(default);
-                frames[top].vals = collect(&frames[top].vals, edge_args)?;
+                collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
+                std::mem::swap(&mut frames[top].vals, &mut edge_buf);
                 frames[top].block = *target as usize;
                 frames[top].inst = 0;
             }
@@ -10252,6 +10262,22 @@ fn get(vals: &[Value], v: ValIdx) -> Result<Value, Trap> {
 
 fn collect(vals: &[Value], idxs: &[ValIdx]) -> Result<Vec<Value>, Trap> {
     idxs.iter().map(|&v| get(vals, v)).collect()
+}
+
+/// Like [`collect`], but gather into a caller-owned buffer instead of a fresh `Vec`. The
+/// hot-loop branch path (`Br`/`BrIf`/`BrTable`) fills a reusable scratch buffer and then
+/// **swaps** it into the frame's value slot, so a taken edge allocates nothing in steady
+/// state — the back-edge of a loop runs every iteration, where the per-branch `collect`
+/// alloc/free dominated. `dst` is cleared first; on a bad index it returns `Malformed`
+/// (leaving `dst` partially filled, which the caller discards as it traps), exactly as
+/// `collect` would have.
+fn collect_into(dst: &mut Vec<Value>, vals: &[Value], idxs: &[ValIdx]) -> Result<(), Trap> {
+    dst.clear();
+    dst.reserve(idxs.len());
+    for &v in idxs {
+        dst.push(get(vals, v)?);
+    }
+    Ok(())
 }
 
 #[inline]
