@@ -504,15 +504,19 @@ Two derived invariants the fuzzer checks directly:
 TCB; depends on `svm-ir`/`svm-encode`/`svm-interp`, **not** `svm-durable`) implements the
 §12 container: `freeze(module, window, host) -> Vec<u8>` and `restore(artifact, module,
 &mut host) -> window`. Header carries the 256-bit non-crypto instrumented-module digest
-(D-hash); the window image is sparse with zero-page elision (the shadow state rides along);
-Section 3 is the handle table. `crates/svm-snapshot/tests/roundtrip.rs` drives the real
+(D-hash); the window image is sparse with zero-page elision (the shadow state rides along)
+and carries **per-page protection** (`Rw`/`Ro`/`Unmapped`, §12.3) — `freeze_with_prots` /
+`restore_with_prots`, with the flat `freeze`/`restore` treating the window as all-`Rw`
+(`tests/prots.rs`); Section 3 is the handle table. `crates/svm-snapshot/tests/roundtrip.rs` drives the real
 freeze→serialize→restore→thaw on the interpreter and asserts both invariants above plus the
 non-durable freeze refusal. The **cross-backend** property (`crates/svm/tests/durable_jit.rs`
 + the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
-Still ahead: §12.4 fiber/dispatch control state and `svm-mem` page-prot restore (Phase 2,
-escape-TCB).
+Still ahead (Phase 2, escape-TCB): **capturing** real page protections from a running backend
+(interp `Mem` / JIT window) into the image and **re-establishing** them on the restored
+window — the codec now carries prots, but no backend yet feeds or applies them. Then §12.4
+fiber/dispatch control state.
 
 ### 12.7 Shadow-frame layout
 
