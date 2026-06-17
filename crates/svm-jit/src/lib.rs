@@ -1410,6 +1410,7 @@ impl CompiledModule {
             build_clif(
                 &mut module,
                 &ids,
+                &m.funcs,
                 &distinct,
                 cap,
                 fiber,
@@ -1985,6 +1986,7 @@ impl CompiledModule {
             build_clif(
                 &mut self.module,
                 &ids,
+                funcs,
                 &self.distinct,
                 self.cap,
                 self.fiber,
@@ -2357,6 +2359,7 @@ fn compile_child(
         build_clif(
             &mut module,
             &ids,
+            funcs,
             &distinct,
             cap,
             FiberEnv::null(),
@@ -2424,6 +2427,32 @@ fn natural_sig(module: &mut JITModule, f: &Func) -> cranelift_codegen::ir::Signa
     sig_from(module, &f.params, &f.results)
 }
 
+/// Max function results returned **in registers**. Above this the JIT spills results to a
+/// caller-provided memory **return-area (sret) pointer** — like wasm engines do for multi-value —
+/// so a many-result function compiles **uniformly on every target**. (Cranelift's `Tail` calling
+/// convention caps register returns at a per-ABI budget: x86-64 fits 8, aarch64 fewer, so returning
+/// the count in registers was the one place a *valid* module compiled on one supported target and was
+/// rejected on another.) `4` keeps every real signature — including the §12 `(sp,arg)->i64` fiber/
+/// thread entry and the multi-result test cases — on the fast register path, while being safely
+/// within the tightest target's budget; only `>4`-result functions take the sret path. The decision
+/// is by result **count**, a property of the function *type*, so it is identical at every call site —
+/// direct, `call_indirect` (its type id pins the same choice), and tail calls.
+const MAX_REG_RESULTS: usize = 4;
+
+/// Whether a function with these results returns via the memory return-area pointer (sret) rather
+/// than registers — see [`MAX_REG_RESULTS`].
+fn uses_sret(results: &[ValType]) -> bool {
+    results.len() > MAX_REG_RESULTS
+}
+
+/// The sret return-area uses 8-byte slots (`encode_slot`/`decode_slot`, the buffer-ABI encoding), so
+/// a `v128` result cannot be carried through it. A `>4`-result signature containing a `v128` is
+/// therefore rejected uniformly (`Unsupported`) rather than miscompiled — an exotic non-case (`v128`
+/// buffer slots are already out of MVP scope, §17), and the interpreter still covers it.
+fn sret_blocked_by_v128(results: &[ValType]) -> bool {
+    uses_sret(results) && results.iter().any(|t| matches!(t, ValType::V128))
+}
+
 /// The natural signature for an explicit param/result list (shared by `natural_sig`
 /// and the `call_indirect` signature import).
 fn sig_from(
@@ -2438,11 +2467,20 @@ fn sig_from(
     sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
     sig.params.push(AbiParam::new(I64)); // trap_out (host-owned trap cell)
+    let sret = uses_sret(results);
+    if sret {
+        // The return-area pointer: the callee writes its results here (8-byte slots) instead of
+        // returning them in registers, so the result count is target-independent. Placed right
+        // after the context pointers, before the user params — the order every call site mirrors.
+        sig.params.push(AbiParam::new(I64));
+    }
     for p in params {
         sig.params.push(AbiParam::new(clif_ty(*p)));
     }
-    for r in results {
-        sig.returns.push(AbiParam::new(clif_ty(*r)));
+    if !sret {
+        for r in results {
+            sig.returns.push(AbiParam::new(clif_ty(*r)));
+        }
     }
     sig
 }
@@ -2450,6 +2488,27 @@ fn sig_from(
 /// Reject functions using any op outside the integer slice, so `build_clif` can lower
 /// the remainder totally. Keeping the check separate keeps the lowering readable.
 fn ensure_supported(f: &Func) -> Result<(), JitError> {
+    // The sret return-area (used for `>MAX_REG_RESULTS` results) carries 8-byte slots, so a
+    // many-result signature containing a `v128` can't pass through it — reject uniformly on every
+    // target (the interpreter still covers it). This function's own results + any indirect
+    // call/tail-call target type; direct callees are checked as their own definitions.
+    if sret_blocked_by_v128(&f.results) {
+        return Err(JitError::Unsupported("v128 in a many-result signature"));
+    }
+    for blk in &f.blocks {
+        if let Terminator::ReturnCallIndirect { ty, .. } = &blk.term {
+            if sret_blocked_by_v128(&ty.results) {
+                return Err(JitError::Unsupported("v128 in a many-result signature"));
+            }
+        }
+        for inst in &blk.insts {
+            if let Inst::CallIndirect { ty, .. } = inst {
+                if sret_blocked_by_v128(&ty.results) {
+                    return Err(JitError::Unsupported("v128 in a many-result signature"));
+                }
+            }
+        }
+    }
     for blk in &f.blocks {
         for inst in &blk.insts {
             match inst {
@@ -2663,8 +2722,16 @@ struct Lower<'a> {
     epoch_addr: i64,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
+    /// The functions of this compilation unit, indexed like [`Self::ids`], so a **direct** `call`
+    /// can read its callee's result types to decide the sret ABI (see [`uses_sret`]). `call_indirect`
+    /// uses its own carried type instead.
+    funcs: &'a [Func],
     /// Distinct module signatures, for `call_indirect` type ids.
     distinct: &'a [FuncType],
+    /// The current function's **return-area pointer** variable when it returns via sret
+    /// ([`uses_sret`] of its results), else `None`. A `Return` stores results through it; a tail
+    /// call forwards it (the tail callee shares the caller's result type, so its sret-ness matches).
+    sret_var: Option<Variable>,
 }
 
 /// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
@@ -2681,6 +2748,7 @@ struct Lower<'a> {
 fn build_clif(
     module: &mut JITModule,
     ids: &[FuncId],
+    funcs: &[Func],
     distinct: &[FuncType],
     cap: CapEnv,
     fiber: FiberEnv,
@@ -2711,10 +2779,14 @@ fn build_clif(
             b.append_block_param(blocks[i], clif_ty(*p));
         }
     }
+    let sret = uses_sret(&f.results);
     let entry = b.create_block();
     b.append_block_param(entry, I64); // mem_base
     b.append_block_param(entry, I64); // fn_table_base
     b.append_block_param(entry, I64); // trap_out
+    if sret {
+        b.append_block_param(entry, I64); // return-area pointer (results spilled here, not returned)
+    }
     for p in &f.params {
         b.append_block_param(entry, clif_ty(*p));
     }
@@ -2731,10 +2803,20 @@ fn build_clif(
     b.def_var(fn_table_var, fn_table_base);
     let trap_var = b.declare_var(I64);
     b.def_var(trap_var, trap_out);
+    // The return-area pointer (when sret) is likewise needed in the `Return`/tail-call blocks.
+    let sret_var = if sret {
+        let var = b.declare_var(I64);
+        b.def_var(var, b.block_params(entry)[3]);
+        Some(var)
+    } else {
+        None
+    };
     let lower = Lower {
         mem_var,
         fn_table_var,
         trap_var,
+        sret_var,
+        funcs,
         result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
         mapped,
@@ -2749,11 +2831,13 @@ fn build_clif(
         distinct,
     };
 
-    // Jump into IR block 0 passing the function parameters (entry params after the
-    // three context pointers). A §5 kill-path check guards the *entry* (caught before any work):
-    // this is what stops unbounded recursion and tail-call loops — each (re-)entry polls the
-    // interrupt cell. Intra-function loops are caught by the per-back-edge check in `lower_block`.
-    let entry_args: Vec<BlockArg> = b.block_params(entry)[3..]
+    // Jump into IR block 0 passing the function parameters (entry params after the three context
+    // pointers, plus the sret pointer when present). A §5 kill-path check guards the *entry* (caught
+    // before any work): this is what stops unbounded recursion and tail-call loops — each (re-)entry
+    // polls the interrupt cell. Intra-function loops are caught by the per-back-edge check in
+    // `lower_block`.
+    let pbase = 3 + usize::from(sret);
+    let entry_args: Vec<BlockArg> = b.block_params(entry)[pbase..]
         .iter()
         .map(|v| BlockArg::from(*v))
         .collect();
@@ -2795,8 +2879,14 @@ fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncI
     let fn_table_base = b.block_params(blk)[3];
     let trap_out = b.block_params(blk)[4];
 
-    // Decode args (context pointers first), call the entry, store results.
+    // Decode args (context pointers first), call the entry, store results. When the entry returns
+    // via sret, hand it `results_ptr` directly as the return-area pointer — it writes its results
+    // (8-byte `encode_slot` slots) straight into the buffer Rust reads, so no register read-back.
+    let sret = uses_sret(&entry.results);
     let mut call_args = vec![mem_base, fn_table_base, trap_out];
+    if sret {
+        call_args.push(results_ptr);
+    }
     for (i, p) in entry.params.iter().enumerate() {
         let slot = b
             .ins()
@@ -2805,11 +2895,13 @@ fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncI
     }
     let callee = module.declare_func_in_func(entry_id, b.func);
     let call = b.ins().call(callee, &call_args);
-    let rets: Vec<Value> = b.inst_results(call).to_vec();
-    for (i, r) in rets.iter().enumerate() {
-        let slot = encode_slot(&mut b, *r);
-        b.ins()
-            .store(MemFlags::trusted(), slot, results_ptr, (i * 8) as i32);
+    if !sret {
+        let rets: Vec<Value> = b.inst_results(call).to_vec();
+        for (i, r) in rets.iter().enumerate() {
+            let slot = encode_slot(&mut b, *r);
+            b.ins()
+                .store(MemFlags::trusted(), slot, results_ptr, (i * 8) as i32);
+        }
     }
     b.ins().return_(&[]);
     b.seal_all_blocks();
@@ -2939,16 +3031,23 @@ fn lower_block(
         if let Inst::Call { func, args } = inst {
             let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
             let callee = module.declare_func_in_func(callee_id, b.func);
+            let results = &lower
+                .funcs
+                .get(*func as usize)
+                .ok_or(JitError::Malformed)?
+                .results;
             let mut cargs = ctx_args(b, lower);
+            let sret = sret_call_slot(b, &mut cargs, results);
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
             let call = b.ins().call(callee, &cargs);
             // A trap raised inside the callee leaves the trap cell set and returns zeros; propagate
             // it here so it unwinds immediately (else the caller would run on with bogus results,
-            // and a later successful `cap.call` could reset the cell, masking the trap).
+            // and a later successful `cap.call` could reset the cell, masking the trap). On the sret
+            // path this also returns *before* reading the unwritten return-area slots.
             emit_trap_propagate(b, lower);
-            vals.extend_from_slice(b.inst_results(call));
+            read_call_results(b, call, sret, results, &mut vals);
             ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
         }
@@ -2956,13 +3055,14 @@ fn lower_block(
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
             let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);
+            let sret = sret_call_slot(b, &mut cargs, &ty.results);
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
             let call = b.ins().call_indirect(sig, code, &cargs);
             // Propagate a callee trap immediately (see the direct-call case above).
             emit_trap_propagate(b, lower);
-            vals.extend_from_slice(b.inst_results(call));
+            read_call_results(b, call, sret, &ty.results, &mut vals);
             ubs.resize(vals.len(), UB_TOP); // call results are unknown
             continue;
         }
@@ -3657,18 +3757,35 @@ fn lower_block(
             b.ins().br_table(index, jt);
         }
         Terminator::Return(outs) => {
-            // Natural ABI: return the result values directly (CLIF multi-return).
             let rets: Vec<Value> = outs
                 .iter()
                 .map(|o| get(&vals, *o))
                 .collect::<Result<_, _>>()?;
-            b.ins().return_(&rets);
+            if let Some(sret_var) = lower.sret_var {
+                // sret ABI: write each result into the caller-provided return-area (8-byte slots,
+                // `encode_slot`-encoded like the buffer ABI), then return void.
+                let ptr = b.use_var(sret_var);
+                for (i, r) in rets.iter().enumerate() {
+                    let slot = encode_slot(b, *r);
+                    b.ins()
+                        .store(MemFlags::trusted(), slot, ptr, (i * 8) as i32);
+                }
+                b.ins().return_(&[]);
+            } else {
+                // Natural ABI: return the result values directly (CLIF multi-return).
+                b.ins().return_(&rets);
+            }
         }
         Terminator::ReturnCall { func, args } => {
             // Tail call (§3b): replace this frame with the callee, threading the context.
             let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
             let callee = module.declare_func_in_func(callee_id, b.func);
             let mut cargs = ctx_args(b, lower);
+            // The tail callee shares this function's result type (verifier-enforced), so its sret-ness
+            // matches ours: when we return via sret, forward our own return-area pointer.
+            if let Some(sret_var) = lower.sret_var {
+                cargs.push(b.use_var(sret_var));
+            }
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
@@ -3679,6 +3796,11 @@ fn lower_block(
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
             let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);
+            // `ty.results` equals this function's results (tail-call contract), so sret-ness matches:
+            // forward our return-area pointer when we return via sret.
+            if let Some(sret_var) = lower.sret_var {
+                cargs.push(b.use_var(sret_var));
+            }
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
@@ -3701,6 +3823,48 @@ fn ctx_args(b: &mut FunctionBuilder, lower: &Lower) -> Vec<Value> {
     ]
 }
 
+/// For a callee whose `results` use the sret ABI ([`uses_sret`]), allocate a stack **return-area**,
+/// push its address onto `cargs` (right after the context pointers, before the user args — the order
+/// [`sig_from`] lays out), and return the slot; else push nothing and return `None`.
+fn sret_call_slot(
+    b: &mut FunctionBuilder,
+    cargs: &mut Vec<Value>,
+    results: &[ValType],
+) -> Option<cranelift_codegen::ir::StackSlot> {
+    if !uses_sret(results) {
+        return None;
+    }
+    let ss = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        (results.len() * 8) as u32,
+        3, // 8-byte aligned slots
+    ));
+    let addr = b.ins().stack_addr(I64, ss, 0);
+    cargs.push(addr);
+    Some(ss)
+}
+
+/// Append a call's results to `vals`: from registers ([`FunctionBuilder::inst_results`]) on the
+/// normal path, or by loading the sret return-area's 8-byte slots ([`decode_slot`]-encoded, matching
+/// the storing `Return`) on the sret path.
+fn read_call_results(
+    b: &mut FunctionBuilder,
+    call: cranelift_codegen::ir::Inst,
+    sret: Option<cranelift_codegen::ir::StackSlot>,
+    results: &[ValType],
+    vals: &mut Vec<Value>,
+) {
+    match sret {
+        None => vals.extend_from_slice(b.inst_results(call)),
+        Some(ss) => {
+            for (i, r) in results.iter().enumerate() {
+                let raw = b.ins().stack_load(I64, ss, (i * 8) as i32);
+                vals.push(decode_slot(b, raw, *r));
+            }
+        }
+    }
+}
+
 /// Lower a trap (§5 detect-and-kill): store the kind code into the host trap cell, then
 /// `return` dummy zero results so the run unwinds to the trampoline, which reports the
 /// trap. (The reference JIT detects traps this way; production uses hardware faults.)
@@ -3712,8 +3876,19 @@ fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
     let cell = b.use_var(lower.trap_var);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
     b.ins().store(MemFlags::trusted(), code, cell, 0);
-    let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
-    b.ins().return_(&zeros);
+    emit_trap_return(b, lower);
+}
+
+/// Emit the function `return` on a trap / early-exit path: **void** for an sret function (its results
+/// flow through the return-area pointer, left unwritten — the trap cell is set, so the caller returns
+/// before reading them), else dummy zeros of the result types (the register-ABI convention).
+fn emit_trap_return(b: &mut FunctionBuilder, lower: &Lower) {
+    if lower.sret_var.is_some() {
+        b.ins().return_(&[]);
+    } else {
+        let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
+        b.ins().return_(&zeros);
+    }
 }
 
 /// Emit the §5 fuel/epoch **kill-path** check: if the host has set the interrupt cell non-zero
@@ -3803,8 +3978,7 @@ fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     b.ins().brif(trapped, trapret, &[], cont, &[]);
     b.switch_to_block(trapret);
     b.seal_block(trapret);
-    let zeros: Vec<Value> = lower.result_tys.iter().map(|t| zero_of(b, *t)).collect();
-    b.ins().return_(&zeros);
+    emit_trap_return(b, lower);
     b.switch_to_block(cont);
     b.seal_block(cont);
 }
