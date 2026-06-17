@@ -54,7 +54,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text); chibicc `-g` emits `debug.var` + `debug.loc` + `debug.type`/`debug.field`** (D-DBG-7/§6; binary section pending; DAP consumer of types pending) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-interp`, `codegen_ir.c` |
-| DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
+| DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -588,8 +588,8 @@ window and formatted per their `TypeDef` (signed/unsigned/float/`_Bool`/pointer-
 come from the frame's data-SP (`read_ir_value(frame, 0)`) plus the `Window` offset; `seek`/resume
 clear the place table (the addresses go stale). Test (`dap.rs`): a guest fills a `struct {int x,y}`
 and an `int[3]`, and the scripted conversation expands `p` → `x=11, y=22` and `row` → `[0]=100,
-[1]=200, [2]=300`. The `evaluate` member/index half landed in slice 10 (below); still open:
-pointer-deref *expansion* in the Variables pane and richer render names (the C tag, e.g.
+[1]=200, [2]=300`. The `evaluate` member/index half landed in slice 10 and pointer-deref
+expansion in slice 11 (both below); still open: richer render names (the C tag, e.g.
 `"struct Point"`).
 
 **Built — `evaluate` member / index / arrow access (W4 slice 10, the consumer half completed).**
@@ -602,8 +602,8 @@ pure address arithmetic over `TypeDef` + window reads, no `svm-ir`/frontend type
 itself. `eval_int` (conditional breakpoints) is unchanged, now a thin wrapper over the same core.
 Tests (`dap.rs`): member/index/mixed arithmetic over a struct+array, and `->`/pointer-indexing
 through a pointer; bad accesses (`p.nope`, `p.x.y`, `pp->x->y`) fail cleanly. *Not yet:*
-pointer-deref expansion (Variables pane), floats / short-circuit `&&`/`||`, and richer render
-names.
+floats / short-circuit `&&`/`||`, and richer render names. (Pointer-deref *expansion* in the
+Variables pane landed in slice 11.)
 
 **Built — frontend-neutrality cleanup (W4 slice 9).** Scalar read widths now come from the
 structured type's `size` (`scalar_width` → `TypeDef.size`), not the variable's *name*; the old
@@ -1021,16 +1021,24 @@ naming a `Place` (thread + window address + `TypeId`), and a `variables` request
 fields/elements — recursively for nested aggregates, scalar leaves read from the window and
 formatted per `TypeDef`. Full design in §7.
 
-**Slice 10 — `evaluate` member / index / arrow.** Completes the consumer half: `evaluate` resolves
+**Slice 10 — `evaluate` member / index / arrow.** Completes the `evaluate` half: `evaluate` resolves
 `a.b` / `arr[i]` / `p->x` (and mixes like `p.x + arr[i]`) over the structured types. The `expr`
 evaluator grew a frontend-agnostic `Resolver` trait + a `Value` (`Int | Place`); `svm-dap`'s
 `EvalEnv` implements the navigation as address arithmetic over `TypeDef` + window reads. Full
 design in §7.
 
-**Not yet (next slices):** pointer-deref *expansion* in the Variables pane; richer type render
-names; the LLVM/wasm `debug.loc` + type ingest sides; binary serialization of the debug
-section; and the remaining W4 refinement (per-block `LocList` so promoted scalars are debuggable
-without `-Og`, per-producer rich blob). (Multithreaded debugging and the interpreter-backed DAP
+**Slice 11 — pointer-deref expansion (Variables pane).** A pointer local/field is now expandable:
+its row shows the address (`0x…`, read from the window) and expands to a single synthetic `*`
+child — the pointee at the dereferenced address, itself expandable if it's a struct/array/pointer.
+A null pointer shows a `<null>` leaf, an unreadable one `<unreadable>` (lazy, so a self-referential
+`struct Node { Node *next; }` walks one level per click). `is_expandable` now covers `Pointer`, and
+an expandable row's summary comes from a memory-aware `place_summary`. Test (`dap.rs`): a `pp`
+→ `struct Point *` expands `pp` (`0x410`) → `*` (`{...}`) → `x=7, y=9`.
+
+**Not yet (next slices):** richer type render names (the C tag, e.g. `"struct Point"`); the
+LLVM/wasm `debug.loc` + type ingest sides; binary serialization of the debug section; and the
+remaining W4 refinement (per-block `LocList` so promoted scalars are debuggable without `-Og`,
+per-producer rich blob). (Multithreaded debugging and the interpreter-backed DAP
 server are already built — Milestone B and W5 slices 1–6.)
 
 ### Open questions (S4/S5/S2)

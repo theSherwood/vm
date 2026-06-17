@@ -483,13 +483,9 @@ impl DapServer {
                 (loc, type_id.filter(|&t| self.is_expandable(t)))
             {
                 if let Some(base) = self.var_base_addr(frame_idx, off) {
+                    let summary = self.place_summary(base, tid_ref);
                     let vr = self.alloc_place(tid, base, tid_ref);
-                    out.push(var_json(
-                        &name,
-                        &type_summary(self.types(), tid_ref),
-                        &ty,
-                        vr,
-                    ));
+                    out.push(var_json(&name, &summary, &ty, vr));
                     continue;
                 }
             }
@@ -526,6 +522,20 @@ impl DapServer {
                     members.push((format!("[{i}]"), base + i * stride, *elem));
                 }
             }
+            // A pointer expands to its pointee under a synthetic `*` child (`*p`).
+            TypeDef::Pointer { pointee, .. } => {
+                let session = self.session.as_ref()?;
+                match session
+                    .inspector
+                    .read_window(base, 8)
+                    .map(|b| le_uint(&b, 8))
+                {
+                    // A null pointer has no pointee; an unreadable one can't be followed.
+                    Ok(0) => return Some(vec![var_json("*", "<null>", "", 0)]),
+                    Err(_) => return Some(vec![var_json("*", "<unreadable>", "", 0)]),
+                    Ok(ptr) => members.push(("*".to_string(), ptr, *pointee)),
+                }
+            }
             _ => return Some(vec![]),
         }
 
@@ -533,8 +543,9 @@ impl DapServer {
         for (name, addr, mty) in members {
             let ty_name = type_render_name(&types, mty);
             if self.is_expandable(mty) {
+                let summary = self.place_summary(addr, mty);
                 let vr = self.alloc_place(tid, addr, mty);
-                out.push(var_json(&name, &type_summary(&types, mty), &ty_name, vr));
+                out.push(var_json(&name, &summary, &ty_name, vr));
             } else {
                 let size = type_size(&types, mty) as usize;
                 let session = self.session.as_ref()?;
@@ -564,12 +575,30 @@ impl DapServer {
         Some(sp.wrapping_add(off as u64))
     }
 
-    /// Does this type expand into members (struct/array)? Pointers render as a scalar address.
+    /// Does this type expand into children — a struct's fields, an array's elements, or a
+    /// pointer's pointee (`*p`)?
     fn is_expandable(&self, type_id: TypeId) -> bool {
         matches!(
             self.types().get(type_id as usize),
-            Some(TypeDef::Aggregate { .. } | TypeDef::Array { .. })
+            Some(TypeDef::Aggregate { .. } | TypeDef::Array { .. } | TypeDef::Pointer { .. })
         )
+    }
+
+    /// The value summary shown next to an expandable variable: a struct/array uses the static
+    /// [`type_summary`]; a pointer shows its current address (read from the window).
+    fn place_summary(&self, addr: u64, type_id: TypeId) -> String {
+        let types = self.types();
+        if matches!(types.get(type_id as usize), Some(TypeDef::Pointer { .. })) {
+            return match self
+                .session
+                .as_ref()
+                .and_then(|s| s.inspector.read_window(addr, 8).ok())
+            {
+                Some(bytes) => format!("0x{:x}", le_uint(&bytes, 8)),
+                None => "<unreadable>".to_string(),
+            };
+        }
+        type_summary(types, type_id)
     }
 
     /// Borrow the structured type table (empty if no debug info).

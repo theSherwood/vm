@@ -1338,3 +1338,59 @@ fn dap_evaluate_pointer_arrow_and_index() {
         "arrow through a non-pointer fails"
     );
 }
+
+/// The Locals `variablesReference` for the given frame (`scopes` → first scope).
+fn scope_ref(s: &mut DapServer, fid: i64) -> i64 {
+    let out = s.handle(&req(
+        6,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(fid))]),
+    ));
+    response(&out)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap()
+}
+
+/// `variables` on a reference, as a name → (value, variablesReference) map.
+fn variables(s: &mut DapServer, vref: i64) -> std::collections::HashMap<String, (String, i64)> {
+    let out = s.handle(&req(
+        7,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(vref))]),
+    ));
+    vars_map(&out)
+}
+
+#[test]
+fn dap_expands_a_pointer_to_its_pointee() {
+    // POINTER_DBG: `pp` (at +0) points at a `struct Point {x=7,y=9}` at +16; data-SP arg 1024,
+    // so the stored pointer value is 1040 (= 0x410).
+    let mut s = DapServer::new();
+    let fid = launch_and_break(&mut s, POINTER_DBG, "/work/p.c", 3);
+    let sref = scope_ref(&mut s, fid);
+
+    // The pointer local shows its address and is expandable (not a bare scalar).
+    let locals = variables(&mut s, sref);
+    let (summary, pp_ref) = locals.get("pp").expect("local pp");
+    assert_eq!(summary, "0x410", "pointer shows its hex value");
+    assert!(*pp_ref >= (1 << 20), "pointer is expandable");
+
+    // Expanding the pointer yields a single `*` child — the pointee struct, itself expandable.
+    let deref = variables(&mut s, *pp_ref);
+    let (star_summary, star_ref) = deref.get("*").expect("deref child");
+    assert_eq!(star_summary, "{...}", "pointee is the struct");
+    assert!(*star_ref >= (1 << 20), "pointee struct is expandable");
+
+    // And through it, the struct's fields read correctly.
+    let fields = variables(&mut s, *star_ref);
+    assert_eq!(fields.get("x").map(|(v, _)| v.as_str()), Some("7"));
+    assert_eq!(fields.get("y").map(|(v, _)| v.as_str()), Some("9"));
+}
