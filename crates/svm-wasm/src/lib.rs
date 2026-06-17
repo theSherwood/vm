@@ -31,14 +31,14 @@
 //! masked load/store, splat, extract/replace_lane, integer-/float-lane arithmetic, bitwise +
 //! `bitselect`, `shuffle`/`swizzle` — a real `clang -msimd128 -O2` saxpy transpiles to verified
 //! SIMD IR, `tests/simd.rs`) · **§12 wasm threads**: the full-width (i32/i64) `*.atomic.*` ops map
-//! 1:1 onto SVM's IR atomics (`tests/atomics.rs`), **shared** + **imported** memory are accepted,
-//! and the **wasi-threads** ABI lowers to SVM's *native* `thread.spawn` — a `wasi:thread/spawn`
-//! import becomes a real OS-thread vCPU over the shared window via a synthesized shim (concurrency in
-//! the VM, DESIGN §1a; the same bytes `wasmtime-wasi-threads` runs — `tests/threads.rs`). Still a
-//! clean [`Error::Unsupported`] (the niche features typical clang output doesn't emit): **narrow**
-//! atomics (`*.atomic.rmw8`/`load16_u`/… — SVM atomics are 32/64-bit only); the `table.*` bulk ops
-//! and passive *element* segments; imported table/global/tag; imports across multiple capability
-//! interfaces (incl. wasi:thread/spawn *alongside* capability imports — the per-thread handle stash);
+//! 1:1 onto SVM's IR atomics (`tests/atomics.rs`), the **narrow** (8/16-bit) `*.atomic.*` forms
+//! emulate via a 32-bit word-CAS loop (the i64 32-bit forms are word-sized natives), **shared** +
+//! **imported** memory are accepted, and the **wasi-threads** ABI lowers to SVM's *native*
+//! `thread.spawn` — a `wasi:thread/spawn` import becomes a real OS-thread vCPU over the shared window
+//! via a synthesized shim (concurrency in the VM, DESIGN §1a; the same bytes `wasmtime-wasi-threads`
+//! runs — `tests/threads.rs`). Still a clean [`Error::Unsupported`] (the niche features typical clang
+//! output doesn't emit): the `table.*` bulk ops and passive *element* segments; imported
+//! table/global/tag; wasi:thread/spawn *alongside* capability imports (the per-thread handle stash);
 //! reference types; multi-memory/multi-table. **Passive data segments + `memory.init`/`data.drop`**
 //! are supported (a constant-offset init unrolls to const-stores of the segment's known bytes).
 
@@ -2034,6 +2034,383 @@ fn atomic_notify(lo: &mut Lower, m: MemArg) -> Result<(), Error> {
     Ok(())
 }
 
+// ---- narrow (sub-word) atomics: emulate via a 32-bit word CAS loop ----
+//
+// SVM IR atomics are 32/64-bit only, but wasm has 8/16-bit (and i64's 32-bit) atomic
+// load/store/rmw/cmpxchg. A *naturally aligned* narrow access lies entirely within one 32-bit word
+// (wasm requires natural alignment for atomics), so we operate on the **containing word** atomically:
+//   - load: atomic word-load, then shift+mask the sub-word out (zero-extended).
+//   - store/rmw/cmpxchg: a compare-and-swap loop on the word that splices the new sub-word in,
+//     retrying until the word CAS lands (a concurrent change to an adjacent byte just retries).
+// The i64 **32-bit** forms are word-sized (not sub-word): a native i32 atomic op, zero-extended.
+//
+// Note: like SVM's §1a OOB-masking (confine, don't trap), a *misaligned* narrow atomic is not
+// trapped — a valid wasm module never emits one (the validator + toolchain guarantee alignment), so
+// the word-CAS is always exact for the programs we accept.
+
+/// The low-`w`-byte mask as an i32 (`w` ∈ {1,2}): `0xFF` / `0xFFFF`.
+fn sub_mask(w: u32) -> i32 {
+    ((1u64 << (w * 8)) - 1) as i32
+}
+
+/// Wrap an `i64` operand down to `i32` for the sub-word word-math (the sub-word is ≤16 bits, so the
+/// low 32 bits suffice); an `i32` operand passes through.
+fn wrap_i32(lo: &mut Lower, src: IntTy, v: ValIdx) -> ValIdx {
+    match src {
+        IntTy::I32 => v,
+        IntTy::I64 => lo.emit(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: v,
+        }),
+    }
+}
+
+/// Zero-extend a sub-word `i32` result back to the op's destination width (`i64` ops wrap operands to
+/// i32 for the word-math, then zero-extend the result).
+fn zext_result(lo: &mut Lower, dst: IntTy, v: ValIdx) -> ValIdx {
+    match dst {
+        IntTy::I32 => v,
+        IntTy::I64 => lo.emit(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: v,
+        }),
+    }
+}
+
+/// Pop the address (folding the memarg offset) and split it into `(word_addr = addr & ~3, shift =
+/// (addr & 3) * 8)` — the inputs every sub-word atomic needs. `shift` is an i32 bit-count (0/8/16/24).
+fn narrow_word(lo: &mut Lower, offset: u64) -> Result<(ValIdx, ValIdx), Error> {
+    let addr = pop_atomic_addr(lo, offset)?; // i64, offset folded
+    let three = lo.emit(Inst::ConstI64(3));
+    let byte = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::And,
+        a: addr,
+        b: three,
+    });
+    let neg4 = lo.emit(Inst::ConstI64(!3i64));
+    let word_addr = lo.emit(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::And,
+        a: addr,
+        b: neg4,
+    });
+    let byte32 = lo.emit(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: byte,
+    });
+    let eight = lo.emit(Inst::ConstI32(8));
+    let shift = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Mul,
+        a: byte32,
+        b: eight,
+    });
+    Ok((word_addr, shift))
+}
+
+/// `<i>.atomic.load{8,16}_u` (sub-word) / `i64.atomic.load32_u` (word-sized): atomic load, then for a
+/// sub-word width extract+zero-extend the lane.
+fn narrow_atomic_load(lo: &mut Lower, dst: IntTy, w: u32, m: MemArg) -> Result<(), Error> {
+    if w == 4 {
+        // i64.atomic.load32_u: word-sized — native i32 atomic load, zero-extended to i64.
+        let addr = pop_addr(lo)?;
+        let word = lo.emit(Inst::AtomicLoad {
+            ty: IntTy::I32,
+            addr,
+            offset: m.offset,
+            order: Ordering::SeqCst,
+        });
+        let v = zext_result(lo, dst, word);
+        lo.push(v, int_vt(dst));
+        return Ok(());
+    }
+    let (word_addr, shift) = narrow_word(lo, m.offset)?;
+    let word = lo.emit(Inst::AtomicLoad {
+        ty: IntTy::I32,
+        addr: word_addr,
+        offset: 0,
+        order: Ordering::SeqCst,
+    });
+    let shifted = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::ShrU,
+        a: word,
+        b: shift,
+    });
+    let submask = lo.emit(Inst::ConstI32(sub_mask(w)));
+    let sub = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::And,
+        a: shifted,
+        b: submask,
+    });
+    let v = zext_result(lo, dst, sub);
+    lo.push(v, int_vt(dst));
+    Ok(())
+}
+
+/// Which sub-word write a CAS loop performs.
+enum SubAtomic {
+    Store,
+    Rmw(AtomicRmwOp),
+    Cmpxchg,
+}
+
+/// `<i>.atomic.{store,rmwN.*,cmpxchg}{8,16}` (sub-word, `w` ∈ {1,2}): a 32-bit word CAS loop that
+/// splices the new sub-word into the containing word, retrying until the word CAS lands. Store pushes
+/// nothing; rmw/cmpxchg push the (zero-extended) **old** sub-word.
+fn narrow_sub_word(
+    lo: &mut Lower,
+    dst: IntTy,
+    w: u32,
+    kind: SubAtomic,
+    m: MemArg,
+) -> Result<(), Error> {
+    let cmpxchg = matches!(kind, SubAtomic::Cmpxchg);
+    let want_result = !matches!(kind, SubAtomic::Store);
+    // Operands (wrapped to i32 for the word-math). cmpxchg: [expected, replacement]; else: [value]
+    // (carried in `a`; `b` is unused but threaded uniformly to keep the loop layout fixed).
+    let (a, b) = if cmpxchg {
+        let (rep, _) = lo.pop()?;
+        let (exp, _) = lo.pop()?;
+        (wrap_i32(lo, dst, exp), wrap_i32(lo, dst, rep))
+    } else {
+        let (val, _) = lo.pop()?;
+        let v = wrap_i32(lo, dst, val);
+        (v, v)
+    };
+    let (word_addr, shift) = narrow_word(lo, m.offset)?;
+    let old0 = lo.emit(Inst::AtomicLoad {
+        ty: IntTy::I32,
+        addr: word_addr,
+        offset: 0,
+        order: Ordering::SeqCst,
+    });
+
+    // The loop carries: prefix ++ operand-stack ++ [word_addr i64, shift i32, a i32, b i32, old i32].
+    let below_t: Vec<ValType> = lo.stack.iter().map(|(_, t)| *t).collect();
+    let below_v = lo.stack_vals();
+    let extra_t = [
+        ValType::I64,
+        ValType::I32,
+        ValType::I32,
+        ValType::I32,
+        ValType::I32,
+    ];
+    let body_sig = lo.synth_sig(&below_t, &extra_t);
+    let body = lo.new_block(body_sig);
+    let exit_extra: &[ValType] = if want_result { &[ValType::I32] } else { &[] };
+    let exit_sig = lo.synth_sig(&below_t, exit_extra);
+    let exit = lo.new_block(exit_sig);
+
+    let args = lo.synth_args(&below_v, &[word_addr, shift, a, b, old0]);
+    lo.set_term(Terminator::Br {
+        target: body as u32,
+        args,
+    });
+
+    // body: splice, CAS, retry on failure.
+    let bx = lo.enter_synth(body, &below_t, 5);
+    let (wa, sh, a, b, old_word) = (bx[0], bx[1], bx[2], bx[3], bx[4]);
+    let submask = lo.emit(Inst::ConstI32(sub_mask(w)));
+    let mask = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Shl,
+        a: submask,
+        b: sh,
+    });
+    let all_ones = lo.emit(Inst::ConstI32(-1));
+    let notmask = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Xor,
+        a: mask,
+        b: all_ones,
+    });
+    // old_sub = (old_word >> shift) & submask
+    let shifted = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::ShrU,
+        a: old_word,
+        b: sh,
+    });
+    let old_sub = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::And,
+        a: shifted,
+        b: submask,
+    });
+    // new_sub by kind.
+    let new_sub = match &kind {
+        SubAtomic::Store => a,
+        SubAtomic::Rmw(AtomicRmwOp::Xchg) => a,
+        SubAtomic::Rmw(op) => {
+            let bin = match op {
+                AtomicRmwOp::Add => BinOp::Add,
+                AtomicRmwOp::Sub => BinOp::Sub,
+                AtomicRmwOp::And => BinOp::And,
+                AtomicRmwOp::Or => BinOp::Or,
+                AtomicRmwOp::Xor => BinOp::Xor,
+                AtomicRmwOp::Xchg => unreachable!("handled above"),
+            };
+            lo.emit(Inst::IntBin {
+                ty: IntTy::I32,
+                op: bin,
+                a: old_sub,
+                b: a,
+            })
+        }
+        SubAtomic::Cmpxchg => {
+            // (old_sub == expected) ? replacement : old_sub
+            let eq = lo.emit(Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: old_sub,
+                b: a,
+            });
+            lo.emit(Inst::Select {
+                cond: eq,
+                a: b,
+                b: old_sub,
+            })
+        }
+    };
+    // new_word = (old_word & ~mask) | ((new_sub << shift) & mask)
+    let cleared = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::And,
+        a: old_word,
+        b: notmask,
+    });
+    let placed_raw = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Shl,
+        a: new_sub,
+        b: sh,
+    });
+    let placed = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::And,
+        a: placed_raw,
+        b: mask,
+    });
+    let new_word = lo.emit(Inst::IntBin {
+        ty: IntTy::I32,
+        op: BinOp::Or,
+        a: cleared,
+        b: placed,
+    });
+    let prev = lo.emit(Inst::AtomicCmpxchg {
+        ty: IntTy::I32,
+        addr: wa,
+        expected: old_word,
+        replacement: new_word,
+        offset: 0,
+        order: Ordering::SeqCst,
+    });
+    let success = lo.emit(Inst::IntCmp {
+        ty: IntTy::I32,
+        op: CmpOp::Eq,
+        a: prev,
+        b: old_word,
+    });
+    let bv = lo.stack_vals();
+    let then_args = if want_result {
+        lo.synth_args(&bv, &[old_sub])
+    } else {
+        lo.synth_args(&bv, &[])
+    };
+    let else_args = lo.synth_args(&bv, &[wa, sh, a, b, prev]);
+    lo.set_term(Terminator::BrIf {
+        cond: success,
+        then_blk: exit as u32,
+        then_args,
+        else_blk: body as u32,
+        else_args,
+    });
+
+    // exit: restore the operand stack; push the old sub-word for rmw/cmpxchg.
+    if want_result {
+        let ex = lo.enter_synth(exit, &below_t, 1);
+        let v = zext_result(lo, dst, ex[0]);
+        lo.push(v, int_vt(dst));
+    } else {
+        lo.enter(exit, &below_t);
+    }
+    Ok(())
+}
+
+/// `<i>.atomic.store{8,16,32}`: sub-word (8/16) via the CAS loop; the i64 32-bit form is word-sized
+/// (native i32 atomic store of the wrapped low word).
+fn narrow_atomic_store(lo: &mut Lower, dst: IntTy, w: u32, m: MemArg) -> Result<(), Error> {
+    if w == 4 {
+        let (value, _) = lo.pop()?;
+        let value = wrap_i32(lo, dst, value);
+        let addr = pop_addr(lo)?;
+        lo.emit_void(Inst::AtomicStore {
+            ty: IntTy::I32,
+            addr,
+            value,
+            offset: m.offset,
+            order: Ordering::SeqCst,
+        });
+        return Ok(());
+    }
+    narrow_sub_word(lo, dst, w, SubAtomic::Store, m)
+}
+
+/// `<i>.atomic.rmw{8,16,32}.<op>`: sub-word (8/16) via the CAS loop; the i64 32-bit form is a native
+/// i32 atomic rmw, zero-extended.
+fn narrow_atomic_rmw(
+    lo: &mut Lower,
+    dst: IntTy,
+    w: u32,
+    op: AtomicRmwOp,
+    m: MemArg,
+) -> Result<(), Error> {
+    if w == 4 {
+        let (value, _) = lo.pop()?;
+        let value = wrap_i32(lo, dst, value);
+        let addr = pop_addr(lo)?;
+        let old = lo.emit(Inst::AtomicRmw {
+            ty: IntTy::I32,
+            op,
+            addr,
+            value,
+            offset: m.offset,
+            order: Ordering::SeqCst,
+        });
+        let v = zext_result(lo, dst, old);
+        lo.push(v, int_vt(dst));
+        return Ok(());
+    }
+    narrow_sub_word(lo, dst, w, SubAtomic::Rmw(op), m)
+}
+
+/// `<i>.atomic.rmw{8,16,32}.cmpxchg`: sub-word (8/16) via the CAS loop; the i64 32-bit form is a
+/// native i32 atomic cmpxchg, zero-extended.
+fn narrow_atomic_cmpxchg(lo: &mut Lower, dst: IntTy, w: u32, m: MemArg) -> Result<(), Error> {
+    if w == 4 {
+        let (replacement, _) = lo.pop()?;
+        let (expected, _) = lo.pop()?;
+        let replacement = wrap_i32(lo, dst, replacement);
+        let expected = wrap_i32(lo, dst, expected);
+        let addr = pop_addr(lo)?;
+        let old = lo.emit(Inst::AtomicCmpxchg {
+            ty: IntTy::I32,
+            addr,
+            expected,
+            replacement,
+            offset: m.offset,
+            order: Ordering::SeqCst,
+        });
+        let v = zext_result(lo, dst, old);
+        lo.push(v, int_vt(dst));
+        return Ok(());
+    }
+    narrow_sub_word(lo, dst, w, SubAtomic::Cmpxchg, m)
+}
+
 /// The wasm memory index/size type: `i64` for `memory64`, else `i32`.
 fn idx_ty(mem64: bool) -> ValType {
     if mem64 {
@@ -2761,6 +3138,112 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64AtomicRmwXor { memarg } => atomic_rmw(lo, IntTy::I64, AtomicRmwOp::Xor, memarg)?,
         O::I64AtomicRmwXchg { memarg } => atomic_rmw(lo, IntTy::I64, AtomicRmwOp::Xchg, memarg)?,
         O::I64AtomicRmwCmpxchg { memarg } => atomic_cmpxchg(lo, IntTy::I64, memarg)?,
+        // ---- narrow (8/16-bit, and i64's 32-bit) atomics: word-CAS emulation ----
+        O::I32AtomicLoad8U { memarg } => narrow_atomic_load(lo, IntTy::I32, 1, memarg)?,
+        O::I32AtomicLoad16U { memarg } => narrow_atomic_load(lo, IntTy::I32, 2, memarg)?,
+        O::I64AtomicLoad8U { memarg } => narrow_atomic_load(lo, IntTy::I64, 1, memarg)?,
+        O::I64AtomicLoad16U { memarg } => narrow_atomic_load(lo, IntTy::I64, 2, memarg)?,
+        O::I64AtomicLoad32U { memarg } => narrow_atomic_load(lo, IntTy::I64, 4, memarg)?,
+        O::I32AtomicStore8 { memarg } => narrow_atomic_store(lo, IntTy::I32, 1, memarg)?,
+        O::I32AtomicStore16 { memarg } => narrow_atomic_store(lo, IntTy::I32, 2, memarg)?,
+        O::I64AtomicStore8 { memarg } => narrow_atomic_store(lo, IntTy::I64, 1, memarg)?,
+        O::I64AtomicStore16 { memarg } => narrow_atomic_store(lo, IntTy::I64, 2, memarg)?,
+        O::I64AtomicStore32 { memarg } => narrow_atomic_store(lo, IntTy::I64, 4, memarg)?,
+        O::I32AtomicRmw8AddU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 1, AtomicRmwOp::Add, memarg)?
+        }
+        O::I32AtomicRmw16AddU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 2, AtomicRmwOp::Add, memarg)?
+        }
+        O::I64AtomicRmw8AddU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 1, AtomicRmwOp::Add, memarg)?
+        }
+        O::I64AtomicRmw16AddU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 2, AtomicRmwOp::Add, memarg)?
+        }
+        O::I64AtomicRmw32AddU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 4, AtomicRmwOp::Add, memarg)?
+        }
+        O::I32AtomicRmw8SubU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 1, AtomicRmwOp::Sub, memarg)?
+        }
+        O::I32AtomicRmw16SubU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 2, AtomicRmwOp::Sub, memarg)?
+        }
+        O::I64AtomicRmw8SubU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 1, AtomicRmwOp::Sub, memarg)?
+        }
+        O::I64AtomicRmw16SubU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 2, AtomicRmwOp::Sub, memarg)?
+        }
+        O::I64AtomicRmw32SubU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 4, AtomicRmwOp::Sub, memarg)?
+        }
+        O::I32AtomicRmw8AndU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 1, AtomicRmwOp::And, memarg)?
+        }
+        O::I32AtomicRmw16AndU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 2, AtomicRmwOp::And, memarg)?
+        }
+        O::I64AtomicRmw8AndU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 1, AtomicRmwOp::And, memarg)?
+        }
+        O::I64AtomicRmw16AndU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 2, AtomicRmwOp::And, memarg)?
+        }
+        O::I64AtomicRmw32AndU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 4, AtomicRmwOp::And, memarg)?
+        }
+        O::I32AtomicRmw8OrU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 1, AtomicRmwOp::Or, memarg)?
+        }
+        O::I32AtomicRmw16OrU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 2, AtomicRmwOp::Or, memarg)?
+        }
+        O::I64AtomicRmw8OrU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 1, AtomicRmwOp::Or, memarg)?
+        }
+        O::I64AtomicRmw16OrU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 2, AtomicRmwOp::Or, memarg)?
+        }
+        O::I64AtomicRmw32OrU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 4, AtomicRmwOp::Or, memarg)?
+        }
+        O::I32AtomicRmw8XorU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 1, AtomicRmwOp::Xor, memarg)?
+        }
+        O::I32AtomicRmw16XorU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 2, AtomicRmwOp::Xor, memarg)?
+        }
+        O::I64AtomicRmw8XorU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 1, AtomicRmwOp::Xor, memarg)?
+        }
+        O::I64AtomicRmw16XorU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 2, AtomicRmwOp::Xor, memarg)?
+        }
+        O::I64AtomicRmw32XorU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 4, AtomicRmwOp::Xor, memarg)?
+        }
+        O::I32AtomicRmw8XchgU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 1, AtomicRmwOp::Xchg, memarg)?
+        }
+        O::I32AtomicRmw16XchgU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I32, 2, AtomicRmwOp::Xchg, memarg)?
+        }
+        O::I64AtomicRmw8XchgU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 1, AtomicRmwOp::Xchg, memarg)?
+        }
+        O::I64AtomicRmw16XchgU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 2, AtomicRmwOp::Xchg, memarg)?
+        }
+        O::I64AtomicRmw32XchgU { memarg } => {
+            narrow_atomic_rmw(lo, IntTy::I64, 4, AtomicRmwOp::Xchg, memarg)?
+        }
+        O::I32AtomicRmw8CmpxchgU { memarg } => narrow_atomic_cmpxchg(lo, IntTy::I32, 1, memarg)?,
+        O::I32AtomicRmw16CmpxchgU { memarg } => narrow_atomic_cmpxchg(lo, IntTy::I32, 2, memarg)?,
+        O::I64AtomicRmw8CmpxchgU { memarg } => narrow_atomic_cmpxchg(lo, IntTy::I64, 1, memarg)?,
+        O::I64AtomicRmw16CmpxchgU { memarg } => narrow_atomic_cmpxchg(lo, IntTy::I64, 2, memarg)?,
+        O::I64AtomicRmw32CmpxchgU { memarg } => narrow_atomic_cmpxchg(lo, IntTy::I64, 4, memarg)?,
         O::MemoryAtomicWait32 { memarg } => atomic_wait(lo, IntTy::I32, memarg)?,
         O::MemoryAtomicWait64 { memarg } => atomic_wait(lo, IntTy::I64, memarg)?,
         O::MemoryAtomicNotify { memarg } => atomic_notify(lo, memarg)?,

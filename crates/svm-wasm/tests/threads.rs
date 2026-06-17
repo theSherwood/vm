@@ -90,6 +90,59 @@ fn parallel_counter_wat(nworkers: i32, steps: i32) -> String {
     )
 }
 
+/// Like `parallel_counter_wat`, but the workers hammer a **narrow** (16-bit) atomic counter
+/// (`i32.atomic.rmw16.add_u`), which the transpiler emulates with a 32-bit word-CAS loop. With
+/// `nworkers * steps < 65536` the halfword never wraps, so the result is *exactly* the total on
+/// every interleaving — a lost update (a non-atomic read-modify-write) would yield less. This is the
+/// real proof the sub-word CAS loop is genuinely atomic under contention, on both backends.
+fn parallel_narrow_counter_wat(nworkers: i32, steps: i32) -> String {
+    format!(
+        r#"
+      (module
+        (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
+        (memory 1 1 shared)
+        ;; worker: `steps` narrow (16-bit) atomic increments of the halfword at mem[0].
+        (func (export "wasi_thread_start") (param $tid i32) (param $start_arg i32)
+          (local $j i32)
+          (block $done
+            (loop $lp
+              (br_if $done (i32.ge_u (local.get $j) (i32.const {steps})))
+              (drop (i32.atomic.rmw16.add_u (i32.const 0) (i32.const 1)))
+              (local.set $j (i32.add (local.get $j) (i32.const 1)))
+              (br $lp)))
+          (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))     ;; remaining -= 1 (full word)
+          (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))
+        (func (export "run") (result i32)
+          (local $i i32) (local $r i32)
+          (i32.atomic.store (i32.const 4) (i32.const {nworkers}))
+          (block $spawned
+            (loop $sp
+              (br_if $spawned (i32.ge_u (local.get $i) (i32.const {nworkers})))
+              (drop (call $spawn (local.get $i)))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br $sp)))
+          (block $finished
+            (loop $wait
+              (local.set $r (i32.atomic.load (i32.const 4)))
+              (br_if $finished (i32.eqz (local.get $r)))
+              (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 2000000000)))
+              (br $wait)))
+          (i32.atomic.load16_u (i32.const 0))))
+      "#
+    )
+}
+
+#[test]
+fn parallel_narrow_counter_8x1000() {
+    // 8 × 1000 = 8000 < 65536, so no wrap: the narrow CAS loop must land every increment.
+    let wat = parallel_narrow_counter_wat(8, 1000);
+    assert_eq!(
+        run(&wat, "run", &[]),
+        8000,
+        "8 workers × 1000 narrow (rmw16) increments — no lost updates"
+    );
+}
+
 #[test]
 fn parallel_counter_4x1000() {
     let wat = parallel_counter_wat(4, 1000);
