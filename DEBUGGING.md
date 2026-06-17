@@ -48,9 +48,9 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | `cap.call` I/O record log (`CapTape`) — input caps `Clock` + stdin `read` (slots **and** buffer writes); replayed for faithful `seek` | **Built — W1 slice 2** | `svm-interp` `Host::record_caps` / `CapTape` / `RecordingMem` |
 | Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
 | W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `svm-interp` `find_schedule` / `replay_schedule` / `Witness` |
-| W1 time-travel — `seek(t)` / `step_back` via stateless re-execution; faithful for `Clock`-input guests via `CapTape` | **Built — slices 1–2** | `svm-interp` `Inspector::seek` / `step_back` / `cap_tape` |
+| W1 time-travel — `seek(t)` / `step_back`: single-threaded (op `clock`) **and** multithreaded (global `turn`); faithful via `CapTape` | **Built — slices 1–3** | `svm-interp` `Inspector::seek` / `turn` / `step_back` |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
-| Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`) | **Built — Milestone B slice 1–2** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
+| Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
 | DWARF emission + DAP server | **Missing** | — |
@@ -206,9 +206,24 @@ replay. Replay verifies each served crossing matches the live `(type_id, op, han
 (divergence detection). Tests (`debug.rs`): a guest summing two `Clock` reads (host clock seeded to
 1000) replays to `2001` after `seek(0)` (vs `1` on a fresh clock); a guest reading 2 stdin bytes
 into its buffer and returning `buf[0]` replays to `'H'` (72) — the captured buffer write re-applied
-— vs `0` on a fresh empty-stdin host. *Not yet:* RNG / host-fn inputs, the `SchedTape` (schedule
-record for concurrent replay), scheduled-mode (multithreaded) seek, and snapshot/checkpoint cadence
-to bound re-execution cost.
+— vs `0` on a fresh empty-stdin host.
+
+**Built — slice 3 (scheduled-mode seek: multithreaded time-travel).** `seek(t)` now also time-travels
+a **multithreaded** (`attach_scheduled`) run — the W1↔Milestone-B unification. The coordinate is the
+**global scheduler turn** (`Inspector::turn()`), one per visible-op decision across all threads — the
+plan index, the only coordinate that names a whole-program instant (per-vCPU clocks diverge). `seek(t)`
+rebuilds the run and replays the fixed plan for exactly `t` turns, landing at a **global snapshot**:
+no thread is "stopped", but every thread is inspectable via `threads()`/`select_task()`/`backtrace`
+(the focus defaults to the thread that ran turn `t`). Mechanism: the re-entrant `SchedDriver` gained a
+`turn_limit` (stop at the turn boundary — no held vCPU), and a `suppress_stops` flag on `DebugShared`
+fast-forwards past breakpoints during the replay; `step_back` decrements `turn()` (vs the op `clock`
+single-threaded). Because the plan pins the interleaving and the `CapTape` replays the inputs, the
+snapshot at turn `t` — including whatever the guest's own userland scheduler had done by then — is
+exact and reproducible. Test (`debug_threads.rs`): a witness-pinned racy run seeks to a mid-turn
+global snapshot (reproducible across repeats), `seek(0)` + resume reproduces the raced outcome, and
+`step_back` walks the global turn down by one. *Not yet:* RNG / host-fn input caps, the `SchedTape` as
+a standalone capture-from-a-live-run artifact, and snapshot/checkpoint cadence to bound re-execution
+cost.
 
 ---
 

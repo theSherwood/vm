@@ -178,3 +178,79 @@ fn select_task_inspects_another_thread_while_stopped() {
         );
     }
 }
+
+// --- W1 scheduled-mode time-travel: seek to a global scheduler turn (DEBUGGING.md W1) -----------
+
+/// `seek(t)` in scheduled mode re-executes the pinned plan for `t` global scheduler turns and lands
+/// at a reproducible global snapshot — every thread inspectable — and resuming from turn 0
+/// reproduces the exact interleaving. The coordinate is `turn()`, not a per-thread clock.
+#[test]
+fn scheduled_seek_time_travels_to_a_global_turn() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    // A witness plan pins the (racy) interleaving so the whole run is deterministic.
+    let raced = Ok(vec![Value::I64(1)]);
+    let plan = find_schedule(&m, 0, &[], 50_000_000, 200_000, |o| *o == raced)
+        .expect("a lost-update schedule exists")
+        .plan;
+
+    let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, plan.clone());
+
+    // Run to completion under the plan → the raced outcome; note how many turns it took.
+    run_to_finished(&mut insp, &raced);
+    let total = insp.turn();
+    assert!(total > 2, "the run spans several scheduler turns: {total}");
+
+    // Focused-thread snapshot (pc + live SSA per frame) — what time-travel must reproduce.
+    fn snap(i: &Inspector) -> (Vec<u64>, Vec<(IrPc, Vec<Value>)>) {
+        let bt = i
+            .backtrace()
+            .iter()
+            .map(|f| (f.pc, f.vals.clone()))
+            .collect();
+        (i.threads(), bt)
+    }
+
+    // Seek to a middle turn: a global snapshot, not finished, with live threads.
+    let mid = total / 2;
+    assert!(matches!(insp.seek(mid), Stop::Break { .. }));
+    assert_eq!(insp.turn(), mid);
+    assert!(insp.result().is_none(), "mid-run is not finished");
+    assert!(
+        !insp.threads().is_empty(),
+        "threads are live at the snapshot"
+    );
+    let at_mid = snap(&insp);
+
+    // Time-travel is reproducible: seeking the same turn again restores the identical global state.
+    assert!(matches!(insp.seek(mid), Stop::Break { .. }));
+    assert_eq!(
+        snap(&insp),
+        at_mid,
+        "seek(mid) reproduces the exact global snapshot"
+    );
+
+    // Seek to the start, then resume forward: the pinned plan reproduces the raced outcome.
+    assert!(matches!(insp.seek(0), Stop::Break { .. }));
+    assert_eq!(insp.turn(), 0);
+    run_to_finished(&mut insp, &raced);
+
+    // step_back walks the global turn down by one.
+    insp.seek(mid);
+    insp.step_back();
+    assert_eq!(insp.turn(), mid - 1, "step_back decrements the global turn");
+    // ...and seeking past the end lands on the finished result.
+    assert!(matches!(insp.seek(total), Stop::Finished(ref r) if *r == raced));
+}
+
+fn run_to_finished(insp: &mut Inspector, want: &Result<Vec<Value>, svm_interp::Trap>) {
+    loop {
+        match insp.run_until_stop() {
+            Stop::Finished(r) => {
+                assert_eq!(&r, want);
+                return;
+            }
+            Stop::Break { .. } => continue,
+            Stop::Blocked => panic!("unexpected block"),
+        }
+    }
+}
