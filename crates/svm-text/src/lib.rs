@@ -24,8 +24,9 @@ use std::fmt::Write as _;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module,
-    Ordering, StoreOp, Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType,
-    VarInfo, VarLoc,
+    Ordering, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
+    VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo,
+    VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -350,13 +351,26 @@ fn print_inst(inst: &Inst) -> String {
             format!("{}.replace_lane {lane} v{a} v{b}", shape.name())
         }
         Inst::VIntBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VIntCmp { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VShift { shape, op, a, amt } => {
+            format!("{}.{} v{a} v{amt}", shape.name(), op.name())
+        }
+        Inst::VFloatCmp { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VIntUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VSatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VWiden { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
+        Inst::VNarrow { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VConvert { op, a } => format!("{} v{a}", op.name()),
         Inst::VBitBin { op, a, b } => format!("v128.{} v{a} v{b}", op.name()),
         Inst::VNot { a } => format!("v128.not v{a}"),
         Inst::Bitselect { a, b, mask } => format!("v128.bitselect v{a} v{b} v{mask}"),
         Inst::Shuffle { lanes, a, b } => format!("i8x16.shuffle{} v{a} v{b}", byte_list(lanes)),
         Inst::Swizzle { a, b } => format!("i8x16.swizzle v{a} v{b}"),
+        Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
+        Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
+        Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
         Inst::SimdWidthBytes => "simd.width_bytes".to_string(),
     }
 }
@@ -1539,6 +1553,18 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
+        if op == "v128.any_true" {
+            return Ok(Inst::VAnyTrue {
+                a: self.value(names)?,
+            });
+        }
+        // Conversions are whole-instruction mnemonics (source/result shapes differ).
+        if let Some(o) = VCvtOp::from_name(op.as_str()) {
+            return Ok(Inst::VConvert {
+                op: o,
+                a: self.value(names)?,
+            });
+        }
         if op == "v128.bitselect" {
             let a = self.value(names)?;
             let b = self.value(names)?;
@@ -1601,6 +1627,18 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
+        if suffix == "all_true" {
+            return Ok(Inst::VAllTrue {
+                shape,
+                a: self.value(names)?,
+            });
+        }
+        if suffix == "bitmask" {
+            return Ok(Inst::VBitmask {
+                shape,
+                a: self.value(names)?,
+            });
+        }
         // `extract_lane[_s|_u] <lane> v<a>` — the sign suffix is only meaningful for narrow
         // integer shapes; accept (and ignore) it elsewhere only if absent.
         if let Some(rest) = suffix.strip_prefix("extract_lane") {
@@ -1643,10 +1681,48 @@ impl<'a> Parser<'a> {
                     a: self.value(names)?,
                 });
             }
+            if let Some(o) = VFCmpOp::from_name(suffix) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VFloatCmp { shape, op: o, a, b });
+            }
         } else if let Some(o) = VIntBinOp::from_name(suffix) {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::VIntBin { shape, op: o, a, b });
+        } else if let Some(o) = VICmpOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VIntCmp { shape, op: o, a, b });
+        } else if let Some(o) = VShiftOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let amt = self.value(names)?;
+            return Ok(Inst::VShift {
+                shape,
+                op: o,
+                a,
+                amt,
+            });
+        } else if let Some(o) = VIntUnOp::from_name(suffix) {
+            return Ok(Inst::VIntUn {
+                shape,
+                op: o,
+                a: self.value(names)?,
+            });
+        } else if let Some(o) = VSatBinOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VSatBin { shape, op: o, a, b });
+        } else if let Some(o) = VWidenOp::from_name(suffix) {
+            return Ok(Inst::VWiden {
+                shape,
+                op: o,
+                a: self.value(names)?,
+            });
+        } else if let Some(o) = VNarrowOp::from_name(suffix) {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VNarrow { shape, op: o, a, b });
         }
         err(format!("unknown opcode `{op}`"))
     }

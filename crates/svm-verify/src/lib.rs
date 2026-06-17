@@ -17,7 +17,7 @@
 //! is the separate hard problem (§18).
 #![forbid(unsafe_code)]
 
-use svm_ir::{BlockIdx, Func, Inst, Module, Terminator, ValIdx, ValType};
+use svm_ir::{BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
 
 /// Why verification rejected a module. Carries enough location to debug, never
 /// enough to be load-bearing for safety (the boolean accept/reject is the contract).
@@ -643,7 +643,29 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
-        Inst::VFloatBin { shape, a, b, .. } => {
+        Inst::VIntCmp { shape, a, b, .. } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        Inst::VShift { shape, a, amt, .. } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*amt, ValType::I32)?;
+            ValType::V128
+        }
+        Inst::VFloatBin { shape, a, b, .. } | Inst::VFloatCmp { shape, a, b, .. } => {
             if !shape.is_float() {
                 return Err(VerifyError::BadSimdShape {
                     func: fi,
@@ -663,6 +685,72 @@ fn check_inst(
             }
             cx.expect(*a, ValType::V128)?;
             ValType::V128
+        }
+        Inst::VIntUn { shape, a, .. } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // Saturating add/sub is `i8x16`/`i16x8` only (the wasm spec has no wider sat).
+        Inst::VSatBin { shape, a, b, .. } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Widen: the result shape must be an integer shape that has a (half-width) source.
+        Inst::VWiden { shape, a, .. } => {
+            if shape.narrower().is_none() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // Narrow: `i8x16`/`i16x8` results only (the wasm spec has no wider narrow).
+        Inst::VNarrow { shape, a, b, .. } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Lane conversions: `v128` → `v128`, fully described by the op.
+        Inst::VConvert { a, .. } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // Boolean reductions: a `v128` → an `i32`. `all_true`/`bitmask` carry an integer shape;
+        // `any_true` is shape-agnostic.
+        Inst::VAnyTrue { a } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::I32
+        }
+        Inst::VAllTrue { shape, a } | Inst::VBitmask { shape, a } => {
+            if shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::I32
         }
         Inst::VBitBin { a, b, .. } => {
             cx.expect(*a, ValType::V128)?;

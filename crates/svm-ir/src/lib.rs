@@ -152,6 +152,30 @@ impl VShape {
     pub fn from_name(s: &str) -> Option<VShape> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
+
+    /// The integer shape with **half** the lane width (and twice the lanes): `i16x8`→`i8x16`,
+    /// `i32x4`→`i16x8`, `i64x2`→`i32x4`. `None` for `i8x16` and the float shapes. The source of a
+    /// widen / the result of a narrow.
+    pub fn narrower(self) -> Option<VShape> {
+        match self {
+            VShape::I16x8 => Some(VShape::I8x16),
+            VShape::I32x4 => Some(VShape::I16x8),
+            VShape::I64x2 => Some(VShape::I32x4),
+            _ => None,
+        }
+    }
+
+    /// The integer shape with **double** the lane width: `i8x16`→`i16x8`, `i16x8`→`i32x4`,
+    /// `i32x4`→`i64x2`. `None` for `i64x2` and the float shapes. The result of a widen / the source
+    /// of a narrow.
+    pub fn wider(self) -> Option<VShape> {
+        match self {
+            VShape::I8x16 => Some(VShape::I16x8),
+            VShape::I16x8 => Some(VShape::I32x4),
+            VShape::I32x4 => Some(VShape::I64x2),
+            _ => None,
+        }
+    }
 }
 
 /// Lane-wise binary integer ops on a `v128` (§17). Defined for every integer [`VShape`]
@@ -163,15 +187,31 @@ pub enum VIntBinOp {
     Add,
     Sub,
     Mul,
+    MinS,
+    MinU,
+    MaxS,
+    MaxU,
 }
 
 impl VIntBinOp {
-    pub const ALL: [VIntBinOp; 3] = [VIntBinOp::Add, VIntBinOp::Sub, VIntBinOp::Mul];
+    pub const ALL: [VIntBinOp; 7] = [
+        VIntBinOp::Add,
+        VIntBinOp::Sub,
+        VIntBinOp::Mul,
+        VIntBinOp::MinS,
+        VIntBinOp::MinU,
+        VIntBinOp::MaxS,
+        VIntBinOp::MaxU,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             VIntBinOp::Add => "add",
             VIntBinOp::Sub => "sub",
             VIntBinOp::Mul => "mul",
+            VIntBinOp::MinS => "min_s",
+            VIntBinOp::MinU => "min_u",
+            VIntBinOp::MaxS => "max_s",
+            VIntBinOp::MaxU => "max_u",
         }
     }
     pub fn index(self) -> u8 {
@@ -181,6 +221,325 @@ impl VIntBinOp {
         Self::ALL.get(i as usize).copied()
     }
     pub fn from_name(s: &str) -> Option<VIntBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise integer **comparison** ops on a `v128` (§17): each lane yields an all-ones (true) or
+/// all-zeros (false) mask of the lane width, so the result is a `v128`. `s`/`u` select signed vs
+/// unsigned lane ordering (`Eq`/`Ne` are sign-agnostic). Defined for every integer [`VShape`] — the
+/// wasm spec omits unsigned `i64x2` compares, but the op set is total and the transpiler only emits
+/// the shapes wasm defines.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VICmpOp {
+    Eq,
+    Ne,
+    LtS,
+    LtU,
+    GtS,
+    GtU,
+    LeS,
+    LeU,
+    GeS,
+    GeU,
+}
+
+impl VICmpOp {
+    pub const ALL: [VICmpOp; 10] = [
+        VICmpOp::Eq,
+        VICmpOp::Ne,
+        VICmpOp::LtS,
+        VICmpOp::LtU,
+        VICmpOp::GtS,
+        VICmpOp::GtU,
+        VICmpOp::LeS,
+        VICmpOp::LeU,
+        VICmpOp::GeS,
+        VICmpOp::GeU,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VICmpOp::Eq => "eq",
+            VICmpOp::Ne => "ne",
+            VICmpOp::LtS => "lt_s",
+            VICmpOp::LtU => "lt_u",
+            VICmpOp::GtS => "gt_s",
+            VICmpOp::GtU => "gt_u",
+            VICmpOp::LeS => "le_s",
+            VICmpOp::LeU => "le_u",
+            VICmpOp::GeS => "ge_s",
+            VICmpOp::GeU => "ge_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VICmpOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VICmpOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise **float** comparison ops on a `v128` (§17): each lane yields an all-ones (true) or
+/// all-zeros (false) mask of the lane width → result `v128`. Defined for the float [`VShape`]s
+/// (`f32x4`/`f64x2`). `eq`/`lt`/`gt`/`le`/`ge` are **ordered** (a NaN operand ⇒ false); `ne` is the
+/// **unordered** negation (a NaN operand ⇒ true) — exactly the wasm (and Rust `==`/`!=`/`<`/…) rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VFCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+impl VFCmpOp {
+    pub const ALL: [VFCmpOp; 6] = [
+        VFCmpOp::Eq,
+        VFCmpOp::Ne,
+        VFCmpOp::Lt,
+        VFCmpOp::Gt,
+        VFCmpOp::Le,
+        VFCmpOp::Ge,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VFCmpOp::Eq => "eq",
+            VFCmpOp::Ne => "ne",
+            VFCmpOp::Lt => "lt",
+            VFCmpOp::Gt => "gt",
+            VFCmpOp::Le => "le",
+            VFCmpOp::Ge => "ge",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VFCmpOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VFCmpOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise integer **shift** ops on a `v128` (§17): every lane is shifted by the **same** scalar
+/// `i32` amount, taken **modulo the lane bit-width** (the wasm rule). `ShrS` is arithmetic
+/// (sign-replicating); `Shl`/`ShrU` are logical. Defined for every integer [`VShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VShiftOp {
+    Shl,
+    ShrS,
+    ShrU,
+}
+
+impl VShiftOp {
+    pub const ALL: [VShiftOp; 3] = [VShiftOp::Shl, VShiftOp::ShrS, VShiftOp::ShrU];
+    pub fn name(self) -> &'static str {
+        match self {
+            VShiftOp::Shl => "shl",
+            VShiftOp::ShrS => "shr_s",
+            VShiftOp::ShrU => "shr_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VShiftOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VShiftOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise **unary** integer ops on a `v128` (§17): `Abs` (`|x|`, two's-complement, so
+/// `abs(INT_MIN) == INT_MIN`, the wasm/hardware wrap) and `Neg` (`0 - x`, wrapping). `a`/result are
+/// `v128`. Defined for every integer [`VShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VIntUnOp {
+    Abs,
+    Neg,
+}
+
+impl VIntUnOp {
+    pub const ALL: [VIntUnOp; 2] = [VIntUnOp::Abs, VIntUnOp::Neg];
+    pub fn name(self) -> &'static str {
+        match self {
+            VIntUnOp::Abs => "abs",
+            VIntUnOp::Neg => "neg",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VIntUnOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VIntUnOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise **saturating** add/sub on a `v128` (§17): a lane that would overflow clamps to the
+/// lane's signed/unsigned min or max instead of wrapping. Defined **only for `i8x16`/`i16x8`** (the
+/// wasm spec has no wider saturating add/sub) — the verifier rejects any other [`VShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VSatBinOp {
+    AddS,
+    AddU,
+    SubS,
+    SubU,
+}
+
+impl VSatBinOp {
+    pub const ALL: [VSatBinOp; 4] = [
+        VSatBinOp::AddS,
+        VSatBinOp::AddU,
+        VSatBinOp::SubS,
+        VSatBinOp::SubU,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VSatBinOp::AddS => "add_sat_s",
+            VSatBinOp::AddU => "add_sat_u",
+            VSatBinOp::SubS => "sub_sat_s",
+            VSatBinOp::SubU => "sub_sat_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VSatBinOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VSatBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane **widening** (`extend`): take the low or high half of the source lanes and sign/zero-extend
+/// each to twice the width. The result [`VShape`] is the wider one; the source is its [`VShape::narrower`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VWidenOp {
+    LowS,
+    LowU,
+    HighS,
+    HighU,
+}
+
+impl VWidenOp {
+    pub const ALL: [VWidenOp; 4] = [
+        VWidenOp::LowS,
+        VWidenOp::LowU,
+        VWidenOp::HighS,
+        VWidenOp::HighU,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VWidenOp::LowS => "extend_low_s",
+            VWidenOp::LowU => "extend_low_u",
+            VWidenOp::HighS => "extend_high_s",
+            VWidenOp::HighU => "extend_high_u",
+        }
+    }
+    /// `(low_half, signed)`.
+    pub fn parts(self) -> (bool, bool) {
+        match self {
+            VWidenOp::LowS => (true, true),
+            VWidenOp::LowU => (true, false),
+            VWidenOp::HighS => (false, true),
+            VWidenOp::HighU => (false, false),
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VWidenOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VWidenOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane **narrowing**: take two source vectors (each the wider shape), saturate every lane to the
+/// narrow width, and concatenate (`a`'s lanes then `b`'s). `S`/`U` pick the *saturation* range; the
+/// source is always read as **signed** (the wasm rule). `i8x16`/`i16x8` results only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VNarrowOp {
+    S,
+    U,
+}
+
+impl VNarrowOp {
+    pub const ALL: [VNarrowOp; 2] = [VNarrowOp::S, VNarrowOp::U];
+    pub fn name(self) -> &'static str {
+        match self {
+            VNarrowOp::S => "narrow_s",
+            VNarrowOp::U => "narrow_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VNarrowOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VNarrowOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane **int↔float / float↔float conversions** (§17). Each is a whole-instruction mnemonic (the
+/// source and result lane shapes differ, so unlike the lane-op families these don't share a
+/// `shape.suffix` form). `a`/result are `v128`. `trunc_sat` is the non-trapping float→int (NaN→0,
+/// clamp to the integer range); `demote`/`promote` change float width (low 2 lanes, high zeroed).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VCvtOp {
+    /// `f32x4.convert_i32x4_s`: each `i32` lane → `f32`.
+    F32x4ConvertI32x4S,
+    /// `f32x4.convert_i32x4_u`: each `u32` lane → `f32`.
+    F32x4ConvertI32x4U,
+    /// `i32x4.trunc_sat_f32x4_s`: each `f32` lane → saturating `i32`.
+    I32x4TruncSatF32x4S,
+    /// `i32x4.trunc_sat_f32x4_u`: each `f32` lane → saturating `u32`.
+    I32x4TruncSatF32x4U,
+    /// `f32x4.demote_f64x2_zero`: the two `f64` lanes → `f32` (lanes 0/1); lanes 2/3 = 0.
+    F32x4DemoteF64x2Zero,
+    /// `f64x2.promote_low_f32x4`: the low two `f32` lanes → `f64`.
+    F64x2PromoteLowF32x4,
+}
+
+impl VCvtOp {
+    pub const ALL: [VCvtOp; 6] = [
+        VCvtOp::F32x4ConvertI32x4S,
+        VCvtOp::F32x4ConvertI32x4U,
+        VCvtOp::I32x4TruncSatF32x4S,
+        VCvtOp::I32x4TruncSatF32x4U,
+        VCvtOp::F32x4DemoteF64x2Zero,
+        VCvtOp::F64x2PromoteLowF32x4,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VCvtOp::F32x4ConvertI32x4S => "f32x4.convert_i32x4_s",
+            VCvtOp::F32x4ConvertI32x4U => "f32x4.convert_i32x4_u",
+            VCvtOp::I32x4TruncSatF32x4S => "i32x4.trunc_sat_f32x4_s",
+            VCvtOp::I32x4TruncSatF32x4U => "i32x4.trunc_sat_f32x4_u",
+            VCvtOp::F32x4DemoteF64x2Zero => "f32x4.demote_f64x2_zero",
+            VCvtOp::F64x2PromoteLowF32x4 => "f64x2.promote_low_f32x4",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VCvtOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VCvtOp> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
 }
@@ -1435,6 +1794,81 @@ pub enum Inst {
         op: VIntBinOp,
         a: ValIdx,
         b: ValIdx,
+    },
+    /// Lane-wise integer comparison (see [`VICmpOp`]); `a`/`b`/result are `v128` (per-lane all-ones
+    /// or all-zeros mask of the lane width).
+    VIntCmp {
+        shape: VShape,
+        op: VICmpOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise float comparison (see [`VFCmpOp`]); `a`/`b`/result are `v128` (per-lane all-ones or
+    /// all-zeros mask of the lane width).
+    VFloatCmp {
+        shape: VShape,
+        op: VFCmpOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane-wise integer shift by a scalar amount (see [`VShiftOp`]): `a`/result are `v128`, `amt`
+    /// is an `i32` (taken modulo the lane bit-width).
+    VShift {
+        shape: VShape,
+        op: VShiftOp,
+        a: ValIdx,
+        amt: ValIdx,
+    },
+    /// Lane-wise unary integer op (see [`VIntUnOp`]); `a`/result are `v128`.
+    VIntUn {
+        shape: VShape,
+        op: VIntUnOp,
+        a: ValIdx,
+    },
+    /// Lane-wise saturating add/sub (see [`VSatBinOp`]); `a`/`b`/result are `v128`. `i8x16`/`i16x8`
+    /// only (verifier-enforced).
+    VSatBin {
+        shape: VShape,
+        op: VSatBinOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane **widen** (`extend`, see [`VWidenOp`]); `shape` is the **result** (wider) shape, the
+    /// source is its [`VShape::narrower`]. `a`/result are `v128`.
+    VWiden {
+        shape: VShape,
+        op: VWidenOp,
+        a: ValIdx,
+    },
+    /// Lane **narrow** (see [`VNarrowOp`]); `shape` is the **result** (narrow) shape, the source is
+    /// its [`VShape::wider`]. `a`/`b`/result are `v128`. `i8x16`/`i16x8` only (verifier-enforced).
+    VNarrow {
+        shape: VShape,
+        op: VNarrowOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Lane int↔float / float↔float conversion (see [`VCvtOp`]); `a`/result are `v128`.
+    VConvert {
+        op: VCvtOp,
+        a: ValIdx,
+    },
+    /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
+    /// (shape-agnostic). `a` is `v128`, result `i32`.
+    VAnyTrue {
+        a: ValIdx,
+    },
+    /// `<shape>.all_true`: `i32` `1` if **every** lane (of `shape`) is non-zero, else `0`. `a` is
+    /// `v128`, result `i32`.
+    VAllTrue {
+        shape: VShape,
+        a: ValIdx,
+    },
+    /// `<shape>.bitmask`: gather the **high (sign) bit** of each lane into the low bits of an `i32`
+    /// (lane `i` → bit `i`). `a` is `v128`, result `i32`.
+    VBitmask {
+        shape: VShape,
+        a: ValIdx,
     },
     /// Lane-wise binary float op (see [`VFloatBinOp`]); `a`/`b`/result are `v128`.
     VFloatBin {

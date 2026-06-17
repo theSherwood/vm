@@ -45,7 +45,8 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
-    VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
+    VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp,
+    VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1300,6 +1301,78 @@ fn v_intbin(lo: &mut Lower, shape: VShape, op: VIntBinOp) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VIntBin { shape, op, a, b });
     lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_icmp(lo: &mut Lower, shape: VShape, op: VICmpOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VIntCmp { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_fcmp(lo: &mut Lower, shape: VShape, op: VFCmpOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VFloatCmp { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_shift(lo: &mut Lower, shape: VShape, op: VShiftOp) -> Result<(), Error> {
+    // Stack: [vector, amount] — pop the i32 amount, then the v128.
+    let (amt, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VShift { shape, op, a, amt });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_intun(lo: &mut Lower, shape: VShape, op: VIntUnOp) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VIntUn { shape, op, a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_satbin(lo: &mut Lower, shape: VShape, op: VSatBinOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VSatBin { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_widen(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VWiden { shape, op, a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_narrow(lo: &mut Lower, shape: VShape, op: VNarrowOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VNarrow { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_convert(lo: &mut Lower, op: VCvtOp) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VConvert { op, a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_anytrue(lo: &mut Lower) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VAnyTrue { a });
+    lo.push(v, ValType::I32);
+    Ok(())
+}
+fn v_alltrue(lo: &mut Lower, shape: VShape) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VAllTrue { shape, a });
+    lo.push(v, ValType::I32);
+    Ok(())
+}
+fn v_bitmask(lo: &mut Lower, shape: VShape) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VBitmask { shape, a });
+    lo.push(v, ValType::I32);
     Ok(())
 }
 fn v_fbin(lo: &mut Lower, shape: VShape, op: VFloatBinOp) -> Result<(), Error> {
@@ -2818,6 +2891,123 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64x2Add => v_intbin(lo, VShape::I64x2, VIntBinOp::Add)?,
         O::I64x2Sub => v_intbin(lo, VShape::I64x2, VIntBinOp::Sub)?,
         O::I64x2Mul => v_intbin(lo, VShape::I64x2, VIntBinOp::Mul)?,
+        // integer lane comparisons → a per-lane all-ones/all-zeros mask. `i64x2` has signed-only
+        // ordering in the wasm spec (no unsigned lt/gt/le/ge); `eq`/`ne` exist for every shape.
+        O::I8x16Eq => v_icmp(lo, VShape::I8x16, VICmpOp::Eq)?,
+        O::I8x16Ne => v_icmp(lo, VShape::I8x16, VICmpOp::Ne)?,
+        O::I8x16LtS => v_icmp(lo, VShape::I8x16, VICmpOp::LtS)?,
+        O::I8x16LtU => v_icmp(lo, VShape::I8x16, VICmpOp::LtU)?,
+        O::I8x16GtS => v_icmp(lo, VShape::I8x16, VICmpOp::GtS)?,
+        O::I8x16GtU => v_icmp(lo, VShape::I8x16, VICmpOp::GtU)?,
+        O::I8x16LeS => v_icmp(lo, VShape::I8x16, VICmpOp::LeS)?,
+        O::I8x16LeU => v_icmp(lo, VShape::I8x16, VICmpOp::LeU)?,
+        O::I8x16GeS => v_icmp(lo, VShape::I8x16, VICmpOp::GeS)?,
+        O::I8x16GeU => v_icmp(lo, VShape::I8x16, VICmpOp::GeU)?,
+        O::I16x8Eq => v_icmp(lo, VShape::I16x8, VICmpOp::Eq)?,
+        O::I16x8Ne => v_icmp(lo, VShape::I16x8, VICmpOp::Ne)?,
+        O::I16x8LtS => v_icmp(lo, VShape::I16x8, VICmpOp::LtS)?,
+        O::I16x8LtU => v_icmp(lo, VShape::I16x8, VICmpOp::LtU)?,
+        O::I16x8GtS => v_icmp(lo, VShape::I16x8, VICmpOp::GtS)?,
+        O::I16x8GtU => v_icmp(lo, VShape::I16x8, VICmpOp::GtU)?,
+        O::I16x8LeS => v_icmp(lo, VShape::I16x8, VICmpOp::LeS)?,
+        O::I16x8LeU => v_icmp(lo, VShape::I16x8, VICmpOp::LeU)?,
+        O::I16x8GeS => v_icmp(lo, VShape::I16x8, VICmpOp::GeS)?,
+        O::I16x8GeU => v_icmp(lo, VShape::I16x8, VICmpOp::GeU)?,
+        O::I32x4Eq => v_icmp(lo, VShape::I32x4, VICmpOp::Eq)?,
+        O::I32x4Ne => v_icmp(lo, VShape::I32x4, VICmpOp::Ne)?,
+        O::I32x4LtS => v_icmp(lo, VShape::I32x4, VICmpOp::LtS)?,
+        O::I32x4LtU => v_icmp(lo, VShape::I32x4, VICmpOp::LtU)?,
+        O::I32x4GtS => v_icmp(lo, VShape::I32x4, VICmpOp::GtS)?,
+        O::I32x4GtU => v_icmp(lo, VShape::I32x4, VICmpOp::GtU)?,
+        O::I32x4LeS => v_icmp(lo, VShape::I32x4, VICmpOp::LeS)?,
+        O::I32x4LeU => v_icmp(lo, VShape::I32x4, VICmpOp::LeU)?,
+        O::I32x4GeS => v_icmp(lo, VShape::I32x4, VICmpOp::GeS)?,
+        O::I32x4GeU => v_icmp(lo, VShape::I32x4, VICmpOp::GeU)?,
+        O::I64x2Eq => v_icmp(lo, VShape::I64x2, VICmpOp::Eq)?,
+        O::I64x2Ne => v_icmp(lo, VShape::I64x2, VICmpOp::Ne)?,
+        O::I64x2LtS => v_icmp(lo, VShape::I64x2, VICmpOp::LtS)?,
+        O::I64x2GtS => v_icmp(lo, VShape::I64x2, VICmpOp::GtS)?,
+        O::I64x2LeS => v_icmp(lo, VShape::I64x2, VICmpOp::LeS)?,
+        O::I64x2GeS => v_icmp(lo, VShape::I64x2, VICmpOp::GeS)?,
+        // integer lane min/max (signed + unsigned); `i64x2` has none in the wasm spec.
+        O::I8x16MinS => v_intbin(lo, VShape::I8x16, VIntBinOp::MinS)?,
+        O::I8x16MinU => v_intbin(lo, VShape::I8x16, VIntBinOp::MinU)?,
+        O::I8x16MaxS => v_intbin(lo, VShape::I8x16, VIntBinOp::MaxS)?,
+        O::I8x16MaxU => v_intbin(lo, VShape::I8x16, VIntBinOp::MaxU)?,
+        O::I16x8MinS => v_intbin(lo, VShape::I16x8, VIntBinOp::MinS)?,
+        O::I16x8MinU => v_intbin(lo, VShape::I16x8, VIntBinOp::MinU)?,
+        O::I16x8MaxS => v_intbin(lo, VShape::I16x8, VIntBinOp::MaxS)?,
+        O::I16x8MaxU => v_intbin(lo, VShape::I16x8, VIntBinOp::MaxU)?,
+        O::I32x4MinS => v_intbin(lo, VShape::I32x4, VIntBinOp::MinS)?,
+        O::I32x4MinU => v_intbin(lo, VShape::I32x4, VIntBinOp::MinU)?,
+        O::I32x4MaxS => v_intbin(lo, VShape::I32x4, VIntBinOp::MaxS)?,
+        O::I32x4MaxU => v_intbin(lo, VShape::I32x4, VIntBinOp::MaxU)?,
+        // integer lane shifts (one scalar i32 amount, taken mod the lane bit-width)
+        O::I8x16Shl => v_shift(lo, VShape::I8x16, VShiftOp::Shl)?,
+        O::I8x16ShrS => v_shift(lo, VShape::I8x16, VShiftOp::ShrS)?,
+        O::I8x16ShrU => v_shift(lo, VShape::I8x16, VShiftOp::ShrU)?,
+        O::I16x8Shl => v_shift(lo, VShape::I16x8, VShiftOp::Shl)?,
+        O::I16x8ShrS => v_shift(lo, VShape::I16x8, VShiftOp::ShrS)?,
+        O::I16x8ShrU => v_shift(lo, VShape::I16x8, VShiftOp::ShrU)?,
+        O::I32x4Shl => v_shift(lo, VShape::I32x4, VShiftOp::Shl)?,
+        O::I32x4ShrS => v_shift(lo, VShape::I32x4, VShiftOp::ShrS)?,
+        O::I32x4ShrU => v_shift(lo, VShape::I32x4, VShiftOp::ShrU)?,
+        O::I64x2Shl => v_shift(lo, VShape::I64x2, VShiftOp::Shl)?,
+        O::I64x2ShrS => v_shift(lo, VShape::I64x2, VShiftOp::ShrS)?,
+        O::I64x2ShrU => v_shift(lo, VShape::I64x2, VShiftOp::ShrU)?,
+        // saturating add/sub (i8x16/i16x8 only)
+        O::I8x16AddSatS => v_satbin(lo, VShape::I8x16, VSatBinOp::AddS)?,
+        O::I8x16AddSatU => v_satbin(lo, VShape::I8x16, VSatBinOp::AddU)?,
+        O::I8x16SubSatS => v_satbin(lo, VShape::I8x16, VSatBinOp::SubS)?,
+        O::I8x16SubSatU => v_satbin(lo, VShape::I8x16, VSatBinOp::SubU)?,
+        O::I16x8AddSatS => v_satbin(lo, VShape::I16x8, VSatBinOp::AddS)?,
+        O::I16x8AddSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::AddU)?,
+        O::I16x8SubSatS => v_satbin(lo, VShape::I16x8, VSatBinOp::SubS)?,
+        O::I16x8SubSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::SubU)?,
+        // int↔float / float↔float conversions
+        O::F32x4ConvertI32x4S => v_convert(lo, VCvtOp::F32x4ConvertI32x4S)?,
+        O::F32x4ConvertI32x4U => v_convert(lo, VCvtOp::F32x4ConvertI32x4U)?,
+        O::I32x4TruncSatF32x4S => v_convert(lo, VCvtOp::I32x4TruncSatF32x4S)?,
+        O::I32x4TruncSatF32x4U => v_convert(lo, VCvtOp::I32x4TruncSatF32x4U)?,
+        O::F32x4DemoteF64x2Zero => v_convert(lo, VCvtOp::F32x4DemoteF64x2Zero)?,
+        O::F64x2PromoteLowF32x4 => v_convert(lo, VCvtOp::F64x2PromoteLowF32x4)?,
+        // lane narrowing (saturating): result shape is the narrower one
+        O::I8x16NarrowI16x8S => v_narrow(lo, VShape::I8x16, VNarrowOp::S)?,
+        O::I8x16NarrowI16x8U => v_narrow(lo, VShape::I8x16, VNarrowOp::U)?,
+        O::I16x8NarrowI32x4S => v_narrow(lo, VShape::I16x8, VNarrowOp::S)?,
+        O::I16x8NarrowI32x4U => v_narrow(lo, VShape::I16x8, VNarrowOp::U)?,
+        // lane widening (extend): result shape is the wider one
+        O::I16x8ExtendLowI8x16S => v_widen(lo, VShape::I16x8, VWidenOp::LowS)?,
+        O::I16x8ExtendHighI8x16S => v_widen(lo, VShape::I16x8, VWidenOp::HighS)?,
+        O::I16x8ExtendLowI8x16U => v_widen(lo, VShape::I16x8, VWidenOp::LowU)?,
+        O::I16x8ExtendHighI8x16U => v_widen(lo, VShape::I16x8, VWidenOp::HighU)?,
+        O::I32x4ExtendLowI16x8S => v_widen(lo, VShape::I32x4, VWidenOp::LowS)?,
+        O::I32x4ExtendHighI16x8S => v_widen(lo, VShape::I32x4, VWidenOp::HighS)?,
+        O::I32x4ExtendLowI16x8U => v_widen(lo, VShape::I32x4, VWidenOp::LowU)?,
+        O::I32x4ExtendHighI16x8U => v_widen(lo, VShape::I32x4, VWidenOp::HighU)?,
+        O::I64x2ExtendLowI32x4S => v_widen(lo, VShape::I64x2, VWidenOp::LowS)?,
+        O::I64x2ExtendHighI32x4S => v_widen(lo, VShape::I64x2, VWidenOp::HighS)?,
+        O::I64x2ExtendLowI32x4U => v_widen(lo, VShape::I64x2, VWidenOp::LowU)?,
+        O::I64x2ExtendHighI32x4U => v_widen(lo, VShape::I64x2, VWidenOp::HighU)?,
+        // integer lane abs/neg
+        O::I8x16Abs => v_intun(lo, VShape::I8x16, VIntUnOp::Abs)?,
+        O::I8x16Neg => v_intun(lo, VShape::I8x16, VIntUnOp::Neg)?,
+        O::I16x8Abs => v_intun(lo, VShape::I16x8, VIntUnOp::Abs)?,
+        O::I16x8Neg => v_intun(lo, VShape::I16x8, VIntUnOp::Neg)?,
+        O::I32x4Abs => v_intun(lo, VShape::I32x4, VIntUnOp::Abs)?,
+        O::I32x4Neg => v_intun(lo, VShape::I32x4, VIntUnOp::Neg)?,
+        O::I64x2Abs => v_intun(lo, VShape::I64x2, VIntUnOp::Abs)?,
+        O::I64x2Neg => v_intun(lo, VShape::I64x2, VIntUnOp::Neg)?,
+        // boolean reductions (v128 → i32): any_true (whole-vector), all_true / bitmask (per shape)
+        O::V128AnyTrue => v_anytrue(lo)?,
+        O::I8x16AllTrue => v_alltrue(lo, VShape::I8x16)?,
+        O::I16x8AllTrue => v_alltrue(lo, VShape::I16x8)?,
+        O::I32x4AllTrue => v_alltrue(lo, VShape::I32x4)?,
+        O::I64x2AllTrue => v_alltrue(lo, VShape::I64x2)?,
+        O::I8x16Bitmask => v_bitmask(lo, VShape::I8x16)?,
+        O::I16x8Bitmask => v_bitmask(lo, VShape::I16x8)?,
+        O::I32x4Bitmask => v_bitmask(lo, VShape::I32x4)?,
+        O::I64x2Bitmask => v_bitmask(lo, VShape::I64x2)?,
         // float lane arithmetic
         O::F32x4Add => v_fbin(lo, VShape::F32x4, VFloatBinOp::Add)?,
         O::F32x4Sub => v_fbin(lo, VShape::F32x4, VFloatBinOp::Sub)?,
@@ -2837,6 +3027,19 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::F64x2Abs => v_fun(lo, VShape::F64x2, VFloatUnOp::Abs)?,
         O::F64x2Neg => v_fun(lo, VShape::F64x2, VFloatUnOp::Neg)?,
         O::F64x2Sqrt => v_fun(lo, VShape::F64x2, VFloatUnOp::Sqrt)?,
+        // float lane comparisons → a per-lane all-ones/all-zeros mask (ordered; `ne` unordered).
+        O::F32x4Eq => v_fcmp(lo, VShape::F32x4, VFCmpOp::Eq)?,
+        O::F32x4Ne => v_fcmp(lo, VShape::F32x4, VFCmpOp::Ne)?,
+        O::F32x4Lt => v_fcmp(lo, VShape::F32x4, VFCmpOp::Lt)?,
+        O::F32x4Gt => v_fcmp(lo, VShape::F32x4, VFCmpOp::Gt)?,
+        O::F32x4Le => v_fcmp(lo, VShape::F32x4, VFCmpOp::Le)?,
+        O::F32x4Ge => v_fcmp(lo, VShape::F32x4, VFCmpOp::Ge)?,
+        O::F64x2Eq => v_fcmp(lo, VShape::F64x2, VFCmpOp::Eq)?,
+        O::F64x2Ne => v_fcmp(lo, VShape::F64x2, VFCmpOp::Ne)?,
+        O::F64x2Lt => v_fcmp(lo, VShape::F64x2, VFCmpOp::Lt)?,
+        O::F64x2Gt => v_fcmp(lo, VShape::F64x2, VFCmpOp::Gt)?,
+        O::F64x2Le => v_fcmp(lo, VShape::F64x2, VFCmpOp::Le)?,
+        O::F64x2Ge => v_fcmp(lo, VShape::F64x2, VFCmpOp::Ge)?,
         // whole-vector bitwise
         O::V128And => v_bitbin(lo, VBitBinOp::And)?,
         O::V128Or => v_bitbin(lo, VBitBinOp::Or)?,

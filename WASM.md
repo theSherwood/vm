@@ -6,8 +6,9 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (63 tests across
-`transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`). Real clang programs + two real C
+**Status: feature-complete for *typical clang/rustc -O2 output*** (79 tests across
+`transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
+Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
 and a wasi-threads parallel kernel run on both backends. `bench --threads`: SVM ~1.35× faster than
 Wasmtime+wasi-threads on spawn-heavy, parity on compute.
@@ -27,7 +28,8 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
   multi-value** block types; `call`; `call_indirect` (§3c type-id check); `memory.size`/`memory.grow`.
 - **memory64** — the 64-bit address path.
 - **Finished proposals**: sign-extension ops; non-trapping float→int (`trunc_sat`); bulk-memory
-  `memory.copy`/`memory.fill`; **fixed-128 SIMD** (a pragmatic ~60-op v128 subset, D58); **threads** —
+  `memory.copy`/`memory.fill`; **fixed-128 SIMD** (a pragmatic v128 subset, D58 — arith/bitwise/shuffle
+  + the **integer lane compares** `iNxM.{eq,ne,lt,gt,le,ge}` s/u → mask, `VIntCmp`); **threads** —
   full-width (i32/i64) `*.atomic.*` + `atomic.fence`, `shared`+imported memory, and the **wasi-threads**
   `wasi:thread/spawn` → native `thread.spawn` (a synthesized shim + unique-tid slot).
 - **Host ABI**: function imports → `cap.call` by the numeric `module`=type_id / `name`=op convention.
@@ -93,10 +95,48 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [ ] **SIMD remainder** (~175 of the v128 proposal): lane compares, lane shifts, int min/max/abs, sat
-  add/sub, narrow/widen, `all_true`/`bitmask`, dot product, etc. Mechanical breadth over the proven
-  5-step pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few
-  ops have no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
+- [ ] **SIMD remainder** (~68 of the v128 proposal): dot product, `i8x16.popcnt`, pmin/pmax,
+  the f64↔i32 conversions (`convert_low`/`trunc_sat_*_zero`), extadd/extmul, avgr, q15mulr, etc.
+  Mechanical breadth over the proven 5-step
+  pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops have
+  no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
+  - [x] **Integer lane compares — DONE.** `i8x16`/`i16x8`/`i32x4` `{eq,ne,lt,gt,le,ge}` s/u + the
+    `i64x2` signed set → a per-lane all-ones/all-zeros mask (`Inst::VIntCmp`, one Cranelift `icmp`).
+    `crates/svm/tests/simd.rs` (round-trip + interp==JIT, oracle = Rust's own compares) and
+    `svm-wasm/tests/simd.rs` (the wasm bridge + a real `bitselect`-max idiom).
+  - [x] **Integer min/max — DONE.** `i8x16`/`i16x8`/`i32x4` `{min,max}_{s,u}` (extends `VIntBinOp` →
+    one Cranelift `smin`/`umin`/`smax`/`umax`; `i64x2` has no min/max op, and would not legalize so it
+    bails on the JIT alongside `i8x16.mul`). Tests incl. a real lane-wise `clamp` kernel.
+  - [x] **Float lane compares — DONE.** `f32x4`/`f64x2` `{eq,ne,lt,gt,le,ge}` → mask (`Inst::VFloatCmp`,
+    one Cranelift `fcmp`; ordered, `ne` unordered — matches Rust's float operators, the test oracle,
+    incl. NaN). `crates/svm/tests/simd.rs` + `svm-wasm/tests/simd.rs`.
+  - [x] **Lane shifts — DONE.** `i8x16`/`i16x8`/`i32x4`/`i64x2` `{shl,shr_s,shr_u}` by a scalar `i32`
+    amount mod the lane width (`Inst::VShift`; vector `ishl`/`ushr`/`sshr` — Cranelift legalizes every
+    shape incl. `i8x16`). Oracle = Rust's scalar shifts at the lane width.
+  - [x] **Integer abs/neg — DONE.** `i8x16`/`i16x8`/`i32x4`/`i64x2` `{abs,neg}` (`Inst::VIntUn`, the
+    unary int sibling of `VFloatUn`; vector `iabs`/`ineg`, all shapes legalize incl. `i64x2.abs`).
+    Two's-complement wrap (`abs(INT_MIN) == INT_MIN`); oracle = Rust's `wrapping_abs`/`wrapping_neg`.
+  - [x] **Boolean reductions — DONE.** `v128.any_true`, `iNxM.all_true`, `iNxM.bitmask` → an `i32`
+    (`Inst::VAnyTrue`/`VAllTrue`/`VBitmask`; Cranelift `vany_true`/`vall_true`/`vhigh_bits`). The
+    v128→i32 result shape — how vectorized code **branches on a lane compare**. Tests incl. a SIMD
+    `memchr` (`eq` + `any_true`) and a move-mask (`lt_s` + `bitmask`).
+  - [x] **Saturating add/sub — DONE.** `i8x16`/`i16x8` `{add,sub}_sat_{s,u}` (`Inst::VSatBin`, a
+    dedicated family the **verifier restricts to the two narrow shapes** the wasm spec defines — so
+    no JIT bail list and the fuzzer can't reach a wide-shape sat; Cranelift `sadd_sat`/… native on
+    x86/aarch64). Oracle = Rust's `saturating_add`/`saturating_sub`; tests incl. a pixel-blend idiom.
+  - [x] **Lane widening (extend) — DONE.** `i16x8`/`i32x4`/`i64x2`.`extend_{low,high}_*_{s,u}`
+    (`Inst::VWiden` + `VShape::narrower`/`wider` helpers; Cranelift `swiden`/`uwiden` low/high). The
+    verifier rejects a result shape with no narrower source. Tests across all three width steps.
+  - [x] **Lane narrowing — DONE.** `i8x16`/`i16x8`.`narrow_*_{s,u}` — two wide vectors saturated into
+    one narrow vector, `a` then `b` (`Inst::VNarrow`; Cranelift `snarrow`/`unarrow`; verifier restricts
+    to the two narrow result shapes). Source read as signed, `s`/`u` pick the clamp range; tests incl.
+    a clamp-pack idiom.
+  - [x] **int↔float / float↔float conversions (i32↔f32 + demote/promote) — DONE.**
+    `f32x4.convert_i32x4_{s,u}`, `i32x4.trunc_sat_f32x4_{s,u}`, `f32x4.demote_f64x2_zero`,
+    `f64x2.promote_low_f32x4` (`Inst::VConvert`, whole-instruction mnemonics; Cranelift
+    `fcvt_from_{s,u}int`/`fcvt_to_{s,u}int_sat`/`fvdemote`/`fvpromote_low`). Rust's `as` casts are the
+    oracle — they already match wasm's round-to-nearest + `trunc_sat` (NaN→0, clamp). The **f64↔i32**
+    `convert_low`/`trunc_sat_*_zero` four remain (lane-count mismatch → multi-instruction lowering).
 - [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
   atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
   in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR
