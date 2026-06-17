@@ -513,10 +513,14 @@ non-durable freeze refusal. The **cross-backend** property (`crates/svm/tests/du
 + the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
-Still ahead (Phase 2, escape-TCB): **capturing** real page protections from a running backend
-(interp `Mem` / JIT window) into the image and **re-establishing** them on the restored
-window — the codec now carries prots, but no backend yet feeds or applies them. Then §12.4
-fiber/dispatch control state.
+**Capture** landed for the interpreter: `run_capture_reserved_with_host_prots` returns a
+per-page `CapturedProt` map (`Rw`/`Ro`/`Unmapped`/`Backed`) alongside the window bytes, at the
+fixed `DURABLE_SNAPSHOT_PAGE` (= codec `PAGE`) granularity. `crates/svm/tests/durable_prot_capture.rs`
+shows a D40 `readonly` data segment captured as `Ro` and surviving freeze→restore through the
+codec (where Phase-1's flat all-`Rw` image would have lost it); a `Backed` page maps to a
+freeze refusal (D-region). Still ahead (escape-TCB): **re-establishing** protections on the
+restored runtime window (interp `Mem` then the JIT `GuestWindow` via `mprotect`/`VirtualProtect`)
+so a thawed `Ro` page faults on write; JIT-side capture; then §12.4 fiber/dispatch control state.
 
 ### 12.7 Shadow-frame layout
 

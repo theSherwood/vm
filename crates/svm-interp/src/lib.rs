@@ -1161,6 +1161,58 @@ pub fn run_capture_reserved_with_host(
     (r, snap)
 }
 
+/// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `svm-snapshot`'s
+/// `PAGE`). Protections are captured at this fixed size — independent of the host page size — so
+/// an artifact is portable across hosts. A 4 KiB codec page sits within one host page (host
+/// pages are `≥ 4 KiB`), so each codec page's protection is that of its containing host page.
+pub const DURABLE_SNAPSHOT_PAGE: u64 = 4096;
+
+/// Per-page protection of a captured window region, for the durable snapshot (DURABILITY.md
+/// §12.3). A faithful view of the interpreter's page model; `Backed` is the §13
+/// `SharedRegion`-aliased case a durable snapshot must reject (D-region — freeze refuses).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CapturedProt {
+    /// Read/write (the default for a committed prefix page).
+    Rw,
+    /// Read-only — e.g. a D40 `readonly` data segment, or a guest `protect`.
+    Ro,
+    /// Unmapped / uncommitted — any access faults.
+    Unmapped,
+    /// A §13 `SharedRegion`-aliased page — not snapshottable in v1 (D-region).
+    Backed,
+}
+
+/// [`run_capture_reserved_with_host`] that additionally returns the per-page **protection** map
+/// over the same snapshot span (one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page), so
+/// a durable freeze can record real `Ro`/`Unmapped` pages (DURABILITY.md §12.3) rather than
+/// assuming the whole window is `Rw`. Capture-only: re-establishing protections on restore is a
+/// separate step.
+pub fn run_capture_reserved_with_host_prots(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    reserved_log2: u8,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<u8>, Vec<CapturedProt>) {
+    if m.funcs.get(func as usize).is_none() {
+        return (Err(Trap::Malformed), Vec::new(), Vec::new());
+    }
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        mm.seed(init_mem);
+        mm.init_data(&m.data);
+        mm
+    });
+    let r = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (snap, prots) = mem
+        .as_ref()
+        .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
+        .unwrap_or_default();
+    (r, snap, prots)
+}
+
 /// Run the guest confined to a §14 **nested sub-window** `[base, base+size)` of a fully-backed
 /// parent of `parent_bytes` (the child runs over the parent's `Region`; `size = 1 << size_log2` is
 /// the module's declared memory). The masking unit ([`svm_mask::Window::sub`]) confines every child
@@ -8099,6 +8151,32 @@ impl Mem {
             }
         }
         out
+    }
+
+    /// Per-page protections over the same span as [`snapshot_window`], one [`CapturedProt`] per
+    /// [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). A page absent from the map is
+    /// `Rw` in the committed prefix and `Unmapped` in the reserved tail — the same default the
+    /// access path and the JIT's page tables use.
+    fn snapshot_prots(&self, snap_cap: usize) -> Vec<CapturedProt> {
+        let snap = self
+            .window
+            .reserved()
+            .min(self.window.mapped().max(snap_cap as u64));
+        let mapped = self.window.mapped();
+        let space = self.space_read();
+        (0..snap / DURABLE_SNAPSHOT_PAGE)
+            .map(|i| {
+                let byte_off = i * DURABLE_SNAPSHOT_PAGE;
+                match space.prot.get(&(byte_off / self.page)) {
+                    Some(PageProt::Rw) => CapturedProt::Rw,
+                    Some(PageProt::Ro) => CapturedProt::Ro,
+                    Some(PageProt::Unmapped) => CapturedProt::Unmapped,
+                    Some(PageProt::Backed { .. }) => CapturedProt::Backed,
+                    None if byte_off < mapped => CapturedProt::Rw,
+                    None => CapturedProt::Unmapped,
+                }
+            })
+            .collect()
     }
 }
 
