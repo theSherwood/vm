@@ -51,9 +51,10 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | W1 time-travel — `seek(t)` / `step_back`: single-threaded (op `clock`) **and** multithreaded (global `turn`); faithful via `CapTape` | **Built — slices 1–3** | `svm-interp` `Inspector::seek` / `turn` / `step_back` |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
+| Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
-| Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
-| DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover) | **Built — W5 slices 1–6** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text); chibicc `-g` emits `debug.var` + `debug.loc` + `debug.type`/`debug.field`** (D-DBG-7/§6; binary section pending; DAP consumer of types pending) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-interp`, `codegen_ir.c` |
+| DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -565,15 +566,59 @@ editor-facing refinements, both pure DAP/interpreter-side (no ABI change):
   breakpoint skips the i=3/i=2 loop iterations and stops at i=1; `evaluate("i * 2 + acc")` = 6,
   `"i / acc"` (acc=0) fails cleanly. Evaluator unit tests in `expr`.
 
-**Not yet — structured `TypeRef` (W4), the gate for aggregate inspection.** Member/index access
-(`a.b`, `arr[i]`) in `evaluate` **and** expanding a struct/array in the Variables pane (nested
-`variablesReference` children) both need **field offsets / element strides**, which the debug-info
-ABI doesn't carry — today `debug.var` records a type *name string* (`"int"`), not a structured
-`TypeRef`. So the next aggregate-inspection step is a **W4 debug-info ABI enrichment** (structured
-types in `svm-ir` + the chibicc emitter), after which both fall out; the expression *parser* is
-already in place. Also still open: float expressions and short-circuit `&&`/`||`; conditional
-breakpoints are honored by forward `continue` but not yet by `reverseContinue` (it stops at any
-breakpoint pc); and the JIT/DWARF tier for gdb/lldb on native code.
+**Built — structured `TypeRef` ABI + producer (W4 slice 7).** The debug-info waist now carries a
+structured type table — `DebugInfo::types: Vec<TypeDef>` (`Base{enc,size}` | `Pointer{pointee}` |
+`Array{elem,count}` | `Aggregate{size,fields:[{name,offset,ty}]}` | `Opaque{size}`), referenced
+by a `VarInfo::type_id: Option<TypeId>` — so a variable's **layout** (struct field offsets, array
+strides, pointee) crosses the IR, not just a render name. Text round-trips it (`debug.type` /
+`debug.field`, and an optional trailing id on `debug.var`); the `ty` name string stays for the
+scalar common case and back-compat (a var with no `type_id` is name-only). chibicc `-g` emits it:
+`intern_type` walks each named local's C `Type`, interning by pointer identity (which bounds the
+`struct Node { struct Node *next; }` cycle) plus structural dedup for base scalars, and records
+field offsets / element counts / pointees. Tests: chibicc emits a `struct`/array/pointer with the
+right offsets and a self-consistent table (`c_frontend.rs`); the table round-trips through text
+(`debug.rs`).
+
+**Built — DAP Variables-pane aggregate expansion (W4 slice 8, the first consumer of the type
+table).** A struct/array local now shows in the editor's Variables pane with an expand triangle:
+the DAP server hands back a nonzero `variablesReference` (a `Place` = focused thread + window
+address + `TypeId`), and a `variables` request on it enumerates the struct's fields / the array's
+elements — each itself expandable if aggregate, scalar leaves read straight from the thread's
+window and formatted per their `TypeDef` (signed/unsigned/float/`_Bool`/pointer-as-hex). Addresses
+come from the frame's data-SP (`read_ir_value(frame, 0)`) plus the `Window` offset; `seek`/resume
+clear the place table (the addresses go stale). Test (`dap.rs`): a guest fills a `struct {int x,y}`
+and an `int[3]`, and the scripted conversation expands `p` → `x=11, y=22` and `row` → `[0]=100,
+[1]=200, [2]=300`. The `evaluate` member/index half landed in slice 10 (below); still open:
+pointer-deref *expansion* in the Variables pane and richer render names (the C tag, e.g.
+`"struct Point"`).
+
+**Built — `evaluate` member / index / arrow access (W4 slice 10, the consumer half completed).**
+`evaluate` now resolves `a.b`, `arr[i]`, and `p->x` (and combinations like `p.x + arr[i]`,
+`pp[0].y`) over the structured types. The scalar `expr` evaluator grew a frontend-agnostic
+[`expr::Resolver`] trait + a [`Value`] = `Int | Place{addr, type_id}`: parsing/precedence stay in
+`expr` (now with postfix `.`/`->`/`[]`), while the *semantics* (name lookup, member/index/deref,
+integer coercion) are a callback the caller implements. `svm-dap`'s `EvalEnv` is that callback —
+pure address arithmetic over `TypeDef` + window reads, no `svm-ir`/frontend types in `expr`
+itself. `eval_int` (conditional breakpoints) is unchanged, now a thin wrapper over the same core.
+Tests (`dap.rs`): member/index/mixed arithmetic over a struct+array, and `->`/pointer-indexing
+through a pointer; bad accesses (`p.nope`, `p.x.y`, `pp->x->y`) fail cleanly. *Not yet:*
+pointer-deref expansion (Variables pane), floats / short-circuit `&&`/`||`, and richer render
+names.
+
+**Built — frontend-neutrality cleanup (W4 slice 9).** Scalar read widths now come from the
+structured type's `size` (`scalar_width` → `TypeDef.size`), not the variable's *name*; the old
+C-name heuristic (`ty_width`) survives only as the fallback for name-only / legacy debug info with
+no `type_id`. That removes the one remaining C-specific assumption from the normal consumer path —
+an audit of `svm-interp` + `svm-dap` finds **zero** chibicc/frontend references and `ty_width` as
+the lone C-name site. A standing **neutrality test** (`dap.rs`,
+`dap_inspects_a_non_c_frontend_by_structured_layout_only`) inspects a debug section with *non-C*
+type names (`i32`, `Pair`, an `x.rs` file) and asserts the interpreter + DAP read and expand it
+correctly using only the structured layout — locking the consumer's frontend-agnosticism into CI
+(the D-DBG-7 waist holds: consumers depend only on the neutral `DebugInfo`, never on a producer).
+
+**Not yet (other W5 gaps).** Float expressions and short-circuit `&&`/`||` in `evaluate`;
+conditional breakpoints are honored by forward `continue` but not yet by `reverseContinue` (it
+stops at any breakpoint pc); and the JIT/DWARF tier for gdb/lldb on native code.
 
 ---
 
@@ -948,10 +993,45 @@ values. Default (non-`-g`) output is unchanged, so all 78 existing c_frontend te
 untouched. `debug.loc` (per-op source lines) needs per-op inst counting in the emitter — a later
 slice.
 
-**Not yet (next slices):** `debug.loc` source-line emission (chibicc + the LLVM/wasm ingest
-sides), binary serialization of the debug section, multithreaded debugging (the `Policy`
-scheduler seam, Milestone B), and the W4 refinements (per-block `LocList`, structured `TypeRef`,
-rich blob).
+**Slice 6 — `debug.loc` source lines (chibicc).** `chibicc -g` now also emits `debug.loc`
+rows, so breakpoints and backtraces resolve to `file:line`, not just named variables. The
+emitter routes every IR line through one sink (`cg(...)`) that counts `block.insts` entries (a
+two-space-prefixed, non-terminator line), so source locations key on `(func, block, inst)`
+*exactly* — no fragile heuristics. Locations are recorded per statement (in `gen_stmt`), and the
+interpreter's `source_loc` uses **nearest-preceding within `(func, block)`** (DWARF line-table
+semantics). `backtrace` frames carry the resolved `SourceLoc`. Tests (`c_frontend.rs`): a
+breakpoint at the last block op resolves to the `return` line, and multi-block control flow
+(a `for` loop) maps each block to its source line. The full source-level loop — *set a breakpoint,
+see the line and the named locals* — now works end-to-end on real C.
+
+**Slice 7 — structured `TypeRef` ABI + chibicc emission.** The debug-info waist gained a
+structured type table (`DebugInfo::types`, referenced by `VarInfo::type_id`), so a variable
+carries its **layout** — struct field offsets, array element + count, pointer pointee — and not
+just a render-name string. `TypeDef ∈ { Base, Pointer, Array, Aggregate{fields}, Opaque }`; the
+text form adds `debug.type` / `debug.field` and an optional trailing id on `debug.var`, with the
+old name-only `debug.var` still valid (back-compat: `type_id = None`). chibicc `-g` interns each
+named local's C `Type` (by pointer identity to bound recursive aggregates, plus structural dedup
+of base scalars) and emits the table. This is the **producer + ABI** half (the §7 W5 note). The
+binary section is still stripped (`svm-encode` sets `debug_info: None`), and render names are
+still generic (`"struct"`, not `"struct Point"` — the C tag isn't on chibicc's `Type`).
+
+**Slice 8 — DAP Variables-pane aggregate expansion (first consumer of the type table).** A
+struct/array local expands in the editor: the server hands back a nonzero `variablesReference`
+naming a `Place` (thread + window address + `TypeId`), and a `variables` request on it lists the
+fields/elements — recursively for nested aggregates, scalar leaves read from the window and
+formatted per `TypeDef`. Full design in §7.
+
+**Slice 10 — `evaluate` member / index / arrow.** Completes the consumer half: `evaluate` resolves
+`a.b` / `arr[i]` / `p->x` (and mixes like `p.x + arr[i]`) over the structured types. The `expr`
+evaluator grew a frontend-agnostic `Resolver` trait + a `Value` (`Int | Place`); `svm-dap`'s
+`EvalEnv` implements the navigation as address arithmetic over `TypeDef` + window reads. Full
+design in §7.
+
+**Not yet (next slices):** pointer-deref *expansion* in the Variables pane; richer type render
+names; the LLVM/wasm `debug.loc` + type ingest sides; binary serialization of the debug
+section; and the remaining W4 refinement (per-block `LocList` so promoted scalars are debuggable
+without `-Og`, per-producer rich blob). (Multithreaded debugging and the interpreter-backed DAP
+server are already built — Milestone B and W5 slices 1–6.)
 
 ### Open questions (S4/S5/S2)
 

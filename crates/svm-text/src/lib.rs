@@ -22,11 +22,11 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module,
-    Ordering, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
-    VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo,
-    VarLoc,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, FBinOp, FCmpOp,
+    FToI, FUnOp, Field, FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc,
+    Memory, Module, Ordering, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp,
+    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp,
+    VWidenOp, ValType, VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -90,10 +90,11 @@ pub fn print_module(m: &Module) -> String {
 
 /// Print the frontend-neutral debug-info waist (DEBUGGING.md §6) as module-level directives after
 /// the functions: `debug.file <idx> "<path>"`, `debug.loc <fn> <bb> <i> <file> <line> <col>`,
-/// `debug.var <fn> "<name>" win|ssa <n> "<type>"`. Absent ⇒ nothing printed.
+/// the structured type table (`debug.type` / `debug.field`), and
+/// `debug.var <fn> "<name>" win|ssa <n> "<type>" [<type_id>]`. Absent ⇒ nothing printed.
 fn print_debug_info(s: &mut String, m: &Module) {
     let Some(di) = &m.debug_info else { return };
-    if di.files.is_empty() && di.locs.is_empty() && di.vars.is_empty() {
+    if di.files.is_empty() && di.locs.is_empty() && di.types.is_empty() && di.vars.is_empty() {
         return;
     }
     s.push('\n');
@@ -107,16 +108,58 @@ fn print_debug_info(s: &mut String, m: &Module) {
             l.func, l.block, l.inst, l.file, l.line, l.col
         );
     }
+    // Type table: `debug.type <id> <kind> ...` (declaration order ⇒ dense ids), with an aggregate's
+    // members on following `debug.field <type_id> "<name>" <off> <field_ty>` lines.
+    for (id, t) in di.types.iter().enumerate() {
+        match t {
+            TypeDef::Base {
+                name,
+                encoding,
+                size,
+            } => {
+                let enc = match encoding {
+                    Encoding::Signed => "signed",
+                    Encoding::Unsigned => "unsigned",
+                    Encoding::Float => "float",
+                    Encoding::Bool => "bool",
+                };
+                let _ = writeln!(s, "debug.type {id} base \"{name}\" {enc} {size}");
+            }
+            TypeDef::Pointer {
+                name,
+                pointee,
+                size,
+            } => {
+                let _ = writeln!(s, "debug.type {id} ptr \"{name}\" {pointee} {size}");
+            }
+            TypeDef::Array { name, elem, count } => {
+                let _ = writeln!(s, "debug.type {id} array \"{name}\" {elem} {count}");
+            }
+            TypeDef::Aggregate { name, size, fields } => {
+                let _ = writeln!(s, "debug.type {id} agg \"{name}\" {size}");
+                for f in fields {
+                    let _ = writeln!(s, "debug.field {id} \"{}\" {} {}", f.name, f.offset, f.ty);
+                }
+            }
+            TypeDef::Opaque { name, size } => {
+                let _ = writeln!(s, "debug.type {id} opaque \"{name}\" {size}");
+            }
+        }
+    }
     for v in &di.vars {
         let (kind, n) = match v.loc {
             VarLoc::Window { off } => ("win", off),
             VarLoc::Ssa { value } => ("ssa", value as i64),
         };
-        let _ = writeln!(
+        let _ = write!(
             s,
             "debug.var {} \"{}\" {kind} {n} \"{}\"",
             v.func, v.name, v.ty
         );
+        if let Some(tid) = v.type_id {
+            let _ = write!(s, " {tid}");
+        }
+        s.push('\n');
     }
 }
 
@@ -720,6 +763,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
     let mut data: Vec<Data> = Vec::new();
     let mut dbg_files: Vec<String> = Vec::new();
     let mut dbg_locs: Vec<Loc> = Vec::new();
+    let mut dbg_types: Vec<TypeDef> = Vec::new();
     let mut dbg_vars: Vec<VarInfo> = Vec::new();
     while !p.at_end() {
         match p.peek() {
@@ -747,6 +791,71 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     col: p.parse_u32()?,
                 });
             }
+            // Structured type table (DEBUGGING.md §6 `TypeRef`): `debug.type <id> <kind> ...` with
+            // dense ids in declaration order; an aggregate's members follow on `debug.field` lines.
+            Some(Tok::Ident(s)) if s == "debug.type" => {
+                p.next()?;
+                let id = p.parse_int()?;
+                if id < 0 || id as usize != dbg_types.len() {
+                    return err("debug.type ids must be dense and in declaration order");
+                }
+                let kind = p.parse_ident()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.type name is not valid UTF-8".into()))?;
+                let t = match kind.as_str() {
+                    "base" => {
+                        let encoding = match p.parse_ident()?.as_str() {
+                            "signed" => Encoding::Signed,
+                            "unsigned" => Encoding::Unsigned,
+                            "float" => Encoding::Float,
+                            "bool" => Encoding::Bool,
+                            e => return err(format!("unknown debug.type base encoding: {e}")),
+                        };
+                        TypeDef::Base {
+                            name,
+                            encoding,
+                            size: p.parse_u32()?,
+                        }
+                    }
+                    "ptr" => TypeDef::Pointer {
+                        name,
+                        pointee: p.parse_u32()?,
+                        size: p.parse_u32()?,
+                    },
+                    "array" => TypeDef::Array {
+                        name,
+                        elem: p.parse_u32()?,
+                        count: p.parse_u32()?,
+                    },
+                    "agg" => TypeDef::Aggregate {
+                        name,
+                        size: p.parse_u32()?,
+                        fields: Vec::new(),
+                    },
+                    "opaque" => TypeDef::Opaque {
+                        name,
+                        size: p.parse_u32()?,
+                    },
+                    k => return err(format!("unknown debug.type kind: {k}")),
+                };
+                dbg_types.push(t);
+            }
+            Some(Tok::Ident(s)) if s == "debug.field" => {
+                p.next()?;
+                let ty_id = p.parse_int()?;
+                let name = String::from_utf8(p.parse_str()?)
+                    .map_err(|_| ParseError("debug.field name is not valid UTF-8".into()))?;
+                let offset = p.parse_u32()?;
+                let field_ty = p.parse_u32()?;
+                match dbg_types.get_mut(ty_id as usize) {
+                    Some(TypeDef::Aggregate { fields, .. }) => fields.push(Field {
+                        name,
+                        offset,
+                        ty: field_ty,
+                    }),
+                    _ => return err("debug.field references a non-aggregate (or undeclared) type"),
+                }
+            }
             Some(Tok::Ident(s)) if s == "debug.var" => {
                 p.next()?;
                 let func = p.parse_u32()?;
@@ -767,11 +876,19 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                 };
                 let ty = String::from_utf8(p.parse_str()?)
                     .map_err(|_| ParseError("debug.var type is not valid UTF-8".into()))?;
+                // Optional trailing structured type id (a bare integer). Directives that follow
+                // start with an `Ident`, and a func body opens with `(`/`func`, so an `Int` here is
+                // unambiguously the type ref.
+                let type_id = match p.peek() {
+                    Some(Tok::Int(_)) => Some(p.parse_u32()?),
+                    _ => None,
+                };
                 dbg_vars.push(VarInfo {
                     func,
                     name,
                     ty,
                     loc,
+                    type_id,
                 });
             }
             // Module-level `memory <size_log2>` declaration.
@@ -820,12 +937,17 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
             _ => funcs.push(p.parse_func()?),
         }
     }
-    let debug_info = if dbg_files.is_empty() && dbg_locs.is_empty() && dbg_vars.is_empty() {
+    let debug_info = if dbg_files.is_empty()
+        && dbg_locs.is_empty()
+        && dbg_types.is_empty()
+        && dbg_vars.is_empty()
+    {
         None
     } else {
         Some(DebugInfo {
             files: dbg_files,
             locs: dbg_locs,
+            types: dbg_types,
             vars: dbg_vars,
         })
     };
@@ -900,6 +1022,34 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                     p.parse_int()?;
                 }
             }
+            Some(Tok::Ident(s)) if s == "debug.type" => {
+                p.next()?;
+                p.parse_int()?; // id
+                let kind = p.parse_ident()?;
+                p.parse_str()?; // name
+                                // Trailing operands vary by kind; consume them as bare integers.
+                let n = match kind.as_str() {
+                    "base" => {
+                        p.next()?; // encoding ident
+                        1 // size
+                    }
+                    "ptr" => 2,    // pointee, size
+                    "array" => 2,  // elem, count
+                    "agg" => 1,    // size
+                    "opaque" => 1, // size
+                    _ => return err("unknown debug.type kind in prescan"),
+                };
+                for _ in 0..n {
+                    p.parse_int()?;
+                }
+            }
+            Some(Tok::Ident(s)) if s == "debug.field" => {
+                p.next()?;
+                p.parse_int()?; // type id
+                p.parse_str()?; // name
+                p.parse_int()?; // offset
+                p.parse_int()?; // field type
+            }
             Some(Tok::Ident(s)) if s == "debug.var" => {
                 p.next()?;
                 p.parse_int()?; // func
@@ -907,6 +1057,9 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.next()?; // location kind (win|ssa)
                 p.parse_int()?; // n
                 p.parse_str()?; // type
+                if matches!(p.peek(), Some(Tok::Int(_))) {
+                    p.parse_int()?; // optional structured type id
+                }
             }
             _ => return err("expected `func` or `memory`"),
         }

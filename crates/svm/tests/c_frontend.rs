@@ -2702,3 +2702,143 @@ int compute(int a, int b) {
     assert_eq!(as_i32_var(insp.read_var(0, "b", 4)), 3);
     assert_eq!(insp.read_var(0, "nonesuch", 4), None);
 }
+
+#[test]
+fn chibicc_g_maps_breakpoints_to_source_lines() {
+    // Raw string starts with a newline, so: line 2 = signature, 3 = `int s`, 4 = `int t`,
+    // 5 = `return t`.
+    let src = r#"
+int compute(int a, int b) {
+  int s = a + b;
+  int t = s + 100;
+  return t;
+}
+"#;
+    let ir = c_to_ir_g(src);
+    assert!(ir.contains("debug.loc 0 "), "emits debug.loc rows:\n{ir}");
+    assert!(ir.contains("debug.file 0 "), "emits a debug.file");
+    let m = parse_module(&ir).expect("parse");
+
+    let sp = 32768i64;
+    let mut insp = Inspector::attach(
+        &m,
+        0,
+        &[Value::I64(sp), Value::I32(5), Value::I32(3)],
+        1_000_000,
+    );
+
+    // The last op of the single block is the return's value load → the `return t` line (5).
+    let last = m.funcs[0].blocks[0].insts.len() - 1;
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: last,
+    };
+    insp.set_breakpoint(bp);
+    assert!(matches!(
+        insp.run_until_stop(),
+        svm_interp::Stop::Break { .. }
+    ));
+
+    let loc = insp.source_loc(bp).expect("source loc at the return");
+    assert_eq!(loc.line, 5, "last block op maps to `return t`");
+    assert!(
+        loc.file.ends_with(".c"),
+        "file is the C source: {}",
+        loc.file
+    );
+    // The backtrace frame carries the same source line.
+    assert_eq!(insp.backtrace()[0].source.as_ref().map(|s| s.line), Some(5));
+    // And `t` is still readable by name (= s + 100 = 108).
+    assert_eq!(as_i32_var(insp.read_var(0, "t", 4)), 108);
+}
+
+#[test]
+fn chibicc_g_emits_structured_types_with_field_offsets() {
+    use svm_ir::{Encoding, TypeDef, VarLoc};
+
+    // A struct local carries its layout through the §6 `TypeRef` waist: the type table records
+    // `struct Point { int x; int y; }` with field offsets, an array records its element + count,
+    // and a pointer records its pointee — the data aggregate inspection (struct/array expansion,
+    // `a.b` / `arr[i]`) needs.
+    let src = r#"
+struct Point { int x; int y; };
+int dist(int ax, int ay) {
+  struct Point p;
+  int row[4];
+  struct Point *pp;
+  p.x = ax;
+  p.y = ay;
+  pp = &p;
+  row[0] = pp->x;
+  return p.x + p.y + row[0];
+}
+"#;
+    let ir = c_to_ir_g(src);
+    // Producer side: the structured directives are present in the text.
+    assert!(
+        ir.contains("debug.type") && ir.contains(" agg \"struct\""),
+        "emits an aggregate type for the struct:\n{ir}"
+    );
+    assert!(
+        ir.contains("debug.field") && ir.contains("\"y\" 4"),
+        "emits field `y` at offset 4:\n{ir}"
+    );
+
+    // ABI side: parse and walk the structured types.
+    let m = parse_module(&ir).expect("parse");
+    let di = m.debug_info.as_ref().expect("debug info");
+    let resolve = |name: &str| -> &TypeDef {
+        let v = di
+            .vars
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("var {name}"));
+        // `-g` is `-Og`, so every local is a window slot.
+        assert!(
+            matches!(v.loc, VarLoc::Window { .. }),
+            "{name} is a window local"
+        );
+        let tid = v
+            .type_id
+            .unwrap_or_else(|| panic!("{name} carries a structured type"));
+        &di.types[tid as usize]
+    };
+
+    // `struct Point p` — an aggregate with x@0, y@4, both 4-byte signed ints, size 8.
+    let TypeDef::Aggregate { name, size, fields } = resolve("p") else {
+        panic!("p is a struct");
+    };
+    assert_eq!(name, "struct"); // render name; the C tag ("Point") is a later enrichment
+    assert_eq!(*size, 8);
+    assert_eq!(fields.len(), 2);
+    assert_eq!((fields[0].name.as_str(), fields[0].offset), ("x", 0));
+    assert_eq!((fields[1].name.as_str(), fields[1].offset), ("y", 4));
+    for f in fields {
+        let TypeDef::Base { encoding, size, .. } = &di.types[f.ty as usize] else {
+            panic!("field {} is a base type", f.name);
+        };
+        assert_eq!((*encoding, *size), (Encoding::Signed, 4));
+    }
+
+    // `int row[4]` — an array of 4 elements; element resolves to a 4-byte int.
+    let TypeDef::Array { elem, count, .. } = resolve("row") else {
+        panic!("row is an array");
+    };
+    assert_eq!(*count, 4);
+    assert!(matches!(
+        &di.types[*elem as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `struct Point *pp` — a pointer whose pointee is the same aggregate as `p`.
+    let TypeDef::Pointer { pointee, size, .. } = resolve("pp") else {
+        panic!("pp is a pointer");
+    };
+    assert_eq!(*size, 8, "pointer width");
+    assert!(
+        matches!(&di.types[*pointee as usize], TypeDef::Aggregate { name, .. } if name == "struct"),
+        "pp points at the struct"
+    );
+}

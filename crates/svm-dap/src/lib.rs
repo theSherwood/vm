@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue};
-use svm_ir::{DebugInfo, ValType};
+use svm_ir::{DebugInfo, Encoding, TypeDef, TypeId, ValType, VarInfo, VarLoc};
 
 mod expr;
 mod json;
@@ -51,6 +51,10 @@ struct Session {
     /// `scopes`/`variables`/`evaluate`, so a reference names a specific thread's frame (multithreaded
     /// DAP). Cleared whenever execution resumes (old frames become stale).
     frame_refs: Vec<(u64, usize)>,
+    /// Expandable aggregate/array sub-values, indexed by `variablesReference - PLACE_BASE`. A
+    /// `variables` request on such a reference enumerates the struct's fields / array's elements
+    /// (each itself expandable if aggregate). Cleared on resume alongside `frame_refs`.
+    place_refs: Vec<Place>,
     /// Multithreaded run (`attach_scheduled[_seeded]`)? Selects the time-travel coordinate: the
     /// global scheduler `turn` when scheduled, the op `clock` single-threaded.
     scheduled: bool,
@@ -61,15 +65,13 @@ impl Session {
     /// `frame_idx` levels up the focused thread — the binding the expression evaluator and
     /// conditional breakpoints use. `None` if there is no such variable or its value isn't integral.
     fn resolve_var(&self, frame_idx: usize, func: u32, name: &str) -> Option<i64> {
-        let ty = self
-            .debug
-            .as_ref()?
+        let debug = self.debug.as_ref()?;
+        let var = debug
             .vars
             .iter()
-            .find(|v| v.func == func && v.name == name)?
-            .ty
-            .clone();
-        var_to_i64(&self.inspector.read_var(frame_idx, name, ty_width(&ty))?)
+            .find(|v| v.func == func && v.name == name)?;
+        let width = scalar_width(&debug.types, var.type_id, &var.ty);
+        var_to_i64(&self.inspector.read_var(frame_idx, name, width)?)
     }
 }
 
@@ -82,6 +84,20 @@ enum StepKind {
     Over,
     Out,
 }
+
+/// A typed location in a thread's window — the target of an expandable `variablesReference`. Holds
+/// the focused thread and the absolute window address + structured type of the aggregate/array, so
+/// `variables` can read its members (DEBUGGING.md §6 structured `TypeRef`).
+struct Place {
+    tid: u64,
+    addr: u64,
+    type_id: TypeId,
+}
+
+/// Expandable-variable references start here, above the frame references (`frame_refs`, numbered
+/// `1..=len`). `variablesReference >= PLACE_BASE` ⇒ an aggregate/array place (`place_refs[ref -
+/// PLACE_BASE]`); a smaller nonzero reference is a frame's Locals scope.
+const PLACE_BASE: i64 = 1 << 20;
 
 impl DapServer {
     pub fn new() -> DapServer {
@@ -238,6 +254,7 @@ impl DapServer {
             breakpoints: Vec::new(),
             conditions: BTreeMap::new(),
             frame_refs: Vec::new(),
+            place_refs: Vec::new(),
             scheduled,
         });
         (true, Json::Null, vec![])
@@ -421,42 +438,154 @@ impl DapServer {
             Json::obj(vec![("variables", Json::Arr(vec![]))]),
             vec![],
         );
-        let Some(session) = self.session.as_mut() else {
+        if self.session.is_none() {
             return (false, Json::Null, vec![]);
+        }
+        // A reference at/above PLACE_BASE expands a struct/array sub-value; below it is a frame's
+        // Locals scope.
+        let out = if vref >= PLACE_BASE {
+            self.expand_place((vref - PLACE_BASE) as usize)
+        } else {
+            self.frame_locals(vref)
         };
-        // Recover (thread, frame index) from the reference, focus that thread, then read its locals.
-        let Some(&(tid, frame_idx)) = vref
+        match out {
+            Some(vars) => (
+                true,
+                Json::obj(vec![("variables", Json::Arr(vars))]),
+                vec![],
+            ),
+            None => empty,
+        }
+    }
+
+    /// The Locals of a frame reference (`vref = frameId + 1`): one DAP variable per source local,
+    /// with an expandable `variablesReference` for aggregates/arrays (DEBUGGING.md §6).
+    fn frame_locals(&mut self, vref: i64) -> Option<Vec<Json>> {
+        let session = self.session.as_mut()?;
+        let &(tid, frame_idx) = vref
             .checked_sub(1)
-            .and_then(|r| session.frame_refs.get(r as usize))
-        else {
-            return empty;
-        };
-        let Some(debug) = session.debug.as_ref() else {
-            return empty;
-        };
+            .and_then(|r| session.frame_refs.get(r as usize))?;
+        let debug = session.debug.as_ref()?;
         session.inspector.select_task(tid);
         let frames = session.inspector.backtrace();
+        let frame = frames.get(frame_idx)?;
+        // Snapshot (name, ty, loc, type_id) so the `debug` borrow ends before we read/allocate.
+        let vars: Vec<(String, String, VarLoc, Option<TypeId>)> = debug
+            .vars
+            .iter()
+            .filter(|v| v.func == frame.pc.func)
+            .map(|v| (v.name.clone(), v.ty.clone(), v.loc, v.type_id))
+            .collect();
         let mut out = Vec::new();
-        if let Some(frame) = frames.get(frame_idx) {
-            // Collect the (name, type) pairs first so the `debug` borrow ends before `read_var`.
-            let vars: Vec<(String, String)> = debug
-                .vars
-                .iter()
-                .filter(|v| v.func == frame.pc.func)
-                .map(|v| (v.name.clone(), v.ty.clone()))
-                .collect();
-            for (name, ty) in vars {
-                if let Some(val) = session.inspector.read_var(frame_idx, &name, ty_width(&ty)) {
-                    out.push(Json::obj(vec![
-                        ("name", Json::s(name)),
-                        ("value", Json::s(fmt_var(&val))),
-                        ("type", Json::s(ty)),
-                        ("variablesReference", Json::i(0)),
-                    ]));
+        for (name, ty, loc, type_id) in vars {
+            // An aggregate/array window local is expandable: name a `Place` at its base address.
+            if let (VarLoc::Window { off }, Some(tid_ref)) =
+                (loc, type_id.filter(|&t| self.is_expandable(t)))
+            {
+                if let Some(base) = self.var_base_addr(frame_idx, off) {
+                    let vr = self.alloc_place(tid, base, tid_ref);
+                    out.push(var_json(
+                        &name,
+                        &type_summary(self.types(), tid_ref),
+                        &ty,
+                        vr,
+                    ));
+                    continue;
                 }
             }
+            // Otherwise a scalar: read and format its value. Width from the structured type.
+            let width = scalar_width(self.types(), type_id, &ty);
+            let session = self.session.as_ref()?;
+            if let Some(val) = session.inspector.read_var(frame_idx, &name, width) {
+                out.push(var_json(&name, &fmt_var(&val), &ty, 0));
+            }
         }
-        (true, Json::obj(vec![("variables", Json::Arr(out))]), vec![])
+        Some(out)
+    }
+
+    /// The members of an expandable `Place`: a struct's fields or an array's elements, each itself
+    /// expandable if aggregate. Reads scalar leaves straight from the thread's window.
+    fn expand_place(&mut self, idx: usize) -> Option<Vec<Json>> {
+        let session = self.session.as_ref()?;
+        let place = session.place_refs.get(idx)?;
+        let (tid, base, type_id) = (place.tid, place.addr, place.type_id);
+        let types = session.debug.as_ref()?.types.clone();
+        self.session.as_mut()?.inspector.select_task(tid);
+
+        // Build the (name, addr, type) of each member, then render — reading children below.
+        let mut members: Vec<(String, u64, TypeId)> = Vec::new();
+        match types.get(type_id as usize)? {
+            TypeDef::Aggregate { fields, .. } => {
+                for f in fields {
+                    members.push((f.name.clone(), base + f.offset as u64, f.ty));
+                }
+            }
+            TypeDef::Array { elem, count, .. } => {
+                let stride = type_size(&types, *elem) as u64;
+                for i in 0..*count as u64 {
+                    members.push((format!("[{i}]"), base + i * stride, *elem));
+                }
+            }
+            _ => return Some(vec![]),
+        }
+
+        let mut out = Vec::new();
+        for (name, addr, mty) in members {
+            let ty_name = type_render_name(&types, mty);
+            if self.is_expandable(mty) {
+                let vr = self.alloc_place(tid, addr, mty);
+                out.push(var_json(&name, &type_summary(&types, mty), &ty_name, vr));
+            } else {
+                let size = type_size(&types, mty) as usize;
+                let session = self.session.as_ref()?;
+                let value = match session.inspector.read_window(addr, size) {
+                    Ok(bytes) => fmt_scalar(&types, mty, &bytes),
+                    Err(_) => "<unreadable>".to_string(),
+                };
+                out.push(var_json(&name, &value, &ty_name, 0));
+            }
+        }
+        Some(out)
+    }
+
+    /// The base window address of a `Window`-located local in the frame `frame_idx` levels up: the
+    /// frame's data-SP (block param `v0`) plus the variable's offset.
+    fn var_base_addr(&self, frame_idx: usize, off: i64) -> Option<u64> {
+        let sp = match self
+            .session
+            .as_ref()?
+            .inspector
+            .read_ir_value(frame_idx, 0)?
+        {
+            Value::I64(n) => n as u64,
+            Value::I32(n) => n as u64,
+            _ => return None,
+        };
+        Some(sp.wrapping_add(off as u64))
+    }
+
+    /// Does this type expand into members (struct/array)? Pointers render as a scalar address.
+    fn is_expandable(&self, type_id: TypeId) -> bool {
+        matches!(
+            self.types().get(type_id as usize),
+            Some(TypeDef::Aggregate { .. } | TypeDef::Array { .. })
+        )
+    }
+
+    /// Borrow the structured type table (empty if no debug info).
+    fn types(&self) -> &[TypeDef] {
+        self.session
+            .as_ref()
+            .and_then(|s| s.debug.as_ref())
+            .map(|d| d.types.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Record an expandable `Place` and return its `variablesReference`.
+    fn alloc_place(&mut self, tid: u64, addr: u64, type_id: TypeId) -> i64 {
+        let session = self.session.as_mut().expect("session present");
+        session.place_refs.push(Place { tid, addr, type_id });
+        PLACE_BASE + (session.place_refs.len() - 1) as i64
     }
 
     fn on_continue(&mut self) -> (bool, Json, Vec<Event>) {
@@ -589,6 +718,7 @@ impl DapServer {
             return (false, Json::Null, vec![]);
         };
         session.frame_refs.clear();
+        session.place_refs.clear();
         // The time-travel coordinate: the global scheduler `turn` when multithreaded, the op `clock`
         // single-threaded.
         let scheduled = session.scheduled;
@@ -619,9 +749,10 @@ impl DapServer {
 
     fn on_evaluate(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
         // Watch / hover / REPL / breakpoint-condition expression. A bare known variable keeps its
-        // rich form (declared type + formatted value); anything else is an integer expression over
-        // the frame's source variables (`expr::eval_int`). Member/index access (`a.b`, `arr[i]`)
-        // needs structured type layout — the W4 `TypeRef` follow-up. Failure ⇒ `success:false`.
+        // rich form (declared type + formatted value); anything else is a C expression over the
+        // frame's source variables — including member / index / arrow access (`a.b`, `arr[i]`,
+        // `p->x`) walked over the §6 structured types via an `EvalEnv` resolver. Failure ⇒
+        // `success:false`.
         let fail = (false, Json::Null, vec![]);
         let expr = args
             .and_then(|a| a.get("expression"))
@@ -649,15 +780,15 @@ impl DapServer {
         };
 
         // A bare known variable: return its declared type + formatted value (richer than a raw i64).
-        let bare = session
-            .debug
-            .as_ref()
-            .and_then(|d| d.vars.iter().find(|v| v.func == func && v.name == expr));
-        if let Some(var) = bare {
-            if let Some(val) = session
-                .inspector
-                .read_var(frame_idx, &expr, ty_width(&var.ty))
-            {
+        let bare = session.debug.as_ref().and_then(|d| {
+            d.vars
+                .iter()
+                .find(|v| v.func == func && v.name == expr)
+                .map(|v| (d, v))
+        });
+        if let Some((debug, var)) = bare {
+            let width = scalar_width(&debug.types, var.type_id, &var.ty);
+            if let Some(val) = session.inspector.read_var(frame_idx, &expr, width) {
                 return (
                     true,
                     Json::obj(vec![
@@ -670,19 +801,53 @@ impl DapServer {
             }
         }
 
-        // Otherwise evaluate as an integer expression over the frame's variables.
-        let resolve = |name: &str| session.resolve_var(frame_idx, func, name);
-        match expr::eval_int(&expr, &resolve) {
-            Some(v) => (
-                true,
-                Json::obj(vec![
-                    ("result", Json::s(v.to_string())),
-                    ("variablesReference", Json::i(0)),
-                ]),
-                vec![],
-            ),
-            None => fail,
-        }
+        // Otherwise evaluate as a C expression (arithmetic + member/index/arrow) over the frame's
+        // variables, walking the structured types through the window.
+        let (types, vars) = match session.debug.as_ref() {
+            Some(d) => (d.types.as_slice(), d.vars.as_slice()),
+            None => (&[][..], &[][..]),
+        };
+        let mut env = EvalEnv {
+            inspector: &session.inspector,
+            types,
+            vars,
+            frame_idx,
+            func,
+        };
+        let (result, ty) = match expr::eval(&expr, &mut env) {
+            Some(expr::Value::Int(n)) => (n.to_string(), String::new()),
+            Some(expr::Value::Place { addr, type_id }) => {
+                if matches!(
+                    types.get(type_id as usize),
+                    Some(TypeDef::Aggregate { .. } | TypeDef::Array { .. })
+                ) {
+                    // An aggregate result renders as a summary (expandable-from-evaluate is a TODO).
+                    (
+                        type_summary(types, type_id),
+                        type_render_name(types, type_id),
+                    )
+                } else {
+                    let size = type_size(types, type_id) as usize;
+                    match session.inspector.read_window(addr, size) {
+                        Ok(bytes) => (
+                            fmt_scalar(types, type_id, &bytes),
+                            type_render_name(types, type_id),
+                        ),
+                        Err(_) => return fail,
+                    }
+                }
+            }
+            None => return fail,
+        };
+        (
+            true,
+            Json::obj(vec![
+                ("result", Json::s(result)),
+                ("type", Json::s(ty)),
+                ("variablesReference", Json::i(0)),
+            ]),
+            vec![],
+        )
     }
 
     fn on_disconnect(&mut self) -> (bool, Json, Vec<Event>) {
@@ -696,6 +861,7 @@ impl DapServer {
     fn stop_events(&mut self, stop: Stop) -> Vec<Event> {
         if let Some(s) = self.session.as_mut() {
             s.frame_refs.clear();
+            s.place_refs.clear();
         }
         let tid = self.stopped_thread_id();
         match stop {
@@ -781,8 +947,22 @@ fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-/// Byte width to read for a window-resident variable, inferred from its C type name. Ignored for
-/// promoted (SSA) variables.
+/// The byte width to read for a window-resident scalar. Prefers the **structured type's** size
+/// (`TypeDef.size`) — frontend-neutral: any producer that emits a `TypeRef` gets the exact width,
+/// no type-name spelling involved. Falls back to the C-name heuristic ([`ty_width`]) only when the
+/// variable carries no structured type (or a zero-size one), e.g. hand-written / name-only debug
+/// info. Ignored for promoted (SSA) variables, whose value comes from the frame value table.
+fn scalar_width(types: &[TypeDef], type_id: Option<TypeId>, ty_name: &str) -> usize {
+    match type_id.map(|t| type_size(types, t)) {
+        Some(n) if n > 0 => n as usize,
+        _ => ty_width(ty_name),
+    }
+}
+
+/// Best-effort byte width inferred from a C type *name* — the **fallback** [`scalar_width`] uses
+/// only when a variable carries no structured `TypeRef`. The structured path is preferred and is
+/// frontend-neutral; this heuristic exists for name-only / legacy debug info and is the one piece
+/// of C-specific knowledge left in the consumer.
 fn ty_width(ty: &str) -> usize {
     match ty {
         "_Bool" | "bool" | "char" | "signed char" | "unsigned char" => 1,
@@ -830,6 +1010,256 @@ fn var_to_i64(v: &VarValue) -> Option<i64> {
             x as i64
         }
     })
+}
+
+/// Build a DAP `variables` entry. `vref` is `0` for a leaf scalar, or an expandable reference.
+fn var_json(name: &str, value: &str, ty: &str, vref: i64) -> Json {
+    Json::obj(vec![
+        ("name", Json::s(name.to_string())),
+        ("value", Json::s(value.to_string())),
+        ("type", Json::s(ty.to_string())),
+        ("variablesReference", Json::i(vref)),
+    ])
+}
+
+/// The render name of a structured type (every [`TypeDef`] variant carries one), or `"?"`.
+fn type_render_name(types: &[TypeDef], id: TypeId) -> String {
+    match types.get(id as usize) {
+        Some(
+            TypeDef::Base { name, .. }
+            | TypeDef::Pointer { name, .. }
+            | TypeDef::Array { name, .. }
+            | TypeDef::Aggregate { name, .. }
+            | TypeDef::Opaque { name, .. },
+        ) => name.clone(),
+        None => "?".to_string(),
+    }
+}
+
+/// A brief value summary shown next to an expandable variable (its members appear on expansion).
+fn type_summary(types: &[TypeDef], id: TypeId) -> String {
+    match types.get(id as usize) {
+        Some(TypeDef::Array { count, .. }) => format!("[{count}]"),
+        Some(TypeDef::Aggregate { .. }) => "{...}".to_string(),
+        _ => type_render_name(types, id),
+    }
+}
+
+/// The `sizeof` of a structured type — like [`TypeDef::size`] but resolving an array to
+/// `count * elem.size` (the stride the element type defines).
+fn type_size(types: &[TypeDef], id: TypeId) -> u32 {
+    match types.get(id as usize) {
+        Some(TypeDef::Array { elem, count, .. }) => count * type_size(types, *elem),
+        Some(t) => t.size(),
+        None => 0,
+    }
+}
+
+/// Read a little-endian unsigned integer from the first `n` bytes (`n <= 8`).
+fn le_uint(bytes: &[u8], n: usize) -> u64 {
+    let mut x = 0u64;
+    for (i, &b) in bytes.iter().take(n).enumerate() {
+        x |= (b as u64) << (8 * i);
+    }
+    x
+}
+
+/// Format a scalar leaf's window bytes per its structured type: signed/unsigned ints, floats, a
+/// `_Bool`, or a pointer (hex address). Aggregates/arrays never reach here (they expand instead).
+fn fmt_scalar(types: &[TypeDef], id: TypeId, bytes: &[u8]) -> String {
+    match types.get(id as usize) {
+        Some(TypeDef::Base { encoding, size, .. }) => {
+            let n = *size as usize;
+            match encoding {
+                Encoding::Unsigned => le_uint(bytes, n).to_string(),
+                Encoding::Bool => (le_uint(bytes, n) != 0).to_string(),
+                Encoding::Signed => {
+                    let raw = le_uint(bytes, n);
+                    // Sign-extend from the value's width to i64.
+                    let bits = (n * 8) as u32;
+                    if bits == 0 || bits >= 64 {
+                        (raw as i64).to_string()
+                    } else {
+                        let shift = 64 - bits;
+                        (((raw << shift) as i64) >> shift).to_string()
+                    }
+                }
+                Encoding::Float => {
+                    if *size == 4 {
+                        f32::from_bits(le_uint(bytes, 4) as u32).to_string()
+                    } else {
+                        f64::from_bits(le_uint(bytes, 8)).to_string()
+                    }
+                }
+            }
+        }
+        Some(TypeDef::Pointer { .. }) => format!("0x{:x}", le_uint(bytes, 8)),
+        _ => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+    }
+}
+
+/// Decode a scalar's window bytes to `i64` for the expression evaluator: signed ints
+/// sign-extended, unsigned/`_Bool` zero-extended, a float truncated, a pointer as its address.
+/// Aggregates/arrays aren't integers ⇒ `None`.
+fn scalar_to_i64(types: &[TypeDef], id: TypeId, bytes: &[u8]) -> Option<i64> {
+    match types.get(id as usize)? {
+        TypeDef::Base { encoding, size, .. } => {
+            let n = *size as usize;
+            Some(match encoding {
+                Encoding::Unsigned | Encoding::Bool => le_uint(bytes, n) as i64,
+                Encoding::Signed => {
+                    let raw = le_uint(bytes, n);
+                    let bits = (n * 8) as u32;
+                    if bits == 0 || bits >= 64 {
+                        raw as i64
+                    } else {
+                        let shift = 64 - bits;
+                        ((raw << shift) as i64) >> shift
+                    }
+                }
+                Encoding::Float => {
+                    if *size == 4 {
+                        f32::from_bits(le_uint(bytes, 4) as u32) as i64
+                    } else {
+                        f64::from_bits(le_uint(bytes, 8)) as i64
+                    }
+                }
+            })
+        }
+        TypeDef::Pointer { .. } => Some(le_uint(bytes, 8) as i64),
+        _ => None,
+    }
+}
+
+/// Coerce an interpreter [`Value`] to `i64` (for reading a promoted SSA scalar).
+fn value_to_i64(v: Value) -> Option<i64> {
+    Some(match v {
+        Value::I32(n) => n as i64,
+        Value::I64(n) => n,
+        Value::F32(x) => x as i64,
+        Value::F64(x) => x as i64,
+        _ => return None,
+    })
+}
+
+/// The [`expr::Resolver`] for `evaluate`: resolves names + member/index/arrow access against a
+/// stopped frame, reading the focused thread's window through the neutral structured types. Holds
+/// only immutable borrows; navigation is pure address arithmetic over `TypeDef` (frontend-neutral).
+struct EvalEnv<'a> {
+    inspector: &'a Inspector,
+    types: &'a [TypeDef],
+    vars: &'a [VarInfo],
+    frame_idx: usize,
+    func: u32,
+}
+
+impl EvalEnv<'_> {
+    /// The frame's data-SP (block param `v0`) — the base address for window locals.
+    fn data_sp(&self) -> Option<u64> {
+        Some(match self.inspector.read_ir_value(self.frame_idx, 0)? {
+            Value::I64(n) => n as u64,
+            Value::I32(n) => n as u64,
+            _ => return None,
+        })
+    }
+
+    /// Read an 8-byte pointer value from the window.
+    fn read_ptr(&self, addr: u64) -> Option<u64> {
+        Some(le_uint(&self.inspector.read_window(addr, 8).ok()?, 8))
+    }
+}
+
+impl expr::Resolver for EvalEnv<'_> {
+    fn ident(&mut self, name: &str) -> Option<expr::Value> {
+        let var = self
+            .vars
+            .iter()
+            .find(|v| v.func == self.func && v.name == name)?;
+        match var.loc {
+            VarLoc::Window { off } => {
+                let addr = self.data_sp()?.wrapping_add(off as u64);
+                match var.type_id {
+                    Some(type_id) => Some(expr::Value::Place { addr, type_id }),
+                    None => {
+                        // Name-only / legacy var: read as a scalar integer (width from the name).
+                        let w = ty_width(&var.ty);
+                        let bytes = self.inspector.read_window(addr, w).ok()?;
+                        Some(expr::Value::Int(le_uint(&bytes, w.min(8)) as i64))
+                    }
+                }
+            }
+            VarLoc::Ssa { value } => value_to_i64(
+                self.inspector
+                    .read_ir_value(self.frame_idx, value as usize)?,
+            )
+            .map(expr::Value::Int),
+        }
+    }
+
+    fn member(&mut self, base: &expr::Value, name: &str) -> Option<expr::Value> {
+        let &expr::Value::Place { addr, type_id } = base else {
+            return None;
+        };
+        match self.types.get(type_id as usize)? {
+            TypeDef::Aggregate { fields, .. } => {
+                let f = fields.iter().find(|f| f.name == name)?;
+                Some(expr::Value::Place {
+                    addr: addr.wrapping_add(f.offset as u64),
+                    type_id: f.ty,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn index(&mut self, base: &expr::Value, index: i64) -> Option<expr::Value> {
+        let &expr::Value::Place { addr, type_id } = base else {
+            return None;
+        };
+        match self.types.get(type_id as usize)? {
+            TypeDef::Array { elem, .. } => {
+                let stride = type_size(self.types, *elem) as u64;
+                Some(expr::Value::Place {
+                    addr: addr.wrapping_add((index as u64).wrapping_mul(stride)),
+                    type_id: *elem,
+                })
+            }
+            // `p[i] == *(p + i)`: dereference, then offset by the element stride.
+            TypeDef::Pointer { pointee, .. } => {
+                let base = self.read_ptr(addr)?;
+                let stride = type_size(self.types, *pointee) as u64;
+                Some(expr::Value::Place {
+                    addr: base.wrapping_add((index as u64).wrapping_mul(stride)),
+                    type_id: *pointee,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn deref(&mut self, base: &expr::Value) -> Option<expr::Value> {
+        let &expr::Value::Place { addr, type_id } = base else {
+            return None;
+        };
+        match self.types.get(type_id as usize)? {
+            TypeDef::Pointer { pointee, .. } => Some(expr::Value::Place {
+                addr: self.read_ptr(addr)?,
+                type_id: *pointee,
+            }),
+            _ => None,
+        }
+    }
+
+    fn coerce_int(&mut self, v: &expr::Value) -> Option<i64> {
+        match v {
+            expr::Value::Int(n) => Some(*n),
+            &expr::Value::Place { addr, type_id } => {
+                let size = type_size(self.types, type_id) as usize;
+                let bytes = self.inspector.read_window(addr, size).ok()?;
+                scalar_to_i64(self.types, type_id, &bytes)
+            }
+        }
+    }
 }
 
 /// Coerce a JSON array of integers to entry-function arguments, one per declared parameter type.
