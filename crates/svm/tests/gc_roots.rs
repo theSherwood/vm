@@ -342,7 +342,7 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
     let check = |slots: &[i64], backend: &str| {
         let (count, buf0, buf1) = (slots[0], slots[1], slots[2]);
         assert!(
-            count >= 1 && count <= 2,
+            (1..=2).contains(&count),
             "{backend}: expected 1-2 in-window roots (0x7000/0x7050), got count {count}"
         );
         assert!(
