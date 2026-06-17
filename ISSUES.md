@@ -13,49 +13,55 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I1 — A fiber-stack OS allocation failure aborts the process instead of trapping (S2)
+_(none)_
 
-**Where:** `crates/svm-fiber/src/stack_windows.rs:42` (`assert!(!base.is_null(), "fiber stack
-VirtualAlloc failed")`) and its unix twin `crates/svm-fiber/src/stack_unix.rs:35`
-(`assert!(base != MAP_FAILED, "fiber stack mmap failed")`), reached via `Fiber::new` ←
-`svm_jit::fiber_rt::{make_fiber, fiber_new}` (and the interpreter's analogue).
+---
 
-**Symptom:** under real memory pressure, allocating a fiber's control stack fails, the `assert!`
-**panics**, and because `fiber_new` is an `unsafe extern "C"` thunk (called from JITted guest code,
-which cannot unwind) the panic becomes a **non-unwinding abort** — the whole process dies
+## Resolved
+
+### I1 — A fiber-stack OS allocation failure aborts the process instead of trapping (S2) — fixed on `claude/fiber-stack-lazy-commit`
+
+**Where:** `crates/svm-fiber/src/stack_windows.rs` / `stack_unix.rs` (`Stack::new`), reached via
+`Fiber::new` ← `svm_jit::fiber_rt::{make_fiber, fiber_new, seed_frozen_fibers}` and
+`svm_jit::instantiator_rt` (the coroutine child). The interpreter has no analogue: its fibers are
+host-side `Pending` entries with no native control stack, so only the JIT allocates here.
+
+**Symptom (was):** under real memory pressure, allocating a fiber's control stack failed, an
+`assert!` **panicked**, and because `fiber_new` is an `unsafe extern "C"` thunk (called from JITted
+guest code, which cannot unwind) the panic became a **non-unwinding abort** — the whole process died
 (`STATUS_STACK_BUFFER_OVERRUN` / `SIGABRT`). First observed as a flaky **Windows CI** failure in the
-unrelated `jit_threads` concurrent-fiber stress test (PR #36): all tests passed, then a lingering
-spawned-vCPU thread's `cont.new` aborted the test binary.
+unrelated `jit_threads` concurrent-fiber stress test (PRs #36, #41): a lingering spawned-vCPU
+thread's `cont.new` aborted the test binary.
 
-**Root cause / why it bites Windows first.** The design intends a fiber that can't be created to be a
-clean, recoverable `Trap::FiberFault` — and the **quota pre-check** (`SharedFiberTable::has_room`)
-already delivers that for a fiber *bomb* (too many fibers). But a *genuine OS-allocation failure
-below the quota* has no such path: `Stack::new` just `assert!`s. Two compounding factors:
-- **Windows commits eagerly.** `stack_windows.rs` reserves **and commits** the full per-fiber stack
-  (`FIBER_STACK = 1 MiB`, `MEM_RESERVE | MEM_COMMIT`), so N live fibers cost N MiB of *committed*
-  VA. The unix path `mmap`s lazily (reserve; pages commit on touch), so the same fiber count is far
-  cheaper. The default fiber quota (`MAX_FIBERS = 1 << 16`) × 1 MiB ⇒ a 64 GiB *committed* ceiling on
-  Windows — well past a CI runner's commit limit — so the quota does **not** bound real Windows
-  memory, and `VirtualAlloc` fails long before the quota trips.
-- **`extern "C"` + panic = abort.** Even where a fault *should* be recoverable, the panic can't
-  unwind out of the thunk, so it aborts rather than writing the trap cell.
+**Root cause / why it bit Windows first.** The design intends a fiber that can't be created to be a
+clean, recoverable `Trap::FiberFault` — the **quota pre-check** (`SharedFiberTable::has_room`)
+already delivers that for a fiber *bomb*. But a *genuine OS-allocation failure below the quota* had no
+such path: `Stack::new` just `assert!`ed. Compounded by Windows committing eagerly:
+`stack_windows.rs` reserved **and committed** the full per-fiber stack (`FIBER_STACK = 1 MiB`,
+`MEM_RESERVE | MEM_COMMIT`), so N live fibers cost N MiB of *committed* VA, while the unix `mmap` path
+commits lazily on touch. The quota (`MAX_FIBERS = 1 << 16`) × 1 MiB ⇒ a 64 GiB committed ceiling that
+does not bound real Windows memory, so `VirtualAlloc` failed long before the quota tripped.
 
-**Impact.** (a) Robustness/CI flakiness on memory-tight Windows runners. (b) A latent
-**guest-triggerable host crash**: a guest creating many fibers (within the configured quota) can
-exhaust host commit on Windows and abort the host process, rather than getting a `FiberFault`. Not a
-confinement escape (no memory is corrupted), but an availability gap.
+**Fix (landed):**
+1. **`Stack::new` and `Fiber::new` are now fallible** (`-> Option<…>`, returning `None` on
+   `MAP_FAILED` / null `VirtualAlloc` / guard-`mprotect`/`VirtualProtect` failure, with the partial
+   reservation cleaned up). The JIT callers turn `None` into the intended recoverable trap:
+   `fiber_new` writes the trap cell + returns `-1` (the existing `FiberFault` path); `make_fiber` and
+   `seed_frozen_fibers` propagate it (a thaw re-seed failure skips the root re-entry rather than
+   re-entering with missing fibers); the instantiator coroutine returns `CapFault`. No path can abort
+   the host on a fiber-stack allocation failure anymore.
+2. **Per-fiber control stack reduced 1 MiB → 256 KiB** (`FIBER_STACK` / `CORO_STACK = 1 << 18`),
+   cutting committed Windows memory 4× per live fiber and pushing the practical fiber ceiling out
+   correspondingly. Still ample for deep guest call chains.
 
-**Fix sketch (deferred — touches the `svm-fiber` unsafe substrate, out of scope for the durable
-fiber-parity PR where it was found):**
-1. Make `Stack::new` **fallible** (`-> Option<Stack>` / `Result`) instead of `assert!`-on-failure;
-   thread the failure up so `Fiber::new` / `fiber_new` return the existing `FiberFault` path
-   (`fiber_new` already returns `-1` + writes the trap cell on the quota pre-check — reuse it). Same
-   on the interpreter side. This converts the abort into the intended recoverable trap on **both**
-   backends.
-2. Consider lazy commit on Windows (reserve with `MEM_RESERVE`, commit on demand via a guard-page /
-   `VirtualAlloc(MEM_COMMIT)` fault handler, or a smaller committed prefix) so the per-fiber cost and
-   the effective fiber ceiling match the unix `mmap` model — otherwise the quota's memory bound stays
-   wildly off on Windows.
+**Why not true kernel-growth lazy commit on Windows (the original fix-sketch point 2):** rejected.
+The `svm-jit` `gc.roots` walker scans a *running* fiber's whole usable stack via
+`Fiber::full_extent()` → `[usable_low, top)` (a sound conservative superset of its live frames).
+Under demand-commit that scan would touch uncommitted pages and fault. Making it safe would need a
+committed/high-water bound threaded through the GC scan, and Windows can't be run-tested in this
+environment — so the size reduction + fallible alloc (both fully testable, and the latter is the
+actual abort cure) were chosen over an untestable, GC-entangled commit-on-fault scheme.
 
-**Workaround today:** none in-process; re-run flaky Windows CI. The fiber quota can be lowered by the
-embedder to bound concurrent fibers, but it counts fibers, not committed bytes.
+**Verification:** `svm-fiber` + `svm-jit` unit tests, `jit_threads`, and the durable-fiber
+freeze/thaw suites pass on unix; `cargo check --target x86_64-pc-windows-gnu -p svm-fiber` compiles
+the rewritten Windows path. The recurring Windows `jit_threads` flake's abort mechanism is removed.
