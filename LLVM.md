@@ -774,16 +774,36 @@ including **virtual destructors** (the deleting-dtor chain through the vtable). 
   the `i33` intermediate **overflows 33 bits and wraps**, which only the native differential validates
   (interp == JIT alone would agree even on a wrong mask). 93 translate tests green, fmt + clippy clean.
 
+**Slice AI (DONE) — real `core` Rust + panic-path lowering.** Idiomatic `no_std` Rust runs
+byte-identical to native `rustc` with **no translator change** beyond the C corpus — a `#[repr(u8)]`
+enum dispatched by `match` (→ `switch`/`br_table`), fixed arrays + slice iteration, `Option` + `match`
+(niche-optimized), iterator `find`/`map`/`max` with closures, by-value `struct`s + array-of-struct +
+field access, and signed `/`/`%`. The one real gap closed:
+- **Panic-path lowering (`-C panic=abort`).** A real Rust program is littered with non-elidable panic
+  branches (div-by-zero, bounds, overflow) that call `core::panicking::*` — **external** (precompiled
+  libcore), which the on-ramp's undefined-call path rejected, blocking essentially all real Rust. Now
+  `is_rust_abort_call` recognizes those entry points (`panicking`/`unwrap_failed`/`expect_failed`/
+  `slice_index`/`panic_cannot_unwind`) and, since they are `-> !` and always followed by `unreachable`,
+  lowers the call to a **trap** (drop it; the trailing `unreachable` already traps — §3b/§5/totality).
+  Gated on the name being an *undefined external*, so a guest-defined function of a matching name is a
+  real call.
+- *Out of scope:* `core::hint::black_box` is an empty inline-`asm!` optimization barrier → inline asm
+  stays a clean `Unsupported` (a non-goal); use `read_volatile` to make a value opaque.
+- Tests: `rust_core_enum_slice_option`, `rust_core_structs_and_iterators` (idiomatic `core` vs native),
+  `rust_panic_path_div_traps_and_runs` (a runtime division whose div-by-zero/overflow panic branches
+  now trap, taking the non-panic path to match native). 96 translate tests green, fmt + clippy clean.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
       inheritance / `this`-adjusting thunks, references, `static`-local guards, …).
-- [x] **Rust** (`no_std`/panic=abort) — runs vs native (slice AH), via the pinned Rust 1.81 (LLVM 18)
-      toolchain + `iN` support. Broaden (`core` data structures, `Option`/`Result`, traits → vtables)
-      as gaps surface.
+- [x] **Rust** (`no_std`/panic=abort) — runs vs native: `iN` (slice AH), real `core` (enums/slices/
+      `Option`/iterators/structs) + panic-path → trap (slice AI). Broaden (traits → vtables, `&[T]` fat
+      pointers as args, `unwrap`/`expect`) as gaps surface.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
-- [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand.
+- [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`
+      uses `i64` for signed div/rem-by-constant, not `iN`).
 
 ### Deferred / hard (name them, don't hide them — DESIGN §20) ⚪
 - [ ] **C++ exceptions / unwinding** — `invoke`/`landingpad`/`resume` + `.eh_frame` unwind

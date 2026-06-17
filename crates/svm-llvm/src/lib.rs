@@ -3902,6 +3902,22 @@ fn is_droppable_call(c: &llvm_ir::instruction::Call) -> bool {
     false
 }
 
+/// Is this a call to a Rust **panic/abort lang item**? Under `-C panic=abort` the panic entry points
+/// (`core::panicking::*` — `panic`, `panic_fmt`, `panic_const_*`, `panic_bounds_check` — plus the
+/// `unwrap`/`expect`/slice-index failure helpers) are `-> !` and abort the process, and they are
+/// **external** (precompiled libcore, never in the bitcode). A real Rust program is littered with
+/// these on its non-elidable panic paths (div-by-zero, bounds, overflow), so a call to one lowers to
+/// a **trap** (the SVM abort, §3b/§5): the on-ramp drops the call and relies on the `unreachable` that
+/// LLVM always places after a `noreturn` call (already lowered to a trap). Gated by the caller on the
+/// name being an *undefined external* (a guest-defined function of a matching name is a real call).
+fn is_rust_abort_call(name: &str) -> bool {
+    name.contains("panicking")
+        || name.contains("unwrap_failed")
+        || name.contains("expect_failed")
+        || name.contains("slice_index")
+        || name.contains("panic_cannot_unwind")
+}
+
 /// The local value operands a terminator uses (the branch condition / returned value). Validates
 /// terminator support. Branch *arguments* are synthesized from block parameters, not from here.
 fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
@@ -4607,6 +4623,14 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // direct-call path below.
         if let Some(name) = callee_name(c) {
             if !ctx.name2idx.contains_key(&name) && lower_io_call(ctx, c, &name)? {
+                return Ok(());
+            }
+        }
+        // A call to a Rust panic/abort lang item (`-C panic=abort`) lowers to a trap: drop the call —
+        // it is `noreturn` and LLVM always follows it with `unreachable`, which the on-ramp traps on
+        // (§3b/§5). This is what lets real Rust, with its non-elidable panic paths, translate.
+        if let Some(name) = callee_name(c) {
+            if !ctx.name2idx.contains_key(&name) && is_rust_abort_call(&name) {
                 return Ok(());
             }
         }

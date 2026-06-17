@@ -2227,3 +2227,182 @@ fn rust_no_std_matches_native() {
         );
     }
 }
+
+// --- Rust breadth, deeper: `core`-using programs (enums/`match`, slices, iterators, `Option`) ----
+
+/// Translate a `no_std` Rust crate whose `items` define `#[no_mangle] pub extern "C" fn
+/// run(n: i32) -> i32` (+ any types/helpers), run `run(n)` on both backends (interp == JIT), and
+/// return the result. `None` if the toolchain is unavailable.
+fn rust_run_onramp(name: &str, items: &str, n: i32) -> Option<i32> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n{items}\n"
+    );
+    let bc = compile_rust_to_bc(name, &src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated Rust IR");
+    let idx = module
+        .funcs
+        .iter()
+        .position(|f| f.params == [ValType::I64, ValType::I32] && f.results == [ValType::I32])
+        .expect("run present") as u32;
+    let mut fuel = 200_000_000u64;
+    let interp = match svm_interp::run(
+        &module,
+        idx,
+        &[Value::I64(t.entry_sp as i64), Value::I32(n)],
+        &mut fuel,
+    )
+    .expect("interp run")
+    .as_slice()
+    {
+        [Value::I32(x)] => *x,
+        other => panic!("run: expected one i32, got {other:?}"),
+    };
+    let jit = match svm_jit::compile_and_run(&module, idx, &[t.entry_sp as i64, n as i64])
+        .expect("jit run")
+    {
+        JitOutcome::Returned(s) => s[0] as i32,
+        other => panic!("unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, jit, "run({n}): interp {interp} vs JIT {jit}");
+    Some(interp)
+}
+
+/// Native oracle: the same `items` (with `run`) compiled by `rustc 1.81` into a std binary printing
+/// `run(n)`, run natively.
+fn rust_run_native(name: &str, items: &str, n: i32) -> Option<i32> {
+    let dir = std::env::temp_dir();
+    // Per-test unique paths (`name`) — tests run in parallel, so a shared path would race.
+    let rs = dir.join(format!("svm_llvm_{}_{}_rsrun.rs", std::process::id(), name));
+    let exe = dir.join(format!("svm_llvm_{}_{}_rsrun", std::process::id(), name));
+    std::fs::write(
+        &rs,
+        format!("{items}\nfn main() {{ println!(\"{{}}\", run({n})); }}\n"),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args(["+1.81.0", "-C", "opt-level=2", "-C", "overflow-checks=off"])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    let out = Command::new(&exe).output().expect("run native rust");
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("parse native run"),
+    )
+}
+
+/// Drive `items` (which define `run(i32)->i32`) through both lanes for each `n`, asserting the on-ramp
+/// matches native `rustc`.
+fn check_rust_run_vs_native(name: &str, items: &str, ns: &[i32]) {
+    for &n in ns {
+        let (Some(svm), Some(native)) = (
+            rust_run_onramp(name, items, n),
+            rust_run_native(name, items, n),
+        ) else {
+            return; // toolchain unavailable — skip
+        };
+        assert_eq!(
+            svm, native,
+            "{name}: run({n}) on-ramp {svm} vs native {native}"
+        );
+    }
+}
+
+/// **Real Rust** — idiomatic `core` (a `#[repr(u8)]` enum dispatched by `match`, fixed arrays +
+/// slice iteration, `Option` + `match`, an iterator `find` with a closure) through the on-ramp,
+/// byte-identical to native `rustc`. A bytecode-style fold over a data array, then an `Option`-typed
+/// search — the shapes a real `no_std` Rust program is built from. Exercises enum discriminants →
+/// `switch`/`br_table`, slice indexing, niche-optimized `Option<i32>`, and `-O2` iterator lowering.
+#[test]
+fn rust_core_enum_slice_option() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    enum Op { Add, Mul, Xor, Sub }
+    fn apply(op: Op, a: i32, x: i32) -> i32 {
+        match op {
+            Op::Add => a.wrapping_add(x),
+            Op::Mul => a.wrapping_mul(x),
+            Op::Xor => a ^ x,
+            Op::Sub => a.wrapping_sub(x),
+        }
+    }
+    let prog = [Op::Add, Op::Mul, Op::Xor, Op::Sub, Op::Add];
+    let data = [3i32, 1, 4, 1, 5, 9, 2, 6];
+    let mut acc = n;
+    let mut k = 0usize;
+    for &x in data.iter() {
+        acc = apply(prog[k % prog.len()], acc, x);
+        k += 1;
+    }
+    acc = acc.wrapping_add(match data.iter().copied().find(|&v| v > n) {
+        Some(v) => v,
+        None => -1,
+    });
+    acc
+}
+"#;
+    check_rust_run_vs_native("rs_core", items, &[0, 1, 5, 100, -3, 1000]);
+}
+
+/// **Real Rust** — by-value `struct`s, an array-of-struct with slice iteration + field access, a
+/// by-value struct argument, signed `/`+`%`, and an iterator `map().max()` yielding `Option<i32>`.
+/// The aggregate/by-value-struct shapes (clang's small-struct coercion, slice J) and `-O2` iterator
+/// lowering, from the Rust frontend — byte-identical to native `rustc`.
+#[test]
+fn rust_core_structs_and_iterators() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    #[derive(Clone, Copy)]
+    struct Pt { x: i32, y: i32 }
+    fn norm(p: Pt) -> i32 { p.x.wrapping_mul(p.x).wrapping_add(p.y.wrapping_mul(p.y)) }
+    let pts = [
+        Pt { x: 1, y: 2 },
+        Pt { x: n, y: 3 },
+        Pt { x: 4, y: n / 2 },
+        Pt { x: n % 5, y: 7 },
+    ];
+    let mut s = 0i32;
+    for p in pts.iter() {
+        s = s.wrapping_add(norm(*p));
+    }
+    let best = pts.iter().map(|p| norm(*p)).max();
+    s.wrapping_add(match best { Some(m) => m, None => 0 })
+}
+"#;
+    check_rust_run_vs_native("rs_structs", items, &[0, 3, 10, -8, 100]);
+}
+
+/// **Real Rust panic paths** — a runtime division emits non-elidable div-by-zero + overflow checks
+/// whose panic branches call `core::panicking::panic_const_*` (external libcore). Under `panic=abort`
+/// the on-ramp lowers those to a trap (drop + the trailing `unreachable`), so the program *translates*
+/// — the gap that blocks essentially all real Rust. The divisor here is `(n & 7) + 1` through
+/// `black_box` (always ≥ 1, but opaque so the panic paths stay in the IR), so the non-panic path runs
+/// and `n / d` matches native `rustc` exactly. Without the fix, translation fails on the undefined
+/// `panic_const_div_by_zero` reference.
+#[test]
+fn rust_panic_path_div_traps_and_runs() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let tmp = (n & 7) + 1;                      // [1, 8] — never zero…
+    let d = unsafe { core::ptr::read_volatile(&tmp) }; // …but opaque (a volatile load), so the
+                                                // div-by-zero + overflow panic checks stay in the IR
+    (n / d).wrapping_add(n % d)
+}
+"#;
+    check_rust_run_vs_native("rs_panic", items, &[0, 1, 7, 100, -50, 1234]);
+}
