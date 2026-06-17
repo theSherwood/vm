@@ -1256,11 +1256,27 @@ impl Inspector {
                 .vars
                 .iter()
                 .find(|x| x.func == frame.func && x.name == name)?;
-            match var.loc {
-                VarLoc::Ssa { value } => {
+            match &var.loc {
+                VarLoc::Ssa { value } => frame
+                    .vals
+                    .get(*value as usize)
+                    .copied()
+                    .map(VarValue::Value),
+                // Location list (S2): pick the entry covering the frame's current pc — within the
+                // stopped block, the largest `inst` at-or-before `frame.inst` (nearest-preceding,
+                // like `source_loc`). No covering entry ⇒ the var isn't live here.
+                VarLoc::SsaList(locs) => {
+                    let value = locs
+                        .iter()
+                        .filter(|l| {
+                            l.block as usize == frame.block && l.inst as usize <= frame.inst
+                        })
+                        .max_by_key(|l| l.inst)?
+                        .value;
                     frame.vals.get(value as usize).copied().map(VarValue::Value)
                 }
                 VarLoc::Window { off } => {
+                    let off = *off;
                     // Address = data-SP (block param v0) + off; read `width` raw bytes from *this*
                     // thread's window (read directly, not via `read_window`, to avoid re-locking).
                     let base = as_i64(*frame.vals.first()?).ok()? as u64;

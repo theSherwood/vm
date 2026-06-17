@@ -474,7 +474,7 @@ impl DapServer {
             .vars
             .iter()
             .filter(|v| v.func == frame.pc.func)
-            .map(|v| (v.name.clone(), v.ty.clone(), v.loc, v.type_id))
+            .map(|v| (v.name.clone(), v.ty.clone(), v.loc.clone(), v.type_id))
             .collect();
         let mut out = Vec::new();
         for (name, ty, loc, type_id) in vars {
@@ -1167,17 +1167,6 @@ fn scalar_to_i64(types: &[TypeDef], id: TypeId, bytes: &[u8]) -> Option<i64> {
     }
 }
 
-/// Coerce an interpreter [`Value`] to `i64` (for reading a promoted SSA scalar).
-fn value_to_i64(v: Value) -> Option<i64> {
-    Some(match v {
-        Value::I32(n) => n as i64,
-        Value::I64(n) => n,
-        Value::F32(x) => x as i64,
-        Value::F64(x) => x as i64,
-        _ => return None,
-    })
-}
-
 /// The [`expr::Resolver`] for `evaluate`: resolves names + member/index/arrow access against a
 /// stopped frame, reading the focused thread's window through the neutral structured types. Holds
 /// only immutable borrows; navigation is pure address arithmetic over `TypeDef` (frontend-neutral).
@@ -1211,9 +1200,9 @@ impl expr::Resolver for EvalEnv<'_> {
             .vars
             .iter()
             .find(|v| v.func == self.func && v.name == name)?;
-        match var.loc {
+        match &var.loc {
             VarLoc::Window { off } => {
-                let addr = self.data_sp()?.wrapping_add(off as u64);
+                let addr = self.data_sp()?.wrapping_add(*off as u64);
                 match var.type_id {
                     Some(type_id) => Some(expr::Value::Place { addr, type_id }),
                     None => {
@@ -1224,11 +1213,15 @@ impl expr::Resolver for EvalEnv<'_> {
                     }
                 }
             }
-            VarLoc::Ssa { value } => value_to_i64(
-                self.inspector
-                    .read_ir_value(self.frame_idx, value as usize)?,
-            )
-            .map(expr::Value::Int),
+            // A promoted scalar (single value or a location list): let the Inspector resolve it at
+            // the frame's pc, then map the read-back value to an Int/Float operand.
+            VarLoc::Ssa { .. } | VarLoc::SsaList(_) => {
+                match self.inspector.read_var(self.frame_idx, name, 0)? {
+                    VarValue::Value(Value::F32(x)) => Some(expr::Value::Float(x as f64)),
+                    VarValue::Value(Value::F64(x)) => Some(expr::Value::Float(x)),
+                    v => var_to_i64(&v).map(expr::Value::Int),
+                }
+            }
         }
     }
 

@@ -17,7 +17,7 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, FBinOp,
     FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp,
-    LoadOp, Loc, Memory, Module, Ordering, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp,
+    LoadOp, Loc, Memory, Module, Ordering, SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp,
     VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape,
     VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
@@ -341,14 +341,23 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
         write_uleb(out, v.func as u64);
         write_str(out, &v.name);
         write_str(out, &v.ty);
-        match v.loc {
+        match &v.loc {
             VarLoc::Window { off } => {
                 out.push(0);
-                write_sleb(out, off);
+                write_sleb(out, *off);
             }
             VarLoc::Ssa { value } => {
                 out.push(1);
-                write_uleb(out, value as u64);
+                write_uleb(out, *value as u64);
+            }
+            VarLoc::SsaList(locs) => {
+                out.push(2);
+                write_uleb(out, locs.len() as u64);
+                for l in locs {
+                    write_uleb(out, l.block as u64);
+                    write_uleb(out, l.inst as u64);
+                    write_uleb(out, l.value as u64);
+                }
             }
         }
         match v.type_id {
@@ -1359,6 +1368,18 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
         let loc = match c.byte()? {
             0 => VarLoc::Window { off: c.sleb()? },
             1 => VarLoc::Ssa { value: c.idx()? },
+            2 => {
+                let n = c.count()?;
+                let mut locs = Vec::new();
+                for _ in 0..n {
+                    locs.push(SsaLoc {
+                        block: c.idx()?,
+                        inst: c.idx()?,
+                        value: c.idx()?,
+                    });
+                }
+                VarLoc::SsaList(locs)
+            }
             b => return Err(DecodeError::BadVarLoc(b)),
         };
         let type_id = match c.byte()? {
@@ -1979,6 +2000,25 @@ mod debug_tests {
                     name: "neg".into(),
                     ty: "int".into(),
                     loc: VarLoc::Window { off: -8 },
+                    type_id: Some(0),
+                },
+                // A location list (S2): the holding SSA value varies by pc.
+                VarInfo {
+                    func: 0,
+                    name: "k".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::SsaList(vec![
+                        SsaLoc {
+                            block: 0,
+                            inst: 0,
+                            value: 1,
+                        },
+                        SsaLoc {
+                            block: 1,
+                            inst: 2,
+                            value: 4,
+                        },
+                    ]),
                     type_id: Some(0),
                 },
             ],

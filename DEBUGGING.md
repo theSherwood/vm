@@ -1075,11 +1075,26 @@ in-range IR pcs, and still verifies. *Scope:* source lines only — variable ing
 per-block `LocList` (wasm/LLVM locals are SSA values that vary by block), and the LLVM bitcode
 metadata path is its own slice.
 
-**Not yet (next slices):** wasm/LLVM **variable** ingest, gated on the per-block `LocList`
-refinement (so the SSA-valued locals both producers use are representable — also lets chibicc debug
-without `-Og`); the LLVM `!DILocation` → `debug.loc` path; and a per-producer rich blob. (The
-chibicc producer, both DAP consumers, binary serialization, and now a second producer's source
-lines are all built.)
+**Slice 16 — per-block `LocList` ABI + interpreter resolution (S2, the location-list case).**
+`VarLoc` gained an `SsaList(Vec<SsaLoc>)` variant: a DWARF-style location list where each entry
+(`block, inst, value`) says "from this pc onward within the block, the var is this block-local SSA
+value". The interpreter's `read_var` resolves it **nearest-preceding within the stopped block**
+(like `source_loc`), so a promoted scalar whose holding value changes — across a block boundary
+(its block-param index differs per block) or mid-block (a reassignment makes a fresh SSA value) —
+reads correctly at any stopped pc. This is the representation SSA-valued locals need: it unblocks
+**wasm/LLVM variable ingest** and lets **chibicc debug without `-Og`**. The text (`debug.var …
+ssalist <n> <b> <i> <v>…`) and binary forms round-trip it; `Window`/`Ssa` are unchanged
+(back-compat). The DAP `EvalEnv` resolves an `SsaList` name through `read_var` at the frame pc.
+Tests: an interpreter test reads `x` at three pcs (block boundary + intra-block transition) getting
+the right value each time; text + binary round-trips. *This is the ABI + consumer; producers
+emitting location lists (chibicc promotion, wasm locals) are follow-up slices, per the slice-4→5
+pattern.*
+
+**Not yet (next slices):** producers emitting location lists — chibicc keeping promotion under
+`-g` (drop the `-Og` requirement) and wasm/LLVM **variable** ingest (now representable via
+`SsaList`); the LLVM `!DILocation` → `debug.loc` path; and a per-producer rich blob. (The chibicc
+producer, both DAP consumers, binary serialization, a second producer's source lines, and the
+location-list ABI are all built.)
 
 ### Open questions (S4/S5/S2)
 

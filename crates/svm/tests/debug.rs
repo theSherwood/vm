@@ -455,13 +455,21 @@ debug.field 3 "y" 4 0
 debug.var 0 "x" ssa 0 "int"
 debug.var 0 "buf" win 16 "char"
 debug.var 0 "p" win 24 "struct" 3
+debug.var 0 "k" ssalist 2 0 0 0 1 1 2 "int"
 "#;
     let m = parse_module(src).expect("parse");
     let di = m.debug_info.as_ref().expect("debug info present");
     assert_eq!(di.files, vec!["a.c".to_string()]);
     assert_eq!(di.locs.len(), 1);
     assert_eq!(di.types.len(), 4);
-    assert_eq!(di.vars.len(), 3);
+    assert_eq!(di.vars.len(), 4);
+
+    // The location-list var (S2) parsed its entries.
+    let svm_ir::VarLoc::SsaList(locs) = &di.vars[3].loc else {
+        panic!("k is an ssalist var");
+    };
+    assert_eq!(locs.len(), 2);
+    assert_eq!((locs[1].block, locs[1].inst, locs[1].value), (1, 1, 2));
 
     // The aggregate's fields parsed with their offsets.
     let svm_ir::TypeDef::Aggregate { fields, size, .. } = &di.types[3] else {
@@ -480,6 +488,53 @@ debug.var 0 "p" win 24 "struct" 3
     // parse → print → parse is stable (the debug section round-trips).
     let m2 = parse_module(&print_module(&m)).expect("reparse");
     assert_eq!(m, m2);
+}
+
+/// A promoted local `x` whose holding SSA value changes through the function — across the block
+/// boundary (block0 `v0` → block1 `v3`) and again mid-block1 (`v3` → `v5`). The `ssalist` location
+/// list (S2) must resolve to the right value at each stopped pc. This is what lets SSA-valued locals
+/// be inspected without a window slot (the wasm/LLVM case, and chibicc without `-Og`).
+#[test]
+fn ssalist_resolves_the_right_value_per_pc() {
+    // dist(3): block0 x=v0=3, then v2 = v0+10 = 13 → block1(13); block1 x=v3=13, v5 = v3+5 = 18,
+    // v6 = v5+v5 = 36. `x`'s value index: (block0,inst0)→v0=0, (block1,inst0)→v3=0, (block1,inst2)→v5=2.
+    let src = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 10
+  v2 = i32.add v0 v1
+  br block1(v2)
+block1(v3: i32):
+  v4 = i32.const 5
+  v5 = i32.add v3 v4
+  v6 = i32.add v5 v5
+  return v6
+}
+
+debug.file 0 "x.c"
+debug.var 0 "x" ssalist 3 0 0 0 1 0 0 1 2 2 "int"
+"#;
+    let m = parse_module(src).expect("parse");
+
+    // Read `x` at three stopped pcs by replaying with one breakpoint each.
+    let read_x_at = |block: usize, inst: usize| -> VarValue {
+        let mut insp = Inspector::attach(&m, 0, &[Value::I32(3)], 1_000_000);
+        insp.set_breakpoint(IrPc {
+            module: 0,
+            func: 0,
+            block,
+            inst,
+        });
+        assert!(matches!(insp.run_until_stop(), Stop::Break { .. }));
+        insp.read_var(0, "x", 4).expect("x is live here")
+    };
+
+    // block0 inst1: x is still the parameter v0 = 3.
+    assert_eq!(read_x_at(0, 1), VarValue::Value(Value::I32(3)));
+    // block1 inst0/inst1: x is the block param v3 = 13 (the cross-block re-indexing).
+    assert_eq!(read_x_at(1, 1), VarValue::Value(Value::I32(13)));
+    // block1 inst2: after `v5 = v3 + 5`, x is now v5 = 18 (the intra-block transition).
+    assert_eq!(read_x_at(1, 2), VarValue::Value(Value::I32(18)));
 }
 
 #[test]
