@@ -22,4 +22,14 @@ fn shadow_layout_constants_agree_across_crates() {
         svm_interp::DURABLE_RESERVE,
         "durable reserve ceiling must match"
     );
+    assert_eq!(
+        svm_durable::STATE_OFF,
+        svm_interp::STATE_OFF,
+        "state-word offset must match (the freeze driver reads what the transform writes)"
+    );
+    assert_eq!(
+        svm_durable::STATE_UNWINDING,
+        svm_interp::STATE_UNWINDING,
+        "the UNWINDING state value must match (the freeze-driver trigger)"
+    );
 }

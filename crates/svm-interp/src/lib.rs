@@ -2738,6 +2738,18 @@ fn worker_loop(sched: &Arc<Scheduler>) {
 fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     match v.run(u64::MAX) {
         Step::Done(result) => {
+            // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING`
+            // has drained the root's native stack into the root's shadow region; now flatten the
+            // still-parked fibers into theirs, while the registry is alive, before the window is
+            // snapshotted. A drive trap (out-of-scope module) surfaces as the run's result.
+            let result = if v.durable
+                && result.is_ok()
+                && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
+            {
+                v.freeze_drive().and(result)
+            } else {
+                result
+            };
             let id = v.id;
             let outcome = Outcome {
                 result,
@@ -3256,6 +3268,15 @@ impl SchedDriver {
 // whose lone shadow stack started at `SHADOW_BASE`); a `cont.new`-created fiber in registry
 // slot `s` is context `s + 1`.
 
+/// Window byte offset of the `i32` durable **state word** (`NORMAL | UNWINDING | REWINDING`).
+/// The freeze driver reads it to tell a freeze (UNWINDING) run from an ordinary one. Must equal
+/// `svm_durable::STATE_OFF`.
+pub const STATE_OFF: u64 = 0;
+/// State-word values (must equal `svm_durable::STATE_*`). Only `UNWINDING` is read by the runtime
+/// today (the freeze-driver trigger); the others are maintained entirely by the instrumented IR.
+pub const STATE_NORMAL: i32 = 0;
+pub const STATE_UNWINDING: i32 = 1;
+pub const STATE_REWINDING: i32 = 2;
 /// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
 /// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
 /// on each fiber switch. Must equal `svm_durable::SHADOW_SP_OFF`.
@@ -3358,6 +3379,11 @@ enum RegFiber {
     /// historical tables, so handles stay dense and deterministic); recycling + the generation
     /// tag land with the JIT shared registry (3b-ii) so both backends adopt one policy together.
     Done,
+    /// **Flattened for freeze** (DURABILITY.md §12.8 slice 3.1.4): the freeze driver drove this
+    /// (formerly `Parked`) fiber under `UNWINDING`, so its continuation now lives in its in-window
+    /// shadow region (extent recorded in the registry's `shadow` table) instead of as host frames.
+    /// A `claim` of it currently loses (thaw re-entry is slice 3.1.5); never claimable meanwhile.
+    Frozen,
 }
 
 /// What a successful [`FiberRegistry::claim`] hands the winning vCPU.
@@ -3501,6 +3527,21 @@ impl FiberRegistry {
         let mut t = self.lock();
         debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
         t.fibers[slot] = RegFiber::Done;
+    }
+
+    /// Freeze driver (slice 3.1.4): take the lowest still-`Parked` fiber's frames and mark its slot
+    /// `Frozen`, so the driver can flatten it into its shadow region and not revisit it. Returns
+    /// `(slot, frames)`, or `None` once every fiber is flattened (no `Parked` slot remains).
+    fn take_parked_for_freeze(&self) -> Option<(usize, Vec<Frame>)> {
+        let mut t = self.lock();
+        let slot = t
+            .fibers
+            .iter()
+            .position(|f| matches!(f, RegFiber::Parked(_)))?;
+        match std::mem::replace(&mut t.fibers[slot], RegFiber::Frozen) {
+            RegFiber::Parked(frames) => Some((slot, frames)),
+            _ => unreachable!("position found a Parked slot"),
+        }
     }
 }
 
@@ -3826,6 +3867,52 @@ impl VCpu {
             Err(t) => Step::Done(Err(t)),
         }
     }
+
+    /// **Freeze driver** (DURABILITY.md §12.8 slice 3.1.4). Called once this vCPU's root has run to
+    /// completion under `UNWINDING` (its native stack drained into the root's shadow region): flatten
+    /// every still-**parked** fiber into *its own* shadow region so the window snapshot captures it.
+    ///
+    /// Each parked fiber is resumed under `UNWINDING` like a standalone root run — its frames become
+    /// the active stack with `cur = ROOT_FIBER`, the active shadow-SP is pointed at the fiber's region
+    /// base, and a placeholder resume value is delivered (mimicking `cont.resume`, so the post-suspend
+    /// continuation is well-formed; the suspend's result slot is inert — the `Yield` thaw arm
+    /// redelivers it). Because the transform places the poll **immediately** after the `suspend`, that
+    /// poll fires before any of the fiber's guest code runs, so it unwinds with **zero forward
+    /// progress** and its base-frame return (under `cur == ROOT_FIBER`) ends the sub-run. The fiber's
+    /// flattened shadow-SP extent is recorded in the registry's `shadow` table for the snapshot.
+    ///
+    /// Single-vCPU only (slice 3.1); the multi-vCPU stop-the-world choreography is slice 3.2. Handles
+    /// idle parked fibers; a fiber still on an active resume chain at freeze unwinds with the root and
+    /// is a 3.1.5/3.2 follow-up.
+    fn freeze_drive(&mut self) -> Result<(), Trap> {
+        while let Some((slot, mut frames)) = self.registry.take_parked_for_freeze() {
+            if let Some(f) = frames.last_mut() {
+                f.vals.push(Value::I64(0)); // placeholder resume value (inert; not spilled by Yield)
+            }
+            if let Some(m) = self.mem.as_mut() {
+                m.durable_set_sp(shadow_region_base(shadow_context_index(slot)));
+            }
+            self.frames = frames;
+            self.cur = ROOT_FIBER;
+            self.chain = vec![ROOT_FIBER];
+            self.root_parked = None;
+            self.parked_frames = 0;
+            run_inner(self, u64::MAX)?; // the fiber unwinds; base return (cur == ROOT) ends the sub-run
+            let sp = self
+                .mem
+                .as_ref()
+                .map(|m| m.durable_get_sp())
+                .unwrap_or(SHADOW_BASE);
+            self.registry.set_saved_sp(slot, sp);
+        }
+        Ok(())
+    }
+}
+
+/// The shadow-context index of a fiber registry `slot` (the root is context 0, fiber slot `s` is
+/// context `s + 1`). Mirrors [`shadow_switch`]'s mapping for the off-table root vs. a fiber.
+fn shadow_context_index(slot: usize) -> usize {
+    slot + 1
 }
 
 /// A **visible** instruction — one whose effect another vCPU can observe or that synchronizes with
@@ -8620,6 +8707,15 @@ impl Mem {
 
     fn durable_set_sp(&mut self, sp: u64) {
         let _ = self.write_bytes_impl(SHADOW_SP_OFF, &sp.to_le_bytes());
+    }
+
+    /// The durable state word at [`STATE_OFF`] (the freeze driver's trigger). `STATE_NORMAL` if the
+    /// word's page is somehow uncommitted (a non-durable / malformed window).
+    fn durable_state(&self) -> i32 {
+        self.read_bytes_impl(STATE_OFF, 4)
+            .and_then(|b| b.try_into().ok())
+            .map(i32::from_le_bytes)
+            .unwrap_or(STATE_NORMAL)
     }
 
     fn read_le(&self, base: u64, width: u32) -> u64 {

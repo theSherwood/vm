@@ -658,11 +658,13 @@ recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'
 **per-fiber shadow-stack layout + shadow-SP swap landed** (slice 3.1.1), the **resumer-side
 `cont.resume` thaw arm** re-issues the resume on rewind (slice 3.1.2), and the **fiber-side
 `suspend` re-park arm** flips to `NORMAL` and re-executes `suspend` on rewind (slice 3.1.3) —
-so **both fiber thaw arms are now wired** (no fiber arm fails closed). Still to wire — the
-freeze driver that flattens an idle parked fiber (switch into it under `UNWINDING` so its
-post-suspend poll unwinds it with no forward progress) and the snapshot Section-2 fiber
-metadata. Until those land, a parked fiber's continuation isn't yet captured, so a full fiber
-*thaw* isn't exercisable end-to-end. 3.2 — multi-vCPU quiesce + per-context layout.
+so **both fiber thaw arms are now wired** (no fiber arm fails closed). The **freeze driver
+flattens idle parked fibers** into their shadow regions (slice 3.1.4): after the root unwinds,
+each still-parked fiber is resumed under `UNWINDING` so its post-suspend poll unwinds it with
+zero forward progress. Still to wire — the snapshot Section-2 fiber metadata + restore (slice
+3.1.5), which records each frozen fiber's handle/region/status and rebuilds the registry so a
+thaw re-enters it. Until that lands, freeze captures a parked fiber's continuation in the window
+but a cross-domain *thaw* can't yet reconstruct the fiber. 3.2 — multi-vCPU quiesce + per-context layout.
 3.3 — JIT parity (drive real OS threads to safepoints; respect the D57 single-owner protocol;
 **replicate the swap** in the JIT's fiber-switch path). Phase 4 — back-edge polls for bounded
 latency.
@@ -734,13 +736,20 @@ each a small reviewable commit on the interpreter only:
    still needs 3.1.4–5** (a parked fiber's continuation isn't captured until the freeze driver
    flattens it into its shadow stack and the snapshot records its metadata).
 
-4. **Freeze driver — flatten idle parked fibers.** Today freeze drives the running vCPU to
-   unwind. Extend it: for each *idle* `RegFiber::Parked` fiber, switch into it with
-   `state = UNWINDING`; because the transform places the poll **immediately** after the
-   suspend point, that poll fires before any guest code runs → the fiber unwinds into its
-   shadow stack with **zero forward progress**, then control returns. Verify that
-   "poll-immediately-after-suspend" guarantee holds in the emitted IR (load-bearing). Drive
-   to quiescence (all fibers flattened), then snapshot. *Host-side driver, not escape-TCB.*
+4. **[DONE] Freeze driver — flatten idle parked fibers.** `VCpu::freeze_drive`, hooked into
+   `dispatch` right after the root's run returns `Done` while still `UNWINDING` (the registry is
+   still alive there, before `mem.take()`). It loops over `RegFiber::Parked` fibers, marking each
+   `Frozen` and running its frames as a standalone unwind: the active shadow-SP is pointed at the
+   fiber's region base, `cur = ROOT_FIBER` (so the fiber's base-frame return ends the sub-run, not
+   a fiber-finish), and a placeholder resume value is delivered (mimicking `cont.resume`; the
+   suspend's result slot is inert — the `Yield` arm redelivers it). Because the transform places
+   the poll **immediately** after the `suspend`, that poll fires before any guest code runs → zero
+   forward progress; the flattened shadow-SP extent is recorded in the registry's `shadow` table.
+   The existing capture entry point then snapshots a window that already includes the flattened
+   fibers. *Host-side driver, not escape-TCB; single-vCPU (3.1) — a fiber still on an active resume
+   chain at freeze, and multi-vCPU STW, are 3.1.5/3.2 follow-ups.* Tested
+   (`svm-durable/tests/fiber.rs`): a parked fiber lands a frame in its **own** region (distinct
+   from the root's) and unwinds **at its suspend point** (resume id 1) — a precise zero-forward-progress check.
 
 5. **End-to-end test + snapshot wiring.** One fiber, `freeze → serialize → restore → thaw ≡
    uninterrupted`, interp-only. The snapshot needs Section 2 to record each fiber's

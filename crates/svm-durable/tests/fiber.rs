@@ -10,8 +10,10 @@
 //! freeze driver flattens it into its shadow stack and the snapshot records its metadata (slices
 //! 3.1.4–5) — so these tests pin verification + NORMAL-inertness + the arm wiring, structurally.
 
-use svm_durable::{init_durable_window, transform_module};
-use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use svm_durable::{init_durable_window, transform_module, write_state, STATE_UNWINDING};
+use svm_interp::{
+    run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_SP_OFF, SHADOW_STRIDE,
+};
 use svm_ir::{Inst, Memory, Module, Terminator};
 
 const SIZE_LOG2: u8 = 17;
@@ -141,5 +143,85 @@ fn both_fiber_thaw_arms_reissue_their_op() {
     assert_eq!(
         traps, 2,
         "only the per-function forged-id TRAP blocks are Unreachable"
+    );
+}
+
+fn le_u64(b: &[u8]) -> u64 {
+    u64::from_le_bytes(b.try_into().unwrap())
+}
+fn le_u32(b: &[u8]) -> u32 {
+    u32::from_le_bytes(b.try_into().unwrap())
+}
+
+/// Slice 3.1.4 — the **freeze driver** flattens an idle parked fiber into its *own* shadow region.
+/// Root resumes fiber F, which suspends and parks; freezing the durable domain (UNWINDING) drives
+/// the root's unwind *and* then drives F so its post-suspend poll unwinds it with zero forward
+/// progress. We check both contexts left a frame in their (distinct) regions, and that F unwound
+/// **at its suspend point** (resume id 1) — i.e. it did not run any of its post-suspend code.
+#[test]
+fn freeze_driver_flattens_a_parked_fiber_into_its_region() {
+    // Root resumes F once; F suspends 42 then (if ever run forward) would compute 42+7 and return.
+    const SRC2: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 99
+  v4, v5 = cont.resume v2 v3
+  return v5
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 42
+  v3 = suspend v2
+  v4 = i64.const 7
+  v5 = i64.add v3 v4
+  return v5
+}
+"#;
+    let mut m = svm_text::parse_module(SRC2).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = transform_module(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("instrumented IR verifies");
+
+    // Freeze: seed the window in UNWINDING so the run unwinds instead of completing.
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut host = Host::new();
+    host.set_durable(true);
+    let mut fuel = 1_000_000u64;
+    let (res, snap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut host);
+    assert!(
+        res.is_ok(),
+        "freeze returns a placeholder, not a trap: {res:?}"
+    );
+
+    // Region bases: root is context 0, the single fiber (slot 0) is context 1.
+    let root_base = SHADOW_BASE;
+    let fiber_base = SHADOW_BASE + SHADOW_STRIDE;
+
+    // The root unwound its `cont.resume` frame into context 0's region.
+    let root_region = &snap[root_base as usize..(root_base + SHADOW_STRIDE) as usize];
+    assert!(
+        root_region.iter().any(|&b| b != 0),
+        "the root unwound a frame into context 0's region"
+    );
+
+    // After the driver, the active shadow-SP points at the (last-driven) fiber's flattened stack.
+    let fiber_sp = le_u64(&snap[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]);
+    assert!(
+        fiber_sp > fiber_base && fiber_sp <= fiber_base + SHADOW_STRIDE,
+        "the fiber flattened a frame into its own region [{fiber_base}, +stride): sp={fiber_sp}"
+    );
+    // The fiber unwound *at its suspend point* (resume id 1 = the first/only point), proving the
+    // driver made zero forward progress past the `suspend` (it never reached `42 + 7`).
+    let rid = le_u32(&snap[(fiber_sp - 4) as usize..fiber_sp as usize]);
+    assert_eq!(
+        rid, 1,
+        "the fiber unwound at its suspend point (zero forward progress)"
     );
 }
