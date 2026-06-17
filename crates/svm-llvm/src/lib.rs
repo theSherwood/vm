@@ -76,11 +76,18 @@
 //!   (a `size×nmemb` slice / a string), and `fflush` (a no-op — the `Stream` is unbuffered). The
 //!   libc `FILE*` stream argument is ignored (the handle is the endpoint). `clang -O2` also lowers
 //!   `printf("…\n")` → `puts` and `printf("%c",c)` → `putc`, so format-free `printf` rides this path.
+//! - **P — funnel shifts + runtime mem-loop helpers (first real corpus demo).** `llvm.fshl`/`fshr`
+//!   lower to `rotl`/`rotr` for the rotate idiom (identical operands — SHA-256's `ROTRIGHT`). A
+//!   variable-length (or oversized-constant) `memset`/`memcpy` calls a **synthesized runtime loop
+//!   helper** (`__svm_memset`/`__svm_memcpy`, a real counted byte loop — the first multi-block helper)
+//!   instead of an inline unroll. Together these make B-Con's **SHA-256** run byte-identical to
+//!   native `clang` (`demo_sha256_vs_native`).
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `mem*`, varargs
-//! `printf`/`fprintf` (formatting), `malloc`/heap, transcendental math, `puts`/`fputs` of a
-//! *non-literal* string (runtime strlen), `llvm.load.relative` (clang's relative-offset string
-//! tables) and GEP-constexpr relocations (`&arr[k]`), SIMD vectors, `i33`.
+//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `memmove` (overlap),
+//! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `malloc`/heap,
+//! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen),
+//! `llvm.load.relative` (clang's relative-offset string tables) and GEP-constexpr relocations
+//! (`&arr[k]`), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
