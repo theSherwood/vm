@@ -9,6 +9,7 @@ members = [
     "crates/svm-encode",
     "crates/svm-verify",
     "crates/svm-interp",
+    "crates/svm-dap",
     "crates/svm-snapshot",
     "crates/svm-fiber",
     "crates/svm-jit",
