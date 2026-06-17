@@ -254,6 +254,40 @@ static int npromo;                 // promoted locals in the current function
 static char *promo_ty[MAXPROMO];   // IR type of each promoted slot
 static int curval[MAXPROMO];       // current SSA value of each slot in the current block
 
+// Debug location list for promoted locals (DEBUGGING.md §6/W4 S2): a promoted scalar's holding SSA
+// value changes through the function (a different block parameter per block, a fresh value on each
+// write), so `-g` records each `(func, slot, block, inst, value)` as it happens and emits an
+// `ssalist` for the local. This is what lets the optimized (promoted) build be debugged — no `-Og`.
+typedef struct {
+  int func, slot, block, inst, value;
+} PromoLoc;
+static PromoLoc *promo_buf;
+static int n_promo, cap_promo;
+
+static void record_promo(int slot, int value) {
+  if (!opt_g || cur_block < 0)
+    return;
+  // Collapse a repeated set at the same pc (e.g. `x = y = e`) to the latest value.
+  if (n_promo) {
+    PromoLoc *l = &promo_buf[n_promo - 1];
+    if (l->func == cur_func_idx && l->slot == slot && l->block == cur_block && l->inst == cur_inst) {
+      l->value = value;
+      return;
+    }
+  }
+  if (n_promo == cap_promo) {
+    cap_promo = cap_promo ? cap_promo * 2 : 256;
+    promo_buf = realloc(promo_buf, cap_promo * sizeof(PromoLoc));
+  }
+  promo_buf[n_promo++] = (PromoLoc){cur_func_idx, slot, cur_block, cur_inst, value};
+}
+
+// Set a promoted slot's current SSA value, recording the change for `-g`'s location list.
+static void set_curval(int slot, int value) {
+  curval[slot] = value;
+  record_promo(slot, value);
+}
+
 // A local is promoted iff its frame offset was set to the sentinel -(slot+1) (see
 // prepare_func); a real memory local keeps a non-negative offset.
 static bool is_promoted(Obj *v) { return v->is_local && v->offset < 0; }
@@ -305,11 +339,11 @@ static char *cparams(void) {
 static void open_block(int id) {
   cg("block%d(" SP ": i64%s):\n", id, cparams());
   nv = npromo + 1; // v0 is the data-SP; v1..vN are the promoted locals
-  for (int s = 0; s < npromo; s++)
-    curval[s] = s + 1;
   term = false;
   cur_block = id; // debug.loc keys (DEBUGGING.md §6): track which block we emit into
   cur_inst = 0;   // ... and the instruction index within it
+  for (int s = 0; s < npromo; s++)
+    set_curval(s, s + 1); // each promoted slot enters as its block parameter
 }
 
 // The data stack (address-taken locals, §3d) lives in the window. We reserve the low
@@ -736,9 +770,11 @@ static int gen_truth(Node *node) {
 static void open_merge(int id, char *ty) {
   cg("block%d(" SP ": i64%s, v%d: %s):\n", id, cparams(), MERGE_VAL, ty);
   nv = npromo + 2;
-  for (int s = 0; s < npromo; s++)
-    curval[s] = s + 1;
   term = false;
+  cur_block = id; // keep the debug keys (W4) tracking this block too
+  cur_inst = 0;
+  for (int s = 0; s < npromo; s++)
+    set_curval(s, s + 1);
 }
 
 // `a && b` and `a || b` → i32 0/1, short-circuit; the result is carried into the merge.
@@ -1738,7 +1774,7 @@ static int gen_expr(Node *node) {
     if (node->lhs->kind == ND_VAR && node->lhs->var->is_local &&
         is_promoted(node->lhs->var)) {
       int val = gen_expr(node->rhs);
-      curval[slot_of(node->lhs->var)] = val;
+      set_curval(slot_of(node->lhs->var), val);
       return val;
     }
     // Whole-struct/union assignment is a byte copy (§3d D39): the rhs yields its address.
@@ -2181,11 +2217,12 @@ static void prepare_func(Obj *fn) {
 
   int slot = 0, off = 0;
   for (Obj *v = fn->locals; v; v = v->next) {
-    // `-g` is `-Og`: disable SSA promotion so every local keeps a stable window data-stack slot
-    // (DEBUGGING.md W6 / §19). A promoted scalar's value index varies by block/PC (it needs the
-    // S2 per-block LocList), but a window slot has one constant offset, so `debug.var ... win`
-    // resolves correctly function-wide. The classic optimized-vs-debuggable trade.
-    bool promote = !opt_g && promotable_ty(v->ty) && !is_ataken(v) && !is_synthetic(v) &&
+    // Promotion is independent of `-g`: a never-address-taken full-width scalar becomes an SSA
+    // value in both the optimized and debug builds. `-g` no longer forces `-Og` — instead it emits
+    // a location list (`ssalist`, S2) so the promoted scalar is debuggable *as optimized*, the
+    // value-location-list tier of the W6/§19 trade (the interpreter resolves it per pc). A memory
+    // local still emits `debug.var ... win <off>`.
+    bool promote = promotable_ty(v->ty) && !is_ataken(v) && !is_synthetic(v) &&
                    v != fn->va_area && v != fn->alloca_bottom && slot < MAXPROMO;
     if (promote) {
       v->offset = -(slot + 1); // sentinel: a promoted local has no frame slot
@@ -2273,7 +2310,7 @@ static void gen_func(Obj *fn) {
   for (Obj *p = guest_params(fn); p; p = p->next) {
     if (is_promoted(p)) {
       int s = slot_of(p);
-      curval[s] = pi;
+      set_curval(s, pi); // a promoted param's value is its incoming block parameter
       param_slot[s] = true;
     } else {
       int off = nv++;
@@ -2311,7 +2348,7 @@ static void gen_func(Obj *fn) {
       int s = slot_of(v);
       int z = nv++;
       cg("  v%d = %s.const 0\n", z, promo_ty[s]);
-      curval[s] = z;
+      set_curval(s, z);
     }
 
   gen_stmt(fn->body);
@@ -2491,7 +2528,8 @@ static void emit_start(Obj *main_fn) {
 //   * a memory local lives at data-stack offset `v->offset` (matches `VarLoc::Window{off}`).
 // `debug.loc` (per-op source lines) needs per-op inst counting and is a later slice.
 
-// A neutral render-name for a C type (the §6 `TypeRef` simplified to a string for slice 1).
+// A neutral render-name for a C type (the §6 `TypeRef`). Composite for derived types
+// (`int *`, `int[4]`, `struct Point`) so the debugger shows a readable type, not just a kind.
 static const char *dbg_typename(Type *ty) {
   switch (ty->kind) {
   case TY_VOID:    return "void";
@@ -2504,10 +2542,13 @@ static const char *dbg_typename(Type *ty) {
   case TY_DOUBLE:  return "double";
   case TY_LDOUBLE: return "long double";
   case TY_ENUM:    return "enum";
-  case TY_PTR:     return "ptr";
-  case TY_ARRAY:   return "array";
-  case TY_STRUCT:  return "struct";
-  case TY_UNION:   return "union";
+  case TY_PTR:     return format("%s *", dbg_typename(ty->base));
+  case TY_ARRAY:   return format("%s[%d]", dbg_typename(ty->base), ty->array_len);
+  case TY_STRUCT:
+  case TY_UNION: {
+    const char *kw = ty->kind == TY_STRUCT ? "struct" : "union";
+    return ty->tag ? format("%s %.*s", kw, ty->tag->len, ty->tag->loc) : kw;
+  }
   case TY_FUNC:    return "func";
   default:         return "opaque";
   }
@@ -2672,10 +2713,22 @@ static void emit_debug_vars(Obj *fn, int func_idx) {
       continue;
     const char *ty = dbg_typename(v->ty);
     int tid = intern_type(v->ty); // cached: returns the id assigned in the interning pass
-    if (is_promoted(v))
-      cg("debug.var %d \"%s\" ssa %d \"%s\" %d\n", func_idx, v->name, slot_of(v) + 1, ty, tid);
-    else
+    if (is_promoted(v)) {
+      // A promoted scalar: emit the location list recorded as its current SSA value changed
+      // (across blocks and writes). The interpreter resolves it nearest-preceding per pc.
+      int s = slot_of(v);
+      int n = 0;
+      for (int i = 0; i < n_promo; i++)
+        if (promo_buf[i].func == func_idx && promo_buf[i].slot == s)
+          n++;
+      cg("debug.var %d \"%s\" ssalist %d", func_idx, v->name, n);
+      for (int i = 0; i < n_promo; i++)
+        if (promo_buf[i].func == func_idx && promo_buf[i].slot == s)
+          cg(" %d %d %d", promo_buf[i].block, promo_buf[i].inst, promo_buf[i].value);
+      cg(" \"%s\" %d\n", ty, tid);
+    } else {
       cg("debug.var %d \"%s\" win %d \"%s\" %d\n", func_idx, v->name, v->offset, ty, tid);
+    }
   }
 }
 

@@ -2692,6 +2692,7 @@ static Type *struct_union_decl(Token **rest, Token *tok) {
     tag = tok;
     tok = tok->next;
   }
+  ty->tag = tag; // carry the tag for debug-info render names (NULL if anonymous)
 
   if (tag && !equal(tok, "{")) {
     *rest = tok;
