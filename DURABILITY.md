@@ -655,12 +655,14 @@ guest).
 "continuation in a shadow stack" from thread coordination). *In progress:* the transform
 recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'd module is
 **NORMAL-inert** under instrumentation + verifies (`svm-durable/tests/fiber.rs`); the
-**per-fiber shadow-stack layout + shadow-SP swap landed** (slice 3.1.1) and the **resumer-side
-`cont.resume` thaw arm** re-issues the resume on rewind (slice 3.1.2). Still to wire — the
-fiber-side **`suspend` re-park** arm (slice 3.1.3, the novel bit) and the freeze driver that
-flattens an idle parked fiber (switch into it under `UNWINDING` so its post-suspend poll
-unwinds it with no forward progress). The `suspend` thaw arm currently fails closed (trap), so
-a full fiber *thaw* is not yet possible. 3.2 — multi-vCPU quiesce + per-context layout.
+**per-fiber shadow-stack layout + shadow-SP swap landed** (slice 3.1.1), the **resumer-side
+`cont.resume` thaw arm** re-issues the resume on rewind (slice 3.1.2), and the **fiber-side
+`suspend` re-park arm** flips to `NORMAL` and re-executes `suspend` on rewind (slice 3.1.3) —
+so **both fiber thaw arms are now wired** (no fiber arm fails closed). Still to wire — the
+freeze driver that flattens an idle parked fiber (switch into it under `UNWINDING` so its
+post-suspend poll unwinds it with no forward progress) and the snapshot Section-2 fiber
+metadata. Until those land, a parked fiber's continuation isn't yet captured, so a full fiber
+*thaw* isn't exercisable end-to-end. 3.2 — multi-vCPU quiesce + per-context layout.
 3.3 — JIT parity (drive real OS threads to safepoints; respect the D57 single-owner protocol;
 **replicate the swap** in the JIT's fiber-switch path). Phase 4 — back-edge polls for bounded
 latency.
@@ -718,12 +720,19 @@ each a small reviewable commit on the interpreter only:
    fiber's *own* rewind (the `Yield` re-park), which is slice 3.1.3; the round-trip test lands with
    3.1.3–5 (the fiber re-park + freeze driver + snapshot Section-2 fiber metadata).
 
-3. **`Yield` thaw arm — re-park** (the novel bit). On thaw of a `suspend` point, rewind the
-   fiber's frames from its shadow stack and **return it to the parked state** in the fiber
-   registry (awaiting a future `cont.resume`), *not* continue forward. The deepest-frame
-   "flip to NORMAL and continue" rule (§12.7) becomes, for a fiber's base frame, "re-park
-   the fiber." Needs the interp's `RegFiber`/registry to accept a fiber rebuilt-from-shadow
-   as `Parked`. Replace the fail-closed trap arm for `Yield`.
+3. **[DONE] `Yield` thaw arm — re-park** (the novel bit). On thaw of a `suspend` point the arm
+   reloads the fiber's frame, pops, **flips the state word to `NORMAL`**, and **re-executes
+   `suspend`** — which parks the fiber back (its current rebuilt frames) and hands `value` to
+   the resumer, *not* continue forward; the re-executed suspend's result (the next resume's
+   value) threads into the continuation exactly as a leaf's reloaded cap.call result does. The
+   deepest-frame "flip to NORMAL" lives here (a parked fiber's `suspend` is the globally-deepest
+   frozen frame), **not** in the resumer's `Resume` arm — so the resumer regains control already
+   in NORMAL. *Turned out transform-only:* the interp's existing `Suspend` handler re-parks via
+   the registry, and the 3.1.1 shadow-SP swap routes the SP, so no `RegFiber` change was needed.
+   Tested structurally (`svm-durable/tests/fiber.rs`): both fiber arms now re-issue their op and
+   the only `Unreachable` blocks left are the per-function forged-id TRAPs. **End-to-end thaw
+   still needs 3.1.4–5** (a parked fiber's continuation isn't captured until the freeze driver
+   flattens it into its shadow stack and the snapshot records its metadata).
 
 4. **Freeze driver — flatten idle parked fibers.** Today freeze drives the running vCPU to
    unwind. Extend it: for each *idle* `RegFiber::Parked` fiber, switch into it with

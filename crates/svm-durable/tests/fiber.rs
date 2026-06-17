@@ -3,11 +3,12 @@
 //! the **NORMAL-inertness** invariant for a fiber'd module — instrumented runs identically to
 //! un-instrumented — and that the instrumented IR verifies.
 //!
-//! Slice 3.1.2 wires the **resumer-side thaw arm**: a `cont.resume` rewinds by re-issuing the
-//! resume (reloading its spilled handle + arg), mirroring a propagated call. The **fiber side**
-//! — re-parking a `suspend`ed fiber on thaw (slice 3.1.3) — is still fail-closed (its arm traps),
-//! so a full fiber thaw isn't exercised here yet; the freeze driver + snapshot wiring (3.1.4–5)
-//! complete the round-trip.
+//! Slices 3.1.2–3 wire both **fiber thaw arms**: a `cont.resume` rewinds by re-issuing the resume
+//! (reloading its spilled handle + arg), and a `suspend` rewinds by flipping to `NORMAL` and
+//! re-executing `suspend` to re-park the fiber. No fiber arm fails closed any more. A full fiber
+//! *thaw* still isn't exercisable here — a parked fiber's continuation isn't captured until the
+//! freeze driver flattens it into its shadow stack and the snapshot records its metadata (slices
+//! 3.1.4–5) — so these tests pin verification + NORMAL-inertness + the arm wiring, structurally.
 
 use svm_durable::{init_durable_window, transform_module};
 use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
@@ -105,12 +106,13 @@ fn op_and_trap_counts(m: &Module) -> (usize, usize, usize) {
     (resumes, suspends, unreachable)
 }
 
-/// Slice 3.1.2: the `cont.resume` resumer-side thaw arm is wired (re-issues the resume), while a
-/// `suspend` point's arm still fails closed. Structurally: instrumenting adds one re-issued
-/// `cont.resume` per resume point (its rewind arm) on top of the one kept in the forward segment,
-/// but adds **no** new `suspend` (the `Yield` arm is a bare `Unreachable` trap, slice 3.1.3).
+/// Slices 3.1.2–3: both fiber thaw arms are wired. A `cont.resume` rewind arm re-issues the
+/// resume (3.1.2); a `suspend` rewind arm re-executes `suspend` to re-park the fiber (3.1.3).
+/// Structurally each resume/suspend point keeps its forward op and gains a re-issue in its rewind
+/// arm (so both counts double), and the **only** `Unreachable` block left is the shared forged-id
+/// TRAP — no fiber arm fails closed any more.
 #[test]
-fn resume_thaw_arm_reissues_while_suspend_stays_fail_closed() {
+fn both_fiber_thaw_arms_reissue_their_op() {
     let mut m = svm_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
@@ -122,17 +124,22 @@ fn resume_thaw_arm_reissues_while_suspend_stays_fail_closed() {
     svm_verify::verify_module(&inst).expect("instrumented IR verifies");
     let (res1, susp1, traps) = op_and_trap_counts(&inst);
 
-    // Each of the 2 resume points keeps its forward `cont.resume` and gains a re-issue in its
-    // rewind arm → the count doubles. The single `suspend` gains no re-issue (its arm traps).
+    // Each resume/suspend point keeps its forward op and gains a re-issuing rewind arm → both
+    // counts double.
     assert_eq!(
         res1,
         2 * res0,
         "each cont.resume gains a re-issuing rewind arm"
     );
-    assert_eq!(susp1, susp0, "a suspend point's thaw arm does not re-issue");
-    // At least the one `suspend`'s fail-closed arm (plus the shared forged-id TRAP block).
-    assert!(
-        traps >= 2,
-        "the suspend arm and the forged-id trap are Unreachable"
+    assert_eq!(
+        susp1,
+        2 * susp0,
+        "each suspend gains a re-parking rewind arm"
+    );
+    // No fiber arm fails closed now: the only Unreachable blocks are the per-function forged-id
+    // TRAPs — one in the root and one in the fiber (both functions are instrumented).
+    assert_eq!(
+        traps, 2,
+        "only the per-function forged-id TRAP blocks are Unreachable"
     );
 }

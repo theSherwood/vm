@@ -367,9 +367,11 @@ enum SuspendKind {
     /// 3.1.3) — until that lands, a thaw that actually re-enters a suspended fiber still relies
     /// on the fiber side being wired.
     Resume { k: ValIdx, arg: ValIdx },
-    /// `suspend` (fiber side): unwinds the fiber's stack like a leaf, but thaw must **re-park**
-    /// the fiber (await a future `cont.resume`), not continue. *Thaw not yet wired (Phase 3.1).*
-    Yield,
+    /// `suspend` (fiber side): unwinds the fiber's stack like a leaf, and thaw **re-parks** the
+    /// fiber — flips the state word to `NORMAL` (a parked fiber's suspend is the globally-deepest
+    /// frozen frame) and re-executes `suspend` so control returns to the resumer awaiting a future
+    /// `cont.resume` (slice 3.1.3). `value` is the suspended value's block-local index.
+    Yield { value: ValIdx },
 }
 
 /// One resume point's metadata across the whole function (global id by vector order).
@@ -563,7 +565,7 @@ fn transform_func(
                         args: args.clone(),
                     },
                     Inst::ContResume { k, arg } => SuspendKind::Resume { k: *k, arg: *arg },
-                    Inst::Suspend { .. } => SuspendKind::Yield,
+                    Inst::Suspend { value } => SuspendKind::Yield { value: *value },
                     _ => unreachable!("suspend position is a cap.call / call / fiber op"),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
@@ -572,7 +574,7 @@ fn transform_func(
                         func_results[*callee as usize].len()
                     }
                     (SuspendKind::Resume { .. }, _) => 2, // (status, value)
-                    (SuspendKind::Yield, _) => 1,         // the resume arg
+                    (SuspendKind::Yield { .. }, _) => 1,  // the resume arg
                     _ => unreachable!(),
                 };
                 // Spillable range: values `[0, save_end)`. A leaf reloads its own result too
@@ -584,7 +586,7 @@ fn transform_func(
                     // they aren't spilled — same as a propagated call.
                     SuspendKind::Propagated { .. }
                     | SuspendKind::Resume { .. }
-                    | SuspendKind::Yield => out - nres,
+                    | SuspendKind::Yield { .. } => out - nres,
                 };
                 let slot_types = bi.types[0..out].to_vec();
 
@@ -621,6 +623,9 @@ fn transform_func(
                 if let SuspendKind::Resume { k, arg } = &kind {
                     used[*k as usize] = true; // operands of the re-issued cont.resume
                     used[*arg as usize] = true;
+                }
+                if let SuspendKind::Yield { value } = &kind {
+                    used[*value as usize] = true; // operand of the re-executed suspend
                 }
                 let spilled: Vec<usize> = if conservative {
                     (0..save_end).collect()
@@ -725,22 +730,6 @@ fn transform_func(
         let ret: Vec<ValIdx> = f.results.iter().map(|&t| ub.one(zero_const(t))).collect();
         unwind_blocks.push(ub.finish(Terminator::Return(ret)));
 
-        // A `suspend` point (`Yield`) unwinds the fiber into its shadow stack like any other
-        // point (the UNWIND above), but its *thaw* — rewinding the fiber's frames and
-        // **re-parking** it (await a future `cont.resume`) rather than continuing forward — is
-        // the novel bit still ahead (slice 3.1.3). Fail closed: route its arm to the trap so a
-        // fiber thaw traps rather than miscomputes. (`cont.resume`'s resumer-side arm *is* wired
-        // below — slice 3.1.2.) NORMAL execution never reaches an arm, so a fiber'd module stays
-        // fully inert under instrumentation.
-        if matches!(pt.kind, SuspendKind::Yield) {
-            arm_blocks.push(Block {
-                params: vec![],
-                insts: vec![],
-                term: Terminator::Unreachable,
-            });
-            continue;
-        }
-
         // ARM: reload the spilled set (self-contained — no incoming params), pop, resume.
         let mut ab = Bb::new(vec![]);
         let sp_a = ab.one(Inst::ConstI64(SHADOW_SP_OFF as i64));
@@ -778,17 +767,26 @@ fn transform_func(
                 )
             }
             // `cont.resume` re-issue (slice 3.1.2): reload the (spilled) handle + arg and resume
-            // the fiber again. On thaw the fiber rewinds in turn (its `Yield` re-park, slice
-            // 3.1.3) and redelivers `(status, value)` — the resumer threads those two results
-            // into its continuation just like a propagated call threads its results.
+            // the fiber again. On thaw the fiber rewinds in turn (its `Yield` re-park) and
+            // redelivers `(status, value)` — the resumer threads those two results into its
+            // continuation just like a propagated call. The resumer does **not** flip the state
+            // word: the resumee's `Yield` arm (the globally-deepest frame) does.
             SuspendKind::Resume { k, arg } => {
                 let kk = reloaded[spill_slot(*k as usize).expect("resume handle spilled")];
                 let aa = reloaded[spill_slot(*arg as usize).expect("resume arg spilled")];
                 ab.many(Inst::ContResume { k: kk, arg: aa }, pt.nres)
             }
-            // `suspend` (`Yield`) routes to the trap arm above and never reaches here (slice 3.1.3).
-            SuspendKind::Yield => {
-                unreachable!("a `suspend` point fails closed in the arm early-out")
+            // `suspend` re-park (slice 3.1.3): a parked fiber's suspend is the globally-deepest
+            // frozen frame, so flip the state word to NORMAL, then re-execute `suspend` — which
+            // parks this fiber and hands `value` back to the resumer (in NORMAL). Its result, the
+            // value the *next* resume delivers, threads into the continuation exactly as a leaf's
+            // reloaded cap.call result does.
+            SuspendKind::Yield { value } => {
+                let st_a = ab.one(Inst::ConstI64(STATE_OFF as i64));
+                let normal_v = ab.one(Inst::ConstI32(STATE_NORMAL));
+                ab.zero(store(StoreOp::I32, st_a, normal_v, 0));
+                let v = reloaded[spill_slot(*value as usize).expect("suspend value spilled")];
+                ab.many(Inst::Suspend { value: v }, pt.nres)
             }
         };
 
