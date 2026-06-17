@@ -2103,6 +2103,8 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     let status = Command::new("rustc")
         .args([
             "+1.81.0",
+            "--edition",
+            "2021",
             "--emit=llvm-bc",
             "--crate-type=lib",
             "-C",
@@ -2198,7 +2200,15 @@ fn rust_compute_native(n: i32) -> Option<i32> {
     )
     .expect("write Rust source");
     match Command::new("rustc")
-        .args(["+1.81.0", "-C", "opt-level=2", "-C", "overflow-checks=off"])
+        .args([
+            "+1.81.0",
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
         .arg(&rs)
         .arg("-o")
         .arg(&exe)
@@ -2291,7 +2301,15 @@ fn rust_run_native(name: &str, items: &str, n: i32) -> Option<i32> {
     )
     .expect("write Rust source");
     match Command::new("rustc")
-        .args(["+1.81.0", "-C", "opt-level=2", "-C", "overflow-checks=off"])
+        .args([
+            "+1.81.0",
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
         .arg(&rs)
         .arg("-o")
         .arg(&exe)
@@ -2484,4 +2502,124 @@ pub extern "C" fn run(n: i32) -> i32 {
 }
 "#;
     check_rust_run_vs_native("rs_unwrap", items, &[0, 1, 8, -5]);
+}
+
+/// Run a `no_std` + `alloc` Rust crate (whose `items` define `fn compute() -> i32`) **through the
+/// powerbox**: the on-ramp synthesizes `#[no_mangle] extern "C" fn main` calling `compute`, so it gets
+/// a powerbox `_start` that grants the `Memory` handle and seeds the heap (the `vm_map`-growing bump
+/// allocator the program's `#[global_allocator]` reaches via `malloc`). Returns `compute()`'s value as
+/// the program's `u8` exit/return code, run on the JIT. `None` if the toolchain is unavailable.
+fn rust_alloc_onramp(name: &str, items: &str) -> Option<u8> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
+         {items}\n\
+         #[no_mangle] pub extern \"C\" fn main() -> i32 {{ compute() }}\n"
+    );
+    let bc = compile_rust_to_bc(name, &src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: an alloc program must produce a powerbox entry (Memory granted)"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated Rust IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    Some(match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    })
+}
+
+/// Native oracle: the same `items` (with `compute`) built as a std binary that `process::exit`s with
+/// `compute()`, run natively; its `u8` exit code is the ground truth.
+fn rust_alloc_native(name: &str, items: &str) -> Option<u8> {
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("svm_llvm_{}_{}_alloc.rs", std::process::id(), name));
+    let exe = dir.join(format!("svm_llvm_{}_{}_alloc", std::process::id(), name));
+    std::fs::write(
+        &rs,
+        format!("{items}\nfn main() {{ std::process::exit(compute()); }}\n"),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args([
+            "+1.81.0",
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    Some(
+        Command::new(&exe)
+            .status()
+            .expect("run native")
+            .code()
+            .unwrap_or(-1) as u8,
+    )
+}
+
+/// **Rust `alloc` / heap — `Vec` via a guest `#[global_allocator]`.** The headline for *real* Rust: a
+/// `no_std` + `alloc` crate whose global allocator routes to the guest `malloc`/`free`. Run through the
+/// powerbox (the on-ramp synthesizes `main` → `_start`, granting the `Memory` handle and the
+/// `vm_map`-growing bump allocator), `Vec::push` grows the heap (alloc + `memcpy` + free) and the sum
+/// is returned as the exit code — heap data structures from Rust, byte-identical to native `rustc`.
+#[test]
+fn rust_alloc_vec_via_global_allocator() {
+    let items = r#"
+extern crate alloc;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { malloc(layout.size()) }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) { free(ptr); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+fn compute() -> i32 {
+    let mut v: alloc::vec::Vec<i32> = Vec::new();
+    let mut i = 0i32;
+    while i < 64 {
+        v.push(i.wrapping_mul(i)); // grows the heap several times
+        i = i.wrapping_add(1);
+    }
+    let mut s: i32 = 0;
+    for &x in v.iter() {
+        s = s.wrapping_add(x);
+    }
+    s.rem_euclid(251) // a deterministic value in [0, 250] — fits the u8 exit code
+}
+"#;
+    let (Some(svm), Some(native)) = (
+        rust_alloc_onramp("rs_alloc", items),
+        rust_alloc_native("rs_alloc", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        svm, native,
+        "rust alloc/Vec: on-ramp exit {svm} vs native {native}"
+    );
+    // Pin the value so the differential can't pass vacuously: Σ i² for i in 0..64 = 85344; % 251 = 4.
+    assert_eq!(svm, 4, "rust alloc/Vec: expected 4, got {svm}");
 }

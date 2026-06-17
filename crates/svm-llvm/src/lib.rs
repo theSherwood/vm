@@ -3916,6 +3916,10 @@ fn is_rust_abort_call(name: &str) -> bool {
         || name.contains("expect_failed")
         || name.contains("slice_index")
         || name.contains("panic_cannot_unwind")
+        // `alloc`'s out-of-memory / capacity-overflow aborts (`alloc::raw_vec::handle_error`,
+        // `alloc::alloc::handle_alloc_error`) — also `-> !` external lang items under `panic=abort`.
+        || name.contains("handle_error")
+        || name.contains("alloc_error")
 }
 
 /// The local value operands a terminator uses (the branch condition / returned value). Validates
@@ -4460,7 +4464,10 @@ impl<'a> BlockCtx<'a> {
                 }
                 // A constexpr interior pointer (`&".str"[k]`, `&g.field`) — fold to its constant
                 // window address (base global + type-walked offset), like the `getelementptr` instr.
-                Constant::GetElementPtr(_) => {
+                // A constexpr interior pointer, or a pointer materialized from an integer
+                // (`inttoptr`/`ptrtoint` over constants — e.g. Rust's `NonNull::dangling()` for an
+                // empty `Vec`, an `inttoptr(align)`), folds to its constant `i64` window value.
+                Constant::GetElementPtr(_) | Constant::IntToPtr(_) | Constant::PtrToInt(_) => {
                     let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
                     Ok(self.push(Inst::ConstI64(v)))
                 }

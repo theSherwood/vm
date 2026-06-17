@@ -806,14 +806,32 @@ sub-slice), and **`Option::unwrap`** (its panic path traps via slice AI's recogn
 - Tests: `rust_trait_object_dispatch`, `rust_slice_argument`, `rust_option_unwrap`. 99 translate tests
   green, fmt + clippy clean.
 
+**Slice AK (DONE) — Rust `alloc` / heap (`Vec` via a guest `#[global_allocator]`).** The headline for
+*real* Rust: a `no_std` + `alloc` crate whose `#[global_allocator]` routes to the guest `malloc`/`free`
+runs byte-identical to native `rustc`, with `Vec::push` growing the heap (alloc + `memcpy` + free)
+through the on-ramp's `vm_map`-growing bump allocator. Because the allocator + `Memory` grant live in
+the powerbox `_start` (gated on `main`), the test runs **through the powerbox**: the on-ramp synthesizes
+`#[no_mangle] extern "C" fn main` calling `compute()`, the differential compares the `u8` exit/return
+code, and a pinned expected value keeps it non-vacuous. Three gaps closed:
+- **`alloc` abort lang items.** `alloc::raw_vec::handle_error` / `alloc::alloc::handle_alloc_error`
+  (OOM / capacity-overflow, `-> !`, external) join the panic recognizer (slice AI) → trap.
+- **Constant `inttoptr`/`ptrtoint` operands.** Rust's `NonNull::dangling()` (an empty `Vec`'s pointer =
+  its alignment, e.g. `inttoptr(i64 4)`) folds to its `i64` window value in `operand` (via `const_eval`,
+  like the constexpr-GEP path) — not just in global initializers.
+- **rustc edition.** The Rust lanes pin `--edition 2021` (the default 2015 mis-resolves `core::`/
+  `alloc::` paths in the std oracle).
+- Test: `rust_alloc_vec_via_global_allocator` (Σ i² for i in 0..64 = 85344, % 251 = **4**, vs native).
+  100 translate tests green, fmt + clippy clean.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
       inheritance / `this`-adjusting thunks, references, `static`-local guards, …).
 - [x] **Rust** (`no_std`/panic=abort) — runs vs native: `iN` (slice AH), real `core` (enums/slices/
       `Option`/iterators/structs) + panic-path → trap (slice AI), trait objects / `&[T]` args / `unwrap`
-      (slice AJ). Auto-vectorization is disabled (SIMD is §17). Broaden (`Result`, generics with
-      bounds, `&mut` aliasing) as gaps surface.
+      (slice AJ), **`alloc`/heap — `Vec` via a guest `#[global_allocator]`** (slice AK). Auto-vectorization
+      is disabled (SIMD is §17); `--edition 2021`. Broaden (`Result`/`?`, `String`/`Box`/`BTreeMap`,
+      generics with bounds, `&mut` aliasing) as gaps surface.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 - [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`
