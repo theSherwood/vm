@@ -1031,6 +1031,28 @@ fn demo_hexdump_vs_native() {
 }
 
 #[test]
+fn demo_mat4_vs_native() {
+    // A 4×4 matrix × vec4 affine transform using `<4 x float>` (vector_size(16)) — `matvec`
+    // broadcasts each component and accumulates the columns (`llvm.fmuladd.v4f32`), printing the
+    // int-truncated results. Drives 128-bit SIMD: `v128.load`/`store`, `f32x4` mul/add, extract/
+    // replace lane, and the splat `shufflevector`. Byte-identical to native.
+    check_demo_vs_native("mat4", "mat4/mat4.c", b"");
+}
+
+#[test]
+fn vec4_float_scale() {
+    // A `<4 x float>` passed/returned by value (a `v128` call/ret) and scaled by a broadcast scalar
+    // (`splat` + `f32x4.mul`), then lane-summed. scale({1,2,3,4}, 3) = {3,6,9,12} → 30.
+    let src =
+        "typedef float float4 __attribute__((vector_size(16))); float4 scale(float4, float); \
+               int run(int n){ float4 v = {1.0f, 2.0f, 3.0f, 4.0f}; float4 r = scale(v, (float)n); \
+               return (int)(r[0] + r[1] + r[2] + r[3]); } \
+               __attribute__((noinline)) float4 scale(float4 v, float s){ return v * s; } \
+               int main(void){ return run(3); }";
+    check_vs_native("vec4_scale", src, 3);
+}
+
+#[test]
 fn demo_sortvec_vs_native() {
     // A growable int vector + insertion sort: 50 pseudo-random signed ints into a `realloc`-doubling
     // buffer (from `realloc(NULL,…)` ≡ malloc), sorted, printed 10/line via `printf("%d%c")`. Drives

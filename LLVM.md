@@ -566,7 +566,7 @@ the dominant general-C gap).
 |---|---|---|---|
 | 1 ✅ | **`hexdump`** — read stdin, print `%08lx  %02x ×16  \|ascii\|` rows (`demos/hexdump`, slice W) | **varargs `printf`** (unsigned `%u`/`%x`, width, `0`-pad, `l`) — DONE, byte-identical to native | `read`, loops |
 | 2 ✅ | **`sortvec`** — `realloc`-doubling int vector + insertion sort, print `%d` 10/line (`demos/sortvec`, slice X) | **`realloc`** (header-sized grow-and-copy) + signed `printf` (`%d`) — DONE, byte-identical to native | `malloc` |
-| 3 | **`mat4`** — 4×4 matrix × vec4 / 3D transform, print rows | **wider SIMD** (`<4 x float>`) — generalize the 2-lane scalarization | floats, `printf` |
+| 3 ✅ | **`mat4`** — 4×4 matrix × vec4 affine transform, print rows (`demos/mat4`, slice Y) | **128-bit SIMD** (`<4 x float>` → native `v128`) — DONE, byte-identical to native | floats, `printf` |
 | 4 | **`crc32` + big-endian TLV reader** | **`llvm.bswap`** (endian) | tables, `printf` |
 | 5 | **`editor`/gap-buffer** — insert/delete in a text buffer | **overlapping `memmove`** (direction-aware runtime loop) | arrays |
 | 6 | **`raytrace`/`mandelbrot+shading`** or **DSP sine** | **transcendental libm** (`sqrt`/`sin`/`cos`/`pow`/`exp`) — bundle a small **guest `libm`** (poly approximations), like the corpus demos bundle `memset` | floats, `printf` |
@@ -604,7 +604,15 @@ space-padded fields supported (zero-padded `%d` stays fail-closed — sign+pad o
 `demo_sortvec_vs_native`, `printf_signed_formats`, `realloc_grow_preserves`. (heapgrow/calloc still
 pass — the data region stays freshly-`vm_map`-zeroed below the bump.)
 
-**Next:** demo 3 (**`mat4`** → wider SIMD `<4 x float>`).
+**Slice Y (DONE) — 128-bit SIMD (`<4 x float>` → native `v128`); lands `mat4`.** A 4-lane 32-bit
+vector maps to SVM's §17 `v128` (vs the 2-lane → packed-`i64`, since `<4 x …>` is 16 bytes): `load`/
+`store` → `v128.load`/`store`; `fadd`/`fsub`/`fmul`/`fdiv` → `f32x4` `VFloatBin`; `extractelement`/
+`insertelement` → extract/replace lane; `shufflevector` → an `i8x16.shuffle` byte mask (an all-equal
+mask is a splat/broadcast); `<4 x …>` constants → `ConstV128`; `llvm.fmuladd.v4f32` → `f32x4` mul+add
+(unfused). The `<4 x i32>` shuffle masks are read as constants, not values. Tests:
+`demo_mat4_vs_native`, `vec4_float_scale` (a `<4 x float>` by-value arg/return + splat-mul).
+
+**Next:** demo 4 (**`crc32` + big-endian reader** → `llvm.bswap`).
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
