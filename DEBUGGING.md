@@ -53,7 +53,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
-| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text); chibicc `-g` emits `debug.var` + `debug.loc` + `debug.type`/`debug.field`** (D-DBG-7/§6; binary section pending; DAP consumer of types pending) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-interp`, `codegen_ir.c` |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits `debug.var` + `debug.loc` + `debug.type`/`debug.field`; DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c` |
 | DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
@@ -1011,8 +1011,8 @@ text form adds `debug.type` / `debug.field` and an optional trailing id on `debu
 old name-only `debug.var` still valid (back-compat: `type_id = None`). chibicc `-g` interns each
 named local's C `Type` (by pointer identity to bound recursive aggregates, plus structural dedup
 of base scalars) and emits the table. This is the **producer + ABI** half (the §7 W5 note). The
-binary section is still stripped (`svm-encode` sets `debug_info: None`); render names were
-generic until slice 12 (below) gave them the C tag.
+binary section was text-only until slice 14 (below); render names were generic until slice 12
+(below) gave them the C tag.
 
 **Slice 8 — DAP Variables-pane aggregate expansion (first consumer of the type table).** A
 struct/array local expands in the editor: the server hands back a nonzero `variablesReference`
@@ -1049,9 +1049,20 @@ longer trips integer division-by-zero. The bare-variable `evaluate`/Variables sc
 formats window bytes through the structured type, so a `double` reads as `2.5`, not its bit
 pattern. Tests: `expr` unit tests (promotion, short-circuit) + a DAP test over a window `double`.
 
-**Not yet (next slices):** binary serialization of the debug section; the LLVM/wasm `debug.loc` +
-type ingest sides; and the remaining W4 refinement (per-block `LocList` so promoted scalars are
-debuggable without `-Og`, per-producer rich blob). (Multithreaded debugging and the
+**Slice 14 — binary serialization of the debug section.** `svm-encode` now encodes/decodes the
+full `DebugInfo` (files, locs, the structured type table, vars) as a strippable section appended
+after the funcs, so debug info survives the binary IR form, not just text. It's **append-only and
+back-compatible**: a module with no debug info encodes byte-identically to before (the decoder
+treats "no bytes after the funcs" as `None`), so existing blobs and `svm-snapshot` digests are
+unchanged — verified by a prefix assertion. The decoder keeps the untrusted-input discipline
+(bounded counts, UTF-8-checked strings, validated discriminants → typed `DecodeError`s) and the
+verifier still ignores the section (§2a). Tests (`svm-encode`): a module exercising every
+`TypeDef` variant + `VarLoc` + `type_id` round-trips; the no-debug case stays a byte-prefix; a
+corrupted section fails to decode without panicking.
+
+**Not yet (next slices):** the LLVM/wasm `debug.loc` + type ingest sides (a second producer — the
+real frontend-neutrality proof); and the remaining W4 refinement (per-block `LocList` so promoted
+scalars are debuggable without `-Og`, per-producer rich blob). (Multithreaded debugging and the
 interpreter-backed DAP server are already built — Milestone B and W5 slices 1–6.)
 
 ### Open questions (S4/S5/S2)
