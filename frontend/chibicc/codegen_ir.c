@@ -151,6 +151,7 @@ struct LoopCtx {
   int brk_blk;
   char *cont_label;
   int cont_blk;
+  int cont_used; // set when a `continue` actually targets cont_blk (see gen_for)
 };
 static struct LoopCtx loopstk[64];
 static int loopsp;
@@ -1907,16 +1908,28 @@ static void gen_for(Node *node) {
   term = true;
 
   open_block(body);
-  loopstk[loopsp++] = (struct LoopCtx){node->brk_label, end, node->cont_label, cont};
+  loopstk[loopsp++] = (struct LoopCtx){node->brk_label, end, node->cont_label, cont, 0};
   gen_stmt(node->then);
+  int cont_used = loopstk[loopsp - 1].cont_used;
   loopsp--;
-  if (!term)
-    cg("  br block%d(" SP "%s)\n", cont, cvals());
-
-  open_block(cont);
-  if (node->inc)
-    gen_expr(node->inc);
-  cg("  br block%d(" SP "%s)\n", cond, cvals());
+  // Inline the increment on the body's fall-through path so the body + increment form ONE block.
+  // That lets the backend update the induction variable in place (`leaq 1(%r),%r`) instead of
+  // carrying `i+1` through a scratch register across a body→cont block boundary — an extra mov per
+  // iteration on the loop-carried critical path (the `locals_c` residual). `continue` still routes
+  // to the `cont` block below, which runs the same increment; that block is emitted **only when a
+  // `continue` actually targets it** (otherwise it would be dead, and the body path is what runs).
+  if (!term) {
+    if (node->inc)
+      gen_expr(node->inc);
+    cg("  br block%d(" SP "%s)\n", cond, cvals());
+    term = true;
+  }
+  if (cont_used) {
+    open_block(cont);
+    if (node->inc)
+      gen_expr(node->inc);
+    cg("  br block%d(" SP "%s)\n", cond, cvals());
+  }
 
   open_block(end);
 }
@@ -2063,6 +2076,7 @@ static void gen_stmt(Node *node) {
       }
       if (node->unique_label && loopstk[i].cont_label &&
           !strcmp(node->unique_label, loopstk[i].cont_label)) {
+        loopstk[i].cont_used = 1; // gen_for emits the cont block only if it's actually targeted
         cg("  br block%d(" SP "%s)\n", loopstk[i].cont_blk, cvals());
         term = true;
         return;
