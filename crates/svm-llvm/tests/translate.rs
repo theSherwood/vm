@@ -1668,3 +1668,189 @@ int main(void) { return (__vm_cap(6) == __vm_blocking_handle()) ? 7 : 0; }
         "__vm_cap(6) == __vm_blocking_handle()"
     );
 }
+
+// ---- §22 guest-driven JIT: `__vm_jit_compile` / `invoke2` / `release` / `install` / `uninstall` ---
+
+/// Structural: every guest-driven-JIT builtin lowers to a `CallImport` on the `Jit` import, and a
+/// program using them is granted the full 8-handle powerbox (the `Jit` handle is the last `VM_CAP_*`
+/// index, so `synth_start` grants the whole prefix). Verifies the import table + entry arity without
+/// the (heavier) end-to-end blob dance below.
+#[test]
+fn vm_jit_builtins_lower_and_grant_full_powerbox() {
+    let src = r#"
+long __vm_jit_compile(void *blob, long len);
+long __vm_jit_invoke2(long code, long a, long b);
+long __vm_jit_install(long code);
+long __vm_jit_uninstall(long slot);
+long __vm_jit_release(long code);
+static char blob[64];
+int main(void) {
+  long code = __vm_jit_compile(blob, 64);
+  long r = __vm_jit_invoke2(code, 2, 3);
+  long slot = __vm_jit_install(code);
+  __vm_jit_uninstall(slot);
+  __vm_jit_release(code);
+  return (int)(r + slot);
+}
+"#;
+    let Some(bc) = compile_to_bc("vm_jit_struct", src) else {
+        return;
+    };
+    let m = svm_llvm::translate_bc_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    let imports: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    for want in [
+        "vm_jit_compile",
+        "vm_jit_invoke2",
+        "vm_jit_install",
+        "vm_jit_uninstall",
+        "vm_jit_release",
+    ] {
+        assert!(
+            imports.contains(&want),
+            "missing JIT import {want}: {imports:?}"
+        );
+    }
+    assert!(
+        svm_run::is_powerbox_entry(&m),
+        "a JIT-builtin program must produce a powerbox entry"
+    );
+    assert_eq!(
+        m.funcs[0].params.len(),
+        8,
+        "the Jit handle is the last VM_CAP_* index → the full 8-handle powerbox"
+    );
+    // Resolves + re-verifies (every `CallImport` binds to the `Jit` capability).
+    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+}
+
+/// End-to-end: the **guest that JITs itself** (`demos/jit/jit_demo.c`) through the LLVM on-ramp. The
+/// guest emits serialized SVM IR byte-by-byte into its window, `__vm_jit_compile`s it, and checks
+/// `__vm_jit_invoke2` (raw unit) **and** an `__vm_jit_install`ed unit reached via a C function pointer
+/// (`call_indirect`) against its own bytecode interpreter on a 49-input grid — guest-emitted,
+/// host-verified, Cranelift-compiled, on the real JIT powerbox.
+///
+/// The blob's memory descriptor must declare the **same** `size_log2` as the parent (the validator's
+/// exact-match precondition). The demo hardcodes chibicc's `16`; svm-llvm sizes the parent window
+/// differently, so we translate once to learn its `size_log2`, patch the demo's descriptor to match,
+/// then translate+run the patched source (no magic constant — it tracks svm-llvm's sizing).
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn vm_jit_guest_self_jit_demo() {
+    // Replace the chibicc-only `#include <svm.h>` with the `__vm_jit_*` prototypes the demo uses (it
+    // declares `write` itself) — so clang resolves them without chibicc's include dir on the path
+    // (which would shadow the system `<stdlib.h>`/`<stdint.h>` for the other tests).
+    let jit_decls = "\
+long __vm_jit_compile(void *blob, long len);\n\
+long __vm_jit_invoke2(long code, long a, long b);\n\
+long __vm_jit_release(long code);\n\
+long __vm_jit_install(long code);\n\
+long __vm_jit_uninstall(long slot);\n";
+    let src0 =
+        include_str!("../../svm-run/demos/jit/jit_demo.c").replace("#include <svm.h>", jit_decls);
+    let Some(bc0) = compile_to_bc("jit_probe", &src0) else {
+        return;
+    };
+    // Probe svm-llvm's parent window size (translation does not check the memory-match — that is a
+    // runtime precondition of `__vm_jit_compile`), then patch the blob's descriptor to it.
+    let s = svm_llvm::translate_bc_path(&bc0)
+        .expect("translate probe")
+        .module
+        .memory
+        .expect("powerbox program declares a window")
+        .size_log2;
+    let src = src0.replace("eb(buf, 16);", &format!("eb(buf, {s});"));
+    assert_ne!(
+        src, src0,
+        "expected to patch the blob memory descriptor `eb(buf, 16);`"
+    );
+
+    let Some(bc) = compile_to_bc("jit_demo", &src) else {
+        return;
+    };
+    let m = svm_llvm::translate_bc_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.contains("98 inputs agree (invoke + installed call_indirect)"),
+        "guest self-JIT (invoke + installed call_indirect) must agree on every input:\n{out}"
+    );
+}
+
+// ---- §13/§14 SharedRegion: `__vm_region_create` / `map` / `unmap` / `page_size` -----------------
+
+/// The **magic ring buffer** in C through the LLVM on-ramp: a guest mints a `SharedRegion` from its
+/// `AddressSpace` handle, maps it at two adjacent window offsets, and a single 8-byte store straddling
+/// the seam wraps tail→head as one contiguous access — the whole point of the §13/§14 layout, with no
+/// host hand-holding (the host only installed the region factory + granted AddressSpace). Exercises
+/// `create` (on the stashed AddressSpace handle, slot 4) and `map`/`unmap`/`page_size` (on the returned
+/// region handle), and the **5-handle powerbox** `synth_start` now grants. Run on the JIT powerbox
+/// (real shared-memory aliasing); the success marker `'Y'` is asserted against stdout.
+#[test]
+#[cfg(unix)]
+fn vm_region_magic_ring_buffer() {
+    let src = r#"
+long __vm_region_create(long len);
+long __vm_region_map(int r, long win_off, long region_off, long len, int prot);
+long __vm_region_unmap(int r, long win_off, long len);
+long __vm_region_page_size(int r);
+long write(int fd, const void *buf, long n);
+int main(void) {
+  int r = (int)__vm_region_create(1 << 16);          /* mint a 64 KiB region */
+  if (r < 0) { char e='E'; write(1,&e,1); return 1; }
+  long g = __vm_region_page_size(r);                 /* host map granularity */
+  volatile long vbase = 268435456;                   /* 256 MiB — reserved tail, clear of data/stack */
+  long base = vbase;                                 /* volatile defeats constant inttoptr fold */
+  if (__vm_region_map(r, base, 0, g, 3) < 0)      { char e='1'; write(1,&e,1); return 2; }
+  if (__vm_region_map(r, base + g, 0, g, 3) < 0)  { char e='2'; write(1,&e,1); return 3; }
+  /* one 8-byte store straddling the seam: low half -> region tail, high half wraps -> region head */
+  *(unsigned long *)(base + g - 4) = 0x1122334455667788UL;
+  unsigned int head = *(unsigned int *)(base);             /* region head, via mapping 1 */
+  unsigned int tail = *(unsigned int *)(base + 2 * g - 4); /* region tail, via mapping 2 */
+  unsigned long combined = ((unsigned long)head << 32) | tail;
+  long u = __vm_region_unmap(r, base, g);                  /* exercise unmap too (must return 0) */
+  char ok = (combined == 0x1122334455667788UL && u == 0) ? 'Y' : 'N';
+  write(1, &ok, 1);
+  return 0;
+}
+"#;
+    let Some(bc) = compile_to_bc("vm_region", src) else {
+        return;
+    };
+    let m = svm_llvm::translate_bc_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    // Structural: the SharedRegion ops became their `CallImport`s, and the entry grants through
+    // AddressSpace (5 handles: stdout, stdin, exit, memory, addrspace).
+    let imports: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    for want in [
+        "vm_region_create",
+        "vm_region_map",
+        "vm_region_unmap",
+        "vm_region_page_size",
+    ] {
+        assert!(
+            imports.contains(&want),
+            "missing region import {want}: {imports:?}"
+        );
+    }
+    assert_eq!(
+        m.funcs[0].params.len(),
+        5,
+        "a region-minting program grants through the AddressSpace handle (5-handle entry)"
+    );
+    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(
+        run.stdout, b"Y",
+        "magic ring buffer: seam-straddling store must wrap tail->head (got {:?})",
+        run.stdout
+    );
+}
