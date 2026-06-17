@@ -163,15 +163,31 @@ pub enum VIntBinOp {
     Add,
     Sub,
     Mul,
+    MinS,
+    MinU,
+    MaxS,
+    MaxU,
 }
 
 impl VIntBinOp {
-    pub const ALL: [VIntBinOp; 3] = [VIntBinOp::Add, VIntBinOp::Sub, VIntBinOp::Mul];
+    pub const ALL: [VIntBinOp; 7] = [
+        VIntBinOp::Add,
+        VIntBinOp::Sub,
+        VIntBinOp::Mul,
+        VIntBinOp::MinS,
+        VIntBinOp::MinU,
+        VIntBinOp::MaxS,
+        VIntBinOp::MaxU,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             VIntBinOp::Add => "add",
             VIntBinOp::Sub => "sub",
             VIntBinOp::Mul => "mul",
+            VIntBinOp::MinS => "min_s",
+            VIntBinOp::MinU => "min_u",
+            VIntBinOp::MaxS => "max_s",
+            VIntBinOp::MaxU => "max_u",
         }
     }
     pub fn index(self) -> u8 {

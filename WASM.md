@@ -95,14 +95,17 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [ ] **SIMD remainder** (~145 of the v128 proposal): lane shifts, int min/max/abs, sat add/sub,
-  narrow/widen, `all_true`/`bitmask`, dot product, float lane compares, etc. Mechanical breadth over the
-  proven 5-step pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm);
-  a few ops have no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
+- [ ] **SIMD remainder** (~135 of the v128 proposal): lane shifts, int abs, sat add/sub, narrow/widen,
+  `all_true`/`bitmask`, dot product, float lane compares, etc. Mechanical breadth over the proven 5-step
+  pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops have
+  no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
   - [x] **Integer lane compares — DONE.** `i8x16`/`i16x8`/`i32x4` `{eq,ne,lt,gt,le,ge}` s/u + the
     `i64x2` signed set → a per-lane all-ones/all-zeros mask (`Inst::VIntCmp`, one Cranelift `icmp`).
     `crates/svm/tests/simd.rs` (round-trip + interp==JIT, oracle = Rust's own compares) and
     `svm-wasm/tests/simd.rs` (the wasm bridge + a real `bitselect`-max idiom).
+  - [x] **Integer min/max — DONE.** `i8x16`/`i16x8`/`i32x4` `{min,max}_{s,u}` (extends `VIntBinOp` →
+    one Cranelift `smin`/`umin`/`smax`/`umax`; `i64x2` has no min/max op, and would not legalize so it
+    bails on the JIT alongside `i8x16.mul`). Tests incl. a real lane-wise `clamp` kernel.
 - [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
   atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
   in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR

@@ -2558,10 +2558,21 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
                 // serviced host-side like any cap op — so it matches the interpreter.
                 Inst::CapSelfCount | Inst::CapSelfGet { .. } => {}
-                // `i8x16.mul` has no single-instruction lowering on the target ISAs, so Cranelift
-                // can't legalize it; bail to `Unsupported` (the interp oracle still covers it).
+                // `i8x16.mul` and `i64x2` min/max have no single-instruction lowering on the target
+                // ISAs, so Cranelift can't legalize them; bail to `Unsupported` (the interp oracle
+                // still covers them, and wasm never emits them — `i64x2` has no min/max op).
                 Inst::VIntBin { shape, op, .. }
-                    if !(*shape == VShape::I8x16 && *op == VIntBinOp::Mul) => {}
+                    if !matches!(
+                        (*shape, *op),
+                        (VShape::I8x16, VIntBinOp::Mul)
+                            | (
+                                VShape::I64x2,
+                                VIntBinOp::MinS
+                                    | VIntBinOp::MinU
+                                    | VIntBinOp::MaxS
+                                    | VIntBinOp::MaxU
+                            )
+                    ) => {}
                 // Lane compares lower to a single Cranelift `icmp` (legalizes on every target).
                 Inst::VIntCmp { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
@@ -3548,6 +3559,10 @@ fn lower_block(
                     VIntBinOp::Add => b.ins().iadd(x, y),
                     VIntBinOp::Sub => b.ins().isub(x, y),
                     VIntBinOp::Mul => b.ins().imul(x, y),
+                    VIntBinOp::MinS => b.ins().smin(x, y),
+                    VIntBinOp::MinU => b.ins().umin(x, y),
+                    VIntBinOp::MaxS => b.ins().smax(x, y),
+                    VIntBinOp::MaxU => b.ins().umax(x, y),
                 };
                 vcast(b, r, I8X16)
             }

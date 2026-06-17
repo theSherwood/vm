@@ -451,3 +451,71 @@ fn diff_i16x8_and_i64x2_lane_compares() {
         assert_eq!(i64x2("ge_s", a, b), mask(a >= b), "i64x2.ge_s {a} {b}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Integer lane min/max (signed + unsigned) — VIntBinOp::Min*/Max*.
+// ---------------------------------------------------------------------------
+
+/// `i32x4.{min,max}_{s,u}` of two splatted scalars, lane 0 read back. `diff1` asserts interp == JIT;
+/// the expectation is Rust's own `min`/`max` (the oracle).
+fn i32x4_minmax(op: &str, a: i32, b: i32) -> i32 {
+    let s = format!(
+        "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+         \x20 v2 = i32x4.splat v0\n  v3 = i32x4.splat v1\n  v4 = i32x4.{op} v2 v3\n\
+         \x20 v5 = i32x4.extract_lane 0 v4\n  return v5\n}}\n"
+    );
+    diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
+}
+
+#[test]
+fn diff_i32x4_min_max() {
+    for (a, b) in [(3, 7), (-5, 2), (i32::MIN, i32::MAX), (4, 4), (-1, -100)] {
+        let (ua, ub) = (a as u32, b as u32);
+        assert_eq!(i32x4_minmax("min_s", a, b), a.min(b), "min_s {a} {b}");
+        assert_eq!(i32x4_minmax("max_s", a, b), a.max(b), "max_s {a} {b}");
+        assert_eq!(
+            i32x4_minmax("min_u", a, b),
+            ua.min(ub) as i32,
+            "min_u {a} {b}"
+        );
+        assert_eq!(
+            i32x4_minmax("max_u", a, b),
+            ua.max(ub) as i32,
+            "max_u {a} {b}"
+        );
+    }
+}
+
+/// Narrow lanes: `i8x16.splat` broadcasts the low byte; the result lane 0 is read as a signed i8.
+/// `a = 0xFF` (−1 signed / 255 unsigned) vs `b = 1` pins the signed/unsigned split.
+#[test]
+fn diff_i8x16_and_i16x8_min_max() {
+    let i8 = |op: &str, a: i32, b: i32| -> i32 {
+        let s = format!(
+            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+             \x20 v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n  v4 = i8x16.{op} v2 v3\n\
+             \x20 v5 = i8x16.extract_lane_s 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
+    };
+    assert_eq!(i8("min_s", 0xFF, 1), -1, "min_s(-1, 1)");
+    assert_eq!(i8("max_s", 0xFF, 1), 1, "max_s(-1, 1)");
+    assert_eq!(i8("min_u", 0xFF, 1), 1, "min_u(255, 1)");
+    assert_eq!(i8("max_u", 0xFF, 1), -1, "max_u(255, 1) = 255 → -1 as i8");
+
+    let i16 = |op: &str, a: i32, b: i32| -> i32 {
+        let s = format!(
+            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+             \x20 v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n  v4 = i16x8.{op} v2 v3\n\
+             \x20 v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
+    };
+    assert_eq!(i16("min_s", 0xFFFF, 1), -1, "min_s(-1, 1)");
+    assert_eq!(
+        i16("max_u", 0xFFFF, 1),
+        -1,
+        "max_u(65535, 1) = 65535 → -1 as i16"
+    );
+    assert_eq!(i16("min_u", 0xFFFF, 1), 1, "min_u(65535, 1)");
+}

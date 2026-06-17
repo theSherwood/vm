@@ -5292,6 +5292,11 @@ fn simd_vint_bin(shape: VShape, op: VIntBinOp, a: [u8; 16], b: [u8; 16]) -> [u8;
             VIntBinOp::Add => x.wrapping_add(y),
             VIntBinOp::Sub => x.wrapping_sub(y),
             VIntBinOp::Mul => x.wrapping_mul(y),
+            // Unsigned compares use the zero-extended lane values directly; signed sign-extend first.
+            VIntBinOp::MinU => x.min(y),
+            VIntBinOp::MaxU => x.max(y),
+            VIntBinOp::MinS => lane_sext(x, bytes).min(lane_sext(y, bytes)) as u64,
+            VIntBinOp::MaxS => lane_sext(x, bytes).max(lane_sext(y, bytes)) as u64,
         };
         lane_write(&mut o, i, bytes, r);
     }

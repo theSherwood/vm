@@ -250,3 +250,33 @@ fn i32x4_max_via_compare_and_bitselect() {
         assert_eq!(got, a.max(b), "max({a}, {b})");
     }
 }
+
+/// A real clamp kernel through the wasm bridge: `clamp(x, lo, hi) = max(lo, min(hi, x))` lane-wise,
+/// using `i32x4.min_s`/`max_s`. Proves the new min/max ops compose and stay byte-identical interp vs JIT.
+#[test]
+fn i32x4_clamp_via_min_max() {
+    let wat = r#"
+    (module
+      (func (export "clamp") (param $x i32) (param $lo i32) (param $hi i32) (result i32)
+        (i32x4.extract_lane 0
+          (i32x4.max_s (i32x4.splat (local.get $lo))
+            (i32x4.min_s (i32x4.splat (local.get $hi)) (i32x4.splat (local.get $x)))))))
+    "#;
+    for (x, lo, hi) in [
+        (5, 0, 10),
+        (-3, 0, 10),
+        (42, 0, 10),
+        (7, 7, 7),
+        (-100, -50, -10),
+    ] {
+        let got = match eval(
+            wat,
+            "clamp",
+            &[Value::I32(x), Value::I32(lo), Value::I32(hi)],
+        ) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        };
+        assert_eq!(got, x.clamp(lo, hi), "clamp({x}, {lo}, {hi})");
+    }
+}
