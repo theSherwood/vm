@@ -1,13 +1,16 @@
 # Durable Domains — Snapshot / Restore / Clone
 
-> **Status: Phase 1 + snapshot codec landed; Phases 2–4 ahead.** This file is the
-> single source of truth for the *design and implementation status* of durable
-> domains. Built so far: the `svm-durable` IR→IR transform (arbitrary single-vCPU
-> CFGs), the `svm-interp` handle-table durability primitives (§12.5), and the
-> `svm-snapshot` artifact codec (§12 container + window image + handle table + the R5
-> identity gate). The master design is `DESIGN.md` (D-notes, §-sections); the project
-> status/pickup doc is `HANDOFF.md`. Keep all three in step — if code and a doc
-> disagree, fix one of them in the same change (per `AGENTS.md`).
+> **Status: Phases 1–2 landed + Phase 3.1 (single-fiber freeze/thaw) complete on the
+> interpreter; 3.2/3.3 ahead.** This file is the single source of truth for the *design and
+> implementation status* of durable domains. Built so far: the `svm-durable` IR→IR transform
+> (arbitrary single-vCPU CFGs **+ the §12 fiber control ops**), the `svm-interp` handle-table
+> durability primitives (§12.5) **+ the per-fiber shadow-SP swap / freeze driver (D-fiber-cont
+> option A)**, the `svm-snapshot` artifact codec (§12 container + window image + handle table +
+> the R5 identity gate **+ Section-2 fiber residue**), and **per-page protection capture +
+> re-establish on both backends** (Phase 2). A single-fiber domain round-trips
+> `freeze → serialize → restore → thaw` end-to-end. The master design is `DESIGN.md` (D-notes,
+> §-sections); the project status/pickup doc is `HANDOFF.md`. Keep all three in step — if code and
+> a doc disagree, fix one of them in the same change (per `AGENTS.md`).
 >
 > Proposed decision: **D60** (D59 is currently the last). See bottom of file.
 
@@ -312,15 +315,20 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     digest, sparse zero-eliding window image, Section-3 handle table — now give a real
     `freeze → bytes → restore → thaw` on the interpreter (`crates/svm-snapshot`), with the
     §12.6 canonical + identity-gated invariants tested.
-- **[~] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT (the
-  `durable_jit` cross-backend property already holds); **artifact codec done** (above).
-  Remaining: `svm-mem` page+prot snapshot/**restore** for protected/large windows (the
-  codec's flat zero-eliding image covers the Phase-1 flat window), and routing the codec
-  through the cross-backend §7 property. Risk: low (oracle does the work); Windows
-  placeholder semantics the known annoyance. *(escape-TCB touch — restore.)*
-- **[ ] Phase 3 — STW + multi-vCPU + fiber freeze/thaw.** Cooperative quiesce, drain
-  residue, freeze/thaw choreography against the D57 migratable-fiber ownership
-  protocol. **Highest risk** — concurrency seam (loom-check, like the futex glue).
+- **[x] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT (the
+  `durable_jit` cross-backend property holds); **artifact codec done**; **per-page protection
+  capture + re-establish landed on both backends, both directions** (§12.6 / `durable_prot_capture.rs`).
+  The page-protection story is complete; a `Backed` (§13 shared-region) page stays out of scope
+  (D-region). *(escape-TCB touch — restore.)*
+- **[~] Phase 3 — STW + multi-vCPU + fiber freeze/thaw.** Cooperative quiesce, drain
+  residue, freeze/thaw choreography against the D57 migratable-fiber ownership protocol.
+  **Highest risk** — concurrency seam (loom-check, like the futex glue). **Design in §12.8**;
+  **D-fiber-cont RESOLVED (option A).** **Sub-phase 3.1 (one interp fiber) is complete** —
+  per-fiber shadow regions + shadow-SP swap, both thaw arms, the freeze driver, and the
+  Section-2 residue codec give an end-to-end single-fiber `freeze → serialize → restore → thaw`
+  on the interpreter (§12.8, `svm-durable/tests/fiber.rs` + `svm-snapshot/tests/roundtrip.rs`).
+  Remaining: 3.2 multi-vCPU + per-context layout, 3.3 JIT parity (replicate the swap in the JIT
+  fiber-switch path). (Dispatch table is a no-op — §12.4.) Single-vCPU durability is a coherent MVP.
 - **[ ] Phase 4 — Back-edge polls, handle hardening, CoW clone.** Latency +
   durability quality + cheap clone. Incremental, off critical path.
 
@@ -445,10 +453,13 @@ construction. What's stored:
   fiber/funcref handles stay valid across restore; its in-window shadow-stack
   location; and `suspended | runnable` status. The pending `Suspend`/`ContResume`
   value is already spilled in-window at the resume point, so it is *not* stored here.
-- **Dispatch table** (`DomainTable`, `:984`): the `call_indirect` slot contents as
-  funcref indices (small ints into module funcs). **v1 stores plain module funcrefs
-  only**; installed guest-JIT native funcrefs are not durable (consistent with the
-  `JitDomain`/`JitCode` exclusion in §12.5).
+- **Dispatch table** (`DomainTable`, `svm-interp:2002`): **nothing to capture in v1.**
+  The table is an *identity* table built deterministically from the module
+  (`slot i → (module 0, func i)`), so it is re-created bit-identically on thaw from the
+  same instrumented module — like the JIT's `readonly` data segments. The only runtime
+  mutation is `install` of guest-JIT native units, which are **non-durable** anyway
+  (their `JitDomain`/`JitCode` handles make freeze refuse — §12.5). So a freezable
+  domain's table is a pure function of the module; storing it would be redundant.
 
 ### 12.5 Section 3 — Handle table (durability classification)
 
@@ -533,8 +544,15 @@ data segments (`Ro`) merged with the runtime page-state map (`cap_pages`, popula
 `map`/`unmap`/`protect`) — mirroring the interpreter's `snapshot_prots`. `durable_prot_capture.rs`
 asserts interp and JIT capture the **same** map for a readonly-segment module, and that a runtime
 `cap_pages` entry overrides the default. So page protections now round-trip on **both** backends,
-both directions. The page-protection story is complete; remaining Phase-2/3 work is §12.4
-fiber/dispatch control state (multi-vCPU / fibers).
+both directions. The page-protection story is complete.
+
+The §12.4 **fiber control state** now rides along too (Section 2 — the `FrozenFiber` residue,
+slice 3.1.5): a freeze flattens each parked fiber's continuation into the window image and records
+its residue (slot/funcref/sp/shadow-SP) in a TLV control section (tag 2, elided when there are no
+fibers, so no-fiber artifacts stay byte-identical); `restore` re-seeds the `Host`. A single-fiber
+domain now round-trips through the real artifact (`crates/svm-snapshot/tests/roundtrip.rs`,
+including the §12.6 canonical re-serialize invariant). Remaining Phase-3 control-state work is
+**multi-vCPU** (per-context state words) and the **dispatch table** (a module-derived no-op today).
 
 ### 12.7 Shadow-frame layout
 
@@ -599,6 +617,205 @@ are *recommended in checked builds* but not normative — correctness needs only
 > parts most likely to shift once the Phase 1 transform is real; the
 > resume-id-at-`SP−4` rule and the in-window triple-stack placement are the load-
 > bearing commitments and should be stable.
+
+### 12.8 Phase-3 design — STW drive + fiber continuations
+
+Phase 1/2 froze a **single vCPU with no live fibers**. Phase 3 adds multi-vCPU and
+fibers. Scoping (verified against the tree) found the work concentrates in two places;
+the dispatch table is *not* one of them (see §12.4 — it's a module-derived identity
+table, re-created on thaw, nothing to capture).
+
+**(a) Stop-the-world is cooperative safepoints, never preemption.** The safepoint is a
+**poll site** (the `if state == UNWINDING` after every may-suspend op the transform
+already emits). Freeze, Go/JVM-shaped:
+
+1. Host writes `UNWINDING` to the in-window state word(s).
+2. Each running vCPU, at its next poll, unwinds one frame into its shadow stack and
+   returns to its caller — the native stack peels off frame-by-frame into in-window,
+   durable form.
+3. Host waits for **quiescence** (every native stack empty), then snapshots.
+
+Two signal carriers already exist: the **state word** is window memory shared by all
+the domain's vCPUs (one write is domain-wide; the poll reads it), and the JIT's
+**`interrupt`/epoch cell** (`os_thread_rt`, polled at back-edges + function entries,
+re-checked every 20 ms by parked threads) is the *promptness* nudge that drives running
+OS threads to a safepoint. The §5 residues drain by **running to the next safepoint**:
+a vCPU inside a host `cap.call` finishes the call then polls; a fault-suspended fiber
+gets its page, runs to its next poll. Both are semantically invisible (a poll site is a
+point the program already passes through).
+
+**(b) The crux — making a guest-suspended fiber's continuation durable.** A fiber the
+guest `Suspend`ed sits in `RegFiber::Parked(Vec<Frame>)` (interp, `svm-interp:2966`) or
+as a **native stack** (`FiberSlot.fiber`, JIT). Neither is durable, and — unlike the §5
+residues — it **must not be run forward** (no `ContResume` is coming; advancing it would
+execute work the guest never requested). So its parked continuation must become
+shadow-stack form *without advancing the computation*. **[DECISION D-fiber-cont —
+RESOLVED: option (A).]** Three options were:
+
+- **(A) Fibers always keep their continuation in an in-window shadow stack.** Instrument
+  `Suspend`/`ContResume`/`ContNew` so a suspend spills the continuation to the fiber's
+  shadow stack; a parked fiber is then *already* durable. Clean, and the only option
+  that gives **both backends** durable fibers (preserves the §7 cross-backend property).
+  Cost: a real rework of the fiber engine + a per-suspend window-spill on the hot path.
+- **(B) Freeze-time conversion by walking the parked frames.** On the interp,
+  `RegFiber::Parked(Vec<Frame>)` is structured — the host can translate each `Frame`
+  into a shadow frame directly (no guest execution). Cheap, but **interp-only**: the
+  JIT's parked continuation is a raw native stack (no stackmaps — §8 rejected that), so
+  this *breaks* cross-backend parity for fiber'd domains.
+- **(C) Refuse to freeze with any live/parked fiber.** Too restrictive to be useful.
+
+Recommendation: **(A)** — keep the cross-backend invariant the whole feature rests on,
+and pay the engine cost. This decision gates the first implementation slice (the two
+options are different implementations), so it should be settled before engine code.
+
+**(c) Per-vCPU / per-fiber window layout.** Today the reserve has *one* state word +
+*one* shadow stack (`STATE_OFF=0`, `SHADOW_SP_OFF=8`, `SHADOW_BASE=64` — the vCPU-0
+layout). Multi-vCPU and ≥1 fiber need the reserve **partitioned per context** (state
+word + shadow stack each), with a runtime-maintained "current context" so a poll
+reaches the right shadow-SP. §12.7's per-fiber triple-stack already anticipates this.
+
+**(d) Latency caveat (R6 / Phase 4).** Polls land only after may-suspend calls, not at
+loop back-edges, so a vCPU in a poll-free compute loop never reaches a safepoint —
+freeze hangs until it exits. Bounded-latency STW needs Phase-4 back-edge polls + a
+`Blocking.work` cancellation story. A first cut accepts unbounded latency (cooperative
+guest).
+
+**Sub-phases.** 3.1 — freeze/thaw **one fiber, single vCPU, interpreter-only** (isolates
+"continuation in a shadow stack" from thread coordination). *In progress:* the transform
+recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'd module is
+**NORMAL-inert** under instrumentation + verifies (`svm-durable/tests/fiber.rs`); the
+**per-fiber shadow-stack layout + shadow-SP swap landed** (slice 3.1.1), the **resumer-side
+`cont.resume` thaw arm** re-issues the resume on rewind (slice 3.1.2), and the **fiber-side
+`suspend` re-park arm** flips to `NORMAL` and re-executes `suspend` on rewind (slice 3.1.3) —
+so **both fiber thaw arms are now wired** (no fiber arm fails closed). The **freeze driver
+flattens idle parked fibers** into their shadow regions (slice 3.1.4), and the **end-to-end
+single-fiber round-trip works** (slice 3.1.5): freeze exports each flattened fiber's residue
+(`svm_interp::FrozenFiber` via the `Host`), and a thaw re-seeds the registry and re-enters the
+root under `REWINDING` — the resumer re-issues `cont.resume`, the fiber rewinds and re-parks,
+then runs forward to the same result as the uninterrupted run (`svm-durable/tests/fiber.rs`).
+The byte-level snapshot **Section-2 codec** lands too: `svm-snapshot` serializes the
+`FrozenFiber` residue (slot/funcref/sp/shadow-SP) into a TLV control section (elided when there
+are no fibers, so no-fiber artifacts stay byte-identical) and `restore` re-seeds the `Host`, so a
+full `freeze → serialize → restore → thaw ≡ uninterrupted` runs through the **real artifact**
+(`svm-snapshot/tests/roundtrip.rs`, incl. the §12.6 canonical re-serialize invariant). **3.1 is
+complete on the interpreter.** Remaining polish: fold fiber'd modules into the `durable_fuzz`
+generator. 3.2 — multi-vCPU quiesce + per-context layout.
+3.3 — JIT parity (drive real OS threads to safepoints; respect the D57 single-owner protocol;
+**replicate the swap** in the JIT's fiber-switch path). Phase 4 — back-edge polls for bounded
+latency.
+
+#### 3.1 implementation plan (next-session pickup)
+
+Done: the transform recognizes the fiber ops + NORMAL-inert (PR #27, branch
+`claude/durable-phase3-design`, commit `4403d41`). The remaining 3.1 slices, in order,
+each a small reviewable commit on the interpreter only:
+
+1. **[DONE] Per-fiber shadow-stack layout + shadow-SP swap — the runtime maintains the
+   swap (D-fiber-cont option A), *not* the transform.** Generalizes the durable reserve from
+   one shadow stack to one **per fiber/context**: context `i` owns `[SHADOW_BASE +
+   i*SHADOW_STRIDE, +SHADOW_STRIDE)` within `[0, DURABLE_RESERVE)` (root = context 0; fiber
+   slot `s` = context `s+1`). The *active* shadow-SP stays at the fixed `SHADOW_SP_OFF`, and
+   the **interpreter's `cont.*` execution** save/restores it to/from a per-context saved slot
+   on every fiber switch (`shadow_switch` in `svm-interp`, called from the `cont.resume`,
+   `suspend`, and fiber base-frame `Return` arms); `cont.new` assigns the new fiber's region
+   (refusing — clean `FiberFault` — if the reserve is full). A non-running context's saved-SP
+   lives host-side (the root's on `VCpu::root_shadow_sp`, a fiber's in the registry's parallel
+   `shadow` table); the running context's live SP is the in-window word the instrumented IR
+   maintains.
+
+   **Why option A (not "the transform emits the swap").** The switch knowledge lives in the
+   runtime's resume chain. Two of the three switch points (`cont.resume`, `suspend`) are
+   visible IR ops, but the third — a fiber's **base-frame `Return`** — is a `Return`
+   terminator statically indistinguishable from an ordinary intra-fiber call return, so the
+   transform *cannot* emit its swap; only the interp (which knows it is a base return) can.
+   Emitting the resume/suspend swaps in IR would also force reconstructing the resumer chain
+   in guest memory (the interp already has it). Option A handles all three points, keeps the
+   transform simple, and costs only that the JIT must replicate the ~3-site swap in its own
+   fiber-switch path in 3.3 (guarded by the cross-backend artifact-equality property). Cost
+   acknowledged: the layout constants (`SHADOW_SP_OFF`/`SHADOW_BASE`/`DURABLE_RESERVE`) are
+   now duplicated across the TCB `svm-interp` and tooling `svm-durable` — cross-checked by
+   `svm-durable/tests/layout_abi.rs` so they can't drift.
+
+   Gated on a domain-level `Host::set_durable` flag (propagated to every vCPU by `drive`), so
+   a non-durable fiber run never touches the reserve. Tests: existing single-vCPU durable
+   tests still pass (root = context 0); `svm/tests/durable_fibers.rs` proves two fibers get
+   **distinct** regions (a host-fn probes the active shadow-SP from inside each context) and
+   that a non-durable run leaves the reserve untouched. *Touched only `svm-interp` (the swap +
+   region tracking) — the transform is unchanged.* **Open sub-question deferred:** the
+   transform's shadow-overflow guard still trips at the global `DURABLE_RESERVE`, not a
+   per-region bound, so a fiber recursed past `SHADOW_STRIDE` could grow into a neighbor's
+   region before tripping — harmless for shallow fibers, fixed alongside the sizing decision.
+
+2. **[DONE] `Resume` thaw arm** (`cont.resume`, resumer side). Mirrors `SuspendKind::Propagated`'s
+   re-issue, but emits `Inst::ContResume { k, arg }` (operands reloaded from the spilled slots —
+   `used[k]/used[arg]` already mark them) and threads its **two** results `(status, value)` into
+   the continuation; the fail-closed trap arm now applies to `Yield` only. *Touched only
+   `svm-durable`.* Tested structurally (`svm-durable/tests/fiber.rs`): the instrumented module
+   verifies, stays NORMAL-inert, and gains one re-issued `cont.resume` per resume point while
+   `suspend` gains none (its arm is still a bare `Unreachable`). **A full thaw that re-enters a
+   suspended fiber is not yet exercisable** — the re-issued resume reconstructs the fiber via the
+   fiber's *own* rewind (the `Yield` re-park), which is slice 3.1.3; the round-trip test lands with
+   3.1.3–5 (the fiber re-park + freeze driver + snapshot Section-2 fiber metadata).
+
+3. **[DONE] `Yield` thaw arm — re-park** (the novel bit). On thaw of a `suspend` point the arm
+   reloads the fiber's frame, pops, **flips the state word to `NORMAL`**, and **re-executes
+   `suspend`** — which parks the fiber back (its current rebuilt frames) and hands `value` to
+   the resumer, *not* continue forward; the re-executed suspend's result (the next resume's
+   value) threads into the continuation exactly as a leaf's reloaded cap.call result does. The
+   deepest-frame "flip to NORMAL" lives here (a parked fiber's `suspend` is the globally-deepest
+   frozen frame), **not** in the resumer's `Resume` arm — so the resumer regains control already
+   in NORMAL. *Turned out transform-only:* the interp's existing `Suspend` handler re-parks via
+   the registry, and the 3.1.1 shadow-SP swap routes the SP, so no `RegFiber` change was needed.
+   Tested structurally (`svm-durable/tests/fiber.rs`): both fiber arms now re-issue their op and
+   the only `Unreachable` blocks left are the per-function forged-id TRAPs. **End-to-end thaw
+   still needs 3.1.4–5** (a parked fiber's continuation isn't captured until the freeze driver
+   flattens it into its shadow stack and the snapshot records its metadata).
+
+4. **[DONE] Freeze driver — flatten idle parked fibers.** `VCpu::freeze_drive`, hooked into
+   `dispatch` right after the root's run returns `Done` while still `UNWINDING` (the registry is
+   still alive there, before `mem.take()`). It loops over `RegFiber::Parked` fibers, marking each
+   `Frozen` and running its frames as a standalone unwind: the active shadow-SP is pointed at the
+   fiber's region base, `cur = ROOT_FIBER` (so the fiber's base-frame return ends the sub-run, not
+   a fiber-finish), and a placeholder resume value is delivered (mimicking `cont.resume`; the
+   suspend's result slot is inert — the `Yield` arm redelivers it). Because the transform places
+   the poll **immediately** after the `suspend`, that poll fires before any guest code runs → zero
+   forward progress; the flattened shadow-SP extent is recorded in the registry's `shadow` table.
+   The existing capture entry point then snapshots a window that already includes the flattened
+   fibers. *Host-side driver, not escape-TCB; single-vCPU (3.1) — a fiber still on an active resume
+   chain at freeze, and multi-vCPU STW, are 3.1.5/3.2 follow-ups.* Tested
+   (`svm-durable/tests/fiber.rs`): a parked fiber lands a frame in its **own** region (distinct
+   from the root's) and unwinds **at its suspend point** (resume id 1) — a precise zero-forward-progress check.
+
+5. **[DONE (interp round-trip); snapshot codec follow-up] End-to-end test + fiber residue.** The
+   freeze driver records each flattened fiber as a `svm_interp::FrozenFiber` (slot, entry funcref,
+   data-sp, shadow-SP) and hands it back through the `Host`; `freeze_drive` leaves the active
+   shadow-SP at the **root's** region so the captured window is thaw-ready. A thaw re-seeds the
+   registry (`drive` recreates each as a `Pending` fiber at its dense slot, with its shadow-SP in
+   the `shadow` table) and re-enters the root under `REWINDING`: the resumer re-issues
+   `cont.resume`, the seeded fiber re-runs its entry → rewinds → re-parks, then forward execution
+   completes. `svm-durable/tests/fiber.rs::single_fiber_freeze_thaw_round_trips` proves `freeze →
+   (window + residue) → thaw ≡ uninterrupted` (107). **Remaining:** the byte-level **Section-2
+   codec** in `svm-snapshot` — serialize/restore the `FrozenFiber` residue (the §12.4 per-fiber
+   record: `(slot, generation)` handle + shadow region/extent + status) instead of the in-memory
+   hand-off — and folding fiber'd modules into the `durable_fuzz` generator.
+
+   **[DONE] Section-2 codec.** `svm-snapshot` now carries the fiber residue: `freeze` writes a TLV
+   control section (tag 2) of `(slot, funcref, sp, shadow_sp)` per fiber — ascending slot,
+   header `fiber_count`-gated, **elided when there are no fibers** so the no-fiber artifact is
+   byte-identical to the pre-fiber format — and `restore` decodes it and re-seeds the `Host`
+   (`set_frozen_fibers`). `svm-snapshot/tests/roundtrip.rs::fiber_freeze_serialize_restore_thaw_through_the_codec`
+   drives the full round-trip through the **serialized artifact** (107) and the §12.6 canonical
+   re-serialize invariant. (Per-fiber `generation` is deferred with the JIT shared-registry
+   recycling work; interp slots aren't recycled, so slot alone keys the handle today.)
+
+Then 3.2 (multi-vCPU) and 3.3 (JIT parity) as above. **Slice-1 sub-questions, now settled:**
+a fiber handle maps to its region by **dense slot index × stride** (`context i = slot+1`,
+base `SHADOW_BASE + i*SHADOW_STRIDE`); the resume chain depth needs **no explicit recording**
+— each fiber's saved-SP is tracked independently (registry `shadow` table + the root's
+`root_shadow_sp`), so per-fiber rewind falls out. **Still open:** per-fiber shadow-stack
+*size* + quota accounting (slice 1 uses a provisional 4 KiB `SHADOW_STRIDE`, ~15 contexts),
+and with it the per-region overflow bound (the guard still uses the global `DURABLE_RESERVE`
+ceiling — see slice 1 above).
 
 ---
 
