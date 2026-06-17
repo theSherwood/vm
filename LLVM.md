@@ -793,13 +793,27 @@ field access, and signed `/`/`%`. The one real gap closed:
   `rust_panic_path_div_traps_and_runs` (a runtime division whose div-by-zero/overflow panic branches
   now trap, taking the non-panic path to match native). 96 translate tests green, fmt + clippy clean.
 
+**Slice AJ (DONE) — Rust trait objects, slices, `unwrap`.** More idiomatic Rust, byte-identical to
+native: **`&dyn Trait` dynamic dispatch** (a vtable load + `call_indirect` per call — the Rust analog
+of the C++ vtable path, slice AG: fat pointers + per-type vtable globals + funcref dispatch, all
+already covered), **`&[T]` slice arguments** ({ptr,len} across an `#[inline(never)]` call + a
+sub-slice), and **`Option::unwrap`** (its panic path traps via slice AI's recognizer). The one gap:
+- **Auto-vectorization → SIMD.** `rustc -O2` vectorizes a reduction loop (the slice `sum`) into
+  `<N x i32>` + a horizontal reduce — out of the MVP (§17/D58 is the SIMD lane). The Rust bitcode
+  helper now disables it (`-C llvm-args=-vectorize-loops=false -vectorize-slp=false`), matching the
+  C/C++ lanes' `-fno-*-vectorize`. The native oracle keeps vectorizing — an integer reduction is
+  associative, so scalar (on-ramp) and vectorized (native) agree.
+- Tests: `rust_trait_object_dispatch`, `rust_slice_argument`, `rust_option_unwrap`. 99 translate tests
+  green, fmt + clippy clean.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
       inheritance / `this`-adjusting thunks, references, `static`-local guards, …).
 - [x] **Rust** (`no_std`/panic=abort) — runs vs native: `iN` (slice AH), real `core` (enums/slices/
-      `Option`/iterators/structs) + panic-path → trap (slice AI). Broaden (traits → vtables, `&[T]` fat
-      pointers as args, `unwrap`/`expect`) as gaps surface.
+      `Option`/iterators/structs) + panic-path → trap (slice AI), trait objects / `&[T]` args / `unwrap`
+      (slice AJ). Auto-vectorization is disabled (SIMD is §17). Broaden (`Result`, generics with
+      bounds, `&mut` aliasing) as gaps surface.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 - [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`

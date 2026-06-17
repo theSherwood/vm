@@ -2111,6 +2111,14 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
             "opt-level=2",
             "-C",
             "overflow-checks=off",
+            // Keep SIMD out of the MVP (matching the C/C++ lanes' `-fno-*-vectorize`): `-O2`
+            // auto-vectorizes reductions/loops into `<N x iM>` + horizontal reduces, which is a
+            // separate §17/D58 concern. The native oracle keeps vectorizing — an integer reduction is
+            // associative, so scalar (on-ramp) and vectorized (native) agree.
+            "-C",
+            "llvm-args=-vectorize-loops=false",
+            "-C",
+            "llvm-args=-vectorize-slp=false",
         ])
         .arg(&rs)
         .arg("-o")
@@ -2405,4 +2413,75 @@ pub extern "C" fn run(n: i32) -> i32 {
 }
 "#;
     check_rust_run_vs_native("rs_panic", items, &[0, 1, 7, 100, -50, 1234]);
+}
+
+/// **Rust trait objects** — `&dyn Trait` dynamic dispatch through the on-ramp. Two types implement a
+/// trait; an array of `&dyn Shape` (each a `{data, vtable}` fat pointer) is iterated and the method is
+/// called dynamically — a vtable load + `call_indirect` per element, the Rust analog of the C++ vtable
+/// path (slice AG). Exercises Rust vtable globals (function-pointer initializers, slice K), fat-pointer
+/// aggregates, and dynamic dispatch — byte-identical to native `rustc`.
+#[test]
+fn rust_trait_object_dispatch() {
+    let items = r#"
+trait Shape {
+    fn area(&self) -> i32;
+}
+struct Sq(i32);
+struct Rect(i32, i32);
+impl Shape for Sq {
+    fn area(&self) -> i32 { self.0.wrapping_mul(self.0) }
+}
+impl Shape for Rect {
+    fn area(&self) -> i32 { self.0.wrapping_mul(self.1) }
+}
+
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let sq = Sq(n);
+    let rect = Rect(n, 3);
+    let shapes: [&dyn Shape; 2] = [&sq, &rect];
+    let mut total = 0i32;
+    for s in shapes.iter() {
+        total = total.wrapping_add(s.area()); // dynamic dispatch via the vtable
+    }
+    total
+}
+"#;
+    check_rust_run_vs_native("rs_traits", items, &[0, 2, 7, -4, 100]);
+}
+
+/// **Rust slices as arguments** — `&[i32]` (a `{ptr, len}` fat pointer) passed across a real
+/// (`#[inline(never)]`) call boundary, plus a sub-slice (`&data[1..4]`). Exercises the slice-arg ABI
+/// and bounds-checked range indexing (provably in-bounds → elided), vs native `rustc`.
+#[test]
+fn rust_slice_argument() {
+    let items = r#"
+#[inline(never)]
+fn sum(s: &[i32]) -> i32 {
+    let mut t = 0i32;
+    for &x in s { t = t.wrapping_add(x); }
+    t
+}
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let data = [n, n.wrapping_add(1), n.wrapping_add(2), 7, 5, 6];
+    sum(&data).wrapping_add(sum(&data[1..4]))
+}
+"#;
+    check_rust_run_vs_native("rs_slice", items, &[0, 10, -3]);
+}
+
+/// **Rust `Option::unwrap`** — the unwrap panic path (`core::panicking::panic` / `unwrap_failed`) is
+/// in the IR; under `panic=abort` it lowers to a trap (slice AI's recognizer). The value is always
+/// `Some` at runtime, so the non-panic path runs and matches native `rustc`.
+#[test]
+fn rust_option_unwrap() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let v: Option<i32> = if (n & 1) == 0 { Some(n.wrapping_mul(3)) } else { Some(n.wrapping_sub(1)) };
+    v.unwrap().wrapping_add(7) // always Some at runtime; the None panic path traps
+}
+"#;
+    check_rust_run_vs_native("rs_unwrap", items, &[0, 1, 8, -5]);
 }
