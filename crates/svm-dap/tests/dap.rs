@@ -1442,3 +1442,61 @@ fn dap_evaluate_floats_and_short_circuit() {
     assert_eq!(eval(&mut s, "d < 2 && 1 / 0"), (true, Some("0".into())));
     assert_eq!(eval(&mut s, "d > 2 || 1 / 0"), (true, Some("1".into())));
 }
+
+// A `WindowVia` struct local (the wasm/DWARF case): `p` lives at a runtime base (frame value v2 =
+// the arg + 16) + 0, with a `struct {int x, y}`. v0 (= the launch arg 1024) is the frame pointer.
+const WINVIA_DBG: &str = r#"
+memory 17
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i64.const 16
+  v2 = i64.add v0 v1
+  v3 = i32.const 10
+  i32.store v2 v3
+  v4 = i64.const 4
+  v5 = i64.add v2 v4
+  v6 = i32.const 20
+  i32.store v5 v6
+  v7 = i32.const 0
+  return v7
+}
+
+debug.file 0 "s.c"
+debug.loc 0 0 8 0 3 1
+debug.type 0 base "int" signed 4
+debug.type 1 agg "struct" 8
+debug.field 1 "x" 0 0
+debug.field 1 "y" 4 0
+debug.var 0 "p" winvia 1 0 2 2 0 "struct" 1
+"#;
+
+#[test]
+fn dap_expands_and_evaluates_a_windowvia_struct() {
+    // A WindowVia aggregate is a first-class window location: it expands in the Variables pane and
+    // `evaluate` resolves its members — the wasm-variable consumer path (base resolved per pc).
+    let mut s = DapServer::new();
+    let fid = launch_and_break(&mut s, WINVIA_DBG, "/work/s.c", 3);
+    let sref = scope_ref(&mut s, fid);
+
+    // `p` shows as an expandable struct (a nonzero variablesReference).
+    let locals = variables(&mut s, sref);
+    let (summary, p_ref) = locals.get("p").expect("local p");
+    assert_eq!(summary, "{...}", "struct summary");
+    assert!(*p_ref >= (1 << 20), "p is expandable");
+
+    // Expand it: fields x = 10, y = 20, read through the runtime base + field offsets.
+    let fields = variables(&mut s, *p_ref);
+    assert_eq!(fields.get("x").map(|(v, _)| v.as_str()), Some("10"));
+    assert_eq!(fields.get("y").map(|(v, _)| v.as_str()), Some("20"));
+
+    // `evaluate` resolves member access over the WindowVia place.
+    let out = s.handle(&req(
+        50,
+        "evaluate",
+        Json::obj(vec![
+            ("expression", Json::s("p.x + p.y")),
+            ("frameId", Json::i(fid)),
+        ]),
+    ));
+    assert_eq!(eval_result(&out), (true, Some("30".into())));
+}
