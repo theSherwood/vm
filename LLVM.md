@@ -728,14 +728,37 @@ AddressSpace). This is the magic-ring-buffer / zero-copy parent↔child data pla
   (then `unmap`s), on the real JIT powerbox (true shared-memory aliasing via the host region factory);
   the `'Y'` success marker is checked against stdout. 89 translate tests green, fmt + clippy clean.
 
-**Next:** the `<svm.h>` capability/concurrency/GC/JIT/region surface is now **complete** — the LLVM
-on-ramp has full capability parity with the chibicc frontend. Remaining: Milestone 2 (tail calls, real
-Rust/C++ without EH — the D54 breadth proof) and a bundled guest `libm` header.
+The `<svm.h>` capability/concurrency/GC/JIT/region surface is now **complete** — the LLVM on-ramp has
+full capability parity with the chibicc frontend. The next frontier is the D54 **breadth proof**
+(Milestone 2): the on-ramp consumes *any* LLVM frontend's bitcode, so other languages should run with
+no translator change beyond what the C corpus proved.
+
+**Slice AG (DONE) — C++ first light (the breadth proof begins).** A freestanding C++ TU compiled
+`clang++ -O2 -fno-exceptions -fno-rtti` runs **byte-identical to native `clang++`** through the on-ramp
+— the first non-C language. Mostly **free** (the C corpus already covers it): classes, inheritance,
+**virtual dispatch** (vtables are function-pointer global initializers, slice K → loaded + `call_indirect`,
+slice G), the `this` pointer, mangled names, **templates** (monomorphize to ordinary functions), and
+heap **`new`/`delete`** (the program defines `operator new`/`delete` over the guest `malloc`/`free`),
+including **virtual destructors** (the deleting-dtor chain through the vtable). The one real gap closed:
+- **C++ static initialization (`@llvm.global_ctors`).** clang emits a `_GLOBAL__sub_I_*` runner for
+  global objects with non-trivial ctors; the on-ramp jumped straight to `main`, so static init never
+  ran. Now `globals_layout` skips the `llvm.*` reserved globals (metadata, not window data) and
+  `collect_global_ctors` extracts the ctor funcrefs in priority order; the synthesized `_start` calls
+  them (each `(i64 sp) -> ()`) **before** `main`, exactly as native ([basic.start]). A program with
+  global ctors now forces a powerbox `_start` even with no other capability use.
+- Tests (`translate.rs`): `cpp_virtual_dispatch_first_light` (a polymorphic shape hierarchy summed via
+  virtual calls), `cpp_new_delete_virtual_dtor_templates` (heap `new`/`delete` + virtual dtor + a
+  template), `cpp_global_constructor_runs_before_main` (a side-effecting global ctor prints before
+  `main`) — all vs native `clang++`. 92 translate tests green, fmt + clippy clean.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
+- [x] **C++ without EH/RTTI** — first light done (slice AG); broaden as gaps surface (multiple
+      inheritance / `this`-adjusting thunks, references, `static`-local guards, …).
+- [ ] **Rust** (`no_std`/panic=abort) — *blocked on a toolchain re-pin:* the container's `rustc`
+      bundles **LLVM 21**, but the on-ramp pins **LLVM 18** (`llvm-ir`'s `llvm-18`), so `rustc`-emitted
+      bitcode is rejected. Needs either an LLVM-18 `rustc` or bumping the pin (a deliberate §2 decision,
+      not a drift) before the Rust breadth proof can run.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
-- [ ] Real Rust/C++ *without* EH/unwinding: `rustc --emit=llvm-bc` of a `no_std`/panic=abort
-      crate; a C++ TU compiled `-fno-exceptions -fno-rtti`. The breadth proof.
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 
 ### Deferred / hard (name them, don't hide them — DESIGN §20) ⚪

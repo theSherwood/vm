@@ -1854,3 +1854,231 @@ int main(void) {
         run.stdout
     );
 }
+
+// ============================================================================================
+// Milestone 2 — beyond chibicc's C subset: the D54 **breadth proof**. The on-ramp consumes any
+// LLVM frontend's bitcode, so a freestanding C++ TU (`-fno-exceptions -fno-rtti`) — classes,
+// virtual dispatch (vtables → `call_indirect`), templates, mangled names — must run byte-identical
+// to native `clang++`, with no translator change beyond what the C corpus already proved. (Rust is
+// gated on a toolchain re-pin: `rustc`'s bundled LLVM is newer than our pinned 18.)
+// ============================================================================================
+
+/// Compile a freestanding C++ snippet to legalized LLVM-18 bitcode: `-fno-exceptions -fno-rtti`
+/// keeps EH/RTTI out (the §18 stance), `-O2` runs mem2reg/SROA, `-fno-*-vectorize` keeps SIMD out.
+/// Returns `None` (skip) if `clang++` is unavailable.
+fn compile_cpp_to_bc(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let cc = dir.join(format!("svm_llvm_{}_{}.cpp", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_cpp_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&cc, src).expect("write C++ source");
+    let status = Command::new("clang++")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-fno-exceptions",
+            "-fno-rtti",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&cc)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang++ unavailable)");
+            None
+        }
+    }
+}
+
+/// The C++ breadth differential: build the TU with native `clang++` and through the on-ramp, and
+/// assert identical stdout + exit. The program is a powerbox program (`extern "C" int main`, output
+/// via `extern "C" write`), exactly like the C corpus demos.
+fn check_cpp_vs_native(name: &str, src: &str, stdin: &[u8]) {
+    let Some(bc) = compile_cpp_to_bc(name, src) else {
+        return;
+    };
+    let cc = std::env::temp_dir().join(format!("svm_llvm_{}_{}.cpp", std::process::id(), name));
+    let exe = std::env::temp_dir().join(format!("svm_llvm_cppnat_{}_{}", std::process::id(), name));
+    match Command::new("clang++")
+        .arg(&cc)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (clang++ link unavailable)");
+            return;
+        }
+    }
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native")
+    };
+    let native_code = native.status.code().unwrap_or(-1) as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate C++ bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: a libc-using C++ program must produce a powerbox entry"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let run = svm_run::run_powerbox(&module, stdin).expect("powerbox run");
+    assert_eq!(
+        run.stdout, native.stdout,
+        "{name}: svm stdout {:?} vs native {:?}",
+        run.stdout, native.stdout
+    );
+    let svm_code = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(
+        svm_code, native_code,
+        "{name}: svm exit {svm_code} vs native {native_code}"
+    );
+}
+
+/// **C++ first light** — classes + virtual dispatch through the on-ramp. Two shapes derive a common
+/// polymorphic base; a loop sums their areas through a base pointer (a virtual call per element →
+/// a vtable load + `call_indirect`), and the total is printed. Exercises vtables (function-pointer
+/// global initializers, slice K), the `this` pointer, mangled names, and `call_indirect` (slice G) —
+/// byte-identical to native `clang++`.
+#[test]
+fn cpp_virtual_dispatch_first_light() {
+    let src = r#"
+extern "C" long write(int fd, const void *buf, long n);
+
+struct Shape {
+  virtual int area() const { return 0; }
+};
+struct Square : Shape {
+  int s;
+  Square(int s) : s(s) {}
+  int area() const override { return s * s; }
+};
+struct Rect : Shape {
+  int w, h;
+  Rect(int w, int h) : w(w), h(h) {}
+  int area() const override { return w * h; }
+};
+
+static int sum_areas(Shape **shapes, int n) {
+  int t = 0;
+  for (int i = 0; i < n; i++) t += shapes[i]->area();
+  return t;
+}
+
+extern "C" int main() {
+  Square sq(5);
+  Rect r(3, 4);
+  Shape *shapes[2] = { &sq, &r };
+  int t = sum_areas(shapes, 2); // 25 + 12 = 37
+
+  char buf[16];
+  int n = 0;
+  char tmp[16];
+  int k = 0;
+  if (t == 0) buf[n++] = '0';
+  while (t > 0) { tmp[k++] = (char)('0' + (t % 10)); t /= 10; }
+  while (k > 0) buf[n++] = tmp[--k];
+  buf[n++] = '\n';
+  write(1, buf, n);
+  return 0;
+}
+"#;
+    check_cpp_vs_native("cpp_vdispatch", src, b"");
+}
+
+/// C++ breadth, deeper: heap `new`/`delete`, **virtual destructors**, and templates. A polymorphic
+/// hierarchy is heap-allocated through `operator new` (defined over the guest `malloc`), summed via
+/// virtual dispatch, then `delete`d through a base pointer — exercising the *deleting destructor* the
+/// vtable carries (a virtual-call chain into `operator delete` → `free`). A function template
+/// monomorphizes to an ordinary function. Byte-identical to native `clang++`.
+#[test]
+fn cpp_new_delete_virtual_dtor_templates() {
+    let src = r#"
+extern "C" long write(int fd, const void *buf, long n);
+extern "C" void *malloc(unsigned long n);
+extern "C" void free(void *p);
+
+void *operator new(unsigned long n) { return malloc(n); }
+void operator delete(void *p) noexcept { free(p); }
+void operator delete(void *p, unsigned long) noexcept { free(p); }
+
+template <typename T> static T add(T a, T b) { return a + b; }
+
+struct Animal {
+  int legs;
+  Animal(int l) : legs(l) {}
+  virtual int sound() const { return 0; }
+  virtual ~Animal() {}
+};
+struct Dog : Animal {
+  Dog() : Animal(4) {}
+  int sound() const override { return 7; }
+};
+struct Bird : Animal {
+  Bird() : Animal(2) {}
+  int sound() const override { return 3; }
+};
+
+extern "C" int main() {
+  Animal *zoo[2];
+  zoo[0] = new Dog();
+  zoo[1] = new Bird();
+  int total = 0;
+  for (int i = 0; i < 2; i++)
+    total = add(total, zoo[i]->legs + zoo[i]->sound()); // (4+7) + (2+3) = 16
+  for (int i = 0; i < 2; i++)
+    delete zoo[i]; // virtual dtor via base ptr -> deleting dtor -> operator delete -> free
+
+  char buf[16];
+  int n = 0;
+  char tmp[16];
+  int k = 0;
+  if (total == 0) buf[n++] = '0';
+  while (total > 0) { tmp[k++] = (char)('0' + (total % 10)); total /= 10; }
+  while (k > 0) buf[n++] = tmp[--k];
+  buf[n++] = '\n';
+  write(1, buf, n);
+  return 0;
+}
+"#;
+    check_cpp_vs_native("cpp_new_delete", src, b"");
+}
+
+/// C++ **static initialization** — `@llvm.global_ctors`. A global object with a side-effecting
+/// constructor must run **before** `main` (the C++ [basic.start] order), exactly as native: the
+/// on-ramp's `_start` now calls the global constructors (priority order) before `main`. Here a global
+/// `Banner` ctor writes "init\n" and `main` writes "main\n" — the on-ramp must emit both, in order,
+/// byte-identical to native `clang++` (a bug that drops static init would print only "main\n").
+#[test]
+fn cpp_global_constructor_runs_before_main() {
+    let src = r#"
+extern "C" long write(int fd, const void *buf, long n);
+struct Banner {
+  Banner() { write(1, "init\n", 5); }
+};
+static Banner g_banner;
+extern "C" int main() {
+  write(1, "main\n", 5);
+  return 0;
+}
+"#;
+    check_cpp_vs_native("cpp_static_init", src, b"");
+}
