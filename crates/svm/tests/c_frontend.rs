@@ -2645,29 +2645,32 @@ fn reflection_enumerates_granted_capabilities() {
 
 // ---- W4 chibicc debug emission: read C locals by name on real frontend output ----
 
-/// Decode a little-endian i32 from a window-located variable's bytes.
+/// Read an i32 source variable, whether it's a promoted SSA value or a window slot.
 fn as_i32_var(v: Option<VarValue>) -> i32 {
     match v {
+        Some(VarValue::Value(Value::I32(n))) => n,
         Some(VarValue::Bytes(b)) => i32::from_le_bytes(b.try_into().expect("4 bytes")),
-        other => panic!("expected window bytes, got {other:?}"),
+        other => panic!("expected an i32 var, got {other:?}"),
     }
 }
 
 #[test]
 fn chibicc_g_emits_named_locals_resolved_by_the_inspector() {
-    // No `main` ⇒ no `_start`/powerbox; `compute` is function 0. With `-g` (= `-Og`) every local
-    // is a window slot, so its `debug.var ... win <off>` resolves function-wide.
+    // No `main` ⇒ no `_start`/powerbox; `compute` is function 0. `-g` now keeps SSA promotion and
+    // emits a location list (`ssalist`), so a promoted scalar is debuggable *as optimized* — the
+    // interpreter resolves its holding SSA value per pc. (`return t + s` gives a final op where
+    // both `s` and `t` are already live to inspect.)
     let src = r#"
 int compute(int a, int b) {
   int s = a + b;
   int t = s + 100;
-  return t;
+  return t + s;
 }
 "#;
     let ir = c_to_ir_g(src);
     assert!(
-        ir.contains("debug.var 0 \"s\" win"),
-        "emits a debug.var for s:\n{ir}"
+        ir.contains("debug.var 0 \"s\" ssalist"),
+        "emits a location-list debug.var for the promoted s:\n{ir}"
     );
     let m = parse_module(&ir).expect("parse");
 
@@ -2681,7 +2684,7 @@ int compute(int a, int b) {
         1_000_000,
     );
 
-    // Break at the last op of the single block (all local stores have happened by then).
+    // Break at the last op (the `t + s` add): `s` and `t` are both already live there.
     let last = m.funcs[0].blocks[0].insts.len() - 1;
     insp.set_breakpoint(IrPc {
         module: 0,
@@ -2694,10 +2697,9 @@ int compute(int a, int b) {
         svm_interp::Stop::Break { .. }
     ));
 
-    // Read the C locals by their source names: s = a + b = 8, t = s + 100 = 108.
+    // Read the C locals by their source names: s = a + b = 8, t = s + 100 = 108, params a/b.
     assert_eq!(as_i32_var(insp.read_var(0, "s", 4)), 8);
     assert_eq!(as_i32_var(insp.read_var(0, "t", 4)), 108);
-    // The params are window locals too under -Og.
     assert_eq!(as_i32_var(insp.read_var(0, "a", 4)), 5);
     assert_eq!(as_i32_var(insp.read_var(0, "b", 4)), 3);
     assert_eq!(insp.read_var(0, "nonesuch", 4), None);
@@ -2706,12 +2708,12 @@ int compute(int a, int b) {
 #[test]
 fn chibicc_g_maps_breakpoints_to_source_lines() {
     // Raw string starts with a newline, so: line 2 = signature, 3 = `int s`, 4 = `int t`,
-    // 5 = `return t`.
+    // 5 = `return t + s` (its add is the block's last op, so it's a real step point on line 5).
     let src = r#"
 int compute(int a, int b) {
   int s = a + b;
   int t = s + 100;
-  return t;
+  return t + s;
 }
 "#;
     let ir = c_to_ir_g(src);
@@ -2756,7 +2758,7 @@ int compute(int a, int b) {
 
 #[test]
 fn chibicc_g_emits_structured_types_with_field_offsets() {
-    use svm_ir::{Encoding, TypeDef, VarLoc};
+    use svm_ir::{Encoding, TypeDef};
 
     // A struct local carries its layout through the §6 `TypeRef` waist: the type table records
     // `struct Point { int x; int y; }` with field offsets, an array records its element + count,
@@ -2789,17 +2791,14 @@ int dist(int ax, int ay) {
     // ABI side: parse and walk the structured types.
     let m = parse_module(&ir).expect("parse");
     let di = m.debug_info.as_ref().expect("debug info");
+    // The test is about the structured *type* table; a var's `loc` (window for the aggregates, a
+    // promoted `ssalist` for the pointer) is incidental, so resolve only via its `type_id`.
     let resolve = |name: &str| -> &TypeDef {
         let v = di
             .vars
             .iter()
             .find(|v| v.name == name)
             .unwrap_or_else(|| panic!("var {name}"));
-        // `-g` is `-Og`, so every local is a window slot.
-        assert!(
-            matches!(v.loc, VarLoc::Window { .. }),
-            "{name} is a window local"
-        );
         let tid = v
             .type_id
             .unwrap_or_else(|| panic!("{name} carries a structured type"));
@@ -2848,4 +2847,59 @@ int dist(int ax, int ay) {
         matches!(&di.types[*pointee as usize], TypeDef::Aggregate { name, .. } if name == "struct Point"),
         "pp points at the struct"
     );
+}
+
+#[test]
+fn chibicc_g_location_list_tracks_a_loop_accumulator_across_blocks() {
+    // The headline of the `ssalist` producer: a promoted accumulator/counter changes value across
+    // the loop's blocks (a different block parameter each iteration), and a mid-body write. The
+    // emitted location list must resolve each to the right value at the loop-body breakpoint — i.e.
+    // chibicc can debug the *optimized* (promoted) build, no `-Og`. Line 5 is `acc = acc + i;`.
+    let src = r#"
+int run(int n) {
+  int acc = 0;
+  for (int i = 0; i < n; i = i + 1) {
+    acc = acc + i;
+  }
+  return acc;
+}
+"#;
+    let ir = c_to_ir_g(src);
+    let m = parse_module(&ir).expect("parse");
+    let di = m.debug_info.as_ref().expect("debug info");
+
+    // Breakpoint at the loop body (line 5), found via the emitted source map — its first IR pc.
+    let bl = di
+        .locs
+        .iter()
+        .filter(|l| l.line == 5)
+        .min_by_key(|l| (l.block, l.inst))
+        .expect("line 5 (loop body) is mapped");
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: bl.block as usize,
+        inst: bl.inst as usize,
+    };
+    let mut insp = Inspector::attach(&m, 0, &[Value::I64(32768), Value::I32(3)], 1_000_000);
+    insp.set_breakpoint(bp);
+
+    // Before `acc = acc + i` each iteration, (i, acc) = (0,0), (1,0), (2,1) — read by name from the
+    // location lists as the promoted values shift across the loop blocks.
+    for (expect_i, expect_acc) in [(0, 0), (1, 0), (2, 1)] {
+        assert!(matches!(
+            insp.run_until_stop(),
+            svm_interp::Stop::Break { .. }
+        ));
+        assert_eq!(
+            as_i32_var(insp.read_var(0, "i", 4)),
+            expect_i,
+            "i per iteration"
+        );
+        assert_eq!(
+            as_i32_var(insp.read_var(0, "acc", 4)),
+            expect_acc,
+            "acc per iteration"
+        );
+    }
 }

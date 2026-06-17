@@ -981,10 +981,10 @@ and the LLVM/wasm ingest sides, are their own slices targeting this same waist.
 
 **Slice 5 — chibicc `-g` emission (the producer side, end-to-end).** `chibicc --emit-ir -g`
 now emits the §6 waist from real C: a `debug.var` per named local mapping its C name to a
-`VarLoc`. Crucially, **`-g` is `-Og`** — it disables SSA promotion (the W6 / §19 debuggable-vs-
-optimized trade), so every local keeps a *stable* window data-stack slot and resolves
-function-wide as `VarLoc::Window{off}`. (Promoted scalars would need S2's per-block `LocList`
-since their value index varies by block/PC — deferred.) `main.c` gains a 2-line `-g` flag
+`VarLoc`. At first, **`-g` was `-Og`** — it disabled SSA promotion (the W6 / §19 debuggable-vs-
+optimized trade), so every local kept a *stable* window data-stack slot resolving function-wide as
+`VarLoc::Window{off}` (promoted scalars would need S2's per-block `LocList`). **Superseded by slice
+17**, which keeps promotion and emits a location list instead — debugging the optimized build. `main.c` gains a 2-line `-g` flag
 (intercepted before chibicc's generic `-g*`-ignore block); everything else is in `codegen_ir.c`
 (the project's "ours" file). End-to-end test (`c_frontend.rs`, behind the unix toolchain gate):
 compile C → parse → `Inspector` reads `s`, `t`, `a`, `b` by their **C names** with correct
@@ -1090,11 +1090,24 @@ the right value each time; text + binary round-trips. *This is the ABI + consume
 emitting location lists (chibicc promotion, wasm locals) are follow-up slices, per the slice-4→5
 pattern.*
 
-**Not yet (next slices):** producers emitting location lists — chibicc keeping promotion under
-`-g` (drop the `-Og` requirement) and wasm/LLVM **variable** ingest (now representable via
-`SsaList`); the LLVM `!DILocation` → `debug.loc` path; and a per-producer rich blob. (The chibicc
-producer, both DAP consumers, binary serialization, a second producer's source lines, and the
-location-list ABI are all built.)
+**Slice 17 — chibicc emits location lists (debug the optimized build; no more `-Og`).** `-g` no
+longer disables SSA promotion (superseding slice 5's `-g = -Og`): a promoted scalar now keeps its
+SSA value and `-g` emits a **location list** (`debug.var … ssalist …`) recording the holding
+block-local value as it changes — across blocks (a fresh block parameter each block, e.g. a loop's
+iteration variable) and on each write. The emitter records every `set_curval` (block entry, the
+entry block's param/zero-init bindings, and writes) as a `(func, slot, block, inst, value)` and
+emits the list; memory locals still emit `win`. So you debug the **actually-optimized** code — the
+value-location-list tier of the W6/§19 trade — and the interpreter resolves a var to the right SSA
+value at each pc. (Honest optimized-debug consequence: a variable assigned by a block's *last* op
+is only live at the following step point, since the interpreter breaks before an op, not at the
+terminator.) Tests (`c_frontend.rs`): named locals read by C name at a breakpoint (now via
+`ssalist`), source-line mapping, structured types, and a **loop accumulator** whose `(i, acc)` read
+correctly across iterations — chibicc debugging promoted code end-to-end.
+
+**Not yet (next slices):** wasm/LLVM **variable** ingest (now representable via `SsaList`); the
+LLVM `!DILocation` → `debug.loc` path; and a per-producer rich blob. (The chibicc producer — now
+incl. location lists for the optimized build — both DAP consumers, binary serialization, a second
+producer's source lines, and the location-list ABI are all built.)
 
 ### Open questions (S4/S5/S2)
 
