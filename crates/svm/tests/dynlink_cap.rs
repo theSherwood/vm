@@ -112,23 +112,13 @@ fn seed_service_and_unit(svc: &[u8], unit: &[u8]) -> Vec<u8> {
     init
 }
 
-/// The flagship: the **full guest-driven REPL flow**, end to end, on both backends. The guest
-/// compiles `service`, installs it (getting a table slot), **builds a symbol table in its own
-/// window** binding `"F"` to that slot, `compile_linked`s the unit — which imports `F` by name —
-/// against it, and finally invokes the unit. The unit reaches the installed service purely by name:
-/// `unit(5, 2) = service(5, 2) + 100 = (25 + 2) + 100 = 127`. Nothing is hand-resolved in the
-/// harness; the *guest* delivers the symbol table and the *host* does the rewrite-then-verify.
-#[test]
-fn guest_compiles_links_and_invokes_by_name_across_backends() {
-    let svc = blob(SERVICE);
-    let unit = unresolved_blob(UNIT);
-    let init = seed_service_and_unit(&svc, &unit);
-
-    // The guest builds the 5-byte symbol table `[count=1, namelen=1, 'F', kind=0/Slot, slot]` at
-    // SYMTAB_OFF using the **slot it got back from install** (the loader's real pattern — no
-    // hard-coded slot), then compiles+links+invokes the unit. (`'F'` = 70; a slot < 128 is one
-    // uleb byte.)
-    let guest = format!(
+/// The guest for the full install→link→invoke flow (shared by the success case and the type-mismatch
+/// case): compile the service at [`SVC_OFF`], install it, build the symbol table binding `"F"` to the
+/// **install slot** at [`SYMTAB_OFF`] (`[count=1, namelen=1, 'F', kind=0/Slot, slot]`; `'F'`=70, a
+/// slot < 128 is one uleb byte), `compile_linked` the unit at [`UNIT_OFF`] against it, and invoke
+/// `unit(a, b)`. The slot is read back from install (the loader's real pattern — never hard-coded).
+fn install_link_invoke_guest(svc_len: usize, unit_len: usize) -> String {
+    format!(
         "memory 16\nfunc (i32, i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32, v2: i32):\n\
          \x20 v3 = i64.const {svc_off}\n  v4 = i64.const {svc_len}\n\
          \x20 v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n\
@@ -144,20 +134,55 @@ fn guest_compiles_links_and_invokes_by_name_across_backends() {
          \x20 v21 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v20, v1, v2)\n\
          \x20 return v21\n}}\n",
         svc_off = SVC_OFF,
-        svc_len = svc.len(),
         unit_off = UNIT_OFF,
-        unit_len = unit.len(),
         st = SYMTAB_OFF,
         st1 = SYMTAB_OFF + 1,
         st2 = SYMTAB_OFF + 2,
         st3 = SYMTAB_OFF + 3,
         st4 = SYMTAB_OFF + 4,
-    );
+    )
+}
+
+/// The flagship: the **full guest-driven REPL flow**, end to end, on both backends. The guest
+/// compiles `service`, installs it (getting a table slot), **builds a symbol table in its own
+/// window** binding `"F"` to that slot, `compile_linked`s the unit — which imports `F` by name —
+/// against it, and finally invokes the unit. The unit reaches the installed service purely by name:
+/// `unit(5, 2) = service(5, 2) + 100 = (25 + 2) + 100 = 127`. Nothing is hand-resolved in the
+/// harness; the *guest* delivers the symbol table and the *host* does the rewrite-then-verify.
+#[test]
+fn guest_compiles_links_and_invokes_by_name_across_backends() {
+    let svc = blob(SERVICE);
+    let unit = unresolved_blob(UNIT);
+    let init = seed_service_and_unit(&svc, &unit);
+    let guest = install_link_invoke_guest(svc.len(), unit.len());
 
     let (out, _) = diff(&guest, &init, &[5, 2], 4);
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[127]),
         "the guest-linked unit reached the installed service by name: expected 127, got {out:?}"
+    );
+}
+
+/// The security edge: linking a symbol to a slot holding a **wrong-typed** function does not produce
+/// a type-confused call — it **traps** at the call site. Here the same guest installs a *one*-arg
+/// service `(i32)->(i32)` and binds `"F"` (which the unit imports as `(i32,i32)->(i32)`) to it. The
+/// link succeeds (resolution only rewrites the import to `call_indirect <slot>` and re-verifies — a
+/// `call_indirect` is well-typed IR), but at invoke the slot's `type_id` doesn't match the call's, so
+/// the masked dispatch faults `IndirectCallType`, identically on both backends. The loader cannot be
+/// tricked into an out-of-type dispatch — the §3c table check carries the safety, exactly as for any
+/// slot the guest already controls.
+#[test]
+fn linking_to_a_wrong_typed_slot_traps_not_confuses() {
+    // A service of the WRONG arity for the import: (i32) -> (i32).
+    let svc = blob("memory 16\nfunc (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let unit = unresolved_blob(UNIT); // imports F as (i32, i32) -> (i32)
+    let init = seed_service_and_unit(&svc, &unit);
+    let guest = install_link_invoke_guest(svc.len(), unit.len());
+
+    let (out, _) = diff(&guest, &init, &[5, 2], 4);
+    assert!(
+        matches!(out, JitOutcome::Trapped(TrapKind::IndirectCallType)),
+        "a mis-typed link must trap (IndirectCallType), never dispatch type-confused: got {out:?}"
     );
 }
 

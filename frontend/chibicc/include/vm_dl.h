@@ -102,23 +102,33 @@ static long vm_dlopen(const char *name, const void *ir, long ir_len) {
     __vm_jit_release(code);
     return slot;
   }
-  // Record it. Newest-first so a re-`vm_dlopen` of a name shadows the old (hot reload).
+  // Register — or **hot-reload**: if the name is already loaded, overwrite its slot+code in place.
+  // The *previous* slot stays installed, so any unit already linked to it keeps working (it baked
+  // that slot at link time); only a *later* `vm_dlopen`'s symbol table sees the new slot. That is
+  // the live-patch shape: old callers pinned to the old version, new callers bound to the new.
+  int free_idx = -1;
   for (int i = 0; i < VM_DL_MAX; i++) {
-    if (!vm_dl_reg[i].used) {
-      int k = 0;
-      while (name[k] && k < VM_DL_NAMEMAX - 1) {
-        vm_dl_reg[i].name[k] = name[k];
-        k++;
-      }
-      vm_dl_reg[i].name[k] = 0;
+    if (vm_dl_reg[i].used && vm_dl_streq(vm_dl_reg[i].name, name)) {
       vm_dl_reg[i].slot = slot;
       vm_dl_reg[i].code = code;
-      vm_dl_reg[i].used = 1;
-      vm_dl_count++;
       return slot;
     }
+    if (free_idx < 0 && !vm_dl_reg[i].used)
+      free_idx = i;
   }
-  return -12; // registry full
+  if (free_idx < 0)
+    return -12; // registry full
+  int k = 0;
+  while (name[k] && k < VM_DL_NAMEMAX - 1) {
+    vm_dl_reg[free_idx].name[k] = name[k];
+    k++;
+  }
+  vm_dl_reg[free_idx].name[k] = 0;
+  vm_dl_reg[free_idx].slot = slot;
+  vm_dl_reg[free_idx].code = code;
+  vm_dl_reg[free_idx].used = 1;
+  vm_dl_count++;
+  return slot;
 }
 
 // `vm_dlcall2(name, a, b)`: look the name up and invoke it (the REPL "eval"). The symbol's unit must

@@ -150,6 +150,21 @@ These already prove old code reaching newly-loaded code; the dynlink work adds t
       `demos/jit/jit_dlopen.c` (the guest-C twin of `dynlink_repl.rs`): loads `add`, `mul`, then
       `poly = add(mul(a,a), b)` linking to both **by name** (`poly(5,2)=27`), then `vm_dlclose`s it.
       Driven by `c_frontend.rs::c_guest_jit_dlopen_demo` (interp == JIT).
+- [x] **Edge coverage** — the claims/surfaces that were only asserted in prose:
+  - **Hot reload / live patching** (`demos/jit/jit_hotreload.c`, `c_guest_jit_hotreload_demo`): a
+    redefined symbol gets a *new* slot; old callers stay pinned to the old, new callers bind to the new
+    (`g(5)=105` on `f` v1, `h(5)=205` on `f` v2). Fixed a `vm_dl.h` bug: re-`vm_dlopen` now overwrites
+    the registry entry in place (was appending a dup `vm_dlsym` never found).
+  - **Type-confusion safety** (`dynlink_cap.rs::linking_to_a_wrong_typed_slot_traps_not_confuses`):
+    binding an import to a wrong-typed slot links + verifies, but the call **traps** `IndirectCallType`
+    at the §3c table check — never a type-confused dispatch — identically on both backends.
+  - **Symbol-table decoder fuzz** (`svm-run` `symtab_tests`): round-trip + an adversarial sweep
+    (exhaustive ≤ 3 bytes + 100k pseudo-random) proving `decode_symbol_table` is fail-closed, never
+    panics/hangs on arbitrary guest bytes (it's a new untrusted-input surface).
+  - **`Cap` kind** (`dynlink_resolve.rs::symbol_table_resolves_a_capability_import_by_name`): a named
+    import can bind to a *host capability* (not just a slot) → lowers to `cap.call`. This was
+    implemented-but-unexercised; now tested through the real `jit_blob_validator` byte path — so it
+    stays (a plugin reaching host services by name), no longer dead code.
 - [ ] (Later) **data symbols** — resolution covers *function* imports → slots; a data import would
       place the unit's data via `Memory` + `memory.init` applying M2's `DataReloc`s, and `vm_dlsym`
       would return a data **address**. Not yet wired (no demo needs it).

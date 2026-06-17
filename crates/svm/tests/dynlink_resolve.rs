@@ -11,9 +11,9 @@
 //! mis-link is caught by re-verification rather than trusted ("rewrite-then-verify").
 
 use svm_encode::{decode_module, encode_module};
-use svm_ir::{Resolved, DEFAULT_RESERVED_LOG2};
+use svm_ir::{Inst, Resolved, ResolvedCap, DEFAULT_RESERVED_LOG2};
 use svm_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
-use svm_run::jit_resolve_and_validate;
+use svm_run::{encode_symbol_table, jit_blob_validator, jit_resolve_and_validate};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -110,4 +110,43 @@ fn unresolved_symbol_fails_closed() {
 fn malformed_blob_fails_closed() {
     let r = jit_resolve_and_validate(&[0xde, 0xad, 0xbe, 0xef], None, |_| Some(Resolved::Slot(0)));
     assert_eq!(r.err(), Some(-22), "a malformed blob must fail closed");
+}
+
+/// A symbol can resolve to a **host capability**, not only a table slot: the symbol table's `Cap`
+/// kind (the `1` byte) binds a named import to a `(type_id, op)` capability, which the loader lowers
+/// to a `cap.call` — so a loaded unit (a plugin) can reach a *host service* by name (e.g. `"write"`),
+/// not just another loaded unit. This drives the symbol table's `Cap` branch through the real
+/// `jit_blob_validator` byte path (the same gate the `compile_linked` op uses), proving the wire
+/// form + lowering are exercised end to end. The unit takes the capability handle as `arg0` (the
+/// import's handle operand, kept across the rewrite — unlike a `Slot`, a `Cap` needs no placeholder).
+#[test]
+fn symbol_table_resolves_a_capability_import_by_name() {
+    let unit = "func (i32, i64, i64) -> (i64) {\n\
+                block0(v0: i32, v1: i64, v2: i64):\n\
+                \x20 v3 = call.import \"write\" (i64, i64) -> (i64) v0 (v1, v2)\n\
+                \x20 return v3\n\
+                }\n";
+    let blob = encode_module(&parse_module(unit).expect("parse cap-importing unit"));
+
+    // The loader binds "write" to a host capability (type_id 3, op 1) via the symbol table's Cap kind.
+    let symtab =
+        encode_symbol_table(&[("write", Resolved::Cap(ResolvedCap { type_id: 3, op: 1 }))]);
+    let funcs = jit_blob_validator(&blob, None, &symtab)
+        .expect("the capability import resolves by name and re-verifies");
+
+    // Resolution lowered `call.import "write"` to a concrete `cap.call 3 1` (no import survives).
+    let lowered_to_cap_call = funcs[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(
+            i,
+            Inst::CapCall {
+                type_id: 3,
+                op: 1,
+                ..
+            }
+        )
+    });
+    assert!(
+        lowered_to_cap_call,
+        "the named capability import must lower to `cap.call 3 1`"
+    );
 }

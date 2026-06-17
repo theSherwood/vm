@@ -2296,6 +2296,23 @@ fn c_guest_jit_dlopen_demo() {
     );
 }
 
+/// **Hot reload** over the guest `vm_dlopen` loader (DYNLINK.md C3b edge, `demos/jit/jit_hotreload.c`):
+/// redefining a symbol gives it a new slot, but units already linked to the old one keep their
+/// binding. The guest loads `f` (a+100), then `g` calling `f` by name, hot-reloads `f` (a+200), then
+/// loads `h` calling `f` by name: `g(5)=105` (pinned to the old `f`), `h(5)=205` (sees the new one).
+/// Proves the slot model's live-patch behaviour. `run_c_full` enforces interp == JIT.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_hotreload_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_hotreload.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.contains("g(5) = 105") && out.contains("h(5) = 205"),
+        "an old caller must keep its binding across a hot reload, on both backends:\n{out}"
+    );
+}
+
 /// The **threaded** guest-driven JIT capstone (`demos/jit/jit_threads.c`, DESIGN.md §22), run as a
 /// full interp≡JIT **differential**: `NWORKERS` guest threads each emit a distinct unit, `Jit.compile`
 /// it **concurrently**, and invoke the native code, checking it against a C reference. Because the

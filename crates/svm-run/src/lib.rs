@@ -2414,3 +2414,107 @@ pub fn run_kernel(module: &Module, args: &[i64]) -> Result<Vec<Value>, String> {
         JitOutcome::Trapped(kind) => Err(format!("kernel trapped ({kind:?})")),
     }
 }
+
+#[cfg(test)]
+mod symtab_tests {
+    //! The `compile_linked` symbol table is a **new untrusted-input surface** (guest-controlled
+    //! bytes the host decodes). Like the IR decoder it must be fail-closed: never panic / over-read
+    //! / hang on arbitrary bytes — only `Some(table)` or `None`. These tests pin the round-trip with
+    //! the encoder and sweep adversarial bytes through the decoder.
+    use super::*;
+
+    #[test]
+    fn encode_decode_round_trips() {
+        let entries = [
+            ("sq", Resolved::Slot(0)),
+            ("a_longer_name", Resolved::Slot(1234)),
+            (
+                "io",
+                Resolved::Cap(svm_ir::ResolvedCap { type_id: 3, op: 7 }),
+            ),
+            ("", Resolved::Slot(u32::MAX)), // empty name + boundary slot
+        ];
+        let bytes = encode_symbol_table(&entries);
+        let table = decode_symbol_table(&bytes).expect("a well-formed table decodes");
+        assert_eq!(table.len(), entries.len());
+        for (name, want) in entries {
+            assert_eq!(table.get(name), Some(&want), "entry {name:?} round-trips");
+        }
+    }
+
+    #[test]
+    fn empty_buffer_and_explicit_zero_count_are_both_the_empty_table() {
+        // `&[]` (the closed `compile` op) and `[0]` (encode of no entries) both mean "no symbols".
+        assert_eq!(decode_symbol_table(&[]).map(|t| t.len()), Some(0));
+        assert_eq!(decode_symbol_table(&[0]).map(|t| t.len()), Some(0));
+        assert_eq!(
+            decode_symbol_table(&encode_symbol_table(&[])).map(|t| t.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn malformations_fail_closed_without_panicking() {
+        // Each of these is structurally broken in a different way; all must be `None`, never a panic.
+        let cases: &[&[u8]] = &[
+            &[1],                      // count 1, but no entry bytes
+            &[1, 1],                   // count 1, namelen 1, but no name byte
+            &[1, 1, b'F'],             // name present, but no kind byte
+            &[1, 1, b'F', 9],          // unknown kind 9
+            &[1, 1, b'F', 0],          // Slot kind, but no slot value
+            &[1, 1, 0xff, 0, 0],       // a non-UTF-8 name byte
+            &[1, 0x80],                // a truncated LEB128 namelen
+            &[0xff, 0xff, 0xff, 0xff], // a huge count (must fail fast as bytes exhaust, not hang)
+            &[0, 0],                   // count 0 but a trailing byte (length mismatch)
+            &[1, 1, b'F', 0, 0, 0],    // a valid entry plus trailing bytes
+        ];
+        for &c in cases {
+            assert_eq!(
+                decode_symbol_table(c),
+                None,
+                "malformed {c:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn never_panics_on_arbitrary_bytes() {
+        // A deterministic adversarial sweep: every byte string up to length 4, plus a pseudo-random
+        // tail of longer inputs. The decoder must always *return* (Some or None), never panic/hang.
+        for len in 0..=3usize {
+            let mut buf = vec![0u8; len];
+            loop {
+                let _ = decode_symbol_table(&buf); // must not panic
+                                                   // Odometer over [0,256)^len; stop after the most-significant digit wraps.
+                let mut i = 0;
+                while i < len {
+                    if buf[i] == 255 {
+                        buf[i] = 0;
+                        i += 1;
+                    } else {
+                        buf[i] += 1;
+                        break;
+                    }
+                }
+                if i == len {
+                    break; // wrapped around (or len == 0): done.
+                }
+            }
+        }
+        // Longer pseudo-random inputs (xorshift) for breadth past the exhaustive region.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        for _ in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let n = (state % 96) as usize;
+            let mut buf = Vec::with_capacity(n);
+            let mut s = state;
+            for _ in 0..n {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                buf.push((s >> 33) as u8);
+            }
+            let _ = decode_symbol_table(&buf); // must not panic
+        }
+    }
+}
