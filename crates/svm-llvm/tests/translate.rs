@@ -1031,6 +1031,26 @@ fn demo_hexdump_vs_native() {
 }
 
 #[test]
+fn demo_crc32_vs_native() {
+    // CRC-32 over stdin (shift/xor) + a big-endian u32 reader (`__builtin_bswap32` on host-endian
+    // loads) — drives `llvm.bswap` (an inline byte reversal). Prints the CRC and the be32 sum.
+    // Byte-identical to native.
+    let input = b"The quick brown fox jumps over the lazy dog.\nbig-endian!\x00\x01\x02\x03";
+    check_demo_vs_native("crc32", "crc32/crc32.c", input);
+}
+
+#[test]
+fn bswap_intrinsic() {
+    // `__builtin_bswap32`/`bswap64` → inline byte reversal, checked vs native.
+    let src = "int run(int n){ unsigned x = 0x11223344u + (unsigned)n; \
+               unsigned long y = 0xaabbccdd00112233UL; \
+               unsigned s = __builtin_bswap32(x); unsigned long t = __builtin_bswap64(y); \
+               return (int)((s ^ (unsigned)t ^ (unsigned)(t >> 32)) & 0xff); } \
+               int main(void){ return run(5); }";
+    check_vs_native("bswap", src, 5);
+}
+
+#[test]
 fn demo_mat4_vs_native() {
     // A 4×4 matrix × vec4 affine transform using `<4 x float>` (vector_size(16)) — `matvec`
     // broadcasts each component and accumulates the columns (`llvm.fmuladd.v4f32`), printing the

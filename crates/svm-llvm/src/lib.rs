@@ -135,11 +135,14 @@
 //!   byte mask (the all-equal mask is a splat); vector constants → `ConstV128`; `llvm.fmuladd.v4f32`
 //!   → `f32x4` mul+add (unfused). (2-lane vectors stay scalarized to `i64` — they're 8 bytes.) Lands
 //!   the **`mat4`** demo (a 4×4 × vec4 transform) byte-identical to native.
+//! - **Z — `llvm.bswap`.** Byte-reverse synthesized inline (no SVM op): each source byte `i` →
+//!   destination byte `nbytes-1-i` via shift/mask/or (`i16`/`i32`/`i64`). Lands the **`crc32`** demo
+//!   (CRC-32 + a big-endian `u32` reader) byte-identical to native.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): `printf` `%s`/`%f`, zero-padded `%d`,
 //! precision/`*`/`-`+# flags, and non-constant formats; variable-length `memmove` (overlap), general
-//! (non-rotate) funnel shifts, transcendental math, `puts`/`fputs` of a *non-literal* string (runtime
-//! strlen), other SIMD (`<2 x double>`, `<8 x i16>`, dynamic lanes, …), `i33`.
+//! (non-rotate) funnel shifts, `llvm.bitreverse`, transcendental math, `puts`/`fputs` of a
+//! *non-literal* string (runtime strlen), other SIMD (`<2 x double>`, `<8 x i16>`, dynamic lanes), `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -2519,6 +2522,7 @@ fn lower_int_intrinsic(
             | "llvm.abs"
             | "llvm.fshl"
             | "llvm.fshr"
+            | "llvm.bswap"
     ) {
         return Ok(None);
     }
@@ -2581,9 +2585,71 @@ fn lower_int_intrinsic(
             };
             ctx.push(Inst::IntBin { ty, op, a, b: amt })
         }
+        // `llvm.bswap` — reverse the value's bytes inline (no SVM op): each source byte `i` is
+        // shifted to destination byte `nbytes-1-i`.
+        "llvm.bswap" => {
+            let bits = src_bits(args[0], types)?;
+            let v = ctx.operand(args[0])?;
+            emit_bswap(ctx, v, ty, (bits / 8).max(1) as u64)
+        }
         _ => unreachable!(),
     };
     Ok(Some(idx))
+}
+
+/// Emit an inline byte-reverse of `v` (`ty`-wide, `nbytes` bytes): OR together, for each source byte
+/// `i`, `((v >> 8*i) & 0xff) << 8*(nbytes-1-i)`. Lowers `llvm.bswap.{i16,i32,i64}`.
+fn emit_bswap(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, nbytes: u64) -> ValIdx {
+    let kof = |ctx: &mut BlockCtx, k: i64| {
+        ctx.push(if ty == IntTy::I64 {
+            Inst::ConstI64(k)
+        } else {
+            Inst::ConstI32(k as i32)
+        })
+    };
+    let ff = kof(ctx, 0xff);
+    let mut acc: Option<ValIdx> = None;
+    for i in 0..nbytes {
+        let shifted = if i == 0 {
+            v
+        } else {
+            let s = kof(ctx, (8 * i) as i64);
+            ctx.push(Inst::IntBin {
+                ty,
+                op: BinOp::ShrU,
+                a: v,
+                b: s,
+            })
+        };
+        let byte = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::And,
+            a: shifted,
+            b: ff,
+        });
+        let dst_sh = 8 * (nbytes - 1 - i);
+        let placed = if dst_sh == 0 {
+            byte
+        } else {
+            let d = kof(ctx, dst_sh as i64);
+            ctx.push(Inst::IntBin {
+                ty,
+                op: BinOp::Shl,
+                a: byte,
+                b: d,
+            })
+        };
+        acc = Some(match acc {
+            None => placed,
+            Some(a) => ctx.push(Inst::IntBin {
+                ty,
+                op: BinOp::Or,
+                a,
+                b: placed,
+            }),
+        });
+    }
+    acc.unwrap_or(v)
 }
 
 /// Lower a call to an external **libm math** function that has a direct SVM float op (`sqrt`,

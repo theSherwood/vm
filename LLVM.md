@@ -567,7 +567,7 @@ the dominant general-C gap).
 | 1 ✅ | **`hexdump`** — read stdin, print `%08lx  %02x ×16  \|ascii\|` rows (`demos/hexdump`, slice W) | **varargs `printf`** (unsigned `%u`/`%x`, width, `0`-pad, `l`) — DONE, byte-identical to native | `read`, loops |
 | 2 ✅ | **`sortvec`** — `realloc`-doubling int vector + insertion sort, print `%d` 10/line (`demos/sortvec`, slice X) | **`realloc`** (header-sized grow-and-copy) + signed `printf` (`%d`) — DONE, byte-identical to native | `malloc` |
 | 3 ✅ | **`mat4`** — 4×4 matrix × vec4 affine transform, print rows (`demos/mat4`, slice Y) | **128-bit SIMD** (`<4 x float>` → native `v128`) — DONE, byte-identical to native | floats, `printf` |
-| 4 | **`crc32` + big-endian TLV reader** | **`llvm.bswap`** (endian) | tables, `printf` |
+| 4 ✅ | **`crc32`** — CRC-32 over stdin + a big-endian `u32` reader (`demos/crc32`, slice Z) | **`llvm.bswap`** (inline byte reversal) — DONE, byte-identical to native | shifts, `printf` |
 | 5 | **`editor`/gap-buffer** — insert/delete in a text buffer | **overlapping `memmove`** (direction-aware runtime loop) | arrays |
 | 6 | **`raytrace`/`mandelbrot+shading`** or **DSP sine** | **transcendental libm** (`sqrt`/`sin`/`cos`/`pow`/`exp`) — bundle a small **guest `libm`** (poly approximations), like the corpus demos bundle `memset` | floats, `printf` |
 
@@ -612,7 +612,12 @@ mask is a splat/broadcast); `<4 x …>` constants → `ConstV128`; `llvm.fmuladd
 (unfused). The `<4 x i32>` shuffle masks are read as constants, not values. Tests:
 `demo_mat4_vs_native`, `vec4_float_scale` (a `<4 x float>` by-value arg/return + splat-mul).
 
-**Next:** demo 4 (**`crc32` + big-endian reader** → `llvm.bswap`).
+**Slice Z (DONE) — `llvm.bswap` (lands `crc32`).** No SVM byte-swap op, so it is synthesized inline:
+each source byte `i` is moved to destination byte `nbytes-1-i` via `((v >> 8*i) & 0xff) << 8*(nbytes-1-i)`,
+OR-accumulated (`i16`/`i32`/`i64`; `emit_bswap`). Tests: `demo_crc32_vs_native` (CRC-32 + a
+`__builtin_bswap32` big-endian reader, with stdin) and `bswap_intrinsic` (bswap32/64 vs native).
+
+**Next:** demo 5 (**gap-buffer / text edit** → overlapping `memmove`).
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
