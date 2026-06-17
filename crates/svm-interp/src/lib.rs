@@ -5299,7 +5299,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 else_blk,
                 else_args,
             } => {
-                let (target, edge_args) = if as_i32(get(&frames[top].vals, *cond)?)? != 0 {
+                let (target, edge_args) = if get_i32(&frames[top].vals, *cond)? != 0 {
                     (*then_blk, then_args)
                 } else {
                     (*else_blk, else_args)
@@ -5314,7 +5314,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 targets,
                 default,
             } => {
-                let i = as_i32(get(&frames[top].vals, *idx)?)? as u32 as usize;
+                let i = get_i32(&frames[top].vals, *idx)? as u32 as usize;
                 let (target, edge_args) = targets.get(i).unwrap_or(default);
                 collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
                 std::mem::swap(&mut frames[top].vals, &mut edge_buf);
@@ -5430,51 +5430,50 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
 }
 
 fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Option<Value>, Trap> {
-    // `Store` is the only instruction that produces no value.
-    if let Inst::Store {
-        op,
-        addr,
-        value,
-        offset,
-        ..
-    } = inst
-    {
-        let m = mem.as_mut().ok_or(Trap::Malformed)?;
-        let a = as_i64(get(vals, *addr)?)? as u64;
-        let v = get(vals, *value)?;
-        m.store(a, *offset, *op, v)?;
-        return Ok(None);
-    }
-    // §12 atomic store — the other no-result memory op.
-    if let Inst::AtomicStore {
-        ty,
-        addr,
-        value,
-        offset,
-        ..
-    } = inst
-    {
-        let m = mem.as_mut().ok_or(Trap::Malformed)?;
-        let a = as_i64(get(vals, *addr)?)? as u64;
-        let v = get(vals, *value)?;
-        m.atomic_store(a, *offset, *ty, v)?;
-        return Ok(None);
-    }
-    // §17 `v128.store` — the third no-result memory op (a 16-byte masked write, D58).
-    if let Inst::V128Store {
-        addr,
-        value,
-        offset,
-        ..
-    } = inst
-    {
-        let m = mem.as_mut().ok_or(Trap::Malformed)?;
-        let a = as_i64(get(vals, *addr)?)? as u64;
-        let v = as_v128(get(vals, *value)?)?;
-        m.store_v128(a, *offset, v)?;
-        return Ok(None);
-    }
+    // Single dispatch over `inst`: value-producing ops yield the produced `Value`; the
+    // no-result ops (`Store`/`AtomicStore`/`V128Store`, fences, and the control/fiber ops
+    // serviced in the eval loop) take a `return Ok(None)` arm. Folding the three stores into
+    // this match drops the leading `if let` discriminant probes every instruction used to pay.
     let v = match inst {
+        // ----- §3a/§12/§17 no-result memory writes (the only value-less data ops) -----
+        Inst::Store {
+            op,
+            addr,
+            value,
+            offset,
+            ..
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = get_i64(vals, *addr)? as u64;
+            let v = get(vals, *value)?;
+            m.store(a, *offset, *op, v)?;
+            return Ok(None);
+        }
+        Inst::AtomicStore {
+            ty,
+            addr,
+            value,
+            offset,
+            ..
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = get_i64(vals, *addr)? as u64;
+            let v = get(vals, *value)?;
+            m.atomic_store(a, *offset, *ty, v)?;
+            return Ok(None);
+        }
+        Inst::V128Store {
+            addr,
+            value,
+            offset,
+            ..
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = get_i64(vals, *addr)? as u64;
+            let v = as_v128(get(vals, *value)?)?;
+            m.store_v128(a, *offset, v)?;
+            return Ok(None);
+        }
         Inst::ConstI32(c) => Value::I32(*c),
         Inst::ConstI64(c) => Value::I64(*c),
         // §7 named imports must be lowered to `cap.call` by `resolve_imports` before
@@ -5484,42 +5483,34 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         // (like `cap.call`), never here.
         Inst::CapSelfCount | Inst::CapSelfGet { .. } => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
-            IntTy::I32 => Value::I32(bin32(
-                *op,
-                as_i32(get(vals, *a)?)?,
-                as_i32(get(vals, *b)?)?,
-            )?),
-            IntTy::I64 => Value::I64(bin64(
-                *op,
-                as_i64(get(vals, *a)?)?,
-                as_i64(get(vals, *b)?)?,
-            )?),
+            IntTy::I32 => Value::I32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?),
+            IntTy::I64 => Value::I64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?),
         },
         Inst::IntCmp { ty, op, a, b } => {
             let r = match ty {
-                IntTy::I32 => cmp32(*op, as_i32(get(vals, *a)?)?, as_i32(get(vals, *b)?)?),
-                IntTy::I64 => cmp64(*op, as_i64(get(vals, *a)?)?, as_i64(get(vals, *b)?)?),
+                IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?),
+                IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?),
             };
             Value::I32(r as i32)
         }
         Inst::IntUn { ty, op, a } => match ty {
-            IntTy::I32 => Value::I32(intun32(*op, as_i32(get(vals, *a)?)?)),
-            IntTy::I64 => Value::I64(intun64(*op, as_i64(get(vals, *a)?)?)),
+            IntTy::I32 => Value::I32(intun32(*op, get_i32(vals, *a)?)),
+            IntTy::I64 => Value::I64(intun64(*op, get_i64(vals, *a)?)),
         },
         Inst::Eqz { ty, a } => {
             let r = match ty {
-                IntTy::I32 => as_i32(get(vals, *a)?)? == 0,
-                IntTy::I64 => as_i64(get(vals, *a)?)? == 0,
+                IntTy::I32 => get_i32(vals, *a)? == 0,
+                IntTy::I64 => get_i64(vals, *a)? == 0,
             };
             Value::I32(r as i32)
         }
         Inst::Convert { op, a } => match op {
-            ConvOp::ExtendI32S => Value::I64(as_i32(get(vals, *a)?)? as i64),
-            ConvOp::ExtendI32U => Value::I64(as_i32(get(vals, *a)?)? as u32 as i64),
-            ConvOp::WrapI64 => Value::I32(as_i64(get(vals, *a)?)? as i32),
+            ConvOp::ExtendI32S => Value::I64(get_i32(vals, *a)? as i64),
+            ConvOp::ExtendI32U => Value::I64(get_i32(vals, *a)? as u32 as i64),
+            ConvOp::WrapI64 => Value::I32(get_i64(vals, *a)? as i32),
         },
         Inst::Select { cond, a, b } => {
-            if as_i32(get(vals, *cond)?)? != 0 {
+            if get_i32(vals, *cond)? != 0 {
                 get(vals, *a)?
             } else {
                 get(vals, *b)?
@@ -5528,36 +5519,26 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         Inst::ConstF32(bits) => Value::F32(f32::from_bits(*bits)),
         Inst::ConstF64(bits) => Value::F64(f64::from_bits(*bits)),
         Inst::FBin { ty, op, a, b } => match ty {
-            FloatTy::F32 => Value::F32(fbin32(
-                *op,
-                as_f32(get(vals, *a)?)?,
-                as_f32(get(vals, *b)?)?,
-            )),
-            FloatTy::F64 => Value::F64(fbin64(
-                *op,
-                as_f64(get(vals, *a)?)?,
-                as_f64(get(vals, *b)?)?,
-            )),
+            FloatTy::F32 => Value::F32(fbin32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?)),
+            FloatTy::F64 => Value::F64(fbin64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?)),
         },
         Inst::FUn { ty, op, a } => match ty {
-            FloatTy::F32 => Value::F32(fun32(*op, as_f32(get(vals, *a)?)?)),
-            FloatTy::F64 => Value::F64(fun64(*op, as_f64(get(vals, *a)?)?)),
+            FloatTy::F32 => Value::F32(fun32(*op, get_f32(vals, *a)?)),
+            FloatTy::F64 => Value::F64(fun64(*op, get_f64(vals, *a)?)),
         },
         Inst::FCmp { ty, op, a, b } => {
             let r = match ty {
-                FloatTy::F32 => fcmp32(*op, as_f32(get(vals, *a)?)?, as_f32(get(vals, *b)?)?),
-                FloatTy::F64 => fcmp64(*op, as_f64(get(vals, *a)?)?, as_f64(get(vals, *b)?)?),
+                FloatTy::F32 => fcmp32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?),
+                FloatTy::F64 => fcmp64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?),
             };
             Value::I32(r as i32)
         }
         Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?)?,
         Inst::FToITrap { op, a } => trunc_trap(*op, get(vals, *a)?)?,
         Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?)?,
-        Inst::PtrAdd { a, b } => {
-            Value::I64(as_i64(get(vals, *a)?)?.wrapping_add(as_i64(get(vals, *b)?)?))
-        }
+        Inst::PtrAdd { a, b } => Value::I64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?)),
         // `ptr.from_int`/`ptr.to_int` are a no-op off-CHERI: pass the i64 through.
-        Inst::PtrCast { a, .. } => Value::I64(as_i64(get(vals, *a)?)?),
+        Inst::PtrCast { a, .. } => Value::I64(get_i64(vals, *a)?),
         Inst::Cast { op, a } => cast(*op, get(vals, *a)?)?,
         // A funcref is just the function index as plain i32 data (§3c).
         Inst::RefFunc { func } => Value::I32(*func as i32),
@@ -5565,7 +5546,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             op, addr, offset, ..
         } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
+            let a = get_i64(vals, *addr)? as u64;
             m.load(a, *offset, *op)?
         }
         // The `order` is carried but execution is seq-cst (a sound strengthening; see `svm_ir::Ordering`).
@@ -5573,7 +5554,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             ty, addr, offset, ..
         } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
+            let a = get_i64(vals, *addr)? as u64;
             m.atomic_load(a, *offset, *ty)?
         }
         Inst::AtomicRmw {
@@ -5585,7 +5566,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             ..
         } => {
             let m = mem.as_mut().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
+            let a = get_i64(vals, *addr)? as u64;
             let v = get(vals, *value)?;
             m.atomic_rmw(a, *offset, *ty, *op, v)?
         }
@@ -5598,7 +5579,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             ..
         } => {
             let m = mem.as_mut().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
+            let a = get_i64(vals, *addr)? as u64;
             let exp = get(vals, *expected)?;
             let rep = get(vals, *replacement)?;
             m.atomic_cmpxchg(a, *offset, *ty, exp, rep)?
@@ -5622,7 +5603,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         Inst::ConstV128(b) => Value::V128(*b),
         Inst::V128Load { addr, offset, .. } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
+            let a = get_i64(vals, *addr)? as u64;
             m.load_v128(a, *offset)?
         }
         Inst::Splat { shape, a } => Value::V128(simd_splat(*shape, store_bits(get(vals, *a)?))),
@@ -5763,12 +5744,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         // stays identical across the interp↔JIT oracle.
         Inst::SimdWidthBytes => Value::I32(16),
 
-        // Handled before/around the match (or in `run_func` for the §12 fiber ops, which
-        // switch stacks); listed for exhaustiveness (no panic).
-        Inst::Store { .. }
-        | Inst::AtomicStore { .. }
-        | Inst::V128Store { .. }
-        | Inst::Call { .. }
+        // Handled in `run_func` for the §12 fiber ops (which switch stacks) and in the eval
+        // loop for calls/cap-calls; listed for exhaustiveness (no panic).
+        Inst::Call { .. }
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
         | Inst::ContNew { .. }
@@ -10258,6 +10236,42 @@ fn step(fuel: &mut u64) -> Result<(), Trap> {
 #[inline]
 fn get(vals: &[Value], v: ValIdx) -> Result<Value, Trap> {
     vals.get(v as usize).copied().ok_or(Trap::Malformed)
+}
+
+// Typed operand reads: pull just the needed scalar out of the value slot instead of copying a
+// whole 24-byte `Value` (the inline `v128` variant makes `Value` wide) and then re-matching it.
+// Semantics match `as_*(get(..)?)?` exactly — `Malformed` on an out-of-range index *or* a
+// type-mismatched slot — but a hot integer op now reads 8 bytes, not 24.
+#[inline]
+fn get_i32(vals: &[Value], v: ValIdx) -> Result<i32, Trap> {
+    match vals.get(v as usize) {
+        Some(Value::I32(x)) => Ok(*x),
+        _ => Err(Trap::Malformed),
+    }
+}
+
+#[inline]
+fn get_i64(vals: &[Value], v: ValIdx) -> Result<i64, Trap> {
+    match vals.get(v as usize) {
+        Some(Value::I64(x)) => Ok(*x),
+        _ => Err(Trap::Malformed),
+    }
+}
+
+#[inline]
+fn get_f32(vals: &[Value], v: ValIdx) -> Result<f32, Trap> {
+    match vals.get(v as usize) {
+        Some(Value::F32(x)) => Ok(*x),
+        _ => Err(Trap::Malformed),
+    }
+}
+
+#[inline]
+fn get_f64(vals: &[Value], v: ValIdx) -> Result<f64, Trap> {
+    match vals.get(v as usize) {
+        Some(Value::F64(x)) => Ok(*x),
+        _ => Err(Trap::Malformed),
+    }
 }
 
 fn collect(vals: &[Value], idxs: &[ValIdx]) -> Result<Vec<Value>, Trap> {
