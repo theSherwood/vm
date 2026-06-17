@@ -44,11 +44,24 @@ mod tag {
     pub const RESTRICT_TYPE: u16 = 0x37;
 }
 
-/// One source variable recovered from an `llvm.dbg.declare`: its name, the **alloca ordinal** (the
-/// correlation key into the translator's frame layout), and its structured [`TypeId`].
+/// How a recovered variable's value is located, in terms the translator can correlate to the IR.
+pub enum DiLoc {
+    /// A `-O0` `llvm.dbg.declare` memory variable: the **alloca ordinal** (the Nth alloca in
+    /// textual order, the correlation key into the translator's frame layout) → a `Window` slot.
+    Window { alloca_ordinal: usize },
+    /// A `-O2`/`-Og` `llvm.dbg.value` binding to **function argument `index`** — a stable SSA value
+    /// the translator threads as a block parameter, so it resolves to an `SsaList` over the arg's
+    /// live range. (Bindings to non-argument SSA values / constants / `poison` are skipped — the
+    /// optimizer didn't keep a recoverable location there; instruction-result bindings are a
+    /// follow-up.)
+    Arg { index: u32 },
+}
+
+/// One source variable recovered from the DI metadata: its name, structured [`TypeId`], render
+/// name, and how to locate it ([`DiLoc`]).
 pub struct DiVar {
     pub name: String,
-    pub alloca_ordinal: usize,
+    pub loc: DiLoc,
     pub type_id: Option<TypeId>,
     /// The neutral render name (e.g. `"int"`, `"struct Point"`) — always present, even when the
     /// structured `type_id` could not be built.
@@ -112,15 +125,17 @@ unsafe fn read_debug_unsafe(path: &str) -> Option<LlvmDebug> {
     result
 }
 
-/// Walk one function: number its allocas (textual order = the translator's order), then turn each
-/// `llvm.dbg.declare` into a [`DiVar`] correlated by alloca ordinal.
+/// Walk one function and recover its source variables: `-O0` `llvm.dbg.declare`s (→ `Window`,
+/// correlated by alloca ordinal) and `-O2`/`-Og` `llvm.dbg.value`s bound to a function argument
+/// (→ `Arg`, the stable-SSA case). A module is compiled at one opt level, so in practice only one
+/// kind appears; a variable seen twice keeps its first (more complete) location.
 unsafe fn read_function_vars(
     ctx: LLVMContextRef,
     f: LLVMValueRef,
     types: &mut Vec<TypeDef>,
     interner: &mut HashMap<usize, TypeId>,
 ) -> Vec<DiVar> {
-    // Pass 1: alloca → ordinal (the Nth alloca in the function, in block/instruction order).
+    // alloca → ordinal (the Nth alloca in the function, in block/instruction order).
     let mut alloca_ord: HashMap<usize, usize> = HashMap::new();
     let mut n_alloca = 0usize;
     for_each_inst(f, |inst| {
@@ -129,30 +144,50 @@ unsafe fn read_function_vars(
             n_alloca += 1;
         }
     });
+    // function argument pointer → its index (the `dbg.value` correlation key: arg `k` is the IR's
+    // ValueId `k`, threaded as a block parameter — see `lib.rs`).
+    let mut param_index: HashMap<usize, u32> = HashMap::new();
+    let nparams = LLVMCountParams(f);
+    for i in 0..nparams {
+        param_index.insert(LLVMGetParam(f, i) as usize, i);
+    }
 
-    // Pass 2: each `llvm.dbg.declare(addr, var, expr)` → a window variable at the alloca's slot.
+    // Shared: pull (name, type_id, ty) out of the `!DILocalVariable` at call operand 1.
+    let mut seen: HashMap<String, ()> = HashMap::new();
     let mut vars = Vec::new();
     for_each_inst(f, |inst| {
         if LLVMIsACallInst(inst) != inst {
             return;
         }
         let callee = LLVMGetCalledValue(inst);
-        if callee.is_null() || value_name(callee) != "llvm.dbg.declare" {
+        if callee.is_null() || LLVMGetNumOperands(inst) < 2 {
             return;
         }
-        if LLVMGetNumOperands(inst) < 2 {
+        let kind = value_name(callee);
+        let is_declare = kind == "llvm.dbg.declare";
+        let is_value = kind == "llvm.dbg.value";
+        if !is_declare && !is_value {
             return;
         }
-        // op0 = address: a MetadataAsValue wrapping LocalAsMetadata(alloca); its single MDNode
-        // operand is the alloca value, matched by pointer identity to the ordinal map.
-        let arg0 = LLVMGetOperand(inst, 0);
-        let Some(alloca) = single_md_value(arg0) else {
+        // op0 = the located value/address: a MetadataAsValue whose single wrapped value is the
+        // alloca (declare) or the SSA value (value); a constant/`poison` wraps none we track.
+        let Some(loc_val) = single_md_value(LLVMGetOperand(inst, 0)) else {
             return;
         };
-        let Some(&ordinal) = alloca_ord.get(&(alloca as usize)) else {
-            return; // address isn't a tracked alloca (e.g. a dbg.declare of a field) — skip
+        let loc = if is_declare {
+            match alloca_ord.get(&(loc_val as usize)) {
+                Some(&ordinal) => DiLoc::Window {
+                    alloca_ordinal: ordinal,
+                },
+                None => return, // not a tracked alloca (e.g. a field) — skip
+            }
+        } else {
+            match param_index.get(&(loc_val as usize)) {
+                Some(&index) => DiLoc::Arg { index },
+                None => return, // not an argument (a constant / poison / instruction result) — skip
+            }
         };
-        // op1 = the !DILocalVariable.
+        // op1 = the !DILocalVariable → name + structured type.
         let var_md = LLVMValueAsMetadata(LLVMGetOperand(inst, 1));
         if var_md.is_null()
             || !matches!(
@@ -163,17 +198,16 @@ unsafe fn read_function_vars(
             return;
         }
         let name = op_string(ctx, var_md, 1).unwrap_or_default();
-        if name.is_empty() {
-            return;
+        if name.is_empty() || seen.insert(name.clone(), ()).is_some() {
+            return; // unnamed, or already recorded (first binding wins)
         }
-        let type_md = op_md(ctx, var_md, 3);
-        let type_id = type_md.and_then(|t| intern_type(ctx, t, types, interner));
+        let type_id = op_md(ctx, var_md, 3).and_then(|t| intern_type(ctx, t, types, interner));
         let ty = type_id
             .map(|id| render_name(&types[id as usize]))
             .unwrap_or_else(|| "void".to_string());
         vars.push(DiVar {
             name,
-            alloca_ordinal: ordinal,
+            loc,
             type_id,
             ty,
         });

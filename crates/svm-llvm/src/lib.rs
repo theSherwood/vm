@@ -170,7 +170,8 @@ use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    IToF, Inst, IntTy, IntUnOp, Loc, Module, Terminator, TypeDef, ValIdx, ValType, VarInfo, VarLoc,
+    IToF, Inst, IntTy, IntUnOp, Loc, Module, SsaLoc, Terminator, TypeDef, ValIdx, ValType, VarInfo,
+    VarLoc,
 };
 
 pub mod di;
@@ -1162,21 +1163,46 @@ fn translate_func(
     let block_params = block_params(f, &scan, &live_in);
     let (frame, frame_size) = frame_layout(f, &scan, types)?;
 
-    // §6 debug-info variables (the `dbg.declare` → `Window` half): the `di` reader gives this
-    // function's source locals keyed by **alloca ordinal**; resolve that ordinal to the alloca's
-    // data-stack offset (the same textual alloca order `frame_layout` lays out) → `VarLoc::Window`.
+    // §6 debug-info variables. The `di` reader gives this function's source locals; resolve each to
+    // an IR location:
+    //   - `dbg.declare` (`-O0`): an alloca *ordinal* → the alloca's data-stack offset (same textual
+    //     order `frame_layout` lays out) → `VarLoc::Window`.
+    //   - `dbg.value` bound to argument `k` (`-O2`/`-Og`): the argument is ValueId `k`, threaded as
+    //     a block parameter wherever it is live; its block-local value index is its position in that
+    //     block's param list, so one `SsaLoc` per such block (effective from block entry) gives an
+    //     `SsaList` covering the argument's whole live range.
     if let Some(vars) = di.and_then(|d| d.vars.get(&f.name)) {
         let alloca_offsets = alloca_order_offsets(f, &scan, &frame);
         for v in vars {
-            if let Some(&off) = alloca_offsets.get(v.alloca_ordinal) {
-                dbg.vars.push(VarInfo {
-                    func: func_idx,
-                    name: v.name.clone(),
-                    ty: v.ty.clone(),
-                    loc: VarLoc::Window { off: off as i64 },
-                    type_id: v.type_id,
-                });
-            }
+            let loc = match v.loc {
+                di::DiLoc::Window { alloca_ordinal } => match alloca_offsets.get(alloca_ordinal) {
+                    Some(&off) => VarLoc::Window { off: off as i64 },
+                    None => continue,
+                },
+                di::DiLoc::Arg { index } => {
+                    let mut locs = Vec::new();
+                    for (bi, params) in block_params.iter().enumerate() {
+                        if let Some(pos) = params.iter().position(|&p| p == index as ValueId) {
+                            locs.push(SsaLoc {
+                                block: bi as u32,
+                                inst: 0,
+                                value: pos as u32,
+                            });
+                        }
+                    }
+                    if locs.is_empty() {
+                        continue;
+                    }
+                    VarLoc::SsaList(locs)
+                }
+            };
+            dbg.vars.push(VarInfo {
+                func: func_idx,
+                name: v.name.clone(),
+                ty: v.ty.clone(),
+                loc,
+                type_id: v.type_id,
+            });
         }
     }
 

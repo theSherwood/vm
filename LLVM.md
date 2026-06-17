@@ -828,9 +828,13 @@ case — every C local is an `alloca` + `dbg.declare`, recovered as a `TypeDef`-
 correlated to the IR by *alloca ordinal* (stable across the two parses). The LLVM-C DI API has no
 getters for the `baseType`/`elements` edges or the base-type `encoding`, so the type graph is walked
 via the generic MDNode-operand bridge at the positional indices LLVM 18 uses (pinned + tested), and
-`encoding` is inferred from the C name. The remaining piece is the `-O2`/`-Og` `dbg.value`
-location-list case (promoted scalars), which LLVM solves for free (its intrinsics survive
-mem2reg/SROA) — it feeds the same `SsaList`/`WindowVia` + `TypeDef` machinery, a focused follow-up.
+`encoding` is inferred from the C name. Slice 26 adds the `-O2`/`-Og` `dbg.value` case (promoted
+scalars, which LLVM solves for free — its intrinsics survive mem2reg/SROA): a `dbg.value` bound to a
+function **argument** becomes a `VarLoc::SsaList` over the arg's live range (the arg is ValueId `k`,
+threaded as a block parameter, so its block-local index is its position in each block's param list).
+At `-Og`/`-O2` most *other* locals are optimized to `poison`/constants, so parameters are the main
+recoverable variable; `dbg.value` bindings to instruction-result / φ values (needing a value→ValueId
+ordinal correlation and per-pc `SsaLoc.inst`) are a follow-up of limited yield.
 **Fallback order if `llvm-ir` bites:** `inkwell` (maintained, version-tracking wrapper) →
 hand-rolled `.ll` parser over `opt -S` (zero libLLVM link, but a rot-prone parser we own).
 

@@ -1207,18 +1207,30 @@ full structured types, the LLVM analog of the wasm slice-23 ingest. Tests (`tran
 verifies, and — the correlation lock — its values **read back correctly at runtime** (`p.x`, `p.y`,
 `row[0]` through the interpreter's `Window` reads at a breakpoint).
 
-**Not yet — the LLVM `-O2`/`-Og` `llvm.dbg.value` SSA-location-list case.** At higher opt levels
-mem2reg/SROA promote scalars, so their debug locations become `llvm.dbg.value(ssavalue, var, expr)`
-location lists rather than `dbg.declare`+alloca — the case where **LLVM solves S2's
-promotion-vs-inspectability for free** (its intrinsics survive optimization). The `di` reader and
-the `TypeDef` machinery are in place; what remains is correlating each `dbg.value`'s SSA value to the
-SVM block-local index per pc and emitting a `VarLoc::SsaList`/`WindowVia` (the same machinery the
-wasm producer already exercises) — a focused follow-up. (Everything else is built: the chibicc
-producer incl. optimized-build location lists; both DAP consumers over `Window` *and* `WindowVia`;
-binary serialization; the wasm producer's source lines, DWARF pass-through, named variables, and
-aggregate/pointer/array types; and now LLVM source lines **and** `-O0` variable/type ingest. The W4
-debug-info waist is exercised end-to-end by **three** independent frontends — all three on the
-source-line half, all three on the variable+type half.)
+**Slice 26 — LLVM `-O2`/`-Og` `llvm.dbg.value` → `SsaList` (promoted variables, the optimized
+case).** At higher opt levels mem2reg/SROA promote scalars, so their debug locations are
+`llvm.dbg.value(ssavalue, var, expr)` bindings rather than `dbg.declare`+alloca — the case where
+**LLVM solves S2's promotion-vs-inspectability for free** (its intrinsics survive optimization). The
+`di` reader now also recovers `dbg.value` bindings to a function **argument** (the stable-SSA case);
+the translator emits a `VarLoc::SsaList` over the argument's live range — the argument is ValueId
+`k`, threaded as a block parameter wherever it's live, so its block-local value index is simply its
+position in that block's param list (one `SsaLoc` per such block, effective from block entry — no
+per-pc instruction plumbing needed). So an optimized LLVM build's **function parameters** are named,
+typed, and inspectable via the same location-list machinery chibicc and wasm use. The honest reality
+of `-Og`/`-O2` is that most *other* locals are optimized to `poison`/constants (no recoverable
+location — the reader skips those); a clang loop accumulator, e.g., is folded to closed form. Tests
+(`translate.rs`): a `-Og` argument ingests as a multi-entry `SsaList` with the `int` type, verifies,
+and **reads back its value at runtime** through the list at a breakpoint. *Not yet:* `dbg.value`
+bindings to non-argument SSA values (instruction results / φ / loop-carried), which need the
+value→ValueId ordinal correlation and the per-pc `SsaLoc.inst` position — a follow-up, of limited
+yield at `-Og` since those values are often optimized away anyway.
+
+(Everything else is built: the chibicc producer incl. optimized-build location lists; both DAP
+consumers over `Window` *and* `WindowVia`; binary serialization; the wasm producer's source lines,
+DWARF pass-through, named variables, and aggregate/pointer/array types; and the LLVM producer's
+source lines, `-O0` `dbg.declare` variable/type ingest, and `-O2`/`-Og` `dbg.value` argument
+location lists. The W4 debug-info waist is exercised end-to-end by **three** independent frontends —
+all three on the source-line half, all three on the variable+type half.)
 
 ### Open questions (S4/S5/S2)
 

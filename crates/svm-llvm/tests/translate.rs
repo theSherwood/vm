@@ -2276,8 +2276,8 @@ fn rust_no_std_matches_native() {
 /// The LLVM on-ramp populates the §6 frontend-neutral debug-info waist's **source-line half** from
 /// each instruction's `!DILocation` — the third independent frontend (after chibicc and the wasm
 /// DWARF producer) to feed the *same* neutral core, the cross-check that the waist isn't coupled to
-/// any one frontend (DEBUGGING.md §6). The variable/type half is blocked on the `llvm-ir` metadata
-/// reader (`MetadataOperand` is payloadless) — its own effort.
+/// any one frontend (DEBUGGING.md §6). (The variable/type half is covered by the `_o0_`/`_og_`
+/// tests; here `n` rides in as an argument var, asserted minimally.)
 #[test]
 fn llvm_dilocation_maps_into_the_debug_info_waist() {
     // A chain of dependent statements over a runtime input: each keeps its own source line and
@@ -2311,15 +2311,13 @@ int chain(int n) {
         "file table names the C source: {:?}",
         di.files
     );
-    // Source lines are mapped onto IR pcs; the variable/type half is empty on this path.
+    // Source lines are mapped onto IR pcs.
     assert!(!di.locs.is_empty(), "some source locations were mapped");
+    // The parameter `n` is ingested via `dbg.value` (the variable half — exercised in depth by the
+    // `_o0_`/`_og_` tests).
     assert!(
-        di.vars.is_empty(),
-        "variable ingest is blocked on the metadata reader"
-    );
-    assert!(
-        di.types.is_empty(),
-        "type ingest is blocked on the metadata reader"
+        di.vars.iter().any(|v| v.name == "n"),
+        "the parameter is ingested"
     );
 
     // Every loc resolves to an in-range IR `(func, block, inst)` — the cross-check that the
@@ -2502,4 +2500,80 @@ int dist(int n) {
     assert_eq!(i32_at(p, 4), n + 1, "p.y");
     // `int row[3]` — element 0 was set to n.
     assert_eq!(i32_at(insp.read_var(0, "row", 4), 0), n, "row[0]");
+}
+
+/// The §6 variable half at **`-O2`/`-Og`**: `llvm.dbg.value` binds a source variable to an SSA
+/// value rather than memory (mem2reg/SROA promoted it). The `di` reader recovers `dbg.value`
+/// bindings to a function **argument** and the translator emits a `VarLoc::SsaList` over the
+/// argument's live range (its block-local index per block) — the LLVM frontend exercising the same
+/// location-list machinery chibicc and wasm use, the case where LLVM's debug intrinsics surviving
+/// optimization make the parameter inspectable for free (DEBUGGING.md slice 26).
+#[test]
+fn llvm_og_ingests_argument_via_dbg_value_ssalist() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+    use svm_ir::{Encoding, TypeDef, VarLoc};
+
+    // A loop keeps `n` live across multiple blocks, so the SsaList spans more than the entry block.
+    let src = "\
+int scaled(int n) {
+  int total = 0;
+  for (int k = 0; k < 4; k++)
+    total += n;
+  return total;
+}
+";
+    let Some(bc) = compile_to_bc_g("og_arg", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    // `n` (the argument) is ingested as a typed SSA-located var with at least one location-list
+    // entry (no `Window` slot — it was promoted to a register).
+    let n_var = di.vars.iter().find(|v| v.name == "n").unwrap_or_else(|| {
+        panic!(
+            "n ingested: {:?}",
+            di.vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+        )
+    });
+    let VarLoc::SsaList(locs) = &n_var.loc else {
+        panic!("n is an SsaList var, got {:?}", n_var.loc);
+    };
+    assert!(!locs.is_empty(), "n has location-list entries");
+    for l in locs {
+        assert!(
+            (l.block as usize) < t.module.funcs[0].blocks.len(),
+            "entry block in range"
+        );
+    }
+    assert!(matches!(
+        &di.types[n_var.type_id.expect("typed") as usize],
+        TypeDef::Base {
+            encoding: Encoding::Signed,
+            size: 4,
+            ..
+        }
+    ));
+
+    // Runtime: stop in the entry block and read `n` back through the SsaList → the argument value.
+    let n = 7i32;
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    // The first entry-block instruction is a step point with the argument already live.
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped in entry"
+    );
+    assert_eq!(
+        insp.read_var(0, "n", 4),
+        Some(VarValue::Value(Value::I32(n))),
+        "n reads the arg"
+    );
 }
