@@ -653,14 +653,15 @@ guest).
 
 **Sub-phases.** 3.1 — freeze/thaw **one fiber, single vCPU, interpreter-only** (isolates
 "continuation in a shadow stack" from thread coordination). *In progress:* the transform
-now recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'd
-module is **NORMAL-inert** under instrumentation + verifies (`svm-durable/tests/fiber.rs`);
-still to wire — the fiber resume arms (re-issue `cont.resume`; **re-park** a `suspend`),
-per-fiber shadow stacks, and the freeze driver that flattens an idle parked fiber (switch
-into it under `UNWINDING` so its post-suspend poll unwinds it with no forward progress).
-Those arms currently fail closed (trap), so a fiber *thaw* is not yet possible. 3.2 —
-multi-vCPU quiesce + per-context layout. 3.3 — JIT parity (drive real OS threads to
-safepoints; respect the D57 single-owner protocol). Phase 4 — back-edge polls for bounded
+recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'd module is
+**NORMAL-inert** under instrumentation + verifies (`svm-durable/tests/fiber.rs`); the
+**per-fiber shadow-stack layout + shadow-SP swap landed** (slice 3.1.1, below). Still to
+wire — the fiber resume arms (re-issue `cont.resume`; **re-park** a `suspend`) and the freeze
+driver that flattens an idle parked fiber (switch into it under `UNWINDING` so its
+post-suspend poll unwinds it with no forward progress). Those thaw arms currently fail closed
+(trap), so a fiber *thaw* is not yet possible. 3.2 — multi-vCPU quiesce + per-context layout.
+3.3 — JIT parity (drive real OS threads to safepoints; respect the D57 single-owner protocol;
+**replicate the swap** in the JIT's fiber-switch path). Phase 4 — back-edge polls for bounded
 latency.
 
 #### 3.1 implementation plan (next-session pickup)
@@ -669,17 +670,41 @@ Done: the transform recognizes the fiber ops + NORMAL-inert (PR #27, branch
 `claude/durable-phase3-design`, commit `4403d41`). The remaining 3.1 slices, in order,
 each a small reviewable commit on the interpreter only:
 
-1. **Per-fiber shadow-stack layout + shadow-SP swap.** Generalize the durable reserve
-   from one shadow stack to one **per fiber/context**. Keep the *active* shadow-SP at the
-   fixed `SHADOW_SP_OFF` (so the transform's existing `SHADOW_SP_OFF` reads are unchanged),
-   and have the fiber switch save/restore it to/from a per-fiber saved slot keyed by the
-   fiber handle (the §12.7 "swapped alongside on fiber switch"). Decide the in-window
-   layout: a per-fiber region `[base_i, base_i+stack_size)` + a saved-`shadow_SP_i` word,
-   indexed by fiber slot, inside `[0, DURABLE_RESERVE)`. The transform emits the
-   save/restore around `cont.resume`/`suspend`; `cont.new` allocates the new fiber's
-   region. Test: existing single-vCPU durable tests still pass (root = context 0), and two
-   fibers get **distinct** shadow regions (no collision). *Touches `svm-durable` (emit the
-   swap) + the interp's `cont.*` execution (allocate/track the region) — `svm-interp`.*
+1. **[DONE] Per-fiber shadow-stack layout + shadow-SP swap — the runtime maintains the
+   swap (D-fiber-cont option A), *not* the transform.** Generalizes the durable reserve from
+   one shadow stack to one **per fiber/context**: context `i` owns `[SHADOW_BASE +
+   i*SHADOW_STRIDE, +SHADOW_STRIDE)` within `[0, DURABLE_RESERVE)` (root = context 0; fiber
+   slot `s` = context `s+1`). The *active* shadow-SP stays at the fixed `SHADOW_SP_OFF`, and
+   the **interpreter's `cont.*` execution** save/restores it to/from a per-context saved slot
+   on every fiber switch (`shadow_switch` in `svm-interp`, called from the `cont.resume`,
+   `suspend`, and fiber base-frame `Return` arms); `cont.new` assigns the new fiber's region
+   (refusing — clean `FiberFault` — if the reserve is full). A non-running context's saved-SP
+   lives host-side (the root's on `VCpu::root_shadow_sp`, a fiber's in the registry's parallel
+   `shadow` table); the running context's live SP is the in-window word the instrumented IR
+   maintains.
+
+   **Why option A (not "the transform emits the swap").** The switch knowledge lives in the
+   runtime's resume chain. Two of the three switch points (`cont.resume`, `suspend`) are
+   visible IR ops, but the third — a fiber's **base-frame `Return`** — is a `Return`
+   terminator statically indistinguishable from an ordinary intra-fiber call return, so the
+   transform *cannot* emit its swap; only the interp (which knows it is a base return) can.
+   Emitting the resume/suspend swaps in IR would also force reconstructing the resumer chain
+   in guest memory (the interp already has it). Option A handles all three points, keeps the
+   transform simple, and costs only that the JIT must replicate the ~3-site swap in its own
+   fiber-switch path in 3.3 (guarded by the cross-backend artifact-equality property). Cost
+   acknowledged: the layout constants (`SHADOW_SP_OFF`/`SHADOW_BASE`/`DURABLE_RESERVE`) are
+   now duplicated across the TCB `svm-interp` and tooling `svm-durable` — cross-checked by
+   `svm-durable/tests/layout_abi.rs` so they can't drift.
+
+   Gated on a domain-level `Host::set_durable` flag (propagated to every vCPU by `drive`), so
+   a non-durable fiber run never touches the reserve. Tests: existing single-vCPU durable
+   tests still pass (root = context 0); `svm/tests/durable_fibers.rs` proves two fibers get
+   **distinct** regions (a host-fn probes the active shadow-SP from inside each context) and
+   that a non-durable run leaves the reserve untouched. *Touched only `svm-interp` (the swap +
+   region tracking) — the transform is unchanged.* **Open sub-question deferred:** the
+   transform's shadow-overflow guard still trips at the global `DURABLE_RESERVE`, not a
+   per-region bound, so a fiber recursed past `SHADOW_STRIDE` could grow into a neighbor's
+   region before tripping — harmless for shallow fibers, fixed alongside the sizing decision.
 
 2. **`Resume` thaw arm** (`cont.resume`, resumer side). Mirror `SuspendKind::Propagated`'s
    re-issue, but emit `Inst::ContResume { k, arg }` (operands reloaded from the spilled
@@ -709,11 +734,14 @@ each a small reviewable commit on the interpreter only:
    (§12.4); restore rebuilds the registry and re-parks. Add to `svm-snapshot` + a
    `durable`-style test; fold into the `durable_fuzz` generator once stable.
 
-Then 3.2 (multi-vCPU) and 3.3 (JIT parity) as above. **Open sub-questions to resolve in
-slice 1:** per-fiber shadow-stack *size* + quota accounting (§6/§12.7); how a fiber handle
-maps to its region offset (dense slot index × stride?); and whether the resume chain depth
-needs explicit recording or falls out of per-fiber rewind (likely the latter — each fiber
-rewinds its own shadow stack independently).
+Then 3.2 (multi-vCPU) and 3.3 (JIT parity) as above. **Slice-1 sub-questions, now settled:**
+a fiber handle maps to its region by **dense slot index × stride** (`context i = slot+1`,
+base `SHADOW_BASE + i*SHADOW_STRIDE`); the resume chain depth needs **no explicit recording**
+— each fiber's saved-SP is tracked independently (registry `shadow` table + the root's
+`root_shadow_sp`), so per-fiber rewind falls out. **Still open:** per-fiber shadow-stack
+*size* + quota accounting (slice 1 uses a provisional 4 KiB `SHADOW_STRIDE`, ~15 contexts),
+and with it the per-region overflow bound (the guard still uses the global `DURABLE_RESERVE`
+ceiling — see slice 1 above).
 
 ---
 

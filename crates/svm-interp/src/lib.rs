@@ -1300,6 +1300,9 @@ fn drive(
     // B2 `install`: the table reservation the root vCPU builds its dispatch table with (must
     // equal the JIT's `table_reserve_log2`). Read before the host is moved into the Arc below.
     let jit_table_log2 = host.jit_table_log2();
+    // Durability is a domain property (DURABILITY.md §12.8): every vCPU of a durable run maintains
+    // the per-context shadow-SP swap. Read before the host moves into the shared Arc.
+    let durable = host.is_durable();
     let sched = Arc::new(Scheduler::new(quota.max_vcpus, workers));
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
@@ -1327,7 +1330,7 @@ fn drive(
                        // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
                        // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
         let dt = Arc::new(DomainTable::new(&funcs, jit_table_log2));
-        let root = Box::new(VCpu::new(
+        let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
             entry,
             args,
@@ -1340,6 +1343,7 @@ fn drive(
             quota,
             dt,
         ));
+        root.durable = durable;
         s.runnable.push_back(root);
         id
     };
@@ -3235,6 +3239,92 @@ impl SchedDriver {
     }
 }
 
+// ---- Durable runtime ABI (DURABILITY.md §12.7/§12.8) ----
+//
+// These describe where a **durable** (freeze/thaw-instrumented) module's per-context shadow
+// state lives in the window. They are the runtime half of a contract whose tooling half is
+// `svm-durable`: the transform emits IR that reads/writes the *active* shadow-SP word at
+// [`SHADOW_SP_OFF`]; the runtime (here) keeps that word pointing at the **currently-running
+// context's** shadow region, swapping it on every fiber switch (D-fiber-cont option A — the
+// switch knowledge lives in the runtime's resume chain, not in emitted IR). `svm-interp` is
+// TCB and must not depend on the tooling-tier `svm-durable`, so these constants are duplicated
+// and cross-checked against `svm_durable`'s in that crate's tests.
+//
+// Per-context layout: context `i` owns the shadow region `[SHADOW_BASE + i*SHADOW_STRIDE, +
+// SHADOW_STRIDE)`, all within the reserved low slice `[0, DURABLE_RESERVE)`. The root
+// computation is context 0 (so a single-context run is byte-identical to the pre-fiber layout,
+// whose lone shadow stack started at `SHADOW_BASE`); a `cont.new`-created fiber in registry
+// slot `s` is context `s + 1`.
+
+/// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
+/// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
+/// on each fiber switch. Must equal `svm_durable::SHADOW_SP_OFF`.
+pub const SHADOW_SP_OFF: u64 = 8;
+/// Window byte offset where **context 0's** (the root's) shadow stack begins. Must equal
+/// `svm_durable::SHADOW_BASE`.
+pub const SHADOW_BASE: u64 = 64;
+/// Per-context shadow-stack stride: context `i` occupies `[SHADOW_BASE + i*SHADOW_STRIDE, +
+/// SHADOW_STRIDE)`. 4 KiB per context fits ~15 contexts in the 64 KiB reserve — a provisional
+/// slice-1 value; precise per-fiber sizing + quota accounting is the open §12.8 sub-question.
+///
+/// NOTE (slice-1 limitation): the transform's shadow-overflow guard still trips at the global
+/// `DURABLE_RESERVE` ceiling, not at a per-region bound, so a fiber recursed deeper than
+/// `SHADOW_STRIDE` would grow into the next context's region before tripping. Shallow fibers
+/// (every test today) stay confined; making the overflow bound per-region travels with the
+/// sizing decision.
+pub const SHADOW_STRIDE: u64 = 1 << 12;
+/// Ceiling of the reserved durable region `[0, DURABLE_RESERVE)`. Must equal
+/// `svm_durable::DURABLE_RESERVE`.
+pub const DURABLE_RESERVE: u64 = 1 << 16;
+
+/// The shadow-region base (window offset) of context `ctx_idx` (root = 0, fiber slot `s` =
+/// `s + 1`). The per-context partition that keeps two fibers' frozen frames from colliding.
+fn shadow_region_base(ctx_idx: usize) -> u64 {
+    SHADOW_BASE + ctx_idx as u64 * SHADOW_STRIDE
+}
+
+/// Whether context `ctx_idx`'s shadow region fits within the reserve — the capacity bound
+/// `cont.new` checks before handing out a new fiber's region.
+fn shadow_region_fits(ctx_idx: usize) -> bool {
+    shadow_region_base(ctx_idx) + SHADOW_STRIDE <= DURABLE_RESERVE
+}
+
+/// Re-point the active shadow-SP word from the outgoing context's region to the incoming one's,
+/// on a fiber switch (D-fiber-cont option A). A no-op unless the run is `durable` and has a
+/// window. The saved-SP of each *non-running* context lives host-side (the root's in
+/// [`VCpu::root_shadow_sp`], a fiber's in the registry's `shadow` table); the running context's
+/// live SP is the in-window word the instrumented IR maintains. In `NORMAL` execution the
+/// shadow stacks are empty (frames are pushed only under `UNWINDING`), so a saved SP equals its
+/// region base — but saving/restoring the real word keeps this correct for the freeze/thaw
+/// choreography (slices 3.1.3–4), where a drained fiber carries a non-empty shadow stack.
+fn shadow_switch(
+    mem: &mut Option<Mem>,
+    registry: &FiberRegistry,
+    root_shadow_sp: &mut u64,
+    durable: bool,
+    out_ctx: usize,
+    in_ctx: usize,
+) {
+    if !durable {
+        return;
+    }
+    let Some(m) = mem.as_mut() else { return };
+    // Save the outgoing context's live SP to its host-side slot.
+    let sp = m.durable_get_sp();
+    if out_ctx == ROOT_FIBER {
+        *root_shadow_sp = sp;
+    } else {
+        registry.set_saved_sp(out_ctx, sp);
+    }
+    // Load the incoming context's SP into the active word.
+    let in_sp = if in_ctx == ROOT_FIBER {
+        *root_shadow_sp
+    } else {
+        registry.saved_sp(in_ctx)
+    };
+    m.durable_set_sp(in_sp);
+}
+
 /// Sentinel "fiber slot" for a vCPU's **root computation**, which lives *off-table*: the shared
 /// [`FiberRegistry`] holds only `cont.new`-created fibers, so the first handle of a run is `0` on
 /// both backends (the JIT has always run the root off-table — this is the handle-namespace
@@ -3289,31 +3379,67 @@ enum Claimed {
 /// `Ownership`-word table is slice 3b-ii/3c). The lock is a leaf (nothing else is locked while
 /// it is held) and is touched only by fiber ops, never the execution hot path.
 struct FiberRegistry {
-    mx: Mutex<Vec<RegFiber>>,
+    mx: Mutex<RegState>,
+}
+
+/// The registry's locked state: the fiber slots, plus a parallel **durable shadow** table
+/// (`shadow[s]` = the saved shadow-SP window offset of the fiber in slot `s`, for the
+/// freeze/thaw codec — D-fiber-cont option A). The two vecs grow together in [`create`], so a
+/// slot's index is the same in both. `shadow` is meaningful only for durable runs; a
+/// non-durable run never reads it.
+struct RegState {
+    fibers: Vec<RegFiber>,
+    shadow: Vec<u64>,
 }
 
 impl FiberRegistry {
     fn new() -> FiberRegistry {
         FiberRegistry {
-            mx: Mutex::new(Vec::new()),
+            mx: Mutex::new(RegState {
+                fibers: Vec::new(),
+                shadow: Vec::new(),
+            }),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<RegFiber>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegState> {
         self.mx.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The saved shadow-SP of the fiber in `slot` (its region base if it has never been frozen).
+    /// Out-of-range slots return the root base — they can only arise from a corrupt chain, which
+    /// the surrounding fiber logic already treats as `Malformed`.
+    fn saved_sp(&self, slot: usize) -> u64 {
+        self.lock().shadow.get(slot).copied().unwrap_or(SHADOW_BASE)
+    }
+
+    /// Record the fiber in `slot`'s shadow-SP (called when it stops being the running context).
+    fn set_saved_sp(&self, slot: usize, sp: u64) {
+        let mut t = self.lock();
+        if let Some(s) = t.shadow.get_mut(slot) {
+            *s = sp;
+        }
     }
 
     /// `cont.new`: allocate the next slot — the guest handle — under the §15 quota, which is
     /// **per run** now that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the
     /// off-table root computation, so a quota value admits exactly the creations the JIT's
     /// `fibers.len() + 1 >= max_fibers` check admits for a single-vCPU run.
-    fn create(&self, func: i32, sp: i64, max_fibers: usize) -> Result<i32, Trap> {
+    fn create(&self, func: i32, sp: i64, max_fibers: usize, durable: bool) -> Result<i32, Trap> {
         let mut t = self.lock();
-        if t.len() + 1 >= max_fibers {
+        if t.fibers.len() + 1 >= max_fibers {
             return Err(Trap::FiberFault);
         }
-        t.push(RegFiber::Pending { func, sp });
-        Ok((t.len() - 1) as i32)
+        let slot = t.fibers.len();
+        // A durable fiber needs a distinct shadow region; refuse if the reserve has no room (a
+        // clean `FiberFault`, like exhausting the quota — never an overflow into another
+        // context's region). The fiber's context index is `slot + 1` (the root is context 0).
+        if durable && !shadow_region_fits(slot + 1) {
+            return Err(Trap::FiberFault);
+        }
+        t.fibers.push(RegFiber::Pending { func, sp });
+        t.shadow.push(shadow_region_base(slot + 1)); // fresh region: empty stack at its base
+        Ok(slot as i32)
     }
 
     /// `cont.resume`: resolve the (forgeable) handle — **masked** into the power-of-two-padded
@@ -3325,16 +3451,16 @@ impl FiberRegistry {
     /// later resume sees as an ordinary lost claim.
     fn claim(&self, handle: i32) -> Result<(usize, Claimed), Trap> {
         let mut t = self.lock();
-        let mask = t.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
+        let mask = t.fibers.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
         let slot = (handle as u32 as usize) & mask;
-        if slot >= t.len() {
+        if slot >= t.fibers.len() {
             return Err(Trap::FiberFault);
         }
-        match std::mem::replace(&mut t[slot], RegFiber::Running(None)) {
+        match std::mem::replace(&mut t.fibers[slot], RegFiber::Running(None)) {
             RegFiber::Pending { func, sp } => Ok((slot, Claimed::Start { func, sp })),
             RegFiber::Parked(f) => Ok((slot, Claimed::Live(f))),
             old => {
-                t[slot] = old; // lost: already running (or done) — put it back untouched
+                t.fibers[slot] = old; // lost: already running (or done) — put it back untouched
                 Err(Trap::FiberFault)
             }
         }
@@ -3345,8 +3471,8 @@ impl FiberRegistry {
     /// resume chain is never claimable.
     fn park_resumer(&self, slot: usize, frames: Vec<Frame>) {
         let mut t = self.lock();
-        debug_assert!(matches!(t[slot], RegFiber::Running(None)));
-        t[slot] = RegFiber::Running(Some(frames));
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::Running(Some(frames));
     }
 
     /// Pop back into a parked resumer (its resumee suspended or returned): take its frames; the
@@ -3354,7 +3480,7 @@ impl FiberRegistry {
     fn unpark_resumer(&self, slot: usize) -> Result<Vec<Frame>, Trap> {
         let mut t = self.lock();
         match std::mem::replace(
-            t.get_mut(slot).ok_or(Trap::Malformed)?,
+            t.fibers.get_mut(slot).ok_or(Trap::Malformed)?,
             RegFiber::Running(None),
         ) {
             RegFiber::Running(Some(f)) => Ok(f),
@@ -3366,15 +3492,15 @@ impl FiberRegistry {
     /// vCPU again (the migration point).
     fn park_suspended(&self, slot: usize, frames: Vec<Frame>) {
         let mut t = self.lock();
-        debug_assert!(matches!(t[slot], RegFiber::Running(None)));
-        t[slot] = RegFiber::Parked(frames);
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::Parked(frames);
     }
 
     /// The claimant's current fiber returned: the slot is `Done` (resuming it again faults).
     fn finish(&self, slot: usize) {
         let mut t = self.lock();
-        debug_assert!(matches!(t[slot], RegFiber::Running(None)));
-        t[slot] = RegFiber::Done;
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::Done;
     }
 }
 
@@ -3449,6 +3575,16 @@ struct VCpu {
     /// maintained at fiber switches so the recursion depth bound (`MAX_CALL_DEPTH`) spans all
     /// active fibers without walking the shared registry on every call.
     parked_frames: usize,
+    /// This run executes a **durable** (freeze/thaw-instrumented) module, so the runtime keeps the
+    /// active shadow-SP word ([`SHADOW_SP_OFF`]) pointing at the running context's per-fiber shadow
+    /// region, swapping it on every fiber switch (D-fiber-cont option A, DURABILITY.md §12.8). A
+    /// non-durable run leaves this `false` and never touches the reserve. Set from
+    /// [`Host::is_durable`] by `drive`, inherited by `thread.spawn` children.
+    durable: bool,
+    /// The root computation's saved shadow-SP (window offset) while it is parked resuming a fiber
+    /// — the off-table root's slot in the per-context saved-SP table (a fiber's lives in the
+    /// registry's `shadow`). The root is context 0, so this starts at [`SHADOW_BASE`].
+    root_shadow_sp: u64,
     /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
     mem: Option<Mem>,
     /// The domain's powerbox, **shared** by every vCPU of the run (`Arc<Mutex<Host>>`): a spawned
@@ -3541,6 +3677,8 @@ impl VCpu {
             }],
             root_parked: None,
             parked_frames: 0,
+            durable: false,
+            root_shadow_sp: SHADOW_BASE,
             mem,
             host,
             fuel,
@@ -3596,6 +3734,8 @@ impl VCpu {
             }],
             root_parked: None,
             parked_frames: 0,
+            durable: false,
+            root_shadow_sp: SHADOW_BASE,
             mem,
             host,
             fuel,
@@ -3766,6 +3906,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         frames,
         root_parked,
         parked_frames,
+        durable,
+        root_shadow_sp,
         mem,
         host,
         fuel,
@@ -3786,6 +3928,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         debug,
     } = v;
     let depth = *depth;
+    let durable = *durable;
     let memop = *memop;
     let fault_yields = *fault_yields;
 
@@ -4531,7 +4674,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::ContNew { func, sp } => {
                     let funcref = as_i32(get(&frames[top].vals, *func)?)?;
                     let stack_base = as_i64(get(&frames[top].vals, *sp)?)?;
-                    let handle = registry.create(funcref, stack_base, spawn_quota.max_fibers)?;
+                    // `durable` runs assign the new fiber a distinct shadow region (and refuse if
+                    // the reserve is full); a non-durable run ignores the region bookkeeping.
+                    let handle =
+                        registry.create(funcref, stack_base, spawn_quota.max_fibers, durable)?;
                     frames[top].vals.push(Value::I32(handle));
                 }
                 // §12 fiber resume: **claim** fiber `k` — any vCPU may, so a fiber suspended on
@@ -4581,6 +4727,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         registry.park_resumer(*cur, parked);
                     }
+                    // Re-point the active shadow-SP from the resumer's region to the target's
+                    // (durable runs only) so a freeze that lands while the target runs spills into
+                    // the target's own region — never the resumer's.
+                    shadow_switch(mem, registry, root_shadow_sp, durable, *cur, target);
                     chain.push(target);
                     *cur = target;
                     *frames = new_frames;
@@ -4594,9 +4744,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::FiberFault); // no resumer (the root cannot suspend)
                     }
                     let v = as_i64(get(&frames[top].vals, *value)?)?;
+                    let leaving = *cur;
                     registry.park_suspended(*cur, std::mem::take(frames));
                     chain.pop();
                     *cur = *chain.last().expect("chain keeps the root");
+                    // Hand the active shadow-SP back to the resumer's region (durable runs only):
+                    // the suspended fiber's SP is saved to its slot so a later resume restores it.
+                    shadow_switch(mem, registry, root_shadow_sp, durable, leaving, *cur);
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {
@@ -4633,7 +4787,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some(rp) = root_parked.as_ref() {
                         gc_scan_frames(rp, lo, hi, &mut roots);
                     }
-                    for fib in registry.lock().iter() {
+                    for fib in registry.lock().fibers.iter() {
                         if let RegFiber::Parked(f) | RegFiber::Running(Some(f)) = fib {
                             gc_scan_frames(f, lo, hi, &mut roots);
                         }
@@ -4692,6 +4846,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         );
                         child.registry = creg;
                         child.memop = memop; // inherit the explorer's memory-op granularity
+                        child.durable = durable; // durability is a domain property (shared window/registry)
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         Box::new(child)
                     });
@@ -4824,9 +4979,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 } else {
                     // A fiber's function returned: hand its single `i64` back to the resumer
                     // with status RETURNED; the fiber is now `Done` (resuming again traps).
+                    let leaving = *cur;
                     registry.finish(*cur);
                     chain.pop();
                     *cur = *chain.last().expect("chain keeps the root");
+                    // Restore the resumer's active shadow-SP (durable runs only). The fiber is
+                    // `Done`, so saving its SP is moot, but `shadow_switch` reads the live word
+                    // before overwriting it — correct whether or not it had unwound frames.
+                    shadow_switch(mem, registry, root_shadow_sp, durable, leaving, *cur);
                     *frames = if *cur == ROOT_FIBER {
                         root_parked.take().ok_or(Trap::Malformed)?
                     } else {
@@ -6319,6 +6479,11 @@ pub struct Host {
     /// W1 replay: when `Some`, serve nondeterministic-input `cap.call`s from this tape (cursor) in
     /// order instead of the live host, so a fresh-powerbox re-execution reproduces the guest's inputs.
     cap_replay: Option<(Arc<[CapRecord]>, usize)>,
+    /// This domain runs a **durable** (freeze/thaw-instrumented) module: `drive` propagates it to
+    /// every vCPU so the runtime maintains the per-context shadow-SP swap (D-fiber-cont option A,
+    /// DURABILITY.md §12.8). `false` (the default) ⇒ an ordinary run that never touches the
+    /// durable reserve. Set with [`Host::set_durable`] before [`run_with_host`] / friends.
+    durable: bool,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -6415,7 +6580,21 @@ impl Host {
             jit_table_log2: 0,
             cap_record: None,
             cap_replay: None,
+            durable: false,
         }
+    }
+
+    /// Mark this domain **durable**: its module has been freeze/thaw-instrumented, so the runtime
+    /// keeps the per-context shadow-SP word pointing at the running fiber's region (D-fiber-cont
+    /// option A, DURABILITY.md §12.8). Set before handing the host to [`run_with_host`] /
+    /// [`run_capture_reserved_with_host`]. A non-durable run leaves the reserve untouched.
+    pub fn set_durable(&mut self, durable: bool) {
+        self.durable = durable;
+    }
+
+    /// Whether this domain runs a durable module (see [`Host::set_durable`]). Read by `drive`.
+    pub fn is_durable(&self) -> bool {
+        self.durable
     }
 
     /// Begin recording the nondeterministic capability **inputs** crossing into the guest, so a
@@ -8426,6 +8605,21 @@ impl Mem {
             self.set_byte(base + ptr + k as u64, *b);
         }
         Some(())
+    }
+
+    /// The durable **active shadow-SP** word at [`SHADOW_SP_OFF`] (the running context's
+    /// shadow-stack pointer). Read/written by the runtime on a fiber switch to keep it pointing at
+    /// the current context's region (D-fiber-cont option A). Falls back to [`SHADOW_BASE`] if the
+    /// word's page is somehow uncommitted (a malformed durable window) — `set` then no-ops.
+    fn durable_get_sp(&self) -> u64 {
+        self.read_bytes_impl(SHADOW_SP_OFF, 8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(SHADOW_BASE)
+    }
+
+    fn durable_set_sp(&mut self, sp: u64) {
+        let _ = self.write_bytes_impl(SHADOW_SP_OFF, &sp.to_le_bytes());
     }
 
     fn read_le(&self, base: u64, width: u32) -> u64 {
