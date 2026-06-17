@@ -11,7 +11,8 @@
 //! 3.1.4–5) — so these tests pin verification + NORMAL-inertness + the arm wiring, structurally.
 
 use svm_durable::{
-    init_durable_window, transform_module, write_state, STATE_REWINDING, STATE_UNWINDING,
+    init_durable_window, transform_module, transform_module_assume_confined, write_state,
+    STATE_REWINDING, STATE_UNWINDING,
 };
 use svm_interp::{
     run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_SP_OFF, SHADOW_STRIDE,
@@ -303,5 +304,131 @@ block0(v0: i64, v1: i64):
         rt.expect("thaw runs to completion"),
         want,
         "freeze → thaw reproduces the uninterrupted result"
+    );
+}
+
+/// Phase-3 slice 3.2 (active-resume-chain): a fiber that's **running** (mid-`cap.call`), not idle,
+/// when freeze lands. Unlike a parked fiber (flattened by the driver), this one unwinds *in place*
+/// during the root's run — its base-frame return happens under UNWINDING — and must be captured as
+/// `Frozen` + residue (not `Done`), so a thaw re-seeds it and it rewinds at its leaf point and runs
+/// **forward** (the active analogue of an idle fiber's re-park). The fiber does a clock `cap.call`
+/// then returns; freezing mid-call must **reload** the saved clock value on thaw, not re-issue it.
+///
+/// The clock handle reaches the fiber through guest memory (`transform_module_assume_confined`),
+/// since the fiber entry's `i64` args can't be narrowed to the `i32` cap handle without a conversion
+/// op the transform doesn't model.
+#[test]
+fn active_resume_chain_fiber_freezes_and_thaws() {
+    // Root stashes the clock handle at the first guest byte, then resumes F. F loads the handle,
+    // calls the clock, and returns clock + 5 — no `suspend`, so at freeze F is *running*.
+    const SRC: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 65536
+  i32.store v1 v0
+  v2 = ref.func 1
+  v3 = i64.const 4096
+  v4 = cont.new v2 v3
+  v5 = i64.const 0
+  v6, v7 = cont.resume v4 v5
+  return v7
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65536
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 5
+  v7 = i64.add v5 v6
+  return v7
+}
+"#;
+    let mut m = svm_text::parse_module(SRC).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    // The guest uses linear memory (the handle stash), so transform on the cooperating-toolchain
+    // path; the stash is above the durable reserve.
+    let inst = transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Uninterrupted baseline: clock starts at 42 → F returns 42 + 5 = 47.
+    let want = {
+        let mut h = Host::new();
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut h,
+        );
+        r.expect("uninterrupted")
+    };
+    assert_eq!(want, vec![Value::I64(47)], "uninterrupted: clock 42 + 5");
+
+    // Freeze: UNWINDING from the start — F runs the cap.call, then its poll unwinds it *in place*
+    // (it never reaches its real return). Capture the window + the active-chain fiber's residue.
+    let (frozen, snap, clock_after) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut win = init_durable_window(WINDOW);
+        write_state(&mut win, STATE_UNWINDING);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+        (h.frozen_fibers().to_vec(), snap, h.clock_ns)
+    };
+    assert_eq!(
+        frozen.len(),
+        1,
+        "the active (mid-cap.call) fiber was captured as Frozen, not dropped as Done"
+    );
+    assert!(
+        clock_after > 42,
+        "the freeze actually called the clock once"
+    );
+
+    // Thaw on a host whose clock has *advanced* (clock_after): the fiber must reload the saved 42,
+    // not re-issue the clock (which would yield clock_after + 5). Re-seed the fiber and re-enter.
+    let r_thaw = {
+        let mut win = snap.clone();
+        write_state(&mut win, STATE_REWINDING);
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = clock_after;
+        let clk = h.grant_clock();
+        h.set_frozen_fibers(frozen);
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        r
+    };
+    assert_eq!(
+        r_thaw,
+        Ok(want),
+        "thawed active-chain fiber reloads the saved clock (47), not a re-issued one"
     );
 }

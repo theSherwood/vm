@@ -3701,6 +3701,17 @@ impl FiberRegistry {
         t.fibers[slot] = RegFiber::Done;
     }
 
+    /// Freeze (slice 3.2 active-chain): the running fiber base-returned **while unwinding for a
+    /// freeze** (state == UNWINDING), so it didn't really finish — its continuation now lives in its
+    /// shadow region. Mark the slot `Frozen` (re-enterable on thaw, *not* `Done`) and record its
+    /// flattened shadow-SP, so the residue + a thaw re-seed reconstruct it like an idle-parked fiber.
+    fn freeze_active(&self, slot: usize, shadow_sp: u64) {
+        let mut t = self.lock();
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::Frozen;
+        t.shadow[slot] = shadow_sp;
+    }
+
     /// Freeze driver (slice 3.1.4): take the lowest still-`Parked` fiber's frames and mark its slot
     /// `Frozen`, so the driver can flatten it into its shadow region and not revisit it. Returns
     /// `(slot, frames)`, or `None` once every fiber is flattened (no `Parked` slot remains).
@@ -4211,7 +4222,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         parked_frames,
         durable,
         root_shadow_sp,
-        frozen: _, // populated by `freeze_drive` (a `&mut self` method), not the run loop
+        frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         mem,
         host,
         fuel,
@@ -5274,7 +5285,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
             Terminator::Return(out) => {
                 let results = collect(&frames[top].vals, out)?;
-                frames.pop();
+                let popped = frames.pop();
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
                     caller.vals.extend(results);
@@ -5282,9 +5293,48 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     return Ok(Inner::Done(results)); // the root returned: this vCPU is done
                 } else {
                     // A fiber's function returned: hand its single `i64` back to the resumer
-                    // with status RETURNED; the fiber is now `Done` (resuming again traps).
+                    // with status RETURNED; the fiber is now `Done` (resuming again traps) —
+                    // **unless** this is a freeze-unwind (durable + UNWINDING): then the fiber is
+                    // mid-resume-chain and unwound *for freeze*, not a real return, so capture its
+                    // residue and mark it `Frozen` (re-enterable on thaw) instead of `Done`. Its
+                    // continuation is already flattened into its shadow region; on thaw the resumer
+                    // re-issues `cont.resume`, the fiber rewinds at its in-flight (leaf/propagated)
+                    // point and runs *forward* — the active-chain analogue of an idle fiber's re-park.
                     let leaving = *cur;
-                    registry.finish(*cur);
+                    // Distinguish a freeze-unwind from a genuine return under UNWINDING: an unwound
+                    // fiber spilled frames into its shadow region (`shadow_sp` past the region base),
+                    // whereas a non-instrumented fiber that truly returned left it empty. Only the
+                    // former is `Frozen` (an instrumented fiber always unwinds at a poll before its
+                    // real return, so this never mis-classifies one that should be `Done`).
+                    let shadow_sp = mem
+                        .as_ref()
+                        .map(|m| m.durable_get_sp())
+                        .unwrap_or(SHADOW_BASE);
+                    let region_base = shadow_region_base(shadow_context_index(leaving));
+                    let freezing = durable
+                        && shadow_sp > region_base
+                        && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+                    if freezing {
+                        let (func, sp) = match popped.as_ref() {
+                            Some(f) => (
+                                f.func as i32,
+                                match f.vals.first() {
+                                    Some(Value::I64(x)) => *x,
+                                    _ => 0,
+                                },
+                            ),
+                            None => (0, 0),
+                        };
+                        registry.freeze_active(*cur, shadow_sp);
+                        frozen.push(FrozenFiber {
+                            slot: leaving,
+                            func,
+                            sp,
+                            shadow_sp,
+                        });
+                    } else {
+                        registry.finish(*cur);
+                    }
                     chain.pop();
                     *cur = *chain.last().expect("chain keeps the root");
                     // Restore the resumer's active shadow-SP (durable runs only). The fiber is

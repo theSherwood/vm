@@ -728,10 +728,22 @@ before re-entering under `REWINDING` (`fiber_rt::seed_frozen_fibers` builds each
 to a **byte-identical §12 artifact** (window image + Section-2 residue), and an **interpreter-frozen
 fiber artifact** restored through the codec **thaws on the JIT** to the uninterrupted result (107).
 So a fiber'd durable domain now freezes, serializes, restores, and thaws **on either backend, in
-either direction**. Remaining JIT-parity-adjacent gaps: the **active-resume-chain** case (a fiber on
-an active chain at the freeze instant, marked done rather than flattened — a shared interp/JIT
-limitation) and multi-vCPU spawned-fiber durability. 3.2 — multi-vCPU quiesce + per-context layout.
-Phase 4 — back-edge polls for bounded latency.
+either direction**.
+
+The **active-resume-chain** gap is now **closed (slice 3.2, both backends)**: a fiber that's
+*running* (mid-`cap.call` / mid-propagated-call / mid-nested-resume), not idle-parked, at the freeze
+instant unwinds *in place* during the root's run — its base-frame return (interp) / `Complete`
+(JIT) happens under `UNWINDING`. Previously such a fiber was marked `Done` and dropped from the
+residue (so it couldn't thaw); now, when it actually unwound (its shadow region is non-empty —
+`shadow_sp > region base`, which cleanly distinguishes a freeze-unwind from a *genuine* return of a
+non-instrumented fiber), it is captured as residue (`Frozen` on the interp) and re-seeded on thaw,
+where it rewinds at its in-flight (leaf/propagated/resume) point and runs **forward** — the active
+analogue of an idle fiber's re-park. Tested both backends incl. **reload-not-reissue** of the
+in-flight `cap.call` (`svm-durable/tests/fiber.rs::active_resume_chain_fiber_freezes_and_thaws`,
+`durable_fibers_jit.rs::interp_frozen_active_chain_fiber_thaws_on_the_jit`).
+
+Remaining: **multi-vCPU** (3.2 proper — per-context state words + cooperative STW; also enables
+spawned-fiber durability) and **Phase 4** back-edge polls for bounded-latency (async) freeze.
 
 #### 3.1 implementation plan (next-session pickup)
 
