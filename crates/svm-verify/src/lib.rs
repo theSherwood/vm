@@ -698,6 +698,11 @@ fn check_inst(
             cx.expect(*a, ValType::V128)?;
             ValType::V128
         }
+        // `i8x16.popcnt`: shape is fixed (i8x16), so there is no lane rule to enforce.
+        Inst::VPopcnt { a } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
         // Saturating add/sub is `i8x16`/`i16x8` only (the wasm spec has no wider sat).
         Inst::VSatBin { shape, a, b, .. } => {
             if !matches!(shape, VShape::I8x16 | VShape::I16x8) {

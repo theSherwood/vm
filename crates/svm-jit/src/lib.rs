@@ -2581,6 +2581,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VShift { .. } => {}
                 // Lane `abs`/`neg` lower to vector `iabs`/`ineg`; Cranelift legalizes every shape.
                 Inst::VIntUn { .. } => {}
+                // `i8x16.popcnt` lowers to a vector `popcnt` (native `cnt` on aarch64, a byte
+                // shuffle sequence on x86 — Cranelift legalizes both).
+                Inst::VPopcnt { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -3631,6 +3634,10 @@ fn lower_block(
                     VIntUnOp::Neg => b.ins().ineg(x),
                 };
                 vcast(b, r, I8X16)
+            }
+            Inst::VPopcnt { a } => {
+                // Canonical vectors are already I8X16, matching the op's fixed shape.
+                b.ins().popcnt(get(&vals, *a)?)
             }
             Inst::VSatBin {
                 shape,

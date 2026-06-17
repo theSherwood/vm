@@ -374,6 +374,21 @@ fn f64x2_pmin_pmax() {
     }
 }
 
+/// `i8x16.popcnt` through the wasm bridge: splat a byte across all lanes, popcount, read lane 0.
+/// Oracle = Rust's `count_ones`; `eval` enforces interp == JIT.
+#[test]
+fn i8x16_popcnt() {
+    let wat = "(module (func (export \"f\") (param $x i32) (result i32)
+                 (i8x16.extract_lane_u 0 (i8x16.popcnt (i8x16.splat (local.get $x))))))";
+    for byte in [0x00u8, 0xFF, 0x01, 0x80, 0xAA, 0x42] {
+        let got = match eval(wat, "f", &[Value::I32(byte as i32)]) {
+            Value::I32(x) => x,
+            _ => unreachable!(),
+        };
+        assert_eq!(got, byte.count_ones() as i32, "popcnt 0x{byte:02x}");
+    }
+}
+
 /// Integer lane shifts through the wasm bridge: one scalar amount (taken mod the lane width) shifts
 /// every lane. Covers `shl`/`shr_s`/`shr_u` and an amount ≥ the lane width.
 #[test]

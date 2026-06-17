@@ -1888,6 +1888,11 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+    /// `i8x16.popcnt`: per-byte population count. `a`/result are `v128`. Shape is always `i8x16`
+    /// (the only shape wasm defines), so no shape field — the verifier needs no lane rule.
+    VPopcnt {
+        a: ValIdx,
+    },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.
     VAnyTrue {

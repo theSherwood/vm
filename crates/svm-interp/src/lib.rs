@@ -5239,6 +5239,14 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_v128(get(vals, *b)?)?,
         )),
+        Inst::VPopcnt { a } => {
+            let v = as_v128(get(vals, *a)?)?;
+            let mut o = [0u8; 16];
+            for i in 0..16 {
+                o[i] = v[i].count_ones() as u8;
+            }
+            Value::V128(o)
+        }
         Inst::VAnyTrue { a } => {
             Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
         }

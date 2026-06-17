@@ -90,6 +90,7 @@ fn simd_text_and_binary_roundtrip() {
           v14 = f32x4.neg v4\n\
           v140 = f32x4.pmin v4 v4\n\
           v141 = f32x4.pmax v4 v4\n\
+          v142 = i8x16.popcnt v2\n\
           v15 = v128.and v2 v3\n\
           v16 = v128.or v2 v3\n\
           v17 = v128.xor v2 v3\n\
@@ -352,6 +353,23 @@ fn diff_f32x4_pminmax_nan() {
             pmax.to_bits(),
             "pmax nan {a} {b}"
         );
+    }
+}
+
+// `i8x16.popcnt` — per-byte population count (`Inst::VPopcnt`, fixed i8x16 shape). Splat a byte
+// pattern across all 16 lanes, read lane 0 back; the oracle is Rust's `count_ones`. `diff1`
+// pins interp == JIT.
+#[test]
+fn diff_i8x16_popcnt() {
+    // Splat the low byte of an i32 across i8x16, popcnt, read lane 0 (unsigned).
+    let s = "func (i32) -> (i32) {\n\
+        block0(v0: i32):\n\
+          v1 = i8x16.splat v0\n\
+          v2 = i8x16.popcnt v1\n\
+          v3 = i8x16.extract_lane_u 0 v2\n  return v3\n}\n";
+    for byte in [0x00u8, 0xFF, 0x01, 0x80, 0xAA, 0x7F, 0x42] {
+        let got = diff1(s, &[Value::I32(byte as i32)]);
+        assert_eq!(got, byte.count_ones() as i64, "popcnt 0x{byte:02x}");
     }
 }
 

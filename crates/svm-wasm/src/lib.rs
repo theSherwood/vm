@@ -1363,6 +1363,12 @@ fn v_anytrue(lo: &mut Lower) -> Result<(), Error> {
     lo.push(v, ValType::I32);
     Ok(())
 }
+fn v_popcnt(lo: &mut Lower) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VPopcnt { a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
 fn v_alltrue(lo: &mut Lower, shape: VShape) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VAllTrue { shape, a });
@@ -2999,6 +3005,7 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         // integer lane abs/neg
         O::I8x16Abs => v_intun(lo, VShape::I8x16, VIntUnOp::Abs)?,
         O::I8x16Neg => v_intun(lo, VShape::I8x16, VIntUnOp::Neg)?,
+        O::I8x16Popcnt => v_popcnt(lo)?,
         O::I16x8Abs => v_intun(lo, VShape::I16x8, VIntUnOp::Abs)?,
         O::I16x8Neg => v_intun(lo, VShape::I16x8, VIntUnOp::Neg)?,
         O::I32x4Abs => v_intun(lo, VShape::I32x4, VIntUnOp::Abs)?,

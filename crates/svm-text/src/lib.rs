@@ -369,6 +369,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::Bitselect { a, b, mask } => format!("v128.bitselect v{a} v{b} v{mask}"),
         Inst::Shuffle { lanes, a, b } => format!("i8x16.shuffle{} v{a} v{b}", byte_list(lanes)),
         Inst::Swizzle { a, b } => format!("i8x16.swizzle v{a} v{b}"),
+        Inst::VPopcnt { a } => format!("i8x16.popcnt v{a}"),
         Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
         Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
         Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
@@ -1556,6 +1557,11 @@ impl<'a> Parser<'a> {
         }
         if op == "v128.any_true" {
             return Ok(Inst::VAnyTrue {
+                a: self.value(names)?,
+            });
+        }
+        if op == "i8x16.popcnt" {
+            return Ok(Inst::VPopcnt {
                 a: self.value(names)?,
             });
         }
