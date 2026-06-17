@@ -1918,6 +1918,22 @@ impl CompiledModule {
             trap_cell.as_ptr(),
         );
 
+        // Durable freeze driver (DURABILITY.md §12.8 slice 3.3.2): on a durable **freeze** run
+        // (state word UNWINDING) the root has now unwound into context 0's shadow region; flatten
+        // every still-parked fiber into its own region before the window is snapshotted, so the
+        // artifact captures their continuations. CURRENT_RT is still the root runtime here. A
+        // flattening fiber touches only the committed reserve, so it's sound outside the guard.
+        // Single-vCPU (Phase 3.2 for multi-vCPU). Skipped on a fault or a non-freeze run.
+        #[cfg(fiber_rt)]
+        if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
+            if let Some(rt) = (*this).fiber_rt.as_mut() {
+                fiber_rt::freeze_drive(
+                    &mut **rt as *mut fiber_rt::FiberRuntime,
+                    trap_cell.as_ptr() as u64,
+                );
+            }
+        }
+
         // ---- Teardown: transient references again. ----
         (*this).live_fault_range = None;
         #[cfg(fiber_rt)]

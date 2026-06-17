@@ -90,6 +90,11 @@ const FIBER_STACK: usize = 1 << 20;
 const SHADOW_SP_OFF: u64 = 8;
 const SHADOW_BASE: u64 = 64;
 const SHADOW_STRIDE: u64 = 1 << 12;
+/// Window byte offset of the durable state word (`NORMAL | UNWINDING | REWINDING`); the freeze
+/// driver reads it to confirm a freeze is in progress. Must match `svm-interp`'s `STATE_OFF`.
+const STATE_OFF: u64 = 0;
+/// State-word value meaning "freeze in progress" (must match `svm-interp`'s `STATE_UNWINDING`).
+const STATE_UNWINDING: i32 = 1;
 
 /// The shadow-region base (window offset) of the fiber in registry `slot` (context `slot+1`).
 fn fiber_region_base(slot: usize) -> u64 {
@@ -105,6 +110,12 @@ unsafe fn read_shadow_sp(mem_base: u64) -> u64 {
 /// Write the active shadow-SP word into the durable window. # Safety: as [`read_shadow_sp`].
 unsafe fn write_shadow_sp(mem_base: u64, sp: u64) {
     *((mem_base + SHADOW_SP_OFF) as *mut u64) = sp;
+}
+
+/// Whether the durable state word is `UNWINDING` (a freeze is in progress) — the entry path's gate
+/// for running the [`freeze_drive`]. # Safety: `mem_base` is a durable run's committed window base.
+pub(crate) unsafe fn window_is_unwinding(mem_base: u64) -> bool {
+    *((mem_base + STATE_OFF) as *const i32) == STATE_UNWINDING
 }
 
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
@@ -211,6 +222,19 @@ impl SharedFiberTable {
             return None;
         }
         Some(Arc::clone(&t[slot]))
+    }
+
+    /// The handles of every **voluntarily-suspended** (`RUNNABLE`) fiber — the parked fibers the
+    /// durable freeze driver flattens (DURABILITY.md §12.8). Collected once: flattening a fiber
+    /// makes zero forward progress (its post-suspend poll unwinds immediately), so it spawns no new
+    /// parked fibers, and it ends `FREE` — the set never grows.
+    fn runnable_handles(&self) -> Vec<i32> {
+        self.lock()
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.own.is_runnable())
+            .map(|(i, _)| i as i32)
+            .collect()
     }
 }
 
@@ -546,6 +570,39 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
         rt.yielders.push(y);
     }
     r as i64
+}
+
+/// **Durable freeze driver** (DURABILITY.md §12.8 slice 3.3.2) — the JIT analogue of the
+/// interpreter's `VCpu::freeze_drive`. Called once the root has unwound under `UNWINDING` (its
+/// native stack drained into context 0's shadow region): flatten every still-**parked**
+/// (`RUNNABLE`) fiber into *its own* shadow region so the window snapshot captures its continuation.
+///
+/// Each parked fiber is resumed (via the ordinary [`fiber_resume`] path, so the shadow-SP swap
+/// points the active word at the fiber's region first): its `suspend` returns, and because the
+/// transform places the poll **immediately** after, that poll fires before any guest code runs →
+/// the fiber unwinds with **zero forward progress**, its guest function returns, and the `Fiber`
+/// *completes* (the slot frees). The exit swap leaves the fiber's flattened shadow-SP in its
+/// `FiberSlot` and restores the root's region, so the captured window is thaw-ready.
+///
+/// Runs **host-side** with `rt` (the root vCPU's runtime) published as [`CURRENT_RT`]. A flattening
+/// fiber touches only the committed durable reserve (state word + its shadow region) — never guest
+/// memory — so no guard page can fault; it is sound to run outside the §5 detect-and-kill guard.
+/// Single-vCPU (slice 3.1/3.3); multi-vCPU stop-the-world quiesce is Phase 3.2.
+///
+/// # Safety
+/// `rt` is the live root runtime (its `mem_base`/`durable` armed for this run); `trap_out` is the
+/// live trap cell. Called at a quiescent safepoint (the root returned), so the table is at rest.
+pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, trap_out: u64) {
+    // The entry path already published `rt` as CURRENT_RT and hasn't restored it yet, but set it
+    // explicitly so the driver is correct independent of caller ordering.
+    let prev = set_current(rt);
+    let table = Arc::clone(&(*rt).table);
+    let mut status: i64 = 0;
+    for handle in table.runnable_handles() {
+        // Resume under the in-progress UNWINDING state word: the fiber flattens itself and returns.
+        fiber_resume(handle, 0, &mut status as *mut i64, trap_out);
+    }
+    set_current(prev);
 }
 
 /// This frame's stack pointer (approximately): the address of a local, slightly **below** the

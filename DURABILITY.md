@@ -710,10 +710,18 @@ brackets a fiber's residency — entry swaps in, exit swaps back, so `fiber_susp
 keyed off a `durable` flag + window base armed on the root `FiberRuntime` at entry and a per-`FiberSlot`
 saved-SP. Gated by `compile_and_run_capture_reserved_with_host_durable`; tested by
 `crates/svm/tests/durable_fibers_jit.rs` (each context routes to its own region, cross-checked
-against `svm_interp`'s `SHADOW_*`). Still ahead: **3.3.2** the JIT freeze driver (resume each parked
-*native* stack under UNWINDING to flatten it — the materially-harder part) and **3.3.3** the
-`FrozenFiber` residue export + the cross-backend fiber freeze/thaw property. 3.2 — multi-vCPU
-quiesce + per-context layout. Phase 4 — back-edge polls for bounded latency.
+against `svm_interp`'s `SHADOW_*`). Slice **3.3.2 landed**: the JIT **freeze driver**
+(`fiber_rt::freeze_drive`, hooked into `run_code_raw` after the root unwinds, gated on the
+`UNWINDING` state word) flattens every still-`RUNNABLE` (parked) fiber into its shadow region by
+resuming it under `UNWINDING` via the ordinary `fiber_resume` path — its post-suspend poll fires
+before any guest code runs, so it unwinds with zero forward progress and its `Fiber` completes. It
+runs host-side and unguarded — a flattening fiber touches only the committed reserve, so no guard
+page can fault. Tested by a **cross-backend freeze comparison** (`jit_freeze_driver_flattens_a_fiber_matching_interp`):
+interp and JIT freeze the same instrumented fiber module into a **byte-identical durable reserve**.
+Still ahead: **3.3.3** the `FrozenFiber` residue export + the full cross-backend fiber freeze→thaw
+property (the active-resume-chain case — a fiber on the chain at freeze, marked done rather than
+flattened — is the shared interp/JIT gap to close there). 3.2 — multi-vCPU quiesce + per-context
+layout. Phase 4 — back-edge polls for bounded latency.
 
 #### 3.1 implementation plan (next-session pickup)
 

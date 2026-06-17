@@ -18,7 +18,11 @@
 
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex};
-use svm_interp::{Host, SHADOW_BASE, SHADOW_SP_OFF, SHADOW_STRIDE};
+use svm_durable::{init_durable_window, transform_module, write_state, STATE_UNWINDING};
+use svm_interp::{
+    run_capture_reserved_with_host, Host, DURABLE_RESERVE, SHADOW_BASE, SHADOW_SP_OFF,
+    SHADOW_STRIDE,
+};
 use svm_jit::{compile_and_run_capture_reserved_with_host_durable, JitOutcome};
 use svm_text::parse_module;
 use svm_verify::verify_module;
@@ -106,5 +110,83 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     assert!(
         a != root && b != root && a != b,
         "per-context regions are distinct (no collision)"
+    );
+}
+
+/// Phase-3 slice 3.3.2: the **JIT freeze driver** flattens a parked fiber into its shadow region
+/// exactly as the interpreter does. Freezing the *same* instrumented fiber module (UNWINDING from
+/// the start) on both backends drives the root's unwind and then flattens the parked fiber; the
+/// resulting durable reserve — both contexts' shadow regions + the state/SP words — must be
+/// **byte-identical** across backends (the same emitted IR spills the same values to the same
+/// offsets), the cross-backend §7 property extended to fibers.
+#[test]
+fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
+    // Pure-arithmetic fiber (no caps → deterministic): root resumes a fiber that suspends once then
+    // would return 7 + 100. Freezing from the start parks the fiber after its suspend.
+    let src = "memory 17\n\
+        func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.const 7\n\
+        \x20 v7, v8 = cont.resume v2 v6\n\
+        \x20 return v8\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 42\n\
+        \x20 v3 = suspend v2\n\
+        \x20 v4 = i64.const 100\n\
+        \x20 v5 = i64.add v3 v4\n\
+        \x20 return v5\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+
+    // Interp freeze: UNWINDING → the root unwinds at resume #1 and the freeze driver flattens the
+    // parked fiber into its region.
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW);
+    write_state(&mut iwin, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(
+        ires.is_ok(),
+        "interp freeze returns a placeholder: {ires:?}"
+    );
+
+    // JIT freeze: the new JIT freeze driver must flatten the same fiber identically.
+    let mut jhost = Host::new();
+    let mut jwin = init_durable_window(WINDOW);
+    write_state(&mut jwin, STATE_UNWINDING);
+    let (jout, jsnap) = compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[],
+        &jwin,
+        &[],
+        WINDOW_LOG2,
+        svm_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+    )
+    .expect("JIT freeze compiles + runs");
+    assert!(
+        matches!(jout, JitOutcome::Returned(_)),
+        "JIT freeze returns a placeholder, got {jout:?}"
+    );
+
+    // The whole durable reserve (control words + both contexts' flattened shadow regions) must
+    // match byte-for-byte: the interp and JIT freeze the fiber into the identical artifact.
+    let reserve = DURABLE_RESERVE as usize;
+    assert_eq!(
+        &isnap[..reserve],
+        &jsnap[..reserve],
+        "interp/JIT freeze the parked fiber into a byte-identical durable reserve"
     );
 }
