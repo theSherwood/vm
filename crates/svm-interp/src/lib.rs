@@ -16,10 +16,10 @@ use std::time::{Duration, Instant};
 
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
-    Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarLoc,
-    DEFAULT_RESERVED_LOG2,
+    FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, SsaLoc,
+    StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
+    VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -1256,44 +1256,72 @@ impl Inspector {
                 .vars
                 .iter()
                 .find(|x| x.func == frame.func && x.name == name)?;
+            // Resolve a location list (S2) at the frame's current pc (nearest-preceding within the
+            // stopped block). `None` ⇒ no covering entry, the var isn't live here.
+            let resolve = |locs: &[SsaLoc]| loclist_value(locs, frame.block, frame.inst);
+            // Read `width` window bytes at `base + off`, directly (not via `read_window`, to avoid
+            // re-locking).
+            let window_read = |base: u64, off: i64| -> Option<VarValue> {
+                let bytes = v
+                    .mem
+                    .as_ref()?
+                    .read_window(base.wrapping_add(off as u64), width)
+                    .ok()?;
+                Some(VarValue::Bytes(bytes))
+            };
             match &var.loc {
                 VarLoc::Ssa { value } => frame
                     .vals
                     .get(*value as usize)
                     .copied()
                     .map(VarValue::Value),
-                // Location list (S2): pick the entry covering the frame's current pc — within the
-                // stopped block, the largest `inst` at-or-before `frame.inst` (nearest-preceding,
-                // like `source_loc`). No covering entry ⇒ the var isn't live here.
-                VarLoc::SsaList(locs) => {
-                    let value = locs
-                        .iter()
-                        .filter(|l| {
-                            l.block as usize == frame.block && l.inst as usize <= frame.inst
-                        })
-                        .max_by_key(|l| l.inst)?
-                        .value;
-                    frame.vals.get(value as usize).copied().map(VarValue::Value)
-                }
+                VarLoc::SsaList(locs) => frame
+                    .vals
+                    .get(resolve(locs)? as usize)
+                    .copied()
+                    .map(VarValue::Value),
                 VarLoc::Window { off } => {
-                    let off = *off;
-                    // Address = data-SP (block param v0) + off; read `width` raw bytes from *this*
-                    // thread's window (read directly, not via `read_window`, to avoid re-locking).
-                    let base = as_i64(*frame.vals.first()?).ok()? as u64;
-                    let bytes = v
-                        .mem
-                        .as_ref()?
-                        .read_window(base.wrapping_add(off as u64), width)
-                        .ok()?;
-                    Some(VarValue::Bytes(bytes))
+                    // Address = data-SP (block param v0) + off.
+                    window_read(as_i64(*frame.vals.first()?).ok()? as u64, *off)
+                }
+                VarLoc::WindowVia { base, off } => {
+                    // Address = (the per-pc base SSA value, e.g. a wasm frame pointer) + off.
+                    let base_val = frame.vals.get(resolve(base)? as usize)?;
+                    window_read(as_i64(*base_val).ok()? as u64, *off)
                 }
             }
         })
         .flatten()
     }
 
-    /// Read SSA value `value_idx` of the frame `frame_from_top` levels up (0 = innermost) of the
-    /// focused thread. This is the S2 `Ssa` resolution: the interpreter holds block-local SSA values
+    /// The window address of a memory-located source variable (`Window` / `WindowVia`), resolved at
+    /// the focused thread's frame `frame_from_top` levels up — the base a debugger uses to expand an
+    /// aggregate or take a member's address. `None` for an SSA-valued var (no memory address) or an
+    /// unmapped/not-yet-live one.
+    pub fn var_addr(&self, frame_from_top: usize, name: &str) -> Option<u64> {
+        let di = self.debug_info.as_ref()?;
+        self.with_focused(|v| {
+            let n = v.frames.len();
+            let frame = v.frames.get(n.checked_sub(1 + frame_from_top)?)?;
+            if frame.module != 0 {
+                return None;
+            }
+            let var = di
+                .vars
+                .iter()
+                .find(|x| x.func == frame.func && x.name == name)?;
+            let base = match &var.loc {
+                VarLoc::Window { off } => as_i64(*frame.vals.first()?).ok()? as u64 + *off as u64,
+                VarLoc::WindowVia { base, off } => {
+                    let idx = loclist_value(base, frame.block, frame.inst)?;
+                    as_i64(*frame.vals.get(idx as usize)?).ok()? as u64 + *off as u64
+                }
+                VarLoc::Ssa { .. } | VarLoc::SsaList(_) => return None,
+            };
+            Some(base)
+        })
+        .flatten()
+    }
     /// by index, so a promoted local is a direct lookup — no debug-build mode needed (DEBUGGING.md
     /// W6).
     pub fn read_ir_value(&self, frame_from_top: usize, value_idx: usize) -> Option<Value> {
@@ -3701,6 +3729,17 @@ impl FiberRegistry {
         t.fibers[slot] = RegFiber::Done;
     }
 
+    /// Freeze (slice 3.2 active-chain): the running fiber base-returned **while unwinding for a
+    /// freeze** (state == UNWINDING), so it didn't really finish — its continuation now lives in its
+    /// shadow region. Mark the slot `Frozen` (re-enterable on thaw, *not* `Done`) and record its
+    /// flattened shadow-SP, so the residue + a thaw re-seed reconstruct it like an idle-parked fiber.
+    fn freeze_active(&self, slot: usize, shadow_sp: u64) {
+        let mut t = self.lock();
+        debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
+        t.fibers[slot] = RegFiber::Frozen;
+        t.shadow[slot] = shadow_sp;
+    }
+
     /// Freeze driver (slice 3.1.4): take the lowest still-`Parked` fiber's frames and mark its slot
     /// `Frozen`, so the driver can flatten it into its shadow region and not revisit it. Returns
     /// `(slot, frames)`, or `None` once every fiber is flattened (no `Parked` slot remains).
@@ -4211,7 +4250,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         parked_frames,
         durable,
         root_shadow_sp,
-        frozen: _, // populated by `freeze_drive` (a `&mut self` method), not the run loop
+        frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         mem,
         host,
         fuel,
@@ -5274,7 +5313,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
             Terminator::Return(out) => {
                 let results = collect(&frames[top].vals, out)?;
-                frames.pop();
+                let popped = frames.pop();
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
                     caller.vals.extend(results);
@@ -5282,9 +5321,48 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     return Ok(Inner::Done(results)); // the root returned: this vCPU is done
                 } else {
                     // A fiber's function returned: hand its single `i64` back to the resumer
-                    // with status RETURNED; the fiber is now `Done` (resuming again traps).
+                    // with status RETURNED; the fiber is now `Done` (resuming again traps) —
+                    // **unless** this is a freeze-unwind (durable + UNWINDING): then the fiber is
+                    // mid-resume-chain and unwound *for freeze*, not a real return, so capture its
+                    // residue and mark it `Frozen` (re-enterable on thaw) instead of `Done`. Its
+                    // continuation is already flattened into its shadow region; on thaw the resumer
+                    // re-issues `cont.resume`, the fiber rewinds at its in-flight (leaf/propagated)
+                    // point and runs *forward* — the active-chain analogue of an idle fiber's re-park.
                     let leaving = *cur;
-                    registry.finish(*cur);
+                    // Distinguish a freeze-unwind from a genuine return under UNWINDING: an unwound
+                    // fiber spilled frames into its shadow region (`shadow_sp` past the region base),
+                    // whereas a non-instrumented fiber that truly returned left it empty. Only the
+                    // former is `Frozen` (an instrumented fiber always unwinds at a poll before its
+                    // real return, so this never mis-classifies one that should be `Done`).
+                    let shadow_sp = mem
+                        .as_ref()
+                        .map(|m| m.durable_get_sp())
+                        .unwrap_or(SHADOW_BASE);
+                    let region_base = shadow_region_base(shadow_context_index(leaving));
+                    let freezing = durable
+                        && shadow_sp > region_base
+                        && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+                    if freezing {
+                        let (func, sp) = match popped.as_ref() {
+                            Some(f) => (
+                                f.func as i32,
+                                match f.vals.first() {
+                                    Some(Value::I64(x)) => *x,
+                                    _ => 0,
+                                },
+                            ),
+                            None => (0, 0),
+                        };
+                        registry.freeze_active(*cur, shadow_sp);
+                        frozen.push(FrozenFiber {
+                            slot: leaving,
+                            func,
+                            sp,
+                            shadow_sp,
+                        });
+                    } else {
+                        registry.finish(*cur);
+                    }
                     chain.pop();
                     *cur = *chain.last().expect("chain keeps the root");
                     // Restore the resumer's active shadow-SP (durable runs only). The fiber is
@@ -10230,6 +10308,16 @@ fn as_i64(v: Value) -> Result<i64, Trap> {
         Value::I64(x) => Ok(x),
         _ => Err(Trap::Malformed),
     }
+}
+
+/// Resolve a debug-info location list (`SsaList` / `WindowVia` base) at pc `(block, inst)`: the
+/// covering entry is the largest `inst` at-or-before within the stopped block (nearest-preceding,
+/// DWARF line-table semantics). `None` ⇒ the var isn't live at this pc.
+fn loclist_value(locs: &[SsaLoc], block: usize, inst: usize) -> Option<u32> {
+    locs.iter()
+        .filter(|l| l.block as usize == block && l.inst as usize <= inst)
+        .max_by_key(|l| l.inst)
+        .map(|l| l.value)
 }
 
 #[inline]

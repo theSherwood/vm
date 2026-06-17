@@ -366,6 +366,16 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
                     write_uleb(out, l.value as u64);
                 }
             }
+            VarLoc::WindowVia { base, off } => {
+                out.push(3);
+                write_uleb(out, base.len() as u64);
+                for l in base {
+                    write_uleb(out, l.block as u64);
+                    write_uleb(out, l.inst as u64);
+                    write_uleb(out, l.value as u64);
+                }
+                write_sleb(out, *off);
+            }
         }
         match v.type_id {
             None => out.push(0),
@@ -1484,6 +1494,21 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
                 }
                 VarLoc::SsaList(locs)
             }
+            3 => {
+                let n = c.count()?;
+                let mut base = Vec::new();
+                for _ in 0..n {
+                    base.push(SsaLoc {
+                        block: c.idx()?,
+                        inst: c.idx()?,
+                        value: c.idx()?,
+                    });
+                }
+                VarLoc::WindowVia {
+                    base,
+                    off: c.sleb()?,
+                }
+            }
             b => return Err(DecodeError::BadVarLoc(b)),
         };
         let type_id = match c.byte()? {
@@ -2133,6 +2158,28 @@ mod debug_tests {
                             value: 4,
                         },
                     ]),
+                    type_id: Some(0),
+                },
+                // A runtime-base window var (wasm/DWARF fbreg case): base loclist + a negative off.
+                VarInfo {
+                    func: 0,
+                    name: "w".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::WindowVia {
+                        base: vec![
+                            SsaLoc {
+                                block: 0,
+                                inst: 0,
+                                value: 4,
+                            },
+                            SsaLoc {
+                                block: 2,
+                                inst: 1,
+                                value: 4,
+                            },
+                        ],
+                        off: -8,
+                    },
                     type_id: Some(0),
                 },
             ],

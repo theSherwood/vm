@@ -730,8 +730,8 @@ AddressSpace). This is the magic-ring-buffer / zero-copy parent↔child data pla
 
 The `<svm.h>` capability/concurrency/GC/JIT/region surface is now **complete** — the LLVM on-ramp has
 full capability parity with the chibicc frontend. The next frontier is the D54 **breadth proof**
-(Milestone 2): the on-ramp consumes *any* LLVM frontend's bitcode, so other languages should run with
-no translator change beyond what the C corpus proved.
+(Milestone 2): the on-ramp consumes *any* LLVM frontend's bitcode, so other languages run with no
+translator change beyond what the C corpus proved.
 
 **Slice AG (DONE) — C++ first light (the breadth proof begins).** A freestanding C++ TU compiled
 `clang++ -O2 -fno-exceptions -fno-rtti` runs **byte-identical to native `clang++`** through the on-ramp
@@ -746,20 +746,44 @@ including **virtual destructors** (the deleting-dtor chain through the vtable). 
   `collect_global_ctors` extracts the ctor funcrefs in priority order; the synthesized `_start` calls
   them (each `(i64 sp) -> ()`) **before** `main`, exactly as native ([basic.start]). A program with
   global ctors now forces a powerbox `_start` even with no other capability use.
-- Tests (`translate.rs`): `cpp_virtual_dispatch_first_light` (a polymorphic shape hierarchy summed via
-  virtual calls), `cpp_new_delete_virtual_dtor_templates` (heap `new`/`delete` + virtual dtor + a
-  template), `cpp_global_constructor_runs_before_main` (a side-effecting global ctor prints before
-  `main`) — all vs native `clang++`. 92 translate tests green, fmt + clippy clean.
+- Tests (`translate.rs`): `cpp_virtual_dispatch_first_light`, `cpp_new_delete_virtual_dtor_templates`
+  (heap `new`/`delete` + virtual dtor + a template), `cpp_global_constructor_runs_before_main` (a
+  side-effecting global ctor prints before `main`) — all vs native `clang++`.
+
+**Slice AH (DONE) — Rust through the on-ramp + non-power-of-two integers (`iN`).** A `no_std`/
+`panic=abort` Rust crate now runs **byte-identical to native `rustc`** — the second non-C frontend.
+- **Toolchain pin (a §2 "pin, don't drift" decision).** `rustc` bundles its own LLVM, so the bitcode
+  version must match our pinned reader (LLVM 18). The container's default `rustc` ships **LLVM 21**
+  (rejected by `llvm-ir`'s `llvm-18`), and re-pinning the *reader* to 21 is blocked here (no
+  `llvm-21-dev`/`llvm-config-21`; `llvm-ir` tops out at LLVM 19). The resolution is the reverse: pin a
+  **Rust 1.81 toolchain (LLVM 18.1)**, which emits bitcode the existing reader accepts — *no re-pin*.
+  (CI must `rustup toolchain install 1.81.0`, as it installs `llvm-18-dev` for the bitcode lane.)
+- **The one real gap, closed: non-power-of-two integers (`iN`).** `clang`/`rustc -O2` SCEV closes a
+  counted loop into a **polynomial with `i33` intermediates** (holding `n·(n-1)·(2n-1)` before a
+  magic-constant divide); slice A had deferred these. Now `val_type` maps `iN` (`33..=64`) to an `i64`
+  container, `operand` materializes `iN` constants canonicalized, and `bin` **masks the result of the
+  de-normalizing ops** (`add`/`sub`/`mul`/`shl`) back to `N` bits — so every `iN` value stays canonical
+  (`mod 2ᴺ` = the exact wrap semantics) and downstream `lshr`/`trunc`/unsigned-compare see clean bits
+  (the §3b widen-and-mask discipline, generalized from the existing `i8`/`i16` narrow collapse).
+  `i128`+ stays a clean `Unsupported`; signed `iN` ops needing a sign-extended container
+  (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) are not yet emitted by the corpus — add on
+  demand. This benefits **optimized C/C++ too** (any frontend's `-O2` produces `iN`).
+- Test: `rust_no_std_matches_native` — the same `compute` (a sum-of-squares, which LLVM closes into the
+  `i33` polynomial) compiled both as a `no_std` lib (→ bitcode → on-ramp, interp == JIT) and as a
+  native std binary (the oracle), agreeing for `n` in `{5, 1000, 46341, 200000, -7}` — values chosen so
+  the `i33` intermediate **overflows 33 bits and wraps**, which only the native differential validates
+  (interp == JIT alone would agree even on a wrong mask). 93 translate tests green, fmt + clippy clean.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
-- [x] **C++ without EH/RTTI** — first light done (slice AG); broaden as gaps surface (multiple
+- [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
+      virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
       inheritance / `this`-adjusting thunks, references, `static`-local guards, …).
-- [ ] **Rust** (`no_std`/panic=abort) — *blocked on a toolchain re-pin:* the container's `rustc`
-      bundles **LLVM 21**, but the on-ramp pins **LLVM 18** (`llvm-ir`'s `llvm-18`), so `rustc`-emitted
-      bitcode is rejected. Needs either an LLVM-18 `rustc` or bumping the pin (a deliberate §2 decision,
-      not a drift) before the Rust breadth proof can run.
+- [x] **Rust** (`no_std`/panic=abort) — runs vs native (slice AH), via the pinned Rust 1.81 (LLVM 18)
+      toolchain + `iN` support. Broaden (`core` data structures, `Option`/`Result`, traits → vtables)
+      as gaps surface.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
+- [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand.
 
 ### Deferred / hard (name them, don't hide them — DESIGN §20) ⚪
 - [ ] **C++ exceptions / unwinding** — `invoke`/`landingpad`/`resume` + `.eh_frame` unwind
@@ -832,3 +856,4 @@ ASan items in HANDOFF.
   `prefer-dynamic` deps); workspace exclusion in the root `Cargo.toml`.
 - The oracle to diff against (Lane B): chibicc `frontend/chibicc/codegen_ir.c` + the running
   demos in `demos/` — wired in at Milestone 1.
+

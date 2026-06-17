@@ -2082,3 +2082,148 @@ extern "C" int main() {
 "#;
     check_cpp_vs_native("cpp_static_init", src, b"");
 }
+
+// ============================================================================================
+// Milestone 2 — Rust through the on-ramp (the D54 breadth headline). `rustc` bundles its own LLVM,
+// so the bitcode version must match our pin (LLVM 18): the container's default `rustc` ships LLVM
+// 21 (rejected by the pinned `llvm-ir`), but a **pinned LLVM-18 Rust toolchain** (1.81, LLVM 18.1)
+// emits bitcode the existing reader accepts — no re-pin needed. A `no_std`/`panic=abort` crate has
+// no EH/unwinding, so it lowers like C. (CI must `rustup toolchain install 1.81.0`, as it installs
+// `llvm-18-dev` for the bitcode lane.)
+// ============================================================================================
+
+/// Compile a `no_std`/`panic=abort` Rust source to legalized **LLVM-18** bitcode via the pinned
+/// Rust 1.81 toolchain (its LLVM 18.1 matches our `llvm-ir` pin). `-O` runs mem2reg/SROA. Returns
+/// `None` (skip) if the toolchain is unavailable.
+fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("svm_llvm_{}_{}.rs", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_rust_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&rs, src).expect("write Rust source");
+    let status = Command::new("rustc")
+        .args([
+            "+1.81.0",
+            "--emit=llvm-bc",
+            "--crate-type=lib",
+            "-C",
+            "panic=abort",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (rustc +1.81.0 unavailable — `rustup toolchain install 1.81.0`)");
+            None
+        }
+    }
+}
+
+/// The body of `compute` (shared by the `no_std` bitcode lib and the native std oracle): a sum of
+/// squares. `clang`/`rustc -O2` closes this loop into a **polynomial with `i33` intermediates** (to
+/// hold `n·(n-1)·(2n-1)` before a magic-constant divide), so it exercises the on-ramp's non-power-of-
+/// two integer support — `i33` held in an `i64`, kept canonical by masking after the de-normalizing
+/// ops. `wrapping_*` matches `-C overflow-checks=off` (LLVM's `nsw`/`nuw` are wrap for us, §3b).
+const RUST_COMPUTE_BODY: &str = "{
+    let mut acc: i32 = 0;
+    let mut i: i32 = 0;
+    while i < n { acc = acc.wrapping_add(i.wrapping_mul(i)); i = i.wrapping_add(1); }
+    acc
+}";
+
+/// Run `compute(n)` through the on-ramp (a `no_std`/`panic=abort` lib → LLVM-18 bitcode → translate →
+/// both backends), asserting interp == JIT, and return the result. `None` if the toolchain is absent.
+fn rust_compute_onramp(n: i32) -> Option<i32> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
+         #[no_mangle] pub extern \"C\" fn compute(n: i32) -> i32 {RUST_COMPUTE_BODY}\n"
+    );
+    let bc = compile_rust_to_bc("rs_compute", &src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated Rust IR");
+    // A `no_std` lib has no `main`/powerbox; the panic handler (`rust_begin_unwind`, a `loop {}`) is
+    // also defined (at index 0), so locate `compute` by its IR signature `(i64 sp, i32) -> i32`.
+    let idx = module
+        .funcs
+        .iter()
+        .position(|f| f.params == [ValType::I64, ValType::I32] && f.results == [ValType::I32])
+        .expect("compute present") as u32;
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut fuel = 100_000_000u64;
+    let interp = match svm_interp::run(&module, idx, &full, &mut fuel)
+        .expect("interp run")
+        .as_slice()
+    {
+        [Value::I32(x)] => *x,
+        other => panic!("compute: expected one i32, got {other:?}"),
+    };
+    let slots = vec![t.entry_sp as i64, n as i64];
+    let jit = match svm_jit::compile_and_run(&module, idx, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => s[0] as i32,
+        other => panic!("unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, jit, "compute({n}): interp {interp} vs JIT {jit}");
+    Some(interp)
+}
+
+/// The native oracle: the **same** `compute` body compiled by `rustc 1.81` into a std binary that
+/// prints `compute(n)`, run natively. (A `no_std` lib can't be run directly; std `compute` is the
+/// identical function, so it is the ground truth — incl. the `i33` overflow/wrap path.)
+fn rust_compute_native(n: i32) -> Option<i32> {
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("svm_llvm_{}_rsnat.rs", std::process::id()));
+    let exe = dir.join(format!("svm_llvm_{}_rsnat", std::process::id()));
+    std::fs::write(
+        &rs,
+        format!(
+            "fn compute(n: i32) -> i32 {RUST_COMPUTE_BODY}\n\
+             fn main() {{ println!(\"{{}}\", compute({n})); }}\n"
+        ),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args(["+1.81.0", "-C", "opt-level=2", "-C", "overflow-checks=off"])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    let out = Command::new(&exe).output().expect("run native rust");
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("parse native compute"),
+    )
+}
+
+/// **Rust through the on-ramp — the D54 breadth headline.** A `no_std`/`panic=abort` Rust crate
+/// (a different frontend, its own ABI/lowering) translates and runs with no translator change beyond
+/// the C corpus, given a version-matched toolchain (Rust 1.81 / LLVM 18). The chosen function forces
+/// LLVM's `i33` closed-form (the non-power-of-two integer support added here), and the values include
+/// `n` large enough that the `i33` intermediate **overflows 33 bits and wraps** — caught only by the
+/// native differential (interp == JIT alone would agree even if the masking were wrong). Every value
+/// matches native `rustc`.
+#[test]
+fn rust_no_std_matches_native() {
+    for n in [5i32, 1000, 46341, 200000, -7] {
+        let (Some(svm), Some(native)) = (rust_compute_onramp(n), rust_compute_native(n)) else {
+            return; // toolchain unavailable — skip
+        };
+        assert_eq!(
+            svm, native,
+            "compute({n}): on-ramp {svm} vs native rustc {native} (i33 wrap mismatch?)"
+        );
+    }
+}

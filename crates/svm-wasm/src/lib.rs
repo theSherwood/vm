@@ -36,25 +36,35 @@
 //! **imported** memory are accepted, and the **wasi-threads** ABI lowers to SVM's *native*
 //! `thread.spawn` — a `wasi:thread/spawn` import becomes a real OS-thread vCPU over the shared window
 //! via a synthesized shim (concurrency in the VM, DESIGN §1a; the same bytes `wasmtime-wasi-threads`
-//! runs — `tests/threads.rs`). Still a clean [`Error::Unsupported`] (the niche features typical clang
-//! output doesn't emit): the `table.*` bulk ops and passive *element* segments; imported
-//! table/global/tag; wasi:thread/spawn *alongside* capability imports (the per-thread handle stash);
-//! reference types; multi-memory/multi-table. **Passive data segments + `memory.init`/`data.drop`**
+//! runs — `tests/threads.rs`). Imports spanning multiple capability interfaces bind (one handle per
+//! interface). Still a clean [`Error::Unsupported`] (the niche features typical clang output doesn't
+//! emit): the `table.*` bulk ops and passive *element* segments; imported table/global/tag;
+//! wasi:thread/spawn *alongside* capability imports (the per-thread handle stash); reference types;
+//! multi-memory/multi-table. **Passive data segments + `memory.init`/`data.drop`**
 //! are supported (a constant-offset init unrolls to const-stores of the segment's known bytes).
 
+use std::collections::BTreeMap;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, Edge, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering, StoreOp,
-    Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    Field, FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering,
+    SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp,
+    VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp,
+    ValIdx, ValType, VarInfo, VarLoc,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
+/// DWARF `.debug_info` reader for source-variable ingest (DEBUGGING.md W4 — wasm producer). Public
+/// so it is testable against a real fixture; the transpiler wiring lands in a follow-up slice.
+pub mod dwarf_info;
 mod dwarf_line;
 
 /// Per-operator debug records from lowering: `(code-relative offset, block, inst index)` for the
 /// first IR instruction each wasm operator emits (DEBUGGING.md §6/W4 — mapped onto DWARF line rows).
 type OpLocs = Vec<(u32, u32, u32)>;
+
+/// Per-wasm-local debug records from lowering: `(local index, block, inst, SSA value)` — each change
+/// of a local's holding value, the `SsaList` a DWARF frame-pointer local needs (W4 variable ingest).
+type LocalLocs = Vec<(u32, u32, u32, u32)>;
 
 /// Why a wasm module couldn't be transpiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,8 +110,8 @@ const WASI_THREAD_SPAWN_NAME: &str = "thread-spawn";
 /// `op` field carries its index into the module's import table) rather than an inline `cap.call`; the
 /// embedder resolves the name to a concrete `(type_id, op)` at load (e.g. an `svm-wasi` shim). It is
 /// distinct from the `wasi:thread/spawn` placeholder (`u32::MAX`) and, being `!= u32::MAX`, it counts
-/// as a handle-using capability import in the existing one-handle / one-interface checks — so all
-/// named imports share the single threaded handle (the host grants one capability behind them).
+/// as a handle-using capability import — its handle slot is its module's interface (all named imports
+/// from one module share one handle; distinct modules get distinct handles).
 const NAMED_IMPORT: u32 = u32::MAX - 1;
 /// The export the host calls on a freshly spawned thread: `(func (param $tid i32) (param $start_arg
 /// i32))`. The synthesized spawn shim adapts SVM's `(i64 sp, i64 arg)` thread-entry ABI to it.
@@ -140,13 +150,16 @@ fn val_type(w: W) -> Result<ValType, Error> {
 /// **Host-function imports (the host ABI).** A wasm `(import "<module>" "<name>" (func …))` binds to
 /// an SVM capability by a naming convention: `module` is the decimal capability **`type_id`** and
 /// `name` the decimal **`op`**. A wasm `call` to an import then lowers to `cap.call type_id op` on a
-/// single capability **handle** the transpiler threads as the leading `i32` parameter of every
-/// function (the data-SP trick). The embedder grants the matching capability and passes its handle as
-/// the entry function's leading argument; the transpiler stays pure mechanism (it never interprets the
-/// host semantics — `(type_id, op)` just select an interface/method). v1 threads **one** handle, so
-/// every import must share one `type_id` (methods distinguished by `op`); a non-numeric name, a
-/// table/memory/global import, or imports spanning multiple interfaces is a clean [`Error::Unsupported`]
-/// (real WASI, whose imports are non-numeric, needs a dedicated shim). A no-import module is unchanged.
+/// capability **handle** the transpiler threads as a leading `i32` parameter of every function (the
+/// data-SP trick). The transpiler threads **one handle per distinct import interface** — keyed by the
+/// wasm `module` string, in first-appearance order — so a module spanning N interfaces takes N leading
+/// `i32` params (the multi-handle powerbox ABI; N=0/1 collapse to the no-handle / single-handle case).
+/// The embedder grants one capability per interface and passes their handles as the entry function's
+/// leading arguments, in that same order; the transpiler stays pure mechanism (it never interprets the
+/// host semantics — `(type_id, op)` just select an interface/method). The module string is the
+/// grouping key because it is known at transpile time for both numeric and §7 **named** imports (a
+/// named import — non-numeric, e.g. real WASI — defers its concrete `(type_id, op)` to load, but its
+/// module/slot is fixed here). A table/global/tag import is still a clean [`Error::Unsupported`].
 ///
 /// **Linear-memory growth (`memory.size` / `memory.grow`).** The linear memory sits at window offset 0
 /// (wasm address `a` == window address `a`). When a module uses `memory.grow`, the window reserves the
@@ -196,8 +209,16 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     let mut elements: Vec<(u64, Vec<u32>)> = Vec::new(); // (offset, func indices)
                                                          // Function imports, in import order: each binds to an SVM capability `(type_id, op)` by the naming
                                                          // convention (`module` = decimal type_id, `name` = decimal op) and lowers to a `cap.call`. The
-                                                         // function index space puts imports first, so a wasm index `< imports.len()` is an import.
-    let mut imports: Vec<(u32, u32, FuncType)> = Vec::new();
+                                                         // function index space puts imports first, so a wasm index `< imports.len()` is an import. The 4th
+                                                         // field is the import's **handle slot** — its interface's index in `handle_modules` (`u32::MAX` for
+                                                         // the spawn placeholder, which uses no handle).
+    let mut imports: Vec<(u32, u32, FuncType, u32)> = Vec::new();
+    // Distinct import **modules**, in first-appearance order — the handle-slot map. Each distinct wasm
+    // `module` string is one capability interface threaded as one `i32` handle: a module spanning N
+    // interfaces takes N leading handle params (the multi-handle powerbox ABI). The module string is
+    // the grouping key because it is known at transpile time for both numeric and named imports (a
+    // named import defers its concrete `(type_id, op)` to load, but its module is fixed).
+    let mut handle_modules: Vec<String> = Vec::new();
     // §7 named imports (non-numeric module/name, e.g. real WASI): the module-level import table the
     // `Inst::CallImport`s reference, resolved to concrete capabilities at load. Empty for the numeric
     // host-ABI convention. Parallel to `imports` (a `NAMED_IMPORT` entry's `op` indexes this).
@@ -266,7 +287,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                             return unsup("multiple wasi:thread/spawn imports");
                         }
                         spawn_import = Some(imports.len() as u32);
-                        imports.push((u32::MAX, 0, sig)); // placeholder (type_id unused; never cap-called)
+                        // placeholder (type_id unused; never cap-called; no handle slot)
+                        imports.push((u32::MAX, 0, sig, u32::MAX));
                         continue;
                     }
                     // The binding convention has two forms. (a) **Numeric**: `module` is the decimal
@@ -275,8 +297,18 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     // anything else (e.g. a real WASI `("wasi_snapshot_preview1", "fd_write")`) becomes
                     // a `CallImport "<module>.<name>"` the embedder resolves to a concrete capability
                     // at load — so the transpiler still stays pure mechanism, just deferring the bind.
+                    // The import's handle slot is its module's index in `handle_modules` (one handle
+                    // per distinct interface; methods within an interface share the slot, the op
+                    // distinguishes them). Find-or-assign by the module string.
+                    let slot = match handle_modules.iter().position(|m| m == imp.module) {
+                        Some(i) => i as u32,
+                        None => {
+                            handle_modules.push(imp.module.to_string());
+                            (handle_modules.len() - 1) as u32
+                        }
+                    };
                     match (imp.module.parse::<u32>(), imp.name.parse::<u32>()) {
-                        (Ok(type_id), Ok(op)) => imports.push((type_id, op, sig)),
+                        (Ok(type_id), Ok(op)) => imports.push((type_id, op, sig, slot)),
                         _ => {
                             let name = format!("{}.{}", imp.module, imp.name);
                             let idx = named_imports.len() as u32;
@@ -284,25 +316,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                                 name,
                                 sig: sig.clone(),
                             });
-                            imports.push((NAMED_IMPORT, idx, sig));
+                            imports.push((NAMED_IMPORT, idx, sig, slot));
                         }
-                    }
-                }
-                // v1 threads a single capability handle, so every **capability** import must share one
-                // type_id (one interface, methods distinguished by op); the `wasi:thread/spawn` import
-                // (placeholder `type_id == u32::MAX`) is excluded — it is the native spawn, not a
-                // cap.call. Distinct interfaces would need one handle each — a later slice.
-                let mut cap_type_id: Option<u32> = None;
-                for (t, _, _) in imports.iter().filter(|(t, _, _)| *t != u32::MAX) {
-                    match cap_type_id {
-                        None => cap_type_id = Some(*t),
-                        Some(first) if *t != first => {
-                            return unsup(
-                                "imports spanning multiple capability interfaces (one handle is \
-                                 threaded in v1 — give every import the same module/type_id)",
-                            );
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -535,7 +550,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // `wasi_thread_start` export.
     let spawn_shim = bodies.len() as u32;
     if spawn_import.is_some() {
-        if imports.iter().any(|(t, _, _)| *t != u32::MAX) {
+        if imports.iter().any(|(t, _, _, _)| *t != u32::MAX) {
             return unsup(
                 "wasi:thread/spawn alongside capability imports — needs the per-thread handle stash \
                  (threads-only modules are supported in this slice)",
@@ -567,14 +582,20 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         .iter()
         .map(|&ti| types[ti as usize].clone())
         .collect();
-    let want_locs = debug_line.is_some();
-    // Global `(code-relative offset, func, block, inst)` map for the DWARF→IR pc resolution below.
+    // One capability handle per distinct import interface (module); 0 collapses to a no-handle module,
+    // 1 to the original single-handle ABI. Threaded as N leading `i32` params of every function.
+    let n_handles = handle_modules.len();
+    // Collect debug locations whenever any embedded DWARF is present (source lines *or* variables).
+    let want_locs = !debug_blobs.is_empty();
+    // Global `(code-relative offset, func, block, inst)` map for the DWARF→IR pc resolution below,
+    // and per-(func, local) location records for `WindowVia` frame-pointer bases.
     let mut op_locs: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut local_locs: Vec<(u32, u32, u32, u32, u32)> = Vec::new(); // (func, local, block, inst, val)
     let mut funcs = Vec::with_capacity(bodies.len() + spawn_import.is_some() as usize);
     for (i, body) in bodies.into_iter().enumerate() {
         let ty = &types[func_type_idx[i] as usize];
         let func_idx = funcs.len() as u32; // defined funcs come first, so this is the IR index
-        let (f, flocs) = lower_func(
+        let (f, flocs, local_flocs) = lower_func(
             &ty.0,
             &ty.1,
             &types,
@@ -585,6 +606,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             &body,
             mem64,
             &imports,
+            n_handles,
             &data_segments,
             MemGrow {
                 uses_grow,
@@ -599,6 +621,9 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         funcs.push(f);
         for (off, block, inst) in flocs {
             op_locs.push((off, func_idx, block, inst));
+        }
+        for (local, block, inst, val) in local_flocs {
+            local_locs.push((func_idx, local, block, inst, val));
         }
     }
     // Append the spawn shim (its `thread.spawn` target) for a threaded module.
@@ -627,14 +652,13 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         if !sp.is_empty() || !sr.is_empty() {
             return unsup("start function must have type () -> ()");
         }
-        let has_handle = imports.iter().any(|(t, _, _)| *t != u32::MAX);
         for (_, ir_idx) in exports.iter_mut() {
             if *ir_idx == start_ir {
                 continue; // exporting the start function itself: don't double-run it
             }
             let params = funcs[*ir_idx as usize].params.clone();
             let results = funcs[*ir_idx as usize].results.clone();
-            let wrap = build_start_wrapper(start_ir, *ir_idx, params, results, has_handle);
+            let wrap = build_start_wrapper(start_ir, *ir_idx, params, results, n_handles);
             *ir_idx = funcs.len() as u32;
             funcs.push(wrap);
         }
@@ -670,29 +694,29 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             imports: named_imports,
             // Debug info — map wasm's embedded DWARF `.debug_line` into the §6 waist (D-DBG-7) and
             // carry every `.debug_*` section through as a rich blob.
-            debug_info: build_debug_info(debug_line.as_deref(), op_locs, debug_blobs),
+            debug_info: build_debug_info(debug_line.as_deref(), op_locs, local_locs, debug_blobs),
         },
         exports,
     })
 }
 
 /// Build the §6 debug-info waist from a wasm guest's embedded DWARF: map `.debug_line` rows onto IR
-/// pcs (each line row's code-relative address resolving to the first operator at-or-after it, via
-/// the `op_locs` the lowering recorded), and carry every `.debug_*` section through as a rich blob.
-/// Best-effort: returns `None` only if neither locations nor blobs are present. The verifier ignores
-/// the section (§2a).
+/// pcs, ingest `.debug_info` **source variables** (name, type, and a `WindowVia` location built from
+/// the subprogram's frame-base wasm local), and carry every `.debug_*` section through as a rich
+/// blob. Best-effort: returns `None` only if nothing was recovered. The verifier ignores it (§2a).
 fn build_debug_info(
     debug_line: Option<&[u8]>,
     mut op_locs: Vec<(u32, u32, u32, u32)>,
+    local_locs: Vec<(u32, u32, u32, u32, u32)>,
     blobs: Vec<svm_ir::ProducerBlob>,
 ) -> Option<DebugInfo> {
+    op_locs.sort_by_key(|e| e.0);
     let mut files: Vec<String> = Vec::new();
     let mut locs: Vec<Loc> = Vec::new();
     if let Some(prog) = debug_line.and_then(dwarf_line::parse) {
         if prog.files.len() > 1 {
             // DWARF file indices are 1-based; flatten to a 0-based table for `Loc::file`.
             files = prog.files[1..].to_vec();
-            op_locs.sort_by_key(|e| e.0);
             for row in &prog.rows {
                 if row.end_sequence || row.file == 0 || row.file as usize > files.len() {
                     continue;
@@ -722,16 +746,201 @@ fn build_debug_info(
             }
         }
     }
-    if locs.is_empty() && blobs.is_empty() {
+    // Source variables from `.debug_info` (DEBUGGING.md W4 — wasm variable ingest).
+    let (types, vars) = ingest_variables(&blobs, &op_locs, &local_locs);
+
+    if locs.is_empty() && vars.is_empty() && blobs.is_empty() {
         return None;
     }
     Some(DebugInfo {
         files,
         locs,
-        types: Vec::new(),
-        vars: Vec::new(),
+        types,
+        vars,
         blobs,
     })
+}
+
+/// Ingest `.debug_info` source variables into `(types, vars)`: each DWARF variable's
+/// `(frame_base_local + DW_OP_fbreg)` becomes a `VarLoc::WindowVia` whose base is that local's
+/// recorded `SsaList`, and its `DW_TAG_base_type` becomes a structured `TypeRef`. A subprogram is
+/// matched to its IR function by PC range (via `op_locs`). Empty if there is no parseable
+/// `.debug_info`.
+fn ingest_variables(
+    blobs: &[svm_ir::ProducerBlob],
+    op_locs: &[(u32, u32, u32, u32)],
+    local_locs: &[(u32, u32, u32, u32, u32)],
+) -> (Vec<TypeDef>, Vec<VarInfo>) {
+    let sec = |name: &str| {
+        blobs
+            .iter()
+            .find(|b| b.producer == name)
+            .map(|b| b.bytes.as_slice())
+    };
+    let (Some(info), Some(abbrev)) = (sec(".debug_info"), sec(".debug_abbrev")) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(dw) = dwarf_info::parse(info, abbrev, sec(".debug_str").unwrap_or(&[])) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut types: Vec<TypeDef> = Vec::new();
+    let mut type_ids: BTreeMap<u32, u32> = BTreeMap::new(); // DWARF type-DIE offset → svm TypeId
+    let mut vars: Vec<VarInfo> = Vec::new();
+
+    for sub in &dw.subs {
+        let Some(fb_local) = sub.frame_base_local else {
+            continue; // only the `DW_OP_WASM_location <local>` frame base is supported
+        };
+        let Some(func) = func_for_pc_range(op_locs, sub.low_pc as u32, sub.high_pc as u32) else {
+            continue;
+        };
+        // The frame-base local's location list (its SSA value per pc) becomes the `WindowVia` base.
+        let base: Vec<SsaLoc> = local_locs
+            .iter()
+            .filter(|&&(f, l, _, _, _)| f == func && l == fb_local)
+            .map(|&(_, _, block, inst, value)| SsaLoc { block, inst, value })
+            .collect();
+        if base.is_empty() {
+            continue;
+        }
+        for v in &sub.vars {
+            let type_id = intern_type(&dw, v.type_ref, &mut types, &mut type_ids);
+            let ty = type_id
+                .and_then(|id| types.get(id as usize))
+                .map(type_render_name)
+                .unwrap_or_else(|| "?".to_string());
+            vars.push(VarInfo {
+                func,
+                name: v.name.clone(),
+                ty,
+                loc: VarLoc::WindowVia {
+                    base: base.clone(),
+                    off: v.fbreg,
+                },
+                type_id,
+            });
+        }
+    }
+    (types, vars)
+}
+
+/// The IR function whose code spans `[low, high)` (a DWARF subprogram's PC range), found via the
+/// first recorded operator offset in that range. `op_locs` is sorted by offset.
+fn func_for_pc_range(op_locs: &[(u32, u32, u32, u32)], low: u32, high: u32) -> Option<u32> {
+    let idx = op_locs.partition_point(|e| e.0 < low);
+    op_locs.get(idx).filter(|e| e.0 < high).map(|e| e.1)
+}
+
+/// Intern a DWARF type DIE (by offset) into the structured type table, recursively — base / pointer
+/// / struct+union members / array — returning its `TypeId`. A `typedef` / cv-qualified type is
+/// transparent (resolves to the underlying). Cycle-safe: reserves the id before recursing, so a
+/// self-referential aggregate resolves to itself. `None` for an unmodeled / missing type.
+fn intern_type(
+    dw: &dwarf_info::DwarfInfo,
+    type_ref: u32,
+    types: &mut Vec<TypeDef>,
+    type_ids: &mut BTreeMap<u32, u32>,
+) -> Option<u32> {
+    if let Some(&id) = type_ids.get(&type_ref) {
+        return Some(id);
+    }
+    let dt = dw.types.get(&type_ref)?;
+    // A transparent alias forwards straight to its underlying type.
+    if let dwarf_info::DwarfType::Alias { underlying } = dt {
+        let id = intern_type(dw, (*underlying)?, types, type_ids)?;
+        type_ids.insert(type_ref, id);
+        return Some(id);
+    }
+    // Reserve the id before recursing into members/pointees (cycle safety).
+    let id = types.len() as u32;
+    types.push(TypeDef::Opaque {
+        name: String::new(),
+        size: 0,
+    });
+    type_ids.insert(type_ref, id);
+    let name_of =
+        |types: &[TypeDef], i: Option<u32>| i.map(|i| type_render_name(&types[i as usize]));
+    let resolved = match dt {
+        dwarf_info::DwarfType::Base {
+            name,
+            encoding,
+            size,
+        } => TypeDef::Base {
+            name: name.clone(),
+            encoding: dwarf_encoding(*encoding),
+            size: *size,
+        },
+        dwarf_info::DwarfType::Pointer { pointee, size } => {
+            let pid = (*pointee).and_then(|p| intern_type(dw, p, types, type_ids));
+            let pname = name_of(types, pid).unwrap_or_else(|| "void".to_string());
+            TypeDef::Pointer {
+                name: format!("{pname} *"),
+                pointee: pid.unwrap_or(0),
+                size: *size,
+            }
+        }
+        dwarf_info::DwarfType::Aggregate {
+            kw,
+            name,
+            size,
+            members,
+        } => {
+            let fields = members
+                .iter()
+                .filter_map(|m| {
+                    Some(Field {
+                        name: m.name.clone(),
+                        offset: m.offset,
+                        ty: intern_type(dw, m.type_ref, types, type_ids)?,
+                    })
+                })
+                .collect();
+            let rname = if name.is_empty() {
+                kw.to_string()
+            } else {
+                format!("{kw} {name}")
+            };
+            TypeDef::Aggregate {
+                name: rname,
+                size: *size,
+                fields,
+            }
+        }
+        dwarf_info::DwarfType::Array { elem, count } => {
+            let eid = (*elem).and_then(|e| intern_type(dw, e, types, type_ids));
+            let ename = name_of(types, eid).unwrap_or_else(|| "?".to_string());
+            TypeDef::Array {
+                name: format!("{ename}[{count}]"),
+                elem: eid.unwrap_or(0),
+                count: *count,
+            }
+        }
+        dwarf_info::DwarfType::Alias { .. } => unreachable!("handled above"),
+    };
+    types[id as usize] = resolved;
+    Some(id)
+}
+
+/// Map a DWARF `DW_AT_encoding` byte to the neutral [`svm_ir::Encoding`].
+fn dwarf_encoding(e: u8) -> svm_ir::Encoding {
+    match e {
+        0x02 => svm_ir::Encoding::Bool,
+        0x04 => svm_ir::Encoding::Float,
+        0x07 | 0x08 => svm_ir::Encoding::Unsigned, // unsigned, unsigned_char
+        _ => svm_ir::Encoding::Signed,             // signed, signed_char, address, …
+    }
+}
+
+/// The render name of a structured type (each variant carries one).
+fn type_render_name(t: &TypeDef) -> String {
+    match t {
+        TypeDef::Base { name, .. }
+        | TypeDef::Pointer { name, .. }
+        | TypeDef::Array { name, .. }
+        | TypeDef::Aggregate { name, .. }
+        | TypeDef::Opaque { name, .. } => name.clone(),
+    }
 }
 
 /// Evaluate a global's constant initializer to its little-endian bytes (4 or 8 wide).
@@ -870,16 +1079,16 @@ struct Lower<'a> {
     mem64: bool,
     /// `memory.size`/`memory.grow` lowering config (size-cell offset, page caps).
     mg: MemGrow,
-    /// The single threaded **capability handle** (`i32`, the forgeable index a `cap.call` takes),
-    /// present iff the module has function imports.
-    /// Like the data-SP in the chibicc frontend, it is block param 0 of every block and is prepended
-    /// to every branch's args, so every function can reach it and a wasm `call` to an import lowers to
-    /// a `cap.call` on it. The embedder grants one capability and passes its handle as the entry's
-    /// leading argument.
-    handle: Option<ValIdx>,
-    /// Per function-import (by import index): the `(type_id, op, signature)` its `call` lowers to as a
-    /// `cap.call`. Empty when the module has no imports.
-    imports: &'a [(u32, u32, FuncType)],
+    /// The threaded **capability handles** (`i32`s, the forgeable indices a `cap.call` takes) — one
+    /// per distinct import interface (module). Like the data-SP in the chibicc frontend, they are
+    /// block params `0..N` of every block and are prepended to every branch's args, so every function
+    /// can reach them and a wasm `call` to an import lowers to a `cap.call` on the **right** handle
+    /// (its interface's slot). The embedder grants one capability per interface and passes the handles
+    /// as the entry's leading arguments, in first-appearance order. Empty for a no-import module.
+    handles: Vec<ValIdx>,
+    /// Per function-import (by import index): the `(type_id, op, signature, handle-slot)` its `call`
+    /// lowers to as a `cap.call`. The slot indexes `handles`. Empty when the module has no imports.
+    imports: &'a [(u32, u32, FuncType, u32)],
     /// Number of imported functions: a wasm function index `< n_imp` is an import (→ `cap.call`), else
     /// a defined function at IR index `idx - n_imp`.
     n_imp: usize,
@@ -893,6 +1102,10 @@ struct Lower<'a> {
     /// line rows can be mapped to IR pcs. The file offset where the code section content begins (to
     /// turn file-absolute operator offsets into code-relative ones); 0 ⇒ collection off.
     locs: Vec<(u32, u32, u32)>,
+    /// Per-wasm-local location records `(local, block, inst, value)`: each change of a local's
+    /// holding SSA value (block-entry re-threading + `local.set`/`tee`), the `SsaList` that supplies
+    /// a `WindowVia` base for a DWARF frame-pointer local (DEBUGGING.md W4 — wasm variable ingest).
+    local_locs: Vec<(u32, u32, u32, u32)>,
     code_content_start: usize,
     want_locs: bool,
 }
@@ -943,26 +1156,22 @@ impl Lower<'_> {
             .ok_or_else(|| Error::Parse("operand stack underflow".into()))
     }
 
-    /// Width of the always-threaded prefix every block carries: the capability handle (if any),
-    /// then all locals. The surviving operand stack follows.
+    /// Width of the always-threaded prefix every block carries: the N capability handles, then all
+    /// locals. The surviving operand stack follows.
     fn prefix_len(&self) -> usize {
-        self.handle.is_some() as usize + self.local_types.len()
+        self.handles.len() + self.local_types.len()
     }
-    /// The prefix value list (handle ++ locals) every branch threads, in `cur`'s value space.
+    /// The prefix value list (handles ++ locals) every branch threads, in `cur`'s value space.
     fn prefix_vals(&self) -> Vec<ValIdx> {
         let mut v = Vec::with_capacity(self.prefix_len());
-        if let Some(h) = self.handle {
-            v.push(h);
-        }
+        v.extend_from_slice(&self.handles);
         v.extend_from_slice(&self.locals);
         v
     }
-    /// The prefix types (the i32 capability handle ++ local types).
+    /// The prefix types (the N i32 capability handles ++ local types).
     fn prefix_types(&self) -> Vec<ValType> {
         let mut t = Vec::with_capacity(self.prefix_len());
-        if self.handle.is_some() {
-            t.push(ValType::I32);
-        }
+        t.extend(std::iter::repeat_n(ValType::I32, self.handles.len()));
         t.extend_from_slice(&self.local_types);
         t
     }
@@ -1003,12 +1212,12 @@ impl Lower<'_> {
     /// values become the params after it.
     fn enter(&mut self, blk: usize, stack_types: &[ValType]) {
         self.cur = blk;
-        let p = self.handle.is_some() as ValIdx;
-        if self.handle.is_some() {
-            self.handle = Some(0);
-        }
+        let p = self.handles.len() as ValIdx;
+        // The handles are block params `0..N` of every block.
+        self.handles = (0..p).collect();
         let nl = self.local_types.len() as ValIdx;
         self.locals = (p..p + nl).collect();
+        self.record_locals(); // each local re-enters as its block parameter (DEBUGGING.md W4)
         self.stack = stack_types
             .iter()
             .enumerate()
@@ -1016,6 +1225,25 @@ impl Lower<'_> {
             .collect();
         self.consts.clear(); // SSA values are block-local; constants don't carry across blocks
         self.reachable = true;
+    }
+
+    /// Set wasm local `i` to SSA value `v`, recording the change for the per-local location list.
+    fn set_local(&mut self, i: usize, v: ValIdx) {
+        self.locals[i] = v;
+        if self.want_locs {
+            let inst = self.blocks[self.cur].insts.len() as u32;
+            self.local_locs.push((i as u32, self.cur as u32, inst, v));
+        }
+    }
+
+    /// Record every local's current value at the start of the current block (inst 0) — the
+    /// block-parameter re-threading that makes a local resolvable in each block.
+    fn record_locals(&mut self) {
+        if self.want_locs {
+            for (i, &v) in self.locals.iter().enumerate() {
+                self.local_locs.push((i as u32, self.cur as u32, 0, v));
+            }
+        }
     }
 
     /// The compile-time value of `idx` if it was produced by an `i32.const`/`i64.const` in the
@@ -1048,12 +1276,12 @@ impl Lower<'_> {
     /// and return the SSA values of the `n_extra` trailing loop-private params (in order).
     fn enter_synth(&mut self, blk: usize, below: &[ValType], n_extra: usize) -> Vec<ValIdx> {
         self.cur = blk;
-        let p = self.handle.is_some() as ValIdx;
-        if self.handle.is_some() {
-            self.handle = Some(0);
-        }
+        let p = self.handles.len() as ValIdx;
+        // The handles are block params `0..N` of every block.
+        self.handles = (0..p).collect();
         let nl = self.local_types.len() as ValIdx;
         self.locals = (p..p + nl).collect();
+        self.record_locals();
         let stack_start = p + nl;
         self.stack = below
             .iter()
@@ -1132,17 +1360,17 @@ fn build_start_wrapper(
     target: u32,
     params: Vec<ValType>,
     results: Vec<ValType>,
-    has_handle: bool,
+    n_handles: usize,
 ) -> Func {
     let nparams = params.len() as ValIdx;
     let insts = vec![
-        // call start() — thread the handle if the module has capability imports (start produces no
+        // call start() — thread the N capability handles (block params 0..n_handles; start produces no
         // value, so it doesn't advance the value counter).
         Inst::Call {
             func: start_ir,
-            args: if has_handle { vec![0] } else { vec![] },
+            args: (0..n_handles as ValIdx).collect(),
         },
-        // call the real export with every param in order (handle? ++ wasm params = values 0..nparams);
+        // call the real export with every param in order (handles ++ wasm params = values 0..nparams);
         // its results land at values nparams.. .
         Inst::Call {
             func: target,
@@ -1187,13 +1415,14 @@ fn lower_func(
     table_base: u64,
     body: &wasmparser::FunctionBody,
     mem64: bool,
-    imports: &[(u32, u32, FuncType)],
+    imports: &[(u32, u32, FuncType, u32)],
+    n_handles: usize,
     data_segments: &[Vec<u8>],
     mg: MemGrow,
     threads: ThreadCfg,
     code_content_start: usize,
     want_locs: bool,
-) -> Result<(Func, OpLocs), Error> {
+) -> Result<(Func, OpLocs, LocalLocs), Error> {
     // Locals = params (with their incoming param values) then declared locals (default 0).
     let mut local_types: Vec<ValType> = params.to_vec();
     for decl in body.get_locals_reader()? {
@@ -1204,21 +1433,18 @@ fn lower_func(
         }
     }
 
-    // When the module has **capability** imports we thread one capability handle (i32) as the leading
-    // param of every function/block (the data-SP trick): the IR signature is `(i32 handle,
-    // wasm-params...) -> results` and param 0 is the handle. A module whose only import is
-    // `wasi:thread/spawn` (placeholder `type_id == u32::MAX`, lowered to the native `thread.spawn`, not
-    // a cap.call) needs no handle — so it is byte-identical to a no-import module. A no-import module
-    // is likewise unchanged.
-    let has_handle = imports.iter().any(|(t, _, _)| *t != u32::MAX);
+    // When the module has **capability** imports we thread one capability handle (i32) **per distinct
+    // import interface** as the leading params of every function/block (the data-SP trick): the IR
+    // signature is `(i32 handle_0, …, i32 handle_{n-1}, wasm-params...) -> results` and params
+    // `0..n_handles` are the handles. `n_handles == 0` (no capability imports — e.g. a module whose
+    // only import is `wasi:thread/spawn`, lowered to the native `thread.spawn`, not a cap.call) is
+    // byte-identical to a no-import module; `n_handles == 1` is the original single-handle ABI.
     let n_imp = imports.len();
-    let mut entry_params: Vec<ValType> = Vec::with_capacity(has_handle as usize + params.len());
-    if has_handle {
-        entry_params.push(ValType::I32);
-    }
+    let mut entry_params: Vec<ValType> = Vec::with_capacity(n_handles + params.len());
+    entry_params.extend(std::iter::repeat_n(ValType::I32, n_handles));
     entry_params.extend_from_slice(params);
     let nparams = params.len() as ValIdx;
-    let base = has_handle as ValIdx; // value index of wasm param 0 (after the handle, if present)
+    let base = n_handles as ValIdx; // value index of wasm param 0 (after the handles)
 
     let entry = BlockB {
         params: entry_params.clone(),
@@ -1242,12 +1468,13 @@ fn lower_func(
         table_base,
         mem64,
         mg,
-        handle: has_handle.then_some(0),
+        handles: (0..n_handles as ValIdx).collect(),
         imports,
         n_imp,
         data_segments,
         threads,
         locs: Vec::new(),
+        local_locs: Vec::new(),
         code_content_start,
         want_locs,
     };
@@ -1276,6 +1503,7 @@ fn lower_func(
         dead: false,
     });
 
+    lo.record_locals(); // the entry block's initial local values (params + zero-inits)
     for item in body.get_operators_reader()?.into_iter_with_offsets() {
         let (op, off) = item?;
         // Record where this operator's first IR instruction lands, for the DWARF→IR pc mapping.
@@ -1290,6 +1518,7 @@ fn lower_func(
     }
 
     let locs = std::mem::take(&mut lo.locs);
+    let local_locs = std::mem::take(&mut lo.local_locs);
     let blocks = lo
         .blocks
         .into_iter()
@@ -1307,6 +1536,7 @@ fn lower_func(
             blocks,
         },
         locs,
+        local_locs,
     ))
 }
 
@@ -1645,13 +1875,14 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
         return spawn_op(lo);
     }
     if (func as usize) < lo.n_imp {
-        let (type_id, op, sig) = lo.imports[func as usize].clone();
+        let (type_id, op, sig, slot) = lo.imports[func as usize].clone();
         let mut args = Vec::with_capacity(sig.params.len());
         for _ in 0..sig.params.len() {
             args.push(lo.pop()?.0);
         }
         args.reverse(); // stack top is the last argument
-        let handle = lo.handle.expect("import call requires a threaded handle");
+                        // The import's interface owns one handle slot; a `cap.call` rides that handle.
+        let handle = lo.handles[slot as usize];
         let results = sig.results.clone();
         // §7 named import (`type_id == NAMED_IMPORT`): emit a `CallImport` (the host binds the name to
         // a concrete capability at load); `op` carries the index into the module's import table.
@@ -1684,14 +1915,13 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
         .get(ir_idx as usize)
         .ok_or_else(|| Error::Parse(format!("call to unknown function {func}")))?
         .clone();
-    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    let mut args = Vec::with_capacity(lo.handles.len() + params.len());
     for _ in 0..params.len() {
         args.push(lo.pop()?.0);
     }
     args.reverse(); // stack top is the last argument
-    if let Some(h) = lo.handle {
-        args.insert(0, h); // the callee's leading handle param
-    }
+                    // Prepend the callee's leading handle params (all N, in slot order).
+    args.splice(0..0, lo.handles.iter().copied());
     let res = lo.emit_call(Inst::Call { func: ir_idx, args }, results.len());
     for (v, t) in res.into_iter().zip(results.iter()) {
         lo.push(v, *t);
@@ -1789,18 +2019,16 @@ fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result
         offset: lo.table_base,
         align: 2,
     });
-    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    let mut args = Vec::with_capacity(lo.handles.len() + params.len());
     for _ in 0..params.len() {
         args.push(lo.pop()?.0);
     }
     args.reverse();
-    // Every defined function carries a leading handle param when the module has imports, so the
-    // indirect-call signature (used for the §3c runtime type-id check) and args must include it too.
+    // Every defined function carries N leading handle params when the module has imports, so the
+    // indirect-call signature (used for the §3c runtime type-id check) and args must include them too.
     let mut ty_params = params.clone();
-    if let Some(h) = lo.handle {
-        args.insert(0, h);
-        ty_params.insert(0, ValType::I32);
-    }
+    args.splice(0..0, lo.handles.iter().copied());
+    ty_params.splice(0..0, std::iter::repeat_n(ValType::I32, lo.handles.len()));
     let ty = FuncType {
         params: ty_params,
         results: results.clone(),
@@ -1845,14 +2073,13 @@ fn return_call_op(lo: &mut Lower, func: u32, fn_results: &[ValType]) -> Result<(
         .get(ir_idx as usize)
         .ok_or_else(|| Error::Parse(format!("return_call to unknown function {func}")))?
         .clone();
-    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    let mut args = Vec::with_capacity(lo.handles.len() + params.len());
     for _ in 0..params.len() {
         args.push(lo.pop()?.0);
     }
     args.reverse();
-    if let Some(h) = lo.handle {
-        args.insert(0, h); // the callee's leading handle param
-    }
+    // Prepend the callee's leading handle params (all N, in slot order).
+    args.splice(0..0, lo.handles.iter().copied());
     lo.set_term(Terminator::ReturnCall { func: ir_idx, args });
     Ok(())
 }
@@ -1883,18 +2110,16 @@ fn return_call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) ->
         offset: lo.table_base,
         align: 2,
     });
-    let mut args = Vec::with_capacity(lo.handle.is_some() as usize + params.len());
+    let mut args = Vec::with_capacity(lo.handles.len() + params.len());
     for _ in 0..params.len() {
         args.push(lo.pop()?.0);
     }
     args.reverse();
-    // The handle is a leading param of every defined function, so it rides both the args and the
-    // §3c type-check signature (matching the targets that carry it — same as `call_indirect`).
+    // The N handles are leading params of every defined function, so they ride both the args and the
+    // §3c type-check signature (matching the targets that carry them — same as `call_indirect`).
     let mut ty_params = params;
-    if let Some(h) = lo.handle {
-        args.insert(0, h);
-        ty_params.insert(0, ValType::I32);
-    }
+    args.splice(0..0, lo.handles.iter().copied());
+    ty_params.splice(0..0, std::iter::repeat_n(ValType::I32, lo.handles.len()));
     let ty = FuncType {
         params: ty_params,
         results,
@@ -3005,14 +3230,14 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         }
         O::LocalSet { local_index } => {
             let (v, _) = lo.pop()?;
-            lo.locals[local_index as usize] = v;
+            lo.set_local(local_index as usize, v);
         }
         O::LocalTee { local_index } => {
             let (v, _) = *lo
                 .stack
                 .last()
                 .ok_or_else(|| Error::Parse("tee on empty stack".into()))?;
-            lo.locals[local_index as usize] = v;
+            lo.set_local(local_index as usize, v);
         }
         O::Select => {
             let (c, _) = lo.pop()?;

@@ -1115,13 +1115,73 @@ variable-bearing section the core doesn't yet parse) is preserved for later. Thi
 schema's rich-blob slot, as the doc recommended. Tests: wasm carries `.debug_info`/`.debug_line`
 blobs verbatim; text + binary round-trips; a truncated debug section errors without panicking.
 
-**Not yet (next slices):** wasm/LLVM **variable** ingest — the large, design-heavy piece: it needs
-full `.debug_info`/`.debug_abbrev` DIE parsing **and** a location model for DWARF's frame-base /
-`DW_OP_fbreg` memory locations (clang `-O0` describes C-frame memory, not our SSA/window values, so
-neither `Ssa`/`SsaList` nor `Window` maps directly — a runtime `__stack_pointer`-relative base). The
-LLVM `!DILocation` → `debug.loc` bitcode-metadata path is its own effort. (The chibicc producer
-(incl. optimized-build location lists), both DAP consumers, binary serialization, a second
-producer's source lines, the location-list ABI, and now the rich-blob pass-through are all built.)
+**Slice 19 — wasm `.debug_info` DIE reader (variable-ingest foundation).** A small hand-rolled
+DWARF v2–v4 (DWARF32) `.debug_info` reader (`dwarf_info.rs`, no `gimli` — matching the line reader)
+parses `.debug_abbrev` (abbreviation tables) + `.debug_info` (the DIE tree) + `.debug_str`,
+recovering per `DW_TAG_subprogram`: its PC range, its **frame base** (a wasm local, from
+`DW_OP_WASM_location 0x0 <n>`), and its parameter/variable children — each a `(name, DW_OP_fbreg
+offset, type DIE)` — plus `DW_TAG_base_type` DIEs by offset. Best-effort (malformed/unsupported ⇒
+no vars; the verifier ignores it, §2a). This grounds the variable-ingest location model against real
+clang output: the wasm DWARF describes a var as a **C-frame memory** location `(frame_base + fbreg)`
+= a window address whose base is a *runtime* wasm-local value, so resolving it needs the local's SSA
+value per pc (an `SsaList`-style lookup) plus the offset — a forthcoming `VarLoc` variant. Test
+(`debug_line.rs`): the reader recovers `add`'s frame-base local 4 and its `a/b/s` at fbreg +12/+8/+4
+with the `int` base type, from the committed fixture.
+
+**Slice 20 — `VarLoc::WindowVia` (the wasm/DWARF location model).** A variable in **window memory at
+a runtime base + offset**: `WindowVia { base: Vec<SsaLoc>, off }` resolves `base` as a location list
+per pc (nearest-preceding within the block, like `SsaList`) to a frame value, reads that as a
+window address, adds `off`, and reads `width` bytes. This is the `DW_OP_fbreg <off>` case from slice
+19 — the frame base is a wasm local (an SSA value here), not a fixed `data-SP` slot. (`Window{off}`
+is the special case where the base is always frame value 0.) The interpreter `read_var` resolves it
+(refactored to share the loclist lookup with `SsaList`); text (`debug.var … winvia <n> <b> <i> <v>…
+<off>`) and binary forms round-trip it; DAP's `evaluate` reads such a name through the Inspector.
+Tests: an interpreter test stores a value at `data-SP+8` and reads it back through a `winvia` whose
+base is value 0; text + binary round-trips (incl. a negative offset).
+
+**Slice 21 — wasm variable ingest, end-to-end (a second producer feeds the *variable* half).** A
+clang-compiled wasm guest's source variables now land in the §6 waist as named `debug.var`s the
+interpreter/DAP read by name. Two pieces: (a) the lowering records each **wasm local's SSA value per
+pc** (`(local, block, inst, value)` at block-entry re-threading + `local.set`/`tee`) — the
+`SsaList` a frame-pointer local needs; (b) `build_debug_info` parses `.debug_info`
+([`dwarf_info`]), matches each subprogram to its IR function by PC range (via the op offsets), and
+for each variable emits a `VarLoc::WindowVia { base = the frame-base local's recorded `SsaList`, off
+= DW_OP_fbreg }` plus a structured `TypeRef` from the `DW_TAG_base_type`. So the DWARF "C-frame
+memory at `frame_base + fbreg`" resolves at runtime to the actual window address (the frame pointer's
+value per pc, + offset). Test (`debug_line.rs`): the fixture's `a/b/s` are ingested as `WindowVia`
+vars at fbreg +12/+8/+4 with the `int` type, into the right IR function, and the module still
+verifies — **frontend neutrality demonstrated for variables, not just source lines**.
+
+**Slice 22 — DAP treats `WindowVia` as a first-class window location.** A new
+`Inspector::var_addr(frame, name)` resolves a memory-located var (`Window` *or* `WindowVia`) to its
+window address at the stopped pc (factored out of `read_var`, sharing the `loclist_value`
+nearest-preceding lookup). DAP now uses it uniformly: a `WindowVia` aggregate **expands** in the
+Variables pane (struct fields / array elements / pointer deref), `evaluate` returns a **typed
+`Place`** for it (so `p.x` / `arr[i]` / `p->x` work over wasm vars), and the scalar Variables path
+formats through the structured type (a window `double`/pointer reads typed, not as raw bytes). So a
+wasm guest's variables — ingested as `WindowVia` in slice 21 — are now fully inspectable, the same
+as chibicc's. Test (`dap.rs`): a `WindowVia` `struct {int x,y}` expands to `x=10, y=20` and
+`evaluate("p.x + p.y") = 30`.
+
+**Slice 23 — wasm aggregate / pointer / array type ingest (the structured-type half).** The
+`.debug_info` reader is now a proper **DIE-*tree* walk** (a depth stack tracks open
+subprogram/struct/array DIEs) instead of a flat base-type pass, and recovers the full structured-type
+graph: `DW_TAG_structure_type`/`union_type` + `DW_TAG_member` (name + `DW_AT_data_member_location`),
+`DW_TAG_pointer_type` (pointee ref), `DW_TAG_array_type` + `DW_TAG_subrange_type` (`DW_AT_count` /
+`DW_AT_upper_bound + 1`), and `DW_TAG_typedef`/`const`/`volatile` (transparent aliases). A recursive,
+cycle-safe `intern_type` (reserves the `TypeId` with an `Opaque` placeholder before recursing, so a
+`struct Point *` whose pointee is `struct Point` terminates) lowers each `DwarfType` into the §6
+`TypeDef` graph — `Aggregate{fields}`, `Pointer{pointee}`, `Array{elem,count}`, `Base` — with names
+like `struct Point *` / `int[3]`. So a wasm guest's `struct`/array/pointer locals expand in the DAP
+Variables pane the same as chibicc's. Test (`debug_line.rs`, new `agg_clang.wasm` fixture): `struct
+Point p` ingests as an `Aggregate{x@0,y@4,size 8}`, `int row[3]` as `Array{count 3}`, and `struct
+Point *pp` as a `Pointer` whose pointee is the same aggregate — all `WindowVia` into the C frame.
+
+**Not yet:** the LLVM `!DILocation`/`dbg.value` bitcode path (its own frontend effort). (The chibicc
+producer (incl. optimized-build location lists), both DAP consumers — over `Window` *and*
+`WindowVia` — binary serialization, and a second producer's **source lines, DWARF pass-through, named
+variables, and now aggregate/pointer/array types** are all built; the W4 debug-info waist is
+exercised end-to-end by two independent frontends.)
 
 ### Open questions (S4/S5/S2)
 

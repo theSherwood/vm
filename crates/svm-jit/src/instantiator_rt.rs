@@ -41,9 +41,10 @@ const SUSP_FAULT: u64 = 1;
 /// cross-backend differential — the handle is guest-visible data).
 const YIELDER_HANDLE: i32 = 256;
 
-/// Per-coroutine control stack (matches `fiber_rt::FIBER_STACK`): 1 MiB of reserved VA, committed on
-/// demand, guard-paged by `svm-fiber`.
-const CORO_STACK: usize = 1 << 20;
+/// Per-coroutine control stack (matches `fiber_rt::FIBER_STACK`): 256 KiB of reserved VA, guard-paged
+/// by `svm-fiber`. On Windows the reservation is eager-committed (ISSUES.md I1), so this is real RAM
+/// per live coroutine; a reservation the OS refuses surfaces as a trap, never an abort.
+const CORO_STACK: usize = 1 << 18;
 
 /// One spawned child's outcome: its `i64` result and trap cell (`0` = clean), plus whether it has
 /// been `join`ed (a second join is inert — `ThreadFault`, matching the interpreter).
@@ -570,7 +571,7 @@ pub(crate) unsafe extern "C" fn coro_spawn(
     let fnt_ptr = code.fn_table.as_ptr() as *const core::ffi::c_void;
     let child_base = window.base();
     let (lo, hi) = window.fault_range();
-    let fiber = svm_fiber::Fiber::new(CORO_STACK, move |y, _first| {
+    let Some(fiber) = svm_fiber::Fiber::new(CORO_STACK, move |y, _first| {
         // SAFETY: the fiber only runs inside `coro_resume` while the owning `Coro` (and so `sh_ptr`,
         // the code, and the window) is alive; all access is on the resuming thread.
         unsafe {
@@ -594,7 +595,11 @@ pub(crate) unsafe extern "C" fn coro_spawn(
             (*sh_ptr).yielder.set(core::ptr::null());
             results[0] as u64
         }
-    });
+    }) else {
+        // The OS refused the coroutine control-stack reservation — recoverable, not an abort (I1).
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    };
 
     let coro = Box::new(Coro {
         fiber,
