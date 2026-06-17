@@ -1901,6 +1901,13 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+    /// `i32x4.dot_i16x8_s`: signed dot product of adjacent `i16` pairs into `i32` lanes —
+    /// `result[i] = a[2i]·b[2i] + a[2i+1]·b[2i+1]`. Source `i16x8`, result `i32x4` (the only dot
+    /// wasm defines), so no shape field. `a`/`b`/result are `v128`.
+    VDot {
+        a: ValIdx,
+        b: ValIdx,
+    },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.
     VAnyTrue {

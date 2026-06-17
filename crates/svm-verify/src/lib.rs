@@ -727,6 +727,12 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
+        // Dot product: fixed shapes (i16x8 → i32x4), so there is no lane rule to enforce.
+        Inst::VDot { a, b } => {
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
         // Widen: the result shape must be an integer shape that has a (half-width) source.
         Inst::VWiden { shape, a, .. } => {
             if shape.narrower().is_none() {

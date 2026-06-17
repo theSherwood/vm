@@ -5252,6 +5252,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_v128(get(vals, *b)?)?,
         )),
+        Inst::VDot { a, b } => {
+            Value::V128(simd_dot(as_v128(get(vals, *a)?)?, as_v128(get(vals, *b)?)?))
+        }
         Inst::VAnyTrue { a } => {
             Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
         }
@@ -5650,6 +5653,22 @@ fn simd_avgr(shape: VShape, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
         let x = lane_read(&a, i, bytes);
         let y = lane_read(&b, i, bytes);
         lane_write(&mut o, i, bytes, (x + y + 1) >> 1);
+    }
+    o
+}
+
+/// `i32x4.dot_i16x8_s`: signed dot product of adjacent `i16` pairs into `i32` lanes —
+/// `out[i] = a[2i]·b[2i] + a[2i+1]·b[2i+1]`. Products are computed in `i32`; the pair sum can
+/// overflow `i32` only for the `(-32768)·(-32768)` corner doubled, which wraps (matches wasm).
+fn simd_dot(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..4 {
+        let a0 = lane_sext(lane_read(&a, 2 * i, 2), 2) as i32;
+        let a1 = lane_sext(lane_read(&a, 2 * i + 1, 2), 2) as i32;
+        let b0 = lane_sext(lane_read(&b, 2 * i, 2), 2) as i32;
+        let b1 = lane_sext(lane_read(&b, 2 * i + 1, 2), 2) as i32;
+        let r = a0.wrapping_mul(b0).wrapping_add(a1.wrapping_mul(b1));
+        lane_write(&mut o, i, 4, r as u32 as u64);
     }
     o
 }

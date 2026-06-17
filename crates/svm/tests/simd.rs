@@ -93,6 +93,7 @@ fn simd_text_and_binary_roundtrip() {
           v142 = i8x16.popcnt v2\n\
           v143 = i8x16.avgr_u v2 v3\n\
           v144 = i16x8.avgr_u v2 v3\n\
+          v145 = i32x4.dot_i16x8_s v2 v3\n\
           v15 = v128.and v2 v3\n\
           v16 = v128.or v2 v3\n\
           v17 = v128.xor v2 v3\n\
@@ -453,6 +454,54 @@ fn avgr_roundtrip_and_shape_reject() {
         verify_module(&bad).is_err(),
         "i32x4 avgr_u must fail verification"
     );
+}
+
+// `i32x4.dot_i16x8_s` — signed dot of adjacent i16 pairs into i32 (`Inst::VDot`, fixed i16x8→i32x4).
+// Two const i16x8 vectors, each i32 result lane read back; oracle = the same pair-sum in Rust.
+#[test]
+fn diff_i32x4_dot() {
+    // a = [1,2,3,4,5,6,7,8], b = [8,7,6,5,4,3,2,1] as i16 lanes (little-endian bytes).
+    let a: [i16; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    let b: [i16; 8] = [8, 7, 6, 5, 4, 3, 2, 1];
+    let bytes = |v: &[i16; 8]| {
+        v.iter()
+            .flat_map(|x| x.to_le_bytes())
+            .map(|byte| byte.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for lane in 0..4u8 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n\
+               v0 = v128.const {}\n\
+               v1 = v128.const {}\n\
+               v2 = i32x4.dot_i16x8_s v0 v1\n\
+               v3 = i32x4.extract_lane {lane} v2\n  return v3\n}}\n",
+            bytes(&a),
+            bytes(&b)
+        );
+        let want = a[2 * lane as usize] as i32 * b[2 * lane as usize] as i32
+            + a[2 * lane as usize + 1] as i32 * b[2 * lane as usize + 1] as i32;
+        assert_eq!(diff1(&s, &[]), want as i64, "dot lane {lane}");
+    }
+
+    // Overflow corner: lane of [-32768,-32768]·[-32768,-32768] wraps in i32 (matches wasm).
+    let m = (-32768i16).to_le_bytes();
+    let row = format!(
+        "{} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0",
+        m[0], m[1], m[0], m[1]
+    );
+    let s = format!(
+        "func () -> (i32) {{\nblock0():\n\
+           v0 = v128.const {row}\n\
+           v1 = v128.const {row}\n\
+           v2 = i32x4.dot_i16x8_s v0 v1\n\
+           v3 = i32x4.extract_lane 0 v2\n  return v3\n}}\n"
+    );
+    let want = (-32768i32)
+        .wrapping_mul(-32768)
+        .wrapping_add((-32768i32).wrapping_mul(-32768));
+    assert_eq!(diff1(&s, &[]), want as u32 as i64, "dot overflow lane");
 }
 
 #[test]

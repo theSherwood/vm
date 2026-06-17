@@ -389,6 +389,27 @@ fn i8x16_popcnt() {
     }
 }
 
+/// `i32x4.dot_i16x8_s` through the wasm bridge — the signed pairwise dot product that DSP/ML inner
+/// loops emit. Two i16x8 vectors from `data`, dot, sum the four i32 lanes. With a=[1..8], b=[8..1]:
+/// lanes = [1·8+2·7, 3·6+4·5, 5·4+6·3, 7·2+8·1] = [22, 38, 38, 22], total 120.
+#[test]
+fn i32x4_dot_i16x8_s() {
+    let wat = r#"
+    (module
+      (memory 1)
+      (data (i32.const 0)  "\01\00\02\00\03\00\04\00\05\00\06\00\07\00\08\00")
+      (data (i32.const 16) "\08\00\07\00\06\00\05\00\04\00\03\00\02\00\01\00")
+      (func (export "dot") (result i32)
+        (local $p v128)
+        (local.set $p
+          (i32x4.dot_i16x8_s (v128.load (i32.const 0)) (v128.load (i32.const 16))))
+        (i32.add
+          (i32.add (i32x4.extract_lane 0 (local.get $p)) (i32x4.extract_lane 1 (local.get $p)))
+          (i32.add (i32x4.extract_lane 2 (local.get $p)) (i32x4.extract_lane 3 (local.get $p))))))
+    "#;
+    assert_eq!(eval(wat, "dot", &[]), Value::I32(120));
+}
+
 /// `i8x16.avgr_u` through the wasm bridge — the unsigned rounding average that image/blend kernels
 /// emit for "blend two pixels". Splat two byte values, read lane 0; oracle = `(a+b+1)>>1`.
 #[test]

@@ -2586,6 +2586,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VPopcnt { .. } => {}
                 // `avgr_u` (`i8x16`/`i16x8` only, verifier-enforced) → native `avg_round`.
                 Inst::VAvgr { .. } => {}
+                // `i32x4.dot_i16x8_s` → `swiden_low/high` + `imul` + `iadd_pairwise` (all legalize).
+                Inst::VDot { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -3646,6 +3648,21 @@ fn lower_block(
                 let x = vcast(b, get(&vals, *a)?, ty);
                 let y = vcast(b, get(&vals, *rb)?, ty);
                 let r = b.ins().avg_round(x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VDot { a, b: rb } => {
+                // Widen each i16x8 operand to two i32x4 halves, multiply lane-wise, then
+                // horizontally add adjacent products: `iadd_pairwise([a0b0,a1b1,a2b2,a3b3],
+                // [a4b4,..]) = [a0b0+a1b1, a2b2+a3b3, a4b4+a5b5, a6b6+a7b7]` — the wasm dot result.
+                let x = vcast(b, get(&vals, *a)?, I16X8);
+                let y = vcast(b, get(&vals, *rb)?, I16X8);
+                let xl = b.ins().swiden_low(x);
+                let xh = b.ins().swiden_high(x);
+                let yl = b.ins().swiden_low(y);
+                let yh = b.ins().swiden_high(y);
+                let pl = b.ins().imul(xl, yl);
+                let ph = b.ins().imul(xh, yh);
+                let r = b.ins().iadd_pairwise(pl, ph);
                 vcast(b, r, I8X16)
             }
             Inst::VSatBin {

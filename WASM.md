@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (93 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (94 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -95,7 +95,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [ ] **SIMD remainder** (~68 of the v128 proposal): dot product,
+- [ ] **SIMD remainder** (~68 of the v128 proposal):
   the f64↔i32 conversions (`convert_low`/`trunc_sat_*_zero`), extadd/extmul, q15mulr, etc.
   Mechanical breadth over the proven 5-step
   pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops have
@@ -150,6 +150,11 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     (`Inst::VAvgr`, a dedicated family the **verifier restricts to the two narrow shapes** — so no
     JIT bail list, like saturating add/sub). JIT lowers to native `avg_round`; oracle computes the
     average wide. Tests incl. a pixel-blend idiom through the wasm bridge.
+  - [x] **Dot product (`i32x4.dot_i16x8_s`) — DONE.** Signed dot of adjacent `i16` pairs into `i32`
+    lanes — `out[i] = a[2i]·b[2i] + a[2i+1]·b[2i+1]` (`Inst::VDot`, fixed `i16x8`→`i32x4`, no shape
+    field). JIT lowers to `swiden_low/high` + `imul` + `iadd_pairwise` (the pairwise-add legalizes
+    the lane-count change); oracle = the same pair-sum in Rust, incl. the `i32` overflow corner.
+    Tests incl. a DSP-style dot kernel through the wasm bridge.
 - [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
   atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
   in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR
@@ -196,9 +201,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 3. **Tail calls** 🟡 — common LLVM output, likely near-free (IR terminators exist).
 4. **Passive *data* segments + `memory.init`/`data.drop`** 🟡 — DONE. (The *table* bulk ops + passive
    *element* segments remain — they need a mutable runtime table; lower audience.)
-5. **SIMD remainder** 🟡 — **mostly landed** (13 of ~17 op families: compares (int+float), min/max,
+5. **SIMD remainder** 🟡 — **mostly landed** (14 of ~17 op families: compares (int+float), min/max,
    shifts, abs/neg, the boolean reductions, saturating add/sub, widen, narrow, the i32↔f32 + demote/
-   promote conversions, pmin/pmax, `i8x16.popcnt`, `avgr_u`). The **tail** remains: dot product,
+   promote conversions, pmin/pmax, `i8x16.popcnt`, `avgr_u`, dot product). The **tail** remains:
    extadd/extmul, `q15mulr_sat`, and the f64↔i32 conversions. Same proven 5-step pattern.
 6. **Reference types** 🟡 (externref→handle, funcref→index), then the **narrow-atomic CAS-loop** 🟡.
 7. EH, relaxed SIMD, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.

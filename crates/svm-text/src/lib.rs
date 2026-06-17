@@ -371,6 +371,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::Swizzle { a, b } => format!("i8x16.swizzle v{a} v{b}"),
         Inst::VPopcnt { a } => format!("i8x16.popcnt v{a}"),
         Inst::VAvgr { shape, a, b } => format!("{}.avgr_u v{a} v{b}", shape.name()),
+        Inst::VDot { a, b } => format!("i32x4.dot_i16x8_s v{a} v{b}"),
         Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
         Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
         Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
@@ -1565,6 +1566,11 @@ impl<'a> Parser<'a> {
             return Ok(Inst::VPopcnt {
                 a: self.value(names)?,
             });
+        }
+        if op == "i32x4.dot_i16x8_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VDot { a, b });
         }
         // Conversions are whole-instruction mnemonics (source/result shapes differ).
         if let Some(o) = VCvtOp::from_name(op.as_str()) {
