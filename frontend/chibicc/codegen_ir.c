@@ -2513,21 +2513,169 @@ static const char *dbg_typename(Type *ty) {
   }
 }
 
-// Emit a `debug.var` for each named local of `fn` (its module index is `start_off + idx`).
+// --- Structured type table (DEBUGGING.md §6 `TypeRef`) --------------------------------------
+// `-g` carries each named local's structured type so a debugger can expand aggregates (struct
+// field offsets, array strides) — not just render a name. Types are interned by chibicc `Type *`
+// identity (which also bounds recursion: a `struct Node { struct Node *next; }` cycles back to
+// the already-reserved id), emitted as `debug.type <id> <kind> "<name>" ...` with aggregate
+// members on following `debug.field <type_id> "<name>" <off> <field_ty>` lines.
+enum { DT_BASE, DT_PTR, DT_ARRAY, DT_AGG, DT_OPAQUE };
+enum { ENC_SIGNED, ENC_UNSIGNED, ENC_FLOAT, ENC_BOOL };
+typedef struct {
+  Type *ty;        // identity for dedup
+  int kind;        // DT_*
+  const char *name; // render name
+  int enc;         // base encoding (ENC_*)
+  int size;        // sizeof (base/ptr/agg/opaque); arrays carry their stride via `child`
+  int child;       // ptr pointee / array element type id
+  int count;       // array element count
+} DbgType;
+typedef struct {
+  int owner;       // owning aggregate's type id
+  char *name;
+  int offset;
+  int field_ty;
+} DbgField;
+static DbgType *dbg_types;
+static int n_dbg_types, cap_dbg_types;
+static DbgField *dbg_fields;
+static int n_dbg_fields, cap_dbg_fields;
+
+static int base_enc(Type *ty) {
+  switch (ty->kind) {
+  case TY_BOOL:    return ENC_BOOL;
+  case TY_FLOAT:
+  case TY_DOUBLE:
+  case TY_LDOUBLE: return ENC_FLOAT;
+  default:         return ty->is_unsigned ? ENC_UNSIGNED : ENC_SIGNED;
+  }
+}
+
+// Intern `ty` into the type table, returning its dense id. Reserves the id *before* recursing into
+// pointee/element/member types so a self-referential aggregate resolves to itself (no infinite
+// recursion). Idempotent: a repeated `Type *` returns its cached id.
+static int intern_type(Type *ty) {
+  for (int i = 0; i < n_dbg_types; i++)
+    if (dbg_types[i].ty == ty)
+      return i;
+  // Scalars: also dedup structurally — chibicc copies base `Type` structs freely (each `int`
+  // decl can be a distinct pointer), so identity alone would bloat the table with clones.
+  bool is_base = ty->kind != TY_PTR && ty->kind != TY_ARRAY && ty->kind != TY_STRUCT &&
+                 ty->kind != TY_UNION && ty->kind != TY_FUNC && ty->kind != TY_VLA;
+  if (is_base) {
+    int enc = base_enc(ty);
+    for (int i = 0; i < n_dbg_types; i++)
+      if (dbg_types[i].kind == DT_BASE && dbg_types[i].enc == enc && dbg_types[i].size == ty->size)
+        return i;
+  }
+  if (n_dbg_types == cap_dbg_types) {
+    cap_dbg_types = cap_dbg_types ? cap_dbg_types * 2 : 64;
+    dbg_types = realloc(dbg_types, cap_dbg_types * sizeof(DbgType));
+  }
+  int id = n_dbg_types++;
+  dbg_types[id] = (DbgType){.ty = ty, .name = dbg_typename(ty), .size = ty->size};
+  switch (ty->kind) {
+  case TY_PTR:
+    dbg_types[id].kind = DT_PTR;
+    dbg_types[id].child = intern_type(ty->base); // realloc may move the array — re-index below
+    break;
+  case TY_ARRAY:
+    dbg_types[id].kind = DT_ARRAY;
+    dbg_types[id].count = ty->base->size ? ty->size / ty->base->size : 0;
+    dbg_types[id].child = intern_type(ty->base);
+    break;
+  case TY_STRUCT:
+  case TY_UNION:
+    dbg_types[id].kind = DT_AGG;
+    for (Member *m = ty->members; m; m = m->next) {
+      if (!m->name)
+        continue;
+      int fty = intern_type(m->ty); // may realloc dbg_types and grow dbg_fields
+      if (n_dbg_fields == cap_dbg_fields) {
+        cap_dbg_fields = cap_dbg_fields ? cap_dbg_fields * 2 : 64;
+        dbg_fields = realloc(dbg_fields, cap_dbg_fields * sizeof(DbgField));
+      }
+      dbg_fields[n_dbg_fields++] = (DbgField){
+          .owner = id, .name = strndup(m->name->loc, m->name->len), .offset = m->offset,
+          .field_ty = fty};
+    }
+    break;
+  case TY_FUNC:
+  case TY_VLA:
+    dbg_types[id].kind = DT_OPAQUE;
+    break;
+  default:
+    dbg_types[id].kind = DT_BASE;
+    dbg_types[id].enc = base_enc(ty);
+    break;
+  }
+  return id;
+}
+
+// Emit the interned type table (after files/locs, before the vars that reference it).
+static void emit_type_table(void) {
+  for (int i = 0; i < n_dbg_types; i++) {
+    DbgType *t = &dbg_types[i];
+    switch (t->kind) {
+    case DT_BASE: {
+      const char *enc = t->enc == ENC_SIGNED     ? "signed"
+                        : t->enc == ENC_UNSIGNED ? "unsigned"
+                        : t->enc == ENC_FLOAT    ? "float"
+                                                 : "bool";
+      cg("debug.type %d base \"%s\" %s %d\n", i, t->name, enc, t->size);
+      break;
+    }
+    case DT_PTR:
+      cg("debug.type %d ptr \"%s\" %d %d\n", i, t->name, t->child, t->size);
+      break;
+    case DT_ARRAY:
+      cg("debug.type %d array \"%s\" %d %d\n", i, t->name, t->child, t->count);
+      break;
+    case DT_AGG:
+      cg("debug.type %d agg \"%s\" %d\n", i, t->name, t->size);
+      for (int j = 0; j < n_dbg_fields; j++)
+        if (dbg_fields[j].owner == i)
+          cg("debug.field %d \"%s\" %d %d\n", i, dbg_fields[j].name, dbg_fields[j].offset,
+                  dbg_fields[j].field_ty);
+      break;
+    default:
+      cg("debug.type %d opaque \"%s\" %d\n", i, t->name, t->size);
+      break;
+    }
+  }
+}
+
+// Is this local one we emit a `debug.var` for? (Skips the data-SP, sret, varargs, and other
+// synthetic/unnamed slots.)
+static bool is_debuggable_local(Obj *fn, Obj *v) {
+  return v->is_local && v->name && v->name[0] != '\0' && v != fn->va_area &&
+         v != fn->alloca_bottom;
+}
+
+// Intern the structured type of every named local of `fn`, so the type table is fully populated
+// before it (and the `debug.var` lines that reference it) are emitted.
+static void intern_func_var_types(Obj *fn) {
+  if (!fn->is_definition)
+    return;
+  for (Obj *v = fn->locals; v; v = v->next)
+    if (is_debuggable_local(fn, v))
+      intern_type(v->ty);
+}
+
+// Emit a `debug.var` for each named local of `fn` (its module index is `start_off + idx`). The
+// trailing integer is the structured type id (interned in `intern_func_var_types`).
 static void emit_debug_vars(Obj *fn, int func_idx) {
   if (!fn->is_definition)
     return;
   for (Obj *v = fn->locals; v; v = v->next) {
-    if (!v->is_local || !v->name || v->name[0] == '\0')
-      continue; // skip the data-SP, sret, and other synthetic/unnamed slots
-    if (v == fn->va_area || v == fn->alloca_bottom)
+    if (!is_debuggable_local(fn, v))
       continue;
     const char *ty = dbg_typename(v->ty);
+    int tid = intern_type(v->ty); // cached: returns the id assigned in the interning pass
     if (is_promoted(v))
-      cg("debug.var %d \"%s\" ssa %d \"%s\"\n", func_idx, v->name,
-              slot_of(v) + 1, ty);
+      cg("debug.var %d \"%s\" ssa %d \"%s\" %d\n", func_idx, v->name, slot_of(v) + 1, ty, tid);
     else
-      cg("debug.var %d \"%s\" win %d \"%s\"\n", func_idx, v->name, v->offset, ty);
+      cg("debug.var %d \"%s\" win %d \"%s\" %d\n", func_idx, v->name, v->offset, ty, tid);
   }
 }
 
@@ -2581,8 +2729,10 @@ void codegen_ir(Obj *prog, FILE *out) {
     gen_func(funcs[i]);
 
   // `-g`: the §6 debug-info section, after the functions (module-level, strippable): the source
-  // file table, then `debug.loc` source lines (collected during emission), then `debug.var` per
-  // named local. `funcs[i]` has module index `start_off + i` (matching `func_index`).
+  // file table, then `debug.loc` source lines (collected during emission), then the structured
+  // type table, then `debug.var` per named local (each referencing its type id). The type table
+  // is interned first so the vars resolve to dense ids. `funcs[i]` has module index
+  // `start_off + i` (matching `func_index`).
   if (opt_g) {
     for (int i = 0; i < n_dbg_files; i++)
       cg("debug.file %d \"%s\"\n", i, dbg_files[i]);
@@ -2591,6 +2741,9 @@ void codegen_ir(Obj *prog, FILE *out) {
       cg("debug.loc %d %d %d %d %d %d\n", l->func, l->block, l->inst, l->file, l->line,
               l->col);
     }
+    for (int i = 0; i < nfuncs; i++)
+      intern_func_var_types(funcs[i]);
+    emit_type_table();
     for (int i = 0; i < nfuncs; i++)
       emit_debug_vars(funcs[i], start_off + i);
   }

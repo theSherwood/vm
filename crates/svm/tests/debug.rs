@@ -434,7 +434,9 @@ fn source_location_and_named_vars_at_a_breakpoint() {
 
 #[test]
 fn debug_info_round_trips_through_text() {
-    // Includes a window-located variable to exercise that VarLoc on the wire.
+    // Includes a window-located variable to exercise that VarLoc on the wire, the structured type
+    // table (base / pointer / array / aggregate + fields), a var that references a structured type
+    // (trailing id), and a var with *no* type id (back-compat: name string only).
     let src = r#"
 func () -> (i32) {
 block0():
@@ -444,14 +446,36 @@ block0():
 
 debug.file 0 "a.c"
 debug.loc 0 0 0 0 1 1
+debug.type 0 base "int" signed 4
+debug.type 1 ptr "ptr" 0 8
+debug.type 2 array "array" 0 4
+debug.type 3 agg "struct" 8
+debug.field 3 "x" 0 0
+debug.field 3 "y" 4 0
 debug.var 0 "x" ssa 0 "int"
 debug.var 0 "buf" win 16 "char"
+debug.var 0 "p" win 24 "struct" 3
 "#;
     let m = parse_module(src).expect("parse");
     let di = m.debug_info.as_ref().expect("debug info present");
     assert_eq!(di.files, vec!["a.c".to_string()]);
     assert_eq!(di.locs.len(), 1);
-    assert_eq!(di.vars.len(), 2);
+    assert_eq!(di.types.len(), 4);
+    assert_eq!(di.vars.len(), 3);
+
+    // The aggregate's fields parsed with their offsets.
+    let svm_ir::TypeDef::Aggregate { fields, size, .. } = &di.types[3] else {
+        panic!("type 3 is an aggregate");
+    };
+    assert_eq!(*size, 8);
+    assert_eq!(fields.len(), 2);
+    assert_eq!(
+        (fields[1].name.as_str(), fields[1].offset, fields[1].ty),
+        ("y", 4, 0)
+    );
+    // The struct var references it; the scalar vars carry no structured type.
+    assert_eq!(di.vars[2].type_id, Some(3));
+    assert_eq!(di.vars[0].type_id, None);
 
     // parse → print → parse is stable (the debug section round-trips).
     let m2 = parse_module(&print_module(&m)).expect("reparse");
