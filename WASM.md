@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (98 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (104 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -31,8 +31,9 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
   `memory.copy`/`memory.fill`; **fixed-128 SIMD** (the complete fixed-width v128 op set, D58 — all
   arith/bitwise/shuffle/compare/convert/widen/narrow/dot/extmul/q15 lanes; only relaxed-SIMD is out);
   **threads** —
-  full-width (i32/i64) `*.atomic.*` + `atomic.fence`, `shared`+imported memory, and the **wasi-threads**
-  `wasi:thread/spawn` → native `thread.spawn` (a synthesized shim + unique-tid slot).
+  the full `*.atomic.*` set (full-width i32/i64 map 1:1 onto IR atomics; the narrow 8/16-bit forms
+  emulate via a 32-bit word-CAS loop) + `atomic.fence`, `shared`+imported memory, and the
+  **wasi-threads** `wasi:thread/spawn` → native `thread.spawn` (a synthesized shim + unique-tid slot).
 - **Host ABI**: function imports → `cap.call` by the numeric `module`=type_id / `name`=op convention.
 
 ---
@@ -180,11 +181,17 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     with rounding + saturation — `out[i] = sat_i16((a·b + 0x4000) >> 15)` (`Inst::VQ15MulrSat`, fixed
     `i16x8`). JIT lowers to native `sqmul_round_sat`; oracle = the formula in `i64`, tests incl. the
     `-1.0·-1.0` corner that saturates to `i16::MAX`. Tests incl. a DSP idiom through the wasm bridge.
-- [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
-  atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
-  in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR
-  (widens the escape-TCB). wasi-libc locks use 32-bit futex words, so pthreads works without this;
-  user code with `_Atomic char`/`bool` needs it.
+- [x] **Narrow atomics — DONE.** `*.atomic.{load,store,rmw8/16/32.*,cmpxchg}{8,16}` (and i64's 32-bit
+  forms). SVM IR atomics are 32/64-bit only (the §3b narrow-integer decision), so the **8/16-bit**
+  forms emulate with a **32-bit word-CAS loop** in the transpiler: align to the containing word, then
+  load → splice the sub-word (`(old & ~mask) | (new << shift & mask)`) → `cmpxchg`, retrying until it
+  lands (load is loop-free: word-load + shift/mask). The i64 **32-bit** forms are word-sized (a native
+  i32 atomic, zero-extended). No IR/TCB change (i8/i16 stay out of the escape-TCB). A naturally-aligned
+  narrow access lies in one word (wasm requires it), so the word-CAS is exact; a *misaligned* one isn't
+  trapped (the §1a confine-don't-trap stance). `tests/atomics.rs` (sub-word extract, splice preserving
+  neighbours, the rmw old-value + wrap contracts, cmpxchg hit/miss, the i64 forms — all interp == JIT)
+  + `tests/threads.rs` (8 workers × 1000 `rmw16` increments = exactly 8000, the real atomicity proof
+  under contention on both backends).
 - [ ] **Imported globals & imported tables.** Dynamic-linking / PIC (`__memory_base`/`__table_base`/
   `__stack_pointer` imports). Statically-linked output defines its own, so this only bites `-shared`/PIC.
 - [ ] **Relaxed SIMD** (a separate proposal: relaxed madd, relaxed swizzle, …; clang `-mrelaxed-simd`).
@@ -230,7 +237,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
    backends (compares, min/max, shifts, abs/neg, reductions, saturating add/sub, widen, narrow, all
    10 conversions, pmin/pmax, popcnt, `avgr_u`, dot product, extmul, extadd_pairwise, q15mulr_sat).
    Only relaxed-SIMD (non-deterministic) is out of scope.
-6. **Reference types** 🟡 (externref→handle, funcref→index), then the **narrow-atomic CAS-loop** 🟡.
+6. **Narrow-atomic CAS-loop** 🟢 — **DONE.** Then **reference types** 🟡 (externref→handle, funcref→index).
 7. EH, relaxed SIMD, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
 
 Code map: the rejection sites are the `unsup(...)` calls in `crates/svm-wasm/src/lib.rs` (section
