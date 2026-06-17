@@ -18,7 +18,7 @@ use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
     Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VSatBinOp, VShape, VShiftOp, ValIdx, ValType, VarLoc, DEFAULT_RESERVED_LOG2,
+    VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -5178,6 +5178,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_v128(get(vals, *b)?)?,
         )),
+        Inst::VWiden { shape, op, a } => {
+            Value::V128(simd_widen(*shape, *op, as_v128(get(vals, *a)?)?))
+        }
         Inst::VAnyTrue { a } => {
             Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
         }
@@ -5442,6 +5445,27 @@ fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
             VShiftOp::ShrS => (lane_sext(x, bytes) >> sh) as u64,
         };
         lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// `<wide>.extend_{low,high}_{s,u}`: take the low or high half of the (half-width) source lanes and
+/// sign/zero-extend each to the wide lane width.
+fn simd_widen(out: VShape, op: VWidenOp, a: [u8; 16]) -> [u8; 16] {
+    let (low, signed) = op.parts();
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize; // result lanes = source lanes we consume
+    let base = if low { 0 } else { n }; // the low or high half of the source lanes
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let s = lane_read(&a, base + i, src_bytes);
+        let v = if signed {
+            lane_sext(s, src_bytes) as u64
+        } else {
+            s
+        };
+        lane_write(&mut o, i, out_bytes, v);
     }
     o
 }

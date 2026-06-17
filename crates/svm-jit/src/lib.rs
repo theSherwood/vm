@@ -2586,6 +2586,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
                 // `sadd_sat`/`uadd_sat`/`ssub_sat`/`usub_sat`.
                 Inst::VSatBin { .. } => {}
+                // Widen lowers to `swiden_low`/`uwiden_low`/`*_high`.
+                Inst::VWiden { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3640,6 +3642,19 @@ fn lower_block(
                     VSatBinOp::AddU => b.ins().uadd_sat(x, y),
                     VSatBinOp::SubS => b.ins().ssub_sat(x, y),
                     VSatBinOp::SubU => b.ins().usub_sat(x, y),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VWiden { shape, op, a } => {
+                // The source is the half-width shape; widen low/high → the wide result.
+                let src_ty = vec_ty(shape.narrower().expect("verifier ensures a narrower shape"));
+                let x = vcast(b, get(&vals, *a)?, src_ty);
+                let (low, signed) = op.parts();
+                let r = match (low, signed) {
+                    (true, true) => b.ins().swiden_low(x),
+                    (false, true) => b.ins().swiden_high(x),
+                    (true, false) => b.ins().uwiden_low(x),
+                    (false, false) => b.ins().uwiden_high(x),
                 };
                 vcast(b, r, I8X16)
             }

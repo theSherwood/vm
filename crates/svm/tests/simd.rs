@@ -916,3 +916,104 @@ fn saturating_roundtrip_and_shape_reject() {
         "i32x4 saturating add must fail verification"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lane widening / extend (VWiden) — low/high half, sign/zero-extend.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn diff_widen_extend() {
+    // i16x8 ← i8x16. Source bytes: low half [128,1,..], high half [200,9,..].
+    let src8 = "128 1 2 3 4 5 6 7 200 9 10 11 12 13 14 15";
+    let w16 = |op: &str, ext: &str, lane: u8| -> i32 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src8}\n\
+             \x20 v1 = i16x8.{op} v0\n  v2 = i16x8.{ext} {lane} v1\n  return v2\n}}\n"
+        );
+        diff1(&s, &[]) as i32
+    };
+    assert_eq!(
+        w16("extend_low_s", "extract_lane_s", 0),
+        -128,
+        "low_s lane0 = (i8)128 = -128"
+    );
+    assert_eq!(
+        w16("extend_low_u", "extract_lane_u", 0),
+        128,
+        "low_u lane0 = (u8)128"
+    );
+    assert_eq!(w16("extend_low_s", "extract_lane_s", 1), 1, "low_s lane1");
+    assert_eq!(
+        w16("extend_high_s", "extract_lane_s", 0),
+        -56,
+        "high_s lane0 = (i8)200 = -56"
+    );
+    assert_eq!(
+        w16("extend_high_u", "extract_lane_u", 0),
+        200,
+        "high_u lane0 = (u8)200"
+    );
+
+    // i32x4 ← i16x8. i16 lane0 = 0xFFFF (-1), lane1 = 1, lane4 (high half) = 7.
+    let src16 = "255 255 1 0 2 0 3 0 7 0 8 0 9 0 10 0";
+    let w32 = |op: &str, lane: u8| -> i32 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src16}\n\
+             \x20 v1 = i32x4.{op} v0\n  v2 = i32x4.extract_lane {lane} v1\n  return v2\n}}\n"
+        );
+        diff1(&s, &[]) as i32
+    };
+    assert_eq!(w32("extend_low_s", 0), -1, "i32 low_s lane0 = (i16)0xFFFF");
+    assert_eq!(
+        w32("extend_low_u", 0),
+        0xFFFF,
+        "i32 low_u lane0 = (u16)0xFFFF"
+    );
+    assert_eq!(w32("extend_high_s", 0), 7, "i32 high_s lane0 = i16 lane4");
+
+    // i64x2 ← i32x4. i32 lane0 = 0xFFFFFFFF (-1), lane2 (high half) = 9.
+    let src32 = "255 255 255 255 5 0 0 0 9 0 0 0 11 0 0 0";
+    let w64 = |op: &str, lane: u8| -> i64 {
+        let s = format!(
+            "func () -> (i64) {{\nblock0():\n  v0 = v128.const {src32}\n\
+             \x20 v1 = i64x2.{op} v0\n  v2 = i64x2.extract_lane {lane} v1\n  return v2\n}}\n"
+        );
+        diff1(&s, &[])
+    };
+    assert_eq!(w64("extend_low_s", 0), -1, "i64 low_s lane0");
+    assert_eq!(w64("extend_low_u", 0), 0xFFFF_FFFF, "i64 low_u lane0");
+    assert_eq!(w64("extend_high_s", 0), 9, "i64 high_s lane0 = i32 lane2");
+}
+
+/// Widen round-trips; the verifier rejects widening to `i8x16` (no narrower source).
+#[test]
+fn widen_roundtrip_and_shape_reject() {
+    let src = "func () -> (i32) {\nblock0():\n\
+        v0 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
+        v1 = i16x8.extend_low_s v0\n\
+        v2 = i32x4.extend_high_u v0\n\
+        v3 = i64x2.extend_low_s v0\n\
+        v4 = i16x8.extract_lane_s 0 v1\n  return v4\n}\n";
+    let m = build(src);
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
+
+    let bad = parse_module(
+        "func () -> () {\nblock0():\n\
+         v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         v1 = i8x16.extend_low_s v0\n  return\n}\n",
+    )
+    .expect("parses");
+    assert!(
+        verify_module(&bad).is_err(),
+        "widening to i8x16 has no source — must reject"
+    );
+}

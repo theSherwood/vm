@@ -152,6 +152,30 @@ impl VShape {
     pub fn from_name(s: &str) -> Option<VShape> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
+
+    /// The integer shape with **half** the lane width (and twice the lanes): `i16x8`→`i8x16`,
+    /// `i32x4`→`i16x8`, `i64x2`→`i32x4`. `None` for `i8x16` and the float shapes. The source of a
+    /// widen / the result of a narrow.
+    pub fn narrower(self) -> Option<VShape> {
+        match self {
+            VShape::I16x8 => Some(VShape::I8x16),
+            VShape::I32x4 => Some(VShape::I16x8),
+            VShape::I64x2 => Some(VShape::I32x4),
+            _ => None,
+        }
+    }
+
+    /// The integer shape with **double** the lane width: `i8x16`→`i16x8`, `i16x8`→`i32x4`,
+    /// `i32x4`→`i64x2`. `None` for `i64x2` and the float shapes. The result of a widen / the source
+    /// of a narrow.
+    pub fn wider(self) -> Option<VShape> {
+        match self {
+            VShape::I8x16 => Some(VShape::I16x8),
+            VShape::I16x8 => Some(VShape::I32x4),
+            VShape::I32x4 => Some(VShape::I64x2),
+            _ => None,
+        }
+    }
 }
 
 /// Lane-wise binary integer ops on a `v128` (§17). Defined for every integer [`VShape`]
@@ -393,6 +417,51 @@ impl VSatBinOp {
         Self::ALL.get(i as usize).copied()
     }
     pub fn from_name(s: &str) -> Option<VSatBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane **widening** (`extend`): take the low or high half of the source lanes and sign/zero-extend
+/// each to twice the width. The result [`VShape`] is the wider one; the source is its [`VShape::narrower`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VWidenOp {
+    LowS,
+    LowU,
+    HighS,
+    HighU,
+}
+
+impl VWidenOp {
+    pub const ALL: [VWidenOp; 4] = [
+        VWidenOp::LowS,
+        VWidenOp::LowU,
+        VWidenOp::HighS,
+        VWidenOp::HighU,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VWidenOp::LowS => "extend_low_s",
+            VWidenOp::LowU => "extend_low_u",
+            VWidenOp::HighS => "extend_high_s",
+            VWidenOp::HighU => "extend_high_u",
+        }
+    }
+    /// `(low_half, signed)`.
+    pub fn parts(self) -> (bool, bool) {
+        match self {
+            VWidenOp::LowS => (true, true),
+            VWidenOp::LowU => (true, false),
+            VWidenOp::HighS => (false, true),
+            VWidenOp::HighU => (false, false),
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VWidenOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VWidenOp> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
 }
@@ -1685,6 +1754,13 @@ pub enum Inst {
         op: VSatBinOp,
         a: ValIdx,
         b: ValIdx,
+    },
+    /// Lane **widen** (`extend`, see [`VWidenOp`]); `shape` is the **result** (wider) shape, the
+    /// source is its [`VShape::narrower`]. `a`/result are `v128`.
+    VWiden {
+        shape: VShape,
+        op: VWidenOp,
+        a: ValIdx,
     },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.

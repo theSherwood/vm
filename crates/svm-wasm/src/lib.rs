@@ -46,7 +46,7 @@ use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
     VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VSatBinOp, VShape,
-    VShiftOp, ValIdx, ValType,
+    VShiftOp, VWidenOp, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1335,6 +1335,12 @@ fn v_satbin(lo: &mut Lower, shape: VShape, op: VSatBinOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VSatBin { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_widen(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VWiden { shape, op, a });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -2945,6 +2951,19 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I16x8AddSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::AddU)?,
         O::I16x8SubSatS => v_satbin(lo, VShape::I16x8, VSatBinOp::SubS)?,
         O::I16x8SubSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::SubU)?,
+        // lane widening (extend): result shape is the wider one
+        O::I16x8ExtendLowI8x16S => v_widen(lo, VShape::I16x8, VWidenOp::LowS)?,
+        O::I16x8ExtendHighI8x16S => v_widen(lo, VShape::I16x8, VWidenOp::HighS)?,
+        O::I16x8ExtendLowI8x16U => v_widen(lo, VShape::I16x8, VWidenOp::LowU)?,
+        O::I16x8ExtendHighI8x16U => v_widen(lo, VShape::I16x8, VWidenOp::HighU)?,
+        O::I32x4ExtendLowI16x8S => v_widen(lo, VShape::I32x4, VWidenOp::LowS)?,
+        O::I32x4ExtendHighI16x8S => v_widen(lo, VShape::I32x4, VWidenOp::HighS)?,
+        O::I32x4ExtendLowI16x8U => v_widen(lo, VShape::I32x4, VWidenOp::LowU)?,
+        O::I32x4ExtendHighI16x8U => v_widen(lo, VShape::I32x4, VWidenOp::HighU)?,
+        O::I64x2ExtendLowI32x4S => v_widen(lo, VShape::I64x2, VWidenOp::LowS)?,
+        O::I64x2ExtendHighI32x4S => v_widen(lo, VShape::I64x2, VWidenOp::HighS)?,
+        O::I64x2ExtendLowI32x4U => v_widen(lo, VShape::I64x2, VWidenOp::LowU)?,
+        O::I64x2ExtendHighI32x4U => v_widen(lo, VShape::I64x2, VWidenOp::HighU)?,
         // integer lane abs/neg
         O::I8x16Abs => v_intun(lo, VShape::I8x16, VIntUnOp::Abs)?,
         O::I8x16Neg => v_intun(lo, VShape::I8x16, VIntUnOp::Neg)?,

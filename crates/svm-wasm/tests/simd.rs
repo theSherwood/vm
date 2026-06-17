@@ -420,3 +420,23 @@ fn i8x16_add_sat_u() {
     assert_eq!(blend(10, 20), 30, "10 + 20 = 30");
     assert_eq!(blend(255, 255), 255, "255 + 255 = 255");
 }
+
+/// Widen through the wasm bridge: sum the low 8 bytes of a vector by widening `i8x16`→`i16x8` (so
+/// the adds don't overflow a byte), then horizontal-add a couple of lanes. Exercises the real
+/// "widen before accumulate" pattern.
+#[test]
+fn i8x16_widen_low() {
+    let wat = r#"
+    (module
+      (func (export "lane0") (param $x i32) (result i32)
+        (i16x8.extract_lane_s 0
+          (i16x8.extend_low_i8x16_s (i8x16.splat (local.get $x))))))
+    "#;
+    let lane0 = |x: i32| match eval(wat, "lane0", &[Value::I32(x)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(lane0(200), -56, "(i8)200 sign-extends to -56");
+    assert_eq!(lane0(5), 5, "5 widens to 5");
+    assert_eq!(lane0(0x80), -128, "(i8)0x80 = -128");
+}

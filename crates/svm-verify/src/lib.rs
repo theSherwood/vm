@@ -708,6 +708,17 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
+        // Widen: the result shape must be an integer shape that has a (half-width) source.
+        Inst::VWiden { shape, a, .. } => {
+            if shape.narrower().is_none() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
         // Boolean reductions: a `v128` → an `i32`. `all_true`/`bitmask` carry an integer shape;
         // `any_true` is shape-agnostic.
         Inst::VAnyTrue { a } => {

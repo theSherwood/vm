@@ -95,8 +95,8 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [ ] **SIMD remainder** (~90 of the v128 proposal): narrow/widen, dot product, `i8x16.popcnt`,
-  pmin/pmax, conversions, extadd/extmul, avgr, q15mulr, etc. Mechanical breadth over the proven 5-step
+- [ ] **SIMD remainder** (~78 of the v128 proposal): narrow, dot product, `i8x16.popcnt`,
+  pmin/pmax, int↔float conversions, extadd/extmul, avgr, q15mulr, etc. Mechanical breadth over the proven 5-step
   pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops have
   no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
   - [x] **Integer lane compares — DONE.** `i8x16`/`i16x8`/`i32x4` `{eq,ne,lt,gt,le,ge}` s/u + the
@@ -123,6 +123,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     dedicated family the **verifier restricts to the two narrow shapes** the wasm spec defines — so
     no JIT bail list and the fuzzer can't reach a wide-shape sat; Cranelift `sadd_sat`/… native on
     x86/aarch64). Oracle = Rust's `saturating_add`/`saturating_sub`; tests incl. a pixel-blend idiom.
+  - [x] **Lane widening (extend) — DONE.** `i16x8`/`i32x4`/`i64x2`.`extend_{low,high}_*_{s,u}`
+    (`Inst::VWiden` + `VShape::narrower`/`wider` helpers; Cranelift `swiden`/`uwiden` low/high). The
+    verifier rejects a result shape with no narrower source. Tests across all three width steps.
 - [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
   atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
   in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR
