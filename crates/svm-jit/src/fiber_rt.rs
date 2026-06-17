@@ -74,9 +74,12 @@ fn current() -> *mut FiberRuntime {
 /// ceiling so a fiber-bomb traps (`FiberFault`) instead of exhausting host memory.
 const MAX_FIBERS: usize = 1 << 16;
 
-/// Per-fiber control-stack size (the out-of-band native stack, guard-paged by `svm-fiber`). 1 MiB of
-/// reserved VA, committed on demand — cheap even with many fibers.
-const FIBER_STACK: usize = 1 << 20;
+/// Per-fiber control-stack size (the out-of-band native stack, guard-paged by `svm-fiber`). 256 KiB:
+/// large enough for deep guest call chains, but small enough that many concurrent fibers stay within
+/// the host's address space — on Windows the reservation is **eager-committed**, so the per-fiber cost
+/// is real RAM, not lazy VA (ISSUES.md I1). A reservation that the OS still refuses surfaces as a
+/// `FiberFault`, never an abort, via the fallible `svm_fiber::Fiber::new`.
+const FIBER_STACK: usize = 1 << 18;
 
 // ---- Durable per-fiber shadow-stack layout (DURABILITY.md §12.8, D-fiber-cont option A) ----
 //
@@ -372,6 +375,9 @@ unsafe fn fault(trap_out: u64) {
 /// resume, like the interpreter. Shared by `cont.new` ([`fiber_new`]) and durable thaw re-seeding
 /// ([`SharedFiberTable::seed_frozen`]), so a thawed fiber re-enters its entry identically.
 ///
+/// Returns `None` if the OS refuses the control-stack reservation — the caller turns it into a
+/// `FiberFault`, never an abort, so a guest spawning many fibers can't crash the host (ISSUES.md I1).
+///
 /// # Safety
 /// `fn_table_base`/`mem_base`/`trap_out`/`call_tramp` are this run's threaded context (live for the
 /// fiber's lifetime); the body reads [`CURRENT_RT`] dynamically at each use (3c migration).
@@ -385,7 +391,7 @@ unsafe fn make_fiber(
     mask: u64,
     type_id: u32,
     call_tramp: FiberCallTramp,
-) -> Fiber {
+) -> Option<Fiber> {
     Fiber::new(FIBER_STACK, move |y: &Yielder, arg: u64| -> u64 {
         // The *resuming* vCPU's runtime — read dynamically at **each** use, never carried across
         // a potential suspension: the body's start and its return may run on different OS threads
@@ -447,7 +453,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
         )
     };
 
-    let fiber = make_fiber(
+    let fiber = match make_fiber(
         funcref,
         sp,
         mem_base,
@@ -456,7 +462,14 @@ pub(crate) unsafe extern "C" fn fiber_new(
         mask,
         type_id,
         call_tramp,
-    );
+    ) {
+        Some(f) => f,
+        None => {
+            // The OS refused the control-stack reservation — recoverable, not an abort (I1).
+            fault(trap_out);
+            return -1;
+        }
+    };
 
     let rt = &*rt;
     match rt.table.create(Box::new(fiber), funcref, sp as i64) {
@@ -704,6 +717,10 @@ pub(crate) unsafe fn take_frozen(rt: *mut FiberRuntime) -> Vec<crate::FrozenFibe
 /// the same fiber). `rt` supplies the per-run threaded context; `mem_base`/`fn_table_base`/`trap_out`
 /// are this run's window/table/trap cell.
 ///
+/// Returns `false` (after writing a `FiberFault` to `trap_out`) if the OS refuses a control-stack
+/// reservation mid-seed — the caller skips the re-entry rather than aborting (ISSUES.md I1); `true`
+/// when every frozen fiber was re-seeded.
+///
 /// # Safety
 /// `rt` is the live runtime (its `call_tramp`/`mask`/`type_id` set); the addresses are this run's.
 pub(crate) unsafe fn seed_frozen_fibers(
@@ -712,7 +729,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
     mem_base: u64,
     fn_table_base: u64,
     trap_out: u64,
-) {
+) -> bool {
     let r = &*rt;
     let (mask, type_id, call_tramp) = (
         r.fn_table_mask,
@@ -723,7 +740,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
     let mut seed = seed.to_vec();
     seed.sort_by_key(|f| f.slot);
     for (expected, f) in seed.iter().enumerate() {
-        let fiber = make_fiber(
+        let Some(fiber) = make_fiber(
             f.func,
             f.sp as u64,
             mem_base,
@@ -732,13 +749,18 @@ pub(crate) unsafe fn seed_frozen_fibers(
             mask,
             type_id,
             call_tramp,
-        );
+        ) else {
+            // The OS refused a thaw control-stack reservation — recoverable, not an abort (I1).
+            fault(trap_out);
+            return false;
+        };
         let got = r
             .table
             .seed_frozen(Box::new(fiber), f.func, f.sp, f.shadow_sp);
         debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
         debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
     }
+    true
 }
 
 /// This frame's stack pointer (approximately): the address of a local, slightly **below** the
