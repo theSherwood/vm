@@ -62,6 +62,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "durable_fiber"
+path = "fuzz_targets/durable_fiber.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "durable_jit"
 path = "fuzz_targets/durable_jit.rs"
 test = false
