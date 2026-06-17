@@ -46,7 +46,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | SSA promotion (the inspectability-tension source) | **Built** | §3d, frontend promote pass |
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
 | `cap.call` I/O record log (`CapTape`) — input caps `Clock` + stdin `read` (slots **and** buffer writes); replayed for faithful `seek` | **Built — W1 slice 2** | `svm-interp` `Host::record_caps` / `CapTape` / `RecordingMem` |
-| Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
+| Schedule record log (`SchedTape`) — capture a live interleaving as a replayable plan; seeded schedule fuzzing | **Built — W1 slice 4** (interp; SC ⇒ schedule *is* memory order) | `svm-interp` `Inspector::sched_tape` / `attach_scheduled_seeded` |
 | W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `svm-interp` `find_schedule` / `replay_schedule` / `Witness` |
 | W1 time-travel — `seek(t)` / `step_back`: single-threaded (op `clock`) **and** multithreaded (global `turn`); faithful via `CapTape` | **Built — slices 1–3** | `svm-interp` `Inspector::seek` / `turn` / `step_back` |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
@@ -221,9 +221,23 @@ single-threaded). Because the plan pins the interleaving and the `CapTape` repla
 snapshot at turn `t` — including whatever the guest's own userland scheduler had done by then — is
 exact and reproducible. Test (`debug_threads.rs`): a witness-pinned racy run seeks to a mid-turn
 global snapshot (reproducible across repeats), `seek(0)` + resume reproduces the raced outcome, and
-`step_back` walks the global turn down by one. *Not yet:* RNG / host-fn input caps, the `SchedTape` as
-a standalone capture-from-a-live-run artifact, and snapshot/checkpoint cadence to bound re-execution
-cost.
+`step_back` walks the global turn down by one.
+
+**Built — slice 4 (`SchedTape`: capture a live interleaving + schedule fuzzing).** The schedule a
+scheduled run actually executed is now a first-class artifact: `Inspector::sched_tape() -> Vec<u64>`
+returns the ordered `TaskId` choice at each visible-op decision (a direct dump of the explorer's
+`trace`). Under sequential consistency the schedule *is* the memory order, so this fully pins the
+run — `attach_scheduled(tape)` replays the exact interleaving deterministically, making any run a
+portable, shareable repro. To make capture worthwhile, `attach_scheduled_seeded(seed)` drives a
+**random** fine-grained interleaving (one random runnable thread per turn) — schedule fuzzing — so
+different seeds explore different interleavings (and surface different race outcomes); a found
+failure's `sched_tape` replays it. The randomization is a seed on `Dpor`'s schedule-*extension*
+(past the plan); the explorer leaves it unset so its DPOR backtracking stays deterministic, and the
+choices still land in `trace`, so a seeded run replays from either its seed (`seek`) or its captured
+tape. Tests (`debug_threads.rs`): across 64 seeds fuzzing surfaces both the lost update (1) and the
+correct total (2), each run's `sched_tape` replays to the identical outcome and interleaving, and
+`seek(0)` reproduces a seeded run. *Not yet:* RNG / host-fn input caps, capturing a `SchedTape` from
+a non-interpreter (JIT) execution, and snapshot/checkpoint cadence to bound re-execution cost.
 
 ---
 

@@ -392,6 +392,11 @@ struct SeekInit {
     /// for `t` scheduler turns (the global logical-time coordinate). `None` ⇒ single-threaded, where
     /// `seek(t)` targets the sole vCPU's op clock.
     schedule: Option<Arc<[u64]>>,
+    /// The fuzzing seed, if the scheduled run was [`attach_scheduled_seeded`]. `seek` re-applies it
+    /// so the same random interleaving is reproduced.
+    ///
+    /// [`attach_scheduled_seeded`]: Inspector::attach_scheduled_seeded
+    seed: Option<u64>,
 }
 
 /// Scheduled (multithreaded) execution state owned by an [`Inspector`] across pumps (Milestone B).
@@ -563,6 +568,7 @@ impl Inspector {
                 memory: m.memory,
                 data,
                 schedule: None,
+                seed: None,
             }),
             finished: None,
         }
@@ -629,6 +635,35 @@ impl Inspector {
         fuel: u64,
         schedule: Vec<u64>,
     ) -> Inspector {
+        Self::scheduled_impl(m, func, args, fuel, schedule, None)
+    }
+
+    /// Like [`attach_scheduled`](Inspector::attach_scheduled), but drive a **random** interleaving
+    /// from `seed` instead of a fixed plan — schedule fuzzing (DEBUGGING.md W1). Each turn picks a
+    /// random runnable thread, so different seeds explore different interleavings (and may surface
+    /// different race outcomes). The interleaving that ran is captured: [`sched_tape`] returns it as
+    /// a portable plan you can `attach_scheduled` to replay deterministically (or share as a repro).
+    /// `seek`/`step_back` reproduce this exact random run (same seed).
+    ///
+    /// [`sched_tape`]: Inspector::sched_tape
+    pub fn attach_scheduled_seeded(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        seed: u64,
+    ) -> Inspector {
+        Self::scheduled_impl(m, func, args, fuel, Vec::new(), Some(seed))
+    }
+
+    fn scheduled_impl(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        schedule: Vec<u64>,
+        seed: Option<u64>,
+    ) -> Inspector {
         let funcs: Arc<[Func]> = m.funcs.to_vec().into();
         let args_arc: Arc<[Value]> = args.into();
         let data: Arc<[Data]> = m.data.clone().into();
@@ -647,6 +682,7 @@ impl Inspector {
             Arc::clone(&shared),
             Arc::clone(&host),
             &schedule,
+            seed,
             None,
         );
         Inspector {
@@ -664,6 +700,7 @@ impl Inspector {
                 memory: m.memory,
                 data,
                 schedule: Some(schedule),
+                seed,
             }),
             finished: None,
         }
@@ -684,6 +721,7 @@ impl Inspector {
         shared: Arc<Mutex<DebugShared>>,
         host: Arc<Mutex<Host>>,
         schedule: &[u64],
+        seed: Option<u64>,
         turn_limit: Option<u64>,
     ) -> SchedState {
         let mem = memory.map(|mc| {
@@ -716,9 +754,14 @@ impl Inspector {
             s.runnable.push(Box::new(root));
             id
         };
+        let mut dpor = Dpor::new(schedule.to_vec(), Vec::new());
+        // Seeded fuzzing extends the schedule randomly past the (usually empty) plan; mixing the raw
+        // seed avoids the xorshift zero fixpoint, and is applied identically here for `seek` to
+        // reproduce the same random schedule.
+        dpor.rng = seed.map(|s| s ^ 0x9E37_79B9_7F4A_7C15);
         SchedState {
             det,
-            dpor: Dpor::new(schedule.to_vec(), Vec::new()),
+            dpor,
             driver: SchedDriver {
                 turn_limit,
                 ..Default::default()
@@ -764,6 +807,7 @@ impl Inspector {
                     Arc::clone(&self.shared),
                     Arc::clone(&host),
                     schedule,
+                    init.seed,
                     Some(t),
                 );
                 self.shared().suppress_stops = true; // fast-forward past breakpoints
@@ -848,6 +892,19 @@ impl Inspector {
     /// single-threaded mode (which uses the op [`clock`](Inspector::clock) instead).
     pub fn turn(&self) -> u64 {
         self.sched.as_ref().map(|s| s.driver.turns).unwrap_or(0)
+    }
+
+    /// The **`SchedTape`** (DEBUGGING.md W1): the interleaving this scheduled run actually executed,
+    /// as the ordered `TaskId` choice at each visible-op decision. Empty in single-threaded mode or
+    /// before any turn runs. It is a portable, replayable artifact — `attach_scheduled` it to
+    /// reproduce the exact interleaving deterministically (no seed needed), e.g. to share a race
+    /// repro found by [`attach_scheduled_seeded`](Inspector::attach_scheduled_seeded). Under
+    /// sequential consistency the schedule *is* the memory order, so this fully pins the run.
+    pub fn sched_tape(&self) -> Vec<u64> {
+        self.sched
+            .as_ref()
+            .map(|s| s.dpor.trace.iter().map(|e| e.tid).collect())
+            .unwrap_or_default()
     }
 
     /// Step **backward** one unit of logical time (DEBUGGING.md W1): the global `turn` in scheduled
@@ -1660,6 +1717,11 @@ struct Dpor {
     trace: Vec<SchedEvent>,
     pending: Option<(TaskId, Vec<TaskId>)>,
     blocked: bool,
+    /// `Some(state)` ⇒ extend the schedule *randomly* (seeded fuzzing for the debugger's
+    /// `SchedTape`, DEBUGGING.md W1) instead of the deterministic smallest-id greedy. Only set by the
+    /// `Inspector` (which runs one schedule); the explorer leaves it `None` so its DPOR backtracking
+    /// stays deterministic. The executed choices still land in `trace`, so the run replays exactly.
+    rng: Option<u64>,
 }
 
 impl Dpor {
@@ -1672,6 +1734,7 @@ impl Dpor {
             trace: Vec::new(),
             pending: None,
             blocked: false,
+            rng: None,
         }
     }
 
@@ -1683,12 +1746,33 @@ impl Dpor {
             // Forced replay (incl. a race-woken thread): the planned choice overrides the sleep set.
             self.plan[self.depth]
         } else {
-            // Greedy extension: the smallest enabled thread that is not asleep here.
-            match enabled
-                .iter()
-                .copied()
-                .find(|t| !self.sleep.contains_key(t))
-            {
+            // Extension past the plan: the smallest enabled, non-asleep thread (deterministic), or —
+            // when seeded for fuzzing — a random one. Either way the choice is recorded in `trace`.
+            let chosen = if let Some(state) = &mut self.rng {
+                let avail: Vec<TaskId> = enabled
+                    .iter()
+                    .copied()
+                    .filter(|t| !self.sleep.contains_key(t))
+                    .collect();
+                if avail.is_empty() {
+                    None
+                } else {
+                    // xorshift* (matches `DetState::rng`).
+                    let mut x = *state;
+                    x ^= x >> 12;
+                    x ^= x << 25;
+                    x ^= x >> 27;
+                    *state = x;
+                    let r = x.wrapping_mul(0x2545F4914F6CDD1D);
+                    Some(avail[(r as usize) % avail.len()])
+                }
+            } else {
+                enabled
+                    .iter()
+                    .copied()
+                    .find(|t| !self.sleep.contains_key(t))
+            };
+            match chosen {
                 Some(t) => t,
                 None => {
                     self.blocked = true;

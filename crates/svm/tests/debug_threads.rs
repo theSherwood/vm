@@ -254,3 +254,78 @@ fn run_to_finished(insp: &mut Inspector, want: &Result<Vec<Value>, svm_interp::T
         }
     }
 }
+
+// --- W1 SchedTape: capture a (fuzzed) interleaving as a portable, replayable artifact -----------
+
+fn run_outcome(insp: &mut Inspector) -> Result<Vec<Value>, svm_interp::Trap> {
+    loop {
+        match insp.run_until_stop() {
+            Stop::Finished(r) => return r,
+            Stop::Break { .. } => continue,
+            Stop::Blocked => panic!("unexpected block"),
+        }
+    }
+}
+
+/// Schedule fuzzing (`attach_scheduled_seeded`) explores random interleavings — surfacing both the
+/// correct total and the lost-update race — and each run's `sched_tape()` is a portable artifact
+/// that `attach_scheduled` replays to the *exact* same outcome and interleaving.
+#[test]
+fn sched_tape_captures_a_seeded_run_and_replays_it() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    let mut saw_race = false;
+    let mut saw_ok = false;
+    for seed in 0..64u64 {
+        let mut insp = Inspector::attach_scheduled_seeded(&m, 0, &[], 50_000_000, seed);
+        let outcome = run_outcome(&mut insp);
+        match &outcome {
+            Ok(v) if *v == vec![Value::I64(1)] => saw_race = true,
+            Ok(v) if *v == vec![Value::I64(2)] => saw_ok = true,
+            other => panic!("unexpected outcome {other:?}"),
+        }
+
+        // The interleaving that actually ran, captured as a plan.
+        let tape = insp.sched_tape();
+        assert!(
+            !tape.is_empty(),
+            "a multithreaded run records scheduling decisions"
+        );
+
+        // Replay the captured tape deterministically (no seed) → identical outcome and interleaving.
+        let mut replay = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, tape.clone());
+        assert_eq!(
+            run_outcome(&mut replay),
+            outcome,
+            "captured SchedTape replays to the same outcome (seed {seed})"
+        );
+        assert_eq!(
+            replay.sched_tape(),
+            tape,
+            "replay follows the recorded schedule exactly"
+        );
+    }
+    assert!(saw_race, "fuzzing surfaced the lost-update race (1)");
+    assert!(saw_ok, "fuzzing surfaced the correct total (2)");
+}
+
+/// A seeded run reproduces under `seek` (same seed ⇒ same random interleaving) and under tape replay.
+#[test]
+fn seek_reproduces_a_seeded_run() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    let mut insp = Inspector::attach_scheduled_seeded(&m, 0, &[], 50_000_000, 7);
+    let outcome = run_outcome(&mut insp);
+    let tape = insp.sched_tape();
+
+    // seek(0) rebuilds with the same seed → the same random schedule replays on resume.
+    assert!(matches!(insp.seek(0), Stop::Break { .. }));
+    assert_eq!(
+        run_outcome(&mut insp),
+        outcome,
+        "seek replays the seeded run's outcome"
+    );
+    assert_eq!(
+        insp.sched_tape(),
+        tape,
+        "...with the identical interleaving"
+    );
+}
