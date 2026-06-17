@@ -716,13 +716,21 @@ its validator + call_indirect table). The host verifies + Cranelift-compiles the
   its own bytecode interpreter on a 49-input grid. The validator's memory-match is exact, so the test
   probes svm-llvm's parent `size_log2` and patches the demo's blob descriptor to it (no magic
   constant). 88 translate tests green, fmt + clippy clean.
-- *Still deferred:* the §13/§14 `__vm_region_*` (SharedRegion) builtins — the reserved AddressSpace(4)
-  slot is ready; on demand.
+**Slice AF (DONE) — SharedRegion (§13/§14); completes the `<svm.h>` surface.** Guest-minted shareable
+memory now lowers on the on-ramp: `__vm_region_create(len)` mints a region from the stashed
+`AddressSpace` handle (slot 4; import `vm_region_create` → `AddressSpace` op 5) and returns a **region
+handle**; `__vm_region_map`/`unmap`/`page_size` then `cap.call` *that* region handle (their first C
+arg — not a stash slot; imports → `SharedRegion` ops 0/1/3) to alias the region's bytes into the
+window. A region-minting program is granted the **5-handle powerbox** (`synth_start`'s prefix reaches
+AddressSpace). This is the magic-ring-buffer / zero-copy parent↔child data plane (DESIGN §13/§14).
+- Test: `vm_region_magic_ring_buffer` — a guest mints a 64 KiB region, maps it at two adjacent window
+  offsets, and a single 8-byte store straddling the seam wraps tail→head as one contiguous access
+  (then `unmap`s), on the real JIT powerbox (true shared-memory aliasing via the host region factory);
+  the `'Y'` success marker is checked against stdout. 89 translate tests green, fmt + clippy clean.
 
-**Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native), and the
-`<svm.h>` capability/concurrency/GC/JIT builtins are in **except** the §13/§14 SharedRegion family —
-the only remaining `<svm.h>` surface. Beyond that: Milestone 2 (tail calls, real Rust/C++ without EH)
-and a bundled guest `libm` header.
+**Next:** the `<svm.h>` capability/concurrency/GC/JIT/region surface is now **complete** — the LLVM
+on-ramp has full capability parity with the chibicc frontend. Remaining: Milestone 2 (tail calls, real
+Rust/C++ without EH — the D54 breadth proof) and a bundled guest `libm` header.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).

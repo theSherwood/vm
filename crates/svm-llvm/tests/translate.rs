@@ -1782,3 +1782,75 @@ long __vm_jit_uninstall(long slot);\n";
         "guest self-JIT (invoke + installed call_indirect) must agree on every input:\n{out}"
     );
 }
+
+// ---- §13/§14 SharedRegion: `__vm_region_create` / `map` / `unmap` / `page_size` -----------------
+
+/// The **magic ring buffer** in C through the LLVM on-ramp: a guest mints a `SharedRegion` from its
+/// `AddressSpace` handle, maps it at two adjacent window offsets, and a single 8-byte store straddling
+/// the seam wraps tail→head as one contiguous access — the whole point of the §13/§14 layout, with no
+/// host hand-holding (the host only installed the region factory + granted AddressSpace). Exercises
+/// `create` (on the stashed AddressSpace handle, slot 4) and `map`/`unmap`/`page_size` (on the returned
+/// region handle), and the **5-handle powerbox** `synth_start` now grants. Run on the JIT powerbox
+/// (real shared-memory aliasing); the success marker `'Y'` is asserted against stdout.
+#[test]
+#[cfg(unix)]
+fn vm_region_magic_ring_buffer() {
+    let src = r#"
+long __vm_region_create(long len);
+long __vm_region_map(int r, long win_off, long region_off, long len, int prot);
+long __vm_region_unmap(int r, long win_off, long len);
+long __vm_region_page_size(int r);
+long write(int fd, const void *buf, long n);
+int main(void) {
+  int r = (int)__vm_region_create(1 << 16);          /* mint a 64 KiB region */
+  if (r < 0) { char e='E'; write(1,&e,1); return 1; }
+  long g = __vm_region_page_size(r);                 /* host map granularity */
+  volatile long vbase = 268435456;                   /* 256 MiB — reserved tail, clear of data/stack */
+  long base = vbase;                                 /* volatile defeats constant inttoptr fold */
+  if (__vm_region_map(r, base, 0, g, 3) < 0)      { char e='1'; write(1,&e,1); return 2; }
+  if (__vm_region_map(r, base + g, 0, g, 3) < 0)  { char e='2'; write(1,&e,1); return 3; }
+  /* one 8-byte store straddling the seam: low half -> region tail, high half wraps -> region head */
+  *(unsigned long *)(base + g - 4) = 0x1122334455667788UL;
+  unsigned int head = *(unsigned int *)(base);             /* region head, via mapping 1 */
+  unsigned int tail = *(unsigned int *)(base + 2 * g - 4); /* region tail, via mapping 2 */
+  unsigned long combined = ((unsigned long)head << 32) | tail;
+  long u = __vm_region_unmap(r, base, g);                  /* exercise unmap too (must return 0) */
+  char ok = (combined == 0x1122334455667788UL && u == 0) ? 'Y' : 'N';
+  write(1, &ok, 1);
+  return 0;
+}
+"#;
+    let Some(bc) = compile_to_bc("vm_region", src) else {
+        return;
+    };
+    let m = svm_llvm::translate_bc_path(&bc)
+        .expect("translate bitcode")
+        .module;
+    // Structural: the SharedRegion ops became their `CallImport`s, and the entry grants through
+    // AddressSpace (5 handles: stdout, stdin, exit, memory, addrspace).
+    let imports: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    for want in [
+        "vm_region_create",
+        "vm_region_map",
+        "vm_region_unmap",
+        "vm_region_page_size",
+    ] {
+        assert!(
+            imports.contains(&want),
+            "missing region import {want}: {imports:?}"
+        );
+    }
+    assert_eq!(
+        m.funcs[0].params.len(),
+        5,
+        "a region-minting program grants through the AddressSpace handle (5-handle entry)"
+    );
+    let module = svm_run::resolve_capability_imports(m).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify resolved IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    assert_eq!(
+        run.stdout, b"Y",
+        "magic ring buffer: seam-straddling store must wrap tail->head (got {:?})",
+        run.stdout
+    );
+}

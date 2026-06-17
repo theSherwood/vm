@@ -235,6 +235,9 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // §22 guest-driven-JIT builtins (`__vm_jit_*`): register their `Jit` imports; the program then
     // needs the full 8-handle powerbox (the `Jit` handle is the last `VM_CAP_*` index).
     let uses_vm_jit = register_vm_jit_imports(m, &defined_names, &mut imports, &mut caps);
+    // §13/§14 SharedRegion builtins (`__vm_region_*`): register their imports; `__vm_region_create`
+    // mints from the `AddressSpace` handle, so the program needs it granted (slot 4).
+    let uses_vm_region = register_vm_region_imports(m, &defined_names, &mut imports, &mut caps);
     // `realloc` is a synthesized helper built on `malloc` + `memcpy`, so it forces both on.
     let need_realloc = calls_external(m, &defined_names, "realloc") && has_main;
     let need_malloc = (needs_malloc(m, &defined_names) || need_realloc) && has_main;
@@ -246,15 +249,17 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
     // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
     // declared arity), sized to the highest capability index the program uses: exit(2) always,
-    // memory(3) for `malloc`/Memory builtins, ioring(5) for the async ring, blocking(6) for
-    // `__vm_blocking_handle`, jit(7) for the guest-driven-JIT builtins. (AddressSpace(4) comes with
-    // the §13/§14 region builtins, not yet lowered.)
+    // memory(3) for `malloc`/Memory builtins, addrspace(4) for the SharedRegion builtins, ioring(5)
+    // for the async ring, blocking(6) for `__vm_blocking_handle`, jit(7) for the guest-driven-JIT
+    // builtins.
     let max_cap_index = if uses_vm_jit {
         7
     } else if uses_blocking {
         6
     } else if uses_vm_io {
         5
+    } else if uses_vm_region {
+        4
     } else if need_memory_cap {
         3
     } else {
@@ -1297,6 +1302,10 @@ const STASH_EXIT: u64 = 8;
 /// `<svm.h>` Memory builtin (then `_start` takes a 4th granted handle). The bump allocator + the
 /// `__vm_map`/… builtins reload it to drive `Memory` capability calls.
 const STASH_MEMORY: u64 = 12;
+/// The `AddressSpace` handle (slot 4) — granted when the program mints a §13/§14 `SharedRegion`
+/// (`__vm_region_create` calls `AddressSpace.create_region`). The region handle it returns is then the
+/// capability for `__vm_region_map`/`unmap`/`page_size` (not a stash slot — those take it as an arg).
+const STASH_ADDRSPACE: u64 = 16;
 /// The `IoRing` (slot 5) and `Blocking` (slot 6) handles — granted when the program uses the §9/§12
 /// async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap` drive `IoRing`; `__vm_blocking_handle`
 /// returns the `Blocking` handle a guest names in an SQE).
@@ -1414,6 +1423,13 @@ fn import_sig(import: &str) -> svm_ir::FuncType {
         "vm_jit_invoke2" => ft(vec![I64, I64, I64], vec![I64]),
         "vm_jit_release" | "vm_jit_install" | "vm_jit_uninstall" => ft(vec![I64], vec![I64]),
         "vm_jit_compile_linked" => ft(vec![I64, I64, I64, I64], vec![I64]),
+        // §13/§14 SharedRegion: mint a region from `AddressSpace` (`create`, op 5 on the AddressSpace
+        // handle) → a region handle; `map`/`unmap`/`page_size` (ops 0/1/3 on that *region* handle) then
+        // alias its bytes into the window (the magic ring buffer / zero-copy child data plane).
+        "vm_region_create" => ft(vec![I64], vec![I64]),
+        "vm_region_map" => ft(vec![I64, I64, I64, I32], vec![I64]),
+        "vm_region_unmap" => ft(vec![I64, I64], vec![I64]),
+        "vm_region_page_size" => ft(vec![], vec![I64]),
         _ => ft(vec![I64, I64], vec![I64]), // write / read (Stream)
     }
 }
@@ -1590,6 +1606,56 @@ fn register_vm_jit_imports(
                     continue;
                 }
                 if let Some(import) = vm_jit_builtin_import(&name) {
+                    used = true;
+                    caps.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
+                        });
+                        i
+                    });
+                }
+            }
+        }
+    }
+    used
+}
+
+/// The §7 import a §13/§14 SharedRegion builtin needs (`__vm_region_create` → `vm_region_create`, …),
+/// or `None`. `create` reaches the `AddressSpace` (slot 4) handle; `map`/`unmap`/`page_size` reach the
+/// region handle `create` returned (passed as the call's first arg, not a stash slot).
+fn vm_region_builtin_import(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__vm_region_create" => "vm_region_create",
+        "__vm_region_map" => "vm_region_map",
+        "__vm_region_unmap" => "vm_region_unmap",
+        "__vm_region_page_size" => "vm_region_page_size",
+        _ => return None,
+    })
+}
+
+/// Scan for the SharedRegion builtins, registering each one's §7 import. Returns whether any were used
+/// — the signal that `_start` must be granted the `AddressSpace` handle (`__vm_region_create` mints
+/// from it). A guest-*defined* function of the same name shadows the builtin.
+fn register_vm_region_imports(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    imports: &mut Vec<svm_ir::Import>,
+    caps: &mut HashMap<String, u32>,
+) -> bool {
+    let mut used = false;
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if defined.contains_key(&name) {
+                    continue;
+                }
+                if let Some(import) = vm_region_builtin_import(&name) {
                     used = true;
                     caps.entry(import.to_string()).or_insert_with(|| {
                         let i = imports.len() as u32;
@@ -2620,6 +2686,49 @@ fn lower_vm_builtin(
                 args.push(ctx.operand_i64(vm_arg(c, i)?)?);
             }
             let handle = ctx.stash_load(STASH_JIT);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig(import),
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // ---- §13/§14 SharedRegion: mint from AddressSpace, then alias via the region handle ----
+        // `create(len)` calls `AddressSpace.create_region` on the stashed AddressSpace handle (slot 4)
+        // and returns a region handle. `map`/`unmap`/`page_size` take that region handle as their first
+        // C arg (`int region`) and `cap.call` *it* — the handle is the capability, not a stash slot.
+        "__vm_region_create" => {
+            let imp = ctx.import_of("vm_region_create")?;
+            let len = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let handle = ctx.stash_load(STASH_ADDRSPACE);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig("vm_region_create"),
+                handle,
+                args: vec![len],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_region_map" | "__vm_region_unmap" | "__vm_region_page_size" => {
+            let import = vm_region_builtin_import(name).expect("region builtin");
+            let imp = ctx.import_of(import)?;
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the region handle (arg 0)
+            let args = match name {
+                "__vm_region_map" => vec![
+                    ctx.operand_i64(vm_arg(c, 1)?)?, // win_off
+                    ctx.operand_i64(vm_arg(c, 2)?)?, // region_off
+                    ctx.operand_i64(vm_arg(c, 3)?)?, // len
+                    ctx.operand_i32(vm_arg(c, 4)?)?, // prot
+                ],
+                "__vm_region_unmap" => vec![
+                    ctx.operand_i64(vm_arg(c, 1)?)?, // win_off
+                    ctx.operand_i64(vm_arg(c, 2)?)?, // len
+                ],
+                _ => vec![], // page_size
+            };
             let r = ctx.push(Inst::CallImport {
                 import: imp,
                 sig: import_sig(import),
