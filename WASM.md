@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (79 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (89 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -183,9 +183,12 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 3. **Tail calls** 🟡 — common LLVM output, likely near-free (IR terminators exist).
 4. **Passive *data* segments + `memory.init`/`data.drop`** 🟡 — DONE. (The *table* bulk ops + passive
    *element* segments remain — they need a mutable runtime table; lower audience.)
-5. **Reference types** 🟡 (externref→handle, funcref→index), then the **SIMD remainder** 🟡 (breadth),
-   then **narrow-atomic CAS-loop** 🟡.
-6. EH, relaxed SIMD, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
+5. **SIMD remainder** 🟡 — **mostly landed** (10 of ~17 op families: compares (int+float), min/max,
+   shifts, abs/neg, the boolean reductions, saturating add/sub, widen, narrow, the i32↔f32 + demote/
+   promote conversions). The **tail** remains: `pmin`/`pmax`, dot product, `avgr_u`, `i8x16.popcnt`,
+   extadd/extmul, `q15mulr_sat`, and the f64↔i32 conversions. Same proven 5-step pattern.
+6. **Reference types** 🟡 (externref→handle, funcref→index), then the **narrow-atomic CAS-loop** 🟡.
+7. EH, relaxed SIMD, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
 
 Code map: the rejection sites are the `unsup(...)` calls in `crates/svm-wasm/src/lib.rs` (section
 parse + the `worker_op` operator catch-all `other => unsup("operator {…}")`); tests live in
