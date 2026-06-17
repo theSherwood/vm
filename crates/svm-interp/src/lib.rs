@@ -461,9 +461,11 @@ pub struct CapTape {
 /// Whether a capability is a **nondeterministic input** whose result a re-execution must replay
 /// (rather than re-derive). Deterministic / structural caps (window `Memory` ops, `SharedRegion`,
 /// `Stream` *write*) re-run faithfully on a fresh powerbox, so they are left live. Inputs: `Clock`
-/// (op 0 `now`) and `Stream` op 0 (stdin `read`); RNG and host-fns extend this.
+/// (op 0 `now`), `Stream` op 0 (stdin `read`), and **any host-fn** (`iface::HOST_FN`) — the
+/// embedder's escape hatch (RNG, a real clock, external I/O), whose closure is *gone* on the fresh
+/// replay powerbox, so only the tape can reproduce it.
 fn is_recorded_input(type_id: u32, op: u32) -> bool {
-    type_id == iface::CLOCK || (type_id == iface::STREAM && op == 0)
+    type_id == iface::CLOCK || (type_id == iface::STREAM && op == 0) || type_id == iface::HOST_FN
 }
 
 /// A [`GuestMem`] wrapper that records every `write_bytes` a capability makes into the guest window

@@ -645,3 +645,44 @@ fn captape_replays_stdin_read_into_the_buffer_for_faithful_seek() {
     let mut insp2 = Inspector::attach_with_host(&m, 0, &[Value::I32(s2)], 100_000, h2);
     assert_eq!(finished_ok(insp2.run_until_stop()), vec![Value::I32(0)]);
 }
+
+// Calls a host-fn capability (iface 13) twice and sums the results — the general embedder
+// nondeterminism escape hatch. The closure is gone on a fresh powerbox, so ONLY the CapTape can
+// reproduce its outputs across time-travel.
+const HOSTFN_SUM: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = cap.call 13 0 () -> (i64) v0 ()
+  v2 = cap.call 13 0 () -> (i64) v0 ()
+  v3 = i64.add v1 v2
+  return v3
+}
+"#;
+
+#[test]
+fn captape_replays_host_fn_inputs_for_faithful_seek() {
+    let m = parse_module(HOSTFN_SUM).expect("parse");
+    let mut host = Host::new();
+    // A nondeterministic host capability: each call returns an incrementing counter.
+    let mut n = 100i64;
+    let hf = host.grant_host_fn(Box::new(move |_op, _args, _mem| {
+        let v = n;
+        n += 1;
+        Ok(vec![v])
+    }));
+    let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(hf)], 100_000, host);
+
+    // Forward: 100 + 101 = 201; both crossings taped.
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I64(201)]);
+    assert_eq!(insp.cap_tape().records.len(), 2);
+    assert_eq!(insp.cap_tape().records[0].result, Ok(vec![100]));
+
+    // Time-travel: the host-fn closure does not exist on the fresh replay powerbox, so without the
+    // tape the re-run would fault. seek(0)+resume still yields 201 — the tape carried the outputs.
+    insp.seek(0);
+    assert_eq!(
+        finished_ok(insp.run_until_stop()),
+        vec![Value::I64(201)],
+        "host-fn outputs replay from the tape, not a (vanished) live closure"
+    );
+}
