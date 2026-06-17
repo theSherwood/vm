@@ -1139,14 +1139,24 @@ is the special case where the base is always frame value 0.) The interpreter `re
 Tests: an interpreter test stores a value at `data-SP+8` and reads it back through a `winvia` whose
 base is value 0; text + binary round-trips (incl. a negative offset).
 
-**Not yet (next slices), completing wasm variable ingest:** (2) svm-wasm tracking each wasm local's
-SSA value per pc (an `SsaList` per local, like the slice-15/17 op recording) — to supply the
-`WindowVia` base for the frame-base local; (3) wiring `dwarf_info` vars + base types → `debug.var`
-(`WindowVia`) + `TypeRef`, keyed by subprogram→IR-func, end-to-end. Plus the LLVM
-`!DILocation`/`dbg.value` bitcode path (its own effort). (The chibicc producer (incl. optimized-build
-location lists), both DAP consumers, binary serialization, a second producer's source lines + DWARF
-pass-through, the location-list ABI, the `.debug_info` reader, and now the `WindowVia` location model
-are all built.)
+**Slice 21 — wasm variable ingest, end-to-end (a second producer feeds the *variable* half).** A
+clang-compiled wasm guest's source variables now land in the §6 waist as named `debug.var`s the
+interpreter/DAP read by name. Two pieces: (a) the lowering records each **wasm local's SSA value per
+pc** (`(local, block, inst, value)` at block-entry re-threading + `local.set`/`tee`) — the
+`SsaList` a frame-pointer local needs; (b) `build_debug_info` parses `.debug_info`
+([`dwarf_info`]), matches each subprogram to its IR function by PC range (via the op offsets), and
+for each variable emits a `VarLoc::WindowVia { base = the frame-base local's recorded `SsaList`, off
+= DW_OP_fbreg }` plus a structured `TypeRef` from the `DW_TAG_base_type`. So the DWARF "C-frame
+memory at `frame_base + fbreg`" resolves at runtime to the actual window address (the frame pointer's
+value per pc, + offset). Test (`debug_line.rs`): the fixture's `a/b/s` are ingested as `WindowVia`
+vars at fbreg +12/+8/+4 with the `int` type, into the right IR function, and the module still
+verifies — **frontend neutrality demonstrated for variables, not just source lines**.
+
+**Not yet:** wasm aggregate/pointer types (only base types ingested so far) + DAP aggregate
+expansion over `WindowVia`; the LLVM `!DILocation`/`dbg.value` bitcode path (its own effort). (The
+chibicc producer (incl. optimized-build location lists), both DAP consumers, binary serialization,
+and a second producer's **source lines, DWARF pass-through, _and now named variables_** are all
+built — the W4 debug-info waist is exercised end-to-end by two independent frontends.)
 
 ### Open questions (S4/S5/S2)
 

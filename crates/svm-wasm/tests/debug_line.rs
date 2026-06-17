@@ -26,8 +26,7 @@ fn wasm_dwarf_line_maps_into_the_debug_info_waist() {
         "file table names the C source: {:?}",
         di.files
     );
-    // Only source locations are ingested as core (no types/vars yet).
-    assert!(di.types.is_empty() && di.vars.is_empty());
+    // Source locations are mapped onto IR pcs (variable ingest is asserted separately below).
     assert!(!di.locs.is_empty(), "some source locations were mapped");
 
     // Every `.debug_*` section is carried through verbatim as a §6 rich blob (for a future DWARF
@@ -107,4 +106,56 @@ fn wasm_dwarf_info_extracts_source_variables() {
         .expect("s's type DIE");
     assert_eq!(int_ty.name, "int");
     assert_eq!((int_ty.encoding, int_ty.size), (5, 4));
+}
+
+#[test]
+fn wasm_dwarf_variables_ingested_into_the_waist() {
+    // End-to-end: a clang wasm guest's source variables land in the §6 waist as named `debug.var`s
+    // with a `WindowVia` location (the DWARF frame-base local resolved per pc + the `fbreg` offset)
+    // and a structured `int` type — a second producer feeding the *variable* half of the waist.
+    use svm_ir::{Encoding, TypeDef, VarLoc};
+
+    let t = svm_wasm::transpile(DLINE).expect("transpile");
+    svm_verify::verify_module(&t.module).expect("verify"); // debug info is escape-irrelevant
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    // a, b, s are present, each a window-via-frame-base var into the C stack frame.
+    let var = |n: &str| {
+        di.vars.iter().find(|v| v.name == n).unwrap_or_else(|| {
+            panic!(
+                "var {n} ingested: {:?}",
+                di.vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+            )
+        })
+    };
+    for n in ["a", "b", "s"] {
+        let v = var(n);
+        let VarLoc::WindowVia { base, off } = &v.loc else {
+            panic!("{n} is a WindowVia var, got {:?}", v.loc);
+        };
+        // The base loclist (the frame-base wasm local's SSA value per pc) is non-empty, and `off` is
+        // the `DW_OP_fbreg` offset (a/b/s at +12/+8/+4).
+        assert!(!base.is_empty(), "{n} has a frame-base location list");
+        let expected_off = match n {
+            "a" => 12,
+            "b" => 8,
+            _ => 4,
+        };
+        assert_eq!(*off, expected_off, "{n} fbreg offset");
+        // All resolve to the same in-range IR function.
+        let func = v.func as usize;
+        assert!(func < t.module.funcs.len());
+        for l in base {
+            assert!(
+                (l.block as usize) < t.module.funcs[func].blocks.len(),
+                "base block in range"
+            );
+        }
+        // Type is the structured `int` (signed, 4 bytes).
+        let tid = v.type_id.expect("typed");
+        assert!(matches!(
+            &di.types[tid as usize],
+            TypeDef::Base { name, encoding: Encoding::Signed, size: 4 } if name == "int"
+        ));
+    }
 }

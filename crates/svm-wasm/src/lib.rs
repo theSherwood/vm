@@ -42,11 +42,13 @@
 //! reference types; multi-memory/multi-table. **Passive data segments + `memory.init`/`data.drop`**
 //! are supported (a constant-offset init unrolls to const-stores of the segment's known bytes).
 
+use std::collections::BTreeMap;
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, Edge, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering, StoreOp,
-    Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering, SsaLoc,
+    StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
+    VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx,
+    ValType, VarInfo, VarLoc,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -58,6 +60,10 @@ mod dwarf_line;
 /// Per-operator debug records from lowering: `(code-relative offset, block, inst index)` for the
 /// first IR instruction each wasm operator emits (DEBUGGING.md §6/W4 — mapped onto DWARF line rows).
 type OpLocs = Vec<(u32, u32, u32)>;
+
+/// Per-wasm-local debug records from lowering: `(local index, block, inst, SSA value)` — each change
+/// of a local's holding value, the `SsaList` a DWARF frame-pointer local needs (W4 variable ingest).
+type LocalLocs = Vec<(u32, u32, u32, u32)>;
 
 /// Why a wasm module couldn't be transpiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,14 +576,17 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         .iter()
         .map(|&ti| types[ti as usize].clone())
         .collect();
-    let want_locs = debug_line.is_some();
-    // Global `(code-relative offset, func, block, inst)` map for the DWARF→IR pc resolution below.
+    // Collect debug locations whenever any embedded DWARF is present (source lines *or* variables).
+    let want_locs = !debug_blobs.is_empty();
+    // Global `(code-relative offset, func, block, inst)` map for the DWARF→IR pc resolution below,
+    // and per-(func, local) location records for `WindowVia` frame-pointer bases.
     let mut op_locs: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut local_locs: Vec<(u32, u32, u32, u32, u32)> = Vec::new(); // (func, local, block, inst, val)
     let mut funcs = Vec::with_capacity(bodies.len() + spawn_import.is_some() as usize);
     for (i, body) in bodies.into_iter().enumerate() {
         let ty = &types[func_type_idx[i] as usize];
         let func_idx = funcs.len() as u32; // defined funcs come first, so this is the IR index
-        let (f, flocs) = lower_func(
+        let (f, flocs, local_flocs) = lower_func(
             &ty.0,
             &ty.1,
             &types,
@@ -602,6 +611,9 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         funcs.push(f);
         for (off, block, inst) in flocs {
             op_locs.push((off, func_idx, block, inst));
+        }
+        for (local, block, inst, val) in local_flocs {
+            local_locs.push((func_idx, local, block, inst, val));
         }
     }
     // Append the spawn shim (its `thread.spawn` target) for a threaded module.
@@ -673,29 +685,29 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             imports: named_imports,
             // Debug info — map wasm's embedded DWARF `.debug_line` into the §6 waist (D-DBG-7) and
             // carry every `.debug_*` section through as a rich blob.
-            debug_info: build_debug_info(debug_line.as_deref(), op_locs, debug_blobs),
+            debug_info: build_debug_info(debug_line.as_deref(), op_locs, local_locs, debug_blobs),
         },
         exports,
     })
 }
 
 /// Build the §6 debug-info waist from a wasm guest's embedded DWARF: map `.debug_line` rows onto IR
-/// pcs (each line row's code-relative address resolving to the first operator at-or-after it, via
-/// the `op_locs` the lowering recorded), and carry every `.debug_*` section through as a rich blob.
-/// Best-effort: returns `None` only if neither locations nor blobs are present. The verifier ignores
-/// the section (§2a).
+/// pcs, ingest `.debug_info` **source variables** (name, type, and a `WindowVia` location built from
+/// the subprogram's frame-base wasm local), and carry every `.debug_*` section through as a rich
+/// blob. Best-effort: returns `None` only if nothing was recovered. The verifier ignores it (§2a).
 fn build_debug_info(
     debug_line: Option<&[u8]>,
     mut op_locs: Vec<(u32, u32, u32, u32)>,
+    local_locs: Vec<(u32, u32, u32, u32, u32)>,
     blobs: Vec<svm_ir::ProducerBlob>,
 ) -> Option<DebugInfo> {
+    op_locs.sort_by_key(|e| e.0);
     let mut files: Vec<String> = Vec::new();
     let mut locs: Vec<Loc> = Vec::new();
     if let Some(prog) = debug_line.and_then(dwarf_line::parse) {
         if prog.files.len() > 1 {
             // DWARF file indices are 1-based; flatten to a 0-based table for `Loc::file`.
             files = prog.files[1..].to_vec();
-            op_locs.sort_by_key(|e| e.0);
             for row in &prog.rows {
                 if row.end_sequence || row.file == 0 || row.file as usize > files.len() {
                     continue;
@@ -725,16 +737,129 @@ fn build_debug_info(
             }
         }
     }
-    if locs.is_empty() && blobs.is_empty() {
+    // Source variables from `.debug_info` (DEBUGGING.md W4 — wasm variable ingest).
+    let (types, vars) = ingest_variables(&blobs, &op_locs, &local_locs);
+
+    if locs.is_empty() && vars.is_empty() && blobs.is_empty() {
         return None;
     }
     Some(DebugInfo {
         files,
         locs,
-        types: Vec::new(),
-        vars: Vec::new(),
+        types,
+        vars,
         blobs,
     })
+}
+
+/// Ingest `.debug_info` source variables into `(types, vars)`: each DWARF variable's
+/// `(frame_base_local + DW_OP_fbreg)` becomes a `VarLoc::WindowVia` whose base is that local's
+/// recorded `SsaList`, and its `DW_TAG_base_type` becomes a structured `TypeRef`. A subprogram is
+/// matched to its IR function by PC range (via `op_locs`). Empty if there is no parseable
+/// `.debug_info`.
+fn ingest_variables(
+    blobs: &[svm_ir::ProducerBlob],
+    op_locs: &[(u32, u32, u32, u32)],
+    local_locs: &[(u32, u32, u32, u32, u32)],
+) -> (Vec<TypeDef>, Vec<VarInfo>) {
+    let sec = |name: &str| {
+        blobs
+            .iter()
+            .find(|b| b.producer == name)
+            .map(|b| b.bytes.as_slice())
+    };
+    let (Some(info), Some(abbrev)) = (sec(".debug_info"), sec(".debug_abbrev")) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(dw) = dwarf_info::parse(info, abbrev, sec(".debug_str").unwrap_or(&[])) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut types: Vec<TypeDef> = Vec::new();
+    let mut type_ids: BTreeMap<u32, u32> = BTreeMap::new(); // DWARF type-DIE offset → svm TypeId
+    let mut vars: Vec<VarInfo> = Vec::new();
+
+    for sub in &dw.subs {
+        let Some(fb_local) = sub.frame_base_local else {
+            continue; // only the `DW_OP_WASM_location <local>` frame base is supported
+        };
+        let Some(func) = func_for_pc_range(op_locs, sub.low_pc as u32, sub.high_pc as u32) else {
+            continue;
+        };
+        // The frame-base local's location list (its SSA value per pc) becomes the `WindowVia` base.
+        let base: Vec<SsaLoc> = local_locs
+            .iter()
+            .filter(|&&(f, l, _, _, _)| f == func && l == fb_local)
+            .map(|&(_, _, block, inst, value)| SsaLoc { block, inst, value })
+            .collect();
+        if base.is_empty() {
+            continue;
+        }
+        for v in &sub.vars {
+            let type_id = intern_base_type(&dw, v.type_ref, &mut types, &mut type_ids);
+            let ty = type_id
+                .and_then(|id| types.get(id as usize))
+                .map(type_render_name)
+                .unwrap_or_else(|| "?".to_string());
+            vars.push(VarInfo {
+                func,
+                name: v.name.clone(),
+                ty,
+                loc: VarLoc::WindowVia {
+                    base: base.clone(),
+                    off: v.fbreg,
+                },
+                type_id,
+            });
+        }
+    }
+    (types, vars)
+}
+
+/// The IR function whose code spans `[low, high)` (a DWARF subprogram's PC range), found via the
+/// first recorded operator offset in that range. `op_locs` is sorted by offset.
+fn func_for_pc_range(op_locs: &[(u32, u32, u32, u32)], low: u32, high: u32) -> Option<u32> {
+    let idx = op_locs.partition_point(|e| e.0 < low);
+    op_locs.get(idx).filter(|e| e.0 < high).map(|e| e.1)
+}
+
+/// Intern a DWARF `DW_TAG_base_type` (by DIE offset) into the structured type table, returning its
+/// `TypeId`. Non-base types (pointer/struct — not yet ingested for wasm) yield `None`.
+fn intern_base_type(
+    dw: &dwarf_info::DwarfInfo,
+    type_ref: u32,
+    types: &mut Vec<TypeDef>,
+    type_ids: &mut BTreeMap<u32, u32>,
+) -> Option<u32> {
+    if let Some(&id) = type_ids.get(&type_ref) {
+        return Some(id);
+    }
+    let bt = dw.base_types.get(&type_ref)?;
+    let encoding = match bt.encoding {
+        0x02 => svm_ir::Encoding::Bool,
+        0x04 => svm_ir::Encoding::Float,
+        0x07 | 0x08 => svm_ir::Encoding::Unsigned, // unsigned, unsigned_char
+        _ => svm_ir::Encoding::Signed,             // signed, signed_char, address, …
+    };
+    let id = types.len() as u32;
+    types.push(TypeDef::Base {
+        name: bt.name.clone(),
+        encoding,
+        size: bt.size,
+    });
+    type_ids.insert(type_ref, id);
+    Some(id)
+}
+
+/// The render name of a structured type (each variant carries one).
+fn type_render_name(t: &TypeDef) -> String {
+    match t {
+        TypeDef::Base { name, .. }
+        | TypeDef::Pointer { name, .. }
+        | TypeDef::Array { name, .. }
+        | TypeDef::Aggregate { name, .. }
+        | TypeDef::Opaque { name, .. } => name.clone(),
+    }
 }
 
 /// Evaluate a global's constant initializer to its little-endian bytes (4 or 8 wide).
@@ -896,6 +1021,10 @@ struct Lower<'a> {
     /// line rows can be mapped to IR pcs. The file offset where the code section content begins (to
     /// turn file-absolute operator offsets into code-relative ones); 0 ⇒ collection off.
     locs: Vec<(u32, u32, u32)>,
+    /// Per-wasm-local location records `(local, block, inst, value)`: each change of a local's
+    /// holding SSA value (block-entry re-threading + `local.set`/`tee`), the `SsaList` that supplies
+    /// a `WindowVia` base for a DWARF frame-pointer local (DEBUGGING.md W4 — wasm variable ingest).
+    local_locs: Vec<(u32, u32, u32, u32)>,
     code_content_start: usize,
     want_locs: bool,
 }
@@ -1012,6 +1141,7 @@ impl Lower<'_> {
         }
         let nl = self.local_types.len() as ValIdx;
         self.locals = (p..p + nl).collect();
+        self.record_locals(); // each local re-enters as its block parameter (DEBUGGING.md W4)
         self.stack = stack_types
             .iter()
             .enumerate()
@@ -1019,6 +1149,25 @@ impl Lower<'_> {
             .collect();
         self.consts.clear(); // SSA values are block-local; constants don't carry across blocks
         self.reachable = true;
+    }
+
+    /// Set wasm local `i` to SSA value `v`, recording the change for the per-local location list.
+    fn set_local(&mut self, i: usize, v: ValIdx) {
+        self.locals[i] = v;
+        if self.want_locs {
+            let inst = self.blocks[self.cur].insts.len() as u32;
+            self.local_locs.push((i as u32, self.cur as u32, inst, v));
+        }
+    }
+
+    /// Record every local's current value at the start of the current block (inst 0) — the
+    /// block-parameter re-threading that makes a local resolvable in each block.
+    fn record_locals(&mut self) {
+        if self.want_locs {
+            for (i, &v) in self.locals.iter().enumerate() {
+                self.local_locs.push((i as u32, self.cur as u32, 0, v));
+            }
+        }
     }
 
     /// The compile-time value of `idx` if it was produced by an `i32.const`/`i64.const` in the
@@ -1057,6 +1206,7 @@ impl Lower<'_> {
         }
         let nl = self.local_types.len() as ValIdx;
         self.locals = (p..p + nl).collect();
+        self.record_locals();
         let stack_start = p + nl;
         self.stack = below
             .iter()
@@ -1196,7 +1346,7 @@ fn lower_func(
     threads: ThreadCfg,
     code_content_start: usize,
     want_locs: bool,
-) -> Result<(Func, OpLocs), Error> {
+) -> Result<(Func, OpLocs, LocalLocs), Error> {
     // Locals = params (with their incoming param values) then declared locals (default 0).
     let mut local_types: Vec<ValType> = params.to_vec();
     for decl in body.get_locals_reader()? {
@@ -1251,6 +1401,7 @@ fn lower_func(
         data_segments,
         threads,
         locs: Vec::new(),
+        local_locs: Vec::new(),
         code_content_start,
         want_locs,
     };
@@ -1279,6 +1430,7 @@ fn lower_func(
         dead: false,
     });
 
+    lo.record_locals(); // the entry block's initial local values (params + zero-inits)
     for item in body.get_operators_reader()?.into_iter_with_offsets() {
         let (op, off) = item?;
         // Record where this operator's first IR instruction lands, for the DWARF→IR pc mapping.
@@ -1293,6 +1445,7 @@ fn lower_func(
     }
 
     let locs = std::mem::take(&mut lo.locs);
+    let local_locs = std::mem::take(&mut lo.local_locs);
     let blocks = lo
         .blocks
         .into_iter()
@@ -1310,6 +1463,7 @@ fn lower_func(
             blocks,
         },
         locs,
+        local_locs,
     ))
 }
 
@@ -2631,14 +2785,14 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         }
         O::LocalSet { local_index } => {
             let (v, _) = lo.pop()?;
-            lo.locals[local_index as usize] = v;
+            lo.set_local(local_index as usize, v);
         }
         O::LocalTee { local_index } => {
             let (v, _) = *lo
                 .stack
                 .last()
                 .ok_or_else(|| Error::Parse("tee on empty stack".into()))?;
-            lo.locals[local_index as usize] = v;
+            lo.set_local(local_index as usize, v);
         }
         O::Select => {
             let (c, _) = lo.pop()?;
