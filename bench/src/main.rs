@@ -104,6 +104,10 @@ struct Kernel {
     /// return the *identical* value as the IR/WAT (the harness asserts it before timing). `None`
     /// for kernels with no pure-native analog (the `HostCall` interface kernels).
     native: Option<fn(i64) -> i64>,
+    /// Override `(n_big, n_small)` for the subtraction. `None` ⇒ the mode default (compute /
+    /// host-call). A knob for any future kernel whose per-iteration cost is large enough that the
+    /// 2M default span would make a pass too slow (none currently need it).
+    n_span: Option<(i64, i64)>,
 }
 
 /// `(i64 n) -> i64`: an LCG-style recurrence over `n` iterations — a tight `i64` mul/add
@@ -173,6 +177,7 @@ block3(v17: i64):
 "#,
     ),
     native: Some(native_alu),
+    n_span: None,
 };
 
 /// `(i64 n) -> i64`: a §17 `v128` compute loop — an `i32x4` accumulator gains `[1,2,3,4]`
@@ -266,6 +271,7 @@ block3(v0: i64, v1: i64, v2: v128):
     // it would make the JIT look (misleadingly) faster than "native". `simd` stays a v128 reference
     // point on the interp/jit/wasm lanes (it is deliberately left out of baseline.txt too).
     native: None,
+    n_span: None,
 };
 
 /// `(i64 n) -> i64`: store then load `i` through a windowed address each iteration, so the
@@ -334,9 +340,10 @@ block3(v18: i64):
 "#,
     ),
     native: Some(native_memsum),
+    n_span: None,
 };
 
-const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER, SIMD];
+const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER, SIMD, FLOAT, CALLI];
 
 /// `(i64 n) -> i64`: like `memsum` but the store and the load go to **different, per-iter
 /// varying** slots — write slot `(i·M1)&1023`, read slot `(i·M2)&1023` (M1,M2 odd, so each
@@ -421,6 +428,153 @@ block3(v24: i64):
 "#,
     ),
     native: Some(native_scatter),
+    n_span: None,
+};
+
+/// `(i64 n) -> i64`: an **f64 compute** loop — a bounded recurrence `acc = acc*0.5 + (i & 1023)`,
+/// returning `i64.reinterpret_f64(acc)` so the f64 result slots into the harness's `(i64) -> i64`
+/// comparison as raw bits. Pure `fmul`/`fadd`/`convert` in a fixed order ⇒ every engine (and native
+/// Rust, which does not fuse `a*b+c` to an FMA) produces a **bit-identical** result, so the
+/// cross-check is exact. The first FP kernel — tracks f64 lowering on all four lanes.
+const FLOAT: Kernel = Kernel {
+    name: "float",
+    ir: "\
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = f64.const 0.0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: f64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: f64, v9: i64):
+  v10 = i64.const 1023
+  v11 = i64.and v9 v10
+  v12 = f64.convert_i64_s v11
+  v13 = f64.const 0.5
+  v14 = f64.mul v8 v13
+  v15 = f64.add v14 v12
+  v16 = i64.const 1
+  v17 = i64.add v9 v16
+  br block1(v7, v15, v17)
+block3(v18: f64):
+  v19 = i64.reinterpret_f64 v18
+  return v19
+}
+",
+    wat32: r#"
+(module
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc f64) (local $i i64)
+    (local.set $acc (f64.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc
+          (f64.add
+            (f64.mul (local.get $acc) (f64.const 0.5))
+            (f64.convert_i64_s (i64.and (local.get $i) (i64.const 1023)))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (i64.reinterpret_f64 (local.get $acc))))
+"#,
+    // wasm64 twin for completeness (no memory ⇒ a declared-but-unused `(memory i64 1)`).
+    wat64: Some(
+        r#"
+(module
+  (memory i64 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc f64) (local $i i64)
+    (local.set $acc (f64.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc
+          (f64.add
+            (f64.mul (local.get $acc) (f64.const 0.5))
+            (f64.convert_i64_s (i64.and (local.get $i) (i64.const 1023)))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (i64.reinterpret_f64 (local.get $acc))))
+"#,
+    ),
+    native: Some(native_float),
+    n_span: None,
+};
+
+/// `(i64 n) -> i64`: a **`call_indirect` dispatch** loop — each iteration calls a leaf `x -> x+1`
+/// through the function table (slot 1 = the leaf), accumulating, so the timing isolates the §3c
+/// table-dispatch cost (mask + type-id check) vs a Wasmtime `call_indirect`. Result = Σ (i+1).
+const CALLI: Kernel = Kernel {
+    name: "calli",
+    ir: "\
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i32.const 1
+  v11 = call_indirect (i64) -> (i64) v10 (v9)
+  v12 = i64.add v8 v11
+  v13 = i64.const 1
+  v14 = i64.add v9 v13
+  br block1(v7, v12, v14)
+block3(v15: i64):
+  return v15
+}
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 1
+  v2 = i64.add v0 v1
+  return v2
+}
+",
+    wat32: r#"
+(module
+  (type $sig (func (param i64) (result i64)))
+  (table 2 funcref)
+  (elem (i32.const 1) $leaf)
+  (func $leaf (type $sig) (i64.add (local.get 0) (i64.const 1)))
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc
+          (i64.add (local.get $acc)
+            (call_indirect (type $sig) (local.get $i) (i32.const 1))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    // wasm64 twin for completeness (the table is unaffected by memory64; add a dummy memory).
+    wat64: Some(
+        r#"
+(module
+  (memory i64 1)
+  (type $sig (func (param i64) (result i64)))
+  (table 2 funcref)
+  (elem (i32.const 1) $leaf)
+  (func $leaf (type $sig) (i64.add (local.get 0) (i64.const 1)))
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc
+          (i64.add (local.get $acc)
+            (call_indirect (type $sig) (local.get $i) (i32.const 1))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    ),
+    native: Some(native_calli),
+    n_span: None,
 };
 
 const N_SMALL: i64 = 1_000;
@@ -499,6 +653,32 @@ fn native_locals(n: i64) -> i64 {
         acc = acc.wrapping_add(black_box(a[slot]));
     }
     black_box(&a);
+    acc
+}
+
+/// Native twin of `FLOAT`: the bounded f64 recurrence, returned as raw bits. Rust does not fuse
+/// `acc * 0.5 + x` to an FMA, so the rounding matches the IR/WAT lanes bit-for-bit.
+fn native_float(n: i64) -> i64 {
+    let mut acc: f64 = 0.0;
+    for i in 0..n {
+        let x = (i & 1023) as f64;
+        acc = acc * 0.5 + x;
+    }
+    black_box(acc).to_bits() as i64
+}
+
+/// Native twin of `CALLI`: call a leaf through a `black_box`'d function pointer each iteration
+/// (so the compiler can't devirtualize/inline it — a real indirect call, like `call_indirect`).
+fn native_calli(n: i64) -> i64 {
+    fn leaf(x: i64) -> i64 {
+        x.wrapping_add(1)
+    }
+    let table: [fn(i64) -> i64; 2] = [leaf, leaf];
+    let mut acc: i64 = 0;
+    for i in 0..n {
+        let f = black_box(table[1]);
+        acc = acc.wrapping_add(f(i));
+    }
     acc
 }
 
@@ -662,6 +842,12 @@ struct Resolved {
     mode: Mode,
     /// The `native` lane (the bare-metal ceiling), if this kernel has one — see [`Kernel::native`].
     native: Option<fn(i64) -> i64>,
+    /// Pre-compiled wasm32 bytes (the `irreducible` kernel: `clang --target=wasm32` output, so the
+    /// LLVM wasm backend does the relooping). When `Some`, the wasm32 lane uses these directly
+    /// instead of assembling `wat32` — the only kernels with a real C→wasm compile, not hand WAT.
+    wasm32_bytes: Option<Vec<u8>>,
+    /// Optional `(n_big, n_small)` override for the subtraction span (see [`Kernel::n_span`]).
+    n_span: Option<(i64, i64)>,
 }
 
 /// The hand-written [`KERNELS`] plus, when the C frontend is buildable, the chibicc-lowered
@@ -692,9 +878,11 @@ fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
             wat64: k.wat64.map(|w| w.to_string()),
             mode: Mode::Compute,
             native: k.native,
+            wasm32_bytes: None,
+            n_span: k.n_span,
         })
         .collect();
-    for k in [alu_from_c(), locals_from_c()] {
+    for k in [alu_from_c(), locals_from_c(), irreducible_from_c()] {
         match k {
             Ok(r) => v.push(r),
             Err(e) => eprintln!("note: skipping a C-frontend kernel (frontend unavailable): {e}"),
@@ -706,7 +894,13 @@ fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
 
     if from_wasm {
         for k in &mut v {
-            match transpile_wat_to_ir(&k.wat32) {
+            // The `irreducible` kernel already *is* wasm (clang output); transpile those bytes.
+            // Everything else assembles its hand-written WAT first.
+            let transpiled = match &k.wasm32_bytes {
+                Some(b) => transpile_wasm_to_ir(b),
+                None => transpile_wat_to_ir(&k.wat32),
+            };
+            match transpiled {
                 Ok((ir, entry)) => {
                     k.ir = ir;
                     k.entry = entry;
@@ -733,7 +927,13 @@ fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
 /// and re-parsed by `measure`, so this also exercises the text round-trip.
 fn transpile_wat_to_ir(wat32: &str) -> Result<(String, u32), String> {
     let wasm = wat::parse_str(wat32).map_err(|e| e.to_string())?;
-    let t = svm_wasm::transpile(&wasm).map_err(|e| e.to_string())?;
+    transpile_wasm_to_ir(&wasm)
+}
+
+/// Like [`transpile_wat_to_ir`] but from already-assembled wasm bytes (the `irreducible` kernel's
+/// `clang` output) — run the *same relooped wasm* on svm under `--from-wasm`.
+fn transpile_wasm_to_ir(wasm: &[u8]) -> Result<(String, u32), String> {
+    let t = svm_wasm::transpile(wasm).map_err(|e| e.to_string())?;
     let entry = t
         .exports
         .iter()
@@ -793,6 +993,8 @@ block3(v15: i64):
         wat64: None,
         mode: Mode::HostCall,
         native: None,
+        wasm32_bytes: None,
+        n_span: None,
     }
 }
 
@@ -850,6 +1052,8 @@ block3(v17: i64):
         wat64: None,
         mode: Mode::HostCall,
         native: None,
+        wasm32_bytes: None,
+        n_span: None,
     }
 }
 
@@ -886,6 +1090,8 @@ fn c_kernel(
         wat64,
         mode: Mode::Compute,
         native,
+        wasm32_bytes: None,
+        n_span: None,
     })
 }
 
@@ -968,6 +1174,80 @@ fn locals_from_c() -> Result<Resolved, String> {
         Some(WAT64.to_string()),
         Some(native_locals),
     )
+}
+
+/// **Irreducible control flow (§1a/D2 differentiator).** A `goto` into the middle of a loop gives
+/// the loop two entry points → an irreducible CFG. SVM runs it natively (chibicc → IR, no
+/// restructuring); the wasm lane is **`clang --target=wasm32`** output, where LLVM's wasm backend
+/// must reloop it (the Stackifier + `fix-irreducible-control-flow` pass — a dispatch branch per
+/// iteration), so the *same C* exercises "wasm forces a relooper, svm doesn't". The wasm here is a
+/// genuine C→wasm compile rather than hand-written WAT. No `native` lane (Rust has no `goto`; a
+/// structured rewrite would be a different CFG — same call we make for `simd`). `clang` `-O2` can
+/// sometimes remove the irreducibility, in which case the relooper cost is small — an honest
+/// measurement either way. Skipped (like the other C kernels) if the toolchain is unavailable.
+fn irreducible_from_c() -> Result<Resolved, String> {
+    const SRC: &str = "long long run(long long n){\n  \
+        long long a = 0, b = 0, i = 0;\n  \
+        if (n & 1) goto odd;\n  \
+        while (i < n) {\n    \
+            a += i; i++;\n  \
+        odd:\n    \
+            b += i * 3; i++;\n  \
+        }\n  \
+        return a + b;\n}\n\
+        int main(){ return (int)run(0); }\n";
+    let ir = compile_c_to_ir(SRC)?;
+    let m = svm_text::parse_module(&ir).map_err(|e| format!("parse frontend IR: {e:?}"))?;
+    let entry = m
+        .funcs
+        .iter()
+        .position(|f| {
+            f.params == [svm_ir::ValType::I64, svm_ir::ValType::I64]
+                && f.results == [svm_ir::ValType::I64]
+        })
+        .ok_or("no `run(i64,i64)->i64` entry in frontend output")? as u32;
+    let wasm = compile_c_to_wasm(SRC)?;
+    Ok(Resolved {
+        name: "irreducible".into(),
+        ir,
+        entry,
+        lead_args: vec![0],
+        wat32: String::new(),
+        wat64: None,
+        mode: Mode::Compute,
+        native: None,
+        wasm32_bytes: Some(wasm),
+        n_span: None,
+    })
+}
+
+/// Compile `src` to a wasm32 module (exporting `run`) with stock `clang` + `wasm-ld`, returning the
+/// bytes. Used for the `irreducible` kernel so LLVM's wasm backend does the relooping. `Err` (caller
+/// skips the kernel) if `clang`'s wasm target is unavailable.
+fn compile_c_to_wasm(src: &str) -> Result<Vec<u8>, String> {
+    use std::process::Command;
+    let base = std::env::temp_dir().join(format!("svm_bench_wasm_{}", std::process::id()));
+    let cfile = base.with_extension("c");
+    let wfile = base.with_extension("wasm");
+    std::fs::write(&cfile, src).map_err(|e| format!("write temp C: {e}"))?;
+    let ok = Command::new("clang")
+        .args([
+            "--target=wasm32",
+            "-O2",
+            "-nostdlib",
+            "-Wl,--no-entry",
+            "-Wl,--export=run",
+            "-o",
+            wfile.to_str().unwrap(),
+            cfile.to_str().unwrap(),
+        ])
+        .status()
+        .map_err(|e| format!("run clang: {e}"))?
+        .success();
+    if !ok {
+        return Err("clang --target=wasm32 failed".into());
+    }
+    std::fs::read(&wfile).map_err(|e| format!("read wasm: {e}"))
 }
 
 /// Build the chibicc fork (idempotent `make`) and compile `src` to our text IR. Returns `Err`
@@ -1138,18 +1418,24 @@ struct Ratios {
 /// engine agrees on the result first, so we never benchmark a miscompile.
 fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
     let m = svm_text::parse_module(&k.ir).expect("parse our IR text");
-    let wasm32 = wat::parse_str(&k.wat32).expect("assemble wasm32 WAT");
+    // wasm32 bytes come either pre-compiled (the `irreducible` kernel's clang output) or by
+    // assembling the hand-written WAT.
+    let wasm32 = match &k.wasm32_bytes {
+        Some(b) => b.clone(),
+        None => wat::parse_str(&k.wat32).expect("assemble wasm32 WAT"),
+    };
     let wasm64 = k
         .wat64
         .as_deref()
         .map(|wat| wat::parse_str(wat).expect("assemble wasm64 WAT"));
     // `Compute` kernels time the inner loop; `HostCall` kernels make one host crossing per
     // iteration, so they use the no-cap vs cap-thunk SVM path, the import-linked wasm path, and
-    // a smaller iteration span (a host call ≫ a compute op).
-    let (n_big, n_small) = match k.mode {
+    // a smaller iteration span (a host call ≫ a compute op). A kernel may override the span
+    // (`n_span`) — the cache-miss kernel does, since each iteration is DRAM-latency-bound.
+    let (n_big, n_small) = k.n_span.unwrap_or(match k.mode {
         Mode::Compute => (N_BIG, N_SMALL),
         Mode::HostCall => (N_HOST_BIG, N_HOST_SMALL),
-    };
+    });
     let svm = |n: i64| match k.mode {
         Mode::Compute => svm_call(&m, k.entry, &k.lead_args, n),
         Mode::HostCall => svm_call_host(&m, k.entry, &k.lead_args, n),
@@ -1354,14 +1640,14 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
         tol * 100.0
     );
     println!(
-        "{:<8} {:<16} {:>9} {:>9} {:>8}  status",
+        "{:<11} {:<16} {:>9} {:>9} {:>8}  status",
         "kernel", "metric", "baseline", "current", "delta"
     );
     let mut ok = true;
     for (k, raw) in results {
         let Some(b) = base.get(k.name.as_str()) else {
             println!(
-                "{:<8} {:<16} {:>9} {:>9} {:>8}  MISSING",
+                "{:<11} {:<16} {:>9} {:>9} {:>8}  MISSING",
                 k.name, "(all)", "-", "-", "-"
             );
             continue;
@@ -1372,7 +1658,7 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
             let regressed = delta > tol;
             ok &= !regressed;
             println!(
-                "{:<8} {:<16} {:>9.3} {:>9.3} {:>+7.1}%  {}",
+                "{:<11} {:<16} {:>9.3} {:>9.3} {:>+7.1}%  {}",
                 k.name,
                 metric,
                 baseline,
@@ -1422,12 +1708,12 @@ fn print_table(results: &[(Resolved, Raw)]) {
          N_big={N_BIG} N_small={N_SMALL}\n"
     );
     println!(
-        "{:<8} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
+        "{:<11} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
         "kernel", "native", "jit", "interp", "i/jit", "jit/nat", "wasm32", "ratio", "wasm64",
         "ratio", "svm", "wasm32", "ratio"
     );
     println!(
-        "{:<8} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
+        "{:<11} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
         "", "ns/it", "ns/it", "ns/it", "", "", "ns/it", "", "ns/it", "", "cold ms", "cold ms", ""
     );
     let fmt_ns = |o: Option<f64>| o.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into());
@@ -1439,7 +1725,7 @@ fn print_table(results: &[(Resolved, Raw)]) {
             _ => ("—".into(), "—".into()),
         };
         println!(
-            "{:<8} | {:>8} {:>8.3} {:>8} {:>6} {:>7} | {:>8.3} {:>5.2}× | {:>8} {:>6} | {:>8.4} {:>8.4} {:>5.2}×",
+            "{:<11} | {:>8} {:>8.3} {:>8} {:>6} {:>7} | {:>8.3} {:>5.2}× | {:>8} {:>6} | {:>8.4} {:>8.4} {:>5.2}×",
             k.name,
             fmt_ns(raw.native_ns),
             raw.svm_ns,
