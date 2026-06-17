@@ -344,3 +344,157 @@ fn dap_reverse_debugging_walks_back_through_breakpoint_hits() {
     );
     assert!(!s.is_terminated());
 }
+
+// Two worker threads (func 1) over a shared counter, with a §6/W4 debug section: the worker's load
+// op maps to worker.c:4 and its argument is the source variable `delta`.
+const WORKERS_DBG: &str = r#"
+memory 16
+func () -> (i64) {
+block0():
+  vsp = i64.const 0
+  va = i64.const 1
+  vh0 = thread.spawn 1 vsp va
+  vh1 = thread.spawn 1 vsp va
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.load vaddr
+  return vr
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  vaddr = i64.const 0
+  vc = i64.load vaddr
+  vn = i64.add vc varg
+  i64.store vaddr vn
+  vz = i64.const 0
+  return vz
+}
+
+debug.file 0 "worker.c"
+debug.loc 1 0 1 0 4 3
+debug.var 1 "delta" ssa 1 "long"
+"#;
+
+/// Multithreaded debugging over DAP (DEBUGGING.md Milestone B): a scheduled launch surfaces every
+/// `thread.spawn` vCPU as a DAP thread; a source breakpoint in the worker fires per-thread, the
+/// `stopped` event names which thread, and `stackTrace`/`variables` inspect a chosen thread's frame.
+#[test]
+fn dap_multithreaded_threads_per_thread_stacks_and_which_stopped() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    // `schedule: []` ⇒ a deterministic multithreaded run (every thread.spawn vCPU is a DAP thread).
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(WORKERS_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("schedule", Json::Arr(vec![])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("worker.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(4))])]),
+            ),
+        ]),
+    ));
+
+    // configurationDone runs to the worker breakpoint — a *worker* thread stops, not the root (1).
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let first = event(&out, "stopped")
+        .unwrap()
+        .get("body")
+        .unwrap()
+        .get("threadId")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert!(
+        first >= 2,
+        "a spawned worker stopped, not the root thread 1 (got {first})"
+    );
+
+    // `threads` lists every live vCPU (root + two workers).
+    let out = s.handle(&req(5, "threads", Json::obj(vec![])));
+    let threads = response(&out).get("body").unwrap().get("threads").unwrap();
+    assert!(
+        threads.as_array().unwrap().len() >= 2,
+        "multiple threads are live: {}",
+        threads.as_array().unwrap().len()
+    );
+
+    // stackTrace of the stopped worker → its frame at worker.c:4, with delta = 1.
+    let out = s.handle(&req(
+        6,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(first))]),
+    ));
+    let top = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .clone();
+    assert_eq!(top.get("line"), Some(&Json::i(4)));
+    assert_eq!(
+        top.get("source").unwrap().get("name"),
+        Some(&Json::s("worker.c"))
+    );
+
+    let fid = top.get("id").unwrap().as_i64().unwrap();
+    let out = s.handle(&req(
+        7,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(fid))]),
+    ));
+    let vref = response(&out)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        8,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(vref))]),
+    ));
+    let vars = response(&out)
+        .get("body")
+        .unwrap()
+        .get("variables")
+        .unwrap();
+    let delta = vars
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("delta"))
+        .and_then(|v| v.get("value"))
+        .and_then(|v| v.as_str());
+    assert_eq!(delta, Some("1"), "the worker's argument delta = 1");
+
+    // continue → the *other* worker hits the same breakpoint (a different DAP thread).
+    let out = s.handle(&req(9, "continue", Json::obj(vec![])));
+    let second = event(&out, "stopped")
+        .unwrap()
+        .get("body")
+        .unwrap()
+        .get("threadId")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_ne!(first, second, "the second hit is a different worker thread");
+}

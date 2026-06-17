@@ -42,6 +42,10 @@ struct Session {
     line_index: BTreeMap<(u32, u32), IrPc>,
     /// IR pcs currently set as breakpoints (so `setBreakpoints` can replace them per the protocol).
     breakpoints: Vec<IrPc>,
+    /// DAP `frameId` → `(thread id, frame index)`, assigned during `stackTrace` and consumed by
+    /// `scopes`/`variables`, so a variable reference names a specific thread's frame (multithreaded
+    /// DAP). Cleared whenever execution resumes (old frames become stale).
+    frame_refs: Vec<(u64, usize)>,
 }
 
 /// An event to emit after a response: `(event-name, body)`.
@@ -171,12 +175,28 @@ impl DapServer {
 
         let debug = module.debug_info.clone();
         let line_index = debug.as_ref().map(build_line_index).unwrap_or_default();
-        let inspector = Inspector::attach(&module, func, &call_args, fuel);
+        // Execution mode (DEBUGGING.md Milestone B): `seed` ⇒ a fuzzed interleaving; `schedule`
+        // (possibly empty) ⇒ a fixed multithreaded interleaving (a witness, or the deterministic
+        // default); neither ⇒ single-threaded. Multithreaded debugging surfaces every `thread.spawn`
+        // vCPU as a DAP thread.
+        let inspector = if let Some(seed) = args.get("seed").and_then(|v| v.as_i64()) {
+            Inspector::attach_scheduled_seeded(&module, func, &call_args, fuel, seed as u64)
+        } else if let Some(plan) = args.get("schedule").and_then(|v| v.as_array()) {
+            let plan: Vec<u64> = plan
+                .iter()
+                .filter_map(|t| t.as_i64())
+                .map(|t| t as u64)
+                .collect();
+            Inspector::attach_scheduled(&module, func, &call_args, fuel, plan)
+        } else {
+            Inspector::attach(&module, func, &call_args, fuel)
+        };
         self.session = Some(Session {
             inspector,
             debug,
             line_index,
             breakpoints: Vec::new(),
+            frame_refs: Vec::new(),
         });
         (true, Json::Null, vec![])
     }
@@ -230,7 +250,7 @@ impl DapServer {
         // The interpreter starts paused before the first op. If `stopOnEntry`, surface that as a
         // stop; otherwise run to the first breakpoint (or completion).
         if self.stop_on_entry {
-            let ev = stopped_event("entry");
+            let ev = stopped_event("entry", 1);
             (true, Json::Null, vec![ev])
         } else {
             let stop = match self.session.as_mut() {
@@ -242,24 +262,51 @@ impl DapServer {
     }
 
     fn on_threads(&mut self) -> (bool, Json, Vec<Event>) {
-        // Slice 1 surfaces a single thread; per-`thread.spawn` threads (Milestone B) map later.
-        let threads = Json::Arr(vec![Json::obj(vec![
-            ("id", Json::i(1)),
-            ("name", Json::s("thread-0")),
-        ])]);
-        (true, Json::obj(vec![("threads", threads)]), vec![])
+        // Every live `thread.spawn` vCPU is a DAP thread (Milestone B). DAP thread id = vCPU id + 1
+        // (1-based; the root vCPU 0 ⇒ thread 1). Single-threaded runs report the sole vCPU.
+        let ids = self
+            .session
+            .as_ref()
+            .map(|s| s.inspector.threads())
+            .unwrap_or_default();
+        let threads = ids
+            .iter()
+            .map(|&tid| {
+                Json::obj(vec![
+                    ("id", Json::i(tid as i64 + 1)),
+                    ("name", Json::s(format!("thread-{tid}"))),
+                ])
+            })
+            .collect();
+        (
+            true,
+            Json::obj(vec![("threads", Json::Arr(threads))]),
+            vec![],
+        )
     }
 
-    fn on_stack_trace(&mut self, _args: Option<&Json>) -> (bool, Json, Vec<Event>) {
-        let Some(session) = self.session.as_ref() else {
+    fn on_stack_trace(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        // Focus the requested thread, then report *its* stack (multithreaded DAP). In a
+        // single-threaded run `select_task` is a no-op and the sole vCPU is used.
+        let thread_id = args
+            .and_then(|a| a.get("threadId"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1);
+        let tid = thread_id.max(1) as u64 - 1;
+        let Some(session) = self.session.as_mut() else {
             return (false, Json::Null, vec![]);
         };
+        session.inspector.select_task(tid);
         let frames = session.inspector.backtrace();
         let mut out = Vec::new();
-        for (i, f) in frames.iter().enumerate() {
+        for f in frames.iter() {
+            // Assign a `frameId` that records (thread, frame index) so `variables` reads the right
+            // thread's frame even after the client switches threads.
+            let frame_id = session.frame_refs.len();
+            session.frame_refs.push((tid, out.len()));
             let mut fields = vec![
-                ("id", Json::i(i as i64)),
-                ("name", Json::s(format!("#{i} func{}", f.pc.func))),
+                ("id", Json::i(frame_id as i64)),
+                ("name", Json::s(format!("#{} func{}", out.len(), f.pc.func))),
                 (
                     "line",
                     Json::i(f.source.as_ref().map(|s| s.line as i64).unwrap_or(0)),
@@ -301,7 +348,8 @@ impl DapServer {
             .and_then(|a| a.get("frameId"))
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        // A single "Locals" scope per frame; variablesReference = frameId+1 (nonzero ⇒ has children).
+        // A single "Locals" scope per frame; variablesReference = frameId+1 (nonzero ⇒ has children,
+        // and `variables` recovers the frame from `frame_refs[ref-1]`).
         let scope = Json::obj(vec![
             ("name", Json::s("Locals")),
             ("variablesReference", Json::i(frame_id + 1)),
@@ -319,29 +367,41 @@ impl DapServer {
             .and_then(|a| a.get("variablesReference"))
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        let Some(session) = self.session.as_ref() else {
+        let empty = (
+            true,
+            Json::obj(vec![("variables", Json::Arr(vec![]))]),
+            vec![],
+        );
+        let Some(session) = self.session.as_mut() else {
             return (false, Json::Null, vec![]);
         };
-        let (Some(debug), Some(frame_idx)) = (session.debug.as_ref(), vref.checked_sub(1)) else {
-            return (
-                true,
-                Json::obj(vec![("variables", Json::Arr(vec![]))]),
-                vec![],
-            );
+        // Recover (thread, frame index) from the reference, focus that thread, then read its locals.
+        let Some(&(tid, frame_idx)) = vref
+            .checked_sub(1)
+            .and_then(|r| session.frame_refs.get(r as usize))
+        else {
+            return empty;
         };
-        let frame_idx = frame_idx as usize;
+        let Some(debug) = session.debug.as_ref() else {
+            return empty;
+        };
+        session.inspector.select_task(tid);
         let frames = session.inspector.backtrace();
         let mut out = Vec::new();
         if let Some(frame) = frames.get(frame_idx) {
-            for v in debug.vars.iter().filter(|v| v.func == frame.pc.func) {
-                if let Some(val) = session
-                    .inspector
-                    .read_var(frame_idx, &v.name, ty_width(&v.ty))
-                {
+            // Collect the (name, type) pairs first so the `debug` borrow ends before `read_var`.
+            let vars: Vec<(String, String)> = debug
+                .vars
+                .iter()
+                .filter(|v| v.func == frame.pc.func)
+                .map(|v| (v.name.clone(), v.ty.clone()))
+                .collect();
+            for (name, ty) in vars {
+                if let Some(val) = session.inspector.read_var(frame_idx, &name, ty_width(&ty)) {
                     out.push(Json::obj(vec![
-                        ("name", Json::s(v.name.clone())),
+                        ("name", Json::s(name)),
                         ("value", Json::s(fmt_var(&val))),
-                        ("type", Json::s(v.ty.clone())),
+                        ("type", Json::s(ty)),
                         ("variablesReference", Json::i(0)),
                     ]));
                 }
@@ -389,6 +449,7 @@ impl DapServer {
         let Some(session) = self.session.as_mut() else {
             return (false, Json::Null, vec![]);
         };
+        session.frame_refs.clear();
         let target = session.inspector.clock();
         session.inspector.seek(0);
         let mut prev: Option<u64> = None;
@@ -405,7 +466,12 @@ impl DapServer {
             None => (0, "entry"), // no earlier breakpoint: rewound to the start
         };
         session.inspector.seek(landed);
-        (true, Json::Null, vec![stopped_event(reason)])
+        let tid = session
+            .inspector
+            .stopped_task()
+            .map(|t| t as i64 + 1)
+            .unwrap_or(1);
+        (true, Json::Null, vec![stopped_event(reason, tid)])
     }
 
     fn on_disconnect(&mut self) -> (bool, Json, Vec<Event>) {
@@ -414,26 +480,40 @@ impl DapServer {
         (true, Json::Null, vec![])
     }
 
-    /// Map a resume's outcome to the DAP event(s) that follow the response.
+    /// Map a resume's outcome to the DAP event(s) that follow the response. The previous stop's
+    /// frame references are now stale, so clear them; the next `stackTrace` assigns fresh ones.
     fn stop_events(&mut self, stop: Stop) -> Vec<Event> {
+        if let Some(s) = self.session.as_mut() {
+            s.frame_refs.clear();
+        }
+        let tid = self.stopped_thread_id();
         match stop {
-            Stop::Break { reason, .. } => vec![stopped_event(dap_reason(reason))],
+            Stop::Break { reason, .. } => vec![stopped_event(dap_reason(reason), tid)],
             Stop::Finished(_) => {
                 self.terminated = true;
                 vec![("terminated", Json::obj(vec![]))]
             }
-            Stop::Blocked => vec![stopped_event("pause")],
+            Stop::Blocked => vec![stopped_event("pause", tid)],
         }
+    }
+
+    /// The DAP thread id of the stopped thread (vCPU id + 1); `1` in single-threaded mode.
+    fn stopped_thread_id(&self) -> i64 {
+        self.session
+            .as_ref()
+            .and_then(|s| s.inspector.stopped_task())
+            .map(|t| t as i64 + 1)
+            .unwrap_or(1)
     }
 }
 
-/// A `stopped` event for thread 1.
-fn stopped_event(reason: &'static str) -> Event {
+/// A `stopped` event for `thread_id`.
+fn stopped_event(reason: &'static str, thread_id: i64) -> Event {
     (
         "stopped",
         Json::obj(vec![
             ("reason", Json::s(reason)),
-            ("threadId", Json::i(1)),
+            ("threadId", Json::i(thread_id)),
             ("allThreadsStopped", Json::Bool(true)),
         ]),
     )

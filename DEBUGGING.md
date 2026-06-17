@@ -53,7 +53,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
-| DAP server (interpreter-backed: source breakpoints, frames, locals, stepping, **reverse debugging**) | **Built — W5 slices 1–2** | `svm-dap` (`DapServer` / `run_stdio`) |
+| DAP server (interpreter-backed: source breakpoints, frames, locals, stepping, **reverse debugging**, **multithreaded** per-thread stacks) | **Built — W5 slices 1–3** | `svm-dap` (`DapServer` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -514,10 +514,22 @@ strictly before the current op `clock`, and `seek`ing there (else rewinding to t
 backward through the hits — `i=1,acc=5` → `i=2,acc=3` → `i=3,acc=0` → entry — with the locals
 correct at each, then `stepBack` reverse-single-steps. Reverse debugging in an editor is a genuine
 differentiator (few debuggers implement DAP's `stepBack`/`reverseContinue`), here free from the
-deterministic interpreter + `seek`. *Not yet:* multithreaded DAP (map `thread.spawn` vCPUs to DAP
-threads + `select_task`; `reverseContinue` would then use the global `turn`), `evaluate`/watch
-expressions, proper step-over/step-out (vs single-op), and the JIT/DWARF tier for gdb/lldb on native
-code.
+deterministic interpreter + `seek`.
+
+**Built — slice 3 (multithreaded DAP).** A scheduled `launch` (arg `schedule: [tids]` for a fixed
+interleaving / witness, `schedule: []` for the deterministic default, or `seed: N` to fuzz) drives a
+`thread.spawn` guest, and the editor sees every vCPU as a **DAP thread** (`threads` → `Inspector::
+threads`, DAP id = vCPU id + 1). The `stopped` event names **which thread** hit the breakpoint
+(`stopped_task`), `stackTrace(threadId)` focuses that thread (`select_task`) and reports *its* stack,
+and `variables` reads the right thread's frame — DAP frame references encode `(thread, frame)` so a
+client switching threads never reads the wrong one. Test (`dap.rs`): two workers over a shared
+counter, a source breakpoint at `worker.c:4` fires in one worker (the `stopped` event names it, not
+the root), `threads` lists root + workers, the worker's `stackTrace`/`variables` show `worker.c:4`
+with `delta = 1`, and `continue` stops in the *other* worker. So the headline multithread debugger —
+per-thread breakpoints, thread selection, deterministic interleavings — is now usable from an editor.
+*Not yet:* multithreaded `reverseContinue` (would switch from the op `clock` to the global `turn`
+coordinate), `evaluate`/watch expressions, proper step-over/step-out (vs single-op), and the
+JIT/DWARF tier for gdb/lldb on native code.
 
 ---
 
