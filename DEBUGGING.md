@@ -1232,6 +1232,18 @@ source lines, `-O0` `dbg.declare` variable/type ingest, and `-O2`/`-Og` `dbg.val
 location lists. The W4 debug-info waist is exercised end-to-end by **three** independent frontends —
 all three on the source-line half, all three on the variable+type half.)
 
+**Slice 27 — the LLVM producer driven through the *DAP server* end-to-end.** The prior LLVM slices
+proved the waist at the interpreter-`Inspector` level; this one closes the loop through the **actual
+W5 DAP consumer**. A real LLVM-bitcode → SVM-IR translation (with its §6 debug info) is serialized to
+text (`print_module` — the debug info survives the round-trip the DAP server launches from) and
+driven over the Debug Adapter Protocol: a source breakpoint **binds by line** to the recorded clang
+path, the Variables pane **expands the LLVM-ingested `struct`** (a nonzero `variablesReference` →
+`x`/`y` members), and **`evaluate("p.x + p.y")`** reads members over the structured type. So the LLVM
+frontend's debug output is fully DAP-inspectable, the same as chibicc's and wasm's — the §6 waist is
+*frontend-neutral all the way to the debugger UI*, not just at ingest. Test (`dap_over_llvm.rs`, a
+new `svm-dap` dev-dep on the LLVM-only lane): a `-O0 -g` `struct Point` guest stops at its `return`
+line and expands to `x=5, y=6`, with `evaluate` yielding `11`.
+
 ### Open questions (S4/S5/S2)
 
 - *Probe dispatch in the hot loop*: monomorphized generic (`Probe` type param on `run_inner`)
