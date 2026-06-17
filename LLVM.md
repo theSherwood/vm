@@ -774,16 +774,87 @@ including **virtual destructors** (the deleting-dtor chain through the vtable). 
   the `i33` intermediate **overflows 33 bits and wraps**, which only the native differential validates
   (interp == JIT alone would agree even on a wrong mask). 93 translate tests green, fmt + clippy clean.
 
+**Slice AI (DONE) — real `core` Rust + panic-path lowering.** Idiomatic `no_std` Rust runs
+byte-identical to native `rustc` with **no translator change** beyond the C corpus — a `#[repr(u8)]`
+enum dispatched by `match` (→ `switch`/`br_table`), fixed arrays + slice iteration, `Option` + `match`
+(niche-optimized), iterator `find`/`map`/`max` with closures, by-value `struct`s + array-of-struct +
+field access, and signed `/`/`%`. The one real gap closed:
+- **Panic-path lowering (`-C panic=abort`).** A real Rust program is littered with non-elidable panic
+  branches (div-by-zero, bounds, overflow) that call `core::panicking::*` — **external** (precompiled
+  libcore), which the on-ramp's undefined-call path rejected, blocking essentially all real Rust. Now
+  `is_rust_abort_call` recognizes those entry points (`panicking`/`unwrap_failed`/`expect_failed`/
+  `slice_index`/`panic_cannot_unwind`) and, since they are `-> !` and always followed by `unreachable`,
+  lowers the call to a **trap** (drop it; the trailing `unreachable` already traps — §3b/§5/totality).
+  Gated on the name being an *undefined external*, so a guest-defined function of a matching name is a
+  real call.
+- *Out of scope:* `core::hint::black_box` is an empty inline-`asm!` optimization barrier → inline asm
+  stays a clean `Unsupported` (a non-goal); use `read_volatile` to make a value opaque.
+- Tests: `rust_core_enum_slice_option`, `rust_core_structs_and_iterators` (idiomatic `core` vs native),
+  `rust_panic_path_div_traps_and_runs` (a runtime division whose div-by-zero/overflow panic branches
+  now trap, taking the non-panic path to match native). 96 translate tests green, fmt + clippy clean.
+
+**Slice AJ (DONE) — Rust trait objects, slices, `unwrap`.** More idiomatic Rust, byte-identical to
+native: **`&dyn Trait` dynamic dispatch** (a vtable load + `call_indirect` per call — the Rust analog
+of the C++ vtable path, slice AG: fat pointers + per-type vtable globals + funcref dispatch, all
+already covered), **`&[T]` slice arguments** ({ptr,len} across an `#[inline(never)]` call + a
+sub-slice), and **`Option::unwrap`** (its panic path traps via slice AI's recognizer). The one gap:
+- **Auto-vectorization → SIMD.** `rustc -O2` vectorizes a reduction loop (the slice `sum`) into
+  `<N x i32>` + a horizontal reduce — out of the MVP (§17/D58 is the SIMD lane). The Rust bitcode
+  helper now disables it (`-C llvm-args=-vectorize-loops=false -vectorize-slp=false`), matching the
+  C/C++ lanes' `-fno-*-vectorize`. The native oracle keeps vectorizing — an integer reduction is
+  associative, so scalar (on-ramp) and vectorized (native) agree.
+- Tests: `rust_trait_object_dispatch`, `rust_slice_argument`, `rust_option_unwrap`. 99 translate tests
+  green, fmt + clippy clean.
+
+**Slice AK (DONE) — Rust `alloc` / heap (`Vec` via a guest `#[global_allocator]`).** The headline for
+*real* Rust: a `no_std` + `alloc` crate whose `#[global_allocator]` routes to the guest `malloc`/`free`
+runs byte-identical to native `rustc`, with `Vec::push` growing the heap (alloc + `memcpy` + free)
+through the on-ramp's `vm_map`-growing bump allocator. Because the allocator + `Memory` grant live in
+the powerbox `_start` (gated on `main`), the test runs **through the powerbox**: the on-ramp synthesizes
+`#[no_mangle] extern "C" fn main` calling `compute()`, the differential compares the `u8` exit/return
+code, and a pinned expected value keeps it non-vacuous. Three gaps closed:
+- **`alloc` abort lang items.** `alloc::raw_vec::handle_error` / `alloc::alloc::handle_alloc_error`
+  (OOM / capacity-overflow, `-> !`, external) join the panic recognizer (slice AI) → trap.
+- **Constant `inttoptr`/`ptrtoint` operands.** Rust's `NonNull::dangling()` (an empty `Vec`'s pointer =
+  its alignment, e.g. `inttoptr(i64 4)`) folds to its `i64` window value in `operand` (via `const_eval`,
+  like the constexpr-GEP path) — not just in global initializers.
+- **rustc edition.** The Rust lanes pin `--edition 2021` (the default 2015 mis-resolves `core::`/
+  `alloc::` paths in the std oracle).
+- Test: `rust_alloc_vec_via_global_allocator` (Σ i² for i in 0..64 = 85344, % 251 = **4**, vs native).
+  100 translate tests green, fmt + clippy clean.
+
+**Slice AL (DONE) — `Box` + `String`: a mini expression evaluator (the heap capstone demo).** A
+recursive-descent parser over a byte slice builds a **`Box`ed recursive AST** (`enum Expr { Num,
+Add(Box,Box), … }` — the canonical use of `Box`), `eval` walks it recursively, and `render` serializes
+it back into a heap **`String`** — a tiny interpreter, right at home next to the guest-JIT demo, running
+byte-identical to native `rustc` (through the powerbox/alloc harness). Two real gaps closed, both
+generally useful (any frontend's `-O2` hits them):
+- **`llvm.{u,s}{add,sub,mul}.with.overflow.iN`** (`lower_overflow_intrinsic`) → the wrapping op + a
+  computed overflow flag, recorded as a 2-field aggregate `{result, overflow}` (consumed by
+  `extractvalue`). Rust's checked capacity/index arithmetic (`Vec`/`String`/`Layout::array`) emits
+  these; the flag feeds a branch to `handle_error`/`panicking` (→ trap). Exact formulas (`add`: wrapped
+  sum below an operand; `sub`: borrow; signed: sign-disagreement; `mul`: zero-guarded `r/a != b`).
+- **`switch` on `i64`** (Rust enum discriminants). `translate_switch` now lowers an `i64` operand to a
+  `br_table` by biasing with `min` (`i64`) and **folding the high 32 bits into the index** — an
+  out-of-`[0,2^32)` value forces the default — sound for any `i64` (a bare low-32 `br_table` would
+  alias far-apart values onto a case). `i128` switches stay `Unsupported`.
+- Test: `rust_box_string_expr_evaluator` — `eval("2+3*4-(5-1)*2+10") = 16`, rendered string is 26
+  chars, `(16+26) % 251 = 42`, on-ramp == native. 101 translate tests green, fmt + clippy clean.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
       inheritance / `this`-adjusting thunks, references, `static`-local guards, …).
-- [x] **Rust** (`no_std`/panic=abort) — runs vs native (slice AH), via the pinned Rust 1.81 (LLVM 18)
-      toolchain + `iN` support. Broaden (`core` data structures, `Option`/`Result`, traits → vtables)
-      as gaps surface.
+- [x] **Rust** (`no_std`/panic=abort) — runs vs native: `iN` (slice AH), real `core` (enums/slices/
+      `Option`/iterators/structs) + panic-path → trap (slice AI), trait objects / `&[T]` args / `unwrap`
+      (slice AJ), `alloc`/heap `Vec` (slice AK), **`Box` recursive AST + `String`** via a mini expr
+      evaluator (slice AL — + `*.with.overflow` intrinsics and `i64` switches). Auto-vectorization is
+      disabled (SIMD is §17); `--edition 2021`. Broaden (`Result`/`?`, `BTreeMap`, generics with
+      bounds, `&mut` aliasing) as gaps surface.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
-- [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand.
+- [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`
+      uses `i64` for signed div/rem-by-constant, not `iN`).
 
 ### Deferred / hard (name them, don't hide them — DESIGN §20) ⚪
 - [ ] **C++ exceptions / unwinding** — `invoke`/`landingpad`/`resume` + `.eh_frame` unwind
