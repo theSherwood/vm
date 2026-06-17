@@ -70,10 +70,17 @@
 //!   `exit` → `Exit`) lowers to an `Inst::CallImport` the embedder resolves at load (§7); the handle
 //!   is reloaded from the stash (the POSIX `fd` is dropped — the handle selects the endpoint). Runs
 //!   end-to-end through the reference powerbox with stdout + exit code matching the native build.
+//! - **O — the stdio output surface.** The non-varargs libc output family funnels to `Stream.write`
+//!   on stdout: `puts` (the literal's bytes + a newline, length from the string global — no runtime
+//!   strlen), `putchar`/`putc`/`fputc` (one byte staged through the stash scratch), `fwrite`/`fputs`
+//!   (a `size×nmemb` slice / a string), and `fflush` (a no-op — the `Stream` is unbuffered). The
+//!   libc `FILE*` stream argument is ignored (the handle is the endpoint). `clang -O2` also lowers
+//!   `printf("…\n")` → `puts` and `printf("%c",c)` → `putc`, so format-free `printf` rides this path.
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `mem*`, the rest of
-//! libc (`malloc`/`printf`/transcendental math), `llvm.load.relative` (clang's relative-offset
-//! string tables) and GEP-constexpr relocations (`&arr[k]`), SIMD vectors, `i33`.
+//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `mem*`, varargs
+//! `printf`/`fprintf` (formatting), `malloc`/heap, transcendental math, `puts`/`fputs` of a
+//! *non-literal* string (runtime strlen), `llvm.load.relative` (clang's relative-offset string
+//! tables) and GEP-constexpr relocations (`&arr[k]`), SIMD vectors, `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -151,7 +158,7 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // page-granularly) must never share a page with the stash, or `_start`'s handle stores would
     // fault on the read-only page (the same page-isolation the data stack already gets above globals).
     let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
-    let (globals, data, globals_end) = globals_layout(m, &name2idx, globals_base)?;
+    let (globals, data, globals_end, cstrs) = globals_layout(m, &name2idx, globals_base)?;
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
     // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
@@ -161,7 +168,7 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
     for f in &defined {
-        let (func, frame_size) = translate_func(f, &m.types, &name2idx, &globals, &caps)?;
+        let (func, frame_size) = translate_func(f, &m.types, &name2idx, &globals, &caps, &cstrs)?;
         any_frame |= frame_size > 0;
         funcs.push(func);
     }
@@ -350,12 +357,20 @@ fn const_bytes(
 
 /// The result of [`globals_layout`]: name → window address, the `data` segments to emit, and the
 /// globals region's end offset (for window sizing).
-type Globals = (HashMap<String, u64>, Vec<svm_ir::Data>, u64);
+/// `globals_layout`'s output: name → window-address, the `data` segments to emit, the region's end
+/// offset, and name → C-string length (bytes before the first NUL) for the string-literal globals a
+/// `puts`/`fputs` argument points at (so the on-ramp knows the write length without a runtime strlen).
+type Globals = (
+    HashMap<String, u64>,
+    Vec<svm_ir::Data>,
+    u64,
+    HashMap<String, u64>,
+);
 
 /// Lay out the module's global variables in the window's globals region (from `base`, each
 /// natural-aligned), returning the name → window-address map, the `data` segments to emit
 /// (constants read-only, §3a/D40; all-zero/BSS globals just reserve space in the zero-init
-/// window), and the region's end (for window sizing).
+/// window), the region's end (for window sizing), and the string-literal lengths (for `puts`).
 fn globals_layout(
     m: &LModule,
     name2idx: &HashMap<String, u32>,
@@ -382,10 +397,15 @@ fn globals_layout(
     }
     // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
     let mut segs = Vec::new();
+    let mut cstrs = HashMap::new();
     for (gi, at) in placed {
         let g = &m.global_vars[gi];
         let Some(init) = &g.initializer else { continue }; // BSS / extern → zero-init window
         let bytes = const_bytes(init.as_ref(), &m.types, &addr, name2idx)?;
+        // Record the C-string length (up to the first NUL) so `puts`/`fputs` on this literal can
+        // write the right slice without a runtime strlen.
+        let slen = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len()) as u64;
+        cstrs.insert(name_str(&g.name), slen);
         // Emit a segment only for non-zero initialized data (the window is zero-init). A read-only
         // segment is protected (D40), so a guest write to it faults.
         if g.is_constant || bytes.iter().any(|&x| x != 0) {
@@ -396,7 +416,7 @@ fn globals_layout(
             });
         }
     }
-    Ok((addr, segs, off))
+    Ok((addr, segs, off, cstrs))
 }
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
@@ -592,6 +612,7 @@ fn translate_func(
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
+    cstrs: &HashMap<String, u64>,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
         return unsup(format!("varargs function `{}`", f.name));
@@ -629,6 +650,7 @@ fn translate_func(
             name2idx,
             globals,
             caps,
+            cstrs,
         )?);
     }
     Ok((
@@ -860,6 +882,11 @@ fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
 const STASH_STDOUT: u64 = 0;
 const STASH_STDIN: u64 = 4;
 const STASH_EXIT: u64 = 8;
+/// A 1-byte writable scratch in the stash's spare slot (`[12, 16)` — page 0 is writable since the
+/// globals start a page up). Used by `putc`/`puts` to stage a single byte (a char, a newline) the
+/// `Stream` capability writes (its ABI is a `(buf, len)` window slice, so a scalar char must transit
+/// memory). Reused per call — single-threaded, fully produced-then-consumed within one lowering.
+const STASH_SCRATCH: u64 = 12;
 
 /// Which stash slot a capability call reads its handle from.
 #[derive(Clone, Copy)]
@@ -910,17 +937,42 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
     })
 }
 
+/// The §7 import a libc I/O function ultimately needs, or `None` if it is not a bound I/O function.
+/// The *stdio* wrappers (`puts`/`putc`/`putchar`/`fputc`/`fwrite`/`fputs`) all funnel to the same
+/// `Stream.write` capability — they differ only in how the on-ramp marshals their args (a single
+/// char, a NUL-terminated string + newline, a `size×nmemb` slice). `fflush` is recognized by the
+/// lowering but needs *no* import (an unbuffered `Stream` makes it a no-op), so it is not listed here.
+fn cap_import_name(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "write" | "puts" | "putc" | "putchar" | "fputc" | "fwrite" | "fputs" => "write",
+        "read" => "read",
+        "exit" | "_exit" | "_Exit" => "exit",
+        _ => return None,
+    })
+}
+
+/// The capability op signature for an import name (`default_cap_resolver`'s ABI): `Stream`
+/// (`write`/`read`) is `(i64 buf, i64 len) -> (i64)`, `Exit` is `(i32) -> ()`.
+fn import_sig(import: &str) -> svm_ir::FuncType {
+    use ValType::{I32, I64};
+    let ft = |params: Vec<ValType>, results: Vec<ValType>| svm_ir::FuncType { params, results };
+    match import {
+        "exit" => ft(vec![I32], vec![]),
+        _ => ft(vec![I64, I64], vec![I64]), // write / read (Stream)
+    }
+}
+
 /// Scan the module for calls to external (not guest-defined) functions bound to a host capability,
-/// building the module's §7 import table (deduplicated by import name) and a `C-callee-name → import
-/// index` map the call lowering uses. A name the guest *defines* is never treated as a capability
-/// (it shadows the libc symbol), mirroring the libm-intrinsic rule.
+/// building the module's §7 import table (deduplicated) and an `import-name → import index` map the
+/// call lowering uses. Several libc names can funnel to one import (e.g. `write`/`puts`/`fwrite` all
+/// need `Stream.write`), so the table is keyed by the *import* name, not the C name. A name the guest
+/// *defines* is never treated as a capability (it shadows the libc symbol), mirroring the libm rule.
 fn collect_cap_imports(
     m: &LModule,
     defined: &HashMap<String, u32>,
 ) -> (Vec<svm_ir::Import>, HashMap<String, u32>) {
     let mut imports: Vec<svm_ir::Import> = Vec::new();
-    let mut by_import_name: HashMap<String, u32> = HashMap::new();
-    let mut cap_idx: HashMap<String, u32> = HashMap::new();
+    let mut import_of: HashMap<String, u32> = HashMap::new();
     for f in &m.functions {
         for bb in &f.basic_blocks {
             for instr in &bb.instrs {
@@ -928,26 +980,23 @@ fn collect_cap_imports(
                     continue;
                 };
                 let Some(name) = callee_name(c) else { continue };
-                if defined.contains_key(&name) || cap_idx.contains_key(&name) {
+                if defined.contains_key(&name) {
                     continue;
                 }
-                if let Some(spec) = cap_spec(&name) {
-                    let idx = *by_import_name
-                        .entry(spec.name.to_string())
-                        .or_insert_with(|| {
-                            let i = imports.len() as u32;
-                            imports.push(svm_ir::Import {
-                                name: spec.name.to_string(),
-                                sig: spec.sig.clone(),
-                            });
-                            i
+                if let Some(import) = cap_import_name(&name) {
+                    import_of.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
                         });
-                    cap_idx.insert(name, idx);
+                        i
+                    });
                 }
             }
         }
     }
-    (imports, cap_idx)
+    (imports, import_of)
 }
 
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
@@ -994,6 +1043,121 @@ fn synth_start(main_idx: u32, main_results: &[ValType], entry_sp: u64) -> Func {
             term,
         }],
         params,
+    }
+}
+
+/// The global-variable name a pointer operand points at, if it is a direct `@global` reference (the
+/// shape clang passes a string literal to `puts`/`fputs`). A computed pointer returns `None`.
+fn global_name_of(op: &Operand) -> Option<String> {
+    match op {
+        Operand::ConstantOperand(c) => match c.as_ref() {
+            Constant::GlobalReference { name, .. } => Some(name_str(name)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Lower a call to an external libc function bound to a host capability (§7): the primitive
+/// `write`/`read`/`exit`, or a stdio **output wrapper** that funnels to `Stream.write` on stdout —
+/// `puts` (string + newline), `putchar`/`putc`/`fputc` (one byte via the stash scratch),
+/// `fwrite`/`fputs` (a `size×nmemb` slice / a string), and `fflush` (a no-op — the `Stream` is
+/// unbuffered). The libc `FILE*`/`fd` stream argument is ignored: the powerbox handle (always
+/// stdout here) selects the endpoint. Returns `Ok(false)` if `name` is not a bound function (so it
+/// stays an ordinary call). Result-fidelity notes (the *stdout bytes* are exact regardless): `putc`
+/// yields the written char, `fwrite` the item count `nmemb`, `puts`/`fputs`/`fflush` a `0` success.
+fn lower_io_call(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    // The primitive capability mapping (write/read/exit): drop the dropped args, map the rest.
+    if let Some(spec) = cap_spec(name) {
+        let import = ctx.import_of(spec.name)?;
+        let off = match spec.handle {
+            HandleSlot::Stdout => STASH_STDOUT,
+            HandleSlot::Stdin => STASH_STDIN,
+            HandleSlot::Exit => STASH_EXIT,
+        };
+        let handle = ctx.stash_load(off);
+        let mut args = Vec::new();
+        for (a, _attrs) in c.arguments.iter().skip(spec.drop_args) {
+            args.push(ctx.operand(a)?);
+        }
+        let inst = Inst::CallImport {
+            import,
+            sig: spec.sig,
+            handle,
+            args,
+        };
+        // A non-void result (write/read) is a value to bind; `exit` is void (`push_effect`).
+        match &c.dest {
+            Some(_) => {
+                let r = ctx.push(inst);
+                ctx.bind_dest(&c.dest, r);
+            }
+            None => ctx.push_effect(inst),
+        }
+        return Ok(true);
+    }
+
+    match name {
+        // `puts(s)` / `fputs(s, stream)`: write the literal's bytes; `puts` then writes a newline.
+        // The length comes from the string-literal global (no runtime strlen); a non-literal pointer
+        // is a clean `Unsupported` (a runtime strlen loop is a later slice).
+        "puts" | "fputs" => {
+            let gname = global_name_of(&c.arguments[0].0)
+                .ok_or_else(|| Error::Unsupported(format!("`{name}` of a non-literal string")))?;
+            let &addr = ctx.globals.get(&gname).ok_or_else(|| {
+                Error::Unsupported(format!("`{name}` of unknown global `@{gname}`"))
+            })?;
+            let &len = ctx.cstrs.get(&gname).ok_or_else(|| {
+                Error::Unsupported(format!("`{name}` of non-string global `@{gname}`"))
+            })?;
+            let buf = ctx.const_i64(addr as i64);
+            let n = ctx.const_i64(len as i64);
+            ctx.emit_write(buf, n)?;
+            if name == "puts" {
+                // puts appends a newline (this is why `printf("…\n")` lowers to `puts`).
+                let nl = ctx.push(Inst::ConstI32(b'\n' as i32));
+                let scratch = ctx.scratch_byte(nl);
+                let one = ctx.const_i64(1);
+                ctx.emit_write(scratch, one)?;
+            }
+            // Both return a non-negative success — 0 suffices.
+            let r = ctx.push(Inst::ConstI32(0));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `putchar(c)` / `putc(c, stream)` / `fputc(c, stream)`: write the low byte of `c`.
+        "putchar" | "putc" | "fputc" => {
+            let ch = ctx.operand(&c.arguments[0].0)?;
+            let scratch = ctx.scratch_byte(ch);
+            let one = ctx.const_i64(1);
+            ctx.emit_write(scratch, one)?;
+            // Returns the written char (the low byte). Re-materialize from the input value.
+            ctx.bind_dest(&c.dest, ch);
+            Ok(true)
+        }
+        // `fwrite(buf, size, nmemb, stream)`: write `size*nmemb` bytes; return `nmemb` (items).
+        "fwrite" => {
+            let buf = ctx.operand(&c.arguments[0].0)?;
+            let size = ctx.operand(&c.arguments[1].0)?;
+            let nmemb = ctx.operand(&c.arguments[2].0)?;
+            let len = ctx.mul_i64(size, nmemb);
+            ctx.emit_write(buf, len)?;
+            ctx.bind_dest(&c.dest, nmemb);
+            Ok(true)
+        }
+        // `fflush(stream)`: the `Stream` capability is unbuffered, so a flush is a no-op returning 0.
+        "fflush" | "fflush_unlocked" => {
+            if c.dest.is_some() {
+                let r = ctx.push(Inst::ConstI32(0));
+                ctx.bind_dest(&c.dest, r);
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -1553,8 +1717,11 @@ struct BlockCtx<'a> {
     name2idx: &'a HashMap<String, u32>,
     /// Global variable name → its window address (for resolving a `@global` reference).
     globals: &'a HashMap<String, u64>,
-    /// External libc name → its §7 import index (for lowering a capability call to `CallImport`).
+    /// Import name (`write`/`read`/`exit`) → its §7 import index (for lowering a libc call to
+    /// `CallImport`); several libc names can share one import (e.g. `puts`/`fwrite` → `write`).
     caps: &'a HashMap<String, u32>,
+    /// String-literal global name → its C-string length (for `puts`/`fputs` write lengths).
+    cstrs: &'a HashMap<String, u64>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     next_val: ValIdx,
@@ -1584,10 +1751,54 @@ impl<'a> BlockCtx<'a> {
         })
     }
 
+    /// The §7 import index for an import name (registered by `collect_cap_imports`).
+    fn import_of(&self, name: &str) -> Result<u32, Error> {
+        self.caps
+            .get(name)
+            .copied()
+            .ok_or_else(|| Error::Unsupported(format!("capability `{name}` import not registered")))
+    }
+
+    /// Emit a `Stream.write(buf, len)` on the stdout handle (a `CallImport`); returns the result
+    /// (bytes written). Used by `write` and every stdio output wrapper.
+    fn emit_write(&mut self, buf: ValIdx, len: ValIdx) -> Result<ValIdx, Error> {
+        let import = self.import_of("write")?;
+        let handle = self.stash_load(STASH_STDOUT);
+        Ok(self.push(Inst::CallImport {
+            import,
+            sig: import_sig("write"),
+            handle,
+            args: vec![buf, len],
+        }))
+    }
+
+    /// Store a single byte `value` (`i32`-typed) into the 1-byte stash scratch and return its window
+    /// address — the staging point a `Stream.write(scratch, 1)` then sends (for `putc`/the newline).
+    fn scratch_byte(&mut self, value: ValIdx) -> ValIdx {
+        let addr = self.const_i64(STASH_SCRATCH as i64);
+        self.push_effect(Inst::Store {
+            op: svm_ir::StoreOp::I32_8,
+            addr,
+            value,
+            offset: 0,
+            align: 0,
+        });
+        addr
+    }
+
     /// Append an instruction that produces **no** SSA value (e.g. `store`). It must not consume a
     /// block-local value index — the verifier/interpreter number only value-producing insts (§3a).
     fn push_effect(&mut self, inst: Inst) {
         self.insts.push(inst);
+    }
+
+    /// Bind a call's LLVM result name to a block-local value (its translated result).
+    fn bind_dest(&mut self, dest: &Option<Name>, r: ValIdx) {
+        if let Some(d) = dest {
+            if let Some(&vid) = self.s.name2id.get(d) {
+                self.idx_of.insert(vid, r);
+            }
+        }
     }
 
     fn const_i64(&mut self, v: i64) -> ValIdx {
@@ -1687,6 +1898,7 @@ fn translate_block(
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
+    cstrs: &HashMap<String, u64>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // The data-SP (`SP` sentinel) types as `i64`; every other param reads its scanned type.
@@ -1701,6 +1913,7 @@ fn translate_block(
         name2idx,
         globals,
         caps,
+        cstrs,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         next_val: 0,
@@ -1783,39 +1996,13 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
             return Ok(());
         }
-        // A call to an external libc function bound to a host capability (§7) lowers to a
-        // `CallImport` the embedder resolves at load: the handle comes from the powerbox stash (the
-        // `fd` arg is dropped — the handle selects the endpoint), the args are mapped per the
-        // capability ABI. A guest-*defined* function of the same name is never a capability (handled
-        // by the direct-call path below, since `caps` excludes defined names).
+        // A call to an external libc function bound to a host capability (§7): the primitive
+        // `write`/`read`/`exit`, or a stdio output wrapper (`puts`/`putc`/`fwrite`/…). All lower to
+        // `Stream`/`Exit` capability calls (`CallImport`) the embedder resolves at load. A
+        // guest-*defined* function of the same name is never a capability — it falls through to the
+        // direct-call path below.
         if let Some(name) = callee_name(c) {
-            if let Some(&import) = ctx.caps.get(&name) {
-                let spec = cap_spec(&name).expect("caps only holds capability names");
-                let off = match spec.handle {
-                    HandleSlot::Stdout => STASH_STDOUT,
-                    HandleSlot::Stdin => STASH_STDIN,
-                    HandleSlot::Exit => STASH_EXIT,
-                };
-                let handle = ctx.stash_load(off);
-                let mut args = Vec::new();
-                for (a, _attrs) in c.arguments.iter().skip(spec.drop_args) {
-                    args.push(ctx.operand(a)?);
-                }
-                let inst = Inst::CallImport {
-                    import,
-                    sig: spec.sig,
-                    handle,
-                    args,
-                };
-                match &c.dest {
-                    Some(dest) => {
-                        let r = ctx.push(inst);
-                        if let Some(&vid) = ctx.s.name2id.get(dest) {
-                            ctx.idx_of.insert(vid, r);
-                        }
-                    }
-                    None => ctx.push_effect(inst),
-                }
+            if !ctx.name2idx.contains_key(&name) && lower_io_call(ctx, c, &name)? {
                 return Ok(());
             }
         }
