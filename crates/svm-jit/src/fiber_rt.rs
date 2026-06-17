@@ -46,6 +46,7 @@
 use crate::fiber_registry::Ownership;
 use crate::{FnEntry, TrapKind};
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use svm_fiber::{Fiber, State, Yielder};
@@ -193,6 +194,12 @@ pub(crate) struct FiberRuntime {
     fiber_type_id: u32,
     /// `next_pow2(nfuncs) - 1`, to mask a funcref into the function table.
     fn_table_mask: u64,
+    /// The OS-thread stack pointer captured at this vCPU's guest entry — the **high** bound for a
+    /// `gc.roots` scan of the root computation's frames (its live region is `[root_low, root_entry_sp)`
+    /// on the OS thread stack; the low bound is the current SP, or the outermost fiber's resumer SP
+    /// when the collector runs inside a fiber). `0` until the entry path records it (and for vCPUs
+    /// that never run guest code), which simply skips the root-frame scan.
+    root_entry_sp: usize,
 }
 
 impl FiberRuntime {
@@ -209,12 +216,20 @@ impl FiberRuntime {
             call_tramp: None,
             fiber_type_id,
             fn_table_mask,
+            root_entry_sp: 0,
         }
     }
 
     /// Record the finalized call-trampoline address (must be set before any fiber runs).
     pub(crate) fn set_call_tramp(&mut self, t: FiberCallTramp) {
         self.call_tramp = Some(t);
+    }
+
+    /// Record the OS-thread stack pointer at this vCPU's guest entry — the high bound for the
+    /// `gc.roots` root-frame scan (see [`FiberRuntime::root_entry_sp`]). Called by the entry path
+    /// right before the guarded guest call.
+    pub(crate) fn set_root_entry_sp(&mut self, sp: usize) {
+        self.root_entry_sp = sp;
     }
 }
 
@@ -431,4 +446,144 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
         rt.yielders.push(y);
     }
     r as i64
+}
+
+/// This frame's stack pointer (approximately): the address of a local, slightly **below** the
+/// caller's frame — a sound *low* bound for scanning the caller's live region upward. `inline(never)`
+/// + `black_box` keep the probe from being optimized away or hoisted.
+#[inline(never)]
+fn current_sp() -> usize {
+    let probe = 0usize;
+    std::hint::black_box(&probe as *const usize as usize)
+}
+
+/// Scan raw native-stack words in `[low, high)` (host byte addresses), inserting every 8-byte word
+/// that falls in the guest heap window `[heap_lo, heap_hi)` into `out`. Conservative: every aligned
+/// word is treated as a candidate root (spilled pointers are 8-byte aligned on the control stack).
+/// An empty/inverted range scans nothing.
+///
+/// # Safety
+/// `[low, high)` must be a readable region of a *quiescent* native stack — a parked fiber's saved
+/// extent, a paused resume-chain ancestor's stack, or the calling computation's own frames at a GC
+/// safepoint. Reading a stack a *concurrent* thread is mutating (no stop-the-world) is a data race.
+unsafe fn scan_words(low: usize, high: usize, heap_lo: u64, heap_hi: u64, out: &mut BTreeSet<u64>) {
+    let mut p = (low + 7) & !7usize; // first 8-aligned address at or above `low`
+    while p.saturating_add(8) <= high {
+        let w = (p as *const u64).read_unaligned();
+        if w >= heap_lo && w < heap_hi {
+            out.insert(w);
+        }
+        p += 8;
+    }
+}
+
+/// `gc.roots` thunk (§ GC.md §3/§6): a **conservative, ambient** root enumeration for the JIT. Walks
+/// the live native control stacks of the running computation's fibers and reports every distinct
+/// machine word that falls in the guest heap window `[heap_lo, heap_hi)` — the in-window words the
+/// guest's own heap already encodes; out-of-window words (host return addresses, frame pointers, host
+/// pointers) are filtered here and never cross the boundary. Writes the first `cap` candidates
+/// (ascending, deduplicated) as little-endian `i64`s into guest memory at offset `buf`, and returns
+/// the **total** found (the guest retries with a bigger buffer if it exceeds `cap`). This mirrors the
+/// interpreter's `Inst::GcRoots` (which scans its reified `Value` frames) — soundness-equivalent
+/// (a superset of the live roots), not word-for-word identical (GC.md §3.2: backends over-approximate
+/// differently).
+///
+/// **Scan coverage (the "spilled-only" contract).** Every region scanned is one where roots are
+/// already flushed to memory: (1) all **parked** fibers in the domain-shared table — `[ctx, top)`,
+/// where the suspend spilled their callee-saved registers; (2) **running** resume-chain ancestors
+/// (and the fiber calling this) — their whole usable stack `[usable_low, top)`, a sound superset;
+/// (3) the **root computation's** frames on the OS thread stack — `[root_low, root_entry_sp)`. Live
+/// roots a caller holds *only* in unspilled callee-saved registers of its own frame are out of scope
+/// (documented; a register-flush shim is a future follow-up) — but the call boundary to this thunk
+/// itself forces the `gc.roots` *caller* to spill, so its roots are covered.
+///
+/// **Concurrency (GC.md §3.3).** The scan is sound only at a stop-the-world safepoint — every other
+/// vCPU parked, exactly as the interpreter scans the shared registry. We enforce the cheap sanity
+/// check the contract permits: if any fiber is `RUNNING` on a vCPU *other than this one*, the caller
+/// is not under STW, so the op **refuses** (`FiberFault`) rather than read a racing stack. The
+/// current vCPU's own resume chain is quiescent while this synchronous thunk runs, so its `RUNNING`
+/// fibers are scanned normally.
+///
+/// # Safety
+/// `mem_base`/`mask`/`mapped`/`sub_base`/`trap_out` are the threaded guest-window context (as for
+/// `cap.call`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
+/// out-of-window `buf`, or a non-STW call (a fiber running on another vCPU) faults (`FiberFault`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn gc_roots(
+    heap_lo: u64,
+    heap_hi: u64,
+    buf: u64,
+    cap: i64,
+    mem_base: u64,
+    mask: u64,
+    mapped: u64,
+    sub_base: u64,
+    trap_out: u64,
+) -> i64 {
+    let rt = current();
+    if rt.is_null() {
+        fault(trap_out);
+        return 0;
+    }
+    let rt = &*rt;
+    let mut roots: BTreeSet<u64> = BTreeSet::new();
+
+    // (1)+(2) Every live fiber in the domain-shared table: a parked fiber's exact saved extent, or a
+    // running fiber's whole usable stack (a sound superset — its exact SP is not known here). A
+    // `FREE` (completed) slot holds no fiber (`take`n on finish) and is skipped.
+    {
+        let slots = rt.table.lock();
+        for slot in slots.iter() {
+            let guard = slot.fiber.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(fib) = guard.as_ref() {
+                let (lo, hi) = if slot.own.is_running() {
+                    // §3.3 stop-the-world sanity check: a fiber running on *another* vCPU means the
+                    // caller is **not** under STW — scanning its live, mutating native stack would be
+                    // a data race. Refuse (fail closed with `FiberFault`) rather than read it. A
+                    // fiber running on *this* vCPU is the caller's own resume chain (quiescent while
+                    // this synchronous thunk runs) and is scanned as a superset.
+                    if slot.running_on.load(Ordering::Relaxed) != rt.me {
+                        fault(trap_out);
+                        return 0;
+                    }
+                    fib.full_extent()
+                } else {
+                    fib.parked_extent()
+                };
+                scan_words(lo as usize, hi as usize, heap_lo, heap_hi, &mut roots);
+            }
+        }
+    }
+
+    // (3) The root computation's frames on the OS thread stack, when recorded. Its low bound is the
+    // current SP if `gc.roots` is called directly from the root (no fiber on this vCPU), else the
+    // outermost fiber's resumer SP — the root's saved low-water mark at the point it resumed the
+    // chain.
+    if rt.root_entry_sp != 0 {
+        let root_low = match rt.yielders.first() {
+            None => current_sp(),
+            Some(&y) => (*y).resumer_sp() as usize,
+        };
+        scan_words(root_low, rt.root_entry_sp, heap_lo, heap_hi, &mut roots);
+    }
+
+    let total = roots.len();
+    let nwrite = total.min(cap.max(0) as usize);
+    if nwrite > 0 {
+        // Confine the buffer offset exactly like the JIT's `mask_addr`: the writable region is the
+        // *backed* window `[0, mapped)` (child-relative), physically at `mem_base + sub_base + off`.
+        let masked = buf & mask;
+        let nbytes = (nwrite as u64) * 8;
+        if masked.checked_add(nbytes).is_none_or(|end| end > mapped) {
+            fault(trap_out); // a forged / out-of-window buffer — like the interp's `MemoryFault`
+            return 0;
+        }
+        let dst = (mem_base + sub_base + masked) as *mut u8;
+        let mut off = 0usize;
+        for w in roots.iter().take(nwrite) {
+            std::ptr::copy_nonoverlapping(w.to_le_bytes().as_ptr(), dst.add(off), 8);
+            off += 8;
+        }
+    }
+    total as i64
 }

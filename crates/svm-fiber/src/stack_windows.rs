@@ -48,6 +48,14 @@ impl Stack {
         }
     }
 
+    /// The lowest *usable* address (just above the guard page) — the conservative low bound for a
+    /// GC stack scan of a **running** fiber (see the unix counterpart). Same address as
+    /// [`Self::limit_ptr`], named for the scanner's intent.
+    pub fn usable_low(&self) -> *const u8 {
+        // SAFETY: within the reservation; not dereferenced here.
+        unsafe { self.base.add(PAGE) as *const u8 }
+    }
+
     /// The usable region's low address + size (above the guard page) — the stack bounds handed to
     /// AddressSanitizer's fiber-switch annotations (`feature = "asan"`).
     #[cfg(feature = "asan")]

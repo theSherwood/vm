@@ -143,6 +143,17 @@ impl Yielder {
         c.resumer.set(t.fctx); // the resumer may be a different context next time
         c.value.get()
     }
+
+    /// The resumer's saved stack pointer — the context this fiber will `jump` back to when it
+    /// suspends, i.e. the resumer's live low-water mark at the moment it switched in. Used by the
+    /// `svm-jit` `gc.roots` walker as the conservative low bound for scanning the **root
+    /// computation's** frames (the resume chain's non-fiber parent runs on the OS thread stack, so
+    /// its live region is `[resumer_sp, entry_sp)`).
+    pub fn resumer_sp(&self) -> *const u8 {
+        // SAFETY: `control` outlives the running body (the `Fiber` owns the `Box<Control>` and
+        // cannot be dropped while suspended inside its own body), and only this side is live.
+        unsafe { (*self.control).resumer.get() as *const u8 }
+    }
 }
 
 /// A first-class suspendable computation running on its own native stack.
@@ -256,6 +267,26 @@ impl Fiber {
     /// Whether the fiber has finished (returned). A finished fiber must not be resumed.
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Conservative GC stack-scan bounds `[low, high)` for a **parked** (suspended or fresh) fiber:
+    /// `[ctx, top)`. `ctx` is the saved-context pointer — the lowest live address, since the switch
+    /// spilled the fiber's callee-saved registers (its in-register roots) there before suspending —
+    /// so this is the *exact* live extent, and scanning it conservatively (every in-range word is a
+    /// candidate root) cannot miss a root the suspended fiber holds.
+    ///
+    /// Must only be called on a fiber that is **not currently running** (parked): while a fiber
+    /// runs, `ctx` is the stale pre-resume context and does not bound the live frames.
+    pub fn parked_extent(&self) -> (*const u8, *const u8) {
+        (self.ctx as *const u8, self._stack.top() as *const u8)
+    }
+
+    /// Conservative bounds `[usable_low, top)` for a **running** fiber whose exact live SP the
+    /// scanner does not know (a resume-chain ancestor, or the fiber calling `gc.roots` itself):
+    /// scan the *whole* usable stack — a sound superset of its live frames (the unused portion is
+    /// untouched/zeroed reserved pages or stale non-root bytes, harmless to a conservative scan).
+    pub fn full_extent(&self) -> (*const u8, *const u8) {
+        (self._stack.usable_low(), self._stack.top() as *const u8)
     }
 
     /// Resume the fiber, passing `val`; returns whether it yielded or completed.

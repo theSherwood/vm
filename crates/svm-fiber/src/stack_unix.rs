@@ -51,6 +51,16 @@ impl Stack {
         unsafe { self.base.add(self.len) }
     }
 
+    /// The lowest *usable* address (just above the guard page) — the conservative low bound for a
+    /// GC stack scan of a **running** fiber, whose exact live SP the scanner does not know (the
+    /// `svm-jit` `gc.roots` walker over-approximates a running fiber's roots by scanning its whole
+    /// usable stack `[usable_low, top)`, a sound superset).
+    pub fn usable_low(&self) -> *const u8 {
+        // SAFETY: arithmetic within the allocation; not dereferenced here.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        unsafe { self.base.add(page) as *const u8 }
+    }
+
     /// The usable region's low address + size (above the guard page) — the stack bounds handed to
     /// AddressSanitizer's fiber-switch annotations (`feature = "asan"`).
     #[cfg(feature = "asan")]
