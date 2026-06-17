@@ -66,6 +66,7 @@
 
 mod threads;
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::hint::black_box;
 use std::time::Instant;
@@ -343,7 +344,7 @@ block3(v18: i64):
     n_span: None,
 };
 
-const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER, SIMD, FLOAT, CALLI];
+const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER, SIMD, FLOAT, CALLI, CACHE];
 
 /// `(i64 n) -> i64`: like `memsum` but the store and the load go to **different, per-iter
 /// varying** slots — write slot `(i·M1)&1023`, read slot `(i·M2)&1023` (M1,M2 odd, so each
@@ -577,6 +578,104 @@ block0(v0: i64):
     n_span: None,
 };
 
+/// `(i64 n) -> i64`: a **memory-latency** loop — like `scatter` but over a 1 MiB array (mask
+/// `0x1FFFF` ⇒ 128 Ki `i64` slots), so the hashed store/load addresses miss L1/L2 (and on smaller
+/// machines L3). The interesting question: svm's confinement mask (§4) is ~one `AND`; once an access
+/// is memory-latency-bound the mask hides in the miss shadow, so svm should **track wasm** here even
+/// though `locals_c`'s in-cache mask shows a gap.
+///
+/// **Warm-buffer methodology (why this kernel needs a custom span).** svm allocates a *fresh* window
+/// per run (no warm-window API), so a naive small/large subtraction would leave svm paying page-fault
+/// + cold-cache cost that Wasmtime (which reuses one warm `Store` across timing iterations) does not —
+/// an apples-to-oranges result. The fix: a **saturating `n_span`** — both `n_small` and `n_big` are
+/// large enough that *every* page is faulted and the cache reaches steady state in **both**, so that
+/// fixed transient is identical for the two and cancels in the subtraction, isolating steady-state
+/// memory-bound compute on every lane. `native` likewise reuses a thread-local warm buffer (so it
+/// isn't re-zeroed per call). `n_span.is_some()` also selects reduced per-call iteration counts (each
+/// iteration is ~tens of ns, so the loop would otherwise take seconds).
+const CACHE: Kernel = Kernel {
+    name: "cache",
+    ir: "\
+memory 20
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br block1(v0, v1, v2)
+block1(v3: i64, v4: i64, v5: i64):
+  v6 = i64.lt_s v5 v3
+  br_if v6 block2(v3, v4, v5) block3(v4)
+block2(v7: i64, v8: i64, v9: i64):
+  v10 = i64.const 2654435761
+  v11 = i64.mul v9 v10
+  v12 = i64.const 131071
+  v13 = i64.and v11 v12
+  v14 = i64.const 8
+  v15 = i64.mul v13 v14
+  i64.store v15 v9
+  v16 = i64.const 2246822519
+  v17 = i64.mul v9 v16
+  v18 = i64.and v17 v12
+  v19 = i64.mul v18 v14
+  v20 = i64.load v19
+  v21 = i64.add v8 v20
+  v22 = i64.const 1
+  v23 = i64.add v9 v22
+  br block1(v7, v21, v23)
+block3(v24: i64):
+  return v24
+}
+",
+    wat32: r#"
+(module
+  (memory 16)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (i64.store
+          (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2654435761)))
+                            (i32.const 131071)) (i32.const 8))
+          (local.get $i))
+        (local.set $acc
+          (i64.add (local.get $acc)
+            (i64.load
+              (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2246822519)))
+                                (i32.const 131071)) (i32.const 8)))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    wat64: Some(
+        r#"
+(module
+  (memory i64 16)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (i64.store
+          (i64.mul (i64.and (i64.mul (local.get $i) (i64.const 2654435761))
+                            (i64.const 131071)) (i64.const 8))
+          (local.get $i))
+        (local.set $acc
+          (i64.add (local.get $acc)
+            (i64.load
+              (i64.mul (i64.and (i64.mul (local.get $i) (i64.const 2246822519))
+                                (i64.const 131071)) (i64.const 8)))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    ),
+    native: Some(native_cache),
+    // Saturating span: both ends fault every page + reach cache steady state, so that fixed
+    // transient cancels (see the kernel doc). `Some` also selects reduced per-call counts.
+    n_span: Some((800_000, 400_000)),
+};
+
 const N_SMALL: i64 = 1_000;
 const N_BIG: i64 = 2_000_000;
 // Host-call kernels do real boundary crossings per iteration (≫ a compute op), so they use a
@@ -680,6 +779,27 @@ fn native_calli(n: i64) -> i64 {
         acc = acc.wrapping_add(f(i));
     }
     acc
+}
+
+/// Native twin of `CACHE`: the same scattered store/load over a 1 MiB array (128 Ki `i64` slots).
+/// The buffer is **thread-local and reused** across calls (warm + faulted once), so native pays the
+/// same steady-state memory-latency cost the warm wasm lane does — not a per-call alloc/zero. The
+/// first call (the cross-check) sees a zeroed buffer, so its result matches the cold svm/wasm lanes.
+fn native_cache(n: i64) -> i64 {
+    thread_local! {
+        static MEM: RefCell<Vec<i64>> = RefCell::new(vec![0i64; 131_072]);
+    }
+    MEM.with(|cell| {
+        let mem = &mut *cell.borrow_mut();
+        let mut acc: i64 = 0;
+        for i in 0..n {
+            let w = (i.wrapping_mul(2654435761) & 131071) as usize;
+            mem[w] = i;
+            let r = (i.wrapping_mul(2246822519) & 131071) as usize;
+            acc = acc.wrapping_add(black_box(mem[r]));
+        }
+        acc
+    })
 }
 
 /// Compile + run a kernel's IR entry once and return the single `i64` result. `lead` is the
@@ -1362,11 +1482,12 @@ fn wasm_compute_ns(
     run: &TypedFunc<i64, i64>,
     n_big: i64,
     n_small: i64,
+    pc: u32,
 ) -> f64 {
-    let big = per_call(100, || {
+    let big = per_call(pc, || {
         black_box(run.call(&mut *store, n_big).unwrap());
     });
-    let small = per_call(100, || {
+    let small = per_call(pc, || {
         black_box(run.call(&mut *store, n_small).unwrap());
     });
     (big - small) * 1e9 / (n_big - n_small) as f64
@@ -1444,6 +1565,15 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
         Mode::Compute => wasm_entry(engine, wasm),
         Mode::HostCall => wasm_entry_host(engine, wasm),
     };
+    // Per-call iteration counts for the timing loops. A kernel with a custom `n_span` (the
+    // memory-latency `cache` kernel) has ~tens-of-ns iterations over a large span, so each call is
+    // milliseconds — far fewer repeats still stabilise (and best-of-`reps` tightens it further),
+    // and the high default counts would make a pass take many seconds.
+    let (pc_svm, pc_wasm, pc_native, pc_interp) = if k.n_span.is_some() {
+        (6u32, 10u32, 10u32, 4u32)
+    } else {
+        (25u32, 100u32, 200u32, 8u32)
+    };
 
     // Cross-check every engine agrees before timing (never benchmark a miscompile).
     let ours = svm(n_small);
@@ -1496,10 +1626,10 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
     };
     for _ in 0..reps.max(1) {
         // --- per-iteration time (subtraction isolates the loop body / the host call) ---
-        let svm_big = per_call(25, || {
+        let svm_big = per_call(pc_svm, || {
             black_box(svm(n_big));
         });
-        let svm_small = per_call(25, || {
+        let svm_small = per_call(pc_svm, || {
             black_box(svm(n_small));
         });
         raw.svm_ns = raw
@@ -1509,21 +1639,21 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
         let (mut s32, run32) = inst(&wasm32);
         raw.w32_ns = raw
             .w32_ns
-            .min(wasm_compute_ns(&mut s32, &run32, n_big, n_small));
+            .min(wasm_compute_ns(&mut s32, &run32, n_big, n_small, pc_wasm));
 
         if let Some(w) = &wasm64 {
             let (mut s64, run64) = inst(w);
-            let v = wasm_compute_ns(&mut s64, &run64, n_big, n_small);
+            let v = wasm_compute_ns(&mut s64, &run64, n_big, n_small, pc_wasm);
             raw.w64_ns = Some(raw.w64_ns.unwrap().min(v));
         }
 
         // --- interp lane: the same IR via the reference interpreter (its own smaller iteration
         // span, since it is ~100–1000× slower; per-iteration cost is span-independent). ---
         if raw.interp_ns.is_some() {
-            let ib = per_call(8, || {
+            let ib = per_call(pc_interp, || {
                 black_box(interp_call(&m, k.entry, &k.lead_args, N_INTERP_BIG));
             });
-            let is = per_call(8, || {
+            let is = per_call(pc_interp, || {
                 black_box(interp_call(&m, k.entry, &k.lead_args, N_INTERP_SMALL));
             });
             let v = (ib - is) * 1e9 / (N_INTERP_BIG - N_INTERP_SMALL) as f64;
@@ -1532,10 +1662,10 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32) -> Raw {
 
         // --- native lane: the Rust twin (same big/small span as the VMs; setup cost cancels). ---
         if let Some(nat) = k.native {
-            let nb = per_call(200, || {
+            let nb = per_call(pc_native, || {
                 black_box(nat(n_big));
             });
-            let ns = per_call(200, || {
+            let ns = per_call(pc_native, || {
                 black_box(nat(n_small));
             });
             let v = (nb - ns) * 1e9 / (n_big - n_small) as f64;
