@@ -1279,8 +1279,8 @@ fn dap_evaluate_member_and_index_access() {
     // The index is itself an expression (resolved to 0 here → row[0]).
     assert_eq!(eval(&mut s, "row[p.y - 22]"), (true, Some("100".into())));
     // Errors fail cleanly: unknown member, and member access on a scalar.
-    assert_eq!(eval(&mut s, "p.nope").0, false);
-    assert_eq!(eval(&mut s, "p.x.y").0, false);
+    assert!(!eval(&mut s, "p.nope").0, "unknown member fails");
+    assert!(!eval(&mut s, "p.x.y").0, "member access on a scalar fails");
 }
 
 // A pointer `pp` (at +0) to a `struct Point {x=7,y=9}` placed at +16. Tests `->` and pointer
@@ -1333,5 +1333,8 @@ fn dap_evaluate_pointer_arrow_and_index() {
     assert_eq!(eval(&mut s, "pp[0].y"), (true, Some("9".into())));
     assert_eq!(eval(&mut s, "pp->x + pp->y"), (true, Some("16".into())));
     // Arrow through a non-pointer fails cleanly.
-    assert_eq!(eval(&mut s, "pp->x->y").0, false);
+    assert!(
+        !eval(&mut s, "pp->x->y").0,
+        "arrow through a non-pointer fails"
+    );
 }
