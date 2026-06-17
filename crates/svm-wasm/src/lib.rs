@@ -45,8 +45,8 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
-    VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VShape, VShiftOp,
-    ValIdx, ValType,
+    VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VSatBinOp, VShape,
+    VShiftOp, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1328,6 +1328,13 @@ fn v_shift(lo: &mut Lower, shape: VShape, op: VShiftOp) -> Result<(), Error> {
 fn v_intun(lo: &mut Lower, shape: VShape, op: VIntUnOp) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VIntUn { shape, op, a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_satbin(lo: &mut Lower, shape: VShape, op: VSatBinOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VSatBin { shape, op, a, b });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -2929,6 +2936,15 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64x2Shl => v_shift(lo, VShape::I64x2, VShiftOp::Shl)?,
         O::I64x2ShrS => v_shift(lo, VShape::I64x2, VShiftOp::ShrS)?,
         O::I64x2ShrU => v_shift(lo, VShape::I64x2, VShiftOp::ShrU)?,
+        // saturating add/sub (i8x16/i16x8 only)
+        O::I8x16AddSatS => v_satbin(lo, VShape::I8x16, VSatBinOp::AddS)?,
+        O::I8x16AddSatU => v_satbin(lo, VShape::I8x16, VSatBinOp::AddU)?,
+        O::I8x16SubSatS => v_satbin(lo, VShape::I8x16, VSatBinOp::SubS)?,
+        O::I8x16SubSatU => v_satbin(lo, VShape::I8x16, VSatBinOp::SubU)?,
+        O::I16x8AddSatS => v_satbin(lo, VShape::I16x8, VSatBinOp::AddS)?,
+        O::I16x8AddSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::AddU)?,
+        O::I16x8SubSatS => v_satbin(lo, VShape::I16x8, VSatBinOp::SubS)?,
+        O::I16x8SubSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::SubU)?,
         // integer lane abs/neg
         O::I8x16Abs => v_intun(lo, VShape::I8x16, VIntUnOp::Abs)?,
         O::I8x16Neg => v_intun(lo, VShape::I8x16, VIntUnOp::Neg)?,

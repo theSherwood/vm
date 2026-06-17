@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
-    Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VShape,
-    VShiftOp, ValIdx, ValType, VarLoc, DEFAULT_RESERVED_LOG2,
+    Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
+    VSatBinOp, VShape, VShiftOp, ValIdx, ValType, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -5172,6 +5172,12 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         Inst::VIntUn { shape, op, a } => {
             Value::V128(simd_vint_un(*shape, *op, as_v128(get(vals, *a)?)?))
         }
+        Inst::VSatBin { shape, op, a, b } => Value::V128(simd_vsat_bin(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
         Inst::VAnyTrue { a } => {
             Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
         }
@@ -5436,6 +5442,35 @@ fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
             VShiftOp::ShrS => (lane_sext(x, bytes) >> sh) as u64,
         };
         lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// `<i-shape>.{add,sub}_sat_{s,u}`: per-lane add/sub that **clamps** to the lane's signed/unsigned
+/// range instead of wrapping. Computed in `i128` so the intermediate can't overflow. `i8x16`/`i16x8`.
+fn simd_vsat_bin(shape: VShape, op: VSatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let bits = bytes as u32 * 8;
+    let max_u = (1i128 << bits) - 1;
+    let max_s = (1i128 << (bits - 1)) - 1;
+    let min_s = -(1i128 << (bits - 1));
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let (xu, yu) = (
+            lane_read(&a, i, bytes) as i128,
+            lane_read(&b, i, bytes) as i128,
+        );
+        let (xs, ys) = (
+            lane_sext(lane_read(&a, i, bytes), bytes) as i128,
+            lane_sext(lane_read(&b, i, bytes), bytes) as i128,
+        );
+        let r = match op {
+            VSatBinOp::AddU => (xu + yu).min(max_u),
+            VSatBinOp::SubU => (xu - yu).max(0),
+            VSatBinOp::AddS => (xs + ys).clamp(min_s, max_s),
+            VSatBinOp::SubS => (xs - ys).clamp(min_s, max_s),
+        };
+        lane_write(&mut o, i, bytes, r as u64);
     }
     o
 }

@@ -17,7 +17,7 @@
 //! is the separate hard problem (§18).
 #![forbid(unsafe_code)]
 
-use svm_ir::{BlockIdx, Func, Inst, Module, Terminator, ValIdx, ValType};
+use svm_ir::{BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
 
 /// Why verification rejected a module. Carries enough location to debug, never
 /// enough to be load-bearing for safety (the boolean accept/reject is the contract).
@@ -694,6 +694,18 @@ fn check_inst(
                 });
             }
             cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // Saturating add/sub is `i8x16`/`i16x8` only (the wasm spec has no wider sat).
+        Inst::VSatBin { shape, a, b, .. } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
         // Boolean reductions: a `v128` → an `i32`. `all_true`/`bitmask` carry an integer shape;

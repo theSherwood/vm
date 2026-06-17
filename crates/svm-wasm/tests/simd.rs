@@ -401,3 +401,22 @@ fn i32x4_bitmask_of_compare() {
     assert_eq!(mask(5), 0b1111, "all < 5");
     assert_eq!(mask(0), 0b0000, "none < 0");
 }
+
+/// Saturating add through the wasm bridge — the classic "blend pixels without overflow" idiom:
+/// `i8x16.add_sat_u` of two byte vectors clamps each lane at 255 instead of wrapping.
+#[test]
+fn i8x16_add_sat_u() {
+    let wat = r#"
+    (module
+      (func (export "blend") (param $x i32) (param $y i32) (result i32)
+        (i8x16.extract_lane_u 0
+          (i8x16.add_sat_u (i8x16.splat (local.get $x)) (i8x16.splat (local.get $y))))))
+    "#;
+    let blend = |x: i32, y: i32| match eval(wat, "blend", &[Value::I32(x), Value::I32(y)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(blend(200, 100), 255, "200 + 100 saturates to 255");
+    assert_eq!(blend(10, 20), 30, "10 + 20 = 30");
+    assert_eq!(blend(255, 255), 255, "255 + 255 = 255");
+}

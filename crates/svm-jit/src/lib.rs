@@ -71,8 +71,8 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VShape, VShiftOp, ValType,
-    DEFAULT_RESERVED_LOG2,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VSatBinOp, VShape, VShiftOp,
+    ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -2583,6 +2583,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VIntUn { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
+                // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
+                // `sadd_sat`/`uadd_sat`/`ssub_sat`/`usub_sat`.
+                Inst::VSatBin { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3620,6 +3623,23 @@ fn lower_block(
                 let r = match op {
                     VIntUnOp::Abs => b.ins().iabs(x),
                     VIntUnOp::Neg => b.ins().ineg(x),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VSatBin {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let r = match op {
+                    VSatBinOp::AddS => b.ins().sadd_sat(x, y),
+                    VSatBinOp::AddU => b.ins().uadd_sat(x, y),
+                    VSatBinOp::SubS => b.ins().ssub_sat(x, y),
+                    VSatBinOp::SubU => b.ins().usub_sat(x, y),
                 };
                 vcast(b, r, I8X16)
             }

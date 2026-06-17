@@ -18,7 +18,7 @@ use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering,
     StoreOp, Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VShape, VShiftOp, ValIdx, ValType,
+    VSatBinOp, VShape, VShiftOp, ValIdx, ValType,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -166,6 +166,7 @@ mod op {
         pub const VANY_TRUE: u8 = 0x13; // a -> i32
         pub const VALL_TRUE: u8 = 0x14; // shape, a -> i32
         pub const VBITMASK: u8 = 0x15; // shape, a -> i32
+        pub const VSAT_BIN: u8 = 0x16; // shape, op, a, b
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -671,6 +672,14 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(o.index());
             write_uleb(out, *a as u64);
         }
+        Inst::VSatBin { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VSAT_BIN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
         Inst::VAnyTrue { a } => {
             out.push(op::SIMD);
             out.push(op::simd::VANY_TRUE);
@@ -839,6 +848,16 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
                 shape,
                 op: VIntUnOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
                 a: c.idx()?,
+            }
+        }
+        op::simd::VSAT_BIN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VSatBin {
+                shape,
+                op: VSatBinOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
             }
         }
         op::simd::VANY_TRUE => Inst::VAnyTrue { a: c.idx()? },

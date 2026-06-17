@@ -805,3 +805,114 @@ fn reduction_roundtrip() {
         "binary round-trip"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Saturating add/sub (VSatBin) — i8x16/i16x8 only; clamps instead of wrapping.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn diff_saturating_add_sub() {
+    // i8x16, signed result via extract_lane_s.
+    let i8s = |op: &str, a: i32, b: i32| -> i32 {
+        let s = format!(
+            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+             \x20 v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n  v4 = i8x16.{op} v2 v3\n\
+             \x20 v5 = i8x16.extract_lane_s 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
+    };
+    // i8x16, unsigned result via extract_lane_u.
+    let i8u = |op: &str, a: i32, b: i32| -> i32 {
+        let s = format!(
+            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+             \x20 v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n  v4 = i8x16.{op} v2 v3\n\
+             \x20 v5 = i8x16.extract_lane_u 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
+    };
+    for (a, b) in [
+        (100, 50),
+        (-100, -50),
+        (127, 1),
+        (-128, -1),
+        (0, 0),
+        (50, -50),
+    ] {
+        assert_eq!(
+            i8s("add_sat_s", a, b),
+            (a as i8).saturating_add(b as i8) as i32,
+            "add_sat_s {a} {b}"
+        );
+        assert_eq!(
+            i8s("sub_sat_s", a, b),
+            (a as i8).saturating_sub(b as i8) as i32,
+            "sub_sat_s {a} {b}"
+        );
+    }
+    for (a, b) in [(200, 100), (50, 100), (255, 1), (0, 1), (128, 128)] {
+        assert_eq!(
+            i8u("add_sat_u", a, b),
+            (a as u8).saturating_add(b as u8) as i32,
+            "add_sat_u {a} {b}"
+        );
+        assert_eq!(
+            i8u("sub_sat_u", a, b),
+            (a as u8).saturating_sub(b as u8) as i32,
+            "sub_sat_u {a} {b}"
+        );
+    }
+
+    // i16x8 spot checks.
+    let i16s = |op: &str, a: i32, b: i32| -> i32 {
+        let s = format!(
+            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+             \x20 v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n  v4 = i16x8.{op} v2 v3\n\
+             \x20 v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I32(a), Value::I32(b)]) as i32
+    };
+    assert_eq!(
+        i16s("add_sat_s", 30000, 5000),
+        (30000i16).saturating_add(5000) as i32,
+        "i16 add_sat_s"
+    );
+    assert_eq!(
+        i16s("sub_sat_s", -30000, 5000),
+        (-30000i16).saturating_sub(5000) as i32,
+        "i16 sub_sat_s"
+    );
+}
+
+/// Saturating ops round-trip through text + binary; the verifier rejects a wide shape.
+#[test]
+fn saturating_roundtrip_and_shape_reject() {
+    let src = "func () -> (i32) {\nblock0():\n\
+        v0 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
+        v1 = i8x16.add_sat_s v0 v0\n\
+        v2 = i8x16.sub_sat_u v0 v0\n\
+        v3 = i16x8.add_sat_u v0 v0\n\
+        v4 = i8x16.extract_lane_s 0 v1\n  return v4\n}\n";
+    let m = build(src);
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
+
+    // i32x4 saturating add is not a wasm op and the verifier rejects it.
+    let bad = parse_module(
+        "func () -> () {\nblock0():\n\
+         v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         v1 = i32x4.add_sat_s v0 v0\n  return\n}\n",
+    )
+    .expect("parses (shape check is at verify)");
+    assert!(
+        verify_module(&bad).is_err(),
+        "i32x4 saturating add must fail verification"
+    );
+}

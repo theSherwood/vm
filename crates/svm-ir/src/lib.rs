@@ -360,6 +360,43 @@ impl VIntUnOp {
     }
 }
 
+/// Lane-wise **saturating** add/sub on a `v128` (§17): a lane that would overflow clamps to the
+/// lane's signed/unsigned min or max instead of wrapping. Defined **only for `i8x16`/`i16x8`** (the
+/// wasm spec has no wider saturating add/sub) — the verifier rejects any other [`VShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VSatBinOp {
+    AddS,
+    AddU,
+    SubS,
+    SubU,
+}
+
+impl VSatBinOp {
+    pub const ALL: [VSatBinOp; 4] = [
+        VSatBinOp::AddS,
+        VSatBinOp::AddU,
+        VSatBinOp::SubS,
+        VSatBinOp::SubU,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            VSatBinOp::AddS => "add_sat_s",
+            VSatBinOp::AddU => "add_sat_u",
+            VSatBinOp::SubS => "sub_sat_s",
+            VSatBinOp::SubU => "sub_sat_u",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VSatBinOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VSatBinOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
 /// Lane-wise binary float ops on a `v128` (§17, IEEE 754, no traps). `Min`/`Max` are the
 /// IEEE `minimum`/`maximum` (NaN-propagating, `-0 < +0`) matching the scalar [`FBinOp`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1640,6 +1677,14 @@ pub enum Inst {
         shape: VShape,
         op: VIntUnOp,
         a: ValIdx,
+    },
+    /// Lane-wise saturating add/sub (see [`VSatBinOp`]); `a`/`b`/result are `v128`. `i8x16`/`i16x8`
+    /// only (verifier-enforced).
+    VSatBin {
+        shape: VShape,
+        op: VSatBinOp,
+        a: ValIdx,
+        b: ValIdx,
     },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.
