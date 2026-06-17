@@ -6180,23 +6180,26 @@ impl Host {
                 }
             })
             .collect();
-        // `readonly` data segments → Ro (page-granular, like the runtime's `protect_ro`).
+        // `readonly` data segments → Ro. Protection is **host-page** granular (the runtime's
+        // `protect_ro` and the interpreter's `init_data` protect the whole host page), so a
+        // segment marks every codec page of the host page(s) it touches — this is what makes the
+        // result match `snapshot_prots` on a host whose page is larger than a codec page.
+        let host = host_page_size();
         for d in data {
             if !d.readonly || d.bytes.is_empty() {
                 continue;
             }
-            let lo = d.offset / DURABLE_SNAPSHOT_PAGE;
-            let hi = (d.offset + d.bytes.len() as u64).div_ceil(DURABLE_SNAPSHOT_PAGE);
+            let lo = (d.offset / host) * host / DURABLE_SNAPSHOT_PAGE;
+            let hi = (d.offset + d.bytes.len() as u64).div_ceil(host) * host / DURABLE_SNAPSHOT_PAGE;
             for p in lo..hi.min(npages as u64) {
                 out[p as usize] = CapturedProt::Ro;
             }
         }
         // Runtime map/unmap/protect (host-page-indexed) override the defaults.
         if let Some((_, map)) = &self.cap_pages {
-            let host_page = host_page_size();
             let m = map.lock().unwrap();
             for (p, slot) in out.iter_mut().enumerate() {
-                let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host_page;
+                let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host;
                 match m.get(&hp) {
                     Some(1) => *slot = CapturedProt::Rw,
                     Some(2) => *slot = CapturedProt::Ro,
