@@ -904,3 +904,169 @@ fn dap_evaluate_computes_an_expression() {
     let out = eval(&mut s, "i / acc");
     assert_eq!(response(&out).get("success"), Some(&Json::Bool(false)));
 }
+
+// A function that fills a `struct Point { int x, y; }` at data-SP+0 and an `int[3]` at +8 (with
+// known values), with a hand-written §6 structured-type debug section. Param v0 is the data-SP.
+// Breakpoint line 6 maps to the last op (after all stores), so the window holds the values.
+const AGGREGATES_DBG: &str = r#"
+memory 17
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 11
+  i32.store v0 v1
+  v2 = i64.const 4
+  v3 = i64.add v0 v2
+  v4 = i32.const 22
+  i32.store v3 v4
+  v5 = i64.const 8
+  v6 = i64.add v0 v5
+  v7 = i32.const 100
+  i32.store v6 v7
+  v8 = i64.const 12
+  v9 = i64.add v0 v8
+  v10 = i32.const 200
+  i32.store v9 v10
+  v11 = i64.const 16
+  v12 = i64.add v0 v11
+  v13 = i32.const 300
+  i32.store v12 v13
+  v14 = i32.const 0
+  return v14
+}
+
+debug.file 0 "s.c"
+debug.loc 0 0 18 0 6 1
+debug.type 0 base "int" signed 4
+debug.type 1 agg "struct" 8
+debug.field 1 "x" 0 0
+debug.field 1 "y" 4 0
+debug.type 2 array "array" 0 3
+debug.var 0 "p" win 0 "struct" 1
+debug.var 0 "row" win 8 "array" 2
+"#;
+
+/// `variables` as a map name → (value, variablesReference).
+fn vars_map(out: &[Json]) -> std::collections::HashMap<String, (String, i64)> {
+    response(out)
+        .get("body")
+        .unwrap()
+        .get("variables")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            (
+                v.get("name").unwrap().as_str().unwrap().to_string(),
+                (
+                    v.get("value").unwrap().as_str().unwrap().to_string(),
+                    v.get("variablesReference").unwrap().as_i64().unwrap(),
+                ),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn dap_expands_struct_and_array_in_the_variables_pane() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    // Drive func 0 with the data-SP as its argument (a window address with headroom).
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(AGGREGATES_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(1024)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("/work/s.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(6))])]),
+            ),
+        ]),
+    ));
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert!(event(&out, "stopped").is_some(), "stops at the breakpoint");
+
+    // stackTrace → frame → scopes → the Locals reference.
+    let out = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let fid = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        6,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(fid))]),
+    ));
+    let scope_ref = response(&out)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+
+    // Locals: `p` and `row` are *expandable* (nonzero variablesReference), not leaf scalars.
+    let out = s.handle(&req(
+        7,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(scope_ref))]),
+    ));
+    let locals = vars_map(&out);
+    let (p_summary, p_ref) = locals.get("p").expect("local p");
+    let (row_summary, row_ref) = locals.get("row").expect("local row");
+    assert_eq!(p_summary, "{...}", "struct summary");
+    assert_eq!(row_summary, "[3]", "array summary (count)");
+    assert!(*p_ref >= (1 << 20), "p is expandable");
+    assert!(*row_ref >= (1 << 20), "row is expandable");
+
+    // Expand the struct: fields x = 11, y = 22, both scalar leaves (reference 0).
+    let out = s.handle(&req(
+        8,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(*p_ref))]),
+    ));
+    let fields = vars_map(&out);
+    assert_eq!(
+        fields.get("x").map(|(v, r)| (v.as_str(), *r)),
+        Some(("11", 0))
+    );
+    assert_eq!(
+        fields.get("y").map(|(v, r)| (v.as_str(), *r)),
+        Some(("22", 0))
+    );
+
+    // Expand the array: elements [0]=100, [1]=200, [2]=300.
+    let out = s.handle(&req(
+        9,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(*row_ref))]),
+    ));
+    let elems = vars_map(&out);
+    assert_eq!(elems.get("[0]").map(|(v, _)| v.as_str()), Some("100"));
+    assert_eq!(elems.get("[1]").map(|(v, _)| v.as_str()), Some("200"));
+    assert_eq!(elems.get("[2]").map(|(v, _)| v.as_str()), Some("300"));
+}

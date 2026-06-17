@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue};
-use svm_ir::{DebugInfo, ValType};
+use svm_ir::{DebugInfo, Encoding, TypeDef, TypeId, ValType, VarLoc};
 
 mod expr;
 mod json;
@@ -51,6 +51,10 @@ struct Session {
     /// `scopes`/`variables`/`evaluate`, so a reference names a specific thread's frame (multithreaded
     /// DAP). Cleared whenever execution resumes (old frames become stale).
     frame_refs: Vec<(u64, usize)>,
+    /// Expandable aggregate/array sub-values, indexed by `variablesReference - PLACE_BASE`. A
+    /// `variables` request on such a reference enumerates the struct's fields / array's elements
+    /// (each itself expandable if aggregate). Cleared on resume alongside `frame_refs`.
+    place_refs: Vec<Place>,
     /// Multithreaded run (`attach_scheduled[_seeded]`)? Selects the time-travel coordinate: the
     /// global scheduler `turn` when scheduled, the op `clock` single-threaded.
     scheduled: bool,
@@ -82,6 +86,20 @@ enum StepKind {
     Over,
     Out,
 }
+
+/// A typed location in a thread's window — the target of an expandable `variablesReference`. Holds
+/// the focused thread and the absolute window address + structured type of the aggregate/array, so
+/// `variables` can read its members (DEBUGGING.md §6 structured `TypeRef`).
+struct Place {
+    tid: u64,
+    addr: u64,
+    type_id: TypeId,
+}
+
+/// Expandable-variable references start here, above the frame references (`frame_refs`, numbered
+/// `1..=len`). `variablesReference >= PLACE_BASE` ⇒ an aggregate/array place (`place_refs[ref -
+/// PLACE_BASE]`); a smaller nonzero reference is a frame's Locals scope.
+const PLACE_BASE: i64 = 1 << 20;
 
 impl DapServer {
     pub fn new() -> DapServer {
@@ -238,6 +256,7 @@ impl DapServer {
             breakpoints: Vec::new(),
             conditions: BTreeMap::new(),
             frame_refs: Vec::new(),
+            place_refs: Vec::new(),
             scheduled,
         });
         (true, Json::Null, vec![])
@@ -421,42 +440,153 @@ impl DapServer {
             Json::obj(vec![("variables", Json::Arr(vec![]))]),
             vec![],
         );
-        let Some(session) = self.session.as_mut() else {
+        if self.session.is_none() {
             return (false, Json::Null, vec![]);
+        }
+        // A reference at/above PLACE_BASE expands a struct/array sub-value; below it is a frame's
+        // Locals scope.
+        let out = if vref >= PLACE_BASE {
+            self.expand_place((vref - PLACE_BASE) as usize)
+        } else {
+            self.frame_locals(vref)
         };
-        // Recover (thread, frame index) from the reference, focus that thread, then read its locals.
-        let Some(&(tid, frame_idx)) = vref
+        match out {
+            Some(vars) => (
+                true,
+                Json::obj(vec![("variables", Json::Arr(vars))]),
+                vec![],
+            ),
+            None => empty,
+        }
+    }
+
+    /// The Locals of a frame reference (`vref = frameId + 1`): one DAP variable per source local,
+    /// with an expandable `variablesReference` for aggregates/arrays (DEBUGGING.md §6).
+    fn frame_locals(&mut self, vref: i64) -> Option<Vec<Json>> {
+        let session = self.session.as_mut()?;
+        let &(tid, frame_idx) = vref
             .checked_sub(1)
-            .and_then(|r| session.frame_refs.get(r as usize))
-        else {
-            return empty;
-        };
-        let Some(debug) = session.debug.as_ref() else {
-            return empty;
-        };
+            .and_then(|r| session.frame_refs.get(r as usize))?;
+        let debug = session.debug.as_ref()?;
         session.inspector.select_task(tid);
         let frames = session.inspector.backtrace();
+        let frame = frames.get(frame_idx)?;
+        // Snapshot (name, ty, loc, type_id) so the `debug` borrow ends before we read/allocate.
+        let vars: Vec<(String, String, VarLoc, Option<TypeId>)> = debug
+            .vars
+            .iter()
+            .filter(|v| v.func == frame.pc.func)
+            .map(|v| (v.name.clone(), v.ty.clone(), v.loc, v.type_id))
+            .collect();
         let mut out = Vec::new();
-        if let Some(frame) = frames.get(frame_idx) {
-            // Collect the (name, type) pairs first so the `debug` borrow ends before `read_var`.
-            let vars: Vec<(String, String)> = debug
-                .vars
-                .iter()
-                .filter(|v| v.func == frame.pc.func)
-                .map(|v| (v.name.clone(), v.ty.clone()))
-                .collect();
-            for (name, ty) in vars {
-                if let Some(val) = session.inspector.read_var(frame_idx, &name, ty_width(&ty)) {
-                    out.push(Json::obj(vec![
-                        ("name", Json::s(name)),
-                        ("value", Json::s(fmt_var(&val))),
-                        ("type", Json::s(ty)),
-                        ("variablesReference", Json::i(0)),
-                    ]));
+        for (name, ty, loc, type_id) in vars {
+            // An aggregate/array window local is expandable: name a `Place` at its base address.
+            if let (VarLoc::Window { off }, Some(tid_ref)) =
+                (loc, type_id.filter(|&t| self.is_expandable(t)))
+            {
+                if let Some(base) = self.var_base_addr(frame_idx, off) {
+                    let vr = self.alloc_place(tid, base, tid_ref);
+                    out.push(var_json(
+                        &name,
+                        &type_summary(self.types(), tid_ref),
+                        &ty,
+                        vr,
+                    ));
+                    continue;
                 }
             }
+            // Otherwise a scalar: read and format its value (current behavior).
+            let session = self.session.as_ref()?;
+            if let Some(val) = session.inspector.read_var(frame_idx, &name, ty_width(&ty)) {
+                out.push(var_json(&name, &fmt_var(&val), &ty, 0));
+            }
         }
-        (true, Json::obj(vec![("variables", Json::Arr(out))]), vec![])
+        Some(out)
+    }
+
+    /// The members of an expandable `Place`: a struct's fields or an array's elements, each itself
+    /// expandable if aggregate. Reads scalar leaves straight from the thread's window.
+    fn expand_place(&mut self, idx: usize) -> Option<Vec<Json>> {
+        let session = self.session.as_ref()?;
+        let place = session.place_refs.get(idx)?;
+        let (tid, base, type_id) = (place.tid, place.addr, place.type_id);
+        let types = session.debug.as_ref()?.types.clone();
+        self.session.as_mut()?.inspector.select_task(tid);
+
+        // Build the (name, addr, type) of each member, then render — reading children below.
+        let mut members: Vec<(String, u64, TypeId)> = Vec::new();
+        match types.get(type_id as usize)? {
+            TypeDef::Aggregate { fields, .. } => {
+                for f in fields {
+                    members.push((f.name.clone(), base + f.offset as u64, f.ty));
+                }
+            }
+            TypeDef::Array { elem, count, .. } => {
+                let stride = type_size(&types, *elem) as u64;
+                for i in 0..*count as u64 {
+                    members.push((format!("[{i}]"), base + i * stride, *elem));
+                }
+            }
+            _ => return Some(vec![]),
+        }
+
+        let mut out = Vec::new();
+        for (name, addr, mty) in members {
+            let ty_name = type_render_name(&types, mty);
+            if self.is_expandable(mty) {
+                let vr = self.alloc_place(tid, addr, mty);
+                out.push(var_json(&name, &type_summary(&types, mty), &ty_name, vr));
+            } else {
+                let size = type_size(&types, mty) as usize;
+                let session = self.session.as_ref()?;
+                let value = match session.inspector.read_window(addr, size) {
+                    Ok(bytes) => fmt_scalar(&types, mty, &bytes),
+                    Err(_) => "<unreadable>".to_string(),
+                };
+                out.push(var_json(&name, &value, &ty_name, 0));
+            }
+        }
+        Some(out)
+    }
+
+    /// The base window address of a `Window`-located local in the frame `frame_idx` levels up: the
+    /// frame's data-SP (block param `v0`) plus the variable's offset.
+    fn var_base_addr(&self, frame_idx: usize, off: i64) -> Option<u64> {
+        let sp = match self
+            .session
+            .as_ref()?
+            .inspector
+            .read_ir_value(frame_idx, 0)?
+        {
+            Value::I64(n) => n as u64,
+            Value::I32(n) => n as u64,
+            _ => return None,
+        };
+        Some(sp.wrapping_add(off as u64))
+    }
+
+    /// Does this type expand into members (struct/array)? Pointers render as a scalar address.
+    fn is_expandable(&self, type_id: TypeId) -> bool {
+        matches!(
+            self.types().get(type_id as usize),
+            Some(TypeDef::Aggregate { .. } | TypeDef::Array { .. })
+        )
+    }
+
+    /// Borrow the structured type table (empty if no debug info).
+    fn types(&self) -> &[TypeDef] {
+        self.session
+            .as_ref()
+            .and_then(|s| s.debug.as_ref())
+            .map(|d| d.types.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Record an expandable `Place` and return its `variablesReference`.
+    fn alloc_place(&mut self, tid: u64, addr: u64, type_id: TypeId) -> i64 {
+        let session = self.session.as_mut().expect("session present");
+        session.place_refs.push(Place { tid, addr, type_id });
+        PLACE_BASE + (session.place_refs.len() - 1) as i64
     }
 
     fn on_continue(&mut self) -> (bool, Json, Vec<Event>) {
@@ -589,6 +719,7 @@ impl DapServer {
             return (false, Json::Null, vec![]);
         };
         session.frame_refs.clear();
+        session.place_refs.clear();
         // The time-travel coordinate: the global scheduler `turn` when multithreaded, the op `clock`
         // single-threaded.
         let scheduled = session.scheduled;
@@ -696,6 +827,7 @@ impl DapServer {
     fn stop_events(&mut self, stop: Stop) -> Vec<Event> {
         if let Some(s) = self.session.as_mut() {
             s.frame_refs.clear();
+            s.place_refs.clear();
         }
         let tid = self.stopped_thread_id();
         match stop {
@@ -830,6 +962,92 @@ fn var_to_i64(v: &VarValue) -> Option<i64> {
             x as i64
         }
     })
+}
+
+/// Build a DAP `variables` entry. `vref` is `0` for a leaf scalar, or an expandable reference.
+fn var_json(name: &str, value: &str, ty: &str, vref: i64) -> Json {
+    Json::obj(vec![
+        ("name", Json::s(name.to_string())),
+        ("value", Json::s(value.to_string())),
+        ("type", Json::s(ty.to_string())),
+        ("variablesReference", Json::i(vref)),
+    ])
+}
+
+/// The render name of a structured type (every [`TypeDef`] variant carries one), or `"?"`.
+fn type_render_name(types: &[TypeDef], id: TypeId) -> String {
+    match types.get(id as usize) {
+        Some(
+            TypeDef::Base { name, .. }
+            | TypeDef::Pointer { name, .. }
+            | TypeDef::Array { name, .. }
+            | TypeDef::Aggregate { name, .. }
+            | TypeDef::Opaque { name, .. },
+        ) => name.clone(),
+        None => "?".to_string(),
+    }
+}
+
+/// A brief value summary shown next to an expandable variable (its members appear on expansion).
+fn type_summary(types: &[TypeDef], id: TypeId) -> String {
+    match types.get(id as usize) {
+        Some(TypeDef::Array { count, .. }) => format!("[{count}]"),
+        Some(TypeDef::Aggregate { .. }) => "{...}".to_string(),
+        _ => type_render_name(types, id),
+    }
+}
+
+/// The `sizeof` of a structured type — like [`TypeDef::size`] but resolving an array to
+/// `count * elem.size` (the stride the element type defines).
+fn type_size(types: &[TypeDef], id: TypeId) -> u32 {
+    match types.get(id as usize) {
+        Some(TypeDef::Array { elem, count, .. }) => count * type_size(types, *elem),
+        Some(t) => t.size(),
+        None => 0,
+    }
+}
+
+/// Read a little-endian unsigned integer from the first `n` bytes (`n <= 8`).
+fn le_uint(bytes: &[u8], n: usize) -> u64 {
+    let mut x = 0u64;
+    for (i, &b) in bytes.iter().take(n).enumerate() {
+        x |= (b as u64) << (8 * i);
+    }
+    x
+}
+
+/// Format a scalar leaf's window bytes per its structured type: signed/unsigned ints, floats, a
+/// `_Bool`, or a pointer (hex address). Aggregates/arrays never reach here (they expand instead).
+fn fmt_scalar(types: &[TypeDef], id: TypeId, bytes: &[u8]) -> String {
+    match types.get(id as usize) {
+        Some(TypeDef::Base { encoding, size, .. }) => {
+            let n = *size as usize;
+            match encoding {
+                Encoding::Unsigned => le_uint(bytes, n).to_string(),
+                Encoding::Bool => (le_uint(bytes, n) != 0).to_string(),
+                Encoding::Signed => {
+                    let raw = le_uint(bytes, n);
+                    // Sign-extend from the value's width to i64.
+                    let bits = (n * 8) as u32;
+                    if bits == 0 || bits >= 64 {
+                        (raw as i64).to_string()
+                    } else {
+                        let shift = 64 - bits;
+                        (((raw << shift) as i64) >> shift).to_string()
+                    }
+                }
+                Encoding::Float => {
+                    if *size == 4 {
+                        f32::from_bits(le_uint(bytes, 4) as u32).to_string()
+                    } else {
+                        f64::from_bits(le_uint(bytes, 8)).to_string()
+                    }
+                }
+            }
+        }
+        Some(TypeDef::Pointer { .. }) => format!("0x{:x}", le_uint(bytes, 8)),
+        _ => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+    }
 }
 
 /// Coerce a JSON array of integers to entry-function arguments, one per declared parameter type.
