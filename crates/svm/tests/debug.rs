@@ -456,6 +456,7 @@ debug.var 0 "x" ssa 0 "int"
 debug.var 0 "buf" win 16 "char"
 debug.var 0 "p" win 24 "struct" 3
 debug.var 0 "k" ssalist 2 0 0 0 1 1 2 "int"
+debug.var 0 "w" winvia 2 0 0 1 1 3 5 -8 "int"
 debug.blob "x.dw" "ab\x00\xffcd"
 "#;
     let m = parse_module(src).expect("parse");
@@ -467,7 +468,15 @@ debug.blob "x.dw" "ab\x00\xffcd"
     assert_eq!(di.files, vec!["a.c".to_string()]);
     assert_eq!(di.locs.len(), 1);
     assert_eq!(di.types.len(), 4);
-    assert_eq!(di.vars.len(), 4);
+    assert_eq!(di.vars.len(), 5);
+
+    // The runtime-base window var (winvia) parsed its base loclist + offset.
+    let svm_ir::VarLoc::WindowVia { base, off } = &di.vars[4].loc else {
+        panic!("w is a winvia var");
+    };
+    assert_eq!(base.len(), 2);
+    assert_eq!((base[1].block, base[1].inst, base[1].value), (1, 3, 5));
+    assert_eq!(*off, -8);
 
     // The location-list var (S2) parsed its entries.
     let svm_ir::VarLoc::SsaList(locs) = &di.vars[3].loc else {
@@ -540,6 +549,46 @@ debug.var 0 "x" ssalist 3 0 0 0 1 0 0 1 2 2 "int"
     assert_eq!(read_x_at(1, 1), VarValue::Value(Value::I32(13)));
     // block1 inst2: after `v5 = v3 + 5`, x is now v5 = 18 (the intra-block transition).
     assert_eq!(read_x_at(1, 2), VarValue::Value(Value::I32(18)));
+}
+
+/// `VarLoc::WindowVia`: a variable in window memory at `(a per-pc base SSA value) + off` — the
+/// wasm/DWARF `DW_OP_fbreg` case. The base here is value 0 (the data-SP `v0`, a window address);
+/// the var lives at `data-SP + 8`, where a store left a known int.
+#[test]
+fn windowvia_reads_through_a_runtime_base_value() {
+    // v0 (data-SP) is the runtime base; store 77 at v0+8, then break and read `x` (winvia base=v0,
+    // off=8) → 77 from the window.
+    let src = r#"
+memory 17
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 77
+  v2 = i64.const 8
+  v3 = i64.add v0 v2
+  i32.store v3 v1
+  v4 = i32.const 0
+  return v4
+}
+
+debug.file 0 "w.c"
+debug.var 0 "x" winvia 1 0 0 0 8 "int"
+"#;
+    let m = parse_module(src).expect("parse");
+    let mut insp = Inspector::attach(&m, 0, &[Value::I64(4096)], 1_000_000);
+    // Break at the last op (after the store), so the window holds the value.
+    let last = m.funcs[0].blocks[0].insts.len() - 1;
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: last,
+    });
+    assert!(matches!(insp.run_until_stop(), Stop::Break { .. }));
+    // `x` = window[data-SP + 8] = 77, read as 4 raw bytes (the base value-0 is resolved per pc).
+    assert_eq!(
+        insp.read_var(0, "x", 4),
+        Some(VarValue::Bytes(77i32.to_le_bytes().to_vec()))
+    );
 }
 
 #[test]

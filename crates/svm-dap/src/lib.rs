@@ -1213,10 +1213,12 @@ impl expr::Resolver for EvalEnv<'_> {
                     }
                 }
             }
-            // A promoted scalar (single value or a location list): let the Inspector resolve it at
-            // the frame's pc, then map the read-back value to an Int/Float operand.
-            VarLoc::Ssa { .. } | VarLoc::SsaList(_) => {
-                match self.inspector.read_var(self.frame_idx, name, 0)? {
+            // A promoted scalar (single value / location list) or a runtime-base window var: let
+            // the Inspector resolve it at the frame's pc, then map the value to an Int/Float operand.
+            // (`WindowVia` reads window bytes; member/index on such an aggregate is a later refinement.)
+            VarLoc::Ssa { .. } | VarLoc::SsaList(_) | VarLoc::WindowVia { .. } => {
+                let width = scalar_width(self.types, var.type_id, &var.ty);
+                match self.inspector.read_var(self.frame_idx, name, width)? {
                     VarValue::Value(Value::F32(x)) => Some(expr::Value::Float(x as f64)),
                     VarValue::Value(Value::F64(x)) => Some(expr::Value::Float(x)),
                     v => var_to_i64(&v).map(expr::Value::Int),

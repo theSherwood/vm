@@ -153,7 +153,8 @@ fn print_debug_info(s: &mut String, m: &Module) {
     }
     for v in &di.vars {
         // `debug.var <fn> "<name>" <loc> "<ty>" [<type_id>]`, where `<loc>` is `win <off>`,
-        // `ssa <value>`, or `ssalist <n> <b0> <i0> <v0> …` (the location list, S2).
+        // `ssa <value>`, `ssalist <n> <b0> <i0> <v0> …` (the location list, S2), or
+        // `winvia <n> <b0> <i0> <v0> … <off>` (window via a per-pc base value + offset).
         let _ = write!(s, "debug.var {} \"{}\" ", v.func, v.name);
         match &v.loc {
             VarLoc::Window { off } => {
@@ -167,6 +168,13 @@ fn print_debug_info(s: &mut String, m: &Module) {
                 for l in locs {
                     let _ = write!(s, " {} {} {}", l.block, l.inst, l.value);
                 }
+            }
+            VarLoc::WindowVia { base, off } => {
+                let _ = write!(s, "winvia {}", base.len());
+                for l in base {
+                    let _ = write!(s, " {} {} {}", l.block, l.inst, l.value);
+                }
+                let _ = write!(s, " {off}");
             }
         }
         let _ = write!(s, " \"{}\"", v.ty);
@@ -927,9 +935,24 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                         }
                         VarLoc::SsaList(locs)
                     }
+                    "winvia" => {
+                        let n = p.parse_u32()?;
+                        let mut base = Vec::new();
+                        for _ in 0..n {
+                            base.push(svm_ir::SsaLoc {
+                                block: p.parse_u32()?,
+                                inst: p.parse_u32()?,
+                                value: p.parse_u32()?,
+                            });
+                        }
+                        VarLoc::WindowVia {
+                            base,
+                            off: p.parse_int()?,
+                        }
+                    }
                     k => {
                         return err(format!(
-                            "debug.var location kind must be win, ssa, or ssalist, got {k}"
+                            "debug.var location kind must be win, ssa, ssalist, or winvia, got {k}"
                         ))
                     }
                 };
@@ -1125,10 +1148,13 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_str()?; // name
                                 // Location: `win <off>` / `ssa <value>` (one int), or `ssalist <n>` + 3n ints.
                 let kind = p.parse_ident()?;
-                if kind == "ssalist" {
+                if kind == "ssalist" || kind == "winvia" {
                     let n = p.parse_int()?;
                     for _ in 0..n.max(0) * 3 {
                         p.parse_int()?;
+                    }
+                    if kind == "winvia" {
+                        p.parse_int()?; // the trailing offset
                     }
                 } else {
                     p.parse_int()?; // win off / ssa value

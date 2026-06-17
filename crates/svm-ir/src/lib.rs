@@ -2335,6 +2335,14 @@ pub enum VarLoc {
     /// is what lets promoted scalars — and wasm/LLVM SSA-valued locals, which change per block — be
     /// inspected without a window slot.
     SsaList(Vec<SsaLoc>),
+    /// A variable in **window memory at a runtime base address + offset**: the base is an SSA value
+    /// that varies per pc (a location list, `base`), so `read = window[resolve(base) + off ..]`.
+    /// This is the wasm/DWARF case — clang describes a C local as `DW_OP_fbreg <off>` relative to a
+    /// frame base held in a wasm local (an SSA value here), not as a fixed `data-SP + off` window
+    /// slot. ([`Window`] is the special case where the base is always frame value 0, the data-SP.)
+    ///
+    /// [`Window`]: VarLoc::Window
+    WindowVia { base: Vec<SsaLoc>, off: i64 },
 }
 
 /// One entry of a [`VarLoc::SsaList`] location list: within block `block`, from instruction `inst`

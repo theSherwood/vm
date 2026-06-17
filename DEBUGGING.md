@@ -1128,14 +1128,25 @@ value per pc (an `SsaList`-style lookup) plus the offset — a forthcoming `VarL
 (`debug_line.rs`): the reader recovers `add`'s frame-base local 4 and its `a/b/s` at fbreg +12/+8/+4
 with the `int` base type, from the committed fixture.
 
-**Not yet (next slices), completing wasm variable ingest:** (1) a `VarLoc` for *window-via-a-per-pc-
-base-value + offset* (the frame-base local resolved as an `SsaList`, then `+ fbreg`, read from the
-window); (2) svm-wasm tracking each wasm local's SSA value per pc (an `SsaList` per local, like the
-slice-15/17 op recording); (3) wiring `dwarf_info` vars + base types → `debug.var` + `TypeRef`,
-keyed by subprogram→IR-func, end-to-end. Plus the LLVM `!DILocation`/`dbg.value` bitcode path (its
-own effort). (The chibicc producer (incl. optimized-build location lists), both DAP consumers,
-binary serialization, a second producer's source lines + DWARF pass-through, the location-list ABI,
-and now the `.debug_info` reader are all built.)
+**Slice 20 — `VarLoc::WindowVia` (the wasm/DWARF location model).** A variable in **window memory at
+a runtime base + offset**: `WindowVia { base: Vec<SsaLoc>, off }` resolves `base` as a location list
+per pc (nearest-preceding within the block, like `SsaList`) to a frame value, reads that as a
+window address, adds `off`, and reads `width` bytes. This is the `DW_OP_fbreg <off>` case from slice
+19 — the frame base is a wasm local (an SSA value here), not a fixed `data-SP` slot. (`Window{off}`
+is the special case where the base is always frame value 0.) The interpreter `read_var` resolves it
+(refactored to share the loclist lookup with `SsaList`); text (`debug.var … winvia <n> <b> <i> <v>…
+<off>`) and binary forms round-trip it; DAP's `evaluate` reads such a name through the Inspector.
+Tests: an interpreter test stores a value at `data-SP+8` and reads it back through a `winvia` whose
+base is value 0; text + binary round-trips (incl. a negative offset).
+
+**Not yet (next slices), completing wasm variable ingest:** (2) svm-wasm tracking each wasm local's
+SSA value per pc (an `SsaList` per local, like the slice-15/17 op recording) — to supply the
+`WindowVia` base for the frame-base local; (3) wiring `dwarf_info` vars + base types → `debug.var`
+(`WindowVia`) + `TypeRef`, keyed by subprogram→IR-func, end-to-end. Plus the LLVM
+`!DILocation`/`dbg.value` bitcode path (its own effort). (The chibicc producer (incl. optimized-build
+location lists), both DAP consumers, binary serialization, a second producer's source lines + DWARF
+pass-through, the location-list ABI, the `.debug_info` reader, and now the `WindowVia` location model
+are all built.)
 
 ### Open questions (S4/S5/S2)
 
