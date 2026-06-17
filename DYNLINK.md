@@ -4,11 +4,14 @@ Handoff + tracker for **dynamic linking in SVM**: loading separately-authored/co
 and resolving cross-unit references (functions, data) by **name** — the foundation for plugins,
 **dynamic class loading in GC'd-language runtimes**, a stateful REPL, and shared runtime libraries.
 
-Status: M0–M3 **merged to `main`** (via PR #11, branch `claude/dynamic-linking`) — those are `svm-ir`
-+ tests, no TCB-backend changes. **C1 (host-assisted resolve)** then extended the binary codec
-(`svm-encode`, which *is* untrusted-input TCB — re-verification still gates it) and added the host
-resolving-compile primitive in `svm-run`. Fold the settled parts into `DESIGN.md` and drop this file
-once the loader lands (repo convention, cf. the former `SCHEDULING.md`/`AUDIT.md`).
+Status: M0–M3 **merged to `main`** (via PR #11). The **capstone is now complete end to end** (branch
+`claude/dynlink-host-assisted-resolve`, PR #21): C1 made the codec carry unresolved imports + added the
+host resolving-compile primitive; C2 exposed it as the `compile_linked` cap op (op 5) on both backends;
+C3 added the chibicc `__vm_jit_compile_linked` builtin; C3b shipped the `vm_dlopen`/`vm_dlsym`/`vm_dlclose`
+guest loader. In-sandbox `dlopen` is real: a guest C program loads a unit and links it **by name** at
+runtime, re-verified and capability-gated. **Next: fold the settled design into `DESIGN.md` and retire
+this file** (repo convention, cf. the former `SCHEDULING.md`/`AUDIT.md`); only the optional data-symbol
+follow-up remains open.
 
 ---
 
@@ -139,12 +142,17 @@ These already prove old code reaching newly-loaded code; the dynlink work adds t
       emits a self-contained `service` (installed → slot) and a `client` that imports it by name,
       builds the C2 symbol-table buffer from the install slot, `compile_linked`s the client against it,
       and invokes it (`client(5,2)=127`). Driven by `c_frontend.rs::c_guest_jit_link_demo` (interp == JIT).
-- [ ] **C3b — ergonomic `vm_dlopen`/`vm_dlsym`/`vm_dlclose` wrappers + a linking REPL.** Package the
-      jit_link.c steps as a small guest C library (a malloc-backed `name → slot` registry; `vm_dlopen`
-      = build symtab + `compile_linked` + `install` + record exports; `vm_dlsym` = registry lookup;
-      `vm_dlclose` = `__vm_jit_uninstall`), then evolve `demos/jit/jit_repl.c` into the **linking** REPL
-      (today it JITs throwaway units — make definitions persist + compose by name, the guest-C twin of
-      `dynlink_repl.rs`). Plus (later) data placement via `Memory` + `DataReloc`s for data symbols.
+- [x] **C3b — ergonomic `vm_dlopen`/`vm_dlsym`/`vm_dlclose` loader** (`frontend/chibicc/include/vm_dl.h`).
+      A guest C header: a fixed-capacity `name → {slot, code}` registry + symbol-table marshalling over
+      `__vm_jit_compile_linked`/`__vm_jit_install`. `vm_dlopen(name, ir, len)` = build the symtab from
+      the registry → `compile_linked` (host re-verifies) → `install` → record; `vm_dlsym(name)` = the
+      funcref slot; `vm_dlcall2` = invoke; `vm_dlclose` = `uninstall` + drop. Demo
+      `demos/jit/jit_dlopen.c` (the guest-C twin of `dynlink_repl.rs`): loads `add`, `mul`, then
+      `poly = add(mul(a,a), b)` linking to both **by name** (`poly(5,2)=27`), then `vm_dlclose`s it.
+      Driven by `c_frontend.rs::c_guest_jit_dlopen_demo` (interp == JIT).
+- [ ] (Later) **data symbols** — resolution covers *function* imports → slots; a data import would
+      place the unit's data via `Memory` + `memory.init` applying M2's `DataReloc`s, and `vm_dlsym`
+      would return a data **address**. Not yet wired (no demo needs it).
 - [ ] GOT / late-binding variant (so *old* code calls *not-yet-loaded* code by name without recompiling
       the caller: the caller does `call_indirect (load GOT[i])`; the loader writes the resolved slot
       into the GOT at load — pure data writes via `Memory` + `memory.init`, reusing M2's reloc). The

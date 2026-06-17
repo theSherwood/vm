@@ -2276,6 +2276,26 @@ fn c_guest_jit_link_demo() {
     );
 }
 
+/// The guest-side **`vm_dlopen` loader** in C (DYNLINK.md C3b, `demos/jit/jit_dlopen.c`): the
+/// ergonomic `vm_dlopen`/`vm_dlsym`/`vm_dlclose` library (`<vm_dl.h>` — a name→slot registry over the
+/// `Jit` cap) used to build functions that compose **by name**. The guest loads `add` and `mul`, then
+/// `poly = add(mul(a,a), b)` which imports both by name; `poly(5,2)=27`, `poly(3,4)=13`; then
+/// `vm_dlclose("poly")` unloads it. The guest-C twin of `dynlink_repl.rs`. `run_c_full` enforces
+/// interp == JIT.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_dlopen_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_dlopen.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.contains("poly(5, 2) = 27\n")
+            && out.contains("poly(3, 4) = 13\n")
+            && out.ends_with("linked by name via vm_dlopen/vm_dlsym/vm_dlclose\n"),
+        "the guest vm_dlopen loader must compose symbols by name on both backends:\n{out}"
+    );
+}
+
 /// The **threaded** guest-driven JIT capstone (`demos/jit/jit_threads.c`, DESIGN.md §22), run as a
 /// full interp≡JIT **differential**: `NWORKERS` guest threads each emit a distinct unit, `Jit.compile`
 /// it **concurrently**, and invoke the native code, checking it against a C reference. Because the
