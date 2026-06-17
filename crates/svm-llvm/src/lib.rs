@@ -138,11 +138,17 @@
 //! - **Z — `llvm.bswap`.** Byte-reverse synthesized inline (no SVM op): each source byte `i` →
 //!   destination byte `nbytes-1-i` via shift/mask/or (`i16`/`i32`/`i64`). Lands the **`crc32`** demo
 //!   (CRC-32 + a big-endian `u32` reader) byte-identical to native.
+//! - **AA — overlap-safe `memmove` (a direction-aware runtime helper).** A variable-length (or
+//!   oversized-constant) `llvm.memmove` calls the synthesized **`__svm_memmove`** — a counted byte
+//!   copy that runs *forward* when `dst <= src` and *backward* otherwise (the direction `memcpy`
+//!   can't do), so overlapping shifts in either direction are correct. (Constant small `memmove`
+//!   still inlines load-all-then-store-all, already overlap-safe.) Lands the **`lineedit`** demo (a
+//!   line editor doing overlapping left/right shifts) byte-identical to native.
 //!
 //! Out of the current subset (clean [`Error::Unsupported`]): `printf` `%s`/`%f`, zero-padded `%d`,
-//! precision/`*`/`-`+# flags, and non-constant formats; variable-length `memmove` (overlap), general
-//! (non-rotate) funnel shifts, `llvm.bitreverse`, transcendental math, `puts`/`fputs` of a
-//! *non-literal* string (runtime strlen), other SIMD (`<2 x double>`, `<8 x i16>`, dynamic lanes), `i33`.
+//! precision/`*`/`-`+# flags, and non-constant formats; general (non-rotate) funnel shifts,
+//! `llvm.bitreverse`, transcendental math, `puts`/`fputs` of a *non-literal* string (runtime
+//! strlen), other SIMD (`<2 x double>`, `<8 x i16>`, dynamic lanes), `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -250,11 +256,11 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // Synthesized helpers (mem-loop `memset`/`memcpy`, the `malloc` allocator) sit after the defined
     // functions and `_start` (index 0 when `synth`), at `base + defined.len()` onward — their indices
     // are fixed before translating call sites. The allocator references the `vm_map` import index.
-    let (need_memset, need_memcpy0) = needs_mem_helpers(m);
+    let (need_memset, need_memcpy0, need_memmove) = needs_mem_helpers(m);
     let need_memcpy = need_memcpy0 || need_realloc; // `realloc` copies via `__svm_memcpy`
                                                     // Helper indices are assigned in a fixed order after the defined functions (and `_start`):
-                                                    // memset, memcpy, malloc, utoa, realloc — each present only if needed. The append order below
-                                                    // must match.
+                                                    // memset, memcpy, malloc, utoa, realloc, memmove — each present only if needed. The append
+                                                    // order below must match.
     let mut next_helper = base + defined.len() as u32;
     let mut take = |needed: bool| {
         needed.then(|| {
@@ -269,6 +275,7 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         malloc: take(need_malloc),
         utoa: take(need_printf),
         realloc: take(need_realloc),
+        memmove: take(need_memmove),
     };
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
@@ -328,6 +335,9 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
             helpers.malloc.expect("realloc needs malloc"),
             helpers.memcpy.expect("realloc needs memcpy"),
         ));
+    }
+    if need_memmove {
+        funcs.push(synth_memmove());
     }
     Ok(Translated {
         module: Module {
@@ -1594,6 +1604,8 @@ struct Helpers {
     utoa: Option<u32>,
     /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
     realloc: Option<u32>,
+    /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
+    memmove: Option<u32>,
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
@@ -1612,11 +1624,10 @@ fn needs_malloc(m: &LModule, defined: &HashMap<String, u32>) -> bool {
     calls_external(m, defined, "malloc") || calls_external(m, defined, "calloc")
 }
 
-/// Does any mem intrinsic need the runtime loop helper — a **non-constant** length, or a constant
-/// one too large to unroll inline? Returns `(needs_memset, needs_memcpy)`. (`memmove` with a
-/// variable length is left `Unsupported` — overlap direction needs a runtime branch, a later slice.)
-fn needs_mem_helpers(m: &LModule) -> (bool, bool) {
-    let (mut set, mut cpy) = (false, false);
+/// Does any mem intrinsic need a runtime helper — a **non-constant** length, or a constant one too
+/// large to unroll inline? Returns `(needs_memset, needs_memcpy, needs_memmove)`.
+fn needs_mem_helpers(m: &LModule) -> (bool, bool, bool) {
+    let (mut set, mut cpy, mut mov) = (false, false, false);
     for f in &m.functions {
         for bb in &f.basic_blocks {
             for instr in &bb.instrs {
@@ -1633,11 +1644,13 @@ fn needs_mem_helpers(m: &LModule) -> (bool, bool) {
                     set = true;
                 } else if name.starts_with("llvm.memcpy") && big(c) {
                     cpy = true;
+                } else if name.starts_with("llvm.memmove") && big(c) {
+                    mov = true;
                 }
             }
         }
     }
-    (set, cpy)
+    (set, cpy, mov)
 }
 
 /// Synthesize `__svm_realloc(p:i64, n:i64) -> i64`: `realloc` over the header-bearing bump allocator.
@@ -1879,6 +1892,153 @@ fn synth_memcpy() -> Func {
         params,
         results: vec![],
         blocks: vec![entry, test, body, done],
+    }
+}
+
+/// Synthesize `__svm_memmove(dst:i64, src:i64, len:i64)`: an **overlap-safe** byte copy — forward
+/// when `dst <= src`, backward otherwise (the direction `memcpy` can't do). 8 blocks: the direction
+/// branch, then a forward and a backward counted byte loop sharing the `done` return.
+fn synth_memmove() -> Func {
+    use svm_ir::{LoadOp, StoreOp};
+    let p3 = || vec![ValType::I64, ValType::I64, ValType::I64]; // dst, src, len
+    let p4 = || vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64]; // + i
+    let add = |a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let load8 = |addr: ValIdx| Inst::Load {
+        op: LoadOp::I32_8U,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let store8 = |addr: ValIdx, value: ValIdx| Inst::Store {
+        op: StoreOp::I32_8,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    // block0(dst=0,src=1,len=2): dst <=u src ? forward : backward.
+    let b0 = Block {
+        params: p3(),
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LeU,
+            a: 0,
+            b: 1,
+        }], // v3
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 1, // fwd
+            then_args: vec![0, 1, 2],
+            else_blk: 4, // bwd
+            else_args: vec![0, 1, 2],
+        },
+    };
+    // fwd(dst,src,len): i = 0; → floop.
+    let fwd = Block {
+        params: p3(),
+        insts: vec![Inst::ConstI64(0)], // v3 = i
+        term: Terminator::Br {
+            target: 2,
+            args: vec![0, 1, 2, 3],
+        },
+    };
+    // floop(dst,src,len,i): i <u len ? fbody : done.
+    let floop = Block {
+        params: p4(),
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtU,
+            a: 3,
+            b: 2,
+        }], // v4
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 3,
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 7,
+            else_args: vec![],
+        },
+    };
+    // fbody(dst,src,len,i): dst[i] = src[i]; i++ → floop.
+    let fbody = Block {
+        params: p4(),
+        insts: vec![
+            add(1, 3),         // v4 = src + i
+            load8(4),          // v5 = src[i]
+            add(0, 3),         // v6 = dst + i
+            store8(6, 5),      // dst[i] = src[i]
+            Inst::ConstI64(1), // v7
+            add(3, 7),         // v8 = i + 1
+        ],
+        term: Terminator::Br {
+            target: 2,
+            args: vec![0, 1, 2, 8],
+        },
+    };
+    // bwd(dst,src,len): i = len; → bloop.
+    let bwd = Block {
+        params: p3(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 5,
+            args: vec![0, 1, 2, 2], // i = len
+        },
+    };
+    // bloop(dst,src,len,i): i >u 0 ? bbody : done.
+    let bloop = Block {
+        params: p4(),
+        insts: vec![
+            Inst::ConstI64(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::GtU,
+                a: 3,
+                b: 4,
+            }, // v5 = i > 0
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 6,
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 7,
+            else_args: vec![],
+        },
+    };
+    // bbody(dst,src,len,i): i--; dst[i] = src[i]; → bloop.
+    let bbody = Block {
+        params: p4(),
+        insts: vec![
+            Inst::ConstI64(1), // v4
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: 3,
+                b: 4,
+            }, // v5 = i - 1
+            add(1, 5),         // v6 = src + (i-1)
+            load8(6),          // v7 = src[i-1]
+            add(0, 5),         // v8 = dst + (i-1)
+            store8(8, 7),      // dst[i-1] = src[i-1]
+        ],
+        term: Terminator::Br {
+            target: 5,
+            args: vec![0, 1, 2, 5], // loop with i-1
+        },
+    };
+    let done = Block {
+        params: vec![],
+        insts: vec![],
+        term: Terminator::Return(vec![]),
+    };
+    Func {
+        params: p3(),
+        results: vec![],
+        blocks: vec![b0, fwd, floop, fbody, bwd, bloop, bbody, done],
     }
 }
 
@@ -2747,8 +2907,8 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Re
     }
     let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
     // A non-constant length — or a constant too large to unroll inline — calls the synthesized
-    // runtime loop helper (`__svm_memset`/`__svm_memcpy`). A variable-length `memmove` (overlap)
-    // has no helper yet (the copy direction needs a runtime branch) — a clean `Unsupported`.
+    // runtime loop helper (`__svm_memset`/`__svm_memcpy`/`__svm_memmove`). Variable-length `memmove`
+    // routes to the overlap-safe (direction-aware) `__svm_memmove`.
     let len = match const_int(args[2]) {
         Some(n) if n <= MAX_MEM_UNROLL => n,
         _ => {
@@ -2770,9 +2930,13 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Re
                     args: vec![dst, src, len],
                 });
             } else {
-                return unsup(format!(
-                    "variable-length `{name}` (memmove overlap needs a runtime branch)"
-                ));
+                let f = ctx.helpers.memmove.expect("memmove helper synthesized");
+                let dst = ctx.operand(args[0])?;
+                let src = ctx.operand(args[1])?;
+                ctx.push_effect(Inst::Call {
+                    func: f,
+                    args: vec![dst, src, len],
+                });
             }
             return Ok(true);
         }

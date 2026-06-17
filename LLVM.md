@@ -472,7 +472,8 @@ driving B-Con's SHA-256 (`sha_demo.c`) through the on-ramp and closing the two g
       `(ptr, …, i)` as block params — the first hand-built multi-block CFG / "mini-libc"), instead of
       erroring. clang's loop-idiom recognizer turns hand-written `mem*` loops *into* these intrinsics
       with a runtime length, so most real code needs it. Helper indices sit after the defined
-      functions, fixed before lowering call sites. Variable-length `memmove` (overlap) stays deferred.
+      functions, fixed before lowering call sites. (Variable-length `memmove` later got its own
+      direction-aware `synth_memmove` — slice AA.)
 - [x] **Demo:** `demo_sha256_vs_native` runs the whole SHA-256 library (multi-function calls, the
       data stack, a const global table, rotates, the `memset` loop helper, `write`) — digests
       byte-identical to native `clang`. Plus focused `funnel_shift_rotate` and
@@ -568,7 +569,7 @@ the dominant general-C gap).
 | 2 ✅ | **`sortvec`** — `realloc`-doubling int vector + insertion sort, print `%d` 10/line (`demos/sortvec`, slice X) | **`realloc`** (header-sized grow-and-copy) + signed `printf` (`%d`) — DONE, byte-identical to native | `malloc` |
 | 3 ✅ | **`mat4`** — 4×4 matrix × vec4 affine transform, print rows (`demos/mat4`, slice Y) | **128-bit SIMD** (`<4 x float>` → native `v128`) — DONE, byte-identical to native | floats, `printf` |
 | 4 ✅ | **`crc32`** — CRC-32 over stdin + a big-endian `u32` reader (`demos/crc32`, slice Z) | **`llvm.bswap`** (inline byte reversal) — DONE, byte-identical to native | shifts, `printf` |
-| 5 | **`editor`/gap-buffer** — insert/delete in a text buffer | **overlapping `memmove`** (direction-aware runtime loop) | arrays |
+| 5 ✅ | **`lineedit`** — read a line, wrap in `[...]` (right shift) + delete middle char (left shift) (`demos/lineedit`, slice AA) | **overlapping `memmove`** (direction-aware runtime loop) — DONE, byte-identical to native | arrays, `read` |
 | 6 | **`raytrace`/`mandelbrot+shading`** or **DSP sine** | **transcendental libm** (`sqrt`/`sin`/`cos`/`pow`/`exp`) — bundle a small **guest `libm`** (poly approximations), like the corpus demos bundle `memset` | floats, `printf` |
 
 Notes:
@@ -617,7 +618,16 @@ each source byte `i` is moved to destination byte `nbytes-1-i` via `((v >> 8*i) 
 OR-accumulated (`i16`/`i32`/`i64`; `emit_bswap`). Tests: `demo_crc32_vs_native` (CRC-32 + a
 `__builtin_bswap32` big-endian reader, with stdin) and `bswap_intrinsic` (bswap32/64 vs native).
 
-**Next:** demo 5 (**gap-buffer / text edit** → overlapping `memmove`).
+**Slice AA (DONE) — overlap-safe `memmove` (lands `lineedit`).** A variable-length (or
+oversized-constant) `llvm.memmove` now calls the synthesized **`__svm_memmove(dst, src, len)`** — an
+8-block, direction-aware counted byte copy: when `dst <=u src` it copies **forward** (`i = 0…len`),
+otherwise **backward** (`i = len…0`), so overlapping shifts are correct in either direction (the one
+thing `memcpy`'s load-all-then-store inline path can't do for runtime lengths). The helper is
+appended last in the fixed helper-index order (after `realloc`). Constant small `memmove` still
+inlines (already overlap-safe). Tests: `demo_lineedit_vs_native` (right+left overlapping shifts, with
+stdin) and `memmove_overlap_runtime` (both directions over an 8-byte window vs native).
+
+**Next:** demo 6 (**raytrace / DSP sine** → transcendental libm via a bundled guest `libm`).
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).

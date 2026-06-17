@@ -1040,6 +1040,31 @@ fn demo_crc32_vs_native() {
 }
 
 #[test]
+fn demo_lineedit_vs_native() {
+    // A tiny line editor: read a line, wrap it in `[...]` (a right shift, `dst > src` → backward
+    // copy), then delete the middle char (a left shift, `dst < src` → forward copy). The runtime
+    // length keeps clang from folding the `memmove`s inline, so both route to the synthesized
+    // direction-aware `__svm_memmove`. Byte-identical to native. Empty + non-empty inputs.
+    check_demo_vs_native("lineedit", "lineedit/lineedit.c", b"hello world\n");
+    check_demo_vs_native("lineedit_short", "lineedit/lineedit.c", b"ab\n");
+}
+
+#[test]
+fn memmove_overlap_runtime() {
+    // Variable-length `memmove` with overlap in both directions, driven through the guest helper.
+    // A right shift by 1 (dst > src, backward) then a left shift by 1 (dst < src, forward) over an
+    // 8-byte window; the surviving bytes must match native (which uses the libc `memmove`).
+    let src = "void *memmove(void *, const void *, unsigned long); \
+               int run(int n){ char b[16]; for (int i=0;i<8;i++) b[i]='a'+i; \
+               unsigned long m=(unsigned long)n; \
+               memmove(b+1, b, m);            /* shift right: dst>src */ \
+               memmove(b, b+1, m);            /* shift left:  dst<src */ \
+               int s=0; for (int i=0;i<8;i++) s+=b[i]; return s & 0x7f; } \
+               int main(void){ return run(7); }";
+    check_vs_native("memmove_overlap", src, 7);
+}
+
+#[test]
 fn bswap_intrinsic() {
     // `__builtin_bswap32`/`bswap64` → inline byte reversal, checked vs native.
     let src = "int run(int n){ unsigned x = 0x11223344u + (unsigned)n; \
