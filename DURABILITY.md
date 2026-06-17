@@ -321,6 +321,10 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - **[ ] Phase 3 — STW + multi-vCPU + fiber freeze/thaw.** Cooperative quiesce, drain
   residue, freeze/thaw choreography against the D57 migratable-fiber ownership
   protocol. **Highest risk** — concurrency seam (loom-check, like the futex glue).
+  **Design in §12.8**; gated on the open **D-fiber-cont** decision (how a suspended
+  fiber's continuation becomes durable — recommend option A). Sub-phases: 3.1 one
+  interp fiber, 3.2 multi-vCPU + per-context layout, 3.3 JIT parity. (Dispatch table is
+  a no-op — §12.4.) Single-vCPU durability is a coherent MVP without this.
 - **[ ] Phase 4 — Back-edge polls, handle hardening, CoW clone.** Latency +
   durability quality + cheap clone. Incremental, off critical path.
 
@@ -445,10 +449,13 @@ construction. What's stored:
   fiber/funcref handles stay valid across restore; its in-window shadow-stack
   location; and `suspended | runnable` status. The pending `Suspend`/`ContResume`
   value is already spilled in-window at the resume point, so it is *not* stored here.
-- **Dispatch table** (`DomainTable`, `:984`): the `call_indirect` slot contents as
-  funcref indices (small ints into module funcs). **v1 stores plain module funcrefs
-  only**; installed guest-JIT native funcrefs are not durable (consistent with the
-  `JitDomain`/`JitCode` exclusion in §12.5).
+- **Dispatch table** (`DomainTable`, `svm-interp:2002`): **nothing to capture in v1.**
+  The table is an *identity* table built deterministically from the module
+  (`slot i → (module 0, func i)`), so it is re-created bit-identically on thaw from the
+  same instrumented module — like the JIT's `readonly` data segments. The only runtime
+  mutation is `install` of guest-JIT native units, which are **non-durable** anyway
+  (their `JitDomain`/`JitCode` handles make freeze refuse — §12.5). So a freezable
+  domain's table is a pure function of the module; storing it would be redundant.
 
 ### 12.5 Section 3 — Handle table (durability classification)
 
@@ -581,6 +588,74 @@ are *recommended in checked builds* but not normative — correctness needs only
 > parts most likely to shift once the Phase 1 transform is real; the
 > resume-id-at-`SP−4` rule and the in-window triple-stack placement are the load-
 > bearing commitments and should be stable.
+
+### 12.8 Phase-3 design — STW drive + fiber continuations
+
+Phase 1/2 froze a **single vCPU with no live fibers**. Phase 3 adds multi-vCPU and
+fibers. Scoping (verified against the tree) found the work concentrates in two places;
+the dispatch table is *not* one of them (see §12.4 — it's a module-derived identity
+table, re-created on thaw, nothing to capture).
+
+**(a) Stop-the-world is cooperative safepoints, never preemption.** The safepoint is a
+**poll site** (the `if state == UNWINDING` after every may-suspend op the transform
+already emits). Freeze, Go/JVM-shaped:
+
+1. Host writes `UNWINDING` to the in-window state word(s).
+2. Each running vCPU, at its next poll, unwinds one frame into its shadow stack and
+   returns to its caller — the native stack peels off frame-by-frame into in-window,
+   durable form.
+3. Host waits for **quiescence** (every native stack empty), then snapshots.
+
+Two signal carriers already exist: the **state word** is window memory shared by all
+the domain's vCPUs (one write is domain-wide; the poll reads it), and the JIT's
+**`interrupt`/epoch cell** (`os_thread_rt`, polled at back-edges + function entries,
+re-checked every 20 ms by parked threads) is the *promptness* nudge that drives running
+OS threads to a safepoint. The §5 residues drain by **running to the next safepoint**:
+a vCPU inside a host `cap.call` finishes the call then polls; a fault-suspended fiber
+gets its page, runs to its next poll. Both are semantically invisible (a poll site is a
+point the program already passes through).
+
+**(b) The crux — making a guest-suspended fiber's continuation durable.** A fiber the
+guest `Suspend`ed sits in `RegFiber::Parked(Vec<Frame>)` (interp, `svm-interp:2966`) or
+as a **native stack** (`FiberSlot.fiber`, JIT). Neither is durable, and — unlike the §5
+residues — it **must not be run forward** (no `ContResume` is coming; advancing it would
+execute work the guest never requested). So its parked continuation must become
+shadow-stack form *without advancing the computation*. **[DECISION D-fiber-cont —
+OPEN]** three options:
+
+- **(A) Fibers always keep their continuation in an in-window shadow stack.** Instrument
+  `Suspend`/`ContResume`/`ContNew` so a suspend spills the continuation to the fiber's
+  shadow stack; a parked fiber is then *already* durable. Clean, and the only option
+  that gives **both backends** durable fibers (preserves the §7 cross-backend property).
+  Cost: a real rework of the fiber engine + a per-suspend window-spill on the hot path.
+- **(B) Freeze-time conversion by walking the parked frames.** On the interp,
+  `RegFiber::Parked(Vec<Frame>)` is structured — the host can translate each `Frame`
+  into a shadow frame directly (no guest execution). Cheap, but **interp-only**: the
+  JIT's parked continuation is a raw native stack (no stackmaps — §8 rejected that), so
+  this *breaks* cross-backend parity for fiber'd domains.
+- **(C) Refuse to freeze with any live/parked fiber.** Too restrictive to be useful.
+
+Recommendation: **(A)** — keep the cross-backend invariant the whole feature rests on,
+and pay the engine cost. This decision gates the first implementation slice (the two
+options are different implementations), so it should be settled before engine code.
+
+**(c) Per-vCPU / per-fiber window layout.** Today the reserve has *one* state word +
+*one* shadow stack (`STATE_OFF=0`, `SHADOW_SP_OFF=8`, `SHADOW_BASE=64` — the vCPU-0
+layout). Multi-vCPU and ≥1 fiber need the reserve **partitioned per context** (state
+word + shadow stack each), with a runtime-maintained "current context" so a poll
+reaches the right shadow-SP. §12.7's per-fiber triple-stack already anticipates this.
+
+**(d) Latency caveat (R6 / Phase 4).** Polls land only after may-suspend calls, not at
+loop back-edges, so a vCPU in a poll-free compute loop never reaches a safepoint —
+freeze hangs until it exits. Bounded-latency STW needs Phase-4 back-edge polls + a
+`Blocking.work` cancellation story. A first cut accepts unbounded latency (cooperative
+guest).
+
+**Sub-phases.** 3.1 — settle D-fiber-cont, then freeze/thaw **one fiber, single vCPU,
+interpreter-only** (isolates "continuation in a shadow stack" from thread coordination).
+3.2 — multi-vCPU quiesce + per-context layout. 3.3 — JIT parity (drive real OS threads
+to safepoints; respect the D57 single-owner protocol). Phase 4 — back-edge polls for
+bounded latency.
 
 ---
 
