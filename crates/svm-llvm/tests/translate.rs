@@ -719,19 +719,14 @@ int apply(int sel, int a, int b){ return ops[sel & 1](a, b); }";
     check_vs_native("kitchen", src, 7);
 }
 
-/// Compile a **powerbox program** (one that does real I/O via libc), translate it, resolve its §7
-/// capability imports against the reference host policy, verify, and run it end-to-end through the
-/// reference powerbox — then assert its stdout **and** exit code match the *native* build of the
-/// same C (the strongest oracle). This exercises the whole Lane C on-ramp: the synthesized `_start`,
-/// the handle stash, and `write`/`exit` bound to the `Stream`/`Exit` capabilities.
-fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
-    let Some(bc) = compile_to_bc(name, src) else {
-        return;
-    };
+/// The shared core of the powerbox differential: given the legalized `bc` and the C source file it
+/// came from, build the source natively with `cc`, run both, and assert the SVM translation's stdout
+/// **and** exit code match native. Exercises the whole Lane C on-ramp end-to-end (the synthesized
+/// `_start`, the handle stash, libc → `Stream`/`Exit`). Skips silently if `cc` is unavailable.
+fn powerbox_diff(name: &str, bc: &std::path::Path, c_src: &std::path::Path, stdin: &[u8]) {
     // Native oracle: build with `cc`, run, capture stdout + exit code.
     let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{}_{}", std::process::id(), name));
-    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
-    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+    match Command::new("cc").arg(c_src).arg("-o").arg(&exe).status() {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("note: skipping {name} (cc unavailable)");
@@ -751,7 +746,7 @@ fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
     let native_code = native.status.code().unwrap_or(-1) as u8;
 
     // The on-ramp: translate → resolve §7 imports to concrete capabilities → verify → run.
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_bc_path(bc).expect("translate bitcode");
     assert!(
         svm_run::is_powerbox_entry(&t.module),
         "{name}: a libc program must produce a powerbox entry"
@@ -776,6 +771,47 @@ fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
         svm_code, native_code,
         "{name}: svm exit {svm_code} vs native {native_code}"
     );
+}
+
+/// Compile a **powerbox program** (real I/O via libc) from an inline source string and run the
+/// differential ([`powerbox_diff`]).
+fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    powerbox_diff(name, &bc, &c, stdin);
+}
+
+/// Run the powerbox differential on a **real corpus demo** (`crates/svm-run/demos/<rel>`) — a
+/// whole-program, self-contained C file (its own `memset`, `write`-only output). This is the D54
+/// "matches native clang" exit criterion applied to an actual library. The file is compiled *in
+/// place* so its same-directory `#include "…"`s resolve.
+fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos")
+        .join(rel);
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_{}.bc", std::process::id(), name));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&path)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            return;
+        }
+    }
+    powerbox_diff(name, &bc, &path, stdin);
 }
 
 #[test]
@@ -860,6 +896,177 @@ fn stdio_mixed_then_exit() {
     let src = "#include <stdio.h>\n#include <stdlib.h>\n\
                int main(void){ puts(\"goodbye\"); printf(\"done\\n\"); exit(42); }";
     check_powerbox_vs_native("pb_mixed_exit", src, b"");
+}
+
+#[test]
+fn funnel_shift_rotate() {
+    // SHA-style rotates: clang -O2 turns `(x<<n)|(x>>(w-n))` into `llvm.fshl`/`fshr` (the operands
+    // identical → a rotate). Lowered to `rotl`/`rotr`. Checked on i32 and i64 against hand values.
+    let src = "unsigned rotr32(unsigned x, unsigned n){ return (x >> n) | (x << (32 - n)); } \
+               unsigned long rotl64(unsigned long x, unsigned n){ return (x << n) | (x >> (64 - n)); }";
+    // rotr32(0x12345678, 8) = 0x78123456
+    check(
+        "rotr32",
+        src,
+        &[Value::I32(0x12345678), Value::I32(8)],
+        &[Value::I32(0x78123456u32 as i32)],
+    );
+}
+
+#[test]
+fn variable_length_memset_loop() {
+    // A runtime-length zero-fill: clang's loop-idiom recognizer emits `llvm.memset.p0.i64` with a
+    // non-constant length, which lowers to a call to the synthesized `__svm_memset` loop helper.
+    // `run` zeroes `n` bytes of a stack buffer (seeded non-zero), then sums them → 0.
+    let src = "int run(int n){ unsigned char buf[300]; \
+               for (int i = 0; i < 300; i++) buf[i] = (unsigned char)(i + 1); \
+               for (int i = 0; i < n; i++) buf[i] = 0; \
+               int s = 0; for (int i = 0; i < 300; i++) s += buf[i]; return s; }";
+    check_vs_native(
+        "var_memset",
+        &format!("{src} int main(){{ return run(300); }}"),
+        300,
+    );
+}
+
+#[test]
+fn demo_sha256_vs_native() {
+    // The first real corpus library end-to-end: B-Con's SHA-256 hashing "", "abc", and the
+    // pangram, printing each digest as hex via `write` — byte-identical to the native `clang` build.
+    // Exercises funnel-shift rotates, the variable-length `memset` loop helper, multi-function calls,
+    // the data stack, a const global table, and the `Stream` capability all at once (the D54 goal).
+    check_demo_vs_native("sha256", "sha256/sha_demo.c", b"");
+}
+
+#[test]
+fn demo_xxhash_vs_native() {
+    // xxHash (XXH32/64) over the same inputs — 32- and 64-bit funnel-shift rotates + wide integer
+    // mixing. Already covered by slices A–P; byte-identical to native `clang`.
+    check_demo_vs_native("xxhash", "xxhash/xxh_demo.c", b"");
+}
+
+#[test]
+fn demo_perlin_vs_native() {
+    // stb_perlin: float-heavy noise (`fmuladd`/`fabs` intrinsics, int↔float, a const gradient table).
+    // The float coverage (slice F) + `llvm.abs` (slice M) carry it — matching native `clang`.
+    check_demo_vs_native("perlin", "perlin/perlin_demo.c", b"");
+}
+
+#[test]
+fn demo_regex_vs_native() {
+    // kokke/tiny-regex-c: a backtracking matcher over a table of (pattern, text) cases. Exercises
+    // `ptrtoint`/`freeze`, a constexpr GEP (interior string pointer), writable function-static arrays
+    // sharing the globals region with read-only string literals (the page-isolation fix), and deep
+    // recursive control flow — byte-identical to native `clang`.
+    check_demo_vs_native("regex", "regex/regex_demo.c", b"");
+}
+
+#[test]
+fn demo_jsmn_vs_native() {
+    // jsmn: a zero-allocation JSON parser. Parses an embedded document into a fixed token array and
+    // prints each token's type/size/text. Exercises `llvm.load.relative` — clang lowers the
+    // type→name `switch` into a relative lookup table (`&str − &table` offsets) — plus struct-array
+    // indexing and interior string pointers. Byte-identical to native `clang`.
+    check_demo_vs_native("jsmn", "jsmn/jsmn_demo.c", b"");
+}
+
+#[test]
+fn demo_heapgrow_vs_native() {
+    // The §1a headline: a guest **grows its own heap past the initial window** — allocating eight
+    // 128 KiB blocks (~1 MiB, ~16× the initial mapped window) through `malloc`, which commits
+    // reserved-tail pages on demand via the `Memory` capability (`vm_map`). Fills/sums/frees each and
+    // prints running totals — byte-identical to the native `cc` build (which uses the real `malloc`).
+    check_demo_vs_native("heapgrow", "heapgrow/heapgrow.c", b"");
+}
+
+#[test]
+fn heap_malloc_calloc_free() {
+    // The allocator directly: a `malloc` large enough to force `vm_map` growth past the initial
+    // window (filled/summed), a `free` (no-op), then a `calloc` that must read back as zero (freshly
+    // committed pages are zeroed and the bump heap never reuses). Exit code = (s + z) & 0xff vs native.
+    let src = "#include <stdlib.h>\n\
+               int run(void){ int *a = (int*)malloc(300000 * sizeof(int)); \
+               for (int i = 0; i < 300000; i++) a[i] = (i * 3 + 1) & 255; \
+               long s = 0; for (int i = 0; i < 300000; i++) s += a[i]; free(a); \
+               int *b = (int*)calloc(1000, sizeof(int)); \
+               long z = 0; for (int i = 0; i < 1000; i++) z += b[i]; \
+               return (int)((s + z) & 0xff); } \
+               int main(void){ return run(); }";
+    check_powerbox_vs_native("heap_alloc", src, b"");
+}
+
+#[test]
+fn ro_and_writable_global_page_isolation() {
+    // A read-only global (string literal) next to a writable one (a mutable array) must not share a
+    // protected page: a write to the writable global would otherwise fault on the read-only page
+    // (D40 is page-granular). `run` writes the array, reads the constant, returns their combination.
+    let src = "static char buf[8]; static const char msg[] = \"hi\"; \
+               int run(int n){ for (int i = 0; i < 8; i++) buf[i] = (char)(n + i); \
+               return buf[3] + msg[0] + msg[1]; }";
+    // buf[3] = n+3; msg = "hi" → 'h'(104) + 'i'(105). run(10): 13 + 104 + 105 = 222.
+    check_vs_native(
+        "ro_rw_page",
+        &format!("{src} int main(){{ return run(10); }}"),
+        10,
+    );
+}
+
+#[test]
+fn demo_clay_vs_native() {
+    // Clay UI layout: 2D points/dimensions as `<2 x float>`/`<2 x i32>` vectors (loads/stores/`fadd`/
+    // phi/extractelement) plus `{i64,ptr}` array returns — the on-ramp scalarizes each 2-lane vector
+    // to a packed `i64`. Lays out a small UI and prints the render commands, byte-identical to native.
+    // The eighth and final corpus demo (the D54 exit criterion).
+    check_demo_vs_native("clay", "clay/clay_demo.c", b"");
+}
+
+#[test]
+fn vec2_float_struct() {
+    // A `{float,float}` struct passed/returned by value — clang coerces it to `<2 x float>` and does
+    // `extractelement`/`insertelement`/lane-wise `fadd`. Scalarized to a packed i64. addv({1.5,2.5},
+    // {7,0.5}) = {8.5,3.0} → 8.5*10 + 3 = 88.
+    let src = "struct V2 { float x, y; }; struct V2 addv(struct V2 a, struct V2 b); \
+               int run(int n){ struct V2 a = {1.5f, 2.5f}; struct V2 b = {(float)n, 0.5f}; \
+               struct V2 c = addv(a, b); return (int)(c.x * 10.0f + c.y); } \
+               struct V2 addv(struct V2 a, struct V2 b){ struct V2 r = {a.x + b.x, a.y + b.y}; return r; } \
+               int main(void){ return run(7); }";
+    check_vs_native("vec2f", src, 7);
+}
+
+#[test]
+fn demo_tinfl_vs_native() {
+    // miniz's tinfl DEFLATE/zlib inflate engine: a deeply nested coroutine-macro state machine with
+    // Huffman fast/slow lookup tables (`mz_int16`) and a 32 KiB LZ77 dictionary. Inflates an embedded
+    // zlib stream and writes it out — byte-identical to native. (Regression for the narrow-signed
+    // `icmp` fix: the slow Huffman walk tests a sign-extended `i16` table entry `< 0`.)
+    check_demo_vs_native("tinfl", "tinfl/tinfl_demo.c", b"");
+}
+
+#[test]
+fn narrow_signed_compare() {
+    // §3b narrow-int hazard: a *signed* `i16`/`i8` value loaded zero-extended must be sign-extended
+    // before a signed `icmp` (else `< 0` is always false). Sum the negative entries of a signed-short
+    // table — wrong (0) without the fix. Compared to native `cc`.
+    let src = "int run(int n){ static const short t[6] = {-1, -100, 5, -32768, 32767, -7}; \
+               int s = 0; for (int k = 0; k < 6; k++) if (t[k] < 0) s += t[k]; \
+               return (s ^ n) & 0xff; } \
+               int main(void){ return run(0); }";
+    check_vs_native("narrow_signed_cmp", src, 0);
+}
+
+#[test]
+fn multi_value_struct_return() {
+    // A small by-value struct returned in two registers — clang coerces it to a `{ i64, i64 }`
+    // return (`insertvalue`/`ret`) the caller destructures with `extractvalue`. Exercises the §3a
+    // multi-result path: `mk` returns two values, `run` reads both. mk(7,14) → 7+14 = 21.
+    // `run` is defined first (the unit at index 0 the harness invokes); `mk` is declared then defined
+    // after, so it stays a real out-of-line multi-result call.
+    let src = "struct Pair { long a; long b; }; \
+               struct Pair mk(long a, long b); \
+               int run(int x){ struct Pair p = mk(x, (long)x * 2); return (int)(p.a + p.b); } \
+               __attribute__((noinline)) struct Pair mk(long a, long b){ struct Pair p = {a, b}; return p; } \
+               int main(void){ return run(7); }";
+    check_vs_native("multival", src, 7);
 }
 
 #[test]

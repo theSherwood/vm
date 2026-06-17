@@ -8,19 +8,24 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
-**Status: Milestone 1 slices A–O (control flow, memory, calls, switch, globals, floats, indirect
-calls, struct aggregates, memory intrinsics, by-value aggregates, relocations, libm math, int
-min/max+bit intrinsics, the powerbox libc on-ramp, and the stdio output surface) done — a broad
-swath of scalar C from `clang -O2` runs on both backends (49 tests). A **kitchen-sink capstone**
-exercises everything at once (structs by-value, a function-pointer table, floats+libm, recursion,
-loops, an array `memcpy`, a global array, `switch`, bit intrinsics) and matches **native `cc`** end
-to end. **Slice N** binds the raw I/O primitives (`write`/`read` → `Stream`, `exit` → `Exit`) via §7
-named imports + a synthesized powerbox `_start`; **slice O** adds the non-varargs **stdio** output
-family (`puts`/`putchar`/`putc`/`fputc`/`fwrite`/`fputs`/`fflush`, and `clang`'s `printf("…\n")`→
-`puts` / `printf("%c")`→`putc` lowering) — all funnelling to `Stream.write` on stdout. A real I/O
-program runs through the reference powerbox with **stdout + exit code matching native**
-(`check_powerbox_vs_native`). Next: varargs `printf` (formatting), `malloc`/heap, then the
-real-library demo corpus (Lane C).** `crates/svm-llvm` does the **SSA → block-argument
+**Status: Milestone 1 slices A–V done — the **D54 exit criterion is met**: all **eight corpus
+libraries run byte-identical to native `clang`** — B-Con's **SHA-256**, **xxHash**, **stb_perlin**,
+**tiny-regex-c**, **jsmn**, **heapgrow**, **miniz/tinfl**, and **clay** (`demo_*_vs_native`, 64 tests).
+Slice U fixed a **narrow-signed `icmp`** bug (a signed compare of a zero-extended `i8`/`i16` must
+sign-extend first, §3b), landing tinfl. Slice V scalarizes **2-lane 32-bit vectors**
+(`<2 x float>`/`<2 x i32>`) to a packed `i64` — they flow through `phi`/`call`/`ret`/`load`/`store` as
+an ordinary `i64`, and only the vector ops (`extractelement`/`insertelement`/lane-wise
+`fadd`/`shufflevector`) unpack/repack — landing clay (the 8th demo).
+A **kitchen-sink capstone** exercises everything at once (structs by-value, a function-pointer table,
+floats+libm, recursion, loops, an array `memcpy`, a global array, `switch`, bit intrinsics) and
+matches **native `cc`** end to end. **Slice N** binds the raw I/O primitives (`write`/`read` →
+`Stream`, `exit` → `Exit`) via §7 named imports + a synthesized powerbox `_start`; **slice O** adds
+the non-varargs **stdio** output family (`puts`/`putchar`/`putc`/`fputc`/`fwrite`/`fputs`/`fflush`,
+and `clang`'s `printf("…\n")`→`puts` / `printf("%c")`→`putc` lowering); **slice P** adds funnel-shift
+rotates (`llvm.fshl`/`fshr` → `rotl`/`rotr`) and **synthesized runtime mem-loop helpers**
+(`__svm_memset`/`__svm_memcpy` — the first multi-block helper, for a variable-length `memset`/`memcpy`).
+Next: varargs `printf` (formatting), `malloc`/heap, then more of the demo corpus (Lane C).**
+`crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
@@ -36,11 +41,14 @@ conversions, `fabs`/`floor`, an indirect call through a function pointer, struct
 (global/array-of-struct/stack), a struct `memcpy` + `memset`, and by-value struct args/returns
 (small-coerced + `byval`/`sret`), and pointer-valued global relocations (a function-pointer table,
 a struct string-pointer member), libm math calls (`sqrt`/`fmin`), and int min/max + bit intrinsics
-(`smax`/`ctlz`/`popcount`) — run **interp == JIT == hand-computed** (49 tests, incl. a kitchen-sink
-program checked against native `cc`, plus `write`/`exit`/`read`-echo and `puts`/`printf`/`putchar`/
-`fwrite`/`fputs` powerbox programs checked against native stdout + exit code).
-Remaining M1: varargs `printf` (formatting) + `malloc`/heap, then the
-demo Lane C. Section numbers like "§3d"
+(`smax`/`ctlz`/`popcount`), funnel-shift rotates (`fshl`/`fshr`), and a variable-length `memset`
+loop, `ptr`↔`int`, `freeze`, a constexpr GEP, RO/writable page isolation, `llvm.load.relative`, a
+`vm_map`-growing `malloc`/`calloc`/`free`, multi-value struct returns, narrow-signed `icmp`, 2-lane
+vector scalarization — run **interp == JIT == hand-computed** (64 tests, incl. a kitchen-sink program
+checked against native `cc`, `write`/`exit`/`read`-echo and `puts`/`printf`/`putchar`/`fwrite`/`fputs`
+powerbox programs, and **all eight corpus demos** — SHA-256 / xxHash / perlin / regex / jsmn /
+heapgrow / tinfl / clay — checked against native stdout). The D54 corpus exit criterion is met;
+varargs `printf` remains as general-C breadth (no corpus demo needs it). Section numbers like "§3d"
 refer to `DESIGN.md`; "D54" etc. are its Decision Log.
 
 ---
@@ -447,16 +455,103 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 - [x] Tests (`check_powerbox_vs_native`): `puts`, two-line `printf` (→`puts`), a `putchar` range
       loop, `fwrite`+`fputs` mixed, and stdio composed with `exit(42)`.
 
-**Remaining slices.**
-- [ ] `llvm.load.relative` (relative-offset string tables); transcendental math (needs a guest libm);
-      `llvm.bswap`/`bitreverse`/`fshl`.
-- [ ] Varargs `printf`/`fprintf`/`snprintf` (the varargs ABI on the data stack + a format engine) —
-      the headline gap for numeric output; `puts`/`fputs` of a *non-literal* string (a runtime
-      strlen loop). `malloc`/`free` (→ the `Memory` capability + a guest allocator), `argc`/`argv`
-      `main`. The §7 import mechanism (slices N/O) is the hard part; these build on it.
-- [ ] **Goal: every existing C demo runs byte-identical to native `clang` on Lane C**
-      (the same corpus chibicc passes — clay, jsmn, sha256, xxhash, tinfl, perlin, regex,
-      heapgrow). This is the D54 "matches native clang" exit criterion.
+**Slice P (DONE) — funnel shifts + runtime mem-loop helpers (first corpus demo).** Data-driven from
+driving B-Con's SHA-256 (`sha_demo.c`) through the on-ramp and closing the two gaps it hit.
+- [x] `llvm.fshl`/`fshr` → `rotl`/`rotr` when the two value operands are identical (the rotate idiom
+      clang emits for `(x<<n)|(x>>(w-n))`, e.g. SHA-256's `ROTRIGHT`/`ROTLEFT`); `rotl`/`rotr` mask
+      the count mod width, so no shift-by-`w` edge case. A general (non-rotate) funnel shift is a
+      clean `Unsupported` (`lower_int_intrinsic`).
+- [x] A variable-length — or oversized-constant — `llvm.memset`/`memcpy` calls a **synthesized
+      runtime loop helper** (`synth_memset`/`synth_memcpy`: a 4-block counted byte loop threading
+      `(ptr, …, i)` as block params — the first hand-built multi-block CFG / "mini-libc"), instead of
+      erroring. clang's loop-idiom recognizer turns hand-written `mem*` loops *into* these intrinsics
+      with a runtime length, so most real code needs it. Helper indices sit after the defined
+      functions, fixed before lowering call sites. Variable-length `memmove` (overlap) stays deferred.
+- [x] **Demo:** `demo_sha256_vs_native` runs the whole SHA-256 library (multi-function calls, the
+      data stack, a const global table, rotates, the `memset` loop helper, `write`) — digests
+      byte-identical to native `clang`. Plus focused `funnel_shift_rotate` and
+      `variable_length_memset_loop` unit checks.
+
+**Slice Q (DONE) — more corpus demos + the gaps they revealed.** Data-driven: drove xxHash, perlin,
+and tiny-regex-c through the on-ramp. xxHash + perlin needed *no* new code (slices A–P); regex hit a
+cluster of small gaps, all now closed.
+- [x] `ptrtoint`/`inttoptr` (instruction form): pointers are an `i64` window offset, so this is a
+      width adjust (identity at `i64`, `wrap`/`zext` for narrow), never a reinterpret.
+- [x] `freeze`: an identity — the IR is total (`undef`/`poison` → defined 0, no poison propagates).
+- [x] **Constexpr GEP** (`&".."[k]`, `&g.f`): an interior pointer into a constant aggregate, folded
+      to base address + type-walked constant offset (`const_gep_offset`, mirroring `translate_gep`);
+      handled both as an operand and inside an initializer.
+- [x] **Read-only globals are page-isolated from writable ones** (`globals_layout`): lay writable +
+      BSS globals first, page-align, then the read-only ones — so a `const` never shares a
+      D40-protected page with a writable/BSS global (a write to which would otherwise fault). This
+      was a latent layout bug, now exercised by regex's `static` arrays beside string literals.
+- [x] **Demos:** `demo_xxhash_vs_native`, `demo_perlin_vs_native`, `demo_regex_vs_native`, plus a
+      focused `ro_and_writable_global_page_isolation` unit check.
+
+**Slice R (DONE) — `llvm.load.relative` (lands jsmn).** clang lowers a constant-returning `switch`
+(jsmn's token-type → name) into a **relative lookup table**: `@reltable = [i32 (&str − &reltable)…]`,
+and `llvm.load.relative.i64(P, off)` returns `P + sext_i32(*(i32*)(P + off))` — the absolute target.
+- [x] `lower_load_relative`: `add` the offset to the base, `load.i32`, `sext` to i64, `add` to the
+      base. The table initializer (`trunc(sub(ptrtoint(@str), ptrtoint(@table)))`) already folds via
+      `const_eval` (`Trunc`/`Sub`/`PtrToInt`), so no new initializer support was needed.
+- [x] **Demo:** `demo_jsmn_vs_native` — a zero-allocation JSON parser, parsing an embedded document
+      into a fixed token array and printing each token's type/size/text, byte-identical to native.
+
+**Slice S (DONE) — `malloc`/heap (the §1a sparse address space; lands heapgrow).** `malloc`/`calloc`
+lower to a synthesized **bump allocator** (`synth_malloc` → `__svm_malloc(size)`) that grows the heap
+into the window's reserved tail by `vm_map`-committing pages on demand via the `Memory` capability.
+- [x] A program that allocates gets a **4-handle `_start`** (`stdout, stdin, exit, memory`); the
+      powerbox grants `Memory` for a 4-param entry. `_start` stashes the handle and seeds the heap
+      (`HEAP_BRK`/`HEAP_TOP` = the window's mapped boundary, the first reserved page).
+- [x] `__svm_malloc`: a 3-block CFG — align the request to 16; if it crosses the committed boundary,
+      `CallImport "vm_map"(top, page_up(new) − top, RW)` (resolved to `Memory.map`) and advance the
+      boundary; publish the new break and return the old. `free` is a no-op; the heap never reuses, so
+      freshly-committed (`vm_map`-zeroed) pages make `calloc` ≡ `malloc`. `realloc` stays `Unsupported`.
+- [x] **Demo:** `demo_heapgrow_vs_native` — a guest allocating eight 128 KiB blocks (~16× its initial
+      window), growing on demand via the `Memory` cap, byte-identical to native. Plus a focused
+      `heap_malloc_calloc_free` check (a growth-forcing `malloc` + a zero-reading `calloc`).
+
+**Slice T (DONE) — multi-value struct returns.** A small by-value struct returned in registers (clang
+coerces it to e.g. `{ i64, i64 }` / `{ i64, ptr }`, as clay's `*Array_Allocate_Arena` and any C
+returning a 2-field struct) maps to an SVM **multi-result** function (§3a).
+- [x] `result_types` flattens a small struct return to its scalar fields; a multi-result `call`
+      records the aggregate field-wise (`BlockCtx.agg`, value-id → field indices) via `push_multi`;
+      `insertvalue`/`extractvalue` build/read it; `ret` returns the fields. Aggregates are assumed not
+      to cross block boundaries (clang's register-coercion produces+consumes them in one block; if one
+      did, `agg_of` returns `None` → a clean error). Plus `llvm.experimental.noalias.scope.decl`
+      dropped. Tested: `multi_value_struct_return` (a `{i64,i64}` return round-trip vs native).
+
+**Slice U (DONE) — narrow-signed `icmp` (lands tinfl).** A signed `icmp` on a **narrow** (`i8`/`i16`)
+operand now sign-extends the operand to `i32` first (`emit_ext` with the predicate's signedness),
+fixing the §3b hazard where a zero-extended narrow value (e.g. an `i16` load of a *signed*
+`mz_int16`) made `< 0` always false.
+- [x] Root-caused from tinfl's runtime fault: the Huffman slow-path `do { temp = tree[~temp + bit]; }
+      while (temp < 0)` compared a zero-extended `i16` table entry against 0 (always false), so `~temp`
+      produced index `-1` → `zext` `0xFFFFFFFF` → `×2` → a bit-33 corrupt back-reference pointer.
+- [x] Lands **tinfl** (`demo_tinfl_vs_native`) — miniz inflate, byte-identical to native. Plus a
+      focused `narrow_signed_compare` regression (summing negative signed-`short` table entries).
+
+**Slice V (DONE) — 2-lane vectors (`<2 x float>`/`<2 x i32>`); lands clay → the full corpus.** A 2-lane
+32-bit vector (clang's `Clay_Vector2`/2D-point coercion) is **scalarized to a packed `i64`** (lane 0 =
+bits 0–31, lane 1 = 32–63 — its little-endian image).
+- [x] `vec2_lane_ty` recognizes `<2 x float>`/`<2 x i32>`; `val_type`/`type_size`/`load_op`/`store_op`
+      map them to `i64`, so the vector flows through `phi`/`call`/`ret`/`load`/`store`/block-params as
+      a plain `i64` — *no* liveness/block-param changes. Only the ops unpack/repack: `vec_lane`/
+      `vec_pack` (lane-type-aware) drive `extractelement`/`insertelement`, lane-wise
+      `fadd`/`fsub`/`fmul`/`fdiv` (`fp_binop`), constant-mask `shufflevector`, and vector constants/
+      `zeroinitializer`/`undef`; a `bitcast` between 2-lane vectors is a no-op (same packed `i64`).
+- [x] Lands **clay** (`demo_clay_vs_native`) byte-identical to native — UI layout printing render
+      commands. Plus a focused `vec2_float_struct` check (a `{float,float}` add coerced to `<2 x float>`).
+
+**Goal — MET: every corpus demo runs byte-identical to native `clang` on Lane C** ✅
+(sha256 ✅, xxhash ✅, perlin ✅, regex ✅, jsmn ✅, heapgrow ✅, tinfl ✅, clay ✅). **8 of 8** — the D54
+"matches native clang" exit criterion.
+
+**Remaining (general-C breadth, beyond the corpus).**
+- [ ] Varargs `printf`/`fprintf`/`snprintf` (varargs ABI on the data stack + a format engine) — no
+      corpus demo needs it; `puts`/`fputs` of a non-literal string; `realloc`; `argc`/`argv`;
+      transcendental math; `llvm.bswap`/`bitreverse`; variable-length `memmove`; wider SIMD
+      (`<4 x float>`, `<2 x double>`, …).
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
