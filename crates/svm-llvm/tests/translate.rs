@@ -46,13 +46,24 @@ fn compile_to_bc(name: &str, src: &str) -> Option<PathBuf> {
 /// onto one). So the §6 source-line ingest can be exercised against real, multi-line clang debug
 /// metadata. `None` (skip) if clang is unavailable.
 fn compile_to_bc_g(name: &str, src: &str) -> Option<PathBuf> {
+    compile_g(name, src, "-Og")
+}
+
+/// Compile at `-O0 -g`: every C local stays an `alloca` + `llvm.dbg.declare`, the shape the §6
+/// **variable** ingest reads (a `dbg.declare` → a `Window` frame slot). `None` (skip) if clang is
+/// unavailable.
+fn compile_to_bc_o0g(name: &str, src: &str) -> Option<PathBuf> {
+    compile_g(name, src, "-O0")
+}
+
+fn compile_g(name: &str, src: &str, opt: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_g_{}_{}.c", std::process::id(), name));
     let bc = dir.join(format!("svm_llvm_g_{}_{}.bc", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
         .args([
-            "-Og",
+            opt,
             "-g",
             "-emit-llvm",
             "-c",
@@ -2343,4 +2354,152 @@ fn llvm_without_g_has_no_debug_info() {
         return;
     };
     assert!(m.debug_info.is_none(), "no -g ⇒ no debug section");
+}
+
+/// The §6 **variable/type half** for LLVM: a direct `llvm-sys` walk of the `-O0 -g` DI metadata
+/// recovers each source local's name + structured type and correlates it to the IR by alloca
+/// ordinal, landing it in the waist as a `Window` var — the LLVM analog of the wasm DWARF
+/// aggregate/pointer/array ingest (DEBUGGING.md slice 25). Mirrors the wasm
+/// `wasm_dwarf_ingests_aggregate_pointer_and_array_types` test over the same struct/array/pointer
+/// shapes, the cross-frontend cross-check that the structured-type waist is genuinely neutral.
+#[test]
+fn llvm_o0_ingests_aggregate_pointer_and_array_variables() {
+    use svm_ir::{TypeDef, VarLoc};
+
+    // `pp = &p` forces the struct to stay in memory (a real dbg.declare/alloca, not a dbg.value).
+    let src = "\
+struct Point { int x; int y; };
+int dist(int n) {
+  struct Point p;
+  int row[3];
+  struct Point *pp = &p;
+  p.x = n; p.y = n + 1;
+  row[0] = n;
+  return p.x + p.y + row[0] + pp->x;
+}
+";
+    let Some(bc) = compile_to_bc_o0g("llvm_vars", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify"); // debug info is escape-irrelevant
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    let var = |n: &str| {
+        di.vars.iter().find(|v| v.name == n).unwrap_or_else(|| {
+            panic!(
+                "var {n}: {:?}",
+                di.vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+            )
+        })
+    };
+    let var_type = |n: &str| &di.types[var(n).type_id.expect("typed") as usize];
+
+    // Every local is a `Window` frame slot (the alloca's data-stack offset); offsets are distinct.
+    let mut offs = Vec::new();
+    for n in ["p", "row", "pp"] {
+        let VarLoc::Window { off } = var(n).loc else {
+            panic!("{n} is a Window var, got {:?}", var(n).loc);
+        };
+        assert!(off >= 0 && (off as u64) < t.module.funcs[0].blocks.len() as u64 * 4096);
+        offs.push(off);
+    }
+    offs.sort();
+    offs.dedup();
+    assert_eq!(offs.len(), 3, "p/row/pp occupy distinct frame slots");
+
+    // `struct Point p` — aggregate x@0, y@4, both 4-byte ints, size 8.
+    let TypeDef::Aggregate { name, size, fields } = var_type("p") else {
+        panic!("p is a struct, got {:?}", var_type("p"));
+    };
+    assert_eq!(name, "struct Point");
+    assert_eq!(*size, 8);
+    assert_eq!(
+        fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.offset))
+            .collect::<Vec<_>>(),
+        vec![("x", 0), ("y", 4)]
+    );
+    assert!(matches!(
+        &di.types[fields[0].ty as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `int row[3]` — array of 3 ints.
+    let TypeDef::Array { elem, count, .. } = var_type("row") else {
+        panic!("row is an array, got {:?}", var_type("row"));
+    };
+    assert_eq!(*count, 3);
+    assert!(matches!(
+        &di.types[*elem as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `struct Point *pp` — pointer whose pointee is the same aggregate as `p`.
+    let TypeDef::Pointer { pointee, name, .. } = var_type("pp") else {
+        panic!("pp is a pointer, got {:?}", var_type("pp"));
+    };
+    assert_eq!(name, "struct Point *");
+    assert!(matches!(
+        &di.types[*pointee as usize],
+        TypeDef::Aggregate { name, .. } if name == "struct Point"
+    ));
+}
+
+/// Runtime proof that the alloca-ordinal correlation lands on the **right** frame slots: stop the
+/// interpreter just before `dist` returns and read each source variable back through the §6 waist
+/// (`Window` reads at the resolved data-stack offset). Locks that the `dbg.declare` address →
+/// alloca ordinal → frame offset chain is correct, not merely structurally plausible.
+#[test]
+fn llvm_o0_variables_read_at_runtime() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+
+    let src = "\
+struct Point { int x; int y; };
+int dist(int n) {
+  struct Point p;
+  int row[3];
+  struct Point *pp = &p;
+  p.x = n; p.y = n + 1;
+  row[0] = n;
+  return p.x + p.y + row[0] + pp->x;
+}
+";
+    let Some(bc) = compile_to_bc_o0g("llvm_vars_rt", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+
+    // Break at the last instruction of the last block — `dist` is branch-free at -O0, so by here
+    // every store (p.x=n, p.y=n+1, row[0]=n) has executed.
+    let lb = t.module.funcs[0].blocks.len() - 1;
+    let li = t.module.funcs[0].blocks[lb].insts.len() - 1;
+    let n = 5i32;
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: lb,
+        inst: li,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped at the return"
+    );
+
+    let i32_at = |vv: Option<VarValue>, off: usize| -> i32 {
+        match vv {
+            Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[off..off + 4].try_into().unwrap()),
+            other => panic!("expected window bytes, got {other:?}"),
+        }
+    };
+    // `struct Point p` reads x = n, y = n + 1 (8 bytes: x then y).
+    let p = insp.read_var(0, "p", 8);
+    assert_eq!(i32_at(p.clone(), 0), n, "p.x");
+    assert_eq!(i32_at(p, 4), n + 1, "p.y");
+    // `int row[3]` — element 0 was set to n.
+    assert_eq!(i32_at(insp.read_var(0, "row", 4), 0), n, "row[0]");
 }

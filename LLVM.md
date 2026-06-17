@@ -819,13 +819,18 @@ libLLVM; D54 sanctions that as a build/dev-time dep (Q4 keeps it off the runtime
 `llvm-ir` **does** expose per-instruction `!DILocation` (line/col/file, via `HasDebugLoc`), so the
 on-ramp populates the §6 neutral core's **source-line half** from it (`DebugAcc` in
 `crates/svm-llvm/src/lib.rs` → `DebugInfo.locs`; DEBUGGING.md slice 24) — making LLVM the *third*
-producer to feed the frontend-neutral waist. What's genuinely missing is the **structured DI graph**
-(`DILocalVariable`/`DIType`/`llvm.dbg.value`): `Metadata::from_llvm_ref` is `unimplemented!` and
-`MetadataOperand` is payloadless, so the variable/type half is unreachable through `llvm-ir` 0.11.3.
-Unblocking it is the **fallback-reader** decision above made concrete: a direct `llvm-sys` walk of
-the DI nodes (the LLVM-C debug-info API) — or `inkwell`'s DI wrappers — feeding the existing
-`SsaList`/`WindowVia` + `TypeDef` machinery. LLVM's `dbg.value` survives mem2reg/SROA, so it solves
-the S2 promotion-vs-inspectability problem for free once the nodes are readable.
+producer to feed the frontend-neutral waist. The **structured DI graph**
+(`DILocalVariable`/`DIType`/`llvm.dbg.value`) is missing from `llvm-ir` (`Metadata::from_llvm_ref` is
+`unimplemented!`, `MetadataOperand` is payloadless), so the **fallback-reader** decision above is now
+realized concretely: `crates/svm-llvm/src/di.rs` walks the DI nodes **directly through `llvm-sys`**
+(the LLVM-C debug-info API), re-parsing the `.bc` into its own context. Slice 25 lands the `-O0 -g`
+case — every C local is an `alloca` + `dbg.declare`, recovered as a `TypeDef`-typed `VarLoc::Window`
+correlated to the IR by *alloca ordinal* (stable across the two parses). The LLVM-C DI API has no
+getters for the `baseType`/`elements` edges or the base-type `encoding`, so the type graph is walked
+via the generic MDNode-operand bridge at the positional indices LLVM 18 uses (pinned + tested), and
+`encoding` is inferred from the C name. The remaining piece is the `-O2`/`-Og` `dbg.value`
+location-list case (promoted scalars), which LLVM solves for free (its intrinsics survive
+mem2reg/SROA) — it feeds the same `SsaList`/`WindowVia` + `TypeDef` machinery, a focused follow-up.
 **Fallback order if `llvm-ir` bites:** `inkwell` (maintained, version-tracking wrapper) →
 hand-rolled `.ll` parser over `opt -S` (zero libLLVM link, but a rot-prone parser we own).
 

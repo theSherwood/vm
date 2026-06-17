@@ -53,7 +53,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
-| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM maps `!DILocation` → source lines** — three independent producers; DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm`, `svm-llvm` |
+| Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types via `llvm-sys`** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm`, `svm-llvm` |
 | DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
@@ -1189,19 +1189,36 @@ Tests (`translate.rs`): a clang `-Og -g` statement chain maps several distinct s
 an in-range IR pc, and module verification is unaffected (debug info is escape-irrelevant); a
 non-`-g` build has `debug_info: None`.
 
-**Not yet — the LLVM *variable / type* half (`llvm.dbg.value` → `VarLoc`, DI type graph →
-`TypeDef`).** Blocked on the reader, not the waist: the pinned `llvm-ir` 0.11.3 leaves the
-structured metadata graph unimplemented (`Metadata::from_llvm_ref` is `unimplemented!`,
-`MetadataOperand` carries no payload), so the `DILocalVariable`/`DIType` nodes never reach the
-crate. Unblocking needs a metadata-capable reader — a direct `llvm-sys` walk of the DI nodes (the
-LLVM-C debug-info API) — its own effort (see `LLVM.md`). When it lands it maps straight onto the
-existing `SsaList`/`WindowVia` + `TypeDef` machinery the wasm producer already exercises; **LLVM's
-`dbg.value` solves S2's promotion-vs-inspectability for free** (its intrinsics survive mem2reg/SROA).
-(Everything else is built: the chibicc producer incl. optimized-build location lists; both DAP
-consumers over `Window` *and* `WindowVia`; binary serialization; and the wasm producer's source
-lines, DWARF pass-through, named variables, and aggregate/pointer/array types. The W4 debug-info
-waist is now exercised end-to-end by **three** independent frontends on the source-line half, two on
-the full variable+type half.)
+**Slice 25 — LLVM *variable / type* ingest via a direct `llvm-sys` DI walk (`dbg.declare` →
+`Window`).** The pinned `llvm-ir` 0.11.3 leaves the structured metadata graph unimplemented
+(`Metadata::from_llvm_ref` is `unimplemented!`, `MetadataOperand` is payloadless), so a new
+[`svm-llvm::di`] module reads the DI graph **directly through `llvm-sys`** (the fallback reader
+`LLVM.md` §8 sanctioned), re-parsing the same `.bc` into its own context and walking it. At `-O0
+-g` every C local is an `alloca` + `llvm.dbg.declare(addr, !DILocalVariable, !DIExpression)`; the
+reader recovers each variable's **name + structured type** (a recursive, cycle-safe `intern_type`
+over `DIBasicType`/`DICompositeType`/`DIDerivedType` → the §6 `TypeDef` graph — `Base`/`Aggregate`/
+`Array`/`Pointer`, transparent typedef/const/volatile, array `count = size/elem_size`, base
+`encoding` inferred from the C name since the LLVM-C API exposes no getter) and **correlates it to
+the IR by alloca *ordinal*** — the Nth alloca in textual order is stable across the `llvm-sys` parse
+and the translator's own walk, so it resolves to the alloca's data-stack frame slot → a
+`VarLoc::Window`. So a `-O0 -g` LLVM guest's `struct`/array/pointer locals are now ingested with
+full structured types, the LLVM analog of the wasm slice-23 ingest. Tests (`translate.rs`): a
+`struct Point`/`int[3]`/`struct Point *` fixture ingests with the right field offsets and pointee,
+verifies, and — the correlation lock — its values **read back correctly at runtime** (`p.x`, `p.y`,
+`row[0]` through the interpreter's `Window` reads at a breakpoint).
+
+**Not yet — the LLVM `-O2`/`-Og` `llvm.dbg.value` SSA-location-list case.** At higher opt levels
+mem2reg/SROA promote scalars, so their debug locations become `llvm.dbg.value(ssavalue, var, expr)`
+location lists rather than `dbg.declare`+alloca — the case where **LLVM solves S2's
+promotion-vs-inspectability for free** (its intrinsics survive optimization). The `di` reader and
+the `TypeDef` machinery are in place; what remains is correlating each `dbg.value`'s SSA value to the
+SVM block-local index per pc and emitting a `VarLoc::SsaList`/`WindowVia` (the same machinery the
+wasm producer already exercises) — a focused follow-up. (Everything else is built: the chibicc
+producer incl. optimized-build location lists; both DAP consumers over `Window` *and* `WindowVia`;
+binary serialization; the wasm producer's source lines, DWARF pass-through, named variables, and
+aggregate/pointer/array types; and now LLVM source lines **and** `-O0` variable/type ingest. The W4
+debug-info waist is exercised end-to-end by **three** independent frontends — all three on the
+source-line half, all three on the variable+type half.)
 
 ### Open questions (S4/S5/S2)
 

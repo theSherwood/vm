@@ -170,8 +170,10 @@ use llvm_ir::{FPPredicate, IntPredicate, Name, Operand};
 
 use svm_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
-    IToF, Inst, IntTy, IntUnOp, Loc, Module, Terminator, ValIdx, ValType,
+    IToF, Inst, IntTy, IntUnOp, Loc, Module, Terminator, TypeDef, ValIdx, ValType, VarInfo, VarLoc,
 };
+
+pub mod di;
 
 /// Why a translation could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,13 +202,24 @@ pub struct Translated {
 
 /// Translate a legalized LLVM bitcode file (`*.bc`). The bitcode must come from the pinned LLVM
 /// (18); off-version input is an [`Error::Parse`].
+///
+/// A `-g` build additionally feeds the §6 debug-info waist's *variable/type half*: the structured
+/// `!DILocalVariable`/DI-type graph (which the `llvm-ir` AST doesn't expose) is read by a direct
+/// `llvm-sys` walk ([`di`]) over the same file and correlated to the IR ([`di::read_debug`]).
 pub fn translate_bc_path(path: impl AsRef<Path>) -> Result<Translated, Error> {
+    let path = path.as_ref();
     let m = LModule::from_bc_path(path).map_err(Error::Parse)?;
-    translate(&m)
+    let di = path.to_str().and_then(di::read_debug);
+    translate_impl(&m, di.as_ref())
 }
 
-/// Translate an already-parsed `llvm-ir` module.
+/// Translate an already-parsed `llvm-ir` module. The neutral core's source-line half is populated
+/// from `!DILocation`; the variable/type half requires the bitcode path (see [`translate_bc_path`]).
 pub fn translate(m: &LModule) -> Result<Translated, Error> {
+    translate_impl(m, None)
+}
+
+fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated, Error> {
     // Pass 0: assign each *defined* function an IR index (its position among defined functions),
     // so a `call` can resolve its target by name. Declaration-only functions (extern/intrinsic
     // prototypes) have no body and are skipped — a call to one needs import support (a later slice).
@@ -336,8 +349,13 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
                                // §6 debug-info: each defined function's final index is `base + i` (the synth `_start`, inserted
                                // at 0 below, shifts them up by `base`; the appended helpers carry no source). Source positions
-                               // come from each LLVM instruction's `!DILocation`.
+                               // come from each LLVM instruction's `!DILocation`; the structured type graph (when a `-g`
+                               // bitcode path was walked by the `di` reader) seeds the shared `types` table up front, its
+                               // `TypeId`s referenced unchanged by the per-function variables.
     let mut dbg = DebugAcc::default();
+    if let Some(di) = di {
+        dbg.types = di.types.clone();
+    }
     for (i, f) in defined.iter().enumerate() {
         let (func, frame_size) = translate_func(
             f,
@@ -349,6 +367,7 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
             &cstrs,
             &gbytes,
             &helpers,
+            di,
             &mut dbg,
         )?;
         any_frame |= frame_size > 0;
@@ -467,6 +486,11 @@ struct DebugAcc {
     files: Vec<String>,
     file_idx: HashMap<String, u32>,
     locs: Vec<Loc>,
+    /// The structured `TypeDef` graph (from the `di` reader; empty without `-g` variables).
+    types: Vec<TypeDef>,
+    /// Source variables (the `dbg.declare` → `Window` half; empty without `-g` / on the `translate`
+    /// entry, which has no bitcode path to walk).
+    vars: Vec<VarInfo>,
 }
 
 impl DebugAcc {
@@ -504,15 +528,17 @@ impl DebugAcc {
         }
     }
 
-    /// The populated waist, or `None` when no instruction carried a `!DILocation` (a non-`-g`
-    /// build) — so a debug-free module stays `debug_info: None`, byte-identical to before.
+    /// The populated waist, or `None` when nothing was recorded (a non-`-g` build) — so a debug-free
+    /// module stays `debug_info: None`, byte-identical to before.
     fn finish(self) -> Option<DebugInfo> {
-        if self.locs.is_empty() {
+        if self.locs.is_empty() && self.vars.is_empty() {
             None
         } else {
             Some(DebugInfo {
                 files: self.files,
                 locs: self.locs,
+                types: self.types,
+                vars: self.vars,
                 ..Default::default()
             })
         }
@@ -1113,6 +1139,7 @@ fn translate_func(
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
+    di: Option<&di::LlvmDebug>,
     dbg: &mut DebugAcc,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
@@ -1134,6 +1161,24 @@ fn translate_func(
     let live_in = liveness(f, &scan)?;
     let block_params = block_params(f, &scan, &live_in);
     let (frame, frame_size) = frame_layout(f, &scan, types)?;
+
+    // §6 debug-info variables (the `dbg.declare` → `Window` half): the `di` reader gives this
+    // function's source locals keyed by **alloca ordinal**; resolve that ordinal to the alloca's
+    // data-stack offset (the same textual alloca order `frame_layout` lays out) → `VarLoc::Window`.
+    if let Some(vars) = di.and_then(|d| d.vars.get(&f.name)) {
+        let alloca_offsets = alloca_order_offsets(f, &scan, &frame);
+        for v in vars {
+            if let Some(&off) = alloca_offsets.get(v.alloca_ordinal) {
+                dbg.vars.push(VarInfo {
+                    func: func_idx,
+                    name: v.name.clone(),
+                    ty: v.ty.clone(),
+                    loc: VarLoc::Window { off: off as i64 },
+                    type_id: v.type_id,
+                });
+            }
+        }
+    }
 
     let mut blocks = Vec::with_capacity(f.basic_blocks.len());
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
@@ -1164,6 +1209,28 @@ fn translate_func(
         },
         frame_size,
     ))
+}
+
+/// The data-stack offset of each `alloca` **in textual order** (ordinal → offset). This is the
+/// correlation target for the `di` reader's `alloca_ordinal`: both walk the function's allocas in
+/// the same block/instruction order, so the Nth alloca here is the Nth there. An alloca with no
+/// frame slot (shouldn't happen at `-O0`) contributes a `0` placeholder to keep ordinals aligned.
+fn alloca_order_offsets(f: &Function, s: &Scan, frame: &HashMap<ValueId, u64>) -> Vec<u64> {
+    let mut offs = Vec::new();
+    for bb in &f.basic_blocks {
+        for instr in &bb.instrs {
+            if let Instruction::Alloca(a) = instr {
+                let off = s
+                    .name2id
+                    .get(&a.dest)
+                    .and_then(|vid| frame.get(vid))
+                    .copied()
+                    .unwrap_or(0);
+                offs.push(off);
+            }
+        }
+    }
+    offs
 }
 
 /// Lay out every `alloca`'s data-stack slot at a `sp`-relative offset (from 0, natural-aligned),
