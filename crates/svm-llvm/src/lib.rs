@@ -721,13 +721,14 @@ fn globals_layout(
 }
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
-/// are memory widths only, not SSA value types); `i64` stays `i64`. Non-byte widths (`i33`,
-/// `i128`), floats, pointers, and aggregates are outside the slice-A subset.
+/// are memory widths only, not SSA value types); `i64` stays `i64`. A non-power-of-two width in
+/// `33..=64` (LLVM's `-O2` SCEV often produces `i33` etc. closing a loop into a polynomial) is held
+/// in an `i64`, kept canonical by masking after the de-normalizing ops (`bin`). `i128`+ is rejected.
 fn val_type(ty: &Type) -> Result<ValType, Error> {
     match ty {
         Type::IntegerType { bits } if *bits <= 32 => Ok(ValType::I32),
-        Type::IntegerType { bits } if *bits == 64 => Ok(ValType::I64),
-        Type::IntegerType { bits } => unsup(format!("integer width i{bits} (Milestone 1+)")),
+        Type::IntegerType { bits } if *bits <= 64 => Ok(ValType::I64),
+        Type::IntegerType { bits } => unsup(format!("integer width i{bits} (i128+ unsupported)")),
         // Pointers are an erasable refinement of `i64` (§3a/§10) — a window offset.
         Type::PointerType { .. } => Ok(ValType::I64),
         Type::FPType(FPType::Single) => Ok(ValType::F32),
@@ -4366,8 +4367,15 @@ impl<'a> BlockCtx<'a> {
                 Constant::Int { bits, value } if *bits <= 32 => {
                     Ok(self.push(Inst::ConstI32(*value as u32 as i32)))
                 }
-                Constant::Int { bits, value } if *bits == 64 => {
-                    Ok(self.push(Inst::ConstI64(*value as i64)))
+                // `i64` and the `iN` (33..63) widths share the `i64` container; an `iN` constant is
+                // canonicalized to its low `N` bits (its in-container representation, see `val_type`).
+                Constant::Int { bits, value } if *bits <= 64 => {
+                    let v = if *bits == 64 {
+                        *value
+                    } else {
+                        *value & ((1u64 << *bits) - 1)
+                    };
+                    Ok(self.push(Inst::ConstI64(v as i64)))
                 }
                 Constant::Float(Float::Single(f)) => Ok(self.push(Inst::ConstF32(f.to_bits()))),
                 Constant::Float(Float::Double(d)) => Ok(self.push(Inst::ConstF64(d.to_bits()))),
@@ -4741,6 +4749,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::Add,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::Sub(x) => bin(
             ctx,
@@ -4749,6 +4758,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::Sub,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::Mul(x) => bin(
             ctx,
@@ -4757,6 +4767,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::Mul,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::UDiv(x) => bin(
             ctx,
@@ -4765,6 +4776,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::DivU,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::SDiv(x) => bin(
             ctx,
@@ -4773,6 +4785,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::DivS,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::URem(x) => bin(
             ctx,
@@ -4781,6 +4794,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::RemU,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::SRem(x) => bin(
             ctx,
@@ -4789,6 +4803,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::RemS,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::And(x) => bin(
             ctx,
@@ -4797,6 +4812,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::And,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::Or(x) => bin(
             ctx,
@@ -4805,6 +4821,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::Or,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::Xor(x) => bin(
             ctx,
@@ -4813,6 +4830,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::Xor,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::Shl(x) => bin(
             ctx,
@@ -4821,6 +4839,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::Shl,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::LShr(x) => bin(
             ctx,
@@ -4829,6 +4848,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::ShrU,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::AShr(x) => bin(
             ctx,
@@ -4837,6 +4857,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             BinOp::ShrS,
             &x.operand0,
             &x.operand1,
+            types,
         )?,
         I::ICmp(x) => {
             let ty = bin_ty(&x.operand0)?;
@@ -5125,10 +5146,42 @@ fn bin<'d>(
     op: BinOp,
     a: &Operand,
     b: &Operand,
+    types: &Types,
 ) -> Result<(&'d Name, ValIdx), Error> {
+    let width = int_bits(a.get_type(types).as_ref());
     let a = ctx.operand(a)?;
     let b = ctx.operand(b)?;
-    Ok((dest, ctx.push(Inst::IntBin { ty, op, a, b })))
+    let r = ctx.push(Inst::IntBin { ty, op, a, b });
+    // Keep an `iN` value (a non-power-of-two width `33..63` held in an `i64`) **canonical**: the
+    // de-normalizing ops (`add`/`sub`/`mul`/`shl`) can set bits `≥ N`, so mask the result back to its
+    // low `N` bits. Downstream `lshr`/`trunc`/unsigned-compare then see clean bits (§3b widen-and-
+    // mask); `and`/`or`/`xor`/`lshr`/`div`/`rem` of canonical inputs stay canonical (no extra mask).
+    // 32-/64-bit ops are exact in their container, so nothing to do.
+    let r = match width {
+        Some(w)
+            if (33..64).contains(&w)
+                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl) =>
+        {
+            mask_to_i64(ctx, r, w)
+        }
+        _ => r,
+    };
+    Ok((dest, r))
+}
+
+/// Mask an `i64`-container value to its low `n` bits (`n` in `33..=63`) — the canonical form of an
+/// `iN` value (`val_type`). `n == 64` is the identity (no mask).
+fn mask_to_i64(ctx: &mut BlockCtx, v: ValIdx, n: u32) -> ValIdx {
+    if n >= 64 {
+        return v;
+    }
+    let m = ctx.const_i64(((1u64 << n) - 1) as i64);
+    ctx.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::And,
+        a: v,
+        b: m,
+    })
 }
 
 /// Emit a binary float op and return `(dest, result-index)`.

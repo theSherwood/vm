@@ -1892,8 +1892,15 @@ static void gen_for(Node *node) {
   open_block(cond);
   if (node->cond) {
     int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
-    cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", c, body, cvals(), end,
-            cvals());
+    // Emit the test INVERTED so the body is the fall-through (else) edge and the loop exit is the
+    // taken (then) edge. svm-jit lowers a `br_if`'s second target as the fall-through, so putting
+    // the body there costs one taken branch per iteration (the back-edge) instead of two (a taken
+    // branch into the body *plus* the back-edge). Pure layout win — ~2x on a tight data-stack loop
+    // (the `locals_c` bench) — and it mirrors what svm-wasm emits for `br_if $done`. This is the
+    // test-at-top form (`for`/`while`); `do/while` already tests on the back-edge, so it's untouched.
+    int nc = nv++;
+    cg("  v%d = i32.eqz v%d\n", nc, c);
+    cg("  br_if v%d block%d(" SP "%s) block%d(" SP "%s)\n", nc, end, cvals(), body, cvals());
   } else {
     cg("  br block%d(" SP "%s)\n", body, cvals()); // `for(;;)` — unconditional
   }

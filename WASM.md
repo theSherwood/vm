@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (97 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (98 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -53,7 +53,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `() -> ()`. `tests/start.rs` (runs-before-export, param/result threading, runs-once/internal-bypass,
   bad-signature rejection). A non-`(start)` module is byte-identical to before.
 
-### 🟠 Host-ABI — named import binding
+### 🟢 Host-ABI — named import binding (DONE)
 
 - [x] **Named import binding — DONE (single-handle).** A non-numeric import (e.g. a real WASI
   `("wasi_snapshot_preview1", "fd_write")`) now lowers to a §7 `Inst::CallImport "<module>.<name>"`
@@ -65,11 +65,19 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   WASI semantics live outside both svm-wasm and the interp TCB), plus a `resolve` policy. A real WASI
   "hello world" runs end-to-end (`crates/svm-wasi/src/lib.rs` tests). WASI's specific fd/clock/random
   *semantics* stay a ⚪ non-goal — the shim is a host-layer subset, not conformant preview1.
-- [ ] **Multi-*handle* import binding (remaining).** Still **one** capability handle threaded (a single
-  leading param; `has_handle` is module-wide), so all named imports must share one interface — fine for
-  WASI (one `HostFn` handle, many ops) but a module spanning **distinct** capability interfaces is
-  rejected. Work: thread **N** handles via reserved slots (the chibicc multi-handle powerbox pattern)
-  instead of one leading param. (The `wasi:thread/spawn` import remains separately special-cased.)
+- [x] **Multi-*handle* import binding — DONE.** The transpiler now threads **one handle per distinct
+  import interface** (keyed by the wasm `module` string, in first-appearance order) as the leading
+  `i32` params of every function — so a module spanning N capability interfaces takes N leading handle
+  params (N=0/1 collapse to the no-handle / single-handle cases, byte-identical to before). Each
+  `cap.call`/`CallImport` rides its interface's slot handle; the embedder grants one capability per
+  interface and passes the handles as the entry's leading args, in slot order. The module string is the
+  grouping key because it is known at transpile time for both numeric and §7 named imports. Purely an
+  svm-wasm (frontend) change — the IR/interp/JIT already take a per-call handle. The `Lower` prefix
+  machinery generalized `handle: Option<ValIdx>` → `handles: Vec<ValIdx>`; the old "one interface only"
+  rejection is gone. Differential tests (interp == JIT) cover two distinct interfaces (Clock + Blocking)
+  bound to two handles, threaded through both the entry and a cross-function `call`. (The
+  `wasi:thread/spawn` import remains separately special-cased — *alongside* caps still needs the
+  per-thread handle stash.)
 
 ### 🟡 Fail-closed feature gaps (clean `Unsupported`)
 
@@ -211,10 +219,10 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 ## Recommended order (for "handle more real programs")
 
 1. **Start section** 🔴 — kill the silent footgun (cheap; fail-closed at minimum, ideally run it).
-2. **Named multi-capability import binding** 🟠 — let the embedder bind symbolic import names to
-   `(type_id, op)` and thread N capability handles (the chibicc powerbox pattern). The general
-   mechanism for "host provides arbitrary capabilities, guest uses them"; the single biggest
-   real-program blocker. (WASI *semantics* stay ⚪ — a host binds its own caps to whatever names.)
+2. **Named multi-capability import binding** 🟢 — **DONE.** Named imports bind to `(type_id, op)` at
+   load, and the transpiler threads **N capability handles** (one per distinct import interface/module,
+   the powerbox pattern). A module can now span arbitrary capability interfaces. (WASI *semantics*
+   stay ⚪ — a host binds its own caps to whatever names.)
 3. **Tail calls** 🟡 — common LLVM output, likely near-free (IR terminators exist).
 4. **Passive *data* segments + `memory.init`/`data.drop`** 🟡 — DONE. (The *table* bulk ops + passive
    *element* segments remain — they need a mutable runtime table; lower audience.)

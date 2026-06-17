@@ -19,7 +19,8 @@
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use svm_durable::{
-    init_durable_window, transform_module, write_state, STATE_REWINDING, STATE_UNWINDING,
+    init_durable_window, transform_module, transform_module_assume_confined, write_state,
+    STATE_REWINDING, STATE_UNWINDING,
 };
 use svm_interp::{
     run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value, DURABLE_RESERVE,
@@ -360,5 +361,95 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
             )
         }
         other => panic!("JIT thaw: expected Returned([107]), got {other:?}"),
+    }
+}
+
+/// Phase-3 slice 3.2 (active-resume-chain, cross-backend): an **interpreter-frozen** fiber that was
+/// *running* (mid-`cap.call`), not idle, at freeze — restored through the §12 codec and **thawed on
+/// the JIT**. The JIT must re-seed the active-chain fiber and re-enter it so it rewinds at its leaf
+/// point and runs *forward*, **reloading** the saved clock value (47) rather than re-issuing the
+/// clock against the JIT thaw host's advanced clock. The clock handle reaches the fiber via guest
+/// memory (`transform_module_assume_confined`).
+#[test]
+fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
+    let src = "memory 17\n\
+        func (i32) -> (i64) {\n\
+        block0(v0: i32):\n\
+        \x20 v1 = i64.const 65536\n\
+        \x20 i32.store v1 v0\n\
+        \x20 v2 = ref.func 1\n\
+        \x20 v3 = i64.const 4096\n\
+        \x20 v4 = cont.new v2 v3\n\
+        \x20 v5 = i64.const 0\n\
+        \x20 v6, v7 = cont.resume v4 v5\n\
+        \x20 return v7\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 65536\n\
+        \x20 v3 = i32.load v2\n\
+        \x20 v4 = i32.const 0\n\
+        \x20 v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)\n\
+        \x20 v6 = i64.const 5\n\
+        \x20 v7 = i64.add v5 v6\n\
+        \x20 return v7\n\
+        }\n";
+    let mut m = parse_module(src).expect("parse");
+    m.memory = Some(svm_ir::Memory {
+        size_log2: WINDOW_LOG2,
+    });
+    let inst = transform_module_assume_confined(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+
+    // Interp freeze: clock 42 → F calls the clock (42), then unwinds mid-call; capture the artifact.
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    ihost.clock_ns = 42;
+    let iclk = ihost.grant_clock();
+    let mut iwin = init_durable_window(WINDOW);
+    write_state(&mut iwin, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(iclk)],
+        &mut ifuel,
+        &iwin,
+        WINDOW_LOG2,
+        &mut ihost,
+    );
+    assert!(ires.is_ok(), "interp freeze placeholder: {ires:?}");
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze serializes the active-chain fiber");
+
+    // Restore + bridge the residue to the JIT.
+    let mut thost = Host::new();
+    let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
+    write_state(&mut thaw_win, STATE_REWINDING);
+    let seed = jit_seed(thost.frozen_fibers());
+    assert_eq!(seed.len(), 1, "the artifact carried the active-chain fiber");
+
+    // Thaw on the JIT, clock advanced to 99 — the fiber must reload 42 (→ 47), not re-issue (→ 104).
+    let mut jhost = Host::new();
+    jhost.clock_ns = 99;
+    let jclk = jhost.grant_clock();
+    let (jout, _win, _res) = compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[jclk as i64],
+        &thaw_win,
+        &[],
+        &seed,
+        WINDOW_LOG2,
+        svm_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+    )
+    .expect("JIT thaw");
+    match jout {
+        JitOutcome::Returned(slots) => assert_eq!(
+            slots,
+            vec![47],
+            "JIT thaw reloads the saved clock (47), not a re-issued one (104)"
+        ),
+        other => panic!("JIT thaw: expected Returned([47]), got {other:?}"),
     }
 }
