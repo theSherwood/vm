@@ -1985,6 +1985,7 @@ fn typed(t: ValType, v: i64) -> Value {
         ValType::I64 => Value::I64(v),
         ValType::F32 => Value::F32(f32::from_bits(v as u32)),
         ValType::F64 => Value::F64(f64::from_bits(v as u64)),
+        ValType::Ref => Value::Ref(v as u64), // opaque i64-width reference
         // CLI entry args are scalar `i64` slots; a `v128` entry param is out of scope. Total arm:
         // zero-extend the slot into the low lanes.
         ValType::V128 => {

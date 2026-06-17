@@ -40,6 +40,7 @@ fn diff1(src: &str, args: &[Value]) -> i64 {
             Value::F32(x) => x.to_bits() as i64,
             Value::F64(x) => x.to_bits() as i64,
             Value::V128(b) => i64::from_le_bytes(b[..8].try_into().unwrap()),
+            Value::Ref(x) => *x as i64,
         })
         .collect();
     let jit = match compile_and_run(&m, 0, &slots).expect("jit") {
@@ -52,6 +53,7 @@ fn diff1(src: &str, args: &[Value]) -> i64 {
         Value::F32(x) => x.to_bits() as i64,
         Value::F64(x) => x.to_bits() as i64,
         Value::V128(b) => i64::from_le_bytes(b[..8].try_into().unwrap()),
+        Value::Ref(x) => x as i64,
     };
     // JIT i32 results occupy the low 32 bits of the slot; compare width-appropriately.
     let got = jit[0];

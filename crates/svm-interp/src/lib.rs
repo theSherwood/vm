@@ -33,6 +33,9 @@ pub enum Value {
     /// A `v128` SIMD vector (§17/D58): 16 raw little-endian bytes. Lane interpretation is
     /// per-op, never per-value — so the value carries only the bytes.
     V128([u8; 16]),
+    /// An opaque 64-bit `ref` (GC.md §6 forward-compat reservation). Operationally identical to
+    /// `I64` — a distinct variant only so type confusion is compile-caught; it carries raw bits.
+    Ref(u64),
 }
 
 /// Reasons execution stopped without producing results.
@@ -1346,9 +1349,15 @@ impl MemAccess {
 fn access_of(inst: &Inst, vals: &[Value], mem: &Option<Mem>) -> MemAccess {
     // Fiber ops touch the run-shared registry, not the window — classified before the memory
     // check (a module with no linear memory can still race on fibers via handles in args).
+    // `gc.roots` reads every fiber's frames, so it is conservatively dependent on all of them too
+    // (it is meant to run under stop-the-world quiescence — GC.md §2 — so this only matters to the
+    // adversarial concurrency explorer, which should still order it against every fiber op).
     if matches!(
         inst,
-        Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+        Inst::ContNew { .. }
+            | Inst::ContResume { .. }
+            | Inst::Suspend { .. }
+            | Inst::GcRoots { .. }
     ) {
         return MemAccess::Fiber;
     }
@@ -3280,6 +3289,7 @@ impl VCpu {
                     Value::F32(x) => (2u8, x.to_bits() as u64).hash(h),
                     Value::F64(x) => (3u8, x.to_bits()).hash(h),
                     Value::V128(b) => (4u8, *b).hash(h),
+                    Value::Ref(x) => (5u8, *x).hash(h),
                 }
             }
         }
@@ -3358,6 +3368,9 @@ fn is_visible(inst: &Inst) -> bool {
             | Inst::ContNew { .. }
             | Inst::ContResume { .. }
             | Inst::Suspend { .. }
+            // §GC `gc.roots` reads every fiber's registry frames and writes guest memory, so it is
+            // observable to another vCPU — a scheduling decision point like the fiber ops.
+            | Inst::GcRoots { .. }
     )
 }
 
@@ -4250,6 +4263,48 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[rtop].vals.push(Value::I64(v));
                     continue 'frames;
                 }
+                // §GC conservative root enumeration (`gc.roots`): collect the deduplicated set of
+                // candidate words in `[heap_lo, heap_hi)` across **every** fiber of the domain —
+                // this computation's own live `frames` (the caller; the op is call-clobbering, so
+                // its roots are already in `frames`), the parked root computation (`root_parked`),
+                // and every registry fiber that holds frames: `Parked` (suspended) and
+                // `Running(Some)` (a resume-chain ancestor). The currently-running fiber's slot is
+                // `Running(None)` (its frames are `frames`, scanned above) so nothing double-counts.
+                // Write the first `cap` candidates (ascending) into guest memory at `buf`, yield the
+                // total found. Ambient + authority-neutral (GC.md §3): every candidate is in-window
+                // guest data the heap already encodes; nothing host-side can appear in a `Value`.
+                Inst::GcRoots {
+                    heap_lo,
+                    heap_hi,
+                    buf,
+                    cap,
+                } => {
+                    let lo = as_i64(get(&frames[top].vals, *heap_lo)?)? as u64;
+                    let hi = as_i64(get(&frames[top].vals, *heap_hi)?)? as u64;
+                    let dst = as_i64(get(&frames[top].vals, *buf)?)? as u64;
+                    let cap = as_i64(get(&frames[top].vals, *cap)?)?.max(0) as usize;
+                    let mut roots = std::collections::BTreeSet::new();
+                    gc_scan_frames(frames, lo, hi, &mut roots);
+                    if let Some(rp) = root_parked.as_ref() {
+                        gc_scan_frames(rp, lo, hi, &mut roots);
+                    }
+                    for fib in registry.lock().iter() {
+                        if let RegFiber::Parked(f) | RegFiber::Running(Some(f)) = fib {
+                            gc_scan_frames(f, lo, hi, &mut roots);
+                        }
+                    }
+                    let total = roots.len();
+                    let mut bytes = Vec::with_capacity(total.min(cap) * 8);
+                    for w in roots.into_iter().take(cap) {
+                        bytes.extend_from_slice(&w.to_le_bytes());
+                    }
+                    // Reuse the §7 cap-buffer write path: confines `buf` to committed, writable
+                    // window pages (a forged/unmapped buffer ⇒ `MemoryFault`), exactly like a host
+                    // capability writing its result buffer.
+                    let m = mem.as_mut().ok_or(Trap::Malformed)?;
+                    m.write_bytes_impl(dst, &bytes).ok_or(Trap::MemoryFault)?;
+                    frames[top].vals.push(Value::I64(total as i64));
+                }
                 // §12 thread spawn: enqueue a new vCPU (green thread) running `funcs[func](arg)` over
                 // the *shared* memory (the `Arc<Region>` bytes + §13 `Arc` regions; the child snapshots
                 // the page-protection map). The executor runs it on a pooled worker. The child **shares
@@ -4743,6 +4798,7 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
         | Inst::Suspend { .. }
+        | Inst::GcRoots { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }
         | Inst::MemoryWait { .. }
@@ -8198,7 +8254,7 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
         // `v128` never reaches here — its loads go through the dedicated 16-byte path, not
         // a `LoadOp` (whose widths are ≤8). Total arm for exhaustiveness only.
         ValType::V128 => Value::V128([0; 16]),
-        ValType::I32 | ValType::I64 => {
+        ValType::I32 | ValType::I64 | ValType::Ref => {
             let bits = width * 8;
             let ext = if signed && bits < 64 {
                 let shift = 64 - bits;
@@ -8206,10 +8262,38 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
             } else {
                 raw
             };
-            if rty == ValType::I32 {
-                Value::I32(ext as i32)
-            } else {
-                Value::I64(ext as i64)
+            match rty {
+                ValType::I32 => Value::I32(ext as i32),
+                ValType::Ref => Value::Ref(ext), // opaque, stored/loaded as an i64-width word
+                _ => Value::I64(ext as i64),
+            }
+        }
+    }
+}
+
+/// Scan a fiber's frames for candidate root words in `[lo, hi)` and insert them into `out` (§GC
+/// `gc.roots`). Conservative: every SSA value whose raw bits land in range is a candidate — the
+/// interpreter scans typed `Value`s (the JIT scans raw control-stack words; both are sound
+/// over-approximations that may differ in false positives, GC.md §3.2). `v128` contributes both of
+/// its 64-bit halves.
+fn gc_scan_frames(frames: &[Frame], lo: u64, hi: u64, out: &mut std::collections::BTreeSet<u64>) {
+    let mut consider = |w: u64| {
+        if w >= lo && w < hi {
+            out.insert(w);
+        }
+    };
+    for f in frames {
+        for v in &f.vals {
+            match v {
+                Value::I32(x) => consider(*x as u32 as u64),
+                Value::I64(x) => consider(*x as u64),
+                Value::Ref(x) => consider(*x),
+                Value::F32(x) => consider(x.to_bits() as u64),
+                Value::F64(x) => consider(x.to_bits()),
+                Value::V128(b) => {
+                    consider(u64::from_le_bytes(b[0..8].try_into().unwrap()));
+                    consider(u64::from_le_bytes(b[8..16].try_into().unwrap()));
+                }
             }
         }
     }
@@ -8225,6 +8309,7 @@ fn store_bits(v: Value) -> u64 {
         // `v128` stores go through the dedicated 16-byte path; a scalar store never sees one.
         // Total arm: low 8 bytes (little-endian).
         Value::V128(b) => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => x, // opaque reference: its raw 64-bit word
     }
 }
 
@@ -8454,6 +8539,7 @@ fn val_to_slot(v: Value) -> i64 {
         // The cap ABI marshals scalars only; a `v128` arg/result is out of MVP scope (§17). Total
         // arm — its low 8 bytes — keeps the interpreter panic-free if a module declares one.
         Value::V128(b) => i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        Value::Ref(x) => x as i64, // opaque reference marshals as its i64-width word
     }
 }
 
@@ -8464,6 +8550,7 @@ fn slot_to_val(ty: ValType, s: i64) -> Value {
         ValType::I64 => Value::I64(s),
         ValType::F32 => Value::F32(f32::from_bits(s as u32)),
         ValType::F64 => Value::F64(f64::from_bits(s as u64)),
+        ValType::Ref => Value::Ref(s as u64), // opaque i64-width reference
         // `v128` cap results are out of MVP scope; zero-extend the slot into the low lanes.
         ValType::V128 => {
             let mut b = [0u8; 16];

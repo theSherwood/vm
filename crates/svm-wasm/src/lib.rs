@@ -1150,6 +1150,8 @@ fn lower_func(
             ValType::F32 => lo.emit(Inst::ConstF32(0)),
             ValType::F64 => lo.emit(Inst::ConstF64(0)),
             ValType::V128 => lo.emit(Inst::ConstV128([0; 16])),
+            // WASM never declares a `ref` local (it's an svm-only GC reservation); treat as i64.
+            ValType::Ref => lo.emit(Inst::ConstI64(0)),
         };
         lo.locals.push(v);
     }
@@ -1376,7 +1378,7 @@ fn global_addr(lo: &Lower, g: u32) -> u64 {
 fn load_op(ty: ValType) -> LoadOp {
     match ty {
         ValType::I32 => LoadOp::I32,
-        ValType::I64 | ValType::V128 => LoadOp::I64,
+        ValType::I64 | ValType::V128 | ValType::Ref => LoadOp::I64,
         ValType::F32 => LoadOp::F32,
         ValType::F64 => LoadOp::F64,
     }
@@ -1384,7 +1386,7 @@ fn load_op(ty: ValType) -> LoadOp {
 fn store_op(ty: ValType) -> StoreOp {
     match ty {
         ValType::I32 => StoreOp::I32,
-        ValType::I64 | ValType::V128 => StoreOp::I64,
+        ValType::I64 | ValType::V128 | ValType::Ref => StoreOp::I64,
         ValType::F32 => StoreOp::F32,
         ValType::F64 => StoreOp::F64,
     }

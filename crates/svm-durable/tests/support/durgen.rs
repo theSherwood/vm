@@ -22,7 +22,10 @@ use svm_durable::{
 use svm_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use svm_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, Memory, Module, Terminator, ValType};
 
-pub const SIZE_LOG2: u8 = 18;
+// 128 KiB: the durable region needs `DURABLE_RESERVE` (64 KiB), and a smaller window keeps the
+// per-run commit footprint modest — the JIT commits a window per compile, and on a memory-tight
+// Windows CI runner the cumulative commit of many compiles can hit the limit (os error 1455).
+pub const SIZE_LOG2: u8 = 17;
 pub const WINDOW: usize = 1 << SIZE_LOG2;
 
 // Clock capability (type_id 2, op 0): `(i32) -> (i64)`, deterministic per host.

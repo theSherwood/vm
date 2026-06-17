@@ -8,9 +8,10 @@ mod durjit;
 
 #[test]
 fn freeze_thaw_cross_backend_over_generated_modules() {
-    // Each module JIT-compiles three times over a 256 KiB window, so the count is lower
-    // than the interp-only smoke; the libFuzzer target `durable_jit` does the heavy run.
-    for seed in 0..150u64 {
+    // Each module JIT-compiles three times and commits a guest window each time; the libFuzzer
+    // target `durable_jit` does the heavy run, so keep this a modest smoke. The low count also
+    // bounds the cumulative JIT commit on memory-tight Windows CI (os error 1455 / commit limit).
+    for seed in 0..64u64 {
         let mut g = durjit::durgen::Gen::from_seed(seed);
         durjit::fuzz_one_xbackend(&mut g);
     }

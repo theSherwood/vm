@@ -879,13 +879,15 @@ fn zero_const(t: ValType) -> Inst {
         ValType::F32 => Inst::ConstF32(0),
         ValType::F64 => Inst::ConstF64(0),
         ValType::V128 => Inst::ConstV128([0; 16]),
+        // An opaque `ref` is i64-width (GC.md §6 reservation); its zero is the i64 zero word.
+        ValType::Ref => Inst::ConstI64(0),
     }
 }
 
 fn vsize(t: ValType) -> u64 {
     match t {
         ValType::I32 | ValType::F32 => 4,
-        ValType::I64 | ValType::F64 => 8,
+        ValType::I64 | ValType::F64 | ValType::Ref => 8,
         ValType::V128 => 16,
     }
 }
@@ -897,7 +899,7 @@ fn align_up(x: u64, a: u64) -> u64 {
 fn store_op(t: ValType) -> StoreOp {
     match t {
         ValType::I32 => StoreOp::I32,
-        ValType::I64 => StoreOp::I64,
+        ValType::I64 | ValType::Ref => StoreOp::I64, // `ref` spills as its opaque i64 word
         ValType::F32 => StoreOp::F32,
         ValType::F64 => StoreOp::F64,
         ValType::V128 => unreachable!("v128 spill rejected earlier"),
@@ -907,7 +909,7 @@ fn store_op(t: ValType) -> StoreOp {
 fn load_op(t: ValType) -> LoadOp {
     match t {
         ValType::I32 => LoadOp::I32,
-        ValType::I64 => LoadOp::I64,
+        ValType::I64 | ValType::Ref => LoadOp::I64, // `ref` reloads as its opaque i64 word
         ValType::F32 => LoadOp::F32,
         ValType::F64 => LoadOp::F64,
         ValType::V128 => unreachable!("v128 reload rejected earlier"),

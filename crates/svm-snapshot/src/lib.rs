@@ -22,12 +22,16 @@
 //! order, sparse entries ascending — so the §12.6 invariant "re-serialize a freshly-restored
 //! domain at the same safepoint is byte-identical" is a plain `==`.
 //!
-//! # Scope (Phase-1 domain shape)
+//! # Scope
 //!
-//! Single vCPU, no fibers, no protected pages: the window image is sparse with **zero-page
-//! elision**, every page `Rw`; control state is just the header's `vcpu_count = 1` /
-//! `fiber_count = 0` (the state word is in the window image). §12.4 fiber/dispatch state and
-//! `svm-mem` page-prot restore are later slices; the TLV container is forward-compatible.
+//! Single vCPU, no fibers. The window image is sparse with **zero-page elision** and carries
+//! per-page protection (`Rw`/`Ro`/`Unmapped`, §12.3) — see [`freeze_with_prots`] /
+//! [`restore_with_prots`]; the flat [`freeze`]/[`restore`] treat the whole window as `Rw`.
+//! Control state is just the header's `vcpu_count = 1` / `fiber_count = 0` (the state word is
+//! in the window image). Capturing real protections from a running backend and re-establishing
+//! them on the runtime window (escape-TCB) is the next Phase-2 slice; §12.4 fiber/dispatch
+//! state is later. A `Backed` (§13 shared-region) page is out of scope — D-region: freeze
+//! refuses a domain holding shared regions. The TLV container is forward-compatible.
 
 #![forbid(unsafe_code)]
 
@@ -58,6 +62,23 @@ const B_ADDRESS_SPACE: u8 = 5;
 const B_INSTANTIATOR: u8 = 6;
 
 const PROT_RW: u8 = 0;
+const PROT_RO: u8 = 1;
+const PROT_UNMAPPED: u8 = 2;
+
+/// Per-page protection carried in the window image (§12.3), mirroring the runtime page model
+/// (`svm-interp`'s `PageProt` / the JIT window). A `Backed` (§13 `SharedRegion`-aliased) page
+/// is **not** representable — D-region: v1 freeze refuses a domain with shared regions, so the
+/// caller rejects those before serializing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PageProt {
+    /// Read/write — the default. A zero `Rw` page is elided from the image (restore re-zeros it).
+    Rw,
+    /// Read-only (e.g. a D40 `readonly` data segment). Always stored (bytes + prot), even if
+    /// zero, so restore can re-establish the protection.
+    Ro,
+    /// Unmapped / uncommitted — no bytes stored; restore leaves it zero and inaccessible.
+    Unmapped,
+}
 
 /// Why a domain can't be frozen.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -67,6 +88,8 @@ pub enum FreezeError {
     NonDurableHandle(NonDurableHandle),
     /// The window length isn't a power of two `≥ PAGE` — it can't be a valid masked window.
     WindowGeometry(usize),
+    /// The supplied per-page protection map's length doesn't match the window's page count.
+    ProtCount { pages: usize, prots: usize },
 }
 
 /// Why restoring an artifact failed. All are fail-closed: restore never yields partial state.
@@ -93,10 +116,32 @@ pub enum RestoreError {
 
 /// Serialize a quiesced durable domain into a §12 artifact: the `window` image (the shadow
 /// state rides along) bound to `module`'s digest, plus `host`'s re-grantable handle table.
-/// Refuses if a live handle isn't durable (§12.5).
+/// Refuses if a live handle isn't durable (§12.5). Every page is treated as `Rw` (the flat
+/// window model); for a window with read-only / unmapped pages use [`freeze_with_prots`].
 pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, FreezeError> {
+    let npages = window.len() / PAGE;
+    freeze_with_prots(module, window, &vec![PageProt::Rw; npages], host)
+}
+
+/// [`freeze`] with an explicit per-page protection map (§12.3): `prots[i]` is the protection of
+/// the window page at `[i*PAGE, (i+1)*PAGE)` and must cover every page. `Ro` pages are always
+/// stored (bytes + prot) so restore can re-establish them; `Unmapped` pages store no bytes;
+/// zero `Rw` pages are elided.
+pub fn freeze_with_prots(
+    module: &Module,
+    window: &[u8],
+    prots: &[PageProt],
+    host: &Host,
+) -> Result<Vec<u8>, FreezeError> {
     if !window.len().is_power_of_two() || window.len() < PAGE {
         return Err(FreezeError::WindowGeometry(window.len()));
+    }
+    let npages = window.len() / PAGE;
+    if prots.len() != npages {
+        return Err(FreezeError::ProtCount {
+            pages: npages,
+            prots: prots.len(),
+        });
     }
     let handles = host
         .capture_durable_handles()
@@ -118,18 +163,32 @@ pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, Fr
         write_uleb(b, 0); // fiber_count
     });
 
-    // Section 1 — Window image (§12.3): sparse, zero-eliding, ascending page index.
+    // Section 1 — Window image (§12.3): sparse + zero-eliding, ascending page index. A page is
+    // stored when it carries protection or content the restore can't infer: `Ro`/`Unmapped`
+    // always, `Rw` only when non-zero (an elided page restores as zero `Rw`).
     section(&mut out, TAG_WINDOW, |b| {
-        let pages: Vec<(usize, &[u8])> = window
+        let entries: Vec<(usize, &[u8])> = window
             .chunks_exact(PAGE)
             .enumerate()
-            .filter(|(_, p)| p.iter().any(|&x| x != 0))
+            .filter(|&(i, p)| match prots[i] {
+                PageProt::Rw => p.iter().any(|&x| x != 0),
+                PageProt::Ro | PageProt::Unmapped => true,
+            })
             .collect();
-        write_uleb(b, pages.len() as u64);
-        for (idx, page) in pages {
+        write_uleb(b, entries.len() as u64);
+        for (idx, page) in entries {
             write_uleb(b, idx as u64);
-            b.push(PROT_RW);
-            b.extend_from_slice(page);
+            match prots[idx] {
+                PageProt::Rw => {
+                    b.push(PROT_RW);
+                    b.extend_from_slice(page);
+                }
+                PageProt::Ro => {
+                    b.push(PROT_RO);
+                    b.extend_from_slice(page);
+                }
+                PageProt::Unmapped => b.push(PROT_UNMAPPED), // no bytes
+            }
         }
     });
 
@@ -149,9 +208,21 @@ pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, Fr
 
 /// Restore a §12 artifact: validate it against `module` (R5 digest gate + geometry), re-grant
 /// its handle table into `host` (a fresh table the embedder supplies behind its own resources,
-/// D-scope), and return the reconstructed window image. The caller flips the state word to
-/// `REWINDING` and re-enters to thaw.
+/// D-scope), and return the reconstructed window bytes (protections dropped — every page is
+/// `Rw` content). The caller flips the state word to `REWINDING` and re-enters to thaw. Use
+/// [`restore_with_prots`] when the window has `Ro`/`Unmapped` pages to re-establish.
 pub fn restore(artifact: &[u8], module: &Module, host: &mut Host) -> Result<Vec<u8>, RestoreError> {
+    restore_with_prots(artifact, module, host).map(|(window, _)| window)
+}
+
+/// [`restore`] that also recovers the per-page protection map (§12.3): `prots[i]` is the
+/// protection to re-establish on the window page at `[i*PAGE, (i+1)*PAGE)` (default `Rw` for an
+/// elided page). Re-applying these to the runtime window is the escape-TCB restore step.
+pub fn restore_with_prots(
+    artifact: &[u8],
+    module: &Module,
+    host: &mut Host,
+) -> Result<(Vec<u8>, Vec<PageProt>), RestoreError> {
     let mut r = Reader::new(artifact);
     if r.take(4)? != MAGIC {
         return Err(RestoreError::BadMagic);
@@ -197,8 +268,9 @@ pub fn restore(artifact: &[u8], module: &Module, host: &mut Host) -> Result<Vec<
         return Err(RestoreError::GeometryMismatch);
     }
 
-    // ---- Window image: zeroed window, splat the stored non-zero pages. ----
+    // ---- Window image: zeroed window (default `Rw`); splat each stored page + its prot. ----
     let mut window = vec![0u8; mapped];
+    let mut prots = vec![PageProt::Rw; mapped / PAGE];
     let mut w = Reader::new(win_body);
     let n_pages = w.uleb()?;
     let mut last: Option<u64> = None;
@@ -208,13 +280,22 @@ pub fn restore(artifact: &[u8], module: &Module, host: &mut Host) -> Result<Vec<
             return Err(RestoreError::Malformed); // non-canonical: pages must ascend
         }
         last = Some(idx);
-        let _prot = w.u8()?;
-        let bytes = w.take(PAGE)?;
-        let start = (idx as usize)
+        let page = idx as usize;
+        let start = page
             .checked_mul(PAGE)
             .filter(|&s| s + PAGE <= mapped)
             .ok_or(RestoreError::Malformed)?;
-        window[start..start + PAGE].copy_from_slice(bytes);
+        match w.u8()? {
+            PROT_RW => {
+                window[start..start + PAGE].copy_from_slice(w.take(PAGE)?);
+            }
+            PROT_RO => {
+                window[start..start + PAGE].copy_from_slice(w.take(PAGE)?);
+                prots[page] = PageProt::Ro;
+            }
+            PROT_UNMAPPED => prots[page] = PageProt::Unmapped, // no bytes; window stays zero
+            _ => return Err(RestoreError::Malformed),
+        }
     }
     if !w.at_end() {
         return Err(RestoreError::Malformed);
@@ -244,7 +325,7 @@ pub fn restore(artifact: &[u8], module: &Module, host: &mut Host) -> Result<Vec<
     }
     host.restore_durable_handles(&handles);
 
-    Ok(window)
+    Ok((window, prots))
 }
 
 // ---- Binding (de)serialization (§12.5) ----
