@@ -332,6 +332,34 @@ impl VShiftOp {
     }
 }
 
+/// Lane-wise **unary** integer ops on a `v128` (§17): `Abs` (`|x|`, two's-complement, so
+/// `abs(INT_MIN) == INT_MIN`, the wasm/hardware wrap) and `Neg` (`0 - x`, wrapping). `a`/result are
+/// `v128`. Defined for every integer [`VShape`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VIntUnOp {
+    Abs,
+    Neg,
+}
+
+impl VIntUnOp {
+    pub const ALL: [VIntUnOp; 2] = [VIntUnOp::Abs, VIntUnOp::Neg];
+    pub fn name(self) -> &'static str {
+        match self {
+            VIntUnOp::Abs => "abs",
+            VIntUnOp::Neg => "neg",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VIntUnOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VIntUnOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
 /// Lane-wise binary float ops on a `v128` (§17, IEEE 754, no traps). `Min`/`Max` are the
 /// IEEE `minimum`/`maximum` (NaN-propagating, `-0 < +0`) matching the scalar [`FBinOp`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1606,6 +1634,12 @@ pub enum Inst {
         op: VShiftOp,
         a: ValIdx,
         amt: ValIdx,
+    },
+    /// Lane-wise unary integer op (see [`VIntUnOp`]); `a`/result are `v128`.
+    VIntUn {
+        shape: VShape,
+        op: VIntUnOp,
+        a: ValIdx,
     },
     /// Lane-wise binary float op (see [`VFloatBinOp`]); `a`/`b`/result are `v128`.
     VFloatBin {

@@ -71,7 +71,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, VShiftOp, ValType,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VShape, VShiftOp, ValType,
     DEFAULT_RESERVED_LOG2,
 };
 
@@ -2579,6 +2579,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // Lane shifts lower to vector `ishl`/`ushr`/`sshr`; Cranelift legalizes every shape
                 // (incl. `i8x16`, which has no native per-byte shift on x86 — it emits a sequence).
                 Inst::VShift { .. } => {}
+                // Lane `abs`/`neg` lower to vector `iabs`/`ineg`; Cranelift legalizes every shape.
+                Inst::VIntUn { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3607,6 +3609,15 @@ fn lower_block(
                     VShiftOp::Shl => b.ins().ishl(x, sh),
                     VShiftOp::ShrU => b.ins().ushr(x, sh),
                     VShiftOp::ShrS => b.ins().sshr(x, sh),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VIntUn { shape, op, a } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let r = match op {
+                    VIntUnOp::Abs => b.ins().iabs(x),
+                    VIntUnOp::Neg => b.ins().ineg(x),
                 };
                 vcast(b, r, I8X16)
             }

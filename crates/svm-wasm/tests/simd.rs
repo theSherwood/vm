@@ -341,3 +341,22 @@ fn i32x4_lane_shifts() {
         assert_eq!(i32("i32x4.shr_s", -16, amt), -16i32 >> m, "shr_s {amt}");
     }
 }
+
+/// Integer lane abs/neg through the wasm bridge (two's-complement: `abs(INT_MIN) == INT_MIN`).
+#[test]
+fn i32x4_abs_neg() {
+    let un = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $x i32) (result i32)
+               (i32x4.extract_lane 0 ({op} (i32x4.splat (local.get $x))))))"
+        )
+    };
+    let f = |w: &str, x: i32| match eval(&un(w), "f", &[Value::I32(x)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    for x in [7, -7, 0, i32::MIN, i32::MAX] {
+        assert_eq!(f("i32x4.abs", x), x.wrapping_abs(), "abs {x}");
+        assert_eq!(f("i32x4.neg", x), x.wrapping_neg(), "neg {x}");
+    }
+}

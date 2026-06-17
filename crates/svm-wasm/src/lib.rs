@@ -45,8 +45,8 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Edge, FBinOp, FCmpOp, FToI, FUnOp, FloatTy,
     Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Module, Ordering, StoreOp, Terminator,
-    VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, VShiftOp, ValIdx,
-    ValType,
+    VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VShape, VShiftOp,
+    ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1322,6 +1322,12 @@ fn v_shift(lo: &mut Lower, shape: VShape, op: VShiftOp) -> Result<(), Error> {
     let (amt, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VShift { shape, op, a, amt });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_intun(lo: &mut Lower, shape: VShape, op: VIntUnOp) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VIntUn { shape, op, a });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -2905,6 +2911,15 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I64x2Shl => v_shift(lo, VShape::I64x2, VShiftOp::Shl)?,
         O::I64x2ShrS => v_shift(lo, VShape::I64x2, VShiftOp::ShrS)?,
         O::I64x2ShrU => v_shift(lo, VShape::I64x2, VShiftOp::ShrU)?,
+        // integer lane abs/neg
+        O::I8x16Abs => v_intun(lo, VShape::I8x16, VIntUnOp::Abs)?,
+        O::I8x16Neg => v_intun(lo, VShape::I8x16, VIntUnOp::Neg)?,
+        O::I16x8Abs => v_intun(lo, VShape::I16x8, VIntUnOp::Abs)?,
+        O::I16x8Neg => v_intun(lo, VShape::I16x8, VIntUnOp::Neg)?,
+        O::I32x4Abs => v_intun(lo, VShape::I32x4, VIntUnOp::Abs)?,
+        O::I32x4Neg => v_intun(lo, VShape::I32x4, VIntUnOp::Neg)?,
+        O::I64x2Abs => v_intun(lo, VShape::I64x2, VIntUnOp::Abs)?,
+        O::I64x2Neg => v_intun(lo, VShape::I64x2, VIntUnOp::Neg)?,
         // float lane arithmetic
         O::F32x4Add => v_fbin(lo, VShape::F32x4, VFloatBinOp::Add)?,
         O::F32x4Sub => v_fbin(lo, VShape::F32x4, VFloatBinOp::Sub)?,

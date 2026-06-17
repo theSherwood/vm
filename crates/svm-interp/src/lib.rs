@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
-    Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape, VShiftOp,
-    ValIdx, ValType, VarLoc, DEFAULT_RESERVED_LOG2,
+    Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VShape,
+    VShiftOp, ValIdx, ValType, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -5169,6 +5169,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_i32(get(vals, *amt)?)? as u32,
         )),
+        Inst::VIntUn { shape, op, a } => {
+            Value::V128(simd_vint_un(*shape, *op, as_v128(get(vals, *a)?)?))
+        }
         Inst::VFloatBin { shape, op, a, b } => Value::V128(simd_vfloat_bin(
             *shape,
             *op,
@@ -5428,6 +5431,22 @@ fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
             VShiftOp::ShrS => (lane_sext(x, bytes) >> sh) as u64,
         };
         lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// `<i-shape>.{abs,neg}`: per-lane two's-complement `|x|` / `0 - x` (both wrapping at the lane
+/// width — `abs(INT_MIN) == INT_MIN`, matching wasm/hardware).
+fn simd_vint_un(shape: VShape, op: VIntUnOp, a: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_sext(lane_read(&a, i, bytes), bytes);
+        let r = match op {
+            VIntUnOp::Abs => x.wrapping_abs(),
+            VIntUnOp::Neg => x.wrapping_neg(),
+        };
+        lane_write(&mut o, i, bytes, r as u64);
     }
     o
 }

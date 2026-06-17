@@ -689,3 +689,46 @@ fn diff_lane_shifts() {
         "i64 shr_s 4"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Integer lane abs/neg (VIntUn) — two's-complement, wrapping at INT_MIN.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn diff_lane_abs_neg() {
+    let i32x4 = |op: &str, x: i32| -> i32 {
+        let s = format!(
+            "func (i32) -> (i32) {{\nblock0(v0: i32):\n\
+             \x20 v1 = i32x4.splat v0\n  v2 = i32x4.{op} v1\n  v3 = i32x4.extract_lane 0 v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::I32(x)]) as i32
+    };
+    for x in [0, 5, -5, i32::MIN, i32::MAX, -1] {
+        assert_eq!(i32x4("abs", x), x.wrapping_abs(), "i32 abs {x}");
+        assert_eq!(i32x4("neg", x), x.wrapping_neg(), "i32 neg {x}");
+    }
+
+    // i8x16: low byte, observed via signed extract. `abs(-128)` wraps to -128 (two's complement).
+    let i8 = |op: &str, x: i32| -> i32 {
+        let s = format!(
+            "func (i32) -> (i32) {{\nblock0(v0: i32):\n\
+             \x20 v1 = i8x16.splat v0\n  v2 = i8x16.{op} v1\n  v3 = i8x16.extract_lane_s 0 v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::I32(x)]) as i32
+    };
+    assert_eq!(i8("abs", 0x80), -128, "i8 abs(-128) wraps");
+    assert_eq!(i8("abs", 0xFB), 5, "i8 abs(-5)");
+    assert_eq!(i8("neg", 5), -5, "i8 neg(5)");
+
+    // i64x2 (also probes i64x2.abs JIT legalization — diff1 runs both backends).
+    let i64 = |op: &str, x: i64| -> i64 {
+        let s = format!(
+            "func (i64) -> (i64) {{\nblock0(v0: i64):\n\
+             \x20 v1 = i64x2.splat v0\n  v2 = i64x2.{op} v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::I64(x)])
+    };
+    assert_eq!(i64("abs", -1000), 1000, "i64 abs(-1000)");
+    assert_eq!(i64("abs", i64::MIN), i64::MIN, "i64 abs(MIN) wraps");
+    assert_eq!(i64("neg", 7), -7, "i64 neg(7)");
+}

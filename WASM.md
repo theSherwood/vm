@@ -95,8 +95,8 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [ ] **SIMD remainder** (~115 of the v128 proposal): int abs/neg, sat add/sub, narrow/widen,
-  `all_true`/`bitmask`, dot product, etc. Mechanical breadth over the proven 5-step
+- [ ] **SIMD remainder** (~107 of the v128 proposal): sat add/sub, narrow/widen, `all_true`/`bitmask`,
+  dot product, `i8x16.popcnt`, etc. Mechanical breadth over the proven 5-step
   pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops have
   no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
   - [x] **Integer lane compares — DONE.** `i8x16`/`i16x8`/`i32x4` `{eq,ne,lt,gt,le,ge}` s/u + the
@@ -112,6 +112,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   - [x] **Lane shifts — DONE.** `i8x16`/`i16x8`/`i32x4`/`i64x2` `{shl,shr_s,shr_u}` by a scalar `i32`
     amount mod the lane width (`Inst::VShift`; vector `ishl`/`ushr`/`sshr` — Cranelift legalizes every
     shape incl. `i8x16`). Oracle = Rust's scalar shifts at the lane width.
+  - [x] **Integer abs/neg — DONE.** `i8x16`/`i16x8`/`i32x4`/`i64x2` `{abs,neg}` (`Inst::VIntUn`, the
+    unary int sibling of `VFloatUn`; vector `iabs`/`ineg`, all shapes legalize incl. `i64x2.abs`).
+    Two's-complement wrap (`abs(INT_MIN) == INT_MIN`); oracle = Rust's `wrapping_abs`/`wrapping_neg`.
 - [ ] **Narrow atomics** (`*.atomic.rmw8`/`rmw16`, `load8_u`/`16_u`/`32_u`, narrow store/cmpxchg). SVM
   atomics are 32/64-bit only (the §3b narrow-integer decision). Lower via a **32-bit CAS-loop emulation**
   in the transpiler (read containing word, splice the sub-word, cmpxchg) — *not* adding i8/i16 to the IR

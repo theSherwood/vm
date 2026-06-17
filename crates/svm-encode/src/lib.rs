@@ -17,8 +17,8 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering,
-    StoreOp, Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VShape,
-    VShiftOp, ValIdx, ValType,
+    StoreOp, Terminator, VBitBinOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
+    VShape, VShiftOp, ValIdx, ValType,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -162,6 +162,7 @@ mod op {
         pub const VINT_CMP: u8 = 0x0F; // shape, op, a, b
         pub const VFLOAT_CMP: u8 = 0x10; // shape, op, a, b
         pub const VSHIFT: u8 = 0x11; // shape, op, a (v128), amt (i32)
+        pub const VINT_UN: u8 = 0x12; // shape, op, a
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -660,6 +661,13 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(o.index());
             write_uleb(out, *a as u64);
         }
+        Inst::VIntUn { shape, op: o, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VINT_UN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
         Inst::VBitBin { op: o, a, b } => {
             out.push(op::SIMD);
             out.push(op::simd::VBIT_BIN);
@@ -801,6 +809,15 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             Inst::VFloatUn {
                 shape,
                 op: VFloatUnOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VINT_UN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VIntUn {
+                shape,
+                op: VIntUnOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
                 a: c.idx()?,
             }
         }
