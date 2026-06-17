@@ -1070,3 +1070,131 @@ fn dap_expands_struct_and_array_in_the_variables_pane() {
     assert_eq!(elems.get("[1]").map(|(v, _)| v.as_str()), Some("200"));
     assert_eq!(elems.get("[2]").map(|(v, _)| v.as_str()), Some("300"));
 }
+
+// A *non-C* debug section — Rust-flavored type names (`i32`, `Pair`) and a `.rs` file — over the
+// same IR. The consumer (interpreter + DAP) must inspect it correctly using only the structured
+// layout, never the type-name spelling: nothing here matches the `ty_width` C-name heuristic, so
+// if the width came from the name (`i32` → fallback 8) the scalar would read 8 bytes and report a
+// huge number. `n` and `pair` overlay the same 8 window bytes: i32 1000 at +0, i32 2000 at +4.
+const NON_C_DBG: &str = r#"
+memory 17
+func (i64) -> (i32) {
+block0(v0: i64):
+  v1 = i32.const 1000
+  i32.store v0 v1
+  v2 = i64.const 4
+  v3 = i64.add v0 v2
+  v4 = i32.const 2000
+  i32.store v3 v4
+  v5 = i32.const 0
+  return v5
+}
+
+debug.file 0 "x.rs"
+debug.loc 0 0 6 0 3 1
+debug.type 0 base "i32" signed 4
+debug.type 1 agg "Pair" 8
+debug.field 1 "a" 0 0
+debug.field 1 "b" 4 0
+debug.var 0 "n" win 0 "i32" 0
+debug.var 0 "pair" win 0 "Pair" 1
+"#;
+
+#[test]
+fn dap_inspects_a_non_c_frontend_by_structured_layout_only() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(NON_C_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(1024)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("/work/x.rs"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(3))])]),
+            ),
+        ]),
+    ));
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert!(event(&out, "stopped").is_some(), "stops at the breakpoint");
+
+    let out = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let fid = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        6,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(fid))]),
+    ));
+    let scope_ref = response(&out)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+
+    // The scalar `n` reads exactly 4 bytes (from `TypeDef.size`), not 8 (the `i32` name heuristic).
+    let out = s.handle(&req(
+        7,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(scope_ref))]),
+    ));
+    let locals = vars_map(&out);
+    assert_eq!(
+        locals.get("n").map(|(v, _)| v.as_str()),
+        Some("1000"),
+        "scalar width came from the structured type, not the C-name fallback"
+    );
+    let (_, pair_ref) = locals.get("pair").expect("local pair");
+
+    // The aggregate expands purely from its field offsets — type names are opaque to the consumer.
+    let out = s.handle(&req(
+        8,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(*pair_ref))]),
+    ));
+    let fields = vars_map(&out);
+    assert_eq!(fields.get("a").map(|(v, _)| v.as_str()), Some("1000"));
+    assert_eq!(fields.get("b").map(|(v, _)| v.as_str()), Some("2000"));
+
+    // `evaluate` of the bare scalar likewise uses the structured width.
+    let out = s.handle(&req(
+        9,
+        "evaluate",
+        Json::obj(vec![
+            ("expression", Json::s("n")),
+            ("frameId", Json::i(fid)),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("body").unwrap().get("result"),
+        Some(&Json::s("1000"))
+    );
+}

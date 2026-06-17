@@ -65,15 +65,13 @@ impl Session {
     /// `frame_idx` levels up the focused thread — the binding the expression evaluator and
     /// conditional breakpoints use. `None` if there is no such variable or its value isn't integral.
     fn resolve_var(&self, frame_idx: usize, func: u32, name: &str) -> Option<i64> {
-        let ty = self
-            .debug
-            .as_ref()?
+        let debug = self.debug.as_ref()?;
+        let var = debug
             .vars
             .iter()
-            .find(|v| v.func == func && v.name == name)?
-            .ty
-            .clone();
-        var_to_i64(&self.inspector.read_var(frame_idx, name, ty_width(&ty))?)
+            .find(|v| v.func == func && v.name == name)?;
+        let width = scalar_width(&debug.types, var.type_id, &var.ty);
+        var_to_i64(&self.inspector.read_var(frame_idx, name, width)?)
     }
 }
 
@@ -495,9 +493,10 @@ impl DapServer {
                     continue;
                 }
             }
-            // Otherwise a scalar: read and format its value (current behavior).
+            // Otherwise a scalar: read and format its value. Width from the structured type.
+            let width = scalar_width(self.types(), type_id, &ty);
             let session = self.session.as_ref()?;
-            if let Some(val) = session.inspector.read_var(frame_idx, &name, ty_width(&ty)) {
+            if let Some(val) = session.inspector.read_var(frame_idx, &name, width) {
                 out.push(var_json(&name, &fmt_var(&val), &ty, 0));
             }
         }
@@ -780,15 +779,15 @@ impl DapServer {
         };
 
         // A bare known variable: return its declared type + formatted value (richer than a raw i64).
-        let bare = session
-            .debug
-            .as_ref()
-            .and_then(|d| d.vars.iter().find(|v| v.func == func && v.name == expr));
-        if let Some(var) = bare {
-            if let Some(val) = session
-                .inspector
-                .read_var(frame_idx, &expr, ty_width(&var.ty))
-            {
+        let bare = session.debug.as_ref().and_then(|d| {
+            d.vars
+                .iter()
+                .find(|v| v.func == func && v.name == expr)
+                .map(|v| (d, v))
+        });
+        if let Some((debug, var)) = bare {
+            let width = scalar_width(&debug.types, var.type_id, &var.ty);
+            if let Some(val) = session.inspector.read_var(frame_idx, &expr, width) {
                 return (
                     true,
                     Json::obj(vec![
@@ -913,8 +912,22 @@ fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-/// Byte width to read for a window-resident variable, inferred from its C type name. Ignored for
-/// promoted (SSA) variables.
+/// The byte width to read for a window-resident scalar. Prefers the **structured type's** size
+/// (`TypeDef.size`) — frontend-neutral: any producer that emits a `TypeRef` gets the exact width,
+/// no type-name spelling involved. Falls back to the C-name heuristic ([`ty_width`]) only when the
+/// variable carries no structured type (or a zero-size one), e.g. hand-written / name-only debug
+/// info. Ignored for promoted (SSA) variables, whose value comes from the frame value table.
+fn scalar_width(types: &[TypeDef], type_id: Option<TypeId>, ty_name: &str) -> usize {
+    match type_id.map(|t| type_size(types, t)) {
+        Some(n) if n > 0 => n as usize,
+        _ => ty_width(ty_name),
+    }
+}
+
+/// Best-effort byte width inferred from a C type *name* — the **fallback** [`scalar_width`] uses
+/// only when a variable carries no structured `TypeRef`. The structured path is preferred and is
+/// frontend-neutral; this heuristic exists for name-only / legacy debug info and is the one piece
+/// of C-specific knowledge left in the consumer.
 fn ty_width(ty: &str) -> usize {
     match ty {
         "_Bool" | "bool" | "char" | "signed char" | "unsigned char" => 1,

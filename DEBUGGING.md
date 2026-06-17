@@ -593,6 +593,17 @@ and an `int[3]`, and the scripted conversation expands `p` → `x=11, y=22` and 
 memory (its current `resolve: Fn(&str)->i64` interface is name→int only); plus pointer-deref
 expansion and richer render names (the C tag, e.g. `"struct Point"`).
 
+**Built — frontend-neutrality cleanup (W4 slice 9).** Scalar read widths now come from the
+structured type's `size` (`scalar_width` → `TypeDef.size`), not the variable's *name*; the old
+C-name heuristic (`ty_width`) survives only as the fallback for name-only / legacy debug info with
+no `type_id`. That removes the one remaining C-specific assumption from the normal consumer path —
+an audit of `svm-interp` + `svm-dap` finds **zero** chibicc/frontend references and `ty_width` as
+the lone C-name site. A standing **neutrality test** (`dap.rs`,
+`dap_inspects_a_non_c_frontend_by_structured_layout_only`) inspects a debug section with *non-C*
+type names (`i32`, `Pair`, an `x.rs` file) and asserts the interpreter + DAP read and expand it
+correctly using only the structured layout — locking the consumer's frontend-agnosticism into CI
+(the D-DBG-7 waist holds: consumers depend only on the neutral `DebugInfo`, never on a producer).
+
 **Not yet (other W5 gaps).** Float expressions and short-circuit `&&`/`||` in `evaluate`;
 conditional breakpoints are honored by forward `continue` but not yet by `reverseContinue` (it
 stops at any breakpoint pc); and the JIT/DWARF tier for gdb/lldb on native code.
