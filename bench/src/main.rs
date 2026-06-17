@@ -782,15 +782,20 @@ fn native_calli(n: i64) -> i64 {
 }
 
 /// Native twin of `CACHE`: the same scattered store/load over a 1 MiB array (128 Ki `i64` slots).
-/// The buffer is **thread-local and reused** across calls (warm + faulted once), so native pays the
-/// same steady-state memory-latency cost the warm wasm lane does — not a per-call alloc/zero. The
-/// first call (the cross-check) sees a zeroed buffer, so its result matches the cold svm/wasm lanes.
+/// The buffer is a **fixed-size boxed array** (not a `Vec`): since the index is `& 131071`, it
+/// provably lands in `[0, 131072)` = the array's const length, so LLVM elides the bounds check —
+/// a true check-free ceiling matching the VMs' masked window access. It is **thread-local and
+/// reused** across calls (warm + faulted once), so native pays the same steady-state memory-latency
+/// cost the warm wasm lane does. The first call (the cross-check) sees a zeroed buffer, so its
+/// result matches the cold svm/wasm lanes.
 fn native_cache(n: i64) -> i64 {
     thread_local! {
-        static MEM: RefCell<Vec<i64>> = RefCell::new(vec![0i64; 131_072]);
+        // Heap-allocated via `into_boxed_slice().try_into()` to avoid a 1 MiB stack temporary.
+        static MEM: RefCell<Box<[i64; 131_072]>> =
+            RefCell::new(vec![0i64; 131_072].into_boxed_slice().try_into().unwrap());
     }
     MEM.with(|cell| {
-        let mem = &mut *cell.borrow_mut();
+        let mem = &mut **cell.borrow_mut();
         let mut acc: i64 = 0;
         for i in 0..n {
             let w = (i.wrapping_mul(2654435761) & 131071) as usize;
