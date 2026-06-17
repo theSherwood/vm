@@ -198,13 +198,20 @@ general (the interp has no spill words to match).
 2. Reserve `ref` `ValType` — cheap, uncontroversial, no runtime effect. *(done — opaque i64,
    threaded through ir/text/encode/jit/interp; round-trip + interp/JIT identity tests.)*
 3. `gc.roots` ambient range-filtered enumeration op. *(interp done — registry + caller-frame
-   walk, range-filter, dedup, buffer write; functional + round-trip tests. **JIT staged**: it
-   bails `Unsupported` for now, like `atomic.fence`, so the differential harness skips it.)*
-4. **Follow-up — `gc.roots` on the JIT** (the intricate, unsafe piece): new `svm-fiber`
-   accessors for a suspended fiber's `[sp, base)` extent; a baked thunk reading `CURRENT_RT`'s
-   `SharedFiberTable`; raw control-stack word scanning; and the resume-chain-ancestor /
-   physical-stack-identification logic for the collector's own live stack. Backend-uniform
-   *semantics* per §3.2 (not bit-identical candidate sets).
+   walk, range-filter, dedup, buffer write; functional + round-trip tests.)*
+4. **`gc.roots` on the JIT** (the intricate, unsafe piece). *(done — a conservative native-stack
+   walk.)* New `svm-fiber` accessors expose a parked fiber's `[ctx, top)` saved extent and a
+   running fiber's `[usable_low, top)` superset; a baked thunk reads `CURRENT_RT`'s
+   `SharedFiberTable` and scans raw control-stack words, filtering to `[heap_lo, heap_hi)` and
+   writing the deduped result to the (confined) guest buffer. **Spilled-only contract:** every
+   region scanned has its roots already flushed to memory — parked fibers (the suspend spilled
+   their registers), running resume-chain ancestors + the calling fiber (whole-stack superset),
+   and the root computation's OS-stack frames `[root_low, root_entry_sp)`. Roots a caller holds
+   *only* in unspilled callee-saved registers of its own frame are out of scope (a register-flush
+   shim is a future follow-up); the call boundary into the thunk forces the `gc.roots` caller to
+   spill, so its own roots are covered. Scanning a running fiber's / another vCPU's stack assumes
+   a stop-the-world safepoint, exactly as the interpreter scans the shared registry. Backend-uniform
+   *semantics* per §3.2 (a sound superset of the live roots, not bit-identical candidate sets).
 
 No world-stop primitive, no register capture, no stack-map work.
 

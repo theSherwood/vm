@@ -1325,7 +1325,12 @@ pub enum Inst {
     /// every candidate is an in-window word the guest's own heap already encodes, while
     /// out-of-window words (host return addresses, frame pointers, host pointers) are filtered
     /// *inside* the VM and never cross the boundary, so no host layout leaks (GC.md §3, §6).
-    /// Interp-only for now; the JIT bails `Unsupported` (like `atomic.fence`).
+    /// Implemented on **both backends**: the interpreter scans its reified `Value` frames; the JIT
+    /// conservatively walks the live native control stacks of its fibers (parked fibers' saved
+    /// extents `[ctx, top)`, the running resume chain, and the root computation's frames). The two
+    /// over-approximate differently (a sound superset of the live roots, not a matching set —
+    /// GC.md §3.2). Where the stack-switch substrate is absent the JIT bails `Unsupported` and the
+    /// interpreter covers it.
     GcRoots {
         heap_lo: ValIdx,
         heap_hi: ValIdx,

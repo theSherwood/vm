@@ -1281,6 +1281,7 @@ impl CompiledModule {
                 new_thunk: fiber_rt::fiber_new as *const () as i64,
                 resume_thunk: fiber_rt::fiber_resume as *const () as i64,
                 suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
+                roots_thunk: fiber_rt::gc_roots as *const () as i64,
             }
         } else {
             FiberEnv::null()
@@ -1759,10 +1760,17 @@ impl CompiledModule {
         // thread-local for the duration of the entry; spawned vCPUs publish their own.
         #[cfg(fiber_rt)]
         let prev_rt = {
+            // The OS-thread stack pointer in *this* (`run_inner`) frame — above the guarded guest
+            // call below and every guest root frame it pushes — is the high bound for `gc.roots`'
+            // scan of the root computation's frames. Captured via a local's address here (not a
+            // sub-call) so it provably dominates the guest's frames.
+            let entry_probe = 0u8;
+            let entry_sp = std::hint::black_box(&entry_probe as *const u8 as usize);
             let t = &mut *this;
-            t.fiber_rt
-                .as_mut()
-                .map(|rt| fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime))
+            t.fiber_rt.as_mut().map(|rt| {
+                rt.set_root_entry_sp(entry_sp);
+                fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime)
+            })
         };
 
         // Publish the live window's fault range so a mid-run `invoke_extra` (from a cap.call
@@ -2428,6 +2436,10 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::ThreadJoin { .. }
                 | Inst::MemoryWait { .. }
                 | Inst::MemoryNotify { .. }
+                // §GC `gc.roots`: scans the live fiber stacks via the fiber runtime — supported only
+                // where the stack-switch substrate exists (else it bails like the other fiber ops and
+                // the interpreter covers it).
+                | Inst::GcRoots { .. }
                     if cfg!(fiber_rt) => {}
                 _ => return Err(JitError::Unsupported("instruction")),
             }
@@ -2463,6 +2475,9 @@ struct FiberEnv {
     new_thunk: i64,
     resume_thunk: i64,
     suspend_thunk: i64,
+    /// The `gc.roots` thunk (conservative root enumeration over the live fiber stacks). `0` when the
+    /// module uses no fibers / `gc.roots`, or the target has no stack-switch support.
+    roots_thunk: i64,
 }
 
 impl FiberEnv {
@@ -2471,6 +2486,7 @@ impl FiberEnv {
             new_thunk: 0,
             resume_thunk: 0,
             suspend_thunk: 0,
+            roots_thunk: 0,
         }
     }
 }
@@ -2741,7 +2757,12 @@ fn module_uses_fibers(m: &IrModule) -> bool {
             blk.insts.iter().any(|i| {
                 matches!(
                     i,
-                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                    Inst::ContNew { .. }
+                        | Inst::ContResume { .. }
+                        | Inst::Suspend { .. }
+                        // `gc.roots` walks the fiber runtime's live stacks, so it needs the runtime
+                        // stood up even if the module never explicitly creates a fiber.
+                        | Inst::GcRoots { .. }
                 )
             })
         })
@@ -2997,6 +3018,44 @@ fn lower_block(
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.suspend_thunk);
             let call = b.ins().call_indirect(tref, thunk, &[v, trap_out]);
+            emit_trap_propagate(b, lower);
+            vals.push(b.inst_results(call)[0]);
+            ubs.resize(vals.len(), UB_TOP);
+            continue;
+        }
+        if let Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            buf,
+            cap,
+        } = inst
+        {
+            // gc_roots(heap_lo, heap_hi, buf, cap, mem_base, mask, mapped, sub_base, trap_out) -> i64
+            // count. The thunk walks the live fiber stacks (runtime via the thread-local), filters
+            // to `[heap_lo, heap_hi)`, and writes the first `cap` deduped words to guest `buf` —
+            // confining/bounds-checking it with the same `mask`/`mapped`/`sub_base` as `mask_addr`,
+            // so a forged/out-of-window buffer faults (propagated below).
+            let lo = get(&vals, *heap_lo)?;
+            let hi = get(&vals, *heap_hi)?;
+            let dst = get(&vals, *buf)?;
+            let cap_v = get(&vals, *cap)?;
+            let mem_base = b.use_var(lower.mem_var);
+            let maskv = b.ins().iconst(I64, lower.mask as i64);
+            let mappedv = b.ins().iconst(I64, lower.mapped as i64);
+            let subv = b.ins().iconst(I64, lower.sub_base as i64);
+            let trap_out = b.use_var(lower.trap_var);
+            let mut tsig = module.make_signature();
+            for _ in 0..9 {
+                tsig.params.push(AbiParam::new(I64));
+            }
+            tsig.returns.push(AbiParam::new(I64));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.fiber.roots_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[lo, hi, dst, cap_v, mem_base, maskv, mappedv, subv, trap_out],
+            );
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             ubs.resize(vals.len(), UB_TOP);

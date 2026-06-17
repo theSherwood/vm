@@ -3,9 +3,12 @@
 //! The op scans every fiber of the domain (the caller's own live frames, the parked root, and every
 //! registry fiber's frames) for the deduplicated set of candidate words that fall in the half-open
 //! guest range `[heap_lo, heap_hi)`, writes the first `cap` of them (ascending) into guest memory at
-//! `buf`, and returns the total found. It is **interp-only** for now (the JIT bails `Unsupported`,
-//! like `atomic.fence`); correctness here is *soundness* (every live in-range root is reported), not
-//! interp↔JIT equality — the two backends legitimately over-approximate differently (GC.md §3.2).
+//! `buf`, and returns the total found. **Both backends** implement it: the interpreter scans its
+//! reified `Value` frames; the JIT walks the live native control stacks of its fibers (parked fibers'
+//! saved extents + the running resume chain + the root computation's frames). Correctness here is
+//! *soundness* (every live in-range root is reported), not interp↔JIT equality — the two backends
+//! legitimately over-approximate differently (GC.md §3.2). Where the stack-switch substrate is absent
+//! the JIT still bails `Unsupported` and the interpreter covers it.
 
 use svm_encode::{decode_module, encode_module};
 use svm_interp::{run, Value};
@@ -132,10 +135,15 @@ fn gc_roots_scans_suspended_fiber_stack() {
     assert_eq!(run_i64s(src), vec![2, 0x7050]);
 }
 
-/// The JIT does not lower `gc.roots` yet (staged — GC.md build order): a module using it must
-/// compile to `Unsupported`, so the differential harness skips it rather than miscompiling.
+/// On targets **without** the stack-switch substrate, `gc.roots` (like the other fiber ops) bails
+/// `Unsupported` on the JIT — the interpreter covers it there.
+#[cfg(not(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+)))]
 #[test]
-fn gc_roots_is_unsupported_on_the_jit() {
+fn gc_roots_is_unsupported_on_the_jit_without_fibers() {
     use svm_jit::{compile_and_run, JitError};
     let src = "memory 16\n\
         func () -> (i64) {\n\
@@ -151,6 +159,75 @@ fn gc_roots_is_unsupported_on_the_jit() {
     verify_module(&m).expect("verify");
     assert!(
         matches!(compile_and_run(&m, 0, &[]), Err(JitError::Unsupported(_))),
-        "the JIT must bail Unsupported on gc.roots (staged, interp-only)"
+        "the JIT must bail Unsupported on gc.roots where stack switching is absent"
+    );
+}
+
+/// **`gc.roots` on the JIT** — a conservative native-stack walk over the live fiber stacks. The fiber
+/// receives the heap pointer `0x7050` as its `arg` and keeps it live across its `suspend` (returning
+/// it afterward), so the switch spills it onto the fiber's own control stack; the root then calls
+/// `gc.roots` over `[0x7000, 0x8000)` and the JIT's walker must recover that word from the suspended
+/// fiber's stack (the part the guest cannot reach itself). The pointer is a fiber *parameter* — which
+/// regalloc cannot rematerialize, so it is genuinely on the fiber's stack across the suspend — and the
+/// root passes it only as the (immediately-dead) `cont.resume` arg, never retaining it; so `0x7050`'s
+/// presence in the result proves the fiber-stack scan specifically, not the root's own frame.
+///
+/// Soundness framing (GC.md §3.2), not interp↔JIT equality: the JIT over-approximates from raw stack
+/// words, the interpreter from reified `Value` frames, so the exact candidate *set* legitimately
+/// differs. We assert the live fiber root is reported and that out-of-window words don't flood in.
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
+    use svm_jit::{compile_and_run, JitOutcome};
+    // range [0x7000, 0x8000); the root passes arg 0x7050 (28752) to the fiber, which keeps it live
+    // across its suspend and returns it; buf at offset 0, cap 8 slots.
+    let src = "memory 16\n\
+        func () -> (i64, i64, i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 28752\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.const 28672\n\
+        \x20 v7 = i64.const 32768\n\
+        \x20 v8 = i64.const 0\n\
+        \x20 v9 = i64.const 8\n\
+        \x20 v10 = gc.roots v6 v7 v8 v9\n\
+        \x20 v11 = i64.const 0\n\
+        \x20 v12 = i64.load v11\n\
+        \x20 v13 = i64.const 8\n\
+        \x20 v14 = i64.load v13\n\
+        \x20 return v10 v12 v14\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 v3 = suspend v2\n\
+        \x20 return v1\n\
+        }\n";
+    let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
+    verify_module(&m).expect("verify");
+    let slots = match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+        JitOutcome::Returned(s) => s,
+        other => panic!("jit did not return: {other:?}"),
+    };
+    let (count, buf0, buf1) = (slots[0], slots[1], slots[2]);
+    assert!(
+        count >= 1,
+        "the suspended fiber's root must be found (count {count})"
+    );
+    assert!(
+        count <= 2,
+        "only in-window words (0x7000/0x7050) should be reported, got count {count} \
+         (out-of-window stack words must be filtered)"
+    );
+    assert!(
+        buf0 == 0x7050 || buf1 == 0x7050,
+        "the fiber's live heap pointer 0x7050 must be enumerated; got buf=[{buf0:#x}, {buf1:#x}]"
     );
 }
