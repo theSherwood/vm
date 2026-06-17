@@ -119,9 +119,23 @@ These already prove old code reaching newly-loaded code; the dynlink work adds t
       + installs, and registers the name; later definitions reach earlier ones by name (`sq` → `quad =
       sq(sq(x))` → `quad_plus = quad(x)+sq(x)`). The symbol table **is** the dlopen registry — this is
       the **executable spec** for the guest-side `vm_dlopen`/`vm_dlsym` surface (runs today, no cap op).
-- [ ] **The capstone: a guest-side `dlopen`/`dlsym` loader** — see below. (C1 settled the design and
-      built the host half; the REPL demo specs the guest API; what remains is the *guest* delivering
-      the symbol table + driving it — the `compile_linked` cap op, then the C surface.)
+- [x] **C2 — guest-driven `compile_linked` (`Jit` cap op 5)** (`crates/svm/tests/dynlink_cap.rs`). The
+      guest delivers a unit-with-unresolved-imports **plus a symbol-table buffer** from its own window;
+      the host resolves by name, re-verifies, and compiles — all in-sandbox. Pieces:
+  - **Symbol-table wire form** (`svm-run`, LEB128): `count`, then per entry `name` + `kind`
+    (`0=Slot(uleb)`, `1=Cap(uleb type_id, uleb op)`). `encode_symbol_table` (producer) +
+    `decode_symbol_table` (fail-closed; values are guest-chosen by design — re-verify + the masked,
+    `type_id`-checked `call_indirect` carry safety). An empty buffer = the empty table (closed op 0).
+  - **The `JitValidator` seam** (`svm-interp`) widened to `fn(&[u8], Option<u8>, &[u8])` — the third
+    arg is the symtab bytes; resolve stays in `svm-run` (can't be a dep of `svm-interp`).
+    `Host::jit_compile_linked` is the core; `jit_compile` calls it with `&[]`.
+  - **Op 5 on both backends**: the interp generic `Binding::JitDomain` arm + the JIT `jit_native_op`,
+    differential-tested (interp == JIT) — incl. the full REPL flow guest-side (compile service →
+    install → build symtab from the install slot → `compile_linked` a unit importing it → invoke = 127).
+- [ ] **C3 — the `vm_dlopen`/`vm_dlsym`/`vm_dlclose` C surface** over op 5 + `Memory` (data placement /
+      `DataReloc`s) + a chibicc `__vm_jit_compile_linked` builtin → `(iface::JIT, 5)`; then evolve
+      `demos/jit/jit_repl.c` into the real linking REPL. (C1 host half + C2 cap op are done; this is the
+      guest-facing packaging — the last capstone step.)
 - [ ] GOT / late-binding variant (so *old* code calls *not-yet-loaded* code by name without recompiling
       the caller: the caller does `call_indirect (load GOT[i])`; the loader writes the resolved slot
       into the GOT at load — pure data writes via `Memory` + `memory.init`, reusing M2's reloc). The
@@ -170,21 +184,22 @@ data: `name → slot | address`) with `resolve_imports_with` (`Slot`/`Data`); pl
 `Jit.install` each export → slots; record new exports. `vm_dlsym` is a symbol-table lookup.
 
 **Design question — SETTLED (C1): host-assisted.** The import-resolution rewrite runs **host-side**:
-`Jit.compile` takes a guest-provided symbol table and resolves *before* verify (rewrite-then-verify),
-so the symbol table stays guest-controlled but a mis-link can't escape — it fails verification. This
-is simpler than a guest-side rewrite (no in-guest IR-rewriter to load/trust) and equally safe. The
-host primitive ([`svm_run::jit_resolve_and_validate`]) and the serializable import section (svm-encode
-v2) are done; what remains is the **guest delivery path**.
+`Jit.compile`/`compile_linked` takes a guest-provided symbol table and resolves *before* verify
+(rewrite-then-verify), so the symbol table stays guest-controlled but a mis-link can't escape — it
+fails verification. Simpler than a guest-side rewrite (no in-guest IR-rewriter to load/trust) and
+equally safe. **Done:** the host primitive (`jit_resolve_and_validate`), the serializable import
+section (svm-encode v2), **and the `compile_linked` cap op (op 5) on both backends (C2)** — a guest
+delivers the IR + symbol-table bytes and the host resolves+verifies+compiles.
 
-**Remaining for the capstone (next slices):**
-- A `Jit` cap op (e.g. op 4 `compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len)`) that reads the
-  blob **and** a guest symbol-table buffer from guest memory, calls `jit_resolve_and_validate` with a
-  resolver backed by that buffer, then `define_extra` — mirrored on the interpreter so the differential
-  holds. Needs a small wire format for the symbol table (`name → Slot | Cap`), decoded host-side.
-- The C surface (`vm_dlopen`/`vm_dlsym`/`vm_dlclose`) over that op + `Memory` (for data placement /
-  `DataReloc`s) — the guest builds the symbol table from its own loaded-unit registry.
-- (Later) data-symbol resolution — today C1 resolves *function* imports → slots; data imports still go
-  through M2's `DataReloc` at link time, not a runtime `vm_dlsym` address.
+**Remaining for the capstone — C3, the guest C surface:**
+- `vm_dlopen`/`vm_dlsym`/`vm_dlclose` over op 5 + `Memory` (for data placement / `DataReloc`s) — the
+  guest builds the symbol-table buffer (the C2 wire form) from its own loaded-unit registry. The op
+  is `cap.call 11 5 (i64,i64,i64,i64)->(i64)`; add a chibicc `__vm_jit_compile_linked` builtin →
+  `(iface::JIT, 5)` (next to the existing `__vm_jit_*` at `frontend/chibicc/codegen_ir.c` /
+  `svm-run/src/lib.rs` ~`"vm_jit_compile" => (iface::JIT, 0)`).
+- Then evolve `demos/jit/jit_repl.c` into the real **linking** REPL (today it JITs throwaway units).
+- (Later) data-symbol resolution — today resolution covers *function* imports → slots; data imports
+  still go through M2's `DataReloc` at link time, not a runtime `vm_dlsym` address.
 
 **Why SVM's `dlopen` is *better* than POSIX** (the selling point): the "shared object" is serialized
 SVM IR; `dlsym` returns an **unforgeable funcref slot** (§3c-checked at the call), not a raw pointer;

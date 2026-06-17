@@ -12,7 +12,7 @@
 
 use core::ffi::c_void;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
     iface, AsyncCounter, CapPageMap, GuestMem, Host, RegionBacking, StreamRole, Trap,
@@ -446,7 +446,57 @@ unsafe fn jit_native_op(
             };
             put(results, n_results, v, trap_out);
         }
-        // An op-index outside the Jit interface's defined ops (0..=4) is out of range, so it
+        5 => {
+            // compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len) -> code_handle | -errno
+            // (DYNLINK.md host-assisted dynamic linking). Like op 0, but the unit may carry
+            // unresolved §7 imports bound by name against the guest's symbol-table buffer before
+            // verify+compile. Any failure leaves nothing installed.
+            let Ok(domain) = host.resolve_jit_domain(handle) else {
+                return cap_fault(trap_out);
+            };
+            let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
+            if cm.is_null() {
+                return put(results, n_results, EINVAL, trap_out);
+            }
+            let ir_ptr = *args.first().unwrap_or(&0) as u64;
+            let ir_len = *args.get(1).unwrap_or(&0) as u64;
+            let st_ptr = *args.get(2).unwrap_or(&0) as u64;
+            let st_len = *args.get(3).unwrap_or(&0) as u64;
+            let Some(ir) = gm.as_mut().and_then(|m| m.read_bytes(ir_ptr, ir_len)) else {
+                return put(results, n_results, EFAULT, trap_out);
+            };
+            let Some(symtab) = gm.as_mut().and_then(|m| m.read_bytes(st_ptr, st_len)) else {
+                return put(results, n_results, EFAULT, trap_out);
+            };
+            let compiled = match host.jit_compile_linked(handle, &ir, &symtab) {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return put(results, n_results, e, trap_out),
+                Err(_) => return cap_fault(trap_out),
+            };
+            let funcs = host
+                .jit_unit_funcs(compiled.domain, compiled.unit)
+                .expect("unit was just stored");
+            // SAFETY: identical contract to op 0 — `cm` is the in-flight run's CompiledModule and
+            // the guest is suspended in this synchronous cap.call, so the re-entry aliases nothing.
+            match (*cm).define_extra(&funcs) {
+                Ok(defs) => {
+                    let d = defs[0];
+                    host.set_jit_unit_native(
+                        compiled.domain,
+                        compiled.unit,
+                        d.tramp as usize,
+                        d.code as usize,
+                        d.type_id,
+                    );
+                    put(results, n_results, compiled.handle as i64, trap_out);
+                }
+                Err(_) => {
+                    let _ = host.jit_release(compiled.handle);
+                    put(results, n_results, EINVAL, trap_out);
+                }
+            }
+        }
+        // An op-index outside the Jit interface's defined ops (0..=5) is out of range, so it
         // traps (`CapFault`) — matching the interpreter, where an unknown Jit op falls through
         // the explicit op arms to the generic dispatch and faults, and §3c (an out-of-range
         // op-index is a runtime trap, not a non-fatal errno). The defined ops above own their
@@ -464,11 +514,122 @@ unsafe fn jit_native_op(
 /// the interpreter and JIT `Host`s of a differential pair ([`grant_jit`] does), so both
 /// backends accept/reject identically. All failures are `-EINVAL` (guest-visible, non-fatal,
 /// nothing installed).
-pub fn jit_blob_validator(bytes: &[u8], mem_log2: Option<u8>) -> Result<Arc<[svm_ir::Func]>, i64> {
-    // A closed blob: no symbol table, so any declared import is unresolvable and the unit fails
-    // closed at resolution (an import-free unit — every prior caller — is unaffected). The
-    // resolving path ([`jit_resolve_and_validate`]) is the host-assisted dynamic-link entry.
-    jit_resolve_and_validate(bytes, mem_log2, |_| None)
+pub fn jit_blob_validator(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    symtab: &[u8],
+) -> Result<Arc<[svm_ir::Func]>, i64> {
+    const EINVAL: i64 = -22;
+    // Decode the guest's symbol table (empty for the closed `compile` op — every prior caller —
+    // which then resolves nothing, so a unit with imports fails closed). A malformed table is
+    // fail-closed, before any IR is touched.
+    let Some(table) = decode_symbol_table(symtab) else {
+        return Err(EINVAL);
+    };
+    jit_resolve_and_validate(bytes, mem_log2, |name| table.get(name).copied())
+}
+
+/// Decode the guest-provided **symbol table** for `compile_linked` (DYNLINK.md): a `name →
+/// [`Resolved`]` map the loader binds a unit's §7 imports against. Untrusted-input-facing and
+/// fail-closed (`None` on any malformation) — but note the *values* are guest-chosen by design:
+/// a forged slot confers no authority (the resolved `call_indirect` is masked + `type_id`-checked
+/// at the call, exactly like a slot the guest already controls in its own code), and the whole
+/// unit is re-verified after the rewrite. Wire form (LEB128, mirroring `svm-encode`):
+/// `count`, then per entry `name` (uleb len + UTF-8 bytes), a `kind` byte, and its payload —
+/// `0` = `Slot(uleb)`, `1` = `Cap(uleb type_id, uleb op)`.
+fn decode_symbol_table(bytes: &[u8]) -> Option<HashMap<String, Resolved>> {
+    // The closed-blob `compile` op passes no table at all (`&[]`); treat that as the empty table
+    // (it resolves nothing, so a unit with imports fails closed). `[0]` — an explicit count of 0 —
+    // is the same thing and is handled by the normal path below.
+    if bytes.is_empty() {
+        return Some(HashMap::new());
+    }
+    let mut c = SymCursor { bytes, pos: 0 };
+    let count = c.uleb()?;
+    let mut table = HashMap::new();
+    for _ in 0..count {
+        let name = c.string()?;
+        let resolved = match c.byte()? {
+            0 => Resolved::Slot(c.u32()?),
+            1 => Resolved::Cap(svm_ir::ResolvedCap {
+                type_id: c.u32()?,
+                op: c.u32()?,
+            }),
+            _ => return None, // unknown kind
+        };
+        table.insert(name, resolved);
+    }
+    // Trailing bytes mean a length mismatch — reject rather than silently ignore (fail-closed).
+    (c.pos == bytes.len()).then_some(table)
+}
+
+/// Encode a [`decode_symbol_table`] buffer — the producer side a guest loader (or a test) uses to
+/// build the symbol table it hands `compile_linked`. Only `Slot`/`Cap` bindings are deliverable:
+/// `Func` is the static-link (same-module-index) case, meaningless for a separately-compiled unit.
+pub fn encode_symbol_table(entries: &[(&str, Resolved)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    svm_encode::write_uleb(&mut out, entries.len() as u64);
+    for (name, r) in entries {
+        svm_encode::write_uleb(&mut out, name.len() as u64);
+        out.extend_from_slice(name.as_bytes());
+        match r {
+            Resolved::Slot(slot) => {
+                out.push(0);
+                svm_encode::write_uleb(&mut out, *slot as u64);
+            }
+            Resolved::Cap(cap) => {
+                out.push(1);
+                svm_encode::write_uleb(&mut out, cap.type_id as u64);
+                svm_encode::write_uleb(&mut out, cap.op as u64);
+            }
+            Resolved::Func(_) => panic!("Func is not deliverable via the guest symbol table"),
+        }
+    }
+    out
+}
+
+/// A minimal fail-closed cursor for [`decode_symbol_table`] (the IR codec's `Cursor` is private to
+/// `svm-encode`). Never panics/over-reads on arbitrary bytes.
+struct SymCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl SymCursor<'_> {
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.bytes.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    /// Unsigned LEB128 → `u64` (max 10 bytes; rejects overflow / truncation).
+    fn uleb(&mut self) -> Option<u64> {
+        let (mut result, mut shift) = (0u64, 0u32);
+        loop {
+            let b = self.byte()?;
+            if shift >= 64 || (shift == 63 && b & 0x7f > 1) {
+                return None;
+            }
+            result |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some(result);
+            }
+            shift += 7;
+        }
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        u32::try_from(self.uleb()?).ok()
+    }
+
+    /// Length-prefixed UTF-8 string; the length is bounded by the remaining bytes (anti-OOM).
+    fn string(&mut self) -> Option<String> {
+        let n = usize::try_from(self.uleb()?).ok()?;
+        let end = self.pos.checked_add(n)?;
+        let s = core::str::from_utf8(self.bytes.get(self.pos..end)?).ok()?;
+        self.pos = end;
+        Some(s.to_owned())
+    }
 }
 
 /// Host-assisted dynamic-link resolve — the host-assisted half of the DYNLINK.md capstone. Decode

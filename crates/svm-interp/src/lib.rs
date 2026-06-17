@@ -5978,7 +5978,13 @@ pub struct Host {
 /// ([`Func::uses_concurrency`]) — and the *same* function must be installed for the
 /// interpreter and JIT runs of a differential pair, so both backends accept/reject
 /// identically (`svm-run` provides the canonical one).
-pub type JitValidator = fn(&[u8], Option<u8>) -> Result<Arc<[Func]>, i64>;
+///
+/// The third argument is the **symbol-table bytes** for host-assisted dynamic linking
+/// (DYNLINK.md): a guest-provided `name → slot | capability` table the validator resolves the
+/// unit's §7 imports against *before* verify (rewrite-then-verify). It is empty (`&[]`) for the
+/// ordinary closed-blob `compile` op — an empty table resolves nothing, so a unit with imports
+/// fails closed — and carries the guest's table only for the `compile_linked` op.
+pub type JitValidator = fn(&[u8], Option<u8>, &[u8]) -> Result<Arc<[Func]>, i64>;
 
 /// A successful [`Host::jit_compile`]: the minted `CompiledCode` handle and the `(domain,
 /// unit)` indices the JIT embedder needs to compile the unit natively and register its
@@ -6497,6 +6503,21 @@ impl Host {
         handle: i32,
         bytes: &[u8],
     ) -> Result<Result<JitCompiled, i64>, Trap> {
+        // The closed-blob path: no symbol table, so a unit with §7 imports fails closed.
+        self.jit_compile_linked(handle, bytes, &[])
+    }
+
+    /// Like [`Self::jit_compile`], but the unit's §7 imports are resolved against the
+    /// guest-provided **symbol-table bytes** before verify — host-assisted dynamic linking
+    /// (DYNLINK.md). The `compile_linked` op routes here; `compile` routes here with an empty
+    /// table. The validator does the resolve-then-verify, so the symbol table stays
+    /// guest-controlled yet a mis-link can never escape (it fails re-verification, `-EINVAL`).
+    pub fn jit_compile_linked(
+        &mut self,
+        handle: i32,
+        bytes: &[u8],
+        symtab: &[u8],
+    ) -> Result<Result<JitCompiled, i64>, Trap> {
         let domain = self.resolve_jit_domain(handle)?;
         let Some(validate) = self.jit_validator else {
             return Ok(Err(EINVAL));
@@ -6508,7 +6529,7 @@ impl Host {
             return Ok(Err(ENOMEM));
         }
         d.bytes_left -= bytes.len() as u64;
-        let funcs = match validate(bytes, d.mem_log2) {
+        let funcs = match validate(bytes, d.mem_log2, symtab) {
             Ok(f) if !f.is_empty() => f,
             Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
             Err(e) => return Ok(Err(e)),
@@ -6912,6 +6933,30 @@ impl Host {
                     Ok(vec![match self.jit_release(ch) {
                         Ok(()) => 0,
                         Err(_) => EINVAL,
+                    }])
+                }
+                5 => {
+                    // compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len) -> code_handle |
+                    // -errno (DYNLINK.md host-assisted dynamic linking). Like op 0 `compile`, but
+                    // the unit may carry unresolved §7 imports, bound by name against the guest's
+                    // symbol-table buffer before verify. Both buffers are borrowed from the
+                    // window; with no window there is nothing to read (-EFAULT, like op 0).
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let ir_ptr = *args.first().unwrap_or(&0) as u64;
+                    let ir_len = *args.get(1).unwrap_or(&0) as u64;
+                    let st_ptr = *args.get(2).unwrap_or(&0) as u64;
+                    let st_len = *args.get(3).unwrap_or(&0) as u64;
+                    let Some(ir) = mem.read_bytes(ir_ptr, ir_len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let Some(symtab) = mem.read_bytes(st_ptr, st_len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    Ok(vec![match self.jit_compile_linked(handle, &ir, &symtab)? {
+                        Ok(c) => c.handle as i64,
+                        Err(e) => e,
                     }])
                 }
                 _ => Ok(vec![EINVAL]),
