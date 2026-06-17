@@ -54,6 +54,13 @@ struct Session {
 /// An event to emit after a response: `(event-name, body)`.
 type Event = (&'static str, Json);
 
+/// Which DAP step request is being served: `stepIn` (into calls), `next` (over calls), `stepOut`.
+enum StepKind {
+    In,
+    Over,
+    Out,
+}
+
 impl DapServer {
     pub fn new() -> DapServer {
         DapServer::default()
@@ -85,7 +92,9 @@ impl DapServer {
             "scopes" => self.on_scopes(args),
             "variables" => self.on_variables(args),
             "continue" => self.on_continue(),
-            "next" | "stepIn" | "stepOut" => self.on_step(),
+            "next" => self.on_step(StepKind::Over),
+            "stepIn" => self.on_step(StepKind::In),
+            "stepOut" => self.on_step(StepKind::Out),
             "stepBack" => self.on_step_back(),
             "reverseContinue" => self.on_reverse_continue(),
             "evaluate" => self.on_evaluate(args),
@@ -430,10 +439,14 @@ impl DapServer {
         )
     }
 
-    fn on_step(&mut self) -> (bool, Json, Vec<Event>) {
-        // Slice 1: all of next / stepIn / stepOut single-step one op (step-over/out are a refinement).
+    fn on_step(&mut self, kind: StepKind) -> (bool, Json, Vec<Event>) {
+        // `stepIn` descends into calls (single op); `next` runs over them; `stepOut` runs to return.
         let stop = match self.session.as_mut() {
-            Some(s) => s.inspector.step(),
+            Some(s) => match kind {
+                StepKind::In => s.inspector.step(),
+                StepKind::Over => s.inspector.step_over(),
+                StepKind::Out => s.inspector.step_out(),
+            },
             None => return (false, Json::Null, vec![]),
         };
         (true, Json::Null, self.stop_events(stop))

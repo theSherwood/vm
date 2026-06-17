@@ -686,3 +686,106 @@ fn captape_replays_host_fn_inputs_for_faithful_seek() {
         "host-fn outputs replay from the tape, not a (vanished) live closure"
     );
 }
+
+// --- W2 step-over / step-out: depth-aware stepping over the frame stack -------------------------
+
+// func 0 (caller) calls func 1 (helper) at block0/inst0, then has *more* ops (so there is somewhere
+// to land after stepping over the call); helper(x) = x + 10, so the caller returns helper(5)+1 = 16.
+const CALL_THEN_MORE: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = call 1 (v0)
+  v2 = i32.const 1
+  v3 = i32.add v1 v2
+  return v3
+}
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 10
+  v2 = i32.add v0 v1
+  return v2
+}
+"#;
+
+/// `step_over` runs a call to completion instead of descending — it lands at the next op in the
+/// *same* frame (the call is block0/inst0; the next op is inst1).
+#[test]
+fn step_over_runs_a_call_to_completion() {
+    let m = parse_module(CALL_THEN_MORE).expect("parse");
+    let mut insp = Inspector::attach(&m, 0, &[Value::I32(5)], 100_000);
+    let call_pc = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    }; // the `call 1 (v0)`
+    insp.set_breakpoint(call_pc);
+    assert!(matches!(insp.run_until_stop(), Stop::Break { .. }));
+    assert_eq!(
+        insp.backtrace().len(),
+        1,
+        "stopped in the caller, before the call"
+    );
+    assert_eq!(insp.backtrace()[0].pc, call_pc);
+
+    // Step over the call: the callee runs to completion; we stay in the caller (depth 1).
+    match insp.step_over() {
+        Stop::Break { pc, .. } => {
+            assert_eq!(insp.backtrace().len(), 1, "did not descend into the callee");
+            assert_eq!(
+                pc,
+                IrPc {
+                    module: 0,
+                    func: 0,
+                    block: 0,
+                    inst: 1
+                },
+                "next op in the caller"
+            );
+        }
+        other => panic!("expected a step stop, got {other:?}"),
+    }
+    // And the call's effect is in place: helper(5) + 1 = 16.
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(16)]);
+}
+
+/// `step` descends into a call; `step_out` then runs the callee to its return, landing back in the
+/// caller at the op after the call.
+#[test]
+fn step_in_then_step_out_of_a_call() {
+    let m = parse_module(CALL_THEN_MORE).expect("parse");
+    let mut insp = Inspector::attach(&m, 0, &[Value::I32(5)], 100_000);
+    let call_pc = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    };
+    insp.set_breakpoint(call_pc);
+    assert!(matches!(insp.run_until_stop(), Stop::Break { .. }));
+
+    // Step in: descend into the callee (func 1), depth 2.
+    match insp.step() {
+        Stop::Break { pc, .. } => {
+            assert_eq!(pc.func, 1, "stepped into the callee");
+            assert_eq!(insp.backtrace().len(), 2, "a new frame was pushed");
+        }
+        other => panic!("expected to step into the callee, got {other:?}"),
+    }
+    // Step out: run the callee to its return, back in the caller (depth 1) past the call.
+    match insp.step_out() {
+        Stop::Break { pc, .. } => {
+            assert_eq!(insp.backtrace().len(), 1, "returned to the caller");
+            assert_eq!(
+                pc,
+                IrPc {
+                    module: 0,
+                    func: 0,
+                    block: 0,
+                    inst: 1
+                }
+            );
+        }
+        other => panic!("expected to step out to the caller, got {other:?}"),
+    }
+}

@@ -535,9 +535,19 @@ hover / REPL expression — slice 1 a bare source-variable name in the given fra
 coordinate by mode — the global scheduler `turn` when multithreaded, the op `clock` single-threaded —
 so reverse debugging works for concurrent guests too. Tests (`dap.rs`): `evaluate("i")`/`("acc")`
 return `3`/`0` at the loop breakpoint (`"nope"` fails); and a two-worker run's `reverseContinue`
-walks back through the per-thread breakpoint hits, then to the start. *Not yet:* richer `evaluate`
-expressions (`a.b`, `arr[i]`, arithmetic), proper step-over/step-out (vs single-op), and the
-JIT/DWARF tier for gdb/lldb on native code.
+walks back through the per-thread breakpoint hits, then to the start.
+
+**Built — slice 5 (step-over / step-out).** Stepping is now call-depth-aware via the reified frame
+stack (W2). A new `Inspector::step_over` runs any call the current op makes to completion instead of
+descending (stops at the next op in the *same* frame), and `step_out` runs until the current
+function returns (stops at the op in the caller it returned to). Both are one depth-aware primitive:
+the per-op seam stops at the first op (after stepping off the current one) whose call depth is `<=`
+a target — current depth for over, current − 1 for out — read from `frames.len()`. DAP `next`/
+`stepOut` map to these (and `stepIn` stays single-op = descend). Tests: at the Inspector level
+(`debug.rs`) `step_over` stays in the caller and runs the callee, `step`+`step_out` descend then
+return; at the DAP level (`dap.rs`) `next` on a call line lands on the next source line in one frame
+(no descent). *Not yet:* richer `evaluate` expressions (`a.b`, `arr[i]`, arithmetic), source-line
+(vs op) step granularity, and the JIT/DWARF tier for gdb/lldb on native code.
 
 ---
 

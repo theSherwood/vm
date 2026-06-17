@@ -635,3 +635,94 @@ fn dap_multithreaded_reverse_continue_walks_back_through_hits() {
         "no earlier hit → rewinds to the start"
     );
 }
+
+// Caller (func 0) calls helper (func 1) then continues; the call is m.c:5 and the next line m.c:6.
+const CALL_DBG: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = call 1 (v0)
+  v2 = i32.const 1
+  v3 = i32.add v1 v2
+  return v3
+}
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 10
+  v2 = i32.add v0 v1
+  return v2
+}
+
+debug.file 0 "m.c"
+debug.loc 0 0 0 0 5 1
+debug.loc 0 0 1 0 6 1
+"#;
+
+/// DAP `next` steps over a call: from the call line it lands on the *next* line in the same frame,
+/// without descending into the callee.
+#[test]
+fn dap_next_steps_over_a_call() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(CALL_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(5)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("m.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(5))])]),
+            ),
+        ]),
+    ));
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+
+    // Stopped at the call line (m.c:5), one frame.
+    let out = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let frames = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap();
+    assert_eq!(frames.as_array().unwrap().len(), 1);
+    assert_eq!(frames.as_array().unwrap()[0].get("line"), Some(&Json::i(5)));
+
+    // `next` runs the call to completion and lands on m.c:6 — still one frame (did not step in).
+    let out = s.handle(&req(6, "next", Json::obj(vec![("threadId", Json::i(1))])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("step"))
+    );
+    let out = s.handle(&req(
+        7,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let frames = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap();
+    assert_eq!(
+        frames.as_array().unwrap().len(),
+        1,
+        "stepped over the call, did not descend"
+    );
+    assert_eq!(frames.as_array().unwrap()[0].get("line"), Some(&Json::i(6)));
+}

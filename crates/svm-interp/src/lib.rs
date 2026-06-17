@@ -265,6 +265,11 @@ struct DebugCtx {
     resume_clock: u64,
     /// When `Some(t)`, stop once `clock` reaches `t` (a pending single-step).
     step_target: Option<u64>,
+    /// Depth-aware stepping (DEBUGGING.md W2): when `Some(d)`, stop at the next op (after stepping
+    /// off the current one) whose call depth is `<= d`. `d` = current depth runs over (skips into and
+    /// out of) any call the current op makes (step-**over**); `d` = current depth − 1 runs until this
+    /// function returns (step-**out**).
+    step_max_depth: Option<usize>,
     /// Time-travel seek (DEBUGGING.md W1): when `Some(t)`, fast-forward this fresh re-execution to
     /// logical time `t` — pausing exactly at `clock == t` and **ignoring** breakpoints/watchpoints
     /// along the way (we are replaying to a known coordinate, not hunting for stops).
@@ -278,6 +283,7 @@ impl DebugCtx {
             clock: 0,
             resume_clock: u64::MAX, // nothing stopped yet, so the first op may itself break
             step_target: None,
+            step_max_depth: None,
             seek_target: None,
         }
     }
@@ -295,7 +301,13 @@ impl DebugCtx {
     /// the op itself (for the `cap.call` boundary stop). `Some(reason)` pauses (the op has not run,
     /// `clock` unchanged, so the continuation re-enters here); `None` charges one tick of logical
     /// time and lets the op run. The `resume_clock` guard makes resume step off the current op.
-    fn before_op(&mut self, pc: IrPc, inst: &Inst, access: MemAccess) -> Option<StopReason> {
+    fn before_op(
+        &mut self,
+        pc: IrPc,
+        inst: &Inst,
+        access: MemAccess,
+        depth: usize,
+    ) -> Option<StopReason> {
         // Time-travel seek (W1): replay straight to logical time `t`, past any breakpoints.
         if let Some(t) = self.seek_target {
             if self.clock >= t {
@@ -321,6 +333,10 @@ impl DebugCtx {
                 Some(r)
             } else if self.step_target == Some(self.clock) {
                 Some(StopReason::Step)
+            } else if matches!(self.step_max_depth, Some(d) if depth <= d) {
+                // Step-over/out: we have stepped off the original op and the call depth is back at
+                // (or below) the target, so a call we ran over has returned.
+                Some(StopReason::Step)
             } else {
                 None
             }
@@ -329,6 +345,7 @@ impl DebugCtx {
             Some(r) => {
                 self.resume_clock = self.clock;
                 self.step_target = None;
+                self.step_max_depth = None;
                 Some(r)
             }
             None => {
@@ -1121,6 +1138,33 @@ impl Inspector {
         }
         let d = self.dbg();
         d.step_target = Some(d.clock + 1);
+        self.run_until_stop()
+    }
+
+    /// **Step over** (DEBUGGING.md W2): execute the current op and stop at the next one in this
+    /// frame — running any call it makes to completion rather than descending into it. (Op-level: a
+    /// non-call advances one op, like [`step`](Inspector::step); a `call` runs the whole callee.)
+    pub fn step_over(&mut self) -> Stop {
+        self.step_to_depth(|depth| depth)
+    }
+
+    /// **Step out** (DEBUGGING.md W2): run until the current function returns, stopping at the op in
+    /// the caller that the call returned to. From the outermost frame this runs to completion.
+    pub fn step_out(&mut self) -> Stop {
+        self.step_to_depth(|depth| depth.saturating_sub(1))
+    }
+
+    /// Shared driver for step-over/out: step off the current op, then stop at the next op whose call
+    /// depth is `<= target(current_depth)`.
+    fn step_to_depth(&mut self, target: impl Fn(usize) -> usize) -> Stop {
+        if self.finished.is_some() || self.cur().is_none() {
+            return self.run_until_stop();
+        }
+        let depth = self.cur().map(|v| v.frames.len()).unwrap_or(0);
+        let d = self.dbg();
+        d.resume_clock = d.clock; // step off the current op even on the very first step
+        d.step_max_depth = Some(target(depth));
+        d.step_target = None;
         self.run_until_stop()
     }
 
@@ -3833,7 +3877,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 } else {
                     MemAccess::None
                 };
-                if let Some(reason) = dbg.before_op(pc, inst, access) {
+                if let Some(reason) = dbg.before_op(pc, inst, access, frames.len()) {
                     return Ok(Inner::Pause(reason, pc));
                 }
             }
