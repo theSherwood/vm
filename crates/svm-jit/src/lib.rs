@@ -1965,17 +1965,15 @@ impl CompiledModule {
         // every still-parked fiber into its own region before the window is snapshotted, so the
         // artifact captures their continuations. CURRENT_RT is still the root runtime here. A
         // flattening fiber touches only the committed reserve, so it's sound outside the guard.
-        // Single-vCPU (Phase 3.2 for multi-vCPU). Skipped on a fault or a non-freeze run.
+        // Single-vCPU (Phase 3.2 for multi-vCPU). Skipped on a fault or a non-freeze run. The
+        // residue (incl. any fiber unwound mid-resume-chain during the root run, slice 3.2) is
+        // accumulated in the runtime by each fiber's `Complete` arm; drain it after driving.
         #[cfg(fiber_rt)]
         if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
-            let residue = (*this).fiber_rt.as_mut().map(|rt| {
-                fiber_rt::freeze_drive(
-                    &mut **rt as *mut fiber_rt::FiberRuntime,
-                    trap_cell.as_ptr() as u64,
-                )
-            });
-            if let Some(residue) = residue {
-                (*this).frozen_out = residue; // read back by the durable entry point
+            if let Some(rt) = (*this).fiber_rt.as_mut() {
+                let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
+                fiber_rt::freeze_drive(rt, trap_cell.as_ptr() as u64);
+                (*this).frozen_out = fiber_rt::take_frozen(rt); // read back by the durable entry
             }
         }
 
