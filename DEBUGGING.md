@@ -53,7 +53,8 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
-| DWARF emission + DAP server | **Missing** | — |
+| DAP server (interpreter-backed: source breakpoints + **conditions**, frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover) | **Built — W5 slices 1–6** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
+| DWARF emission (gdb/lldb on JIT native code) | **Missing** | needs the S6 Cranelift debug layer |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
 
@@ -488,6 +489,91 @@ the source-level loop on the interpreter.
 
 **Acceptance.** Set a breakpoint in VS Code on a `.c` line; it binds; hitting it shows the
 source frame and inspectable locals.
+
+**Built — slice 1 (interpreter-backed DAP server).** A new `svm-dap` crate translates Debug Adapter
+Protocol requests onto the `Inspector` — so the **interpreter is the stepping engine** and source
+mapping comes straight from the §6/W4 debug info, with **no DWARF and no JIT** (the doc's recommended
+first tier; optimized-code inspection is sidestepped entirely). `DapServer::handle(request) ->
+[messages]` covers the acceptance loop: `initialize` (+ `initialized` event), `launch` (parse IR,
+attach the `Inspector`), `setBreakpoints` (source line → IR pc via a reverse `(file,line)→pc` index
+over `debug.loc`, snapping forward to the next line with code), `configurationDone`,
+`threads`/`stackTrace`/`scopes`/`variables` (frames carry the source location; locals enumerate
+`debug.var` and resolve through `read_var`), `continue`/`next`/`stepIn`/`stepOut`, `disconnect`, and
+the `stopped`/`terminated` events. JSON is hand-rolled (no serde — matching the workspace's
+dependency ethos); `run_stdio` is the `Content-Length`-framed wire loop a real client (VS Code)
+connects to, and the `svm-dap` binary is the server. Test (`dap.rs`): a scripted conversation sets a
+breakpoint on `sum.c:7`, hits it, and reads back the source frame plus `i = 3` / `acc = 0` — the
+acceptance, no editor needed.
+
+**Built — slice 2 (reverse debugging over DAP).** The W5 server now exposes the W1 time-travel
+engine to the editor: `initialize` advertises `supportsStepBack`, so VS Code enables its reverse
+controls. `stepBack` calls `Inspector::step_back` (reverse single-step); `reverseContinue` runs
+*backward* to the previous breakpoint — found by re-executing from time 0, remembering the last stop
+strictly before the current op `clock`, and `seek`ing there (else rewinding to the start). Test
+(`dap.rs`): a loop-body breakpoint hits three times (`i` = 3, 2, 1) and `reverseContinue` walks
+backward through the hits — `i=1,acc=5` → `i=2,acc=3` → `i=3,acc=0` → entry — with the locals
+correct at each, then `stepBack` reverse-single-steps. Reverse debugging in an editor is a genuine
+differentiator (few debuggers implement DAP's `stepBack`/`reverseContinue`), here free from the
+deterministic interpreter + `seek`.
+
+**Built — slice 3 (multithreaded DAP).** A scheduled `launch` (arg `schedule: [tids]` for a fixed
+interleaving / witness, `schedule: []` for the deterministic default, or `seed: N` to fuzz) drives a
+`thread.spawn` guest, and the editor sees every vCPU as a **DAP thread** (`threads` → `Inspector::
+threads`, DAP id = vCPU id + 1). The `stopped` event names **which thread** hit the breakpoint
+(`stopped_task`), `stackTrace(threadId)` focuses that thread (`select_task`) and reports *its* stack,
+and `variables` reads the right thread's frame — DAP frame references encode `(thread, frame)` so a
+client switching threads never reads the wrong one. Test (`dap.rs`): two workers over a shared
+counter, a source breakpoint at `worker.c:4` fires in one worker (the `stopped` event names it, not
+the root), `threads` lists root + workers, the worker's `stackTrace`/`variables` show `worker.c:4`
+with `delta = 1`, and `continue` stops in the *other* worker. So the headline multithread debugger —
+per-thread breakpoints, thread selection, deterministic interleavings — is now usable from an editor.
+
+**Built — slice 4 (`evaluate` + multithreaded reverse-continue).** `evaluate` resolves a watch /
+hover / REPL expression — slice 1 a bare source-variable name in the given frame, read through
+`read_var` (advertised via `supportsEvaluateForHovers`; an unknown name fails so the client shows
+"not available"); richer expressions are a follow-up. And `reverseContinue` now picks its time-travel
+coordinate by mode — the global scheduler `turn` when multithreaded, the op `clock` single-threaded —
+so reverse debugging works for concurrent guests too. Tests (`dap.rs`): `evaluate("i")`/`("acc")`
+return `3`/`0` at the loop breakpoint (`"nope"` fails); and a two-worker run's `reverseContinue`
+walks back through the per-thread breakpoint hits, then to the start.
+
+**Built — slice 5 (step-over / step-out).** Stepping is now call-depth-aware via the reified frame
+stack (W2). A new `Inspector::step_over` runs any call the current op makes to completion instead of
+descending (stops at the next op in the *same* frame), and `step_out` runs until the current
+function returns (stops at the op in the caller it returned to). Both are one depth-aware primitive:
+the per-op seam stops at the first op (after stepping off the current one) whose call depth is `<=`
+a target — current depth for over, current − 1 for out — read from `frames.len()`. DAP `next`/
+`stepOut` map to these (and `stepIn` stays single-op = descend). Tests: at the Inspector level
+(`debug.rs`) `step_over` stays in the caller and runs the callee, `step`+`step_out` descend then
+return; at the DAP level (`dap.rs`) `next` on a call line lands on the next source line in one frame
+(no descent).
+
+**Built — slice 6 (source-line stepping + expression evaluator + conditional breakpoints).** Two
+editor-facing refinements, both pure DAP/interpreter-side (no ABI change):
+- **Source-line stepping.** Op-step stays the interpreter primitive (and the behavior with no debug
+  info — IR-level debugging); but with debug info the DAP `next`/`stepIn` now op-step *until the
+  frame's source line changes*, so the editor advances a line at a time rather than stuttering
+  op-by-op across one C line. (`stepOut` already lands in the caller.) A safety op-cap guards against
+  unmapped code.
+- **Scalar expression evaluator** (`svm-dap::expr`, ~one screen, hand-rolled): integer literals,
+  frame variables, `()`, unary `- ! ~`, and the C arithmetic/bitwise/comparison/logical binops with
+  C precedence; values are `i64`. It powers a richer `evaluate` (watch / hover / REPL — a bare
+  variable keeps its typed form, anything else evaluates to an integer) **and conditional
+  breakpoints**: DAP `setBreakpoints` `condition`s are stored per pc and `continue`/`configurationDone`
+  transparently skip a breakpoint whose condition is zero (`supportsConditionalBreakpoints`).
+  Tests (`dap.rs`): one `next` advances a two-op source line to the next line; a `i == 1` conditional
+  breakpoint skips the i=3/i=2 loop iterations and stops at i=1; `evaluate("i * 2 + acc")` = 6,
+  `"i / acc"` (acc=0) fails cleanly. Evaluator unit tests in `expr`.
+
+**Not yet — structured `TypeRef` (W4), the gate for aggregate inspection.** Member/index access
+(`a.b`, `arr[i]`) in `evaluate` **and** expanding a struct/array in the Variables pane (nested
+`variablesReference` children) both need **field offsets / element strides**, which the debug-info
+ABI doesn't carry — today `debug.var` records a type *name string* (`"int"`), not a structured
+`TypeRef`. So the next aggregate-inspection step is a **W4 debug-info ABI enrichment** (structured
+types in `svm-ir` + the chibicc emitter), after which both fall out; the expression *parser* is
+already in place. Also still open: float expressions and short-circuit `&&`/`||`; conditional
+breakpoints are honored by forward `continue` but not yet by `reverseContinue` (it stops at any
+breakpoint pc); and the JIT/DWARF tier for gdb/lldb on native code.
 
 ---
 

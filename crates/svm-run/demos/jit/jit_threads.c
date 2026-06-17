@@ -103,12 +103,13 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 'V');
   eb(&e, 'M');
   eb(&e, 0);
-  eb(&e, 1);
+  eb(&e, 2); // format v2 (adds the §7 import section below)
   // Memory descriptor: present, size_log2 16 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
   eb(&e, 1);
   eb(&e, 16);
   eb(&e, 0); // no data segments
+  eb(&e, 0); // no imports — self-contained unit (v2 import section)
   eb(&e, 1); // one function
   // params (a, b) : i64, i64 ; results : i64 (type tag 1 = i64).
   eb(&e, 2);

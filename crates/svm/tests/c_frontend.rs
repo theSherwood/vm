@@ -2258,6 +2258,61 @@ fn c_guest_jit_demo() {
     );
 }
 
+/// Guest-side **dynamic linking** in C (DESIGN.md §22, `demos/jit/jit_link.c`): a guest emits two
+/// units — a self-contained `service` it installs, and a `client` that references the service **by
+/// name** (an unresolved import `F`) — builds a symbol table binding `"F"` to the install slot, and
+/// `__vm_jit_compile_linked`s the client against it. The host resolves the import by name and
+/// re-verifies, so the client reaches the installed service through the table: `client(5,2) = 127`.
+/// This is `vm_dlopen`/`vm_dlsym` done in guest C. `run_c_full` enforces interp == JIT.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_link_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_link.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.ends_with("client(5, 2) = 127  [linked by name: service(5,2)+100]\n"),
+        "the guest-linked client must reach the installed service by name on both backends:\n{out}"
+    );
+}
+
+/// The guest-side **`vm_dlopen` loader** in C (DESIGN.md §22, `demos/jit/jit_dlopen.c`): the
+/// ergonomic `vm_dlopen`/`vm_dlsym`/`vm_dlclose` library (`<vm_dl.h>` — a name→slot registry over the
+/// `Jit` cap) used to build functions that compose **by name**. The guest loads `add` and `mul`, then
+/// `poly = add(mul(a,a), b)` which imports both by name; `poly(5,2)=27`, `poly(3,4)=13`; then
+/// `vm_dlclose("poly")` unloads it. The guest-C twin of `dynlink_repl.rs`. `run_c_full` enforces
+/// interp == JIT.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_dlopen_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_dlopen.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.contains("poly(5, 2) = 27\n")
+            && out.contains("poly(3, 4) = 13\n")
+            && out.ends_with("linked by name via vm_dlopen/vm_dlsym/vm_dlclose\n"),
+        "the guest vm_dlopen loader must compose symbols by name on both backends:\n{out}"
+    );
+}
+
+/// **Hot reload** over the guest `vm_dlopen` loader (DESIGN.md §22, `demos/jit/jit_hotreload.c`):
+/// redefining a symbol gives it a new slot, but units already linked to the old one keep their
+/// binding. The guest loads `f` (a+100), then `g` calling `f` by name, hot-reloads `f` (a+200), then
+/// loads `h` calling `f` by name: `g(5)=105` (pinned to the old `f`), `h(5)=205` (sees the new one).
+/// Proves the slot model's live-patch behaviour. `run_c_full` enforces interp == JIT.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_hotreload_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_hotreload.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.contains("g(5) = 105") && out.contains("h(5) = 205"),
+        "an old caller must keep its binding across a hot reload, on both backends:\n{out}"
+    );
+}
+
 /// The **threaded** guest-driven JIT capstone (`demos/jit/jit_threads.c`, DESIGN.md §22), run as a
 /// full interp≡JIT **differential**: `NWORKERS` guest threads each emit a distinct unit, `Jit.compile`
 /// it **concurrently**, and invoke the native code, checking it against a C reference. Because the

@@ -1,13 +1,16 @@
 # Durable Domains — Snapshot / Restore / Clone
 
-> **Status: Phase 1 + snapshot codec landed; Phases 2–4 ahead.** This file is the
-> single source of truth for the *design and implementation status* of durable
-> domains. Built so far: the `svm-durable` IR→IR transform (arbitrary single-vCPU
-> CFGs), the `svm-interp` handle-table durability primitives (§12.5), and the
-> `svm-snapshot` artifact codec (§12 container + window image + handle table + the R5
-> identity gate). The master design is `DESIGN.md` (D-notes, §-sections); the project
-> status/pickup doc is `HANDOFF.md`. Keep all three in step — if code and a doc
-> disagree, fix one of them in the same change (per `AGENTS.md`).
+> **Status: Phases 1–2 landed + Phase 3.1 (single-fiber freeze/thaw) complete on the
+> interpreter; 3.2/3.3 ahead.** This file is the single source of truth for the *design and
+> implementation status* of durable domains. Built so far: the `svm-durable` IR→IR transform
+> (arbitrary single-vCPU CFGs **+ the §12 fiber control ops**), the `svm-interp` handle-table
+> durability primitives (§12.5) **+ the per-fiber shadow-SP swap / freeze driver (D-fiber-cont
+> option A)**, the `svm-snapshot` artifact codec (§12 container + window image + handle table +
+> the R5 identity gate **+ Section-2 fiber residue**), and **per-page protection capture +
+> re-establish on both backends** (Phase 2). A single-fiber domain round-trips
+> `freeze → serialize → restore → thaw` end-to-end. The master design is `DESIGN.md` (D-notes,
+> §-sections); the project status/pickup doc is `HANDOFF.md`. Keep all three in step — if code and
+> a doc disagree, fix one of them in the same change (per `AGENTS.md`).
 >
 > Proposed decision: **D60** (D59 is currently the last). See bottom of file.
 
@@ -312,19 +315,20 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     digest, sparse zero-eliding window image, Section-3 handle table — now give a real
     `freeze → bytes → restore → thaw` on the interpreter (`crates/svm-snapshot`), with the
     §12.6 canonical + identity-gated invariants tested.
-- **[~] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT (the
-  `durable_jit` cross-backend property already holds); **artifact codec done** (above).
-  Remaining: `svm-mem` page+prot snapshot/**restore** for protected/large windows (the
-  codec's flat zero-eliding image covers the Phase-1 flat window), and routing the codec
-  through the cross-backend §7 property. Risk: low (oracle does the work); Windows
-  placeholder semantics the known annoyance. *(escape-TCB touch — restore.)*
-- **[ ] Phase 3 — STW + multi-vCPU + fiber freeze/thaw.** Cooperative quiesce, drain
-  residue, freeze/thaw choreography against the D57 migratable-fiber ownership
-  protocol. **Highest risk** — concurrency seam (loom-check, like the futex glue).
-  **Design in §12.8**; gated on the open **D-fiber-cont** decision (how a suspended
-  fiber's continuation becomes durable — recommend option A). Sub-phases: 3.1 one
-  interp fiber, 3.2 multi-vCPU + per-context layout, 3.3 JIT parity. (Dispatch table is
-  a no-op — §12.4.) Single-vCPU durability is a coherent MVP without this.
+- **[x] Phase 2 — JIT parity + real memory snapshot.** Same instrumented IR on JIT (the
+  `durable_jit` cross-backend property holds); **artifact codec done**; **per-page protection
+  capture + re-establish landed on both backends, both directions** (§12.6 / `durable_prot_capture.rs`).
+  The page-protection story is complete; a `Backed` (§13 shared-region) page stays out of scope
+  (D-region). *(escape-TCB touch — restore.)*
+- **[~] Phase 3 — STW + multi-vCPU + fiber freeze/thaw.** Cooperative quiesce, drain
+  residue, freeze/thaw choreography against the D57 migratable-fiber ownership protocol.
+  **Highest risk** — concurrency seam (loom-check, like the futex glue). **Design in §12.8**;
+  **D-fiber-cont RESOLVED (option A).** **Sub-phase 3.1 (one interp fiber) is complete** —
+  per-fiber shadow regions + shadow-SP swap, both thaw arms, the freeze driver, and the
+  Section-2 residue codec give an end-to-end single-fiber `freeze → serialize → restore → thaw`
+  on the interpreter (§12.8, `svm-durable/tests/fiber.rs` + `svm-snapshot/tests/roundtrip.rs`).
+  Remaining: 3.2 multi-vCPU + per-context layout, 3.3 JIT parity (replicate the swap in the JIT
+  fiber-switch path). (Dispatch table is a no-op — §12.4.) Single-vCPU durability is a coherent MVP.
 - **[ ] Phase 4 — Back-edge polls, handle hardening, CoW clone.** Latency +
   durability quality + cheap clone. Incremental, off critical path.
 
@@ -520,12 +524,35 @@ non-durable freeze refusal. The **cross-backend** property (`crates/svm/tests/du
 + the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
+**Capture + re-establish** landed for the interpreter: `run_capture_reserved_with_host_prots`
+both **seeds** an initial per-page protection map (restore) and **returns** the post-run map
+(freeze) — `CapturedProt` (`Rw`/`Ro`/`Unmapped`/`Backed`) at the fixed `DURABLE_SNAPSHOT_PAGE`
+(= codec `PAGE`) granularity. `crates/svm/tests/durable_prot_capture.rs` shows a D40 `readonly`
+data segment captured as `Ro` and surviving freeze→restore through the codec (where Phase-1's
+flat all-`Rw` image would have lost it), **and** that re-establishing the map on a thawed run
+makes a write to a restored `Ro` page fault — while the same window without it writes through. A
+`Backed` page maps to a freeze refusal / is skipped on restore (D-region: the embedder re-grants
+the region). **JIT re-establish parity** also landed:
+`svm_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map and applies
+it to the freshly-seeded window (`protect_ro` / new `protect_none` via real
+`mprotect`/`VirtualProtect`) before the run, so a thawed `Ro`/`Unmapped` page faults on the JIT
+exactly as on the interpreter (`durable_prot_capture.rs` asserts both). Note module-defined
+`readonly` segments already re-apply on every JIT instantiation; this adds the *runtime*-captured
+map. **JIT-side capture** also landed: `Host::capture_window_prots(data, mapped, npages)`
+reconstructs the window's protection map from the two host-side sources — the module's `readonly`
+data segments (`Ro`) merged with the runtime page-state map (`cap_pages`, populated by Memory-cap
+`map`/`unmap`/`protect`) — mirroring the interpreter's `snapshot_prots`. `durable_prot_capture.rs`
+asserts interp and JIT capture the **same** map for a readonly-segment module, and that a runtime
+`cap_pages` entry overrides the default. So page protections now round-trip on **both** backends,
+both directions. The page-protection story is complete.
+
 The §12.4 **fiber control state** now rides along too (Section 2 — the `FrozenFiber` residue,
-slice 3.1.5), so a single-fiber domain round-trips through the real artifact. Still ahead
-(Phase 2, escape-TCB): **capturing** real page protections from a running backend (interp `Mem`
-/ JIT window) into the image and **re-establishing** them on the restored window — the codec now
-carries prots, but no backend yet feeds or applies them. (The dispatch table stays a no-op —
-§12.4.)
+slice 3.1.5): a freeze flattens each parked fiber's continuation into the window image and records
+its residue (slot/funcref/sp/shadow-SP) in a TLV control section (tag 2, elided when there are no
+fibers, so no-fiber artifacts stay byte-identical); `restore` re-seeds the `Host`. A single-fiber
+domain now round-trips through the real artifact (`crates/svm-snapshot/tests/roundtrip.rs`,
+including the §12.6 canonical re-serialize invariant). Remaining Phase-3 control-state work is
+**multi-vCPU** (per-context state words) and the **dispatch table** (a module-derived no-op today).
 
 ### 12.7 Shadow-frame layout
 

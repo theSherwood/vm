@@ -116,10 +116,47 @@
 //!   no-op (same packed `i64`). Lands **clay** (UI layout) byte-identical to native — the **8th of 8
 //!   corpus demos**, meeting the D54 "matches native clang" exit criterion.
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `memmove` (overlap),
-//! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `realloc`,
-//! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen), wider/other SIMD
-//! vectors (`<4 x float>`, `<2 x double>`, … — only 2-lane 32-bit vectors are scalarized), `i33`.
+//! Beyond the corpus (general-C breadth, demo-driven — see `LLVM.md`):
+//! - **W — varargs `printf` (a guest-side format engine).** A `printf(fmt, …)` with a **constant**
+//!   format string is parsed at translate time: literal runs are written straight from the format
+//!   global, and each conversion lowers to the synthesized `__svm_utoa` (int→ASCII) + width/zero-pad
+//!   (a buffer pre-fill) → `Stream.write`. Unsigned `%u`/`%x`, `%c`, `%%`, field width and the `0`
+//!   flag, and length modifiers (the LLVM arg carries the real width). All formatting runs **in the
+//!   guest**; only the bytes cross the boundary. Lands the **`hexdump`** demo byte-identical to native.
+//! - **X — `realloc` + signed `printf` (`%d`).** `malloc` now writes a 16-byte **size header** before
+//!   the data (keeping it 16-aligned), so `realloc(p, n)` recovers the old size, `malloc`s `n`, copies
+//!   `min(old, n)` bytes (`__svm_realloc` → `__svm_malloc` + `__svm_memcpy`; `realloc(NULL,…)` ≡
+//!   `malloc`). `printf` gains signed `%d`/`%i` (sign computed, magnitude via `__svm_utoa`, `-`
+//!   prepended) with plain/space-padded fields. Lands the **`sortvec`** demo (a `realloc`-doubling
+//!   vector + insertion sort) byte-identical to native.
+//! - **Y — 128-bit SIMD (`<4 x float>` → native `v128`).** A 4-lane 32-bit vector maps to SVM's §17
+//!   `v128`: `load`/`store` → `v128.load`/`store`; `fadd`/`fmul`/… → `f32x4` `VFloatBin`;
+//!   `extractelement`/`insertelement` → extract/replace lane; `shufflevector` → an `i8x16.shuffle`
+//!   byte mask (the all-equal mask is a splat); vector constants → `ConstV128`; `llvm.fmuladd.v4f32`
+//!   → `f32x4` mul+add (unfused). (2-lane vectors stay scalarized to `i64` — they're 8 bytes.) Lands
+//!   the **`mat4`** demo (a 4×4 × vec4 transform) byte-identical to native.
+//! - **Z — `llvm.bswap`.** Byte-reverse synthesized inline (no SVM op): each source byte `i` →
+//!   destination byte `nbytes-1-i` via shift/mask/or (`i16`/`i32`/`i64`). Lands the **`crc32`** demo
+//!   (CRC-32 + a big-endian `u32` reader) byte-identical to native.
+//! - **AA — overlap-safe `memmove` (a direction-aware runtime helper).** A variable-length (or
+//!   oversized-constant) `llvm.memmove` calls the synthesized **`__svm_memmove`** — a counted byte
+//!   copy that runs *forward* when `dst <= src` and *backward* otherwise (the direction `memcpy`
+//!   can't do), so overlapping shifts in either direction are correct. (Constant small `memmove`
+//!   still inlines load-all-then-store-all, already overlap-safe.) Lands the **`lineedit`** demo (a
+//!   line editor doing overlapping left/right shifts) byte-identical to native.
+//! - **AB — transcendental libm, bundled as guest code.** Math beyond the SVM float ops (`sin`/
+//!   `cos`/`exp`/`pow`/…) is supplied *by the program* as ordinary guest C (polynomial
+//!   approximations) — no new lowering, and no host math capability (the on-ramp keeps math in the
+//!   sandbox). This is the key to a clean differential: native `cc` compiles the same guest `libm`,
+//!   so every value is bit-identical (the only machine ops in play — `sqrt`/`floor` (slices F/L),
+//!   `fmuladd` (unfused), `+−*∕` — are IEEE on both sides). Lands the **`raytrace`** demo (an ASCII
+//!   sphere raytracer: `sqrt` intersection + guest `g_sin`/`g_exp` shading) byte-identical to native.
+//!
+//! Out of the current subset (clean [`Error::Unsupported`]): `printf` `%s`/`%f`, zero-padded `%d`,
+//! precision/`*`/`-`+# flags, and non-constant formats; general (non-rotate) funnel shifts,
+//! `llvm.bitreverse`, transcendental math as *external* libm calls (the program must supply it as
+//! guest code — see slice AB), `puts`/`fputs` of a *non-literal* string (runtime strlen), other
+//! SIMD (`<2 x double>`, `<8 x i16>`, dynamic lanes), `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -187,7 +224,12 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // then sit at index `base..` so `main` can be called from `_start`.
     let (mut imports, mut caps) = collect_cap_imports(m, &defined_names);
     let has_main = defined_names.contains_key("main");
-    let need_malloc = needs_malloc(m, &defined_names) && has_main;
+    // `realloc` is a synthesized helper built on `malloc` + `memcpy`, so it forces both on.
+    let need_realloc = calls_external(m, &defined_names, "realloc") && has_main;
+    let need_malloc = (needs_malloc(m, &defined_names) || need_realloc) && has_main;
+    // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
+    // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
+    let need_printf = calls_external(m, &defined_names, "printf") && has_main;
     let synth = (!imports.is_empty() || need_malloc) && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
@@ -212,7 +254,7 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // page-granularly) must never share a page with the stash, or `_start`'s handle stores would
     // fault on the read-only page (the same page-isolation the data stack already gets above globals).
     let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
-    let (globals, data, globals_end, cstrs) = globals_layout(m, &name2idx, globals_base)?;
+    let (globals, data, globals_end, cstrs, gbytes) = globals_layout(m, &name2idx, globals_base)?;
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
     // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
@@ -222,19 +264,34 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // Synthesized helpers (mem-loop `memset`/`memcpy`, the `malloc` allocator) sit after the defined
     // functions and `_start` (index 0 when `synth`), at `base + defined.len()` onward — their indices
     // are fixed before translating call sites. The allocator references the `vm_map` import index.
-    let (need_memset, need_memcpy) = needs_mem_helpers(m);
-    let helper_base = base + defined.len() as u32;
+    let (need_memset, need_memcpy0, need_memmove) = needs_mem_helpers(m);
+    let need_memcpy = need_memcpy0 || need_realloc; // `realloc` copies via `__svm_memcpy`
+                                                    // Helper indices are assigned in a fixed order after the defined functions (and `_start`):
+                                                    // memset, memcpy, malloc, utoa, realloc, memmove — each present only if needed. The append
+                                                    // order below must match.
+    let mut next_helper = base + defined.len() as u32;
+    let mut take = |needed: bool| {
+        needed.then(|| {
+            let i = next_helper;
+            next_helper += 1;
+            i
+        })
+    };
     let helpers = Helpers {
-        memset: need_memset.then_some(helper_base),
-        memcpy: need_memcpy.then_some(helper_base + need_memset as u32),
-        malloc: need_malloc.then_some(helper_base + need_memset as u32 + need_memcpy as u32),
+        memset: take(need_memset),
+        memcpy: take(need_memcpy),
+        malloc: take(need_malloc),
+        utoa: take(need_printf),
+        realloc: take(need_realloc),
+        memmove: take(need_memmove),
     };
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
     for f in &defined {
-        let (func, frame_size) =
-            translate_func(f, &m.types, &name2idx, &globals, &caps, &cstrs, &helpers)?;
+        let (func, frame_size) = translate_func(
+            f, &m.types, &name2idx, &globals, &caps, &cstrs, &gbytes, &helpers,
+        )?;
         any_frame |= frame_size > 0;
         funcs.push(func);
     }
@@ -267,7 +324,8 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         let main_results = funcs[(main_idx - base) as usize].results.clone();
         funcs.insert(0, synth_start(main_idx, &main_results, entry_sp, heap_base));
     }
-    // Append the synthesized helpers in index order (memset, memcpy, malloc) — matching `helper_base`.
+    // Append the synthesized helpers in index order (memset, memcpy, malloc, utoa, realloc) —
+    // matching the indices assigned above.
     if need_memset {
         funcs.push(synth_memset());
     }
@@ -276,6 +334,18 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     }
     if need_malloc {
         funcs.push(synth_malloc(caps["vm_map"]));
+    }
+    if need_printf {
+        funcs.push(synth_utoa());
+    }
+    if need_realloc {
+        funcs.push(synth_realloc(
+            helpers.malloc.expect("realloc needs malloc"),
+            helpers.memcpy.expect("realloc needs memcpy"),
+        ));
+    }
+    if need_memmove {
+        funcs.push(synth_memmove());
     }
     Ok(Translated {
         module: Module {
@@ -505,6 +575,7 @@ type Globals = (
     Vec<svm_ir::Data>,
     u64,
     HashMap<String, u64>,
+    HashMap<String, Vec<u8>>,
 );
 
 /// Lay out the module's global variables in the window's globals region (from `base`, each
@@ -558,6 +629,7 @@ fn globals_layout(
                                        // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
     let mut segs = Vec::new();
     let mut cstrs = HashMap::new();
+    let mut gbytes = HashMap::new();
     for (gi, at) in placed {
         let g = &m.global_vars[gi];
         let Some(init) = &g.initializer else { continue }; // BSS / extern → zero-init window
@@ -566,6 +638,11 @@ fn globals_layout(
         // write the right slice without a runtime strlen.
         let slen = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len()) as u64;
         cstrs.insert(name_str(&g.name), slen);
+        // Keep a constant global's bytes so `printf` can parse a constant format string at translate
+        // time (the format engine reads `@.str`'s content here, not at runtime).
+        if g.is_constant {
+            gbytes.insert(name_str(&g.name), bytes.clone());
+        }
         // Emit a segment only for non-zero initialized data (the window is zero-init). A read-only
         // segment is protected (D40), so a guest write to it faults.
         if g.is_constant || bytes.iter().any(|&x| x != 0) {
@@ -576,7 +653,7 @@ fn globals_layout(
             });
         }
     }
-    Ok((addr, segs, off, cstrs))
+    Ok((addr, segs, off, cstrs, gbytes))
 }
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
@@ -596,6 +673,7 @@ fn val_type(ty: &Type) -> Result<ValType, Error> {
         // through `phi`/`call`/`ret`/block-params as an ordinary `i64`; only the vector *ops*
         // (`extractelement`/`insertelement`/`fadd`…) unpack/repack the lanes. SIMD-proper is §17 V128.
         _ if is_vec2(ty) => Ok(ValType::I64),
+        _ if is_vec4(ty) => Ok(ValType::V128), // `<4 x {float,i32}>` → a native v128 (§17)
         other => unsup(format!("type {other} (Milestone 1+)")),
     }
 }
@@ -625,6 +703,36 @@ fn is_vec2(ty: &Type) -> bool {
 /// Is `ty` specifically `<2 x float>` (the vector that takes the lane-wise float-arith path)?
 fn is_vec2f(ty: &Type) -> bool {
     vec2_lane_ty(ty) == Some(ValType::F32)
+}
+
+/// The lane type of a **4-lane 32-bit vector** (`<4 x float>`/`<4 x i32>`), which maps to a native
+/// `v128` (§17). `None` for any other vector. (2-lane vectors are scalarized to `i64` instead — they
+/// are 8 bytes, so a 16-byte `v128.load` would overrun.)
+fn vec4_lane_ty(ty: &Type) -> Option<ValType> {
+    match ty {
+        Type::VectorType {
+            element_type,
+            num_elements: 4,
+            scalable: false,
+        } => match element_type.as_ref() {
+            Type::FPType(FPType::Single) => Some(ValType::F32),
+            Type::IntegerType { bits: 32 } => Some(ValType::I32),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_vec4(ty: &Type) -> bool {
+    vec4_lane_ty(ty).is_some()
+}
+
+/// The SVM `VShape` for a 4-lane 32-bit vector's lane type (`f32x4` / `i32x4`).
+fn vshape4(lane: ValType) -> svm_ir::VShape {
+    match lane {
+        ValType::F32 => svm_ir::VShape::F32x4,
+        _ => svm_ir::VShape::I32x4,
+    }
 }
 
 /// The scalar **fields of a small by-value struct** (clang's multi-register return/arg coercion,
@@ -741,6 +849,7 @@ fn type_size(ty: &Type, types: &Types) -> Result<u64, Error> {
             Ok(struct_layout(&fields, packed, types)?.1)
         }
         _ if is_vec2(ty) => Ok(8), // `<2 x float>`/`<2 x i32>` — two packed 32-bit lanes
+        _ if is_vec4(ty) => Ok(16), // `<4 x {float,i32}>` — a v128
         other => unsup(format!("size of type {other} (Milestone 1+)")),
     }
 }
@@ -757,7 +866,8 @@ fn type_align(ty: &Type, types: &Types) -> Result<u64, Error> {
             let (fields, packed) = resolve_struct(ty, types)?;
             Ok(struct_layout(&fields, packed, types)?.2)
         }
-        _ if is_vec2(ty) => Ok(8), // a 2-lane 32-bit vector is 8-aligned
+        _ if is_vec2(ty) => Ok(8),  // a 2-lane 32-bit vector is 8-aligned
+        _ if is_vec4(ty) => Ok(16), // a v128 is 16-aligned
         other => unsup(format!("align of type {other} (Milestone 1+)")),
     }
 }
@@ -842,6 +952,7 @@ struct Scan {
     block_name: Vec<Name>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_func(
     f: &Function,
     types: &Types,
@@ -849,6 +960,7 @@ fn translate_func(
     globals: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
+    gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
@@ -886,6 +998,7 @@ fn translate_func(
             globals,
             caps,
             cstrs,
+            gbytes,
             helpers,
         )?);
     }
@@ -1148,6 +1261,11 @@ const HEAP_TOP: u64 = 24;
 const STASH_SCRATCH: u64 = 32;
 /// The `prot` bits a guest passes to `Memory.map` for a read-write commit (`PROT_READ|PROT_WRITE`).
 const PROT_RW: i32 = 3;
+/// A scratch buffer (`[FMT_BUF, FMT_BUF_END)`, on the writable page 0) where `printf` formats one
+/// integer conversion: `__svm_utoa` writes the digits backward from `FMT_BUF_END`, and width padding
+/// pre-fills the low end. 64 bytes covers a 64-bit value in any base plus a generous field width.
+const FMT_BUF: u64 = 64;
+const FMT_BUF_END: u64 = 128;
 
 /// Which stash slot a capability call reads its handle from.
 #[derive(Clone, Copy)]
@@ -1205,7 +1323,7 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
 /// lowering but needs *no* import (an unbuffered `Stream` makes it a no-op), so it is not listed here.
 fn cap_import_name(name: &str) -> Option<&'static str> {
     Some(match name {
-        "write" | "puts" | "putc" | "putchar" | "fputc" | "fwrite" | "fputs" => "write",
+        "write" | "puts" | "putc" | "putchar" | "fputc" | "fwrite" | "fputs" | "printf" => "write",
         "read" => "read",
         "exit" | "_exit" | "_Exit" => "exit",
         _ => return None,
@@ -1346,20 +1464,19 @@ fn synth_start(
 /// reuses, so every result is freshly `vm_map`-zeroed memory (hence `calloc` ≡ `malloc`).
 ///
 /// ```text
-///   block0(size):                              ; align the request to 16, compute the new break
-///     brk = load.i64 [HEAP_BRK]
-///     new = (brk + size + 15) & ~15
-///     top = load.i64 [HEAP_TOP]
-///     grow? = new >u top   → grow(brk,new,top) : commit(brk,new)
-///   grow(brk,new,top):                         ; commit [top, page_up(new)) via the Memory cap
-///     limit = (new + (PAGE-1)) & ~(PAGE-1)
-///     vm_map(mem_handle, top, limit - top, RW)
-///     store.i64 [HEAP_TOP] = limit
-///     → commit(brk,new)
-///   commit(brk,new):                           ; publish the new break, return the old one
+///   block0(size):                              ; data=brk+16; new=align16(data+size)
+///     brk = load.i64 [HEAP_BRK]; top = load.i64 [HEAP_TOP]
+///     grow? = new >u top   → grow(brk,size,new,top) : commit(brk,size,new)
+///   grow(brk,size,new,top):                    ; commit [top, page_up(new)) via the Memory cap
+///     vm_map(mem_handle, top, page_up(new) - top, RW); store.i64 [HEAP_TOP] = page_up(new)
+///     → commit(brk,size,new)
+///   commit(brk,size,new):                       ; now the page is mapped: write the header + publish
+///     store.i64 [brk] = size                    ; 16-byte size header (for realloc)
 ///     store.i64 [HEAP_BRK] = new
-///     return brk
+///     return brk + 16                           ; the data pointer
 /// ```
+/// The header is written in `commit` (not `block0`) because on the first `malloc` `brk` is an
+/// *uncommitted* reserved page — only `grow` (or the prior commit) maps it.
 fn synth_malloc(vm_map_import: u32) -> Func {
     use svm_ir::{LoadOp, StoreOp};
     let i64add = |a: ValIdx, b: ValIdx| Inst::IntBin {
@@ -1388,81 +1505,88 @@ fn synth_malloc(vm_map_import: u32) -> Func {
         offset: 0,
         align: 0,
     };
-    // block0(size=0): brk = *HEAP_BRK; new = align16(brk + size); top = *HEAP_TOP; branch on new>top.
+    // block0(size=0): brk = *HEAP_BRK; new = align16(brk+16+size); branch on new > *HEAP_TOP. No
+    // heap write here — `brk` may be an uncommitted page until `grow` maps it.
     let b0 = Block {
         params: vec![ValType::I64], // size = v0
         insts: vec![
             Inst::ConstI64(HEAP_BRK as i64), // v1
             load_i64(1),                     // v2 = brk
-            i64add(2, 0),                    // v3 = brk + size
-            Inst::ConstI64(15),              // v4
-            i64add(3, 4),                    // v5 = brk+size+15
-            Inst::ConstI64(!15i64),          // v6 = ~15
-            i64and(5, 6),                    // v7 = new (aligned)
-            Inst::ConstI64(HEAP_TOP as i64), // v8
-            load_i64(8),                     // v9 = top
+            Inst::ConstI64(16),              // v3
+            i64add(2, 3),                    // v4 = brk + 16
+            i64add(4, 0),                    // v5 = brk+16+size
+            Inst::ConstI64(15),              // v6
+            i64add(5, 6),                    // v7
+            Inst::ConstI64(!15i64),          // v8 = ~15
+            i64and(7, 8),                    // v9 = new (aligned)
+            Inst::ConstI64(HEAP_TOP as i64), // v10
+            load_i64(10),                    // v11 = top
             Inst::IntCmp {
                 ty: IntTy::I64,
                 op: CmpOp::GtU,
-                a: 7,
-                b: 9,
-            }, // v10 = new > top
+                a: 9,
+                b: 11,
+            }, // v12 = new > top
         ],
         term: Terminator::BrIf {
-            cond: 10,
-            then_blk: 1, // grow(brk=v2, new=v7, top=v9)
-            then_args: vec![2, 7, 9],
-            else_blk: 2, // commit(brk=v2, new=v7)
-            else_args: vec![2, 7],
+            cond: 12,
+            then_blk: 1, // grow(brk=v2, size=v0, new=v9, top=v11)
+            then_args: vec![2, 0, 9, 11],
+            else_blk: 2, // commit(brk=v2, size=v0, new=v9)
+            else_args: vec![2, 0, 9],
         },
     };
 
-    // grow(brk=0, new=1, top=2): commit [top, page_up(new)) via vm_map, update HEAP_TOP.
+    // grow(brk=0, size=1, new=2, top=3): commit [top, page_up(new)) via vm_map, update HEAP_TOP.
     let page = STACK_PAGE as i64; // commit in ≥-OS-page units (16 KiB covers any real page)
     let g = Block {
-        params: vec![ValType::I64, ValType::I64, ValType::I64], // brk, new, top
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64], // brk, size, new, top
         insts: vec![
-            Inst::ConstI64(page - 1),            // v3
-            i64add(1, 3),                        // v4 = new + (PAGE-1)
-            Inst::ConstI64(!(page - 1)),         // v5 = ~(PAGE-1)
-            i64and(4, 5),                        // v6 = limit (page-aligned)
-            Inst::ConstI64(STASH_MEMORY as i64), // v7
+            Inst::ConstI64(page - 1),            // v4
+            i64add(2, 4),                        // v5 = new + (PAGE-1)
+            Inst::ConstI64(!(page - 1)),         // v6 = ~(PAGE-1)
+            i64and(5, 6),                        // v7 = limit (page-aligned)
+            Inst::ConstI64(STASH_MEMORY as i64), // v8
             Inst::Load {
                 op: LoadOp::I32,
-                addr: 7,
+                addr: 8,
                 offset: 0,
                 align: 0,
-            }, // v8 = mem handle
+            }, // v9 = mem handle
             Inst::IntBin {
                 ty: IntTy::I64,
                 op: BinOp::Sub,
-                a: 6,
-                b: 2,
-            }, // v9 = limit - top (len)
-            Inst::ConstI32(PROT_RW),             // v10 = prot
+                a: 7,
+                b: 3,
+            }, // v10 = limit - top (len)
+            Inst::ConstI32(PROT_RW),             // v11 = prot
             Inst::CallImport {
                 import: vm_map_import,
                 sig: import_sig("vm_map"),
-                handle: 8,
-                args: vec![2, 9, 10],
-            }, // v11 = map result (ignored)
-            Inst::ConstI64(HEAP_TOP as i64),     // v12
-            store_i64(12, 6),                    // *HEAP_TOP = limit
+                handle: 9,
+                args: vec![3, 10, 11],
+            }, // v12 = map result (ignored)
+            Inst::ConstI64(HEAP_TOP as i64),     // v13
+            store_i64(13, 7),                    // *HEAP_TOP = limit
         ],
         term: Terminator::Br {
             target: 2,
-            args: vec![0, 1],
-        }, // commit(brk, new)
+            args: vec![0, 1, 2], // commit(brk, size, new)
+        },
     };
 
-    // commit(brk=0, new=1): publish the new break, return the old break.
+    // commit(brk=0, size=1, new=2): the page is now mapped — write the size header at brk, publish
+    // the new break, and return the data pointer brk+16.
     let c = Block {
-        params: vec![ValType::I64, ValType::I64], // brk, new
+        params: vec![ValType::I64, ValType::I64, ValType::I64], // brk, size, new
         insts: vec![
-            Inst::ConstI64(HEAP_BRK as i64), // v2
-            store_i64(2, 1),                 // *HEAP_BRK = new
+            store_i64(0, 1),                 // *brk = size (header) — no value
+            Inst::ConstI64(HEAP_BRK as i64), // v3
+            store_i64(3, 2),                 // *HEAP_BRK = new — no value
+            Inst::ConstI64(16),              // v4
+            i64add(0, 4),                    // v5 = brk + 16 (data)
         ],
-        term: Terminator::Return(vec![0]), // brk
+        term: Terminator::Return(vec![5]), // data
     };
 
     Func {
@@ -1484,25 +1608,34 @@ struct Helpers {
     memcpy: Option<u32>,
     /// `__svm_malloc(size:i64) -> i64` — the `vm_map`-growing bump allocator (`malloc`/`calloc`).
     malloc: Option<u32>,
+    /// `__svm_utoa(value:i64, base:i64, bufend:i64) -> i64` — unsigned→ASCII for `printf`.
+    utoa: Option<u32>,
+    /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
+    realloc: Option<u32>,
+    /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
+    memmove: Option<u32>,
 }
 
-/// Does the module call any heap allocator function (`malloc`/`calloc`) not defined by the guest?
-/// (`free` is lowered to a no-op and needs no allocator; `realloc` is still `Unsupported`.)
-fn needs_malloc(m: &LModule, defined: &HashMap<String, u32>) -> bool {
+/// Does the module call an external (not guest-defined) function with name `n`?
+fn calls_external(m: &LModule, defined: &HashMap<String, u32>, want: &str) -> bool {
     m.functions.iter().flat_map(|f| &f.basic_blocks).any(|bb| {
         bb.instrs.iter().any(|i| {
             matches!(i, Instruction::Call(c)
-                if callee_name(c).is_some_and(|n| matches!(n.as_str(), "malloc" | "calloc")
-                    && !defined.contains_key(&n)))
+                if callee_name(c).is_some_and(|n| n == want && !defined.contains_key(&n)))
         })
     })
 }
 
-/// Does any mem intrinsic need the runtime loop helper — a **non-constant** length, or a constant
-/// one too large to unroll inline? Returns `(needs_memset, needs_memcpy)`. (`memmove` with a
-/// variable length is left `Unsupported` — overlap direction needs a runtime branch, a later slice.)
-fn needs_mem_helpers(m: &LModule) -> (bool, bool) {
-    let (mut set, mut cpy) = (false, false);
+/// Does the module call the heap allocator (`malloc`/`calloc`)? (`free` is a no-op; `realloc` is
+/// still `Unsupported`.)
+fn needs_malloc(m: &LModule, defined: &HashMap<String, u32>) -> bool {
+    calls_external(m, defined, "malloc") || calls_external(m, defined, "calloc")
+}
+
+/// Does any mem intrinsic need a runtime helper — a **non-constant** length, or a constant one too
+/// large to unroll inline? Returns `(needs_memset, needs_memcpy, needs_memmove)`.
+fn needs_mem_helpers(m: &LModule) -> (bool, bool, bool) {
+    let (mut set, mut cpy, mut mov) = (false, false, false);
     for f in &m.functions {
         for bb in &f.basic_blocks {
             for instr in &bb.instrs {
@@ -1519,11 +1652,94 @@ fn needs_mem_helpers(m: &LModule) -> (bool, bool) {
                     set = true;
                 } else if name.starts_with("llvm.memcpy") && big(c) {
                     cpy = true;
+                } else if name.starts_with("llvm.memmove") && big(c) {
+                    mov = true;
                 }
             }
         }
     }
-    (set, cpy)
+    (set, cpy, mov)
+}
+
+/// Synthesize `__svm_realloc(p:i64, n:i64) -> i64`: `realloc` over the header-bearing bump allocator.
+/// `realloc(NULL, n)` ≡ `malloc(n)`; otherwise allocate `n`, copy `min(old, n)` bytes (the old size
+/// is the 16-byte header at `p-16`), and return the new pointer (the old block is leaked — `free` is
+/// a no-op). The copy never overlaps: the fresh block sits above the old one by construction.
+fn synth_realloc(malloc_idx: u32, memcpy_idx: u32) -> Func {
+    use svm_ir::LoadOp;
+    // block0(p=0, n=1): p == 0 ? malloc(n) : copy from the old block.
+    let b0 = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(0), // v2
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: 0,
+                b: 2,
+            }, // v3 = p == 0
+        ],
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 1, // null_case(n)
+            then_args: vec![1],
+            else_blk: 2, // have(p, n)
+            else_args: vec![0, 1],
+        },
+    };
+    // null_case(n=0): return malloc(n).
+    let null_case = Block {
+        params: vec![ValType::I64],
+        insts: vec![Inst::Call {
+            func: malloc_idx,
+            args: vec![0],
+        }], // v1 = q
+        term: Terminator::Return(vec![1]),
+    };
+    // have(p=0, n=1): old = *(p-16); q = malloc(n); memcpy(q, p, min(old, n)); return q.
+    let have = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(16), // v2
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: 0,
+                b: 2,
+            }, // v3 = p - 16 (header)
+            Inst::Load {
+                op: LoadOp::I64,
+                addr: 3,
+                offset: 0,
+                align: 0,
+            }, // v4 = old size
+            Inst::Call {
+                func: malloc_idx,
+                args: vec![1],
+            }, // v5 = q
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::LtU,
+                a: 4,
+                b: 1,
+            }, // v6 = old < n
+            Inst::Select {
+                cond: 6,
+                a: 4,
+                b: 1,
+            }, // v7 = min(old, n)
+            Inst::Call {
+                func: memcpy_idx,
+                args: vec![5, 0, 7],
+            }, // memcpy(q, p, min) — void
+        ],
+        term: Terminator::Return(vec![5]), // q
+    };
+    Func {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![b0, null_case, have],
+    }
 }
 
 /// Synthesize `__svm_memset(dst:i64, byte:i32, len:i64)`: a counted byte loop
@@ -1687,6 +1903,256 @@ fn synth_memcpy() -> Func {
     }
 }
 
+/// Synthesize `__svm_memmove(dst:i64, src:i64, len:i64)`: an **overlap-safe** byte copy — forward
+/// when `dst <= src`, backward otherwise (the direction `memcpy` can't do). 8 blocks: the direction
+/// branch, then a forward and a backward counted byte loop sharing the `done` return.
+fn synth_memmove() -> Func {
+    use svm_ir::{LoadOp, StoreOp};
+    let p3 = || vec![ValType::I64, ValType::I64, ValType::I64]; // dst, src, len
+    let p4 = || vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64]; // + i
+    let add = |a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let load8 = |addr: ValIdx| Inst::Load {
+        op: LoadOp::I32_8U,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let store8 = |addr: ValIdx, value: ValIdx| Inst::Store {
+        op: StoreOp::I32_8,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    // block0(dst=0,src=1,len=2): dst <=u src ? forward : backward.
+    let b0 = Block {
+        params: p3(),
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LeU,
+            a: 0,
+            b: 1,
+        }], // v3
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 1, // fwd
+            then_args: vec![0, 1, 2],
+            else_blk: 4, // bwd
+            else_args: vec![0, 1, 2],
+        },
+    };
+    // fwd(dst,src,len): i = 0; → floop.
+    let fwd = Block {
+        params: p3(),
+        insts: vec![Inst::ConstI64(0)], // v3 = i
+        term: Terminator::Br {
+            target: 2,
+            args: vec![0, 1, 2, 3],
+        },
+    };
+    // floop(dst,src,len,i): i <u len ? fbody : done.
+    let floop = Block {
+        params: p4(),
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtU,
+            a: 3,
+            b: 2,
+        }], // v4
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 3,
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 7,
+            else_args: vec![],
+        },
+    };
+    // fbody(dst,src,len,i): dst[i] = src[i]; i++ → floop.
+    let fbody = Block {
+        params: p4(),
+        insts: vec![
+            add(1, 3),         // v4 = src + i
+            load8(4),          // v5 = src[i]
+            add(0, 3),         // v6 = dst + i
+            store8(6, 5),      // dst[i] = src[i]
+            Inst::ConstI64(1), // v7
+            add(3, 7),         // v8 = i + 1
+        ],
+        term: Terminator::Br {
+            target: 2,
+            args: vec![0, 1, 2, 8],
+        },
+    };
+    // bwd(dst,src,len): i = len; → bloop.
+    let bwd = Block {
+        params: p3(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 5,
+            args: vec![0, 1, 2, 2], // i = len
+        },
+    };
+    // bloop(dst,src,len,i): i >u 0 ? bbody : done.
+    let bloop = Block {
+        params: p4(),
+        insts: vec![
+            Inst::ConstI64(0), // v4
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::GtU,
+                a: 3,
+                b: 4,
+            }, // v5 = i > 0
+        ],
+        term: Terminator::BrIf {
+            cond: 5,
+            then_blk: 6,
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 7,
+            else_args: vec![],
+        },
+    };
+    // bbody(dst,src,len,i): i--; dst[i] = src[i]; → bloop.
+    let bbody = Block {
+        params: p4(),
+        insts: vec![
+            Inst::ConstI64(1), // v4
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: 3,
+                b: 4,
+            }, // v5 = i - 1
+            add(1, 5),         // v6 = src + (i-1)
+            load8(6),          // v7 = src[i-1]
+            add(0, 5),         // v8 = dst + (i-1)
+            store8(8, 7),      // dst[i-1] = src[i-1]
+        ],
+        term: Terminator::Br {
+            target: 5,
+            args: vec![0, 1, 2, 5], // loop with i-1
+        },
+    };
+    let done = Block {
+        params: vec![],
+        insts: vec![],
+        term: Terminator::Return(vec![]),
+    };
+    Func {
+        params: p3(),
+        results: vec![],
+        blocks: vec![b0, fwd, floop, fbody, bwd, bloop, bbody, done],
+    }
+}
+
+/// Synthesize `__svm_utoa(value:i64, base:i64, bufend:i64) -> i64` — write the **unsigned** `value`
+/// in `base` (10 or 16, lowercase) as ASCII *backward* from `bufend` and return the start pointer
+/// (so the digit count is `bufend - start`). A counted divide loop, like a tiny libc `utoa`; the
+/// `printf` lowering handles sign, width, and padding around it. `value == 0` writes a single `'0'`.
+///
+/// ```text
+///   block0(value, base, bufend):           → loop(value, base, bufend)
+///   loop(value, base, p):                  ; d = value%base; *--p = digit(d); value/=base
+///     digit = d + '0' + (d>=10 ? 39 : 0)   ; 0-9 → '0'-'9', 10-15 → 'a'-'f'
+///     value != 0 ? loop(value/base, base, p-1) : done(p-1)
+///   done(start):                           return start
+/// ```
+fn synth_utoa() -> Func {
+    use svm_ir::StoreOp;
+    let params = vec![ValType::I64, ValType::I64, ValType::I64]; // value, base, bufend
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2],
+        },
+    };
+    // loop(value=0, base=1, p=2)
+    let i64bin = |op: BinOp, a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    };
+    let lp = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            i64bin(BinOp::RemU, 0, 1), // v3 = value % base
+            Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: 3,
+            }, // v4 = d (i32)
+            Inst::ConstI32(10),        // v5
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::GeU,
+                a: 4,
+                b: 5,
+            }, // v6 = d>=10
+            Inst::ConstI32(39),        // v7
+            Inst::ConstI32(0),         // v8
+            Inst::Select {
+                cond: 6,
+                a: 7,
+                b: 8,
+            }, // v9 = d>=10 ? 39 : 0
+            Inst::ConstI32(48),        // v10 = '0'
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 4,
+                b: 10,
+            }, // v11 = d+'0'
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 11,
+                b: 9,
+            }, // v12 = digit char
+            Inst::ConstI64(1),         // v13
+            i64bin(BinOp::Sub, 2, 13), // v14 = p - 1
+            Inst::Store {
+                op: StoreOp::I32_8,
+                addr: 14,
+                value: 12,
+                offset: 0,
+                align: 0,
+            }, // *--p = ch
+            i64bin(BinOp::DivU, 0, 1), // v15 = value / base
+            Inst::ConstI64(0),         // v16
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Ne,
+                a: 15,
+                b: 16,
+            }, // v17 = value' != 0
+        ],
+        term: Terminator::BrIf {
+            cond: 17,
+            then_blk: 1,
+            then_args: vec![15, 1, 14], // loop(value/base, base, p-1)
+            else_blk: 2,
+            else_args: vec![14], // done(p-1)
+        },
+    };
+    let done = Block {
+        params: vec![ValType::I64], // start
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, lp, done],
+    }
+}
+
 /// The global-variable name a pointer operand points at, if it is a direct `@global` reference (the
 /// shape clang passes a string literal to `puts`/`fputs`). A computed pointer returns `None`.
 fn global_name_of(op: &Operand) -> Option<String> {
@@ -1707,6 +2173,117 @@ fn global_name_of(op: &Operand) -> Option<String> {
 /// stdout here) selects the endpoint. Returns `Ok(false)` if `name` is not a bound function (so it
 /// stays an ordinary call). Result-fidelity notes (the *stdout bytes* are exact regardless): `putc`
 /// yields the written char, `fwrite` the item count `nmemb`, `puts`/`fputs`/`fflush` a `0` success.
+/// A parsed `printf` format-string segment (the constant format is parsed at translate time, §ramp
+/// Lane C). Integer conversions (`%d`/`%i`/`%u`/`%x`), `%c`, and `%%` are handled; `%s`, `%f`,
+/// precision, `*`, and the `-`/`+`/` `/`#` flags are a later slice (fail-closed `Unsupported`).
+enum FmtSeg {
+    /// A verbatim run — bytes `[off, off+len)` of the format global, written directly.
+    Lit { off: usize, len: usize },
+    /// An integer conversion: `base` (10/16, lowercase), `signed` (`%d`) vs unsigned (`%u`/`%x`),
+    /// `0`-flag zero-pad, field `width`.
+    Int {
+        base: u64,
+        signed: bool,
+        zero: bool,
+        width: u32,
+    },
+    /// `%c` — the argument's low byte.
+    Char,
+    /// `%%` — a literal percent.
+    Percent,
+}
+
+/// Parse a (NUL-free) `printf` format string into segments. Fail-closed on anything not yet
+/// supported, so an unhandled directive is a clean `Unsupported`, never a silent mis-format.
+fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
+    let mut segs = Vec::new();
+    let mut i = 0;
+    let mut lit_start = 0;
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if i > lit_start {
+            segs.push(FmtSeg::Lit {
+                off: lit_start,
+                len: i - lit_start,
+            });
+        }
+        i += 1; // past '%'
+        let bad = |w: &str| Error::Unsupported(format!("printf: {w}"));
+        if i >= fmt.len() {
+            return Err(bad("trailing '%'"));
+        }
+        if fmt[i] == b'%' {
+            segs.push(FmtSeg::Percent);
+            i += 1;
+            lit_start = i;
+            continue;
+        }
+        // Flags — only `0` (zero-pad) so far; `-`/`+`/` `/`#` change layout, fail-closed.
+        let mut zero = false;
+        while i < fmt.len() {
+            match fmt[i] {
+                b'0' => {
+                    zero = true;
+                    i += 1;
+                }
+                b'-' | b'+' | b' ' | b'#' => return Err(bad("flag (-/+/space/#)")),
+                _ => break,
+            }
+        }
+        // Field width (decimal). `*` (dynamic) and `.` (precision) are deferred.
+        let mut width = 0u32;
+        while i < fmt.len() && fmt[i].is_ascii_digit() {
+            width = width * 10 + u32::from(fmt[i] - b'0');
+            i += 1;
+        }
+        if width as u64 + 2 >= FMT_BUF_END - FMT_BUF {
+            return Err(bad("field width too large"));
+        }
+        if i < fmt.len() && (fmt[i] == b'.' || fmt[i] == b'*') {
+            return Err(bad("precision / dynamic width"));
+        }
+        // Length modifiers are informational here — the LLVM arg already carries the real width.
+        while i < fmt.len() && matches!(fmt[i], b'l' | b'h' | b'z' | b'j' | b't' | b'L') {
+            i += 1;
+        }
+        let conv = *fmt.get(i).ok_or_else(|| bad("trailing conversion"))?;
+        i += 1;
+        // A signed `%d`/`%i` with a zero-pad width needs the sign before the zeros — not yet handled,
+        // so fail closed on that one combination (plain/space-padded `%d` is fine).
+        let int = |base, signed| {
+            if signed && zero && width > 0 {
+                Err(bad("zero-padded signed %d (sign+pad combo)"))
+            } else {
+                Ok(FmtSeg::Int {
+                    base,
+                    signed,
+                    zero,
+                    width,
+                })
+            }
+        };
+        segs.push(match conv {
+            b'd' | b'i' => int(10, true)?,
+            b'u' => int(10, false)?,
+            b'x' => int(16, false)?,
+            b'c' => FmtSeg::Char,
+            b's' => return Err(bad("%s — later slice")),
+            other => return Err(bad(&format!("conversion %{}", other as char))),
+        });
+        lit_start = i;
+    }
+    if fmt.len() > lit_start {
+        segs.push(FmtSeg::Lit {
+            off: lit_start,
+            len: fmt.len() - lit_start,
+        });
+    }
+    Ok(segs)
+}
+
 fn lower_io_call(
     ctx: &mut BlockCtx,
     c: &llvm_ir::instruction::Call,
@@ -1821,8 +2398,219 @@ fn lower_io_call(
         }
         // `free(ptr)`: the bump allocator never reclaims, so this is a no-op.
         "free" => Ok(true),
+        // `realloc(ptr, n)`: the synthesized `__svm_realloc` (malloc + header-sized copy).
+        "realloc" => {
+            let Some(f) = ctx.helpers.realloc else {
+                return Ok(false);
+            };
+            let p = ctx.operand(&c.arguments[0].0)?;
+            let n = ctx.operand(&c.arguments[1].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![p, n],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `printf(fmt, …)`: a **guest-side format engine**. The constant format string is parsed at
+        // translate time; literal runs are written straight from the format global, and each
+        // conversion lowers to `__svm_utoa` + width/zero-padding (a buffer pre-fill) → `Stream.write`.
+        // Returns 0 (the char count is rarely used). Non-constant formats / unsupported directives are
+        // fail-closed `Unsupported` (see `parse_format`).
+        "printf" => {
+            lower_printf(ctx, c)?;
+            let r = ctx.push(Inst::ConstI32(0));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         _ => Ok(false),
     }
+}
+
+/// Lower a `printf(fmt, …)` call (the constant format engine — see the `"printf"` arm). Emits the
+/// `Stream.write`s for the literals and conversions in order, consuming the variadic args.
+fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<(), Error> {
+    let gname = global_name_of(&c.arguments[0].0)
+        .ok_or_else(|| Error::Unsupported("printf: non-constant format string".into()))?;
+    let fmt_addr = *ctx
+        .globals
+        .get(&gname)
+        .ok_or_else(|| Error::Unsupported("printf: format not in window".into()))?;
+    let bytes = ctx
+        .gbytes
+        .get(&gname)
+        .ok_or_else(|| Error::Unsupported("printf: format not a constant string".into()))?
+        .clone();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let segs = parse_format(&bytes[..end])?;
+
+    let utoa = ctx
+        .helpers
+        .utoa
+        .ok_or_else(|| Error::Unsupported("printf: utoa helper missing".into()))?;
+    let mut argi = 1; // arg 0 is the format string; varargs follow
+    for seg in segs {
+        match seg {
+            FmtSeg::Lit { off, len } => {
+                let a = ctx.const_i64((fmt_addr + off as u64) as i64);
+                let n = ctx.const_i64(len as i64);
+                ctx.emit_write(a, n)?;
+            }
+            FmtSeg::Percent => {
+                let pct = ctx.push(Inst::ConstI32(b'%' as i32));
+                let scratch = ctx.scratch_byte(pct);
+                let one = ctx.const_i64(1);
+                ctx.emit_write(scratch, one)?;
+            }
+            FmtSeg::Char => {
+                let arg = &c.arguments.get(argi).ok_or_else(|| {
+                    Error::Unsupported("printf: more conversions than args".into())
+                })?;
+                argi += 1;
+                let v = ctx.operand(&arg.0)?;
+                let scratch = ctx.scratch_byte(v);
+                let one = ctx.const_i64(1);
+                ctx.emit_write(scratch, one)?;
+            }
+            FmtSeg::Int {
+                base,
+                signed,
+                zero,
+                width,
+            } => {
+                let arg = c.arguments.get(argi).ok_or_else(|| {
+                    Error::Unsupported("printf: more conversions than args".into())
+                })?;
+                argi += 1;
+                let av = ctx.operand(&arg.0)?;
+                let is64 = matches!(val_type(arg.0.get_type(ctx.types).as_ref())?, ValType::I64);
+                // Compute the unsigned magnitude `mag` to format and, for `%d`, an `i64` 0/1 `neg`.
+                let (mag, neg) = if signed {
+                    let sval = if is64 {
+                        av
+                    } else {
+                        ctx.push(Inst::Convert {
+                            op: ConvOp::ExtendI32S,
+                            a: av,
+                        })
+                    };
+                    let zero64 = ctx.const_i64(0);
+                    let negi = ctx.push(Inst::IntCmp {
+                        ty: IntTy::I64,
+                        op: CmpOp::LtS,
+                        a: sval,
+                        b: zero64,
+                    });
+                    let nsval = ctx.push(Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Sub,
+                        a: zero64,
+                        b: sval,
+                    });
+                    let mag = ctx.push(Inst::Select {
+                        cond: negi,
+                        a: nsval,
+                        b: sval,
+                    });
+                    let neg = ctx.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: negi,
+                    });
+                    (mag, Some(neg))
+                } else {
+                    let mag = if is64 {
+                        av
+                    } else {
+                        ctx.push(Inst::Convert {
+                            op: ConvOp::ExtendI32U,
+                            a: av,
+                        })
+                    };
+                    (mag, None)
+                };
+                // Pre-fill the pad region of the scratch buffer (`width` constant byte-stores), then
+                // `utoa` writes the digits backward over its high end; the unfilled low pad remains.
+                if width > 0 {
+                    let padch = ctx.push(Inst::ConstI32(if zero { b'0' } else { b' ' } as i32));
+                    for k in 0..width as u64 {
+                        let a = ctx.const_i64((FMT_BUF_END - width as u64 + k) as i64);
+                        ctx.push_effect(Inst::Store {
+                            op: svm_ir::StoreOp::I32_8,
+                            addr: a,
+                            value: padch,
+                            offset: 0,
+                            align: 0,
+                        });
+                    }
+                }
+                let basec = ctx.const_i64(base as i64);
+                let bufend = ctx.const_i64(FMT_BUF_END as i64);
+                let start = ctx.push(Inst::Call {
+                    func: utoa,
+                    args: vec![mag, basec, bufend],
+                }); // i64 start pointer (digits at [start, bufend))
+                    // The leading `-` for a negative `%d`: store it just below the digits unconditionally
+                    // (harmless for non-negatives — it is only included in the write window when `neg`).
+                let content_start = match neg {
+                    Some(neg) => {
+                        let one = ctx.const_i64(1);
+                        let sm1 = ctx.push(Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Sub,
+                            a: start,
+                            b: one,
+                        });
+                        let dash = ctx.push(Inst::ConstI32(b'-' as i32));
+                        ctx.push_effect(Inst::Store {
+                            op: svm_ir::StoreOp::I32_8,
+                            addr: sm1,
+                            value: dash,
+                            offset: 0,
+                            align: 0,
+                        });
+                        ctx.push(Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Sub,
+                            a: start,
+                            b: neg,
+                        }) // start - (neg ? 1 : 0)
+                    }
+                    None => start,
+                };
+                let len = ctx.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: BinOp::Sub,
+                    a: bufend,
+                    b: content_start,
+                });
+                if width > 0 {
+                    // write `max(len, width)` bytes ending at `bufend` (pad + sign + digits).
+                    let wv = ctx.const_i64(width as i64);
+                    let gt = ctx.push(Inst::IntCmp {
+                        ty: IntTy::I64,
+                        op: CmpOp::GtU,
+                        a: len,
+                        b: wv,
+                    });
+                    let maxlen = ctx.push(Inst::Select {
+                        cond: gt,
+                        a: len,
+                        b: wv,
+                    });
+                    let wstart = ctx.push(Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Sub,
+                        a: bufend,
+                        b: maxlen,
+                    });
+                    ctx.emit_write(wstart, maxlen)?;
+                } else {
+                    ctx.emit_write(content_start, len)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The largest constant byte length we unroll a `memcpy`/`memset` into chunked load/stores; a
@@ -1902,6 +2690,7 @@ fn lower_int_intrinsic(
             | "llvm.abs"
             | "llvm.fshl"
             | "llvm.fshr"
+            | "llvm.bswap"
     ) {
         return Ok(None);
     }
@@ -1964,9 +2753,71 @@ fn lower_int_intrinsic(
             };
             ctx.push(Inst::IntBin { ty, op, a, b: amt })
         }
+        // `llvm.bswap` — reverse the value's bytes inline (no SVM op): each source byte `i` is
+        // shifted to destination byte `nbytes-1-i`.
+        "llvm.bswap" => {
+            let bits = src_bits(args[0], types)?;
+            let v = ctx.operand(args[0])?;
+            emit_bswap(ctx, v, ty, (bits / 8).max(1) as u64)
+        }
         _ => unreachable!(),
     };
     Ok(Some(idx))
+}
+
+/// Emit an inline byte-reverse of `v` (`ty`-wide, `nbytes` bytes): OR together, for each source byte
+/// `i`, `((v >> 8*i) & 0xff) << 8*(nbytes-1-i)`. Lowers `llvm.bswap.{i16,i32,i64}`.
+fn emit_bswap(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, nbytes: u64) -> ValIdx {
+    let kof = |ctx: &mut BlockCtx, k: i64| {
+        ctx.push(if ty == IntTy::I64 {
+            Inst::ConstI64(k)
+        } else {
+            Inst::ConstI32(k as i32)
+        })
+    };
+    let ff = kof(ctx, 0xff);
+    let mut acc: Option<ValIdx> = None;
+    for i in 0..nbytes {
+        let shifted = if i == 0 {
+            v
+        } else {
+            let s = kof(ctx, (8 * i) as i64);
+            ctx.push(Inst::IntBin {
+                ty,
+                op: BinOp::ShrU,
+                a: v,
+                b: s,
+            })
+        };
+        let byte = ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::And,
+            a: shifted,
+            b: ff,
+        });
+        let dst_sh = 8 * (nbytes - 1 - i);
+        let placed = if dst_sh == 0 {
+            byte
+        } else {
+            let d = kof(ctx, dst_sh as i64);
+            ctx.push(Inst::IntBin {
+                ty,
+                op: BinOp::Shl,
+                a: byte,
+                b: d,
+            })
+        };
+        acc = Some(match acc {
+            None => placed,
+            Some(a) => ctx.push(Inst::IntBin {
+                ty,
+                op: BinOp::Or,
+                a,
+                b: placed,
+            }),
+        });
+    }
+    acc.unwrap_or(v)
 }
 
 /// Lower a call to an external **libm math** function that has a direct SVM float op (`sqrt`,
@@ -2064,8 +2915,8 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Re
     }
     let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
     // A non-constant length — or a constant too large to unroll inline — calls the synthesized
-    // runtime loop helper (`__svm_memset`/`__svm_memcpy`). A variable-length `memmove` (overlap)
-    // has no helper yet (the copy direction needs a runtime branch) — a clean `Unsupported`.
+    // runtime loop helper (`__svm_memset`/`__svm_memcpy`/`__svm_memmove`). Variable-length `memmove`
+    // routes to the overlap-safe (direction-aware) `__svm_memmove`.
     let len = match const_int(args[2]) {
         Some(n) if n <= MAX_MEM_UNROLL => n,
         _ => {
@@ -2087,9 +2938,13 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Re
                     args: vec![dst, src, len],
                 });
             } else {
-                return unsup(format!(
-                    "variable-length `{name}` (memmove overlap needs a runtime branch)"
-                ));
+                let f = ctx.helpers.memmove.expect("memmove helper synthesized");
+                let dst = ctx.operand(args[0])?;
+                let src = ctx.operand(args[1])?;
+                ctx.push_effect(Inst::Call {
+                    func: f,
+                    args: vec![dst, src, len],
+                });
             }
             return Ok(true);
         }
@@ -2200,6 +3055,49 @@ fn lower_float_intrinsic(
         return Ok(None);
     }
     let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    // `<4 x float>` form → native `v128` lane-wise ops (§17). `fmuladd`/`fma` lower unfused.
+    if args
+        .first()
+        .is_some_and(|a| vec4_lane_ty(a.get_type(types).as_ref()) == Some(ValType::F32))
+    {
+        use svm_ir::{VFloatBinOp as VB, VFloatUnOp as VU, VShape::F32x4};
+        let un = |ctx: &mut BlockCtx, op: VU| -> Result<ValIdx, Error> {
+            let a = ctx.operand(args[0])?;
+            Ok(ctx.push(Inst::VFloatUn {
+                shape: F32x4,
+                op,
+                a,
+            }))
+        };
+        let bin = |ctx: &mut BlockCtx, op: VB| -> Result<ValIdx, Error> {
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            Ok(ctx.push(Inst::VFloatBin {
+                shape: F32x4,
+                op,
+                a,
+                b,
+            }))
+        };
+        let idx = match base {
+            "llvm.sqrt" => un(ctx, VU::Sqrt)?,
+            "llvm.fabs" => un(ctx, VU::Abs)?,
+            "llvm.minnum" | "llvm.minimum" => bin(ctx, VB::Min)?,
+            "llvm.maxnum" | "llvm.maximum" => bin(ctx, VB::Max)?,
+            "llvm.fmuladd" | "llvm.fma" => {
+                let prod = bin(ctx, VB::Mul)?;
+                let cc = ctx.operand(args[2])?;
+                ctx.push(Inst::VFloatBin {
+                    shape: F32x4,
+                    op: VB::Add,
+                    a: prod,
+                    b: cc,
+                })
+            }
+            _ => return unsup(format!("vector float intrinsic `{base}`")),
+        };
+        return Ok(Some(idx));
+    }
     let ty = match args.first() {
         Some(a) => float_ty(val_type(a.get_type(types).as_ref())?)?,
         None => return Ok(None),
@@ -2461,6 +3359,9 @@ struct BlockCtx<'a> {
     caps: &'a HashMap<String, u32>,
     /// String-literal global name → its C-string length (for `puts`/`fputs` write lengths).
     cstrs: &'a HashMap<String, u64>,
+    /// Constant global name → its bytes (for parsing a `printf` constant format string at translate
+    /// time — the format engine reads `@.str`'s content here, never at runtime).
+    gbytes: &'a HashMap<String, Vec<u8>>,
     /// Synthesized mem-loop helper indices (for a variable-length `memset`/`memcpy`).
     helpers: Helpers,
     /// The module's type table — for resolving a constexpr-GEP operand's strides in [`operand`].
@@ -2693,12 +3594,17 @@ impl<'a> BlockCtx<'a> {
                         ValType::I64 => Ok(self.push(Inst::ConstI64(0))),
                         ValType::F32 => Ok(self.push(Inst::ConstF32(0))),
                         ValType::F64 => Ok(self.push(Inst::ConstF64(0))),
+                        ValType::V128 => Ok(self.push(Inst::ConstV128([0u8; 16]))),
                         other => unsup(format!("undef/poison/null of type {}", other.as_str())),
                     }
                 }
-                // A `zeroinitializer` of a 2-lane vector (scalarized to `i64`) is the zero word.
+                // A `zeroinitializer` of a 2-lane vector (scalarized to `i64`) is the zero word; a
+                // 4-lane one is a zero `v128`.
                 Constant::AggregateZero(t) if is_vec2(t.as_ref()) => {
                     Ok(self.push(Inst::ConstI64(0)))
+                }
+                Constant::AggregateZero(t) if is_vec4(t.as_ref()) => {
+                    Ok(self.push(Inst::ConstV128([0u8; 16])))
                 }
                 // A `<2 x float>`/`<2 x i32>` literal — pack the two lanes' 32-bit values into the
                 // `i64` (lane 0 low).
@@ -2712,6 +3618,19 @@ impl<'a> BlockCtx<'a> {
                     };
                     let packed = lane(0) as u64 | ((lane(1) as u64) << 32);
                     Ok(self.push(Inst::ConstI64(packed as i64)))
+                }
+                // A `<4 x float>`/`<4 x i32>` literal — 16 little-endian bytes (lane 0 first).
+                Constant::Vector(elems) if is_vec4(c.get_type(self.types).as_ref()) => {
+                    let mut bytes = [0u8; 16];
+                    for (k, e) in elems.iter().take(4).enumerate() {
+                        let w: u32 = match e.as_ref() {
+                            Constant::Float(Float::Single(f)) => f.to_bits(),
+                            Constant::Int { value, .. } => *value as u32,
+                            _ => 0,
+                        };
+                        bytes[4 * k..4 * k + 4].copy_from_slice(&w.to_le_bytes());
+                    }
+                    Ok(self.push(Inst::ConstV128(bytes)))
                 }
                 // A reference to a global variable is its window address (a constant `i64`). A
                 // reference to a *function* is its §3c funcref index (the function-table index),
@@ -2757,6 +3676,7 @@ fn translate_block(
     globals: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
+    gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
@@ -2773,6 +3693,7 @@ fn translate_block(
         globals,
         caps,
         cstrs,
+        gbytes,
         helpers: *helpers,
         types,
         insts: Vec::new(),
@@ -2812,14 +3733,24 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     if let I::Store(st) = instr {
         let addr = ctx.operand(&st.address)?;
         let value = ctx.operand(&st.value)?;
-        let op = store_op(st.value.get_type(types).as_ref())?;
-        ctx.push_effect(Inst::Store {
-            op,
-            addr,
-            value,
-            offset: 0,
-            align: 0,
-        });
+        // A `<4 x …>` store is a 16-byte `v128.store`; everything else is a width-tagged `store`.
+        if is_vec4(st.value.get_type(types).as_ref()) {
+            ctx.push_effect(Inst::V128Store {
+                addr,
+                value,
+                offset: 0,
+                align: 0,
+            });
+        } else {
+            let op = store_op(st.value.get_type(types).as_ref())?;
+            ctx.push_effect(Inst::Store {
+                op,
+                addr,
+                value,
+                offset: 0,
+                align: 0,
+            });
+        }
         return Ok(());
     }
     if let I::Call(c) = instr {
@@ -2983,16 +3914,28 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         I::Load(l) => {
             let addr = ctx.operand(&l.address)?;
-            let op = load_op(l.loaded_ty.as_ref())?;
-            (
-                &l.dest,
-                ctx.push(Inst::Load {
-                    op,
-                    addr,
-                    offset: 0,
-                    align: 0,
-                }),
-            )
+            // A `<4 x …>` load is a 16-byte `v128.load`; everything else a width-tagged `load`.
+            if is_vec4(l.loaded_ty.as_ref()) {
+                (
+                    &l.dest,
+                    ctx.push(Inst::V128Load {
+                        addr,
+                        offset: 0,
+                        align: 0,
+                    }),
+                )
+            } else {
+                let op = load_op(l.loaded_ty.as_ref())?;
+                (
+                    &l.dest,
+                    ctx.push(Inst::Load {
+                        op,
+                        addr,
+                        offset: 0,
+                        align: 0,
+                    }),
+                )
+            }
         }
         I::GetElementPtr(g) => {
             let addr = translate_gep(ctx, g, types)?;
@@ -3247,35 +4190,61 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `<2 x float>` lane ops (the vector is a packed `i64`). Indices are constant (0/1); a
         // dynamic lane is `Unsupported`.
         I::ExtractElement(ee) => {
-            let lane_ty = vec2_lane_ty(ee.vector.get_type(types).as_ref())
-                .ok_or_else(|| Error::Unsupported("extractelement: unsupported vector".into()))?;
+            let vty = ee.vector.get_type(types);
             let i = const_int(&ee.index)
-                .filter(|&i| i < 2)
-                .ok_or_else(|| Error::Unsupported("extractelement: dynamic/oob lane".into()))?;
+                .ok_or_else(|| Error::Unsupported("extractelement: dynamic lane".into()))?;
             let v = ctx.operand(&ee.vector)?;
-            (&ee.dest, ctx.vec_lane(v, i, lane_ty))
+            if let Some(lane) = vec4_lane_ty(vty.as_ref()) {
+                let idx = ctx.push(Inst::ExtractLane {
+                    shape: vshape4(lane),
+                    lane: i as u8,
+                    signed: false,
+                    a: v,
+                });
+                (&ee.dest, idx)
+            } else {
+                let lane_ty = vec2_lane_ty(vty.as_ref())
+                    .filter(|_| i < 2)
+                    .ok_or_else(|| {
+                        Error::Unsupported("extractelement: unsupported vector".into())
+                    })?;
+                (&ee.dest, ctx.vec_lane(v, i, lane_ty))
+            }
         }
         I::InsertElement(ie) => {
-            let lane_ty = vec2_lane_ty(ie.vector.get_type(types).as_ref())
-                .ok_or_else(|| Error::Unsupported("insertelement: unsupported vector".into()))?;
+            let vty = ie.vector.get_type(types);
             let i = const_int(&ie.index)
-                .filter(|&i| i < 2)
-                .ok_or_else(|| Error::Unsupported("insertelement: dynamic/oob lane".into()))?;
+                .ok_or_else(|| Error::Unsupported("insertelement: dynamic lane".into()))?;
             let v = ctx.operand(&ie.vector)?;
             let x = ctx.operand(&ie.element)?;
-            let other = ctx.vec_lane(v, 1 - i, lane_ty); // the lane we keep
-            let packed = if i == 0 {
-                ctx.vec_pack(x, other, lane_ty)
+            if let Some(lane) = vec4_lane_ty(vty.as_ref()) {
+                let idx = ctx.push(Inst::ReplaceLane {
+                    shape: vshape4(lane),
+                    lane: i as u8,
+                    a: v,
+                    b: x,
+                });
+                (&ie.dest, idx)
             } else {
-                ctx.vec_pack(other, x, lane_ty)
-            };
-            (&ie.dest, packed)
+                let lane_ty = vec2_lane_ty(vty.as_ref())
+                    .filter(|_| i < 2)
+                    .ok_or_else(|| {
+                        Error::Unsupported("insertelement: unsupported vector".into())
+                    })?;
+                let other = ctx.vec_lane(v, 1 - i, lane_ty); // the lane we keep
+                let packed = if i == 0 {
+                    ctx.vec_pack(x, other, lane_ty)
+                } else {
+                    ctx.vec_pack(other, x, lane_ty)
+                };
+                (&ie.dest, packed)
+            }
         }
-        // `shufflevector` of two 2-lane vectors with a constant mask: each result lane picks a lane
-        // from the `[op0.0, op0.1, op1.0, op1.1]` concatenation (index 0..3; undef → lane 0).
+        // `shufflevector` with a constant mask. Each result lane picks a lane from the `a ++ b`
+        // concatenation. `<4 x …>` → a byte-level `i8x16.shuffle` (4 bytes per 32-bit lane; the
+        // common all-equal mask is a broadcast/splat); `<2 x …>` → pick + repack the scalarized lanes.
         I::ShuffleVector(sv) => {
-            let lane_ty = vec2_lane_ty(sv.operand0.get_type(types).as_ref())
-                .ok_or_else(|| Error::Unsupported("shufflevector: unsupported vector".into()))?;
+            let vty = sv.operand0.get_type(types);
             let mask: Vec<u64> = match sv.mask.as_ref() {
                 Constant::Vector(m) => m
                     .iter()
@@ -3286,21 +4255,53 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     .collect(),
                 _ => return unsup("shufflevector: non-constant mask"),
             };
-            if mask.len() != 2 {
-                return unsup("shufflevector: result is not 2-lane");
-            }
             let v0 = ctx.operand(&sv.operand0)?;
             let v1 = ctx.operand(&sv.operand1)?;
-            let pick = |ctx: &mut BlockCtx, m: u64| {
-                if m < 2 {
-                    ctx.vec_lane(v0, m, lane_ty)
-                } else {
-                    ctx.vec_lane(v1, m.saturating_sub(2).min(1), lane_ty)
+            if vec4_lane_ty(vty.as_ref()).is_some() {
+                if mask.len() != 4 {
+                    return unsup("shufflevector: result is not 4-lane");
                 }
-            };
-            let l0 = pick(ctx, mask[0]);
-            let l1 = pick(ctx, mask[1]);
-            (&sv.dest, ctx.vec_pack(l0, l1, lane_ty))
+                // 32-bit lanes → 4 bytes each; lane `src` (0..8) → concat bytes (src<4 ? 4*src :
+                // 16 + 4*(src-4)). An undef/oob mask lane reads lane 0 of `a`.
+                let mut lanes = [0u8; 16];
+                for (k, &src) in mask.iter().enumerate() {
+                    let base = if src < 4 {
+                        4 * src
+                    } else if src < 8 {
+                        16 + 4 * (src - 4)
+                    } else {
+                        0
+                    } as u8;
+                    for b in 0..4u8 {
+                        lanes[4 * k + b as usize] = base + b;
+                    }
+                }
+                (
+                    &sv.dest,
+                    ctx.push(Inst::Shuffle {
+                        lanes,
+                        a: v0,
+                        b: v1,
+                    }),
+                )
+            } else {
+                let lane_ty = vec2_lane_ty(vty.as_ref()).ok_or_else(|| {
+                    Error::Unsupported("shufflevector: unsupported vector".into())
+                })?;
+                if mask.len() != 2 {
+                    return unsup("shufflevector: result is not 2-lane");
+                }
+                let pick = |ctx: &mut BlockCtx, m: u64| {
+                    if m < 2 {
+                        ctx.vec_lane(v0, m, lane_ty)
+                    } else {
+                        ctx.vec_lane(v1, m.saturating_sub(2).min(1), lane_ty)
+                    }
+                };
+                let l0 = pick(ctx, mask[0]);
+                let l1 = pick(ctx, mask[1]);
+                (&sv.dest, ctx.vec_pack(l0, l1, lane_ty))
+            }
         }
         // `extractvalue` reads a field of a small by-value struct — alias the field's value (§3a).
         I::ExtractValue(ev) => {
@@ -3351,8 +4352,22 @@ fn fbin<'d>(
     Ok((dest, ctx.push(Inst::FBin { ty, op, a, b })))
 }
 
-/// A float binary op that may be scalar (`f32`/`f64`) or a `<2 x float>` vector. The vector case
-/// unpacks the two packed-`i64` lanes, applies `op` per lane (`f32`), and repacks (§3b scalarization).
+/// Map a scalar float binop to its lane-wise `v128` form.
+fn vfbin_op(op: FBinOp) -> Result<svm_ir::VFloatBinOp, Error> {
+    use svm_ir::VFloatBinOp as V;
+    Ok(match op {
+        FBinOp::Add => V::Add,
+        FBinOp::Sub => V::Sub,
+        FBinOp::Mul => V::Mul,
+        FBinOp::Div => V::Div,
+        FBinOp::Min => V::Min,
+        FBinOp::Max => V::Max,
+        FBinOp::Copysign => return unsup("vector copysign"),
+    })
+}
+
+/// A float binary op that may be scalar (`f32`/`f64`), a `<2 x float>` (scalarized to a packed
+/// `i64`, applied per lane), or a `<4 x float>` (a native `v128` lane-wise `VFloatBin`, §17).
 fn fp_binop<'d>(
     ctx: &mut BlockCtx,
     dest: &'d Name,
@@ -3361,6 +4376,19 @@ fn fp_binop<'d>(
     o1: &'d Operand,
     types: &Types,
 ) -> Result<(&'d Name, ValIdx), Error> {
+    if vec4_lane_ty(o0.get_type(types).as_ref()) == Some(ValType::F32) {
+        let a = ctx.operand(o0)?;
+        let b = ctx.operand(o1)?;
+        return Ok((
+            dest,
+            ctx.push(Inst::VFloatBin {
+                shape: svm_ir::VShape::F32x4,
+                op: vfbin_op(op)?,
+                a,
+                b,
+            }),
+        ));
+    }
     if is_vec2f(o0.get_type(types).as_ref()) {
         let a = ctx.operand(o0)?;
         let b = ctx.operand(o1)?;

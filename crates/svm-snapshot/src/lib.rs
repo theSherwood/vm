@@ -47,8 +47,10 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// Format version; bump on an incompatible change (§12.2).
 const FORMAT_VERSION: u16 = 1;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
-/// every page is exactly `PAGE` bytes (no partial tail).
-const PAGE: usize = 4096;
+/// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
+/// granularity so a captured prot map lines up with the image, one entry per page.
+pub const PAGE: usize = 4096;
+const _: () = assert!(PAGE as u64 == svm_interp::DURABLE_SNAPSHOT_PAGE);
 
 // ---- Section tags (ascending, §12.2-12.5). ----
 const TAG_HEADER: u64 = 0;

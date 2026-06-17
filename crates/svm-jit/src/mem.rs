@@ -32,6 +32,8 @@ enum Prot {
     Rw,
     /// Read-only (the D40 const data segment; a later write faults).
     Ro,
+    /// Inaccessible — any access faults into the guard (a durable-restored `Unmapped` page).
+    None,
 }
 
 #[inline]
@@ -184,6 +186,20 @@ impl GuestWindow {
         // SAFETY: `[base+start, base+end)` lies within the backed region (the caller bounds
         // `offset+len <= mapped`, which is page-rounded up to `rw`), owned for the lifetime.
         unsafe { pal::protect(self.base.add(start), end - start, Prot::Ro) };
+    }
+
+    /// Map the whole pages touched by `[offset, offset+len)` **inaccessible** — a durable-restored
+    /// `Unmapped` page (DURABILITY.md §12.3): any later access faults into the guarded range,
+    /// exactly as on the frozen guest. The snapshot's `read_low` re-commits it RW before reading.
+    pub(crate) fn protect_none(&self, offset: u64, len: u64) {
+        if self.mapped == 0 || len == 0 {
+            return;
+        }
+        let page = pal::page_size();
+        let start = (offset as usize / page) * page;
+        let end = round_up((offset + len) as usize, page);
+        // SAFETY: as `protect_ro` — `[base+start, base+end)` is within the backed region.
+        unsafe { pal::protect(self.base.add(start), end - start, Prot::None) };
     }
 
     /// The address range a fault must land in to be attributed to this window (the whole
@@ -482,6 +498,7 @@ mod pal {
         let p = match prot {
             Prot::Rw => libc::PROT_READ | libc::PROT_WRITE,
             Prot::Ro => libc::PROT_READ,
+            Prot::None => libc::PROT_NONE,
         };
         libc::mprotect(base as *mut c_void, len, p);
     }
@@ -691,6 +708,7 @@ mod pal {
         let flags: PAGE_PROTECTION_FLAGS = match prot {
             Prot::Rw => PAGE_READWRITE,
             Prot::Ro => PAGE_READONLY,
+            Prot::None => PAGE_NOACCESS,
         };
         let mut old: PAGE_PROTECTION_FLAGS = 0;
         VirtualProtect(base as *const c_void, len, flags, &mut old);

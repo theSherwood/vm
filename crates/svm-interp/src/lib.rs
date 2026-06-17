@@ -265,6 +265,11 @@ struct DebugCtx {
     resume_clock: u64,
     /// When `Some(t)`, stop once `clock` reaches `t` (a pending single-step).
     step_target: Option<u64>,
+    /// Depth-aware stepping (DEBUGGING.md W2): when `Some(d)`, stop at the next op (after stepping
+    /// off the current one) whose call depth is `<= d`. `d` = current depth runs over (skips into and
+    /// out of) any call the current op makes (step-**over**); `d` = current depth − 1 runs until this
+    /// function returns (step-**out**).
+    step_max_depth: Option<usize>,
     /// Time-travel seek (DEBUGGING.md W1): when `Some(t)`, fast-forward this fresh re-execution to
     /// logical time `t` — pausing exactly at `clock == t` and **ignoring** breakpoints/watchpoints
     /// along the way (we are replaying to a known coordinate, not hunting for stops).
@@ -278,6 +283,7 @@ impl DebugCtx {
             clock: 0,
             resume_clock: u64::MAX, // nothing stopped yet, so the first op may itself break
             step_target: None,
+            step_max_depth: None,
             seek_target: None,
         }
     }
@@ -295,7 +301,13 @@ impl DebugCtx {
     /// the op itself (for the `cap.call` boundary stop). `Some(reason)` pauses (the op has not run,
     /// `clock` unchanged, so the continuation re-enters here); `None` charges one tick of logical
     /// time and lets the op run. The `resume_clock` guard makes resume step off the current op.
-    fn before_op(&mut self, pc: IrPc, inst: &Inst, access: MemAccess) -> Option<StopReason> {
+    fn before_op(
+        &mut self,
+        pc: IrPc,
+        inst: &Inst,
+        access: MemAccess,
+        depth: usize,
+    ) -> Option<StopReason> {
         // Time-travel seek (W1): replay straight to logical time `t`, past any breakpoints.
         if let Some(t) = self.seek_target {
             if self.clock >= t {
@@ -321,6 +333,10 @@ impl DebugCtx {
                 Some(r)
             } else if self.step_target == Some(self.clock) {
                 Some(StopReason::Step)
+            } else if matches!(self.step_max_depth, Some(d) if depth <= d) {
+                // Step-over/out: we have stepped off the original op and the call depth is back at
+                // (or below) the target, so a call we ran over has returned.
+                Some(StopReason::Step)
             } else {
                 None
             }
@@ -329,6 +345,7 @@ impl DebugCtx {
             Some(r) => {
                 self.resume_clock = self.clock;
                 self.step_target = None;
+                self.step_max_depth = None;
                 Some(r)
             }
             None => {
@@ -1124,6 +1141,33 @@ impl Inspector {
         self.run_until_stop()
     }
 
+    /// **Step over** (DEBUGGING.md W2): execute the current op and stop at the next one in this
+    /// frame — running any call it makes to completion rather than descending into it. (Op-level: a
+    /// non-call advances one op, like [`step`](Inspector::step); a `call` runs the whole callee.)
+    pub fn step_over(&mut self) -> Stop {
+        self.step_to_depth(|depth| depth)
+    }
+
+    /// **Step out** (DEBUGGING.md W2): run until the current function returns, stopping at the op in
+    /// the caller that the call returned to. From the outermost frame this runs to completion.
+    pub fn step_out(&mut self) -> Stop {
+        self.step_to_depth(|depth| depth.saturating_sub(1))
+    }
+
+    /// Shared driver for step-over/out: step off the current op, then stop at the next op whose call
+    /// depth is `<= target(current_depth)`.
+    fn step_to_depth(&mut self, target: impl Fn(usize) -> usize) -> Stop {
+        if self.finished.is_some() || self.cur().is_none() {
+            return self.run_until_stop();
+        }
+        let depth = self.cur().map(|v| v.frames.len()).unwrap_or(0);
+        let d = self.dbg();
+        d.resume_clock = d.clock; // step off the current op even on the very first step
+        d.step_max_depth = Some(target(depth));
+        d.step_target = None;
+        self.run_until_stop()
+    }
+
     /// The guest's result once it has [`Stop::Finished`]; `None` while still running.
     pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
         self.finished.as_ref()
@@ -1481,6 +1525,65 @@ pub fn run_capture_reserved_with_host(
         .map(|mm| mm.snapshot_window(SNAP_CAP))
         .unwrap_or_default();
     (r, snap)
+}
+
+/// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `svm-snapshot`'s
+/// `PAGE`). Protections are captured at this fixed size — independent of the host page size — so
+/// an artifact is portable across hosts. A 4 KiB codec page sits within one host page (host
+/// pages are `≥ 4 KiB`), so each codec page's protection is that of its containing host page.
+pub const DURABLE_SNAPSHOT_PAGE: u64 = 4096;
+
+/// Per-page protection of a captured window region, for the durable snapshot (DURABILITY.md
+/// §12.3). A faithful view of the interpreter's page model; `Backed` is the §13
+/// `SharedRegion`-aliased case a durable snapshot must reject (D-region — freeze refuses).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CapturedProt {
+    /// Read/write (the default for a committed prefix page).
+    Rw,
+    /// Read-only — e.g. a D40 `readonly` data segment, or a guest `protect`.
+    Ro,
+    /// Unmapped / uncommitted — any access faults.
+    Unmapped,
+    /// A §13 `SharedRegion`-aliased page — not snapshottable in v1 (D-region).
+    Backed,
+}
+
+/// [`run_capture_reserved_with_host`] that **seeds** an initial per-page protection map (the
+/// durable-restore step — re-establishing `Ro`/`Unmapped` pages so a thawed guest faults exactly
+/// as the frozen one would) and **returns** the post-run protection map (the durable-freeze step),
+/// both one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). Pass
+/// `init_prots = None` to capture only (every page starts at its default). A `Backed` entry in
+/// `init_prots` is ignored — a §13 shared-region alias is not restorable (D-region; freeze refuses
+/// it), so the embedder re-grants the region instead.
+#[allow(clippy::too_many_arguments)]
+pub fn run_capture_reserved_with_host_prots(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    init_prots: Option<&[CapturedProt]>,
+    reserved_log2: u8,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<u8>, Vec<CapturedProt>) {
+    if m.funcs.get(func as usize).is_none() {
+        return (Err(Trap::Malformed), Vec::new(), Vec::new());
+    }
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        mm.seed(init_mem);
+        mm.init_data(&m.data);
+        if let Some(prots) = init_prots {
+            mm.apply_prots(prots);
+        }
+        mm
+    });
+    let r = drive(&m.funcs, func, args, fuel, &mut mem, host);
+    let (snap, prots) = mem
+        .as_ref()
+        .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
+        .unwrap_or_default();
+    (r, snap, prots)
 }
 
 /// Run the guest confined to a §14 **nested sub-window** `[base, base+size)` of a fully-backed
@@ -4153,7 +4256,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 } else {
                     MemAccess::None
                 };
-                if let Some(reason) = dbg.before_op(pc, inst, access) {
+                if let Some(reason) = dbg.before_op(pc, inst, access, frames.len()) {
                     return Ok(Inner::Pause(reason, pc));
                 }
             }
@@ -6675,7 +6778,13 @@ pub struct Host {
 /// ([`Func::uses_concurrency`]) — and the *same* function must be installed for the
 /// interpreter and JIT runs of a differential pair, so both backends accept/reject
 /// identically (`svm-run` provides the canonical one).
-pub type JitValidator = fn(&[u8], Option<u8>) -> Result<Arc<[Func]>, i64>;
+///
+/// The third argument is the **symbol-table bytes** for host-assisted dynamic linking
+/// (DESIGN.md §22): a guest-provided `name → slot | capability` table the validator resolves the
+/// unit's §7 imports against *before* verify (rewrite-then-verify). It is empty (`&[]`) for the
+/// ordinary closed-blob `compile` op — an empty table resolves nothing, so a unit with imports
+/// fails closed — and carries the guest's table only for the `compile_linked` op.
+pub type JitValidator = fn(&[u8], Option<u8>, &[u8]) -> Result<Arc<[Func]>, i64>;
 
 /// A successful [`Host::jit_compile`]: the minted `CompiledCode` handle and the `(domain,
 /// unit)` indices the JIT embedder needs to compile the unit natively and register its
@@ -6838,6 +6947,68 @@ impl Host {
                 m
             }
         }
+    }
+
+    /// Capture the window's per-page protections for a durable freeze of a **JIT** run
+    /// (DURABILITY.md §12.3). The JIT keeps protections in the OS page tables, so — unlike the
+    /// interpreter, where [`run_capture_reserved_with_host_prots`] reads its software map — a
+    /// freeze reconstructs them here from the two host-side sources, mirroring the interpreter's
+    /// `snapshot_prots` so the backends agree page-for-page:
+    ///
+    /// * the module's `readonly` data segments → `Ro` (applied to the window at instantiation but
+    ///   not recorded in `cap_pages`), and
+    /// * the runtime page-state map the Memory cap maintained (`cap_pages`: `map`/`unmap`/`protect`)
+    ///   — which **overrides** the segment/default for any page the guest changed.
+    ///
+    /// One [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page over `npages`; `mapped` is the
+    /// backed-prefix byte length (pages beyond it default `Unmapped`). A `Backed` (§13) page can't
+    /// arise here — a domain holding a shared region isn't freezable (its handle is non-durable).
+    pub fn capture_window_prots(
+        &self,
+        data: &[Data],
+        mapped: u64,
+        npages: usize,
+    ) -> Vec<CapturedProt> {
+        // Default: Rw in the backed prefix, Unmapped in the reserved tail.
+        let mut out: Vec<CapturedProt> = (0..npages as u64)
+            .map(|p| {
+                if p * DURABLE_SNAPSHOT_PAGE < mapped {
+                    CapturedProt::Rw
+                } else {
+                    CapturedProt::Unmapped
+                }
+            })
+            .collect();
+        // `readonly` data segments → Ro. Protection is **host-page** granular (the runtime's
+        // `protect_ro` and the interpreter's `init_data` protect the whole host page), so a
+        // segment marks every codec page of the host page(s) it touches — this is what makes the
+        // result match `snapshot_prots` on a host whose page is larger than a codec page.
+        let host = host_page_size();
+        for d in data {
+            if !d.readonly || d.bytes.is_empty() {
+                continue;
+            }
+            let lo = (d.offset / host) * host / DURABLE_SNAPSHOT_PAGE;
+            let hi =
+                (d.offset + d.bytes.len() as u64).div_ceil(host) * host / DURABLE_SNAPSHOT_PAGE;
+            for p in lo..hi.min(npages as u64) {
+                out[p as usize] = CapturedProt::Ro;
+            }
+        }
+        // Runtime map/unmap/protect (host-page-indexed) override the defaults.
+        if let Some((_, map)) = &self.cap_pages {
+            let m = map.lock().unwrap();
+            for (p, slot) in out.iter_mut().enumerate() {
+                let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host;
+                match m.get(&hp) {
+                    Some(1) => *slot = CapturedProt::Rw,
+                    Some(2) => *slot = CapturedProt::Ro,
+                    Some(3) => *slot = CapturedProt::Unmapped,
+                    _ => {}
+                }
+            }
+        }
+        out
     }
 
     /// Install the §9/§12 async-completion `notify` hook (the executor that owns the wake mechanism
@@ -7246,6 +7417,21 @@ impl Host {
         handle: i32,
         bytes: &[u8],
     ) -> Result<Result<JitCompiled, i64>, Trap> {
+        // The closed-blob path: no symbol table, so a unit with §7 imports fails closed.
+        self.jit_compile_linked(handle, bytes, &[])
+    }
+
+    /// Like [`Self::jit_compile`], but the unit's §7 imports are resolved against the
+    /// guest-provided **symbol-table bytes** before verify — host-assisted dynamic linking
+    /// (DESIGN.md §22). The `compile_linked` op routes here; `compile` routes here with an empty
+    /// table. The validator does the resolve-then-verify, so the symbol table stays
+    /// guest-controlled yet a mis-link can never escape (it fails re-verification, `-EINVAL`).
+    pub fn jit_compile_linked(
+        &mut self,
+        handle: i32,
+        bytes: &[u8],
+        symtab: &[u8],
+    ) -> Result<Result<JitCompiled, i64>, Trap> {
         let domain = self.resolve_jit_domain(handle)?;
         let Some(validate) = self.jit_validator else {
             return Ok(Err(EINVAL));
@@ -7257,7 +7443,7 @@ impl Host {
             return Ok(Err(ENOMEM));
         }
         d.bytes_left -= bytes.len() as u64;
-        let funcs = match validate(bytes, d.mem_log2) {
+        let funcs = match validate(bytes, d.mem_log2, symtab) {
             Ok(f) if !f.is_empty() => f,
             Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
             Err(e) => return Ok(Err(e)),
@@ -7739,6 +7925,30 @@ impl Host {
                     Ok(vec![match self.jit_release(ch) {
                         Ok(()) => 0,
                         Err(_) => EINVAL,
+                    }])
+                }
+                5 => {
+                    // compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len) -> code_handle |
+                    // -errno (DESIGN.md §22 host-assisted dynamic linking). Like op 0 `compile`, but
+                    // the unit may carry unresolved §7 imports, bound by name against the guest's
+                    // symbol-table buffer before verify. Both buffers are borrowed from the
+                    // window; with no window there is nothing to read (-EFAULT, like op 0).
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let ir_ptr = *args.first().unwrap_or(&0) as u64;
+                    let ir_len = *args.get(1).unwrap_or(&0) as u64;
+                    let st_ptr = *args.get(2).unwrap_or(&0) as u64;
+                    let st_len = *args.get(3).unwrap_or(&0) as u64;
+                    let Some(ir) = mem.read_bytes(ir_ptr, ir_len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let Some(symtab) = mem.read_bytes(st_ptr, st_len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    Ok(vec![match self.jit_compile_linked(handle, &ir, &symtab)? {
+                        Ok(c) => c.handle as i64,
+                        Err(e) => e,
                     }])
                 }
                 _ => Ok(vec![EINVAL]),
@@ -8950,6 +9160,58 @@ impl Mem {
             }
         }
         out
+    }
+
+    /// Per-page protections over the same span as [`snapshot_window`], one [`CapturedProt`] per
+    /// [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). A page absent from the map is
+    /// `Rw` in the committed prefix and `Unmapped` in the reserved tail — the same default the
+    /// access path and the JIT's page tables use.
+    fn snapshot_prots(&self, snap_cap: usize) -> Vec<CapturedProt> {
+        let snap = self
+            .window
+            .reserved()
+            .min(self.window.mapped().max(snap_cap as u64));
+        let mapped = self.window.mapped();
+        let space = self.space_read();
+        (0..snap / DURABLE_SNAPSHOT_PAGE)
+            .map(|i| {
+                let byte_off = i * DURABLE_SNAPSHOT_PAGE;
+                match space.prot.get(&(byte_off / self.page)) {
+                    Some(PageProt::Rw) => CapturedProt::Rw,
+                    Some(PageProt::Ro) => CapturedProt::Ro,
+                    Some(PageProt::Unmapped) => CapturedProt::Unmapped,
+                    Some(PageProt::Backed { .. }) => CapturedProt::Backed,
+                    None if byte_off < mapped => CapturedProt::Rw,
+                    None => CapturedProt::Unmapped,
+                }
+            })
+            .collect()
+    }
+
+    /// Re-establish a captured protection map on this window (the durable-restore step, the
+    /// inverse of [`snapshot_prots`]): mark each `Ro`/`Unmapped` page so a thawed guest faults
+    /// exactly as the frozen one would. `Rw` is the prefix default (left absent) but is set
+    /// explicitly for a reserved-tail page (a grown commit); `Backed` is skipped — a §13
+    /// shared-region alias isn't restorable here (D-region), the embedder re-grants the region.
+    fn apply_prots(&mut self, prots: &[CapturedProt]) {
+        let mapped = self.window.mapped();
+        let mut space = self.space_write();
+        for (i, &p) in prots.iter().enumerate() {
+            let byte_off = i as u64 * DURABLE_SNAPSHOT_PAGE;
+            let host_page = byte_off / self.page;
+            match p {
+                CapturedProt::Ro => {
+                    space.prot.insert(host_page, PageProt::Ro);
+                }
+                CapturedProt::Unmapped => {
+                    space.prot.insert(host_page, PageProt::Unmapped);
+                }
+                CapturedProt::Rw if byte_off >= mapped => {
+                    space.prot.insert(host_page, PageProt::Rw);
+                }
+                CapturedProt::Rw | CapturedProt::Backed => {}
+            }
+        }
     }
 }
 
