@@ -1115,13 +1115,27 @@ variable-bearing section the core doesn't yet parse) is preserved for later. Thi
 schema's rich-blob slot, as the doc recommended. Tests: wasm carries `.debug_info`/`.debug_line`
 blobs verbatim; text + binary round-trips; a truncated debug section errors without panicking.
 
-**Not yet (next slices):** wasm/LLVM **variable** ingest — the large, design-heavy piece: it needs
-full `.debug_info`/`.debug_abbrev` DIE parsing **and** a location model for DWARF's frame-base /
-`DW_OP_fbreg` memory locations (clang `-O0` describes C-frame memory, not our SSA/window values, so
-neither `Ssa`/`SsaList` nor `Window` maps directly — a runtime `__stack_pointer`-relative base). The
-LLVM `!DILocation` → `debug.loc` bitcode-metadata path is its own effort. (The chibicc producer
-(incl. optimized-build location lists), both DAP consumers, binary serialization, a second
-producer's source lines, the location-list ABI, and now the rich-blob pass-through are all built.)
+**Slice 19 — wasm `.debug_info` DIE reader (variable-ingest foundation).** A small hand-rolled
+DWARF v2–v4 (DWARF32) `.debug_info` reader (`dwarf_info.rs`, no `gimli` — matching the line reader)
+parses `.debug_abbrev` (abbreviation tables) + `.debug_info` (the DIE tree) + `.debug_str`,
+recovering per `DW_TAG_subprogram`: its PC range, its **frame base** (a wasm local, from
+`DW_OP_WASM_location 0x0 <n>`), and its parameter/variable children — each a `(name, DW_OP_fbreg
+offset, type DIE)` — plus `DW_TAG_base_type` DIEs by offset. Best-effort (malformed/unsupported ⇒
+no vars; the verifier ignores it, §2a). This grounds the variable-ingest location model against real
+clang output: the wasm DWARF describes a var as a **C-frame memory** location `(frame_base + fbreg)`
+= a window address whose base is a *runtime* wasm-local value, so resolving it needs the local's SSA
+value per pc (an `SsaList`-style lookup) plus the offset — a forthcoming `VarLoc` variant. Test
+(`debug_line.rs`): the reader recovers `add`'s frame-base local 4 and its `a/b/s` at fbreg +12/+8/+4
+with the `int` base type, from the committed fixture.
+
+**Not yet (next slices), completing wasm variable ingest:** (1) a `VarLoc` for *window-via-a-per-pc-
+base-value + offset* (the frame-base local resolved as an `SsaList`, then `+ fbreg`, read from the
+window); (2) svm-wasm tracking each wasm local's SSA value per pc (an `SsaList` per local, like the
+slice-15/17 op recording); (3) wiring `dwarf_info` vars + base types → `debug.var` + `TypeRef`,
+keyed by subprogram→IR-func, end-to-end. Plus the LLVM `!DILocation`/`dbg.value` bitcode path (its
+own effort). (The chibicc producer (incl. optimized-build location lists), both DAP consumers,
+binary serialization, a second producer's source lines + DWARF pass-through, the location-list ABI,
+and now the `.debug_info` reader are all built.)
 
 ### Open questions (S4/S5/S2)
 

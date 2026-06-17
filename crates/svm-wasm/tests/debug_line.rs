@@ -63,3 +63,48 @@ fn wasm_dwarf_line_maps_into_the_debug_info_waist() {
         );
     }
 }
+
+#[test]
+fn wasm_dwarf_info_extracts_source_variables() {
+    // The §6 variable-ingest foundation: the DWARF `.debug_info` reader recovers each source
+    // variable (name, `DW_OP_fbreg` offset, type) and the subprogram's frame-base wasm local from
+    // the real clang fixture. (Wiring these into `debug.var` is a follow-up slice.)
+    let t = svm_wasm::transpile(DLINE).expect("transpile");
+    let blobs = &t.module.debug_info.as_ref().unwrap().blobs;
+    let sec = |name: &str| -> &[u8] {
+        blobs
+            .iter()
+            .find(|b| b.producer == name)
+            .map(|b| b.bytes.as_slice())
+            .unwrap_or(&[])
+    };
+    let info =
+        svm_wasm::dwarf_info::parse(sec(".debug_info"), sec(".debug_abbrev"), sec(".debug_str"))
+            .expect("parse .debug_info");
+
+    // The `add(int a, int b)` subprogram: frame base is wasm local 4, with a/b/s at fbreg +12/+8/+4.
+    let add = info
+        .subs
+        .iter()
+        .find(|s| s.vars.iter().any(|v| v.name == "a"))
+        .expect("the add() subprogram with named vars");
+    assert_eq!(add.frame_base_local, Some(4), "frame base is wasm local 4");
+
+    let var = |n: &str| {
+        add.vars
+            .iter()
+            .find(|v| v.name == n)
+            .unwrap_or_else(|| panic!("var {n}"))
+    };
+    assert_eq!(var("a").fbreg, 12);
+    assert_eq!(var("b").fbreg, 8);
+    assert_eq!(var("s").fbreg, 4); // `int s = a + b;`
+
+    // The variable type resolves to the `int` base type (signed = DW_ATE_signed = 5, 4 bytes).
+    let int_ty = info
+        .base_types
+        .get(&var("s").type_ref)
+        .expect("s's type DIE");
+    assert_eq!(int_ty.name, "int");
+    assert_eq!((int_ty.encoding, int_ty.size), (5, 4));
+}
