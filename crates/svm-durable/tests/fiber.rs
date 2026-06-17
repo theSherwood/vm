@@ -1,15 +1,17 @@
-//! Phase-3.1 (option A), first slice: the durable transform now recognizes the §12 fiber control
-//! ops (`cont.new`/`cont.resume`/`suspend`) as may-suspend points and instruments them. This pins
+//! Phase-3.1 (option A): the durable transform recognizes the §12 fiber control ops
+//! (`cont.new`/`cont.resume`/`suspend`) as may-suspend points and instruments them. This pins
 //! the **NORMAL-inertness** invariant for a fiber'd module — instrumented runs identically to
 //! un-instrumented — and that the instrumented IR verifies.
 //!
-//! Fiber *freeze/thaw* (re-issuing `cont.resume`, re-parking a `suspend`ed fiber, per-fiber shadow
-//! stacks) is **not** wired yet: those resume arms fail closed (trap) for now, so this slice does
-//! not exercise a fiber thaw — only that instrumentation is transparent in NORMAL.
+//! Slice 3.1.2 wires the **resumer-side thaw arm**: a `cont.resume` rewinds by re-issuing the
+//! resume (reloading its spilled handle + arg), mirroring a propagated call. The **fiber side**
+//! — re-parking a `suspend`ed fiber on thaw (slice 3.1.3) — is still fail-closed (its arm traps),
+//! so a full fiber thaw isn't exercised here yet; the freeze driver + snapshot wiring (3.1.4–5)
+//! complete the round-trip.
 
 use svm_durable::{init_durable_window, transform_module};
 use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
-use svm_ir::{Memory, Module};
+use svm_ir::{Inst, Memory, Module, Terminator};
 
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -78,5 +80,59 @@ fn fiber_module_is_inert_under_instrumentation_in_normal() {
     assert_eq!(
         got, base,
         "instrumentation is inert in NORMAL for a fiber'd module"
+    );
+}
+
+/// Count `cont.resume` / `suspend` ops and `Unreachable`-terminated blocks across every function.
+fn op_and_trap_counts(m: &Module) -> (usize, usize, usize) {
+    let mut resumes = 0;
+    let mut suspends = 0;
+    let mut unreachable = 0;
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::ContResume { .. } => resumes += 1,
+                    Inst::Suspend { .. } => suspends += 1,
+                    _ => {}
+                }
+            }
+            if matches!(b.term, Terminator::Unreachable) {
+                unreachable += 1;
+            }
+        }
+    }
+    (resumes, suspends, unreachable)
+}
+
+/// Slice 3.1.2: the `cont.resume` resumer-side thaw arm is wired (re-issues the resume), while a
+/// `suspend` point's arm still fails closed. Structurally: instrumenting adds one re-issued
+/// `cont.resume` per resume point (its rewind arm) on top of the one kept in the forward segment,
+/// but adds **no** new `suspend` (the `Yield` arm is a bare `Unreachable` trap, slice 3.1.3).
+#[test]
+fn resume_thaw_arm_reissues_while_suspend_stays_fail_closed() {
+    let mut m = svm_text::parse_module(SRC).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let (res0, susp0, _) = op_and_trap_counts(&m);
+    assert_eq!((res0, susp0), (2, 1), "source: 2 cont.resume, 1 suspend");
+
+    let inst = transform_module(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("instrumented IR verifies");
+    let (res1, susp1, traps) = op_and_trap_counts(&inst);
+
+    // Each of the 2 resume points keeps its forward `cont.resume` and gains a re-issue in its
+    // rewind arm → the count doubles. The single `suspend` gains no re-issue (its arm traps).
+    assert_eq!(
+        res1,
+        2 * res0,
+        "each cont.resume gains a re-issuing rewind arm"
+    );
+    assert_eq!(susp1, susp0, "a suspend point's thaw arm does not re-issue");
+    // At least the one `suspend`'s fail-closed arm (plus the shared forged-id TRAP block).
+    assert!(
+        traps >= 2,
+        "the suspend arm and the forged-id trap are Unreachable"
     );
 }

@@ -655,11 +655,12 @@ guest).
 "continuation in a shadow stack" from thread coordination). *In progress:* the transform
 recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'd module is
 **NORMAL-inert** under instrumentation + verifies (`svm-durable/tests/fiber.rs`); the
-**per-fiber shadow-stack layout + shadow-SP swap landed** (slice 3.1.1, below). Still to
-wire — the fiber resume arms (re-issue `cont.resume`; **re-park** a `suspend`) and the freeze
-driver that flattens an idle parked fiber (switch into it under `UNWINDING` so its
-post-suspend poll unwinds it with no forward progress). Those thaw arms currently fail closed
-(trap), so a fiber *thaw* is not yet possible. 3.2 — multi-vCPU quiesce + per-context layout.
+**per-fiber shadow-stack layout + shadow-SP swap landed** (slice 3.1.1) and the **resumer-side
+`cont.resume` thaw arm** re-issues the resume on rewind (slice 3.1.2). Still to wire — the
+fiber-side **`suspend` re-park** arm (slice 3.1.3, the novel bit) and the freeze driver that
+flattens an idle parked fiber (switch into it under `UNWINDING` so its post-suspend poll
+unwinds it with no forward progress). The `suspend` thaw arm currently fails closed (trap), so
+a full fiber *thaw* is not yet possible. 3.2 — multi-vCPU quiesce + per-context layout.
 3.3 — JIT parity (drive real OS threads to safepoints; respect the D57 single-owner protocol;
 **replicate the swap** in the JIT's fiber-switch path). Phase 4 — back-edge polls for bounded
 latency.
@@ -706,12 +707,16 @@ each a small reviewable commit on the interpreter only:
    per-region bound, so a fiber recursed past `SHADOW_STRIDE` could grow into a neighbor's
    region before tripping — harmless for shallow fibers, fixed alongside the sizing decision.
 
-2. **`Resume` thaw arm** (`cont.resume`, resumer side). Mirror `SuspendKind::Propagated`'s
-   re-issue, but emit `Inst::ContResume { k, arg }` (operands reloaded from the spilled
-   slots — already spilled by this slice's `used[k]/used[arg]`) and thread its **two**
-   results `(status, value)` into the continuation. Replace the fail-closed trap arm for
-   `Resume`. Test: a root that resumes a *leaf-ish* fiber freezes/thaws (the fiber side
-   still parked-trap until slice 3, so use a fiber that has already returned, or gate).
+2. **[DONE] `Resume` thaw arm** (`cont.resume`, resumer side). Mirrors `SuspendKind::Propagated`'s
+   re-issue, but emits `Inst::ContResume { k, arg }` (operands reloaded from the spilled slots —
+   `used[k]/used[arg]` already mark them) and threads its **two** results `(status, value)` into
+   the continuation; the fail-closed trap arm now applies to `Yield` only. *Touched only
+   `svm-durable`.* Tested structurally (`svm-durable/tests/fiber.rs`): the instrumented module
+   verifies, stays NORMAL-inert, and gains one re-issued `cont.resume` per resume point while
+   `suspend` gains none (its arm is still a bare `Unreachable`). **A full thaw that re-enters a
+   suspended fiber is not yet exercisable** — the re-issued resume reconstructs the fiber via the
+   fiber's *own* rewind (the `Yield` re-park), which is slice 3.1.3; the round-trip test lands with
+   3.1.3–5 (the fiber re-park + freeze driver + snapshot Section-2 fiber metadata).
 
 3. **`Yield` thaw arm — re-park** (the novel bit). On thaw of a `suspend` point, rewind the
    fiber's frames from its shadow stack and **return it to the parked state** in the fiber

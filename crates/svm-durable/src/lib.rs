@@ -361,8 +361,11 @@ enum SuspendKind {
     Leaf,
     /// `Call` to a may-suspend callee: re-issued on thaw so the callee rewinds in turn.
     Propagated { callee: FuncIdx, args: Vec<ValIdx> },
-    /// `cont.resume` (resumer side): like a propagated call, re-issued on thaw so the fiber
-    /// rewinds in turn. Yields `(status: i32, value: i64)`. *Thaw not yet wired (Phase 3.1).*
+    /// `cont.resume` (resumer side): like a propagated call, **re-issued on thaw** so the fiber
+    /// rewinds in turn and redelivers its `(status: i32, value: i64)` (slice 3.1.2). The
+    /// re-issued resume reconstructs the fiber via its own rewind (the `Yield` re-park, slice
+    /// 3.1.3) — until that lands, a thaw that actually re-enters a suspended fiber still relies
+    /// on the fiber side being wired.
     Resume { k: ValIdx, arg: ValIdx },
     /// `suspend` (fiber side): unwinds the fiber's stack like a leaf, but thaw must **re-park**
     /// the fiber (await a future `cont.resume`), not continue. *Thaw not yet wired (Phase 3.1).*
@@ -722,12 +725,14 @@ fn transform_func(
         let ret: Vec<ValIdx> = f.results.iter().map(|&t| ub.one(zero_const(t))).collect();
         unwind_blocks.push(ub.finish(Terminator::Return(ret)));
 
-        // Fiber resume points (`cont.resume`/`suspend`) unwind into the shadow stack like any
-        // other point (the UNWIND above), but their *thaw* — re-issuing the resume / re-parking
-        // the fiber — is not wired yet (Phase 3.1 follow-up). Fail closed: route the arm to the
-        // trap so a fiber thaw traps rather than miscomputes. NORMAL execution never reaches an
-        // arm, so a fiber'd module stays fully inert under instrumentation.
-        if matches!(pt.kind, SuspendKind::Resume { .. } | SuspendKind::Yield) {
+        // A `suspend` point (`Yield`) unwinds the fiber into its shadow stack like any other
+        // point (the UNWIND above), but its *thaw* — rewinding the fiber's frames and
+        // **re-parking** it (await a future `cont.resume`) rather than continuing forward — is
+        // the novel bit still ahead (slice 3.1.3). Fail closed: route its arm to the trap so a
+        // fiber thaw traps rather than miscomputes. (`cont.resume`'s resumer-side arm *is* wired
+        // below — slice 3.1.2.) NORMAL execution never reaches an arm, so a fiber'd module stays
+        // fully inert under instrumentation.
+        if matches!(pt.kind, SuspendKind::Yield) {
             arm_blocks.push(Block {
                 params: vec![],
                 insts: vec![],
@@ -772,9 +777,18 @@ fn transform_func(
                     pt.nres,
                 )
             }
-            // Fiber kinds route to the trap arm above and never reach here (Phase 3.1).
-            SuspendKind::Resume { .. } | SuspendKind::Yield => {
-                unreachable!("fiber resume points fail closed in the arm early-out")
+            // `cont.resume` re-issue (slice 3.1.2): reload the (spilled) handle + arg and resume
+            // the fiber again. On thaw the fiber rewinds in turn (its `Yield` re-park, slice
+            // 3.1.3) and redelivers `(status, value)` — the resumer threads those two results
+            // into its continuation just like a propagated call threads its results.
+            SuspendKind::Resume { k, arg } => {
+                let kk = reloaded[spill_slot(*k as usize).expect("resume handle spilled")];
+                let aa = reloaded[spill_slot(*arg as usize).expect("resume arg spilled")];
+                ab.many(Inst::ContResume { k: kk, arg: aa }, pt.nres)
+            }
+            // `suspend` (`Yield`) routes to the trap arm above and never reaches here (slice 3.1.3).
+            SuspendKind::Yield => {
+                unreachable!("a `suspend` point fails closed in the arm early-out")
             }
         };
 
