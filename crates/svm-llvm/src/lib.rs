@@ -165,10 +165,21 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // writable global sharing a page is a separate latent issue — page-isolating those is a follow-up.)
     let entry_sp = globals_end.div_ceil(STACK_PAGE) * STACK_PAGE;
 
+    // Synthesized runtime mem-loop helpers (a variable-length `memset`/`memcpy` calls these). They
+    // sit after the defined functions (and after `_start`, which occupies index 0 when `synth`), at
+    // `base + defined.len()` onward — so their indices are fixed before translating the call sites.
+    let (need_memset, need_memcpy) = needs_mem_helpers(m);
+    let helper_base = base + defined.len() as u32;
+    let helpers = Helpers {
+        memset: need_memset.then_some(helper_base),
+        memcpy: need_memcpy.then_some(helper_base + need_memset as u32),
+    };
+
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
     for f in &defined {
-        let (func, frame_size) = translate_func(f, &m.types, &name2idx, &globals, &caps, &cstrs)?;
+        let (func, frame_size) =
+            translate_func(f, &m.types, &name2idx, &globals, &caps, &cstrs, &helpers)?;
         any_frame |= frame_size > 0;
         funcs.push(func);
     }
@@ -178,6 +189,13 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         let main_idx = name2idx["main"];
         let main_results = funcs[(main_idx - base) as usize].results.clone();
         funcs.insert(0, synth_start(main_idx, &main_results, entry_sp));
+    }
+    // Append the mem-loop helpers in index order (memset before memcpy) — matching `helper_base`.
+    if need_memset {
+        funcs.push(synth_memset());
+    }
+    if need_memcpy {
+        funcs.push(synth_memcpy());
     }
     // A window is declared if any function uses the data stack, the module has globals, *or* it uses
     // host capabilities (the handle stash lives in the reserved low window). Layout (§3d): globals
@@ -613,6 +631,7 @@ fn translate_func(
     globals: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
+    helpers: &Helpers,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
         return unsup(format!("varargs function `{}`", f.name));
@@ -651,6 +670,7 @@ fn translate_func(
             globals,
             caps,
             cstrs,
+            helpers,
         )?);
     }
     Ok((
@@ -1046,6 +1066,207 @@ fn synth_start(main_idx: u32, main_results: &[ValType], entry_sp: u64) -> Func {
     }
 }
 
+/// Indices of the synthesized **runtime mem-loop helpers**. A variable-length (or oversized-constant)
+/// `llvm.memset`/`memcpy` calls one of these instead of an inline unroll — the first use of the
+/// synthesized-multi-block-helper machinery (a real CFG with a counted loop, like a tiny libc). The
+/// helpers take no data-SP (they touch only the passed window addresses). `None` when not needed.
+#[derive(Clone, Copy, Default)]
+struct Helpers {
+    /// `__svm_memset(dst:i64, byte:i32, len:i64)` — fill `len` bytes at `dst` with `byte`'s low byte.
+    memset: Option<u32>,
+    /// `__svm_memcpy(dst:i64, src:i64, len:i64)` — copy `len` bytes `src`→`dst` (forward; no overlap).
+    memcpy: Option<u32>,
+}
+
+/// Does any mem intrinsic need the runtime loop helper — a **non-constant** length, or a constant
+/// one too large to unroll inline? Returns `(needs_memset, needs_memcpy)`. (`memmove` with a
+/// variable length is left `Unsupported` — overlap direction needs a runtime branch, a later slice.)
+fn needs_mem_helpers(m: &LModule) -> (bool, bool) {
+    let (mut set, mut cpy) = (false, false);
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                let big = |c: &llvm_ir::instruction::Call| {
+                    c.arguments
+                        .get(2)
+                        .is_some_and(|(a, _)| const_int(a).is_none_or(|n| n > MAX_MEM_UNROLL))
+                };
+                if name.starts_with("llvm.memset") && big(c) {
+                    set = true;
+                } else if name.starts_with("llvm.memcpy") && big(c) {
+                    cpy = true;
+                }
+            }
+        }
+    }
+    (set, cpy)
+}
+
+/// Synthesize `__svm_memset(dst:i64, byte:i32, len:i64)`: a counted byte loop
+/// `for (i=0; i<len; i++) dst[i] = byte`. Four blocks — entry, the `i<len` test, the body, and the
+/// return — threading `(dst, byte, len, i)` as block params (the SSA → block-arg form, hand-built).
+fn synth_memset() -> Func {
+    use svm_ir::StoreOp;
+    let params = vec![ValType::I64, ValType::I32, ValType::I64];
+    // block0(dst=0, byte=1, len=2): i = 0; br loop(dst, byte, len, i)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![Inst::ConstI64(0)],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2, 3],
+        },
+    };
+    // loop(dst=0, byte=1, len=2, i=3): cond = i <u len; br_if cond body(..) done()
+    let loop_params = vec![ValType::I64, ValType::I32, ValType::I64, ValType::I64];
+    let test = Block {
+        params: loop_params.clone(),
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtU,
+            a: 3,
+            b: 2,
+        }],
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 2,
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 3,
+            else_args: vec![],
+        },
+    };
+    // body(dst=0, byte=1, len=2, i=3): dst[i] = byte; br loop(dst, byte, len, i+1)
+    let body = Block {
+        params: loop_params,
+        insts: vec![
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 3,
+            }, // v4 = dst + i
+            Inst::Store {
+                op: StoreOp::I32_8,
+                addr: 4,
+                value: 1,
+                offset: 0,
+                align: 0,
+            },
+            Inst::ConstI64(1), // v5
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 3,
+                b: 5,
+            }, // v6 = i + 1
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2, 6],
+        },
+    };
+    let done = Block {
+        params: vec![],
+        insts: vec![],
+        term: Terminator::Return(vec![]),
+    };
+    Func {
+        params,
+        results: vec![],
+        blocks: vec![entry, test, body, done],
+    }
+}
+
+/// Synthesize `__svm_memcpy(dst:i64, src:i64, len:i64)`: a counted byte loop
+/// `for (i=0; i<len; i++) dst[i] = src[i]` (forward — caller guarantees no overlap, as `memcpy` does).
+fn synth_memcpy() -> Func {
+    use svm_ir::{LoadOp, StoreOp};
+    let params = vec![ValType::I64, ValType::I64, ValType::I64];
+    // block0(dst=0, src=1, len=2): i = 0; br loop(dst, src, len, i)
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![Inst::ConstI64(0)],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2, 3],
+        },
+    };
+    let loop_params = vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64];
+    // loop(dst=0, src=1, len=2, i=3): cond = i <u len; br_if cond body done
+    let test = Block {
+        params: loop_params.clone(),
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtU,
+            a: 3,
+            b: 2,
+        }],
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 2,
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 3,
+            else_args: vec![],
+        },
+    };
+    // body(dst=0, src=1, len=2, i=3): dst[i] = src[i]; br loop(dst, src, len, i+1)
+    let body = Block {
+        params: loop_params,
+        insts: vec![
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 3,
+            }, // v4 = src + i
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 4,
+                offset: 0,
+                align: 0,
+            }, // v5 = src[i]
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 3,
+            }, // v6 = dst + i
+            Inst::Store {
+                op: StoreOp::I32_8,
+                addr: 6,
+                value: 5,
+                offset: 0,
+                align: 0,
+            },
+            Inst::ConstI64(1), // v7
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 3,
+                b: 7,
+            }, // v8 = i + 1
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2, 8],
+        },
+    };
+    let done = Block {
+        params: vec![],
+        insts: vec![],
+        term: Terminator::Return(vec![]),
+    };
+    Func {
+        params,
+        results: vec![],
+        blocks: vec![entry, test, body, done],
+    }
+}
+
 /// The global-variable name a pointer operand points at, if it is a direct `@global` reference (the
 /// shape clang passes a string literal to `puts`/`fputs`). A computed pointer returns `None`.
 fn global_name_of(op: &Operand) -> Option<String> {
@@ -1236,6 +1457,8 @@ fn lower_int_intrinsic(
             | "llvm.cttz"
             | "llvm.ctpop"
             | "llvm.abs"
+            | "llvm.fshl"
+            | "llvm.fshr"
     ) {
         return Ok(None);
     }
@@ -1280,6 +1503,23 @@ fn lower_int_intrinsic(
                 b: x,
             });
             ctx.push(Inst::Select { cond, a: neg, b: x })
+        }
+        // `llvm.fshl(a, b, s)` / `fshr`: funnel shift. The **rotate idiom** (the two value operands
+        // identical — what clang emits for `(x<<n)|(x>>(w-n))`, e.g. SHA-256's `ROTRIGHT`) lowers to
+        // `rotl`/`rotr`, which mask the count mod width and so have no shift-by-`w` edge case. A true
+        // funnel shift (distinct operands) needs a width-edge-safe `select` sequence — deferred.
+        "llvm.fshl" | "llvm.fshr" => {
+            if args[0] != args[1] {
+                return unsup(format!("general funnel shift `{name}` (non-rotate)"));
+            }
+            let a = ctx.operand(args[0])?;
+            let amt = ctx.operand(args[2])?;
+            let op = if base == "llvm.fshl" {
+                BinOp::Rotl
+            } else {
+                BinOp::Rotr
+            };
+            ctx.push(Inst::IntBin { ty, op, a, b: amt })
         }
         _ => unreachable!(),
     };
@@ -1350,15 +1590,39 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Re
         return Ok(false);
     }
     let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
-    let len = const_int(args[2])
-        .ok_or_else(|| Error::Unsupported("variable-length mem intrinsic".into()))?;
+    // A non-constant length — or a constant too large to unroll inline — calls the synthesized
+    // runtime loop helper (`__svm_memset`/`__svm_memcpy`). A variable-length `memmove` (overlap)
+    // has no helper yet (the copy direction needs a runtime branch) — a clean `Unsupported`.
+    let len = match const_int(args[2]) {
+        Some(n) if n <= MAX_MEM_UNROLL => n,
+        _ => {
+            let len = ctx.operand(args[2])?;
+            if is_set {
+                let f = ctx.helpers.memset.expect("memset helper synthesized");
+                let dst = ctx.operand(args[0])?;
+                let byte = ctx.operand(args[1])?;
+                ctx.push_effect(Inst::Call {
+                    func: f,
+                    args: vec![dst, byte, len],
+                });
+            } else if name.starts_with("llvm.memcpy") {
+                let f = ctx.helpers.memcpy.expect("memcpy helper synthesized");
+                let dst = ctx.operand(args[0])?;
+                let src = ctx.operand(args[1])?;
+                ctx.push_effect(Inst::Call {
+                    func: f,
+                    args: vec![dst, src, len],
+                });
+            } else {
+                return unsup(format!(
+                    "variable-length `{name}` (memmove overlap needs a runtime branch)"
+                ));
+            }
+            return Ok(true);
+        }
+    };
     if len == 0 {
         return Ok(true);
-    }
-    if len > MAX_MEM_UNROLL {
-        return unsup(format!(
-            "mem intrinsic length {len} > {MAX_MEM_UNROLL} (needs a loop)"
-        ));
     }
     let chunks = mem_chunks(len);
     if is_copy {
@@ -1722,6 +1986,8 @@ struct BlockCtx<'a> {
     caps: &'a HashMap<String, u32>,
     /// String-literal global name → its C-string length (for `puts`/`fputs` write lengths).
     cstrs: &'a HashMap<String, u64>,
+    /// Synthesized mem-loop helper indices (for a variable-length `memset`/`memcpy`).
+    helpers: Helpers,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     next_val: ValIdx,
@@ -1899,6 +2165,7 @@ fn translate_block(
     globals: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
+    helpers: &Helpers,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // The data-SP (`SP` sentinel) types as `i64`; every other param reads its scanned type.
@@ -1914,6 +2181,7 @@ fn translate_block(
         globals,
         caps,
         cstrs,
+        helpers: *helpers,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         next_val: 0,

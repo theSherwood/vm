@@ -719,19 +719,14 @@ int apply(int sel, int a, int b){ return ops[sel & 1](a, b); }";
     check_vs_native("kitchen", src, 7);
 }
 
-/// Compile a **powerbox program** (one that does real I/O via libc), translate it, resolve its §7
-/// capability imports against the reference host policy, verify, and run it end-to-end through the
-/// reference powerbox — then assert its stdout **and** exit code match the *native* build of the
-/// same C (the strongest oracle). This exercises the whole Lane C on-ramp: the synthesized `_start`,
-/// the handle stash, and `write`/`exit` bound to the `Stream`/`Exit` capabilities.
-fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
-    let Some(bc) = compile_to_bc(name, src) else {
-        return;
-    };
+/// The shared core of the powerbox differential: given the legalized `bc` and the C source file it
+/// came from, build the source natively with `cc`, run both, and assert the SVM translation's stdout
+/// **and** exit code match native. Exercises the whole Lane C on-ramp end-to-end (the synthesized
+/// `_start`, the handle stash, libc → `Stream`/`Exit`). Skips silently if `cc` is unavailable.
+fn powerbox_diff(name: &str, bc: &std::path::Path, c_src: &std::path::Path, stdin: &[u8]) {
     // Native oracle: build with `cc`, run, capture stdout + exit code.
     let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{}_{}", std::process::id(), name));
-    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
-    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+    match Command::new("cc").arg(c_src).arg("-o").arg(&exe).status() {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("note: skipping {name} (cc unavailable)");
@@ -751,7 +746,7 @@ fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
     let native_code = native.status.code().unwrap_or(-1) as u8;
 
     // The on-ramp: translate → resolve §7 imports to concrete capabilities → verify → run.
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let t = svm_llvm::translate_bc_path(bc).expect("translate bitcode");
     assert!(
         svm_run::is_powerbox_entry(&t.module),
         "{name}: a libc program must produce a powerbox entry"
@@ -776,6 +771,47 @@ fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
         svm_code, native_code,
         "{name}: svm exit {svm_code} vs native {native_code}"
     );
+}
+
+/// Compile a **powerbox program** (real I/O via libc) from an inline source string and run the
+/// differential ([`powerbox_diff`]).
+fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    powerbox_diff(name, &bc, &c, stdin);
+}
+
+/// Run the powerbox differential on a **real corpus demo** (`crates/svm-run/demos/<rel>`) — a
+/// whole-program, self-contained C file (its own `memset`, `write`-only output). This is the D54
+/// "matches native clang" exit criterion applied to an actual library. The file is compiled *in
+/// place* so its same-directory `#include "…"`s resolve.
+fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../svm-run/demos")
+        .join(rel);
+    let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_{}.bc", std::process::id(), name));
+    let status = Command::new("clang")
+        .args([
+            "-O2",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&path)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            return;
+        }
+    }
+    powerbox_diff(name, &bc, &path, stdin);
 }
 
 #[test]
@@ -860,6 +896,46 @@ fn stdio_mixed_then_exit() {
     let src = "#include <stdio.h>\n#include <stdlib.h>\n\
                int main(void){ puts(\"goodbye\"); printf(\"done\\n\"); exit(42); }";
     check_powerbox_vs_native("pb_mixed_exit", src, b"");
+}
+
+#[test]
+fn funnel_shift_rotate() {
+    // SHA-style rotates: clang -O2 turns `(x<<n)|(x>>(w-n))` into `llvm.fshl`/`fshr` (the operands
+    // identical → a rotate). Lowered to `rotl`/`rotr`. Checked on i32 and i64 against hand values.
+    let src = "unsigned rotr32(unsigned x, unsigned n){ return (x >> n) | (x << (32 - n)); } \
+               unsigned long rotl64(unsigned long x, unsigned n){ return (x << n) | (x >> (64 - n)); }";
+    // rotr32(0x12345678, 8) = 0x78123456
+    check(
+        "rotr32",
+        src,
+        &[Value::I32(0x12345678), Value::I32(8)],
+        &[Value::I32(0x78123456u32 as i32)],
+    );
+}
+
+#[test]
+fn variable_length_memset_loop() {
+    // A runtime-length zero-fill: clang's loop-idiom recognizer emits `llvm.memset.p0.i64` with a
+    // non-constant length, which lowers to a call to the synthesized `__svm_memset` loop helper.
+    // `run` zeroes `n` bytes of a stack buffer (seeded non-zero), then sums them → 0.
+    let src = "int run(int n){ unsigned char buf[300]; \
+               for (int i = 0; i < 300; i++) buf[i] = (unsigned char)(i + 1); \
+               for (int i = 0; i < n; i++) buf[i] = 0; \
+               int s = 0; for (int i = 0; i < 300; i++) s += buf[i]; return s; }";
+    check_vs_native(
+        "var_memset",
+        &format!("{src} int main(){{ return run(300); }}"),
+        300,
+    );
+}
+
+#[test]
+fn demo_sha256_vs_native() {
+    // The first real corpus library end-to-end: B-Con's SHA-256 hashing "", "abc", and the
+    // pangram, printing each digest as hex via `write` — byte-identical to the native `clang` build.
+    // Exercises funnel-shift rotates, the variable-length `memset` loop helper, multi-function calls,
+    // the data stack, a const global table, and the `Stream` capability all at once (the D54 goal).
+    check_demo_vs_native("sha256", "sha256/sha_demo.c", b"");
 }
 
 #[test]
