@@ -1152,11 +1152,23 @@ value per pc, + offset). Test (`debug_line.rs`): the fixture's `a/b/s` are inges
 vars at fbreg +12/+8/+4 with the `int` type, into the right IR function, and the module still
 verifies — **frontend neutrality demonstrated for variables, not just source lines**.
 
-**Not yet:** wasm aggregate/pointer types (only base types ingested so far) + DAP aggregate
-expansion over `WindowVia`; the LLVM `!DILocation`/`dbg.value` bitcode path (its own effort). (The
-chibicc producer (incl. optimized-build location lists), both DAP consumers, binary serialization,
-and a second producer's **source lines, DWARF pass-through, _and now named variables_** are all
-built — the W4 debug-info waist is exercised end-to-end by two independent frontends.)
+**Slice 22 — DAP treats `WindowVia` as a first-class window location.** A new
+`Inspector::var_addr(frame, name)` resolves a memory-located var (`Window` *or* `WindowVia`) to its
+window address at the stopped pc (factored out of `read_var`, sharing the `loclist_value`
+nearest-preceding lookup). DAP now uses it uniformly: a `WindowVia` aggregate **expands** in the
+Variables pane (struct fields / array elements / pointer deref), `evaluate` returns a **typed
+`Place`** for it (so `p.x` / `arr[i]` / `p->x` work over wasm vars), and the scalar Variables path
+formats through the structured type (a window `double`/pointer reads typed, not as raw bytes). So a
+wasm guest's variables — ingested as `WindowVia` in slice 21 — are now fully inspectable, the same
+as chibicc's. Test (`dap.rs`): a `WindowVia` `struct {int x,y}` expands to `x=10, y=20` and
+`evaluate("p.x + p.y") = 30`.
+
+**Not yet:** wasm aggregate/pointer **types** (only base types ingested so far — needs a
+DIE-tree walk in `dwarf_info` for `DW_TAG_structure_type`/members); the LLVM
+`!DILocation`/`dbg.value` bitcode path (its own effort). (The chibicc producer (incl.
+optimized-build location lists), both DAP consumers — now over `Window` *and* `WindowVia` — binary
+serialization, and a second producer's **source lines, DWARF pass-through, and named variables** are
+all built; the W4 debug-info waist is exercised end-to-end by two independent frontends.)
 
 ### Open questions (S4/S5/S2)
 

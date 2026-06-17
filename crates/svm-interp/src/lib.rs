@@ -1256,15 +1256,9 @@ impl Inspector {
                 .vars
                 .iter()
                 .find(|x| x.func == frame.func && x.name == name)?;
-            // Resolve a location list (S2) at the frame's current pc: within the stopped block, the
-            // entry with the largest `inst` at-or-before `frame.inst` (nearest-preceding, like
-            // `source_loc`). `None` ⇒ no covering entry, the var isn't live here.
-            let resolve = |locs: &[SsaLoc]| -> Option<u32> {
-                locs.iter()
-                    .filter(|l| l.block as usize == frame.block && l.inst as usize <= frame.inst)
-                    .max_by_key(|l| l.inst)
-                    .map(|l| l.value)
-            };
+            // Resolve a location list (S2) at the frame's current pc (nearest-preceding within the
+            // stopped block). `None` ⇒ no covering entry, the var isn't live here.
+            let resolve = |locs: &[SsaLoc]| loclist_value(locs, frame.block, frame.inst);
             // Read `width` window bytes at `base + off`, directly (not via `read_window`, to avoid
             // re-locking).
             let window_read = |base: u64, off: i64| -> Option<VarValue> {
@@ -1300,8 +1294,34 @@ impl Inspector {
         .flatten()
     }
 
-    /// Read SSA value `value_idx` of the frame `frame_from_top` levels up (0 = innermost) of the
-    /// focused thread. This is the S2 `Ssa` resolution: the interpreter holds block-local SSA values
+    /// The window address of a memory-located source variable (`Window` / `WindowVia`), resolved at
+    /// the focused thread's frame `frame_from_top` levels up — the base a debugger uses to expand an
+    /// aggregate or take a member's address. `None` for an SSA-valued var (no memory address) or an
+    /// unmapped/not-yet-live one.
+    pub fn var_addr(&self, frame_from_top: usize, name: &str) -> Option<u64> {
+        let di = self.debug_info.as_ref()?;
+        self.with_focused(|v| {
+            let n = v.frames.len();
+            let frame = v.frames.get(n.checked_sub(1 + frame_from_top)?)?;
+            if frame.module != 0 {
+                return None;
+            }
+            let var = di
+                .vars
+                .iter()
+                .find(|x| x.func == frame.func && x.name == name)?;
+            let base = match &var.loc {
+                VarLoc::Window { off } => as_i64(*frame.vals.first()?).ok()? as u64 + *off as u64,
+                VarLoc::WindowVia { base, off } => {
+                    let idx = loclist_value(base, frame.block, frame.inst)?;
+                    as_i64(*frame.vals.get(idx as usize)?).ok()? as u64 + *off as u64
+                }
+                VarLoc::Ssa { .. } | VarLoc::SsaList(_) => return None,
+            };
+            Some(base)
+        })
+        .flatten()
+    }
     /// by index, so a promoted local is a direct lookup — no debug-build mode needed (DEBUGGING.md
     /// W6).
     pub fn read_ir_value(&self, frame_from_top: usize, value_idx: usize) -> Option<Value> {
@@ -10288,6 +10308,16 @@ fn as_i64(v: Value) -> Result<i64, Trap> {
         Value::I64(x) => Ok(x),
         _ => Err(Trap::Malformed),
     }
+}
+
+/// Resolve a debug-info location list (`SsaList` / `WindowVia` base) at pc `(block, inst)`: the
+/// covering entry is the largest `inst` at-or-before within the stopped block (nearest-preceding,
+/// DWARF line-table semantics). `None` ⇒ the var isn't live at this pc.
+fn loclist_value(locs: &[SsaLoc], block: usize, inst: usize) -> Option<u32> {
+    locs.iter()
+        .filter(|l| l.block as usize == block && l.inst as usize <= inst)
+        .max_by_key(|l| l.inst)
+        .map(|l| l.value)
 }
 
 #[inline]

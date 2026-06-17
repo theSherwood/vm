@@ -478,22 +478,27 @@ impl DapServer {
             .collect();
         let mut out = Vec::new();
         for (name, ty, loc, type_id) in vars {
-            // An aggregate/array window local is expandable: name a `Place` at its base address.
-            if let (VarLoc::Window { off }, Some(tid_ref)) =
-                (loc, type_id.filter(|&t| self.is_expandable(t)))
-            {
-                if let Some(base) = self.var_base_addr(frame_idx, off) {
+            // A memory-located aggregate/array (`Window` or the wasm `WindowVia`) is expandable:
+            // name a `Place` at its base address (resolved per pc by the Inspector).
+            let is_mem = matches!(loc, VarLoc::Window { .. } | VarLoc::WindowVia { .. });
+            if let Some(tid_ref) = type_id.filter(|&t| is_mem && self.is_expandable(t)) {
+                if let Some(base) = self.session.as_ref()?.inspector.var_addr(frame_idx, &name) {
                     let summary = self.place_summary(base, tid_ref);
                     let vr = self.alloc_place(tid, base, tid_ref);
                     out.push(var_json(&name, &summary, &ty, vr));
                     continue;
                 }
             }
-            // Otherwise a scalar: read and format its value. Width from the structured type.
+            // Otherwise a scalar: read it and format through the structured type when present (so a
+            // window `double`/pointer reads typed, not as raw bytes), else the raw value.
             let width = scalar_width(self.types(), type_id, &ty);
             let session = self.session.as_ref()?;
             if let Some(val) = session.inspector.read_var(frame_idx, &name, width) {
-                out.push(var_json(&name, &fmt_var(&val), &ty, 0));
+                let rendered = match (&val, type_id) {
+                    (VarValue::Bytes(b), Some(tid)) => fmt_scalar(self.types(), tid, b),
+                    _ => fmt_var(&val),
+                };
+                out.push(var_json(&name, &rendered, &ty, 0));
             }
         }
         Some(out)
@@ -557,22 +562,6 @@ impl DapServer {
             }
         }
         Some(out)
-    }
-
-    /// The base window address of a `Window`-located local in the frame `frame_idx` levels up: the
-    /// frame's data-SP (block param `v0`) plus the variable's offset.
-    fn var_base_addr(&self, frame_idx: usize, off: i64) -> Option<u64> {
-        let sp = match self
-            .session
-            .as_ref()?
-            .inspector
-            .read_ir_value(frame_idx, 0)?
-        {
-            Value::I64(n) => n as u64,
-            Value::I32(n) => n as u64,
-            _ => return None,
-        };
-        Some(sp.wrapping_add(off as u64))
     }
 
     /// Does this type expand into children — a struct's fields, an array's elements, or a
@@ -1179,15 +1168,6 @@ struct EvalEnv<'a> {
 }
 
 impl EvalEnv<'_> {
-    /// The frame's data-SP (block param `v0`) — the base address for window locals.
-    fn data_sp(&self) -> Option<u64> {
-        Some(match self.inspector.read_ir_value(self.frame_idx, 0)? {
-            Value::I64(n) => n as u64,
-            Value::I32(n) => n as u64,
-            _ => return None,
-        })
-    }
-
     /// Read an 8-byte pointer value from the window.
     fn read_ptr(&self, addr: u64) -> Option<u64> {
         Some(le_uint(&self.inspector.read_window(addr, 8).ok()?, 8))
@@ -1201,8 +1181,10 @@ impl expr::Resolver for EvalEnv<'_> {
             .iter()
             .find(|v| v.func == self.func && v.name == name)?;
         match &var.loc {
-            VarLoc::Window { off } => {
-                let addr = self.data_sp()?.wrapping_add(*off as u64);
+            // A memory-located var (`Window` data-SP slot or the wasm `WindowVia` runtime base) is a
+            // typed `Place` (so member/index/expansion work), resolved per pc by the Inspector.
+            VarLoc::Window { .. } | VarLoc::WindowVia { .. } => {
+                let addr = self.inspector.var_addr(self.frame_idx, name)?;
                 match var.type_id {
                     Some(type_id) => Some(expr::Value::Place { addr, type_id }),
                     None => {
@@ -1213,10 +1195,9 @@ impl expr::Resolver for EvalEnv<'_> {
                     }
                 }
             }
-            // A promoted scalar (single value / location list) or a runtime-base window var: let
-            // the Inspector resolve it at the frame's pc, then map the value to an Int/Float operand.
-            // (`WindowVia` reads window bytes; member/index on such an aggregate is a later refinement.)
-            VarLoc::Ssa { .. } | VarLoc::SsaList(_) | VarLoc::WindowVia { .. } => {
+            // A promoted scalar (single value / location list): the Inspector resolves it at the
+            // frame's pc; map the read-back value to an Int/Float operand.
+            VarLoc::Ssa { .. } | VarLoc::SsaList(_) => {
                 let width = scalar_width(self.types, var.type_id, &var.ty);
                 match self.inspector.read_var(self.frame_idx, name, width)? {
                     VarValue::Value(Value::F32(x)) => Some(expr::Value::Float(x as f64)),
