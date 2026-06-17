@@ -784,10 +784,15 @@ fn native_calli(n: i64) -> i64 {
 /// Native twin of `CACHE`: the same scattered store/load over a 1 MiB array (128 Ki `i64` slots).
 /// The buffer is a **fixed-size boxed array** (not a `Vec`): since the index is `& 131071`, it
 /// provably lands in `[0, 131072)` = the array's const length, so LLVM elides the bounds check —
-/// a true check-free ceiling matching the VMs' masked window access. It is **thread-local and
-/// reused** across calls (warm + faulted once), so native pays the same steady-state memory-latency
-/// cost the warm wasm lane does. The first call (the cross-check) sees a zeroed buffer, so its
-/// result matches the cold svm/wasm lanes.
+/// matching the VMs' masked window access. It is **thread-local and reused** across calls (warm +
+/// faulted once). The first call (the cross-check) sees a zeroed buffer, so its result matches the
+/// cold svm/wasm lanes.
+///
+/// **No per-iteration `black_box`.** A barrier inside the loop would serialize the loads and kill
+/// **memory-level parallelism** — the CPU overlapping successive independent cache-miss latencies —
+/// which is precisely what a DRAM-bound loop lives on (and which the barrier-free VM loops get for
+/// free). So the dead-store/load is kept live by a *single* `black_box(&mem)` after the loop (the
+/// stores feed it, the loads feed `acc`), leaving the body free to pipeline like the VM lanes.
 fn native_cache(n: i64) -> i64 {
     thread_local! {
         // Heap-allocated via `into_boxed_slice().try_into()` to avoid a 1 MiB stack temporary.
@@ -801,8 +806,9 @@ fn native_cache(n: i64) -> i64 {
             let w = (i.wrapping_mul(2654435761) & 131071) as usize;
             mem[w] = i;
             let r = (i.wrapping_mul(2246822519) & 131071) as usize;
-            acc = acc.wrapping_add(black_box(mem[r]));
+            acc = acc.wrapping_add(mem[r]);
         }
+        black_box(&mem);
         acc
     })
 }
