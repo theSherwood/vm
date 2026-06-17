@@ -1907,7 +1907,7 @@ here tangled with our headline optimization.
 
 ---
 
-## 20. Frontends & language on-ramps  [OPEN — strategy settled, vehicle deferred]
+## 20. Frontends & language on-ramps  [LLVM on-ramp BUILT (D54) + wasm bridge built; breadth ongoing]
 
 chibicc is the **MVP frontend** (§3d); the goal is to be a target for **many** languages.
 The enabling principle should be explicit:
@@ -1935,6 +1935,47 @@ item), `setjmp`/`longjmp` and EH lowered onto §6 stack-switching, intrinsic cov
 non-negotiable **two-stack constraint** (§3d) — any frontend must place address-taken objects
 on the in-window data stack, scalars in SSA, control out-of-band, exactly as `codegen_ir.c`
 does. Generalizing that discipline to LLVM is the work.
+
+### 20a. The LLVM on-ramp, built (`crates/svm-llvm`)  [D54 exit criterion MET]
+
+An AOT **LLVM-bitcode → SVM-IR translator**. Untrusted-for-escape (§2a): its output is
+re-verified, so a translation bug is a clean error, never an escape — adding it cost **zero
+escape-TCB**. It links libLLVM at **build/dev time only** (via `llvm-ir`/`llvm-sys`, LLVM 18
+pinned), so it is **excluded from the workspace** and built as a Linux-dev-only CI lane — the
+cross-OS runtime never links libLLVM (off the runtime path). **Legalization is out-of-process**:
+`clang -O2 -emit-llvm` runs `mem2reg`/SROA, so scalars arrive in SSA registers (the §3d two-stack
+split falls out of LLVM's own promotion — address-taken `alloca`s that survive → data-stack slots;
+the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
+
+- **Core.** The headline is the **SSA → block-argument conversion** (the §1a win over wasm):
+  LLVM dominance-SSA + φ-nodes → SVM's block-local form via backward liveness — φ-results and
+  threaded live-ins become block params, branches supply args; loops/joins/irreducible/critical
+  edges need no edge splitting. Plus: narrow ints collapse to `i32` with re-emitted truncation /
+  sign-extension at the hazards (§3b — incl. signed `icmp` on a narrow operand); pointers are `i64`;
+  the **data-SP is threaded** as block-local index 0 of every block (a call passes `sp+frame_size`).
+- **Scalar+memory+call+aggregate coverage.** Integer/float arithmetic, `icmp`/`fcmp`, casts;
+  `switch`→`br_table`; globals low in the window as `data` segments (read-only ones **page-isolated**
+  from writable, D40); direct/indirect calls; struct GEP + by-value structs (`sret`/`byval` and
+  register coercion) + **multi-value returns** (a small struct → multi-result, §3a); memory
+  intrinsics (constant-length inline, variable-length via **synthesized runtime `memset`/`memcpy`
+  loop helpers** — the first hand-built multi-block CFGs); funnel-shift rotates, `ptr↔int`, `freeze`,
+  constexpr-GEP, `llvm.load.relative`; **2-lane 32-bit vectors** (`<2 x float>`/`<2 x i32>`)
+  scalarized to a packed `i64`.
+- **libc & the powerbox (Lane C).** A program that does I/O gets a synthesized `_start` powerbox
+  entry; libc binds via **§7 named imports** the host resolves at load — `write`/`read`→`Stream`,
+  `exit`→`Exit`, `malloc`/`calloc`→a synthesized bump allocator that grows the heap into the reserved
+  window tail by `vm_map`-committing pages on demand via the `Memory` cap (the §1a sparse-address
+  win); the stdio output family (`puts`/`putc`/`fwrite`…) and constant-string `printf` lower to
+  `Stream.write`. **All libc *logic* runs in the guest** as synthesized/translated IR; only the
+  irreducible boundary primitives (`write`/`read`/`exit`/`vm_map`) are host capabilities.
+- **Proof (the D54 "matches native clang" exit criterion).** All **eight** chibicc corpus
+  libraries — SHA-256, xxHash, stb_perlin, tiny-regex-c, jsmn, heapgrow, miniz/tinfl, clay — run
+  **byte-identical to a native `clang` build**, on **both** the interpreter and the JIT (the §18
+  differential). Every translation test is interp == JIT == native/hand-computed.
+- **Pending (general-C breadth, beyond the corpus; tracked in `LLVM.md`).** Varargs
+  `printf`/`fprintf` (a guest-side format engine), `realloc`, wider/other SIMD (`<4 x float>`,
+  `<2 x double>`), transcendental libm (a guest `libm`), `argc`/`argv`, `bswap`/`bitreverse`,
+  overlapping `memmove`, and the deferred-hard items (C++ EH, `setjmp`/`longjmp`).
 
 ---
 
@@ -2555,7 +2596,7 @@ as open-ended, not a byproduct of the build.
 | D51 | **Portability via a thin non-TCB Platform Abstraction Layer** (VA reserve/commit/protect, guard-fault→trap, futex); confinement masking stays platform-independent; **Linux/macOS first, Windows (VEH/SEH) next**; tier-1 MPK is Linux-only and degrades elsewhere. Scheduled as **Phase 3.5** (§18): port Windows, then hold Linux/Windows/macOS parity via a gating three-OS CI matrix | Open (staged) | The escape hinge is portable arithmetic; only the safety-net/syscalls differ per-OS; Wasmtime already proves the cross-platform path, so lean on it (D36/§18) |
 | D52 | **Capability-boundary record/replay** as the primary debugging differentiator: in deterministic mode (§12) nondeterminism enters via capabilities (§7), so logging `cap.call` I/O + seeding that mode gives replayable, time-travel debugging; trustworthy backtraces come free from the out-of-band control stack (§5). **Caveat:** under multicore + relaxed atomics (§12/§23) race outcomes bypass the cap boundary, so faithful replay must also record schedule/memory-order choices (the interp's DPOR `explore_all` already reifies these) | Proposed (premises built; surfaces unbuilt) | Debugging ergonomics are a first-class goal; the ocap boundary is the cheap recording boundary *in single-vCPU mode*; the control stack survives heap corruption |
 | D53 | **Debug surfaces = three cheap pillars + staged DWARF:** reference-interpreter stepping/watchpoints, record/replay, and §5 backtraces now; source-level DWARF (frontend→IR debug side-table→Cranelift→DAP/gdb/lldb) staged. Debug info is untrusted tooling (§2a); debug builds **disable §3d promotion or emit value-locations** so locals stay inspectable; debugger is a host-side `Inspector` capability (like §15 `Monitor`). **Status:** premises built (control stack, deterministic interp, SSA promotion); no stepping API, cap.call log, or §3a debug side-table yet — the side-table is step zero for DWARF | Proposed (premises built; surfaces unbuilt) | The cheap pillars fall out of the architecture; DWARF is the real work; promotion-vs-inspectability is a real trade; debugger-as-capability never widens authority |
-| D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset) and wasm→IR bridge (compat) — vehicle priority deferred.** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | Open (strategy settled) | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
+| D54 | **Frontends are untrusted IR plugins (verifier re-checks all); multi-language via two on-ramps — LLVM-bitcode→IR translator (breadth, PNaCl-style, pinned subset, `crates/svm-llvm`) and wasm→IR bridge (compat, `svm-wasm`).** Our IR is a *better LLVM target than wasm* (irreducible CFG, 64-bit, multivalue, tail calls) | **Settled + built** (§20a): LLVM on-ramp passes the **exit criterion** — all 8 chibicc corpus libraries run byte-identical to native `clang` on both backends; general-C breadth (varargs `printf`, wider SIMD, libm) ongoing | IR-as-stable-ABI makes language breadth a no-TCB-cost effort (§2a); a bitcode translator beats a TableGen backend for an expert-scarce team (D49); the §1a edges are real LLVM-target advantages |
 | D55 | **One synchronous `cap.call` shape; async is a runtime construction over blocking-capable ops.** Synchrony is **interface-guaranteed**; **cost is tier-policy** the guest cannot observe: same-process nesting (tiers 0/1) is synchronous and ~free to any depth; cross-process (tier 3) keeps the shape but pays IPC and batches via §13 rings | Settled (clarification) | Unifies §9/§12/§14; the IR has only a synchronous call; "async-first" amortizes the *distrust* boundary, not the common case; matches zero-overhead nesting (§14) |
 | D56 | **Concurrency primitives only, no scheduler in the VM (honouring D22).** The VM exposes `cont.*` (fibers), `thread.spawn`/`thread.join` (a vCPU = **one real OS thread**, 1:1), and the `wait`/`notify` futex + C11 atomics — implemented in IR/interp/JIT. The guest runtime builds any M:N model over them. **A built-in M:N green-thread executor was implemented and then removed**: it gave deterministic seeded/exhaustive *JIT* scheduling but reintroduced exactly D22's costs (policy lock-in, the double-scheduler pathology, and the project's highest-risk unsafe — fiber migration across OS threads — in the runtime TCB). Verification keeps what mattered without it: the **interpreter** is the deterministic oracle (`run_scheduled`/`explore_all` exhaust interleavings at instruction granularity — a sound model of preemptive 1:1 threads), the real-thread JIT is differential-tested against it, and the futex glue is loom-checked | Settled (course-correction) | Removes the §12/D22 contradiction the executor introduced; shrinks the TCB; keeps the VM **less** opinionated than wasm on threading (threads are a 1:1 primitive, not a baked scheduler); the deterministic-exploration win lived in the interp oracle all along, not in owning the scheduler |
 | D58 | **SIMD = first-class fixed-128 `v128` with real hardware codegen (Cranelift→SSE2/NEON), not scalar expansion; wasm-parity is not a goal.** 128-bit is the guaranteed floor (SSE2/NEON universal), so a `v128` op = one real vector instruction. Op set designed for real hardware SIMD on its own terms and grown **evidence-driven** (an op is added only when a real kernel emits it). Escape-TCB delta is small/isolated: vector arith/lane/shuffle ops add **zero** escape surface (verifier gains total lane-typing only); the lone confinement change is the 16-byte masked `v128.load`/`store` on the final effective address (`svm-mask`+`fuzz/mask` gain 16-byte width, D38). Float lanes are NaN-insensitive in the interp↔JIT differential (NaN bits unpinned across backends → vector-float modules excluded from the byte-exact window oracle, as scalar floats are today). **Wider widths (`v256`/`v512`) feature-detected and DEFERRED — blocked by the backend, not the design.** The design skeleton is right (wider type = total lane-typing only; mask widens to 32/64 B on the width-parametric guard; the differential survives because lane semantics are width-agnostic — interp's exact lanes == JIT's 1×-wide-or-split, and the feature-detect query is per-machine not per-backend). What's missing is in **Cranelift: no YMM/ZMM register class** (`RegClass::Float` = XMM/128-bit; the `avx2`/`avx512` predicates only pick better 128-bit encodings), so a native `vpaddd ymm` needs a new register class + lowering *in the shared backend* = owning codegen, which D36/D49 refuse. The "native" arm is thus empty until Cranelift adds wide vectors upstream; the "split-to-`v128`" arm equals a hand-written `v128` loop. **ROI of guest-emitted wide SIMD is low**: can't capture throughput without forking the backend; **x86-only** (ARM's wide path is scalable SVE, rejected — no NEON-256); AVX-512 fragmented; many kernels memory-bound. **Higher-ROI homes:** a host-provided vectorized capability (host owns tuned AVX-512 behind `cap.call` + zero-copy borrow, §7/§13 — portable guest, zero backend cost) and the GPU broker. **Revisit trigger = Cranelift gaining upstream wide-vector support**, not "a kernel wants it." **Scalable vectors (SVE/RVV) rejected** (runtime-variable width makes the masked-access bounds proof runtime-variable; no backend support; fragmented benefit). | Settled (fixed-128); wider widths deferred | Real hardware SIMD is the goal; wasm was just the lens. Fixed-128 is the portable floor that always lowers to a real instruction with no scalar fallback. Wider widths are deferred not on evidence-discipline grounds but on a hard backend blocker (no Cranelift YMM/ZMM regclass) — owning that codegen contradicts the "as fast/secure as wasm via shared Cranelift" thesis (D36/D49); and width-hungry workloads are better served by a host SIMD capability or the GPU broker. Vector ops are value-only so the security story barely moves — only the masked access widens |

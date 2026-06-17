@@ -71,7 +71,8 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValType, DEFAULT_RESERVED_LOG2,
+    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp,
+    VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -2558,10 +2559,37 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §7 reflection: lowered to a `cap.call` thunk with the reserved `CAP_SELF_TYPE_ID`,
                 // serviced host-side like any cap op — so it matches the interpreter.
                 Inst::CapSelfCount | Inst::CapSelfGet { .. } => {}
-                // `i8x16.mul` has no single-instruction lowering on the target ISAs, so Cranelift
-                // can't legalize it; bail to `Unsupported` (the interp oracle still covers it).
+                // `i8x16.mul` and `i64x2` min/max have no single-instruction lowering on the target
+                // ISAs, so Cranelift can't legalize them; bail to `Unsupported` (the interp oracle
+                // still covers them, and wasm never emits them — `i64x2` has no min/max op).
                 Inst::VIntBin { shape, op, .. }
-                    if !(*shape == VShape::I8x16 && *op == VIntBinOp::Mul) => {}
+                    if !matches!(
+                        (*shape, *op),
+                        (VShape::I8x16, VIntBinOp::Mul)
+                            | (
+                                VShape::I64x2,
+                                VIntBinOp::MinS
+                                    | VIntBinOp::MinU
+                                    | VIntBinOp::MaxS
+                                    | VIntBinOp::MaxU
+                            )
+                    ) => {}
+                // Lane compares lower to a single Cranelift `icmp`/`fcmp` (legalize on every target).
+                Inst::VIntCmp { .. } | Inst::VFloatCmp { .. } => {}
+                // Lane shifts lower to vector `ishl`/`ushr`/`sshr`; Cranelift legalizes every shape
+                // (incl. `i8x16`, which has no native per-byte shift on x86 — it emits a sequence).
+                Inst::VShift { .. } => {}
+                // Lane `abs`/`neg` lower to vector `iabs`/`ineg`; Cranelift legalizes every shape.
+                Inst::VIntUn { .. } => {}
+                // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
+                Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
+                // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
+                // `sadd_sat`/`uadd_sat`/`ssub_sat`/`usub_sat`.
+                Inst::VSatBin { .. } => {}
+                // Widen lowers to `swiden_low`/`uwiden_low`/`*_high`; narrow to `snarrow`/`unarrow`.
+                Inst::VWiden { .. } | Inst::VNarrow { .. } => {}
+                // Int↔float / float↔float conversions → Cranelift `fcvt_*` / `fvdemote`/`fvpromote_low`.
+                Inst::VConvert { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3546,7 +3574,174 @@ fn lower_block(
                     VIntBinOp::Add => b.ins().iadd(x, y),
                     VIntBinOp::Sub => b.ins().isub(x, y),
                     VIntBinOp::Mul => b.ins().imul(x, y),
+                    VIntBinOp::MinS => b.ins().smin(x, y),
+                    VIntBinOp::MinU => b.ins().umin(x, y),
+                    VIntBinOp::MaxS => b.ins().smax(x, y),
+                    VIntBinOp::MaxU => b.ins().umax(x, y),
                 };
+                vcast(b, r, I8X16)
+            }
+            Inst::VIntCmp {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Vector `icmp` yields a per-lane all-ones/all-zeros mask of the lane width — exactly
+                // the wasm/interp semantics — so this is a single instruction on the right vector type.
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let cc = match op {
+                    VICmpOp::Eq => IntCC::Equal,
+                    VICmpOp::Ne => IntCC::NotEqual,
+                    VICmpOp::LtS => IntCC::SignedLessThan,
+                    VICmpOp::LtU => IntCC::UnsignedLessThan,
+                    VICmpOp::GtS => IntCC::SignedGreaterThan,
+                    VICmpOp::GtU => IntCC::UnsignedGreaterThan,
+                    VICmpOp::LeS => IntCC::SignedLessThanOrEqual,
+                    VICmpOp::LeU => IntCC::UnsignedLessThanOrEqual,
+                    VICmpOp::GeS => IntCC::SignedGreaterThanOrEqual,
+                    VICmpOp::GeU => IntCC::UnsignedGreaterThanOrEqual,
+                };
+                let r = b.ins().icmp(cc, x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VShift { shape, op, a, amt } => {
+                // One scalar shift amount, masked to the lane bit-width (the wasm rule), broadcast
+                // across the lanes by Cranelift's vector `ishl`/`ushr`/`sshr`.
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let bits = (shape.lane_bytes() * 8) as i64;
+                let sh = b.ins().band_imm(get(&vals, *amt)?, bits - 1);
+                let r = match op {
+                    VShiftOp::Shl => b.ins().ishl(x, sh),
+                    VShiftOp::ShrU => b.ins().ushr(x, sh),
+                    VShiftOp::ShrS => b.ins().sshr(x, sh),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VIntUn { shape, op, a } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let r = match op {
+                    VIntUnOp::Abs => b.ins().iabs(x),
+                    VIntUnOp::Neg => b.ins().ineg(x),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VSatBin {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let r = match op {
+                    VSatBinOp::AddS => b.ins().sadd_sat(x, y),
+                    VSatBinOp::AddU => b.ins().uadd_sat(x, y),
+                    VSatBinOp::SubS => b.ins().ssub_sat(x, y),
+                    VSatBinOp::SubU => b.ins().usub_sat(x, y),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VWiden { shape, op, a } => {
+                // The source is the half-width shape; widen low/high → the wide result.
+                let src_ty = vec_ty(shape.narrower().expect("verifier ensures a narrower shape"));
+                let x = vcast(b, get(&vals, *a)?, src_ty);
+                let (low, signed) = op.parts();
+                let r = match (low, signed) {
+                    (true, true) => b.ins().swiden_low(x),
+                    (false, true) => b.ins().swiden_high(x),
+                    (true, false) => b.ins().uwiden_low(x),
+                    (false, false) => b.ins().uwiden_high(x),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VNarrow {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // The sources are the wider shape; `snarrow`/`unarrow` saturate `a`'s lanes then
+                // `b`'s into the narrow result.
+                let src_ty = vec_ty(shape.wider().expect("verifier ensures a wider source"));
+                let x = vcast(b, get(&vals, *a)?, src_ty);
+                let y = vcast(b, get(&vals, *rb)?, src_ty);
+                let r = match op {
+                    VNarrowOp::S => b.ins().snarrow(x, y),
+                    VNarrowOp::U => b.ins().unarrow(x, y),
+                };
+                vcast(b, r, I8X16)
+            }
+            Inst::VConvert { op, a } => {
+                let raw = get(&vals, *a)?;
+                let r = match op {
+                    VCvtOp::F32x4ConvertI32x4S => {
+                        let x = vcast(b, raw, I32X4);
+                        b.ins().fcvt_from_sint(F32X4, x)
+                    }
+                    VCvtOp::F32x4ConvertI32x4U => {
+                        let x = vcast(b, raw, I32X4);
+                        b.ins().fcvt_from_uint(F32X4, x)
+                    }
+                    VCvtOp::I32x4TruncSatF32x4S => {
+                        let x = vcast(b, raw, F32X4);
+                        b.ins().fcvt_to_sint_sat(I32X4, x)
+                    }
+                    VCvtOp::I32x4TruncSatF32x4U => {
+                        let x = vcast(b, raw, F32X4);
+                        b.ins().fcvt_to_uint_sat(I32X4, x)
+                    }
+                    VCvtOp::F32x4DemoteF64x2Zero => {
+                        let x = vcast(b, raw, F64X2);
+                        b.ins().fvdemote(x)
+                    }
+                    VCvtOp::F64x2PromoteLowF32x4 => {
+                        let x = vcast(b, raw, F32X4);
+                        b.ins().fvpromote_low(x)
+                    }
+                };
+                vcast(b, r, I8X16)
+            }
+            // Boolean reductions → an `i32`. `vany_true`/`vall_true` yield an `I8` bool (zero/one),
+            // widened to `i32`; `vhigh_bits` produces the bitmask directly into an `i32`.
+            Inst::VAnyTrue { a } => {
+                let x = get(&vals, *a)?; // shape-agnostic; the canonical I8X16 view is fine
+                let t = b.ins().vany_true(x);
+                b.ins().uextend(I32, t)
+            }
+            Inst::VAllTrue { shape, a } => {
+                let x = vcast(b, get(&vals, *a)?, vec_ty(*shape));
+                let t = b.ins().vall_true(x);
+                b.ins().uextend(I32, t)
+            }
+            Inst::VBitmask { shape, a } => {
+                let x = vcast(b, get(&vals, *a)?, vec_ty(*shape));
+                b.ins().vhigh_bits(I32, x)
+            }
+            Inst::VFloatCmp {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Vector `fcmp` yields a per-lane all-ones/all-zeros mask — the wasm/interp semantics.
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let cc = match op {
+                    VFCmpOp::Eq => FloatCC::Equal,
+                    VFCmpOp::Ne => FloatCC::NotEqual,
+                    VFCmpOp::Lt => FloatCC::LessThan,
+                    VFCmpOp::Gt => FloatCC::GreaterThan,
+                    VFCmpOp::Le => FloatCC::LessThanOrEqual,
+                    VFCmpOp::Ge => FloatCC::GreaterThanOrEqual,
+                };
+                let r = b.ins().fcmp(cc, x, y);
                 vcast(b, r, I8X16)
             }
             Inst::VFloatBin {

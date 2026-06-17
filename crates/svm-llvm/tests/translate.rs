@@ -103,7 +103,14 @@ fn check_vs_native(name: &str, src: &str, seed: i32) {
     };
     let exe = std::env::temp_dir().join(format!("svm_llvm_native_{}_{}", std::process::id(), name));
     let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
-    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+    // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
+    match Command::new("cc")
+        .arg(&c)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("note: skipping {name} (cc unavailable)");
@@ -726,7 +733,14 @@ int apply(int sel, int a, int b){ return ops[sel & 1](a, b); }";
 fn powerbox_diff(name: &str, bc: &std::path::Path, c_src: &std::path::Path, stdin: &[u8]) {
     // Native oracle: build with `cc`, run, capture stdout + exit code.
     let exe = std::env::temp_dir().join(format!("svm_llvm_pb_{}_{}", std::process::id(), name));
-    match Command::new("cc").arg(c_src).arg("-o").arg(&exe).status() {
+    // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
+    match Command::new("cc")
+        .arg(c_src)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("note: skipping {name} (cc unavailable)");
@@ -1018,6 +1032,155 @@ fn demo_clay_vs_native() {
     // to a packed `i64`. Lays out a small UI and prints the render commands, byte-identical to native.
     // The eighth and final corpus demo (the D54 exit criterion).
     check_demo_vs_native("clay", "clay/clay_demo.c", b"");
+}
+
+#[test]
+fn demo_hexdump_vs_native() {
+    // A `hexdump -C`-style tool: read stdin in 16-byte rows, print `%08lx  HH×16  |ascii|` via the
+    // guest-side `printf` format engine (parsed at translate time → `__svm_utoa` + width/zero-pad →
+    // `Stream.write`). Exercises `%08lx`/`%02x` (hex + width + zero-pad + `l` modifier) and literals;
+    // clang lowers the `%c` and `"…\n"` to `putchar`/`puts`. Byte-identical to native.
+    let input = b"Hello, hexdump!\nThe quick brown fox.\x00\x01\xff\xfe rest";
+    check_demo_vs_native("hexdump", "hexdump/hexdump.c", input);
+}
+
+#[test]
+fn demo_crc32_vs_native() {
+    // CRC-32 over stdin (shift/xor) + a big-endian u32 reader (`__builtin_bswap32` on host-endian
+    // loads) — drives `llvm.bswap` (an inline byte reversal). Prints the CRC and the be32 sum.
+    // Byte-identical to native.
+    let input = b"The quick brown fox jumps over the lazy dog.\nbig-endian!\x00\x01\x02\x03";
+    check_demo_vs_native("crc32", "crc32/crc32.c", input);
+}
+
+#[test]
+fn demo_raytrace_vs_native() {
+    // A tiny ASCII sphere raytracer: diffuse lighting + sinusoidal bands + an exponential rim, with
+    // a `libm` bundled as *guest code* (`g_sin`/`g_exp` poly approximations). `sqrt`/`floor` lower to
+    // SVM float ops; the transcendentals run in the guest, so native `cc` compiles the same source
+    // and every value is bit-identical. Byte-identical to native.
+    check_demo_vs_native("raytrace", "raytrace/raytrace.c", b"");
+}
+
+#[test]
+fn guest_libm_transcendental() {
+    // A guest `exp` (range-reduced Taylor) + the IEEE `sqrt` op: compute an RMS over a damped wave.
+    // The transcendental is guest code (native compiles the same), `sqrt` is the shared IEEE op, so
+    // the int-quantized result matches native exactly.
+    let src = "double sqrt(double); double floor(double); \
+               static double g_exp(double x){ const double LN2=0.69314718055994530942; \
+                 double kf=floor(x/LN2+0.5); int k=(int)kf; double r=x-kf*LN2; \
+                 double er=1.0+r*(1.0+r*(0.5+r*(1.0/6+r*(1.0/24+r/120)))); double p=1.0; \
+                 if(k>=0) for(int i=0;i<k;i++) p*=2.0; else for(int i=0;i<-k;i++) p*=0.5; \
+                 return er*p; } \
+               int run(int n){ double acc=0; \
+                 for(int i=0;i<n;i++){ double x=(double)i*0.1; double w=g_exp(-x*0.3); acc+=w*w; } \
+                 double rms=sqrt(acc/(double)n); return (int)(rms*1000.0); } \
+               int main(void){ return run(40); }";
+    check_vs_native("guest_libm", src, 40);
+}
+
+#[test]
+fn demo_lineedit_vs_native() {
+    // A tiny line editor: read a line, wrap it in `[...]` (a right shift, `dst > src` → backward
+    // copy), then delete the middle char (a left shift, `dst < src` → forward copy). The runtime
+    // length keeps clang from folding the `memmove`s inline, so both route to the synthesized
+    // direction-aware `__svm_memmove`. Byte-identical to native. Empty + non-empty inputs.
+    check_demo_vs_native("lineedit", "lineedit/lineedit.c", b"hello world\n");
+    check_demo_vs_native("lineedit_short", "lineedit/lineedit.c", b"ab\n");
+}
+
+#[test]
+fn memmove_overlap_runtime() {
+    // Variable-length `memmove` with overlap in both directions, driven through the guest helper.
+    // A right shift by 1 (dst > src, backward) then a left shift by 1 (dst < src, forward) over an
+    // 8-byte window; the surviving bytes must match native (which uses the libc `memmove`).
+    let src = "void *memmove(void *, const void *, unsigned long); \
+               int run(int n){ char b[16]; for (int i=0;i<8;i++) b[i]='a'+i; \
+               unsigned long m=(unsigned long)n; \
+               memmove(b+1, b, m);            /* shift right: dst>src */ \
+               memmove(b, b+1, m);            /* shift left:  dst<src */ \
+               int s=0; for (int i=0;i<8;i++) s+=b[i]; return s & 0x7f; } \
+               int main(void){ return run(7); }";
+    check_vs_native("memmove_overlap", src, 7);
+}
+
+#[test]
+fn bswap_intrinsic() {
+    // `__builtin_bswap32`/`bswap64` → inline byte reversal, checked vs native.
+    let src = "int run(int n){ unsigned x = 0x11223344u + (unsigned)n; \
+               unsigned long y = 0xaabbccdd00112233UL; \
+               unsigned s = __builtin_bswap32(x); unsigned long t = __builtin_bswap64(y); \
+               return (int)((s ^ (unsigned)t ^ (unsigned)(t >> 32)) & 0xff); } \
+               int main(void){ return run(5); }";
+    check_vs_native("bswap", src, 5);
+}
+
+#[test]
+fn demo_mat4_vs_native() {
+    // A 4×4 matrix × vec4 affine transform using `<4 x float>` (vector_size(16)) — `matvec`
+    // broadcasts each component and accumulates the columns (`llvm.fmuladd.v4f32`), printing the
+    // int-truncated results. Drives 128-bit SIMD: `v128.load`/`store`, `f32x4` mul/add, extract/
+    // replace lane, and the splat `shufflevector`. Byte-identical to native.
+    check_demo_vs_native("mat4", "mat4/mat4.c", b"");
+}
+
+#[test]
+fn vec4_float_scale() {
+    // A `<4 x float>` passed/returned by value (a `v128` call/ret) and scaled by a broadcast scalar
+    // (`splat` + `f32x4.mul`), then lane-summed. scale({1,2,3,4}, 3) = {3,6,9,12} → 30.
+    let src =
+        "typedef float float4 __attribute__((vector_size(16))); float4 scale(float4, float); \
+               int run(int n){ float4 v = {1.0f, 2.0f, 3.0f, 4.0f}; float4 r = scale(v, (float)n); \
+               return (int)(r[0] + r[1] + r[2] + r[3]); } \
+               __attribute__((noinline)) float4 scale(float4 v, float s){ return v * s; } \
+               int main(void){ return run(3); }";
+    check_vs_native("vec4_scale", src, 3);
+}
+
+#[test]
+fn demo_sortvec_vs_native() {
+    // A growable int vector + insertion sort: 50 pseudo-random signed ints into a `realloc`-doubling
+    // buffer (from `realloc(NULL,…)` ≡ malloc), sorted, printed 10/line via `printf("%d%c")`. Drives
+    // `realloc` (the header-bearing bump allocator: malloc + copy old contents) and signed `%d`.
+    check_demo_vs_native("sortvec", "sortvec/sortvec.c", b"");
+}
+
+#[test]
+fn printf_signed_formats() {
+    // Signed `%d` (incl. negatives) with plain and space-padded fields, mixed with `%u` — checked vs
+    // native. (Zero-padded `%d` is intentionally fail-closed, so it is not exercised here.)
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"%d %d %d %6d\\n\", 0, -7, 12345, -42); \
+                 printf(\"u=%u neg=%d\\n\", 4000000000u, -1); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_d", src, b"");
+}
+
+#[test]
+fn realloc_grow_preserves() {
+    // `realloc` must preserve the old contents across a grow (the header gives the copy length). Push
+    // 20 ints into a doubling buffer, then sum — exit code compared to native.
+    let src = "#include <stdlib.h>\n\
+               int run(int seed){ int *a = (int*)malloc(2 * sizeof(int)); int cap = 2, n = 0; \
+               for (int i = 0; i < 20; i++) { if (n == cap) { cap *= 2; a = (int*)realloc(a, (unsigned long)cap * sizeof(int)); } a[n++] = i * seed; } \
+               long s = 0; for (int i = 0; i < n; i++) s += a[i]; return (int)(s & 0xff); } \
+               int main(void){ return run(3); }";
+    check_powerbox_vs_native("realloc_grow", src, b"");
+}
+
+#[test]
+fn printf_unsigned_formats() {
+    // The `printf` engine directly: unsigned decimal/hex with field width + zero/space padding, a
+    // 64-bit (`%lx`) arg, `%c`, and `%%` — all in one mixed format (so clang keeps it as `printf`,
+    // not a `putchar`/`puts` special-case). stdout + exit compared to the native build.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"u=%u x=%x p=%05x w=%8x c=%c pct=%%\\n\", 42u, 255u, 7u, 0xabcu, 'Z'); \
+                 printf(\"%lx %02x\\n\", 0xdeadbeefcafeUL, 5u); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_u", src, b"");
 }
 
 #[test]

@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use svm_ir::{
     AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp,
-    Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType, VarLoc,
+    Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
+    VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarLoc,
     DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
@@ -5202,6 +5203,48 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             as_v128(get(vals, *a)?)?,
             as_v128(get(vals, *b)?)?,
         )),
+        Inst::VIntCmp { shape, op, a, b } => Value::V128(simd_vint_cmp(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
+        Inst::VFloatCmp { shape, op, a, b } => Value::V128(simd_vfloat_cmp(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
+        Inst::VShift { shape, op, a, amt } => Value::V128(simd_vshift(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_i32(get(vals, *amt)?)? as u32,
+        )),
+        Inst::VIntUn { shape, op, a } => {
+            Value::V128(simd_vint_un(*shape, *op, as_v128(get(vals, *a)?)?))
+        }
+        Inst::VSatBin { shape, op, a, b } => Value::V128(simd_vsat_bin(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
+        Inst::VWiden { shape, op, a } => {
+            Value::V128(simd_widen(*shape, *op, as_v128(get(vals, *a)?)?))
+        }
+        Inst::VNarrow { shape, op, a, b } => Value::V128(simd_narrow(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
+        Inst::VConvert { op, a } => Value::V128(simd_convert(*op, as_v128(get(vals, *a)?)?)),
+        Inst::VAnyTrue { a } => {
+            Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
+        }
+        Inst::VAllTrue { shape, a } => Value::I32(simd_all_true(*shape, as_v128(get(vals, *a)?)?)),
+        Inst::VBitmask { shape, a } => Value::I32(simd_bitmask(*shape, as_v128(get(vals, *a)?)?)),
         Inst::VFloatBin { shape, op, a, b } => Value::V128(simd_vfloat_bin(
             *shape,
             *op,
@@ -5337,8 +5380,51 @@ fn simd_vint_bin(shape: VShape, op: VIntBinOp, a: [u8; 16], b: [u8; 16]) -> [u8;
             VIntBinOp::Add => x.wrapping_add(y),
             VIntBinOp::Sub => x.wrapping_sub(y),
             VIntBinOp::Mul => x.wrapping_mul(y),
+            // Unsigned compares use the zero-extended lane values directly; signed sign-extend first.
+            VIntBinOp::MinU => x.min(y),
+            VIntBinOp::MaxU => x.max(y),
+            VIntBinOp::MinS => lane_sext(x, bytes).min(lane_sext(y, bytes)) as u64,
+            VIntBinOp::MaxS => lane_sext(x, bytes).max(lane_sext(y, bytes)) as u64,
         };
         lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// Sign-extend the low `bytes` of a zero-extended lane value to a full `i64`.
+fn lane_sext(x: u64, bytes: usize) -> i64 {
+    let bits = bytes * 8;
+    if bits >= 64 {
+        x as i64
+    } else {
+        let shift = 64 - bits;
+        ((x << shift) as i64) >> shift
+    }
+}
+
+/// `<shape>.<cmp>`: per-lane integer comparison → an all-ones (true) / all-zeros (false) mask of the
+/// lane width. `lane_read` zero-extends, so unsigned compares are direct; signed compares
+/// sign-extend each lane first.
+fn simd_vint_cmp(shape: VShape, op: VICmpOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let xu = lane_read(&a, i, bytes);
+        let yu = lane_read(&b, i, bytes);
+        let (xs, ys) = (lane_sext(xu, bytes), lane_sext(yu, bytes));
+        let t = match op {
+            VICmpOp::Eq => xu == yu,
+            VICmpOp::Ne => xu != yu,
+            VICmpOp::LtS => xs < ys,
+            VICmpOp::LtU => xu < yu,
+            VICmpOp::GtS => xs > ys,
+            VICmpOp::GtU => xu > yu,
+            VICmpOp::LeS => xs <= ys,
+            VICmpOp::LeU => xu <= yu,
+            VICmpOp::GeS => xs >= ys,
+            VICmpOp::GeU => xu >= yu,
+        };
+        lane_write(&mut o, i, bytes, if t { u64::MAX } else { 0 });
     }
     o
 }
@@ -5360,6 +5446,220 @@ fn vf_un(op: VFloatUnOp) -> FUnOp {
         VFloatUnOp::Neg => FUnOp::Neg,
         VFloatUnOp::Sqrt => FUnOp::Sqrt,
     }
+}
+
+/// `<f-shape>.<cmp>`: per-lane float comparison → an all-ones (true) / all-zeros (false) mask of the
+/// lane width. Rust's `==`/`!=`/`<`/… already match wasm's ordered (`ne` unordered) NaN behaviour.
+fn simd_vfloat_cmp(shape: VShape, op: VFCmpOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let t = match op {
+                    VFCmpOp::Eq => x == y,
+                    VFCmpOp::Ne => x != y,
+                    VFCmpOp::Lt => x < y,
+                    VFCmpOp::Gt => x > y,
+                    VFCmpOp::Le => x <= y,
+                    VFCmpOp::Ge => x >= y,
+                };
+                lane_write(&mut o, i, 4, if t { u64::MAX } else { 0 });
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let t = match op {
+                    VFCmpOp::Eq => x == y,
+                    VFCmpOp::Ne => x != y,
+                    VFCmpOp::Lt => x < y,
+                    VFCmpOp::Gt => x > y,
+                    VFCmpOp::Le => x <= y,
+                    VFCmpOp::Ge => x >= y,
+                };
+                lane_write(&mut o, i, 8, if t { u64::MAX } else { 0 });
+            }
+        }
+        // Verifier rejects an integer shape here; total fall-through returns zero.
+        _ => {}
+    }
+    o
+}
+
+/// `<i-shape>.{shl,shr_s,shr_u}`: shift every lane by the same scalar amount, taken modulo the lane
+/// bit-width (the wasm rule). `shl`/`shr_u` are logical on the zero-extended lane; `shr_s` is
+/// arithmetic on the sign-extended lane.
+fn simd_vshift(shape: VShape, op: VShiftOp, a: [u8; 16], amt: u32) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let sh = amt & (bytes as u32 * 8 - 1);
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_read(&a, i, bytes);
+        let r = match op {
+            VShiftOp::Shl => x << sh,
+            VShiftOp::ShrU => x >> sh,
+            VShiftOp::ShrS => (lane_sext(x, bytes) >> sh) as u64,
+        };
+        lane_write(&mut o, i, bytes, r);
+    }
+    o
+}
+
+/// Lane int↔float / float↔float conversions. Rust's `as` casts already match wasm: int→float is
+/// round-to-nearest, float→int is `trunc_sat` (NaN→0, clamp to the int range), and `f64 as f32` is
+/// the IEEE round demote. `demote`/`promote_low` touch the low 2 lanes; demote zeroes lanes 2/3.
+fn simd_convert(op: VCvtOp, a: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match op {
+        VCvtOp::F32x4ConvertI32x4S => {
+            for i in 0..4 {
+                let x = lane_read(&a, i, 4) as u32 as i32;
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+        }
+        VCvtOp::F32x4ConvertI32x4U => {
+            for i in 0..4 {
+                let x = lane_read(&a, i, 4) as u32;
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+        }
+        VCvtOp::I32x4TruncSatF32x4S => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, (x as i32) as u32 as u64);
+            }
+        }
+        VCvtOp::I32x4TruncSatF32x4U => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 4, (x as u32) as u64);
+            }
+        }
+        VCvtOp::F32x4DemoteF64x2Zero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as f32).to_bits() as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
+        VCvtOp::F64x2PromoteLowF32x4 => {
+            for i in 0..2 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
+    }
+    o
+}
+
+/// `<narrow>.narrow_{s,u}`: saturate every lane of two wide sources to the narrow width and
+/// concatenate (`a` then `b`). The source is read as **signed**; `S`/`U` pick the saturation range.
+fn simd_narrow(out: VShape, op: VNarrowOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let out_bytes = out.lane_bytes() as usize;
+    let src = out.wider().expect("verifier ensures a wider source");
+    let src_bytes = src.lane_bytes() as usize;
+    let src_lanes = src.lanes() as usize; // = out.lanes() / 2
+    let bits = out_bytes as u32 * 8;
+    let (min, max) = match op {
+        VNarrowOp::S => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
+        VNarrowOp::U => (0i128, (1i128 << bits) - 1),
+    };
+    let mut o = [0u8; 16];
+    for i in 0..src_lanes {
+        let s = lane_sext(lane_read(&a, i, src_bytes), src_bytes) as i128;
+        lane_write(&mut o, i, out_bytes, s.clamp(min, max) as u64);
+    }
+    for i in 0..src_lanes {
+        let s = lane_sext(lane_read(&b, i, src_bytes), src_bytes) as i128;
+        lane_write(&mut o, src_lanes + i, out_bytes, s.clamp(min, max) as u64);
+    }
+    o
+}
+
+/// `<wide>.extend_{low,high}_{s,u}`: take the low or high half of the (half-width) source lanes and
+/// sign/zero-extend each to the wide lane width.
+fn simd_widen(out: VShape, op: VWidenOp, a: [u8; 16]) -> [u8; 16] {
+    let (low, signed) = op.parts();
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize; // result lanes = source lanes we consume
+    let base = if low { 0 } else { n }; // the low or high half of the source lanes
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let s = lane_read(&a, base + i, src_bytes);
+        let v = if signed {
+            lane_sext(s, src_bytes) as u64
+        } else {
+            s
+        };
+        lane_write(&mut o, i, out_bytes, v);
+    }
+    o
+}
+
+/// `<i-shape>.{add,sub}_sat_{s,u}`: per-lane add/sub that **clamps** to the lane's signed/unsigned
+/// range instead of wrapping. Computed in `i128` so the intermediate can't overflow. `i8x16`/`i16x8`.
+fn simd_vsat_bin(shape: VShape, op: VSatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let bits = bytes as u32 * 8;
+    let max_u = (1i128 << bits) - 1;
+    let max_s = (1i128 << (bits - 1)) - 1;
+    let min_s = -(1i128 << (bits - 1));
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let (xu, yu) = (
+            lane_read(&a, i, bytes) as i128,
+            lane_read(&b, i, bytes) as i128,
+        );
+        let (xs, ys) = (
+            lane_sext(lane_read(&a, i, bytes), bytes) as i128,
+            lane_sext(lane_read(&b, i, bytes), bytes) as i128,
+        );
+        let r = match op {
+            VSatBinOp::AddU => (xu + yu).min(max_u),
+            VSatBinOp::SubU => (xu - yu).max(0),
+            VSatBinOp::AddS => (xs + ys).clamp(min_s, max_s),
+            VSatBinOp::SubS => (xs - ys).clamp(min_s, max_s),
+        };
+        lane_write(&mut o, i, bytes, r as u64);
+    }
+    o
+}
+
+/// `<shape>.all_true`: `1` iff every lane is non-zero.
+fn simd_all_true(shape: VShape, a: [u8; 16]) -> i32 {
+    let bytes = shape.lane_bytes() as usize;
+    (0..shape.lanes() as usize).all(|i| lane_read(&a, i, bytes) != 0) as i32
+}
+
+/// `<shape>.bitmask`: lane `i`'s high (sign) bit → bit `i` of the result.
+fn simd_bitmask(shape: VShape, a: [u8; 16]) -> i32 {
+    let bytes = shape.lane_bytes() as usize;
+    let top = bytes as u32 * 8 - 1;
+    let mut m = 0i32;
+    for i in 0..shape.lanes() as usize {
+        m |= (((lane_read(&a, i, bytes) >> top) & 1) as i32) << i;
+    }
+    m
+}
+
+/// `<i-shape>.{abs,neg}`: per-lane two's-complement `|x|` / `0 - x` (both wrapping at the lane
+/// width — `abs(INT_MIN) == INT_MIN`, matching wasm/hardware).
+fn simd_vint_un(shape: VShape, op: VIntUnOp, a: [u8; 16]) -> [u8; 16] {
+    let bytes = shape.lane_bytes() as usize;
+    let mut o = [0u8; 16];
+    for i in 0..shape.lanes() as usize {
+        let x = lane_sext(lane_read(&a, i, bytes), bytes);
+        let r = match op {
+            VIntUnOp::Abs => x.wrapping_abs(),
+            VIntUnOp::Neg => x.wrapping_neg(),
+        };
+        lane_write(&mut o, i, bytes, r as u64);
+    }
+    o
 }
 
 fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {

@@ -200,3 +200,290 @@ fn clang_saxpy_transpiles_to_verified_simd_ir() {
     assert_eq!(mul, 1, "expected one f32x4.mul (a*x)");
     assert_eq!(add, 1, "expected one f32x4.add (+y)");
 }
+
+/// Integer lane comparisons through the wasm bridge: `iNxM.<cmp>` produces a per-lane all-ones/
+/// all-zeros mask, observed via `extract_lane`. Pins the signed/unsigned distinction (`lt_s` vs
+/// `lt_u`) on the same bytes — exactly where real `-msimd128` mask generation lives.
+#[test]
+fn i32x4_lane_compare_masks() {
+    let cmp = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $a i32) (param $b i32) (result i32)
+               (i32x4.extract_lane 0
+                 ({op} (i32x4.splat (local.get $a)) (i32x4.splat (local.get $b))))))"
+        )
+    };
+    // a = -1 (0xFFFFFFFF), b = 1: signed -1 < 1 (true → -1); unsigned 0xFFFFFFFF < 1 (false → 0).
+    let args = [Value::I32(-1), Value::I32(1)];
+    assert_eq!(eval(&cmp("i32x4.lt_s"), "f", &args), Value::I32(-1));
+    assert_eq!(eval(&cmp("i32x4.lt_u"), "f", &args), Value::I32(0));
+    assert_eq!(
+        eval(&cmp("i32x4.eq"), "f", &[Value::I32(7), Value::I32(7)]),
+        Value::I32(-1)
+    );
+    assert_eq!(
+        eval(&cmp("i32x4.ne"), "f", &[Value::I32(7), Value::I32(7)]),
+        Value::I32(0)
+    );
+    assert_eq!(eval(&cmp("i8x16.eq"), "f", &args), Value::I32(0)); // shape check: distinct opcode
+}
+
+/// A real SIMD idiom: lane-wise signed **max** as `bitselect(a>b, a, b)` — the compare feeds its
+/// mask straight into `v128.bitselect`. Proves the mask interoperates with downstream vector ops,
+/// byte-identical across interp and JIT.
+#[test]
+fn i32x4_max_via_compare_and_bitselect() {
+    let wat = r#"
+    (module
+      (func (export "maxlane") (param $a i32) (param $b i32) (result i32)
+        (i32x4.extract_lane 0
+          (v128.bitselect
+            (i32x4.splat (local.get $a))
+            (i32x4.splat (local.get $b))
+            (i32x4.gt_s (i32x4.splat (local.get $a)) (i32x4.splat (local.get $b)))))))
+    "#;
+    for (a, b) in [(3, 7), (9, 2), (-5, -1), (i32::MIN, i32::MAX), (4, 4)] {
+        let got = match eval(wat, "maxlane", &[Value::I32(a), Value::I32(b)]) {
+            Value::I32(x) => x,
+            _ => unreachable!(),
+        };
+        assert_eq!(got, a.max(b), "max({a}, {b})");
+    }
+}
+
+/// A real clamp kernel through the wasm bridge: `clamp(x, lo, hi) = max(lo, min(hi, x))` lane-wise,
+/// using `i32x4.min_s`/`max_s`. Proves the new min/max ops compose and stay byte-identical interp vs JIT.
+#[test]
+fn i32x4_clamp_via_min_max() {
+    let wat = r#"
+    (module
+      (func (export "clamp") (param $x i32) (param $lo i32) (param $hi i32) (result i32)
+        (i32x4.extract_lane 0
+          (i32x4.max_s (i32x4.splat (local.get $lo))
+            (i32x4.min_s (i32x4.splat (local.get $hi)) (i32x4.splat (local.get $x)))))))
+    "#;
+    for (x, lo, hi) in [
+        (5, 0, 10),
+        (-3, 0, 10),
+        (42, 0, 10),
+        (7, 7, 7),
+        (-100, -50, -10),
+    ] {
+        let got = match eval(
+            wat,
+            "clamp",
+            &[Value::I32(x), Value::I32(lo), Value::I32(hi)],
+        ) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        };
+        assert_eq!(got, x.clamp(lo, hi), "clamp({x}, {lo}, {hi})");
+    }
+}
+
+/// Float lane comparisons through the wasm bridge, incl. the NaN behaviour (`eq`/`lt`/… ordered →
+/// false, `ne` unordered → true). The mask is read out with `i32x4.extract_lane`.
+#[test]
+fn f32x4_lane_compare_masks() {
+    let cmp = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $a f32) (param $b f32) (result i32)
+               (i32x4.extract_lane 0
+                 ({op} (f32x4.splat (local.get $a)) (f32x4.splat (local.get $b))))))"
+        )
+    };
+    assert_eq!(
+        eval(&cmp("f32x4.lt"), "f", &[Value::F32(1.0), Value::F32(2.0)]),
+        Value::I32(-1)
+    );
+    assert_eq!(
+        eval(&cmp("f32x4.eq"), "f", &[Value::F32(2.0), Value::F32(2.0)]),
+        Value::I32(-1)
+    );
+    assert_eq!(
+        eval(&cmp("f32x4.ge"), "f", &[Value::F32(2.0), Value::F32(5.0)]),
+        Value::I32(0)
+    );
+    // NaN: ordered compares are false; `ne` is true.
+    let nan = [Value::F32(f32::NAN), Value::F32(1.0)];
+    assert_eq!(eval(&cmp("f32x4.eq"), "f", &nan), Value::I32(0));
+    assert_eq!(eval(&cmp("f32x4.lt"), "f", &nan), Value::I32(0));
+    assert_eq!(eval(&cmp("f32x4.ne"), "f", &nan), Value::I32(-1));
+}
+
+/// Integer lane shifts through the wasm bridge: one scalar amount (taken mod the lane width) shifts
+/// every lane. Covers `shl`/`shr_s`/`shr_u` and an amount ≥ the lane width.
+#[test]
+fn i32x4_lane_shifts() {
+    let sh = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $x i32) (param $amt i32) (result i32)
+               (i32x4.extract_lane 0 ({op} (i32x4.splat (local.get $x)) (local.get $amt)))))"
+        )
+    };
+    let i32 = |w: &str, x: i32, amt: i32| match eval(&sh(w), "f", &[Value::I32(x), Value::I32(amt)])
+    {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    for amt in [0, 1, 5, 31, 34] {
+        let m = (amt & 31) as u32;
+        assert_eq!(
+            i32("i32x4.shl", 0x0011_2233, amt),
+            0x0011_2233i32.wrapping_shl(m),
+            "shl {amt}"
+        );
+        assert_eq!(
+            i32("i32x4.shr_u", -1, amt),
+            (0xFFFF_FFFFu32 >> m) as i32,
+            "shr_u {amt}"
+        );
+        assert_eq!(i32("i32x4.shr_s", -16, amt), -16i32 >> m, "shr_s {amt}");
+    }
+}
+
+/// Integer lane abs/neg through the wasm bridge (two's-complement: `abs(INT_MIN) == INT_MIN`).
+#[test]
+fn i32x4_abs_neg() {
+    let un = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $x i32) (result i32)
+               (i32x4.extract_lane 0 ({op} (i32x4.splat (local.get $x))))))"
+        )
+    };
+    let f = |w: &str, x: i32| match eval(&un(w), "f", &[Value::I32(x)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    for x in [7, -7, 0, i32::MIN, i32::MAX] {
+        assert_eq!(f("i32x4.abs", x), x.wrapping_abs(), "abs {x}");
+        assert_eq!(f("i32x4.neg", x), x.wrapping_neg(), "neg {x}");
+    }
+}
+
+/// A real "does this vector contain X?" idiom (the SIMD `memchr` shape): compare a constant vector
+/// against a splatted needle, then `v128.any_true`. Exercises a reduction fed by a lane compare.
+#[test]
+fn i8x16_any_match() {
+    let wat = r#"
+    (module
+      (func (export "has") (param $needle i32) (result i32)
+        (v128.any_true
+          (i8x16.eq
+            (v128.const i8x16 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+            (i8x16.splat (local.get $needle))))))
+    "#;
+    let has = |n: i32| match eval(wat, "has", &[Value::I32(n)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(has(5), 1, "5 is present");
+    assert_eq!(has(16), 1, "16 is present");
+    assert_eq!(has(0), 0, "0 is absent");
+    assert_eq!(has(99), 0, "99 is absent");
+}
+
+/// `i32x4.bitmask` through the wasm bridge: the sign bit of each lane gathered into an i32 — the
+/// move-mask used to branch on a lane compare. Compare [1,2,3,4] < splat(3) → lanes [T,T,F,F] → 0b0011.
+#[test]
+fn i32x4_bitmask_of_compare() {
+    let wat = r#"
+    (module
+      (func (export "mask") (param $t i32) (result i32)
+        (i32x4.bitmask
+          (i32x4.lt_s (v128.const i32x4 1 2 3 4) (i32x4.splat (local.get $t))))))
+    "#;
+    let mask = |t: i32| match eval(wat, "mask", &[Value::I32(t)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(mask(3), 0b0011, "lanes 1 and 2 are < 3");
+    assert_eq!(mask(5), 0b1111, "all < 5");
+    assert_eq!(mask(0), 0b0000, "none < 0");
+}
+
+/// Saturating add through the wasm bridge — the classic "blend pixels without overflow" idiom:
+/// `i8x16.add_sat_u` of two byte vectors clamps each lane at 255 instead of wrapping.
+#[test]
+fn i8x16_add_sat_u() {
+    let wat = r#"
+    (module
+      (func (export "blend") (param $x i32) (param $y i32) (result i32)
+        (i8x16.extract_lane_u 0
+          (i8x16.add_sat_u (i8x16.splat (local.get $x)) (i8x16.splat (local.get $y))))))
+    "#;
+    let blend = |x: i32, y: i32| match eval(wat, "blend", &[Value::I32(x), Value::I32(y)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(blend(200, 100), 255, "200 + 100 saturates to 255");
+    assert_eq!(blend(10, 20), 30, "10 + 20 = 30");
+    assert_eq!(blend(255, 255), 255, "255 + 255 = 255");
+}
+
+/// Widen through the wasm bridge: sum the low 8 bytes of a vector by widening `i8x16`→`i16x8` (so
+/// the adds don't overflow a byte), then horizontal-add a couple of lanes. Exercises the real
+/// "widen before accumulate" pattern.
+#[test]
+fn i8x16_widen_low() {
+    let wat = r#"
+    (module
+      (func (export "lane0") (param $x i32) (result i32)
+        (i16x8.extract_lane_s 0
+          (i16x8.extend_low_i8x16_s (i8x16.splat (local.get $x))))))
+    "#;
+    let lane0 = |x: i32| match eval(wat, "lane0", &[Value::I32(x)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(lane0(200), -56, "(i8)200 sign-extends to -56");
+    assert_eq!(lane0(5), 5, "5 widens to 5");
+    assert_eq!(lane0(0x80), -128, "(i8)0x80 = -128");
+}
+
+/// Narrow through the wasm bridge: clamp-pack two i16 vectors to u8 (the "convert 16-bit samples to
+/// bytes with saturation" idiom). `i8x16.narrow_i16x8_u` of splat(x) — every lane clamps to [0,255].
+#[test]
+fn i8x16_narrow_u() {
+    let wat = r#"
+    (module
+      (func (export "pack") (param $x i32) (result i32)
+        (i8x16.extract_lane_u 0
+          (i8x16.narrow_i16x8_u (i16x8.splat (local.get $x)) (i16x8.splat (local.get $x))))))
+    "#;
+    let pack = |x: i32| match eval(wat, "pack", &[Value::I32(x)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(pack(300), 255, "300 clamps to 255");
+    assert_eq!(pack(-5), 0, "(i16)-5 clamps to 0");
+    assert_eq!(pack(200), 200, "200 stays");
+}
+
+/// Int↔float conversions through the wasm bridge: convert an i32 vector to f32, scale, and
+/// `trunc_sat` back — the "do float math on integer pixels/samples" pattern. Also pins the
+/// saturating NaN/overflow behaviour.
+#[test]
+fn i32x4_convert_trunc_roundtrip() {
+    // (i32) -> i32: round x through f32, multiply by 2.0, truncate back (saturating).
+    let wat = r#"
+    (module
+      (func (export "f") (param $x i32) (result i32)
+        (i32x4.extract_lane 0
+          (i32x4.trunc_sat_f32x4_s
+            (f32x4.mul
+              (f32x4.convert_i32x4_s (i32x4.splat (local.get $x)))
+              (f32x4.splat (f32.const 2.0)))))))
+    "#;
+    let f = |x: i32| match eval(wat, "f", &[Value::I32(x)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(f(10), 20, "10 → 20.0 → 20");
+    assert_eq!(f(-7), -14, "-7 → -14");
+    assert_eq!(
+        f(2_000_000_000),
+        i32::MAX,
+        "2e9*2 overflows i32 → saturates to MAX"
+    );
+}

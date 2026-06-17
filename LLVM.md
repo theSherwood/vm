@@ -8,6 +8,12 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
+> **Milestone 1 (the D54 exit criterion) is complete and folded into `DESIGN.md` §20a** — all
+> eight chibicc corpus libraries run byte-identical to native `clang`. This file is retained as
+> the tracker for the **remaining general-C breadth** (varargs `printf`, `realloc`, wider SIMD,
+> libm, …), now pursued **demo-driven** — see "Pending work — demo-driven plan" below. The slice
+> log (A–V) is kept as the implementation record until the file is dropped.
+
 **Status: Milestone 1 slices A–V done — the **D54 exit criterion is met**: all **eight corpus
 libraries run byte-identical to native `clang`** — B-Con's **SHA-256**, **xxHash**, **stb_perlin**,
 **tiny-regex-c**, **jsmn**, **heapgrow**, **miniz/tinfl**, and **clay** (`demo_*_vs_native`, 64 tests).
@@ -24,7 +30,10 @@ the non-varargs **stdio** output family (`puts`/`putchar`/`putc`/`fputc`/`fwrite
 and `clang`'s `printf("…\n")`→`puts` / `printf("%c")`→`putc` lowering); **slice P** adds funnel-shift
 rotates (`llvm.fshl`/`fshr` → `rotl`/`rotr`) and **synthesized runtime mem-loop helpers**
 (`__svm_memset`/`__svm_memcpy` — the first multi-block helper, for a variable-length `memset`/`memcpy`).
-Next: varargs `printf` (formatting), `malloc`/heap, then more of the demo corpus (Lane C).**
+The **demo-driven breadth plan (demos 1–6) is now complete** — `hexdump` (varargs `printf`, slice W),
+`sortvec` (`realloc` + signed `%d`, X), `mat4` (`<4 x float>` SIMD, Y), `crc32` (`llvm.bswap`, Z),
+`lineedit` (overlap-safe `memmove`, AA), and `raytrace` (transcendental libm bundled as guest code,
+AB) all run byte-identical to native.**
 `crates/svm-llvm` does the **SSA → block-argument
 conversion** (LLVM dominance SSA + φ-nodes → SVM's block-local form via liveness; loops/joins/
 critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
@@ -466,7 +475,8 @@ driving B-Con's SHA-256 (`sha_demo.c`) through the on-ramp and closing the two g
       `(ptr, …, i)` as block params — the first hand-built multi-block CFG / "mini-libc"), instead of
       erroring. clang's loop-idiom recognizer turns hand-written `mem*` loops *into* these intrinsics
       with a runtime length, so most real code needs it. Helper indices sit after the defined
-      functions, fixed before lowering call sites. Variable-length `memmove` (overlap) stays deferred.
+      functions, fixed before lowering call sites. (Variable-length `memmove` later got its own
+      direction-aware `synth_memmove` — slice AA.)
 - [x] **Demo:** `demo_sha256_vs_native` runs the whole SHA-256 library (multi-function calls, the
       data stack, a const global table, rotates, the `memset` loop helper, `write`) — digests
       byte-identical to native `clang`. Plus focused `funnel_shift_rotate` and
@@ -547,11 +557,98 @@ bits 0–31, lane 1 = 32–63 — its little-endian image).
 (sha256 ✅, xxhash ✅, perlin ✅, regex ✅, jsmn ✅, heapgrow ✅, tinfl ✅, clay ✅). **8 of 8** — the D54
 "matches native clang" exit criterion.
 
-**Remaining (general-C breadth, beyond the corpus).**
-- [ ] Varargs `printf`/`fprintf`/`snprintf` (varargs ABI on the data stack + a format engine) — no
-      corpus demo needs it; `puts`/`fputs` of a non-literal string; `realloc`; `argc`/`argv`;
-      transcendental math; `llvm.bswap`/`bitreverse`; variable-length `memmove`; wider SIMD
-      (`<4 x float>`, `<2 x double>`, …).
+## Pending work — demo-driven plan
+
+The corpus is done; the remaining work is **general-C breadth**, pursued the same way that worked
+for the corpus: pick a small **real end-to-end demo** (`crates/svm-run/demos/`), drive it through
+`clang -O2 → translate → verify → run` vs native, and close exactly the gaps it reveals. Each demo
+below is a whole-program, `write`-output C program (its own minimal libc, like the corpus demos) so
+it stays a clean differential against a native `cc` build. Ordered by value (printf first — it is
+the dominant general-C gap).
+
+| # | Demo (proposed) | Drives (pending item) | Also exercises |
+|---|---|---|---|
+| 1 ✅ | **`hexdump`** — read stdin, print `%08lx  %02x ×16  \|ascii\|` rows (`demos/hexdump`, slice W) | **varargs `printf`** (unsigned `%u`/`%x`, width, `0`-pad, `l`) — DONE, byte-identical to native | `read`, loops |
+| 2 ✅ | **`sortvec`** — `realloc`-doubling int vector + insertion sort, print `%d` 10/line (`demos/sortvec`, slice X) | **`realloc`** (header-sized grow-and-copy) + signed `printf` (`%d`) — DONE, byte-identical to native | `malloc` |
+| 3 ✅ | **`mat4`** — 4×4 matrix × vec4 affine transform, print rows (`demos/mat4`, slice Y) | **128-bit SIMD** (`<4 x float>` → native `v128`) — DONE, byte-identical to native | floats, `printf` |
+| 4 ✅ | **`crc32`** — CRC-32 over stdin + a big-endian `u32` reader (`demos/crc32`, slice Z) | **`llvm.bswap`** (inline byte reversal) — DONE, byte-identical to native | shifts, `printf` |
+| 5 ✅ | **`lineedit`** — read a line, wrap in `[...]` (right shift) + delete middle char (left shift) (`demos/lineedit`, slice AA) | **overlapping `memmove`** (direction-aware runtime loop) — DONE, byte-identical to native | arrays, `read` |
+| 6 ✅ | **`raytrace`** — ASCII sphere raytracer: `sqrt` intersection + diffuse/sinusoidal/exp shading (`demos/raytrace`, slice AB) | **transcendental libm** — `sqrt`/`floor` lower to SVM ops; `sin`/`exp` bundled as **guest `libm`** (poly approximations) — DONE, byte-identical to native | floats, `write` |
+
+Notes:
+- **`printf` runs in the guest** (per the capability model): a guest-side format engine parses the
+  (constant) format string at translate time and lowers each conversion to int→string / float→string
+  helpers → `Stream.write`; only the bytes cross the boundary. `%f` pulls in float formatting (defer
+  to demo 3/6 if demo 1 stays integer/hex). Non-constant format strings stay `Unsupported`.
+- **transcendentals/libm**: prefer a **guest** `libm` (the demo or a bundled header supplies
+  `sqrt`/`sin`/… as guest code) over any host math capability — keeps math in the sandbox. `sqrt`
+  already lowers to the SVM op (slice F); `sin`/`cos`/`exp`/`pow` need guest implementations.
+- **`argc`/`argv`**: needs a powerbox/runner change (pass argv to `_start`), not just the frontend —
+  schedule alongside a CLI-style demo once the above land.
+
+**Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
+`printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
+literal runs are written straight from the format global; each conversion lowers to the synthesized
+**`__svm_utoa`** (unsigned int → ASCII, a counted divide loop) plus width/zero-padding (a constant
+pre-fill of the scratch buffer `[FMT_BUF, FMT_BUF_END)`, then a `max(len,width)` write window) →
+`Stream.write`. Covers unsigned `%u`/`%x`, `%c`, `%%`, field width, the `0` flag, and length
+modifiers (the LLVM arg carries the real width — `%lx` ⇒ an `i64` arg). All formatting is **guest
+code**; only the bytes cross the boundary. Tests: `demo_hexdump_vs_native` (a `hexdump -C` clone, vs
+native, with stdin) + `printf_unsigned_formats` (mixed widths/pads/`%lx`/`%c`/`%%`).
+- *Deferred:* `%s` (runtime strlen), `%f`/`%g`/`%e` (float formatting), precision/`*`/`-`/`+`/space/`#`,
+  non-constant format strings.
+
+**Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
+16-byte **size header** before the data (keeping it 16-aligned), so the header survives for
+`realloc`. **`__svm_realloc(p, n)`** handles `realloc(NULL,…)` ≡ `malloc`, else `malloc`s `n`, reads
+the old size from `p-16`, and `__svm_memcpy`s `min(old, n)` bytes (no overlap — the fresh block sits
+above the old). `printf` gains signed `%d`/`%i`: the sign is computed (`-`), the magnitude formatted
+via `__svm_utoa`, the `-` written just below the digits and included only when negative; plain and
+space-padded fields supported (zero-padded `%d` stays fail-closed — sign+pad ordering). Tests:
+`demo_sortvec_vs_native`, `printf_signed_formats`, `realloc_grow_preserves`. (heapgrow/calloc still
+pass — the data region stays freshly-`vm_map`-zeroed below the bump.)
+
+**Slice Y (DONE) — 128-bit SIMD (`<4 x float>` → native `v128`); lands `mat4`.** A 4-lane 32-bit
+vector maps to SVM's §17 `v128` (vs the 2-lane → packed-`i64`, since `<4 x …>` is 16 bytes): `load`/
+`store` → `v128.load`/`store`; `fadd`/`fsub`/`fmul`/`fdiv` → `f32x4` `VFloatBin`; `extractelement`/
+`insertelement` → extract/replace lane; `shufflevector` → an `i8x16.shuffle` byte mask (an all-equal
+mask is a splat/broadcast); `<4 x …>` constants → `ConstV128`; `llvm.fmuladd.v4f32` → `f32x4` mul+add
+(unfused). The `<4 x i32>` shuffle masks are read as constants, not values. Tests:
+`demo_mat4_vs_native`, `vec4_float_scale` (a `<4 x float>` by-value arg/return + splat-mul).
+
+**Slice Z (DONE) — `llvm.bswap` (lands `crc32`).** No SVM byte-swap op, so it is synthesized inline:
+each source byte `i` is moved to destination byte `nbytes-1-i` via `((v >> 8*i) & 0xff) << 8*(nbytes-1-i)`,
+OR-accumulated (`i16`/`i32`/`i64`; `emit_bswap`). Tests: `demo_crc32_vs_native` (CRC-32 + a
+`__builtin_bswap32` big-endian reader, with stdin) and `bswap_intrinsic` (bswap32/64 vs native).
+
+**Slice AA (DONE) — overlap-safe `memmove` (lands `lineedit`).** A variable-length (or
+oversized-constant) `llvm.memmove` now calls the synthesized **`__svm_memmove(dst, src, len)`** — an
+8-block, direction-aware counted byte copy: when `dst <=u src` it copies **forward** (`i = 0…len`),
+otherwise **backward** (`i = len…0`), so overlapping shifts are correct in either direction (the one
+thing `memcpy`'s load-all-then-store inline path can't do for runtime lengths). The helper is
+appended last in the fixed helper-index order (after `realloc`). Constant small `memmove` still
+inlines (already overlap-safe). Tests: `demo_lineedit_vs_native` (right+left overlapping shifts, with
+stdin) and `memmove_overlap_runtime` (both directions over an 8-byte window vs native).
+
+**Slice AB (DONE) — transcendental libm, bundled as guest code (lands `raytrace`).** No new lowering:
+math beyond the SVM float ops (`sin`/`cos`/`exp`/`pow`/…) is supplied *by the program* as ordinary
+guest C (polynomial approximations), exactly as the corpus demos bundle their own `memset`. This is
+deliberate — it keeps math **in the sandbox** (no host math capability), and it is what makes the
+differential clean: native `cc` compiles the *same* guest `libm`, so every value is bit-identical.
+The only machine float ops in play already match across backends — `sqrt`/`floor` lower to SVM ops
+(slices F/L; IEEE-exact, matching native libm), `fmuladd` is unfused on both sides, and `+−*∕` are
+plain IEEE. The `raytrace` demo (one unit sphere, `sqrt` ray-sphere intersection, diffuse +
+`g_sin` surface bands + `g_exp` rim falloff, rendered to a char ramp) comes out byte-identical to
+native. A note on the harness: native links now pass `-lm` so libm-calling demos link (`sqrt`/`floor`
+become real calls at the native build's `-O0`); harmless for the rest. Tests: `demo_raytrace_vs_native`
+and `guest_libm_transcendental` (a guest `exp` + the `sqrt` op over a damped wave's RMS).
+- *Deferred:* a transcendental as an **external** libm call (e.g. linking the system `sin`) stays
+  `Unsupported` — there is no host math capability and no SVM op for it; the program must bring its
+  own (this slice). Adding a *bundled* guest `libm` header the on-ramp injects automatically (so
+  unmodified code that calls `sin` links against guest poly code) is the natural follow-up.
+
+**Next:** the demo-driven breadth plan is complete (demos 1–6 all byte-identical to native). Beyond
+this: Milestone 2 (tail calls, real Rust/C++ without EH) and a bundled guest `libm` header.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).

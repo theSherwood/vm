@@ -17,7 +17,8 @@
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, Edge, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, Ordering,
-    StoreOp, Terminator, VBitBinOp, VFloatBinOp, VFloatUnOp, VIntBinOp, VShape, ValIdx, ValType,
+    StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
+    VIntUnOp, VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -158,6 +159,17 @@ mod op {
         pub const SHUFFLE: u8 = 0x0C; // 16 lane bytes, a, b
         pub const SWIZZLE: u8 = 0x0D; // a, b
         pub const WIDTH_BYTES: u8 = 0x0E; // (no payload) -> i32
+        pub const VINT_CMP: u8 = 0x0F; // shape, op, a, b
+        pub const VFLOAT_CMP: u8 = 0x10; // shape, op, a, b
+        pub const VSHIFT: u8 = 0x11; // shape, op, a (v128), amt (i32)
+        pub const VINT_UN: u8 = 0x12; // shape, op, a
+        pub const VANY_TRUE: u8 = 0x13; // a -> i32
+        pub const VALL_TRUE: u8 = 0x14; // shape, a -> i32
+        pub const VBITMASK: u8 = 0x15; // shape, a -> i32
+        pub const VSAT_BIN: u8 = 0x16; // shape, op, a, b
+        pub const VWIDEN: u8 = 0x17; // shape (result), op, a
+        pub const VNARROW: u8 = 0x18; // shape (result), op, a, b
+        pub const VCONVERT: u8 = 0x19; // op, a
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -612,6 +624,35 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
+        Inst::VIntCmp { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VINT_CMP);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VFloatCmp { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VFLOAT_CMP);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VShift {
+            shape,
+            op: o,
+            a,
+            amt,
+        } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VSHIFT);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *amt as u64);
+        }
         Inst::VFloatBin { shape, op: o, a, b } => {
             out.push(op::SIMD);
             out.push(op::simd::VFLOAT_BIN);
@@ -625,6 +666,59 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             out.push(op::simd::VFLOAT_UN);
             out.push(shape.index());
             out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VIntUn { shape, op: o, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VINT_UN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VSatBin { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VSAT_BIN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VWiden { shape, op: o, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VWIDEN);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VNarrow { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VNARROW);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VConvert { op: o, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VCONVERT);
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VAnyTrue { a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VANY_TRUE);
+            write_uleb(out, *a as u64);
+        }
+        Inst::VAllTrue { shape, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VALL_TRUE);
+            out.push(shape.index());
+            write_uleb(out, *a as u64);
+        }
+        Inst::VBitmask { shape, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VBITMASK);
+            out.push(shape.index());
             write_uleb(out, *a as u64);
         }
         Inst::VBitBin { op: o, a, b } => {
@@ -722,6 +816,36 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
                 b: c.idx()?,
             }
         }
+        op::simd::VINT_CMP => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VIntCmp {
+                shape,
+                op: VICmpOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VFLOAT_CMP => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VFloatCmp {
+                shape,
+                op: VFCmpOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VSHIFT => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VShift {
+                shape,
+                op: VShiftOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                amt: c.idx()?,
+            }
+        }
         op::simd::VFLOAT_BIN => {
             let shape = dec_shape(c)?;
             let ob = c.byte()?;
@@ -741,6 +865,60 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
                 a: c.idx()?,
             }
         }
+        op::simd::VINT_UN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VIntUn {
+                shape,
+                op: VIntUnOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VSAT_BIN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VSatBin {
+                shape,
+                op: VSatBinOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VWIDEN => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VWiden {
+                shape,
+                op: VWidenOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VNARROW => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VNarrow {
+                shape,
+                op: VNarrowOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VCONVERT => {
+            let ob = c.byte()?;
+            Inst::VConvert {
+                op: VCvtOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VANY_TRUE => Inst::VAnyTrue { a: c.idx()? },
+        op::simd::VALL_TRUE => Inst::VAllTrue {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+        },
+        op::simd::VBITMASK => Inst::VBitmask {
+            shape: dec_shape(c)?,
+            a: c.idx()?,
+        },
         op::simd::VBIT_BIN => {
             let ob = c.byte()?;
             Inst::VBitBin {
