@@ -209,6 +209,10 @@ struct DebugShared {
     next_watch: u32,
     /// Pause before every `cap.call` (the host boundary, DEBUGGING.md S5).
     cap_stops: bool,
+    /// While `true`, the per-op seam ignores breakpoints/watchpoints/steps (clock still ticks) — set
+    /// during a scheduled-mode time-travel `seek` so it fast-forwards to a target turn without
+    /// stopping (DEBUGGING.md W1). Breakpoints stay armed for the run that follows.
+    suppress_stops: bool,
 }
 
 impl DebugShared {
@@ -218,6 +222,7 @@ impl DebugShared {
             watchpoints: Vec::new(),
             next_watch: 0,
             cap_stops: false,
+            suppress_stops: false,
         }
     }
 
@@ -306,7 +311,9 @@ impl DebugCtx {
             None
         } else {
             let sh = self.shared();
-            if sh.breakpoints.contains(&pc) {
+            if sh.suppress_stops {
+                None // scheduled-seek fast-forward: run past stops (clock still ticks below)
+            } else if sh.breakpoints.contains(&pc) {
                 Some(StopReason::Breakpoint)
             } else if let Some((addr, write)) = sh.watch_hit(access) {
                 Some(StopReason::Watchpoint { addr, write })
@@ -384,6 +391,15 @@ struct SeekInit {
     fuel: u64,
     memory: Option<Memory>,
     data: Arc<[Data]>,
+    /// `Some(plan)` ⇒ this was a **scheduled** (multithreaded) run; `seek(t)` re-executes the plan
+    /// for `t` scheduler turns (the global logical-time coordinate). `None` ⇒ single-threaded, where
+    /// `seek(t)` targets the sole vCPU's op clock.
+    schedule: Option<Arc<[u64]>>,
+    /// The fuzzing seed, if the scheduled run was [`attach_scheduled_seeded`]. `seek` re-applies it
+    /// so the same random interleaving is reproduced.
+    ///
+    /// [`attach_scheduled_seeded`]: Inspector::attach_scheduled_seeded
+    seed: Option<u64>,
 }
 
 /// Scheduled (multithreaded) execution state owned by an [`Inspector`] across pumps (Milestone B).
@@ -418,6 +434,94 @@ pub enum VarValue {
     Bytes(Vec<u8>),
 }
 
+/// One recorded crossing of the capability boundary (DEBUGGING.md W1 `CapTape`): the inputs the
+/// guest passed and the result slots the host returned, for a **nondeterministic input** capability
+/// (e.g. `Clock`). Replayed verbatim so a re-execution (time-travel `seek`) sees identical host
+/// inputs without a live host.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CapRecord {
+    pub type_id: u32,
+    pub op: u32,
+    pub handle: i32,
+    pub args: Vec<i64>,
+    /// The result slots the host returned (`Err` for a cap that trapped, e.g. `exit`).
+    pub result: Result<Vec<i64>, Trap>,
+    /// Bytes the cap wrote **into the guest window** as `(ptr, bytes)` — e.g. a stdin `read` filling
+    /// its buffer. Re-applied on replay so a buffer-filling input cap reproduces faithfully. Empty
+    /// for slot-only caps (`Clock`).
+    pub mem_writes: Vec<(u64, Vec<u8>)>,
+}
+
+/// An append-only log of the capability **inputs** crossing into a guest, captured during a run so a
+/// later re-execution reproduces them without a live host (DEBUGGING.md W1). Records the slot-only
+/// input caps (`Clock`) and buffer-filling ones (stdin `read`); RNG / host-fns and the `SchedTape`
+/// are follow-ups.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct CapTape {
+    pub records: Vec<CapRecord>,
+}
+
+/// Whether a capability is a **nondeterministic input** whose result a re-execution must replay
+/// (rather than re-derive). Deterministic / structural caps (window `Memory` ops, `SharedRegion`,
+/// `Stream` *write*) re-run faithfully on a fresh powerbox, so they are left live. Inputs: `Clock`
+/// (op 0 `now`), `Stream` op 0 (stdin `read`), and **any host-fn** (`iface::HOST_FN`) — the
+/// embedder's escape hatch (RNG, a real clock, external I/O), whose closure is *gone* on the fresh
+/// replay powerbox, so only the tape can reproduce it.
+fn is_recorded_input(type_id: u32, op: u32) -> bool {
+    type_id == iface::CLOCK || (type_id == iface::STREAM && op == 0) || type_id == iface::HOST_FN
+}
+
+/// A [`GuestMem`] wrapper that records every `write_bytes` a capability makes into the guest window
+/// (DEBUGGING.md W1), so a buffer-filling input cap (stdin `read`) can be replayed by re-applying the
+/// captured bytes. Every other operation delegates unchanged to the real window.
+struct RecordingMem<'a> {
+    inner: &'a mut dyn GuestMem,
+    writes: Vec<(u64, Vec<u8>)>,
+}
+
+impl GuestMem for RecordingMem<'_> {
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        self.inner.read_bytes(ptr, len)
+    }
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        let r = self.inner.write_bytes(ptr, data);
+        if r.is_some() {
+            self.writes.push((ptr, data.to_vec()));
+        }
+        r
+    }
+    fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        self.inner.map(offset, len, prot)
+    }
+    fn unmap(&mut self, offset: u64, len: u64) -> i64 {
+        self.inner.unmap(offset, len)
+    }
+    fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        self.inner.protect(offset, len, prot)
+    }
+    fn map_region(
+        &mut self,
+        win_off: u64,
+        region_off: u64,
+        len: u64,
+        prot: i32,
+        region: u32,
+        backing: RegionBacking,
+    ) -> i64 {
+        self.inner
+            .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn page_size(&self) -> i64 {
+        self.inner.page_size()
+    }
+    fn region_page_size(&self) -> i64 {
+        self.inner.region_page_size()
+    }
+    fn async_counter(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
+        self.inner.async_counter(counter_addr)
+    }
+}
+
 impl Inspector {
     /// Attach to `m`'s `func(args)` with `fuel` and an **empty powerbox** (any `cap.call` faults),
     /// paused before the first op. Set breakpoints, then
@@ -435,11 +539,12 @@ impl Inspector {
         func: FuncIdx,
         args: &[Value],
         fuel: u64,
-        host: Host,
+        mut host: Host,
     ) -> Inspector {
         let funcs: Arc<[Func]> = m.funcs.to_vec().into();
         let args: Arc<[Value]> = args.into();
         let data: Arc<[Data]> = m.data.clone().into();
+        host.record_caps(); // W1: tape the cap inputs so `seek` can re-execute faithfully
         let host = Arc::new(Mutex::new(host));
         let shared = Arc::new(Mutex::new(DebugShared::new()));
         let root = Self::fresh_single_root(
@@ -467,6 +572,8 @@ impl Inspector {
                 fuel,
                 memory: m.memory,
                 data,
+                schedule: None,
+                seed: None,
             }),
             finished: None,
         }
@@ -533,14 +640,100 @@ impl Inspector {
         fuel: u64,
         schedule: Vec<u64>,
     ) -> Inspector {
+        Self::scheduled_impl(m, func, args, fuel, schedule, None)
+    }
+
+    /// Like [`attach_scheduled`](Inspector::attach_scheduled), but drive a **random** interleaving
+    /// from `seed` instead of a fixed plan — schedule fuzzing (DEBUGGING.md W1). Each turn picks a
+    /// random runnable thread, so different seeds explore different interleavings (and may surface
+    /// different race outcomes). The interleaving that ran is captured: [`sched_tape`] returns it as
+    /// a portable plan you can `attach_scheduled` to replay deterministically (or share as a repro).
+    /// `seek`/`step_back` reproduce this exact random run (same seed).
+    ///
+    /// [`sched_tape`]: Inspector::sched_tape
+    pub fn attach_scheduled_seeded(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        seed: u64,
+    ) -> Inspector {
+        Self::scheduled_impl(m, func, args, fuel, Vec::new(), Some(seed))
+    }
+
+    fn scheduled_impl(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        schedule: Vec<u64>,
+        seed: Option<u64>,
+    ) -> Inspector {
         let funcs: Arc<[Func]> = m.funcs.to_vec().into();
-        let mem = m.memory.map(|mc| {
+        let args_arc: Arc<[Value]> = args.into();
+        let data: Arc<[Data]> = m.data.clone().into();
+        let schedule: Arc<[u64]> = schedule.into();
+        let mut host0 = Host::new();
+        host0.record_caps(); // W1: tape cap inputs so scheduled `seek` re-executes faithfully
+        let host = Arc::new(Mutex::new(host0));
+        let shared = Arc::new(Mutex::new(DebugShared::new()));
+        let sched = Self::fresh_scheduled(
+            Arc::clone(&funcs),
+            func,
+            args,
+            fuel,
+            m.memory,
+            &data,
+            Arc::clone(&shared),
+            Arc::clone(&host),
+            &schedule,
+            seed,
+            None,
+        );
+        Inspector {
+            v: None,
+            sched: Some(sched),
+            host,
+            debug_info: m.debug_info.clone(),
+            shared,
+            focus: None,
+            seek_init: Some(SeekInit {
+                funcs,
+                func,
+                args: args_arc,
+                fuel,
+                memory: m.memory,
+                data,
+                schedule: Some(schedule),
+                seed,
+            }),
+            finished: None,
+        }
+    }
+
+    /// Build a fresh scheduled (multithreaded) run: a `DetSched` holding the root vCPU (debug +
+    /// `memop`), to be driven under `schedule` (a plan, or empty for the deterministic default
+    /// order). `turn_limit` stops the driver at that turn boundary for a time-travel `seek`. Shared
+    /// by `attach_scheduled` and the scheduled branch of `seek` so both build identical state.
+    #[allow(clippy::too_many_arguments)]
+    fn fresh_scheduled(
+        funcs: Arc<[Func]>,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        memory: Option<Memory>,
+        data: &[Data],
+        shared: Arc<Mutex<DebugShared>>,
+        host: Arc<Mutex<Host>>,
+        schedule: &[u64],
+        seed: Option<u64>,
+        turn_limit: Option<u64>,
+    ) -> SchedState {
+        let mem = memory.map(|mc| {
             let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
-            mm.init_data(&m.data);
+            mm.init_data(data);
             mm
         });
-        let host = Arc::new(Mutex::new(Host::new()));
-        let shared = Arc::new(Mutex::new(DebugShared::new()));
         let det = Arc::new(DetSched::new(0, MAX_VCPUS));
         let root_id = {
             let mut s = det.lock();
@@ -566,69 +759,168 @@ impl Inspector {
             s.runnable.push(Box::new(root));
             id
         };
-        Inspector {
-            v: None,
-            sched: Some(SchedState {
-                det,
-                dpor: Dpor::new(schedule, Vec::new()),
-                driver: SchedDriver::default(),
-                root_id,
-            }),
-            host,
-            debug_info: m.debug_info.clone(),
-            shared,
-            focus: None,
-            seek_init: None, // scheduled-mode time-travel is a later W1 slice
-            finished: None,
+        let mut dpor = Dpor::new(schedule.to_vec(), Vec::new());
+        // Seeded fuzzing extends the schedule randomly past the (usually empty) plan; mixing the raw
+        // seed avoids the xorshift zero fixpoint, and is applied identically here for `seek` to
+        // reproduce the same random schedule.
+        dpor.rng = seed.map(|s| s ^ 0x9E37_79B9_7F4A_7C15);
+        SchedState {
+            det,
+            dpor,
+            driver: SchedDriver {
+                turn_limit,
+                ..Default::default()
+            },
+            root_id,
         }
     }
 
-    /// Time-travel to logical time `t` (DEBUGGING.md W1): re-execute the run from the start to the op
-    /// at `clock == t` and pause there, so `backtrace`/`read_*` show the guest exactly **as it was**.
-    /// This is stateless re-execution (the §18 explorer's own trick) — exact for a deterministic
-    /// guest; capabilities re-run against a fresh empty powerbox, so a guest whose `cap.call`s carry
-    /// real side effects or nondeterminism needs the (pending) W1 `CapTape` to seek faithfully.
-    /// Breakpoints are preserved but ignored *during* the fast-forward. Single-threaded mode only for
-    /// now (scheduled-mode seek is pending); returns [`Stop::Blocked`] otherwise.
+    /// Time-travel to logical time `t` (DEBUGGING.md W1): re-execute the run from the start and pause
+    /// at `t`, so `backtrace`/`read_*` show the guest exactly **as it was**. The coordinate `t` is
+    /// the sole vCPU's op [`clock`](Inspector::clock) in single-threaded mode, and the global
+    /// scheduler-[`turn`](Inspector::turn) count in scheduled (multithreaded) mode — where the result
+    /// is a *global snapshot* and every thread is inspectable via [`threads`]/[`select_task`].
+    /// Stateless re-execution (the §18 explorer's trick): exact for a deterministic guest, and
+    /// faithful for nondeterministic *inputs* via the replayed [`CapTape`]. Breakpoints are preserved
+    /// but ignored during the fast-forward. `Stop::Blocked` if the run can't be re-executed.
+    ///
+    /// [`threads`]: Inspector::threads
+    /// [`select_task`]: Inspector::select_task
     pub fn seek(&mut self, t: u64) -> Stop {
         let Some(init) = self.seek_init.clone() else {
             return Stop::Blocked;
         };
-        // A fresh empty powerbox: re-execution reproduces the guest's own computation up to `t`.
-        let host = Arc::new(Mutex::new(Host::new()));
-        let root = Self::fresh_single_root(
-            init.funcs,
-            init.func,
-            &init.args,
-            init.fuel,
-            init.memory,
-            &init.data,
-            Arc::clone(&host),
-            Arc::clone(&self.shared),
-            Some(t),
-        );
-        self.host = host;
-        self.v = Some(root);
-        self.finished = None;
-        self.focus = None;
-        match self.v.as_mut().unwrap().run(u64::MAX) {
-            Step::Pause(_, pc) => Stop::Break {
-                reason: StopReason::Step,
-                pc,
-            },
-            Step::Done(r) => {
-                self.finished = Some(r.clone());
-                Stop::Finished(r)
+        // A fresh powerbox seeded to *replay* the recorded cap inputs (W1) and keep recording past
+        // `t`, so re-execution reproduces nondeterministic inputs (e.g. `Clock`, stdin `read`).
+        let tape: Arc<[CapRecord]> = self.cap_tape().records.into();
+        let mut fresh = Host::new();
+        fresh.replay_caps(tape);
+        fresh.record_caps();
+        let host = Arc::new(Mutex::new(fresh));
+
+        match &init.schedule {
+            // Scheduled (multithreaded): replay the plan for `t` scheduler turns, landing at a global
+            // turn-`t` snapshot. No vCPU is "stopped"; focus the thread that ran the last turn.
+            Some(schedule) => {
+                let mut sched = Self::fresh_scheduled(
+                    init.funcs,
+                    init.func,
+                    &init.args,
+                    init.fuel,
+                    init.memory,
+                    &init.data,
+                    Arc::clone(&self.shared),
+                    Arc::clone(&host),
+                    schedule,
+                    init.seed,
+                    Some(t),
+                );
+                self.shared().suppress_stops = true; // fast-forward past breakpoints
+                let (focus, finished, pc) = {
+                    let SchedState {
+                        det,
+                        dpor,
+                        driver,
+                        root_id,
+                    } = &mut sched;
+                    let mut policy = Policy::Dpor(dpor);
+                    let _ = driver.run(det, &mut policy);
+                    driver.turn_limit = None; // continuing from here runs forward normally
+                    let focus = dpor.trace.last().map(|e| e.tid).unwrap_or(*root_id);
+                    let finished = det.lock().results.get(root_id).map(|o| o.result.clone());
+                    let pc = det.lock().find_vcpu(focus).and_then(Self::pc_of);
+                    (focus, finished, pc)
+                };
+                self.shared().suppress_stops = false;
+                self.v = None;
+                self.host = host;
+                self.focus = Some(focus);
+                self.finished = finished.clone();
+                self.sched = Some(sched);
+                match finished {
+                    Some(r) => Stop::Finished(r),
+                    None => Stop::Break {
+                        reason: StopReason::Step,
+                        pc: pc.unwrap_or(IrPc {
+                            module: 0,
+                            func: 0,
+                            block: 0,
+                            inst: 0,
+                        }),
+                    },
+                }
             }
-            Step::Park(_) | Step::Yield => Stop::Blocked,
+            // Single-threaded: re-execute the sole vCPU to op `clock == t`.
+            None => {
+                let root = Self::fresh_single_root(
+                    init.funcs,
+                    init.func,
+                    &init.args,
+                    init.fuel,
+                    init.memory,
+                    &init.data,
+                    Arc::clone(&host),
+                    Arc::clone(&self.shared),
+                    Some(t),
+                );
+                self.host = host;
+                self.v = Some(root);
+                self.finished = None;
+                self.focus = None;
+                match self.v.as_mut().unwrap().run(u64::MAX) {
+                    Step::Pause(_, pc) => Stop::Break {
+                        reason: StopReason::Step,
+                        pc,
+                    },
+                    Step::Done(r) => {
+                        self.finished = Some(r.clone());
+                        Stop::Finished(r)
+                    }
+                    Step::Park(_) | Step::Yield => Stop::Blocked,
+                }
+            }
         }
     }
 
-    /// Step **backward** one op: time-travel to `clock - 1` (DEBUGGING.md W1). At `clock 0` this
-    /// re-seeks to the initial state (a no-op move).
+    /// The current call frame's pc, if any (innermost frame).
+    fn pc_of(v: &VCpu) -> Option<IrPc> {
+        v.frames.last().map(|f| IrPc {
+            module: f.module,
+            func: f.func,
+            block: f.block,
+            inst: f.inst,
+        })
+    }
+
+    /// The global scheduler-turn count — the coordinate scheduled-mode [`seek`](Inspector::seek)
+    /// targets (DEBUGGING.md W1). One turn per visible-op decision across all threads. `0` in
+    /// single-threaded mode (which uses the op [`clock`](Inspector::clock) instead).
+    pub fn turn(&self) -> u64 {
+        self.sched.as_ref().map(|s| s.driver.turns).unwrap_or(0)
+    }
+
+    /// The **`SchedTape`** (DEBUGGING.md W1): the interleaving this scheduled run actually executed,
+    /// as the ordered `TaskId` choice at each visible-op decision. Empty in single-threaded mode or
+    /// before any turn runs. It is a portable, replayable artifact — `attach_scheduled` it to
+    /// reproduce the exact interleaving deterministically (no seed needed), e.g. to share a race
+    /// repro found by [`attach_scheduled_seeded`](Inspector::attach_scheduled_seeded). Under
+    /// sequential consistency the schedule *is* the memory order, so this fully pins the run.
+    pub fn sched_tape(&self) -> Vec<u64> {
+        self.sched
+            .as_ref()
+            .map(|s| s.dpor.trace.iter().map(|e| e.tid).collect())
+            .unwrap_or_default()
+    }
+
+    /// Step **backward** one unit of logical time (DEBUGGING.md W1): the global `turn` in scheduled
+    /// mode, the op `clock` single-threaded. At time 0 this re-seeks to the initial state.
     pub fn step_back(&mut self) -> Stop {
-        let t = self.clock().saturating_sub(1);
-        self.seek(t)
+        let now = if self.sched.is_some() {
+            self.turn()
+        } else {
+            self.clock()
+        };
+        self.seek(now.saturating_sub(1))
     }
 
     /// The vCPU currently under inspection (the paused thread in scheduled mode, the sole vCPU in
@@ -711,6 +1003,14 @@ impl Inspector {
     /// is paused or finished — it is not executing, so the lock is uncontended.
     pub fn host(&self) -> std::sync::MutexGuard<'_, Host> {
         self.host.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The recorded capability-input trace so far (DEBUGGING.md W1) — the `Clock` (and, later, other
+    /// input) crossings this run has made. This is what [`seek`](Inspector::seek) replays to
+    /// re-execute a nondeterministic guest faithfully, and the artifact a host can capture from a
+    /// live run.
+    pub fn cap_tape(&self) -> CapTape {
+        self.host().cap_tape()
     }
 
     fn dbg(&mut self) -> &mut DebugCtx {
@@ -800,6 +1100,8 @@ impl Inspector {
             match driver.run(det, &mut policy) {
                 DriverStop::Paused { reason, pc, .. } => return Stop::Break { reason, pc },
                 DriverStop::Done => det.lock().results.remove(root_id),
+                // Normal pumping never sets a turn limit (only `seek` does, on its own driver).
+                DriverStop::TurnLimit => unreachable!("turn limit only set during seek"),
             }
         };
         match outcome {
@@ -1426,6 +1728,11 @@ struct Dpor {
     trace: Vec<SchedEvent>,
     pending: Option<(TaskId, Vec<TaskId>)>,
     blocked: bool,
+    /// `Some(state)` ⇒ extend the schedule *randomly* (seeded fuzzing for the debugger's
+    /// `SchedTape`, DEBUGGING.md W1) instead of the deterministic smallest-id greedy. Only set by the
+    /// `Inspector` (which runs one schedule); the explorer leaves it `None` so its DPOR backtracking
+    /// stays deterministic. The executed choices still land in `trace`, so the run replays exactly.
+    rng: Option<u64>,
 }
 
 impl Dpor {
@@ -1438,6 +1745,7 @@ impl Dpor {
             trace: Vec::new(),
             pending: None,
             blocked: false,
+            rng: None,
         }
     }
 
@@ -1449,12 +1757,33 @@ impl Dpor {
             // Forced replay (incl. a race-woken thread): the planned choice overrides the sleep set.
             self.plan[self.depth]
         } else {
-            // Greedy extension: the smallest enabled thread that is not asleep here.
-            match enabled
-                .iter()
-                .copied()
-                .find(|t| !self.sleep.contains_key(t))
-            {
+            // Extension past the plan: the smallest enabled, non-asleep thread (deterministic), or —
+            // when seeded for fuzzing — a random one. Either way the choice is recorded in `trace`.
+            let chosen = if let Some(state) = &mut self.rng {
+                let avail: Vec<TaskId> = enabled
+                    .iter()
+                    .copied()
+                    .filter(|t| !self.sleep.contains_key(t))
+                    .collect();
+                if avail.is_empty() {
+                    None
+                } else {
+                    // xorshift* (matches `DetState::rng`).
+                    let mut x = *state;
+                    x ^= x >> 12;
+                    x ^= x << 25;
+                    x ^= x >> 27;
+                    *state = x;
+                    let r = x.wrapping_mul(0x2545F4914F6CDD1D);
+                    Some(avail[(r as usize) % avail.len()])
+                }
+            } else {
+                enabled
+                    .iter()
+                    .copied()
+                    .find(|t| !self.sleep.contains_key(t))
+            };
+            match chosen {
                 Some(t) => t,
                 None => {
                     self.blocked = true;
@@ -2688,8 +3017,10 @@ fn run_det(det: &Arc<DetSched>) {
 fn run_with_policy(det: &Arc<DetSched>, mut policy: Policy) {
     match SchedDriver::default().run(det, &mut policy) {
         DriverStop::Done => {}
-        // The deterministic explorer never sets `debug`, so a pause is impossible here (S4).
-        DriverStop::Paused { .. } => unreachable!("debug pause in the deterministic explorer"),
+        // The explorer sets neither `debug` nor a turn limit, so only `Done` can occur (S4).
+        DriverStop::Paused { .. } | DriverStop::TurnLimit => {
+            unreachable!("debug pause / turn limit in the deterministic explorer")
+        }
     }
 }
 
@@ -2702,6 +3033,10 @@ enum DriverStop {
     /// The run reached a scheduler quiescence: every vCPU finished, or a join-deadlock, or (under a
     /// plan) every runnable vCPU is asleep. The caller reads outcomes from `det`.
     Done,
+    /// Ran the requested number of scheduler turns (`turn_limit`) and stopped at that turn boundary —
+    /// a global snapshot for scheduled-mode time-travel `seek` (DEBUGGING.md W1). No vCPU is held;
+    /// every thread is back in the scheduler, inspectable via `threads`/`select_task`.
+    TurnLimit,
 }
 
 /// A vCPU whose turn a debug stop interrupted (the op has not run). Resumed verbatim on the next
@@ -2721,6 +3056,11 @@ struct HeldTurn {
 #[derive(Default)]
 struct SchedDriver {
     held: Option<HeldTurn>,
+    /// Completed scheduler turns (one per visible-op decision) — the global logical-time coordinate
+    /// scheduled-mode `seek` targets (DEBUGGING.md W1).
+    turns: u64,
+    /// When `Some(t)`, stop with [`DriverStop::TurnLimit`] once `turns` reaches `t` (a seek).
+    turn_limit: Option<u64>,
 }
 
 impl SchedDriver {
@@ -2728,6 +3068,10 @@ impl SchedDriver {
     /// retained in `self.held` and the next `run` resumes exactly there.
     fn run(&mut self, det: &Arc<DetSched>, policy: &mut Policy) -> DriverStop {
         loop {
+            // Scheduled-seek stop: at the requested turn boundary (no vCPU held — a global snapshot).
+            if self.turn_limit == Some(self.turns) {
+                return DriverStop::TurnLimit;
+            }
             // Resume an interrupted turn verbatim, else pick the next vCPU + quantum under the lock
             // (release it before running — run_inner may re-enter via `spawn`/`notify`).
             let (mut v, quantum, pre_fp, writes_before, spin_capable) = match self.held.take() {
@@ -2808,6 +3152,7 @@ impl SchedDriver {
                 });
                 return DriverStop::Paused { reason, pc };
             }
+            self.turns += 1; // a visible-op decision completed — advance global logical time
 
             let acc = v.acc.take();
             // DPOR: finalize this decision's trace entry now that the step's accessed object is known.
@@ -5968,6 +6313,12 @@ pub struct Host {
     /// JIT's `table_reserve_log2` for the backends to agree on slot indices. `0` ⇒ natural size
     /// (no install room).
     jit_table_log2: u8,
+    /// W1 record/replay (DEBUGGING.md): when `Some`, every nondeterministic-input `cap.call`
+    /// ([`is_recorded_input`]) is appended here as it crosses, so a later re-execution can replay it.
+    cap_record: Option<Vec<CapRecord>>,
+    /// W1 replay: when `Some`, serve nondeterministic-input `cap.call`s from this tape (cursor) in
+    /// order instead of the live host, so a fresh-powerbox re-execution reproduces the guest's inputs.
+    cap_replay: Option<(Arc<[CapRecord]>, usize)>,
 }
 
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
@@ -6062,7 +6413,31 @@ impl Host {
             jit_domains: Vec::new(),
             jit_validator: None,
             jit_table_log2: 0,
+            cap_record: None,
+            cap_replay: None,
         }
+    }
+
+    /// Begin recording the nondeterministic capability **inputs** crossing into the guest, so a
+    /// re-execution can replay them (DEBUGGING.md W1). Idempotent; keeps any records already logged.
+    pub fn record_caps(&mut self) {
+        if self.cap_record.is_none() {
+            self.cap_record = Some(Vec::new());
+        }
+    }
+
+    /// The capability inputs recorded so far (empty if [`record_caps`](Host::record_caps) was never
+    /// called).
+    pub fn cap_tape(&self) -> CapTape {
+        CapTape {
+            records: self.cap_record.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Serve nondeterministic-input `cap.call`s from `tape` (from the start) instead of the live host
+    /// — used by re-execution / time-travel so it sees identical inputs without a live powerbox.
+    fn replay_caps(&mut self, tape: Arc<[CapRecord]>) {
+        self.cap_replay = Some((tape, 0));
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
@@ -6702,6 +7077,84 @@ impl Host {
     /// — the interpreter converts its `Value`s, a JIT passes its slots directly. `mem`
     /// is `None` when the module declares no memory (buffer ops then return `-EFAULT`).
     pub fn cap_dispatch_slots(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
+        // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
+        if is_recorded_input(type_id, op) {
+            // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
+            // re-execution diverged before this point — fall through to live as a best effort).
+            let served = if let Some((tape, pos)) = &mut self.cap_replay {
+                match tape.get(*pos) {
+                    Some(rec)
+                        if rec.type_id == type_id
+                            && rec.op == op
+                            && rec.handle == handle
+                            && rec.args == args =>
+                    {
+                        *pos += 1;
+                        Some(rec.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(rec) = served {
+                // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
+                // return the recorded result slots — no live host needed.
+                if let Some(m) = mem {
+                    for (ptr, bytes) in &rec.mem_writes {
+                        m.write_bytes(*ptr, bytes);
+                    }
+                }
+                return rec.result;
+            }
+            // Record: run live through a `RecordingMem` so any guest-window writes are captured,
+            // then log the crossing for a future replay.
+            let (result, mem_writes) = match mem {
+                Some(m) => {
+                    let mut rec_mem = RecordingMem {
+                        inner: m,
+                        writes: Vec::new(),
+                    };
+                    let r = self.cap_dispatch_slots_inner(
+                        type_id,
+                        op,
+                        handle,
+                        args,
+                        Some(&mut rec_mem),
+                    );
+                    (r, rec_mem.writes)
+                }
+                None => (
+                    self.cap_dispatch_slots_inner(type_id, op, handle, args, None),
+                    Vec::new(),
+                ),
+            };
+            if let Some(rec) = &mut self.cap_record {
+                rec.push(CapRecord {
+                    type_id,
+                    op,
+                    handle,
+                    args: args.to_vec(),
+                    result: result.clone(),
+                    mem_writes,
+                });
+            }
+            return result;
+        }
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem)
+    }
+
+    /// The live capability dispatch (§3c) — resolve the handle in the host table and run the op. The
+    /// public [`cap_dispatch_slots`](Host::cap_dispatch_slots) wraps this with W1 record/replay.
+    fn cap_dispatch_slots_inner(
         &mut self,
         type_id: u32,
         op: u32,

@@ -45,12 +45,12 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Interp↔JIT differential testing of concurrency | **Built** | `jit_fuzz.rs`, `concurrent_fuzz.rs`, `fiber_fuzz.rs` |
 | SSA promotion (the inspectability-tension source) | **Built** | §3d, frontend promote pass |
 | Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
-| `cap.call` I/O record log | **Missing** | — |
-| Schedule / memory-order record log (multicore replay) | **Missing** (substrate in DPOR) | — |
+| `cap.call` I/O record log (`CapTape`) — input caps `Clock` + stdin `read` + **any host-fn** (slots **and** buffer writes); replayed for faithful `seek` | **Built — W1 slices 2, 5** | `svm-interp` `Host::record_caps` / `CapTape` / `RecordingMem` |
+| Schedule record log (`SchedTape`) — capture a live interleaving as a replayable plan; seeded schedule fuzzing | **Built — W1 slice 4** (interp; SC ⇒ schedule *is* memory order) | `svm-interp` `Inspector::sched_tape` / `attach_scheduled_seeded` |
 | W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `svm-interp` `find_schedule` / `replay_schedule` / `Witness` |
-| W1 time-travel — `seek(t)` / `step_back` via stateless re-execution (single-threaded, deterministic) | **Built — slice 1** | `svm-interp` `Inspector::seek` / `step_back` |
+| W1 time-travel — `seek(t)` / `step_back`: single-threaded (op `clock`) **and** multithreaded (global `turn`); faithful via `CapTape` | **Built — slices 1–3** | `svm-interp` `Inspector::seek` / `turn` / `step_back` |
 | Interpreter stepping / breakpoint / watchpoint / cap.call stop / backtrace / value+window read | **Built — slices 1–3** | `svm-interp` `Inspector` (single-threaded) |
-| Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`) | **Built — Milestone B slice 1–2** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
+| Multithreaded debugging — fixed-schedule `thread.spawn` guest, per-thread breakpoints, replay a failing interleaving, inspect any thread (`select_task`), time-travel to a global turn | **Built — Milestone B slices 1–3** | `svm-interp` `Inspector::attach_scheduled` / `SchedDriver` |
 | Backtrace *materialization* (unwind tables → frames) | **Missing** | needs Cranelift unwind info |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs) | **Built — slice 1 (neutral core, text)** (D-DBG-7/§6; binary + chibicc emit pending) | `svm-ir` `DebugInfo`, `svm-text`, `svm-interp` |
 | DWARF emission + DAP server | **Missing** | — |
@@ -190,9 +190,75 @@ deterministic guest** (the common algorithmic-debugging case); the re-run uses a
 powerbox, so a guest whose `cap.call`s carry real side effects or nondeterminism needs the
 `CapTape` (next slice) to seek faithfully. Tests (`debug.rs`): out-of-order `seek` restores the
 exact frame state recorded while stepping forward; `step_back` decrements the clock; `seek(0)` then
-resume reproduces the result; seek-past-end finishes. *Not yet:* the `CapTape` (cap-I/O record →
-feed on replay) and `SchedTape`, scheduled-mode (multithreaded) seek, and snapshot/checkpoint
-cadence to bound re-execution cost.
+resume reproduces the result; seek-past-end finishes.
+
+**Built — slice 2 (`CapTape`: record/replay the nondeterministic cap inputs).** A run now tapes the
+capability **inputs** crossing into the guest (`Inspector::cap_tape() -> CapTape` of `CapRecord`s),
+and `seek` re-executes against a fresh powerbox seeded to **replay** that tape — so time-travel is
+faithful even when the guest's result depends on a host input a fresh re-run couldn't reproduce.
+The hook is the single `cap_dispatch_slots` chokepoint: it records/serves only the *nondeterministic
+input* caps (`is_recorded_input`: `Clock` op 0, `Stream` op 0 = stdin `read`, and **any host-fn**
+`iface::HOST_FN` — the embedder's escape hatch for RNG / a real clock / external I/O, whose closure
+is *gone* on the fresh replay powerbox, so only the tape can reproduce it), leaving deterministic /
+structural caps (`Memory` ops, `SharedRegion`, `Stream` *write*) to re-run live on the fresh powerbox
+— which reproduces them exactly, so they need no tape. Both directions cross: a
+`CapRecord` keeps the result slots **and** the bytes a buffer-filling input wrote into the guest
+window (captured via a `RecordingMem` `GuestMem` wrapper that logs `write_bytes`), re-applied on
+replay. Replay verifies each served crossing matches the live `(type_id, op, handle, args)`
+(divergence detection). Tests (`debug.rs`): a guest summing two `Clock` reads (host clock seeded to
+1000) replays to `2001` after `seek(0)` (vs `1` on a fresh clock); a guest reading 2 stdin bytes
+into its buffer and returning `buf[0]` replays to `'H'` (72) — the captured buffer write re-applied
+— vs `0` on a fresh empty-stdin host; and a guest summing two reads of a stateful host-fn (an
+incrementing counter) replays to `201` even though the closure no longer exists on the fresh
+powerbox — so only the tape could have carried it.
+
+**Built — slice 3 (scheduled-mode seek: multithreaded time-travel).** `seek(t)` now also time-travels
+a **multithreaded** (`attach_scheduled`) run — the W1↔Milestone-B unification. The coordinate is the
+**global scheduler turn** (`Inspector::turn()`), one per visible-op decision across all threads — the
+plan index, the only coordinate that names a whole-program instant (per-vCPU clocks diverge). `seek(t)`
+rebuilds the run and replays the fixed plan for exactly `t` turns, landing at a **global snapshot**:
+no thread is "stopped", but every thread is inspectable via `threads()`/`select_task()`/`backtrace`
+(the focus defaults to the thread that ran turn `t`). Mechanism: the re-entrant `SchedDriver` gained a
+`turn_limit` (stop at the turn boundary — no held vCPU), and a `suppress_stops` flag on `DebugShared`
+fast-forwards past breakpoints during the replay; `step_back` decrements `turn()` (vs the op `clock`
+single-threaded). Because the plan pins the interleaving and the `CapTape` replays the inputs, the
+snapshot at turn `t` — including whatever the guest's own userland scheduler had done by then — is
+exact and reproducible. Test (`debug_threads.rs`): a witness-pinned racy run seeks to a mid-turn
+global snapshot (reproducible across repeats), `seek(0)` + resume reproduces the raced outcome, and
+`step_back` walks the global turn down by one.
+
+**Built — slice 4 (`SchedTape`: capture a live interleaving + schedule fuzzing).** The schedule a
+scheduled run actually executed is now a first-class artifact: `Inspector::sched_tape() -> Vec<u64>`
+returns the ordered `TaskId` choice at each visible-op decision (a direct dump of the explorer's
+`trace`). Under sequential consistency the schedule *is* the memory order, so this fully pins the
+run — `attach_scheduled(tape)` replays the exact interleaving deterministically, making any run a
+portable, shareable repro. To make capture worthwhile, `attach_scheduled_seeded(seed)` drives a
+**random** fine-grained interleaving (one random runnable thread per turn) — schedule fuzzing — so
+different seeds explore different interleavings (and surface different race outcomes); a found
+failure's `sched_tape` replays it. The randomization is a seed on `Dpor`'s schedule-*extension*
+(past the plan); the explorer leaves it unset so its DPOR backtracking stays deterministic, and the
+choices still land in `trace`, so a seeded run replays from either its seed (`seek`) or its captured
+tape. Tests (`debug_threads.rs`): across 64 seeds fuzzing surfaces both the lost update (1) and the
+correct total (2), each run's `sched_tape` replays to the identical outcome and interleaving, and
+`seek(0)` reproduces a seeded run.
+
+**Built — slice 5 (host-fn input caps).** `is_recorded_input` now also tapes `iface::HOST_FN`, the
+embedder's general escape hatch — so RNG, a real wall clock, or external I/O exposed as a host-fn
+records/replays like `Clock`/stdin (slots + any guest-window writes via `RecordingMem`). This is the
+sharpest demonstration of why a tape is needed at all: the host-fn *closure* is not present on the
+fresh replay powerbox, so re-execution **cannot** reproduce it any other way (test: a stateful
+counter host-fn replays to `201` after `seek(0)`).
+
+**Not yet — snapshot/checkpoint cadence (the remaining W1 performance piece).** `seek(t)`
+re-executes from time 0, so it is O(t) and repeated `step_back` is O(t²). Bounding that needs
+periodic state snapshots to restart from the nearest checkpoint — but the interpreter's state is not
+cheaply snapshottable: `VCpu`/`Host` aren't `Clone`, and guest memory is a **shared** `Arc<Region>`
+(`Mem::fork_for_thread` shares bytes, it doesn't copy them), so a checkpoint needs a deep window
+copy (ideally dirty-page-tracked) plus a host-substate snapshot (output buffers, `clock_ns`,
+`stdin_pos`, the cap-replay cursor). That is a dedicated effort, not a small slice; correctness
+(seek already works) is unaffected — only long-run navigation cost. Also still open: RNG via a
+dedicated iface (vs a host-fn), and capturing a `SchedTape`/`CapTape` from a *JIT* execution (the
+interpreter is the debug engine by design, so this is lower priority).
 
 ---
 

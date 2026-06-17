@@ -547,3 +547,142 @@ fn seek_past_the_end_finishes() {
     assert!(matches!(insp.seek(0), Stop::Break { .. }));
     assert_eq!(insp.clock(), 0);
 }
+
+// --- W1 CapTape: record/replay the nondeterministic cap inputs so seek is faithful --------------
+
+// Reads the Clock capability (iface 2, op 0 `now`) twice and returns their sum. The two reads are a
+// nondeterministic *input*: their values depend on the host's clock, which a fresh re-execution
+// cannot reproduce without the recorded tape.
+const CLOCK_SUM: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = cap.call 2 0 () -> (i64) v0 ()
+  v2 = cap.call 2 0 () -> (i64) v0 ()
+  v3 = i64.add v1 v2
+  return v3
+}
+"#;
+
+#[test]
+fn captape_replays_clock_inputs_for_faithful_seek() {
+    let m = parse_module(CLOCK_SUM).expect("parse");
+    let mut host = Host::new();
+    host.clock_ns = 1000; // a nonzero clock a fresh powerbox would not reproduce
+    let clk = host.grant_clock();
+    let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(clk)], 100_000, host);
+
+    // Forward run: now()=1000 then 1001 → 2001.
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I64(2001)]);
+
+    // The tape captured the two Clock crossings, in order, with their result slots.
+    let tape = insp.cap_tape();
+    assert_eq!(tape.records.len(), 2, "two Clock reads taped");
+    assert_eq!(tape.records[0].result, Ok(vec![1000]));
+    assert_eq!(tape.records[1].result, Ok(vec![1001]));
+
+    // Time-travel to the start and replay forward: the CapTape feeds the recorded clock values, so
+    // we reproduce 2001 — not the 0+1=1 a fresh empty powerbox would yield.
+    insp.seek(0);
+    assert_eq!(
+        finished_ok(insp.run_until_stop()),
+        vec![Value::I64(2001)],
+        "seek replays the recorded nondeterministic inputs"
+    );
+
+    // Contrast: the same guest on a fresh clock (no tape) reads 0,1 → 1, proving the input really is
+    // nondeterministic and that the tape (not luck) is what made the replay faithful.
+    let mut h2 = Host::new(); // clock_ns defaults to 0
+    let c2 = h2.grant_clock();
+    let mut insp2 = Inspector::attach_with_host(&m, 0, &[Value::I32(c2)], 100_000, h2);
+    assert_eq!(finished_ok(insp2.run_until_stop()), vec![Value::I64(1)]);
+}
+
+// Reads 2 bytes from a stdin stream (iface 0, op 0 `read`) into window[0..2], then returns the
+// first byte. The bytes are a nondeterministic input that crosses via *guest memory* (the read
+// fills the buffer), so faithful replay needs the captured buffer write, not just a result slot.
+const STDIN_FIRST: &str = r#"
+memory 16
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i64.const 0
+  v2 = i64.const 2
+  v3 = cap.call 0 0 (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = i64.const 0
+  v5 = i32.load8_u v4
+  return v5
+}
+"#;
+
+#[test]
+fn captape_replays_stdin_read_into_the_buffer_for_faithful_seek() {
+    let m = parse_module(STDIN_FIRST).expect("parse");
+    let mut host = Host::new();
+    host.stdin = b"Hi".to_vec();
+    let stdin = host.grant_stream(StreamRole::In);
+    let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(stdin)], 100_000, host);
+
+    // Forward: read "Hi" into the buffer, return buf[0] = 'H' = 72.
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I32(72)]);
+
+    // The tape captured the read, including the bytes it wrote into the guest window.
+    let tape = insp.cap_tape();
+    assert_eq!(tape.records.len(), 1);
+    assert_eq!(tape.records[0].result, Ok(vec![2])); // 2 bytes read
+    assert_eq!(tape.records[0].mem_writes, vec![(0u64, b"Hi".to_vec())]);
+
+    // Time-travel to the start and replay: the read's buffer write is re-applied from the tape, so
+    // we reproduce 72 — even though the replay host has empty stdin.
+    insp.seek(0);
+    assert_eq!(
+        finished_ok(insp.run_until_stop()),
+        vec![Value::I32(72)],
+        "stdin read replays its buffer bytes on seek"
+    );
+
+    // Contrast: a fresh host with empty stdin reads 0 bytes, so buf[0] stays 0.
+    let mut h2 = Host::new();
+    let s2 = h2.grant_stream(StreamRole::In);
+    let mut insp2 = Inspector::attach_with_host(&m, 0, &[Value::I32(s2)], 100_000, h2);
+    assert_eq!(finished_ok(insp2.run_until_stop()), vec![Value::I32(0)]);
+}
+
+// Calls a host-fn capability (iface 13) twice and sums the results — the general embedder
+// nondeterminism escape hatch. The closure is gone on a fresh powerbox, so ONLY the CapTape can
+// reproduce its outputs across time-travel.
+const HOSTFN_SUM: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = cap.call 13 0 () -> (i64) v0 ()
+  v2 = cap.call 13 0 () -> (i64) v0 ()
+  v3 = i64.add v1 v2
+  return v3
+}
+"#;
+
+#[test]
+fn captape_replays_host_fn_inputs_for_faithful_seek() {
+    let m = parse_module(HOSTFN_SUM).expect("parse");
+    let mut host = Host::new();
+    // A nondeterministic host capability: each call returns an incrementing counter.
+    let mut n = 100i64;
+    let hf = host.grant_host_fn(Box::new(move |_op, _args, _mem| {
+        let v = n;
+        n += 1;
+        Ok(vec![v])
+    }));
+    let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(hf)], 100_000, host);
+
+    // Forward: 100 + 101 = 201; both crossings taped.
+    assert_eq!(finished_ok(insp.run_until_stop()), vec![Value::I64(201)]);
+    assert_eq!(insp.cap_tape().records.len(), 2);
+    assert_eq!(insp.cap_tape().records[0].result, Ok(vec![100]));
+
+    // Time-travel: the host-fn closure does not exist on the fresh replay powerbox, so without the
+    // tape the re-run would fault. seek(0)+resume still yields 201 — the tape carried the outputs.
+    insp.seek(0);
+    assert_eq!(
+        finished_ok(insp.run_until_stop()),
+        vec![Value::I64(201)],
+        "host-fn outputs replay from the tape, not a (vanished) live closure"
+    );
+}

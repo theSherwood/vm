@@ -178,3 +178,154 @@ fn select_task_inspects_another_thread_while_stopped() {
         );
     }
 }
+
+// --- W1 scheduled-mode time-travel: seek to a global scheduler turn (DEBUGGING.md W1) -----------
+
+/// `seek(t)` in scheduled mode re-executes the pinned plan for `t` global scheduler turns and lands
+/// at a reproducible global snapshot — every thread inspectable — and resuming from turn 0
+/// reproduces the exact interleaving. The coordinate is `turn()`, not a per-thread clock.
+#[test]
+fn scheduled_seek_time_travels_to_a_global_turn() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    // A witness plan pins the (racy) interleaving so the whole run is deterministic.
+    let raced = Ok(vec![Value::I64(1)]);
+    let plan = find_schedule(&m, 0, &[], 50_000_000, 200_000, |o| *o == raced)
+        .expect("a lost-update schedule exists")
+        .plan;
+
+    let mut insp = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, plan.clone());
+
+    // Run to completion under the plan → the raced outcome; note how many turns it took.
+    run_to_finished(&mut insp, &raced);
+    let total = insp.turn();
+    assert!(total > 2, "the run spans several scheduler turns: {total}");
+
+    // Focused-thread snapshot (pc + live SSA per frame) — what time-travel must reproduce.
+    fn snap(i: &Inspector) -> (Vec<u64>, Vec<(IrPc, Vec<Value>)>) {
+        let bt = i
+            .backtrace()
+            .iter()
+            .map(|f| (f.pc, f.vals.clone()))
+            .collect();
+        (i.threads(), bt)
+    }
+
+    // Seek to a middle turn: a global snapshot, not finished, with live threads.
+    let mid = total / 2;
+    assert!(matches!(insp.seek(mid), Stop::Break { .. }));
+    assert_eq!(insp.turn(), mid);
+    assert!(insp.result().is_none(), "mid-run is not finished");
+    assert!(
+        !insp.threads().is_empty(),
+        "threads are live at the snapshot"
+    );
+    let at_mid = snap(&insp);
+
+    // Time-travel is reproducible: seeking the same turn again restores the identical global state.
+    assert!(matches!(insp.seek(mid), Stop::Break { .. }));
+    assert_eq!(
+        snap(&insp),
+        at_mid,
+        "seek(mid) reproduces the exact global snapshot"
+    );
+
+    // Seek to the start, then resume forward: the pinned plan reproduces the raced outcome.
+    assert!(matches!(insp.seek(0), Stop::Break { .. }));
+    assert_eq!(insp.turn(), 0);
+    run_to_finished(&mut insp, &raced);
+
+    // step_back walks the global turn down by one.
+    insp.seek(mid);
+    insp.step_back();
+    assert_eq!(insp.turn(), mid - 1, "step_back decrements the global turn");
+    // ...and seeking past the end lands on the finished result.
+    assert!(matches!(insp.seek(total), Stop::Finished(ref r) if *r == raced));
+}
+
+fn run_to_finished(insp: &mut Inspector, want: &Result<Vec<Value>, svm_interp::Trap>) {
+    loop {
+        match insp.run_until_stop() {
+            Stop::Finished(r) => {
+                assert_eq!(&r, want);
+                return;
+            }
+            Stop::Break { .. } => continue,
+            Stop::Blocked => panic!("unexpected block"),
+        }
+    }
+}
+
+// --- W1 SchedTape: capture a (fuzzed) interleaving as a portable, replayable artifact -----------
+
+fn run_outcome(insp: &mut Inspector) -> Result<Vec<Value>, svm_interp::Trap> {
+    loop {
+        match insp.run_until_stop() {
+            Stop::Finished(r) => return r,
+            Stop::Break { .. } => continue,
+            Stop::Blocked => panic!("unexpected block"),
+        }
+    }
+}
+
+/// Schedule fuzzing (`attach_scheduled_seeded`) explores random interleavings — surfacing both the
+/// correct total and the lost-update race — and each run's `sched_tape()` is a portable artifact
+/// that `attach_scheduled` replays to the *exact* same outcome and interleaving.
+#[test]
+fn sched_tape_captures_a_seeded_run_and_replays_it() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    let mut saw_race = false;
+    let mut saw_ok = false;
+    for seed in 0..64u64 {
+        let mut insp = Inspector::attach_scheduled_seeded(&m, 0, &[], 50_000_000, seed);
+        let outcome = run_outcome(&mut insp);
+        match &outcome {
+            Ok(v) if *v == vec![Value::I64(1)] => saw_race = true,
+            Ok(v) if *v == vec![Value::I64(2)] => saw_ok = true,
+            other => panic!("unexpected outcome {other:?}"),
+        }
+
+        // The interleaving that actually ran, captured as a plan.
+        let tape = insp.sched_tape();
+        assert!(
+            !tape.is_empty(),
+            "a multithreaded run records scheduling decisions"
+        );
+
+        // Replay the captured tape deterministically (no seed) → identical outcome and interleaving.
+        let mut replay = Inspector::attach_scheduled(&m, 0, &[], 50_000_000, tape.clone());
+        assert_eq!(
+            run_outcome(&mut replay),
+            outcome,
+            "captured SchedTape replays to the same outcome (seed {seed})"
+        );
+        assert_eq!(
+            replay.sched_tape(),
+            tape,
+            "replay follows the recorded schedule exactly"
+        );
+    }
+    assert!(saw_race, "fuzzing surfaced the lost-update race (1)");
+    assert!(saw_ok, "fuzzing surfaced the correct total (2)");
+}
+
+/// A seeded run reproduces under `seek` (same seed ⇒ same random interleaving) and under tape replay.
+#[test]
+fn seek_reproduces_a_seeded_run() {
+    let m = parse_module(RACY_COUNTER).expect("parse");
+    let mut insp = Inspector::attach_scheduled_seeded(&m, 0, &[], 50_000_000, 7);
+    let outcome = run_outcome(&mut insp);
+    let tape = insp.sched_tape();
+
+    // seek(0) rebuilds with the same seed → the same random schedule replays on resume.
+    assert!(matches!(insp.seek(0), Stop::Break { .. }));
+    assert_eq!(
+        run_outcome(&mut insp),
+        outcome,
+        "seek replays the seeded run's outcome"
+    );
+    assert_eq!(
+        insp.sched_tape(),
+        tape,
+        "...with the identical interleaving"
+    );
+}
