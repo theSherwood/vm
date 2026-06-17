@@ -79,6 +79,8 @@ impl DapServer {
             "variables" => self.on_variables(args),
             "continue" => self.on_continue(),
             "next" | "stepIn" | "stepOut" => self.on_step(),
+            "stepBack" => self.on_step_back(),
+            "reverseContinue" => self.on_reverse_continue(),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -126,6 +128,9 @@ impl DapServer {
         let caps = Json::obj(vec![
             ("supportsConfigurationDoneRequest", Json::Bool(true)),
             ("supportsSingleThreadExecutionRequests", Json::Bool(true)),
+            // Reverse debugging (DEBUGGING.md W1 time-travel): tells the client to enable its
+            // step-back / reverse-continue controls, backed by `Inspector::step_back`/`seek`.
+            ("supportsStepBack", Json::Bool(true)),
         ]);
         // The client now sends breakpoints, then `configurationDone`.
         (true, caps, vec![("initialized", Json::obj(vec![]))])
@@ -364,6 +369,43 @@ impl DapServer {
             None => return (false, Json::Null, vec![]),
         };
         (true, Json::Null, self.stop_events(stop))
+    }
+
+    fn on_step_back(&mut self) -> (bool, Json, Vec<Event>) {
+        // Reverse single-step (DEBUGGING.md W1): `Inspector::step_back` re-executes to one unit of
+        // logical time earlier. At the start it stays put. Lands as a `step` stop.
+        let stop = match self.session.as_mut() {
+            Some(s) => s.inspector.step_back(),
+            None => return (false, Json::Null, vec![]),
+        };
+        (true, Json::Null, self.stop_events(stop))
+    }
+
+    fn on_reverse_continue(&mut self) -> (bool, Json, Vec<Event>) {
+        // Run *backward* to the previous breakpoint, else to the start (DEBUGGING.md W1). Found by
+        // re-executing from time 0 and remembering the last stop strictly before the current time,
+        // then seeking there. (Single-threaded DAP uses the op `clock`; multithreaded would use the
+        // global `turn`.)
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let target = session.inspector.clock();
+        session.inspector.seek(0);
+        let mut prev: Option<u64> = None;
+        while let Stop::Break { .. } = session.inspector.run_until_stop() {
+            let t = session.inspector.clock();
+            if t < target {
+                prev = Some(t);
+            } else {
+                break; // reached (or passed) where we started
+            }
+        }
+        let (landed, reason) = match prev {
+            Some(t) => (t, "breakpoint"),
+            None => (0, "entry"), // no earlier breakpoint: rewound to the start
+        };
+        session.inspector.seek(landed);
+        (true, Json::Null, vec![stopped_event(reason)])
     }
 
     fn on_disconnect(&mut self) -> (bool, Json, Vec<Event>) {

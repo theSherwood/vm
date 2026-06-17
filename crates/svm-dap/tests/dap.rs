@@ -193,3 +193,154 @@ fn dap_json_round_trips() {
     let text = v.to_string();
     assert_eq!(svm_dap::parse(&text), Some(v));
 }
+
+/// Read the top frame's locals as name→value (stackTrace → scopes → variables).
+fn locals(s: &mut DapServer) -> std::collections::HashMap<String, String> {
+    let out = s.handle(&req(
+        900,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let frames = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap();
+    let fid = frames.as_array().unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        901,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(fid))]),
+    ));
+    let vref = response(&out)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        902,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(vref))]),
+    ));
+    response(&out)
+        .get("body")
+        .unwrap()
+        .get("variables")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            (
+                v.get("name").unwrap().as_str().unwrap().to_string(),
+                v.get("value").unwrap().as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Reverse debugging over DAP (DEBUGGING.md W1 time-travel): the loop-body breakpoint hits three
+/// times (i = 3, 2, 1); `reverseContinue` walks *backward* through those hits, and `stepBack`
+/// reverse-single-steps — all via `Inspector::seek`/`step_back`.
+#[test]
+fn dap_reverse_debugging_walks_back_through_breakpoint_hits() {
+    let mut s = DapServer::new();
+    let out = s.handle(&req(1, "initialize", Json::obj(vec![])));
+    assert_eq!(
+        response(&out).get("body").unwrap().get("supportsStepBack"),
+        Some(&Json::Bool(true)),
+        "advertises reverse debugging so the client enables the controls"
+    );
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("sum.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(7))])]),
+            ),
+        ]),
+    ));
+
+    // First hit (i=3, acc=0), then forward to the third hit (i=1, acc=5).
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert_eq!(locals(&mut s).get("i").map(String::as_str), Some("3"));
+    s.handle(&req(5, "continue", Json::obj(vec![])));
+    s.handle(&req(6, "continue", Json::obj(vec![])));
+    let l = locals(&mut s);
+    assert_eq!(
+        (l["i"].as_str(), l["acc"].as_str()),
+        ("1", "5"),
+        "third hit"
+    );
+
+    // reverseContinue → the *previous* breakpoint hit (i=2, acc=3).
+    let out = s.handle(&req(7, "reverseContinue", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("breakpoint"))
+    );
+    let l = locals(&mut s);
+    assert_eq!(
+        (l["i"].as_str(), l["acc"].as_str()),
+        ("2", "3"),
+        "reversed to the 2nd hit"
+    );
+
+    // reverseContinue again → the first hit (i=3, acc=0).
+    s.handle(&req(8, "reverseContinue", Json::obj(vec![])));
+    let l = locals(&mut s);
+    assert_eq!(
+        (l["i"].as_str(), l["acc"].as_str()),
+        ("3", "0"),
+        "reversed to the 1st hit"
+    );
+
+    // No earlier breakpoint → reverseContinue rewinds to the start (entry).
+    let out = s.handle(&req(9, "reverseContinue", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("entry")),
+        "rewinds to the start when there is no earlier breakpoint"
+    );
+
+    // stepBack at the start is a no-op move that still reports a `step` stop; session stays live.
+    let out = s.handle(&req(10, "stepBack", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("step"))
+    );
+    assert!(!s.is_terminated());
+}
