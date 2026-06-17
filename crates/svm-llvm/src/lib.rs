@@ -224,13 +224,51 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // then sit at index `base..` so `main` can be called from `_start`.
     let (mut imports, mut caps) = collect_cap_imports(m, &defined_names);
     let has_main = defined_names.contains_key("main");
+    // Direct `<svm.h>` Memory-capability builtins (`__vm_map`/`unmap`/`protect`/`page_size`): register
+    // their §7 imports and remember the program needs the `Memory` handle granted, even with no `malloc`.
+    let uses_vm_memory = register_vm_memory_imports(m, &defined_names, &mut imports, &mut caps);
+    // §9/§12 async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap`): register their `IoRing`
+    // imports; `__vm_blocking_handle` only reads the stashed `Blocking` handle (no import). Together
+    // they raise the powerbox arity to grant the `IoRing`/`Blocking` handles.
+    let uses_vm_io = register_vm_io_imports(m, &defined_names, &mut imports, &mut caps);
+    let uses_blocking = calls_external(m, &defined_names, "__vm_blocking_handle") && has_main;
+    // §22 guest-driven-JIT builtins (`__vm_jit_*`): register their `Jit` imports; the program then
+    // needs the full 8-handle powerbox (the `Jit` handle is the last `VM_CAP_*` index).
+    let uses_vm_jit = register_vm_jit_imports(m, &defined_names, &mut imports, &mut caps);
+    // §13/§14 SharedRegion builtins (`__vm_region_*`): register their imports; `__vm_region_create`
+    // mints from the `AddressSpace` handle, so the program needs it granted (slot 4).
+    let uses_vm_region = register_vm_region_imports(m, &defined_names, &mut imports, &mut caps);
     // `realloc` is a synthesized helper built on `malloc` + `memcpy`, so it forces both on.
     let need_realloc = calls_external(m, &defined_names, "realloc") && has_main;
     let need_malloc = (needs_malloc(m, &defined_names) || need_realloc) && has_main;
+    // The `Memory` handle (4th powerbox grant) is needed by the allocator *and* the direct Memory
+    // builtins; the heap is seeded only for `malloc`.
+    let need_memory_cap = (need_malloc || uses_vm_memory) && has_main;
     // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
     // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
-    let synth = (!imports.is_empty() || need_malloc) && has_main;
+    // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
+    // declared arity), sized to the highest capability index the program uses: exit(2) always,
+    // memory(3) for `malloc`/Memory builtins, addrspace(4) for the SharedRegion builtins, ioring(5)
+    // for the async ring, blocking(6) for `__vm_blocking_handle`, jit(7) for the guest-driven-JIT
+    // builtins.
+    let max_cap_index = if uses_vm_jit {
+        7
+    } else if uses_blocking {
+        6
+    } else if uses_vm_io {
+        5
+    } else if uses_vm_region {
+        4
+    } else if need_memory_cap {
+        3
+    } else {
+        2
+    };
+    let n_handles = max_cap_index + 1;
+    // A powerbox entry is synthesized when the program needs the handle stash: it uses a named import,
+    // `malloc`, or a stash-only builtin (`__vm_blocking_handle`, which adds no import of its own).
+    let synth = (!imports.is_empty() || need_malloc || uses_blocking) && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
     if need_malloc {
@@ -249,10 +287,10 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         name2idx.insert(f.name.clone(), i as u32 + base);
     }
     // Globals live low (from `DATA_BASE`); the data stack starts just above them. For a powerbox
-    // program the writable **handle stash** occupies the reserved low scratch (`[0, DATA_BASE)`), so
-    // start the globals one page up (`STACK_PAGE`): a *read-only* global (D40, protected
-    // page-granularly) must never share a page with the stash, or `_start`'s handle stores would
-    // fault on the read-only page (the same page-isolation the data stack already gets above globals).
+    // program the writable **handle stash + allocator/format state** occupies the reserved low scratch
+    // (page 0, below `STACK_PAGE`), so start the globals one page up (`STACK_PAGE`): a *read-only*
+    // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
+    // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
     let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
     let (globals, data, globals_end, cstrs, gbytes) = globals_layout(m, &name2idx, globals_base)?;
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
@@ -322,7 +360,10 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     if synth {
         let main_idx = name2idx["main"];
         let main_results = funcs[(main_idx - base) as usize].results.clone();
-        funcs.insert(0, synth_start(main_idx, &main_results, entry_sp, heap_base));
+        funcs.insert(
+            0,
+            synth_start(main_idx, &main_results, entry_sp, n_handles, heap_base),
+        );
     }
     // Append the synthesized helpers in index order (memset, memcpy, malloc, utoa, realloc) —
     // matching the indices assigned above.
@@ -1237,28 +1278,55 @@ fn callee_name(c: &llvm_ir::instruction::Call) -> Option<String> {
 // declaration-only externals. The on-ramp binds each to a **host capability** (§7 named import): a
 // call lowers to an `Inst::CallImport "<name>"` the embedder resolves at load (`default_cap_resolver`
 // → `(type_id, op)`). The capability **handle** is not a C argument — it is granted to the powerbox
-// entry and threaded to every call site through the *handle stash*, the reserved low window
-// (`[0, DATA_BASE)`): `_start` stores the granted handles there and each call site reloads the one
-// it needs (so a handle reaches arbitrary call depth without a viral extra parameter). This keeps
+// entry and threaded to every call site through the *handle stash*, the reserved handle region
+// (`[0, HANDLE_REGION_END)`): `_start` stores the granted handles there and each call site reloads the
+// one it needs (so a handle reaches arbitrary call depth without a viral extra parameter). This keeps
 // the translator pure mechanism — it never interprets host semantics, just defers the bind (§2a).
 
 /// Window offsets of the **powerbox handle stash + allocator state** (the reserved low scratch on
 /// page 0, which is writable — for a powerbox program the globals start a page up). `_start` stores
 /// the granted handles here; each call site reloads what it needs. The heap allocator (slice S) keeps
 /// its bump pointer + committed boundary here too.
+///
+/// **Layout (locked to the full §3e powerbox).** The handle region is `[0, HANDLE_REGION_END)` =
+/// `[0, 32)` — eight `i32` slots, one per `VM_CAP_*` index (`<svm.h>`): stdout, stdin, exit, memory,
+/// addrspace, ioring, blocking, jit. `_start` stashes a *prefix* of these (today 3 or 4 — stdout,
+/// stdin, exit, `[memory]`); offsets `16/20/24/28` are **reserved** for the AddressSpace/IoRing/
+/// Blocking/Jit tail so granting it later (the P2 async-I/O work) needs **no stash relocation**. The
+/// allocator/scratch/format state lives strictly **above** the handle region, so it never collides
+/// with a newly-granted handle (the bug this layout forecloses).
 const STASH_STDOUT: u64 = 0;
 const STASH_STDIN: u64 = 4;
 const STASH_EXIT: u64 = 8;
-/// The `Memory` capability handle (`i32`) — present only when the program uses `malloc` (then `_start`
-/// takes a 4th granted handle). The bump allocator reloads it to `vm_map`-commit reserved pages.
+/// The `Memory` capability handle (`i32`) — present when the program uses `malloc` *or* a direct
+/// `<svm.h>` Memory builtin (then `_start` takes a 4th granted handle). The bump allocator + the
+/// `__vm_map`/… builtins reload it to drive `Memory` capability calls.
 const STASH_MEMORY: u64 = 12;
-/// The guest heap's bump pointer and committed boundary (`i64` each) — the allocator's only state.
-const HEAP_BRK: u64 = 16;
-const HEAP_TOP: u64 = 24;
+/// The `AddressSpace` handle (slot 4) — granted when the program mints a §13/§14 `SharedRegion`
+/// (`__vm_region_create` calls `AddressSpace.create_region`). The region handle it returns is then the
+/// capability for `__vm_region_map`/`unmap`/`page_size` (not a stash slot — those take it as an arg).
+const STASH_ADDRSPACE: u64 = 16;
+/// The `IoRing` (slot 5) and `Blocking` (slot 6) handles — granted when the program uses the §9/§12
+/// async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap` drive `IoRing`; `__vm_blocking_handle`
+/// returns the `Blocking` handle a guest names in an SQE).
+const STASH_IORING: u64 = 20;
+const STASH_BLOCKING: u64 = 24;
+/// The `Jit` handle (slot 7) — granted when the program uses the §22 guest-driven-JIT builtins
+/// (`__vm_jit_compile`/`invoke2`/`release`/`install`/`uninstall`/`compile_linked`): a guest submits
+/// serialized SVM IR built in its own window and the host verifies + Cranelift-compiles it into THIS
+/// domain. Slot 4 (`AddressSpace`) stays reserved (offset 16) for the §13/§14 region builtins.
+const STASH_JIT: u64 = 28;
+/// End of the reserved 8-handle region (`[0, 32)`, one `i32` slot per `VM_CAP_*` index). The
+/// allocator/scratch/format state begins here, so it is collision-proof against the full handle set.
+const HANDLE_REGION_END: u64 = 32;
+/// The guest heap's bump pointer and committed boundary (`i64` each) — the allocator's only state,
+/// placed just above the 8-handle region.
+const HEAP_BRK: u64 = HANDLE_REGION_END; // 32
+const HEAP_TOP: u64 = HEAP_BRK + 8; // 40
 /// A 1-byte writable scratch used by `putc`/`puts` to stage a single byte (a char, a newline) the
 /// `Stream` capability writes (its ABI is a `(buf, len)` window slice, so a scalar char must transit
 /// memory). Reused per call — single-threaded, fully produced-then-consumed within one lowering.
-const STASH_SCRATCH: u64 = 32;
+const STASH_SCRATCH: u64 = HEAP_TOP + 8; // 48
 /// The `prot` bits a guest passes to `Memory.map` for a read-write commit (`PROT_READ|PROT_WRITE`).
 const PROT_RW: i32 = 3;
 /// A scratch buffer (`[FMT_BUF, FMT_BUF_END)`, on the writable page 0) where `printf` formats one
@@ -1339,6 +1407,29 @@ fn import_sig(import: &str) -> svm_ir::FuncType {
         "exit" => ft(vec![I32], vec![]),
         // `Memory.map(offset, len, prot)` (§3e op 0) — the allocator's page-commit primitive.
         "vm_map" => ft(vec![I64, I64, I32], vec![I64]),
+        // `Memory.unmap(offset, len)` (op 1) / `protect(offset, len, prot)` (op 2) /
+        // `page_size()` (op 3) — the rest of the §3e/§4 Memory surface a guest reaches from `<svm.h>`.
+        "vm_unmap" => ft(vec![I64, I64], vec![I64]),
+        "vm_protect" => ft(vec![I64, I64, I32], vec![I64]),
+        "vm_page_size" => ft(vec![], vec![I64]),
+        // §9/§12 async I/O ring (`IoRing`): submit a batch of deferred ops onto the host offload pool
+        // (op 1) / reap ready completions (op 2). `(sq, n, counter)` / `(cq, max)`, returning a count.
+        "vm_io_submit_async" => ft(vec![I64, I64, I64], vec![I64]),
+        "vm_io_reap" => ft(vec![I64, I64], vec![I64]),
+        // §22 guest-driven JIT (`Jit`): submit serialized IR → code handle (op 0) / call a compiled
+        // `(i64,i64)->(i64)` unit (op 1) / release (op 2) / install into the call_indirect table (op 3)
+        // / uninstall a slot (op 4) / compile against a guest symbol table (op 5). All return an `i64`.
+        "vm_jit_compile" => ft(vec![I64, I64], vec![I64]),
+        "vm_jit_invoke2" => ft(vec![I64, I64, I64], vec![I64]),
+        "vm_jit_release" | "vm_jit_install" | "vm_jit_uninstall" => ft(vec![I64], vec![I64]),
+        "vm_jit_compile_linked" => ft(vec![I64, I64, I64, I64], vec![I64]),
+        // §13/§14 SharedRegion: mint a region from `AddressSpace` (`create`, op 5 on the AddressSpace
+        // handle) → a region handle; `map`/`unmap`/`page_size` (ops 0/1/3 on that *region* handle) then
+        // alias its bytes into the window (the magic ring buffer / zero-copy child data plane).
+        "vm_region_create" => ft(vec![I64], vec![I64]),
+        "vm_region_map" => ft(vec![I64, I64, I64, I32], vec![I64]),
+        "vm_region_unmap" => ft(vec![I64, I64], vec![I64]),
+        "vm_region_page_size" => ft(vec![], vec![I64]),
         _ => ft(vec![I64, I64], vec![I64]), // write / read (Stream)
     }
 }
@@ -1380,36 +1471,237 @@ fn collect_cap_imports(
     (imports, import_of)
 }
 
+/// The §7 import a `<svm.h>` **Memory-capability** builtin needs (`__vm_map`/`unmap`/`protect`/
+/// `page_size` → `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size`), or `None` if `name` is not one of
+/// them. These reach `Memory` (the 4th powerbox handle, slot 12) — the same cap the bump allocator
+/// uses, exposed directly so a guest manages window pages itself (the §1a sparse-address-space path).
+fn vm_memory_builtin_import(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__vm_map" => "vm_map",
+        "__vm_unmap" => "vm_unmap",
+        "__vm_protect" => "vm_protect",
+        "__vm_page_size" => "vm_page_size",
+        _ => return None,
+    })
+}
+
+/// Scan for direct `<svm.h>` Memory-capability builtin calls (`__vm_map`/…), registering each one's
+/// §7 import into the table (deduplicated, like [`collect_cap_imports`]) so the call lowering's
+/// `import_of` resolves it. Returns whether any were used — the signal that `_start` must be granted
+/// the `Memory` handle even if the program never calls `malloc`. A guest-*defined* function of the
+/// same name shadows the builtin (mirrors the libc/libm rule).
+fn register_vm_memory_imports(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    imports: &mut Vec<svm_ir::Import>,
+    caps: &mut HashMap<String, u32>,
+) -> bool {
+    let mut used = false;
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if defined.contains_key(&name) {
+                    continue;
+                }
+                if let Some(import) = vm_memory_builtin_import(&name) {
+                    used = true;
+                    caps.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
+                        });
+                        i
+                    });
+                }
+            }
+        }
+    }
+    used
+}
+
+/// The §7 import a §9/§12 async-ring builtin needs (`__vm_io_submit_async` → `vm_io_submit_async`,
+/// `__vm_io_reap` → `vm_io_reap`), or `None`. Both reach the `IoRing` (slot 5) handle.
+fn vm_io_builtin_import(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__vm_io_submit_async" => "vm_io_submit_async",
+        "__vm_io_reap" => "vm_io_reap",
+        _ => return None,
+    })
+}
+
+/// Scan for the async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap`), registering each one's
+/// §7 import. Returns whether any were used — the signal that `_start` must be granted up through the
+/// `IoRing` handle. A guest-*defined* function of the same name shadows the builtin.
+fn register_vm_io_imports(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    imports: &mut Vec<svm_ir::Import>,
+    caps: &mut HashMap<String, u32>,
+) -> bool {
+    let mut used = false;
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if defined.contains_key(&name) {
+                    continue;
+                }
+                if let Some(import) = vm_io_builtin_import(&name) {
+                    used = true;
+                    caps.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
+                        });
+                        i
+                    });
+                }
+            }
+        }
+    }
+    used
+}
+
+/// The §7 import a §22 guest-driven-JIT builtin needs (`__vm_jit_compile` → `vm_jit_compile`, …), or
+/// `None`. All reach the `Jit` (slot 7) handle; the host verifies + Cranelift-compiles the submitted IR.
+fn vm_jit_builtin_import(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__vm_jit_compile" => "vm_jit_compile",
+        "__vm_jit_invoke2" => "vm_jit_invoke2",
+        "__vm_jit_release" => "vm_jit_release",
+        "__vm_jit_install" => "vm_jit_install",
+        "__vm_jit_uninstall" => "vm_jit_uninstall",
+        "__vm_jit_compile_linked" => "vm_jit_compile_linked",
+        _ => return None,
+    })
+}
+
+/// Scan for the guest-driven-JIT builtins, registering each one's §7 import. Returns whether any were
+/// used — the signal that `_start` must be granted up through the `Jit` handle (the full 8-handle
+/// powerbox). A guest-*defined* function of the same name shadows the builtin.
+fn register_vm_jit_imports(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    imports: &mut Vec<svm_ir::Import>,
+    caps: &mut HashMap<String, u32>,
+) -> bool {
+    let mut used = false;
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if defined.contains_key(&name) {
+                    continue;
+                }
+                if let Some(import) = vm_jit_builtin_import(&name) {
+                    used = true;
+                    caps.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
+                        });
+                        i
+                    });
+                }
+            }
+        }
+    }
+    used
+}
+
+/// The §7 import a §13/§14 SharedRegion builtin needs (`__vm_region_create` → `vm_region_create`, …),
+/// or `None`. `create` reaches the `AddressSpace` (slot 4) handle; `map`/`unmap`/`page_size` reach the
+/// region handle `create` returned (passed as the call's first arg, not a stash slot).
+fn vm_region_builtin_import(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__vm_region_create" => "vm_region_create",
+        "__vm_region_map" => "vm_region_map",
+        "__vm_region_unmap" => "vm_region_unmap",
+        "__vm_region_page_size" => "vm_region_page_size",
+        _ => return None,
+    })
+}
+
+/// Scan for the SharedRegion builtins, registering each one's §7 import. Returns whether any were used
+/// — the signal that `_start` must be granted the `AddressSpace` handle (`__vm_region_create` mints
+/// from it). A guest-*defined* function of the same name shadows the builtin.
+fn register_vm_region_imports(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    imports: &mut Vec<svm_ir::Import>,
+    caps: &mut HashMap<String, u32>,
+) -> bool {
+    let mut used = false;
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if defined.contains_key(&name) {
+                    continue;
+                }
+                if let Some(import) = vm_region_builtin_import(&name) {
+                    used = true;
+                    caps.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
+                        });
+                        i
+                    });
+                }
+            }
+        }
+    }
+    used
+}
+
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
-/// capabilities. It takes the granted handles `(stdout, stdin, exit)` as `i32` params (the §3e
-/// powerbox shape `is_powerbox_entry` recognizes — no threaded data-SP, since it is the root),
-/// stores them into the handle stash so every capability call site can reload its handle, then calls
-/// the C `main(sp)` at the page-aligned data-stack base and returns its exit code.
+/// capabilities. It takes the `n_handles` granted handles as `i32` params (the §3e powerbox shape
+/// `is_powerbox_entry` recognizes — no threaded data-SP, since it is the root), in the `VM_CAP_*`
+/// order (stdout, stdin, exit, memory, addrspace, ioring, blocking, jit), stores each into its stash
+/// slot (offset `i*4`) so every capability call site can reload its handle, then calls the C
+/// `main(sp)` at the page-aligned data-stack base and returns its exit code. The runner grants
+/// exactly `n_handles` (a contiguous prefix, by declared arity — `run_powerbox`).
 fn synth_start(
     main_idx: u32,
     main_results: &[ValType],
     entry_sp: u64,
+    n_handles: usize,
     heap_base: Option<u64>,
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
-    // params: v0 = stdout, v1 = stdin, v2 = exit, [v3 = memory] (i32 capability handles). A program
-    // that uses `malloc` takes the 4th `Memory` handle (the powerbox grants it for a 4-param entry).
-    let mut handles = vec![(STASH_STDOUT, 0), (STASH_STDIN, 1), (STASH_EXIT, 2)];
-    let mut params = vec![ValType::I32, ValType::I32, ValType::I32];
-    if heap_base.is_some() {
-        handles.push((STASH_MEMORY, 3));
-        params.push(ValType::I32);
-    }
-    let mut next: ValIdx = params.len() as ValIdx;
-    for (off, handle) in handles {
-        insts.push(Inst::ConstI64(off as i64));
+    // params v0..v(n-1) = the granted handles. Each slot offset is just `i*4` (the `STASH_*` layout),
+    // so stashing is a uniform loop: store param `i` at byte offset `i*4`. A program is granted a
+    // prefix sized to the highest capability index it uses (e.g. 4 with `malloc`/Memory, 7 with the
+    // async-ring builtins through `Blocking`).
+    let params = vec![ValType::I32; n_handles];
+    let mut next: ValIdx = n_handles as ValIdx;
+    for i in 0..n_handles {
+        insts.push(Inst::ConstI64((i as i64) * 4));
         let addr = next;
         next += 1;
         insts.push(Inst::Store {
             op: StoreOp::I32,
             addr,
-            value: handle,
+            value: i as ValIdx,
             offset: 0,
             align: 0,
         });
@@ -2282,6 +2574,368 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
         });
     }
     Ok(segs)
+}
+
+/// The `i`-th call argument operand, bounds-checked (a fail-closed error rather than a panic when a
+/// declaration has fewer args than the builtin expects).
+fn vm_arg(c: &llvm_ir::instruction::Call, i: usize) -> Result<&Operand, Error> {
+    c.arguments
+        .get(i)
+        .map(|(o, _)| o)
+        .ok_or_else(|| Error::Unsupported("`__vm_*` builtin: too few arguments".into()))
+}
+
+/// Lower a `<svm.h>` low-level builtin (`crates/.../include/svm.h`, the chibicc oracle in
+/// `frontend/chibicc/codegen_ir.c`) to the matching SVM IR op or `Memory` capability call. Returns
+/// `Ok(true)` if `name` is one of these intrinsics (and it was lowered), `Ok(false)` otherwise so the
+/// caller falls through to the ordinary direct/indirect call path. The caller gates this on `name`
+/// being **external** (not guest-defined), so a guest function of the same name shadows the builtin
+/// (mirrors the libc/libm rule).
+///
+/// Coverage (the P0+P1+Memory surface): the §3e/§4 **Memory** capability (`__vm_map`/`unmap`/
+/// `protect`/`page_size`); §12 **fibers** (`__vm_fiber_new`/`resume`/`suspend` → `cont.new`/`resume`/
+/// `suspend`); §GC conservative **roots** (`__vm_gc_roots` → `gc.roots`); §12 **threads**
+/// (`__vm_thread_spawn`/`join`) and **atomics** (`__vm_atomic_*` → the `iN.atomic.*` ops); the §12
+/// **futex** (`__vm_wait32`/`__vm_notify`); and §7 capability **reflection** (`__vm_cap` reads the
+/// handle stash; `__vm_cap_count`/`__vm_cap_at` → `cap.self.count`/`cap.self.get`). Each mirrors the
+/// chibicc lowering exactly, so a program built through either frontend produces equivalent IR.
+fn lower_vm_builtin(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    use svm_ir::{AtomicRmwOp, LoadOp, Ordering, StoreOp};
+    // All §12 atomics are sequentially consistent (the op makes the JIT emit a hardware atomic).
+    let sc = Ordering::SeqCst;
+    match name {
+        // ---- §3e/§4 Memory capability: `cap.call` on the stashed Memory handle (slot 12) ----
+        "__vm_map" | "__vm_unmap" | "__vm_protect" => {
+            let import = vm_memory_builtin_import(name).expect("memory builtin");
+            let imp = ctx.import_of(import)?;
+            let off = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let len = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let mut args = vec![off, len];
+            if name != "__vm_unmap" {
+                args.push(ctx.operand_i32(vm_arg(c, 2)?)?); // prot
+            }
+            let handle = ctx.stash_load(STASH_MEMORY);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig(import),
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_page_size" => {
+            let imp = ctx.import_of("vm_page_size")?;
+            let handle = ctx.stash_load(STASH_MEMORY);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig("vm_page_size"),
+                handle,
+                args: vec![],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // ---- §9/§12 async I/O ring: `cap.call` on the stashed IoRing handle (slot 5) ----
+        "__vm_io_submit_async" | "__vm_io_reap" => {
+            let import = vm_io_builtin_import(name).expect("io builtin");
+            let imp = ctx.import_of(import)?;
+            let mut args = vec![
+                ctx.operand_i64(vm_arg(c, 0)?)?,
+                ctx.operand_i64(vm_arg(c, 1)?)?,
+            ];
+            if name == "__vm_io_submit_async" {
+                args.push(ctx.operand_i64(vm_arg(c, 2)?)?); // the completion counter pointer
+            }
+            let handle = ctx.stash_load(STASH_IORING);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig(import),
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `__vm_blocking_handle()` returns the stashed Blocking handle (slot 6) — the `i32` a guest
+        // names in an SQE's `handle` field when building a `Blocking.work` request. Just a stash read.
+        "__vm_blocking_handle" => {
+            let r = ctx.stash_load(STASH_BLOCKING);
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // ---- §22 guest-driven JIT: `cap.call` on the stashed Jit handle (slot 7) ----
+        // Each builtin marshals its `i64` args (a blob/symtab pointer+len, a code/slot handle, two
+        // invoke args) and lowers to `CallImport` on the `Jit` handle. The host verifies the submitted
+        // IR and compiles it into THIS domain (verification, not isolation, is the boundary — §2a).
+        "__vm_jit_compile"
+        | "__vm_jit_invoke2"
+        | "__vm_jit_release"
+        | "__vm_jit_install"
+        | "__vm_jit_uninstall"
+        | "__vm_jit_compile_linked" => {
+            let import = vm_jit_builtin_import(name).expect("jit builtin");
+            let imp = ctx.import_of(import)?;
+            let argc = import_sig(import).params.len();
+            let mut args = Vec::with_capacity(argc);
+            for i in 0..argc {
+                args.push(ctx.operand_i64(vm_arg(c, i)?)?);
+            }
+            let handle = ctx.stash_load(STASH_JIT);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig(import),
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // ---- §13/§14 SharedRegion: mint from AddressSpace, then alias via the region handle ----
+        // `create(len)` calls `AddressSpace.create_region` on the stashed AddressSpace handle (slot 4)
+        // and returns a region handle. `map`/`unmap`/`page_size` take that region handle as their first
+        // C arg (`int region`) and `cap.call` *it* — the handle is the capability, not a stash slot.
+        "__vm_region_create" => {
+            let imp = ctx.import_of("vm_region_create")?;
+            let len = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let handle = ctx.stash_load(STASH_ADDRSPACE);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig("vm_region_create"),
+                handle,
+                args: vec![len],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_region_map" | "__vm_region_unmap" | "__vm_region_page_size" => {
+            let import = vm_region_builtin_import(name).expect("region builtin");
+            let imp = ctx.import_of(import)?;
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the region handle (arg 0)
+            let args = match name {
+                "__vm_region_map" => vec![
+                    ctx.operand_i64(vm_arg(c, 1)?)?, // win_off
+                    ctx.operand_i64(vm_arg(c, 2)?)?, // region_off
+                    ctx.operand_i64(vm_arg(c, 3)?)?, // len
+                    ctx.operand_i32(vm_arg(c, 4)?)?, // prot
+                ],
+                "__vm_region_unmap" => vec![
+                    ctx.operand_i64(vm_arg(c, 1)?)?, // win_off
+                    ctx.operand_i64(vm_arg(c, 2)?)?, // len
+                ],
+                _ => vec![], // page_size
+            };
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig(import),
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // ---- §12 fibers (stack switching) ----
+        "__vm_fiber_new" => {
+            // arg0 is a function pointer (an `i64` funcref); `cont.new` wants the `i32` funcref.
+            let fn64 = ctx.operand(vm_arg(c, 0)?)?;
+            let func = ctx.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: fn64,
+            });
+            let sp = ctx.operand_i64(vm_arg(c, 1)?)?; // the fiber's own data-stack base
+            let r = ctx.push(Inst::ContNew { func, sp });
+            ctx.bind_dest(&c.dest, r); // i32 fiber handle
+            Ok(true)
+        }
+        "__vm_fiber_resume" => {
+            let k = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let arg = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let done = ctx.operand_i64(vm_arg(c, 2)?)?; // `int *done`
+            let rs = ctx.push_multi(Inst::ContResume { k, arg }, 2); // (status, value)
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I32,
+                addr: done,
+                value: rs[0],
+                offset: 0,
+                align: 0,
+            }); // *done = status (0 suspended / 1 returned)
+            ctx.bind_dest(&c.dest, rs[1]); // the yielded/returned i64
+            Ok(true)
+        }
+        "__vm_fiber_suspend" => {
+            let value = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let r = ctx.push(Inst::Suspend { value });
+            ctx.bind_dest(&c.dest, r); // the next resume's arg
+            Ok(true)
+        }
+        // ---- §GC conservative root enumeration (`gc.roots`) ----
+        "__vm_gc_roots" => {
+            let heap_lo = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let heap_hi = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let buf = ctx.operand_i64(vm_arg(c, 2)?)?;
+            let cap = ctx.operand_i64(vm_arg(c, 3)?)?;
+            let r = ctx.push(Inst::GcRoots {
+                heap_lo,
+                heap_hi,
+                buf,
+                cap,
+            });
+            ctx.bind_dest(&c.dest, r); // total candidate count (i64)
+            Ok(true)
+        }
+        // ---- §12 threads ----
+        "__vm_thread_spawn" => {
+            let func = ctx.direct_func_idx(vm_arg(c, 0)?)?; // a static funcidx
+            let sp = ctx.operand_i64(vm_arg(c, 1)?)?; // the thread's data-stack base
+            let arg = ctx.operand_i64(vm_arg(c, 2)?)?;
+            let r = ctx.push(Inst::ThreadSpawn { func, sp, arg });
+            ctx.bind_dest(&c.dest, r); // i32 thread handle
+            Ok(true)
+        }
+        "__vm_thread_join" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let r = ctx.push(Inst::ThreadJoin { handle });
+            ctx.bind_dest(&c.dest, r); // i64 result
+            Ok(true)
+        }
+        // ---- §12 atomics (linear-memory) ----
+        "__vm_atomic_add" | "__vm_atomic_add32" => {
+            let ty = if name.ends_with("32") {
+                IntTy::I32
+            } else {
+                IntTy::I64
+            };
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let value = if ty == IntTy::I64 {
+                ctx.operand_i64(vm_arg(c, 1)?)?
+            } else {
+                ctx.operand_i32(vm_arg(c, 1)?)?
+            };
+            let r = ctx.push(Inst::AtomicRmw {
+                ty,
+                op: AtomicRmwOp::Add,
+                addr,
+                value,
+                offset: 0,
+                order: sc,
+            });
+            ctx.bind_dest(&c.dest, r); // the old value
+            Ok(true)
+        }
+        "__vm_atomic_load" | "__vm_atomic_load32" => {
+            let ty = if name.ends_with("32") {
+                IntTy::I32
+            } else {
+                IntTy::I64
+            };
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let r = ctx.push(Inst::AtomicLoad {
+                ty,
+                addr,
+                offset: 0,
+                order: sc,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_atomic_store" | "__vm_atomic_store32" => {
+            let ty = if name.ends_with("32") {
+                IntTy::I32
+            } else {
+                IntTy::I64
+            };
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let value = if ty == IntTy::I64 {
+                ctx.operand_i64(vm_arg(c, 1)?)?
+            } else {
+                ctx.operand_i32(vm_arg(c, 1)?)?
+            };
+            ctx.push_effect(Inst::AtomicStore {
+                ty,
+                addr,
+                value,
+                offset: 0,
+                order: sc,
+            });
+            Ok(true) // void
+        }
+        "__vm_atomic_cas32" => {
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let expected = ctx.operand_i32(vm_arg(c, 1)?)?;
+            let replacement = ctx.operand_i32(vm_arg(c, 2)?)?;
+            let r = ctx.push(Inst::AtomicCmpxchg {
+                ty: IntTy::I32,
+                addr,
+                expected,
+                replacement,
+                offset: 0,
+                order: sc,
+            });
+            ctx.bind_dest(&c.dest, r); // the old value (i32)
+            Ok(true)
+        }
+        // ---- §12 futex ----
+        "__vm_wait32" => {
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let expected = ctx.operand_i32(vm_arg(c, 1)?)?;
+            let timeout = ctx.operand_i64(vm_arg(c, 2)?)?; // ns
+            let r = ctx.push(Inst::MemoryWait {
+                ty: IntTy::I32,
+                addr,
+                expected,
+                timeout,
+            });
+            ctx.bind_dest(&c.dest, r); // 0 woken / 1 not-equal / 2 timed-out
+            Ok(true)
+        }
+        "__vm_notify" => {
+            let addr = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let count = ctx.operand_i32(vm_arg(c, 1)?)?;
+            let r = ctx.push(Inst::MemoryNotify { addr, count });
+            ctx.bind_dest(&c.dest, r); // number woken
+            Ok(true)
+        }
+        // ---- §7 capability reflection ----
+        "__vm_cap" => {
+            // The i-th stashed powerbox handle: an `i32.load` at byte offset `i*4` in the reserved
+            // low window (the handle stash), exactly where `_start` stored the granted handles.
+            let i = ctx.operand_i64(vm_arg(c, 0)?)?;
+            let four = ctx.const_i64(4);
+            let off = ctx.mul_i64(i, four);
+            let r = ctx.push(Inst::Load {
+                op: LoadOp::I32,
+                addr: off,
+                offset: 0,
+                align: 0,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_cap_count" => {
+            let r = ctx.push(Inst::CapSelfCount);
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        "__vm_cap_at" => {
+            let idx = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let type_id_out = ctx.operand_i64(vm_arg(c, 1)?)?; // `int *type_id_out`
+            let rs = ctx.push_multi(Inst::CapSelfGet { idx }, 2); // (handle, type_id)
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I32,
+                addr: type_id_out,
+                value: rs[1],
+                offset: 0,
+                align: 0,
+            }); // *type_id_out = type_id
+            ctx.bind_dest(&c.dest, rs[0]); // the capability handle
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn lower_io_call(
@@ -3557,6 +4211,56 @@ impl<'a> BlockCtx<'a> {
         })
     }
 
+    /// An operand widened to the host word `i64` (the §7/§3e capability-call ABI): a pointer or
+    /// `i64` is already there; a narrow `i32` is zero-extended (addresses/lengths/indices are
+    /// non-negative window quantities). Float/vector operands are a clean `Unsupported`.
+    fn operand_i64(&mut self, op: &Operand) -> Result<ValIdx, Error> {
+        let v = self.operand(op)?;
+        match val_type(op.get_type(self.types).as_ref())? {
+            ValType::I64 => Ok(v),
+            ValType::I32 => Ok(self.push(Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: v,
+            })),
+            other => unsup(format!(
+                "expected an integer/pointer argument, got {}",
+                other.as_str()
+            )),
+        }
+    }
+
+    /// An operand narrowed to `i32` (a capability handle, a 32-bit atomic word, a fiber/thread
+    /// handle): already `i32`, or an `i64` truncated. Float/vector operands are `Unsupported`.
+    fn operand_i32(&mut self, op: &Operand) -> Result<ValIdx, Error> {
+        let v = self.operand(op)?;
+        match val_type(op.get_type(self.types).as_ref())? {
+            ValType::I32 => Ok(v),
+            ValType::I64 => Ok(self.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: v,
+            })),
+            other => unsup(format!(
+                "expected an integer argument, got {}",
+                other.as_str()
+            )),
+        }
+    }
+
+    /// Resolve an operand that must be a **direct function designator** (a `@func` reference) to its
+    /// IR function index — the static `func` immediate `thread.spawn` requires (§12). A computed
+    /// function pointer is a clean `Unsupported` (mirrors the chibicc `__vm_thread_spawn` rule).
+    fn direct_func_idx(&self, op: &Operand) -> Result<u32, Error> {
+        if let Operand::ConstantOperand(c) = op {
+            if let Constant::GlobalReference { name, .. } = c.as_ref() {
+                let n = name_str(name);
+                if let Some(&f) = self.name2idx.get(&n) {
+                    return Ok(f);
+                }
+            }
+        }
+        unsup("`__vm_thread_spawn` requires a direct function name as its first argument")
+    }
+
     /// Resolve a value-id already available in this block (a parameter or an earlier result).
     fn id(&self, vid: ValueId) -> Result<ValIdx, Error> {
         self.idx_of
@@ -3798,6 +4502,14 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 }
             }
             return Ok(());
+        }
+        // A `<svm.h>` low-level builtin (`__vm_map`/`__vm_fiber_*`/`__vm_atomic_*`/`__vm_cap`/…) lowers
+        // to the matching SVM IR op or `Memory` capability call. Gated on the name being external (a
+        // guest-defined function of the same name shadows it), like the libc/libm rules below.
+        if let Some(name) = callee_name(c) {
+            if !ctx.name2idx.contains_key(&name) && lower_vm_builtin(ctx, c, &name)? {
+                return Ok(());
+            }
         }
         // A call to an external libc function bound to a host capability (§7): the primitive
         // `write`/`read`/`exit`, or a stdio output wrapper (`puts`/`putc`/`fwrite`/…). All lower to

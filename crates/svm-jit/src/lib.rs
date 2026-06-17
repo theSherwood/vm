@@ -71,8 +71,8 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp,
-    VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
+    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -320,6 +320,19 @@ pub enum WindowProt {
     Rw,
     Ro,
     Unmapped,
+}
+
+/// The host-side residue of a fiber the durable freeze driver flattened (DURABILITY.md §12.8) — the
+/// JIT mirror of `svm_interp::FrozenFiber`. Its continuation lives in its in-window shadow region;
+/// this carries what a thaw must re-seed: the registry slot (= guest handle), entry funcref +
+/// data-stack base (to re-enter it), and the flattened shadow-SP extent. A durable **freeze** run
+/// returns one per flattened fiber; a **thaw** run is handed them back to re-create the fibers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FrozenFiber {
+    pub slot: usize,
+    pub func: i32,
+    pub sp: i64,
+    pub shadow_sp: u64,
 }
 
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
@@ -943,6 +956,50 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
     cm.run(args, Some(init_mem), Some(SNAP_CAP), None)
 }
 
+/// [`compile_and_run_capture_reserved_with_host_prots`] for a **durable** run (DURABILITY.md §12.8):
+/// arms the per-fiber shadow-SP swap so a freeze that lands while a fiber runs spills into that
+/// fiber's own shadow region (D-fiber-cont option A), drives the freeze (flattening parked fibers),
+/// and round-trips the fiber residue.
+///
+/// - **Freeze:** pass empty `init_prots` + empty `seed`; returns the [`FrozenFiber`] residue of every
+///   fiber the driver flattened (for the snapshot's Section 2).
+/// - **Thaw:** pass the captured page-protection map as `init_prots` and the frozen fibers as `seed`;
+///   they are re-created in the fiber table before the `REWINDING` re-entry. Returns an empty residue.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host`].
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>), JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.durable = true;
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
+}
+
 /// [`compile_and_run_capture_reserved_with_host`] + the §9/§12 **async-ring host seam**
 /// ([`AsyncHostHooks`]): wires this run's futex-`notify` into the embedder's `Host` so an offload-pool
 /// worker can wake a vCPU parked in `IoRing.submit_async`, and drains the pool before teardown. Use it
@@ -1108,6 +1165,16 @@ pub struct CompiledModule {
     /// Per-page protections to re-establish on the window before a run — the durable-restore
     /// step (DURABILITY.md §12.3). Empty ⇒ none (the common path); set per-run by `run_inner`.
     restore_prots: Vec<WindowProt>,
+    /// This run is **durable** (DURABILITY.md §12.8): the fiber runtime keeps the active shadow-SP
+    /// word pointing at the running context's region (swapped on every fiber switch). `false` (the
+    /// default) ⇒ an ordinary run that never touches the durable reserve. Set per-run at entry.
+    durable: bool,
+    /// Durable **thaw** seed (slice 3.3.3): frozen fibers to re-create in the table before a
+    /// `REWINDING` run, so a thaw `cont.resume` re-enters them. Empty for a freeze / ordinary run.
+    frozen_seed: Vec<FrozenFiber>,
+    /// Durable **freeze** residue (slice 3.3.3): the fibers the freeze driver flattened this run,
+    /// read back by the durable entry point. Empty unless a freeze flattened fibers.
+    frozen_out: Vec<FrozenFiber>,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -1525,6 +1592,9 @@ impl CompiledModule {
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
             restore_prots: Vec::new(),
+            durable: false,
+            frozen_seed: Vec::new(),
+            frozen_out: Vec::new(),
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -1846,8 +1916,25 @@ impl CompiledModule {
             let entry_probe = 0u8;
             let entry_sp = std::hint::black_box(&entry_probe as *const u8 as usize);
             let t = &mut *this;
+            let durable = t.durable;
+            // Durable **thaw** (slice 3.3.3): re-create the frozen fibers in the run-shared table
+            // before the root re-enters under REWINDING, so a thaw `cont.resume` resolves + re-enters
+            // them. Done before `set_current` (and the run), while the window/table/trap cell are set.
+            let seed = std::mem::take(&mut t.frozen_seed);
             t.fiber_rt.as_mut().map(|rt| {
                 rt.set_root_entry_sp(entry_sp);
+                // Arm the durable fiber-switch swap for the root vCPU (DURABILITY.md §12.8): the
+                // window base is known now. (Spawned vCPUs are multi-vCPU durability, Phase 3.2.)
+                rt.set_durable_env(mem_base as u64, durable);
+                if durable && !seed.is_empty() {
+                    fiber_rt::seed_frozen_fibers(
+                        &mut **rt as *mut fiber_rt::FiberRuntime,
+                        &seed,
+                        mem_base as u64,
+                        fn_table_ptr as u64,
+                        trap_cell.as_ptr() as u64,
+                    );
+                }
                 fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime)
             })
         };
@@ -1872,6 +1959,25 @@ impl CompiledModule {
             fn_table_ptr,
             trap_cell.as_ptr(),
         );
+
+        // Durable freeze driver (DURABILITY.md §12.8 slice 3.3.2): on a durable **freeze** run
+        // (state word UNWINDING) the root has now unwound into context 0's shadow region; flatten
+        // every still-parked fiber into its own region before the window is snapshotted, so the
+        // artifact captures their continuations. CURRENT_RT is still the root runtime here. A
+        // flattening fiber touches only the committed reserve, so it's sound outside the guard.
+        // Single-vCPU (Phase 3.2 for multi-vCPU). Skipped on a fault or a non-freeze run.
+        #[cfg(fiber_rt)]
+        if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
+            let residue = (*this).fiber_rt.as_mut().map(|rt| {
+                fiber_rt::freeze_drive(
+                    &mut **rt as *mut fiber_rt::FiberRuntime,
+                    trap_cell.as_ptr() as u64,
+                )
+            });
+            if let Some(residue) = residue {
+                (*this).frozen_out = residue; // read back by the durable entry point
+            }
+        }
 
         // ---- Teardown: transient references again. ----
         (*this).live_fault_range = None;
@@ -2581,6 +2687,20 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VShift { .. } => {}
                 // Lane `abs`/`neg` lower to vector `iabs`/`ineg`; Cranelift legalizes every shape.
                 Inst::VIntUn { .. } => {}
+                // `i8x16.popcnt` lowers to a vector `popcnt` (native `cnt` on aarch64, a byte
+                // shuffle sequence on x86 — Cranelift legalizes both).
+                Inst::VPopcnt { .. } => {}
+                // `avgr_u` (`i8x16`/`i16x8` only, verifier-enforced) → native `avg_round`.
+                Inst::VAvgr { .. } => {}
+                // `i32x4.dot_i16x8_s` → `swiden_low/high` + `imul` + `iadd_pairwise` (all legalize).
+                Inst::VDot { .. } => {}
+                // Extended multiply → widen low/high both operands + `imul` on the wide shape.
+                // `imul` legalizes for every wide shape (incl. `i64x2`, unlike `i8x16.mul`).
+                Inst::VExtMul { .. } => {}
+                // Extended pairwise add → `swiden/uwiden` low+high + `iadd_pairwise` (all legalize).
+                Inst::VExtAddPairwise { .. } => {}
+                // Q15 rounding multiply → native `sqmul_round_sat`.
+                Inst::VQ15MulrSat { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -2590,6 +2710,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VWiden { .. } | Inst::VNarrow { .. } => {}
                 // Int↔float / float↔float conversions → Cranelift `fcvt_*` / `fvdemote`/`fvpromote_low`.
                 Inst::VConvert { .. } => {}
+                // pmin/pmax lower to a single `fcmp` plus `bitselect` (both legalize on every target).
+                Inst::VPMinMax { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3630,6 +3752,80 @@ fn lower_block(
                 };
                 vcast(b, r, I8X16)
             }
+            Inst::VPopcnt { a } => {
+                // Canonical vectors are already I8X16, matching the op's fixed shape.
+                b.ins().popcnt(get(&vals, *a)?)
+            }
+            Inst::VAvgr { shape, a, b: rb } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let r = b.ins().avg_round(x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VDot { a, b: rb } => {
+                // Widen each i16x8 operand to two i32x4 halves, multiply lane-wise, then
+                // horizontally add adjacent products: `iadd_pairwise([a0b0,a1b1,a2b2,a3b3],
+                // [a4b4,..]) = [a0b0+a1b1, a2b2+a3b3, a4b4+a5b5, a6b6+a7b7]` — the wasm dot result.
+                let x = vcast(b, get(&vals, *a)?, I16X8);
+                let y = vcast(b, get(&vals, *rb)?, I16X8);
+                let xl = b.ins().swiden_low(x);
+                let xh = b.ins().swiden_high(x);
+                let yl = b.ins().swiden_low(y);
+                let yh = b.ins().swiden_high(y);
+                let pl = b.ins().imul(xl, yl);
+                let ph = b.ins().imul(xh, yh);
+                let r = b.ins().iadd_pairwise(pl, ph);
+                vcast(b, r, I8X16)
+            }
+            Inst::VExtMul {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Widen the same (low/high, sign) half of both operands to the wide shape, then
+                // multiply lane-wise — the wasm extmul.
+                let (low, signed) = op.parts();
+                let src = vec_ty(
+                    shape
+                        .narrower()
+                        .expect("verifier ensures a narrower source"),
+                );
+                let x = vcast(b, get(&vals, *a)?, src);
+                let y = vcast(b, get(&vals, *rb)?, src);
+                let (wx, wy) = match (low, signed) {
+                    (true, true) => (b.ins().swiden_low(x), b.ins().swiden_low(y)),
+                    (false, true) => (b.ins().swiden_high(x), b.ins().swiden_high(y)),
+                    (true, false) => (b.ins().uwiden_low(x), b.ins().uwiden_low(y)),
+                    (false, false) => (b.ins().uwiden_high(x), b.ins().uwiden_high(y)),
+                };
+                let r = b.ins().imul(wx, wy);
+                vcast(b, r, I8X16)
+            }
+            Inst::VExtAddPairwise { shape, signed, a } => {
+                // Widen the low and high halves of the source, then pairwise-add: the two halves'
+                // pairwise sums concatenate to `out[i] = w(a[2i]) + w(a[2i+1])`.
+                let src = vec_ty(
+                    shape
+                        .narrower()
+                        .expect("verifier ensures a narrower source"),
+                );
+                let x = vcast(b, get(&vals, *a)?, src);
+                let (lo, hi) = if *signed {
+                    (b.ins().swiden_low(x), b.ins().swiden_high(x))
+                } else {
+                    (b.ins().uwiden_low(x), b.ins().uwiden_high(x))
+                };
+                let r = b.ins().iadd_pairwise(lo, hi);
+                vcast(b, r, I8X16)
+            }
+            Inst::VQ15MulrSat { a, b: rb } => {
+                let x = vcast(b, get(&vals, *a)?, I16X8);
+                let y = vcast(b, get(&vals, *rb)?, I16X8);
+                let r = b.ins().sqmul_round_sat(x, y);
+                vcast(b, r, I8X16)
+            }
             Inst::VSatBin {
                 shape,
                 op,
@@ -3704,6 +3900,41 @@ fn lower_block(
                         let x = vcast(b, raw, F32X4);
                         b.ins().fvpromote_low(x)
                     }
+                    // Lane-count changes (2↔4). Widen/narrow through the i64x2 intermediate, the
+                    // same recipe Cranelift's own wasm frontend uses.
+                    VCvtOp::F64x2ConvertLowI32x4S => {
+                        let x = vcast(b, raw, I32X4);
+                        let w = b.ins().swiden_low(x); // low 2 i32 → i64x2
+                        b.ins().fcvt_from_sint(F64X2, w)
+                    }
+                    VCvtOp::F64x2ConvertLowI32x4U => {
+                        let x = vcast(b, raw, I32X4);
+                        let w = b.ins().uwiden_low(x); // low 2 u32 → i64x2
+                        b.ins().fcvt_from_uint(F64X2, w)
+                    }
+                    VCvtOp::I32x4TruncSatF64x2SZero => {
+                        let x = vcast(b, raw, F64X2);
+                        let conv = b.ins().fcvt_to_sint_sat(I64X2, x); // i64x2
+                        let zc = b
+                            .func
+                            .dfg
+                            .constants
+                            .insert(ConstantData::from(&[0u8; 16][..]));
+                        let zero = b.ins().vconst(I64X2, zc);
+                        // snarrow packs [conv | zero] → i32x4: low 2 lanes = conv, high 2 = 0.
+                        b.ins().snarrow(conv, zero)
+                    }
+                    VCvtOp::I32x4TruncSatF64x2UZero => {
+                        let x = vcast(b, raw, F64X2);
+                        let conv = b.ins().fcvt_to_uint_sat(I64X2, x); // i64x2
+                        let zc = b
+                            .func
+                            .dfg
+                            .constants
+                            .insert(ConstantData::from(&[0u8; 16][..]));
+                        let zero = b.ins().vconst(I64X2, zc);
+                        b.ins().uunarrow(conv, zero)
+                    }
                 };
                 vcast(b, r, I8X16)
             }
@@ -3763,6 +3994,29 @@ fn lower_block(
                 let x = vcast(b, get(&vals, *a)?, ty);
                 let r = float_un(b, vf_un(*op), x);
                 vcast(b, r, I8X16)
+            }
+            Inst::VPMinMax {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // pmin(a,b) = b < a ? b : a ; pmax(a,b) = a < b ? b : a.
+                // Both select the second operand `b` where a one-sided `<` holds — only the
+                // compare operand order differs. `fcmp` yields the lane mask (`I32X4`/`I64X2`),
+                // which we blend in the canonical `I8X16` domain so `bitselect`'s three args
+                // share a type. This matches the interp's NaN/-0 propagation (no IEEE min/max).
+                let ty = vec_ty(*shape);
+                let xc = get(&vals, *a)?;
+                let yc = get(&vals, *rb)?;
+                let x = vcast(b, xc, ty);
+                let y = vcast(b, yc, ty);
+                let mask = match op {
+                    VPMinMaxOp::Pmin => b.ins().fcmp(FloatCC::LessThan, y, x),
+                    VPMinMaxOp::Pmax => b.ins().fcmp(FloatCC::LessThan, x, y),
+                };
+                let m = vcast(b, mask, I8X16);
+                b.ins().bitselect(m, yc, xc)
             }
             Inst::VBitBin { op, a, b: rb } => {
                 // Whole-vector — operate on the canonical I8X16 directly.

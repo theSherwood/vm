@@ -65,6 +65,13 @@ fn f32(v: Value) -> f32 {
     }
 }
 
+fn f64(v: Value) -> f64 {
+    match v {
+        Value::F64(x) => x,
+        other => panic!("expected f64, got {other:?}"),
+    }
+}
+
 /// A 4-wide f32 dot product: `v128.load` two vectors, `f32x4.mul`, horizontal-sum via
 /// `extract_lane`. x = [1,2,3,4], y = [4,3,2,1] ⇒ 1·4+2·3+3·2+4·1 = 20.
 #[test]
@@ -309,6 +316,185 @@ fn f32x4_lane_compare_masks() {
     assert_eq!(eval(&cmp("f32x4.eq"), "f", &nan), Value::I32(0));
     assert_eq!(eval(&cmp("f32x4.lt"), "f", &nan), Value::I32(0));
     assert_eq!(eval(&cmp("f32x4.ne"), "f", &nan), Value::I32(-1));
+}
+
+/// f64↔i32 lane-count-changing conversions through the wasm bridge: `f64x2.convert_low_i32x4_s`
+/// (low 2 i32 → f64x2) then `i32x4.trunc_sat_f64x2_s_zero` back, with a `+0.5` in between so the
+/// truncation is observable. The result must round-trip the integer (trunc of `x + 0.5` is `x` for
+/// the small values here). `eval` enforces interp == JIT through the i64x2-intermediate lowering.
+#[test]
+fn f64x2_convert_low_and_trunc_sat_zero() {
+    let wat = "(module (func (export \"f\") (param $x i32) (result i32)
+                 (i32x4.extract_lane 0
+                   (i32x4.trunc_sat_f64x2_s_zero
+                     (f64x2.add
+                       (f64x2.convert_low_i32x4_s (i32x4.splat (local.get $x)))
+                       (f64x2.splat (f64.const 0.5)))))))";
+    for x in [0, 1, -1, 7, -7, 1000, -1000] {
+        let got = match eval(wat, "f", &[Value::I32(x)]) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        };
+        // trunc(x + 0.5): toward zero, so x for x>=0, and x for x<0 (e.g. -7+0.5=-6.5 → -6).
+        assert_eq!(got, (x as f64 + 0.5).trunc() as i32, "convert/trunc {x}");
+    }
+}
+
+/// Pseudo-min/max through the wasm bridge. `pmin`/`pmax` are a one-sided compare-and-select
+/// (`pmin(a,b)=b<a?b:a`, `pmax(a,b)=a<b?b:a`), so a NaN operand and signed zeros propagate by the
+/// `<` rule rather than IEEE min/max canonicalization. `eval` enforces interp == JIT lane-for-lane.
+#[test]
+fn f32x4_pmin_pmax() {
+    let pm = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $a f32) (param $b f32) (result f32)
+               (f32x4.extract_lane 0 ({op} (f32x4.splat (local.get $a)) (f32x4.splat (local.get $b))))))"
+        )
+    };
+    let run = |op: &str, a: f32, b: f32| f32(eval(&pm(op), "f", &[Value::F32(a), Value::F32(b)]));
+    for (a, b) in [(1.0f32, 2.0), (2.0, 1.0), (-0.0, 0.0), (3.5, -3.5)] {
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            run("f32x4.pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin {a} {b}"
+        );
+        assert_eq!(
+            run("f32x4.pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax {a} {b}"
+        );
+    }
+    // NaN second operand: every `<` is false, so both return the first operand `a`.
+    assert!(run("f32x4.pmin", 1.0, f32::NAN).to_bits() == 1.0f32.to_bits());
+    assert!(run("f32x4.pmax", 1.0, f32::NAN).to_bits() == 1.0f32.to_bits());
+}
+
+#[test]
+fn f64x2_pmin_pmax() {
+    let pm = |op: &str| {
+        format!(
+            "(module (func (export \"f\") (param $a f64) (param $b f64) (result f64)
+               (f64x2.extract_lane 1 ({op} (f64x2.splat (local.get $a)) (f64x2.splat (local.get $b))))))"
+        )
+    };
+    let run = |op: &str, a: f64, b: f64| f64(eval(&pm(op), "f", &[Value::F64(a), Value::F64(b)]));
+    for (a, b) in [(1.0f64, 2.0), (2.0, 1.0), (-0.0, 0.0), (3.5, -3.5)] {
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            run("f64x2.pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin {a} {b}"
+        );
+        assert_eq!(
+            run("f64x2.pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax {a} {b}"
+        );
+    }
+}
+
+/// `i8x16.popcnt` through the wasm bridge: splat a byte across all lanes, popcount, read lane 0.
+/// Oracle = Rust's `count_ones`; `eval` enforces interp == JIT.
+#[test]
+fn i8x16_popcnt() {
+    let wat = "(module (func (export \"f\") (param $x i32) (result i32)
+                 (i8x16.extract_lane_u 0 (i8x16.popcnt (i8x16.splat (local.get $x))))))";
+    for byte in [0x00u8, 0xFF, 0x01, 0x80, 0xAA, 0x42] {
+        let got = match eval(wat, "f", &[Value::I32(byte as i32)]) {
+            Value::I32(x) => x,
+            _ => unreachable!(),
+        };
+        assert_eq!(got, byte.count_ones() as i32, "popcnt 0x{byte:02x}");
+    }
+}
+
+/// `i32x4.dot_i16x8_s` through the wasm bridge — the signed pairwise dot product that DSP/ML inner
+/// loops emit. Two i16x8 vectors from `data`, dot, sum the four i32 lanes. With a=[1..8], b=[8..1]:
+/// lanes = [1·8+2·7, 3·6+4·5, 5·4+6·3, 7·2+8·1] = [22, 38, 38, 22], total 120.
+#[test]
+fn i32x4_dot_i16x8_s() {
+    let wat = r#"
+    (module
+      (memory 1)
+      (data (i32.const 0)  "\01\00\02\00\03\00\04\00\05\00\06\00\07\00\08\00")
+      (data (i32.const 16) "\08\00\07\00\06\00\05\00\04\00\03\00\02\00\01\00")
+      (func (export "dot") (result i32)
+        (local $p v128)
+        (local.set $p
+          (i32x4.dot_i16x8_s (v128.load (i32.const 0)) (v128.load (i32.const 16))))
+        (i32.add
+          (i32.add (i32x4.extract_lane 0 (local.get $p)) (i32x4.extract_lane 1 (local.get $p)))
+          (i32.add (i32x4.extract_lane 2 (local.get $p)) (i32x4.extract_lane 3 (local.get $p))))))
+    "#;
+    assert_eq!(eval(wat, "dot", &[]), Value::I32(120));
+}
+
+/// Extended multiply + extadd_pairwise through the wasm bridge — the widening multiply-accumulate
+/// that DSP/ML int8 kernels emit. Compute `i16x8.extmul_low_i8x16_s` of two byte vectors, then
+/// `i32x4.extadd_pairwise_i16x8_s` to widen-and-sum — and read lane 0. With both operands = splat(3)
+/// over the low 8 bytes: each extmul lane = 9, pairwise add of two = 18.
+#[test]
+fn extmul_extadd_pairwise_macc() {
+    let wat = "(module (func (export \"f\") (param $x i32) (result i32)
+                 (i32x4.extract_lane 0
+                   (i32x4.extadd_pairwise_i16x8_s
+                     (i16x8.extmul_low_i8x16_s
+                       (i8x16.splat (local.get $x)) (i8x16.splat (local.get $x)))))))";
+    for x in [3, 5, 10, -4] {
+        let got = match eval(wat, "f", &[Value::I32(x)]) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        };
+        // extmul_low_s squares the (sign-extended) low byte; pairwise add sums two adjacent.
+        let sq = (x as i8 as i32).pow(2);
+        assert_eq!(got, sq * 2, "macc {x}");
+    }
+}
+
+/// `i16x8.q15mulr_sat_s` through the wasm bridge — Q15 fixed-point multiply (the saturating
+/// rounding multiply audio/DSP code uses). Splat two i16 values, read lane 0; oracle = the
+/// rounding-saturating formula. Includes the `-1.0 * -1.0` corner that saturates to i16::MAX.
+#[test]
+fn i16x8_q15mulr_sat_s() {
+    let wat = "(module (func (export \"f\") (param $a i32) (param $b i32) (result i32)
+                 (i16x8.extract_lane_s 0
+                   (i16x8.q15mulr_sat_s (i16x8.splat (local.get $a)) (i16x8.splat (local.get $b))))))";
+    for (a, b) in [
+        (16384i16, 16384i16),
+        (-32768, -32768),
+        (1000, -2000),
+        (0, 12345),
+    ] {
+        let got = match eval(wat, "f", &[Value::I32(a as i32), Value::I32(b as i32)]) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        };
+        let want = ((a as i64 * b as i64 + 0x4000) >> 15).clamp(i16::MIN as i64, i16::MAX as i64);
+        assert_eq!(got, want as i32, "q15mulr {a} {b}");
+    }
+}
+
+/// `i8x16.avgr_u` through the wasm bridge — the unsigned rounding average that image/blend kernels
+/// emit for "blend two pixels". Splat two byte values, read lane 0; oracle = `(a+b+1)>>1`.
+#[test]
+fn i8x16_avgr_u() {
+    let wat = "(module (func (export \"f\") (param $a i32) (param $b i32) (result i32)
+                 (i8x16.extract_lane_u 0
+                   (i8x16.avgr_u (i8x16.splat (local.get $a)) (i8x16.splat (local.get $b))))))";
+    for (a, b) in [(0u8, 0u8), (255, 255), (3, 4), (255, 1), (100, 101)] {
+        let got = match eval(wat, "f", &[Value::I32(a as i32), Value::I32(b as i32)]) {
+            Value::I32(x) => x,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            got,
+            ((a as u32 + b as u32 + 1) >> 1) as i32,
+            "avgr_u {a} {b}"
+        );
+    }
 }
 
 /// Integer lane shifts through the wasm bridge: one scalar amount (taken mod the lane width) shifts

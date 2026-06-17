@@ -512,16 +512,28 @@ pub enum VCvtOp {
     F32x4DemoteF64x2Zero,
     /// `f64x2.promote_low_f32x4`: the low two `f32` lanes → `f64`.
     F64x2PromoteLowF32x4,
+    /// `f64x2.convert_low_i32x4_s`: the low two `i32` lanes → `f64` (lanes 0/1).
+    F64x2ConvertLowI32x4S,
+    /// `f64x2.convert_low_i32x4_u`: the low two `u32` lanes → `f64` (lanes 0/1).
+    F64x2ConvertLowI32x4U,
+    /// `i32x4.trunc_sat_f64x2_s_zero`: the two `f64` lanes → saturating `i32` (lanes 0/1); 2/3 = 0.
+    I32x4TruncSatF64x2SZero,
+    /// `i32x4.trunc_sat_f64x2_u_zero`: the two `f64` lanes → saturating `u32` (lanes 0/1); 2/3 = 0.
+    I32x4TruncSatF64x2UZero,
 }
 
 impl VCvtOp {
-    pub const ALL: [VCvtOp; 6] = [
+    pub const ALL: [VCvtOp; 10] = [
         VCvtOp::F32x4ConvertI32x4S,
         VCvtOp::F32x4ConvertI32x4U,
         VCvtOp::I32x4TruncSatF32x4S,
         VCvtOp::I32x4TruncSatF32x4U,
         VCvtOp::F32x4DemoteF64x2Zero,
         VCvtOp::F64x2PromoteLowF32x4,
+        VCvtOp::F64x2ConvertLowI32x4S,
+        VCvtOp::F64x2ConvertLowI32x4U,
+        VCvtOp::I32x4TruncSatF64x2SZero,
+        VCvtOp::I32x4TruncSatF64x2UZero,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -531,6 +543,10 @@ impl VCvtOp {
             VCvtOp::I32x4TruncSatF32x4U => "i32x4.trunc_sat_f32x4_u",
             VCvtOp::F32x4DemoteF64x2Zero => "f32x4.demote_f64x2_zero",
             VCvtOp::F64x2PromoteLowF32x4 => "f64x2.promote_low_f32x4",
+            VCvtOp::F64x2ConvertLowI32x4S => "f64x2.convert_low_i32x4_s",
+            VCvtOp::F64x2ConvertLowI32x4U => "f64x2.convert_low_i32x4_u",
+            VCvtOp::I32x4TruncSatF64x2SZero => "i32x4.trunc_sat_f64x2_s_zero",
+            VCvtOp::I32x4TruncSatF64x2UZero => "i32x4.trunc_sat_f64x2_u_zero",
         }
     }
     pub fn index(self) -> u8 {
@@ -540,6 +556,34 @@ impl VCvtOp {
         Self::ALL.get(i as usize).copied()
     }
     pub fn from_name(s: &str) -> Option<VCvtOp> {
+        Self::ALL.iter().copied().find(|o| o.name() == s)
+    }
+}
+
+/// Lane-wise **pseudo** min/max on a float `v128` (§17). Unlike the IEEE [`VFloatBinOp::Min`]/`Max`,
+/// these are the wasm `pmin`/`pmax`: a plain compare-and-select — `pmin(a,b) = b < a ? b : a`,
+/// `pmax(a,b) = a < b ? b : a` — so a NaN operand (and `±0`) follow the select, not IEEE rules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VPMinMaxOp {
+    Pmin,
+    Pmax,
+}
+
+impl VPMinMaxOp {
+    pub const ALL: [VPMinMaxOp; 2] = [VPMinMaxOp::Pmin, VPMinMaxOp::Pmax];
+    pub fn name(self) -> &'static str {
+        match self {
+            VPMinMaxOp::Pmin => "pmin",
+            VPMinMaxOp::Pmax => "pmax",
+        }
+    }
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|&o| o == self).unwrap() as u8
+    }
+    pub fn from_index(i: u8) -> Option<VPMinMaxOp> {
+        Self::ALL.get(i as usize).copied()
+    }
+    pub fn from_name(s: &str) -> Option<VPMinMaxOp> {
         Self::ALL.iter().copied().find(|o| o.name() == s)
     }
 }
@@ -1852,6 +1896,57 @@ pub enum Inst {
     VConvert {
         op: VCvtOp,
         a: ValIdx,
+    },
+    /// Lane-wise float pseudo-min/max (see [`VPMinMaxOp`]); `a`/`b`/result are `v128`. Float shapes.
+    VPMinMax {
+        shape: VShape,
+        op: VPMinMaxOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// `i8x16.popcnt`: per-byte population count. `a`/result are `v128`. Shape is always `i8x16`
+    /// (the only shape wasm defines), so no shape field — the verifier needs no lane rule.
+    VPopcnt {
+        a: ValIdx,
+    },
+    /// Lane-wise unsigned rounding average `(a + b + 1) >> 1` (computed wide, no overflow).
+    /// `a`/`b`/result are `v128`. `i8x16`/`i16x8` only (verifier-enforced — the only shapes wasm
+    /// defines `avgr_u` for), so like [`Inst::VSatBin`] there is no JIT bail list.
+    VAvgr {
+        shape: VShape,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// `i32x4.dot_i16x8_s`: signed dot product of adjacent `i16` pairs into `i32` lanes —
+    /// `result[i] = a[2i]·b[2i] + a[2i+1]·b[2i+1]`. Source `i16x8`, result `i32x4` (the only dot
+    /// wasm defines), so no shape field. `a`/`b`/result are `v128`.
+    VDot {
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Extended (widening) multiply: widen the low/high half of both `i8x16`/`i16x8`/`i32x4`
+    /// operands (sign- or zero-, per [`VWidenOp`]) to the next wider shape, then multiply lane-wise.
+    /// `shape` is the **wide result** (`i16x8`/`i32x4`/`i64x2`); `a`/`b`/result are `v128`.
+    VExtMul {
+        shape: VShape,
+        op: VWidenOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Extended pairwise add: widen every lane of an `i8x16`/`i16x8` source (sign- or zero-, per
+    /// `signed`) and sum adjacent pairs into the next wider shape — `out[i] = w(a[2i]) + w(a[2i+1])`.
+    /// `shape` is the **wide result** (`i16x8`/`i32x4`); `a`/result are `v128`.
+    VExtAddPairwise {
+        shape: VShape,
+        signed: bool,
+        a: ValIdx,
+    },
+    /// `i16x8.q15mulr_sat_s`: signed Q15 fixed-point multiply with rounding and saturation —
+    /// `out[i] = sat_i16((a[i]·b[i] + 0x4000) >> 15)`. Fixed `i16x8` (the only shape wasm defines),
+    /// so no shape field. `a`/`b`/result are `v128`.
+    VQ15MulrSat {
+        a: ValIdx,
+        b: ValIdx,
     },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.

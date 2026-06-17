@@ -46,7 +46,7 @@ use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, Edge, FBinOp, FCmpOp, FToI, FUnOp,
     FloatTy, Func, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering, StoreOp,
     Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp,
-    VNarrowOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
+    VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
 };
 use wasmparser::{BlockType, MemArg, Operator, Parser, Payload, ValType as W};
 
@@ -1459,6 +1459,40 @@ fn v_satbin(lo: &mut Lower, shape: VShape, op: VSatBinOp) -> Result<(), Error> {
     lo.push(v, ValType::V128);
     Ok(())
 }
+fn v_avgr(lo: &mut Lower, shape: VShape) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VAvgr { shape, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_dot(lo: &mut Lower) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VDot { a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_extmul(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VExtMul { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_extadd(lo: &mut Lower, shape: VShape, signed: bool) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VExtAddPairwise { shape, signed, a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_q15mulr(lo: &mut Lower) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VQ15MulrSat { a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
 fn v_widen(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VWiden { shape, op, a });
@@ -1484,6 +1518,12 @@ fn v_anytrue(lo: &mut Lower) -> Result<(), Error> {
     lo.push(v, ValType::I32);
     Ok(())
 }
+fn v_popcnt(lo: &mut Lower) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VPopcnt { a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
 fn v_alltrue(lo: &mut Lower, shape: VShape) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VAllTrue { shape, a });
@@ -1500,6 +1540,13 @@ fn v_fbin(lo: &mut Lower, shape: VShape, op: VFloatBinOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VFloatBin { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_pminmax(lo: &mut Lower, shape: VShape, op: VPMinMaxOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VPMinMax { shape, op, a, b });
     lo.push(v, ValType::V128);
     Ok(())
 }
@@ -3085,6 +3132,26 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I16x8AddSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::AddU)?,
         O::I16x8SubSatS => v_satbin(lo, VShape::I16x8, VSatBinOp::SubS)?,
         O::I16x8SubSatU => v_satbin(lo, VShape::I16x8, VSatBinOp::SubU)?,
+        O::I8x16AvgrU => v_avgr(lo, VShape::I8x16)?,
+        O::I16x8AvgrU => v_avgr(lo, VShape::I16x8)?,
+        O::I32x4DotI16x8S => v_dot(lo)?,
+        O::I16x8ExtMulLowI8x16S => v_extmul(lo, VShape::I16x8, VWidenOp::LowS)?,
+        O::I16x8ExtMulHighI8x16S => v_extmul(lo, VShape::I16x8, VWidenOp::HighS)?,
+        O::I16x8ExtMulLowI8x16U => v_extmul(lo, VShape::I16x8, VWidenOp::LowU)?,
+        O::I16x8ExtMulHighI8x16U => v_extmul(lo, VShape::I16x8, VWidenOp::HighU)?,
+        O::I32x4ExtMulLowI16x8S => v_extmul(lo, VShape::I32x4, VWidenOp::LowS)?,
+        O::I32x4ExtMulHighI16x8S => v_extmul(lo, VShape::I32x4, VWidenOp::HighS)?,
+        O::I32x4ExtMulLowI16x8U => v_extmul(lo, VShape::I32x4, VWidenOp::LowU)?,
+        O::I32x4ExtMulHighI16x8U => v_extmul(lo, VShape::I32x4, VWidenOp::HighU)?,
+        O::I64x2ExtMulLowI32x4S => v_extmul(lo, VShape::I64x2, VWidenOp::LowS)?,
+        O::I64x2ExtMulHighI32x4S => v_extmul(lo, VShape::I64x2, VWidenOp::HighS)?,
+        O::I64x2ExtMulLowI32x4U => v_extmul(lo, VShape::I64x2, VWidenOp::LowU)?,
+        O::I64x2ExtMulHighI32x4U => v_extmul(lo, VShape::I64x2, VWidenOp::HighU)?,
+        O::I16x8ExtAddPairwiseI8x16S => v_extadd(lo, VShape::I16x8, true)?,
+        O::I16x8ExtAddPairwiseI8x16U => v_extadd(lo, VShape::I16x8, false)?,
+        O::I32x4ExtAddPairwiseI16x8S => v_extadd(lo, VShape::I32x4, true)?,
+        O::I32x4ExtAddPairwiseI16x8U => v_extadd(lo, VShape::I32x4, false)?,
+        O::I16x8Q15MulrSatS => v_q15mulr(lo)?,
         // int↔float / float↔float conversions
         O::F32x4ConvertI32x4S => v_convert(lo, VCvtOp::F32x4ConvertI32x4S)?,
         O::F32x4ConvertI32x4U => v_convert(lo, VCvtOp::F32x4ConvertI32x4U)?,
@@ -3092,6 +3159,10 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I32x4TruncSatF32x4U => v_convert(lo, VCvtOp::I32x4TruncSatF32x4U)?,
         O::F32x4DemoteF64x2Zero => v_convert(lo, VCvtOp::F32x4DemoteF64x2Zero)?,
         O::F64x2PromoteLowF32x4 => v_convert(lo, VCvtOp::F64x2PromoteLowF32x4)?,
+        O::F64x2ConvertLowI32x4S => v_convert(lo, VCvtOp::F64x2ConvertLowI32x4S)?,
+        O::F64x2ConvertLowI32x4U => v_convert(lo, VCvtOp::F64x2ConvertLowI32x4U)?,
+        O::I32x4TruncSatF64x2SZero => v_convert(lo, VCvtOp::I32x4TruncSatF64x2SZero)?,
+        O::I32x4TruncSatF64x2UZero => v_convert(lo, VCvtOp::I32x4TruncSatF64x2UZero)?,
         // lane narrowing (saturating): result shape is the narrower one
         O::I8x16NarrowI16x8S => v_narrow(lo, VShape::I8x16, VNarrowOp::S)?,
         O::I8x16NarrowI16x8U => v_narrow(lo, VShape::I8x16, VNarrowOp::U)?,
@@ -3113,6 +3184,7 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         // integer lane abs/neg
         O::I8x16Abs => v_intun(lo, VShape::I8x16, VIntUnOp::Abs)?,
         O::I8x16Neg => v_intun(lo, VShape::I8x16, VIntUnOp::Neg)?,
+        O::I8x16Popcnt => v_popcnt(lo)?,
         O::I16x8Abs => v_intun(lo, VShape::I16x8, VIntUnOp::Abs)?,
         O::I16x8Neg => v_intun(lo, VShape::I16x8, VIntUnOp::Neg)?,
         O::I32x4Abs => v_intun(lo, VShape::I32x4, VIntUnOp::Abs)?,
@@ -3142,6 +3214,10 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::F64x2Div => v_fbin(lo, VShape::F64x2, VFloatBinOp::Div)?,
         O::F64x2Min => v_fbin(lo, VShape::F64x2, VFloatBinOp::Min)?,
         O::F64x2Max => v_fbin(lo, VShape::F64x2, VFloatBinOp::Max)?,
+        O::F32x4PMin => v_pminmax(lo, VShape::F32x4, VPMinMaxOp::Pmin)?,
+        O::F32x4PMax => v_pminmax(lo, VShape::F32x4, VPMinMaxOp::Pmax)?,
+        O::F64x2PMin => v_pminmax(lo, VShape::F64x2, VPMinMaxOp::Pmin)?,
+        O::F64x2PMax => v_pminmax(lo, VShape::F64x2, VPMinMaxOp::Pmax)?,
         O::F32x4Abs => v_fun(lo, VShape::F32x4, VFloatUnOp::Abs)?,
         O::F32x4Neg => v_fun(lo, VShape::F32x4, VFloatUnOp::Neg)?,
         O::F32x4Sqrt => v_fun(lo, VShape::F32x4, VFloatUnOp::Sqrt)?,

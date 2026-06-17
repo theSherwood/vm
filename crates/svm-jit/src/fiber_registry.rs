@@ -231,6 +231,14 @@ impl Ownership {
     pub(crate) fn is_running(&self) -> bool {
         state_of(self.word.load(Ordering::Relaxed)) == RUNNING
     }
+
+    /// Whether the fiber is **voluntarily suspended** (`RUNNABLE`, in the steal pool) — the durable
+    /// freeze driver (DURABILITY.md §12.8) flattens exactly these (a fresh `OWNED` fiber has no
+    /// continuation to flatten; `RUNNING`/`FREE` are not parked). Relaxed: the freeze runs at a
+    /// quiescent safepoint (the root has unwound, single-vCPU).
+    pub(crate) fn is_runnable(&self) -> bool {
+        state_of(self.word.load(Ordering::Relaxed)) == RUNNABLE
+    }
 }
 
 // Real-build (non-loom) unit tests: the single-threaded transition table + the deterministic ABA

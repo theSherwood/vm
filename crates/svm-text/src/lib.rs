@@ -25,8 +25,8 @@ use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Encoding, FBinOp, FCmpOp,
     FToI, FUnOp, Field, FloatTy, Func, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc,
     Memory, Module, Ordering, ProducerBlob, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp,
-    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp, VShape,
-    VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
+    VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, VWidenOp, ValType, VarInfo, VarLoc,
 };
 
 /// Parse error with a human-readable message (dev tool; not safety-load-bearing).
@@ -422,6 +422,7 @@ fn print_inst(inst: &Inst) -> String {
             format!("{}.{} v{a} v{amt}", shape.name(), op.name())
         }
         Inst::VFloatCmp { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
+        Inst::VPMinMax { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatBin { shape, op, a, b } => format!("{}.{} v{a} v{b}", shape.name(), op.name()),
         Inst::VFloatUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
         Inst::VIntUn { shape, op, a } => format!("{}.{} v{a}", shape.name(), op.name()),
@@ -434,6 +435,28 @@ fn print_inst(inst: &Inst) -> String {
         Inst::Bitselect { a, b, mask } => format!("v128.bitselect v{a} v{b} v{mask}"),
         Inst::Shuffle { lanes, a, b } => format!("i8x16.shuffle{} v{a} v{b}", byte_list(lanes)),
         Inst::Swizzle { a, b } => format!("i8x16.swizzle v{a} v{b}"),
+        Inst::VPopcnt { a } => format!("i8x16.popcnt v{a}"),
+        Inst::VAvgr { shape, a, b } => format!("{}.avgr_u v{a} v{b}", shape.name()),
+        Inst::VDot { a, b } => format!("i32x4.dot_i16x8_s v{a} v{b}"),
+        Inst::VExtMul { shape, op, a, b } => {
+            let (low, signed) = op.parts();
+            let src = shape.narrower().map(|s| s.name()).unwrap_or("?");
+            format!(
+                "{}.extmul_{}_{src}_{} v{a} v{b}",
+                shape.name(),
+                if low { "low" } else { "high" },
+                if signed { "s" } else { "u" },
+            )
+        }
+        Inst::VExtAddPairwise { shape, signed, a } => {
+            let src = shape.narrower().map(|s| s.name()).unwrap_or("?");
+            format!(
+                "{}.extadd_pairwise_{src}_{} v{a}",
+                shape.name(),
+                if *signed { "s" } else { "u" },
+            )
+        }
+        Inst::VQ15MulrSat { a, b } => format!("i16x8.q15mulr_sat_s v{a} v{b}"),
         Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
         Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
         Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
@@ -1770,6 +1793,21 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
+        if op == "i8x16.popcnt" {
+            return Ok(Inst::VPopcnt {
+                a: self.value(names)?,
+            });
+        }
+        if op == "i32x4.dot_i16x8_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VDot { a, b });
+        }
+        if op == "i16x8.q15mulr_sat_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VQ15MulrSat { a, b });
+        }
         // Conversions are whole-instruction mnemonics (source/result shapes differ).
         if let Some(o) = VCvtOp::from_name(op.as_str()) {
             return Ok(Inst::VConvert {
@@ -1898,6 +1936,11 @@ impl<'a> Parser<'a> {
                 let b = self.value(names)?;
                 return Ok(Inst::VFloatCmp { shape, op: o, a, b });
             }
+            if let Some(o) = VPMinMaxOp::from_name(suffix) {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                return Ok(Inst::VPMinMax { shape, op: o, a, b });
+            }
         } else if let Some(o) = VIntBinOp::from_name(suffix) {
             let a = self.value(names)?;
             let b = self.value(names)?;
@@ -1935,6 +1978,48 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::VNarrow { shape, op: o, a, b });
+        } else if suffix == "avgr_u" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VAvgr { shape, a, b });
+        } else if let Some(rest) = suffix.strip_prefix("extmul_") {
+            // rest = "<low|high>_<src-shape>_<s|u>"; the src shape is redundant (= shape.narrower).
+            let parts: Vec<&str> = rest.split('_').collect();
+            if let [half, _src, sign] = parts[..] {
+                let widen = match (half, sign) {
+                    ("low", "s") => Some(VWidenOp::LowS),
+                    ("low", "u") => Some(VWidenOp::LowU),
+                    ("high", "s") => Some(VWidenOp::HighS),
+                    ("high", "u") => Some(VWidenOp::HighU),
+                    _ => None,
+                };
+                if let Some(op_w) = widen {
+                    let a = self.value(names)?;
+                    let b = self.value(names)?;
+                    return Ok(Inst::VExtMul {
+                        shape,
+                        op: op_w,
+                        a,
+                        b,
+                    });
+                }
+            }
+        } else if let Some(rest) = suffix.strip_prefix("extadd_pairwise_") {
+            // rest = "<src-shape>_<s|u>"; src shape is redundant (= shape.narrower).
+            if let Some(sign) = rest.rsplit('_').next() {
+                let signed = match sign {
+                    "s" => Some(true),
+                    "u" => Some(false),
+                    _ => None,
+                };
+                if let Some(signed) = signed {
+                    return Ok(Inst::VExtAddPairwise {
+                        shape,
+                        signed,
+                        a: self.value(names)?,
+                    });
+                }
+            }
         }
         err(format!("unknown opcode `{op}`"))
     }

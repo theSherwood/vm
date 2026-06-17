@@ -1,17 +1,20 @@
 //! Generative property for the freeze/thaw transform (DURABILITY.md §7/§12.6, R11).
 //!
 //! Shared between the stable `cargo test` (`tests/durable_fuzz.rs`) and the libFuzzer
-//! target (`fuzz/fuzz_targets/durable.rs`), mirroring `irgen`. The generator emits
-//! **in-scope** durable modules (single block, single `cap.call`, `return`) so the
-//! property exercises a real input space instead of the arbitrary-IR generator (which
-//! the Phase-1 transform would reject almost everywhere).
+//! targets (`fuzz/fuzz_targets/durable.rs`, `durable_fiber.rs`), mirroring `irgen`. Two
+//! generators, each emitting **in-scope** durable modules so the properties exercise a real
+//! input space instead of the arbitrary-IR generator (which the transform would reject):
+//!
+//!   * [`gen_module`] / [`fuzz_one`] — call-chain modules (leaf `cap.call` / propagated `Call`,
+//!     1..=4 frames, multi-point, multi-block);
+//!   * [`gen_fiber_module`] / [`fuzz_fiber_one`] — root+fiber modules (§12.8 Phase 3.1): a root
+//!     resuming one fiber that `suspend`s 1..=3 times, values live across each suspend.
 //!
 //! Each module is checked for two properties:
 //!   1. **inert in NORMAL** — the instrumented module run in `NORMAL` state produces
 //!      the same result as the original, un-instrumented module;
-//!   2. **round-trip** — freeze → serialize window → restore → thaw equals the
-//!      uninterrupted run, on a *fresh* host (so a buggy re-issue of the `cap.call`
-//!      instead of reloading the saved value would diverge).
+//!   2. **round-trip** — freeze → thaw equals the uninterrupted run on a *fresh* host (a buggy
+//!      re-issue of the `cap.call` / `cont.resume` instead of reloading/redelivering would diverge).
 
 #![allow(dead_code)] // not every helper is used by both includers
 
@@ -318,6 +321,202 @@ fn read_sp(w: &[u8]) -> u64 {
     let mut b = [0u8; 8];
     b.copy_from_slice(&w[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]);
     u64::from_le_bytes(b)
+}
+
+// ---- Fiber generator + freeze/thaw property (Phase 3.1 hardening) ----
+//
+// A fiber'd module the §12.8 single-fiber freeze/thaw path round-trips: a root that creates one
+// fiber and resumes it `S+1` times, and a fiber that `suspend`s `S` times then returns. Pure
+// arithmetic (no caps) so the run is deterministic — freeze→thaw equals the uninterrupted run with
+// no clock bookkeeping. Both functions are single-block multi-point (the transform splits each at
+// its `cont.resume` / `suspend` ops). The fiber keeps its entry `arg` live across *every* suspend
+// (used in the final result), so each suspend point spills/reloads a live value; the root keeps the
+// fiber handle live across *every* resume, so each resume point reloads it for the re-issue.
+
+/// The fiber `(i64 sp, i64 arg) -> (i64)`: suspend `S` times, folding `arg` in each round (so it is
+/// live across all of them), then return.
+fn gen_fiber_func(g: &mut Gen, suspends: u32) -> Func {
+    let arg = 1u32; // v1 — kept live to the end
+    let mut insts: Vec<Inst> = Vec::new();
+    let mut next = 2u32; // v0 = sp, v1 = arg
+    insts.push(Inst::ConstI64(g.u64v() as i64));
+    let c0 = next;
+    next += 1;
+    insts.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: total_binop(g),
+        a: c0,
+        b: arg,
+    });
+    let mut acc = next;
+    next += 1;
+    for _ in 0..suspends {
+        insts.push(Inst::Suspend { value: acc });
+        let r = next; // the next resume's delivered value
+        next += 1;
+        insts.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: total_binop(g),
+            a: r,
+            b: arg, // re-use `arg` → it stays live across this suspend
+        });
+        acc = next;
+        next += 1;
+    }
+    insts.push(Inst::ConstI64(g.u64v() as i64));
+    let cf = next;
+    next += 1;
+    insts.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: total_binop(g),
+        a: acc,
+        b: cf,
+    });
+    let ret = next;
+    Func {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64, ValType::I64],
+            insts,
+            term: Terminator::Return(vec![ret]),
+        }],
+    }
+}
+
+/// The root `() -> (i64)`: create fiber (func 1), resume it `S+1` times threading the handle, and
+/// sum every delivered value. The handle is live across every resume (spilled at each point).
+fn gen_fiber_root(g: &mut Gen, suspends: u32) -> Func {
+    let resumes = suspends + 1;
+    let mut insts: Vec<Inst> = Vec::new();
+    let mut next = 0u32;
+    insts.push(Inst::RefFunc { func: 1 });
+    let vf = next;
+    next += 1;
+    insts.push(Inst::ConstI64(4096)); // the fiber's data-stack base (unused by the interp)
+    let vsp = next;
+    next += 1;
+    insts.push(Inst::ContNew { func: vf, sp: vsp });
+    let k = next;
+    next += 1;
+    let mut vals: Vec<u32> = Vec::new();
+    for _ in 0..resumes {
+        insts.push(Inst::ConstI64(g.u64v() as i64));
+        let a = next;
+        next += 1;
+        insts.push(Inst::ContResume { k, arg: a });
+        next += 1; // status (i32)
+        let val = next; // delivered value (i64)
+        next += 1;
+        vals.push(val);
+    }
+    let mut acc = vals[0];
+    for &v in &vals[1..] {
+        insts.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: total_binop(g),
+            a: acc,
+            b: v,
+        });
+        acc = next;
+        next += 1;
+    }
+    Func {
+        params: vec![],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![],
+            insts,
+            term: Terminator::Return(vec![acc]),
+        }],
+    }
+}
+
+/// A fiber'd durable module: `[root, fiber]`, fiber suspends `1..=3` times.
+pub fn gen_fiber_module(g: &mut Gen) -> Module {
+    let suspends = 1 + g.below(3); // 1..=3
+    Module {
+        funcs: vec![gen_fiber_root(g, suspends), gen_fiber_func(g, suspends)],
+        memory: Some(Memory {
+            size_log2: SIZE_LOG2,
+        }),
+        data: Vec::new(),
+        imports: Vec::new(),
+        debug_info: None,
+    }
+}
+
+/// The §12.8 single-fiber freeze/thaw property: instrumentation is inert in NORMAL, and freezing
+/// (with the driver flattening the parked fiber + exporting its `FrozenFiber` residue) then thawing
+/// (re-seeding the residue + re-entering under REWINDING) reproduces the uninterrupted run.
+pub fn fuzz_fiber_one(g: &mut Gen) {
+    let m = gen_fiber_module(g);
+    let inst = transform_module(&m).expect("an in-scope fiber module must transform");
+    svm_verify::verify_module(&inst).expect("instrumented fiber IR must verify");
+
+    // (1) inert in NORMAL: un-instrumented == instrumented (NORMAL).
+    let r_orig = {
+        let mut h = Host::new();
+        let mut fuel = 1_000_000u64;
+        run_with_host(&m, 0, &[], &mut fuel, &mut h)
+    };
+    let r_base = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut h,
+        );
+        r
+    };
+    assert_eq!(r_orig, r_base, "instrumentation must be inert in NORMAL");
+    let base = r_base.expect("generated fiber programs are trap-free");
+
+    // (2) freeze: UNWINDING from the start unwinds the root at resume #1 (fiber parked), then the
+    // driver flattens the fiber. Capture the window + the exported fiber residue.
+    let (r_freeze, snap, frozen) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let mut win = init_durable_window(WINDOW);
+        write_state(&mut win, STATE_UNWINDING);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) =
+            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+        (r, snap, h.frozen_fibers().to_vec())
+    };
+    assert!(r_freeze.is_ok(), "freeze returns a placeholder, not a trap");
+    assert_eq!(frozen.len(), 1, "the single fiber was flattened");
+    assert!(
+        read_sp(&snap) >= SHADOW_BASE,
+        "the root's shadow-SP is in-reserve"
+    );
+
+    // (3) thaw: re-seed the fiber residue, flip to REWINDING, re-enter; must equal the baseline.
+    let (r_thaw, final_win) = {
+        let mut win = snap.clone();
+        write_state(&mut win, STATE_REWINDING);
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_frozen_fibers(frozen);
+        let mut fuel = 1_000_000u64;
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h)
+    };
+    assert_eq!(
+        r_thaw,
+        Ok(base),
+        "thawed fiber run must equal the uninterrupted run"
+    );
+    assert_eq!(
+        read_state(&final_win),
+        STATE_NORMAL,
+        "thaw must flip the state word back to NORMAL"
+    );
 }
 
 /// Check the two properties on one generated module.

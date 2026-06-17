@@ -88,6 +88,18 @@ fn simd_text_and_binary_roundtrip() {
           v12 = f32x4.sqrt v8\n\
           v13 = f32x4.abs v4\n\
           v14 = f32x4.neg v4\n\
+          v140 = f32x4.pmin v4 v4\n\
+          v141 = f32x4.pmax v4 v4\n\
+          v142 = i8x16.popcnt v2\n\
+          v143 = i8x16.avgr_u v2 v3\n\
+          v144 = i16x8.avgr_u v2 v3\n\
+          v145 = i32x4.dot_i16x8_s v2 v3\n\
+          v146 = i16x8.extmul_low_i8x16_s v2 v3\n\
+          v147 = i32x4.extmul_high_i16x8_u v2 v3\n\
+          v148 = i64x2.extmul_low_i32x4_s v2 v3\n\
+          v149 = i16x8.extadd_pairwise_i8x16_s v2\n\
+          v150 = i32x4.extadd_pairwise_i16x8_u v2\n\
+          v151 = i16x8.q15mulr_sat_s v2 v3\n\
           v15 = v128.and v2 v3\n\
           v16 = v128.or v2 v3\n\
           v17 = v128.xor v2 v3\n\
@@ -248,6 +260,254 @@ fn diff_f64x2_min_max_sqrt() {
     for (a, b) in [(4.0f64, 9.0), (16.0, 2.0), (1.0, 100.0)] {
         diff1(s, &[Value::F64(a), Value::F64(b)]);
     }
+}
+
+// Pseudo-min/max (`f32x4`/`f64x2` pmin/pmax) — VPMinMaxOp. Unlike `min`/`max` these are a
+// one-sided compare-and-select: `pmin(a,b) = b<a ? b : a`, `pmax(a,b) = a<b ? b : a`. The oracle
+// is that exact select (NaN and signed-zero behaviour falls out of `<`, which is what wasm wants).
+
+/// `f32x4.{pmin,pmax}` of two splatted scalars, lane 0 read back as f32.
+fn f32x4_pminmax(op: &str, a: f32, b: f32) -> f32 {
+    let s = format!(
+        "func (f32, f32) -> (f32) {{\n\
+        block0(v0: f32, v1: f32):\n\
+          v2 = f32x4.splat v0\n\
+          v3 = f32x4.splat v1\n\
+          v4 = f32x4.{op} v2 v3\n\
+          v5 = f32x4.extract_lane 0 v4\n  return v5\n}}\n"
+    );
+    f32::from_bits(diff1(&s, &[Value::F32(a), Value::F32(b)]) as u32)
+}
+
+/// `f64x2.{pmin,pmax}` of two splatted scalars, lane 1 read back as f64.
+fn f64x2_pminmax(op: &str, a: f64, b: f64) -> f64 {
+    let s = format!(
+        "func (f64, f64) -> (f64) {{\n\
+        block0(v0: f64, v1: f64):\n\
+          v2 = f64x2.splat v0\n\
+          v3 = f64x2.splat v1\n\
+          v4 = f64x2.{op} v2 v3\n\
+          v5 = f64x2.extract_lane 1 v4\n  return v5\n}}\n"
+    );
+    f64::from_bits(diff1(&s, &[Value::F64(a), Value::F64(b)]) as u64)
+}
+
+#[test]
+fn diff_f32x4_pmin_pmax() {
+    for (a, b) in [
+        (1.0f32, 2.0),
+        (2.0, 1.0),
+        (-0.0, 0.0),
+        (0.0, -0.0),
+        (-5.0, -5.0),
+        (3.5, -3.5),
+    ] {
+        // pmin(a,b) = b<a ? b : a ; pmax(a,b) = a<b ? b : a.
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            f32x4_pminmax("pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin {a} {b}"
+        );
+        assert_eq!(
+            f32x4_pminmax("pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax {a} {b}"
+        );
+    }
+}
+
+#[test]
+fn diff_f64x2_pmin_pmax() {
+    for (a, b) in [
+        (1.0f64, 2.0),
+        (2.0, 1.0),
+        (-0.0, 0.0),
+        (0.0, -0.0),
+        (-5.0, -5.0),
+        (3.5, -3.5),
+    ] {
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            f64x2_pminmax("pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin {a} {b}"
+        );
+        assert_eq!(
+            f64x2_pminmax("pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax {a} {b}"
+        );
+    }
+}
+
+/// NaN propagation: pmin/pmax with a NaN second operand return the *first* operand (since every
+/// `<` against NaN is false), and with a NaN first operand return the second. Verify the bit
+/// pattern matches the select oracle exactly (interp == JIT enforced by `diff1`).
+#[test]
+fn diff_f32x4_pminmax_nan() {
+    let nan = f32::NAN;
+    for (a, b) in [(nan, 1.0f32), (1.0, nan), (nan, nan)] {
+        let pmin = if b < a { b } else { a };
+        let pmax = if a < b { b } else { a };
+        assert_eq!(
+            f32x4_pminmax("pmin", a, b).to_bits(),
+            pmin.to_bits(),
+            "pmin nan {a} {b}"
+        );
+        assert_eq!(
+            f32x4_pminmax("pmax", a, b).to_bits(),
+            pmax.to_bits(),
+            "pmax nan {a} {b}"
+        );
+    }
+}
+
+// `i8x16.popcnt` — per-byte population count (`Inst::VPopcnt`, fixed i8x16 shape). Splat a byte
+// pattern across all 16 lanes, read lane 0 back; the oracle is Rust's `count_ones`. `diff1`
+// pins interp == JIT.
+#[test]
+fn diff_i8x16_popcnt() {
+    // Splat the low byte of an i32 across i8x16, popcnt, read lane 0 (unsigned).
+    let s = "func (i32) -> (i32) {\n\
+        block0(v0: i32):\n\
+          v1 = i8x16.splat v0\n\
+          v2 = i8x16.popcnt v1\n\
+          v3 = i8x16.extract_lane_u 0 v2\n  return v3\n}\n";
+    for byte in [0x00u8, 0xFF, 0x01, 0x80, 0xAA, 0x7F, 0x42] {
+        let got = diff1(s, &[Value::I32(byte as i32)]);
+        assert_eq!(got, byte.count_ones() as i64, "popcnt 0x{byte:02x}");
+    }
+}
+
+// `iNxM.avgr_u` — unsigned rounding average `(a+b+1)>>1` per lane (`Inst::VAvgr`, verifier-restricted
+// to i8x16/i16x8). Splat two scalars, read lane 0 unsigned; oracle computes the same in u32.
+#[test]
+fn diff_i8x16_avgr_u() {
+    let s = "func (i32, i32) -> (i32) {\n\
+        block0(v0: i32, v1: i32):\n\
+          v2 = i8x16.splat v0\n\
+          v3 = i8x16.splat v1\n\
+          v4 = i8x16.avgr_u v2 v3\n\
+          v5 = i8x16.extract_lane_u 0 v4\n  return v5\n}\n";
+    for (a, b) in [(0u8, 0u8), (255, 255), (3, 4), (1, 2), (255, 1), (100, 101)] {
+        let want = ((a as u32 + b as u32 + 1) >> 1) as i64;
+        assert_eq!(
+            diff1(s, &[Value::I32(a as i32), Value::I32(b as i32)]),
+            want,
+            "avgr_u i8 {a} {b}"
+        );
+    }
+}
+
+#[test]
+fn diff_i16x8_avgr_u() {
+    let s = "func (i32, i32) -> (i32) {\n\
+        block0(v0: i32, v1: i32):\n\
+          v2 = i16x8.splat v0\n\
+          v3 = i16x8.splat v1\n\
+          v4 = i16x8.avgr_u v2 v3\n\
+          v5 = i16x8.extract_lane_u 0 v4\n  return v5\n}\n";
+    for (a, b) in [
+        (0u16, 0u16),
+        (65535, 65535),
+        (3, 4),
+        (1, 2),
+        (65535, 1),
+        (40000, 40001),
+    ] {
+        let want = ((a as u32 + b as u32 + 1) >> 1) as i64;
+        assert_eq!(
+            diff1(s, &[Value::I32(a as i32), Value::I32(b as i32)]),
+            want,
+            "avgr_u i16 {a} {b}"
+        );
+    }
+}
+
+/// `avgr_u` round-trips through text + binary, and the verifier rejects a wide shape (wasm defines
+/// it for `i8x16`/`i16x8` only — like saturating add/sub, the restriction lives in the verifier so
+/// there is no JIT bail list).
+#[test]
+fn avgr_roundtrip_and_shape_reject() {
+    let src = "func () -> (i32) {\nblock0():\n\
+        v0 = v128.const 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
+        v1 = i8x16.avgr_u v0 v0\n\
+        v2 = i16x8.avgr_u v0 v0\n\
+        v3 = i8x16.extract_lane_u 0 v1\n  return v3\n}\n";
+    let m = build(src);
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
+
+    // i32x4 avgr_u is not a wasm op and the verifier rejects it.
+    let bad = parse_module(
+        "func () -> () {\nblock0():\n\
+         v0 = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         v1 = i32x4.avgr_u v0 v0\n  return\n}\n",
+    )
+    .expect("parses (shape check is at verify)");
+    assert!(
+        verify_module(&bad).is_err(),
+        "i32x4 avgr_u must fail verification"
+    );
+}
+
+// `i32x4.dot_i16x8_s` — signed dot of adjacent i16 pairs into i32 (`Inst::VDot`, fixed i16x8→i32x4).
+// Two const i16x8 vectors, each i32 result lane read back; oracle = the same pair-sum in Rust.
+#[test]
+fn diff_i32x4_dot() {
+    // a = [1,2,3,4,5,6,7,8], b = [8,7,6,5,4,3,2,1] as i16 lanes (little-endian bytes).
+    let a: [i16; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    let b: [i16; 8] = [8, 7, 6, 5, 4, 3, 2, 1];
+    let bytes = |v: &[i16; 8]| {
+        v.iter()
+            .flat_map(|x| x.to_le_bytes())
+            .map(|byte| byte.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for lane in 0..4u8 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n\
+               v0 = v128.const {}\n\
+               v1 = v128.const {}\n\
+               v2 = i32x4.dot_i16x8_s v0 v1\n\
+               v3 = i32x4.extract_lane {lane} v2\n  return v3\n}}\n",
+            bytes(&a),
+            bytes(&b)
+        );
+        let want = a[2 * lane as usize] as i32 * b[2 * lane as usize] as i32
+            + a[2 * lane as usize + 1] as i32 * b[2 * lane as usize + 1] as i32;
+        assert_eq!(diff1(&s, &[]), want as i64, "dot lane {lane}");
+    }
+
+    // Overflow corner: lane of [-32768,-32768]·[-32768,-32768] wraps in i32 (matches wasm).
+    let m = (-32768i16).to_le_bytes();
+    let row = format!(
+        "{} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0",
+        m[0], m[1], m[0], m[1]
+    );
+    let s = format!(
+        "func () -> (i32) {{\nblock0():\n\
+           v0 = v128.const {row}\n\
+           v1 = v128.const {row}\n\
+           v2 = i32x4.dot_i16x8_s v0 v1\n\
+           v3 = i32x4.extract_lane 0 v2\n  return v3\n}}\n"
+    );
+    let want = (-32768i32)
+        .wrapping_mul(-32768)
+        .wrapping_add((-32768i32).wrapping_mul(-32768));
+    assert_eq!(diff1(&s, &[]), want as u32 as i64, "dot overflow lane");
 }
 
 #[test]
@@ -1062,6 +1322,130 @@ fn diff_narrow() {
     assert_eq!(n16(neg, "narrow_u", "extract_lane_u"), 0, "-1 →_u 0");
 }
 
+// Extended multiply (`<wide>.extmul_{low,high}_<src>_{s,u}`, `Inst::VExtMul`): widen a half of both
+// operands and multiply into the wide shape. Splatting makes low == high; a distinct-lane const test
+// pins the half selection. Oracle = the widened product.
+#[test]
+fn diff_extmul() {
+    // i16x8 ← i8x16: splat two i8 byte patterns, extmul, read i16 lane 0.
+    let em16 = |op: &str, a: u8, b: u8| -> i32 {
+        let s = format!(
+            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+               v2 = i8x16.splat v0\n  v3 = i8x16.splat v1\n\
+               v4 = i16x8.{op} v2 v3\n  v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I32(a as i32), Value::I32(b as i32)]) as i32
+    };
+    for (a, b) in [(2u8, 3u8), (0xFF, 0xFF), (0x80, 2), (0xFF, 1)] {
+        let (sa, sb) = (a as i8 as i32, b as i8 as i32);
+        let (ua, ub) = (a as i32, b as i32);
+        assert_eq!(em16("extmul_low_i8x16_s", a, b), sa * sb, "low_s {a} {b}");
+        assert_eq!(em16("extmul_high_i8x16_s", a, b), sa * sb, "high_s {a} {b}");
+        assert_eq!(
+            em16("extmul_low_i8x16_u", a, b),
+            (ua * ub) as i16 as i32,
+            "low_u {a} {b}"
+        );
+    }
+
+    // i32x4 ← i16x8 and i64x2 ← i32x4 width steps (splatted), read the wide lane.
+    let em32 = |op: &str, a: i16, b: i16| -> i32 {
+        let s = format!(
+            "func (i32, i32) -> (i32) {{\nblock0(v0: i32, v1: i32):\n\
+               v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n\
+               v4 = i32x4.{op} v2 v3\n  v5 = i32x4.extract_lane 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I32(a as i32), Value::I32(b as i32)]) as i32
+    };
+    assert_eq!(
+        em32("extmul_low_i16x8_s", 1000, -1000),
+        -1_000_000,
+        "i32 extmul_s"
+    );
+    let em64 = |op: &str, a: i32, b: i32| -> i64 {
+        let s = format!(
+            "func (i32, i32) -> (i64) {{\nblock0(v0: i32, v1: i32):\n\
+               v2 = i32x4.splat v0\n  v3 = i32x4.splat v1\n\
+               v4 = i64x2.{op} v2 v3\n  v5 = i64x2.extract_lane 0 v4\n  return v5\n}}\n"
+        );
+        diff1(&s, &[Value::I32(a), Value::I32(b)])
+    };
+    assert_eq!(
+        em64("extmul_low_i32x4_s", 100_000, 100_000),
+        10_000_000_000,
+        "i64 extmul_s (overflows i32, fits i64)"
+    );
+
+    // Half selection: a const with distinct low/high bytes. low byte0 = 1, high byte0 = a[8] = 9.
+    let src = "1 0 2 0 3 0 4 0 9 0 10 0 11 0 12 0"; // i8 lanes 0..15
+    let half = |op: &str| -> i32 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src}\n\
+               v1 = i16x8.{op} v0 v0\n  v2 = i16x8.extract_lane_s 0 v1\n  return v2\n}}\n"
+        );
+        diff1(&s, &[]) as i32
+    };
+    assert_eq!(half("extmul_low_i8x16_s"), 1, "low half lane0 = 1·1");
+    assert_eq!(half("extmul_high_i8x16_s"), 81, "high half lane0 = 9·9");
+}
+
+// Extended pairwise add (`<wide>.extadd_pairwise_<src>_{s,u}`, `Inst::VExtAddPairwise`): widen all
+// lanes and sum adjacent pairs. A distinct-lane const pins `out[i] = w(a[2i]) + w(a[2i+1])`.
+#[test]
+fn diff_extadd_pairwise() {
+    // i16x8 ← i8x16. Lanes 0/1 = 0xFF/0x01 → s: (-1)+1 = 0 ; u: 255+1 = 256.
+    let src = "255 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15";
+    let ea = |op: &str| -> i32 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src}\n\
+               v1 = i16x8.{op} v0\n  v2 = i16x8.extract_lane_s 0 v1\n  return v2\n}}\n"
+        );
+        diff1(&s, &[]) as i32
+    };
+    assert_eq!(
+        ea("extadd_pairwise_i8x16_s"),
+        0,
+        "s: (i8)255 + 1 = -1+1 = 0"
+    );
+    assert_eq!(ea("extadd_pairwise_i8x16_u"), 256, "u: 255 + 1 = 256");
+    // lane 1 of the result = a[2]+a[3] = 2+3 = 5.
+    let s = format!(
+        "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src}\n\
+           v1 = i16x8.extadd_pairwise_i8x16_s v0\n  v2 = i16x8.extract_lane_s 1 v1\n  return v2\n}}\n"
+    );
+    assert_eq!(diff1(&s, &[]), 5, "lane1 = 2+3");
+
+    // i32x4 ← i16x8 width step. i16 lanes 0/1 = [1000, 2000] → 3000.
+    let src16 = "232 3 208 7 0 0 0 0 0 0 0 0 0 0 0 0"; // i16 [1000, 2000, 0, ...]
+    let s2 = format!(
+        "func () -> (i32) {{\nblock0():\n  v0 = v128.const {src16}\n\
+           v1 = i32x4.extadd_pairwise_i16x8_s v0\n  v2 = i32x4.extract_lane 0 v1\n  return v2\n}}\n"
+    );
+    assert_eq!(diff1(&s2, &[]), 3000, "1000 + 2000");
+}
+
+// Q15 rounding multiply-saturate (`i16x8.q15mulr_sat_s`, `Inst::VQ15MulrSat`):
+// out = sat_i16((a·b + 0x4000) >> 15). Oracle computes the same in i64.
+#[test]
+fn diff_q15mulr_sat() {
+    let q = |a: i16, b: i16| -> i32 {
+        let s = "func (i32, i32) -> (i32) {\nblock0(v0: i32, v1: i32):\n\
+               v2 = i16x8.splat v0\n  v3 = i16x8.splat v1\n\
+               v4 = i16x8.q15mulr_sat_s v2 v3\n  v5 = i16x8.extract_lane_s 0 v4\n  return v5\n}\n";
+        diff1(s, &[Value::I32(a as i32), Value::I32(b as i32)]) as i32
+    };
+    for (a, b) in [
+        (0i16, 0i16),
+        (16384, 16384),   // 0.5 * 0.5 ≈ 0.25 → 0x2000
+        (-32768, -32768), // the saturating corner: rounds to 32768 → sat 32767
+        (32767, 32767),
+        (1000, -2000),
+    ] {
+        let want = ((a as i64 * b as i64 + 0x4000) >> 15).clamp(i16::MIN as i64, i16::MAX as i64);
+        assert_eq!(q(a, b), want as i32, "q15mulr {a} {b}");
+    }
+}
+
 /// Narrow round-trips; the verifier rejects narrowing to `i32x4`.
 #[test]
 fn narrow_roundtrip_and_shape_reject() {
@@ -1174,6 +1558,70 @@ fn diff_demote_promote() {
     }
 }
 
+// f64↔i32 conversions (the lane-count-changing four): `f64x2.convert_low_i32x4_{s,u}` (low 2 i32
+// lanes → f64x2) and `i32x4.trunc_sat_f64x2_{s,u}_zero` (f64x2 → low 2 i32 lanes, high 2 zeroed).
+// Oracle = Rust's `as` casts; `diff1` pins interp == JIT (so the i64x2-intermediate JIT recipe must
+// match the interp's per-lane semantics).
+#[test]
+fn diff_f64_i32_convert() {
+    // i32 → f64 convert_low (signed + unsigned), observe f64 bits of lane 0.
+    let cl = |op: &str, x: i32| -> i64 {
+        let s = format!(
+            "func (i32) -> (i64) {{\nblock0(v0: i32):\n  v1 = i32x4.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::I32(x)])
+    };
+    for x in [0, -5, 1_000_000, i32::MAX, i32::MIN, -1] {
+        assert_eq!(
+            cl("f64x2.convert_low_i32x4_s", x),
+            (x as f64).to_bits() as i64,
+            "convert_low_s {x}"
+        );
+        assert_eq!(
+            cl("f64x2.convert_low_i32x4_u", x),
+            ((x as u32) as f64).to_bits() as i64,
+            "convert_low_u {x}"
+        );
+    }
+
+    // f64 → i32 trunc_sat_zero (signed + unsigned), observe i32 lane.
+    let ts = |op: &str, x: f64, lane: u8| -> i32 {
+        let s = format!(
+            "func (f64) -> (i32) {{\nblock0(v0: f64):\n  v1 = f64x2.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane {lane} v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::F64(x)]) as i32
+    };
+    for x in [
+        3.9f64,
+        -3.9,
+        0.0,
+        1e18,
+        -1e18,
+        f64::NAN,
+        f64::INFINITY,
+        -f64::INFINITY,
+    ] {
+        assert_eq!(
+            ts("i32x4.trunc_sat_f64x2_s_zero", x, 0),
+            x as i32,
+            "trunc_sat_s {x}"
+        );
+        assert_eq!(
+            ts("i32x4.trunc_sat_f64x2_u_zero", x, 0),
+            (x as u32) as i32,
+            "trunc_sat_u {x}"
+        );
+    }
+    // The high lanes (2/3) are zeroed.
+    assert_eq!(
+        ts("i32x4.trunc_sat_f64x2_s_zero", 3.9, 2),
+        0,
+        "trunc_sat_zero high lane"
+    );
+}
+
 /// Conversions round-trip through text + binary (whole-instruction mnemonics).
 #[test]
 fn conversion_roundtrip() {
@@ -1183,6 +1631,10 @@ fn conversion_roundtrip() {
         v3 = i32x4.trunc_sat_f32x4_u v2\n\
         v4 = f64x2.promote_low_f32x4 v2\n\
         v5 = f32x4.demote_f64x2_zero v4\n\
+        v7 = f64x2.convert_low_i32x4_s v1\n\
+        v8 = f64x2.convert_low_i32x4_u v1\n\
+        v9 = i32x4.trunc_sat_f64x2_s_zero v7\n\
+        v10 = i32x4.trunc_sat_f64x2_u_zero v8\n\
         v6 = i32x4.extract_lane 0 v3\n  return v6\n}\n";
     let m = build(src);
     assert_eq!(

@@ -665,7 +665,9 @@ fn check_inst(
             cx.expect(*amt, ValType::I32)?;
             ValType::V128
         }
-        Inst::VFloatBin { shape, a, b, .. } | Inst::VFloatCmp { shape, a, b, .. } => {
+        Inst::VFloatBin { shape, a, b, .. }
+        | Inst::VFloatCmp { shape, a, b, .. }
+        | Inst::VPMinMax { shape, a, b, .. } => {
             if !shape.is_float() {
                 return Err(VerifyError::BadSimdShape {
                     func: fi,
@@ -696,6 +698,11 @@ fn check_inst(
             cx.expect(*a, ValType::V128)?;
             ValType::V128
         }
+        // `i8x16.popcnt`: shape is fixed (i8x16), so there is no lane rule to enforce.
+        Inst::VPopcnt { a } => {
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
         // Saturating add/sub is `i8x16`/`i16x8` only (the wasm spec has no wider sat).
         Inst::VSatBin { shape, a, b, .. } => {
             if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
@@ -704,6 +711,55 @@ fn check_inst(
                     block: bi,
                 });
             }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Unsigned rounding average: `i8x16`/`i16x8` only (the only shapes wasm defines `avgr_u`).
+        Inst::VAvgr { shape, a, b } => {
+            if !matches!(shape, VShape::I8x16 | VShape::I16x8) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Dot product: fixed shapes (i16x8 → i32x4), so there is no lane rule to enforce.
+        Inst::VDot { a, b } => {
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Extended multiply: the result `shape` must be a wide integer shape (has a half-width
+        // source to widen from) — same rule as widen.
+        Inst::VExtMul { shape, a, b, .. } => {
+            if shape.narrower().is_none() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            ValType::V128
+        }
+        // Extended pairwise add: wide integer result only. `i16x8`/`i32x4` (i64x2 has no wasm op,
+        // but a half-width source exists, so restrict to the two wasm shapes explicitly).
+        Inst::VExtAddPairwise { shape, a, .. } => {
+            if !matches!(shape, VShape::I16x8 | VShape::I32x4) {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            ValType::V128
+        }
+        // Q15 rounding multiply: fixed `i16x8`, so there is no lane rule to enforce.
+        Inst::VQ15MulrSat { a, b } => {
             cx.expect(*a, ValType::V128)?;
             cx.expect(*b, ValType::V128)?;
             ValType::V128

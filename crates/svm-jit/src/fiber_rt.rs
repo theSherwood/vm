@@ -78,6 +78,46 @@ const MAX_FIBERS: usize = 1 << 16;
 /// reserved VA, committed on demand — cheap even with many fibers.
 const FIBER_STACK: usize = 1 << 20;
 
+// ---- Durable per-fiber shadow-stack layout (DURABILITY.md §12.8, D-fiber-cont option A) ----
+//
+// These MUST match `svm-interp`'s `SHADOW_SP_OFF` / `SHADOW_BASE` / `SHADOW_STRIDE` (the durable
+// runtime ABI) — like `DURABLE_SNAPSHOT_PAGE`, svm-jit is TCB and can't depend on the interpreter,
+// so the constants are duplicated; the cross-backend fiber freeze/thaw property catches drift. On a
+// **durable** run the active shadow-SP word lives at `SHADOW_SP_OFF` in the window, and context `i`
+// owns the shadow region `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)` — the root is context 0,
+// a fiber in registry slot `s` is context `s+1`. The runtime keeps the active word pointing at the
+// running context's region, swapping it on every fiber switch so a freeze spills into the right one.
+const SHADOW_SP_OFF: u64 = 8;
+const SHADOW_BASE: u64 = 64;
+const SHADOW_STRIDE: u64 = 1 << 12;
+/// Window byte offset of the durable state word (`NORMAL | UNWINDING | REWINDING`); the freeze
+/// driver reads it to confirm a freeze is in progress. Must match `svm-interp`'s `STATE_OFF`.
+const STATE_OFF: u64 = 0;
+/// State-word value meaning "freeze in progress" (must match `svm-interp`'s `STATE_UNWINDING`).
+const STATE_UNWINDING: i32 = 1;
+
+/// The shadow-region base (window offset) of the fiber in registry `slot` (context `slot+1`).
+fn fiber_region_base(slot: usize) -> u64 {
+    SHADOW_BASE + (slot as u64 + 1) * SHADOW_STRIDE
+}
+
+/// Read the active shadow-SP word from the durable window. `mem_base` is the window's host base.
+/// # Safety: only called on a durable run, where `[SHADOW_SP_OFF, +8)` is committed RW reserve.
+unsafe fn read_shadow_sp(mem_base: u64) -> u64 {
+    *((mem_base + SHADOW_SP_OFF) as *const u64)
+}
+
+/// Write the active shadow-SP word into the durable window. # Safety: as [`read_shadow_sp`].
+unsafe fn write_shadow_sp(mem_base: u64, sp: u64) {
+    *((mem_base + SHADOW_SP_OFF) as *mut u64) = sp;
+}
+
+/// Whether the durable state word is `UNWINDING` (a freeze is in progress) — the entry path's gate
+/// for running the [`freeze_drive`]. # Safety: `mem_base` is a durable run's committed window base.
+pub(crate) unsafe fn window_is_unwinding(mem_base: u64) -> bool {
+    *((mem_base + STATE_OFF) as *const i32) == STATE_UNWINDING
+}
+
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
 /// `call_indirect`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, trap_out, sp, arg) ->
 /// i64`). One trampoline serves every fiber since all fiber entries share that signature (§12).
@@ -111,6 +151,17 @@ pub(crate) struct FiberSlot {
     /// (suspended); the box stays in place during a resume (`RUNNING` guarantees the claimant
     /// exclusive access) and is dropped — its stack unmapped — when the fiber returns (`finish`).
     fiber: Mutex<Option<Box<Fiber>>>,
+    /// **Durable** (DURABILITY.md §12.8): this fiber's saved shadow-SP — the extent of its
+    /// continuation in its in-window shadow region. Initialized to the region base (empty); on a
+    /// durable run the resume/return swap saves the live word here and restores it on the next
+    /// resume. Touched only by the claimant (serialized by the `own` claim/publish), so `Relaxed`
+    /// suffices; unused on a non-durable run.
+    shadow_sp: AtomicU64,
+    /// **Durable**: the fiber's entry funcref and data-stack base (the `cont.new` operands),
+    /// retained so the freeze driver can export them in this fiber's [`crate::FrozenFiber`] residue
+    /// (a thaw re-creates the fiber from them). Immutable after creation.
+    func: i32,
+    sp: i64,
 }
 
 /// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
@@ -149,17 +200,40 @@ impl SharedFiberTable {
 
     /// Allocate the next slot for a fresh (`OWNED`) fiber; the returned slot index is the guest
     /// handle. `None` if a racing allocation filled the domain quota since [`Self::has_room`].
-    fn create(&self, fiber: Box<Fiber>) -> Option<i32> {
+    fn create(&self, fiber: Box<Fiber>, func: i32, sp: i64) -> Option<i32> {
         let mut t = self.lock();
         if t.len() + 1 >= self.max_fibers {
             return None;
         }
+        let slot = t.len();
         t.push(Arc::new(FiberSlot {
             own: Ownership::new_owned(),
             running_on: AtomicU64::new(NOT_RUNNING),
             fiber: Mutex::new(Some(fiber)),
+            // Fresh fiber: its shadow region starts empty (SP at the region base).
+            shadow_sp: AtomicU64::new(fiber_region_base(slot)),
+            func,
+            sp,
         }));
-        Some((t.len() - 1) as i32)
+        Some(slot as i32)
+    }
+
+    /// Durable **thaw** re-seeding (DURABILITY.md §12.8 slice 3.3.3): re-create a frozen fiber at
+    /// the next slot (dense, matching the freeze) as a fresh `OWNED` fiber — so a thaw `cont.resume`
+    /// claims it (`Start`) and re-enters its entry under `REWINDING`, rebuilding then re-parking it —
+    /// with its flattened shadow-SP restored so the swap re-points the active word to its region.
+    fn seed_frozen(&self, fiber: Box<Fiber>, func: i32, sp: i64, shadow_sp: u64) -> usize {
+        let mut t = self.lock();
+        let slot = t.len();
+        t.push(Arc::new(FiberSlot {
+            own: Ownership::new_owned(),
+            running_on: AtomicU64::new(NOT_RUNNING),
+            fiber: Mutex::new(Some(fiber)),
+            shadow_sp: AtomicU64::new(shadow_sp),
+            func,
+            sp,
+        }));
+        slot
     }
 
     /// Resolve a (forgeable) handle: **masked** into the power-of-two-padded table (Spectre-safe,
@@ -173,6 +247,19 @@ impl SharedFiberTable {
             return None;
         }
         Some(Arc::clone(&t[slot]))
+    }
+
+    /// The handles of every **voluntarily-suspended** (`RUNNABLE`) fiber — the parked fibers the
+    /// durable freeze driver flattens (DURABILITY.md §12.8). Collected once: flattening a fiber
+    /// makes zero forward progress (its post-suspend poll unwinds immediately), so it spawns no new
+    /// parked fibers, and it ends `FREE` — the set never grows.
+    fn runnable_handles(&self) -> Vec<i32> {
+        self.lock()
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.own.is_runnable())
+            .map(|(i, _)| i as i32)
+            .collect()
     }
 }
 
@@ -200,6 +287,19 @@ pub(crate) struct FiberRuntime {
     /// when the collector runs inside a fiber). `0` until the entry path records it (and for vCPUs
     /// that never run guest code), which simply skips the root-frame scan.
     root_entry_sp: usize,
+    /// **Durable** (DURABILITY.md §12.8): this run freezes/thaws fibers, so the resume swap keeps
+    /// the active shadow-SP word pointing at the running context's region. `false` ⇒ the fiber
+    /// runtime never touches the durable reserve (an ordinary run). Set per-run at entry.
+    durable: bool,
+    /// The guest window's host base (the durable swap reads/writes `window + SHADOW_SP_OFF`). Set
+    /// per-run at entry (the window doesn't exist at construction). Unused unless `durable`.
+    mem_base: u64,
+    /// The root computation's saved shadow-SP (context 0) while it is parked resuming a fiber — the
+    /// off-table root's slot in the per-context saved-SP table (a fiber's lives in its `FiberSlot`).
+    root_shadow_sp: u64,
+    /// The context currently running on this vCPU (`None` = the root, context 0; `Some` = a fiber).
+    /// The resume swap reads it to know whose SP to save before switching in, and restores it after.
+    cur_shadow: Option<Arc<FiberSlot>>,
 }
 
 impl FiberRuntime {
@@ -217,12 +317,25 @@ impl FiberRuntime {
             fiber_type_id,
             fn_table_mask,
             root_entry_sp: 0,
+            durable: false,
+            mem_base: 0,
+            root_shadow_sp: SHADOW_BASE,
+            cur_shadow: None,
         }
     }
 
     /// Record the finalized call-trampoline address (must be set before any fiber runs).
     pub(crate) fn set_call_tramp(&mut self, t: FiberCallTramp) {
         self.call_tramp = Some(t);
+    }
+
+    /// Arm the **durable** fiber-switch swap for this run (DURABILITY.md §12.8): record the window
+    /// base and whether this is a durable run, so the resume swap can re-point the active shadow-SP
+    /// word per context. Called by the entry path once the window is allocated. A non-durable run
+    /// leaves `durable = false` and the fiber runtime never touches the reserve.
+    pub(crate) fn set_durable_env(&mut self, mem_base: u64, durable: bool) {
+        self.mem_base = mem_base;
+        self.durable = durable;
     }
 
     /// Record the OS-thread stack pointer at this vCPU's guest entry — the high bound for the
@@ -248,6 +361,49 @@ unsafe fn fault(trap_out: u64) {
 // fiber's `&mut` exclusive — a fiber anywhere in a resume chain is `RUNNING`, so a re-entrant resume
 // loses the claim — and slots are separate heap allocations from the table vec, so a re-entrant
 // `cont.new` growing the table never moves a fiber being resumed.
+
+/// Build a suspended native fiber that, on first resume, runs guest `funcref(sp, arg)` through the
+/// call-trampoline — resolving + type-checking the funcref against the function table on that first
+/// resume, like the interpreter. Shared by `cont.new` ([`fiber_new`]) and durable thaw re-seeding
+/// ([`SharedFiberTable::seed_frozen`]), so a thawed fiber re-enters its entry identically.
+///
+/// # Safety
+/// `fn_table_base`/`mem_base`/`trap_out`/`call_tramp` are this run's threaded context (live for the
+/// fiber's lifetime); the body reads [`CURRENT_RT`] dynamically at each use (3c migration).
+#[allow(clippy::too_many_arguments)]
+unsafe fn make_fiber(
+    funcref: i32,
+    sp: u64,
+    mem_base: u64,
+    fn_table_base: u64,
+    trap_out: u64,
+    mask: u64,
+    type_id: u32,
+    call_tramp: FiberCallTramp,
+) -> Fiber {
+    Fiber::new(FIBER_STACK, move |y: &Yielder, arg: u64| -> u64 {
+        // The *resuming* vCPU's runtime — read dynamically at **each** use, never carried across
+        // a potential suspension: the body's start and its return may run on different OS threads
+        // (3c migration), and the yielder push/pop must each target the thread actually running
+        // the fiber at that moment (a push/pop pairs within one residency on one thread).
+        // SAFETY: a fiber only runs under a resume, so `current()` is that thread's live runtime;
+        // each `&mut` deref here is momentary and single-threaded.
+        unsafe {
+            (*current()).yielders.push(y as *const Yielder);
+            // Resolve + type-check the funcref now (first resume), like the interpreter.
+            let slot = (funcref as u32 as usize) & (mask as usize);
+            let entry = (fn_table_base as *const FnEntry).add(slot);
+            let result = if (*entry).type_id() != type_id {
+                fault(trap_out);
+                0u64
+            } else {
+                call_tramp((*entry).code(), mem_base, fn_table_base, trap_out, sp, arg)
+            };
+            (*current()).yielders.pop();
+            result
+        }
+    })
+}
 
 /// `cont.new` thunk: allocate a suspended fiber that, on first resume, calls guest `funcref(sp, arg)`.
 /// Returns the fiber handle (the domain-shared table's slot index — the same numbering as the interp
@@ -286,31 +442,19 @@ pub(crate) unsafe extern "C" fn fiber_new(
         )
     };
 
-    let fiber = Fiber::new(FIBER_STACK, move |y: &Yielder, arg: u64| -> u64 {
-        // The *resuming* vCPU's runtime — read dynamically at **each** use, never carried across
-        // a potential suspension: the body's start and its return may run on different OS threads
-        // (3c migration), and the yielder push/pop must each target the thread actually running
-        // the fiber at that moment (a push/pop pairs within one residency on one thread).
-        // SAFETY: a fiber only runs under a resume, so `current()` is that thread's live runtime;
-        // each `&mut` deref here is momentary and single-threaded.
-        unsafe {
-            (*current()).yielders.push(y as *const Yielder);
-            // Resolve + type-check the funcref now (first resume), like the interpreter.
-            let slot = (funcref as u32 as usize) & (mask as usize);
-            let entry = (fn_table_base as *const FnEntry).add(slot);
-            let result = if (*entry).type_id() != type_id {
-                fault(trap_out);
-                0u64
-            } else {
-                call_tramp((*entry).code(), mem_base, fn_table_base, trap_out, sp, arg)
-            };
-            (*current()).yielders.pop();
-            result
-        }
-    });
+    let fiber = make_fiber(
+        funcref,
+        sp,
+        mem_base,
+        fn_table_base,
+        trap_out,
+        mask,
+        type_id,
+        call_tramp,
+    );
 
     let rt = &*rt;
-    match rt.table.create(Box::new(fiber)) {
+    match rt.table.create(Box::new(fiber), funcref, sp as i64) {
         Some(handle) => handle,
         None => {
             fault(trap_out); // a sibling vCPU filled the domain quota since the pre-check
@@ -387,10 +531,46 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         };
         (slot, fib)
     };
+    // Durable shadow-SP swap (DURABILITY.md §12.8, D-fiber-cont option A): `fiber_resume` brackets a
+    // fiber's residency, so the whole swap lives here (no change to `fiber_suspend`). On entry save
+    // the resumer's live shadow-SP and load this fiber's; on exit (the resume returns — the fiber
+    // suspended *or* finished) save the fiber's and restore the resumer's. So a freeze that lands
+    // while this fiber runs spills into *its* region, and the resumer resumes against its own.
+    let (durable, mem_base) = {
+        let rt = &*rt;
+        (rt.durable, rt.mem_base)
+    };
+    let resumer = if durable {
+        let rtm = &mut *rt;
+        let resumer = rtm.cur_shadow.take(); // the context being suspended (None = root)
+        let cur_sp = read_shadow_sp(mem_base);
+        match &resumer {
+            None => rtm.root_shadow_sp = cur_sp,
+            Some(rs) => rs.shadow_sp.store(cur_sp, Ordering::Relaxed),
+        }
+        write_shadow_sp(mem_base, slot.shadow_sp.load(Ordering::Relaxed));
+        rtm.cur_shadow = Some(Arc::clone(&slot));
+        Some(resumer)
+    } else {
+        None
+    };
     // Phase 2: the switch (may reenter the runtime) — no lock or `&mut` held; the claim makes
     // `*fib` exclusive to this vCPU. The same `svm-fiber` instruction sequence regardless of which
     // thread the fiber last ran on (see the module header's 3c soundness argument).
     let st = (*fib).resume(arg as u64);
+    // Exit swap: back in the resumer (possibly on a different OS thread — re-read the runtime).
+    // Save the fiber's now-current shadow-SP to its slot and restore the resumer's region.
+    if let Some(resumer) = resumer {
+        let rtm = &mut *current();
+        slot.shadow_sp
+            .store(read_shadow_sp(mem_base), Ordering::Relaxed);
+        let restore = match &resumer {
+            None => rtm.root_shadow_sp,
+            Some(rs) => rs.shadow_sp.load(Ordering::Relaxed),
+        };
+        write_shadow_sp(mem_base, restore);
+        rtm.cur_shadow = resumer;
+    }
     // Phase 3: publish the fiber's new state (clearing the seam assert *before* republishing).
     match st {
         State::Yielded(v) => {
@@ -446,6 +626,94 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
         rt.yielders.push(y);
     }
     r as i64
+}
+
+/// **Durable freeze driver** (DURABILITY.md §12.8 slice 3.3.2) — the JIT analogue of the
+/// interpreter's `VCpu::freeze_drive`. Called once the root has unwound under `UNWINDING` (its
+/// native stack drained into context 0's shadow region): flatten every still-**parked**
+/// (`RUNNABLE`) fiber into *its own* shadow region so the window snapshot captures its continuation.
+///
+/// Each parked fiber is resumed (via the ordinary [`fiber_resume`] path, so the shadow-SP swap
+/// points the active word at the fiber's region first): its `suspend` returns, and because the
+/// transform places the poll **immediately** after, that poll fires before any guest code runs →
+/// the fiber unwinds with **zero forward progress**, its guest function returns, and the `Fiber`
+/// *completes* (the slot frees). The exit swap leaves the fiber's flattened shadow-SP in its
+/// `FiberSlot` and restores the root's region, so the captured window is thaw-ready.
+///
+/// Runs **host-side** with `rt` (the root vCPU's runtime) published as [`CURRENT_RT`]. A flattening
+/// fiber touches only the committed durable reserve (state word + its shadow region) — never guest
+/// memory — so no guard page can fault; it is sound to run outside the §5 detect-and-kill guard.
+/// Single-vCPU (slice 3.1/3.3); multi-vCPU stop-the-world quiesce is Phase 3.2.
+///
+/// # Safety
+/// `rt` is the live root runtime (its `mem_base`/`durable` armed for this run); `trap_out` is the
+/// live trap cell. Called at a quiescent safepoint (the root returned), so the table is at rest.
+pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, trap_out: u64) -> Vec<crate::FrozenFiber> {
+    // The entry path already published `rt` as CURRENT_RT and hasn't restored it yet, but set it
+    // explicitly so the driver is correct independent of caller ordering.
+    let prev = set_current(rt);
+    let table = Arc::clone(&(*rt).table);
+    let mut status: i64 = 0;
+    let mut out = Vec::new();
+    for handle in table.runnable_handles() {
+        // Read the fiber's identity (immutable) before flattening; resume under the in-progress
+        // UNWINDING state word so it flattens itself and returns; then read its flattened shadow-SP.
+        let slot = table.resolve(handle).expect("a runnable handle resolves");
+        let (func, sp) = (slot.func, slot.sp);
+        fiber_resume(handle, 0, &mut status as *mut i64, trap_out);
+        out.push(crate::FrozenFiber {
+            slot: handle as usize,
+            func,
+            sp,
+            shadow_sp: slot.shadow_sp.load(Ordering::Relaxed),
+        });
+    }
+    set_current(prev);
+    out
+}
+
+/// Durable **thaw** re-seeding (slice 3.3.3): re-create each frozen fiber in the run-shared table
+/// before the root re-enters under `REWINDING`. Builds a fiber that re-enters its recorded entry
+/// (`make_fiber`, the same path as `cont.new`) at its dense slot, with its flattened shadow-SP
+/// restored. The seed is sorted/dense by slot, so handles match the freeze (`cont.resume k` resolves
+/// the same fiber). `rt` supplies the per-run threaded context; `mem_base`/`fn_table_base`/`trap_out`
+/// are this run's window/table/trap cell.
+///
+/// # Safety
+/// `rt` is the live runtime (its `call_tramp`/`mask`/`type_id` set); the addresses are this run's.
+pub(crate) unsafe fn seed_frozen_fibers(
+    rt: *mut FiberRuntime,
+    seed: &[crate::FrozenFiber],
+    mem_base: u64,
+    fn_table_base: u64,
+    trap_out: u64,
+) {
+    let r = &*rt;
+    let (mask, type_id, call_tramp) = (
+        r.fn_table_mask,
+        r.fiber_type_id,
+        r.call_tramp
+            .expect("call-trampoline set before seeding thawed fibers"),
+    );
+    let mut seed = seed.to_vec();
+    seed.sort_by_key(|f| f.slot);
+    for (expected, f) in seed.iter().enumerate() {
+        let fiber = make_fiber(
+            f.func,
+            f.sp as u64,
+            mem_base,
+            fn_table_base,
+            trap_out,
+            mask,
+            type_id,
+            call_tramp,
+        );
+        let got = r
+            .table
+            .seed_frozen(Box::new(fiber), f.func, f.sp, f.shadow_sp);
+        debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
+        debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
+    }
 }
 
 /// This frame's stack pointer (approximately): the address of a local, slightly **below** the
