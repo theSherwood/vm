@@ -2258,6 +2258,24 @@ fn c_guest_jit_demo() {
     );
 }
 
+/// Guest-side **dynamic linking** in C (DYNLINK.md C3, `demos/jit/jit_link.c`): a guest emits two
+/// units — a self-contained `service` it installs, and a `client` that references the service **by
+/// name** (an unresolved import `F`) — builds a symbol table binding `"F"` to the install slot, and
+/// `__vm_jit_compile_linked`s the client against it. The host resolves the import by name and
+/// re-verifies, so the client reaches the installed service through the table: `client(5,2) = 127`.
+/// This is `vm_dlopen`/`vm_dlsym` done in guest C. `run_c_full` enforces interp == JIT.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_jit_link_demo() {
+    let src = include_str!("../../svm-run/demos/jit/jit_link.c");
+    let run = run_c_full(src);
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        out.ends_with("client(5, 2) = 127  [linked by name: service(5,2)+100]\n"),
+        "the guest-linked client must reach the installed service by name on both backends:\n{out}"
+    );
+}
+
 /// The **threaded** guest-driven JIT capstone (`demos/jit/jit_threads.c`, DESIGN.md §22), run as a
 /// full interp≡JIT **differential**: `NWORKERS` guest threads each emit a distinct unit, `Jit.compile`
 /// it **concurrently**, and invoke the native code, checking it against a C reference. Because the

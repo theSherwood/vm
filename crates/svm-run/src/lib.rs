@@ -2134,6 +2134,7 @@ pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         "vm_io_reap" => (iface::IO_RING, 2),
         // Guest-driven JIT (§22).
         "vm_jit_compile" => (iface::JIT, 0),
+        "vm_jit_compile_linked" => (iface::JIT, 5),
         "vm_jit_invoke2" => (iface::JIT, 1),
         "vm_jit_release" => (iface::JIT, 2),
         "vm_jit_install" => (iface::JIT, 3),

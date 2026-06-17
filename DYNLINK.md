@@ -132,10 +132,19 @@ These already prove old code reaching newly-loaded code; the dynlink work adds t
   - **Op 5 on both backends**: the interp generic `Binding::JitDomain` arm + the JIT `jit_native_op`,
     differential-tested (interp == JIT) — incl. the full REPL flow guest-side (compile service →
     install → build symtab from the install slot → `compile_linked` a unit importing it → invoke = 127).
-- [ ] **C3 — the `vm_dlopen`/`vm_dlsym`/`vm_dlclose` C surface** over op 5 + `Memory` (data placement /
-      `DataReloc`s) + a chibicc `__vm_jit_compile_linked` builtin → `(iface::JIT, 5)`; then evolve
-      `demos/jit/jit_repl.c` into the real linking REPL. (C1 host half + C2 cap op are done; this is the
-      guest-facing packaging — the last capstone step.)
+- [x] **C3 — guest-C dynamic linking** (`crates/svm-run/demos/jit/jit_link.c`). A guest C program
+      links by name end to end: a chibicc `__vm_jit_compile_linked(ir, ir_len, symtab, symtab_len)`
+      builtin (`frontend/chibicc/codegen_ir.c`, declared in `include/svm.h`) lowers to
+      `call.import "vm_jit_compile_linked"`, which the §7 resolver maps to `(iface::JIT, 5)`. The demo
+      emits a self-contained `service` (installed → slot) and a `client` that imports it by name,
+      builds the C2 symbol-table buffer from the install slot, `compile_linked`s the client against it,
+      and invokes it (`client(5,2)=127`). Driven by `c_frontend.rs::c_guest_jit_link_demo` (interp == JIT).
+- [ ] **C3b — ergonomic `vm_dlopen`/`vm_dlsym`/`vm_dlclose` wrappers + a linking REPL.** Package the
+      jit_link.c steps as a small guest C library (a malloc-backed `name → slot` registry; `vm_dlopen`
+      = build symtab + `compile_linked` + `install` + record exports; `vm_dlsym` = registry lookup;
+      `vm_dlclose` = `__vm_jit_uninstall`), then evolve `demos/jit/jit_repl.c` into the **linking** REPL
+      (today it JITs throwaway units — make definitions persist + compose by name, the guest-C twin of
+      `dynlink_repl.rs`). Plus (later) data placement via `Memory` + `DataReloc`s for data symbols.
 - [ ] GOT / late-binding variant (so *old* code calls *not-yet-loaded* code by name without recompiling
       the caller: the caller does `call_indirect (load GOT[i])`; the loader writes the resolved slot
       into the GOT at load — pure data writes via `Memory` + `memory.init`, reusing M2's reloc). The
