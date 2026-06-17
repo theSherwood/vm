@@ -1352,6 +1352,26 @@ fn v_dot(lo: &mut Lower) -> Result<(), Error> {
     lo.push(v, ValType::V128);
     Ok(())
 }
+fn v_extmul(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VExtMul { shape, op, a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_extadd(lo: &mut Lower, shape: VShape, signed: bool) -> Result<(), Error> {
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VExtAddPairwise { shape, signed, a });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+fn v_q15mulr(lo: &mut Lower) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VQ15MulrSat { a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
 fn v_widen(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VWiden { shape, op, a });
@@ -2994,6 +3014,23 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I8x16AvgrU => v_avgr(lo, VShape::I8x16)?,
         O::I16x8AvgrU => v_avgr(lo, VShape::I16x8)?,
         O::I32x4DotI16x8S => v_dot(lo)?,
+        O::I16x8ExtMulLowI8x16S => v_extmul(lo, VShape::I16x8, VWidenOp::LowS)?,
+        O::I16x8ExtMulHighI8x16S => v_extmul(lo, VShape::I16x8, VWidenOp::HighS)?,
+        O::I16x8ExtMulLowI8x16U => v_extmul(lo, VShape::I16x8, VWidenOp::LowU)?,
+        O::I16x8ExtMulHighI8x16U => v_extmul(lo, VShape::I16x8, VWidenOp::HighU)?,
+        O::I32x4ExtMulLowI16x8S => v_extmul(lo, VShape::I32x4, VWidenOp::LowS)?,
+        O::I32x4ExtMulHighI16x8S => v_extmul(lo, VShape::I32x4, VWidenOp::HighS)?,
+        O::I32x4ExtMulLowI16x8U => v_extmul(lo, VShape::I32x4, VWidenOp::LowU)?,
+        O::I32x4ExtMulHighI16x8U => v_extmul(lo, VShape::I32x4, VWidenOp::HighU)?,
+        O::I64x2ExtMulLowI32x4S => v_extmul(lo, VShape::I64x2, VWidenOp::LowS)?,
+        O::I64x2ExtMulHighI32x4S => v_extmul(lo, VShape::I64x2, VWidenOp::HighS)?,
+        O::I64x2ExtMulLowI32x4U => v_extmul(lo, VShape::I64x2, VWidenOp::LowU)?,
+        O::I64x2ExtMulHighI32x4U => v_extmul(lo, VShape::I64x2, VWidenOp::HighU)?,
+        O::I16x8ExtAddPairwiseI8x16S => v_extadd(lo, VShape::I16x8, true)?,
+        O::I16x8ExtAddPairwiseI8x16U => v_extadd(lo, VShape::I16x8, false)?,
+        O::I32x4ExtAddPairwiseI16x8S => v_extadd(lo, VShape::I32x4, true)?,
+        O::I32x4ExtAddPairwiseI16x8U => v_extadd(lo, VShape::I32x4, false)?,
+        O::I16x8Q15MulrSatS => v_q15mulr(lo)?,
         // int↔float / float↔float conversions
         O::F32x4ConvertI32x4S => v_convert(lo, VCvtOp::F32x4ConvertI32x4S)?,
         O::F32x4ConvertI32x4U => v_convert(lo, VCvtOp::F32x4ConvertI32x4U)?,

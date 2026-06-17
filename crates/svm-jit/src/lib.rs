@@ -2588,6 +2588,13 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VAvgr { .. } => {}
                 // `i32x4.dot_i16x8_s` → `swiden_low/high` + `imul` + `iadd_pairwise` (all legalize).
                 Inst::VDot { .. } => {}
+                // Extended multiply → widen low/high both operands + `imul` on the wide shape.
+                // `imul` legalizes for every wide shape (incl. `i64x2`, unlike `i8x16.mul`).
+                Inst::VExtMul { .. } => {}
+                // Extended pairwise add → `swiden/uwiden` low+high + `iadd_pairwise` (all legalize).
+                Inst::VExtAddPairwise { .. } => {}
+                // Q15 rounding multiply → native `sqmul_round_sat`.
+                Inst::VQ15MulrSat { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -3663,6 +3670,54 @@ fn lower_block(
                 let pl = b.ins().imul(xl, yl);
                 let ph = b.ins().imul(xh, yh);
                 let r = b.ins().iadd_pairwise(pl, ph);
+                vcast(b, r, I8X16)
+            }
+            Inst::VExtMul {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Widen the same (low/high, sign) half of both operands to the wide shape, then
+                // multiply lane-wise — the wasm extmul.
+                let (low, signed) = op.parts();
+                let src = vec_ty(
+                    shape
+                        .narrower()
+                        .expect("verifier ensures a narrower source"),
+                );
+                let x = vcast(b, get(&vals, *a)?, src);
+                let y = vcast(b, get(&vals, *rb)?, src);
+                let (wx, wy) = match (low, signed) {
+                    (true, true) => (b.ins().swiden_low(x), b.ins().swiden_low(y)),
+                    (false, true) => (b.ins().swiden_high(x), b.ins().swiden_high(y)),
+                    (true, false) => (b.ins().uwiden_low(x), b.ins().uwiden_low(y)),
+                    (false, false) => (b.ins().uwiden_high(x), b.ins().uwiden_high(y)),
+                };
+                let r = b.ins().imul(wx, wy);
+                vcast(b, r, I8X16)
+            }
+            Inst::VExtAddPairwise { shape, signed, a } => {
+                // Widen the low and high halves of the source, then pairwise-add: the two halves'
+                // pairwise sums concatenate to `out[i] = w(a[2i]) + w(a[2i+1])`.
+                let src = vec_ty(
+                    shape
+                        .narrower()
+                        .expect("verifier ensures a narrower source"),
+                );
+                let x = vcast(b, get(&vals, *a)?, src);
+                let (lo, hi) = if *signed {
+                    (b.ins().swiden_low(x), b.ins().swiden_high(x))
+                } else {
+                    (b.ins().uwiden_low(x), b.ins().uwiden_high(x))
+                };
+                let r = b.ins().iadd_pairwise(lo, hi);
+                vcast(b, r, I8X16)
+            }
+            Inst::VQ15MulrSat { a, b: rb } => {
+                let x = vcast(b, get(&vals, *a)?, I16X8);
+                let y = vcast(b, get(&vals, *rb)?, I16X8);
+                let r = b.ins().sqmul_round_sat(x, y);
                 vcast(b, r, I8X16)
             }
             Inst::VSatBin {

@@ -5255,6 +5255,21 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         Inst::VDot { a, b } => {
             Value::V128(simd_dot(as_v128(get(vals, *a)?)?, as_v128(get(vals, *b)?)?))
         }
+        Inst::VExtMul { shape, op, a, b } => Value::V128(simd_extmul(
+            *shape,
+            *op,
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
+        Inst::VExtAddPairwise { shape, signed, a } => Value::V128(simd_extadd_pairwise(
+            *shape,
+            *signed,
+            as_v128(get(vals, *a)?)?,
+        )),
+        Inst::VQ15MulrSat { a, b } => Value::V128(simd_q15mulr(
+            as_v128(get(vals, *a)?)?,
+            as_v128(get(vals, *b)?)?,
+        )),
         Inst::VAnyTrue { a } => {
             Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
         }
@@ -5637,6 +5652,67 @@ fn simd_widen(out: VShape, op: VWidenOp, a: [u8; 16]) -> [u8; 16] {
             s
         };
         lane_write(&mut o, i, out_bytes, v);
+    }
+    o
+}
+
+/// `<wide>.extmul_{low,high}_<src>_{s,u}`: widen the low/high half of both operands (sign/zero per
+/// the op) and multiply lane-wise into the wide result. Products are computed in `i128` so they
+/// can't overflow before the wrapping write at the wide lane width.
+fn simd_extmul(out: VShape, op: VWidenOp, a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let (low, signed) = op.parts();
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize;
+    let base = if low { 0 } else { n };
+    let widen = |raw: u64| -> i128 {
+        if signed {
+            lane_sext(raw, src_bytes) as i128
+        } else {
+            raw as i128
+        }
+    };
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let x = widen(lane_read(&a, base + i, src_bytes));
+        let y = widen(lane_read(&b, base + i, src_bytes));
+        lane_write(&mut o, i, out_bytes, (x * y) as u64);
+    }
+    o
+}
+
+/// `<wide>.extadd_pairwise_<src>_{s,u}`: widen every source lane (sign/zero) and sum adjacent pairs
+/// into the wide result — `out[i] = w(a[2i]) + w(a[2i+1])`.
+fn simd_extadd_pairwise(out: VShape, signed: bool, a: [u8; 16]) -> [u8; 16] {
+    let out_bytes = out.lane_bytes() as usize;
+    let src_bytes = out_bytes / 2;
+    let n = out.lanes() as usize;
+    let widen = |raw: u64| -> i128 {
+        if signed {
+            lane_sext(raw, src_bytes) as i128
+        } else {
+            raw as i128
+        }
+    };
+    let mut o = [0u8; 16];
+    for i in 0..n {
+        let lo = widen(lane_read(&a, 2 * i, src_bytes));
+        let hi = widen(lane_read(&a, 2 * i + 1, src_bytes));
+        lane_write(&mut o, i, out_bytes, (lo + hi) as u64);
+    }
+    o
+}
+
+/// `i16x8.q15mulr_sat_s`: signed Q15 fixed-point multiply with rounding and saturation —
+/// `out[i] = sat_i16((a[i]·b[i] + 0x4000) >> 15)`.
+fn simd_q15mulr(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for i in 0..8 {
+        let x = lane_sext(lane_read(&a, i, 2), 2);
+        let y = lane_sext(lane_read(&b, i, 2), 2);
+        let r = (x * y + 0x4000) >> 15;
+        let sat = r.clamp(i16::MIN as i64, i16::MAX as i64);
+        lane_write(&mut o, i, 2, sat as u16 as u64);
     }
     o
 }

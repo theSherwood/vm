@@ -432,6 +432,51 @@ fn i32x4_dot_i16x8_s() {
     assert_eq!(eval(wat, "dot", &[]), Value::I32(120));
 }
 
+/// Extended multiply + extadd_pairwise through the wasm bridge — the widening multiply-accumulate
+/// that DSP/ML int8 kernels emit. Compute `i16x8.extmul_low_i8x16_s` of two byte vectors, then
+/// `i32x4.extadd_pairwise_i16x8_s` to widen-and-sum — and read lane 0. With both operands = splat(3)
+/// over the low 8 bytes: each extmul lane = 9, pairwise add of two = 18.
+#[test]
+fn extmul_extadd_pairwise_macc() {
+    let wat = "(module (func (export \"f\") (param $x i32) (result i32)
+                 (i32x4.extract_lane 0
+                   (i32x4.extadd_pairwise_i16x8_s
+                     (i16x8.extmul_low_i8x16_s
+                       (i8x16.splat (local.get $x)) (i8x16.splat (local.get $x)))))))";
+    for x in [3, 5, 10, -4] {
+        let got = match eval(wat, "f", &[Value::I32(x)]) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        };
+        // extmul_low_s squares the (sign-extended) low byte; pairwise add sums two adjacent.
+        let sq = (x as i8 as i32).pow(2);
+        assert_eq!(got, sq * 2, "macc {x}");
+    }
+}
+
+/// `i16x8.q15mulr_sat_s` through the wasm bridge — Q15 fixed-point multiply (the saturating
+/// rounding multiply audio/DSP code uses). Splat two i16 values, read lane 0; oracle = the
+/// rounding-saturating formula. Includes the `-1.0 * -1.0` corner that saturates to i16::MAX.
+#[test]
+fn i16x8_q15mulr_sat_s() {
+    let wat = "(module (func (export \"f\") (param $a i32) (param $b i32) (result i32)
+                 (i16x8.extract_lane_s 0
+                   (i16x8.q15mulr_sat_s (i16x8.splat (local.get $a)) (i16x8.splat (local.get $b))))))";
+    for (a, b) in [
+        (16384i16, 16384i16),
+        (-32768, -32768),
+        (1000, -2000),
+        (0, 12345),
+    ] {
+        let got = match eval(wat, "f", &[Value::I32(a as i32), Value::I32(b as i32)]) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        };
+        let want = ((a as i64 * b as i64 + 0x4000) >> 15).clamp(i16::MIN as i64, i16::MAX as i64);
+        assert_eq!(got, want as i32, "q15mulr {a} {b}");
+    }
+}
+
 /// `i8x16.avgr_u` through the wasm bridge — the unsigned rounding average that image/blend kernels
 /// emit for "blend two pixels". Splat two byte values, read lane 0; oracle = `(a+b+1)>>1`.
 #[test]

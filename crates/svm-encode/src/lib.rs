@@ -174,6 +174,9 @@ mod op {
         pub const VPOPCNT: u8 = 0x1B; // a (i8x16 implicit)
         pub const VAVGR: u8 = 0x1C; // shape, a, b
         pub const VDOT: u8 = 0x1D; // a, b (i16x8 -> i32x4 implicit)
+        pub const VEXTMUL: u8 = 0x1E; // shape (wide), op (VWidenOp), a, b
+        pub const VEXTADD: u8 = 0x1F; // shape (wide), signed (u8), a
+        pub const VQ15MULR: u8 = 0x20; // a, b (i16x8 implicit)
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -734,6 +737,27 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
+        Inst::VExtMul { shape, op: o, a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VEXTMUL);
+            out.push(shape.index());
+            out.push(o.index());
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
+        Inst::VExtAddPairwise { shape, signed, a } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VEXTADD);
+            out.push(shape.index());
+            out.push(*signed as u8);
+            write_uleb(out, *a as u64);
+        }
+        Inst::VQ15MulrSat { a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VQ15MULR);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
         Inst::VAnyTrue { a } => {
             out.push(op::SIMD);
             out.push(op::simd::VANY_TRUE);
@@ -957,6 +981,29 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             b: c.idx()?,
         },
         op::simd::VDOT => Inst::VDot {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::VEXTMUL => {
+            let shape = dec_shape(c)?;
+            let ob = c.byte()?;
+            Inst::VExtMul {
+                shape,
+                op: VWidenOp::from_index(ob).ok_or(DecodeError::BadOpcode(ob))?,
+                a: c.idx()?,
+                b: c.idx()?,
+            }
+        }
+        op::simd::VEXTADD => {
+            let shape = dec_shape(c)?;
+            let signed = c.byte()? != 0;
+            Inst::VExtAddPairwise {
+                shape,
+                signed,
+                a: c.idx()?,
+            }
+        }
+        op::simd::VQ15MULR => Inst::VQ15MulrSat {
             a: c.idx()?,
             b: c.idx()?,
         },

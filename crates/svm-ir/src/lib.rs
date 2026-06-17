@@ -1924,6 +1924,30 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+    /// Extended (widening) multiply: widen the low/high half of both `i8x16`/`i16x8`/`i32x4`
+    /// operands (sign- or zero-, per [`VWidenOp`]) to the next wider shape, then multiply lane-wise.
+    /// `shape` is the **wide result** (`i16x8`/`i32x4`/`i64x2`); `a`/`b`/result are `v128`.
+    VExtMul {
+        shape: VShape,
+        op: VWidenOp,
+        a: ValIdx,
+        b: ValIdx,
+    },
+    /// Extended pairwise add: widen every lane of an `i8x16`/`i16x8` source (sign- or zero-, per
+    /// `signed`) and sum adjacent pairs into the next wider shape — `out[i] = w(a[2i]) + w(a[2i+1])`.
+    /// `shape` is the **wide result** (`i16x8`/`i32x4`); `a`/result are `v128`.
+    VExtAddPairwise {
+        shape: VShape,
+        signed: bool,
+        a: ValIdx,
+    },
+    /// `i16x8.q15mulr_sat_s`: signed Q15 fixed-point multiply with rounding and saturation —
+    /// `out[i] = sat_i16((a[i]·b[i] + 0x4000) >> 15)`. Fixed `i16x8` (the only shape wasm defines),
+    /// so no shape field. `a`/`b`/result are `v128`.
+    VQ15MulrSat {
+        a: ValIdx,
+        b: ValIdx,
+    },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.
     VAnyTrue {
