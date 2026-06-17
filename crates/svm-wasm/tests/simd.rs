@@ -318,6 +318,28 @@ fn f32x4_lane_compare_masks() {
     assert_eq!(eval(&cmp("f32x4.ne"), "f", &nan), Value::I32(-1));
 }
 
+/// f64↔i32 lane-count-changing conversions through the wasm bridge: `f64x2.convert_low_i32x4_s`
+/// (low 2 i32 → f64x2) then `i32x4.trunc_sat_f64x2_s_zero` back, with a `+0.5` in between so the
+/// truncation is observable. The result must round-trip the integer (trunc of `x + 0.5` is `x` for
+/// the small values here). `eval` enforces interp == JIT through the i64x2-intermediate lowering.
+#[test]
+fn f64x2_convert_low_and_trunc_sat_zero() {
+    let wat = "(module (func (export \"f\") (param $x i32) (result i32)
+                 (i32x4.extract_lane 0
+                   (i32x4.trunc_sat_f64x2_s_zero
+                     (f64x2.add
+                       (f64x2.convert_low_i32x4_s (i32x4.splat (local.get $x)))
+                       (f64x2.splat (f64.const 0.5)))))))";
+    for x in [0, 1, -1, 7, -7, 1000, -1000] {
+        let got = match eval(wat, "f", &[Value::I32(x)]) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        };
+        // trunc(x + 0.5): toward zero, so x for x>=0, and x for x<0 (e.g. -7+0.5=-6.5 → -6).
+        assert_eq!(got, (x as f64 + 0.5).trunc() as i32, "convert/trunc {x}");
+    }
+}
+
 /// Pseudo-min/max through the wasm bridge. `pmin`/`pmax` are a one-sided compare-and-select
 /// (`pmin(a,b)=b<a?b:a`, `pmax(a,b)=a<b?b:a`), so a NaN operand and signed zeros propagate by the
 /// `<` rule rather than IEEE min/max canonicalization. `eval` enforces interp == JIT lane-for-lane.

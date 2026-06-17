@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (94 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (95 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -96,7 +96,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
 - [ ] **SIMD remainder** (~68 of the v128 proposal):
-  the f64↔i32 conversions (`convert_low`/`trunc_sat_*_zero`), extadd/extmul, q15mulr, etc.
+  extadd/extmul, q15mulr, etc.
   Mechanical breadth over the proven 5-step
   pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops have
   no single Cranelift instruction (cf. `i8x16.mul` already bailing on the JIT).
@@ -131,12 +131,15 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     one narrow vector, `a` then `b` (`Inst::VNarrow`; Cranelift `snarrow`/`unarrow`; verifier restricts
     to the two narrow result shapes). Source read as signed, `s`/`u` pick the clamp range; tests incl.
     a clamp-pack idiom.
-  - [x] **int↔float / float↔float conversions (i32↔f32 + demote/promote) — DONE.**
+  - [x] **int↔float / float↔float conversions (all 10) — DONE.**
     `f32x4.convert_i32x4_{s,u}`, `i32x4.trunc_sat_f32x4_{s,u}`, `f32x4.demote_f64x2_zero`,
-    `f64x2.promote_low_f32x4` (`Inst::VConvert`, whole-instruction mnemonics; Cranelift
+    `f64x2.promote_low_f32x4`, plus the **f64↔i32** `f64x2.convert_low_i32x4_{s,u}` and
+    `i32x4.trunc_sat_f64x2_{s,u}_zero` (`Inst::VConvert`, whole-instruction mnemonics; Cranelift
     `fcvt_from_{s,u}int`/`fcvt_to_{s,u}int_sat`/`fvdemote`/`fvpromote_low`). Rust's `as` casts are the
-    oracle — they already match wasm's round-to-nearest + `trunc_sat` (NaN→0, clamp). The **f64↔i32**
-    `convert_low`/`trunc_sat_*_zero` four remain (lane-count mismatch → multi-instruction lowering).
+    oracle — they already match wasm's round-to-nearest + `trunc_sat` (NaN→0, clamp). The four
+    lane-count-changing f64↔i32 ops widen/narrow through an `i64x2` intermediate (`swiden_low`/
+    `uwiden_low` for convert_low; `snarrow`/`uunarrow` against a zero vector for trunc_sat_zero) —
+    the same recipe Cranelift's own wasm frontend uses.
   - [x] **Pseudo-min/max (pmin/pmax) — DONE.** `f32x4`/`f64x2` `{pmin,pmax}` (`Inst::VPMinMax`, a
     float-only family the verifier restricts to the two float shapes). Unlike IEEE `min`/`max` these
     are a one-sided compare-and-select — `pmin(a,b)=b<a?b:a`, `pmax(a,b)=a<b?b:a` — so a NaN operand
@@ -201,10 +204,10 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 3. **Tail calls** 🟡 — common LLVM output, likely near-free (IR terminators exist).
 4. **Passive *data* segments + `memory.init`/`data.drop`** 🟡 — DONE. (The *table* bulk ops + passive
    *element* segments remain — they need a mutable runtime table; lower audience.)
-5. **SIMD remainder** 🟡 — **mostly landed** (14 of ~17 op families: compares (int+float), min/max,
-   shifts, abs/neg, the boolean reductions, saturating add/sub, widen, narrow, the i32↔f32 + demote/
-   promote conversions, pmin/pmax, `i8x16.popcnt`, `avgr_u`, dot product). The **tail** remains:
-   extadd/extmul, `q15mulr_sat`, and the f64↔i32 conversions. Same proven 5-step pattern.
+5. **SIMD remainder** 🟡 — **mostly landed** (15 of ~17 op families: compares (int+float), min/max,
+   shifts, abs/neg, the boolean reductions, saturating add/sub, widen, narrow, all 10 int↔float /
+   float↔float conversions, pmin/pmax, `i8x16.popcnt`, `avgr_u`, dot product). The **tail** remains:
+   extadd/extmul and `q15mulr_sat`. Same proven 5-step pattern.
 6. **Reference types** 🟡 (externref→handle, funcref→index), then the **narrow-atomic CAS-loop** 🟡.
 7. EH, relaxed SIMD, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
 

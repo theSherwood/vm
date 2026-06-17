@@ -3739,6 +3739,41 @@ fn lower_block(
                         let x = vcast(b, raw, F32X4);
                         b.ins().fvpromote_low(x)
                     }
+                    // Lane-count changes (2↔4). Widen/narrow through the i64x2 intermediate, the
+                    // same recipe Cranelift's own wasm frontend uses.
+                    VCvtOp::F64x2ConvertLowI32x4S => {
+                        let x = vcast(b, raw, I32X4);
+                        let w = b.ins().swiden_low(x); // low 2 i32 → i64x2
+                        b.ins().fcvt_from_sint(F64X2, w)
+                    }
+                    VCvtOp::F64x2ConvertLowI32x4U => {
+                        let x = vcast(b, raw, I32X4);
+                        let w = b.ins().uwiden_low(x); // low 2 u32 → i64x2
+                        b.ins().fcvt_from_uint(F64X2, w)
+                    }
+                    VCvtOp::I32x4TruncSatF64x2SZero => {
+                        let x = vcast(b, raw, F64X2);
+                        let conv = b.ins().fcvt_to_sint_sat(I64X2, x); // i64x2
+                        let zc = b
+                            .func
+                            .dfg
+                            .constants
+                            .insert(ConstantData::from(&[0u8; 16][..]));
+                        let zero = b.ins().vconst(I64X2, zc);
+                        // snarrow packs [conv | zero] → i32x4: low 2 lanes = conv, high 2 = 0.
+                        b.ins().snarrow(conv, zero)
+                    }
+                    VCvtOp::I32x4TruncSatF64x2UZero => {
+                        let x = vcast(b, raw, F64X2);
+                        let conv = b.ins().fcvt_to_uint_sat(I64X2, x); // i64x2
+                        let zc = b
+                            .func
+                            .dfg
+                            .constants
+                            .insert(ConstantData::from(&[0u8; 16][..]));
+                        let zero = b.ins().vconst(I64X2, zc);
+                        b.ins().uunarrow(conv, zero)
+                    }
                 };
                 vcast(b, r, I8X16)
             }

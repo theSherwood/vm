@@ -512,16 +512,28 @@ pub enum VCvtOp {
     F32x4DemoteF64x2Zero,
     /// `f64x2.promote_low_f32x4`: the low two `f32` lanes → `f64`.
     F64x2PromoteLowF32x4,
+    /// `f64x2.convert_low_i32x4_s`: the low two `i32` lanes → `f64` (lanes 0/1).
+    F64x2ConvertLowI32x4S,
+    /// `f64x2.convert_low_i32x4_u`: the low two `u32` lanes → `f64` (lanes 0/1).
+    F64x2ConvertLowI32x4U,
+    /// `i32x4.trunc_sat_f64x2_s_zero`: the two `f64` lanes → saturating `i32` (lanes 0/1); 2/3 = 0.
+    I32x4TruncSatF64x2SZero,
+    /// `i32x4.trunc_sat_f64x2_u_zero`: the two `f64` lanes → saturating `u32` (lanes 0/1); 2/3 = 0.
+    I32x4TruncSatF64x2UZero,
 }
 
 impl VCvtOp {
-    pub const ALL: [VCvtOp; 6] = [
+    pub const ALL: [VCvtOp; 10] = [
         VCvtOp::F32x4ConvertI32x4S,
         VCvtOp::F32x4ConvertI32x4U,
         VCvtOp::I32x4TruncSatF32x4S,
         VCvtOp::I32x4TruncSatF32x4U,
         VCvtOp::F32x4DemoteF64x2Zero,
         VCvtOp::F64x2PromoteLowF32x4,
+        VCvtOp::F64x2ConvertLowI32x4S,
+        VCvtOp::F64x2ConvertLowI32x4U,
+        VCvtOp::I32x4TruncSatF64x2SZero,
+        VCvtOp::I32x4TruncSatF64x2UZero,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -531,6 +543,10 @@ impl VCvtOp {
             VCvtOp::I32x4TruncSatF32x4U => "i32x4.trunc_sat_f32x4_u",
             VCvtOp::F32x4DemoteF64x2Zero => "f32x4.demote_f64x2_zero",
             VCvtOp::F64x2PromoteLowF32x4 => "f64x2.promote_low_f32x4",
+            VCvtOp::F64x2ConvertLowI32x4S => "f64x2.convert_low_i32x4_s",
+            VCvtOp::F64x2ConvertLowI32x4U => "f64x2.convert_low_i32x4_u",
+            VCvtOp::I32x4TruncSatF64x2SZero => "i32x4.trunc_sat_f64x2_s_zero",
+            VCvtOp::I32x4TruncSatF64x2UZero => "i32x4.trunc_sat_f64x2_u_zero",
         }
     }
     pub fn index(self) -> u8 {

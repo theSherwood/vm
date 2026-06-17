@@ -1428,6 +1428,70 @@ fn diff_demote_promote() {
     }
 }
 
+// f64↔i32 conversions (the lane-count-changing four): `f64x2.convert_low_i32x4_{s,u}` (low 2 i32
+// lanes → f64x2) and `i32x4.trunc_sat_f64x2_{s,u}_zero` (f64x2 → low 2 i32 lanes, high 2 zeroed).
+// Oracle = Rust's `as` casts; `diff1` pins interp == JIT (so the i64x2-intermediate JIT recipe must
+// match the interp's per-lane semantics).
+#[test]
+fn diff_f64_i32_convert() {
+    // i32 → f64 convert_low (signed + unsigned), observe f64 bits of lane 0.
+    let cl = |op: &str, x: i32| -> i64 {
+        let s = format!(
+            "func (i32) -> (i64) {{\nblock0(v0: i32):\n  v1 = i32x4.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i64x2.extract_lane 0 v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::I32(x)])
+    };
+    for x in [0, -5, 1_000_000, i32::MAX, i32::MIN, -1] {
+        assert_eq!(
+            cl("f64x2.convert_low_i32x4_s", x),
+            (x as f64).to_bits() as i64,
+            "convert_low_s {x}"
+        );
+        assert_eq!(
+            cl("f64x2.convert_low_i32x4_u", x),
+            ((x as u32) as f64).to_bits() as i64,
+            "convert_low_u {x}"
+        );
+    }
+
+    // f64 → i32 trunc_sat_zero (signed + unsigned), observe i32 lane.
+    let ts = |op: &str, x: f64, lane: u8| -> i32 {
+        let s = format!(
+            "func (f64) -> (i32) {{\nblock0(v0: f64):\n  v1 = f64x2.splat v0\n\
+             \x20 v2 = {op} v1\n  v3 = i32x4.extract_lane {lane} v2\n  return v3\n}}\n"
+        );
+        diff1(&s, &[Value::F64(x)]) as i32
+    };
+    for x in [
+        3.9f64,
+        -3.9,
+        0.0,
+        1e18,
+        -1e18,
+        f64::NAN,
+        f64::INFINITY,
+        -f64::INFINITY,
+    ] {
+        assert_eq!(
+            ts("i32x4.trunc_sat_f64x2_s_zero", x, 0),
+            x as i32,
+            "trunc_sat_s {x}"
+        );
+        assert_eq!(
+            ts("i32x4.trunc_sat_f64x2_u_zero", x, 0),
+            (x as u32) as i32,
+            "trunc_sat_u {x}"
+        );
+    }
+    // The high lanes (2/3) are zeroed.
+    assert_eq!(
+        ts("i32x4.trunc_sat_f64x2_s_zero", 3.9, 2),
+        0,
+        "trunc_sat_zero high lane"
+    );
+}
+
 /// Conversions round-trip through text + binary (whole-instruction mnemonics).
 #[test]
 fn conversion_roundtrip() {
@@ -1437,6 +1501,10 @@ fn conversion_roundtrip() {
         v3 = i32x4.trunc_sat_f32x4_u v2\n\
         v4 = f64x2.promote_low_f32x4 v2\n\
         v5 = f32x4.demote_f64x2_zero v4\n\
+        v7 = f64x2.convert_low_i32x4_s v1\n\
+        v8 = f64x2.convert_low_i32x4_u v1\n\
+        v9 = i32x4.trunc_sat_f64x2_s_zero v7\n\
+        v10 = i32x4.trunc_sat_f64x2_u_zero v8\n\
         v6 = i32x4.extract_lane 0 v3\n  return v6\n}\n";
     let m = build(src);
     assert_eq!(

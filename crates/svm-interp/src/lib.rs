@@ -5566,6 +5566,32 @@ fn simd_convert(op: VCvtOp, a: [u8; 16]) -> [u8; 16] {
                 lane_write(&mut o, i, 8, (x as f64).to_bits());
             }
         }
+        VCvtOp::F64x2ConvertLowI32x4S => {
+            for i in 0..2 {
+                let x = lane_read(&a, i, 4) as u32 as i32;
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
+        VCvtOp::F64x2ConvertLowI32x4U => {
+            for i in 0..2 {
+                let x = lane_read(&a, i, 4) as u32;
+                lane_write(&mut o, i, 8, (x as f64).to_bits());
+            }
+        }
+        VCvtOp::I32x4TruncSatF64x2SZero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as i32) as u32 as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
+        VCvtOp::I32x4TruncSatF64x2UZero => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                lane_write(&mut o, i, 4, (x as u32) as u64);
+            }
+            // lanes 2/3 stay zero.
+        }
     }
     o
 }
