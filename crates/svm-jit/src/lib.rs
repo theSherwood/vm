@@ -71,8 +71,8 @@ use cranelift_module::{FuncId, Linkage, Module};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
-    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VSatBinOp,
-    VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
+    VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
+    VSatBinOp, VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
@@ -2687,6 +2687,20 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VShift { .. } => {}
                 // Lane `abs`/`neg` lower to vector `iabs`/`ineg`; Cranelift legalizes every shape.
                 Inst::VIntUn { .. } => {}
+                // `i8x16.popcnt` lowers to a vector `popcnt` (native `cnt` on aarch64, a byte
+                // shuffle sequence on x86 — Cranelift legalizes both).
+                Inst::VPopcnt { .. } => {}
+                // `avgr_u` (`i8x16`/`i16x8` only, verifier-enforced) → native `avg_round`.
+                Inst::VAvgr { .. } => {}
+                // `i32x4.dot_i16x8_s` → `swiden_low/high` + `imul` + `iadd_pairwise` (all legalize).
+                Inst::VDot { .. } => {}
+                // Extended multiply → widen low/high both operands + `imul` on the wide shape.
+                // `imul` legalizes for every wide shape (incl. `i64x2`, unlike `i8x16.mul`).
+                Inst::VExtMul { .. } => {}
+                // Extended pairwise add → `swiden/uwiden` low+high + `iadd_pairwise` (all legalize).
+                Inst::VExtAddPairwise { .. } => {}
+                // Q15 rounding multiply → native `sqmul_round_sat`.
+                Inst::VQ15MulrSat { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -2696,6 +2710,8 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VWiden { .. } | Inst::VNarrow { .. } => {}
                 // Int↔float / float↔float conversions → Cranelift `fcvt_*` / `fvdemote`/`fvpromote_low`.
                 Inst::VConvert { .. } => {}
+                // pmin/pmax lower to a single `fcmp` plus `bitselect` (both legalize on every target).
+                Inst::VPMinMax { .. } => {}
                 // §12 fibers/threads: lowered to host runtime calls, but only where the stack-switch
                 // substrate exists (`svm_fiber::supported()` — x86-64 unix). Elsewhere, bail so the
                 // differential harness skips rather than miscompiles.
@@ -3736,6 +3752,80 @@ fn lower_block(
                 };
                 vcast(b, r, I8X16)
             }
+            Inst::VPopcnt { a } => {
+                // Canonical vectors are already I8X16, matching the op's fixed shape.
+                b.ins().popcnt(get(&vals, *a)?)
+            }
+            Inst::VAvgr { shape, a, b: rb } => {
+                let ty = vec_ty(*shape);
+                let x = vcast(b, get(&vals, *a)?, ty);
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let r = b.ins().avg_round(x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VDot { a, b: rb } => {
+                // Widen each i16x8 operand to two i32x4 halves, multiply lane-wise, then
+                // horizontally add adjacent products: `iadd_pairwise([a0b0,a1b1,a2b2,a3b3],
+                // [a4b4,..]) = [a0b0+a1b1, a2b2+a3b3, a4b4+a5b5, a6b6+a7b7]` — the wasm dot result.
+                let x = vcast(b, get(&vals, *a)?, I16X8);
+                let y = vcast(b, get(&vals, *rb)?, I16X8);
+                let xl = b.ins().swiden_low(x);
+                let xh = b.ins().swiden_high(x);
+                let yl = b.ins().swiden_low(y);
+                let yh = b.ins().swiden_high(y);
+                let pl = b.ins().imul(xl, yl);
+                let ph = b.ins().imul(xh, yh);
+                let r = b.ins().iadd_pairwise(pl, ph);
+                vcast(b, r, I8X16)
+            }
+            Inst::VExtMul {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // Widen the same (low/high, sign) half of both operands to the wide shape, then
+                // multiply lane-wise — the wasm extmul.
+                let (low, signed) = op.parts();
+                let src = vec_ty(
+                    shape
+                        .narrower()
+                        .expect("verifier ensures a narrower source"),
+                );
+                let x = vcast(b, get(&vals, *a)?, src);
+                let y = vcast(b, get(&vals, *rb)?, src);
+                let (wx, wy) = match (low, signed) {
+                    (true, true) => (b.ins().swiden_low(x), b.ins().swiden_low(y)),
+                    (false, true) => (b.ins().swiden_high(x), b.ins().swiden_high(y)),
+                    (true, false) => (b.ins().uwiden_low(x), b.ins().uwiden_low(y)),
+                    (false, false) => (b.ins().uwiden_high(x), b.ins().uwiden_high(y)),
+                };
+                let r = b.ins().imul(wx, wy);
+                vcast(b, r, I8X16)
+            }
+            Inst::VExtAddPairwise { shape, signed, a } => {
+                // Widen the low and high halves of the source, then pairwise-add: the two halves'
+                // pairwise sums concatenate to `out[i] = w(a[2i]) + w(a[2i+1])`.
+                let src = vec_ty(
+                    shape
+                        .narrower()
+                        .expect("verifier ensures a narrower source"),
+                );
+                let x = vcast(b, get(&vals, *a)?, src);
+                let (lo, hi) = if *signed {
+                    (b.ins().swiden_low(x), b.ins().swiden_high(x))
+                } else {
+                    (b.ins().uwiden_low(x), b.ins().uwiden_high(x))
+                };
+                let r = b.ins().iadd_pairwise(lo, hi);
+                vcast(b, r, I8X16)
+            }
+            Inst::VQ15MulrSat { a, b: rb } => {
+                let x = vcast(b, get(&vals, *a)?, I16X8);
+                let y = vcast(b, get(&vals, *rb)?, I16X8);
+                let r = b.ins().sqmul_round_sat(x, y);
+                vcast(b, r, I8X16)
+            }
             Inst::VSatBin {
                 shape,
                 op,
@@ -3810,6 +3900,41 @@ fn lower_block(
                         let x = vcast(b, raw, F32X4);
                         b.ins().fvpromote_low(x)
                     }
+                    // Lane-count changes (2↔4). Widen/narrow through the i64x2 intermediate, the
+                    // same recipe Cranelift's own wasm frontend uses.
+                    VCvtOp::F64x2ConvertLowI32x4S => {
+                        let x = vcast(b, raw, I32X4);
+                        let w = b.ins().swiden_low(x); // low 2 i32 → i64x2
+                        b.ins().fcvt_from_sint(F64X2, w)
+                    }
+                    VCvtOp::F64x2ConvertLowI32x4U => {
+                        let x = vcast(b, raw, I32X4);
+                        let w = b.ins().uwiden_low(x); // low 2 u32 → i64x2
+                        b.ins().fcvt_from_uint(F64X2, w)
+                    }
+                    VCvtOp::I32x4TruncSatF64x2SZero => {
+                        let x = vcast(b, raw, F64X2);
+                        let conv = b.ins().fcvt_to_sint_sat(I64X2, x); // i64x2
+                        let zc = b
+                            .func
+                            .dfg
+                            .constants
+                            .insert(ConstantData::from(&[0u8; 16][..]));
+                        let zero = b.ins().vconst(I64X2, zc);
+                        // snarrow packs [conv | zero] → i32x4: low 2 lanes = conv, high 2 = 0.
+                        b.ins().snarrow(conv, zero)
+                    }
+                    VCvtOp::I32x4TruncSatF64x2UZero => {
+                        let x = vcast(b, raw, F64X2);
+                        let conv = b.ins().fcvt_to_uint_sat(I64X2, x); // i64x2
+                        let zc = b
+                            .func
+                            .dfg
+                            .constants
+                            .insert(ConstantData::from(&[0u8; 16][..]));
+                        let zero = b.ins().vconst(I64X2, zc);
+                        b.ins().uunarrow(conv, zero)
+                    }
                 };
                 vcast(b, r, I8X16)
             }
@@ -3869,6 +3994,29 @@ fn lower_block(
                 let x = vcast(b, get(&vals, *a)?, ty);
                 let r = float_un(b, vf_un(*op), x);
                 vcast(b, r, I8X16)
+            }
+            Inst::VPMinMax {
+                shape,
+                op,
+                a,
+                b: rb,
+            } => {
+                // pmin(a,b) = b < a ? b : a ; pmax(a,b) = a < b ? b : a.
+                // Both select the second operand `b` where a one-sided `<` holds — only the
+                // compare operand order differs. `fcmp` yields the lane mask (`I32X4`/`I64X2`),
+                // which we blend in the canonical `I8X16` domain so `bitselect`'s three args
+                // share a type. This matches the interp's NaN/-0 propagation (no IEEE min/max).
+                let ty = vec_ty(*shape);
+                let xc = get(&vals, *a)?;
+                let yc = get(&vals, *rb)?;
+                let x = vcast(b, xc, ty);
+                let y = vcast(b, yc, ty);
+                let mask = match op {
+                    VPMinMaxOp::Pmin => b.ins().fcmp(FloatCC::LessThan, y, x),
+                    VPMinMaxOp::Pmax => b.ins().fcmp(FloatCC::LessThan, x, y),
+                };
+                let m = vcast(b, mask, I8X16);
+                b.ins().bitselect(m, yc, xc)
             }
             Inst::VBitBin { op, a, b: rb } => {
                 // Whole-vector — operate on the canonical I8X16 directly.
