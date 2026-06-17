@@ -227,6 +227,11 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // Direct `<svm.h>` Memory-capability builtins (`__vm_map`/`unmap`/`protect`/`page_size`): register
     // their §7 imports and remember the program needs the `Memory` handle granted, even with no `malloc`.
     let uses_vm_memory = register_vm_memory_imports(m, &defined_names, &mut imports, &mut caps);
+    // §9/§12 async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap`): register their `IoRing`
+    // imports; `__vm_blocking_handle` only reads the stashed `Blocking` handle (no import). Together
+    // they raise the powerbox arity to grant the `IoRing`/`Blocking` handles.
+    let uses_vm_io = register_vm_io_imports(m, &defined_names, &mut imports, &mut caps);
+    let uses_blocking = calls_external(m, &defined_names, "__vm_blocking_handle") && has_main;
     // `realloc` is a synthesized helper built on `malloc` + `memcpy`, so it forces both on.
     let need_realloc = calls_external(m, &defined_names, "realloc") && has_main;
     let need_malloc = (needs_malloc(m, &defined_names) || need_realloc) && has_main;
@@ -236,7 +241,23 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
     // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
-    let synth = (!imports.is_empty() || need_malloc) && has_main;
+    // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
+    // declared arity), sized to the highest capability index the program uses: exit(2) always,
+    // memory(3) for `malloc`/Memory builtins, ioring(5) for the async ring, blocking(6) for
+    // `__vm_blocking_handle`. (AddressSpace(4)/Jit(7) come with the §13/§14 region + §22 jit builtins.)
+    let max_cap_index = if uses_blocking {
+        6
+    } else if uses_vm_io {
+        5
+    } else if need_memory_cap {
+        3
+    } else {
+        2
+    };
+    let n_handles = max_cap_index + 1;
+    // A powerbox entry is synthesized when the program needs the handle stash: it uses a named import,
+    // `malloc`, or a stash-only builtin (`__vm_blocking_handle`, which adds no import of its own).
+    let synth = (!imports.is_empty() || need_malloc || uses_blocking) && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
     if need_malloc {
@@ -330,13 +351,7 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         let main_results = funcs[(main_idx - base) as usize].results.clone();
         funcs.insert(
             0,
-            synth_start(
-                main_idx,
-                &main_results,
-                entry_sp,
-                need_memory_cap,
-                heap_base,
-            ),
+            synth_start(main_idx, &main_results, entry_sp, n_handles, heap_base),
         );
     }
     // Append the synthesized helpers in index order (memset, memcpy, malloc, utoa, realloc) —
@@ -1276,8 +1291,13 @@ const STASH_EXIT: u64 = 8;
 /// `<svm.h>` Memory builtin (then `_start` takes a 4th granted handle). The bump allocator + the
 /// `__vm_map`/… builtins reload it to drive `Memory` capability calls.
 const STASH_MEMORY: u64 = 12;
-/// End of the reserved 8-handle region (slots 4–7, offsets `16/20/24/28`, are the AddressSpace/
-/// IoRing/Blocking/Jit tail — named + granted when a builtin that consumes them lands, P2). The
+/// The `IoRing` (slot 5) and `Blocking` (slot 6) handles — granted when the program uses the §9/§12
+/// async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap` drive `IoRing`; `__vm_blocking_handle`
+/// returns the `Blocking` handle a guest names in an SQE). Slot 4 (`AddressSpace`) and slot 7 (`Jit`)
+/// stay reserved (offsets 16/28) for the §13/§14 region + §22 jit builtins, not yet lowered.
+const STASH_IORING: u64 = 20;
+const STASH_BLOCKING: u64 = 24;
+/// End of the reserved 8-handle region (`[0, 32)`, one `i32` slot per `VM_CAP_*` index). The
 /// allocator/scratch/format state begins here, so it is collision-proof against the full handle set.
 const HANDLE_REGION_END: u64 = 32;
 /// The guest heap's bump pointer and committed boundary (`i64` each) — the allocator's only state,
@@ -1373,6 +1393,10 @@ fn import_sig(import: &str) -> svm_ir::FuncType {
         "vm_unmap" => ft(vec![I64, I64], vec![I64]),
         "vm_protect" => ft(vec![I64, I64, I32], vec![I64]),
         "vm_page_size" => ft(vec![], vec![I64]),
+        // §9/§12 async I/O ring (`IoRing`): submit a batch of deferred ops onto the host offload pool
+        // (op 1) / reap ready completions (op 2). `(sq, n, counter)` / `(cq, max)`, returning a count.
+        "vm_io_submit_async" => ft(vec![I64, I64, I64], vec![I64]),
+        "vm_io_reap" => ft(vec![I64, I64], vec![I64]),
         _ => ft(vec![I64, I64], vec![I64]), // write / read (Stream)
     }
 }
@@ -1467,38 +1491,83 @@ fn register_vm_memory_imports(
     used
 }
 
+/// The §7 import a §9/§12 async-ring builtin needs (`__vm_io_submit_async` → `vm_io_submit_async`,
+/// `__vm_io_reap` → `vm_io_reap`), or `None`. Both reach the `IoRing` (slot 5) handle.
+fn vm_io_builtin_import(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__vm_io_submit_async" => "vm_io_submit_async",
+        "__vm_io_reap" => "vm_io_reap",
+        _ => return None,
+    })
+}
+
+/// Scan for the async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap`), registering each one's
+/// §7 import. Returns whether any were used — the signal that `_start` must be granted up through the
+/// `IoRing` handle. A guest-*defined* function of the same name shadows the builtin.
+fn register_vm_io_imports(
+    m: &LModule,
+    defined: &HashMap<String, u32>,
+    imports: &mut Vec<svm_ir::Import>,
+    caps: &mut HashMap<String, u32>,
+) -> bool {
+    let mut used = false;
+    for f in &m.functions {
+        for bb in &f.basic_blocks {
+            for instr in &bb.instrs {
+                let Instruction::Call(c) = instr else {
+                    continue;
+                };
+                let Some(name) = callee_name(c) else { continue };
+                if defined.contains_key(&name) {
+                    continue;
+                }
+                if let Some(import) = vm_io_builtin_import(&name) {
+                    used = true;
+                    caps.entry(import.to_string()).or_insert_with(|| {
+                        let i = imports.len() as u32;
+                        imports.push(svm_ir::Import {
+                            name: import.to_string(),
+                            sig: import_sig(import),
+                        });
+                        i
+                    });
+                }
+            }
+        }
+    }
+    used
+}
+
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
-/// capabilities. It takes the granted handles `(stdout, stdin, exit)` as `i32` params (the §3e
-/// powerbox shape `is_powerbox_entry` recognizes — no threaded data-SP, since it is the root),
-/// stores them into the handle stash so every capability call site can reload its handle, then calls
-/// the C `main(sp)` at the page-aligned data-stack base and returns its exit code.
+/// capabilities. It takes the `n_handles` granted handles as `i32` params (the §3e powerbox shape
+/// `is_powerbox_entry` recognizes — no threaded data-SP, since it is the root), in the `VM_CAP_*`
+/// order (stdout, stdin, exit, memory, addrspace, ioring, blocking, jit), stores each into its stash
+/// slot (offset `i*4`) so every capability call site can reload its handle, then calls the C
+/// `main(sp)` at the page-aligned data-stack base and returns its exit code. The runner grants
+/// exactly `n_handles` (a contiguous prefix, by declared arity — `run_powerbox`).
 fn synth_start(
     main_idx: u32,
     main_results: &[ValType],
     entry_sp: u64,
-    grant_memory: bool,
+    n_handles: usize,
     heap_base: Option<u64>,
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
-    // params: v0 = stdout, v1 = stdin, v2 = exit, [v3 = memory] (i32 capability handles). A program
-    // that uses `malloc` **or** a direct `<svm.h>` Memory builtin (`__vm_map`/…) takes the 4th
-    // `Memory` handle (the powerbox grants it for a 4-param entry); only `malloc` also seeds the heap.
-    let mut handles = vec![(STASH_STDOUT, 0), (STASH_STDIN, 1), (STASH_EXIT, 2)];
-    let mut params = vec![ValType::I32, ValType::I32, ValType::I32];
-    if grant_memory {
-        handles.push((STASH_MEMORY, 3));
-        params.push(ValType::I32);
-    }
-    let mut next: ValIdx = params.len() as ValIdx;
-    for (off, handle) in handles {
-        insts.push(Inst::ConstI64(off as i64));
+    // params v0..v(n-1) = the granted handles. Each slot offset is just `i*4` (the `STASH_*` layout),
+    // so stashing is a uniform loop: store param `i` at byte offset `i*4`. A program is granted a
+    // prefix sized to the highest capability index it uses (e.g. 4 with `malloc`/Memory, 7 with the
+    // async-ring builtins through `Blocking`).
+    let params = vec![ValType::I32; n_handles];
+    let mut next: ValIdx = n_handles as ValIdx;
+    for i in 0..n_handles {
+        insts.push(Inst::ConstI64((i as i64) * 4));
         let addr = next;
         next += 1;
         insts.push(Inst::Store {
             op: StoreOp::I32,
             addr,
-            value: handle,
+            value: i as ValIdx,
             offset: 0,
             align: 0,
         });
@@ -2434,6 +2503,34 @@ fn lower_vm_builtin(
                 handle,
                 args: vec![],
             });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // ---- §9/§12 async I/O ring: `cap.call` on the stashed IoRing handle (slot 5) ----
+        "__vm_io_submit_async" | "__vm_io_reap" => {
+            let import = vm_io_builtin_import(name).expect("io builtin");
+            let imp = ctx.import_of(import)?;
+            let mut args = vec![
+                ctx.operand_i64(vm_arg(c, 0)?)?,
+                ctx.operand_i64(vm_arg(c, 1)?)?,
+            ];
+            if name == "__vm_io_submit_async" {
+                args.push(ctx.operand_i64(vm_arg(c, 2)?)?); // the completion counter pointer
+            }
+            let handle = ctx.stash_load(STASH_IORING);
+            let r = ctx.push(Inst::CallImport {
+                import: imp,
+                sig: import_sig(import),
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `__vm_blocking_handle()` returns the stashed Blocking handle (slot 6) — the `i32` a guest
+        // names in an SQE's `handle` field when building a `Blocking.work` request. Just a stash read.
+        "__vm_blocking_handle" => {
+            let r = ctx.stash_load(STASH_BLOCKING);
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
