@@ -3501,6 +3501,105 @@ fn lower_int_intrinsic(
     Ok(Some(idx))
 }
 
+/// Lower `llvm.{u,s}{add,sub,mul}.with.overflow.iN` → the wrapping op plus a computed overflow flag,
+/// recorded as a **2-field aggregate** `{result, overflow}` (consumed by `extractvalue 0`/`1`). Rust's
+/// checked capacity/index arithmetic (`Vec`/`String`/`Layout::array`) emits these; the overflow flag
+/// feeds a branch to `handle_error`/`panicking` (which traps), so the result must be exact and the flag
+/// correct in the no-overflow case (it is — the formulas are exact). Returns `true` if handled.
+fn lower_overflow_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    types: &Types,
+) -> Result<bool, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(false);
+    };
+    let base = name.rsplit_once('.').map_or(name.as_str(), |(b, _)| b);
+    // (arith op, signed?) — `None` if not an overflow intrinsic.
+    let spec = match base {
+        "llvm.uadd.with.overflow" => (BinOp::Add, false),
+        "llvm.usub.with.overflow" => (BinOp::Sub, false),
+        "llvm.umul.with.overflow" => (BinOp::Mul, false),
+        "llvm.sadd.with.overflow" => (BinOp::Add, true),
+        "llvm.ssub.with.overflow" => (BinOp::Sub, true),
+        "llvm.smul.with.overflow" => (BinOp::Mul, true),
+        _ => return Ok(false),
+    };
+    let (arith, signed) = spec;
+    let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
+    let a = ctx.operand(args[0])?;
+    let b = ctx.operand(args[1])?;
+    let k = |ctx: &mut BlockCtx, v: i64| {
+        ctx.push(if ty == IntTy::I64 {
+            Inst::ConstI64(v)
+        } else {
+            Inst::ConstI32(v as i32)
+        })
+    };
+    let bin = |ctx: &mut BlockCtx, op: BinOp, x: ValIdx, y: ValIdx| {
+        ctx.push(Inst::IntBin { ty, op, a: x, b: y })
+    };
+    let cmp = |ctx: &mut BlockCtx, op: CmpOp, x: ValIdx, y: ValIdx| {
+        ctx.push(Inst::IntCmp { ty, op, a: x, b: y })
+    };
+    let r = bin(ctx, arith, a, b);
+    let overflow = match (arith, signed) {
+        // unsigned add: wrapped sum is below an operand.
+        (BinOp::Add, false) => cmp(ctx, CmpOp::LtU, r, a),
+        // unsigned sub: borrow ⇔ a <u b.
+        (BinOp::Sub, false) => cmp(ctx, CmpOp::LtU, a, b),
+        // signed add: operands agree in sign but the result disagrees ⇔ `((a^r)&(b^r)) < 0`.
+        (BinOp::Add, true) => {
+            let ar = bin(ctx, BinOp::Xor, a, r);
+            let br = bin(ctx, BinOp::Xor, b, r);
+            let m = bin(ctx, BinOp::And, ar, br);
+            let zero = k(ctx, 0);
+            cmp(ctx, CmpOp::LtS, m, zero)
+        }
+        // signed sub: `((a^b)&(a^r)) < 0`.
+        (BinOp::Sub, true) => {
+            let ab = bin(ctx, BinOp::Xor, a, b);
+            let ar = bin(ctx, BinOp::Xor, a, r);
+            let m = bin(ctx, BinOp::And, ab, ar);
+            let zero = k(ctx, 0);
+            cmp(ctx, CmpOp::LtS, m, zero)
+        }
+        // mul: `a != 0 && (r / a) != b`, dividing by a zero-guarded `a` so the check never traps.
+        (BinOp::Mul, _) => {
+            let zero = k(ctx, 0);
+            let one = k(ctx, 1);
+            let a_nz = cmp(ctx, CmpOp::Ne, a, zero);
+            let safe_a = ctx.push(Inst::Select {
+                cond: a_nz,
+                a,
+                b: one,
+            });
+            let q = bin(
+                ctx,
+                if signed { BinOp::DivS } else { BinOp::DivU },
+                r,
+                safe_a,
+            );
+            let q_ne = cmp(ctx, CmpOp::Ne, q, b);
+            // `a_nz & q_ne` (both `i32` 0/1) — a plain bitwise AND of the boolean flags.
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::And,
+                a: a_nz,
+                b: q_ne,
+            })
+        }
+        _ => unreachable!(),
+    };
+    if let Some(dest) = &c.dest {
+        if let Some(&vid) = ctx.s.name2id.get(dest) {
+            ctx.agg.insert(vid, vec![r, overflow]);
+        }
+    }
+    Ok(true)
+}
+
 /// Emit an inline byte-reverse of `v` (`ty`-wide, `nbytes` bytes): OR together, for each source byte
 /// `i`, `((v >> 8*i) & 0xff) << 8*(nbytes-1-i)`. Lowers `llvm.bswap.{i16,i32,i64}`.
 fn emit_bswap(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, nbytes: u64) -> ValIdx {
@@ -4605,6 +4704,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
             return Ok(());
         }
+        // `llvm.{u,s}{add,sub,mul}.with.overflow.iN` → the op + an overflow flag, as a 2-field
+        // aggregate `{result, overflow}` (Rust's checked capacity/index arithmetic). Records the
+        // aggregate itself, so nothing to bind here.
+        if lower_overflow_intrinsic(ctx, c, types)? {
+            return Ok(());
+        }
         // `llvm.load.relative` (clang's relative lookup table) → load the 32-bit relative offset and
         // add it back to the table base.
         if let Some(idx) = lower_load_relative(ctx, c)? {
@@ -5597,15 +5702,18 @@ fn translate_switch(
     s: &Scan,
     block_params: &[Vec<ValueId>],
 ) -> Result<Terminator, Error> {
-    // The operand must be `i32` (the common C `switch(int)`); `br_table`'s index is `i32`.
-    if operand_bits(&sw.operand)? > 32 {
-        return unsup("switch on i64 (Milestone 1+)");
+    // `br_table`'s index is `i32`; an `i64` operand (e.g. a Rust enum discriminant) is handled by
+    // folding its high 32 bits into the index below (an out-of-`[0,2^32)` value forces the default).
+    let width = operand_bits(&sw.operand)?;
+    if width > 64 {
+        return unsup(format!("switch on i{width} (i128+ unsupported)"));
     }
-    // Collect the (value, dest-block) cases.
+    // Collect the (value, dest-block) cases (full `i64` for an `i64` switch; sign-fit for `i32`).
     let mut cases: Vec<(i64, usize)> = Vec::with_capacity(sw.dests.len());
     for (v, dest) in &sw.dests {
         let val = match v.as_ref() {
-            Constant::Int { value, .. } => *value as i32 as i64,
+            Constant::Int { value, .. } if width <= 32 => *value as i32 as i64,
+            Constant::Int { value, .. } => *value as i64,
             other => return unsup(format!("switch case constant {other:?}")),
         };
         let blk = *s
@@ -5634,17 +5742,70 @@ fn translate_switch(
     }
 
     // Index = operand - min (so the table starts at 0). An out-of-range / unbiased value lands on
-    // the default (a negative bias wraps to a large `u32`, ≥ len ⇒ default).
+    // the default (a too-large biased value, ≥ len ⇒ default).
     let operand = ctx.operand(&sw.operand)?;
-    let idx = if min == 0 {
-        operand
+    let idx = if width <= 32 {
+        if min == 0 {
+            operand
+        } else {
+            let m = ctx.push(Inst::ConstI32(min as i32));
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Sub,
+                a: operand,
+                b: m,
+            })
+        }
     } else {
-        let m = ctx.push(Inst::ConstI32(min as i32));
-        ctx.push(Inst::IntBin {
+        // `i64` operand: bias by `min` (`i64`), then fold the high 32 bits in — if `diff` doesn't fit
+        // in `[0, 2^32)` (high bits set, incl. a negative `diff`) force the index to `0xFFFFFFFF` so it
+        // exceeds the table and hits the default. Sound for any `i64` (the low-32 `br_table` alone
+        // would alias far-apart values onto a case).
+        let diff = if min == 0 {
+            operand
+        } else {
+            let m = ctx.push(Inst::ConstI64(min));
+            ctx.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: operand,
+                b: m,
+            })
+        };
+        let c32 = ctx.push(Inst::ConstI64(32));
+        let hi = ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::ShrU,
+            a: diff,
+            b: c32,
+        });
+        let hi32 = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: hi,
+        });
+        let zero = ctx.push(Inst::ConstI32(0));
+        let oor = ctx.push(Inst::IntCmp {
+            ty: IntTy::I32,
+            op: CmpOp::Ne,
+            a: hi32,
+            b: zero,
+        });
+        // mask = 0 - oor → 0 (in range) or 0xFFFFFFFF (out of range).
+        let mask = ctx.push(Inst::IntBin {
             ty: IntTy::I32,
             op: BinOp::Sub,
-            a: operand,
-            b: m,
+            a: zero,
+            b: oor,
+        });
+        let lo = ctx.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: diff,
+        });
+        ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Or,
+            a: lo,
+            b: mask,
         })
     };
 

@@ -823,15 +823,34 @@ code, and a pinned expected value keeps it non-vacuous. Three gaps closed:
 - Test: `rust_alloc_vec_via_global_allocator` (Σ i² for i in 0..64 = 85344, % 251 = **4**, vs native).
   100 translate tests green, fmt + clippy clean.
 
+**Slice AL (DONE) — `Box` + `String`: a mini expression evaluator (the heap capstone demo).** A
+recursive-descent parser over a byte slice builds a **`Box`ed recursive AST** (`enum Expr { Num,
+Add(Box,Box), … }` — the canonical use of `Box`), `eval` walks it recursively, and `render` serializes
+it back into a heap **`String`** — a tiny interpreter, right at home next to the guest-JIT demo, running
+byte-identical to native `rustc` (through the powerbox/alloc harness). Two real gaps closed, both
+generally useful (any frontend's `-O2` hits them):
+- **`llvm.{u,s}{add,sub,mul}.with.overflow.iN`** (`lower_overflow_intrinsic`) → the wrapping op + a
+  computed overflow flag, recorded as a 2-field aggregate `{result, overflow}` (consumed by
+  `extractvalue`). Rust's checked capacity/index arithmetic (`Vec`/`String`/`Layout::array`) emits
+  these; the flag feeds a branch to `handle_error`/`panicking` (→ trap). Exact formulas (`add`: wrapped
+  sum below an operand; `sub`: borrow; signed: sign-disagreement; `mul`: zero-guarded `r/a != b`).
+- **`switch` on `i64`** (Rust enum discriminants). `translate_switch` now lowers an `i64` operand to a
+  `br_table` by biasing with `min` (`i64`) and **folding the high 32 bits into the index** — an
+  out-of-`[0,2^32)` value forces the default — sound for any `i64` (a bare low-32 `br_table` would
+  alias far-apart values onto a case). `i128` switches stay `Unsupported`.
+- Test: `rust_box_string_expr_evaluator` — `eval("2+3*4-(5-1)*2+10") = 16`, rendered string is 26
+  chars, `(16+26) % 251 = 42`, on-ramp == native. 101 translate tests green, fmt + clippy clean.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
       inheritance / `this`-adjusting thunks, references, `static`-local guards, …).
 - [x] **Rust** (`no_std`/panic=abort) — runs vs native: `iN` (slice AH), real `core` (enums/slices/
       `Option`/iterators/structs) + panic-path → trap (slice AI), trait objects / `&[T]` args / `unwrap`
-      (slice AJ), **`alloc`/heap — `Vec` via a guest `#[global_allocator]`** (slice AK). Auto-vectorization
-      is disabled (SIMD is §17); `--edition 2021`. Broaden (`Result`/`?`, `String`/`Box`/`BTreeMap`,
-      generics with bounds, `&mut` aliasing) as gaps surface.
+      (slice AJ), `alloc`/heap `Vec` (slice AK), **`Box` recursive AST + `String`** via a mini expr
+      evaluator (slice AL — + `*.with.overflow` intrinsics and `i64` switches). Auto-vectorization is
+      disabled (SIMD is §17); `--edition 2021`. Broaden (`Result`/`?`, `BTreeMap`, generics with
+      bounds, `&mut` aliasing) as gaps surface.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 - [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`

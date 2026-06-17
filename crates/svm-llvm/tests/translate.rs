@@ -2623,3 +2623,128 @@ fn compute() -> i32 {
     // Pin the value so the differential can't pass vacuously: Σ i² for i in 0..64 = 85344; % 251 = 4.
     assert_eq!(svm, 4, "rust alloc/Vec: expected 4, got {svm}");
 }
+
+/// **Rust `Box` + `String` — a mini expression evaluator (the heap capstone).** A recursive-descent
+/// parser over a byte slice builds a `Box`ed recursive AST (`enum Expr { Num, Add(Box,Box), … }` — the
+/// canonical use of `Box`), `eval` walks it recursively, and `render` serializes it back into a
+/// `String` (heap text via the guest allocator). The result + the rendered length is returned — `Box`,
+/// `String`, recursive enums, slice parsing, and the panic paths (a malformed parse would trap) all at
+/// once, byte-identical to native `rustc`. A tiny interpreter, right at home next to the guest-JIT demo.
+#[test]
+fn rust_box_string_expr_evaluator() {
+    let items = r#"
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::string::String;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+enum Expr {
+    Num(i64),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+}
+
+fn eval(e: &Expr) -> i64 {
+    match e {
+        Expr::Num(n) => *n,
+        Expr::Add(a, b) => eval(a).wrapping_add(eval(b)),
+        Expr::Sub(a, b) => eval(a).wrapping_sub(eval(b)),
+        Expr::Mul(a, b) => eval(a).wrapping_mul(eval(b)),
+    }
+}
+
+fn render(e: &Expr, out: &mut String) {
+    match e {
+        Expr::Num(n) => {
+            let mut v = *n;
+            if v == 0 { out.push('0'); }
+            let mut tmp = [0u8; 20];
+            let mut k = 0;
+            while v > 0 { tmp[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; }
+            while k > 0 { k -= 1; out.push(tmp[k] as char); }
+        }
+        Expr::Add(a, b) => { out.push('('); render(a, out); out.push('+'); render(b, out); out.push(')'); }
+        Expr::Sub(a, b) => { out.push('('); render(a, out); out.push('-'); render(b, out); out.push(')'); }
+        Expr::Mul(a, b) => { out.push('('); render(a, out); out.push('*'); render(b, out); out.push(')'); }
+    }
+}
+
+struct Parser<'a> { s: &'a [u8], pos: usize }
+impl<'a> Parser<'a> {
+    fn peek(&self) -> u8 { if self.pos < self.s.len() { self.s[self.pos] } else { 0 } }
+    fn bump(&mut self) -> u8 { let c = self.peek(); self.pos += 1; c }
+    fn number(&mut self) -> Box<Expr> {
+        let mut n: i64 = 0;
+        while self.peek().is_ascii_digit() {
+            n = n.wrapping_mul(10).wrapping_add((self.bump() - b'0') as i64);
+        }
+        Box::new(Expr::Num(n))
+    }
+    fn factor(&mut self) -> Box<Expr> {
+        if self.peek() == b'(' {
+            self.bump();
+            let e = self.expr();
+            self.bump(); // ')'
+            e
+        } else {
+            self.number()
+        }
+    }
+    fn term(&mut self) -> Box<Expr> {
+        let mut left = self.factor();
+        while self.peek() == b'*' {
+            self.bump();
+            let right = self.factor();
+            left = Box::new(Expr::Mul(left, right));
+        }
+        left
+    }
+    fn expr(&mut self) -> Box<Expr> {
+        let mut left = self.term();
+        loop {
+            match self.peek() {
+                b'+' => { self.bump(); let r = self.term(); left = Box::new(Expr::Add(left, r)); }
+                b'-' => { self.bump(); let r = self.term(); left = Box::new(Expr::Sub(left, r)); }
+                _ => break,
+            }
+        }
+        left
+    }
+}
+
+fn compute() -> i32 {
+    let input = b"2+3*4-(5-1)*2+10";          // = 2 + 12 - 8 + 10 = 16
+    let mut p = Parser { s: input, pos: 0 };
+    let ast = p.expr();
+    let result = eval(&ast);
+    let mut s = String::new();
+    render(&ast, &mut s);                       // a fully-parenthesized rendering
+    result.wrapping_add(s.len() as i64).rem_euclid(251) as i32
+}
+"#;
+    let (Some(svm), Some(native)) = (
+        rust_alloc_onramp("rs_expr", items),
+        rust_alloc_native("rs_expr", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        svm, native,
+        "expr evaluator: on-ramp {svm} vs native {native}"
+    );
+    // Pin it (non-vacuous): eval = 16, render = `(((2+(3*4))-((5-1)*2))+10)` (26 chars); 42 % 251 = 42.
+    assert_eq!(svm, 42, "expr evaluator: expected 42, got {svm}");
+}
