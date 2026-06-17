@@ -564,7 +564,7 @@ the dominant general-C gap).
 
 | # | Demo (proposed) | Drives (pending item) | Also exercises |
 |---|---|---|---|
-| 1 | **`hexdump`** — read stdin, print `%08x  %02x ×16  |ascii|` rows | **varargs `printf`** (`%x`/`%02x`/`%08x`/`%c`/width/pad) — the big one | `read`, loops |
+| 1 ✅ | **`hexdump`** — read stdin, print `%08lx  %02x ×16  \|ascii\|` rows (`demos/hexdump`, slice W) | **varargs `printf`** (unsigned `%u`/`%x`, width, `0`-pad, `l`) — DONE, byte-identical to native | `read`, loops |
 | 2 | **`vector`/`sort`** — read ints into a doubling buffer, qsort, print | **`realloc`** (grow-and-copy) + numeric `printf` (`%d`) | `malloc`, `read` |
 | 3 | **`mat4`** — 4×4 matrix × vec4 / 3D transform, print rows | **wider SIMD** (`<4 x float>`) — generalize the 2-lane scalarization | floats, `printf` |
 | 4 | **`crc32` + big-endian TLV reader** | **`llvm.bswap`** (endian) | tables, `printf` |
@@ -582,8 +582,20 @@ Notes:
 - **`argc`/`argv`**: needs a powerbox/runner change (pass argv to `_start`), not just the frontend —
   schedule alongside a CLI-style demo once the above land.
 
-**Recommended next slice:** demo 1 (**`hexdump`** → varargs `printf`), the highest-leverage general-C
-gap. Land it, then proceed down the table.
+**Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
+`printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
+literal runs are written straight from the format global; each conversion lowers to the synthesized
+**`__svm_utoa`** (unsigned int → ASCII, a counted divide loop) plus width/zero-padding (a constant
+pre-fill of the scratch buffer `[FMT_BUF, FMT_BUF_END)`, then a `max(len,width)` write window) →
+`Stream.write`. Covers unsigned `%u`/`%x`, `%c`, `%%`, field width, the `0` flag, and length
+modifiers (the LLVM arg carries the real width — `%lx` ⇒ an `i64` arg). All formatting is **guest
+code**; only the bytes cross the boundary. Tests: `demo_hexdump_vs_native` (a `hexdump -C` clone, vs
+native, with stdin) + `printf_unsigned_formats` (mixed widths/pads/`%lx`/`%c`/`%%`).
+- *Deferred to later slices (fail-closed `Unsupported`):* signed `%d`/`%i` (sign + zero-pad combo),
+  `%s` (runtime strlen), `%f`/`%g`/`%e` (float formatting), precision/`*`/`-`/`+`/space/`#`, and
+  non-constant format strings.
+
+**Next:** demo 2 (**`vector`/`sort`** → `realloc` + signed `%d`).
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).

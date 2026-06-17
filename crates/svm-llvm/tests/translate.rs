@@ -1021,6 +1021,29 @@ fn demo_clay_vs_native() {
 }
 
 #[test]
+fn demo_hexdump_vs_native() {
+    // A `hexdump -C`-style tool: read stdin in 16-byte rows, print `%08lx  HH×16  |ascii|` via the
+    // guest-side `printf` format engine (parsed at translate time → `__svm_utoa` + width/zero-pad →
+    // `Stream.write`). Exercises `%08lx`/`%02x` (hex + width + zero-pad + `l` modifier) and literals;
+    // clang lowers the `%c` and `"…\n"` to `putchar`/`puts`. Byte-identical to native.
+    let input = b"Hello, hexdump!\nThe quick brown fox.\x00\x01\xff\xfe rest";
+    check_demo_vs_native("hexdump", "hexdump/hexdump.c", input);
+}
+
+#[test]
+fn printf_unsigned_formats() {
+    // The `printf` engine directly: unsigned decimal/hex with field width + zero/space padding, a
+    // 64-bit (`%lx`) arg, `%c`, and `%%` — all in one mixed format (so clang keeps it as `printf`,
+    // not a `putchar`/`puts` special-case). stdout + exit compared to the native build.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"u=%u x=%x p=%05x w=%8x c=%c pct=%%\\n\", 42u, 255u, 7u, 0xabcu, 'Z'); \
+                 printf(\"%lx %02x\\n\", 0xdeadbeefcafeUL, 5u); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_u", src, b"");
+}
+
+#[test]
 fn vec2_float_struct() {
     // A `{float,float}` struct passed/returned by value — clang coerces it to `<2 x float>` and does
     // `extractelement`/`insertelement`/lane-wise `fadd`. Scalarized to a packed i64. addv({1.5,2.5},

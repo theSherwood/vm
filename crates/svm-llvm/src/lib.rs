@@ -116,10 +116,18 @@
 //!   no-op (same packed `i64`). Lands **clay** (UI layout) byte-identical to native — the **8th of 8
 //!   corpus demos**, meeting the D54 "matches native clang" exit criterion.
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): variable-length `memmove` (overlap),
-//! general (non-rotate) funnel shifts, varargs `printf`/`fprintf` (formatting), `realloc`,
-//! transcendental math, `puts`/`fputs` of a *non-literal* string (runtime strlen), wider/other SIMD
-//! vectors (`<4 x float>`, `<2 x double>`, … — only 2-lane 32-bit vectors are scalarized), `i33`.
+//! Beyond the corpus (general-C breadth, demo-driven — see `LLVM.md`):
+//! - **W — varargs `printf` (a guest-side format engine).** A `printf(fmt, …)` with a **constant**
+//!   format string is parsed at translate time: literal runs are written straight from the format
+//!   global, and each conversion lowers to the synthesized `__svm_utoa` (int→ASCII) + width/zero-pad
+//!   (a buffer pre-fill) → `Stream.write`. Unsigned `%u`/`%x`, `%c`, `%%`, field width and the `0`
+//!   flag, and length modifiers (the LLVM arg carries the real width). All formatting runs **in the
+//!   guest**; only the bytes cross the boundary. Lands the **`hexdump`** demo byte-identical to native.
+//!
+//! Out of the current subset (clean [`Error::Unsupported`]): signed `printf` (`%d`/`%i`), `%s`/`%f`,
+//! precision/`*`/`-`+# flags, and non-constant formats; variable-length `memmove` (overlap), general
+//! (non-rotate) funnel shifts, `realloc`, transcendental math, `puts`/`fputs` of a *non-literal*
+//! string (runtime strlen), wider/other SIMD (`<4 x float>`, `<2 x double>`, …), `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -188,6 +196,9 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     let (mut imports, mut caps) = collect_cap_imports(m, &defined_names);
     let has_main = defined_names.contains_key("main");
     let need_malloc = needs_malloc(m, &defined_names) && has_main;
+    // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
+    // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
+    let need_printf = calls_external(m, &defined_names, "printf") && has_main;
     let synth = (!imports.is_empty() || need_malloc) && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
@@ -212,7 +223,7 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // page-granularly) must never share a page with the stash, or `_start`'s handle stores would
     // fault on the read-only page (the same page-isolation the data stack already gets above globals).
     let globals_base = if synth { STACK_PAGE } else { DATA_BASE };
-    let (globals, data, globals_end, cstrs) = globals_layout(m, &name2idx, globals_base)?;
+    let (globals, data, globals_end, cstrs, gbytes) = globals_layout(m, &name2idx, globals_base)?;
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
     // fault). 16 KiB covers the largest common page size (macOS/aarch64). (A read-only and a
@@ -224,17 +235,22 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     // are fixed before translating call sites. The allocator references the `vm_map` import index.
     let (need_memset, need_memcpy) = needs_mem_helpers(m);
     let helper_base = base + defined.len() as u32;
+    // Helper indices are assigned in a fixed order after the defined functions: memset, memcpy,
+    // malloc, utoa (each present only if needed). `nth` counts how many precede a given helper.
+    let nth = |a: bool, b: bool, c: bool| helper_base + a as u32 + b as u32 + c as u32;
     let helpers = Helpers {
         memset: need_memset.then_some(helper_base),
-        memcpy: need_memcpy.then_some(helper_base + need_memset as u32),
-        malloc: need_malloc.then_some(helper_base + need_memset as u32 + need_memcpy as u32),
+        memcpy: need_memcpy.then_some(nth(need_memset, false, false)),
+        malloc: need_malloc.then_some(nth(need_memset, need_memcpy, false)),
+        utoa: need_printf.then_some(nth(need_memset, need_memcpy, need_malloc)),
     };
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
     for f in &defined {
-        let (func, frame_size) =
-            translate_func(f, &m.types, &name2idx, &globals, &caps, &cstrs, &helpers)?;
+        let (func, frame_size) = translate_func(
+            f, &m.types, &name2idx, &globals, &caps, &cstrs, &gbytes, &helpers,
+        )?;
         any_frame |= frame_size > 0;
         funcs.push(func);
     }
@@ -267,7 +283,8 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
         let main_results = funcs[(main_idx - base) as usize].results.clone();
         funcs.insert(0, synth_start(main_idx, &main_results, entry_sp, heap_base));
     }
-    // Append the synthesized helpers in index order (memset, memcpy, malloc) — matching `helper_base`.
+    // Append the synthesized helpers in index order (memset, memcpy, malloc, utoa) — matching the
+    // indices assigned above.
     if need_memset {
         funcs.push(synth_memset());
     }
@@ -276,6 +293,9 @@ pub fn translate(m: &LModule) -> Result<Translated, Error> {
     }
     if need_malloc {
         funcs.push(synth_malloc(caps["vm_map"]));
+    }
+    if need_printf {
+        funcs.push(synth_utoa());
     }
     Ok(Translated {
         module: Module {
@@ -505,6 +525,7 @@ type Globals = (
     Vec<svm_ir::Data>,
     u64,
     HashMap<String, u64>,
+    HashMap<String, Vec<u8>>,
 );
 
 /// Lay out the module's global variables in the window's globals region (from `base`, each
@@ -558,6 +579,7 @@ fn globals_layout(
                                        // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
     let mut segs = Vec::new();
     let mut cstrs = HashMap::new();
+    let mut gbytes = HashMap::new();
     for (gi, at) in placed {
         let g = &m.global_vars[gi];
         let Some(init) = &g.initializer else { continue }; // BSS / extern → zero-init window
@@ -566,6 +588,11 @@ fn globals_layout(
         // write the right slice without a runtime strlen.
         let slen = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len()) as u64;
         cstrs.insert(name_str(&g.name), slen);
+        // Keep a constant global's bytes so `printf` can parse a constant format string at translate
+        // time (the format engine reads `@.str`'s content here, not at runtime).
+        if g.is_constant {
+            gbytes.insert(name_str(&g.name), bytes.clone());
+        }
         // Emit a segment only for non-zero initialized data (the window is zero-init). A read-only
         // segment is protected (D40), so a guest write to it faults.
         if g.is_constant || bytes.iter().any(|&x| x != 0) {
@@ -576,7 +603,7 @@ fn globals_layout(
             });
         }
     }
-    Ok((addr, segs, off, cstrs))
+    Ok((addr, segs, off, cstrs, gbytes))
 }
 
 /// Map an LLVM type to an SVM value type. Narrow integers collapse to `i32` (§3b: `i8`/`i16`
@@ -842,6 +869,7 @@ struct Scan {
     block_name: Vec<Name>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_func(
     f: &Function,
     types: &Types,
@@ -849,6 +877,7 @@ fn translate_func(
     globals: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
+    gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
 ) -> Result<(Func, u64), Error> {
     if f.is_var_arg {
@@ -886,6 +915,7 @@ fn translate_func(
             globals,
             caps,
             cstrs,
+            gbytes,
             helpers,
         )?);
     }
@@ -1148,6 +1178,11 @@ const HEAP_TOP: u64 = 24;
 const STASH_SCRATCH: u64 = 32;
 /// The `prot` bits a guest passes to `Memory.map` for a read-write commit (`PROT_READ|PROT_WRITE`).
 const PROT_RW: i32 = 3;
+/// A scratch buffer (`[FMT_BUF, FMT_BUF_END)`, on the writable page 0) where `printf` formats one
+/// integer conversion: `__svm_utoa` writes the digits backward from `FMT_BUF_END`, and width padding
+/// pre-fills the low end. 64 bytes covers a 64-bit value in any base plus a generous field width.
+const FMT_BUF: u64 = 64;
+const FMT_BUF_END: u64 = 128;
 
 /// Which stash slot a capability call reads its handle from.
 #[derive(Clone, Copy)]
@@ -1205,7 +1240,7 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
 /// lowering but needs *no* import (an unbuffered `Stream` makes it a no-op), so it is not listed here.
 fn cap_import_name(name: &str) -> Option<&'static str> {
     Some(match name {
-        "write" | "puts" | "putc" | "putchar" | "fputc" | "fwrite" | "fputs" => "write",
+        "write" | "puts" | "putc" | "putchar" | "fputc" | "fwrite" | "fputs" | "printf" => "write",
         "read" => "read",
         "exit" | "_exit" | "_Exit" => "exit",
         _ => return None,
@@ -1484,18 +1519,24 @@ struct Helpers {
     memcpy: Option<u32>,
     /// `__svm_malloc(size:i64) -> i64` — the `vm_map`-growing bump allocator (`malloc`/`calloc`).
     malloc: Option<u32>,
+    /// `__svm_utoa(value:i64, base:i64, bufend:i64) -> i64` — unsigned→ASCII for `printf`.
+    utoa: Option<u32>,
 }
 
-/// Does the module call any heap allocator function (`malloc`/`calloc`) not defined by the guest?
-/// (`free` is lowered to a no-op and needs no allocator; `realloc` is still `Unsupported`.)
-fn needs_malloc(m: &LModule, defined: &HashMap<String, u32>) -> bool {
+/// Does the module call an external (not guest-defined) function with name `n`?
+fn calls_external(m: &LModule, defined: &HashMap<String, u32>, want: &str) -> bool {
     m.functions.iter().flat_map(|f| &f.basic_blocks).any(|bb| {
         bb.instrs.iter().any(|i| {
             matches!(i, Instruction::Call(c)
-                if callee_name(c).is_some_and(|n| matches!(n.as_str(), "malloc" | "calloc")
-                    && !defined.contains_key(&n)))
+                if callee_name(c).is_some_and(|n| n == want && !defined.contains_key(&n)))
         })
     })
+}
+
+/// Does the module call the heap allocator (`malloc`/`calloc`)? (`free` is a no-op; `realloc` is
+/// still `Unsupported`.)
+fn needs_malloc(m: &LModule, defined: &HashMap<String, u32>) -> bool {
+    calls_external(m, defined, "malloc") || calls_external(m, defined, "calloc")
 }
 
 /// Does any mem intrinsic need the runtime loop helper — a **non-constant** length, or a constant
@@ -1687,6 +1728,109 @@ fn synth_memcpy() -> Func {
     }
 }
 
+/// Synthesize `__svm_utoa(value:i64, base:i64, bufend:i64) -> i64` — write the **unsigned** `value`
+/// in `base` (10 or 16, lowercase) as ASCII *backward* from `bufend` and return the start pointer
+/// (so the digit count is `bufend - start`). A counted divide loop, like a tiny libc `utoa`; the
+/// `printf` lowering handles sign, width, and padding around it. `value == 0` writes a single `'0'`.
+///
+/// ```text
+///   block0(value, base, bufend):           → loop(value, base, bufend)
+///   loop(value, base, p):                  ; d = value%base; *--p = digit(d); value/=base
+///     digit = d + '0' + (d>=10 ? 39 : 0)   ; 0-9 → '0'-'9', 10-15 → 'a'-'f'
+///     value != 0 ? loop(value/base, base, p-1) : done(p-1)
+///   done(start):                           return start
+/// ```
+fn synth_utoa() -> Func {
+    use svm_ir::StoreOp;
+    let params = vec![ValType::I64, ValType::I64, ValType::I64]; // value, base, bufend
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 2],
+        },
+    };
+    // loop(value=0, base=1, p=2)
+    let i64bin = |op: BinOp, a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op,
+        a,
+        b,
+    };
+    let lp = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            i64bin(BinOp::RemU, 0, 1), // v3 = value % base
+            Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: 3,
+            }, // v4 = d (i32)
+            Inst::ConstI32(10),        // v5
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::GeU,
+                a: 4,
+                b: 5,
+            }, // v6 = d>=10
+            Inst::ConstI32(39),        // v7
+            Inst::ConstI32(0),         // v8
+            Inst::Select {
+                cond: 6,
+                a: 7,
+                b: 8,
+            }, // v9 = d>=10 ? 39 : 0
+            Inst::ConstI32(48),        // v10 = '0'
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 4,
+                b: 10,
+            }, // v11 = d+'0'
+            Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Add,
+                a: 11,
+                b: 9,
+            }, // v12 = digit char
+            Inst::ConstI64(1),         // v13
+            i64bin(BinOp::Sub, 2, 13), // v14 = p - 1
+            Inst::Store {
+                op: StoreOp::I32_8,
+                addr: 14,
+                value: 12,
+                offset: 0,
+                align: 0,
+            }, // *--p = ch
+            i64bin(BinOp::DivU, 0, 1), // v15 = value / base
+            Inst::ConstI64(0),         // v16
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Ne,
+                a: 15,
+                b: 16,
+            }, // v17 = value' != 0
+        ],
+        term: Terminator::BrIf {
+            cond: 17,
+            then_blk: 1,
+            then_args: vec![15, 1, 14], // loop(value/base, base, p-1)
+            else_blk: 2,
+            else_args: vec![14], // done(p-1)
+        },
+    };
+    let done = Block {
+        params: vec![ValType::I64], // start
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, lp, done],
+    }
+}
+
 /// The global-variable name a pointer operand points at, if it is a direct `@global` reference (the
 /// shape clang passes a string literal to `puts`/`fputs`). A computed pointer returns `None`.
 fn global_name_of(op: &Operand) -> Option<String> {
@@ -1707,6 +1851,105 @@ fn global_name_of(op: &Operand) -> Option<String> {
 /// stdout here) selects the endpoint. Returns `Ok(false)` if `name` is not a bound function (so it
 /// stays an ordinary call). Result-fidelity notes (the *stdout bytes* are exact regardless): `putc`
 /// yields the written char, `fwrite` the item count `nmemb`, `puts`/`fputs`/`fflush` a `0` success.
+/// A parsed `printf` format-string segment (the constant format is parsed at translate time, §ramp
+/// Lane C). The integer conversions are **unsigned** for now (`%u`/`%x`); signed `%d`, `%s`, `%f`,
+/// precision, `*`, and the `-`/`+`/` `/`#` flags are a later slice (fail-closed `Unsupported`).
+enum FmtSeg {
+    /// A verbatim run — bytes `[off, off+len)` of the format global, written directly.
+    Lit { off: usize, len: usize },
+    /// An unsigned integer conversion: `base` (10/16, lowercase), `0`-flag zero-pad, field `width`.
+    Uint { base: u64, zero: bool, width: u32 },
+    /// `%c` — the argument's low byte.
+    Char,
+    /// `%%` — a literal percent.
+    Percent,
+}
+
+/// Parse a (NUL-free) `printf` format string into segments. Fail-closed on anything not yet
+/// supported, so an unhandled directive is a clean `Unsupported`, never a silent mis-format.
+fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
+    let mut segs = Vec::new();
+    let mut i = 0;
+    let mut lit_start = 0;
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if i > lit_start {
+            segs.push(FmtSeg::Lit {
+                off: lit_start,
+                len: i - lit_start,
+            });
+        }
+        i += 1; // past '%'
+        let bad = |w: &str| Error::Unsupported(format!("printf: {w}"));
+        if i >= fmt.len() {
+            return Err(bad("trailing '%'"));
+        }
+        if fmt[i] == b'%' {
+            segs.push(FmtSeg::Percent);
+            i += 1;
+            lit_start = i;
+            continue;
+        }
+        // Flags — only `0` (zero-pad) so far; `-`/`+`/` `/`#` change layout, fail-closed.
+        let mut zero = false;
+        while i < fmt.len() {
+            match fmt[i] {
+                b'0' => {
+                    zero = true;
+                    i += 1;
+                }
+                b'-' | b'+' | b' ' | b'#' => return Err(bad("flag (-/+/space/#)")),
+                _ => break,
+            }
+        }
+        // Field width (decimal). `*` (dynamic) and `.` (precision) are deferred.
+        let mut width = 0u32;
+        while i < fmt.len() && fmt[i].is_ascii_digit() {
+            width = width * 10 + u32::from(fmt[i] - b'0');
+            i += 1;
+        }
+        if width as u64 + 2 >= FMT_BUF_END - FMT_BUF {
+            return Err(bad("field width too large"));
+        }
+        if i < fmt.len() && (fmt[i] == b'.' || fmt[i] == b'*') {
+            return Err(bad("precision / dynamic width"));
+        }
+        // Length modifiers are informational here — the LLVM arg already carries the real width.
+        while i < fmt.len() && matches!(fmt[i], b'l' | b'h' | b'z' | b'j' | b't' | b'L') {
+            i += 1;
+        }
+        let conv = *fmt.get(i).ok_or_else(|| bad("trailing conversion"))?;
+        i += 1;
+        segs.push(match conv {
+            b'u' => FmtSeg::Uint {
+                base: 10,
+                zero,
+                width,
+            },
+            b'x' => FmtSeg::Uint {
+                base: 16,
+                zero,
+                width,
+            },
+            b'c' => FmtSeg::Char,
+            b'd' | b'i' => return Err(bad("%d/%i (signed) — later slice")),
+            b's' => return Err(bad("%s — later slice")),
+            other => return Err(bad(&format!("conversion %{}", other as char))),
+        });
+        lit_start = i;
+    }
+    if fmt.len() > lit_start {
+        segs.push(FmtSeg::Lit {
+            off: lit_start,
+            len: fmt.len() - lit_start,
+        });
+    }
+    Ok(segs)
+}
+
 fn lower_io_call(
     ctx: &mut BlockCtx,
     c: &llvm_ir::instruction::Call,
@@ -1821,8 +2064,135 @@ fn lower_io_call(
         }
         // `free(ptr)`: the bump allocator never reclaims, so this is a no-op.
         "free" => Ok(true),
+        // `printf(fmt, …)`: a **guest-side format engine**. The constant format string is parsed at
+        // translate time; literal runs are written straight from the format global, and each
+        // conversion lowers to `__svm_utoa` + width/zero-padding (a buffer pre-fill) → `Stream.write`.
+        // Returns 0 (the char count is rarely used). Non-constant formats / unsupported directives are
+        // fail-closed `Unsupported` (see `parse_format`).
+        "printf" => {
+            lower_printf(ctx, c)?;
+            let r = ctx.push(Inst::ConstI32(0));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         _ => Ok(false),
     }
+}
+
+/// Lower a `printf(fmt, …)` call (the constant format engine — see the `"printf"` arm). Emits the
+/// `Stream.write`s for the literals and conversions in order, consuming the variadic args.
+fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<(), Error> {
+    let gname = global_name_of(&c.arguments[0].0)
+        .ok_or_else(|| Error::Unsupported("printf: non-constant format string".into()))?;
+    let fmt_addr = *ctx
+        .globals
+        .get(&gname)
+        .ok_or_else(|| Error::Unsupported("printf: format not in window".into()))?;
+    let bytes = ctx
+        .gbytes
+        .get(&gname)
+        .ok_or_else(|| Error::Unsupported("printf: format not a constant string".into()))?
+        .clone();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let segs = parse_format(&bytes[..end])?;
+
+    let utoa = ctx
+        .helpers
+        .utoa
+        .ok_or_else(|| Error::Unsupported("printf: utoa helper missing".into()))?;
+    let mut argi = 1; // arg 0 is the format string; varargs follow
+    for seg in segs {
+        match seg {
+            FmtSeg::Lit { off, len } => {
+                let a = ctx.const_i64((fmt_addr + off as u64) as i64);
+                let n = ctx.const_i64(len as i64);
+                ctx.emit_write(a, n)?;
+            }
+            FmtSeg::Percent => {
+                let pct = ctx.push(Inst::ConstI32(b'%' as i32));
+                let scratch = ctx.scratch_byte(pct);
+                let one = ctx.const_i64(1);
+                ctx.emit_write(scratch, one)?;
+            }
+            FmtSeg::Char => {
+                let arg = &c.arguments.get(argi).ok_or_else(|| {
+                    Error::Unsupported("printf: more conversions than args".into())
+                })?;
+                argi += 1;
+                let v = ctx.operand(&arg.0)?;
+                let scratch = ctx.scratch_byte(v);
+                let one = ctx.const_i64(1);
+                ctx.emit_write(scratch, one)?;
+            }
+            FmtSeg::Uint { base, zero, width } => {
+                let arg = c.arguments.get(argi).ok_or_else(|| {
+                    Error::Unsupported("printf: more conversions than args".into())
+                })?;
+                argi += 1;
+                // The argument as an unsigned `i64` of its own width (a narrow arg zero-extends).
+                let av = ctx.operand(&arg.0)?;
+                let uval = match val_type(arg.0.get_type(ctx.types).as_ref())? {
+                    ValType::I64 => av,
+                    _ => ctx.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: av,
+                    }),
+                };
+                // Pre-fill the pad region of the scratch buffer (`width` constant byte-stores), then
+                // `utoa` writes the digits backward over its high end; the unfilled low pad remains.
+                if width > 0 {
+                    let padch = ctx.push(Inst::ConstI32(if zero { b'0' } else { b' ' } as i32));
+                    for k in 0..width as u64 {
+                        let a = ctx.const_i64((FMT_BUF_END - width as u64 + k) as i64);
+                        ctx.push_effect(Inst::Store {
+                            op: svm_ir::StoreOp::I32_8,
+                            addr: a,
+                            value: padch,
+                            offset: 0,
+                            align: 0,
+                        });
+                    }
+                }
+                let basec = ctx.const_i64(base as i64);
+                let bufend = ctx.const_i64(FMT_BUF_END as i64);
+                let start = ctx.push(Inst::Call {
+                    func: utoa,
+                    args: vec![uval, basec, bufend],
+                }); // i64 start pointer
+                let len = ctx.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: BinOp::Sub,
+                    a: bufend,
+                    b: start,
+                });
+                if width > 0 {
+                    // write `max(len, width)` bytes ending at `bufend` (pad + digits).
+                    let wv = ctx.const_i64(width as i64);
+                    let gt = ctx.push(Inst::IntCmp {
+                        ty: IntTy::I64,
+                        op: CmpOp::GtU,
+                        a: len,
+                        b: wv,
+                    });
+                    let maxlen = ctx.push(Inst::Select {
+                        cond: gt,
+                        a: len,
+                        b: wv,
+                    });
+                    let wstart = ctx.push(Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Sub,
+                        a: bufend,
+                        b: maxlen,
+                    });
+                    ctx.emit_write(wstart, maxlen)?;
+                } else {
+                    ctx.emit_write(start, len)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The largest constant byte length we unroll a `memcpy`/`memset` into chunked load/stores; a
@@ -2461,6 +2831,9 @@ struct BlockCtx<'a> {
     caps: &'a HashMap<String, u32>,
     /// String-literal global name → its C-string length (for `puts`/`fputs` write lengths).
     cstrs: &'a HashMap<String, u64>,
+    /// Constant global name → its bytes (for parsing a `printf` constant format string at translate
+    /// time — the format engine reads `@.str`'s content here, never at runtime).
+    gbytes: &'a HashMap<String, Vec<u8>>,
     /// Synthesized mem-loop helper indices (for a variable-length `memset`/`memcpy`).
     helpers: Helpers,
     /// The module's type table — for resolving a constexpr-GEP operand's strides in [`operand`].
@@ -2757,6 +3130,7 @@ fn translate_block(
     globals: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
+    gbytes: &HashMap<String, Vec<u8>>,
     helpers: &Helpers,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
@@ -2773,6 +3147,7 @@ fn translate_block(
         globals,
         caps,
         cstrs,
+        gbytes,
         helpers: *helpers,
         types,
         insts: Vec::new(),
