@@ -8,6 +8,12 @@ This file is the working tracker for the on-ramp, the analog of `WASM.md` for th
 bridge. Like that doc, fold completed sections into `DESIGN.md` and drop this file once
 the actionable gaps close (the repo convention, cf. the former `WASM.md`/`SCHEDULING.md`).
 
+> **Milestone 1 (the D54 exit criterion) is complete and folded into `DESIGN.md` §20a** — all
+> eight chibicc corpus libraries run byte-identical to native `clang`. This file is retained as
+> the tracker for the **remaining general-C breadth** (varargs `printf`, `realloc`, wider SIMD,
+> libm, …), now pursued **demo-driven** — see "Pending work — demo-driven plan" below. The slice
+> log (A–V) is kept as the implementation record until the file is dropped.
+
 **Status: Milestone 1 slices A–V done — the **D54 exit criterion is met**: all **eight corpus
 libraries run byte-identical to native `clang`** — B-Con's **SHA-256**, **xxHash**, **stb_perlin**,
 **tiny-regex-c**, **jsmn**, **heapgrow**, **miniz/tinfl**, and **clay** (`demo_*_vs_native`, 64 tests).
@@ -547,11 +553,37 @@ bits 0–31, lane 1 = 32–63 — its little-endian image).
 (sha256 ✅, xxhash ✅, perlin ✅, regex ✅, jsmn ✅, heapgrow ✅, tinfl ✅, clay ✅). **8 of 8** — the D54
 "matches native clang" exit criterion.
 
-**Remaining (general-C breadth, beyond the corpus).**
-- [ ] Varargs `printf`/`fprintf`/`snprintf` (varargs ABI on the data stack + a format engine) — no
-      corpus demo needs it; `puts`/`fputs` of a non-literal string; `realloc`; `argc`/`argv`;
-      transcendental math; `llvm.bswap`/`bitreverse`; variable-length `memmove`; wider SIMD
-      (`<4 x float>`, `<2 x double>`, …).
+## Pending work — demo-driven plan
+
+The corpus is done; the remaining work is **general-C breadth**, pursued the same way that worked
+for the corpus: pick a small **real end-to-end demo** (`crates/svm-run/demos/`), drive it through
+`clang -O2 → translate → verify → run` vs native, and close exactly the gaps it reveals. Each demo
+below is a whole-program, `write`-output C program (its own minimal libc, like the corpus demos) so
+it stays a clean differential against a native `cc` build. Ordered by value (printf first — it is
+the dominant general-C gap).
+
+| # | Demo (proposed) | Drives (pending item) | Also exercises |
+|---|---|---|---|
+| 1 | **`hexdump`** — read stdin, print `%08x  %02x ×16  |ascii|` rows | **varargs `printf`** (`%x`/`%02x`/`%08x`/`%c`/width/pad) — the big one | `read`, loops |
+| 2 | **`vector`/`sort`** — read ints into a doubling buffer, qsort, print | **`realloc`** (grow-and-copy) + numeric `printf` (`%d`) | `malloc`, `read` |
+| 3 | **`mat4`** — 4×4 matrix × vec4 / 3D transform, print rows | **wider SIMD** (`<4 x float>`) — generalize the 2-lane scalarization | floats, `printf` |
+| 4 | **`crc32` + big-endian TLV reader** | **`llvm.bswap`** (endian) | tables, `printf` |
+| 5 | **`editor`/gap-buffer** — insert/delete in a text buffer | **overlapping `memmove`** (direction-aware runtime loop) | arrays |
+| 6 | **`raytrace`/`mandelbrot+shading`** or **DSP sine** | **transcendental libm** (`sqrt`/`sin`/`cos`/`pow`/`exp`) — bundle a small **guest `libm`** (poly approximations), like the corpus demos bundle `memset` | floats, `printf` |
+
+Notes:
+- **`printf` runs in the guest** (per the capability model): a guest-side format engine parses the
+  (constant) format string at translate time and lowers each conversion to int→string / float→string
+  helpers → `Stream.write`; only the bytes cross the boundary. `%f` pulls in float formatting (defer
+  to demo 3/6 if demo 1 stays integer/hex). Non-constant format strings stay `Unsupported`.
+- **transcendentals/libm**: prefer a **guest** `libm` (the demo or a bundled header supplies
+  `sqrt`/`sin`/… as guest code) over any host math capability — keeps math in the sandbox. `sqrt`
+  already lowers to the SVM op (slice F); `sin`/`cos`/`exp`/`pow` need guest implementations.
+- **`argc`/`argv`**: needs a powerbox/runner change (pass argv to `_start`), not just the frontend —
+  schedule alongside a CLI-style demo once the above land.
+
+**Recommended next slice:** demo 1 (**`hexdump`** → varargs `printf`), the highest-leverage general-C
+gap. Land it, then proceed down the table.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
