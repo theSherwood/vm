@@ -94,8 +94,10 @@ struct Kernel {
     ir: &'static str,
     /// Core wasm32 (`(memory N)`): `(func (export "run") (param i64) (result i64))`.
     wat32: &'static str,
-    /// Equivalent wasm64 (`(memory i64 N)`), for kernels that touch memory — `None` for
-    /// pure-compute kernels, where the memory type is irrelevant.
+    /// Equivalent wasm64 (`(memory i64 N)`). Memory kernels exercise the real wasm64 bounds-check
+    /// path; pure-compute kernels still carry a wasm64 twin (with a declared-but-unused memory) so
+    /// every row has the column — there it just confirms wasm32≈wasm64 parity. `None` only for
+    /// kernels with no wasm64 form at all (the host-call interface kernels).
     wat64: Option<&'static str>,
     /// The **native** lane: the same algorithm as a plain Rust `fn(n) -> result`, compiled by
     /// `rustc`/LLVM into this binary — the bare-metal ceiling (no VM, no per-run compile). Must
@@ -147,7 +149,29 @@ block3(v17: i64):
         (br $loop)))
     (local.get $acc)))
 "#,
-    wat64: None,
+    // A wasm64 twin for table completeness. `alu` touches no memory, so the only difference from
+    // `wat32` is the declared `(memory i64 1)` (which makes it a genuine memory64 module) — the
+    // compute lowers byte-identically, so this row confirms wasm32≈wasm64 parity for pure compute.
+    wat64: Some(
+        r#"
+(module
+  (memory i64 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc
+          (i64.add
+            (i64.add
+              (i64.mul (local.get $acc) (i64.const 6364136223846793005))
+              (i64.const 1442695040888963407))
+            (local.get $i)))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    ),
     native: Some(native_alu),
 };
 
@@ -216,7 +240,27 @@ block3(v0: i64, v1: i64, v2: v128):
         (i32.add (i32x4.extract_lane 0 (local.get $acc)) (i32x4.extract_lane 1 (local.get $acc)))
         (i32.add (i32x4.extract_lane 2 (local.get $acc)) (i32x4.extract_lane 3 (local.get $acc)))))))
 "#,
-    wat64: None,
+    // A wasm64 twin for table completeness — like `alu`, `simd` touches no memory, so this only
+    // adds a declared `(memory i64 1)`; the v128 compute lowers identically (wasm32≈wasm64).
+    wat64: Some(
+        r#"
+(module
+  (memory i64 1)
+  (func (export "run") (param $n i64) (result i64)
+    (local $i i64) (local $acc v128)
+    (local.set $acc (v128.const i32x4 0 0 0 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc (i32x4.add (local.get $acc) (v128.const i32x4 1 2 3 4)))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (i64.extend_i32_u
+      (i32.add
+        (i32.add (i32x4.extract_lane 0 (local.get $acc)) (i32x4.extract_lane 1 (local.get $acc)))
+        (i32.add (i32x4.extract_lane 2 (local.get $acc)) (i32x4.extract_lane 3 (local.get $acc)))))))
+"#,
+    ),
     // No `native` lane: a fair native SIMD ceiling needs portable SIMD intrinsics (unstable in
     // Rust), and a *scalar* Rust loop is apples-to-oranges against the JIT's `paddd` lowering —
     // it would make the JIT look (misleadingly) faster than "native". `simd` stays a v128 reference
@@ -859,7 +903,7 @@ fn alu_from_c() -> Result<Resolved, String> {
         SRC,
         vec![0],
         ALU.wat32.to_string(),
-        None,
+        ALU.wat64.map(|w| w.to_string()),
         Some(native_alu),
     )
 }
