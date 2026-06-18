@@ -1788,6 +1788,35 @@ fn v_dot(lo: &mut Lower) -> Result<(), Error> {
     lo.push(v, ValType::V128);
     Ok(())
 }
+/// `i16x8.relaxed_dot_i8x16_i7x16_s` — the deterministic signed-i8 dot (`Inst::VDotI8`).
+fn v_dot_i8(lo: &mut Lower) -> Result<(), Error> {
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VDotI8 { a, b });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
+/// `i32x4.relaxed_dot_i8x16_i7x16_add_s` = `extadd_pairwise_s(dot_i8(a, b)) + c` — composed from the
+/// i8 dot, the existing widening pairwise add, and an i32x4 add (the deterministic recipe).
+fn v_dot_i8_add(lo: &mut Lower) -> Result<(), Error> {
+    let (c, _) = lo.pop()?;
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let dot = lo.emit(Inst::VDotI8 { a, b });
+    let wide = lo.emit(Inst::VExtAddPairwise {
+        shape: VShape::I32x4,
+        signed: true,
+        a: dot,
+    });
+    let v = lo.emit(Inst::VIntBin {
+        shape: VShape::I32x4,
+        op: VIntBinOp::Add,
+        a: wide,
+        b: c,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
 fn v_extmul(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
     let (b, _) = lo.pop()?;
     let (a, _) = lo.pop()?;
@@ -4130,6 +4159,8 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             let v = lo.emit(Inst::Swizzle { a, b });
             lo.push(v, ValType::V128);
         }
+        O::I16x8RelaxedDotI8x16I7x16S => v_dot_i8(lo)?,
+        O::I32x4RelaxedDotI8x16I7x16AddS => v_dot_i8_add(lo)?,
 
         other => return unsup(format!("operator {other:?}")),
     }

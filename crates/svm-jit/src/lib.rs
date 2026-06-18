@@ -2706,8 +2706,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VPopcnt { .. } => {}
                 // `avgr_u` (`i8x16`/`i16x8` only, verifier-enforced) → native `avg_round`.
                 Inst::VAvgr { .. } => {}
-                // `i32x4.dot_i16x8_s` → `swiden_low/high` + `imul` + `iadd_pairwise` (all legalize).
-                Inst::VDot { .. } => {}
+                // `i32x4.dot_i16x8_s` / `i16x8.dot_i8x16_s` → `swiden_low/high` + `imul` +
+                // `iadd_pairwise` (all legalize).
+                Inst::VDot { .. } | Inst::VDotI8 { .. } => {}
                 // Extended multiply → widen low/high both operands + `imul` on the wide shape.
                 // `imul` legalizes for every wide shape (incl. `i64x2`, unlike `i8x16.mul`).
                 Inst::VExtMul { .. } => {}
@@ -3805,6 +3806,20 @@ fn lower_block(
                 // [a4b4,..]) = [a0b0+a1b1, a2b2+a3b3, a4b4+a5b5, a6b6+a7b7]` — the wasm dot result.
                 let x = vcast(b, get(&vals, *a)?, I16X8);
                 let y = vcast(b, get(&vals, *rb)?, I16X8);
+                let xl = b.ins().swiden_low(x);
+                let xh = b.ins().swiden_high(x);
+                let yl = b.ins().swiden_low(y);
+                let yh = b.ins().swiden_high(y);
+                let pl = b.ins().imul(xl, yl);
+                let ph = b.ins().imul(xh, yh);
+                let r = b.ins().iadd_pairwise(pl, ph);
+                vcast(b, r, I8X16)
+            }
+            Inst::VDotI8 { a, b: rb } => {
+                // The i8→i16 signed dot, same shape as `VDot` one width down: widen each i8x16 to
+                // two i16x8 halves, multiply, pairwise-add. (Deterministic relaxed_dot_i8x16_i7x16_s.)
+                let x = vcast(b, get(&vals, *a)?, I8X16);
+                let y = vcast(b, get(&vals, *rb)?, I8X16);
                 let xl = b.ins().swiden_low(x);
                 let xh = b.ins().swiden_high(x);
                 let yl = b.ins().swiden_low(y);

@@ -439,6 +439,33 @@ fn relaxed_simd_madd_and_friends() {
     );
 }
 
+/// The two relaxed **i8×i7 dot** ops (the deterministic signed-i8 lowering): the i16 dot and the
+/// i32 dot-with-accumulate. Splatted bytes a=3, b=4 → each i16 lane = 3·4+3·4 = 24; the i32 add
+/// variant widen-pairwise-adds two i16 lanes (24+24) and adds the accumulator. `eval` pins interp==JIT.
+#[test]
+fn relaxed_simd_i8_dot() {
+    // i16x8.relaxed_dot_i8x16_i7x16_s: lane = a·b + a·b = 2·(a·b).
+    let dot = "(module (func (export \"f\") (param $a i32) (param $b i32) (result i32)
+        (i16x8.extract_lane_s 0 (i16x8.relaxed_dot_i8x16_i7x16_s
+          (i8x16.splat (local.get $a)) (i8x16.splat (local.get $b))))))";
+    let got = match eval(dot, "f", &[Value::I32(3), Value::I32(4)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(got, 24, "3·4 + 3·4");
+
+    // i32x4.relaxed_dot_i8x16_i7x16_add_s: extadd_pairwise(dot) + c. dot lanes are all 24, so each
+    // i32 lane = 24 + 24 + c = 48 + c. Accumulator c splatted to 100 ⇒ 148.
+    let dota = "(module (func (export \"f\") (param $a i32) (param $b i32) (param $c i32) (result i32)
+        (i32x4.extract_lane 0 (i32x4.relaxed_dot_i8x16_i7x16_add_s
+          (i8x16.splat (local.get $a)) (i8x16.splat (local.get $b)) (i32x4.splat (local.get $c))))))";
+    let got = match eval(dota, "f", &[Value::I32(3), Value::I32(4), Value::I32(100)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(got, 148, "24 + 24 + 100");
+}
+
 #[test]
 fn f64x2_pmin_pmax() {
     let pm = |op: &str| {

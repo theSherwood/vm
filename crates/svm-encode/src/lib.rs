@@ -176,6 +176,7 @@ mod op {
         pub const VPOPCNT: u8 = 0x1B; // a (i8x16 implicit)
         pub const VAVGR: u8 = 0x1C; // shape, a, b
         pub const VDOT: u8 = 0x1D; // a, b (i16x8 -> i32x4 implicit)
+        pub const VDOT_I8: u8 = 0x22; // a, b (i8x16 -> i16x8 implicit)
         pub const VEXTMUL: u8 = 0x1E; // shape (wide), op (VWidenOp), a, b
         pub const VEXTADD: u8 = 0x1F; // shape (wide), signed (u8), a
         pub const VQ15MULR: u8 = 0x20; // a, b (i16x8 implicit)
@@ -895,6 +896,12 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
+        Inst::VDotI8 { a, b } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VDOT_I8);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+        }
         Inst::VExtMul { shape, op: o, a, b } => {
             out.push(op::SIMD);
             out.push(op::simd::VEXTMUL);
@@ -1154,6 +1161,10 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             b: c.idx()?,
         },
         op::simd::VDOT => Inst::VDot {
+            a: c.idx()?,
+            b: c.idx()?,
+        },
+        op::simd::VDOT_I8 => Inst::VDotI8 {
             a: c.idx()?,
             b: c.idx()?,
         },

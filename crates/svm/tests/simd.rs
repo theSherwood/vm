@@ -96,6 +96,7 @@ fn simd_text_and_binary_roundtrip() {
           v143 = i8x16.avgr_u v2 v3\n\
           v144 = i16x8.avgr_u v2 v3\n\
           v145 = i32x4.dot_i16x8_s v2 v3\n\
+          v1450 = i16x8.dot_i8x16_s v2 v3\n\
           v146 = i16x8.extmul_low_i8x16_s v2 v3\n\
           v147 = i32x4.extmul_high_i16x8_u v2 v3\n\
           v148 = i64x2.extmul_low_i32x4_s v2 v3\n\
@@ -624,6 +625,45 @@ fn diff_i32x4_dot() {
         .wrapping_mul(-32768)
         .wrapping_add((-32768i32).wrapping_mul(-32768));
     assert_eq!(diff1(&s, &[]), want as u32 as i64, "dot overflow lane");
+}
+
+// `i16x8.dot_i8x16_s` — the signed i8 dot into i16 lanes (`Inst::VDotI8`, the deterministic
+// relaxed_dot_i8x16_i7x16_s). Two const i8x16 vectors, an i16 lane read back; oracle = the wrapping
+// pair-sum. Includes the corner where the i16 sum wraps (−128·−128 + −128·−128 = 32768 → −32768).
+#[test]
+fn diff_i16x8_dot_i8() {
+    let a: [i8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let b: [i8; 16] = [-1, 1, -2, 2, -3, 3, -4, 4, 1, 1, 1, 1, 1, 1, 1, 1];
+    let bytes = |v: &[i8; 16]| {
+        v.iter()
+            .map(|x| (*x as u8).to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for lane in 0..8u8 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n\
+               v0 = v128.const {}\n\
+               v1 = v128.const {}\n\
+               v2 = i16x8.dot_i8x16_s v0 v1\n\
+               v3 = i16x8.extract_lane_s {lane} v2\n  return v3\n}}\n",
+            bytes(&a),
+            bytes(&b)
+        );
+        let j = lane as usize;
+        let want = (a[2 * j] as i32 * b[2 * j] as i32 + a[2 * j + 1] as i32 * b[2 * j + 1] as i32)
+            as i16 as i32;
+        assert_eq!(diff1(&s, &[]) as i32, want, "dot_i8 lane {lane}");
+    }
+    // Wrap corner: lane 0 of all-(-128) → −128·−128 + −128·−128 = 32768, wraps to −32768 in i16.
+    let row = "128 128 0 0 0 0 0 0 0 0 0 0 0 0 0 0"; // i8 −128 = 0x80
+    let s = format!(
+        "func () -> (i32) {{\nblock0():\n\
+           v0 = v128.const {row}\n  v1 = v128.const {row}\n\
+           v2 = i16x8.dot_i8x16_s v0 v1\n\
+           v3 = i16x8.extract_lane_s 0 v2\n  return v3\n}}\n"
+    );
+    assert_eq!(diff1(&s, &[]) as i32, -32768, "dot_i8 wrap corner");
 }
 
 #[test]

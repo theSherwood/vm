@@ -1944,6 +1944,14 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+    /// Signed `i8` dot product of adjacent pairs into `i16` lanes — `result[j] = a[2j]·b[2j] +
+    /// a[2j+1]·b[2j+1]` (wrapping at `i16`), both operands read as signed `i8`. Source `i8x16`,
+    /// result `i16x8`. The **deterministic** lowering of the relaxed `relaxed_dot_i8x16_i7x16_s`
+    /// (the spec-allowed signed-×-signed behavior, not the x86 `pmaddubsw` unsigned-×-signed one).
+    VDotI8 {
+        a: ValIdx,
+        b: ValIdx,
+    },
     /// Extended (widening) multiply: widen the low/high half of both `i8x16`/`i16x8`/`i32x4`
     /// operands (sign- or zero-, per [`VWidenOp`]) to the next wider shape, then multiply lane-wise.
     /// `shape` is the **wide result** (`i16x8`/`i32x4`/`i64x2`); `a`/`b`/result are `v128`.

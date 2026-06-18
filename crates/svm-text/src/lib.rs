@@ -461,6 +461,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::VPopcnt { a } => format!("i8x16.popcnt v{a}"),
         Inst::VAvgr { shape, a, b } => format!("{}.avgr_u v{a} v{b}", shape.name()),
         Inst::VDot { a, b } => format!("i32x4.dot_i16x8_s v{a} v{b}"),
+        Inst::VDotI8 { a, b } => format!("i16x8.dot_i8x16_s v{a} v{b}"),
         Inst::VExtMul { shape, op, a, b } => {
             let (low, signed) = op.parts();
             let src = shape.narrower().map(|s| s.name()).unwrap_or("?");
@@ -1886,6 +1887,11 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::VDot { a, b });
+        }
+        if op == "i16x8.dot_i8x16_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VDotI8 { a, b });
         }
         if op == "i16x8.q15mulr_sat_s" {
             let a = self.value(names)?;

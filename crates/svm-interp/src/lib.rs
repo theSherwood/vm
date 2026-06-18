@@ -6216,6 +6216,9 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::VDot { a, b } => {
             Reg::from_v128(simd_dot(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
         }
+        Inst::VDotI8 { a, b } => {
+            Reg::from_v128(simd_dot_i8(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
+        }
         Inst::VExtMul { shape, op, a, b } => Reg::from_v128(simd_extmul(
             *shape,
             *op,
@@ -6738,6 +6741,21 @@ fn simd_dot(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
         let b1 = lane_sext(lane_read(&b, 2 * i + 1, 2), 2) as i32;
         let r = a0.wrapping_mul(b0).wrapping_add(a1.wrapping_mul(b1));
         lane_write(&mut o, i, 4, r as u32 as u64);
+    }
+    o
+}
+
+/// `i16x8.dot_i8x16_s`: signed `i8` dot of adjacent pairs into `i16` lanes (wrapping) — the
+/// deterministic `relaxed_dot_i8x16_i7x16_s`. Products of `i8`s fit in `i16`; the pair sum wraps.
+fn simd_dot_i8(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for j in 0..8 {
+        let a0 = lane_sext(lane_read(&a, 2 * j, 1), 1) as i32;
+        let a1 = lane_sext(lane_read(&a, 2 * j + 1, 1), 1) as i32;
+        let b0 = lane_sext(lane_read(&b, 2 * j, 1), 1) as i32;
+        let b1 = lane_sext(lane_read(&b, 2 * j + 1, 1), 1) as i32;
+        let r = a0 * b0 + a1 * b1; // exact in i32; wraps when written at i16 width
+        lane_write(&mut o, j, 2, r as u16 as u64);
     }
     o
 }

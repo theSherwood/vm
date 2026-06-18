@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (106 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (107 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -30,7 +30,7 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
 - **Finished proposals**: sign-extension ops; non-trapping float→int (`trunc_sat`); bulk-memory
   `memory.copy`/`memory.fill`; **fixed-128 SIMD** (the complete fixed-width v128 op set, D58 — all
   arith/bitwise/shuffle/compare/convert/widen/narrow/dot/extmul/q15 lanes + most of **relaxed SIMD**
-  via deterministic lowerings incl. a fused FMA — only the i8×i7 relaxed dot remains);
+  via deterministic lowerings incl. a fused FMA and the signed-i8 relaxed dot);
   **threads** —
   the full `*.atomic.*` set (full-width i32/i64 map 1:1 onto IR atomics; the narrow 8/16-bit forms
   emulate via a 32-bit word-CAS loop) + `atomic.fence`, `shared`+imported memory, and the
@@ -195,7 +195,7 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   under contention on both backends).
 - [ ] **Imported globals & imported tables.** Dynamic-linking / PIC (`__memory_base`/`__table_base`/
   `__stack_pointer` imports). Statically-linked output defines its own, so this only bites `-shared`/PIC.
-- [~] **Relaxed SIMD — 18 of 20 done** (`-mrelaxed-simd`). A separate proposal of ~20 ops whose
+- [x] **Relaxed SIMD — DONE (all 20)** (`-mrelaxed-simd`). A separate proposal of ~20 ops whose
   results are **implementation-defined within a spec-allowed set** — they let an engine emit one native
   instruction (x86 FMA, ARM rounding, `blendv`, `pmaddubsw`) without the fix-up sequence deterministic
   SIMD needs to be bit-identical across architectures. SVM ships them via the **deterministic-choice**
@@ -209,9 +209,12 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     `swizzle`; `relaxed_q15mulr_s` → `q15mulr_sat`. All alias existing deterministic ops — transpiler
     arms only, no new IR. `crates/svm/tests/simd.rs` (FMA vs `mul_add`, incl. fused≠mul+add cases) +
     `svm-wasm/tests/simd.rs` (the `-mrelaxed-simd` shape on both backends).
-  - **Remaining (2):** `i16x8.relaxed_dot_i8x16_i7x16_s` + `i32x4.relaxed_dot_i8x16_i7x16_add_s` (the
-    `pmaddubsw`-shaped i8×i7 dot) — fiddly deterministic semantics (the "i7" operand's high bit), still
-    a clean `Unsupported`.
+  - `relaxed_dot_i8x16_i7x16_s` → `Inst::VDotI8` (the deterministic **signed-i8 dot** → i16, the
+    spec-allowed signed-×-signed behavior, not x86's unsigned-×-signed `pmaddubsw`; `swiden` + `imul`
+    + `iadd_pairwise`, the same recipe Cranelift's own deterministic-relaxed mode uses). The
+    `relaxed_dot_i8x16_i7x16_add_s` variant composes that dot with the existing `extadd_pairwise` +
+    `i32x4.add` (no extra IR). `crates/svm/tests/simd.rs` (incl. the i16 wrap corner) +
+    `svm-wasm/tests/simd.rs`.
   The deterministic-default rationale, since it's a recurring question:
   - **The base-SIMD "fixups" are op *semantics*, not a determinism tax.** `i32x4.trunc_sat_f32x4_s`
     *means* "saturate out-of-range, NaN→0"; the clamp instructions Cranelift emits on x86 are the cost
@@ -292,10 +295,10 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 5. **SIMD remainder** 🟢 — **DONE.** The full fixed-width v128 op set transpiles + runs on both
    backends (compares, min/max, shifts, abs/neg, reductions, saturating add/sub, widen, narrow, all
    10 conversions, pmin/pmax, popcnt, `avgr_u`, dot product, extmul, extadd_pairwise, q15mulr_sat).
-   **Relaxed SIMD** is 18/20 done via deterministic lowerings (incl. a fused FMA); only the i8×i7
-   relaxed dot remains.
+   **Relaxed SIMD** is fully done (all 20) via deterministic lowerings (incl. a fused FMA and the
+   signed-i8 dot).
 6. **Narrow-atomic CAS-loop** 🟢 — **DONE.** Then **reference types** 🟡 (externref→handle, funcref→index).
-7. EH, the i8×i7 relaxed dot, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
+7. EH, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
 
 Code map: the rejection sites are the `unsup(...)` calls in `crates/svm-wasm/src/lib.rs` (section
 parse + the `worker_op` operator catch-all `other => unsup("operator {…}")`); tests live in
