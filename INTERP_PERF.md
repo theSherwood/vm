@@ -291,11 +291,24 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               `bytecode_caps.rs` (hand-authored host-fn modules: sum-args, op-selector, chained,
               in-loop, forged-handle-traps, self-count, self-get) — all bit-identical to
               `run_with_host`; `.expect(Some)` gates that bytecode actually drove it (didn't fall back).
-        - [ ] **1c-5b** — `Vm` as a schedulable task in the executor (`drive`/`Scheduler`): the
-              foundation threads/fibers ride on. Harness: schedule/interleaving equality.
-        - [ ] **1c-5c** — threads (`thread.spawn`/`join`) + `memory.wait`/`notify`. Harness:
-              concurrent-outcome equality (DPOR-style).
-        - [ ] **1c-5d** — fibers/coroutines (`cont.new`/`resume`/`suspend`, yielder, shared_region).
+        - [x] **1c-5b** — §12 **fibers** (`cont.new` / `cont.resume` / `suspend`), cooperative
+              continuation switching. Reordered ahead of threads because it is **single-vCPU and
+              inline-driven** (no M:N pool, no DPOR), so it builds directly on the 1c-2 suspend/resume
+              machinery. `Outcome` gained `ContNew`/`ContResume`/`FiberSuspend`; the per-op loop
+              escapes to a new `drive` loop that owns the fiber registry (`FiberState`) + resume
+              `chain` (parked resumers, each with its `Vm` and the `cont.resume` result slot) and
+              switches the active `Vm` — the bytecode analogue of `run_inner`'s `cont.*` arms. Fiber
+              entry resolves through the natural table + `fiber_sig` (forged/mistyped → `FiberFault`);
+              `run`/`compile_and_run_sliced` now share `drive` (budget unifies 1c-2 slicing). New TDD
+              harness `bytecode_fibers.rs` (run-to-completion, return-status, suspend round-trip,
+              multi-suspend loop, forged-resume fault, root-suspend fault) — all bit-identical to
+              `run`. **Migration** (a fiber resumed on a *different* vCPU) needs the thread pool, so it
+              rides on 1c-5c.
+        - [ ] **1c-5c** — threads (`thread.spawn`/`join`) + `memory.wait`/`notify`: `Vm` as a
+              schedulable task in the M:N executor (`drive`/`Scheduler`) + fiber migration. Harness:
+              concurrent-outcome equality (DPOR-style). The hard one (pool + DPOR).
+        - [ ] **1c-5d** — coroutines via `Instantiator` (`spawn_coroutine`/`resume`, `Yielder`,
+              `SharedRegion` grant) — inline-driven like fibers, reuses the `drive` switch machinery.
         - [ ] **1c-5e** — cross-module units (`install`/`invoke` indirect calls; tail calls).
     - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
           stepping report tree-walker-identical locations. New harness: debug-trace equality.

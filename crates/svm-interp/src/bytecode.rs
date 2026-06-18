@@ -8,15 +8,18 @@
 //! (`bin64`, `cmp32`, `fto_i`, …) and `Mem` — **no op semantics are duplicated here**, only the
 //! dispatch/layout.
 //!
-//! Scope (this slice): scalar + memory + SIMD/`v128` + fences + direct calls. Hot scalar/memory ops
-//! dispatch inline; the SIMD/`v128`/fence long tail is delegated to the reference
-//! [`super::eval_inst`] (same semantics, no re-implementation). [`compile_module`] returns `None`
-//! when a function uses an op that needs a runtime seam this slice doesn't drive — `call_indirect`
-//! (dispatch table), tail calls, or capability/fiber/thread/reflection ops (host powerbox,
-//! scheduler, fiber registry) — so callers fall back to the tree-walker. It is **not yet wired as
-//! the default execution path**; correctness is gated by the equality harness
-//! (`crates/svm/tests/bytecode_diff.rs`) against the reference interpreter, and the remaining seams
-//! (debug, scheduler, fibers, durability, capabilities) plus those ops land in later slices.
+//! Scope so far: scalar + memory + SIMD/`v128` + fences + direct & indirect calls; the synchronous
+//! capability seam (generic `cap.call` + `cap.self.*`, via `host.cap_dispatch_slots`); and §12
+//! **fibers** (`cont.new`/`cont.resume`/`suspend`, cooperative single-vCPU switching driven by
+//! [`drive`]). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long tail is delegated to
+//! the reference [`super::eval_inst`] (same semantics, no re-implementation). [`compile_module`]
+//! returns `None` when a function needs a seam not yet driven here — threads / `memory.wait` (M:N
+//! pool + DPOR), `Instantiator`/`Yielder` coroutines, cross-module `install`/`invoke`, tail calls,
+//! durability — so callers (`super::run_with_host_fast`) fall back to the tree-walker for those.
+//!
+//! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
+//! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
+//! tree-walker (`bytecode_diff.rs`, `bytecode_caps.rs`, `bytecode_fibers.rs`).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
@@ -229,6 +232,26 @@ enum Op {
     /// results in `dst`, `dst+1`).
     CapSelfGet {
         idx: u32,
+        dst: u32,
+    },
+    /// §12 fiber create (`cont.new`): register a pending fiber `(funcref, sp)` in the driver's
+    /// registry and write its handle to `dst`. No switch — handled by the driver.
+    ContNew {
+        func: u32,
+        sp: u32,
+        dst: u32,
+    },
+    /// §12 fiber resume (`cont.resume`): switch into fiber `k`, delivering `arg`; the two results
+    /// `(status, value)` land in `dst`, `dst+1` when the fiber suspends or returns. Driver-driven.
+    ContResume {
+        k: u32,
+        arg: u32,
+        dst: u32,
+    },
+    /// §12 fiber suspend (`suspend`): hand `value` back to the resumer (status SUSPENDED) and park
+    /// this fiber; `dst` receives the next resume's `arg`. Driver-driven.
+    Suspend {
+        value: u32,
         dst: u32,
     },
     Ret {
@@ -598,12 +621,26 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
         // `self_dispatch`, the same path the tree-walker and the JIT thunk take.
         Inst::CapSelfCount => Op::CapSelfCount { dst },
         Inst::CapSelfGet { idx } => Op::CapSelfGet { idx: g(*idx), dst },
-        // Control / host / cross-module ops this slice doesn't drive (they need the scheduler,
-        // fiber registry, or dispatch table) — fall back to the tree-walker.
+        // §12 fibers — cooperative continuation switching, driven by the bytecode driver (no M:N
+        // pool, no DPOR; single-vCPU). `cont.new` registers a pending fiber, `cont.resume` switches
+        // in (two results), `suspend` switches back (one result).
+        Inst::ContNew { func, sp } => Op::ContNew {
+            func: g(*func),
+            sp: g(*sp),
+            dst,
+        },
+        Inst::ContResume { k, arg } => Op::ContResume {
+            k: g(*k),
+            arg: g(*arg),
+            dst,
+        },
+        Inst::Suspend { value } => Op::Suspend {
+            value: g(*value),
+            dst,
+        },
+        // Control / host / cross-module ops this slice doesn't drive (they need the M:N scheduler
+        // worker pool or the dispatch table) — fall back to the tree-walker.
         Inst::CallImport { .. }
-        | Inst::ContNew { .. }
-        | Inst::ContResume { .. }
-        | Inst::Suspend { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }
         | Inst::MemoryWait { .. }
@@ -683,17 +720,15 @@ pub fn compile_and_run_sliced(
     }
     let mut mem = build_mem(m);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&c, func as usize, args) {
-        Ok(v) => v,
-        Err(t) => return Some(Err(t)),
-    };
-    loop {
-        match vm.resume(&c, fuel, &mut mem, &mut host, slice.max(1)) {
-            Ok(Outcome::Done(vals)) => return Some(Ok(vals)),
-            Ok(Outcome::Suspended) => continue,
-            Err(t) => return Some(Err(t)),
-        }
-    }
+    Some(drive(
+        &c,
+        func,
+        args,
+        fuel,
+        &mut mem,
+        &mut host,
+        slice.max(1),
+    ))
 }
 
 fn run(
@@ -704,24 +739,160 @@ fn run(
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
-    let mut vm = Vm::new(c, entry as usize, args)?;
     // The production path never preempts itself: an unlimited budget makes `resume` run straight to
     // completion, with the per-op budget branch perfectly predicted (so the hot loop is unchanged).
+    drive(c, entry, args, fuel, mem, host, u64::MAX)
+}
+
+/// Why [`Vm::resume`] returned. `Done`/`Suspended` are the run-to-completion + budget cases; the
+/// `Cont*`/`Suspend` cases are §12 fiber switches the [`drive`] loop services (the `Vm` itself owns
+/// no fiber registry — that is per-vCPU driver state). A trap is the `Err` arm of `resume`'s
+/// `Result` and is terminal, like the tree-walker.
+enum Outcome {
+    Done(Vec<Value>),
+    Suspended,
+    /// `cont.new`: register a fiber for `(funcref, sp)`, write its handle to `dst`, continue.
+    ContNew {
+        funcref: i32,
+        sp: i64,
+        dst: u32,
+    },
+    /// `cont.resume`: switch into fiber `kh` with `arg`; `(status, value)` land at `dst`/`dst+1`.
+    ContResume {
+        kh: i32,
+        arg: i64,
+        dst: u32,
+    },
+    /// `suspend`: hand `value` to the resumer; the parked fiber's `dst` receives the next resume arg.
+    FiberSuspend {
+        value: i64,
+        dst: u32,
+    },
+}
+
+/// A §12 fiber's state in the driver's per-vCPU registry (handle = index). Non-durable only — a
+/// durable run falls back to the tree-walker (`run_with_host_fast` gates on `!host.is_durable()`).
+enum FiberState {
+    /// Created by `cont.new` but never resumed: starts by calling `funcref(sp, arg)`.
+    Pending { funcref: i32, sp: i64 },
+    /// Suspended mid-run; resuming delivers the new `arg` into `suspend_dst` and continues `vm`.
+    Parked { vm: Vm, suspend_dst: u32 },
+    /// Currently on the resume chain (active or an ancestor) — not independently resumable.
+    Running,
+    /// Returned; resuming again is a `FiberFault`.
+    Done,
+}
+
+/// The root activation's id in the resume chain (it has no fiber handle).
+const ROOT_FIBER: usize = usize::MAX;
+
+/// Drive one vCPU — the entry activation plus any §12 fibers it spawns — to completion. Owns the
+/// fiber registry and the resume `chain` (parked resumers, each with the `Vm` to restore and the
+/// `cont.resume` result slot awaiting `(status, value)`); the active `Vm` runs until it returns a
+/// fiber [`Outcome`], at which point control switches here, exactly as `run_inner`'s `cont.*` arms
+/// switch the active frame stack. `budget` only slices *where* the active `Vm` pauses (Slice 1c-2);
+/// it never changes results.
+fn drive(
+    c: &Compiled,
+    entry: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+    budget: u64,
+) -> Result<Vec<Value>, Trap> {
+    let mut active = Vm::new(c, entry as usize, args)?;
+    let mut active_id: usize = ROOT_FIBER;
+    let mut chain: Vec<(usize, Vm, u32)> = Vec::new();
+    let mut fibers: Vec<FiberState> = Vec::new();
+
     loop {
-        match vm.resume(c, fuel, mem, host, u64::MAX)? {
-            Outcome::Done(vals) => return Ok(vals),
-            Outcome::Suspended => continue,
+        match active.resume(c, fuel, mem, host, budget)? {
+            // Budget exhausted (sliced harness only): re-enter the same activation; its cursor is
+            // already persisted, so this is transparent.
+            Outcome::Suspended => {}
+            Outcome::Done(vals) => match chain.pop() {
+                // The root finished: that is the whole run's result.
+                None => return Ok(vals),
+                // A fiber's function returned: mark it Done and hand `(RETURNED, retval)` to the
+                // resumer it switched away from.
+                Some((rid, resumer, rdst)) => {
+                    fibers[active_id] = FiberState::Done;
+                    let retval = vals.first().copied().unwrap_or(Value::I64(0));
+                    active = resumer;
+                    active_id = rid;
+                    active.set(rdst, Reg::from_i32(super::FIBER_RETURNED));
+                    active.set(rdst + 1, Reg::from_value(retval));
+                }
+            },
+            Outcome::ContNew { funcref, sp, dst } => {
+                if fibers.len() + 1 >= super::MAX_FIBERS {
+                    return Err(Trap::FiberFault);
+                }
+                let h = fibers.len() as i32;
+                fibers.push(FiberState::Pending { funcref, sp });
+                active.set(dst, Reg::from_i32(h));
+            }
+            Outcome::ContResume { kh, arg, dst } => {
+                let k = kh as usize;
+                // Claim fiber `k`: a pending fiber starts (call `funcref(sp, arg)`), a parked one
+                // continues (the new `arg` becomes its `suspend`'s result). Anything else is inert.
+                let target = match fibers.get_mut(k) {
+                    Some(slot @ FiberState::Pending { .. }) => {
+                        let (funcref, sp) = match std::mem::replace(slot, FiberState::Running) {
+                            FiberState::Pending { funcref, sp } => (funcref, sp),
+                            _ => unreachable!(),
+                        };
+                        // Resolve the fiber entry through the natural table + `fiber_sig`, exactly
+                        // as `table_lookup` does — a forged/mistyped funcref is a `FiberFault`.
+                        let f = (funcref as u32 as usize) & c.table_mask;
+                        let ok = c
+                            .sigs
+                            .get(f)
+                            .is_some_and(|(p, r)| p[..] == FIBER_PARAMS && r[..] == FIBER_RESULTS);
+                        if !ok {
+                            return Err(Trap::FiberFault);
+                        }
+                        Vm::new(c, f, &[Value::I64(sp), Value::I64(arg)])?
+                    }
+                    Some(slot @ FiberState::Parked { .. }) => {
+                        match std::mem::replace(slot, FiberState::Running) {
+                            FiberState::Parked {
+                                mut vm,
+                                suspend_dst,
+                            } => {
+                                vm.set(suspend_dst, Reg::from_i64(arg));
+                                vm
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => return Err(Trap::FiberFault), // forged / Running / Done
+                };
+                let resumer = std::mem::replace(&mut active, target);
+                chain.push((active_id, resumer, dst));
+                active_id = k;
+            }
+            Outcome::FiberSuspend { value, dst } => {
+                // Pop the resumer to switch back to; an empty chain means the root tried to
+                // `suspend`, which is a `FiberFault` (the root has no resumer).
+                let (rid, resumer, rdst) = chain.pop().ok_or(Trap::FiberFault)?;
+                let suspended = std::mem::replace(&mut active, resumer);
+                fibers[active_id] = FiberState::Parked {
+                    vm: suspended,
+                    suspend_dst: dst,
+                };
+                active_id = rid;
+                active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
+                active.set(rdst + 1, Reg::from_i64(value));
+            }
         }
     }
 }
 
-/// Why [`Vm::resume`] returned: the entry activation completed (`Done`), or it hit its op budget at
-/// an op boundary with the cursor persisted into the `Vm` (`Suspended`) — call `resume` again to
-/// continue. (A trap is the `Err` arm of `resume`'s `Result` and is terminal, like the tree-walker.)
-enum Outcome {
-    Done(Vec<Value>),
-    Suspended,
-}
+/// `fiber_sig` params/results, inlined so the driver can compare without allocating a `FuncType`.
+const FIBER_PARAMS: [ValType; 2] = [ValType::I64, ValType::I64];
+const FIBER_RESULTS: [ValType; 1] = [ValType::I64];
 
 /// The reified bytecode continuation — everything a suspended activation needs to resume, held as
 /// an explicit value rather than on the host Rust call stack. The register file (`regs`), the stack
@@ -764,6 +935,14 @@ impl Vm {
             pc: 0,
             scratch: Vec::new(),
         })
+    }
+
+    /// Write a value to a frame-relative slot of the *current* (persisted) activation window. Used
+    /// by [`drive`] to deliver fiber results (`cont.new` handle, `cont.resume` `(status, value)`,
+    /// the next `arg` into a `suspend`) into a `Vm` paused at a fiber op — `base` is the cursor the
+    /// last `resume` persisted, so this targets the same window the op's `dst` was resolved against.
+    fn set(&mut self, slot: u32, v: Reg) {
+        self.regs[self.base + slot as usize] = v;
     }
 
     /// Run the continuation for at most `budget` ops, then return [`Outcome::Suspended`] at the next
@@ -1126,6 +1305,40 @@ impl Vm {
                     self.regs[base + *dst as usize] = Reg::from_i32(res[0] as i32);
                     self.regs[base + *dst as usize + 1] = Reg::from_i32(res[1] as i32);
                     pc += 1;
+                }
+                // §12 fiber ops escape to `drive` (which owns the registry / resume chain). Each
+                // advances past itself and persists the cursor, so the driver — after creating the
+                // fiber, switching in, or switching back — resumes this activation right after the op
+                // (with the op's `dst` slot(s) filled in by the driver).
+                Op::ContNew { func, sp, dst } => {
+                    let funcref = r!(*func).i32();
+                    let spv = r!(*sp).i64();
+                    let dst = *dst;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::ContNew {
+                        funcref,
+                        sp: spv,
+                        dst,
+                    });
+                }
+                Op::ContResume { k, arg, dst } => {
+                    let kh = r!(*k).i32();
+                    let arg = r!(*arg).i64();
+                    let dst = *dst;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::ContResume { kh, arg, dst });
+                }
+                Op::Suspend { value, dst } => {
+                    let value = r!(*value).i64();
+                    let dst = *dst;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::FiberSuspend { value, dst });
                 }
                 Op::Unreachable => return Err(Trap::Unreachable),
                 Op::Eval {
