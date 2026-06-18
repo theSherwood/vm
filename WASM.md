@@ -194,7 +194,43 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   under contention on both backends).
 - [ ] **Imported globals & imported tables.** Dynamic-linking / PIC (`__memory_base`/`__table_base`/
   `__stack_pointer` imports). Statically-linked output defines its own, so this only bites `-shared`/PIC.
-- [ ] **Relaxed SIMD** (a separate proposal: relaxed madd, relaxed swizzle, …; clang `-mrelaxed-simd`).
+- [ ] **Relaxed SIMD** (`f32x4.relaxed_madd`, `relaxed_min`/`max`, `i32x4.relaxed_trunc_*`,
+  `i8x16.relaxed_swizzle`/`relaxed_laneselect`, `relaxed_dot_*`; clang `-mrelaxed-simd`). A separate
+  proposal of ~20 ops whose results are **implementation-defined within a spec-allowed set** — they
+  let an engine emit one native instruction (x86 FMA, ARM rounding, `blendv`, `pmaddubsw`) without the
+  fix-up sequence deterministic SIMD needs to be bit-identical across architectures. Currently a clean
+  `Unsupported` (they hit the `worker_op` catch-all). **Default stance: deliberately out of scope** —
+  with a concrete opt-in path if a real program ever needs the speed. The reasoning, since it's a
+  recurring question:
+  - **The base-SIMD "fixups" are op *semantics*, not a determinism tax.** `i32x4.trunc_sat_f32x4_s`
+    *means* "saturate out-of-range, NaN→0"; the clamp instructions Cranelift emits on x86 are the cost
+    of computing **that operation**, not a surcharge SVM adds. Emitting raw `cvttps2dq` instead
+    wouldn't be "faster non-deterministic SIMD" — it would compute a *different function* than the
+    bytecode specifies (wrong, not merely unportable). For the **vast majority** of v128 ops
+    (arith/bitwise/shift/shuffle/lane/`i*` min-max) there is **zero fixup** — register-to-register,
+    bit-identical across hardware for free. The handful with fixups (float→int trunc, float min/max,
+    narrow) emit *the same Cranelift lowering Wasmtime ships*, so SVM is at parity with the "as fast as
+    wasm" baseline it measures against (D36) — it never pays *more* than the engine it's compared to.
+  - **The one genuine speed-vs-determinism knob already defaults to fast.** Float **NaN bit patterns**
+    are host-defined in the default mode (fast, matches hardware) and canonicalized only in the opt-in
+    deterministic mode (DESIGN §12); the interp↔JIT differential is correspondingly *NaN-insensitive
+    per lane* (DESIGN §17 "float lanes are NaN-insensitive in the differential"). So wherever leaving
+    a result un-fixed-up is a real (free) choice, the default is *already* speed-first.
+  - **What relaxed SIMD would actually cost is JIT trust, not "purity".** The interp↔JIT differential
+    is how SVM *trusts its own JIT* — the primary evidence Cranelift didn't miscompile into a
+    confinement escape (§18/I4), with the architecture-independent interpreter as the oracle. A native
+    relaxed lowering makes interp and JIT legitimately diverge in *value* (not just NaN bits), so that
+    evidence evaporates for those ops. That's a security-model cost, in the exact dimension SVM
+    competes on vs. "just run Wasmtime."
+  - **Opt-in path (if ever built):** extend the existing *NaN-insensitive-per-lane* differential
+    precedent from "ignore NaN payload bits" to "ignore the result of this *op*". Emit the fast native
+    relaxed lowering, mark only the relaxed ops **value-insensitive** in the differential, and keep the
+    full byte-exact oracle for every other op in the module. That gives max-speed relaxed SIMD as a
+    per-op opt-in for perf users (e.g. ML/DSP kernels built with `-mrelaxed-simd`) without globally
+    weakening the JIT-trust story — strictly better than flipping the default to non-deterministic.
+    Until a concrete program needs it, the deterministic default + clean `Unsupported` stands. (A
+    cheaper interim: lower each relaxed op to its *deterministic* cousin — always spec-allowed, keeps
+    interp==JIT — so a `-mrelaxed-simd` binary *runs correctly* but without the relaxed speedup.)
 - [ ] **Multiple memories** and **multiple tables** (`lib.rs` rejects both).
 - [ ] **Typed function references** (the function-references proposal) and **extended const
   expressions** (arithmetic in global/data-offset initializers — currently only constants).
