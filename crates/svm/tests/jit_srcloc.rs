@@ -339,3 +339,110 @@ fn jit_without_debug_vars_tracks_no_variables() {
     let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
     assert!(bare.var_locations().is_empty());
 }
+
+/// A module carrying the four structured `TypeDef` shapes that map to DWARF type DIEs (Stage 3b):
+/// a base `int`, a pointer to it, a `[3]` array of it, and a two-field struct of it. Everything
+/// references type 0 (`int`), exercising the inter-type `DW_FORM_ref4` fixups.
+const TYPES_DBG: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 1
+  v2 = i32.add v0 v1
+  return v2
+}
+
+debug.file 0 "types.c"
+debug.loc 0 0 1 0 2 7
+debug.type 0 base "int" signed 4
+debug.type 1 ptr "int *" 0 8
+debug.type 2 array "int[3]" 0 3
+debug.type 3 agg "Point" 8
+debug.field 3 "x" 0 0
+debug.field 3 "y" 4 0
+"#;
+
+#[test]
+fn jit_emits_type_dies_that_round_trip() {
+    // Stage 3b: the §6 `TypeDef` graph emitted as `DW_TAG_*_type` DIEs, parsed back by the project's
+    // DWARF info reader — every type recovered, and the inter-type references resolve to the right
+    // DIE (the `DW_FORM_ref4` fixups landed on the correct offsets). These are the type DIEs the
+    // Stage 3c variable DIEs will point `DW_AT_type` at.
+    use svm_wasm::dwarf_info::DwarfType;
+
+    let cm = compile(TYPES_DBG);
+    let (info, abbrev) = cm.debug_info_sections();
+    let parsed = svm_wasm::dwarf_info::parse(&info, &abbrev, &[]).expect("the emitted CU parses");
+
+    // The `int` base type is what every other type references; find its DIE offset.
+    let int_off = *parsed
+        .types
+        .iter()
+        .find_map(|(off, t)| {
+            matches!(t, DwarfType::Base { name, .. } if name == "int").then_some(off)
+        })
+        .expect("int base type present");
+
+    // Base: signed, 4 bytes (DW_ATE_signed = 0x05).
+    match &parsed.types[&int_off] {
+        DwarfType::Base {
+            name,
+            encoding,
+            size,
+        } => {
+            assert_eq!(name, "int");
+            assert_eq!(*encoding, 0x05, "DW_ATE_signed");
+            assert_eq!(*size, 4);
+        }
+        _ => panic!("expected a base type at the int offset"),
+    }
+
+    // `int *` — an 8-byte pointer whose pointee resolves back to the `int` DIE.
+    assert!(
+        parsed.types.values().any(|t| matches!(
+            t,
+            DwarfType::Pointer { pointee: Some(p), size } if *p == int_off && *size == 8
+        )),
+        "int* pointer references the int type"
+    );
+
+    // `int[3]` — an array of three elements whose element type resolves to `int`.
+    assert!(
+        parsed.types.values().any(|t| matches!(
+            t,
+            DwarfType::Array { elem: Some(e), count } if *e == int_off && *count == 3
+        )),
+        "int[3] array references the int type"
+    );
+
+    // `struct Point { int x@0; int y@4; }`, 8 bytes — both members reference the `int` DIE.
+    let (kw, size, members) = parsed
+        .types
+        .values()
+        .find_map(|t| match t {
+            DwarfType::Aggregate {
+                kw,
+                name,
+                size,
+                members,
+            } if name == "Point" => Some((*kw, *size, members)),
+            _ => None,
+        })
+        .expect("Point struct present");
+    assert_eq!(kw, "struct");
+    assert_eq!(size, 8);
+    assert_eq!(members.len(), 2);
+    assert_eq!((members[0].name.as_str(), members[0].offset), ("x", 0));
+    assert_eq!((members[1].name.as_str(), members[1].offset), ("y", 4));
+    assert!(
+        members.iter().all(|m| m.type_ref == int_off),
+        "both members reference the int type"
+    );
+
+    // The 2b subprogram still parses alongside the types.
+    assert_eq!(parsed.subs.len(), 1, "the function subprogram survives");
+
+    // A non-`-g` module emits nothing.
+    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let (bi, ba) = bare.debug_info_sections();
+    assert!(bi.is_empty() && ba.is_empty());
+}

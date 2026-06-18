@@ -743,9 +743,17 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     `<optimized out>`), and a module without `debug.var` tracks nothing; the JIT/fiber/SIMD/c_frontend
     differential suites confirm the non-`-g` path is unchanged. (Memory forms `Window`/`WindowVia`/
     `Fixed` carry no value label — they're a DWARF memory expression in 3c.)
-  - [ ] **3b — `DW_TAG_*_type` DIEs.** Emit the §6 `TypeDef` graph (base/pointer/array/struct/union/
-    opaque) as DWARF type DIEs in `.debug_info`, the inverse of `dwarf_info`'s type reader. Round-trip
-    through `svm_wasm::dwarf_info::parse` → `DwarfType` matches the `TypeDef`s.
+  - [x] **3b — `DW_TAG_*_type` DIEs. — built.** `dwarf::debug_info` now also emits the §6 `TypeDef`
+    graph as type DIEs in the CU (the inverse of `dwarf_info`'s type reader): `Base` →
+    `DW_TAG_base_type` (`DW_ATE_*` encoding + byte_size), `Pointer` → `DW_TAG_pointer_type`, `Array` →
+    `DW_TAG_array_type` + a `DW_TAG_subrange_type` child carrying the count, `Aggregate` →
+    `DW_TAG_structure_type` + `DW_TAG_member` children, `Opaque` → an empty `structure_type`.
+    Inter-type references (`pointee`/`elem`/field `ty`) are CU-relative `DW_FORM_ref4`s resolved by a
+    fixup pass once each type DIE's offset is known. `CompiledModule` carries the `TypeDef`s;
+    `debug_info_sections()` emits them ahead of the subprograms. Tests (`jit_srcloc.rs`): the base/
+    pointer/array/struct graph **round-trips through `svm_wasm::dwarf_info::parse`** with every
+    `DW_AT_type` ref resolving to the right DIE, and binutils `readelf --debug-dump=info` parses it
+    cleanly (refs shown as `<0x18>` → the `int` DIE). The 2b subprogram round-trip is unchanged.
   - [ ] **3c — `DW_TAG_variable` DIEs + locations.** Variable DIEs as subprogram children:
     `DW_AT_name`, `DW_AT_type` (→ 3b), and `DW_AT_location` — a `.debug_loclists` list of
     `DW_OP_reg`/`DW_OP_breg`(CFA) ranges from 3a for SSA vars, `DW_OP_addr`/`DW_OP_fbreg` for the

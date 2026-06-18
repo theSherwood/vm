@@ -1287,6 +1287,9 @@ pub struct CompiledModule {
     /// `value_labels_ranges` after finalize. Empty unless the module carried `-g` vars. Host-side
     /// tooling, off the runtime path.
     var_locs: Vec<VarMachineInfo>,
+    /// The §6 structured type graph (`debug_info.types`), emitted as `DW_TAG_*_type` DIEs (W5
+    /// JIT/DWARF Stage 3b). Empty unless the module carried `-g` types. Host-side tooling.
+    debug_types: Vec<svm_ir::TypeDef>,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
     /// (declaration order), after everything that points into it.
     module: JITModule,
@@ -1338,14 +1341,15 @@ impl CompiledModule {
     }
 
     /// The synthesized DWARF `(.debug_info, .debug_abbrev)` for this module's finalized code (W5
-    /// JIT/DWARF Stage 2b): a compile unit with one `DW_TAG_subprogram` per function (its machine
-    /// `[low_pc, high_pc)` extent, derived as the span of its source-mapped ops), so gdb/lldb map a
-    /// stopped address to its function. Both empty without `-g`.
+    /// JIT/DWARF Stages 2b + 3b): a compile unit holding the §6 `TypeDef` graph as `DW_TAG_*_type`
+    /// DIEs (3b) and one `DW_TAG_subprogram` per function (2b: its machine `[low_pc, high_pc)`
+    /// extent), so gdb/lldb map a stopped address to its function and resolve source-variable types.
+    /// Both empty without `-g`.
     pub fn debug_info_sections(&self) -> (Vec<u8>, Vec<u8>) {
         if self.src_ranges.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        dwarf::debug_info(&self.func_extents())
+        dwarf::debug_info(&self.func_extents(), &self.debug_types)
     }
 
     /// Each function's machine `[low_pc, high_pc)` extent, derived as the span (min `lo`, max `hi`)
@@ -1981,6 +1985,11 @@ impl CompiledModule {
             src_ranges,
             src_files,
             var_locs,
+            debug_types: m
+                .debug_info
+                .as_ref()
+                .map(|di| di.types.clone())
+                .unwrap_or_default(),
             module,
         })
     }
