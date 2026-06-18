@@ -23,8 +23,8 @@
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
 //! `return_call_indirect`, reusing the current window — O(1) deep tail recursion). [`compile_module`]
-//! returns `None` when a function needs a seam not yet driven here — the separate-**module**
-//! coroutine variants (ops 6/7), demand/fault-yield coroutines, instantiate-mixed-with-fibers,
+//! returns `None` when a function needs a seam not yet driven here — the demand-paged separate-module
+//! coroutine variant (op 7), demand/fault-yield coroutines (op 4), instantiate-mixed-with-fibers,
 //! `gc.roots`, `call.import`, or durability — so callers (`super::run_with_host_fast`) fall back to
 //! the tree-walker for those.
 //!
@@ -333,6 +333,18 @@ enum Op {
     /// powerbox; its handle (or `EINVAL`) lands at `dst`. `handle` is the Instantiator cap (authority).
     SpawnCoroutine {
         handle: u32,
+        entry: u32,
+        off: u32,
+        size_log2: u32,
+        dst: u32,
+    },
+    /// §14 `Instantiator.spawn_coroutine_module(module, entry, off, size_log2, fuel)` (op 6): like
+    /// [`Op::SpawnCoroutine`], but the cooperative child runs a host-granted **separate** `Module`
+    /// (`module` is its handle, the first i64 arg). The driver resolves + compiles the module and
+    /// materializes its data into the carve; thereafter it is `resume`d inline like any coroutine.
+    SpawnCoroutineModule {
+        handle: u32,
+        module: u32,
         entry: u32,
         off: u32,
         size_log2: u32,
@@ -890,6 +902,16 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     quota: g(args[4]),
                     dst,
                 },
+                // op 6 = spawn_coroutine_module: a coroutine child running a granted `Module` (the
+                // first arg); the carve args (entry/off/size_log2/fuel) follow.
+                (iface::INSTANTIATOR, 6) if args.len() >= 4 => Op::SpawnCoroutineModule {
+                    handle: g(*handle),
+                    module: g(args[0]),
+                    entry: g(args[1]),
+                    off: g(args[2]),
+                    size_log2: g(args[3]),
+                    dst,
+                },
                 // §14 cooperative coroutine round-trip — spawn_coroutine / resume / yield.
                 (iface::INSTANTIATOR, 2) if args.len() >= 3 => Op::SpawnCoroutine {
                     handle: g(*handle),
@@ -1187,6 +1209,17 @@ enum Outcome {
         size_log2: i64,
         dst: u32,
     },
+    /// §14 `spawn_coroutine_module`: like [`Outcome::SpawnCoroutine`], plus the resolved `Module`
+    /// handle `mh` whose granted program the coroutine child runs (the driver resolves + compiles it).
+    SpawnCoroutineModule {
+        ibase: u64,
+        isize: u64,
+        mh: i32,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
+        dst: u32,
+    },
     /// §14 `resume`: drive coroutine `ch` (authority already checked); `(status, value)` → `dst`.
     CoResume {
         ch: i32,
@@ -1272,10 +1305,14 @@ impl VTask {
 /// A §14 coroutine child: its own `Vm` continuation over a **confined** window (`nested_view`) and a
 /// Yielder-only powerbox. Driven inline by `resume_coro` until it yields or returns. `awaiting` is the
 /// `yield`'s result slot, set while suspended — the next `resume` writes the delivered value there.
+/// `table` is the child's natural dispatch table: it maps into module 0 for a same-module coroutine
+/// (op 2) or into the child's own pushed module index for a separate-module coroutine (op 6); the
+/// `vm`'s `module` field selects which (no installed §22 units either way).
 struct Coro {
     vm: Vm,
     mem: Option<Mem>,
     host: Host,
+    table: Table,
     awaiting: Option<u32>,
 }
 
@@ -1291,15 +1328,19 @@ enum CoStop {
 /// [`Vm::resume`] (never reaching here), and coroutine modules carry no fibers/threads — so the only
 /// outcomes possible are `Done`/`Suspended`/`CoYield`. A child trap propagates to the resumer.
 fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoStop, Trap> {
-    // A coroutine child runs module 0 (its entry is a module-0 func) with its **own natural** table:
-    // it holds no `Jit` cap, so it cannot reach installed §22 units (matching the tree-walker, where
-    // a coroutine child gets a fresh `DomainTable::new(&cfuncs, 0)`).
-    let table = build_table(mods[0].progs.len(), 0);
+    // The coroutine child runs over its **own natural** table (built at spawn): it holds no `Jit`
+    // cap, so it cannot reach installed §22 units (matching the tree-walker, where a coroutine child
+    // gets a fresh `DomainTable::new(&cfuncs, 0)`). `coro.vm.module` selects its program (module 0 for
+    // a same-module coroutine, its own pushed index for a separate-module one).
     loop {
-        match coro
-            .vm
-            .resume(mods, &table, fuel, &mut coro.mem, &mut coro.host, u64::MAX)?
-        {
+        match coro.vm.resume(
+            mods,
+            &coro.table,
+            fuel,
+            &mut coro.mem,
+            &mut coro.host,
+            u64::MAX,
+        )? {
             Outcome::Done(vals) => return Ok(CoStop::Done(vals)),
             Outcome::Suspended => {}
             Outcome::CoYield { value, dst } => {
@@ -1371,6 +1412,18 @@ enum VcpuStop {
         off: i64,
         size_log2: i64,
         quota: i64,
+        dst: u32,
+    },
+    /// §14 `Instantiator.spawn_coroutine_module` — the driver resolves + compiles the host-granted
+    /// `Module` (`mh`), builds a coroutine `Coro` over it, and registers it in the spawner's coroutine
+    /// set (thereafter `resume`d inline). Unlike `instantiate_module`, it creates no scheduler task.
+    SpawnCoroutineModule {
+        ibase: u64,
+        isize: u64,
+        mh: i32,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
         dst: u32,
     },
     Wait {
@@ -1625,6 +1678,28 @@ fn step_vcpu(
                 );
                 vt.active.set(dst, Reg::from_i32(h));
             }
+            // A separate-**module** coroutine spawn must compile + push the granted module (which
+            // needs the mutable `Domain`), so it escapes to the driver; once built, it is `resume`d
+            // inline like any coroutine.
+            Outcome::SpawnCoroutineModule {
+                ibase,
+                isize: isz,
+                mh,
+                entry,
+                off,
+                size_log2,
+                dst,
+            } => {
+                return Ok(VcpuStop::SpawnCoroutineModule {
+                    ibase,
+                    isize: isz,
+                    mh,
+                    entry,
+                    off,
+                    size_log2,
+                    dst,
+                })
+            }
             Outcome::CoResume { ch, value, dst } => {
                 // Take the coroutine; a forged/finished slot is an inert CapFault (propagates).
                 let mut coro = vt
@@ -1703,6 +1778,7 @@ fn spawn_coroutine(
         vm: child_vm,
         mem: child_mem,
         host: child_host,
+        table: build_table(c.progs.len(), 0), // same-module coroutine: natural table over module 0
         awaiting: None,
     }));
     (coroutines.len() - 1) as i32
@@ -2117,6 +2193,109 @@ fn drive(
                 let handle = tasks[ti].threads.len() as i32;
                 tasks[ti].threads.push(Some(cidx));
                 tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+            }
+            Ok(VcpuStop::SpawnCoroutineModule {
+                ibase,
+                isize: isz,
+                mh,
+                entry,
+                off,
+                size_log2,
+                dst,
+            }) => {
+                // Resolve + compile the granted module (forged handle → CapFault; uncoverable op →
+                // Malformed), exactly as for `instantiate_module`.
+                let (cfuncs, cmem_log2, cdata) = match host.resolve_module(mh) {
+                    Ok(g) => (g.funcs.clone(), g.memory_log2, g.data.clone()),
+                    Err(t) => {
+                        complete(&mut tasks, ti, Err(t));
+                        continue;
+                    }
+                };
+                let child_compiled = match compile_module(&cfuncs) {
+                    Some(c) => c,
+                    None => {
+                        complete(&mut tasks, ti, Err(Trap::Malformed));
+                        continue;
+                    }
+                };
+                // A coroutine entry is `(i64 yielder) -> (i64)`; the carve must equal the module's
+                // declared memory (§14 transparency).
+                let ok_entry = child_compiled
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
+                let child_size = if (0..64).contains(&size_log2) {
+                    1u64 << size_log2
+                } else {
+                    0
+                };
+                let off_u = off as u64;
+                let fits = child_size != 0
+                    && child_size <= isz
+                    && off_u & (child_size - 1) == 0
+                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                if !ok_entry || !fits || !mod_ok {
+                    tasks[ti]
+                        .vt
+                        .active
+                        .set(dst, Reg::from_i32(super::EINVAL as i32));
+                    continue;
+                }
+                let pbase = match tasks[ti].env {
+                    None => mem.as_ref().map_or(0, |m| m.window.base()),
+                    Some(k) => extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
+                };
+                let abs_base = pbase + ibase + off_u;
+                // Build the child window and materialize the module's data segments into the carve
+                // (as for `instantiate_module`).
+                let child_mem = {
+                    let pm: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    if let Some(m) = pm {
+                        for d in cdata.iter() {
+                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                                for (k, &b) in d.bytes.iter().enumerate() {
+                                    m.set_byte(abs_base + d.offset + k as u64, b);
+                                }
+                            }
+                        }
+                    }
+                    pm.map(|m| m.nested_view(abs_base, size_log2 as u8))
+                };
+                // A coroutine gets a Yielder-only powerbox (its single entry arg); it holds no
+                // Instantiator, so its own spawn/resume CapFault inside `Vm::resume`.
+                let mut child_host = Host::new();
+                let cy = child_host.grant_yielder();
+                let progs_len = child_compiled.progs.len();
+                let cm = dom.mods.len();
+                dom.mods.push(child_compiled);
+                let child_table = build_table_for(progs_len, 0, cm as u32);
+                let mut child_vm =
+                    match Vm::new(&dom.mods[cm], entry as usize, &[Value::I64(cy as i64)]) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tasks[ti]
+                                .vt
+                                .active
+                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                            continue;
+                        }
+                    };
+                child_vm.module = cm;
+                // The coroutine lives in the spawning vCPU's coroutine set, driven inline by `resume`.
+                tasks[ti].vt.coroutines.push(Some(Coro {
+                    vm: child_vm,
+                    mem: child_mem,
+                    host: child_host,
+                    table: child_table,
+                    awaiting: None,
+                }));
+                let h = (tasks[ti].vt.coroutines.len() - 1) as i32;
+                tasks[ti].vt.active.set(dst, Reg::from_i32(h));
             }
             Ok(VcpuStop::Join { handle, dst }) => {
                 let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
@@ -3015,6 +3194,34 @@ impl Vm {
                     return Ok(Outcome::SpawnCoroutine {
                         ibase,
                         isize: isz,
+                        entry,
+                        off,
+                        size_log2,
+                        dst,
+                    });
+                }
+                Op::SpawnCoroutineModule {
+                    handle,
+                    module: module_reg,
+                    entry,
+                    off,
+                    size_log2,
+                    dst,
+                } => {
+                    let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
+                    let mh = r!(*module_reg).i64() as i32;
+                    let entry = r!(*entry).i64();
+                    let off = r!(*off).i64();
+                    let size_log2 = r!(*size_log2).i64();
+                    let dst = *dst;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::SpawnCoroutineModule {
+                        ibase,
+                        isize: isz,
+                        mh,
                         entry,
                         off,
                         size_log2,

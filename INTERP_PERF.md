@@ -403,6 +403,17 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               segment → 1086, marker visible to the parent → 1_086_000_007, carve≠declared-memory →
               −EINVAL, forged module handle → CapFault) bit-identical to `run_with_host`. Still
               deferred: the module **coroutine** variants (ops 6/7) and demand/fault-yield (op 4).
+        - [x] **1c-5i** — §14 separate-**module** *coroutine* (`Instantiator.spawn_coroutine_module`,
+              op 6): the inline-coroutine analogue of op 5. The spawn escapes to the driver (it must
+              compile + push the granted module into `dom.mods`), which builds a `Coro` over it and
+              registers it in the spawner's coroutine set; thereafter it is `resume`d **inline** like
+              any coroutine. `Coro` gained a `table` field (its natural dispatch table — module 0 for
+              op 2, its own pushed index for op 6; the `vm.module` selects the program), so
+              `resume_coro` no longer hard-codes module 0. Data segments materialize into the carve and
+              the carve must equal the module's declared memory, as for op 5. New case in
+              `bytecode_separate_module.rs` (a foreign coroutine module yielding 100 / 210 then
+              returning 1019 → 1_001_329) bit-identical to `run_with_host`. Still deferred: demand
+              variants (ops 4/7, fault-yield paging).
     - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
           stepping report tree-walker-identical locations. New harness: debug-trace equality.
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:

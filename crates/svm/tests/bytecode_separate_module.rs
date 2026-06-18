@@ -162,3 +162,60 @@ block0(v0: i32, v1: i32):
 fn forged_module_handle_faults_identically() {
     check(PARENT_FORGED, CHILD_SRC, Err(()));
 }
+
+/// A coroutine ("plugin") module: a 64 KiB window whose entry (`(i64 yielder) -> (i64)`) yields 100,
+/// then `200 + r1`, then returns `999 + r2` (r1/r2 are the resume values). Stores a marker at offset
+/// 0 to exercise its confined window too.
+const CORO_CHILD: &str = r#"memory 16
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i32.wrap_i64 v0
+  va = i64.const 0
+  vb = i32.const 7
+  i32.store8 va vb
+  v4 = i64.const 100
+  v5 = cap.call 7 0 (i64) -> (i64) v1 (v4)
+  v6 = i64.const 200
+  v7 = i64.add v6 v5
+  v8 = cap.call 7 0 (i64) -> (i64) v1 (v7)
+  v9 = i64.const 999
+  v10 = i64.add v9 v8
+  return v10
+}
+"#;
+
+/// `spawn_coroutine_module(module, entry 0, off 64 KiB, size_log2 16, fuel 0)` → resume three times
+/// (delivering 0, 10, 20). Yields 100, 210, then returns 1019; `100 + 210 + 1019 + RETURNED*1e6`.
+const PARENT_CORO: &str = r#"memory 17
+func (i32, i32) -> (i64) {
+block0(v0: i32, v1: i32):
+  v2 = i64.extend_i32_s v1
+  v3 = i64.const 0
+  v4 = i64.const 65536
+  v5 = i64.const 16
+  v6 = i64.const 0
+  v7 = cap.call 6 6 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v6)
+  v8 = i64.const 0
+  v9, v10 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v7, v8)
+  v11 = i64.const 10
+  v12, v13 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v7, v11)
+  v14 = i64.const 20
+  v15, v16 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v7, v14)
+  v17 = i64.add v10 v13
+  v18 = i64.add v17 v16
+  v19 = i64.extend_i32_s v15
+  v20 = i64.const 1000000
+  v21 = i64.mul v19 v20
+  v22 = i64.add v18 v21
+  return v22
+}
+"#;
+
+#[test]
+fn coroutine_module_round_trip() {
+    check(
+        PARENT_CORO,
+        CORO_CHILD,
+        Ok(vec![Value::I64(100 + 210 + 1019 + 1_000_000)]),
+    );
+}
