@@ -300,12 +300,9 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         .global_vars
         .iter()
         .any(|g| name_str(&g.name) == "llvm.global_ctors");
-    let synth = (!imports.is_empty()
-        || need_malloc
-        || uses_blocking
-        || has_global_ctors
-        || need_getenv)
-        && has_main;
+    let needs_powerbox_entry =
+        !imports.is_empty() || need_malloc || uses_blocking || has_global_ctors || need_getenv;
+    let synth = needs_powerbox_entry && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
     if need_malloc {
@@ -2465,7 +2462,7 @@ fn synth_start_argv(
                 op: ConvOp::ExtendI32U,
                 a: 12,
             }, // v13 = envc (i64)
-            Inst::ConstI64(0), // v14 = j = 0
+            Inst::ConstI64(0),               // v14 = j = 0
         ],
         term: Terminator::Br {
             target: 6,
