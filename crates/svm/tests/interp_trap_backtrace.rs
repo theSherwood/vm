@@ -7,9 +7,12 @@
 use svm_interp::{run_traced, source_loc, Trap, Value};
 use svm_text::parse_module;
 
+/// A run's result plus its trap-time backtrace as `(func, file, line)` per frame (innermost first).
+type TracedRun = (Result<Vec<Value>, Trap>, Vec<(u32, String, u32)>);
+
 /// `(func, file, line)` for each frame of the trap-time backtrace, innermost first — `IrPc`s resolved
 /// to source via the module's `-g` debug info.
-fn traced(src: &str, arg: Value) -> (Result<Vec<Value>, Trap>, Vec<(u32, String, u32)>) {
+fn traced(src: &str, arg: Value) -> TracedRun {
     let m = parse_module(src).expect("parse");
     svm_verify::verify_module(&m).expect("verify");
     let mut fuel = u64::MAX;
