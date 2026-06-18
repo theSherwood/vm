@@ -63,9 +63,10 @@ use cranelift_codegen::ir::types::{
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, Function,
     InstBuilder, JumpTableData, MemFlags, SourceLoc, StackSlotData, StackSlotKind, Type,
-    UserFuncName, Value,
+    UserFuncName, Value, ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::LabelValueLoc;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -1123,6 +1124,14 @@ type SrcLocMap = std::collections::HashMap<(u32, u32, u32), u32>;
 /// `finalize` resolves the base address (W5 JIT/DWARF Stage 1).
 type RawSrcLocs = Vec<(u32, Vec<(u32, u32, u32)>)>;
 
+/// One source variable's machine-location ranges before address resolution (W5 JIT/DWARF Stage 3a):
+/// `[(start offset, end offset, location)]`, relative to its function's start until `finalize`.
+type VarLocRanges = Vec<(u32, u32, VarMachineLoc)>;
+
+/// Per-function captured value-label ranges before address resolution (Stage 3a): `(func index,
+/// [(value-label id, ranges)])`.
+type RawVarLocs = Vec<(u32, Vec<(u32, VarLocRanges)>)>;
+
 /// A machine-address → source range in finalized JIT code (W5 JIT/DWARF tier, Stage 1): the absolute
 /// `[lo, hi)` code range a source position covers, resolved after `finalize` from Cranelift's
 /// per-function `MachSrcLoc` ranges (relative offsets) + the function's finalized base address.
@@ -1145,6 +1154,44 @@ pub struct JitFrameLoc {
     pub file: String,
     pub line: u32,
     pub col: u32,
+}
+
+/// `(func, block) → [(block-local value index, value-label id)]` — the source variables to stamp
+/// with a Cranelift `ValueLabel` during lowering (W5 JIT/DWARF Stage 3a). Built once per compile from
+/// the §6 `debug_info.vars`' SSA-resident `VarLoc`s, only when the module carries `-g`. The label id
+/// is the variable's index into [`CompiledModule::var_locs`]; the block-local value index maps onto
+/// the JIT's per-block value map (see [`lower_block`]).
+type VarLabelMap = std::collections::HashMap<(u32, u32), Vec<(u32, u32)>>;
+
+/// Where a source variable's value physically lives over a machine-code range (W5 JIT/DWARF Stage
+/// 3a) — Cranelift's `LabelValueLoc` translated to DWARF terms, the bridge to a `DW_AT_location`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VarMachineLoc {
+    /// In machine register `dwarf_reg` (a DWARF register number, via `map_regalloc_reg_to_dwarf`) —
+    /// emits `DW_OP_regN` (Stage 3c).
+    Reg(u16),
+    /// At canonical-frame-address + `off` — emits `DW_OP_call_frame_cfa` + offset / `DW_OP_fbreg`.
+    CfaOffset(i64),
+}
+
+/// One `[lo, hi)` absolute machine-code range over which a source variable lives in [`VarMachineLoc`]
+/// (W5 JIT/DWARF Stage 3a) — one entry of a DWARF location list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarRange {
+    pub lo: u64,
+    pub hi: u64,
+    pub loc: VarMachineLoc,
+}
+
+/// A source variable's machine-location list in finalized JIT code (W5 JIT/DWARF Stage 3a): the
+/// `value_labels_ranges` Cranelift produced for the CLIF value that backs it, resolved to absolute
+/// pcs. Empty `ranges` ⇒ the optimizer dropped the value everywhere (gdb will show `<optimized
+/// out>`). Host-side tooling, off the runtime path (§2a).
+#[derive(Clone, Debug)]
+pub struct VarMachineInfo {
+    pub func: u32,
+    pub name: String,
+    pub ranges: Vec<VarRange>,
 }
 
 pub struct CompiledModule {
@@ -1236,6 +1283,10 @@ pub struct CompiledModule {
     src_ranges: Vec<SrcRange>,
     /// Source file paths (from `debug_info.files`), indexed by [`SrcRange::file`].
     src_files: Vec<String>,
+    /// Per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a), resolved from Cranelift's
+    /// `value_labels_ranges` after finalize. Empty unless the module carried `-g` vars. Host-side
+    /// tooling, off the runtime path.
+    var_locs: Vec<VarMachineInfo>,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
     /// (declaration order), after everything that points into it.
     module: JITModule,
@@ -1266,6 +1317,14 @@ impl CompiledModule {
     /// unless the module carried `-g`. For tooling/tests and the forthcoming DWARF line-program emit.
     pub fn src_ranges(&self) -> &[SrcRange] {
         &self.src_ranges
+    }
+
+    /// The per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a): for each `-g` source
+    /// variable whose value the JIT could track, the `[lo, hi)` machine ranges over which it lives in
+    /// a register or CFA-relative slot. The seed for the Stage 3c `DW_AT_location` loclists. Empty
+    /// without `-g`; a variable with empty `ranges` was optimized out everywhere.
+    pub fn var_locations(&self) -> &[VarMachineInfo] {
+        &self.var_locs
     }
 
     /// The synthesized DWARF `.debug_line` section for this module's finalized code (W5 JIT/DWARF
@@ -1628,10 +1687,48 @@ impl CompiledModule {
         });
         let mut raw_srclocs: RawSrcLocs = Vec::new();
 
+        // W5 JIT/DWARF Stage 3a: assign each SSA-resident source variable a `ValueLabel` and record
+        // the `(func, block) → [(block-local value, label)]` points `lower_block` stamps. Only the
+        // SSA forms (`Ssa`/`SsaList`) map to a Cranelift value-location; the window/fixed *memory*
+        // forms are left to Stage 3c (a DWARF memory expression, not a value label). `var_meta[label]`
+        // names the variable a label belongs to. Empty unless the module carries `-g` vars.
+        let mut var_meta: Vec<(u32, String)> = Vec::new();
+        let mut var_label_map: VarLabelMap = std::collections::HashMap::new();
+        if let Some(di) = m.debug_info.as_ref() {
+            for v in &di.vars {
+                let points: Vec<(u32, u32)> = match &v.loc {
+                    // A function-wide SSA index ≈ the block-0 local index (parameters, single-block
+                    // promoted scalars — the cases where the two numberings coincide).
+                    svm_ir::VarLoc::Ssa { value } => vec![(0, *value)],
+                    svm_ir::VarLoc::SsaList(locs) => {
+                        locs.iter().map(|l| (l.block, l.value)).collect()
+                    }
+                    // `Window`/`WindowVia`/`Fixed` are memory locations — no value label here.
+                    _ => continue,
+                };
+                let label = var_meta.len() as u32;
+                var_meta.push((v.func, v.name.clone()));
+                for (block, value) in points {
+                    var_label_map
+                        .entry((v.func, block))
+                        .or_default()
+                        .push((value, label));
+                }
+            }
+        }
+        let var_labels = (!var_label_map.is_empty()).then_some(&var_label_map);
+        let mut raw_var_locs: RawVarLocs = Vec::new();
+
         // Define each function body. `clear_context` after each define resets the cached
         // CFG/domtree so the next function never compiles against a stale CFG.
         let mut ctx = module.make_context();
         for (fi, (f, id)) in m.funcs.iter().zip(&ids).enumerate() {
+            // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in `lower_block`)
+            // takes effect and `value_labels_ranges` is populated. Gated on `-g` vars ⇒ no effect on
+            // an ordinary build. Must be set on the fresh `ctx.func` before lowering populates it.
+            if var_labels.is_some() {
+                ctx.func.collect_debug_info();
+            }
             build_clif(
                 &mut module,
                 &ids,
@@ -1650,6 +1747,7 @@ impl CompiledModule {
                 (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
                 fi as u32,
                 srcloc_map.as_ref(),
+                var_labels,
             )?;
             module
                 .define_function(*id, &mut ctx)
@@ -1665,6 +1763,38 @@ impl CompiledModule {
                         .collect();
                     if !ranges.is_empty() {
                         raw_srclocs.push((fi as u32, ranges));
+                    }
+                }
+            }
+            // Stage 3a: capture this function's value-label ranges, translating each Cranelift
+            // `LabelValueLoc` to DWARF terms now (the ISA is in hand; a `Reg` we cannot map is
+            // dropped — that sub-range simply has no location, like an optimized-out gap).
+            if var_labels.is_some() {
+                if let Some(cc) = ctx.compiled_code() {
+                    let isa = module.isa();
+                    let mut per_label: Vec<(u32, VarLocRanges)> = Vec::new();
+                    for (label, ranges) in &cc.value_labels_ranges {
+                        let mut out: VarLocRanges = Vec::new();
+                        for r in ranges {
+                            if r.end <= r.start {
+                                continue;
+                            }
+                            let loc = match r.loc {
+                                LabelValueLoc::Reg(reg) => match isa.map_regalloc_reg_to_dwarf(reg)
+                                {
+                                    Ok(d) => VarMachineLoc::Reg(d),
+                                    Err(_) => continue,
+                                },
+                                LabelValueLoc::CFAOffset(off) => VarMachineLoc::CfaOffset(off),
+                            };
+                            out.push((r.start, r.end, loc));
+                        }
+                        if !out.is_empty() {
+                            per_label.push((label.as_u32(), out));
+                        }
+                    }
+                    if !per_label.is_empty() {
+                        raw_var_locs.push((fi as u32, per_label));
                     }
                 }
             }
@@ -1727,6 +1857,43 @@ impl CompiledModule {
                 (ranges, di.files.clone())
             }
             None => (Vec::new(), Vec::new()),
+        };
+
+        // W5 JIT/DWARF Stage 3a: resolve the captured value-label ranges (relative offsets) to
+        // absolute machine pcs and group them per source variable. A variable whose label produced
+        // no range (the optimizer dropped its value everywhere) still gets a `VarMachineInfo` with
+        // empty `ranges` — Stage 3c emits that as a `<optimized out>` location.
+        let var_locs: Vec<VarMachineInfo> = if var_meta.is_empty() {
+            Vec::new()
+        } else {
+            let mut by_label: std::collections::HashMap<u32, Vec<VarRange>> =
+                std::collections::HashMap::new();
+            for (fi, per_label) in &raw_var_locs {
+                let base = module.get_finalized_function(ids[*fi as usize]) as u64;
+                for (label, ranges) in per_label {
+                    let entry = by_label.entry(*label).or_default();
+                    for &(s, e, loc) in ranges {
+                        entry.push(VarRange {
+                            lo: base + s as u64,
+                            hi: base + e as u64,
+                            loc,
+                        });
+                    }
+                }
+            }
+            var_meta
+                .iter()
+                .enumerate()
+                .map(|(label, (func, name))| {
+                    let mut ranges = by_label.remove(&(label as u32)).unwrap_or_default();
+                    ranges.sort_by_key(|r| r.lo);
+                    VarMachineInfo {
+                        func: *func,
+                        name: name.clone(),
+                        ranges,
+                    }
+                })
+                .collect()
         };
 
         // Now that code is finalized, hand the root fiber runtime its call-trampoline address (and keep it
@@ -1813,6 +1980,7 @@ impl CompiledModule {
             fiber_table,
             src_ranges,
             src_files,
+            var_locs,
             module,
         })
     }
@@ -2323,6 +2491,7 @@ impl CompiledModule {
                 self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
                 0,
                 None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
+                None, // …nor value-label points (Stage 3a)
             )?;
             self.module
                 .define_function(*id, &mut ctx)
@@ -2698,6 +2867,7 @@ fn compile_child(
             (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
             0,
             None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
+            None, // …nor value-label points (Stage 3a)
         )?;
         module
             .define_function(*id, &mut ctx)
@@ -3106,6 +3276,11 @@ struct Lower<'a> {
     srclocs: Option<&'a SrcLocMap>,
     /// This function's index, the `func` half of the [`Self::srclocs`] key.
     func_idx: u32,
+    /// `-g` value-label points (W5 JIT/DWARF Stage 3a): `(func, block) → [(block-local value, label)]`
+    /// — the source variables whose backing CLIF value `lower_block` stamps with a `ValueLabel`, so
+    /// Cranelift records its machine-location ranges. `None` ⇒ no `-g` vars (no labels, codegen
+    /// unchanged).
+    var_labels: Option<&'a VarLabelMap>,
 }
 
 /// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
@@ -3137,6 +3312,7 @@ fn build_clif(
     fn_table_mask: u64,
     func_idx: u32,
     srclocs: Option<&SrcLocMap>,
+    var_labels: Option<&VarLabelMap>,
 ) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
@@ -3207,6 +3383,7 @@ fn build_clif(
         distinct,
         srclocs,
         func_idx,
+        var_labels,
     };
 
     // Jump into IR block 0 passing the function parameters (entry params after the three context
@@ -4390,6 +4567,22 @@ fn lower_block(
         let u = ub_of(inst, &ubs);
         vals.push(v);
         ubs.push(u);
+    }
+
+    // W5 JIT/DWARF Stage 3a: now that this block's value map is fully populated, stamp the CLIF
+    // values backing source variables with their `ValueLabel`, so Cranelift records the
+    // machine-location ranges (`value_labels_ranges`) `compile` reads back. `set_val_label` is inert
+    // unless `collect_debug_info` was enabled (it is, exactly when `var_labels` is `Some`), so
+    // non-`-g` codegen is untouched. The label association drives liveness-based range computation;
+    // the block-local `value` index maps straight onto `vals`.
+    if let Some(map) = lower.var_labels {
+        if let Some(points) = map.get(&(lower.func_idx, block_idx as u32)) {
+            for &(value, label) in points {
+                if let Some(&v) = vals.get(value as usize) {
+                    b.set_val_label(v, ValueLabel::from_u32(label));
+                }
+            }
+        }
     }
 
     match &blk.term {

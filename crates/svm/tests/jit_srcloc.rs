@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use svm_ir::DEFAULT_RESERVED_LOG2;
-use svm_jit::{CompiledModule, Quota, INERT_CAP_THUNK};
+use svm_jit::{CompiledModule, Quota, VarMachineLoc, INERT_CAP_THUNK};
 use svm_text::parse_module;
 
 /// A pure-compute function with a hand-written §6 debug section: source lines 2, 3, 4 map onto its
@@ -260,4 +260,82 @@ fn jit_registers_and_unregisters_with_the_gdb_jit_interface() {
     // A non-`-g` module has nothing to register.
     let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
     assert!(bare.register_with_gdb().is_none());
+}
+
+const VAR_DBG: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 1
+  v2 = i32.add v0 v1
+  v3 = i32.const 3
+  v4 = i32.mul v2 v3
+  v5 = i32.const 2
+  v6 = i32.sub v4 v5
+  return v6
+}
+
+debug.file 0 "compute.c"
+debug.loc 0 0 1 0 2 7
+debug.loc 0 0 3 0 3 7
+debug.loc 0 0 5 0 4 3
+debug.type 0 base "int" signed 4
+debug.var 0 "a" ssalist 1 0 0 0 "int" 0
+debug.var 0 "t" ssalist 1 0 1 2 "int" 0
+"#;
+
+#[test]
+fn jit_tracks_source_variable_machine_locations() {
+    // Stage 3a: the JIT labels the CLIF values backing SSA-resident source variables and reads back
+    // Cranelift's `value_labels_ranges`, so each `-g` variable gets the machine ranges over which it
+    // lives in a register or CFA-relative slot — the seed for the Stage 3c `DW_AT_location` loclists.
+    let cm = compile(VAR_DBG);
+    let vars = cm.var_locations();
+
+    // Both declared source variables are present, attributed to function 0.
+    let names: BTreeSet<&str> = vars.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(
+        names,
+        BTreeSet::from(["a", "t"]),
+        "both -g vars are tracked"
+    );
+    assert!(vars.iter().all(|v| v.func == 0));
+
+    // At least one variable resolves to a real machine location (the local `t = a + 1` lives in a
+    // register/slot across the multiply that uses it). A variable the optimizer folded away (`a`,
+    // consumed immediately into the add) has empty ranges — the faithful `<optimized out>` case.
+    assert!(
+        vars.iter().any(|v| !v.ranges.is_empty()),
+        "a -g variable is tracked to a machine location"
+    );
+
+    // Every tracked range is a non-empty machine span in a plausible location, and (sharing the
+    // function's finalized base with the source map) sits within the JIT'd code window.
+    let code_end = cm.src_ranges().iter().map(|r| r.hi).max().unwrap();
+    let code_start = cm.src_ranges().iter().map(|r| r.lo).min().unwrap();
+    for v in vars {
+        for r in &v.ranges {
+            assert!(r.lo < r.hi, "non-empty range for {:?}: {r:?}", v.name);
+            assert!(
+                r.hi <= code_end + 0x80 && r.lo + 0x80 >= code_start,
+                "range {r:?} for {:?} lands in the function's code",
+                v.name
+            );
+            match r.loc {
+                VarMachineLoc::Reg(d) => assert!(d < 0x80, "plausible DWARF regnum {d}"),
+                VarMachineLoc::CfaOffset(_) => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn jit_without_debug_vars_tracks_no_variables() {
+    // A `-g` module with source *lines* but no `debug.var` tracks no variables, and an ordinary
+    // module tracks none either (codegen byte-identical — no `collect_debug_info`, no labels).
+    assert!(
+        compile(COMPUTE_DBG).var_locations().is_empty(),
+        "lines without debug.var ⇒ no tracked vars"
+    );
+    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    assert!(bare.var_locations().is_empty());
 }

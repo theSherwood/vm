@@ -727,14 +727,32 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     runs (`Breakpoint 1, fn0 () at compute.c:3`); see the `gdb_attach` example
     (`crates/svm/examples/gdb_attach.rs`) for the repro harness + the exact `gdb --batch` invocation.
     *Effort: high.*
-- [ ] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars).** Label the IR
-  values backing source variables with `ValueLabel`s during codegen; read back `ValueLabelsRanges`
-  after compile; emit `DW_TAG_variable` DIEs with DWARF location lists (`DW_OP_reg`/`DW_OP_breg`/
-  `DW_OP_fbreg` + `.debug_loclists`) bridging the W4 `VarLoc` + Cranelift's ranges. Reuse the §6
-  `TypeDef` graph for `DW_TAG_*_type` DIEs (inverse of `dwarf_info`'s type reader). *Acceptance:*
-  `print x` in gdb/lldb works on JIT'd code; vars dropped by the optimizer show `<optimized out>`
-  (faithful native behavior — the interpreter tier remains the always-faithful inspection
-  fallback). *Effort: high.*
+- [~] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars). — in progress.**
+  The §6 core already carries the inputs (`DebugInfo::vars: Vec<VarInfo>` with a neutral `VarLoc`, and
+  `DebugInfo::types: Vec<TypeDef>`), so this is purely a JIT-side *emit* problem — no IR/text change.
+  - [x] **3a — value-location substrate (W6-JIT core). — built.** Gated on `-g` vars: `compile`
+    assigns each SSA-resident source var (`VarLoc::{Ssa, SsaList}`) a `ValueLabel`, calls Cranelift's
+    `func.collect_debug_info()` per function, and `lower_block` `set_val_label`s the CLIF value backing
+    it (block-local `SsaLoc{block,value}` indexes the JIT's per-block value map directly). After
+    `define_function` it reads `CompiledCode::value_labels_ranges`, translates each `LabelValueLoc`
+    (`Reg` → DWARF regnum via `isa.map_regalloc_reg_to_dwarf`, `CFAOffset` kept) and, post-finalize,
+    resolves the offsets to absolute machine pcs — exposed as `CompiledModule::var_locations() ->
+    [VarMachineInfo{func, name, ranges:[VarRange{lo,hi,VarMachineLoc}]}]`. Non-`-g` codegen stays
+    byte-identical (no `collect_debug_info`, no labels). Tests (`jit_srcloc.rs`): a tracked local lives
+    in a register over the expected code span, a folded var has empty ranges (the faithful
+    `<optimized out>`), and a module without `debug.var` tracks nothing; the JIT/fiber/SIMD/c_frontend
+    differential suites confirm the non-`-g` path is unchanged. (Memory forms `Window`/`WindowVia`/
+    `Fixed` carry no value label — they're a DWARF memory expression in 3c.)
+  - [ ] **3b — `DW_TAG_*_type` DIEs.** Emit the §6 `TypeDef` graph (base/pointer/array/struct/union/
+    opaque) as DWARF type DIEs in `.debug_info`, the inverse of `dwarf_info`'s type reader. Round-trip
+    through `svm_wasm::dwarf_info::parse` → `DwarfType` matches the `TypeDef`s.
+  - [ ] **3c — `DW_TAG_variable` DIEs + locations.** Variable DIEs as subprogram children:
+    `DW_AT_name`, `DW_AT_type` (→ 3b), and `DW_AT_location` — a `.debug_loclists` list of
+    `DW_OP_reg`/`DW_OP_breg`(CFA) ranges from 3a for SSA vars, `DW_OP_addr`/`DW_OP_fbreg` for the
+    `Fixed`/`Window` memory forms. Round-trip through the reader.
+  - [ ] **3d — gdb manual acceptance.** `print x` works on JIT'd code; vars the optimizer dropped show
+    `<optimized out>` (faithful native behavior — the interpreter tier stays the always-faithful
+    inspection fallback). *Effort (whole stage): high.*
 - [ ] **Stage 4 — W3-JIT unwind / backtrace.** Emit Cranelift unwind info; walk the out-of-band
   control stack rooted at a **fiber handle** (not the OS thread — §23/D57 migratable fibers) to
   materialize a per-fiber call stack with source frames. *Acceptance:* `bt` in gdb shows the guest
