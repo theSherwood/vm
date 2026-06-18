@@ -321,8 +321,13 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
         - [ ] **1c-5d** — coroutines via `Instantiator` (`spawn_coroutine`/`resume`, `Yielder`,
               `SharedRegion` grant) — inline-driven like fibers, reuses the `step_vcpu` switch logic.
         - [ ] **1c-5e** — cross-module units (`install`/`invoke` indirect calls; tail calls).
-        - [ ] **1c-5f** — fiber **migration**: run-shared fiber registry across `VTask`s; lifts the
-              thread+fiber compile rejection.
+        - [x] **1c-5f** — fiber **migration**: the fiber registry moved out of `VTask` into a
+              **run-shared** `Vec<FiberState>` owned by `drive` (one domain-wide handle namespace),
+              passed to `step_vcpu`; only the resume `chain` stays per-vCPU. A fiber created/suspended
+              on one vCPU is now claimable on another (cooperative ⇒ claim is trivially exclusive;
+              claiming a fiber Running in another vCPU's chain is `FiberFault`, matching the
+              tree-walker). Lifts the thread+fiber compile rejection. Harness: the `MIGRATE` pattern
+              (fiber suspended on root, resumed on a spawned thread → 75) bit-identical to `run`.
     - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
           stepping report tree-walker-identical locations. New harness: debug-trace equality.
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:

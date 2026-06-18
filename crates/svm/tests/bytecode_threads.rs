@@ -160,6 +160,41 @@ block0():
 }
 "#;
 
+/// **Fiber migration** (D57): the root creates fiber 2 and resumes it once (it suspends, capturing
+/// its first-resume arg 5); then it spawns a thread that resumes that *same* fiber on the other vCPU
+/// with 7. The fiber computes `10*7 + 5 = 75` and returns it; the thread returns it; the root joins
+/// and returns 75. Requires the **run-shared** fiber registry (Slice 1c-5f) — a per-vCPU registry
+/// would `FiberFault` when the thread resumes a fiber it didn't create.
+const MIGRATE: &str = r#"
+func () -> (i64) {
+block0():
+  v0 = ref.func 2
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 5
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.extend_i32_u v2
+  v7 = thread.spawn 1 v6 v6
+  v8 = thread.join v7
+  return v8
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v0 = i32.wrap_i64 varg
+  v1 = i64.const 7
+  v2, v3 = cont.resume v0 v1
+  return v3
+}
+func (i64, i64) -> (i64) {
+block0(vsp: i64, varg: i64):
+  v0 = suspend varg
+  v1 = i64.const 10
+  v2 = i64.mul v0 v1
+  v3 = i64.add v2 varg
+  return v3
+}
+"#;
+
 #[test]
 fn threads_tiny_atomic() {
     check_threads(TINY_ATOMIC, Ok(2));
@@ -178,4 +213,9 @@ fn threads_futex_handoff() {
 #[test]
 fn threads_forged_join_faults_identically() {
     check_threads(FORGED_JOIN, Err(Trap::ThreadFault));
+}
+
+#[test]
+fn threads_fiber_migration() {
+    check_threads(MIGRATE, Ok(75));
 }

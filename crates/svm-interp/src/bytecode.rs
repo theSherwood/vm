@@ -14,11 +14,11 @@
 //! (`thread.spawn`/`join` + `memory.wait`/`notify`) on a cooperative single-threaded scheduler
 //! ([`drive`]) over one shared `Mem` — faithful for the interleaving-invariant programs the oracle
 //! uses. Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long tail is delegated to the
-//! reference [`super::eval_inst`] (same semantics, no re-implementation). [`compile_module`] returns
+//! reference [`super::eval_inst`] (same semantics, no re-implementation). Threads and fibers compose
+//! (the fiber registry is run-shared, so fibers migrate across vCPUs). [`compile_module`] returns
 //! `None` when a function needs a seam not yet driven here — `Instantiator`/`Yielder` coroutines,
-//! cross-module `install`/`invoke`, tail calls, durability, **or** a module mixing threads *and*
-//! fibers (migration needs a run-shared registry) — so callers (`super::run_with_host_fast`) fall
-//! back to the tree-walker for those.
+//! cross-module `install`/`invoke`, tail calls, or durability — so callers
+//! (`super::run_with_host_fast`) fall back to the tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
@@ -319,33 +319,6 @@ pub struct Compiled {
 
 /// Lower every function, or `None` if any uses an op outside this slice's subset.
 pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
-    // The bytecode engine drives threads with a **per-vCPU** fiber registry, whereas the tree-walker
-    // shares one fiber-handle namespace across a domain's vCPUs (so a fiber can migrate, and handles
-    // are domain-global). A module that uses *both* threads and fibers would therefore diverge on
-    // handle numbering / migration, so reject the combination here (→ tree-walker fallback) until the
-    // run-shared registry lands (Slice 1c-5c migration follow-up).
-    let mut has_threads = false;
-    let mut has_fibers = false;
-    for f in funcs {
-        for b in &f.blocks {
-            for inst in &b.insts {
-                match inst {
-                    Inst::ThreadSpawn { .. }
-                    | Inst::MemoryWait { .. }
-                    | Inst::MemoryNotify { .. } => has_threads = true,
-                    Inst::ThreadJoin { .. } => has_threads = true,
-                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => {
-                        has_fibers = true
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    if has_threads && has_fibers {
-        return None;
-    }
-
     let arities: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     let mut progs = Vec::with_capacity(funcs.len());
     for f in funcs {
@@ -895,19 +868,18 @@ enum FiberState {
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
 const ROOT_FIBER: usize = usize::MAX;
 
-/// One vCPU's continuation: its active `Vm` plus its §12 fiber world (per-vCPU registry + resume
-/// `chain`). A `thread.spawn` creates a fresh `VTask`; the scheduler runs them cooperatively over one
-/// shared `Mem` (single-threaded, so shared memory is sequentially consistent — the determinate
-/// programs the oracle uses give the same result on any correct schedule).
+/// One vCPU's continuation: its active `Vm` and its resume `chain`. A `thread.spawn` creates a fresh
+/// `VTask`; the scheduler runs them cooperatively over one shared `Mem` (single-threaded, so shared
+/// memory is sequentially consistent — the determinate programs the oracle uses give the same result
+/// on any correct schedule). The §12 **fiber registry is run-shared** (one handle namespace per
+/// domain, held by [`drive`]), so a fiber created/suspended on one vCPU can be resumed on another
+/// (D57 migration) — only the resume `chain` (the ancestor stack) is per-vCPU.
 struct VTask {
     active: Vm,
     /// `ROOT_FIBER` or the handle of the fiber currently running in this vCPU.
     active_id: usize,
     /// Parked resumers: `(fiber id, its Vm, the `cont.resume` result slot awaiting (status, value))`.
     chain: Vec<(usize, Vm, u32)>,
-    /// This vCPU's fiber registry (handle = index). Per-vCPU — combined thread+fiber modules are
-    /// rejected by the compiler until the run-shared registry (migration) lands in a later slice.
-    fibers: Vec<FiberState>,
 }
 
 impl VTask {
@@ -916,7 +888,6 @@ impl VTask {
             active: Vm::new(c, entry, args)?,
             active_id: ROOT_FIBER,
             chain: Vec::new(),
-            fibers: Vec::new(),
         })
     }
 }
@@ -956,6 +927,7 @@ enum VcpuStop {
 /// slices *where* the active `Vm` pauses (Slice 1c-2); it never changes results.
 fn step_vcpu(
     vt: &mut VTask,
+    fibers: &mut Vec<FiberState>,
     c: &Compiled,
     fuel: &mut u64,
     mem: &mut Option<Mem>,
@@ -972,7 +944,7 @@ fn step_vcpu(
                 None => return Ok(VcpuStop::Done(vals)),
                 // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` to its resumer.
                 Some((rid, resumer, rdst)) => {
-                    vt.fibers[vt.active_id] = FiberState::Done;
+                    fibers[vt.active_id] = FiberState::Done;
                     let retval = vals.first().copied().unwrap_or(Value::I64(0));
                     vt.active = resumer;
                     vt.active_id = rid;
@@ -981,18 +953,20 @@ fn step_vcpu(
                 }
             },
             Outcome::ContNew { funcref, sp, dst } => {
-                if vt.fibers.len() + 1 >= super::MAX_FIBERS {
+                if fibers.len() + 1 >= super::MAX_FIBERS {
                     return Err(Trap::FiberFault);
                 }
-                let h = vt.fibers.len() as i32;
-                vt.fibers.push(FiberState::Pending { funcref, sp });
+                let h = fibers.len() as i32;
+                fibers.push(FiberState::Pending { funcref, sp });
                 vt.active.set(dst, Reg::from_i32(h));
             }
             Outcome::ContResume { kh, arg, dst } => {
                 let k = kh as usize;
-                // Claim fiber `k`: a pending fiber starts (call `funcref(sp, arg)`), a parked one
-                // continues (the new `arg` becomes its `suspend`'s result). Anything else is inert.
-                let target = match vt.fibers.get_mut(k) {
+                // Claim fiber `k` from the **run-shared** registry: a pending fiber starts (call
+                // `funcref(sp, arg)`), a parked one continues (the new `arg` becomes its `suspend`'s
+                // result) — possibly one suspended on *another* vCPU (D57 migration). Anything else
+                // (forged / already running on a vCPU / done) is inert.
+                let target = match fibers.get_mut(k) {
                     Some(slot @ FiberState::Pending { .. }) => {
                         let (funcref, sp) = match std::mem::replace(slot, FiberState::Running) {
                             FiberState::Pending { funcref, sp } => (funcref, sp),
@@ -1033,7 +1007,7 @@ fn step_vcpu(
                 // `suspend`, which is a `FiberFault` (the root has no resumer).
                 let (rid, resumer, rdst) = vt.chain.pop().ok_or(Trap::FiberFault)?;
                 let suspended = std::mem::replace(&mut vt.active, resumer);
-                vt.fibers[vt.active_id] = FiberState::Parked {
+                fibers[vt.active_id] = FiberState::Parked {
                     vm: suspended,
                     suspend_dst: dst,
                 };
@@ -1118,6 +1092,9 @@ fn drive(
         threads: Vec::new(),
         state: TaskState::Runnable,
     }];
+    // The §12 fiber registry is **run-shared** (one handle namespace per domain) so a fiber created
+    // or suspended on one vCPU can be resumed on another (D57 migration).
+    let mut fibers: Vec<FiberState> = Vec::new();
     let mut clock: u64 = 0;
 
     loop {
@@ -1154,7 +1131,7 @@ fn drive(
             continue;
         };
 
-        match step_vcpu(&mut tasks[ti].vt, c, fuel, mem, host, budget) {
+        match step_vcpu(&mut tasks[ti].vt, &mut fibers, c, fuel, mem, host, budget) {
             Err(trap) => complete(&mut tasks, ti, Err(trap)),
             Ok(VcpuStop::Done(vals)) => complete(&mut tasks, ti, Ok(vals)),
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
