@@ -3670,6 +3670,15 @@ enum FmtSeg {
     /// `%s` — a NUL-terminated string argument (runtime `strlen`), right-justified in field `width`
     /// (space-padded), optionally truncated to `prec` bytes.
     Str { width: u32, prec: Option<u32> },
+    /// `%f` — fixed-notation `double`. `prec` is the fractional digit count (C default 6 when
+    /// absent). The synthesized `__svm_dtoa_fixed` produces the full `[-]ddd.ffff` (or `inf`/`nan`)
+    /// string; the caller space-pads it to field `width` per `flags`. (`%F`/`%e`/`%g`, the `0` flag,
+    /// and `#` are still fail-closed.)
+    Float {
+        width: u32,
+        prec: u32,
+        flags: FmtFlags,
+    },
     /// `%%` — a literal percent.
     Percent,
 }
@@ -3802,14 +3811,28 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
             b'x' => int(16, false),
             b'c' => FmtSeg::Char,
             b's' => FmtSeg::Str { width, prec },
-            // Float formatting (`%f`/`%e`/`%g`) is deliberately fail-closed: matching glibc
-            // byte-for-byte requires *exact* decimal conversion (correctly-rounded, à la Dragon4/
-            // Ryū — big-integer arithmetic). An `f64`-arithmetic approximation diverges from native
-            // at the rounding boundary (e.g. `%.17f` of `0.1`), which would break the on-ramp's
-            // byte-exact contract — so it stays `Unsupported` until a bignum formatter lands.
-            b'f' | b'e' | b'g' | b'F' | b'E' | b'G' => {
+            // Fixed-notation float (`%f`). Exact (correctly-rounded) decimal conversion via the
+            // synthesized `__svm_dtoa_fixed` (fixed multi-word integer arithmetic — no host float
+            // formatting, so interp≡JIT≡native). `prec` defaults to 6 (C); bounded so the `m·5^prec`
+            // intermediate fits the helper's fixed bignum. The `0` flag and `#` are not yet handled
+            // for floats (only sign / space-pad / left-justify), so reject them rather than mis-format.
+            b'f' => {
+                let p = prec.unwrap_or(6);
+                if p > 120 {
+                    return Err(bad("float precision > 120 (later slice)"));
+                }
+                if flags.zero || flags.alt {
+                    return Err(bad("float `0`/`#` flag (later slice)"));
+                }
+                FmtSeg::Float {
+                    width,
+                    prec: p,
+                    flags,
+                }
+            }
+            b'F' | b'e' | b'g' | b'E' | b'G' => {
                 return Err(bad(
-                    "float conversion (needs exact-decimal/bignum formatting)",
+                    "float %F/%e/%g (later slice; lowercase %f is supported)",
                 ))
             }
             other => return Err(bad(&format!("conversion %{}", other as char))),
@@ -4518,6 +4541,16 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                     (mag, None)
                 };
                 emit_printf_int_field(ctx, mag, base, neg, width, prec, flags, utoa)?;
+            }
+            FmtSeg::Float { width, prec, flags } => {
+                // Codegen for `%f` is the synthesized `__svm_dtoa_fixed` exact-decimal helper (fixed
+                // multi-word integer arithmetic), landing in the next step. Until it is wired the
+                // conversion stays a clean fail-closed error (never a silent mis-format); the
+                // parser/segment scaffolding above is already in place.
+                let _ = (width, prec, flags);
+                return Err(Error::Unsupported(format!(
+                    "printf: %f codegen pending (prec {prec}, width {width})"
+                )));
             }
         }
     }
