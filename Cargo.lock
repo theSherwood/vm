@@ -582,6 +582,7 @@ dependencies = [
  "svm-snapshot",
  "svm-text",
  "svm-verify",
+ "svm-wasm",
 ]
 
 [[package]]

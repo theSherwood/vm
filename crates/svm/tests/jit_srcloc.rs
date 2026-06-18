@@ -1,8 +1,8 @@
-//! W5 JIT/DWARF tier, Stages 0–1 (DEBUGGING.md §7): the JIT threads each op's §6 `debug.loc` into a
-//! Cranelift `SourceLoc`, and after `finalize` builds a finalized-machine-address → source map that
-//! `CompiledModule::symbolize` resolves. No DWARF or debugger yet — this is the substrate the later
-//! stages (`.debug_line` emit, GDB JIT registration) build on. Host-side tooling, off the runtime
-//! path (§2a).
+//! W5 JIT/DWARF tier, Stages 0–2 (DEBUGGING.md §7): the JIT threads each op's §6 `debug.loc` into a
+//! Cranelift `SourceLoc`, after `finalize` builds a finalized-machine-address → source map that
+//! `CompiledModule::symbolize` resolves (Stages 0–1), and synthesizes a DWARF `.debug_line` section
+//! over that map (Stage 2) — round-tripped here through the existing `svm_wasm::dwarf_line` reader,
+//! no debugger needed. Host-side tooling, off the runtime path (§2a).
 
 use std::collections::BTreeSet;
 
@@ -97,4 +97,44 @@ fn jit_without_debug_info_has_no_source_map() {
     assert!(cm
         .symbolize(cm.src_ranges().first().map_or(0x1000, |r| r.lo as usize))
         .is_none());
+}
+
+#[test]
+fn jit_emits_debug_line_that_round_trips_through_the_reader() {
+    // Stage 2: the synthesized `.debug_line` section, parsed back by the project's own DWARF
+    // line-program reader, reconstructs the exact machine-address → (file, line) map — the
+    // address→source table gdb/lldb will read once the section is registered.
+    let cm = compile(COMPUTE_DBG);
+    let bytes = cm.debug_line_section();
+    assert!(!bytes.is_empty(), "a -g module emits a .debug_line section");
+
+    let prog = svm_wasm::dwarf_line::parse(&bytes).expect("the emitted line program parses");
+    // The 1-based file table names the C source (index 0 is the reader's placeholder).
+    assert_eq!(prog.files.get(1).map(String::as_str), Some("compute.c"));
+
+    // The non-`end_sequence` rows are exactly the JIT's source ranges: each range's `lo` address
+    // carries its source line and file (1-based). Compare as sets, address-keyed.
+    let emitted: BTreeSet<(u64, u32)> = prog
+        .rows
+        .iter()
+        .filter(|r| !r.end_sequence)
+        .map(|r| (r.address, r.line))
+        .collect();
+    let expected: BTreeSet<(u64, u32)> = cm.src_ranges().iter().map(|r| (r.lo, r.line)).collect();
+    assert_eq!(
+        emitted, expected,
+        "line-program rows reconstruct the address→line map"
+    );
+
+    // Every row's file index resolves to the C source through the program's own table.
+    for r in prog.rows.iter().filter(|r| !r.end_sequence) {
+        assert_eq!(
+            prog.files.get(r.file as usize).map(String::as_str),
+            Some("compute.c")
+        );
+    }
+
+    // A non-`-g` module emits no section.
+    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    assert!(bare.debug_line_section().is_empty());
 }

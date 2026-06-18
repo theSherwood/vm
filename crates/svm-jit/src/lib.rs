@@ -76,7 +76,8 @@ use svm_ir::{
     VSatBinOp, VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
 };
 
-mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler
+mod dwarf;
+mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler // W5 JIT/DWARF tier: synthesize DWARF from the Stage 1 machine-address → source map
 
 // JIT fiber runtime (§12): host-side fiber table + `extern "C"` thunks for `cont.new`/`resume`/
 // `suspend`, on top of the `svm-fiber` stack-switch substrate. Available where `svm_fiber::supported()`.
@@ -1264,6 +1265,16 @@ impl CompiledModule {
     /// unless the module carried `-g`. For tooling/tests and the forthcoming DWARF line-program emit.
     pub fn src_ranges(&self) -> &[SrcRange] {
         &self.src_ranges
+    }
+
+    /// The synthesized DWARF `.debug_line` section for this module's finalized code (W5 JIT/DWARF
+    /// Stage 2): a line-number program over the JIT'd machine addresses, for gdb/lldb (via the
+    /// forthcoming GDB JIT registration) to resolve addresses to source lines. Empty without `-g`.
+    pub fn debug_line_section(&self) -> Vec<u8> {
+        if self.src_ranges.is_empty() {
+            return Vec::new();
+        }
+        dwarf::debug_line(&self.src_ranges, &self.src_files)
     }
 
     /// Compile the whole module (the compile half of the old one-shot `compile_and_run*`):

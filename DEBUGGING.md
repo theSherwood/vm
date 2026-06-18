@@ -694,14 +694,23 @@ DWARF variable locations) finally land — they are stages here, not separate wo
   has an empty map. *Trap symbolization* (mapping a live trap pc, which the explicit-check traps
   don't capture today, vs the memory-fault signal pc) folds into Stage 4 / W3-JIT — the map and
   `symbolize` are the substrate.
-- [ ] **Stage 2 — `.debug_line` + `.debug_info` synthesis + GDB JIT registration (line-level
-  gdb/lldb).** Hand-roll a DWARF writer (inverse of `dwarf_line`/`dwarf_info`): a `.debug_line`
-  line-number program over the JIT'd machine addresses (from Stage 1), and a `.debug_info` CU +
-  per-function `DW_TAG_subprogram` (name, `low_pc`/`high_pc`) + `.debug_abbrev`/`.debug_str`. Wrap
-  the JIT code + DWARF in a minimal in-memory **ELF object** (`.text` header pointing at the JIT
-  memory) and register it via the **GDB JIT interface** (`__jit_debug_register_code` +
-  `__jit_debug_descriptor` + the `jit_code_entry` list). *Acceptance:* gdb/lldb binds a source-line
-  breakpoint and shows the source frame. **The headline milestone.** *Effort: high.*
+- [~] **Stage 2 — `.debug_line` + `.debug_info` synthesis + GDB JIT registration (line-level
+  gdb/lldb). — in progress.**
+  - [x] **2a — `.debug_line` synthesis.** A hand-rolled DWARF v4/DWARF32 line-program emitter
+    (`svm-jit`'s `dwarf` module, the inverse of `dwarf_line`) turns the Stage 1 `SrcRange` map into a
+    `.debug_line` section — one self-contained sequence per range (`set_address(lo)` → set
+    file/col/line → `copy` → `set_address(hi)` → `end_sequence`), so gaps never bleed a line into
+    the next. `CompiledModule::debug_line_section()` exposes it. Test (`jit_srcloc.rs`): the emitted
+    bytes **round-trip through `svm_wasm::dwarf_line::parse`** and reconstruct the exact
+    machine-address → (file, line) map; a non-`-g` module emits nothing.
+  - [ ] **2b — `.debug_info`.** A CU DIE + per-function `DW_TAG_subprogram` (name, `low_pc`/
+    `high_pc`) + `.debug_abbrev` (+ `.debug_str`), round-tripped through `svm_wasm::dwarf_info::parse`
+    (validates the address ranges; the reader drops names).
+  - [ ] **2c — in-memory ELF + GDB JIT registration.** Wrap the code + DWARF sections in a minimal
+    ELF (`.text` header pointing at the JIT memory) and register it via the GDB JIT interface
+    (`__jit_debug_register_code` + `__jit_debug_descriptor` + the `jit_code_entry` list).
+    *Acceptance:* gdb/lldb binds a source-line breakpoint and shows the source frame. **The headline
+    milestone** (the gdb-attach step is manual, not CI). *Effort: high.*
 - [ ] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars).** Label the IR
   values backing source variables with `ValueLabel`s during codegen; read back `ValueLabelsRanges`
   after compile; emit `DW_TAG_variable` DIEs with DWARF location lists (`DW_OP_reg`/`DW_OP_breg`/
@@ -735,10 +744,10 @@ DWARF variable locations) finally land — they are stages here, not separate wo
   like the rest of the waist — a malformed DWARF mis-renders, never escapes. Keep it off the
   verifier/runtime hot path.
 
-**Progress:** Stages 0–1 are **built** (`svm-jit` source-loc threading + `symbolize`; see notes
-above). **Next: Stage 2** — synthesize `.debug_line`/`.debug_info` from the Stage 1 address map and
-register an in-memory ELF via the GDB JIT interface, for the headline "set a breakpoint on a `.c`
-line in gdb" milestone. Each stage is independently shippable.
+**Progress:** Stages 0–1 **built** (source-loc threading + `symbolize`) and Stage **2a built** (the
+`.debug_line` emitter, round-tripped through the reader). **Next: 2b** (`.debug_info` CU +
+subprogram DIEs) then **2c** (in-memory ELF + GDB JIT registration) for the headline "set a
+breakpoint on a `.c` line in gdb" milestone. Each stage is independently shippable.
 
 ---
 
