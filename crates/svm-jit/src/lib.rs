@@ -1338,7 +1338,7 @@ impl CompiledModule {
     /// suspend switch. Adjacent duplicate positions are collapsed. Empty if `handle` names no parked
     /// fiber or the module carried no `-g`. Host-side tooling, off the running guest's path (§2a).
     #[cfg(fiber_rt)]
-    pub fn fiber_backtrace(&self, handle: i32) -> Vec<JitFrameLoc> {
+    pub fn fiber_backtrace(&self, handle: i64) -> Vec<JitFrameLoc> {
         let Some(table) = self.fiber_table.as_ref() else {
             return Vec::new();
         };

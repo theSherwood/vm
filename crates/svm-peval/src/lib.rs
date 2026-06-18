@@ -559,6 +559,9 @@ pub fn is_removable_if_dead(inst: &Inst) -> bool {
         | Inst::VPopcnt { .. }
         | Inst::VAvgr { .. }
         | Inst::VDot { .. }
+        | Inst::VDotI8 { .. }
+        | Inst::Fma { .. }
+        | Inst::VFma { .. }
         | Inst::VExtMul { .. }
         | Inst::VExtAddPairwise { .. }
         | Inst::VQ15MulrSat { .. }
@@ -658,6 +661,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::VPMinMax { a, b, .. }
         | Inst::VAvgr { a, b, .. }
         | Inst::VDot { a, b }
+        | Inst::VDotI8 { a, b }
         | Inst::VExtMul { a, b, .. }
         | Inst::VQ15MulrSat { a, b }
         | Inst::VFloatBin { a, b, .. }
@@ -678,6 +682,12 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
             *a = f(*a);
             *b = f(*b);
             *mask = f(*mask);
+        }
+        // Scalar / vector fused multiply-add: `a·b + c`.
+        Inst::Fma { a, b, c, .. } | Inst::VFma { a, b, c, .. } => {
+            *a = f(*a);
+            *b = f(*b);
+            *c = f(*c);
         }
         Inst::AtomicCmpxchg {
             addr,
