@@ -524,3 +524,47 @@ fn vcpu_and_fiber_freeze_serialize_restore_thaw_through_the_codec() {
         "thawed vCPU+fiber run reloads its clock read (57), not re-issues it"
     );
 }
+
+// Recycling step 2 (DURABILITY.md §12.8): the control section carries each fiber's **generation**, so a
+// thaw re-seeds a recycled (generation > 0) fiber at the generation its guest handle expects. The
+// end-to-end durable round-trip of a recycled fiber isn't reachable with a freeze-at-first-safepoint
+// harness (a recycled parked fiber requires a prior fiber-finish, i.e. a prior safepoint), so this
+// pins the codec leg directly: a forced gen-N residue survives freeze → serialize → restore intact.
+#[test]
+fn fiber_residue_generation_round_trips_through_the_codec() {
+    let inst = instrument(SRC_FIBER);
+
+    // A real freeze produces a (gen-0) fiber residue + the matching window image.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 100_000u64;
+    let (frozen, snapshot) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
+    assert!(frozen.is_ok(), "freeze placeholder: {frozen:?}");
+    let mut residue = fhost.frozen_fibers().to_vec();
+    assert_eq!(residue.len(), 1, "one fiber flattened");
+    assert_eq!(
+        residue[0].generation, 0,
+        "a non-recycled fiber is generation 0"
+    );
+
+    // Stamp a non-zero generation (as slot recycling would) and serialize from a host carrying it.
+    residue[0].generation = 7;
+    let mut shost = Host::new();
+    shost.set_durable(true);
+    shost.set_frozen_fibers(residue);
+    let artifact = freeze(&inst, &snapshot, &shost).expect("freeze");
+
+    // Restore: the generation must come back intact (format v2 carries it).
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let _ = restore(&artifact, &inst, &mut thost).expect("restore");
+    let back = thost.frozen_fibers();
+    assert_eq!(back.len(), 1, "residue restored");
+    assert_eq!(
+        back[0].generation, 7,
+        "the fiber residue's generation round-trips through the codec"
+    );
+}

@@ -278,11 +278,20 @@ impl SharedFiberTable {
     /// the next slot (dense, matching the freeze) as a fresh `OWNED` fiber — so a thaw `cont.resume`
     /// claims it (`Start`) and re-enters its entry under `REWINDING`, rebuilding then re-parking it —
     /// with its flattened shadow-SP restored so the swap re-points the active word to its region.
-    fn seed_frozen(&self, fiber: Box<Fiber>, func: i32, sp: i64, shadow_sp: u64) -> usize {
+    fn seed_frozen(
+        &self,
+        fiber: Box<Fiber>,
+        func: i32,
+        sp: i64,
+        shadow_sp: u64,
+        generation: u64,
+    ) -> usize {
         let mut t = self.lock();
         let slot = t.slots.len();
         t.slots.push(Arc::new(FiberSlot {
-            own: Ownership::new_owned(),
+            // Re-seed at the freeze-time generation (recycling step 2), so a guest handle to a
+            // recycled fiber still resolves; 0 for a non-recycled fiber (handle == slot).
+            own: Ownership::new_owned_at(generation),
             running_on: AtomicU64::new(NOT_RUNNING),
             fiber: Mutex::new(Some(fiber)),
             shadow_sp: AtomicU64::new(shadow_sp),
@@ -671,6 +680,9 @@ pub(crate) unsafe extern "C" fn fiber_resume(
                     func: slot.func,
                     sp: slot.sp,
                     shadow_sp: flat_sp,
+                    // Recorded before the `finish` below bumps it — the freeze-time generation, so a
+                    // thaw re-seeds this (possibly recycled) fiber at the generation its handle carries.
+                    generation: slot.own.generation() as u32,
                 });
             }
             // Drop the fiber (unmapping its stack) and free the slot — `finish` bumps the
@@ -811,9 +823,13 @@ pub(crate) unsafe fn seed_frozen_fibers(
             fault(trap_out);
             return false;
         };
-        let got = r
-            .table
-            .seed_frozen(Box::new(fiber), f.func, f.sp, f.shadow_sp);
+        let got = r.table.seed_frozen(
+            Box::new(fiber),
+            f.func,
+            f.sp,
+            f.shadow_sp,
+            f.generation as u64,
+        );
         debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
         debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
     }

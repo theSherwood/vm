@@ -826,13 +826,17 @@ sequenced slice:
    rejects stale handles — so reuse is now ABA-safe. Remaining within step 1's spirit: the JIT freeze
    driver's `runnable_handles()`/`fiber_region_base(handle as usize)` still treat the handle as the raw
    slot (correct only at generation 0); step 3 must encode/extract there once generations can be nonzero.
-2. **[ ] Snapshot format: carry generations.** The control-section fiber residue records each fiber's
-   generation so a **thaw** of a *recycled* (generation > 0) domain re-establishes the same handle
-   namespace (`seed_frozen` restores the generation; a guest's gen-N handle still resolves post-thaw).
-   Gate behind "any recycled slot" / bump `FORMAT_VERSION` to keep pre-recycling artifacts byte-identical.
-   Until this lands, recycling is sound for **non-durable** runs and a durable run that *freezes* a
-   recycled fiber flattens it correctly, but a *thaw* re-seeds it at generation 0 — so a recycled
-   durable round-trip isn't complete yet.
+2. **[~] Snapshot format: carry generations — done (plumbing).** `FrozenFiber` (both backends) gains a
+   `generation`; the freeze records it (interp `registry.generation(slot)`, JIT `slot.own.generation()`
+   read before `finish` bumps it), the control section carries it (format **v2**, one uleb per fiber),
+   and `seed_frozen` re-seeds at it (interp `gens[slot]`, JIT `Ownership::new_owned_at`) — so a thaw of
+   a recycled fiber re-establishes the generation its guest handle expects. Pinned at the codec leg by
+   `svm-snapshot/tests/roundtrip.rs::fiber_residue_generation_round_trips_through_the_codec` (a forced
+   gen-N residue survives freeze → restore). **Not exercisable end-to-end yet:** producing a recycled
+   (gen > 0) *parked* fiber to freeze needs a prior fiber-finish, i.e. a prior safepoint, but the freeze
+   harness unwinds at the *first* safepoint — so the full recycled durable round-trip awaits a
+   later-safepoint freeze trigger (Phase 4 / "freeze after N safepoints"). The plumbing is in place for
+   when it lands.
 3. **[~] Recycle on finish — done, both backends.** A finished fiber's slot returns to a per-registry
    **min-heap** free list (`free`), and `cont.new` reuses the lowest free slot before growing — so the
    table is bounded by *peak concurrent* fibers, not the lifetime total, lifting the `MAX_SHADOW_CTX`
@@ -849,7 +853,15 @@ sequenced slice:
 4. **[ ] Cross-backend parity + fuzz.** Extend the durable generators (`durgen`) to churn fibers
    (create → finish → recreate) so the recycled-slot + generation + thaw path is exercised on both
    backends and the artifacts stay byte-identical. (The interp↔JIT `fiber_fuzz` already churns and
-   agrees on the *run*; this adds the freeze/thaw leg, and depends on step 2.)
+   agrees on the *run*; this adds the freeze/thaw leg, and — like step 2's end-to-end — depends on a
+   later-safepoint freeze trigger to actually freeze a recycled parked fiber.)
+
+**Recycling status:** steps 1 + 3 give complete **non-durable** slot recycling on both backends (the
+table is bounded by peak concurrent fibers, ABA-guarded by generation-carrying handles). Step 2's
+data-model plumbing is in place. The remaining gap — a recycled *durable* freeze/thaw round-trip — is
+blocked not on recycling but on the **freeze trigger**: today a freeze unwinds at the first safepoint,
+so a recycled parked fiber (which needs a prior finish) can't be present to freeze. A later-safepoint /
+mid-run freeze trigger (Phase 4) unblocks steps 2-end-to-end and 4 together.
 
 #### 3.1 implementation plan (next-session pickup)
 

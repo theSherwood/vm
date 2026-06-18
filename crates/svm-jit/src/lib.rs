@@ -333,6 +333,9 @@ pub struct FrozenFiber {
     pub func: i32,
     pub sp: i64,
     pub shadow_sp: u64,
+    /// The slot's generation at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
+    /// recycled fiber still resolves. 0 for a non-recycled fiber. Mirrors `svm_interp::FrozenFiber`.
+    pub generation: u32,
 }
 
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /

@@ -94,6 +94,7 @@ pub(crate) struct Ownership {
 
 impl Ownership {
     /// A freshly created fiber, **owned by its creator** and not yet in the steal pool (generation 0).
+    #[allow(dead_code)] // the live paths use `new_owned_at` (recycling step 2/3); kept for the tests + as the generation-0 spelling
     pub(crate) fn new_owned() -> Ownership {
         Ownership::new_owned_at(0)
     }

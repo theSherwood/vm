@@ -64,6 +64,7 @@ fn jit_seed(interp: &[InterpFrozen]) -> Vec<JitFrozen> {
             func: f.func,
             sp: f.sp,
             shadow_sp: f.shadow_sp,
+            generation: f.generation,
         })
         .collect()
 }
@@ -289,6 +290,7 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
                 func: f.func,
                 sp: f.sp,
                 shadow_sp: f.shadow_sp,
+                generation: f.generation,
             })
             .collect(),
     );

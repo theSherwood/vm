@@ -1493,7 +1493,9 @@ fn drive(
             let mut seed: Vec<FrozenFiber> = thaw_fibers;
             seed.sort_by_key(|f| f.slot);
             for (expected, ff) in seed.into_iter().enumerate() {
-                let got = root.registry.seed_frozen(ff.func, ff.sp, ff.shadow_sp);
+                let got = root
+                    .registry
+                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation);
                 debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
                 debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
             }
@@ -3746,6 +3748,11 @@ pub struct FrozenFiber {
     /// Window offset of the flattened shadow-SP — the extent of its frozen continuation, restored
     /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
     pub shadow_sp: u64,
+    /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
+    /// *recycled* (generation > 0) fiber still resolves (`(generation << 16) | slot`). 0 for a
+    /// non-recycled fiber — then the handle is exactly its slot, and the artifact is unchanged in
+    /// meaning (see the snapshot codec, which is format v2).
+    pub generation: u32,
 }
 
 /// A **spawned vCPU** (a `thread.spawn` child) flattened for freeze (DURABILITY.md §12.8 slice 3.2.1).
@@ -3872,6 +3879,12 @@ impl FiberRegistry {
     /// the surrounding fiber logic already treats as `Malformed`.
     fn saved_sp(&self, slot: usize) -> u64 {
         self.lock().shadow.get(slot).copied().unwrap_or(SHADOW_BASE)
+    }
+
+    /// The `slot`'s current generation (recycling step 2) — recorded in its [`FrozenFiber`] residue at
+    /// freeze so a thaw re-seeds it at the same generation. 0 for an out-of-range slot.
+    fn generation(&self, slot: usize) -> u32 {
+        self.lock().gens.get(slot).copied().unwrap_or(0)
     }
 
     /// Record the fiber in `slot`'s shadow-SP (called when it stops being the running context).
@@ -4040,12 +4053,12 @@ impl FiberRegistry {
     /// thaw `cont.resume` re-enters its entry under `REWINDING`) with its flattened shadow-SP in the
     /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
     /// dense handle namespace; returns the slot, which must equal the recorded one.
-    fn seed_frozen(&self, func: i32, sp: i64, shadow_sp: u64) -> usize {
+    fn seed_frozen(&self, func: i32, sp: i64, shadow_sp: u64, generation: u32) -> usize {
         let mut t = self.lock();
         let slot = t.fibers.len();
         t.fibers.push(RegFiber::Pending { func, sp });
         t.shadow.push(shadow_sp);
-        t.gens.push(0); // re-seeded fibers restart at generation 0 (recycling step 1)
+        t.gens.push(generation); // restore the freeze-time generation so a recycled handle resolves
         slot
     }
 }
@@ -4452,6 +4465,7 @@ impl VCpu {
                 func,
                 sp,
                 shadow_sp,
+                generation: self.registry.generation(slot),
             });
         }
         // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
@@ -5696,6 +5710,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             func,
                             sp,
                             shadow_sp,
+                            generation: registry.generation(leaving),
                         });
                     } else {
                         registry.finish(*cur);
