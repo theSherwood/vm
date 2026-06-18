@@ -1239,6 +1239,52 @@ fn printf_signed_formats() {
 }
 
 #[test]
+fn printf_float_fixed() {
+    // `%f` via the synthesized exact-decimal helper (`__svm_dtoa_fixed`, fixed 128-bit integer
+    // arithmetic — no host float formatting). Covers: default precision (6), explicit precision,
+    // round-half-to-even ties (2.5→2, 3.5→4), a non-exactly-representable decimal (0.1), field width
+    // with right/left justification, a negative value, the `+`/space sign flags, zero, and a value
+    // with a multi-digit integer part. Byte-for-byte stdout compared to the native clang build.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"%f\\n\", 3.14); \
+                 printf(\"%.2f\\n\", 3.14159); \
+                 printf(\"%.0f %.0f\\n\", 2.5, 3.5); \
+                 printf(\"%.3f\\n\", 0.1); \
+                 printf(\"[%8.2f][%-8.2f]\\n\", 3.5, 3.5); \
+                 printf(\"%f\\n\", -2.75); \
+                 printf(\"%+.1f % .1f\\n\", 1.5, 1.5); \
+                 printf(\"%.2f %.2f\\n\", 0.0, 100.0); \
+                 printf(\"%.3f\\n\", 12345.6789); \
+                 printf(\"%.10f\\n\", 0.5); \
+                 printf(\"%.1f\\n\", 9007199254740992.0); \
+                 printf(\"%.0f %.0f %.0f\\n\", 0.5, 1.5, 4.5); \
+                 printf(\"%.4f\\n\", 2.0 / 3.0); \
+                 printf(\"%.2f\\n\", -0.0); \
+                 printf(\"%.2f\\n\", 1e30); \
+                 printf(\"%.1f\\n\", 18014398509481984.0); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f", src, b"");
+}
+
+#[test]
+fn printf_float_nonfinite() {
+    // `%f` of the non-finite doubles: `__svm_dtoa_fixed` writes "inf"/"nan" (lowercase, with the sign
+    // byte / `+`/space flags) just like glibc, rather than trapping. `volatile` keeps clang from
+    // constant-folding the printf away. stdout compared byte-for-byte to native.
+    let src = "#include <stdio.h>\n#include <math.h>\n\
+               int main(void){ \
+                 volatile double inf = INFINITY, nan = NAN, big = 1e308; \
+                 printf(\"%f %f\\n\", inf, -inf); \
+                 printf(\"%+f % f\\n\", inf, inf); \
+                 printf(\"%f\\n\", nan); \
+                 printf(\"[%8.2f][%-8.2f]\\n\", inf, inf); \
+                 printf(\"%f\\n\", big * 10.0); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f_nonfinite", src, b"");
+}
+
+#[test]
 fn realloc_grow_preserves() {
     // `realloc` must preserve the old contents across a grow (the header gives the copy length). Push
     // 20 ints into a doubling buffer, then sum — exit code compared to native.

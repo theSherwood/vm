@@ -273,6 +273,10 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
     // reserved low scratch), so it forces a `_start` below.
     let need_getenv = calls_external(m, &defined_names, "getenv") && has_main;
+    // `%f` formatting (`__svm_dtoa_fixed`) rides on `printf`: it writes via the same `write` import and
+    // stashed stdout handle. Synthesized for any `printf` program (dead if no `%f` appears — scanning
+    // the formats to tighten this is a later refinement).
+    let need_dtoa = need_printf;
     // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
     // declared arity), sized to the highest capability index the program uses: exit(2) always,
     // memory(3) for `malloc`/Memory builtins, addrspace(4) for the SharedRegion builtins, ioring(5)
@@ -360,6 +364,7 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         realloc: take(need_realloc),
         memmove: take(need_memmove),
         getenv: take(need_getenv),
+        dtoa: take(need_dtoa),
     };
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
@@ -437,14 +442,20 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     // any function uses the data stack, the module has globals, or it uses the powerbox (the handle
     // stash / heap state live in the reserved low window).
     let need_window = any_frame || !globals.is_empty() || synth;
+    // The `%f` helper's fixed scratch sits just above the data-stack reserve (so it never collides with
+    // globals, the stack, or the heap, which starts at the mapped boundary above it).
+    let float_scratch_base = need_dtoa.then_some(entry_sp + STACK_RESERVE);
     let memory = need_window.then(|| {
         // Reserve stack when any function (or the argv `_start`) uses the data stack.
-        let top = if any_frame || wants_argv {
+        let mut top = if any_frame || wants_argv {
             entry_sp + STACK_RESERVE
         } else {
             globals_end
         }
         .max(1);
+        if let Some(fsb) = float_scratch_base {
+            top = top.max(fsb + FLOAT_SCRATCH_SIZE);
+        }
         let log2 = (64 - (top - 1).leading_zeros()) as u8;
         svm_ir::Memory { size_log2: log2 }
     });
@@ -506,6 +517,12 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     }
     if need_getenv {
         funcs.push(synth_getenv());
+    }
+    if need_dtoa {
+        funcs.push(synth_dtoa_fixed(
+            caps["write"],
+            float_scratch_base.expect("need_dtoa reserves float scratch"),
+        ));
     }
     Ok(Translated {
         module: Module {
@@ -1714,6 +1731,11 @@ const PROT_RW: i32 = 3;
 /// pre-fills the low end. 64 bytes covers a 64-bit value in any base plus a generous field width.
 const FMT_BUF: u64 = 64;
 const FMT_BUF_END: u64 = 128;
+/// Scratch for the `%f` helper (`__svm_dtoa_fixed`): the 128-bit working limbs, the extracted decimal
+/// digits, the assembled content, a small stashed-context block, and the padded output field. Placed
+/// just above the data-stack reserve in the window (a fixed, reusable region — no per-call alloc),
+/// reserved only when `need_dtoa`. The helper's offsets (`out = 296`, field ≤ 216 B) fit in 512.
+const FLOAT_SCRATCH_SIZE: u64 = 512;
 
 /// Which stash slot a capability call reads its handle from.
 #[derive(Clone, Copy)]
@@ -2762,6 +2784,10 @@ struct Helpers {
     /// `__svm_getenv(name:i64) -> i64` — scan the §3e env strings for `name=`, returning the value
     /// pointer (just past the `=`) or NULL. Reads the blob in the reserved low scratch directly.
     getenv: Option<u32>,
+    /// `__svm_dtoa_fixed(bits, prec, width, flags)` — format a `double` (`%f`) via exact 128-bit
+    /// integer arithmetic and write the padded field to stdout. Self-contained (loads the stdout
+    /// handle, calls the `write` import); uses the reserved float scratch.
+    dtoa: Option<u32>,
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
@@ -3628,6 +3654,1157 @@ fn synth_getenv() -> Func {
     }
 }
 
+/// A tiny auto-numbering block builder for synthesizing CFGs by hand. Value indices in svm-ir are
+/// **block-local** (params first, then each value-producing inst in order, §3a), so `Bdr` tracks the
+/// running count: `push` returns the new value's index and bumps the counter, `eff` appends a
+/// 0-result inst (store/fence) without consuming an index. The convenience methods cover the shapes
+/// `__svm_dtoa_fixed` leans on (consts, i64 arith/compare, width-typed loads/stores, select).
+struct Bdr {
+    insts: Vec<Inst>,
+    n: u32,
+}
+impl Bdr {
+    fn new(nparams: u32) -> Self {
+        Bdr {
+            insts: Vec::new(),
+            n: nparams,
+        }
+    }
+    fn push(&mut self, i: Inst) -> u32 {
+        let id = self.n;
+        self.insts.push(i);
+        self.n += 1;
+        id
+    }
+    fn eff(&mut self, i: Inst) {
+        self.insts.push(i);
+    }
+    fn k(&mut self, v: i64) -> u32 {
+        self.push(Inst::ConstI64(v))
+    }
+    fn bin(&mut self, op: BinOp, a: ValIdx, b: ValIdx) -> u32 {
+        self.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op,
+            a,
+            b,
+        })
+    }
+    fn cmp(&mut self, op: CmpOp, a: ValIdx, b: ValIdx) -> u32 {
+        self.push(Inst::IntCmp {
+            ty: IntTy::I64,
+            op,
+            a,
+            b,
+        })
+    }
+    /// Compare `a` against an immediate — materializes the constant first, so callers never pass a
+    /// bare literal as a value index (in a no-param block index `0` is the first inst, not zero).
+    fn cmpi(&mut self, op: CmpOp, a: ValIdx, imm: i64) -> u32 {
+        let c = self.k(imm);
+        self.cmp(op, a, c)
+    }
+    fn sel(&mut self, cond: ValIdx, a: ValIdx, b: ValIdx) -> u32 {
+        self.push(Inst::Select { cond, a, b })
+    }
+    /// Add `base + off` as a fresh address value (for the scratch slots / digit buffers).
+    fn at(&mut self, base: i64, off: i64) -> u32 {
+        self.push(Inst::ConstI64(base + off))
+    }
+    fn load64(&mut self, addr: ValIdx) -> u32 {
+        self.push(Inst::Load {
+            op: svm_ir::LoadOp::I64,
+            addr,
+            offset: 0,
+            align: 0,
+        })
+    }
+    /// Zero-extended u32 load (a 128-bit limb) into an i64.
+    fn load32u(&mut self, addr: ValIdx) -> u32 {
+        let t = self.push(Inst::Load {
+            op: svm_ir::LoadOp::I32,
+            addr,
+            offset: 0,
+            align: 0,
+        });
+        self.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: t,
+        })
+    }
+    /// Zero-extended u8 load into an i64.
+    fn load8u(&mut self, addr: ValIdx) -> u32 {
+        let t = self.push(Inst::Load {
+            op: svm_ir::LoadOp::I32_8U,
+            addr,
+            offset: 0,
+            align: 0,
+        });
+        self.push(Inst::Convert {
+            op: ConvOp::ExtendI32U,
+            a: t,
+        })
+    }
+    /// Raw i32 load (the stdout stream handle, passed straight to the `write` import).
+    fn load32(&mut self, addr: ValIdx) -> u32 {
+        self.push(Inst::Load {
+            op: svm_ir::LoadOp::I32,
+            addr,
+            offset: 0,
+            align: 0,
+        })
+    }
+    fn store64(&mut self, addr: ValIdx, value: ValIdx) {
+        self.eff(Inst::Store {
+            op: svm_ir::StoreOp::I64,
+            addr,
+            value,
+            offset: 0,
+            align: 0,
+        });
+    }
+    fn store32(&mut self, addr: ValIdx, value: ValIdx) {
+        let w = self.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: value,
+        });
+        self.eff(Inst::Store {
+            op: svm_ir::StoreOp::I32,
+            addr,
+            value: w,
+            offset: 0,
+            align: 0,
+        });
+    }
+    fn store8(&mut self, addr: ValIdx, value: ValIdx) {
+        let w = self.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: value,
+        });
+        self.eff(Inst::Store {
+            op: svm_ir::StoreOp::I32_8,
+            addr,
+            value: w,
+            offset: 0,
+            align: 0,
+        });
+    }
+    fn block(self, params: Vec<ValType>, term: Terminator) -> Block {
+        Block {
+            params,
+            insts: self.insts,
+            term,
+        }
+    }
+}
+
+/// `__svm_dtoa_fixed(bits:i64, prec:i64, width:i64, flags:i64)` — format a C `double` for `%f` and
+/// write the padded field straight to stdout. Conversion is **exact** fixed-point integer arithmetic
+/// over a 128-bit accumulator (four u32 limbs in the reserved float scratch), so interp ≡ JIT ≡
+/// native with no host float formatting:
+///
+///   value = m·2^e  (IEEE-754 decompose) ⇒ round(value·10^prec) = round(m·5^prec · 2^(e+prec))
+///
+/// `A = m·5^prec` fits 128 bits (`m < 2^53`, `5^prec ≤ 5^31 < 2^72`); then `s = e+prec` left-shifts
+/// (exact) or right-shifts with round-half-to-even. A magnitude whose `round(value·10^prec)` exceeds
+/// 128 bits (roughly `|value| > 2^128/10^prec`) is a deterministic **trap** (`Unreachable`) — never a
+/// silent mis-format; the bignum path lifts that ceiling later. `flags` bit0=left-justify, bit1=`+`,
+/// bit2=space. Self-contained: loads the stashed stdout handle and calls the `write` import directly.
+///
+/// `scratch` is the float-scratch base; `write_import` the `write` import index.
+fn synth_dtoa_fixed(write_import: u32, scratch: u64) -> Func {
+    use BinOp::{Add, And, Mul, Or, ShrU, Sub};
+    use CmpOp::{Eq, GeS, GtS, LtS, Ne};
+    let s = scratch as i64;
+    // Scratch layout (relative to `s`): four u32 limbs, the extracted decimal digits (LSB-first,
+    // value-per-byte), the assembled content bytes, a small context block (params stashed so blocks
+    // thread only loop counters), and the final padded output field that gets written.
+    let (l0, l1, l2, l3) = (0i64, 4, 8, 12);
+    let dbuf = 16i64; // up to 39 decimal digit values
+    let cbuf = 80i64; // assembled "[-]int.frac" content (≤ 72 bytes)
+    let prec_slot = 240i64;
+    let width_slot = 248i64;
+    let flags_slot = 256i64;
+    let sign_slot = 264i64;
+    let dcnt_slot = 272i64; // digit count D (then reused for the padded total)
+    let sval_slot = 280i64; // shift exponent s = e+prec (then reused for the lead-pad count)
+    let clen_slot = 288i64; // running content length (== final content length when assembled)
+    let out = 296i64; // padded output field (≤ 216 bytes)
+    let mask32: i64 = 0xFFFF_FFFF;
+
+    // Block indices (block 0 is the implicit entry; see the per-block comments below).
+    const SPECIAL: u32 = 1;
+    const FINITE: u32 = 2;
+    const MUL5_TEST: u32 = 3;
+    const MUL5_BODY: u32 = 4;
+    const DISP_NEG: u32 = 5;
+    const DISP_POS: u32 = 6;
+    const SHL_TEST: u32 = 7;
+    const SHL_BODY: u32 = 8;
+    const SHR_SETUP: u32 = 9;
+    const SHR_TEST: u32 = 10;
+    const SHR_BODY: u32 = 11;
+    const SHR_ROUND: u32 = 12;
+    const SHR_INC: u32 = 13;
+    const DEC_INIT: u32 = 14;
+    const DEC_BODY: u32 = 15;
+    const DEC_TEST: u32 = 16;
+    const ASM_SIGN: u32 = 17;
+    const ASM_INT: u32 = 18;
+    const ASM_INT_ZERO: u32 = 19;
+    const ASM_INT_TEST: u32 = 20;
+    const ASM_INT_BODY: u32 = 21;
+    const ASM_DOT: u32 = 22;
+    const ASM_FRAC_TEST: u32 = 23;
+    const ASM_FRAC_BODY: u32 = 24;
+    const PAD_START: u32 = 25;
+    const PAD_FILL_TEST: u32 = 26;
+    const PAD_FILL_BODY: u32 = 27;
+    const PAD_COPY_TEST: u32 = 28;
+    const PAD_COPY_BODY: u32 = 29;
+    const WRITE: u32 = 30;
+    const TRAP: u32 = 31;
+
+    let i64t = ValType::I64;
+
+    // ── block ENTRY(bits, prec, width, flags): IEEE-754 decompose; stash ctx; split special/finite ──
+    let b_entry = {
+        let mut b = Bdr::new(4);
+        let a = b.at(s, prec_slot);
+        b.store64(a, 1);
+        let a = b.at(s, width_slot);
+        b.store64(a, 2);
+        let a = b.at(s, flags_slot);
+        b.store64(a, 3);
+        let c63 = b.k(63);
+        let sgn = b.bin(ShrU, 0, c63); // signbit (0/1)
+        let a = b.at(s, sign_slot);
+        b.store64(a, sgn);
+        let c52 = b.k(52);
+        let e0 = b.bin(ShrU, 0, c52);
+        let m7ff = b.k(0x7FF);
+        let exp = b.bin(And, e0, m7ff); // biased exponent
+        let mm = b.k((1i64 << 52) - 1);
+        let mant = b.bin(And, 0, mm); // 52-bit fraction
+        let c7ff = b.k(0x7FF);
+        let isspec = b.cmp(Eq, exp, c7ff);
+        b.block(
+            vec![i64t, i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: isspec,
+                then_blk: SPECIAL,
+                then_args: vec![mant],
+                else_blk: FINITE,
+                else_args: vec![exp, mant],
+            },
+        )
+    };
+
+    // ── block SPECIAL(mant): non-finite — write "[sign]inf" (mant==0) or "[sign]nan", then pad ──
+    // Builds the content into `cbuf` (reusing the PAD/WRITE tail) with the same sign-byte rules as a
+    // finite value (sign bit ⇒ '-', else `+`/space flags), matching glibc's `%f` of inf/nan.
+    let b_special = {
+        let mut b = Bdr::new(1); // mant
+        let sa = b.at(s, sign_slot);
+        let sign = b.load64(sa);
+        let fa = b.at(s, flags_slot);
+        let flags = b.load64(fa);
+        let isneg = b.cmpi(Ne, sign, 0);
+        let c2 = b.k(2);
+        let plusf = b.bin(And, flags, c2);
+        let hasplus = b.cmpi(Ne, plusf, 0);
+        let c4 = b.k(4);
+        let spacef = b.bin(And, flags, c4);
+        let hasspace = b.cmpi(Ne, spacef, 0);
+        let space = b.k(b' ' as i64);
+        let zero = b.k(0);
+        let sc1 = b.sel(hasspace, space, zero);
+        let plus = b.k(b'+' as i64);
+        let sc2 = b.sel(hasplus, plus, sc1);
+        let minus = b.k(b'-' as i64);
+        let sc = b.sel(isneg, minus, sc2);
+        let cb0 = b.k(s + cbuf);
+        b.store8(cb0, sc); // overwritten by the first letter when there is no sign
+        let hassign = b.cmpi(Ne, sc, 0);
+        let one = b.k(1);
+        let zero2 = b.k(0);
+        let count = b.sel(hassign, one, zero2);
+        // "inf" when mant==0, else "nan" (lowercase for `%f`).
+        let isinf = b.cmpi(Eq, 0, 0);
+        let ci = b.k(b'i' as i64);
+        let cn = b.k(b'n' as i64);
+        let ch0 = b.sel(isinf, ci, cn);
+        let cn2 = b.k(b'n' as i64);
+        let ca = b.k(b'a' as i64);
+        let ch1 = b.sel(isinf, cn2, ca);
+        let cf = b.k(b'f' as i64);
+        let cn3 = b.k(b'n' as i64);
+        let ch2 = b.sel(isinf, cf, cn3);
+        let base = b.k(s + cbuf);
+        let a0 = b.bin(Add, base, count);
+        b.store8(a0, ch0);
+        let k1 = b.k(1);
+        let p1 = b.bin(Add, count, k1);
+        let a1 = b.bin(Add, base, p1);
+        b.store8(a1, ch1);
+        let k2 = b.k(2);
+        let p2 = b.bin(Add, count, k2);
+        let a2 = b.bin(Add, base, p2);
+        b.store8(a2, ch2);
+        let k3 = b.k(3);
+        let clen = b.bin(Add, count, k3);
+        let ca2 = b.at(s, clen_slot);
+        b.store64(ca2, clen);
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: PAD_START,
+                args: vec![],
+            },
+        )
+    };
+
+    // ── block FINITE(exp, mant): m·2^e → seed the 128-bit limbs; stash s=e+prec; enter ×5^prec ──
+    let b_finite = {
+        let mut b = Bdr::new(2); // exp=0, mant=1
+        let c0 = b.k(0);
+        let isz = b.cmp(Eq, 0, c0); // subnormal/zero?
+        let cimp = b.k(1i64 << 52);
+        let zero = b.k(0);
+        let implicit = b.sel(isz, zero, cimp); // isz ? 0 : 2^52
+        let m = b.bin(Or, 1, implicit); // significand
+        let cm1074 = b.k(-1074);
+        let c1075 = b.k(1075);
+        let enorm = b.bin(Sub, 0, c1075); // exp - 1075
+        let e = b.sel(isz, cm1074, enorm);
+        let pa = b.at(s, prec_slot);
+        let prec = b.load64(pa);
+        let sv = b.bin(Add, e, prec); // s = e + prec
+        let a = b.at(s, sval_slot);
+        b.store64(a, sv);
+        // limbs: L0=m[31:0], L1=m[52:32], L2=L3=0
+        let c32 = b.k(32);
+        let mhi = b.bin(ShrU, m, c32);
+        let a = b.at(s, l0);
+        b.store32(a, m);
+        let a = b.at(s, l1);
+        b.store32(a, mhi);
+        let z = b.k(0);
+        let a = b.at(s, l2);
+        b.store32(a, z);
+        let a = b.at(s, l3);
+        b.store32(a, z);
+        b.block(
+            vec![i64t, i64t],
+            Terminator::Br {
+                target: MUL5_TEST,
+                args: vec![prec],
+            },
+        )
+    };
+
+    // ── block MUL5_TEST(count): while count>0 multiply the 128-bit value by 5 ──
+    let b_mul5_test = {
+        let mut b = Bdr::new(1);
+        let c0 = b.k(0);
+        let done = b.cmp(Eq, 0, c0);
+        b.block(
+            vec![i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: DISP_NEG,
+                then_args: vec![],
+                else_blk: MUL5_BODY,
+                else_args: vec![0],
+            },
+        )
+    };
+
+    // ── block MUL5_BODY(count): 128-bit ×5 (unrolled limbs, carry-propagating) ──
+    let b_mul5_body = {
+        let mut b = Bdr::new(1);
+        let mask = b.k(mask32);
+        let c32 = b.k(32);
+        let c5 = b.k(5);
+        // limb i: t = limb*5 + carry; limb = t&mask; carry = t>>32
+        let a0 = b.at(s, l0);
+        let v0 = b.load32u(a0);
+        let t0 = b.bin(Mul, v0, c5);
+        let n0 = b.bin(And, t0, mask);
+        let cy0 = b.bin(ShrU, t0, c32);
+        let a1 = b.at(s, l1);
+        let v1 = b.load32u(a1);
+        let m1 = b.bin(Mul, v1, c5);
+        let t1 = b.bin(Add, m1, cy0);
+        let n1 = b.bin(And, t1, mask);
+        let cy1 = b.bin(ShrU, t1, c32);
+        let a2 = b.at(s, l2);
+        let v2 = b.load32u(a2);
+        let m2 = b.bin(Mul, v2, c5);
+        let t2 = b.bin(Add, m2, cy1);
+        let n2 = b.bin(And, t2, mask);
+        let cy2 = b.bin(ShrU, t2, c32);
+        let a3 = b.at(s, l3);
+        let v3 = b.load32u(a3);
+        let m3 = b.bin(Mul, v3, c5);
+        let t3 = b.bin(Add, m3, cy2);
+        let n3 = b.bin(And, t3, mask);
+        // carry-out of L3 is always 0 here (A < 2^125), so no trap needed.
+        let a0 = b.at(s, l0);
+        b.store32(a0, n0);
+        let a1 = b.at(s, l1);
+        b.store32(a1, n1);
+        let a2 = b.at(s, l2);
+        b.store32(a2, n2);
+        let a3 = b.at(s, l3);
+        b.store32(a3, n3);
+        let c1 = b.k(1);
+        let nc = b.bin(Sub, 0, c1);
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: MUL5_TEST,
+                args: vec![nc],
+            },
+        )
+    };
+
+    // ── block DISP_NEG: s<0 ⇒ right-shift+round; else check positive ──
+    let b_disp_neg = {
+        let mut b = Bdr::new(0);
+        let a = b.at(s, sval_slot);
+        let sv = b.load64(a);
+        let c0 = b.k(0);
+        let neg = b.cmp(LtS, sv, c0);
+        b.block(
+            vec![],
+            Terminator::BrIf {
+                cond: neg,
+                then_blk: SHR_SETUP,
+                then_args: vec![],
+                else_blk: DISP_POS,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block DISP_POS: s>0 ⇒ left-shift (exact); else (s==0) straight to decimal ──
+    let b_disp_pos = {
+        let mut b = Bdr::new(0);
+        let a = b.at(s, sval_slot);
+        let sv = b.load64(a);
+        let c0 = b.k(0);
+        let pos = b.cmp(GtS, sv, c0);
+        b.block(
+            vec![],
+            Terminator::BrIf {
+                cond: pos,
+                then_blk: SHL_TEST,
+                then_args: vec![sv],
+                else_blk: DEC_INIT,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block SHL_TEST(count): while count>0 shift left by 1 (exact; overflow traps) ──
+    let b_shl_test = {
+        let mut b = Bdr::new(1);
+        let c0 = b.k(0);
+        let done = b.cmp(Eq, 0, c0);
+        b.block(
+            vec![i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: DEC_INIT,
+                then_args: vec![],
+                else_blk: SHL_BODY,
+                else_args: vec![0],
+            },
+        )
+    };
+
+    // ── block SHL_BODY(count): trap if the top bit is set (would overflow 128b), else ≪1 ──
+    let b_shl_body = {
+        let mut b = Bdr::new(1);
+        let mask = b.k(mask32);
+        let c1 = b.k(1);
+        let c31 = b.k(31);
+        let a3 = b.at(s, l3);
+        let v3 = b.load32u(a3);
+        let top = b.bin(ShrU, v3, c31); // bit 127
+        let over = b.cmpi(Ne, top, 0);
+        // Note: the limb reloads below re-issue after the branch in SHL_DO is awkward; instead we
+        // compute the shifted limbs here and only branch on overflow at the terminator.
+        let a0 = b.at(s, l0);
+        let v0 = b.load32u(a0);
+        let a1 = b.at(s, l1);
+        let v1 = b.load32u(a1);
+        let a2 = b.at(s, l2);
+        let v2 = b.load32u(a2);
+        // new Li = ((Li<<1) | (L(i-1)>>31)) & mask
+        let s0 = b.bin(BinOp::Shl, v0, c1);
+        let n0 = b.bin(And, s0, mask);
+        let s1 = b.bin(BinOp::Shl, v1, c1);
+        let c0b = b.bin(ShrU, v0, c31);
+        let s1b = b.bin(Or, s1, c0b);
+        let n1 = b.bin(And, s1b, mask);
+        let s2 = b.bin(BinOp::Shl, v2, c1);
+        let c1b = b.bin(ShrU, v1, c31);
+        let s2b = b.bin(Or, s2, c1b);
+        let n2 = b.bin(And, s2b, mask);
+        let s3 = b.bin(BinOp::Shl, v3, c1);
+        let c2b = b.bin(ShrU, v2, c31);
+        let s3b = b.bin(Or, s3, c2b);
+        let n3 = b.bin(And, s3b, mask);
+        let a0 = b.at(s, l0);
+        b.store32(a0, n0);
+        let a1 = b.at(s, l1);
+        b.store32(a1, n1);
+        let a2 = b.at(s, l2);
+        b.store32(a2, n2);
+        let a3 = b.at(s, l3);
+        b.store32(a3, n3);
+        let c1b2 = b.k(1);
+        let nc = b.bin(Sub, 0, c1b2);
+        // If the top bit was set we must trap (overflow) *instead of* looping; the stores above are
+        // harmless (we abort). Branch on `over`.
+        b.block(
+            vec![i64t],
+            Terminator::BrIf {
+                cond: over,
+                then_blk: TRAP,
+                then_args: vec![],
+                else_blk: SHL_TEST,
+                else_args: vec![nc],
+            },
+        )
+    };
+
+    // ── block SHR_SETUP: shift = -s; enter the ≫1 round loop ──
+    // No big-shift special-case: the ≫1 loop yields 0 with correct rounding for any `shift` (a value
+    // with `shift ≥ 128` is < 1 ulp at this precision); the extra iterations only matter for rare
+    // subnormals. (A standalone zeroing block would have to be gated by the branch — doing it inline
+    // here would zero the limbs on the *normal* path too.)
+    let b_shr_setup = {
+        let mut b = Bdr::new(0);
+        let a = b.at(s, sval_slot);
+        let sv = b.load64(a);
+        let c0 = b.k(0);
+        let shift = b.bin(Sub, c0, sv); // -s > 0
+        let zero = b.k(0);
+        b.block(
+            vec![],
+            Terminator::Br {
+                target: SHR_TEST,
+                args: vec![shift, zero, zero], // (count, sticky, lastout)
+            },
+        )
+    };
+
+    // ── block SHR_TEST(count, sticky, lastout): loop the ≫1, else round ──
+    let b_shr_test = {
+        let mut b = Bdr::new(3);
+        let c0 = b.k(0);
+        let done = b.cmp(Eq, 0, c0);
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::BrIf {
+                cond: done,
+                then_blk: SHR_ROUND,
+                then_args: vec![1, 2], // (sticky, lastout)
+                else_blk: SHR_BODY,
+                else_args: vec![0, 1, 2],
+            },
+        )
+    };
+
+    // ── block SHR_BODY(count, sticky, lastout): shift right by 1, tracking sticky/round bits ──
+    let b_shr_body = {
+        let mut b = Bdr::new(3);
+        let mask = b.k(mask32);
+        let c1 = b.k(1);
+        let c31 = b.k(31);
+        let a0 = b.at(s, l0);
+        let v0 = b.load32u(a0);
+        let a1 = b.at(s, l1);
+        let v1 = b.load32u(a1);
+        let a2 = b.at(s, l2);
+        let v2 = b.load32u(a2);
+        let a3 = b.at(s, l3);
+        let v3 = b.load32u(a3);
+        let outbit = b.bin(And, v0, c1); // bit shifted out this step
+        let newsticky = b.bin(Or, 1, 2); // sticky |= prior lastout
+        // new Li = ((Li>>1) | (L(i+1)<<31)) & mask
+        let r0 = b.bin(ShrU, v0, c1);
+        let up1 = b.bin(BinOp::Shl, v1, c31);
+        let o0 = b.bin(Or, r0, up1);
+        let n0 = b.bin(And, o0, mask);
+        let r1 = b.bin(ShrU, v1, c1);
+        let up2 = b.bin(BinOp::Shl, v2, c31);
+        let o1 = b.bin(Or, r1, up2);
+        let n1 = b.bin(And, o1, mask);
+        let r2 = b.bin(ShrU, v2, c1);
+        let up3 = b.bin(BinOp::Shl, v3, c31);
+        let o2 = b.bin(Or, r2, up3);
+        let n2 = b.bin(And, o2, mask);
+        let r3 = b.bin(ShrU, v3, c1);
+        let n3 = b.bin(And, r3, mask);
+        let a0 = b.at(s, l0);
+        b.store32(a0, n0);
+        let a1 = b.at(s, l1);
+        b.store32(a1, n1);
+        let a2 = b.at(s, l2);
+        b.store32(a2, n2);
+        let a3 = b.at(s, l3);
+        b.store32(a3, n3);
+        let c1b = b.k(1);
+        let nc = b.bin(Sub, 0, c1b);
+        b.block(
+            vec![i64t, i64t, i64t],
+            Terminator::Br {
+                target: SHR_TEST,
+                args: vec![nc, newsticky, outbit],
+            },
+        )
+    };
+
+    // ── block SHR_ROUND(sticky, lastout): round half-to-even; if rounding up, increment ──
+    let b_shr_round = {
+        let mut b = Bdr::new(2); // sticky=0, lastout(round bit)=1
+        let a0 = b.at(s, l0);
+        let v0 = b.load32u(a0);
+        let c1 = b.k(1);
+        let lsb = b.bin(And, v0, c1);
+        let tie = b.bin(Or, 0, lsb); // sticky | lsb
+        let up = b.bin(And, 1, tie); // roundbit & (sticky | lsb)
+        let isup = b.cmpi(Ne, up, 0);
+        b.block(
+            vec![i64t, i64t],
+            Terminator::BrIf {
+                cond: isup,
+                then_blk: SHR_INC,
+                then_args: vec![],
+                else_blk: DEC_INIT,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block SHR_INC: 128-bit += 1 (carry-propagating; carry-out traps) ──
+    let b_shr_inc = {
+        let mut b = Bdr::new(0);
+        let mask = b.k(mask32);
+        let c32 = b.k(32);
+        let c1 = b.k(1);
+        let a0 = b.at(s, l0);
+        let v0 = b.load32u(a0);
+        let t0 = b.bin(Add, v0, c1);
+        let n0 = b.bin(And, t0, mask);
+        let cy0 = b.bin(ShrU, t0, c32);
+        let a1 = b.at(s, l1);
+        let v1 = b.load32u(a1);
+        let t1 = b.bin(Add, v1, cy0);
+        let n1 = b.bin(And, t1, mask);
+        let cy1 = b.bin(ShrU, t1, c32);
+        let a2 = b.at(s, l2);
+        let v2 = b.load32u(a2);
+        let t2 = b.bin(Add, v2, cy1);
+        let n2 = b.bin(And, t2, mask);
+        let cy2 = b.bin(ShrU, t2, c32);
+        let a3 = b.at(s, l3);
+        let v3 = b.load32u(a3);
+        let t3 = b.bin(Add, v3, cy2);
+        let n3 = b.bin(And, t3, mask);
+        let cy3 = b.bin(ShrU, t3, c32);
+        let a0 = b.at(s, l0);
+        b.store32(a0, n0);
+        let a1 = b.at(s, l1);
+        b.store32(a1, n1);
+        let a2 = b.at(s, l2);
+        b.store32(a2, n2);
+        let a3 = b.at(s, l3);
+        b.store32(a3, n3);
+        let over = b.cmpi(Ne, cy3, 0);
+        b.block(
+            vec![],
+            Terminator::BrIf {
+                cond: over,
+                then_blk: TRAP,
+                then_args: vec![],
+                else_blk: DEC_INIT,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block DEC_INIT: D=0; emit digits (do-while ⇒ at least one '0') ──
+    let b_dec_init = {
+        let mut b = Bdr::new(0);
+        let z = b.k(0);
+        let a = b.at(s, dcnt_slot);
+        b.store64(a, z);
+        b.block(vec![], Terminator::Br {
+            target: DEC_BODY,
+            args: vec![],
+        })
+    };
+
+    // ── block DEC_BODY: digit = N % 10; N /= 10; store digit at dbuf[D]; D++ ──
+    let b_dec_body = {
+        let mut b = Bdr::new(0);
+        let c10 = b.k(10);
+        let c32 = b.k(32);
+        // high→low: acc = (acc<<32)|limb; q = acc/10; acc = acc%10
+        let a3 = b.at(s, l3);
+        let v3 = b.load32u(a3);
+        let q3 = b.bin(BinOp::DivU, v3, c10);
+        let r3 = b.bin(BinOp::RemU, v3, c10);
+        let a2 = b.at(s, l2);
+        let v2 = b.load32u(a2);
+        let hi2 = b.bin(BinOp::Shl, r3, c32);
+        let acc2 = b.bin(Or, hi2, v2);
+        let q2 = b.bin(BinOp::DivU, acc2, c10);
+        let r2 = b.bin(BinOp::RemU, acc2, c10);
+        let a1 = b.at(s, l1);
+        let v1 = b.load32u(a1);
+        let hi1 = b.bin(BinOp::Shl, r2, c32);
+        let acc1 = b.bin(Or, hi1, v1);
+        let q1 = b.bin(BinOp::DivU, acc1, c10);
+        let r1 = b.bin(BinOp::RemU, acc1, c10);
+        let a0 = b.at(s, l0);
+        let v0 = b.load32u(a0);
+        let hi0 = b.bin(BinOp::Shl, r1, c32);
+        let acc0 = b.bin(Or, hi0, v0);
+        let q0 = b.bin(BinOp::DivU, acc0, c10);
+        let r0 = b.bin(BinOp::RemU, acc0, c10); // this digit
+        let a3 = b.at(s, l3);
+        b.store32(a3, q3);
+        let a2 = b.at(s, l2);
+        b.store32(a2, q2);
+        let a1 = b.at(s, l1);
+        b.store32(a1, q1);
+        let a0 = b.at(s, l0);
+        b.store32(a0, q0);
+        // dbuf[D] = digit; D++
+        let da = b.at(s, dcnt_slot);
+        let d = b.load64(da);
+        let base = b.k(s + dbuf);
+        let addr = b.bin(Add, base, d);
+        b.store8(addr, r0);
+        let c1 = b.k(1);
+        let nd = b.bin(Add, d, c1);
+        let da = b.at(s, dcnt_slot);
+        b.store64(da, nd);
+        b.block(vec![], Terminator::Br {
+            target: DEC_TEST,
+            args: vec![],
+        })
+    };
+
+    // ── block DEC_TEST: if all limbs zero ⇒ assemble, else extract another digit ──
+    let b_dec_test = {
+        let mut b = Bdr::new(0);
+        let a0 = b.at(s, l0);
+        let v0 = b.load32u(a0);
+        let a1 = b.at(s, l1);
+        let v1 = b.load32u(a1);
+        let a2 = b.at(s, l2);
+        let v2 = b.load32u(a2);
+        let a3 = b.at(s, l3);
+        let v3 = b.load32u(a3);
+        let o01 = b.bin(Or, v0, v1);
+        let o23 = b.bin(Or, v2, v3);
+        let all = b.bin(Or, o01, o23);
+        let zero = b.cmpi(Eq, all, 0);
+        b.block(
+            vec![],
+            Terminator::BrIf {
+                cond: zero,
+                then_blk: ASM_SIGN,
+                then_args: vec![],
+                else_blk: DEC_BODY,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block ASM_SIGN: choose the sign byte, seed the content cursor ──
+    let b_asm_sign = {
+        let mut b = Bdr::new(0);
+        let sa = b.at(s, sign_slot);
+        let sign = b.load64(sa);
+        let fa = b.at(s, flags_slot);
+        let flags = b.load64(fa);
+        let isneg = b.cmpi(Ne, sign, 0);
+        let c2 = b.k(2);
+        let plusf = b.bin(And, flags, c2);
+        let hasplus = b.cmpi(Ne, plusf, 0);
+        let c4 = b.k(4);
+        let spacef = b.bin(And, flags, c4);
+        let hasspace = b.cmpi(Ne, spacef, 0);
+        let space = b.k(b' ' as i64);
+        let zero = b.k(0);
+        let sc1 = b.sel(hasspace, space, zero);
+        let plus = b.k(b'+' as i64);
+        let sc2 = b.sel(hasplus, plus, sc1);
+        let minus = b.k(b'-' as i64);
+        let sc = b.sel(isneg, minus, sc2);
+        // store sc at cbuf[0]; count = (sc != 0) ? 1 : 0 (overwritten by the int digit if no sign)
+        let cb = b.k(s + cbuf);
+        b.store8(cb, sc);
+        let hassign = b.cmpi(Ne, sc, 0);
+        let one = b.k(1);
+        let zero2 = b.k(0);
+        let count = b.sel(hassign, one, zero2);
+        let ca = b.at(s, clen_slot);
+        b.store64(ca, count);
+        b.block(vec![], Terminator::Br {
+            target: ASM_INT,
+            args: vec![],
+        })
+    };
+
+    // ── block ASM_INT: integer part has (D>prec) digits, else a single '0' ──
+    let b_asm_int = {
+        let mut b = Bdr::new(0);
+        let da = b.at(s, dcnt_slot);
+        let d = b.load64(da);
+        let pa = b.at(s, prec_slot);
+        let prec = b.load64(pa);
+        let has = b.cmp(GtS, d, prec);
+        let c1 = b.k(1);
+        let istart = b.bin(Sub, d, c1); // D-1
+        b.block(
+            vec![],
+            Terminator::BrIf {
+                cond: has,
+                then_blk: ASM_INT_TEST,
+                then_args: vec![istart],
+                else_blk: ASM_INT_ZERO,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block ASM_INT_ZERO: emit "0" for the integer part ──
+    let b_asm_int_zero = {
+        let mut b = Bdr::new(0);
+        let ca = b.at(s, clen_slot);
+        let count = b.load64(ca);
+        let base = b.k(s + cbuf);
+        let addr = b.bin(Add, base, count);
+        let zc = b.k(b'0' as i64);
+        b.store8(addr, zc);
+        let c1 = b.k(1);
+        let nc = b.bin(Add, count, c1);
+        let ca = b.at(s, clen_slot);
+        b.store64(ca, nc);
+        b.block(vec![], Terminator::Br {
+            target: ASM_DOT,
+            args: vec![],
+        })
+    };
+
+    // ── block ASM_INT_TEST(i): while i>=prec emit dbuf[i] ──
+    let b_asm_int_test = {
+        let mut b = Bdr::new(1);
+        let pa = b.at(s, prec_slot);
+        let prec = b.load64(pa);
+        let go = b.cmp(GeS, 0, prec);
+        b.block(
+            vec![i64t],
+            Terminator::BrIf {
+                cond: go,
+                then_blk: ASM_INT_BODY,
+                then_args: vec![0],
+                else_blk: ASM_DOT,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block ASM_INT_BODY(i): content[count++] = '0' + dbuf[i]; i-- ──
+    let b_asm_int_body = {
+        let mut b = Bdr::new(1);
+        let dbase = b.k(s + dbuf);
+        let daddr = b.bin(Add, dbase, 0);
+        let dig = b.load8u(daddr);
+        let z = b.k(b'0' as i64);
+        let ch = b.bin(Add, dig, z);
+        let ca = b.at(s, clen_slot);
+        let count = b.load64(ca);
+        let cbase = b.k(s + cbuf);
+        let addr = b.bin(Add, cbase, count);
+        b.store8(addr, ch);
+        let c1 = b.k(1);
+        let nc = b.bin(Add, count, c1);
+        let ca = b.at(s, clen_slot);
+        b.store64(ca, nc);
+        let c1b = b.k(1);
+        let ni = b.bin(Sub, 0, c1b);
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: ASM_INT_TEST,
+                args: vec![ni],
+            },
+        )
+    };
+
+    // ── block ASM_DOT: emit '.' iff prec>0, then enter the fraction loop ──
+    let b_asm_dot = {
+        let mut b = Bdr::new(0);
+        let pa = b.at(s, prec_slot);
+        let prec = b.load64(pa);
+        let ca = b.at(s, clen_slot);
+        let count = b.load64(ca);
+        let cbase = b.k(s + cbuf);
+        let addr = b.bin(Add, cbase, count);
+        let dot = b.k(b'.' as i64);
+        b.store8(addr, dot); // harmless if prec==0 (count not advanced)
+        let c0 = b.k(0);
+        let pos = b.cmp(GtS, prec, c0);
+        let c1 = b.k(1);
+        let cplus = b.bin(Add, count, c1);
+        let count2 = b.sel(pos, cplus, count);
+        let ca = b.at(s, clen_slot);
+        b.store64(ca, count2);
+        let istart = b.bin(Sub, prec, c1); // prec-1
+        b.block(
+            vec![],
+            Terminator::BrIf {
+                cond: pos,
+                then_blk: ASM_FRAC_TEST,
+                then_args: vec![istart],
+                else_blk: PAD_START,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block ASM_FRAC_TEST(i): emit prec fraction digits (i from prec-1 down to 0) ──
+    let b_asm_frac_test = {
+        let mut b = Bdr::new(1);
+        let c0 = b.k(0);
+        let go = b.cmp(GeS, 0, c0);
+        b.block(
+            vec![i64t],
+            Terminator::BrIf {
+                cond: go,
+                then_blk: ASM_FRAC_BODY,
+                then_args: vec![0],
+                else_blk: PAD_START,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block ASM_FRAC_BODY(i): digit = (i<D) ? dbuf[i] : 0; content[count++]='0'+digit ──
+    let b_asm_frac_body = {
+        let mut b = Bdr::new(1);
+        let da = b.at(s, dcnt_slot);
+        let d = b.load64(da);
+        let iltd = b.cmp(LtS, 0, d);
+        let dbase = b.k(s + dbuf);
+        let daddr = b.bin(Add, dbase, 0);
+        let raw = b.load8u(daddr); // valid when i<D; else discarded by select
+        let zero = b.k(0);
+        let dig = b.sel(iltd, raw, zero);
+        let z = b.k(b'0' as i64);
+        let ch = b.bin(Add, dig, z);
+        let ca = b.at(s, clen_slot);
+        let count = b.load64(ca);
+        let cbase = b.k(s + cbuf);
+        let addr = b.bin(Add, cbase, count);
+        b.store8(addr, ch);
+        let c1 = b.k(1);
+        let nc = b.bin(Add, count, c1);
+        let ca = b.at(s, clen_slot);
+        b.store64(ca, nc);
+        let c1b = b.k(1);
+        let ni = b.bin(Sub, 0, c1b);
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: ASM_FRAC_TEST,
+                args: vec![ni],
+            },
+        )
+    };
+
+    // ── block PAD_START: total=max(clen,width); lead=left?0:pad; fill the field with spaces ──
+    let b_pad_start = {
+        let mut b = Bdr::new(0);
+        let ca = b.at(s, clen_slot);
+        let clen = b.load64(ca);
+        let wa = b.at(s, width_slot);
+        let width = b.load64(wa);
+        let wgt = b.cmp(GtS, width, clen);
+        let total = b.sel(wgt, width, clen);
+        let pad = b.bin(Sub, total, clen);
+        let fa = b.at(s, flags_slot);
+        let flags = b.load64(fa);
+        let c1 = b.k(1);
+        let leftf = b.bin(And, flags, c1);
+        let isleft = b.cmpi(Ne, leftf, 0);
+        let zero = b.k(0);
+        let lead = b.sel(isleft, zero, pad);
+        let ta = b.at(s, dcnt_slot); // reuse: total
+        b.store64(ta, total);
+        let la = b.at(s, sval_slot); // reuse: lead
+        b.store64(la, lead);
+        let z = b.k(0);
+        b.block(
+            vec![],
+            Terminator::Br {
+                target: PAD_FILL_TEST,
+                args: vec![z],
+            },
+        )
+    };
+
+    // ── block PAD_FILL_TEST(j): fill out[0..total] with spaces ──
+    let b_pad_fill_test = {
+        let mut b = Bdr::new(1);
+        let ta = b.at(s, dcnt_slot);
+        let total = b.load64(ta);
+        let go = b.cmp(LtS, 0, total);
+        let zk = b.k(0); // start k=0 for the copy loop
+        b.block(
+            vec![i64t],
+            Terminator::BrIf {
+                cond: go,
+                then_blk: PAD_FILL_BODY,
+                then_args: vec![0],
+                else_blk: PAD_COPY_TEST,
+                else_args: vec![zk],
+            },
+        )
+    };
+
+    // ── block PAD_FILL_BODY(j): out[j] = ' ' ──
+    let b_pad_fill_body = {
+        let mut b = Bdr::new(1);
+        let base = b.k(s + out);
+        let addr = b.bin(Add, base, 0);
+        let sp = b.k(b' ' as i64);
+        b.store8(addr, sp);
+        let c1 = b.k(1);
+        let nj = b.bin(Add, 0, c1);
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: PAD_FILL_TEST,
+                args: vec![nj],
+            },
+        )
+    };
+
+    // ── block PAD_COPY_TEST(k): copy content[0..clen] into out[lead..] ──
+    let b_pad_copy_test = {
+        let mut b = Bdr::new(1);
+        let ca = b.at(s, clen_slot);
+        let clen = b.load64(ca);
+        let go = b.cmp(LtS, 0, clen);
+        b.block(
+            vec![i64t],
+            Terminator::BrIf {
+                cond: go,
+                then_blk: PAD_COPY_BODY,
+                then_args: vec![0],
+                else_blk: WRITE,
+                else_args: vec![],
+            },
+        )
+    };
+
+    // ── block PAD_COPY_BODY(k): out[lead+k] = content[k] ──
+    let b_pad_copy_body = {
+        let mut b = Bdr::new(1);
+        let cbase = b.k(s + cbuf);
+        let caddr = b.bin(Add, cbase, 0);
+        let ch = b.load8u(caddr);
+        let la = b.at(s, sval_slot);
+        let lead = b.load64(la);
+        let obase = b.k(s + out);
+        let off = b.bin(Add, lead, 0);
+        let oaddr = b.bin(Add, obase, off);
+        b.store8(oaddr, ch);
+        let c1 = b.k(1);
+        let nk = b.bin(Add, 0, c1);
+        b.block(
+            vec![i64t],
+            Terminator::Br {
+                target: PAD_COPY_TEST,
+                args: vec![nk],
+            },
+        )
+    };
+
+    // ── block WRITE: Stream.write(out, total) on the stashed stdout handle; return ──
+    let b_write = {
+        let mut b = Bdr::new(0);
+        let ta = b.at(s, dcnt_slot);
+        let total = b.load64(ta);
+        let ha = b.k(STASH_STDOUT as i64);
+        let handle = b.load32(ha);
+        let obase = b.k(s + out);
+        b.push(Inst::CallImport {
+            import: write_import,
+            sig: import_sig("write"),
+            handle,
+            args: vec![obase, total],
+        });
+        b.block(vec![], Terminator::Return(vec![]))
+    };
+
+    // ── block TRAP: 128-bit overflow (value too large for this slice) ──
+    let b_trap = {
+        let b = Bdr::new(0);
+        b.block(vec![], Terminator::Unreachable)
+    };
+
+    Func {
+        params: vec![i64t, i64t, i64t, i64t],
+        results: vec![],
+        blocks: vec![
+            b_entry,
+            b_special,
+            b_finite,
+            b_mul5_test,
+            b_mul5_body,
+            b_disp_neg,
+            b_disp_pos,
+            b_shl_test,
+            b_shl_body,
+            b_shr_setup,
+            b_shr_test,
+            b_shr_body,
+            b_shr_round,
+            b_shr_inc,
+            b_dec_init,
+            b_dec_body,
+            b_dec_test,
+            b_asm_sign,
+            b_asm_int,
+            b_asm_int_zero,
+            b_asm_int_test,
+            b_asm_int_body,
+            b_asm_dot,
+            b_asm_frac_test,
+            b_asm_frac_body,
+            b_pad_start,
+            b_pad_fill_test,
+            b_pad_fill_body,
+            b_pad_copy_test,
+            b_pad_copy_body,
+            b_write,
+            b_trap,
+        ],
+    }
+}
+
 /// The global-variable name a pointer operand points at, if it is a direct `@global` reference (the
 /// shape clang passes a string literal to `puts`/`fputs`). A computed pointer returns `None`.
 fn global_name_of(op: &Operand) -> Option<String> {
@@ -3812,14 +4989,19 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
             b'c' => FmtSeg::Char,
             b's' => FmtSeg::Str { width, prec },
             // Fixed-notation float (`%f`). Exact (correctly-rounded) decimal conversion via the
-            // synthesized `__svm_dtoa_fixed` (fixed multi-word integer arithmetic — no host float
-            // formatting, so interp≡JIT≡native). `prec` defaults to 6 (C); bounded so the `m·5^prec`
-            // intermediate fits the helper's fixed bignum. The `0` flag and `#` are not yet handled
-            // for floats (only sign / space-pad / left-justify), so reject them rather than mis-format.
+            // synthesized `__svm_dtoa_fixed` (fixed 128-bit integer arithmetic — no host float
+            // formatting, so interp≡JIT≡native). `prec` defaults to 6 (C); capped at 31 so the
+            // `m·5^prec` intermediate fits 128 bits (`5^31·2^53 < 2^128`), and `width` is bounded to
+            // the helper's scratch field. A value so large that `round(|v|·10^prec)` exceeds 128 bits
+            // traps deterministically (never a silent mis-format; bignum lifts both limits later). The
+            // `0`/`#` flags are not yet handled for floats (only sign / space-pad / left-justify).
             b'f' => {
                 let p = prec.unwrap_or(6);
-                if p > 120 {
-                    return Err(bad("float precision > 120 (later slice)"));
+                if p > 31 {
+                    return Err(bad("float precision > 31 (128-bit cut; bignum later)"));
+                }
+                if width > 200 {
+                    return Err(bad("float field width > 200 (scratch cap; later slice)"));
                 }
                 if flags.zero || flags.alt {
                     return Err(bad("float `0`/`#` flag (later slice)"));
@@ -4543,14 +5725,41 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                 emit_printf_int_field(ctx, mag, base, neg, width, prec, flags, utoa)?;
             }
             FmtSeg::Float { width, prec, flags } => {
-                // Codegen for `%f` is the synthesized `__svm_dtoa_fixed` exact-decimal helper (fixed
-                // multi-word integer arithmetic), landing in the next step. Until it is wired the
-                // conversion stays a clean fail-closed error (never a silent mis-format); the
-                // parser/segment scaffolding above is already in place.
-                let _ = (width, prec, flags);
-                return Err(Error::Unsupported(format!(
-                    "printf: %f codegen pending (prec {prec}, width {width})"
-                )));
+                let arg = c.arguments.get(argi).ok_or_else(|| {
+                    Error::Unsupported("printf: more conversions than args".into())
+                })?;
+                argi += 1;
+                // The variadic argument is a `double` (C promotes `float` → `double`); pass its
+                // IEEE-754 bit pattern so the helper decodes it with pure integer arithmetic.
+                match val_type(arg.0.get_type(ctx.types).as_ref())? {
+                    ValType::F64 => {}
+                    other => {
+                        return Err(Error::Unsupported(format!(
+                            "printf %f expects a double, got {}",
+                            other.as_str()
+                        )))
+                    }
+                }
+                let dval = ctx.operand(&arg.0)?;
+                let bits = ctx.push(Inst::Cast {
+                    op: CastOp::ReinterpF64I64,
+                    a: dval,
+                });
+                let dtoa = ctx
+                    .helpers
+                    .dtoa
+                    .ok_or_else(|| Error::Unsupported("printf: dtoa helper missing".into()))?;
+                let precv = ctx.const_i64(prec as i64);
+                let widthv = ctx.const_i64(width as i64);
+                // flags: bit0 left-justify, bit1 `+`, bit2 space (all compile-time constant here).
+                let fbits = (flags.left as i64)
+                    | ((flags.plus as i64) << 1)
+                    | ((flags.space as i64) << 2);
+                let flagsv = ctx.const_i64(fbits);
+                ctx.push_effect(Inst::Call {
+                    func: dtoa,
+                    args: vec![bits, precv, widthv, flagsv],
+                });
             }
         }
     }
