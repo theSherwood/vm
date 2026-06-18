@@ -24,7 +24,7 @@
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
 //! `return_call_indirect`, reusing the current window — O(1) deep tail recursion). [`compile_module`]
 //! returns `None` when a function needs a seam not yet driven here — the separate-**module**
-//! instantiate variants (ops 5/6/7), demand/fault-yield coroutines, instantiate-mixed-with-fibers,
+//! coroutine variants (ops 6/7), demand/fault-yield coroutines, instantiate-mixed-with-fibers,
 //! `gc.roots`, `call.import`, or durability — so callers (`super::run_with_host_fast`) fall back to
 //! the tree-walker for those.
 //!
@@ -291,6 +291,20 @@ enum Op {
         quota: u32,
         dst: u32,
     },
+    /// §14 `Instantiator.instantiate_module(module, entry, off, size_log2, quota)` (op 5): like
+    /// [`Op::Instantiate`], but the child runs a host-granted **separate** `Module` (`module` is its
+    /// handle, crossing as the first i64 arg) rather than the holder's own program — the §14
+    /// "plugin-in-plugin" story. The driver resolves + compiles the module, materializes its data into
+    /// the carve, and runs it as a confined executor child. `handle` is the Instantiator cap.
+    InstantiateModule {
+        handle: u32,
+        module: u32,
+        entry: u32,
+        off: u32,
+        size_log2: u32,
+        quota: u32,
+        dst: u32,
+    },
     /// §14 `Instantiator.join(child)` (op 1): park until executor child `child` finishes; its result
     /// (or trap) lands at `dst`. `handle` is the Instantiator cap (authority). The join itself reuses
     /// the §12 thread machinery — children share one handle namespace (`threads`) with `thread.spawn`.
@@ -420,11 +434,17 @@ type Table = Vec<Option<(u32, u32)>>;
 /// Build a dispatch table of `2^table_log2` (at least `next_power_of_two(n_funcs)`) slots: the first
 /// `n_funcs` map to `(module 0, i)`, the rest are trapping padding (fillable by `install`).
 fn build_table(n_funcs: usize, table_log2: u8) -> Table {
+    build_table_for(n_funcs, table_log2, 0)
+}
+
+/// [`build_table`] but for an arbitrary `module` index — the natural table a §14 separate-**module**
+/// child uses, whose funcs live at `dom.mods[module]` (not module 0).
+fn build_table_for(n_funcs: usize, table_log2: u8, module: u32) -> Table {
     let len = (1usize << table_log2)
         .max(n_funcs.next_power_of_two())
         .max(1);
     (0..len)
-        .map(|i| (i < n_funcs).then_some((0u32, i as u32)))
+        .map(|i| (i < n_funcs).then_some((module, i as u32)))
         .collect()
 }
 
@@ -488,11 +508,11 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
         for b in &f.blocks {
             for inst in &b.insts {
                 match inst {
-                    // ops 0/1 = instantiate/join (executor children); everything else on
-                    // INSTANTIATOR/YIELDER is the inline coroutine round-trip.
+                    // ops 0/1 = instantiate/join, op 5 = instantiate_module (executor children);
+                    // everything else on INSTANTIATOR/YIELDER is the inline coroutine round-trip.
                     Inst::CapCall {
                         type_id: super::iface::INSTANTIATOR,
-                        op: 0 | 1,
+                        op: 0 | 1 | 5,
                         ..
                     } => has_instantiate = true,
                     Inst::CapCall {
@@ -859,6 +879,17 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     child: g(args[0]),
                     dst,
                 },
+                // op 5 = instantiate_module: the first arg is the granted `Module` handle; the carve
+                // args (entry/off/size_log2/quota) follow. (join, op 1, serves both kinds.)
+                (iface::INSTANTIATOR, 5) if args.len() >= 5 => Op::InstantiateModule {
+                    handle: g(*handle),
+                    module: g(args[0]),
+                    entry: g(args[1]),
+                    off: g(args[2]),
+                    size_log2: g(args[3]),
+                    quota: g(args[4]),
+                    dst,
+                },
                 // §14 cooperative coroutine round-trip — spawn_coroutine / resume / yield.
                 (iface::INSTANTIATOR, 2) if args.len() >= 3 => Op::SpawnCoroutine {
                     handle: g(*handle),
@@ -1119,6 +1150,18 @@ enum Outcome {
         quota: i64,
         dst: u32,
     },
+    /// §14 `Instantiator.instantiate_module`: like [`Outcome::Instantiate`], plus the resolved
+    /// `Module` handle `mh` whose granted program the child runs (the driver resolves + compiles it).
+    InstantiateModule {
+        ibase: u64,
+        isize: u64,
+        mh: i32,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
+        quota: i64,
+        dst: u32,
+    },
     /// `memory.wait`: futex wait on confined address `base` (already validated); `dst` gets the
     /// status (0 woken / 1 not-equal / 2 timed-out).
     MemoryWait {
@@ -1318,6 +1361,18 @@ enum VcpuStop {
         quota: i64,
         dst: u32,
     },
+    /// §14 `Instantiator.instantiate_module` — the driver additionally resolves + compiles the
+    /// host-granted `Module` (`mh`) and runs it as the confined child's program.
+    InstantiateModule {
+        ibase: u64,
+        isize: u64,
+        mh: i32,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
+        quota: i64,
+        dst: u32,
+    },
     Wait {
         base: u64,
         expected: u64,
@@ -1482,6 +1537,27 @@ fn step_vcpu(
                 return Ok(VcpuStop::Instantiate {
                     ibase,
                     isize: isz,
+                    entry,
+                    off,
+                    size_log2,
+                    quota,
+                    dst,
+                })
+            }
+            Outcome::InstantiateModule {
+                ibase,
+                isize: isz,
+                mh,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+            } => {
+                return Ok(VcpuStop::InstantiateModule {
+                    ibase,
+                    isize: isz,
+                    mh,
                     entry,
                     off,
                     size_log2,
@@ -1889,6 +1965,141 @@ fn drive(
                 let c0 = &dom.mods[0];
                 let child_table = build_table(c0.progs.len(), 0);
                 let child_vt = VTask::new(c0, entry as usize, &child_args)?;
+                let eidx = extra_envs.len();
+                extra_envs.push(ChildEnv {
+                    mem: child_mem,
+                    host: child_host,
+                    table: child_table,
+                    fuel: child_fuel,
+                });
+                let cidx = tasks.len();
+                tasks.push(TaskSlot {
+                    vt: child_vt,
+                    threads: Vec::new(),
+                    env: Some(eidx),
+                    state: TaskState::Runnable,
+                });
+                let handle = tasks[ti].threads.len() as i32;
+                tasks[ti].threads.push(Some(cidx));
+                tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+            }
+            Ok(VcpuStop::InstantiateModule {
+                ibase,
+                isize: isz,
+                mh,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+            }) => {
+                // Resolve the granted Module (a forged/closed/wrong-type handle is an inert CapFault).
+                let (cfuncs, cmem_log2, cdata) = match host.resolve_module(mh) {
+                    Ok(g) => (g.funcs.clone(), g.memory_log2, g.data.clone()),
+                    Err(t) => {
+                        complete(&mut tasks, ti, Err(t));
+                        continue;
+                    }
+                };
+                // Compile the granted module to bytecode. A module using an op the engine can't lower
+                // is the one place a guest-provided program outruns coverage (no tree-walker fallback
+                // mid-run) — a `Malformed` trap, exactly as for `Jit.install`.
+                let child_compiled = match compile_module(&cfuncs) {
+                    Some(c) => c,
+                    None => {
+                        complete(&mut tasks, ti, Err(Trap::Malformed));
+                        continue;
+                    }
+                };
+                // The child entry sig is validated against the *child module*. A separate-module
+                // child's carve must equal its declared memory (§14 transparency: it runs exactly as
+                // it would standalone — same window size, same wrap behaviour).
+                let want_as = child_compiled
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                let ok_entry = child_compiled
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, r)| {
+                        r[..] == [ValType::I64]
+                            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
+                    });
+                let child_size = if (0..64).contains(&size_log2) {
+                    1u64 << size_log2
+                } else {
+                    0
+                };
+                let off_u = off as u64;
+                let fits = child_size != 0
+                    && child_size <= isz
+                    && off_u & (child_size - 1) == 0
+                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                if !ok_entry || !fits || !mod_ok {
+                    tasks[ti]
+                        .vt
+                        .active
+                        .set(dst, Reg::from_i32(super::EINVAL as i32));
+                    continue;
+                }
+                let live = tasks
+                    .iter()
+                    .filter(|t| !matches!(t.state, TaskState::Done(_)))
+                    .count();
+                if live >= super::MAX_VCPUS {
+                    complete(&mut tasks, ti, Err(Trap::ThreadFault));
+                    continue;
+                }
+                let (pbase, pfuel) = match tasks[ti].env {
+                    None => (mem.as_ref().map_or(0, |m| m.window.base()), *fuel),
+                    Some(k) => (
+                        extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
+                        extra_envs[k].fuel,
+                    ),
+                };
+                let abs_base = pbase + ibase + off_u;
+                // Build the child window and materialize the module's data segments into the carve
+                // (exactly as if the child wrote them; the verifier bounded them to its declared window
+                // == the carve). RO protection of `readonly` segments is skipped for nested children
+                // (intra-domain self-corruption is a §1 non-goal), matching the tree-walker.
+                let child_mem = {
+                    let pm: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    if let Some(m) = pm {
+                        for d in cdata.iter() {
+                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                                for (k, &b) in d.bytes.iter().enumerate() {
+                                    m.set_byte(abs_base + d.offset + k as u64, b);
+                                }
+                            }
+                        }
+                    }
+                    pm.map(|m| m.nested_view(abs_base, size_log2 as u8))
+                };
+                let mut child_host = Host::new();
+                let cinst = child_host.grant_instantiator(0, child_size);
+                let cas = child_host.grant_address_space(0, child_size);
+                let child_args = if want_as {
+                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                } else {
+                    vec![Value::I64(cinst as i64)]
+                };
+                let child_fuel = if quota <= 0 {
+                    pfuel
+                } else {
+                    (quota as u64).min(pfuel)
+                };
+                // Push the child's compiled module and run the child over it — its own domain: a
+                // natural table mapping into *its* module index (no installed §22 units).
+                let progs_len = child_compiled.progs.len();
+                let cm = dom.mods.len();
+                dom.mods.push(child_compiled);
+                let child_table = build_table_for(progs_len, 0, cm as u32);
+                let mut child_vt = VTask::new(&dom.mods[cm], entry as usize, &child_args)?;
+                child_vt.active.module = cm;
                 let eidx = extra_envs.len();
                 extra_envs.push(ChildEnv {
                     mem: child_mem,
@@ -2680,6 +2891,40 @@ impl Vm {
                     return Ok(Outcome::Instantiate {
                         ibase,
                         isize: isz,
+                        entry,
+                        off,
+                        size_log2,
+                        quota,
+                        dst,
+                    });
+                }
+                // §14 separate-module executor child — like `Instantiate`, but the first arg is a
+                // granted `Module` handle (the slot ABI crosses it as an i64; low 32 bits) whose
+                // program the driver resolves + compiles + runs.
+                Op::InstantiateModule {
+                    handle,
+                    module: module_reg,
+                    entry,
+                    off,
+                    size_log2,
+                    quota,
+                    dst,
+                } => {
+                    let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
+                    let mh = r!(*module_reg).i64() as i32;
+                    let entry = r!(*entry).i64();
+                    let off = r!(*off).i64();
+                    let size_log2 = r!(*size_log2).i64();
+                    let quota = r!(*quota).i64();
+                    let dst = *dst;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::InstantiateModule {
+                        ibase,
+                        isize: isz,
+                        mh,
                         entry,
                         off,
                         size_log2,

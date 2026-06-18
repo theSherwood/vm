@@ -387,8 +387,22 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               walker fall-back). New harness `bytecode_instantiate.rs` (shared-backing round-trip →
               42123, depth-2 nesting → 77, two-arg child driving its own `AddressSpace.unmap` → 0,
               out-of-range carve → −EINVAL, child trap propagating through `join`) bit-identical to
-              `run_with_host`. Still deferred: the separate-**module** variants (ops 5/6/7, needing a
-              granted `Module` handle) and demand/fault-yield coroutines (op 4).
+              `run_with_host`. Still deferred: the separate-**module** coroutine variants (ops 6/7)
+              and demand/fault-yield coroutines (op 4).
+        - [x] **1c-5h** — §14 separate-**module** executor child (`Instantiator.instantiate_module`,
+              op 5): the "plugin-in-plugin" story. The host grants the parent a `Module` capability
+              (iface 8); op 5 takes that handle as its first arg and spawns a confined child running
+              **that** verified module (not the holder's program). The driver resolves the grant,
+              `compile_module`s it (a module using an op the engine can't lower is a `Malformed` trap —
+              the one place a guest program outruns coverage, no fallback mid-run, as for
+              `Jit.install`), pushes it into `dom.mods`, and runs the child over a natural table mapping
+              into *its* module index (`build_table_for`). The carve must **equal** the module's
+              declared memory (§14 transparency), and the module's **data segments materialize** into
+              the carve at spawn (written through the shared backing). Reuses op 1 `join` unchanged.
+              New harness `bytecode_separate_module.rs` (a foreign 64 KiB module with a `"VM"` data
+              segment → 1086, marker visible to the parent → 1_086_000_007, carve≠declared-memory →
+              −EINVAL, forged module handle → CapFault) bit-identical to `run_with_host`. Still
+              deferred: the module **coroutine** variants (ops 6/7) and demand/fault-yield (op 4).
     - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
           stepping report tree-walker-identical locations. New harness: debug-trace equality.
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:
