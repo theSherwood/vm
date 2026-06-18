@@ -167,24 +167,21 @@ block3(v15: i64):
 
 fn interp_call(m: &svm_ir::Module, n: i64) -> i64 {
     let mut fuel = u64::MAX;
-    match run(m, 0, &[Value::I64(n)], &mut fuel).expect("interp") {
-        v => match v[0] {
-            Value::I64(x) => x,
-            o => panic!("{o:?}"),
-        },
+    let v = run(m, 0, &[Value::I64(n)], &mut fuel).expect("interp");
+    match v[0] {
+        Value::I64(x) => x,
+        o => panic!("{o:?}"),
     }
 }
 
 fn bc_call(m: &svm_ir::Module, n: i64) -> i64 {
     let mut fuel = u64::MAX;
-    match bytecode::compile_and_run(m, 0, &[Value::I64(n)], &mut fuel)
+    let v = bytecode::compile_and_run(m, 0, &[Value::I64(n)], &mut fuel)
         .expect("bytecode supports kernel")
-        .expect("bytecode run")
-    {
-        v => match v[0] {
-            Value::I64(x) => x,
-            o => panic!("{o:?}"),
-        },
+        .expect("bytecode run");
+    match v[0] {
+        Value::I64(x) => x,
+        o => panic!("{o:?}"),
     }
 }
 

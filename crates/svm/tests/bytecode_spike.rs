@@ -350,11 +350,10 @@ fn run_module(progs: &[Program], entry: usize, arg: i64, fuel: &mut u64) -> i64 
 
 fn interp(m: &Module, n: i64) -> i64 {
     let mut fuel = u64::MAX;
-    match svm_interp::run(m, 0, &[Value::I64(n)], &mut fuel).expect("interp") {
-        v => match v[0] {
-            Value::I64(x) => x,
-            o => panic!("{o:?}"),
-        },
+    let v = svm_interp::run(m, 0, &[Value::I64(n)], &mut fuel).expect("interp");
+    match v[0] {
+        Value::I64(x) => x,
+        o => panic!("{o:?}"),
     }
 }
 
