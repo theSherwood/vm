@@ -2749,6 +2749,115 @@ fn compute() -> i32 {
     assert_eq!(svm, 42, "expr evaluator: expected 42, got {svm}");
 }
 
+// ============================================================================================
+// SIMD — ingesting `-O2` **auto-vectorized** output (§17/D58 `v128`). The C/C++/Rust breadth lanes
+// disable vectorization (`-fno-*-vectorize`); these tests *enable* it, so the on-ramp consumes the
+// `<4 x i32>` lane ops + horizontal `llvm.vector.reduce.*` a real `-O2` reduction loop emits.
+// ============================================================================================
+
+/// Like [`compile_to_bc`] but with **auto-vectorization enabled** (no `-fno-*-vectorize`), so a
+/// reduction loop lowers to `<4 x i32>` SIMD + `llvm.vector.reduce.*`.
+fn compile_to_bc_vectorized(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_simd_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-emit-llvm", "-c"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
+/// Run `run(seed)` (function 0) from **vectorized** bitcode on both backends and assert it equals a
+/// native `cc` build's exit code (the on-ramp's SIMD lowering vs the scalar native result — they
+/// compute the same value).
+fn check_vectorized_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc_vectorized(name, src) else {
+        return;
+    };
+    let exe =
+        std::env::temp_dir().join(format!("svm_llvm_simdnat_{}_{}", std::process::id(), name));
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => return,
+    }
+    let native = Command::new(&exe)
+        .status()
+        .expect("run native")
+        .code()
+        .unwrap() as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate vectorized bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
+    let mut fuel = 100_000_000u64;
+    let interp = svm_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    let jit = match svm_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => Value::I32(s[0] as i32),
+        other => panic!("{name}: unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, vec![jit], "{name}: interp vs JIT");
+    let svm = match jit {
+        Value::I32(x) => x as u8,
+        _ => panic!("expected i32"),
+    };
+    assert_eq!(svm, native, "{name}: svm={svm} vs native cc={native}");
+}
+
+/// **SIMD first light — an auto-vectorized integer reduction.** A `noinline` `sum` over an opaque
+/// pointer vectorizes at `-O2` to an `<4 x i32>` accumulator + `llvm.vector.reduce.add.v4i32`; the
+/// on-ramp ingests the vector lane add (`VIntBin i32x4`) and unrolls the reduce. `run(7)` fills a
+/// global with `7 + i²` (i in 0..20) and sums it = 140 + 2470 = 2610 (exit `2610 & 0xff = 50`), vs
+/// native — proving the on-ramp consumes real `-O2` vectorized output.
+#[test]
+fn simd_int_reduction_first_light() {
+    let src = "int sum(const int *a, int n);\n\
+        static int data[20];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 20; i++) data[i] = seed + i * i;\n\
+        \x20 return sum(data, 20);\n\
+        }\n\
+        __attribute__((noinline)) int sum(const int *a, int n) {\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < n; i++) s += a[i];\n\
+        \x20 return s;\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vectorized_vs_native("simd_reduce", src, 7);
+}
+
+/// SIMD — an auto-vectorized **max reduction** (`llvm.vector.reduce.smax.v4i32`, + any `<4 x i32>`
+/// lane `smax`). `run(seed)` fills a global with a wave of values and takes the max, vs native —
+/// exercising the min/max reduce fold (`cmp`+`select`).
+#[test]
+fn simd_int_max_reduction() {
+    let src = "int amax(const int *a, int n);\n\
+        static int data[24];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 24; i++) data[i] = ((i * 7 + seed) & 31) - 13;\n\
+        \x20 return amax(data, 24) + 20;\n\
+        }\n\
+        __attribute__((noinline)) int amax(const int *a, int n) {\n\
+        \x20 int m = a[0];\n\
+        \x20 for (int i = 1; i < n; i++) if (a[i] > m) m = a[i];\n\
+        \x20 return m;\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check_vectorized_vs_native("simd_max", src, 3);
+}
+
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
 /// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
 /// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and

@@ -13,7 +13,52 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-_(none)_
+### I2 — LLVM on-ramp cannot ingest auto-vectorized output wider than 128 bits (no vector legalization) (S3)
+
+**Where:** `crates/svm-llvm/src/lib.rs` — `val_type` / `type_size` (vector type recognition) and the
+vector lowering paths (`bin` vec branch, `lower_int_intrinsic` vec branch, `lower_vector_reduce`,
+`is_vec4`). Reached when translating bitcode compiled with auto-vectorization **enabled** (the
+`check_vectorized_vs_native` test harness; the C/C++/Rust breadth lanes deliberately pass
+`-fno-*-vectorize` / `-vectorize-loops=false`, so they don't hit it).
+
+**Symptom:** translating a `clang -O2`-vectorized program fails **fail-closed** with
+`Error::Unsupported("type <16 x i32> (Milestone 1+)")` (or `<16 x i64>`, `<4 x i64>`, `<8 x i8>`,
+`<2 x i64>`, `<16 x i8>`, etc.). No wrong result, no escape — the verifier never sees bad IR; the
+translator just refuses. Observed when probing whether the breadth lanes could re-enable vectorization
+(slices AN/AO): ~7 corpus tests surfaced these shapes.
+
+**Root cause:** svm-ir's SIMD type is a **fixed-128-bit `v128`** (§17/D58). LLVM's `-O2` loop/SLP
+vectorizer emits **arbitrary-width "virtual" vectors** — both wider than 128 bits (`<16 x i32>` =
+512-bit, from the chosen vectorization factor × interleave/unroll) and assorted sub-/non-`i32x4`
+128-bit shapes — on the assumption that the target backend's **type-legalization** pass (LLVM
+SelectionDAG `LegalizeTypes`) will split/scalarize them into legal-width chunks before instruction
+selection. The on-ramp has no such pass: it maps `<4 x {i32,float}>` (and 2-lane → packed `i64`)
+directly and rejects everything else. So it can ingest *controlled* 128-bit `i32x4` vector code
+(slices AN/AO: lane add/sub/mul/and/or/xor/min-max + `llvm.vector.reduce.*.v4i32`) but not the
+mixed/oversized shapes real auto-vec produces.
+
+**Current posture (intended):** the C/C++/Rust breadth lanes keep `-fno-*-vectorize`, so they hand the
+on-ramp scalar IR and run byte-identical to native. This is the correct fail-closed stance — the
+on-ramp never silently mis-translates a vector it can't represent (§2a: a gap is a clean error, never
+an escape). `i32x4` auto-vec *is* supported and tested for code that produces only that shape.
+
+**Fix sketch (deferred — it's its own project):**
+1. **A vector-legalization pass in `svm-llvm`** (the SelectionDAG `LegalizeTypes` analog): split a
+   `<N x T>` whose byte-width > 16 into `ceil(N·sizeof T / 16)` `v128` chunks (and a scalar tail),
+   rewriting each vector op as per-chunk ops; scalarize widths with no clean split. This is the real
+   unblock and the bulk of the work. Alternatively, run `opt`/`llc`-style legalization **out of
+   process** (the PNaCl `pnacl-abi-simplify` model the on-ramp already uses for `mem2reg`), if a pass
+   exists that lowers vectors to ≤128-bit without selecting machine code.
+2. **Generalize the 128-bit shapes first** (bounded, independent): a `is_vec128` recognizer +
+   shape-aware lowering for `i8x16`/`i16x8`/`i64x2` (and the narrow `<8 x i8>` etc. via widen), so all
+   legal-width shapes work even before the splitter lands.
+3. **Cheap experiment worth trying before (1):** `clang -mprefer-vector-width=128
+   -mllvm -force-vector-interleave=1` may constrain the vectorizer to 128-bit, un-interleaved output —
+   if it removes the wide shapes, much real auto-vec code would translate with only step (2). Unproven.
+
+**Why not now:** the breadth proof (C/C++/Rust running real programs byte-identical to native) is
+complete with vectorization off; full auto-vec ingestion is a perf/fidelity nicety gated on a
+substantial legalization pass, not a correctness blocker. Tracked here so it isn't rediscovered.
 
 ---
 
