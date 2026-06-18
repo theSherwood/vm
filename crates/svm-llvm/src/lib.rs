@@ -408,21 +408,19 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     // 2- or ≥4-param `main` (e.g. `envp`) is a fail-closed later slice. Computed here (not just at the
     // `synth_start` call) because the argv `_start` *uses* the data stack — it parks `argv[]` at the
     // entry SP and relocates `main`'s frame a page above — so the window must reserve stack space.
-    let wants_argv = if synth {
-        match funcs[(name2idx["main"] - base) as usize].params.len() {
-            1 => false,
-            3 => true,
-            n => {
-                return Err(Error::Unsupported(format!(
-                    "main with {} parameter(s): only main(void) and main(int, char**) are supported \
-                     (envp/getenv is a later slice)",
-                    n - 1
-                )))
-            }
-        }
+    let main_arity = if synth {
+        funcs[(name2idx["main"] - base) as usize].params.len()
     } else {
-        false
+        1
     };
+    if !matches!(main_arity, 1 | 3) {
+        return Err(Error::Unsupported(format!(
+            "main with {} parameter(s): only main(void) and main(int, char**) are supported \
+             (envp/getenv is a later slice)",
+            main_arity - 1
+        )));
+    }
+    let wants_argv = main_arity == 3;
 
     // The window: globals low, then the data stack from `entry_sp` growing up; `mapped` covers the
     // globals plus a stack reserve, with a faulting guard beyond (reserved > mapped, §5). Declared if
@@ -454,18 +452,22 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         // The C++ global constructors (`@llvm.global_ctors`) `_start` runs before `main` (their
         // funcrefs resolve through `name2idx`, now built).
         let ctors = collect_global_ctors(m, &name2idx)?;
-        let start = if wants_argv {
-            synth_start_argv(main_idx, &main_results, entry_sp, n_handles, heap_base, &ctors)
-        } else {
-            synth_start(
-                main_idx,
-                &main_results,
-                entry_sp,
-                n_handles,
-                heap_base,
-                &ctors,
-            )
-        };
+        // Both entries share a signature; `synth_start_argv` adds the §3e args-buffer → `argv[]`
+        // parsing for a `main(int, char**)`, `synth_start` is the plain `main(void)` entry.
+        let build_start: fn(u32, &[ValType], u64, usize, Option<u64>, &[u32]) -> Func =
+            if wants_argv {
+                synth_start_argv
+            } else {
+                synth_start
+            };
+        let start = build_start(
+            main_idx,
+            &main_results,
+            entry_sp,
+            n_handles,
+            heap_base,
+            &ctors,
+        );
         funcs.insert(0, start);
     }
     // Append the synthesized helpers in index order (memset, memcpy, malloc, utoa, realloc) —
@@ -2299,8 +2301,8 @@ fn synth_start_argv(
             Inst::ConstI64(entry_sp as i64), // v3 = argv base
             Inst::ConstI64(8),               // v4
             mul(1, 4),                       // v5 = i*8
-            add(3, 5),                        // v6 = &argv[i]
-            store64(6, 2),                    // argv[i] = p
+            add(3, 5),                       // v6 = &argv[i]
+            store64(6, 2),                   // argv[i] = p
         ],
         term: Terminator::Br {
             target: 3,
@@ -2318,9 +2320,9 @@ fn synth_start_argv(
                 offset: 0,
                 align: 0,
             }, // v4 = *q
-            Inst::ConstI64(1),  // v5
-            add(3, 5),          // v6 = q+1
-            Inst::ConstI32(0),  // v7
+            Inst::ConstI64(1), // v5
+            add(3, 5),         // v6 = q+1
+            Inst::ConstI32(0), // v7
             Inst::IntCmp {
                 ty: IntTy::I32,
                 op: CmpOp::Eq,
@@ -2354,18 +2356,18 @@ fn synth_start_argv(
     let mut d: Vec<Inst> = vec![
         Inst::ConstI64(entry_sp as i64), // v1 = argv base
         Inst::ConstI64(8),               // v2
-        mul(0, 2),                        // v3 = argc*8
-        add(1, 3),                        // v4 = &argv[argc]
-        Inst::ConstI64(0),                // v5
-        store64(4, 5),                    // argv[argc] = NULL
-        Inst::ConstI64(1),                // v6
-        add(0, 6),                        // v7 = argc+1
-        mul(7, 2),                        // v8 = (argc+1)*8
-        add(1, 8),                        // v9 = entry_sp + array bytes
-        Inst::ConstI64(page - 1),         // v10
-        add(9, 10),                       // v11
-        Inst::ConstI64(!(page - 1)),      // v12
-        and(11, 12),                      // v13 = main_sp (page-aligned)
+        mul(0, 2),                       // v3 = argc*8
+        add(1, 3),                       // v4 = &argv[argc]
+        Inst::ConstI64(0),               // v5
+        store64(4, 5),                   // argv[argc] = NULL
+        Inst::ConstI64(1),               // v6
+        add(0, 6),                       // v7 = argc+1
+        mul(7, 2),                       // v8 = (argc+1)*8
+        add(1, 8),                       // v9 = entry_sp + array bytes
+        Inst::ConstI64(page - 1),        // v10
+        add(9, 10),                      // v11
+        Inst::ConstI64(!(page - 1)),     // v12
+        and(11, 12),                     // v13 = main_sp (page-aligned)
         Inst::Convert {
             op: ConvOp::WrapI64,
             a: 0,
