@@ -2858,6 +2858,105 @@ fn simd_int_max_reduction() {
     check_vectorized_vs_native("simd_max", src, 3);
 }
 
+// ============================================================================================
+// SIMD — the **other 128-bit lane shapes** (`i8x16`/`i16x8`/`i64x2`/`f64x2`), beyond the original
+// `i32x4`/`f32x4`. These use explicit `vector_size(16)` types compiled with vectorization *off*
+// (`compile_to_bc` / `check_vs_native`), so the on-ramp sees exactly the declared 128-bit shape —
+// no auto-vectorizer widening. A `noinline` helper takes opaque pointers so clang must emit real
+// `<N x T>` loads/ops, not scalarize them. Each `vec128_shape` op (load/store, `VIntBin`,
+// `VFloatBin`, `ExtractLane`) is exercised against the native oracle on both backends.
+// ============================================================================================
+
+/// `<2 x i64>` lane multiply + add + per-lane extract (`i64x2` `VIntBin` Mul/Add, `ExtractLane`).
+/// `run(7)`: a={7,9}, b={3,5}, c=a*b+b={24,50}; c[0]+c[1]=74.
+#[test]
+fn simd_i64x2_mul_add_extract() {
+    let src = "long long vdot(const long long *A, const long long *B);\n\
+        static long long A[2], B[2];\n\
+        int run(int seed) {\n\
+        \x20 A[0] = seed; A[1] = seed + 2; B[0] = 3; B[1] = 5;\n\
+        \x20 return (int)(vdot(A, B) & 0xff);\n\
+        }\n\
+        typedef long long i64x2 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) long long vdot(const long long *A, const long long *B) {\n\
+        \x20 i64x2 a = *(const i64x2 *)A;\n\
+        \x20 i64x2 b = *(const i64x2 *)B;\n\
+        \x20 i64x2 c = a * b + b;\n\
+        \x20 return c[0] + c[1];\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("simd_i64x2", src, 7);
+}
+
+/// `<16 x i8>` lane add through a `v128` load → add → store (`i8x16` load/`VIntBin` Add/store).
+/// Two distinct input arrays so `a + b` stays a real lane add (a self-add would strength-reduce to
+/// a vector shift, which is a separate unsupported op). The scalar tail-sum reads the stored bytes
+/// back from memory (stays scalar under `-fno-vectorize`).
+#[test]
+fn simd_i8x16_add_load_store() {
+    let src = "void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[16], F[16], E[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(3 * i + 1); }\n\
+        \x20 vadd(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 16; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char u8x16 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 u8x16 a = *(const u8x16 *)P;\n\
+        \x20 u8x16 b = *(const u8x16 *)Q;\n\
+        \x20 *(u8x16 *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i8x16", src, 5);
+}
+
+/// `<8 x i16>` lane multiply through a `v128` load → mul → store (`i16x8` `VIntBin` Mul). Wraps
+/// mod 2^16 per lane; the scalar read-back truncates to the lane width.
+#[test]
+fn simd_i16x8_mul_load_store() {
+    let src = "void vmul(const unsigned short *P, const unsigned short *Q, unsigned short *O);\n\
+        static unsigned short D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = (unsigned short)(seed + i); F[i] = (unsigned short)(i + 1); }\n\
+        \x20 vmul(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned short u16x8 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vmul(const unsigned short *P, const unsigned short *Q, unsigned short *O) {\n\
+        \x20 u16x8 a = *(const u16x8 *)P;\n\
+        \x20 u16x8 b = *(const u16x8 *)Q;\n\
+        \x20 *(u16x8 *)O = a * b;\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check_vs_native("simd_i16x8", src, 2);
+}
+
+/// `<2 x double>` lane multiply + add (`f64x2` `VFloatBin` Mul/Add). Finite values only, so the
+/// per-lane-NaN differential caveat (§17) doesn't apply; the derived integer result is exact.
+#[test]
+fn simd_f64x2_mul_add() {
+    let src = "double vfma(const double *A, const double *B);\n\
+        static double A[2], B[2];\n\
+        int run(int seed) {\n\
+        \x20 A[0] = seed; A[1] = seed + 1; B[0] = 2.0; B[1] = 3.0;\n\
+        \x20 return (int)vfma(A, B);\n\
+        }\n\
+        typedef double f64x2 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) double vfma(const double *A, const double *B) {\n\
+        \x20 f64x2 a = *(const f64x2 *)A;\n\
+        \x20 f64x2 b = *(const f64x2 *)B;\n\
+        \x20 f64x2 c = a * b + b;\n\
+        \x20 return c[0] + c[1];\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_vs_native("simd_f64x2", src, 4);
+}
+
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
 /// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
 /// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and

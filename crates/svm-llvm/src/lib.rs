@@ -738,7 +738,8 @@ fn val_type(ty: &Type) -> Result<ValType, Error> {
         // through `phi`/`call`/`ret`/block-params as an ordinary `i64`; only the vector *ops*
         // (`extractelement`/`insertelement`/`fadd`…) unpack/repack the lanes. SIMD-proper is §17 V128.
         _ if is_vec2(ty) => Ok(ValType::I64),
-        _ if is_vec4(ty) => Ok(ValType::V128), // `<4 x {float,i32}>` → a native v128 (§17)
+        // Any 128-bit vector (`i8x16`/`i16x8`/`i32x4`/`i64x2`/`f32x4`/`f64x2`) is a native v128 (§17).
+        _ if vec128_shape(ty).is_some() => Ok(ValType::V128),
         other => unsup(format!("type {other} (Milestone 1+)")),
     }
 }
@@ -770,33 +771,30 @@ fn is_vec2f(ty: &Type) -> bool {
     vec2_lane_ty(ty) == Some(ValType::F32)
 }
 
-/// The lane type of a **4-lane 32-bit vector** (`<4 x float>`/`<4 x i32>`), which maps to a native
-/// `v128` (§17). `None` for any other vector. (2-lane vectors are scalarized to `i64` instead — they
-/// are 8 bytes, so a 16-byte `v128.load` would overrun.)
-fn vec4_lane_ty(ty: &Type) -> Option<ValType> {
-    match ty {
-        Type::VectorType {
-            element_type,
-            num_elements: 4,
-            scalable: false,
-        } => match element_type.as_ref() {
-            Type::FPType(FPType::Single) => Some(ValType::F32),
-            Type::IntegerType { bits: 32 } => Some(ValType::I32),
-            _ => None,
-        },
+/// The `VShape` of a **128-bit-wide LLVM vector** — any of the six legal-width shapes
+/// `<16 x i8>`/`<8 x i16>`/`<4 x i32>`/`<2 x i64>`/`<4 x float>`/`<2 x double>`, each mapping to a
+/// native `v128` (§17/D58). `None` for any vector that is not exactly 16 bytes (a 2-lane 32-bit
+/// vector is 8 bytes and takes the packed-`i64` path; wider-than-128 vectors are split into chunks
+/// by the legalization pass). The lane shape is carried per-op, so this is the single source of
+/// truth for "this LLVM vector is one `v128`".
+fn vec128_shape(ty: &Type) -> Option<svm_ir::VShape> {
+    use svm_ir::VShape;
+    let Type::VectorType {
+        element_type,
+        num_elements,
+        scalable: false,
+    } = ty
+    else {
+        return None;
+    };
+    match (element_type.as_ref(), *num_elements) {
+        (Type::IntegerType { bits: 8 }, 16) => Some(VShape::I8x16),
+        (Type::IntegerType { bits: 16 }, 8) => Some(VShape::I16x8),
+        (Type::IntegerType { bits: 32 }, 4) => Some(VShape::I32x4),
+        (Type::IntegerType { bits: 64 }, 2) => Some(VShape::I64x2),
+        (Type::FPType(FPType::Single), 4) => Some(VShape::F32x4),
+        (Type::FPType(FPType::Double), 2) => Some(VShape::F64x2),
         _ => None,
-    }
-}
-
-fn is_vec4(ty: &Type) -> bool {
-    vec4_lane_ty(ty).is_some()
-}
-
-/// The SVM `VShape` for a 4-lane 32-bit vector's lane type (`f32x4` / `i32x4`).
-fn vshape4(lane: ValType) -> svm_ir::VShape {
-    match lane {
-        ValType::F32 => svm_ir::VShape::F32x4,
-        _ => svm_ir::VShape::I32x4,
     }
 }
 
@@ -914,7 +912,7 @@ fn type_size(ty: &Type, types: &Types) -> Result<u64, Error> {
             Ok(struct_layout(&fields, packed, types)?.1)
         }
         _ if is_vec2(ty) => Ok(8), // `<2 x float>`/`<2 x i32>` — two packed 32-bit lanes
-        _ if is_vec4(ty) => Ok(16), // `<4 x {float,i32}>` — a v128
+        _ if vec128_shape(ty).is_some() => Ok(16), // any 128-bit vector — a v128
         other => unsup(format!("size of type {other} (Milestone 1+)")),
     }
 }
@@ -931,8 +929,8 @@ fn type_align(ty: &Type, types: &Types) -> Result<u64, Error> {
             let (fields, packed) = resolve_struct(ty, types)?;
             Ok(struct_layout(&fields, packed, types)?.2)
         }
-        _ if is_vec2(ty) => Ok(8),  // a 2-lane 32-bit vector is 8-aligned
-        _ if is_vec4(ty) => Ok(16), // a v128 is 16-aligned
+        _ if is_vec2(ty) => Ok(8),                  // a 2-lane 32-bit vector is 8-aligned
+        _ if vec128_shape(ty).is_some() => Ok(16),  // a v128 is 16-aligned
         other => unsup(format!("align of type {other} (Milestone 1+)")),
     }
 }
@@ -3431,9 +3429,10 @@ fn lower_int_intrinsic(
         return Ok(None);
     }
     let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
-    // A `<4 x i32>` min/max (auto-vectorized) lowers to the lane-wise `VIntBin` (§17); the other
-    // bit intrinsics have no vector form here. (Float vector min/max go through the float path.)
-    if is_vec4(args[0].get_type(types).as_ref()) {
+    // A 128-bit integer-vector min/max (auto-vectorized) lowers to the lane-wise `VIntBin` (§17) in
+    // the operand's shape; the other bit intrinsics have no vector form here. (Float vector min/max
+    // go through the float path.)
+    if let Some(shape) = vec128_shape(args[0].get_type(types).as_ref()) {
         let op = match base {
             "llvm.smax" => svm_ir::VIntBinOp::MaxS,
             "llvm.smin" => svm_ir::VIntBinOp::MinS,
@@ -3443,12 +3442,7 @@ fn lower_int_intrinsic(
         };
         let a = ctx.operand(args[0])?;
         let b = ctx.operand(args[1])?;
-        return Ok(Some(ctx.push(Inst::VIntBin {
-            shape: svm_ir::VShape::I32x4,
-            op,
-            a,
-            b,
-        })));
+        return Ok(Some(ctx.push(Inst::VIntBin { shape, op, a, b })));
     }
     let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
     let cmp_select = |ctx: &mut BlockCtx, op: CmpOp| -> Result<ValIdx, Error> {
@@ -3635,24 +3629,28 @@ fn lower_vector_reduce(
     let Some(rest) = name.strip_prefix("llvm.vector.reduce.") else {
         return Ok(None);
     };
-    let kind = rest.split('.').next().unwrap_or(""); // "add"/"mul"/… (before the `.v4i32` suffix)
+    let kind = rest.split('.').next().unwrap_or(""); // "add"/"mul"/… (before the `.vNiM` suffix)
     let vec_op = &c.arguments[0].0;
     let vty = vec_op.get_type(types);
-    let Some(lane) = vec4_lane_ty(vty.as_ref()) else {
-        return unsup(format!("vector.reduce on non-`<4 x i32>` vector ({kind})"));
+    let Some(shape) = vec128_shape(vty.as_ref()) else {
+        return unsup(format!("vector.reduce on non-128-bit vector ({kind})"));
     };
-    if lane == ValType::F32 {
+    if shape.is_float() {
         return unsup(format!("float vector.reduce.{kind} (later slice)"));
     }
-    let shape = vshape4(lane); // i32x4
+    // The fold runs in the lane scalar type: `i32` for i8/i16/i32 lanes (narrow lanes widen, §3b —
+    // the result is consumed truncated to the lane width, and modular add/mul stays exact), `i64`
+    // for i64 lanes. A signed min/max needs sign-extended narrow lanes so the `i32` compare orders
+    // them correctly; every other reduce is bit-identical under zero-extension.
+    let lane_ty = int_ty(shape.lane_val())?;
+    let signed = matches!(kind, "smax" | "smin");
     let v = ctx.operand(vec_op)?;
-    // The 4 lanes as `i32` scalars (full-width — `signed` is irrelevant for an `i32` lane extract).
-    let lanes: Vec<ValIdx> = (0..4)
+    let lanes: Vec<ValIdx> = (0..shape.lanes())
         .map(|l| {
             ctx.push(Inst::ExtractLane {
                 shape,
                 lane: l,
-                signed: false,
+                signed,
                 a: v,
             })
         })
@@ -3661,7 +3659,7 @@ fn lower_vector_reduce(
         let mut acc = lanes[0];
         for &l in &lanes[1..] {
             acc = ctx.push(Inst::IntBin {
-                ty: IntTy::I32,
+                ty: lane_ty,
                 op,
                 a: acc,
                 b: l,
@@ -3673,7 +3671,7 @@ fn lower_vector_reduce(
         let mut acc = lanes[0];
         for &l in &lanes[1..] {
             let cond = ctx.push(Inst::IntCmp {
-                ty: IntTy::I32,
+                ty: lane_ty,
                 op: cmp,
                 a: acc,
                 b: l,
@@ -3987,29 +3985,22 @@ fn lower_float_intrinsic(
         return Ok(None);
     }
     let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
-    // `<4 x float>` form → native `v128` lane-wise ops (§17). `fmuladd`/`fma` lower unfused.
-    if args
+    // A 128-bit float vector (`<4 x float>`/`<2 x double>`) → native `v128` lane-wise ops (§17) in
+    // the operand's shape. `fmuladd`/`fma` lower unfused.
+    if let Some(shape) = args
         .first()
-        .is_some_and(|a| vec4_lane_ty(a.get_type(types).as_ref()) == Some(ValType::F32))
+        .and_then(|a| vec128_shape(a.get_type(types).as_ref()))
+        .filter(|s| s.is_float())
     {
-        use svm_ir::{VFloatBinOp as VB, VFloatUnOp as VU, VShape::F32x4};
+        use svm_ir::{VFloatBinOp as VB, VFloatUnOp as VU};
         let un = |ctx: &mut BlockCtx, op: VU| -> Result<ValIdx, Error> {
             let a = ctx.operand(args[0])?;
-            Ok(ctx.push(Inst::VFloatUn {
-                shape: F32x4,
-                op,
-                a,
-            }))
+            Ok(ctx.push(Inst::VFloatUn { shape, op, a }))
         };
         let bin = |ctx: &mut BlockCtx, op: VB| -> Result<ValIdx, Error> {
             let a = ctx.operand(args[0])?;
             let b = ctx.operand(args[1])?;
-            Ok(ctx.push(Inst::VFloatBin {
-                shape: F32x4,
-                op,
-                a,
-                b,
-            }))
+            Ok(ctx.push(Inst::VFloatBin { shape, op, a, b }))
         };
         let idx = match base {
             "llvm.sqrt" => un(ctx, VU::Sqrt)?,
@@ -4020,7 +4011,7 @@ fn lower_float_intrinsic(
                 let prod = bin(ctx, VB::Mul)?;
                 let cc = ctx.operand(args[2])?;
                 ctx.push(Inst::VFloatBin {
-                    shape: F32x4,
+                    shape,
                     op: VB::Add,
                     a: prod,
                     b: cc,
@@ -4607,12 +4598,12 @@ impl<'a> BlockCtx<'a> {
                         other => unsup(format!("undef/poison/null of type {}", other.as_str())),
                     }
                 }
-                // A `zeroinitializer` of a 2-lane vector (scalarized to `i64`) is the zero word; a
-                // 4-lane one is a zero `v128`.
+                // A `zeroinitializer` of a 2-lane vector (scalarized to `i64`) is the zero word; any
+                // 128-bit one is a zero `v128`.
                 Constant::AggregateZero(t) if is_vec2(t.as_ref()) => {
                     Ok(self.push(Inst::ConstI64(0)))
                 }
-                Constant::AggregateZero(t) if is_vec4(t.as_ref()) => {
+                Constant::AggregateZero(t) if vec128_shape(t.as_ref()).is_some() => {
                     Ok(self.push(Inst::ConstV128([0u8; 16])))
                 }
                 // A `<2 x float>`/`<2 x i32>` literal — pack the two lanes' 32-bit values into the
@@ -4628,16 +4619,24 @@ impl<'a> BlockCtx<'a> {
                     let packed = lane(0) as u64 | ((lane(1) as u64) << 32);
                     Ok(self.push(Inst::ConstI64(packed as i64)))
                 }
-                // A `<4 x float>`/`<4 x i32>` literal — 16 little-endian bytes (lane 0 first).
-                Constant::Vector(elems) if is_vec4(c.get_type(self.types).as_ref()) => {
+                // Any 128-bit vector literal — its 16-byte little-endian memory image (lane 0 first),
+                // written `shape.lane_bytes()` bytes per element.
+                Constant::Vector(elems)
+                    if vec128_shape(c.get_type(self.types).as_ref()).is_some() =>
+                {
+                    let shape = vec128_shape(c.get_type(self.types).as_ref()).unwrap();
+                    let lb = shape.lane_bytes() as usize;
                     let mut bytes = [0u8; 16];
-                    for (k, e) in elems.iter().take(4).enumerate() {
-                        let w: u32 = match e.as_ref() {
-                            Constant::Float(Float::Single(f)) => f.to_bits(),
-                            Constant::Int { value, .. } => *value as u32,
+                    for (k, e) in elems.iter().take(shape.lanes() as usize).enumerate() {
+                        // Each lane's little-endian bits: float lanes use their IEEE image, int
+                        // lanes their low `lane_bytes` bytes. An undef/poison lane is 0.
+                        let w: u64 = match e.as_ref() {
+                            Constant::Float(Float::Single(f)) => f.to_bits() as u64,
+                            Constant::Float(Float::Double(f)) => f.to_bits(),
+                            Constant::Int { value, .. } => *value,
                             _ => 0,
                         };
-                        bytes[4 * k..4 * k + 4].copy_from_slice(&w.to_le_bytes());
+                        bytes[k * lb..k * lb + lb].copy_from_slice(&w.to_le_bytes()[..lb]);
                     }
                     Ok(self.push(Inst::ConstV128(bytes)))
                 }
@@ -4751,8 +4750,8 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     if let I::Store(st) = instr {
         let addr = ctx.operand(&st.address)?;
         let value = ctx.operand(&st.value)?;
-        // A `<4 x …>` store is a 16-byte `v128.store`; everything else is a width-tagged `store`.
-        if is_vec4(st.value.get_type(types).as_ref()) {
+        // A 128-bit vector store is a 16-byte `v128.store`; everything else is a width-tagged `store`.
+        if vec128_shape(st.value.get_type(types).as_ref()).is_some() {
             ctx.push_effect(Inst::V128Store {
                 addr,
                 value,
@@ -4964,8 +4963,8 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         I::Load(l) => {
             let addr = ctx.operand(&l.address)?;
-            // A `<4 x …>` load is a 16-byte `v128.load`; everything else a width-tagged `load`.
-            if is_vec4(l.loaded_ty.as_ref()) {
+            // A 128-bit vector load is a 16-byte `v128.load`; everything else a width-tagged `load`.
+            if vec128_shape(l.loaded_ty.as_ref()).is_some() {
                 (
                     &l.dest,
                     ctx.push(Inst::V128Load {
@@ -5257,9 +5256,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             let i = const_int(&ee.index)
                 .ok_or_else(|| Error::Unsupported("extractelement: dynamic lane".into()))?;
             let v = ctx.operand(&ee.vector)?;
-            if let Some(lane) = vec4_lane_ty(vty.as_ref()) {
+            if let Some(shape) = vec128_shape(vty.as_ref()) {
                 let idx = ctx.push(Inst::ExtractLane {
-                    shape: vshape4(lane),
+                    shape,
                     lane: i as u8,
                     signed: false,
                     a: v,
@@ -5280,9 +5279,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 .ok_or_else(|| Error::Unsupported("insertelement: dynamic lane".into()))?;
             let v = ctx.operand(&ie.vector)?;
             let x = ctx.operand(&ie.element)?;
-            if let Some(lane) = vec4_lane_ty(vty.as_ref()) {
+            if let Some(shape) = vec128_shape(vty.as_ref()) {
                 let idx = ctx.push(Inst::ReplaceLane {
-                    shape: vshape4(lane),
+                    shape,
                     lane: i as u8,
                     a: v,
                     b: x,
@@ -5320,23 +5319,25 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             };
             let v0 = ctx.operand(&sv.operand0)?;
             let v1 = ctx.operand(&sv.operand1)?;
-            if vec4_lane_ty(vty.as_ref()).is_some() {
-                if mask.len() != 4 {
-                    return unsup("shufflevector: result is not 4-lane");
+            if let Some(shape) = vec128_shape(vty.as_ref()) {
+                let n = shape.lanes() as u64; // lanes per input vector
+                let lb = shape.lane_bytes() as u64; // bytes per lane
+                if mask.len() != n as usize {
+                    return unsup("shufflevector: result lane count != input lane count");
                 }
-                // 32-bit lanes → 4 bytes each; lane `src` (0..8) → concat bytes (src<4 ? 4*src :
-                // 16 + 4*(src-4)). An undef/oob mask lane reads lane 0 of `a`.
+                // `lb`-byte lanes; source lane `src` (0..2n over the `a ++ b` concat) → concat byte
+                // base (src<n ? lb*src : 16 + lb*(src-n)). An undef/oob mask lane reads lane 0 of `a`.
                 let mut lanes = [0u8; 16];
                 for (k, &src) in mask.iter().enumerate() {
-                    let base = if src < 4 {
-                        4 * src
-                    } else if src < 8 {
-                        16 + 4 * (src - 4)
+                    let base = if src < n {
+                        lb * src
+                    } else if src < 2 * n {
+                        16 + lb * (src - n)
                     } else {
                         0
                     } as u8;
-                    for b in 0..4u8 {
-                        lanes[4 * k + b as usize] = base + b;
+                    for b in 0..lb as u8 {
+                        lanes[lb as usize * k + b as usize] = base + b;
                     }
                 }
                 (
@@ -5397,27 +5398,28 @@ fn bin<'d>(
     b: &Operand,
     types: &Types,
 ) -> Result<(&'d Name, ValIdx), Error> {
-    // A `<4 x i32>` operand (auto-vectorized integer loop) lowers lane-wise to a `v128` op (§17): the
-    // arithmetic ops are `VIntBin` (`i32x4`), the bitwise ops are whole-vector `VBitBin`. (Float vector
-    // binops go through `fp_binop`, not here, so a `vec4` operand here is integer-lane.)
-    if is_vec4(a.get_type(types).as_ref()) {
+    // A 128-bit integer vector operand (auto-vectorized integer loop) lowers lane-wise to a `v128`
+    // op (§17): the arithmetic ops are `VIntBin` (in the operand's lane shape), the bitwise ops are
+    // whole-vector `VBitBin`. (Float vector binops go through `fp_binop`, not here, so a vector
+    // operand here is integer-lane.)
+    if let Some(shape) = vec128_shape(a.get_type(types).as_ref()) {
         let av = ctx.operand(a)?;
         let bv = ctx.operand(b)?;
         let inst = match op {
             BinOp::Add => Inst::VIntBin {
-                shape: svm_ir::VShape::I32x4,
+                shape,
                 op: svm_ir::VIntBinOp::Add,
                 a: av,
                 b: bv,
             },
             BinOp::Sub => Inst::VIntBin {
-                shape: svm_ir::VShape::I32x4,
+                shape,
                 op: svm_ir::VIntBinOp::Sub,
                 a: av,
                 b: bv,
             },
             BinOp::Mul => Inst::VIntBin {
-                shape: svm_ir::VShape::I32x4,
+                shape,
                 op: svm_ir::VIntBinOp::Mul,
                 a: av,
                 b: bv,
@@ -5519,13 +5521,13 @@ fn fp_binop<'d>(
     o1: &'d Operand,
     types: &Types,
 ) -> Result<(&'d Name, ValIdx), Error> {
-    if vec4_lane_ty(o0.get_type(types).as_ref()) == Some(ValType::F32) {
+    if let Some(shape) = vec128_shape(o0.get_type(types).as_ref()).filter(|s| s.is_float()) {
         let a = ctx.operand(o0)?;
         let b = ctx.operand(o1)?;
         return Ok((
             dest,
             ctx.push(Inst::VFloatBin {
-                shape: svm_ir::VShape::F32x4,
+                shape,
                 op: vfbin_op(op)?,
                 a,
                 b,
