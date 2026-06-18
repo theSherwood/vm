@@ -771,6 +771,31 @@ fn is_vec2f(ty: &Type) -> bool {
     vec2_lane_ty(ty) == Some(ValType::F32)
 }
 
+/// The 128-bit `VShape` whose lane *type* matches a vector's element type (`i8`→`i8x16`,
+/// `i16`→`i16x8`, `i32`→`i32x4`, `i64`→`i64x2`, `float`→`f32x4`, `double`→`f64x2`), **independent of
+/// the element count**. `None` for non-vectors, scalable vectors, or an unsupported lane type. This
+/// is the lane shape both a single-`v128` vector and a legalized chunk of a wider vector pack into.
+fn vec_lane_shape(ty: &Type) -> Option<svm_ir::VShape> {
+    use svm_ir::VShape;
+    let Type::VectorType {
+        element_type,
+        scalable: false,
+        ..
+    } = ty
+    else {
+        return None;
+    };
+    Some(match element_type.as_ref() {
+        Type::IntegerType { bits: 8 } => VShape::I8x16,
+        Type::IntegerType { bits: 16 } => VShape::I16x8,
+        Type::IntegerType { bits: 32 } => VShape::I32x4,
+        Type::IntegerType { bits: 64 } => VShape::I64x2,
+        Type::FPType(FPType::Single) => VShape::F32x4,
+        Type::FPType(FPType::Double) => VShape::F64x2,
+        _ => return None,
+    })
+}
+
 /// The `VShape` of a **128-bit-wide LLVM vector** — any of the six legal-width shapes
 /// `<16 x i8>`/`<8 x i16>`/`<4 x i32>`/`<2 x i64>`/`<4 x float>`/`<2 x double>`, each mapping to a
 /// native `v128` (§17/D58). `None` for any vector that is not exactly 16 bytes (a 2-lane 32-bit
@@ -778,24 +803,66 @@ fn is_vec2f(ty: &Type) -> bool {
 /// by the legalization pass). The lane shape is carried per-op, so this is the single source of
 /// truth for "this LLVM vector is one `v128`".
 fn vec128_shape(ty: &Type) -> Option<svm_ir::VShape> {
-    use svm_ir::VShape;
+    let shape = vec_lane_shape(ty)?;
+    match ty {
+        Type::VectorType { num_elements, .. } if *num_elements == shape.lanes() as usize => {
+            Some(shape)
+        }
+        _ => None,
+    }
+}
+
+/// How an LLVM vector that is **not a single `v128`** legalizes to fixed-128 chunks (I2 fix-sketch
+/// step 1): the lane [`svm_ir::VShape`] its lanes pack into, the number of full 16-byte `v128`
+/// chunks, and the count of leftover scalar **tail** lanes — so
+/// `total_lanes = full_chunks * shape.lanes() + tail_lanes`. A wider-than-128 vector has
+/// `full_chunks ≥ 1`; a sub-128 one (e.g. `<8 x i8>`) has `full_chunks == 0` and is fully
+/// scalarized into the tail (a 16-byte `v128.load` would overrun its memory image, so its lanes are
+/// per-element loads/ops). `None` for a single `v128` (use [`vec128_shape`]), a non-vector, a
+/// scalable vector, an unsupported lane type, or the empty vector.
+#[derive(Clone, Copy)]
+struct WideLayout {
+    shape: svm_ir::VShape,
+    full_chunks: usize,
+    tail_lanes: usize,
+}
+
+impl WideLayout {
+    /// Total lane count (`full_chunks * lanes_per_chunk + tail_lanes`).
+    fn total_lanes(self) -> usize {
+        self.full_chunks * self.shape.lanes() as usize + self.tail_lanes
+    }
+    /// Number of legalized parts (chunk `v128`s + tail lane scalars) a value of this layout holds.
+    fn nparts(self) -> usize {
+        self.full_chunks + self.tail_lanes
+    }
+    /// The byte size of the vector's memory image.
+    fn byte_size(self) -> u64 {
+        self.total_lanes() as u64 * self.shape.lane_bytes() as u64
+    }
+}
+
+fn wide_vec_layout(ty: &Type) -> Option<WideLayout> {
+    if vec128_shape(ty).is_some() || is_vec2(ty) {
+        // A single `v128` keeps its native path; a `<2 x {i32,float}>` keeps its packed-`i64` path.
+        return None;
+    }
+    let shape = vec_lane_shape(ty)?;
     let Type::VectorType {
-        element_type,
-        num_elements,
-        scalable: false,
+        num_elements: n, ..
     } = ty
     else {
         return None;
     };
-    match (element_type.as_ref(), *num_elements) {
-        (Type::IntegerType { bits: 8 }, 16) => Some(VShape::I8x16),
-        (Type::IntegerType { bits: 16 }, 8) => Some(VShape::I16x8),
-        (Type::IntegerType { bits: 32 }, 4) => Some(VShape::I32x4),
-        (Type::IntegerType { bits: 64 }, 2) => Some(VShape::I64x2),
-        (Type::FPType(FPType::Single), 4) => Some(VShape::F32x4),
-        (Type::FPType(FPType::Double), 2) => Some(VShape::F64x2),
-        _ => None,
+    if *n == 0 {
+        return None;
     }
+    let lpc = shape.lanes() as usize;
+    Some(WideLayout {
+        shape,
+        full_chunks: n / lpc,
+        tail_lanes: n % lpc,
+    })
 }
 
 /// The scalar **fields of a small by-value struct** (clang's multi-register return/arg coercion,
@@ -913,6 +980,8 @@ fn type_size(ty: &Type, types: &Types) -> Result<u64, Error> {
         }
         _ if is_vec2(ty) => Ok(8), // `<2 x float>`/`<2 x i32>` — two packed 32-bit lanes
         _ if vec128_shape(ty).is_some() => Ok(16), // any 128-bit vector — a v128
+        // A wider/sub-128 vector: its full lane-packed byte image (legalized to v128 chunks + tail).
+        _ if wide_vec_layout(ty).is_some() => Ok(wide_vec_layout(ty).unwrap().byte_size()),
         other => unsup(format!("size of type {other} (Milestone 1+)")),
     }
 }
@@ -931,6 +1000,11 @@ fn type_align(ty: &Type, types: &Types) -> Result<u64, Error> {
         }
         _ if is_vec2(ty) => Ok(8),                  // a 2-lane 32-bit vector is 8-aligned
         _ if vec128_shape(ty).is_some() => Ok(16),  // a v128 is 16-aligned
+        // A wider/sub-128 vector — 16-aligned when it has full chunks, else its (smaller) byte size.
+        _ if wide_vec_layout(ty).is_some() => {
+            let l = wide_vec_layout(ty).unwrap();
+            Ok(if l.full_chunks > 0 { 16 } else { l.byte_size().max(1) })
+        }
         other => unsup(format!("align of type {other} (Milestone 1+)")),
     }
 }
@@ -1005,8 +1079,14 @@ type ValueId = usize;
 struct Scan {
     /// LLVM value name → its `ValueId`.
     name2id: HashMap<Name, ValueId>,
-    /// `ValueId` → its SVM type.
+    /// `ValueId` → its SVM type. A wide-vector value (tracked in `wide`) carries a `V128` placeholder
+    /// here — its real representation is its chunk/tail parts, never a single scalar.
     ty: Vec<ValType>,
+    /// `ValueId` → its legalization layout, for values whose LLVM type is a wider-than-128 or
+    /// sub-128 vector (I2 step 1). These flow as several `v128` chunks + scalar tail lanes, not one
+    /// SSA value; the layout drives the chunk/tail fan-out at block boundaries (`block_params`,
+    /// `branch_args`) and the per-chunk lowering (`lower_wide`).
+    wide: HashMap<ValueId, WideLayout>,
     /// `ValueId` → the block it is defined in (parameters are defined in the entry block, 0).
     def_block: Vec<usize>,
     /// Block name → block index (entry is 0).
@@ -1120,6 +1200,7 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
     let mut s = Scan {
         name2id: HashMap::new(),
         ty: Vec::new(),
+        wide: HashMap::new(),
         def_block: Vec::new(),
         block_idx: HashMap::new(),
         block_name: Vec::new(),
@@ -1148,6 +1229,12 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                 let ty = instr.get_type(types);
                 let vt = match val_type(ty.as_ref()) {
                     Ok(t) => t,
+                    // A wider-than-128 / sub-128 vector result is legalized to `v128` chunks + a
+                    // scalar tail (I2 step 1) — record its layout and a `V128` placeholder type.
+                    Err(_) if wide_vec_layout(ty.as_ref()).is_some() => {
+                        s.wide.insert(id, wide_vec_layout(ty.as_ref()).unwrap());
+                        ValType::V128
+                    }
                     // A small by-value struct (a call/`insertvalue` result) is tracked field-wise via
                     // the aggregate side-table, never used as a scalar — record a placeholder type.
                     Err(_) if struct_field_vtypes(ty.as_ref(), types).is_some() => ValType::I64,
@@ -4316,6 +4403,12 @@ struct BlockCtx<'a> {
     /// `extractvalue`/`ret` (§3a multi-result). Assumed not to cross block boundaries (clang's
     /// register-coercion pattern produces and consumes them in one block).
     agg: HashMap<ValueId, Vec<ValIdx>>,
+    /// Wide-vector SSA values (I2 step 1): value-id → its legalized parts, ordered
+    /// `[chunk_0 … chunk_{C-1}, tail_0 … tail_{T-1}]` (`C` full `v128`s then `T` lane scalars, per
+    /// the value's [`WideLayout`] in `s.wide`). The vector analog of `agg` — one LLVM value is
+    /// several IR values — but, unlike `agg`, these *do* cross block boundaries (a vectorized loop's
+    /// wide accumulator), fanned out into per-part block params by `block_params`/`branch_args`.
+    wide_vals: HashMap<ValueId, Vec<ValIdx>>,
     next_val: ValIdx,
 }
 
@@ -4475,6 +4568,118 @@ impl<'a> BlockCtx<'a> {
             if let Some(&vid) = self.s.name2id.get(d) {
                 self.idx_of.insert(vid, r);
             }
+        }
+    }
+
+    /// Bind a wide-vector dest name to its legalized parts (chunks ++ tail).
+    fn bind_wide(&mut self, dest: &Name, parts: Vec<ValIdx>) {
+        if let Some(&vid) = self.s.name2id.get(dest) {
+            self.wide_vals.insert(vid, parts);
+        }
+    }
+
+    /// Resolve a wide-vector operand to its legalized parts. A local reads its recorded parts; a
+    /// constant wide vector is materialized (per-chunk `ConstV128` + tail lane consts).
+    fn wide_operand(&mut self, op: &Operand, layout: WideLayout) -> Result<Vec<ValIdx>, Error> {
+        match op {
+            Operand::LocalOperand { name, .. } => {
+                let vid = *self
+                    .s
+                    .name2id
+                    .get(name)
+                    .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}")))?;
+                self.wide_vals.get(&vid).cloned().ok_or_else(|| {
+                    Error::Unsupported(format!("wide vector value {vid} not available in block"))
+                })
+            }
+            Operand::ConstantOperand(c) => self.wide_const(c.as_ref(), layout),
+            Operand::MetadataOperand => unsup("metadata operand"),
+        }
+    }
+
+    /// Materialize a constant wide vector into its legalized parts: the lanes' little-endian byte
+    /// image split into `full_chunks` `ConstV128`s, then `tail_lanes` scalar lane consts.
+    fn wide_const(&mut self, c: &Constant, layout: WideLayout) -> Result<Vec<ValIdx>, Error> {
+        let lb = layout.shape.lane_bytes() as usize;
+        let n = layout.total_lanes();
+        let lane_words: Vec<u64> = match c {
+            Constant::AggregateZero(_)
+            | Constant::Undef(_)
+            | Constant::Poison(_)
+            | Constant::Null(_) => vec![0u64; n],
+            Constant::Vector(elems) => (0..n)
+                .map(|k| match elems.get(k).map(|e| e.as_ref()) {
+                    Some(Constant::Float(Float::Single(f))) => f.to_bits() as u64,
+                    Some(Constant::Float(Float::Double(f))) => f.to_bits(),
+                    Some(Constant::Int { value, .. }) => *value,
+                    _ => 0, // undef/poison lane → 0
+                })
+                .collect(),
+            other => return unsup(format!("wide vector constant {other:?}")),
+        };
+        let mut img = vec![0u8; n * lb];
+        for (k, w) in lane_words.iter().enumerate() {
+            img[k * lb..k * lb + lb].copy_from_slice(&w.to_le_bytes()[..lb]);
+        }
+        let mut parts = Vec::with_capacity(layout.nparts());
+        for ci in 0..layout.full_chunks {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&img[ci * 16..ci * 16 + 16]);
+            parts.push(self.push(Inst::ConstV128(b)));
+        }
+        let tail_start = layout.full_chunks * layout.shape.lanes() as usize;
+        for t in 0..layout.tail_lanes {
+            let inst = tail_const_inst(layout.shape, lane_words[tail_start + t]);
+            parts.push(self.push(inst));
+        }
+        Ok(parts)
+    }
+
+    /// Emit the loads for a wide vector at `addr`: `full_chunks` 16-byte `V128Load`s at offsets
+    /// `0,16,…`, then `tail_lanes` width-tagged scalar loads of the leftover lanes.
+    fn wide_load(&mut self, addr: ValIdx, layout: WideLayout) -> Vec<ValIdx> {
+        let mut parts = Vec::with_capacity(layout.nparts());
+        for ci in 0..layout.full_chunks {
+            parts.push(self.push(Inst::V128Load {
+                addr,
+                offset: (ci * 16) as u64,
+                align: 0,
+            }));
+        }
+        let lb = layout.shape.lane_bytes() as u64;
+        let base = (layout.full_chunks * 16) as u64;
+        for t in 0..layout.tail_lanes {
+            parts.push(self.push(Inst::Load {
+                op: lane_load_op(layout.shape),
+                addr,
+                offset: base + t as u64 * lb,
+                align: 0,
+            }));
+        }
+        parts
+    }
+
+    /// Emit the stores of a wide vector's `parts` to `addr`: `full_chunks` `V128Store`s at offsets
+    /// `0,16,…`, then `tail_lanes` width-tagged scalar stores of the leftover lanes.
+    fn wide_store(&mut self, addr: ValIdx, parts: &[ValIdx], layout: WideLayout) {
+        for (ci, &value) in parts[..layout.full_chunks].iter().enumerate() {
+            self.push_effect(Inst::V128Store {
+                addr,
+                value,
+                offset: (ci * 16) as u64,
+                align: 0,
+            });
+        }
+        let lb = layout.shape.lane_bytes() as u64;
+        let base = (layout.full_chunks * 16) as u64;
+        for t in 0..layout.tail_lanes {
+            self.push_effect(Inst::Store {
+                op: lane_store_op(layout.shape),
+                addr,
+                value: parts[layout.full_chunks + t],
+                offset: base + t as u64 * lb,
+                align: 0,
+            });
         }
     }
 
@@ -4710,9 +4915,15 @@ fn translate_block(
         insts: Vec::new(),
         idx_of: HashMap::new(),
         agg: HashMap::new(),
+        wide_vals: HashMap::new(),
         next_val: 0,
     };
     for (pos, &vid) in param_ids.iter().enumerate() {
+        // A wide-vector value carried across a block edge needs the chunk/tail param fan-out
+        // (not yet wired here) — fail-closed until that lands.
+        if vid != SP && s.wide.contains_key(&vid) {
+            return unsup("wide vector live across a block boundary (legalization fan-out pending)");
+        }
         ctx.idx_of.insert(vid, pos as ValIdx);
     }
     ctx.next_val = param_ids.len() as ValIdx;
@@ -4745,6 +4956,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     // The op's float width (f32/f64), likewise.
     let fty =
         |o: &Operand| -> Result<FloatTy, Error> { float_ty(val_type(o.get_type(types).as_ref())?) };
+
+    // Wider-than-128 / sub-128 vector ops legalize to fixed-128 `v128` chunks + a scalar tail (I2
+    // step 1), handled entirely here. `Ok(false)` means no wide vector is involved — fall through.
+    if lower_wide(ctx, instr, types)? {
+        return Ok(());
+    }
 
     // No-result instructions (effects only): handle and return early.
     if let I::Store(st) = instr {
@@ -5386,6 +5603,346 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         ctx.idx_of.insert(vid, idx);
     }
     Ok(())
+}
+
+/// The width-tagged `LoadOp` for a single tail lane of a legalized wide vector (narrow integer
+/// lanes zero-extend into the `i32` container, matching the chunk lanes' `ExtractLane` convention).
+fn lane_load_op(shape: svm_ir::VShape) -> svm_ir::LoadOp {
+    use svm_ir::{LoadOp as L, VShape};
+    match shape {
+        VShape::I8x16 => L::I32_8U,
+        VShape::I16x8 => L::I32_16U,
+        VShape::I32x4 => L::I32,
+        VShape::I64x2 => L::I64,
+        VShape::F32x4 => L::F32,
+        VShape::F64x2 => L::F64,
+    }
+}
+
+/// The width-tagged `StoreOp` for a single tail lane of a legalized wide vector.
+fn lane_store_op(shape: svm_ir::VShape) -> svm_ir::StoreOp {
+    use svm_ir::{StoreOp as S, VShape};
+    match shape {
+        VShape::I8x16 => S::I32_8,
+        VShape::I16x8 => S::I32_16,
+        VShape::I32x4 => S::I32,
+        VShape::I64x2 => S::I64,
+        VShape::F32x4 => S::F32,
+        VShape::F64x2 => S::F64,
+    }
+}
+
+/// A constant for one tail lane (its lane-scalar type), from the lane's little-endian word.
+fn tail_const_inst(shape: svm_ir::VShape, w: u64) -> Inst {
+    match shape.lane_val() {
+        ValType::I64 => Inst::ConstI64(w as i64),
+        ValType::F32 => Inst::ConstF32(w as u32),
+        ValType::F64 => Inst::ConstF64(w),
+        _ => Inst::ConstI32(w as u32 as i32), // i8/i16/i32 lane → i32 container
+    }
+}
+
+/// The chunk op for a wide integer lane binop: lane arithmetic (`VIntBin`) or whole-vector bitwise
+/// (`VBitBin`); the matching scalar `BinOp` is applied to tail lanes.
+enum WIntChunk {
+    Arith(svm_ir::VIntBinOp),
+    Bit(svm_ir::VBitBinOp),
+}
+
+/// Lower a wide **integer** lane binop per chunk + per tail lane, binding `dest` to the result
+/// parts. Returns `Ok(false)` if the operands aren't a wide vector (take the normal path).
+fn wide_int_binop(
+    ctx: &mut BlockCtx,
+    types: &Types,
+    dest: &Name,
+    a: &Operand,
+    b: &Operand,
+    chunk: WIntChunk,
+    tail_op: BinOp,
+) -> Result<bool, Error> {
+    let Some(layout) = wide_vec_layout(a.get_type(types).as_ref()) else {
+        return Ok(false);
+    };
+    let pa = ctx.wide_operand(a, layout)?;
+    let pb = ctx.wide_operand(b, layout)?;
+    let tail_ty = int_ty(layout.shape.lane_val())?;
+    let mut out = Vec::with_capacity(layout.nparts());
+    for i in 0..layout.full_chunks {
+        out.push(ctx.push(match chunk {
+            WIntChunk::Arith(op) => Inst::VIntBin {
+                shape: layout.shape,
+                op,
+                a: pa[i],
+                b: pb[i],
+            },
+            WIntChunk::Bit(op) => Inst::VBitBin {
+                op,
+                a: pa[i],
+                b: pb[i],
+            },
+        }));
+    }
+    for i in layout.full_chunks..layout.nparts() {
+        out.push(ctx.push(Inst::IntBin {
+            ty: tail_ty,
+            op: tail_op,
+            a: pa[i],
+            b: pb[i],
+        }));
+    }
+    ctx.bind_wide(dest, out);
+    Ok(true)
+}
+
+/// Lower a wide **float** lane binop (`VFloatBin` per chunk + scalar `FBin` per tail lane).
+fn wide_float_binop(
+    ctx: &mut BlockCtx,
+    types: &Types,
+    dest: &Name,
+    a: &Operand,
+    b: &Operand,
+    op: FBinOp,
+) -> Result<bool, Error> {
+    let Some(layout) = wide_vec_layout(a.get_type(types).as_ref()) else {
+        return Ok(false);
+    };
+    let pa = ctx.wide_operand(a, layout)?;
+    let pb = ctx.wide_operand(b, layout)?;
+    let vop = vfbin_op(op)?;
+    let tail_ty = float_ty(layout.shape.lane_val())?;
+    let mut out = Vec::with_capacity(layout.nparts());
+    for i in 0..layout.full_chunks {
+        out.push(ctx.push(Inst::VFloatBin {
+            shape: layout.shape,
+            op: vop,
+            a: pa[i],
+            b: pb[i],
+        }));
+    }
+    for i in layout.full_chunks..layout.nparts() {
+        out.push(ctx.push(Inst::FBin {
+            ty: tail_ty,
+            op,
+            a: pa[i],
+            b: pb[i],
+        }));
+    }
+    ctx.bind_wide(dest, out);
+    Ok(true)
+}
+
+/// Lower a wide integer lane **min/max** (`llvm.{s,u}{min,max}.vNiM`) per chunk (`VIntBin`). Tail
+/// lanes would need per-lane signed/unsigned compares (a rare odd-width corner) — `Unsupported`.
+fn wide_minmax(
+    ctx: &mut BlockCtx,
+    layout: WideLayout,
+    op: svm_ir::VIntBinOp,
+    pa: &[ValIdx],
+    pb: &[ValIdx],
+) -> Result<Vec<ValIdx>, Error> {
+    if layout.tail_lanes != 0 {
+        return unsup("wide vector min/max with a scalar tail (odd lane count)");
+    }
+    Ok((0..layout.full_chunks)
+        .map(|i| {
+            ctx.push(Inst::VIntBin {
+                shape: layout.shape,
+                op,
+                a: pa[i],
+                b: pb[i],
+            })
+        })
+        .collect())
+}
+
+/// Lower a wide horizontal `llvm.vector.reduce.{add,mul,and,or,xor,smax,smin,umax,umin}` to a single
+/// scalar: extract every lane (from the `v128` chunks + tail lanes) and fold it, like the 128-bit
+/// reduce. Min/max with a non-empty tail is `Unsupported` (the tail lanes would need explicit
+/// sign/zero extension).
+fn wide_reduce(
+    ctx: &mut BlockCtx,
+    layout: WideLayout,
+    kind: &str,
+    parts: &[ValIdx],
+) -> Result<ValIdx, Error> {
+    let signed = matches!(kind, "smax" | "smin");
+    let is_minmax = matches!(kind, "smax" | "smin" | "umax" | "umin");
+    if is_minmax && layout.tail_lanes != 0 {
+        return unsup(format!("wide vector.reduce.{kind} with a scalar tail"));
+    }
+    let lpc = layout.shape.lanes();
+    let mut lanes: Vec<ValIdx> = Vec::with_capacity(layout.total_lanes());
+    for &chunk in &parts[..layout.full_chunks] {
+        for l in 0..lpc {
+            lanes.push(ctx.push(Inst::ExtractLane {
+                shape: layout.shape,
+                lane: l,
+                signed,
+                a: chunk,
+            }));
+        }
+    }
+    // Tail lanes are already lane scalars (add/mul/and/or/xor only — guarded above for min/max).
+    lanes.extend_from_slice(&parts[layout.full_chunks..]);
+    let lane_ty = int_ty(layout.shape.lane_val())?;
+    let mut acc = lanes[0];
+    for &l in &lanes[1..] {
+        acc = match kind {
+            "add" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::Add, a: acc, b: l }),
+            "mul" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::Mul, a: acc, b: l }),
+            "and" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::And, a: acc, b: l }),
+            "or" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::Or, a: acc, b: l }),
+            "xor" => ctx.push(Inst::IntBin { ty: lane_ty, op: BinOp::Xor, a: acc, b: l }),
+            "smax" | "umax" | "smin" | "umin" => {
+                let cmp = match kind {
+                    "smax" => CmpOp::GtS,
+                    "umax" => CmpOp::GtU,
+                    "smin" => CmpOp::LtS,
+                    _ => CmpOp::LtU,
+                };
+                let cond = ctx.push(Inst::IntCmp { ty: lane_ty, op: cmp, a: acc, b: l });
+                ctx.push(Inst::Select { cond, a: acc, b: l })
+            }
+            other => return unsup(format!("wide vector.reduce.{other}")),
+        };
+    }
+    Ok(acc)
+}
+
+/// Legalize a wide (>128-bit) or sub-128 vector instruction into fixed-128 `v128` chunks plus a
+/// scalar tail (I2 fix-sketch step 1). Returns `Ok(true)` if it fully handled `instr` (the caller
+/// returns early); `Ok(false)` if `instr` involves no wide vector, so the normal lowering runs.
+/// Any wide-vector form this does not explicitly handle stays fail-closed: the normal path's operand
+/// resolver finds no scalar binding for a wide value and returns a clean `Unsupported` (§2a).
+fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<bool, Error> {
+    use svm_ir::{VBitBinOp as Bit, VIntBinOp as VI};
+    use Instruction as I;
+    match instr {
+        I::Store(st) => {
+            let Some(layout) = wide_vec_layout(st.value.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let addr = ctx.operand(&st.address)?;
+            let parts = ctx.wide_operand(&st.value, layout)?;
+            ctx.wide_store(addr, &parts, layout);
+            Ok(true)
+        }
+        I::Load(l) => {
+            let Some(layout) = wide_vec_layout(l.loaded_ty.as_ref()) else {
+                return Ok(false);
+            };
+            let addr = ctx.operand(&l.address)?;
+            let parts = ctx.wide_load(addr, layout);
+            ctx.bind_wide(&l.dest, parts);
+            Ok(true)
+        }
+        I::Add(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Arith(VI::Add), BinOp::Add),
+        I::Sub(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Arith(VI::Sub), BinOp::Sub),
+        I::Mul(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Arith(VI::Mul), BinOp::Mul),
+        I::And(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Bit(Bit::And), BinOp::And),
+        I::Or(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Bit(Bit::Or), BinOp::Or),
+        I::Xor(x) => wide_int_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, WIntChunk::Bit(Bit::Xor), BinOp::Xor),
+        I::FAdd(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Add),
+        I::FSub(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Sub),
+        I::FMul(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Mul),
+        I::FDiv(x) => wide_float_binop(ctx, types, &x.dest, &x.operand0, &x.operand1, FBinOp::Div),
+        I::ExtractElement(ee) => {
+            let Some(layout) = wide_vec_layout(ee.vector.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let i = const_int(&ee.index)
+                .ok_or_else(|| Error::Unsupported("extractelement: dynamic lane".into()))?
+                as usize;
+            if i >= layout.total_lanes() {
+                return unsup("extractelement: lane out of range");
+            }
+            let parts = ctx.wide_operand(&ee.vector, layout)?;
+            let lpc = layout.shape.lanes() as usize;
+            let chunked = layout.full_chunks * lpc;
+            let idx = if i < chunked {
+                ctx.push(Inst::ExtractLane {
+                    shape: layout.shape,
+                    lane: (i % lpc) as u8,
+                    signed: false,
+                    a: parts[i / lpc],
+                })
+            } else {
+                parts[layout.full_chunks + (i - chunked)]
+            };
+            finish(ctx, &ee.dest, idx)?;
+            Ok(true)
+        }
+        I::InsertElement(ie) => {
+            let Some(layout) = wide_vec_layout(ie.vector.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let i = const_int(&ie.index)
+                .ok_or_else(|| Error::Unsupported("insertelement: dynamic lane".into()))?
+                as usize;
+            if i >= layout.total_lanes() {
+                return unsup("insertelement: lane out of range");
+            }
+            let mut parts = ctx.wide_operand(&ie.vector, layout)?;
+            let x = ctx.operand(&ie.element)?;
+            let lpc = layout.shape.lanes() as usize;
+            let chunked = layout.full_chunks * lpc;
+            if i < chunked {
+                parts[i / lpc] = ctx.push(Inst::ReplaceLane {
+                    shape: layout.shape,
+                    lane: (i % lpc) as u8,
+                    a: parts[i / lpc],
+                    b: x,
+                });
+            } else {
+                parts[layout.full_chunks + (i - chunked)] = x;
+            }
+            ctx.bind_wide(&ie.dest, parts);
+            Ok(true)
+        }
+        I::Call(c) => {
+            let Some(name) = callee_name(c) else {
+                return Ok(false);
+            };
+            // A wide horizontal reduce (`llvm.vector.reduce.*`) folds to one scalar.
+            if let Some(rest) = name.strip_prefix("llvm.vector.reduce.") {
+                let vec_op = &c.arguments[0].0;
+                let Some(layout) = wide_vec_layout(vec_op.get_type(types).as_ref()) else {
+                    return Ok(false);
+                };
+                if layout.shape.is_float() {
+                    return unsup("wide float vector.reduce (later slice)");
+                }
+                let kind = rest.split('.').next().unwrap_or("");
+                let parts = ctx.wide_operand(vec_op, layout)?;
+                let r = wide_reduce(ctx, layout, kind, &parts)?;
+                if let Some(dest) = &c.dest {
+                    finish(ctx, dest, r)?;
+                }
+                return Ok(true);
+            }
+            // A wide lane-wise min/max (`llvm.{s,u}{min,max}.vNiM`).
+            let base = name.rsplit_once('.').map_or(name.as_str(), |(b, _)| b);
+            let vop = match base {
+                "llvm.smax" => VI::MaxS,
+                "llvm.smin" => VI::MinS,
+                "llvm.umax" => VI::MaxU,
+                "llvm.umin" => VI::MinU,
+                _ => return Ok(false),
+            };
+            let a0 = &c.arguments[0].0;
+            let Some(layout) = wide_vec_layout(a0.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let pa = ctx.wide_operand(a0, layout)?;
+            let pb = ctx.wide_operand(&c.arguments[1].0, layout)?;
+            let out = wide_minmax(ctx, layout, vop, &pa, &pb)?;
+            if let Some(dest) = &c.dest {
+                ctx.bind_wide(dest, out);
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Emit a binary integer op and return `(dest, result-index)`.

@@ -2957,6 +2957,99 @@ fn simd_f64x2_mul_add() {
     check_vs_native("simd_f64x2", src, 4);
 }
 
+// ============================================================================================
+// SIMD — **wider-than-128-bit** vectors legalized to fixed-128 `v128` chunks + a scalar tail (I2
+// fix-sketch step 1). These use explicit `vector_size` types (compiled with vectorization off) so
+// the on-ramp sees an exact wide shape, and `noinline` helpers with opaque pointers force real wide
+// loads/ops — all *within a single block* (no control flow), exercising the in-block splitter. The
+// `<8 x i32>` / `<4 x i64>` cases split into 2 clean `v128` chunks (no tail); the `<8 x i8>` case is
+// sub-128 and fully scalarized into the tail (0 chunks, 8 lane scalars).
+// ============================================================================================
+
+/// `<8 x i32>` (256-bit) elementwise add → split into **2 `i32x4` chunks** (load/`VIntBin`/store).
+#[test]
+fn simd_i32x8_add_store() {
+    let src = "void vadd8(const int *P, const int *Q, int *O);\n\
+        static int D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = seed + i; F[i] = 2 * i + 1; }\n\
+        \x20 vadd8(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) void vadd8(const int *P, const int *Q, int *O) {\n\
+        \x20 v8si a = *(const v8si *)P, b = *(const v8si *)Q;\n\
+        \x20 *(v8si *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i32x8", src, 5);
+}
+
+/// `<8 x i32>` horizontal `llvm.vector.reduce.add.v8i32` (via `__builtin_reduce_add`) over 2 chunks
+/// — the wide-reduce fold (extract every lane of both chunks, sum). `__builtin_reduce_*` is a clang
+/// builtin (`cc`/gcc lacks it), so this uses `check` with a computed expected value (interp == JIT)
+/// rather than the native oracle. `run(3)`: Σ(3 + i²) for i in 0..8 = 24 + 140 = 164.
+#[test]
+fn simd_i32x8_reduce_add() {
+    let src = "int vred8(const int *P);\n\
+        static int D[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) D[i] = seed + i * i;\n\
+        \x20 return vred8(D);\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) int vred8(const int *P) {\n\
+        \x20 v8si a = *(const v8si *)P;\n\
+        \x20 return __builtin_reduce_add(a);\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check("simd_i32x8_red", src, &[Value::I32(3)], &[Value::I32(164)]);
+}
+
+/// `<4 x i64>` (256-bit) lane multiply + horizontal `reduce.add.v4i64` over **2 `i64x2` chunks**.
+/// `run(2)`: Σ (2+i)·(i+1) for i in 0..4 = 2 + 6 + 12 + 20 = 40.
+#[test]
+fn simd_i64x4_mul_reduce() {
+    let src = "long long vred4(const long long *P, const long long *Q);\n\
+        static long long D[4], F[4];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 4; i++) { D[i] = seed + i; F[i] = i + 1; }\n\
+        \x20 return (int)vred4(D, F);\n\
+        }\n\
+        typedef long long v4di __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) long long vred4(const long long *P, const long long *Q) {\n\
+        \x20 v4di a = *(const v4di *)P, b = *(const v4di *)Q;\n\
+        \x20 v4di c = a * b;\n\
+        \x20 return __builtin_reduce_add(c);\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check("simd_i64x4", src, &[Value::I32(2)], &[Value::I32(40)]);
+}
+
+/// `<8 x i8>` (64-bit, sub-128) elementwise add — **fully scalarized into the tail** (0 chunks, 8
+/// lane scalars: a 16-byte `v128.load` would overrun its 8-byte image, so each lane is a byte op).
+#[test]
+fn simd_i8x8_add_tail() {
+    let src = "void vadd8b(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(3 * i + 1); }\n\
+        \x20 vadd8b(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char v8qi __attribute__((vector_size(8)));\n\
+        __attribute__((noinline)) void vadd8b(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 v8qi a = *(const v8qi *)P, b = *(const v8qi *)Q;\n\
+        \x20 *(v8qi *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i8x8", src, 5);
+}
+
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
 /// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
 /// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and
