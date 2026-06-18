@@ -363,6 +363,12 @@ pub struct FrozenVCpu {
 /// page, so protecting it protects (at most) its host page — exact on a 4 KiB-page host.
 pub const DURABLE_SNAPSHOT_PAGE: usize = 4096;
 
+/// Window offset of durable shadow **context 0** (the root vCPU's region base) — an *empty* shadow-SP
+/// extent. Must match `svm-interp`'s / `fiber_rt`'s `SHADOW_BASE`; duplicated here (not under
+/// `cfg(fiber_rt)`) for the durable run-state defaults. The cross-backend artifact-equality property
+/// catches any drift.
+const DURABLE_SHADOW_BASE: u64 = 64;
+
 /// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
 /// match the codes the lowered checks / the host thunk store into the trap cell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1022,12 +1028,17 @@ pub fn compile_and_run_capture_reserved_with_host_durable(
     Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
 }
 
-/// [`compile_and_run_capture_reserved_with_host_durable`] that also returns the **spawned-vCPU**
-/// freeze residue (DURABILITY.md §12.8 slice 3.3): a durable freeze runs single-worker, so each
-/// `thread.spawn`ed child runs **inline** and, if it unwinds under the freeze, records a
-/// [`FrozenVCpu`] (entry func, `(sp, arg)` operands, flattened shadow-SP). Returned alongside the
-/// flattened fibers so the snapshot can record the whole multi-vCPU domain (a thaw re-attaches the
-/// children). Use this for multi-vCPU durable modules; the fiber-only entry drops the vCPU residue.
+/// [`compile_and_run_capture_reserved_with_host_durable`] for a **multi-vCPU** durable domain
+/// (DURABILITY.md §12.8 slice 3.3) — the full freeze + thaw of a domain whose root has `thread.spawn`ed
+/// children. A durable run is single-worker, so children run **inline** (deferred during a freeze until
+/// the root unwinds; re-attached + run before the root re-enters on a thaw).
+///
+/// - **Freeze** (`vcpu_seed` empty): returns the flattened fibers, the spawned-vCPU residue (each
+///   [`FrozenVCpu`]: entry func, `(sp, arg)` operands, flattened shadow-SP), **and the root vCPU's
+///   flattened extent** (`root_sp`, reported separately because the shared active-SP word ends at the
+///   last child's extent) — everything a snapshot needs to record the whole multi-vCPU domain.
+/// - **Thaw** (`vcpu_seed` = the frozen children, `root_sp` = the root's restored extent): re-attaches
+///   and runs the children, then re-enters the root under `REWINDING`. Returns empty residue.
 ///
 /// # Safety
 /// As [`compile_and_run_capture_reserved_with_host_durable`].
@@ -1039,10 +1050,12 @@ pub fn compile_and_run_capture_reserved_with_host_durable_mv(
     init_mem: &[u8],
     init_prots: &[WindowProt],
     seed: &[FrozenFiber],
+    vcpu_seed: &[FrozenVCpu],
+    root_sp: u64,
     reserved_log2: u8,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
-) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>), JitError> {
+) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>, u64), JitError> {
     let mut cm = CompiledModule::compile(
         m,
         func,
@@ -1058,6 +1071,8 @@ pub fn compile_and_run_capture_reserved_with_host_durable_mv(
     )?;
     cm.restore_prots = init_prots.to_vec();
     cm.frozen_seed = seed.to_vec();
+    cm.frozen_vcpu_seed = vcpu_seed.to_vec();
+    cm.thaw_root_sp = root_sp;
     cm.durable = true;
     let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
     Ok((
@@ -1065,6 +1080,7 @@ pub fn compile_and_run_capture_reserved_with_host_durable_mv(
         win,
         std::mem::take(&mut cm.frozen_out),
         std::mem::take(&mut cm.frozen_vcpus_out),
+        cm.frozen_root_sp_out,
     ))
 }
 
@@ -1330,6 +1346,18 @@ pub struct CompiledModule {
     /// run inline single-worker by `thread.spawn`). Drained from the `Domain` after the root unwinds,
     /// read back by the durable entry point. Empty unless a freeze caught a live child.
     frozen_vcpus_out: Vec<FrozenVCpu>,
+    /// Durable **freeze** residue (slice 3.3): the **root** vCPU's flattened shadow-SP extent, captured
+    /// after the freeze driver (before the children overwrite the shared active-SP word). The root's
+    /// continuation rides in the window image like everyone's, but the active-SP word ends at the last
+    /// child's extent, so the root's own extent is reported separately for a thaw to restore. `0` on a
+    /// non-freeze run.
+    frozen_root_sp_out: u64,
+    /// Durable **thaw** seed (slice 3.3): the spawned vCPUs to re-attach + run before the root re-enters
+    /// under `REWINDING`. Empty for a freeze / ordinary run.
+    frozen_vcpu_seed: Vec<FrozenVCpu>,
+    /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
+    /// artifact), set as the active word before the root rewinds. `SHADOW_BASE` (empty) otherwise.
+    thaw_root_sp: u64,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -2101,6 +2129,9 @@ impl CompiledModule {
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
+            frozen_root_sp_out: 0,
+            frozen_vcpu_seed: Vec::new(),
+            thaw_root_sp: DURABLE_SHADOW_BASE, // empty extent (context 0's region base)
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -2464,6 +2495,21 @@ impl CompiledModule {
             })
         };
 
+        // Durable **multi-vCPU thaw** (slice 3.3, thaw side): re-attach + run the spawned children a
+        // freeze flattened, *before* the root re-enters — the JIT's single-worker thaw (the root's
+        // rewind skips its prologue `thread.spawn`, so the runtime reconstructs the children). Each
+        // child rewinds from its restored extent, runs forward to completion, and publishes its result
+        // so the root's re-executed `thread.join` resolves; the root's active shadow-SP is then set to
+        // its restored extent. Done after the fiber seed (the table is live) and `set_env`.
+        #[cfg(fiber_rt)]
+        if (*this).durable && !(*this).frozen_vcpu_seed.is_empty() {
+            let seed = std::mem::take(&mut (*this).frozen_vcpu_seed);
+            let root_sp = (*this).thaw_root_sp;
+            if let Some(d) = &(*this).domain {
+                d.thaw_reattach_and_run(&seed, root_sp);
+            }
+        }
+
         // Publish the live window's fault range so a mid-run `invoke_extra` (from a cap.call
         // handler) can arm its nested recovery against this run's window.
         (*this).live_fault_range = Some(window.fault_range());
@@ -2495,9 +2541,10 @@ impl CompiledModule {
         // every still-parked fiber into its own region before the window is snapshotted, so the
         // artifact captures their continuations. CURRENT_RT is still the root runtime here. A
         // flattening fiber touches only the committed reserve, so it's sound outside the guard.
-        // Single-vCPU (Phase 3.2 for multi-vCPU). Skipped on a fault or a non-freeze run. The
-        // residue (incl. any fiber unwound mid-resume-chain during the root run, slice 3.2) is
-        // accumulated in the runtime by each fiber's `Complete` arm; drain it after driving.
+        // (The root's *own* fibers; a spawned child's fibers are out of scope, slice 3.3.) Skipped on a
+        // fault or a non-freeze run. The residue (incl. any fiber unwound mid-resume-chain during the
+        // root run, slice 3.2) is accumulated in the runtime by each fiber's `Complete` arm; drain it
+        // after driving — then the deferred children run (`drive_frozen_spawns`).
         #[cfg(fiber_rt)]
         if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
             if let Some(rt) = (*this).fiber_rt.as_mut() {
@@ -2505,6 +2552,11 @@ impl CompiledModule {
                 fiber_rt::freeze_drive(rt, trap_cell.as_ptr() as u64);
                 (*this).frozen_out = fiber_rt::take_frozen(rt); // read back by the durable entry
             }
+            // Slice 3.3: capture the **root's** flattened extent now — the freeze driver restored the
+            // active shadow-SP to context 0's region (root rewinds first on thaw), but the children
+            // below overwrite the shared word with their own extents, so the root's must be read here
+            // (its implicit residue, reported separately for a thaw to restore).
+            (*this).frozen_root_sp_out = fiber_rt::read_shadow_sp(mem_base as u64);
             // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
             // request, returning the handle) so the root could unwind first — matching the interp,
             // which enqueues a child and runs it only after the spawning vCPU yields. Now that the

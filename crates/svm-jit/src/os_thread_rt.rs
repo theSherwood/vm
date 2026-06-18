@@ -544,14 +544,71 @@ unsafe fn defer_spawn(
 }
 
 impl Domain {
+    /// Run one child's guest entry **inline** on this thread (single-worker, slice 3.3): set up its
+    /// fiber execution context (for `cont.*`), arm a **nested** detect-and-kill recovery
+    /// (`run_guarded_range` saves/restores the parent run's recovery state itself, like `invoke_extra`),
+    /// call `code(sp, arg)` via the shared call-trampoline, and return `(result, trap, faulted)`. The
+    /// caller is responsible for the durable control words (state + active shadow-SP) around the call.
+    ///
+    /// # Safety
+    /// `env` is the live run's env; `code` is a guest entry trampoline; called with no other guest code
+    /// on this thread (the root returned / is parked in a join), the durable reserve committed RW.
+    unsafe fn run_child_inline(&self, env: Env, code: u64, sp: u64, arg: u64) -> (i64, i64, bool) {
+        // A child that uses `cont.*` gets its own fiber execution context over the domain-shared table
+        // (D57 3b-ii), like `run_child`; publish it as the current runtime for the run.
+        let mut frt = env.fiber_cfg.map(|(tid, mask)| {
+            let table = self
+                .fiber_table()
+                .expect("fiber_cfg set ⇒ the domain fiber table is set");
+            let mut rt = FiberRuntime::new(table, tid, mask);
+            rt.set_call_tramp(env.call_tramp);
+            Box::new(rt)
+        });
+        let prev = frt
+            .as_mut()
+            .map(|b| fiber_rt::set_current(&mut **b as *mut FiberRuntime));
+
+        let mut call = ChildCall {
+            env,
+            code,
+            sp,
+            arg,
+            ret: 0,
+        };
+        // SAFETY: `child_entry` honours the `Entry` ABI; `call` outlives the call; the guarded call
+        // nests cleanly. A guest fault unwinds back here and is reported as `MemoryFault` below.
+        let faulted = mem::run_guarded_range(
+            child_entry as *const () as *const u8,
+            &mut call as *mut ChildCall as *const i64,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            env.fault_lo,
+            env.fault_hi,
+        );
+        if let Some(pr) = prev {
+            fiber_rt::set_current(pr);
+        }
+
+        let (result, trap) = if faulted {
+            // SAFETY: live trap cell.
+            store_trap(env.trap_out, TrapKind::MemoryFault as i64);
+            (0, TrapKind::MemoryFault as i64)
+        } else {
+            let t = load_trap(env.trap_out);
+            (call.ret, t)
+        };
+        (result, trap, faulted)
+    }
+
     /// Run every child *deferred* during a durable freeze (slice 3.3), inline and in spawn order, once
     /// the root has unwound — the JIT's single-worker equivalent of the interpreter dispatching the
     /// enqueued children after the root yields. Each child runs in its own top-down shadow context
-    /// (the active shadow-SP word points there for the run) under a **nested** detect-and-kill recovery
-    /// (`run_guarded_range` saves/restores the recovery state itself, like `invoke_extra`); one that
-    /// unwound under the freeze records a [`crate::FrozenVCpu`] residue and keeps its context for thaw,
-    /// while a genuine finish frees the context for reuse. The last child leaves the active shadow-SP
-    /// at its own extent, matching the interp's dispatch-last convention so the window is byte-identical.
+    /// (the active shadow-SP word points there for the run); one that unwound under the freeze records a
+    /// [`crate::FrozenVCpu`] residue and keeps its context for thaw, while a genuine finish frees the
+    /// context for reuse. The last child leaves the active shadow-SP at its own extent, matching the
+    /// interp's dispatch-last convention so the window is byte-identical.
     ///
     /// # Safety
     /// Called from `run_inner` after the root's guarded call returned (no guest code is on this thread)
@@ -571,55 +628,11 @@ impl Domain {
             // context; a later child overwrites the word with its own region, so the last child leaves
             // it at its extent (the interp's convention).
             fiber_rt::write_shadow_sp(env.mem_base, fiber_rt::shadow_region_base(p.ctx));
-            // A child that uses `cont.*` gets its own fiber execution context over the domain-shared
-            // table (D57 3b-ii), like `run_child`; publish it as the current runtime for the run.
-            let mut frt = env.fiber_cfg.map(|(tid, mask)| {
-                let table = self
-                    .fiber_table()
-                    .expect("fiber_cfg set ⇒ the domain fiber table is set");
-                let mut rt = FiberRuntime::new(table, tid, mask);
-                rt.set_call_tramp(env.call_tramp);
-                Box::new(rt)
-            });
-            let prev = frt
-                .as_mut()
-                .map(|b| fiber_rt::set_current(&mut **b as *mut FiberRuntime));
-
-            let mut call = ChildCall {
-                env,
-                code: p.code,
-                sp: p.sp,
-                arg: p.arg,
-                ret: 0,
-            };
-            // SAFETY: `child_entry` honours the `Entry` ABI; `call` outlives the call; the guarded
-            // call nests cleanly. A guest fault unwinds back here and is reported as `MemoryFault`.
-            let faulted = mem::run_guarded_range(
-                child_entry as *const () as *const u8,
-                &mut call as *mut ChildCall as *const i64,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                env.fault_lo,
-                env.fault_hi,
-            );
-            if let Some(pr) = prev {
-                fiber_rt::set_current(pr);
-            }
+            let (result, trap, faulted) = self.run_child_inline(env, p.code, p.sp, p.arg);
 
             // The child's flattened extent and whether it unwound under the freeze.
             let child_sp = fiber_rt::read_shadow_sp(env.mem_base);
             let froze = !faulted && fiber_rt::window_is_unwinding(env.mem_base);
-
-            let (result, trap) = if faulted {
-                // SAFETY: live trap cell.
-                store_trap(env.trap_out, TrapKind::MemoryFault as i64);
-                (0, TrapKind::MemoryFault as i64)
-            } else {
-                let t = load_trap(env.trap_out);
-                (call.ret, t)
-            };
 
             // A child that unwound under the freeze records *itself* as residue (its continuation now
             // lives in its own region; extent = the live shadow-SP) and keeps its context (re-spawned
@@ -646,6 +659,84 @@ impl Domain {
             *st = Some((result, trap));
             p.done.cv.notify_all();
         }
+    }
+
+    /// Re-attach and run the spawned children a multi-vCPU freeze flattened (slice 3.3, thaw side),
+    /// **before** the root re-enters — the JIT's single-worker thaw. Mirrors the interp `drive` thaw
+    /// re-spawn: the root's `REWINDING` rewind *skips* its prologue `thread.spawn` (it reloads the
+    /// recorded handle), so a child that existed before the freeze point is reconstructed here, not by
+    /// the root. Each child (in ascending task = spawn order) is registered into the join table at its
+    /// own handle slot (`task − 1`, padding finished/joined slots so the root's reloaded handle still
+    /// resolves) and run inline under `REWINDING` from its restored shadow extent: it rewinds, flips to
+    /// `NORMAL`, runs forward to completion, and publishes its result — so the root's re-executed
+    /// `thread.join` (after its checkpoint) resolves immediately. Finally the active shadow-SP + state
+    /// word are set to the root's extent + `REWINDING` so the root rewinds from the right point.
+    ///
+    /// The children run *before* the root (rather than the interp's root-parks-on-join dispatch): a
+    /// thaw runs to completion with no re-snapshot, and the §12.6 equivalence holds because a
+    /// `REWINDING` vCPU **reloads** its recorded side effects (it never re-issues them), so the
+    /// serialization order doesn't change the result. Scope mirrors the interp's: flat root-spawned
+    /// children, no nested spawns, no child-owned fibers.
+    ///
+    /// # Safety
+    /// Called from `run_inner` after `set_env`, before the root's guarded call, on a durable thaw run;
+    /// the env's window / fault range / call-trampoline are the live run's, the reserve committed RW.
+    pub(crate) unsafe fn thaw_reattach_and_run(&self, seed: &[crate::FrozenVCpu], root_sp: u64) {
+        if seed.is_empty() {
+            return;
+        }
+        let env = self.env();
+        mem::install_guard();
+        let mut seed: Vec<&crate::FrozenVCpu> = seed.iter().collect();
+        seed.sort_by_key(|v| v.task);
+        for v in seed {
+            let slot = v.task.saturating_sub(1); // handle = task − 1 (flat root-spawned)
+            let sp = v.args.first().copied().unwrap_or(0) as u64;
+            let arg = v.args.get(1).copied().unwrap_or(0) as u64;
+            let done = std::sync::Arc::new(Done {
+                state: Mutex::new(None),
+                cv: Condvar::new(),
+            });
+            // Rebuild the join table sparsely: pad the gaps a finished/joined child left with inert
+            // (already-`Some`, `joined`) cells, so the guest's held handle still resolves to *this*
+            // child's cell at `slot`. `live` counts this child until it finishes just below.
+            {
+                let mut t = lock(&self.threads);
+                while t.cells.len() < slot {
+                    t.cells.push(std::sync::Arc::new(Done {
+                        state: Mutex::new(Some((0, 0))),
+                        cv: Condvar::new(),
+                    }));
+                    t.joined.push(true);
+                }
+                t.cells.push(std::sync::Arc::clone(&done));
+                t.joined.push(false);
+                t.live += 1;
+            }
+            // Resolve the child's entry and run it under REWINDING from its restored extent.
+            let entry = (env.fn_table_base as *const FnEntry).add(v.func as u32 as usize);
+            let code = (*entry).code();
+            fiber_rt::window_set_rewinding(env.mem_base);
+            fiber_rt::write_shadow_sp(env.mem_base, v.shadow_sp);
+            let (result, trap, _faulted) = self.run_child_inline(env, code, sp, arg);
+
+            // The child ran to completion (a basic thaw is not armed, so it doesn't re-freeze); free
+            // its context for a post-thaw spawn to reuse, and publish its result for the root's join.
+            if let Some(table) = self.fiber_table() {
+                table.free_vcpu_context(fiber_rt::shadow_context_of_sp(v.shadow_sp));
+            }
+            {
+                let mut t = lock(&self.threads);
+                t.live -= 1;
+            }
+            let mut st = lock(&done.state);
+            *st = Some((result, trap));
+            done.cv.notify_all();
+        }
+        // The root rewinds first on its re-entry: point the active shadow-SP at its restored extent and
+        // re-arm REWINDING (the last child flipped the word to NORMAL when its rewind completed).
+        fiber_rt::write_shadow_sp(env.mem_base, root_sp);
+        fiber_rt::window_set_rewinding(env.mem_base);
     }
 }
 

@@ -1,8 +1,8 @@
 # Durable Domains — Snapshot / Restore / Clone
 
 > **Status: Phases 1–2 landed + Phase 3.1 (single-fiber freeze/thaw) complete on the interpreter
-> + Phase 3.3 (JIT parity) complete single-vCPU and **multi-vCPU freeze side** (deferred single-worker
-> `thread.spawn` + `FrozenVCpu` residue); multi-vCPU JIT thaw side ahead.** This file is the single source of truth for the *design and
+> + Phase 3.3 (JIT parity) complete single-vCPU and **multi-vCPU freeze + thaw** (deferred single-worker
+> `thread.spawn` + `FrozenVCpu` residue + thaw re-attach).** This file is the single source of truth for the *design and
 > implementation status* of durable domains. Built so far: the `svm-durable` IR→IR transform
 > (arbitrary single-vCPU CFGs **+ the §12 fiber control ops**), the `svm-interp` handle-table
 > durability primitives (§12.5) **+ the per-fiber shadow-SP swap / freeze driver (D-fiber-cont
@@ -843,10 +843,18 @@ the interp's multi-worker `NORMAL`).
   `jit_freezes_a_spawned_vcpu_matching_interp`: a root+child domain freezes to a **byte-identical durable
   reserve** and a **field-identical `FrozenVCpu` residue** vs the interpreter (the multi-vCPU analog of
   `jit_freeze_driver_flattens_a_fiber_matching_interp`).
-- **PR-2 (thaw side):** runtime re-attach of frozen children before the root re-enters under
-  `REWINDING` (the root's rewind skips its prologue `thread.spawn`), rebuilding the join table — the
-  analog of the interp `drive` thaw re-spawn; pinned by an interp-frozen multi-vCPU artifact thawing on
-  the JIT to the uninterrupted result.
+- **PR-2 (thaw side) — DONE:** `Domain::thaw_reattach_and_run` re-attaches the frozen children **before**
+  the root re-enters under `REWINDING` (the root's rewind skips its prologue `thread.spawn`, reloading
+  the recorded handle), rebuilds the join table at each child's handle slot (`task − 1`, padding
+  finished/joined gaps), and runs each child inline from its restored extent (rewind → `NORMAL` → run
+  forward → publish its result so the root's re-executed `thread.join` resolves); the root's extent +
+  `REWINDING` are then restored for its re-entry. The freeze side exports the **root's extent** (`root_sp`,
+  separate because the shared active-SP word ends at the last child's). The children run *before* the root
+  (rather than the interp's root-parks-on-join dispatch); this is sound because a `REWINDING` vCPU
+  **reloads** its recorded side effects, so the serialization order can't change the result (§12.6).
+  Pinned by `durable_multivcpu_jit`'s `jit_thaws_its_own_multivcpu_freeze` (JIT freeze → JIT thaw on an
+  advanced clock reproduces the uninterrupted result — reloads, not re-issues) and
+  `interp_frozen_multivcpu_thaws_on_the_jit` (cross-backend: an interp-frozen domain thaws on the JIT).
 
 Scope mirrors the interp's: flat (root-spawned) children, no nested spawns, no child-owned fibers.
 

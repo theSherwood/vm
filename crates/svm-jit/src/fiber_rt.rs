@@ -106,6 +106,9 @@ const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
 const STATE_OFF: u64 = 0;
 /// State-word value meaning "freeze in progress" (must match `svm-interp`'s `STATE_UNWINDING`).
 const STATE_UNWINDING: i32 = 1;
+/// State-word value meaning "thaw in progress" — a restored vCPU rewinds from its shadow extent
+/// then flips to `NORMAL` and runs forward (must match `svm-interp`'s `STATE_REWINDING`).
+const STATE_REWINDING: i32 = 2;
 /// State-word value meaning "freeze armed" — the mid-run freeze trigger (must match
 /// `svm-interp`'s `STATE_ARMED`). On an armed durable run the runtime counts down
 /// [`ARM_COUNTDOWN_OFF`] at each fiber safepoint and promotes the word to `UNWINDING` at 0.
@@ -183,6 +186,22 @@ pub(crate) fn shadow_region_base(ctx: usize) -> u64 {
 /// `svm-interp`). # Safety: `mem_base` is a durable run's committed window base.
 pub(crate) unsafe fn window_is_durable_active(mem_base: u64) -> bool {
     *((mem_base + STATE_OFF) as *const i32) != 0
+}
+
+/// Set the durable state word to `REWINDING` — a thaw re-entry point (slice 3.3): a re-attached child
+/// (and the root) starts in `REWINDING` to rewind from its restored shadow extent, then the
+/// instrumented prologue flips the word to `NORMAL` and runs forward. # Safety: `mem_base` is a
+/// durable run's committed window base.
+pub(crate) unsafe fn window_set_rewinding(mem_base: u64) {
+    *((mem_base + STATE_OFF) as *mut i32) = STATE_REWINDING;
+}
+
+/// The durable vCPU shadow **context** a restored shadow-SP lives in — the inverse of
+/// [`shadow_region_base`] (`(sp − SHADOW_BASE) / SHADOW_STRIDE`, mirroring the interp's thaw). A thaw
+/// derives a re-attached child's context from its frozen extent so the occupancy is rebuilt without a
+/// separate record.
+pub(crate) fn shadow_context_of_sp(sp: u64) -> usize {
+    ((sp - SHADOW_BASE) / SHADOW_STRIDE) as usize
 }
 
 /// Whether the durable state word is `UNWINDING` (a freeze is in progress) — the entry path's gate

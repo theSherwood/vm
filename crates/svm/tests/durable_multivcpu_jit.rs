@@ -22,11 +22,15 @@
 
 use core::ffi::c_void;
 use svm_durable::{
-    init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
+    init_durable_window, transform_module_assume_confined, write_state, STATE_REWINDING,
+    STATE_UNWINDING,
 };
-use svm_interp::{run_capture_reserved_with_host, Host, Value, DURABLE_RESERVE};
+use svm_interp::{run_capture_reserved_with_host, Host, Value, DURABLE_RESERVE, SHADOW_BASE};
 use svm_ir::{Memory, Module};
-use svm_jit::{compile_and_run_capture_reserved_with_host_durable_mv, JitError, JitOutcome};
+use svm_jit::{
+    compile_and_run_capture_reserved_with_host_durable_mv, FrozenVCpu as JitVCpu, JitError,
+    JitOutcome,
+};
 
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -111,17 +115,20 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
     let clk = jhost.grant_clock();
     let mut jwin = init_durable_window(WINDOW);
     write_state(&mut jwin, STATE_UNWINDING);
-    let (jout, jsnap, jfibers, jvcpus) = match compile_and_run_capture_reserved_with_host_durable_mv(
-        &inst,
-        0,
-        &[clk as i64],
-        &jwin,
-        &[],
-        &[], // freeze: no seed
-        SIZE_LOG2,
-        svm_run::cap_thunk,
-        &mut jhost as *mut Host as *mut c_void,
-    ) {
+    let (jout, jsnap, jfibers, jvcpus, _jroot_sp) =
+        match compile_and_run_capture_reserved_with_host_durable_mv(
+            &inst,
+            0,
+            &[clk as i64],
+            &jwin,
+            &[],
+            &[],         // freeze: no fiber seed
+            &[],         // freeze: no vcpu seed
+            SHADOW_BASE, // freeze: root_sp unused
+            SIZE_LOG2,
+            svm_run::cap_thunk,
+            &mut jhost as *mut Host as *mut c_void,
+        ) {
         Ok(t) => t,
         Err(JitError::Unsupported(_)) => return,
         Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
@@ -153,4 +160,184 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
         jvcpus[0].shadow_sp, ifrozen[0].shadow_sp,
         "same flattened shadow-SP extent"
     );
+}
+
+/// The JIT **thaws** a multi-vCPU domain it froze: the spawned child is re-attached + run (rewinds
+/// from its restored extent, runs forward to completion), and the root re-enters under `REWINDING` and
+/// resolves its `thread.join`. Thawing on a host whose clock has *advanced* must reproduce the
+/// uninterrupted result — both vCPUs **reload** their saved clock reads (42, 43), they do not re-issue
+/// them (which would read the advanced clock) — the §12.6 freeze/thaw equivalence, multi-vCPU, on the JIT.
+#[test]
+fn jit_thaws_its_own_multivcpu_freeze() {
+    let inst = instrument();
+
+    // Uninterrupted baseline: clock 42 → reads {42, 43}; result = 42 + (43 + 10) = 95 (order-invariant).
+    let want = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut h,
+        );
+        r.expect("uninterrupted")
+    };
+    assert_eq!(want, vec![Value::I64(95)], "uninterrupted: 42 + (43 + 10)");
+
+    // JIT freeze (UNWINDING): capture the window image, the child residue, and the root's extent.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    fhost.clock_ns = 42;
+    let fclk = fhost.grant_clock();
+    let mut fwin = init_durable_window(WINDOW);
+    write_state(&mut fwin, STATE_UNWINDING);
+    let (fout, fsnap, _ff, fvcpus, froot_sp) =
+        match compile_and_run_capture_reserved_with_host_durable_mv(
+            &inst,
+            0,
+            &[fclk as i64],
+            &fwin,
+            &[],
+            &[],
+            &[],
+            SHADOW_BASE,
+            SIZE_LOG2,
+            svm_run::cap_thunk,
+            &mut fhost as *mut Host as *mut c_void,
+        ) {
+            Ok(t) => t,
+            Err(JitError::Unsupported(_)) => return,
+            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+            Err(e) => panic!("JIT freeze failed: {e:?}\n{inst:#?}"),
+        };
+    assert!(matches!(fout, JitOutcome::Returned(_)), "freeze placeholder");
+    assert_eq!(fvcpus.len(), 1, "the freeze captured the spawned child");
+    assert_eq!(
+        fhost.clock_ns, 44,
+        "the freeze ran both clock reads once (42, 43 → 44)"
+    );
+
+    // JIT thaw on a host whose clock has *advanced* to 44: re-attach the child + restore the root's
+    // extent, re-enter under REWINDING. Reload (42, 43) → 95; a re-issue would read {44, 45} → 99.
+    let mut twin = fsnap.clone();
+    write_state(&mut twin, STATE_REWINDING);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.clock_ns = 44;
+    let tclk = thost.grant_clock();
+    assert_eq!(tclk, fclk, "fresh host re-grants the same clock handle");
+    let (tout, _tsnap, _tf, tvcpus, _troot) =
+        match compile_and_run_capture_reserved_with_host_durable_mv(
+            &inst,
+            0,
+            &[tclk as i64],
+            &twin,
+            &[],
+            &[],        // no fibers
+            &fvcpus,    // re-attach the frozen child
+            froot_sp,   // restore the root's extent
+            SIZE_LOG2,
+            svm_run::cap_thunk,
+            &mut thost as *mut Host as *mut c_void,
+        ) {
+            Ok(t) => t,
+            Err(JitError::Unsupported(_)) => return,
+            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+            Err(e) => panic!("JIT thaw failed: {e:?}\n{inst:#?}"),
+        };
+    assert!(tvcpus.is_empty(), "a thaw re-freezes nothing");
+    match tout {
+        JitOutcome::Returned(rs) => assert_eq!(
+            rs,
+            vec![95],
+            "thawed two-vCPU domain reloads the saved clock reads (95), not re-issued ones (99)"
+        ),
+        other => panic!("thaw did not return cleanly: {other:?}"),
+    }
+}
+
+/// An **interpreter-frozen** multi-vCPU domain **thaws on the JIT** and reproduces the uninterrupted
+/// result — crossing the backend boundary. The interp's `FrozenVCpu` residue + root extent drive the
+/// JIT thaw directly (the residue is a portable host-side record), so the re-attached child reloads its
+/// saved clock read on the JIT just as it would on the interp.
+#[test]
+fn interp_frozen_multivcpu_thaws_on_the_jit() {
+    let inst = instrument();
+
+    // Interp freeze (UNWINDING): capture the window image, the child residue, and the root's extent.
+    let (ivcpus, iroot_sp, isnap) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut win = init_durable_window(WINDOW);
+        write_state(&mut win, STATE_UNWINDING);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        assert!(r.is_ok(), "interp freeze placeholder: {r:?}");
+        (
+            h.frozen_vcpus().to_vec(),
+            h.frozen_root_sp().expect("root extent recorded"),
+            snap,
+        )
+    };
+    assert_eq!(ivcpus.len(), 1, "interp captured the spawned child");
+
+    // Bridge the interp residue to the JIT (same fields), then thaw on the JIT with an advanced clock.
+    let seed: Vec<JitVCpu> = ivcpus
+        .iter()
+        .map(|v| JitVCpu {
+            task: v.task,
+            func: v.func,
+            args: v.args.clone(),
+            shadow_sp: v.shadow_sp,
+        })
+        .collect();
+    let mut twin = isnap.clone();
+    write_state(&mut twin, STATE_REWINDING);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.clock_ns = 44;
+    let tclk = thost.grant_clock();
+    let (tout, ..) = match compile_and_run_capture_reserved_with_host_durable_mv(
+        &inst,
+        0,
+        &[tclk as i64],
+        &twin,
+        &[],
+        &[],
+        &seed,
+        iroot_sp,
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut thost as *mut Host as *mut c_void,
+    ) {
+        Ok(t) => t,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => panic!("JIT thaw of interp freeze failed: {e:?}\n{inst:#?}"),
+    };
+    match tout {
+        JitOutcome::Returned(rs) => assert_eq!(
+            rs,
+            vec![95],
+            "interp-frozen multi-vCPU domain thaws on the JIT to the uninterrupted result (95)"
+        ),
+        other => panic!("cross-backend thaw did not return cleanly: {other:?}"),
+    }
 }
