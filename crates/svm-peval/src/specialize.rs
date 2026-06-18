@@ -1,4 +1,4 @@
-//! Stage 1–2 — the **first Futamura projection** over the IR (see `PEVAL.md`).
+//! Stage 1–2 — the **first Futamura projection** over the IR (see `DESIGN.md` §20c).
 //!
 //! [`specialize`] / [`specialize_with`] / [`specialize_with_config`] take a function (an
 //! *interpreter*) and a list of which parameters are **static** (a known constant at
@@ -34,27 +34,37 @@
 //!   be resolved abstractly (a dynamic address that might alias the region, a *narrow store of a
 //!   dynamic value* — which would need residual masking to read back — a partial-width overlap, a
 //!   call) returns [`SpecError::Unsupported`] rather than guessing.
-//! - The **context** threaded through the CFG is `(source block, the constant valuation of its
-//!   block parameters, the constant valuation of the live abstract-memory cells)`. One residual
-//!   block is generated per context and memoized, so distinct constants (e.g. the program
-//!   counter / stack pointer) drive loop unrolling, while repeated contexts reconnect — bounding
-//!   termination. Dynamic block parameters *and* dynamic memory cells become the residual block's
-//!   parameters; constant ones are baked in.
+//! - The **context** threaded through the CFG is `(call stack, the constant valuation of the live
+//!   abstract-memory cells)`, where each stack frame is `(source block, the constant valuation of
+//!   its live SSA values)` — a one-frame stack for a single function, deeper when calls are
+//!   CFG-inlined. One residual block is generated per context and memoized, so distinct constants
+//!   (e.g. the program counter / stack pointer) drive loop unrolling, while repeated contexts
+//!   reconnect — bounding termination. Dynamic SSA values (across every frame) *and* dynamic memory
+//!   cells become the residual block's parameters; constant ones are baked in.
 //!
 //! **Untrusted for escape** like the rest of the crate: the residual is meant to be
 //! re-verified before it runs. The differential harness (`tests/specialize.rs`) is the spec —
 //! the residual must equal the interpreter on the reference interpreter for every input.
 //!
 //! **Cross-function `call`.** A direct [`Inst::Call`] (and a [`Terminator::ReturnCall`] tail call)
-//! is **inlined at the call site** — the callee's CFG is symbolically executed in the *caller's*
-//! context, sharing the same abstract memory, so a callee that reads constant memory or touches the
-//! renamed operand stack folds exactly as inline code would. The call disappears; what's left is
-//! the callee's residual spliced into the caller. The callee is traced as a single straight-line
-//! path: its internal branches must resolve statically (static recursion unrolls, bounded by an
-//! inline-fuel budget). A callee whose control flow stays *dynamic* (a data-dependent branch that
-//! would need a residual branch inside the inlined body) returns [`SpecError::Unsupported`] rather
-//! than guessing — consistent with the rest of the engine. Indirect calls (`call_indirect`,
-//! `return_call_indirect`) and host/capability calls are not inlined.
+//! is **inlined at the call site** — the callee is symbolically executed in the *caller's* context,
+//! sharing the same abstract memory, so a callee that reads constant memory or touches the renamed
+//! operand stack folds exactly as inline code would. The call disappears; the callee's residual is
+//! spliced into the caller. Two paths, picked automatically:
+//!
+//! - **Straight-line (the fast path).** A callee whose control flow resolves statically is traced
+//!   into the caller's current residual block (static recursion unrolls, bounded by an inline-fuel
+//!   budget). No new blocks; the result flows on inline.
+//! - **CFG inlining (dynamic control flow).** When tracing hits a branch that stays *dynamic* (a
+//!   data-dependent branch that must survive as a residual branch), the engine instead inlines the
+//!   callee's CFG as residual blocks: the symbolic-execution **context becomes a call stack** of
+//!   frames `(func, block, params)`, the caller's live values are threaded through the callee as
+//!   block parameters (dead ones are cleaned up by the optimizer), and each callee `return` becomes
+//!   a branch to the caller's continuation. Recursion + dynamic control flow, loops in the callee,
+//!   and `unreachable` callee paths all work; one residual function still comes out.
+//!
+//! Indirect calls (`call_indirect`, `return_call_indirect`) and host/capability calls are not
+//! inlined.
 //!
 //! **Scope.** Integer / const / load / store / branch ops are specialized (folded where the
 //! operands are constant). Other **pure, single-result** value ops — float and SIMD arithmetic,
@@ -67,6 +77,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use svm_ir::{ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType};
+use svm_verify::func_value_types;
 
 use crate::{fold_int_bin, fold_int_cmp, fold_int_un, Known};
 
@@ -103,18 +114,62 @@ enum Abs {
     Dyn(u32),
 }
 
-/// The constant valuation of one threaded lane (a block parameter or a memory cell): `Some` for a
-/// baked-in constant, `None` for a dynamic value carried as a residual block parameter.
+/// The constant valuation of a frame's threaded SSA values (block params, then any further values
+/// captured when the frame is suspended at a call): `Some` for a baked-in constant, `None` for a
+/// dynamic value carried as a residual block parameter.
 type ParamPattern = Vec<Option<Known>>;
 /// Live abstract-memory cells at a program point, sorted by address: `(addr, width, value)`.
 type MemPattern = Vec<(u64, u32, Option<Known>)>;
 
-/// One residual block still to be generated: a source block plus the constant valuation of the
-/// state threaded into it (parameters, then memory cells).
+/// One activation in the symbolic call stack: a position in a source function plus the constant
+/// valuation of its live SSA values. `ip` is the instruction index to resume at — `0` for a
+/// freshly-entered block (where `env` is exactly the block's parameters), or, for a frame suspended
+/// at a [`Inst::Call`] that needed CFG inlining, the index just after the call (where `env` has been
+/// extended with the call's results before the frame resumes).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Frame {
+    func: u32,
+    block: u32,
+    ip: usize,
+    env: ParamPattern,
+}
+
+/// One residual block still to be generated: the symbolic call stack (innermost/active frame last)
+/// plus the abstract memory threaded into it. The full context is the memoization key.
 struct Task {
-    src_block: u32,
-    params: ParamPattern,
+    frames: Vec<Frame>,
     mem: MemPattern,
+}
+
+/// A frame with its SSA values resolved to concrete abstract values (constants or residual SSA
+/// indices) — the working form while a residual block is built, and the input to [`Spec::branch_to`].
+#[derive(Clone)]
+struct FrameAbs {
+    func: u32,
+    block: u32,
+    ip: usize,
+    env: Vec<Abs>,
+}
+
+/// What executing the active frame's straight-line body produced.
+enum Exec {
+    /// Ran to the terminator with `env` fully populated.
+    Done,
+    /// Hit a call needing CFG inlining: suspend the active frame here and enter the callee.
+    Suspend {
+        callee: u32,
+        args: Vec<Abs>,
+        resume_ip: usize,
+    },
+}
+
+/// The error channel for the straight-line inliner: distinguishes "this callee needs CFG inlining"
+/// (a control-flow decision, recoverable by the caller) from a genuine [`SpecError`].
+enum InlineErr {
+    /// The callee's control flow stayed dynamic — fall back to CFG inlining.
+    NeedsCfg,
+    /// A real failure (unsupported op/access, or budget exhausted).
+    Spec(SpecError),
 }
 
 /// The default ceiling on residual blocks before we declare likely divergence.
@@ -207,15 +262,30 @@ pub fn specialize_with_config(
         }
     }
 
+    let has_memory = module.memory.is_some();
+    let value_types = module
+        .funcs
+        .iter()
+        .map(|f| func_value_types(f, &module.funcs, has_memory))
+        .collect();
     let mut spec = Spec {
         module,
-        f,
         config,
+        value_types,
         memo: HashMap::new(),
         queue: VecDeque::new(),
         next_id: 0,
     };
-    spec.intern(0, params, Vec::new());
+    // The entry context is a single frame: the function being specialized, at its entry block.
+    spec.intern(
+        vec![Frame {
+            func,
+            block: 0,
+            ip: 0,
+            env: params,
+        }],
+        Vec::new(),
+    );
 
     let mut blocks = Vec::new();
     while let Some(task) = spec.queue.pop_front() {
@@ -241,11 +311,13 @@ pub fn specialize_with_config(
 
 struct Spec<'a> {
     module: &'a Module,
-    f: &'a Func,
     config: &'a SpecConfig,
-    /// `(source block, param pattern, memory pattern) → residual block id`. The memo that makes
-    /// the loop terminate and that closes residual loops.
-    memo: HashMap<(u32, ParamPattern, MemPattern), u32>,
+    /// Per-function, per-block, per-value source types (`value_types[func][block][value_idx]`) —
+    /// used to type the SSA values threaded into a residual block as block parameters.
+    value_types: Vec<Vec<Vec<ValType>>>,
+    /// `(call stack, memory pattern) → residual block id`. The memo that makes the loop terminate
+    /// and that closes residual loops.
+    memo: HashMap<(Vec<Frame>, MemPattern), u32>,
     queue: VecDeque<Task>,
     next_id: u32,
 }
@@ -254,41 +326,51 @@ impl Spec<'_> {
     /// Get (or create) the residual block id for a context, enqueuing it the first time it is
     /// seen. Ids are assigned in enqueue order and blocks are produced in that same (FIFO) order,
     /// so id == position in the output `blocks`.
-    fn intern(&mut self, src_block: u32, params: ParamPattern, mem: MemPattern) -> u32 {
-        let key = (src_block, params, mem);
+    fn intern(&mut self, frames: Vec<Frame>, mem: MemPattern) -> u32 {
+        let key = (frames, mem);
         if let Some(&id) = self.memo.get(&key) {
             return id;
         }
         let id = self.next_id;
         self.next_id += 1;
         self.queue.push_back(Task {
-            src_block: key.0,
-            params: key.1.clone(),
-            mem: key.2.clone(),
+            frames: key.0.clone(),
+            mem: key.1.clone(),
         });
         self.memo.insert(key, id);
         id
     }
 
     fn build_block(&mut self, task: Task) -> Result<svm_ir::Block, SpecError> {
-        let f = self.f;
-        let src = &f.blocks[task.src_block as usize];
+        let module = self.module;
 
-        // Reconstruct the threaded state. Dynamic lanes become residual block parameters in a
-        // canonical order: the dynamic block parameters first, then the dynamic memory cells (by
-        // address). Constant lanes are baked back in.
-        let mut env: Vec<Abs> = Vec::with_capacity(src.params.len());
+        // Reconstruct every frame's env and the memory cells from the context, assigning a fresh
+        // residual block parameter to each dynamic lane. The canonical order — frames outermost→
+        // innermost, each frame's dynamic env slots in order, then dynamic memory cells by address —
+        // is shared with `branch_to`, so a successor passes its arguments in exactly the order this
+        // block declares its parameters. Constant lanes are baked back in.
         let mut params: Vec<ValType> = Vec::new();
         let mut rnext: u32 = 0;
-        for (i, slot) in task.params.iter().enumerate() {
-            match slot {
-                Some(k) => env.push(Abs::Const(*k)),
-                None => {
-                    env.push(Abs::Dyn(rnext));
-                    rnext += 1;
-                    params.push(src.params[i]);
+        let mut frames: Vec<FrameAbs> = Vec::with_capacity(task.frames.len());
+        for fr in &task.frames {
+            let types = &self.value_types[fr.func as usize][fr.block as usize];
+            let mut env = Vec::with_capacity(fr.env.len());
+            for (i, slot) in fr.env.iter().enumerate() {
+                match slot {
+                    Some(k) => env.push(Abs::Const(*k)),
+                    None => {
+                        env.push(Abs::Dyn(rnext));
+                        rnext += 1;
+                        params.push(types[i]);
+                    }
                 }
             }
+            frames.push(FrameAbs {
+                func: fr.func,
+                block: fr.block,
+                ip: fr.ip,
+                env,
+            });
         }
         let mut mem: BTreeMap<u64, (u32, Abs)> = BTreeMap::new();
         for &(addr, width, slot) in &task.mem {
@@ -304,13 +386,52 @@ impl Spec<'_> {
             }
         }
 
-        // Symbolically execute the body. `fuel` bounds any call inlining within this block.
+        // Execute the active (innermost) frame's block from its resume point. `fuel` bounds any
+        // straight-line call inlining within this block.
+        let active = frames.pop().expect("a context has at least one frame");
+        let src = &module.funcs[active.func as usize].blocks[active.block as usize];
+        let mut env = active.env;
         let mut out: Vec<Inst> = Vec::new();
         let mut fuel = INLINE_FUEL;
-        self.exec_insts(
-            &src.insts, &mut env, &mut mem, &mut out, &mut rnext, &mut fuel,
+        let exec = self.exec_insts(
+            &src.insts, active.ip, &mut env, &mut mem, &mut out, &mut rnext, &mut fuel,
         )?;
-        let term = self.eval_term(&src.term, &env, &mut mem, &mut out, &mut rnext, &mut fuel)?;
+
+        let term = match exec {
+            // A call needs CFG inlining: suspend the active frame (env captured, resume just past
+            // the call) and branch to the callee's entry. The caller's live values ride along as
+            // this edge's arguments and reappear, threaded, until the callee returns.
+            Exec::Suspend {
+                callee,
+                args,
+                resume_ip,
+            } => {
+                frames.push(FrameAbs {
+                    func: active.func,
+                    block: active.block,
+                    ip: resume_ip,
+                    env,
+                });
+                frames.push(FrameAbs {
+                    func: callee,
+                    block: 0,
+                    ip: 0,
+                    env: args,
+                });
+                let (target, args) = self.branch_to(&frames, &mem);
+                Terminator::Br { target, args }
+            }
+            Exec::Done => self.finish_term(
+                &src.term,
+                frames,
+                active.func,
+                &env,
+                &mut mem,
+                &mut out,
+                &mut rnext,
+                &mut fuel,
+            )?,
+        };
 
         Ok(svm_ir::Block {
             params,
@@ -319,74 +440,115 @@ impl Spec<'_> {
         })
     }
 
-    /// Symbolically execute a straight-line instruction sequence, pushing each instruction's
-    /// abstract result(s) onto `env`. A direct [`Inst::Call`] is inlined here (it may append 0, 1,
-    /// or many results); everything else goes through [`Self::eval_inst`] (one or no result).
-    /// `fuel` is the shared inline budget (a nested call draws from the same pool as its caller).
+    /// Execute the active block's straight-line body from `start_ip`, pushing each instruction's
+    /// abstract result(s) onto `env`. A direct [`Inst::Call`] is first attempted as a straight-line
+    /// inline; if that callee needs CFG inlining, execution stops with [`Exec::Suspend`] so
+    /// [`Self::build_block`] can split the block at the call. Other instructions go through
+    /// [`Self::eval_inst`].
+    #[allow(clippy::too_many_arguments)]
     fn exec_insts(
         &self,
         insts: &[Inst],
+        start_ip: usize,
         env: &mut Vec<Abs>,
         mem: &mut BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
         rnext: &mut u32,
         fuel: &mut usize,
-    ) -> Result<(), SpecError> {
-        for inst in insts {
+    ) -> Result<Exec, SpecError> {
+        for (k, inst) in insts.iter().enumerate().skip(start_ip) {
             if let Inst::Call { func, args } = inst {
-                let results = self.inline_call(*func, args, env, mem, out, rnext, fuel)?;
-                env.extend(results);
+                let args_abs: Vec<Abs> = args.iter().map(|&a| env[a as usize]).collect();
+                match self.try_straightline(*func, &args_abs, mem, out, rnext, fuel)? {
+                    Some(results) => env.extend(results),
+                    None => {
+                        return Ok(Exec::Suspend {
+                            callee: *func,
+                            args: args_abs,
+                            resume_ip: k + 1,
+                        })
+                    }
+                }
             } else if let Some(res) = self.eval_inst(inst, env, mem, out, rnext)? {
                 env.push(res);
             }
         }
-        Ok(())
+        Ok(Exec::Done)
     }
 
-    /// Inline a direct call: symbolically execute callee `func`'s CFG in the *caller's* context,
-    /// returning the abstract values of its results. The callee shares the live abstract memory
-    /// (`mem`) and the residual stream (`out`/`rnext`), so a callee that folds constant memory or
-    /// touches the renamed operand stack behaves exactly as if its body were written inline.
-    ///
-    /// The callee is traced as a single straight-line path: every internal branch must resolve to
-    /// one successor under the current static context (static recursion therefore unrolls, bounded
-    /// by `fuel` — shared across nested inlines so it also caps recursion depth). A branch that
-    /// stays dynamic — one that would need a residual branch *inside* the inlined body — returns
-    /// [`SpecError::Unsupported`]; a callee tail call (`return_call`) is itself inlined.
-    #[allow(clippy::too_many_arguments)]
-    fn inline_call(
+    /// Attempt to inline a direct call as straight-line code into the current residual block. On
+    /// success returns the callee's result values (the emissions are kept). If the callee's control
+    /// flow stays dynamic, every emission/memory effect is rolled back and `None` is returned, so
+    /// the caller falls back to CFG inlining. A real failure surfaces as [`SpecError`].
+    fn try_straightline(
         &self,
-        func: u32,
-        arg_idxs: &[u32],
-        env: &[Abs],
+        callee: u32,
+        args_abs: &[Abs],
         mem: &mut BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
         rnext: &mut u32,
         fuel: &mut usize,
-    ) -> Result<Vec<Abs>, SpecError> {
+    ) -> Result<Option<Vec<Abs>>, SpecError> {
+        let saved_len = out.len();
+        let saved_rnext = *rnext;
+        let saved_mem = mem.clone();
+        match self.inline_call(callee, args_abs, mem, out, rnext, fuel) {
+            Ok(results) => Ok(Some(results)),
+            Err(InlineErr::NeedsCfg) => {
+                out.truncate(saved_len);
+                *rnext = saved_rnext;
+                *mem = saved_mem;
+                Ok(None)
+            }
+            Err(InlineErr::Spec(e)) => Err(e),
+        }
+    }
+
+    /// Inline a direct call as a single straight-line trace into the *caller's* context, sharing the
+    /// live abstract memory (`mem`) and residual stream (`out`/`rnext`) — so a callee that folds
+    /// constant memory or touches the renamed operand stack behaves as if written inline. Static
+    /// recursion unrolls (bounded by `fuel`, shared across nested inlines so it also caps recursion
+    /// depth). Returns [`InlineErr::NeedsCfg`] the moment control flow stays dynamic (a dynamic
+    /// branch, or an `unreachable` path that needs to become a real terminator), so the caller can
+    /// fall back to CFG inlining; a callee tail call is itself inlined.
+    fn inline_call(
+        &self,
+        func: u32,
+        args_abs: &[Abs],
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+        fuel: &mut usize,
+    ) -> Result<Vec<Abs>, InlineErr> {
         let g = self
             .module
             .funcs
             .get(func as usize)
-            .ok_or(SpecError::BadFunc)?;
-        // The callee entry block's parameters are the call arguments (mapped into the caller's env).
-        let mut cur_args: Vec<Abs> = arg_idxs.iter().map(|&a| env[a as usize]).collect();
+            .ok_or(InlineErr::Spec(SpecError::BadFunc))?;
+        let mut cur_args: Vec<Abs> = args_abs.to_vec();
         let mut block_idx = 0u32;
         loop {
-            *fuel = fuel.checked_sub(1).ok_or(SpecError::Budget)?;
-            let blk = g.blocks.get(block_idx as usize).ok_or(SpecError::BadFunc)?;
+            *fuel = fuel
+                .checked_sub(1)
+                .ok_or(InlineErr::Spec(SpecError::Budget))?;
+            let blk = g
+                .blocks
+                .get(block_idx as usize)
+                .ok_or(InlineErr::Spec(SpecError::BadFunc))?;
             // Seed this block's local env with its incoming parameter values, then run the body.
             let mut genv = cur_args;
-            self.exec_insts(&blk.insts, &mut genv, mem, out, rnext, fuel)?;
+            self.exec_insts_sl(&blk.insts, &mut genv, mem, out, rnext, fuel)?;
             match &blk.term {
                 Terminator::Return(vals) => {
                     return Ok(vals.iter().map(|&v| genv[v as usize]).collect());
                 }
                 // A callee tail call: its results are the callee's results, so inline and forward.
                 Terminator::ReturnCall { func, args } => {
-                    return self.inline_call(*func, args, &genv, mem, out, rnext, fuel);
+                    let a: Vec<Abs> = args.iter().map(|&x| genv[x as usize]).collect();
+                    return self.inline_call(*func, &a, mem, out, rnext, fuel);
                 }
-                // Intra-callee control flow must resolve to a single successor (straight-line trace).
+                // Intra-callee control flow must resolve to a single successor (straight-line trace);
+                // a dynamic branch hands off to CFG inlining.
                 Terminator::Br { target, args } => {
                     cur_args = args.iter().map(|&a| genv[a as usize]).collect();
                     block_idx = *target;
@@ -399,8 +561,10 @@ impl Spec<'_> {
                     else_args,
                 } => {
                     let c = match genv[*cond as usize] {
-                        Abs::Const(c) => c.as_i32().ok_or(SpecError::Unsupported)?,
-                        Abs::Dyn(_) => return Err(SpecError::Unsupported),
+                        Abs::Const(c) => {
+                            c.as_i32().ok_or(InlineErr::Spec(SpecError::Unsupported))?
+                        }
+                        Abs::Dyn(_) => return Err(InlineErr::NeedsCfg),
                     };
                     let (blk, args) = if c != 0 {
                         (*then_blk, then_args)
@@ -416,19 +580,51 @@ impl Spec<'_> {
                     default,
                 } => {
                     let i = match genv[*idx as usize] {
-                        Abs::Const(c) => c.as_i32().ok_or(SpecError::Unsupported)? as u32 as usize,
-                        Abs::Dyn(_) => return Err(SpecError::Unsupported),
+                        Abs::Const(c) => {
+                            c.as_i32().ok_or(InlineErr::Spec(SpecError::Unsupported))? as u32
+                                as usize
+                        }
+                        Abs::Dyn(_) => return Err(InlineErr::NeedsCfg),
                     };
                     let (blk, args) = targets.get(i).unwrap_or(default);
                     cur_args = args.iter().map(|&a| genv[a as usize]).collect();
                     block_idx = *blk;
                 }
-                // An indirect tail call or an unreachable callee path is not inlined.
-                Terminator::ReturnCallIndirect { .. } | Terminator::Unreachable => {
-                    return Err(SpecError::Unsupported)
+                // An `unreachable` callee path must become a real residual terminator — only the CFG
+                // path can emit one — so hand off. An indirect tail call is not inlined at all.
+                Terminator::Unreachable => return Err(InlineErr::NeedsCfg),
+                Terminator::ReturnCallIndirect { .. } => {
+                    return Err(InlineErr::Spec(SpecError::Unsupported))
                 }
             }
         }
+    }
+
+    /// Straight-line instruction executor used while tracing an inlined callee: like
+    /// [`Self::exec_insts`] but a nested call must also stay straight-line (its
+    /// [`InlineErr::NeedsCfg`] propagates so the whole attempt rolls back to the outermost call).
+    fn exec_insts_sl(
+        &self,
+        insts: &[Inst],
+        env: &mut Vec<Abs>,
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+        fuel: &mut usize,
+    ) -> Result<(), InlineErr> {
+        for inst in insts {
+            if let Inst::Call { func, args } = inst {
+                let a: Vec<Abs> = args.iter().map(|&x| env[x as usize]).collect();
+                let results = self.inline_call(*func, &a, mem, out, rnext, fuel)?;
+                env.extend(results);
+            } else if let Some(res) = self
+                .eval_inst(inst, env, mem, out, rnext)
+                .map_err(InlineErr::Spec)?
+            {
+                env.push(res);
+            }
+        }
+        Ok(())
     }
 
     /// Abstractly evaluate one instruction. Returns the abstract value of its result (`None` for a
@@ -705,9 +901,17 @@ impl Spec<'_> {
         Ok(None)
     }
 
-    fn eval_term(
+    /// Evaluate the active frame's terminator, given the suspended caller frames (`outer`) and the
+    /// active function. A branch stays within the active frame (replacing it with its target); a
+    /// `return` pops the active frame and either ends the residual function or resumes the caller; a
+    /// `return_call` is straight-line-inlined or, failing that, replaces the active frame (a tail
+    /// call keeps the same return continuation).
+    #[allow(clippy::too_many_arguments)]
+    fn finish_term(
         &mut self,
         term: &Terminator,
+        outer: Vec<FrameAbs>,
+        func: u32,
         env: &[Abs],
         mem: &mut BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
@@ -716,14 +920,12 @@ impl Spec<'_> {
     ) -> Result<Terminator, SpecError> {
         Ok(match term {
             Terminator::Return(vals) => {
-                let vals = vals
-                    .iter()
-                    .map(|v| materialize(env[*v as usize], out, rnext))
-                    .collect();
-                Terminator::Return(vals)
+                let results: Vec<Abs> = vals.iter().map(|&v| env[v as usize]).collect();
+                self.return_from(outer, &results, mem, out, rnext)
             }
             Terminator::Br { target, args } => {
-                let (target, args) = self.branch_to(*target, args, env, mem);
+                let stack = succ_stack(&outer, func, *target, args, env);
+                let (target, args) = self.branch_to(&stack, mem);
                 Terminator::Br { target, args }
             }
             Terminator::BrIf {
@@ -741,13 +943,16 @@ impl Spec<'_> {
                     } else {
                         (*else_blk, else_args)
                     };
-                    let (target, args) = self.branch_to(blk, args, env, mem);
+                    let stack = succ_stack(&outer, func, blk, args, env);
+                    let (target, args) = self.branch_to(&stack, mem);
                     Terminator::Br { target, args }
                 }
                 // Dynamic condition: specialize both successors and keep the branch.
                 Abs::Dyn(cond) => {
-                    let (then_blk, then_args) = self.branch_to(*then_blk, then_args, env, mem);
-                    let (else_blk, else_args) = self.branch_to(*else_blk, else_args, env, mem);
+                    let then_stack = succ_stack(&outer, func, *then_blk, then_args, env);
+                    let (then_blk, then_args) = self.branch_to(&then_stack, mem);
+                    let else_stack = succ_stack(&outer, func, *else_blk, else_args, env);
+                    let (else_blk, else_args) = self.branch_to(&else_stack, mem);
                     Terminator::BrIf {
                         cond,
                         then_blk,
@@ -765,15 +970,20 @@ impl Spec<'_> {
                 Abs::Const(c) => {
                     let i = c.as_i32().ok_or(SpecError::Unsupported)? as u32 as usize;
                     let (blk, args) = targets.get(i).unwrap_or(default);
-                    let (target, args) = self.branch_to(*blk, args, env, mem);
+                    let stack = succ_stack(&outer, func, *blk, args, env);
+                    let (target, args) = self.branch_to(&stack, mem);
                     Terminator::Br { target, args }
                 }
                 Abs::Dyn(idx) => {
                     let targets = targets
                         .iter()
-                        .map(|(blk, args)| self.branch_to(*blk, args, env, mem))
+                        .map(|(blk, args)| {
+                            let stack = succ_stack(&outer, func, *blk, args, env);
+                            self.branch_to(&stack, mem)
+                        })
                         .collect();
-                    let default = self.branch_to(default.0, &default.1, env, mem);
+                    let default_stack = succ_stack(&outer, func, default.0, &default.1, env);
+                    let default = self.branch_to(&default_stack, mem);
                     Terminator::BrTable {
                         idx,
                         targets,
@@ -782,41 +992,86 @@ impl Spec<'_> {
                 }
             },
             Terminator::Unreachable => Terminator::Unreachable,
-            // A direct tail call: inline the callee and turn its results into this function's
-            // return (the residual is a plain function, so the tail call becomes a `return`).
-            Terminator::ReturnCall { func, args } => {
-                let results = self.inline_call(*func, args, env, mem, out, rnext, fuel)?;
+            // A direct tail call: straight-line-inline if we can, else replace the active frame with
+            // the callee, keeping this frame's return continuation (the suspended callers).
+            Terminator::ReturnCall { func: callee, args } => {
+                let args_abs: Vec<Abs> = args.iter().map(|&a| env[a as usize]).collect();
+                match self.try_straightline(*callee, &args_abs, mem, out, rnext, fuel)? {
+                    Some(results) => self.return_from(outer, &results, mem, out, rnext),
+                    None => {
+                        let mut stack = outer;
+                        stack.push(FrameAbs {
+                            func: *callee,
+                            block: 0,
+                            ip: 0,
+                            env: args_abs,
+                        });
+                        let (target, args) = self.branch_to(&stack, mem);
+                        Terminator::Br { target, args }
+                    }
+                }
+            }
+            Terminator::ReturnCallIndirect { .. } => return Err(SpecError::Unsupported),
+        })
+    }
+
+    /// Return `results` from the active frame: end the residual function if no caller is suspended,
+    /// otherwise resume the innermost caller — its env gains the call's results and it continues from
+    /// the instruction after the call (a branch to that continuation context).
+    fn return_from(
+        &mut self,
+        mut outer: Vec<FrameAbs>,
+        results: &[Abs],
+        mem: &BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Terminator {
+        match outer.pop() {
+            None => {
                 let vals = results
                     .iter()
                     .map(|&a| materialize(a, out, rnext))
                     .collect();
                 Terminator::Return(vals)
             }
-            Terminator::ReturnCallIndirect { .. } => return Err(SpecError::Unsupported),
-        })
+            Some(mut caller) => {
+                caller.env.extend_from_slice(results);
+                outer.push(caller);
+                let (target, args) = self.branch_to(&outer, mem);
+                Terminator::Br { target, args }
+            }
+        }
     }
 
-    /// Resolve one outgoing edge. The successor inherits the current abstract memory (memory
-    /// persists across the branch). Constant lanes — block-argument constants and constant memory
-    /// cells — join the context; dynamic lanes are passed as residual block arguments, in the
-    /// canonical order (dynamic parameters first, then dynamic memory cells by address).
+    /// Resolve one outgoing edge into a residual block id + dynamic arguments. The successor inherits
+    /// the full call stack and the current abstract memory; constant lanes join the context, dynamic
+    /// lanes are passed as residual block arguments in the canonical order (frames outermost→
+    /// innermost, each frame's dynamic env slots in order, then dynamic memory cells by address —
+    /// matching [`Self::build_block`]'s parameter declaration).
     fn branch_to(
         &mut self,
-        target: u32,
-        args: &[u32],
-        env: &[Abs],
+        stack: &[FrameAbs],
         mem: &BTreeMap<u64, (u32, Abs)>,
     ) -> (u32, Vec<u32>) {
-        let mut params = Vec::with_capacity(args.len());
+        let mut frames = Vec::with_capacity(stack.len());
         let mut dyn_args = Vec::new();
-        for &a in args {
-            match env[a as usize] {
-                Abs::Const(k) => params.push(Some(k)),
-                Abs::Dyn(i) => {
-                    params.push(None);
-                    dyn_args.push(i);
+        for fr in stack {
+            let mut env = Vec::with_capacity(fr.env.len());
+            for &a in &fr.env {
+                match a {
+                    Abs::Const(k) => env.push(Some(k)),
+                    Abs::Dyn(i) => {
+                        env.push(None);
+                        dyn_args.push(i);
+                    }
                 }
             }
+            frames.push(Frame {
+                func: fr.func,
+                block: fr.block,
+                ip: fr.ip,
+                env,
+            });
         }
         let mut mem_pat = Vec::with_capacity(mem.len());
         for (&addr, &(width, val)) in mem.iter() {
@@ -828,9 +1083,30 @@ impl Spec<'_> {
                 }
             }
         }
-        let id = self.intern(target, params, mem_pat);
+        let id = self.intern(frames, mem_pat);
         (id, dyn_args)
     }
+}
+
+/// Build the successor call stack for an intra-function branch: the suspended `outer` frames
+/// unchanged, with a fresh active frame entering `block` of `func` whose env is the edge's `args`
+/// mapped through the current `env`.
+fn succ_stack(
+    outer: &[FrameAbs],
+    func: u32,
+    block: u32,
+    args: &[u32],
+    env: &[Abs],
+) -> Vec<FrameAbs> {
+    let mut stack = outer.to_vec();
+    let tenv = args.iter().map(|&a| env[a as usize]).collect();
+    stack.push(FrameAbs {
+        func,
+        block,
+        ip: 0,
+        env: tenv,
+    });
+    stack
 }
 
 /// Emit a pure, single-result value op faithfully into the residual: materialize each operand

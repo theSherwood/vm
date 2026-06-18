@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! `svm-peval` — the partial-evaluation / Futamura on-ramp (see `PEVAL.md`).
+//! `svm-peval` — the partial-evaluation / Futamura on-ramp (see `DESIGN.md` §20c).
 //!
 //! Two layers:
 //!

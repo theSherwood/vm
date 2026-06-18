@@ -2000,9 +2000,11 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
 - **Engine — online polyvariant symbolic execution** (weval's shape). Each SSA value is
   abstractly a constant or a residual value; pure integer ops with constant operands fold
   (matching the interpreter's arithmetic exactly), the rest is emitted into the residual. The
-  **context** threaded through the CFG is `(block, constant valuation of its block params +
-  live abstract-memory cells)`; one residual block per context, memoized — so a constant PC
-  drives loop unrolling and repeated contexts reconnect (bounded by a block budget).
+  **context** threaded through the CFG is `(call stack, constant valuation of the live
+  abstract-memory cells)` — each frame `(block, constant valuation of its live SSA values)`, one
+  frame for a single function and deeper when calls are CFG-inlined; one residual block per
+  context, memoized — so a constant PC drives loop unrolling and repeated contexts reconnect
+  (bounded by a block budget).
   - **Constant memory** is a *caller contract*, not a runtime-enforced invariant: a load from a
     caller-declared-constant address folds to those bytes (a readonly data segment by default,
     or an arbitrary region / explicit overlay via `SpecConfig`). A false promise is a miscompile,
@@ -2011,6 +2013,12 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
     interpreter's operand stack/locals) is modeled as abstract memory — its constant-address
     full-width stores/loads are lifted into SSA and elided, so the in-memory stack vanishes from
     the residual. `rename_is_private` additionally lets a pointer-addressed heap coexist with it.
+  - **Cross-function `call` is inlined at the call site.** A static-control-flow callee is traced
+    straight-line into the caller's block (static recursion unrolls); a callee whose control flow
+    stays dynamic has its **CFG inlined as residual blocks** — the context's call stack carries the
+    caller's live values through the callee (dead ones cleaned by the optimizer) and each `return`
+    becomes a branch to the continuation. Loops and `unreachable` in the callee work; one residual
+    function still comes out. (Indirect/host calls are not inlined.)
   - **CFG cleanup** (shared with the generic optimizer): constant folding, branch resolution,
     dead-block / dead-value elimination, block merging, dead block-param elimination — so
     residuals come out as tight straight-line/looped code, not `br`-chains.
@@ -2025,9 +2033,12 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
   end-to-end software-interpreted → compiled-native path is **~470×**. Lean-ISA dispatch-overhead
   fraction, not a universal constant — a heavier decode shows more.
 - **Coverage today:** integer/long/float/SIMD arithmetic, casts, comparisons, static + dynamic
-  branches, any-width constant-memory reads, word-width renamed stack/locals, and a dynamic heap.
-  **Open (tracked in `PEVAL.md`):** cross-function `call` specialization, narrow (`i8`/`i16`)
-  renamed cells, and float/SIMD *constant folding* (they pass through unfolded today).
+  branches, any-width constant-memory reads, renamed stack/locals (word **and** narrow `i8`/`i16`
+  cells, with a dynamic heap alongside), and cross-function `call` inlining (static + dynamic
+  control flow, recursion, loops). **Remaining enhancements (not gaps):** float/SIMD *constant
+  folding* (they pass through unfolded, deliberately — NaN/rounding fidelity), and the guest-side
+  engine (ship the specializer inside the sandbox on the §22 `Jit` capability for dynamic-language
+  IC-style recompilation; the residual IR and back half are shared).
 
 ---
 
