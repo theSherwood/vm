@@ -583,8 +583,7 @@ Notes:
 - **transcendentals/libm**: prefer a **guest** `libm` (the demo or a bundled header supplies
   `sqrt`/`sin`/… as guest code) over any host math capability — keeps math in the sandbox. `sqrt`
   already lowers to the SVM op (slice F); `sin`/`cos`/`exp`/`pow` need guest implementations.
-- **`argc`/`argv`**: needs a powerbox/runner change (pass argv to `_start`), not just the frontend —
-  schedule alongside a CLI-style demo once the above land.
+- **`argc`/`argv`**: **DONE** — see *Slice BE* below. (`envp`/`environ`/`getenv` is still deferred.)
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
@@ -620,6 +619,28 @@ checked byte-for-byte vs native `printf`).**
   alone needs > 64 bits for small magnitudes), which an `f64`-arithmetic approximation cannot give
   without silently breaking the on-ramp's byte-exact contract. Deferred to a bignum-backed formatter.
 - *Also still deferred:* `*` (dynamic width/precision) and non-constant format strings.
+
+**Slice BE (DONE) — `argc`/`argv` (the §3e powerbox args buffer).** A `main(int argc, char** argv)`
+now works end-to-end. The decision was to keep the powerbox ABI **language-neutral**: the host
+delivers arguments as a flat byte blob at a *fixed, known window offset* (`svm_ir::POWERBOX_ARGS_BASE
+= 128`, below the globals base), layout `{ argc:u32-LE, envc:u32-LE }` + packed NUL-terminated
+strings — exactly DESIGN §3e / D44's "args_buffer at a known window offset". *No* entry-signature
+change (`is_powerbox_entry` and handle granting are untouched), so nothing C-specific leaks into the
+VM. All `char**` construction lives in the on-ramp:
+- **Frontend** (`svm-llvm`): when `main`'s arity is `(sp, argc, argv)`, `synth_start_argv` replaces
+  the straight-line `_start` with a 6-block one — same handle-stash/heap-seed prologue, then it reads
+  `argc`, walks the `argc` packed strings building `argv[]` (each entry points *into* the blob — no
+  copy) with the `argv[argc] == NULL` terminator at the entry SP, parks `main`'s frame a page above,
+  and calls `main(main_sp, argc, argv)`. The window now reserves stack whenever this entry is used
+  (it dereferences the SP, unlike the no-arg `_start`). `main(void)` is unchanged; a `main(int)` or
+  `main(…, envp)` is fail-closed (`envp`/`environ`/`getenv` is the next slice — the blob already
+  carries `envc`).
+- **Runner** (`svm-run`): `run_powerbox_with_args` builds the blob from `(args, env)`, seeds it into
+  the window's low bytes via the JIT's `init_mem` (applied *before* data segments, which sit at/above
+  `POWERBOX_ARGS_END`, so they never overlap), and rejects an over-large or NUL-bearing arg vector.
+  The CLI forwards its post-`--` arguments (`svm-run prog.svmb -- a b c`; `argv[0]` = the file name,
+  empty environment — no ambient env leak). Test: `main_argc_argv` (byte-for-byte vs native with a
+  controlled `argv`, via the new `check_powerbox_vs_native_args`).
 
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for

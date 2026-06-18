@@ -152,11 +152,11 @@
 //!   `fmuladd` (unfused), `+−*∕` — are IEEE on both sides). Lands the **`raytrace`** demo (an ASCII
 //!   sphere raytracer: `sqrt` intersection + guest `g_sin`/`g_exp` shading) byte-identical to native.
 //!
-//! Out of the current subset (clean [`Error::Unsupported`]): `printf` `%s`/`%f`, zero-padded `%d`,
-//! precision/`*`/`-`+# flags, and non-constant formats; general (non-rotate) funnel shifts,
-//! `llvm.bitreverse`, transcendental math as *external* libm calls (the program must supply it as
-//! guest code — see slice AB), `puts`/`fputs` of a *non-literal* string (runtime strlen), other
-//! SIMD (`<2 x double>`, `<8 x i16>`, dynamic lanes), `i33`.
+//! Out of the current subset (clean [`Error::Unsupported`]): `printf` float conversions
+//! (`%f`/`%e`/`%g` — need exact-decimal/bignum formatting), `*` (dynamic width/precision), and
+//! non-constant formats; general (non-rotate) funnel shifts, `llvm.bitreverse`, transcendental math
+//! as *external* libm calls (the program must supply it as guest code — see slice AB), other SIMD
+//! (`<2 x double>`, `<8 x i16>`, dynamic lanes), `i33`, and `main(…, char** envp)`/`getenv`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -403,13 +403,35 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         }
     }
 
+    // Does the program's `main` take `argc`/`argv` (so the synthesized entry is `synth_start_argv`)?
+    // Its IR arity is the threaded SP + the C params: 1 ⇒ `main(void)`, 3 ⇒ `main(int, char**)`; a
+    // 2- or ≥4-param `main` (e.g. `envp`) is a fail-closed later slice. Computed here (not just at the
+    // `synth_start` call) because the argv `_start` *uses* the data stack — it parks `argv[]` at the
+    // entry SP and relocates `main`'s frame a page above — so the window must reserve stack space.
+    let wants_argv = if synth {
+        match funcs[(name2idx["main"] - base) as usize].params.len() {
+            1 => false,
+            3 => true,
+            n => {
+                return Err(Error::Unsupported(format!(
+                    "main with {} parameter(s): only main(void) and main(int, char**) are supported \
+                     (envp/getenv is a later slice)",
+                    n - 1
+                )))
+            }
+        }
+    } else {
+        false
+    };
+
     // The window: globals low, then the data stack from `entry_sp` growing up; `mapped` covers the
     // globals plus a stack reserve, with a faulting guard beyond (reserved > mapped, §5). Declared if
     // any function uses the data stack, the module has globals, or it uses the powerbox (the handle
     // stash / heap state live in the reserved low window).
     let need_window = any_frame || !globals.is_empty() || synth;
     let memory = need_window.then(|| {
-        let top = if any_frame {
+        // Reserve stack when any function (or the argv `_start`) uses the data stack.
+        let top = if any_frame || wants_argv {
             entry_sp + STACK_RESERVE
         } else {
             globals_end
@@ -432,8 +454,9 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         // The C++ global constructors (`@llvm.global_ctors`) `_start` runs before `main` (their
         // funcrefs resolve through `name2idx`, now built).
         let ctors = collect_global_ctors(m, &name2idx)?;
-        funcs.insert(
-            0,
+        let start = if wants_argv {
+            synth_start_argv(main_idx, &main_results, entry_sp, n_handles, heap_base, &ctors)
+        } else {
             synth_start(
                 main_idx,
                 &main_results,
@@ -441,8 +464,9 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
                 n_handles,
                 heap_base,
                 &ctors,
-            ),
-        );
+            )
+        };
+        funcs.insert(0, start);
     }
     // Append the synthesized helpers in index order (memset, memcpy, malloc, utoa, realloc) —
     // matching the indices assigned above.
@@ -495,8 +519,14 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
 /// The low window offset where globals begin (kept off a null-like 0).
 const DATA_BASE: u64 = 16;
 /// The page granularity the data stack is aligned to above the globals (≥ the largest OS page so
-/// a stack write never lands in a read-only global's protected page, D40).
+/// a stack write never lands in a read-only global's protected page, D40). For a powerbox program
+/// this is also the globals base, so `[0, STACK_PAGE)` is the reserved low scratch — the handle
+/// stash, allocator/format state, and the §3e args buffer all live there.
 const STACK_PAGE: u64 = 16384;
+// The §3e powerbox args buffer (`svm_ir::POWERBOX_ARGS_BASE..POWERBOX_ARGS_END`) must sit *above*
+// the frontend's format/scratch region and *below* the globals base, so it never overlaps either.
+const _: () = assert!(svm_ir::POWERBOX_ARGS_BASE >= FMT_BUF_END);
+const _: () = assert!(svm_ir::POWERBOX_ARGS_END == STACK_PAGE);
 /// The data-stack reserve (bytes) above the entry SP before the guard region — a stack overflow
 /// past this faults rather than escaping the window.
 const STACK_RESERVE: u64 = 1 << 20;
@@ -2139,6 +2169,235 @@ fn synth_start(
             term,
         }],
         params,
+    }
+}
+
+/// The `_start` for a `main(int argc, char** argv)`: same handle-stash + heap-seed prologue as
+/// [`synth_start`], then it parses the §3e args buffer (`svm_ir::POWERBOX_ARGS_BASE`, seeded by the
+/// host) into a C `argv[]`. It reads `argc`, walks the `argc` packed NUL-terminated strings (each
+/// `argv[i]` points *into* the buffer — no copy), writes the pointer array (plus the required
+/// `argv[argc] == NULL`) at the entry data-stack base, then calls `main(main_sp, argc, argv)` with
+/// `main`'s frame parked one page above the array. This is the only place the C `char**` convention
+/// exists — the powerbox ABI itself only delivers the neutral byte blob.
+fn synth_start_argv(
+    main_idx: u32,
+    main_results: &[ValType],
+    entry_sp: u64,
+    n_handles: usize,
+    heap_base: Option<u64>,
+    ctors: &[u32],
+) -> Func {
+    use svm_ir::{LoadOp, StoreOp};
+    let args_base = svm_ir::POWERBOX_ARGS_BASE as i64;
+    let page = STACK_PAGE as i64;
+    let add = |a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let mul = |a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a,
+        b,
+    };
+    let and = |a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::And,
+        a,
+        b,
+    };
+    let store64 = |addr: ValIdx, value: ValIdx| Inst::Store {
+        op: StoreOp::I64,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+
+    // ---- block 0: entry — stash handles, seed the heap, load argc, jump into the argv loop. ----
+    let params = vec![ValType::I32; n_handles];
+    let mut insts: Vec<Inst> = Vec::new();
+    let mut next: ValIdx = n_handles as ValIdx;
+    for i in 0..n_handles {
+        insts.push(Inst::ConstI64((i as i64) * 4));
+        let addr = next;
+        next += 1;
+        insts.push(Inst::Store {
+            op: StoreOp::I32,
+            addr,
+            value: i as ValIdx,
+            offset: 0,
+            align: 0,
+        });
+    }
+    if let Some(hb) = heap_base {
+        for off in [HEAP_BRK, HEAP_TOP] {
+            insts.push(Inst::ConstI64(off as i64));
+            let addr = next;
+            next += 1;
+            insts.push(Inst::ConstI64(hb as i64));
+            let val = next;
+            next += 1;
+            insts.push(store64(addr, val));
+        }
+    }
+    insts.push(Inst::ConstI64(args_base));
+    let v_aa = next;
+    next += 1;
+    insts.push(Inst::Load {
+        op: LoadOp::I32,
+        addr: v_aa,
+        offset: 0,
+        align: 0,
+    }); // argc (u32)
+    let v_argc32 = next;
+    next += 1;
+    insts.push(Inst::Convert {
+        op: ConvOp::ExtendI32U,
+        a: v_argc32,
+    });
+    let v_argc64 = next;
+    next += 1;
+    insts.push(Inst::ConstI64(args_base + 8)); // first string (past {argc,envc})
+    let v_p0 = next;
+    next += 1;
+    insts.push(Inst::ConstI64(0)); // i = 0
+    let v_i0 = next;
+    let b0 = Block {
+        params,
+        insts,
+        term: Terminator::Br {
+            target: 1,
+            args: vec![v_argc64, v_i0, v_p0],
+        },
+    };
+
+    // ---- block 1: loop_head(argc=0, i=1, p=2) — continue while i <u argc, else finish. ----
+    let b1 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtU,
+            a: 1,
+            b: 0,
+        }], // v3 = i < argc
+        term: Terminator::BrIf {
+            cond: 3,
+            then_blk: 2,
+            then_args: vec![0, 1, 2],
+            else_blk: 5,
+            else_args: vec![0],
+        },
+    };
+
+    // ---- block 2: body(argc=0, i=1, p=2) — argv[i] = p, then scan p to its NUL. ----
+    let b2 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(entry_sp as i64), // v3 = argv base
+            Inst::ConstI64(8),               // v4
+            mul(1, 4),                       // v5 = i*8
+            add(3, 5),                        // v6 = &argv[i]
+            store64(6, 2),                    // argv[i] = p
+        ],
+        term: Terminator::Br {
+            target: 3,
+            args: vec![0, 1, 2, 2], // scan(argc, i, p, q=p)
+        },
+    };
+
+    // ---- block 3: scan(argc=0, i=1, p=2, q=3) — advance q to the byte past the NUL. ----
+    let b3 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 3,
+                offset: 0,
+                align: 0,
+            }, // v4 = *q
+            Inst::ConstI64(1),  // v5
+            add(3, 5),          // v6 = q+1
+            Inst::ConstI32(0),  // v7
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 4,
+                b: 7,
+            }, // v8 = (*q == 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 4,
+            then_args: vec![0, 1, 6], // next(argc, i, p_next = q+1)
+            else_blk: 3,
+            else_args: vec![0, 1, 2, 6], // scan(argc, i, p, q+1)
+        },
+    };
+
+    // ---- block 4: next(argc=0, i=1, p_next=2) — i++ and loop. ----
+    let b4 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(1), // v3
+            add(1, 3),         // v4 = i+1
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 4, 2], // loop_head(argc, i+1, p_next)
+        },
+    };
+
+    // ---- block 5: done(argc=0) — argv[argc] = NULL, compute main_sp, run ctors, call main. ----
+    let mut d: Vec<Inst> = vec![
+        Inst::ConstI64(entry_sp as i64), // v1 = argv base
+        Inst::ConstI64(8),               // v2
+        mul(0, 2),                        // v3 = argc*8
+        add(1, 3),                        // v4 = &argv[argc]
+        Inst::ConstI64(0),                // v5
+        store64(4, 5),                    // argv[argc] = NULL
+        Inst::ConstI64(1),                // v6
+        add(0, 6),                        // v7 = argc+1
+        mul(7, 2),                        // v8 = (argc+1)*8
+        add(1, 8),                        // v9 = entry_sp + array bytes
+        Inst::ConstI64(page - 1),         // v10
+        add(9, 10),                       // v11
+        Inst::ConstI64(!(page - 1)),      // v12
+        and(11, 12),                      // v13 = main_sp (page-aligned)
+        Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: 0,
+        }, // v14 = argc (i32)
+    ];
+    // ctors run on the real frame (`main_sp`); each is `(i64 sp) -> ()`, appending no value.
+    for &ctor in ctors {
+        d.push(Inst::Call {
+            func: ctor,
+            args: vec![13],
+        });
+    }
+    // main(main_sp, argc, argv) — argv is the pointer array at the entry SP (v1).
+    d.push(Inst::Call {
+        func: main_idx,
+        args: vec![13, 14, 1],
+    });
+    let term = if main_results.is_empty() {
+        Terminator::Return(vec![])
+    } else {
+        Terminator::Return(vec![15]) // main's result (params 1 + 14 value insts before the call)
+    };
+    let b5 = Block {
+        params: vec![ValType::I64],
+        insts: d,
+        term,
+    };
+
+    Func {
+        results: main_results.to_vec(),
+        blocks: vec![b0, b1, b2, b3, b4, b5],
+        params: vec![ValType::I32; n_handles],
     }
 }
 

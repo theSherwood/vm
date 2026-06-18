@@ -828,6 +828,61 @@ fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
     powerbox_diff(name, &bc, &c, stdin);
 }
 
+/// The argv differential: build/run the native binary with a **controlled `argv`** (`args[0]` as the
+/// process name, via `arg0`, so it matches the SVM blob) and a cleared+seeded environment, then run
+/// the SVM translation with the same vectors through [`svm_run::run_powerbox_with_args`], asserting
+/// stdout + exit code match. This is the only way to compare a `main(int, char**)` program: native
+/// `argv[0]` is otherwise the temp path, which the guest can't (and shouldn't) reproduce.
+fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&str]) {
+    use std::os::unix::process::CommandExt;
+    let Some(bc) = compile_to_bc(name, src) else {
+        return;
+    };
+    let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    std::fs::write(&c, src).expect("write c source");
+    let exe = std::env::temp_dir().join(format!("svm_llvm_pba_{}_{}", std::process::id(), name));
+    match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("note: skipping {name} (cc unavailable)");
+            return;
+        }
+    }
+    let mut cmd = Command::new(&exe);
+    cmd.arg0(args[0]).args(&args[1..]).env_clear();
+    for e in env {
+        let (k, v) = e.split_once('=').expect("env entry KEY=VALUE");
+        cmd.env(k, v);
+    }
+    let native = cmd.output().expect("run native");
+    let native_code = native.status.code().unwrap_or(-1) as u8;
+
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated IR");
+    let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
+    let envv: Vec<&[u8]> = env.iter().map(|s| s.as_bytes()).collect();
+    let run =
+        svm_run::run_powerbox_with_args(&module, b"", &argv, &envv).expect("powerbox run (args)");
+
+    assert_eq!(
+        run.stdout, native.stdout,
+        "{name}: svm stdout {:?} vs native {:?}",
+        run.stdout, native.stdout
+    );
+    let svm_code = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    assert_eq!(
+        svm_code, native_code,
+        "{name}: svm exit {svm_code} vs native {native_code}"
+    );
+}
+
 /// Run the powerbox differential on a **real corpus demo** (`crates/svm-run/demos/<rel>`) — a
 /// whole-program, self-contained C file (its own `memset`, `write`-only output). This is the D54
 /// "matches native clang" exit criterion applied to an actual library. The file is compiled *in
@@ -1206,6 +1261,22 @@ fn printf_unsigned_formats() {
                  printf(\"%lx %02x\\n\", 0xdeadbeefcafeUL, 5u); \
                  return 0; }";
     check_powerbox_vs_native("printf_u", src, b"");
+}
+
+#[test]
+fn main_argc_argv() {
+    // `int main(int argc, char** argv)`: the synthesized argv-parsing `_start` reads the §3e args
+    // buffer, builds `argv[]` (with the `argv[argc] == NULL` terminator), and passes `argc`/`argv`
+    // to `main` — checked byte-for-byte vs native with a controlled `argv`. Covers iterating argv,
+    // a NULL-terminator walk (`while (argv[i])`), and `argc` flowing to the exit code.
+    let src = "#include <stdio.h>\n\
+               int main(int argc, char** argv){ \
+                 printf(\"argc=%d\\n\", argc); \
+                 for (int i = 0; argv[i]; i++) printf(\"argv[%d]=%s\\n\", i, argv[i]); \
+                 return argc; }";
+    // The common case (program name only), then a multi-arg vector.
+    check_powerbox_vs_native_args("argv1", src, &["prog"], &[]);
+    check_powerbox_vs_native_args("argvN", src, &["myprog", "hello", "world", "42"], &[]);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! `svm-run` — run a guest program in the sandbox from the command line.
 //!
 //! ```text
-//! svm-run <file> [--stdin FILE]
+//! svm-run <file> [--stdin FILE] [-- <guest args>]
 //! ```
 //!
 //! `<file>` is `.svm` (text IR), `.svmb` (binary), or `.c` (C source — compiled through the
@@ -20,7 +20,7 @@ use std::{env, fs, process};
 
 use svm_ir::Module;
 use svm_run::{
-    is_powerbox_entry, run_kernel, run_powerbox_with_deadline_and_quota, Outcome, Quota, Value,
+    is_powerbox_entry, run_kernel, run_powerbox_with_args_and_limits, Outcome, Quota, Value,
 };
 use svm_verify::verify_module;
 
@@ -35,10 +35,11 @@ fn try_main() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "usage: svm-run <file.svm|.svmb|.c> [--stdin FILE]\n\
+            "usage: svm-run <file.svm|.svmb|.c> [--stdin FILE] [-- <guest args>]\n\
              \n  Verifies the module, then runs it sandboxed on the JIT under the MVP powerbox\n\
              \n  (stdout/stderr → real streams, exit code = the guest's). `.c` is compiled via\n\
-             \n  the chibicc frontend ($SVM_CHIBICC or the in-repo build).\n\
+             \n  the chibicc frontend ($SVM_CHIBICC or the in-repo build). Arguments after `--`\n\
+             \n  are passed to the guest as argv[1..] (argv[0] = the file name; empty environment).\n\
              \n  env: SVM_DEADLINE_MS (kill a runaway guest after N ms),\n\
              \n       SVM_MAX_FIBERS / SVM_MAX_VCPUS (§15 spawn quotas — kill a fiber/thread bomb)."
         );
@@ -46,9 +47,17 @@ fn try_main() -> Result<(), String> {
     }
     let mut file: Option<String> = None;
     let mut stdin_path: Option<String> = None;
+    // Everything after a `--` is the guest's own argument vector (the §3e args buffer): it becomes
+    // `argv[1..]`, with `argv[0]` set to the input file name — so a `main(int, char**)` program sees
+    // them exactly as a native invocation would.
+    let mut guest_args: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--" => {
+                guest_args.extend(it.by_ref().cloned());
+                break;
+            }
             "--stdin" => {
                 stdin_path = Some(it.next().ok_or("--stdin needs a file argument")?.clone())
             }
@@ -95,7 +104,12 @@ fn try_main() -> Result<(), String> {
             max_fibers: env_usize("SVM_MAX_FIBERS", dq.max_fibers),
             max_vcpus: env_usize("SVM_MAX_VCPUS", dq.max_vcpus),
         };
-        let run = run_powerbox_with_deadline_and_quota(&module, &stdin, deadline, quota)?;
+        // `argv` = the input file name (argv[0]) followed by the post-`--` guest args. The
+        // environment is deliberately *empty* (no ambient host env leaks into the sandbox, §3e/§7).
+        let argv: Vec<&[u8]> = std::iter::once(file.as_bytes())
+            .chain(guest_args.iter().map(|s| s.as_bytes()))
+            .collect();
+        let run = run_powerbox_with_args_and_limits(&module, &stdin, &argv, &[], deadline, quota)?;
         // Flush captured output to the real streams (process::exit skips destructors, so flush
         // explicitly), then terminate with the guest's exit code.
         let mut out = std::io::stdout().lock();
