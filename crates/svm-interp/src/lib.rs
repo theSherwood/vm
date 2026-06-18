@@ -1484,7 +1484,10 @@ fn drive(
                 let cid = s.next_task;
                 s.next_task += 1;
                 s.live += 1;
-                debug_assert_eq!(cid as usize, ff.task, "thaw re-spawns children densely by task");
+                debug_assert_eq!(
+                    cid as usize, ff.task,
+                    "thaw re-spawns children densely by task"
+                );
                 let child_mem = root.mem.as_ref().map(|m| m.fork_for_thread());
                 let mut child = Box::new(VCpu::new(
                     Arc::clone(&funcs),
@@ -3003,7 +3006,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // is out of scope for 3.2.1, guarded at `thread.spawn`.) The root instead flattens its
                 // fibers; children already pushed their residue by the time the root's `drive` returns.
                 let r = if let Some((func, args)) = v.spawn_residue.clone() {
-                    let shadow_sp = v.mem.as_ref().map(|m| m.durable_get_sp()).unwrap_or(SHADOW_BASE);
+                    let shadow_sp = v
+                        .mem
+                        .as_ref()
+                        .map(|m| m.durable_get_sp())
+                        .unwrap_or(SHADOW_BASE);
                     v.host
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -3019,7 +3026,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     // The root: record its own flattened extent (the shared active-SP word will be
                     // overwritten by a later child, so the root's residue can't ride the window) before
                     // `freeze_drive` repoints the word to flatten idle fibers.
-                    let root_sp = v.mem.as_ref().map(|m| m.durable_get_sp()).unwrap_or(SHADOW_BASE);
+                    let root_sp = v
+                        .mem
+                        .as_ref()
+                        .map(|m| m.durable_get_sp())
+                        .unwrap_or(SHADOW_BASE);
                     v.host
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -5349,9 +5360,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.registry = creg;
                         child.memop = memop; // inherit the explorer's memory-op granularity
                         child.durable = durable; // durability is a domain property (shared window/registry)
-                        // Durable multi-vCPU (slice 3.2.1): this child is context `task id`, so its shadow
-                        // stack lives in its own region; it carries its own state word (swapped in by the
-                        // runtime when it runs). Retain `(entry, [sp, arg])` so a freeze emits its residue.
+                                                 // Durable multi-vCPU (slice 3.2.1): this child is context `task id`, so its shadow
+                                                 // stack lives in its own region; it carries its own state word (swapped in by the
+                                                 // runtime when it runs). Retain `(entry, [sp, arg])` so a freeze emits its residue.
                         child.root_shadow_sp = shadow_region_base(id as usize);
                         child.dstate = child_state;
                         child.spawn_residue = Some((entry, vec![spv, av]));

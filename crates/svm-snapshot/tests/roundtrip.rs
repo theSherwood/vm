@@ -311,7 +311,11 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
         );
         r.expect("uninterrupted")
     };
-    assert_eq!(baseline, vec![Value::I64(95)], "uninterrupted: 42 + (43 + 10)");
+    assert_eq!(
+        baseline,
+        vec![Value::I64(95)],
+        "uninterrupted: 42 + (43 + 10)"
+    );
 
     // Freeze run: UNWINDING → both vCPUs unwind into their own regions; capture the window.
     let mut fhost = Host::new();
@@ -373,6 +377,14 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
         SIZE_LOG2,
         &mut thost,
     );
-    assert_eq!(thawed, Ok(baseline), "thawed multi-vCPU run equals the uninterrupted run");
-    assert_eq!(thawed, Ok(vec![Value::I64(95)]), "saved clock reads reloaded, not re-issued");
+    assert_eq!(
+        thawed,
+        Ok(baseline),
+        "thawed multi-vCPU run equals the uninterrupted run"
+    );
+    assert_eq!(
+        thawed,
+        Ok(vec![Value::I64(95)]),
+        "saved clock reads reloaded, not re-issued"
+    );
 }
