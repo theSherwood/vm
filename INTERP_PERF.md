@@ -331,7 +331,25 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               `run_with_host`. Deferred (rare, complex, ~0 corpus): `instantiate`/`join` executor
               children, demand-paging / fault-yield (`CoFault`), and the module-spawning variants
               (ops 5/6/7). Coroutine modules are single-vCPU (no fibers/threads) by compile-rejection.
-        - [ ] **1c-5e** — cross-module units (`install`/`invoke` indirect calls; tail calls).
+        - [~] **1c-5e** — cross-module §22 units. **Decision (post-clear):** since the tree-walker is
+              oracle-only, bytecode is the real fallback when the JIT backend isn't viable, so a guest
+              holding the `Jit` cap must get guest-JIT on bytecode too (no production fall-back path).
+            - [x] **5e-1** — multi-module foundation + `install`/`uninstall` + cross-module
+                  `call_indirect`. The engine became multi-module: a `Domain { mods, table }` (module 0
+                  = primary, `mods[k≥1]` = installed units; runtime dispatch table replacing the
+                  compile-time natural table). `Vm` activations carry a `module`, re-bound only at
+                  cross-module call/return so the per-op hot loop is unchanged. `compile`/
+                  `compile_linked` (JIT ops 0/5) ride the generic `cap_dispatch_slots` (free);
+                  `install`/`uninstall` (ops 3/4) escape to `drive` (owns the mutable `Domain`):
+                  install compiles the unit to bytecode + fills a padding slot, uninstall clears one.
+                  Coroutine children keep their own natural table (no installed units), matching the
+                  tree-walker. New harness `bytecode_dynlink.rs` (install→call_indirect = 142;
+                  uninstall→call_indirect traps `IndirectCallType`) bit-identical to `run_with_host`.
+                  **Known gap:** a unit using an op the bytecode engine can't lower traps `Malformed`
+                  (no mid-run fall-back) — same coverage edge as a top-level module.
+            - [ ] **5e-2** — `Jit.invoke` (op 1): nested concurrency-free run of a unit over the
+                  shared table; target the `dynlink_cap` compile→install→link→invoke = 127 flow.
+            - [ ] **5e-3** — tail calls (`return_call`/`return_call_indirect`).
         - [x] **1c-5f** — fiber **migration**: the fiber registry moved out of `VTask` into a
               **run-shared** `Vec<FiberState>` owned by `drive` (one domain-wide handle namespace),
               passed to `step_vcpu`; only the resume `chain` stays per-vCPU. A fiber created/suspended
