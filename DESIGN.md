@@ -2037,8 +2037,10 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
   the interpreter (NaN payloads + the wasm min/max/nearest rules preserved; a trapping `trunc` folds
   only in range and is otherwise kept so it still traps); static + dynamic branches; any-width
   constant-memory reads; renamed stack/locals (word **and** narrow `i8`/`i16` cells, with a dynamic
-  heap alongside); and cross-function `call` inlining (static + dynamic control flow, recursion,
-  loops). **Remaining enhancements (not gaps):** **v128 (SIMD) constant folding** (the 128-bit lane
+  heap alongside); and cross-function `call` inlining — direct **and** constant-index
+  `call_indirect`/`return_call_indirect`/`ref.func` (resolved through the identity module-0 table) —
+  with static + dynamic control flow, recursion, and loops. **Remaining enhancements (not gaps):**
+  **v128 (SIMD) constant folding** (the 128-bit lane
   ops still pass through unfolded — a separate, larger lane/shape surface), and the guest-side engine
   (ship the specializer inside the sandbox on the §22 `Jit` capability for dynamic-language IC-style
   recompilation; the residual IR and back half are shared).

@@ -63,8 +63,12 @@
 //!   a branch to the caller's continuation. Recursion + dynamic control flow, loops in the callee,
 //!   and `unreachable` callee paths all work; one residual function still comes out.
 //!
-//! Indirect calls (`call_indirect`, `return_call_indirect`) and host/capability calls are not
-//! inlined.
+//! An **indirect** call (`call_indirect` / `return_call_indirect`, and `ref.func`) is inlined too
+//! when its table index resolves to a **constant, in-range, signature-matching** function — the
+//! module-0 table is the identity map, so a folded funcref dispatches deterministically to that
+//! callee, which is then inlined like a direct call. A dynamic / out-of-range / mismatched index
+//! can't be specialized (the single-function residual carries no table) and returns
+//! [`SpecError::Unsupported`]. Host/capability calls are never inlined.
 //!
 //! **Scope.** Integer and **scalar float** ops — arithmetic, compares, fused multiply-add,
 //! float↔int conversions, reinterpret/demote/promote casts — are specialized (folded where the
@@ -458,13 +462,12 @@ impl Spec<'_> {
         fuel: &mut usize,
     ) -> Result<Exec, SpecError> {
         for (k, inst) in insts.iter().enumerate().skip(start_ip) {
-            if let Inst::Call { func, args } = inst {
-                let args_abs: Vec<Abs> = args.iter().map(|&a| env[a as usize]).collect();
-                match self.try_straightline(*func, &args_abs, mem, out, rnext, fuel)? {
+            if let Some((callee, args_abs)) = self.callee_of(inst, env)? {
+                match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
                     Some(results) => env.extend(results),
                     None => {
                         return Ok(Exec::Suspend {
-                            callee: *func,
+                            callee,
                             args: args_abs,
                             resume_ip: k + 1,
                         })
@@ -475,6 +478,43 @@ impl Spec<'_> {
             }
         }
         Ok(Exec::Done)
+    }
+
+    /// If `inst` is an inlinable call — a direct [`Inst::Call`], or an [`Inst::CallIndirect`] whose
+    /// table index resolves to a constant in-range, signature-matching function — return the concrete
+    /// callee index and its argument values. `Ok(None)` for a non-call. A `CallIndirect` whose index
+    /// is dynamic / out of range / mismatched can't be specialized (the single-function residual has
+    /// no table to dispatch through), so it surfaces as [`SpecError::Unsupported`].
+    fn callee_of(&self, inst: &Inst, env: &[Abs]) -> Result<Option<(u32, Vec<Abs>)>, SpecError> {
+        Ok(match inst {
+            Inst::Call { func, args } => {
+                Some((*func, args.iter().map(|&a| env[a as usize]).collect()))
+            }
+            Inst::CallIndirect { ty, idx, args } => {
+                let callee = self
+                    .resolve_indirect(ty, env[*idx as usize])
+                    .ok_or(SpecError::Unsupported)?;
+                Some((callee, args.iter().map(|&a| env[a as usize]).collect()))
+            }
+            _ => None,
+        })
+    }
+
+    /// Resolve a `call_indirect` table index to a concrete function, or `None` if it can't be pinned
+    /// at specialization time. The module-0 function table is the identity map (slot `i` → func `i`)
+    /// padded with empty slots, and for any in-range index the table-size mask is a no-op — so a
+    /// **constant, in-range, signature-matching** index dispatches deterministically to `funcs[idx]`
+    /// on every backend. A dynamic index, an out-of-range index, or a signature mismatch returns
+    /// `None` (the call can't be specialized — the runtime would dispatch or trap through a table the
+    /// residual doesn't carry).
+    fn resolve_indirect(&self, ty: &svm_ir::FuncType, idx: Abs) -> Option<u32> {
+        let i = match idx {
+            Abs::Const(k) => k.as_i32()?,
+            Abs::Dyn(_) => return None,
+        };
+        let u = i as u32 as usize;
+        let f = self.module.funcs.get(u)?;
+        (f.params == ty.params && f.results == ty.results).then_some(u as u32)
     }
 
     /// Attempt to inline a direct call as straight-line code into the current residual block. On
@@ -592,10 +632,15 @@ impl Spec<'_> {
                     block_idx = *blk;
                 }
                 // An `unreachable` callee path must become a real residual terminator — only the CFG
-                // path can emit one — so hand off. An indirect tail call is not inlined at all.
+                // path can emit one — so hand off.
                 Terminator::Unreachable => return Err(InlineErr::NeedsCfg),
-                Terminator::ReturnCallIndirect { .. } => {
-                    return Err(InlineErr::Spec(SpecError::Unsupported))
+                // An indirect tail call whose index resolves to a constant callee is itself inlined.
+                Terminator::ReturnCallIndirect { ty, idx, args } => {
+                    let callee = self
+                        .resolve_indirect(ty, genv[*idx as usize])
+                        .ok_or(InlineErr::Spec(SpecError::Unsupported))?;
+                    let a: Vec<Abs> = args.iter().map(|&x| genv[x as usize]).collect();
+                    return self.inline_call(callee, &a, mem, out, rnext, fuel);
                 }
             }
         }
@@ -614,9 +659,8 @@ impl Spec<'_> {
         fuel: &mut usize,
     ) -> Result<(), InlineErr> {
         for inst in insts {
-            if let Inst::Call { func, args } = inst {
-                let a: Vec<Abs> = args.iter().map(|&x| env[x as usize]).collect();
-                let results = self.inline_call(*func, &a, mem, out, rnext, fuel)?;
+            if let Some((callee, a)) = self.callee_of(inst, env).map_err(InlineErr::Spec)? {
+                let results = self.inline_call(callee, &a, mem, out, rnext, fuel)?;
                 env.extend(results);
             } else if let Some(res) = self
                 .eval_inst(inst, env, mem, out, rnext)
@@ -643,6 +687,9 @@ impl Spec<'_> {
             Inst::ConstI64(v) => Abs::Const(Known::I64(v)),
             Inst::ConstF32(b) => Abs::Const(Known::F32(b)),
             Inst::ConstF64(b) => Abs::Const(Known::F64(b)),
+            // `ref.func` is the function index as a plain `i32` (a funcref is forgeable data, §3c).
+            // Folding it to a constant lets a downstream `call_indirect` resolve its callee.
+            Inst::RefFunc { func } => Abs::Const(Known::I32(func as i32)),
 
             Inst::IntBin { ty, op, a, b } => {
                 let (av, bv) = (env[a as usize], env[b as usize]);
@@ -1000,27 +1047,52 @@ impl Spec<'_> {
                 }
             },
             Terminator::Unreachable => Terminator::Unreachable,
-            // A direct tail call: straight-line-inline if we can, else replace the active frame with
-            // the callee, keeping this frame's return continuation (the suspended callers).
+            // A direct tail call.
             Terminator::ReturnCall { func: callee, args } => {
                 let args_abs: Vec<Abs> = args.iter().map(|&a| env[a as usize]).collect();
-                match self.try_straightline(*callee, &args_abs, mem, out, rnext, fuel)? {
-                    Some(results) => self.return_from(outer, &results, mem, out, rnext),
-                    None => {
-                        let mut stack = outer;
-                        stack.push(FrameAbs {
-                            func: *callee,
-                            block: 0,
-                            ip: 0,
-                            env: args_abs,
-                        });
-                        let (target, args) = self.branch_to(&stack, mem);
-                        Terminator::Br { target, args }
-                    }
-                }
+                self.tail_call(*callee, args_abs, outer, mem, out, rnext, fuel)?
             }
-            Terminator::ReturnCallIndirect { .. } => return Err(SpecError::Unsupported),
+            // An indirect tail call whose index resolves to a constant callee.
+            Terminator::ReturnCallIndirect { ty, idx, args } => {
+                let callee = self
+                    .resolve_indirect(ty, env[*idx as usize])
+                    .ok_or(SpecError::Unsupported)?;
+                let args_abs: Vec<Abs> = args.iter().map(|&a| env[a as usize]).collect();
+                self.tail_call(callee, args_abs, outer, mem, out, rnext, fuel)?
+            }
         })
+    }
+
+    /// Specialize a tail call to `callee`: straight-line-inline if we can (its results become this
+    /// frame's results — i.e. a return to the caller), else replace the active frame with the callee,
+    /// keeping this frame's return continuation (the suspended callers).
+    #[allow(clippy::too_many_arguments)]
+    fn tail_call(
+        &mut self,
+        callee: u32,
+        args_abs: Vec<Abs>,
+        outer: Vec<FrameAbs>,
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+        fuel: &mut usize,
+    ) -> Result<Terminator, SpecError> {
+        Ok(
+            match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
+                Some(results) => self.return_from(outer, &results, mem, out, rnext),
+                None => {
+                    let mut stack = outer;
+                    stack.push(FrameAbs {
+                        func: callee,
+                        block: 0,
+                        ip: 0,
+                        env: args_abs,
+                    });
+                    let (target, args) = self.branch_to(&stack, mem);
+                    Terminator::Br { target, args }
+                }
+            },
+        )
     }
 
     /// Return `results` from the active frame: end the residual function if no caller is suspended,

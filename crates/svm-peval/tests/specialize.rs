@@ -8,8 +8,8 @@
 
 use svm_interp::{Trap, Value};
 use svm_ir::{
-    BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF,
-    Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func,
+    FuncType, IToF, Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
 };
 use svm_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
@@ -951,15 +951,22 @@ fn private_rename_allows_dynamic_heap_access() {
 // a callee whose control flow stays dynamic returns `Unsupported`.
 // ===========================================================================================
 
-/// No direct or tail call survives in the residual — every call was inlined.
+/// No call (direct or indirect, body or tail) and no `ref.func` survive in the residual — every
+/// call was inlined and every funcref folded away.
 fn assert_no_calls(residual: &Module) {
     for block in &residual.funcs[0].blocks {
         assert!(
-            !block.insts.iter().any(|i| matches!(i, Inst::Call { .. })),
-            "residual still contains a direct call — not inlined"
+            !block.insts.iter().any(|i| matches!(
+                i,
+                Inst::Call { .. } | Inst::CallIndirect { .. } | Inst::RefFunc { .. }
+            )),
+            "residual still contains a call / ref.func — not inlined"
         );
         assert!(
-            !matches!(block.term, Terminator::ReturnCall { .. }),
+            !matches!(
+                block.term,
+                Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. }
+            ),
             "residual still contains a tail call — not inlined"
         );
     }
@@ -2440,4 +2447,336 @@ fn optimizer_folds_float_constants() {
         Ok(vec![Value::I64((7.0f64).to_bits() as i64)])
     );
     assert_eq!(run(&m, &[]), run(&opt, &[]));
+}
+
+// ===========================================================================================
+// Indirect-call specialization: a `call_indirect` / `return_call_indirect` (or `ref.func`) whose
+// table index resolves to a constant, in-range, signature-matching function is resolved to that
+// callee and inlined like a direct call. A dynamic / out-of-range / mismatched index can't be
+// specialized (the single-function residual carries no table) and returns Unsupported.
+// ===========================================================================================
+
+fn i64_to_i64() -> FuncType {
+    FuncType {
+        params: vec![ValType::I64],
+        results: vec![ValType::I64],
+    }
+}
+
+// double(a) = a * 2 — the usual indirect callee (function index 1 in these modules).
+fn double_func() -> Func {
+    Func {
+        params: vec![ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![Block {
+            params: vec![ValType::I64],
+            insts: vec![Inst::ConstI64(2), imul(0, 1)],
+            term: Terminator::Return(vec![2]),
+        }],
+    }
+}
+
+#[test]
+fn const_indirect_call_via_ref_func_inlines() {
+    // main(x) = (ref.func double)(x) through call_indirect -> x * 2.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::RefFunc { func: 1 }, // 1: funcref double (folds to const 1)
+                        Inst::CallIndirect {
+                            ty: i64_to_i64(),
+                            idx: 1,
+                            args: vec![0],
+                        }, // 2
+                    ],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            double_func(),
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("resolves + inlines");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+
+    for x in [0i64, 1, -3, 21, i64::MIN] {
+        let expect = x.wrapping_mul(2);
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        let jit = match svm_jit::compile_and_run(&residual, 0, &[x]) {
+            Ok(svm_jit::JitOutcome::Returned(v)) => v[0],
+            o => panic!("unexpected jit outcome {o:?}"),
+        };
+        assert_eq!(jit, expect, "jit at x={x}");
+    }
+}
+
+#[test]
+fn indirect_call_through_constant_memory_table_inlines() {
+    // A handler-table interpreter shape: the function index lives in a readonly data segment; loading
+    // it folds to a constant funcref, so the call_indirect resolves and the dispatch disappears.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::ConstI64(0), // 1: table address
+                        Inst::Load {
+                            op: LoadOp::I32,
+                            addr: 1,
+                            offset: 0,
+                            align: 0,
+                        }, // 2: funcref (folds to 1)
+                        Inst::CallIndirect {
+                            ty: i64_to_i64(),
+                            idx: 2,
+                            args: vec![0],
+                        }, // 3
+                    ],
+                    term: Terminator::Return(vec![3]),
+                }],
+            },
+            double_func(),
+        ],
+        memory: Some(Memory { size_log2: 16 }),
+        data: vec![Data {
+            offset: 0,
+            readonly: true,
+            bytes: 1i32.to_le_bytes().to_vec(), // the table holds func index 1 (double)
+        }],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("resolves + inlines");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+    // The table load folded away too.
+    assert!(!residual.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Load { .. }))));
+
+    for x in [0i64, 7, -5, 100] {
+        let expect = x.wrapping_mul(2);
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn const_indirect_tail_call_inlines() {
+    // main(x) = return_call_indirect (ref.func double)(x).
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64],             // 0: x
+                    insts: vec![Inst::RefFunc { func: 1 }], // 1
+                    term: Terminator::ReturnCallIndirect {
+                        ty: i64_to_i64(),
+                        idx: 1,
+                        args: vec![0],
+                    },
+                }],
+            },
+            double_func(),
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("resolves + inlines");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+    for x in [0i64, 3, -9, 50] {
+        let expect = x.wrapping_mul(2);
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn indirect_call_to_dynamic_cf_callee_inlines_as_cfg() {
+    // The resolved callee itself has dynamic control flow — resolution + CFG inlining compose.
+    // main(x) = (ref.func pick)(x) ; pick(a) = if a != 0 { a * 2 } else { a + 1 }.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::RefFunc { func: 1 },
+                        Inst::CallIndirect {
+                            ty: i64_to_i64(),
+                            idx: 1,
+                            args: vec![0],
+                        },
+                    ],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![
+                    Block {
+                        params: vec![ValType::I64], // 0: a
+                        insts: vec![
+                            Inst::ConstI64(0),
+                            Inst::IntCmp {
+                                ty: IntTy::I64,
+                                op: CmpOp::Ne,
+                                a: 0,
+                                b: 1,
+                            },
+                        ],
+                        term: Terminator::BrIf {
+                            cond: 2,
+                            then_blk: 1,
+                            then_args: vec![0],
+                            else_blk: 2,
+                            else_args: vec![0],
+                        },
+                    },
+                    Block {
+                        params: vec![ValType::I64],
+                        insts: vec![Inst::ConstI64(2), imul(0, 1)],
+                        term: Terminator::Return(vec![2]),
+                    },
+                    Block {
+                        params: vec![ValType::I64],
+                        insts: vec![
+                            Inst::ConstI64(1),
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Add,
+                                a: 0,
+                                b: 1,
+                            },
+                        ],
+                        term: Terminator::Return(vec![2]),
+                    },
+                ],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("resolves + CFG-inlines");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+    assert!(residual.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| matches!(b.term, Terminator::BrIf { .. })));
+    for x in [0i64, 1, 5, -3, 1000] {
+        let expect = if x != 0 {
+            x.wrapping_mul(2)
+        } else {
+            x.wrapping_add(1)
+        };
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn unresolvable_indirect_calls_are_unsupported() {
+    // A *dynamic* index can't be specialized.
+    let dynamic_idx = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64, ValType::I32], // 0: x, 1: sel (dynamic funcref)
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64, ValType::I32],
+                    insts: vec![Inst::CallIndirect {
+                        ty: i64_to_i64(),
+                        idx: 1,
+                        args: vec![0],
+                    }],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            double_func(),
+        ],
+        ..Default::default()
+    };
+    verify_module(&dynamic_idx).expect("verifies");
+    assert_eq!(
+        specialize(&dynamic_idx, 0, &[SpecArg::Dynamic, SpecArg::Dynamic]),
+        Err(svm_peval::SpecError::Unsupported)
+    );
+
+    // A constant index whose resolved function has the wrong signature also can't be specialized
+    // (it would trap `IndirectCallType` at runtime through a table the residual doesn't carry).
+    let bad_sig = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::RefFunc { func: 1 }, // points at a (i64,i64)->i64 function
+                        Inst::CallIndirect {
+                            ty: i64_to_i64(), // but the call signature is (i64)->i64
+                            idx: 1,
+                            args: vec![0],
+                        },
+                    ],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            Func {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64, ValType::I64],
+                    insts: vec![Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Add,
+                        a: 0,
+                        b: 1,
+                    }],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&bad_sig).expect("verifies");
+    assert_eq!(
+        specialize(&bad_sig, 0, &[SpecArg::Dynamic]),
+        Err(svm_peval::SpecError::Unsupported)
+    );
 }
