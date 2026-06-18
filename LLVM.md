@@ -851,6 +851,15 @@ generally useful (any frontend's `-O2` hits them):
       evaluator (slice AL — + `*.with.overflow` intrinsics and `i64` switches). Auto-vectorization is
       disabled (SIMD is §17); `--edition 2021`. Broaden (`Result`/`?`, `BTreeMap`, generics with
       bounds, `&mut` aliasing) as gaps surface.
+- [~] **SIMD / auto-vectorization** (slice AN — first light). The breadth lanes disable vectorization;
+      ingesting *real* `-O2` vectorized output is its own arc. **Integer reductions land:** a `<4 x i32>`
+      lane op lowers to `v128` (`VIntBin i32x4` for `add`/`sub`/`mul`, whole-vector `VBitBin` for
+      `and`/`or`/`xor`; `bin_ty` returns a harmless `I32` so the pre-`bin` width probe doesn't choke on
+      `v128`), and `llvm.vector.reduce.{add,mul,and,or,xor,smax,smin,umax,umin}.v4i32` unrolls to a lane
+      fold (extract + scalar combine). Test: `simd_int_reduction_first_light` — a `noinline` int `sum`
+      vectorizes to `<4 x i32>` + `reduce.add`, `run(7) = 2610` (exit `50`) vs native. *Next:* wider
+      shapes (`<16 x i8>`/`<8 x i16>`/`<2 x i64>`), float reductions (`fadd`/`fmul`), vector
+      `icmp`/`select`/shifts, and re-enabling vectorization on the C/C++/Rust lanes.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 - [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`

@@ -3600,6 +3600,84 @@ fn lower_overflow_intrinsic(
     Ok(true)
 }
 
+/// Lower `llvm.vector.reduce.{add,mul,and,or,xor,smax,smin,umax,umin}.v4i32` — the horizontal reduction
+/// `-O2` auto-vectorization emits to close a reduction loop (the `i32x4` accumulator → a scalar). No
+/// SVM reduce op, so it is unrolled: extract the 4 lanes and fold them with the scalar op (`add`/`mul`/
+/// `and`/`or`/`xor` via `IntBin`; `min`/`max` via `cmp`+`select`). Returns the scalar `i32`, or `None`
+/// if not a (supported) reduce. (Only `i32x4` for now; wider/float reductions are a later slice.)
+fn lower_vector_reduce(
+    ctx: &mut BlockCtx,
+    c: &llvm_ir::instruction::Call,
+    types: &Types,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    let Some(rest) = name.strip_prefix("llvm.vector.reduce.") else {
+        return Ok(None);
+    };
+    let kind = rest.split('.').next().unwrap_or(""); // "add"/"mul"/… (before the `.v4i32` suffix)
+    let vec_op = &c.arguments[0].0;
+    let vty = vec_op.get_type(types);
+    let Some(lane) = vec4_lane_ty(vty.as_ref()) else {
+        return unsup(format!("vector.reduce on non-`<4 x i32>` vector ({kind})"));
+    };
+    if lane == ValType::F32 {
+        return unsup(format!("float vector.reduce.{kind} (later slice)"));
+    }
+    let shape = vshape4(lane); // i32x4
+    let v = ctx.operand(vec_op)?;
+    // The 4 lanes as `i32` scalars (full-width — `signed` is irrelevant for an `i32` lane extract).
+    let lanes: Vec<ValIdx> = (0..4)
+        .map(|l| {
+            ctx.push(Inst::ExtractLane {
+                shape,
+                lane: l,
+                signed: false,
+                a: v,
+            })
+        })
+        .collect();
+    let fold_bin = |ctx: &mut BlockCtx, op: BinOp| {
+        let mut acc = lanes[0];
+        for &l in &lanes[1..] {
+            acc = ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op,
+                a: acc,
+                b: l,
+            });
+        }
+        acc
+    };
+    let fold_minmax = |ctx: &mut BlockCtx, cmp: CmpOp| {
+        let mut acc = lanes[0];
+        for &l in &lanes[1..] {
+            let cond = ctx.push(Inst::IntCmp {
+                ty: IntTy::I32,
+                op: cmp,
+                a: acc,
+                b: l,
+            });
+            acc = ctx.push(Inst::Select { cond, a: acc, b: l });
+        }
+        acc
+    };
+    let r = match kind {
+        "add" => fold_bin(ctx, BinOp::Add),
+        "mul" => fold_bin(ctx, BinOp::Mul),
+        "and" => fold_bin(ctx, BinOp::And),
+        "or" => fold_bin(ctx, BinOp::Or),
+        "xor" => fold_bin(ctx, BinOp::Xor),
+        "smax" => fold_minmax(ctx, CmpOp::GtS),
+        "smin" => fold_minmax(ctx, CmpOp::LtS),
+        "umax" => fold_minmax(ctx, CmpOp::GtU),
+        "umin" => fold_minmax(ctx, CmpOp::LtU),
+        other => return unsup(format!("vector.reduce.{other}")),
+    };
+    Ok(Some(r))
+}
+
 /// Emit an inline byte-reverse of `v` (`ty`-wide, `nbytes` bytes): OR together, for each source byte
 /// `i`, `((v >> 8*i) & 0xff) << 8*(nbytes-1-i)`. Lowers `llvm.bswap.{i16,i32,i64}`.
 fn emit_bswap(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, nbytes: u64) -> ValIdx {
@@ -4638,8 +4716,14 @@ fn translate_block(
 fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<(), Error> {
     use Instruction as I;
     // The op's integer width, from operand0 (both operands share a type in LLVM binops).
-    let bin_ty =
-        |o: &Operand| -> Result<IntTy, Error> { int_ty(val_type(o.get_type(types).as_ref())?) };
+    // The op's integer width. A `<4 x i32>` operand (auto-vectorized) returns a harmless `I32` — `bin`
+    // detects the vector and lowers lane-wise, ignoring this; computing it before `bin` must not fail.
+    let bin_ty = |o: &Operand| -> Result<IntTy, Error> {
+        match val_type(o.get_type(types).as_ref())? {
+            ValType::I64 => Ok(IntTy::I64),
+            _ => Ok(IntTy::I32),
+        }
+    };
     // The op's float width (f32/f64), likewise.
     let fty =
         |o: &Operand| -> Result<FloatTy, Error> { float_ty(val_type(o.get_type(types).as_ref())?) };
@@ -4708,6 +4792,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // aggregate `{result, overflow}` (Rust's checked capacity/index arithmetic). Records the
         // aggregate itself, so nothing to bind here.
         if lower_overflow_intrinsic(ctx, c, types)? {
+            return Ok(());
+        }
+        // `llvm.vector.reduce.*` (the horizontal reduce auto-vectorization emits) → an unrolled
+        // lane fold to a scalar.
+        if let Some(idx) = lower_vector_reduce(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
             return Ok(());
         }
         // `llvm.load.relative` (clang's relative lookup table) → load the 32-bit relative offset and
@@ -5284,6 +5378,54 @@ fn bin<'d>(
     b: &Operand,
     types: &Types,
 ) -> Result<(&'d Name, ValIdx), Error> {
+    // A `<4 x i32>` operand (auto-vectorized integer loop) lowers lane-wise to a `v128` op (§17): the
+    // arithmetic ops are `VIntBin` (`i32x4`), the bitwise ops are whole-vector `VBitBin`. (Float vector
+    // binops go through `fp_binop`, not here, so a `vec4` operand here is integer-lane.)
+    if is_vec4(a.get_type(types).as_ref()) {
+        let av = ctx.operand(a)?;
+        let bv = ctx.operand(b)?;
+        let inst = match op {
+            BinOp::Add => Inst::VIntBin {
+                shape: svm_ir::VShape::I32x4,
+                op: svm_ir::VIntBinOp::Add,
+                a: av,
+                b: bv,
+            },
+            BinOp::Sub => Inst::VIntBin {
+                shape: svm_ir::VShape::I32x4,
+                op: svm_ir::VIntBinOp::Sub,
+                a: av,
+                b: bv,
+            },
+            BinOp::Mul => Inst::VIntBin {
+                shape: svm_ir::VShape::I32x4,
+                op: svm_ir::VIntBinOp::Mul,
+                a: av,
+                b: bv,
+            },
+            BinOp::And => Inst::VBitBin {
+                op: svm_ir::VBitBinOp::And,
+                a: av,
+                b: bv,
+            },
+            BinOp::Or => Inst::VBitBin {
+                op: svm_ir::VBitBinOp::Or,
+                a: av,
+                b: bv,
+            },
+            BinOp::Xor => Inst::VBitBin {
+                op: svm_ir::VBitBinOp::Xor,
+                a: av,
+                b: bv,
+            },
+            other => {
+                return unsup(format!(
+                    "vector integer op {other:?} (only add/sub/mul/and/or/xor)"
+                ))
+            }
+        };
+        return Ok((dest, ctx.push(inst)));
+    }
     let width = int_bits(a.get_type(types).as_ref());
     let a = ctx.operand(a)?;
     let b = ctx.operand(b)?;
