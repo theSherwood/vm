@@ -8,8 +8,8 @@
 
 use svm_interp::{Trap, Value};
 use svm_ir::{
-    BinOp, Block, CmpOp, ConvOp, Data, FBinOp, FloatTy, Func, Inst, IntTy, LoadOp, Memory, Module,
-    StoreOp, Terminator, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, Data, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF,
+    Inst, IntTy, LoadOp, Memory, Module, StoreOp, Terminator, ValType,
 };
 use svm_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
@@ -2011,4 +2011,433 @@ fn nested_dynamic_cf_calls_inline() {
             "residual diverged at x={x}"
         );
     }
+}
+
+// ===========================================================================================
+// Scalar float constant folding: f32/f64 arithmetic, compares, fused multiply-add, float↔int
+// conversions, and reinterpret/demote/promote casts fold to constants bit-for-bit the interpreter
+// (NaN payloads, ±0, ±inf, ties-to-even). Results are reinterpreted to integers before return so the
+// differential comparison is exact (NaN-safe). The interpreter is the oracle.
+// ===========================================================================================
+
+// Edge-case operand matrices: signed zeros, inf, NaN, subnormals, ties.
+const F64S: [f64; 12] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    2.5,
+    -3.5,
+    0.1,
+    1e308,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::NAN,
+    4.5, // a tie for round-to-even (nearest -> 4)
+];
+const F32S: [f32; 12] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    2.5,
+    -3.5,
+    0.1,
+    1e38,
+    f32::INFINITY,
+    f32::NEG_INFINITY,
+    f32::NAN,
+    4.5,
+];
+
+fn ret(results: Vec<ValType>, insts: Vec<Inst>, ret_idx: u32) -> Module {
+    Module {
+        funcs: vec![Func {
+            params: vec![],
+            results,
+            blocks: vec![Block {
+                params: vec![],
+                insts,
+                term: Terminator::Return(vec![ret_idx]),
+            }],
+        }],
+        memory: None,
+        ..Default::default()
+    }
+}
+
+fn assert_no_residual_float(r: &Module) {
+    for b in &r.funcs[0].blocks {
+        assert!(
+            !b.insts.iter().any(|i| matches!(
+                i,
+                Inst::FBin { .. }
+                    | Inst::FUn { .. }
+                    | Inst::FCmp { .. }
+                    | Inst::Fma { .. }
+                    | Inst::FToISat { .. }
+                    | Inst::FToITrap { .. }
+                    | Inst::IToFConv { .. }
+                    | Inst::Cast { .. }
+            )),
+            "a float op survived folding: {:?}",
+            b.insts
+        );
+    }
+}
+
+/// Verify the module, specialize it (no args), check the residual fully folded away its float ops,
+/// and assert the residual matches the interpreter exactly (results reinterpreted to ints upstream).
+fn check_fold(m: &Module) {
+    verify_module(m).expect("verifies");
+    let r = specialize(m, 0, &[]).expect("specializes");
+    verify_module(&r).expect("residual re-verifies");
+    assert_no_residual_float(&r);
+    assert_eq!(run(m, &[]), run(&r, &[]), "residual diverged from interp");
+}
+
+#[test]
+fn folds_f64_binops() {
+    for op in FBinOp::ALL {
+        for &a in &F64S {
+            for &b in &F64S {
+                let m = ret(
+                    vec![ValType::I64],
+                    vec![
+                        Inst::ConstF64(a.to_bits()),
+                        Inst::ConstF64(b.to_bits()),
+                        Inst::FBin {
+                            ty: FloatTy::F64,
+                            op,
+                            a: 0,
+                            b: 1,
+                        },
+                        Inst::Cast {
+                            op: CastOp::ReinterpF64I64,
+                            a: 2,
+                        },
+                    ],
+                    3,
+                );
+                check_fold(&m);
+            }
+        }
+    }
+}
+
+#[test]
+fn folds_f32_binops() {
+    for op in FBinOp::ALL {
+        for &a in &F32S {
+            for &b in &F32S {
+                let m = ret(
+                    vec![ValType::I32],
+                    vec![
+                        Inst::ConstF32(a.to_bits()),
+                        Inst::ConstF32(b.to_bits()),
+                        Inst::FBin {
+                            ty: FloatTy::F32,
+                            op,
+                            a: 0,
+                            b: 1,
+                        },
+                        Inst::Cast {
+                            op: CastOp::ReinterpF32I32,
+                            a: 2,
+                        },
+                    ],
+                    3,
+                );
+                check_fold(&m);
+            }
+        }
+    }
+}
+
+#[test]
+fn folds_float_unops() {
+    for op in FUnOp::ALL {
+        for &a in &F64S {
+            let m = ret(
+                vec![ValType::I64],
+                vec![
+                    Inst::ConstF64(a.to_bits()),
+                    Inst::FUn {
+                        ty: FloatTy::F64,
+                        op,
+                        a: 0,
+                    },
+                    Inst::Cast {
+                        op: CastOp::ReinterpF64I64,
+                        a: 1,
+                    },
+                ],
+                2,
+            );
+            check_fold(&m);
+        }
+        for &a in &F32S {
+            let m = ret(
+                vec![ValType::I32],
+                vec![
+                    Inst::ConstF32(a.to_bits()),
+                    Inst::FUn {
+                        ty: FloatTy::F32,
+                        op,
+                        a: 0,
+                    },
+                    Inst::Cast {
+                        op: CastOp::ReinterpF32I32,
+                        a: 1,
+                    },
+                ],
+                2,
+            );
+            check_fold(&m);
+        }
+    }
+}
+
+#[test]
+fn folds_float_compares() {
+    // FCmp result is i32 0/1 directly — no reinterpret needed.
+    for op in FCmpOp::ALL {
+        for &a in &F64S {
+            for &b in &F64S {
+                let m = ret(
+                    vec![ValType::I32],
+                    vec![
+                        Inst::ConstF64(a.to_bits()),
+                        Inst::ConstF64(b.to_bits()),
+                        Inst::FCmp {
+                            ty: FloatTy::F64,
+                            op,
+                            a: 0,
+                            b: 1,
+                        },
+                    ],
+                    2,
+                );
+                check_fold(&m);
+            }
+        }
+    }
+}
+
+#[test]
+fn folds_fma() {
+    for &a in &F64S {
+        for &b in &[1.0f64, -2.0, 0.5, f64::NAN, f64::INFINITY] {
+            for &c in &[0.0f64, 3.5, -1e9, f64::NAN] {
+                let m = ret(
+                    vec![ValType::I64],
+                    vec![
+                        Inst::ConstF64(a.to_bits()),
+                        Inst::ConstF64(b.to_bits()),
+                        Inst::ConstF64(c.to_bits()),
+                        Inst::Fma {
+                            ty: FloatTy::F64,
+                            a: 0,
+                            b: 1,
+                            c: 2,
+                        },
+                        Inst::Cast {
+                            op: CastOp::ReinterpF64I64,
+                            a: 3,
+                        },
+                    ],
+                    4,
+                );
+                check_fold(&m);
+            }
+        }
+    }
+}
+
+#[test]
+fn folds_int_float_conversions() {
+    // Saturating float→int (total: NaN -> 0, out-of-range saturates).
+    for op in FToI::ALL {
+        let (from, to, _) = op.parts();
+        let result_ty = match to {
+            IntTy::I32 => ValType::I32,
+            IntTy::I64 => ValType::I64,
+        };
+        for &f in &[0.0f64, 3.9, -3.9, 1e30, -1e30, f64::NAN, f64::INFINITY] {
+            let konst = match from {
+                FloatTy::F32 => Inst::ConstF32((f as f32).to_bits()),
+                FloatTy::F64 => Inst::ConstF64(f.to_bits()),
+            };
+            check_fold(&ret(
+                vec![result_ty],
+                vec![konst, Inst::FToISat { op, a: 0 }],
+                1,
+            ));
+        }
+    }
+    // Int→float.
+    for op in IToF::ALL {
+        for &i in &[0i64, 1, -1, 123_456_789, -987, i64::MAX, i64::MIN] {
+            let konst = match op {
+                IToF::I32F32S | IToF::I32F32U | IToF::I32F64S | IToF::I32F64U => {
+                    Inst::ConstI32(i as i32)
+                }
+                _ => Inst::ConstI64(i),
+            };
+            // Result is f32 or f64; reinterpret to its int width for an exact compare.
+            let (reinterp, res_ty) = match op {
+                IToF::I32F32S | IToF::I32F32U | IToF::I64F32S | IToF::I64F32U => {
+                    (CastOp::ReinterpF32I32, ValType::I32)
+                }
+                _ => (CastOp::ReinterpF64I64, ValType::I64),
+            };
+            check_fold(&ret(
+                vec![res_ty],
+                vec![
+                    konst,
+                    Inst::IToFConv { op, a: 0 },
+                    Inst::Cast { op: reinterp, a: 1 },
+                ],
+                2,
+            ));
+        }
+    }
+}
+
+#[test]
+fn folds_demote_promote_and_reinterpret() {
+    for &f in &F64S {
+        // demote f64 -> f32 -> reinterpret to i32.
+        check_fold(&ret(
+            vec![ValType::I32],
+            vec![
+                Inst::ConstF64(f.to_bits()),
+                Inst::Cast {
+                    op: CastOp::Demote,
+                    a: 0,
+                },
+                Inst::Cast {
+                    op: CastOp::ReinterpF32I32,
+                    a: 1,
+                },
+            ],
+            2,
+        ));
+    }
+    for &f in &F32S {
+        // promote f32 -> f64 -> reinterpret to i64.
+        check_fold(&ret(
+            vec![ValType::I64],
+            vec![
+                Inst::ConstF32(f.to_bits()),
+                Inst::Cast {
+                    op: CastOp::Promote,
+                    a: 0,
+                },
+                Inst::Cast {
+                    op: CastOp::ReinterpF64I64,
+                    a: 1,
+                },
+            ],
+            2,
+        ));
+    }
+    // Integer reinterpret both ways round-trips a bit pattern.
+    check_fold(&ret(
+        vec![ValType::I32],
+        vec![
+            Inst::ConstI32(0x3f80_0000u32 as i32), // 1.0f32 bits
+            Inst::Cast {
+                op: CastOp::ReinterpI32F32,
+                a: 0,
+            },
+            Inst::Cast {
+                op: CastOp::ReinterpF32I32,
+                a: 1,
+            },
+        ],
+        2,
+    ));
+}
+
+#[test]
+fn trapping_ftoi_folds_in_range_but_preserves_out_of_range_trap() {
+    let trap_mod = |a: f64| {
+        ret(
+            vec![ValType::I32],
+            vec![
+                Inst::ConstF64(a.to_bits()),
+                Inst::FToITrap {
+                    op: FToI::F64I32S,
+                    a: 0,
+                },
+            ],
+            1,
+        )
+    };
+
+    // In range: folds to the truncated constant, no trapping op left.
+    let m = trap_mod(3.9);
+    verify_module(&m).expect("verifies");
+    let r = specialize(&m, 0, &[]).expect("specializes");
+    verify_module(&r).expect("re-verifies");
+    assert_no_residual_float(&r);
+    assert_eq!(run(&m, &[]), Ok(vec![Value::I32(3)]));
+    assert_eq!(run(&r, &[]), Ok(vec![Value::I32(3)]));
+
+    // Out of range / NaN: NOT folded — the trapping op survives and traps identically.
+    for &a in &[1e30f64, -1e30, f64::NAN, f64::INFINITY] {
+        let m = trap_mod(a);
+        verify_module(&m).expect("verifies");
+        let r = specialize(&m, 0, &[]).expect("specializes");
+        verify_module(&r).expect("re-verifies");
+        assert!(
+            r.funcs[0]
+                .blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::FToITrap { .. }))),
+            "out-of-range trapping conversion must be preserved, not folded"
+        );
+        assert_eq!(run(&m, &[]), run(&r, &[]), "trap behavior diverged");
+        assert!(run(&r, &[]).is_err(), "should trap at a={a}");
+    }
+}
+
+#[test]
+fn optimizer_folds_float_constants() {
+    // The generic optimizer shares the fold helpers: (2.0 * 3.0) + 1.0 = 7.0 collapses to a const.
+    let m = ret(
+        vec![ValType::I64],
+        vec![
+            Inst::ConstF64(2.0f64.to_bits()),
+            Inst::ConstF64(3.0f64.to_bits()),
+            Inst::FBin {
+                ty: FloatTy::F64,
+                op: FBinOp::Mul,
+                a: 0,
+                b: 1,
+            },
+            Inst::ConstF64(1.0f64.to_bits()),
+            Inst::FBin {
+                ty: FloatTy::F64,
+                op: FBinOp::Add,
+                a: 2,
+                b: 3,
+            },
+            Inst::Cast {
+                op: CastOp::ReinterpF64I64,
+                a: 4,
+            },
+        ],
+        5,
+    );
+    verify_module(&m).expect("verifies");
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    assert_no_residual_float(&opt);
+    assert_eq!(
+        run(&opt, &[]),
+        Ok(vec![Value::I64((7.0f64).to_bits() as i64)])
+    );
+    assert_eq!(run(&m, &[]), run(&opt, &[]));
 }

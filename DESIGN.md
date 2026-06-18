@@ -2032,13 +2032,16 @@ for free** (weval's value proposition for SpiderMonkey, applied here).
   dispatch by specialization is **~5–6×** on either backend (apples-to-apples, same backend); the
   end-to-end software-interpreted → compiled-native path is **~470×**. Lean-ISA dispatch-overhead
   fraction, not a universal constant — a heavier decode shows more.
-- **Coverage today:** integer/long/float/SIMD arithmetic, casts, comparisons, static + dynamic
-  branches, any-width constant-memory reads, renamed stack/locals (word **and** narrow `i8`/`i16`
-  cells, with a dynamic heap alongside), and cross-function `call` inlining (static + dynamic
-  control flow, recursion, loops). **Remaining enhancements (not gaps):** float/SIMD *constant
-  folding* (they pass through unfolded, deliberately — NaN/rounding fidelity), and the guest-side
-  engine (ship the specializer inside the sandbox on the §22 `Jit` capability for dynamic-language
-  IC-style recompilation; the residual IR and back half are shared).
+- **Coverage today:** integer/long **and scalar-float** arithmetic, compares, fused multiply-add,
+  float↔int conversions and reinterpret/demote/promote casts — all constant-**folded** bit-for-bit
+  the interpreter (NaN payloads + the wasm min/max/nearest rules preserved; a trapping `trunc` folds
+  only in range and is otherwise kept so it still traps); static + dynamic branches; any-width
+  constant-memory reads; renamed stack/locals (word **and** narrow `i8`/`i16` cells, with a dynamic
+  heap alongside); and cross-function `call` inlining (static + dynamic control flow, recursion,
+  loops). **Remaining enhancements (not gaps):** **v128 (SIMD) constant folding** (the 128-bit lane
+  ops still pass through unfolded — a separate, larger lane/shape surface), and the guest-side engine
+  (ship the specializer inside the sandbox on the §22 `Jit` capability for dynamic-language IC-style
+  recompilation; the residual IR and back half are shared).
 
 ---
 

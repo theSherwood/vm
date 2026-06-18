@@ -49,13 +49,16 @@
 //! traps — including a randomized fuzz over dead-heavy arithmetic DAGs that stresses the
 //! renumbering/remapper.
 //!
-//! **Still out of scope** (later increments): float/SIMD *constant folding* (they pass through to
-//! the residual but aren't folded — NaN/rounding fidelity), narrow (`i8`/`i16`) renameable cells,
-//! and cross-function specialization (`call`). Value-stack renaming for memory-backed interpreters
-//! is done — see [`mod@specialize`] (Stage 2).
+//! Scalar **float constant folding** is done — `f32`/`f64` arithmetic, compares, fused multiply-add,
+//! float↔int conversions, and reinterpret/demote/promote casts all fold bit-for-bit the interpreter
+//! (NaN payloads and the wasm min/max/nearest rules preserved). **Still out of scope** (later
+//! increments): **v128 (SIMD) constant folding** — the 128-bit lane ops still pass through to the
+//! residual unfolded. Cross-function `call`, narrow renameable cells, and value-stack renaming are
+//! all done — see [`mod@specialize`].
 
 use svm_ir::{
-    BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx, ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
+    IntTy, IntUnOp, Module, Terminator, ValIdx, ValType,
 };
 
 mod specialize;
@@ -63,12 +66,16 @@ pub use specialize::{
     specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig, SpecError,
 };
 
-/// A value known to be a constant at optimization time. Tracks integers only (the only types
-/// folded); floats/v128 are recorded as "unknown". Shared with the [`specialize`] engine.
+/// A value known to be a constant at optimization time. Tracks scalar integers and floats (v128 is
+/// recorded as "unknown"). Floats are held as **raw bits** so equality/hashing are exact and
+/// NaN-safe (needed for the specializer's memo key) and folds preserve NaN payloads. Shared with the
+/// [`specialize`] engine.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Known {
     I32(i32),
     I64(i64),
+    F32(u32),
+    F64(u64),
 }
 
 impl Known {
@@ -77,18 +84,32 @@ impl Known {
         match self {
             Known::I32(v) => Inst::ConstI32(v),
             Known::I64(v) => Inst::ConstI64(v),
+            Known::F32(b) => Inst::ConstF32(b),
+            Known::F64(b) => Inst::ConstF64(b),
         }
     }
     pub(crate) fn as_i32(self) -> Option<i32> {
         match self {
             Known::I32(v) => Some(v),
-            Known::I64(_) => None,
+            _ => None,
         }
     }
     pub(crate) fn as_i64(self) -> Option<i64> {
         match self {
             Known::I64(v) => Some(v),
-            Known::I32(_) => None,
+            _ => None,
+        }
+    }
+    pub(crate) fn as_f32(self) -> Option<f32> {
+        match self {
+            Known::F32(b) => Some(f32::from_bits(b)),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_f64(self) -> Option<f64> {
+        match self {
+            Known::F64(b) => Some(f64::from_bits(b)),
+            _ => None,
         }
     }
 }
@@ -173,6 +194,8 @@ fn const_value(inst: &Inst) -> Option<Known> {
     match *inst {
         Inst::ConstI32(v) => Some(Known::I32(v)),
         Inst::ConstI64(v) => Some(Known::I64(v)),
+        Inst::ConstF32(b) => Some(Known::F32(b)),
+        Inst::ConstF64(b) => Some(Known::F64(b)),
         _ => None,
     }
 }
@@ -213,8 +236,244 @@ fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
             };
             get(known, chosen)
         }
+        // Scalar float folds — bit-for-bit the interpreter's `fbin*`/`fun*`/`fcmp*`/`fto_i`/
+        // `i_to_f`/`cast`. `FToITrap` folds only when in range (else it is kept so it still traps).
+        Inst::FBin { ty, op, a, b } => fold_fbin(ty, op, get(known, a)?, get(known, b)?),
+        Inst::FUn { ty, op, a } => fold_fun(ty, op, get(known, a)?),
+        Inst::FCmp { ty, op, a, b } => fold_fcmp(ty, op, get(known, a)?, get(known, b)?),
+        Inst::Fma { ty, a, b, c } => fold_fma(ty, get(known, a)?, get(known, b)?, get(known, c)?),
+        Inst::FToISat { op, a } => fold_ftoi_sat(op, get(known, a)?),
+        Inst::FToITrap { op, a } => fold_ftoi_trap(op, get(known, a)?),
+        Inst::IToFConv { op, a } => fold_itof(op, get(known, a)?),
+        Inst::Cast { op, a } => fold_cast(op, get(known, a)?),
         _ => None,
     }
+}
+
+// ----- scalar float constant folding (mirrors `svm-interp`'s scalar helpers exactly) -----
+//
+// Floats flow through as raw bits and the math is done in `f32`/`f64`, so NaN payloads and the
+// wasm-specific min/max/nearest rules are preserved. The differential harness (interp vs residual,
+// on both backends, with NaN/±0/±inf/tie inputs) is the spec.
+
+fn fbin32(op: FBinOp, a: f32, b: f32) -> f32 {
+    match op {
+        FBinOp::Add => a + b,
+        FBinOp::Sub => a - b,
+        FBinOp::Mul => a * b,
+        FBinOp::Div => a / b,
+        FBinOp::Min => fmin32(a, b),
+        FBinOp::Max => fmax32(a, b),
+        FBinOp::Copysign => a.copysign(b),
+    }
+}
+fn fbin64(op: FBinOp, a: f64, b: f64) -> f64 {
+    match op {
+        FBinOp::Add => a + b,
+        FBinOp::Sub => a - b,
+        FBinOp::Mul => a * b,
+        FBinOp::Div => a / b,
+        FBinOp::Min => fmin64(a, b),
+        FBinOp::Max => fmax64(a, b),
+        FBinOp::Copysign => a.copysign(b),
+    }
+}
+fn fun32(op: FUnOp, a: f32) -> f32 {
+    match op {
+        FUnOp::Abs => a.abs(),
+        FUnOp::Neg => -a,
+        FUnOp::Sqrt => a.sqrt(),
+        FUnOp::Ceil => a.ceil(),
+        FUnOp::Floor => a.floor(),
+        FUnOp::Trunc => a.trunc(),
+        FUnOp::Nearest => a.round_ties_even(),
+    }
+}
+fn fun64(op: FUnOp, a: f64) -> f64 {
+    match op {
+        FUnOp::Abs => a.abs(),
+        FUnOp::Neg => -a,
+        FUnOp::Sqrt => a.sqrt(),
+        FUnOp::Ceil => a.ceil(),
+        FUnOp::Floor => a.floor(),
+        FUnOp::Trunc => a.trunc(),
+        FUnOp::Nearest => a.round_ties_even(),
+    }
+}
+// wasm min/max: NaN propagates; for ±0, min prefers -0 and max prefers +0.
+fn fmin32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            a
+        } else {
+            b
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+fn fmax32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            b
+        } else {
+            a
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+fn fmin64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            a
+        } else {
+            b
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+fn fmax64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            b
+        } else {
+            a
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Fold a binary float op; operands and result are `ty`.
+pub(crate) fn fold_fbin(ty: FloatTy, op: FBinOp, a: Known, b: Known) -> Option<Known> {
+    Some(match ty {
+        FloatTy::F32 => Known::F32(fbin32(op, a.as_f32()?, b.as_f32()?).to_bits()),
+        FloatTy::F64 => Known::F64(fbin64(op, a.as_f64()?, b.as_f64()?).to_bits()),
+    })
+}
+/// Fold a unary float op; operand and result are `ty`.
+pub(crate) fn fold_fun(ty: FloatTy, op: FUnOp, a: Known) -> Option<Known> {
+    Some(match ty {
+        FloatTy::F32 => Known::F32(fun32(op, a.as_f32()?).to_bits()),
+        FloatTy::F64 => Known::F64(fun64(op, a.as_f64()?).to_bits()),
+    })
+}
+/// Fold a float compare (result is `i32` 0/1).
+pub(crate) fn fold_fcmp(ty: FloatTy, op: FCmpOp, a: Known, b: Known) -> Option<Known> {
+    let r = match ty {
+        FloatTy::F32 => {
+            let (a, b) = (a.as_f32()?, b.as_f32()?);
+            match op {
+                FCmpOp::Eq => a == b,
+                FCmpOp::Ne => a != b,
+                FCmpOp::Lt => a < b,
+                FCmpOp::Le => a <= b,
+                FCmpOp::Gt => a > b,
+                FCmpOp::Ge => a >= b,
+            }
+        }
+        FloatTy::F64 => {
+            let (a, b) = (a.as_f64()?, b.as_f64()?);
+            match op {
+                FCmpOp::Eq => a == b,
+                FCmpOp::Ne => a != b,
+                FCmpOp::Lt => a < b,
+                FCmpOp::Le => a <= b,
+                FCmpOp::Gt => a > b,
+                FCmpOp::Ge => a >= b,
+            }
+        }
+    };
+    Some(Known::I32(r as i32))
+}
+/// Fold a fused multiply-add `a·b + c` (single rounding), matching the interpreter's `mul_add`.
+pub(crate) fn fold_fma(ty: FloatTy, a: Known, b: Known, c: Known) -> Option<Known> {
+    Some(match ty {
+        FloatTy::F32 => Known::F32(a.as_f32()?.mul_add(b.as_f32()?, c.as_f32()?).to_bits()),
+        FloatTy::F64 => Known::F64(a.as_f64()?.mul_add(b.as_f64()?, c.as_f64()?).to_bits()),
+    })
+}
+/// The `f64` value of a float operand, promoting `f32` exactly (matching the interpreter).
+fn ftoi_input(op: FToI, a: Known) -> Option<f64> {
+    Some(match op.parts().0 {
+        FloatTy::F32 => a.as_f32()? as f64,
+        FloatTy::F64 => a.as_f64()?,
+    })
+}
+/// Fold a **saturating** float→int conversion (`trunc_sat`): NaN → 0, out-of-range saturates —
+/// Rust's `as` cast matches wasm exactly, so it never fails.
+pub(crate) fn fold_ftoi_sat(op: FToI, a: Known) -> Option<Known> {
+    let f = ftoi_input(op, a)?;
+    let (_, to, signed) = op.parts();
+    Some(match (to, signed) {
+        (IntTy::I32, true) => Known::I32(f as i32),
+        (IntTy::I32, false) => Known::I32(f as u32 as i32),
+        (IntTy::I64, true) => Known::I64(f as i64),
+        (IntTy::I64, false) => Known::I64(f as u64 as i64),
+    })
+}
+/// Fold a **trapping** float→int conversion (`trunc`) — but only when it would *not* trap (the
+/// input is finite and truncates into range). On a NaN/out-of-range input, return `None` so the
+/// op is kept and traps at runtime exactly as the source would. Bounds mirror `trunc_trap`.
+pub(crate) fn fold_ftoi_trap(op: FToI, a: Known) -> Option<Known> {
+    let f = ftoi_input(op, a)?;
+    let (_, to, signed) = op.parts();
+    if f.is_nan() {
+        return None;
+    }
+    #[allow(clippy::manual_range_contains)]
+    let in_range = match (to, signed) {
+        (IntTy::I32, true) => f > -2_147_483_649.0 && f < 2_147_483_648.0,
+        (IntTy::I32, false) => f > -1.0 && f < 4_294_967_296.0,
+        (IntTy::I64, true) => f >= -9_223_372_036_854_775_808.0 && f < 9_223_372_036_854_775_808.0,
+        (IntTy::I64, false) => f > -1.0 && f < 18_446_744_073_709_551_616.0,
+    };
+    if !in_range {
+        return None;
+    }
+    fold_ftoi_sat(op, a)
+}
+/// Fold an int→float conversion, matching the interpreter's `i_to_f`.
+pub(crate) fn fold_itof(op: IToF, a: Known) -> Option<Known> {
+    Some(match op {
+        IToF::I32F32S => Known::F32((a.as_i32()? as f32).to_bits()),
+        IToF::I32F32U => Known::F32((a.as_i32()? as u32 as f32).to_bits()),
+        IToF::I64F32S => Known::F32((a.as_i64()? as f32).to_bits()),
+        IToF::I64F32U => Known::F32((a.as_i64()? as u64 as f32).to_bits()),
+        IToF::I32F64S => Known::F64((a.as_i32()? as f64).to_bits()),
+        IToF::I32F64U => Known::F64((a.as_i32()? as u32 as f64).to_bits()),
+        IToF::I64F64S => Known::F64((a.as_i64()? as f64).to_bits()),
+        IToF::I64F64U => Known::F64((a.as_i64()? as u64 as f64).to_bits()),
+    })
+}
+/// Fold a `demote`/`promote`/`reinterpret` cast, matching the interpreter's `cast`.
+pub(crate) fn fold_cast(op: CastOp, a: Known) -> Option<Known> {
+    Some(match op {
+        CastOp::Demote => Known::F32((a.as_f64()? as f32).to_bits()),
+        CastOp::Promote => Known::F64((a.as_f32()? as f64).to_bits()),
+        CastOp::ReinterpI32F32 => Known::F32(a.as_i32()? as u32),
+        CastOp::ReinterpF32I32 => Known::I32(a.as_f32()?.to_bits() as i32),
+        CastOp::ReinterpI64F64 => Known::F64(a.as_i64()? as u64),
+        CastOp::ReinterpF64I64 => Known::I64(a.as_f64()?.to_bits() as i64),
+    })
 }
 
 /// Constant-fold an integer binary op, mirroring the interpreter's `bin32`/`bin64` exactly
