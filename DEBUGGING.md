@@ -646,7 +646,93 @@ chain). Both correlate by the same source-line `scope` field the consumer resolv
 guest (wasm or `-O0` LLVM) with an inner-block `int x` shadowing an outer one resolves to the inner
 shadow inside the block and the outer after it, exactly as chibicc does (the LLVM lane verifies it at
 runtime; the wasm lane structurally, since a bare `WindowVia` frame read needs `__stack_pointer`
-setup the direct call doesn't do). *Not yet:* the JIT/DWARF tier for gdb/lldb on native code.
+setup the direct call doesn't do). *Not yet:* the JIT/DWARF tier for gdb/lldb on native code — scoped
+below.
+
+### Scoping — the JIT/DWARF tier (gdb/lldb on native JIT'd code)
+
+**This is the W5 "real work" the interpreter-backed tiers above deliberately deferred** — a
+cross-session workstream tracked here. Goal: a developer attaches **gdb or lldb** (or VS Code via
+DAP) to a process running JIT'd guest code, sets a breakpoint on a `.c`/source line, it binds, and
+hitting it shows the source frame, a backtrace, and inspectable source variables — at native speed.
+
+**Why now / what changed.** The §6 waist is complete across all three frontends (source lines,
+structured types, variables incl. `SsaList`/`WindowVia`/`Fixed`, lexical scopes, globals). That is
+the **load-bearing simplification for this tier**: the JIT/DWARF emitter has *one* uniform input —
+the neutral `DebugInfo` — to **synthesize** DWARF from, rather than transforming three different
+native blobs (the original §7 sketch's "prefer the native blob, relocate addresses" is moot because
+the JIT's addresses are *machine* pcs, so even a carried blob's line program and location
+expressions must be rewritten anyway). So: synthesize DWARF from the §6 core uniformly; the native
+DWARF blobs become an optional later fidelity enhancement, not a prerequisite.
+
+**Current substrate (what exists).** `svm-jit` compiles IR → machine code via `cranelift-jit`
+(`JITModule`), one `cranelift_frontend::FunctionBuilder` per function. Cranelift already provides the
+two hooks this tier needs: `func.set_srcloc(inst, SourceLoc)` (an opaque `u32` we own, attached per
+instruction → carried into the compiled address map) and `ValueLabelsRanges = HashMap<ValueLabel,
+Vec<ValueLocRange>>` (value-location lists — *the* W6-JIT substrate, a value's
+register/stack-slot over a machine-pc range). It does **not** yet set srclocs, label values, emit
+unwind info, or produce any DWARF. The project **hand-rolls DWARF parsing** (`svm-wasm`'s
+`dwarf_line.rs`/`dwarf_info.rs`), so the ethos is to **hand-roll the writer** (the inverse) rather
+than add `gimli`; revisit only if loclist encoding gets heavy. No `gimli`/`object` deps today.
+
+**Dependencies pulled in.** This tier *is* where the long-deferred **W3-JIT** (Cranelift unwind info
++ fiber-rooted stack walk for backtraces, §5/§23) and **W6-JIT** (Cranelift value-location lists →
+DWARF variable locations) finally land — they are stages here, not separate workstreams.
+
+**Staged plan (slices — update status as they land):**
+
+- [ ] **Stage 0 — SourceLoc threading (foundation).** During JIT codegen, map each IR op's W4
+  `debug.loc` to a `cranelift SourceLoc` (a `u32` index into a per-module `(file,line,col)` side
+  table) via `set_srcloc`. No debugger yet. *Deliverable:* the compiled output's source-loc map is
+  populated; a unit test reads it back. *Effort: low.*
+- [ ] **Stage 1 — JIT address→source map + trap symbolization (first user-visible win).** After
+  `finalize`, read Cranelift's `MachSrcLoc`/address ranges to build `machine_pc → (func, file,
+  line)`. Symbolize a JIT trap/panic into a source-line frame (no debugger, no DWARF yet) — the
+  cheapest win and the test vehicle for Stages 2–4. Overlaps W3-JIT. *Effort: low–med.*
+- [ ] **Stage 2 — `.debug_line` + `.debug_info` synthesis + GDB JIT registration (line-level
+  gdb/lldb).** Hand-roll a DWARF writer (inverse of `dwarf_line`/`dwarf_info`): a `.debug_line`
+  line-number program over the JIT'd machine addresses (from Stage 1), and a `.debug_info` CU +
+  per-function `DW_TAG_subprogram` (name, `low_pc`/`high_pc`) + `.debug_abbrev`/`.debug_str`. Wrap
+  the JIT code + DWARF in a minimal in-memory **ELF object** (`.text` header pointing at the JIT
+  memory) and register it via the **GDB JIT interface** (`__jit_debug_register_code` +
+  `__jit_debug_descriptor` + the `jit_code_entry` list). *Acceptance:* gdb/lldb binds a source-line
+  breakpoint and shows the source frame. **The headline milestone.** *Effort: high.*
+- [ ] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars).** Label the IR
+  values backing source variables with `ValueLabel`s during codegen; read back `ValueLabelsRanges`
+  after compile; emit `DW_TAG_variable` DIEs with DWARF location lists (`DW_OP_reg`/`DW_OP_breg`/
+  `DW_OP_fbreg` + `.debug_loclists`) bridging the W4 `VarLoc` + Cranelift's ranges. Reuse the §6
+  `TypeDef` graph for `DW_TAG_*_type` DIEs (inverse of `dwarf_info`'s type reader). *Acceptance:*
+  `print x` in gdb/lldb works on JIT'd code; vars dropped by the optimizer show `<optimized out>`
+  (faithful native behavior — the interpreter tier remains the always-faithful inspection
+  fallback). *Effort: high.*
+- [ ] **Stage 4 — W3-JIT unwind / backtrace.** Emit Cranelift unwind info; walk the out-of-band
+  control stack rooted at a **fiber handle** (not the OS thread — §23/D57 migratable fibers) to
+  materialize a per-fiber call stack with source frames. *Acceptance:* `bt` in gdb shows the guest
+  call stack with source. *Effort: med–high.*
+- [ ] **Stage 5 — DAP-over-JIT (optional; editor parity at native speed).** Either drive the JIT
+  under `svm-dap` (breakpoints via software `int3` patching or single-step over DWARF line
+  boundaries) so VS Code debugs native-speed code, **or** keep the interpreter as the DAP stepping
+  engine and use the JIT only for speed (the two-engine question below). *Effort: high.*
+
+**Key decisions / open questions (to resolve as stages land):**
+- *DWARF writer:* hand-roll (ethos; reuses the `dwarf_line`/`dwarf_info` shapes) vs `gimli` write
+  (standard but a new dep). Lean hand-roll for `.debug_line`/`.debug_info`; reconsider for
+  `.debug_loclists` if the encoding gets heavy.
+- *ELF builder:* a minimal hand-rolled in-memory ELF (a handful of section headers) vs the `object`
+  crate. Lean minimal-hand-rolled — only `.text` + a few `.debug_*` sections are needed.
+- *Registration target:* the **GDB JIT interface** (gdb + lldb, full source/DWARF) is the goal;
+  `/tmp/perf-<pid>.map` (symbols only) and `perf` jitdump are cheaper symbol-only side options if a
+  quick win is wanted before Stage 2.
+- *Two-engine DAP (Stage 5):* interpreter-for-stepping + JIT-for-speed (cheap, already have the
+  interpreter tier, sidesteps optimized-debug) vs JIT-only DWARF/DAP. The original §7 recommendation
+  was interpreter-first (done); Stage 5 is where JIT-native stepping is decided.
+- *Trust/TCB:* DWARF and the JIT registration are **host-side tooling**, untrusted-for-escape (§2a)
+  like the rest of the waist — a malformed DWARF mis-renders, never escapes. Keep it off the
+  verifier/runtime hot path.
+
+**Recommended entry point for the next session:** Stage 0 → Stage 1 (low-risk, self-contained,
+no debugger or DWARF yet, immediately testable via JIT trap symbolization), then Stage 2 for the
+headline gdb milestone. Each stage is independently shippable.
 
 ---
 
