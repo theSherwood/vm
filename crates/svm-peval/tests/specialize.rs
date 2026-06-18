@@ -850,3 +850,95 @@ fn specializes_float_interpreter() {
         assert_eq!(jit, expect, "jit residual at {x}");
     }
 }
+
+#[test]
+fn private_rename_allows_dynamic_heap_access() {
+    // h(ptr) = 7 + *ptr, but the constant 7 is staged through a renamed operand-stack slot. The
+    // stack store/load are renamed away; the *ptr load has a dynamic address and must survive.
+    let region = (STACK_LO, STACK_LO + 8);
+    let st = |addr, value| Inst::Store {
+        op: StoreOp::I64,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let ld = |addr| Inst::Load {
+        op: LoadOp::I64,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let h = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64], // 0: ptr
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![ValType::I64],
+                insts: vec![
+                    Inst::ConstI64(STACK_LO as i64), // 1: stack slot addr
+                    Inst::ConstI64(7),               // 2
+                    st(1, 2),                        // [slot] = 7   (renamed)
+                    ld(1),                           // 3: v = [slot] (renamed -> 7)
+                    ld(0),                           // 4: hv = *ptr  (dynamic addr -> residual)
+                    Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Add,
+                        a: 3,
+                        b: 4,
+                    }, // 5: v + hv
+                ],
+                term: Terminator::Return(vec![5]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        // The heap cell *ptr will point at: a writable word holding 100.
+        data: vec![Data {
+            offset: 4096,
+            readonly: false,
+            bytes: 100i64.to_le_bytes().to_vec(),
+        }],
+        ..Default::default()
+    };
+    verify_module(&h).expect("verifies");
+
+    // Without the privacy promise, the dynamic-address load under an active rename region bails.
+    let conservative = SpecConfig {
+        rename: Some(region),
+        ..SpecConfig::default()
+    };
+    assert_eq!(
+        specialize_with_config(&h, 0, &[SpecArg::Dynamic], &conservative),
+        Err(svm_peval::SpecError::Unsupported)
+    );
+
+    // With it, the heap access is emitted residually while the stack is still renamed away.
+    let cfg = SpecConfig {
+        rename: Some(region),
+        rename_is_private: true,
+        ..SpecConfig::default()
+    };
+    let residual = specialize_with_config(&h, 0, &[SpecArg::Dynamic], &cfg).expect("specializes");
+    verify_module(&residual).expect("re-verifies");
+    let n_load = residual.funcs[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| matches!(i, Inst::Load { .. }))
+        .count();
+    let n_store = residual.funcs[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| matches!(i, Inst::Store { .. }))
+        .count();
+    assert_eq!(n_load, 1, "the heap load survives");
+    assert_eq!(n_store, 0, "the operand-stack store is renamed away");
+
+    // ptr = 4096 -> *ptr = 100 -> 7 + 100 = 107.
+    assert_eq!(run(&h, &[Value::I64(4096)]), Ok(vec![Value::I64(107)]));
+    assert_eq!(
+        run(&residual, &[Value::I64(4096)]),
+        Ok(vec![Value::I64(107)])
+    );
+}

@@ -129,6 +129,13 @@ pub struct SpecConfig {
     /// segment (e.g. one written into the window before the call). Loads fully inside an overlay
     /// fold to its bytes. Overlays take precedence over data segments.
     pub const_overlays: Vec<(u64, Vec<u8>)>,
+    /// Caller promise: the [`rename`](Self::rename) region is **private** — touched only by the
+    /// constant-address accesses the engine renames, never by a dynamic-address load/store. With it
+    /// set, a dynamic-address access (whose target the engine can't pin) is emitted as a faithful
+    /// residual access instead of conservatively refusing — letting an interpreter use a renamed
+    /// operand stack *and* a pointer-addressed heap at once. Unsound if violated (a dynamic write
+    /// into the region would desync the elided renamed cells), so it is opt-in and off by default.
+    pub rename_is_private: bool,
 }
 
 /// Specialize with no caller memory hints (only readonly data segments fold).
@@ -478,8 +485,9 @@ impl Spec<'_> {
             });
             return Ok(Some(Abs::Dyn(bump(rnext))));
         }
-        // Dynamic address: with a region active it might alias the renamed stack — refuse.
-        if self.config.rename.is_some() {
+        // Dynamic address: with a region active it might alias the renamed stack, so refuse —
+        // unless the caller has promised the region is private to the renamed accesses.
+        if self.config.rename.is_some() && !self.config.rename_is_private {
             return Err(SpecError::Unsupported);
         }
         let addr = materialize(env[addr as usize], out, rnext);
@@ -537,8 +545,9 @@ impl Spec<'_> {
             }
             return Err(SpecError::Unsupported); // straddles the region boundary
         }
-        // Dynamic address: with a region active it might alias the renamed stack — refuse.
-        if self.config.rename.is_some() {
+        // Dynamic address: with a region active it might alias the renamed stack, so refuse —
+        // unless the caller has promised the region is private to the renamed accesses.
+        if self.config.rename.is_some() && !self.config.rename_is_private {
             return Err(SpecError::Unsupported);
         }
         let addr = materialize(env[addr as usize], out, rnext);
