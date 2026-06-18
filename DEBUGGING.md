@@ -419,6 +419,14 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   interpreter changes. A test asserts the JIT's `last_trap_backtrace()` equals the interpreter's
   frames `(func, file, line)`, innermost first, across both trap families × single/multi-frame. This
   is the project's standard interp↔JIT differential validation, now closed for trap backtraces.
+- [x] **Interpreter symmetry (the plain-run counterpart).** The trap-time backtrace was previously
+  reachable on the interpreter only via the `Inspector` (stepping); `run_traced` /
+  `run_with_host_traced` now return it on the plain run path too — the M:N executor snapshots the
+  trapping vCPU's live `Vec<Frame>` into its run outcome, and a free `source_loc(m, pc)` resolves each
+  `IrPc` to source (the symmetric analog of the JIT's `JitFrameLoc`). Both engines now report *where*
+  a guest trapped from their ordinary run entry, which also lets the interp↔JIT differential fuzzer
+  pinpoint divergences. *Tests (`interp_trap_backtrace.rs`, all platforms):* a store fault names the
+  store; a callee div-by-zero walks the caller chain; a clean run is empty.
 - [x] **Stage 2 — explicit-check trap backtrace.** An explicit trap has no signal — the lowered check
   stores its kind and `return`s, unwinding the guest frames — so the capture happens *at the trap
   site*: `emit_trap` (the single origin every explicit trap routes through — div/rem, `unreachable`,
