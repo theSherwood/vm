@@ -13,9 +13,46 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-_(none — I2 resolved below)_
+### I3 — Rare deadlock/hang in the work-stealing fiber demos (CI flake) (S3)
+
+**Where:** the guest-built work-stealing schedulers run end-to-end through the `svm-run` binary —
+`crates/svm-run/demos/work_stealing/work_stealing.c` (stackless tasks) and
+`crates/svm-run/demos/steal_fibers/steal_fibers.c` (D57 stackful, migratable fibers stolen across
+real OS threads) — and their product-path smoke tests `demo_work_stealing_runs` /
+`demo_steal_fibers_runs` in `crates/svm-run/tests/run.rs`. The deadlock is in the
+scheduler/fiber-stealing path (guest scheduler logic and/or the host `os_thread_rt` + fiber-steal
+runtime), not in the demos' I/O.
+
+**Symptom:** the demo process occasionally **never terminates** — the guest's worker threads wedge
+with no forward progress, so the test's `Command::…output()` blocks indefinitely. Observed once on
+the **Linux x86_64** CI `check` job (run 27778162761, the `cargo test --workspace` step), which hung
+>1 h until the run was cancelled. It is **rare**: 0 hangs in 48 local back-to-back runs of both
+demos, and the suite passed cleanly on other runs.
+
+**Why only Linux CI sees it:** both tests are gated `#[cfg(all(unix, target_arch = "x86_64"))]`.
+`macos-latest` is arm64 and `windows-latest` is non-unix, so **both skip these demos** — the Linux
+x86_64 `check` job is the only CI lane that runs them, so a hang there shows up as a single stuck
+job while every other job is green.
+
+**Root cause (hypothesis, not yet confirmed):** a timing-dependent liveness bug — most likely a
+lost-wakeup / missed-notification race between the steal path and the park/unpark of idle worker
+threads (or in the guest scheduler's termination detection), exposed only under a particular
+interleaving. Needs root-causing from a stuck instance (attach `gdb`/`lldb` and dump all thread
+backtraces, or add steal/park tracing). **Not** caused by the argc/argv work (PR #66): the demos and
+the fiber/thread runtime are unchanged by it, and they pass consistently with that change applied.
+
+**Fix sketch:**
+1. Root-cause via thread backtraces of a hung process (reproduce by looping the `svm-run` binary on
+   the demo until it wedges, then attach a debugger) — confirm whether the stall is in the host
+   steal/park runtime or the guest scheduler, and fix the wakeup race.
+2. Interim blast-radius mitigation (independent of the root cause): the runner already honours
+   `SVM_DEADLINE_MS` (§5 detect-and-kill); have the demo smoke tests run the `svm-run` subprocess
+   under a deadline / `timeout` so a hang **fails fast** instead of blocking CI for hours, and add a
+   `timeout-minutes:` to the CI `check` job (it currently has none, so a wedged job sits until
+   GitHub's 6 h default).
 
 ---
+
 
 ## Resolved
 
