@@ -1785,6 +1785,21 @@ fn v_q15mulr(lo: &mut Lower) -> Result<(), Error> {
     lo.push(v, ValType::V128);
     Ok(())
 }
+/// `<f>.relaxed_madd`/`relaxed_nmadd` (a ternary `[a, b, c]` op): a fused `±a·b + c`.
+fn v_fma(lo: &mut Lower, shape: VShape, neg: bool) -> Result<(), Error> {
+    let (c, _) = lo.pop()?;
+    let (b, _) = lo.pop()?;
+    let (a, _) = lo.pop()?;
+    let v = lo.emit(Inst::VFma {
+        shape,
+        neg,
+        a,
+        b,
+        c,
+    });
+    lo.push(v, ValType::V128);
+    Ok(())
+}
 fn v_widen(lo: &mut Lower, shape: VShape, op: VWidenOp) -> Result<(), Error> {
     let (a, _) = lo.pop()?;
     let v = lo.emit(Inst::VWiden { shape, op, a });
@@ -4051,6 +4066,42 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
             lo.push(v, ValType::V128);
         }
         O::I8x16Swizzle => {
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Swizzle { a, b });
+            lo.push(v, ValType::V128);
+        }
+
+        // ---- relaxed SIMD: each op lowers to one spec-allowed deterministic behavior, computed
+        // identically in both backends (so the interp↔JIT differential holds). `relaxed_madd`/`nmadd`
+        // get a genuine fused FMA; the rest alias to the deterministic op SVM already has. The two
+        // `relaxed_dot_i8x16_i7x16` ops (pmaddubsw-shaped) are not yet lowered → clean `Unsupported`.
+        O::F32x4RelaxedMadd => v_fma(lo, VShape::F32x4, false)?,
+        O::F32x4RelaxedNmadd => v_fma(lo, VShape::F32x4, true)?,
+        O::F64x2RelaxedMadd => v_fma(lo, VShape::F64x2, false)?,
+        O::F64x2RelaxedNmadd => v_fma(lo, VShape::F64x2, true)?,
+        O::F32x4RelaxedMin => v_fbin(lo, VShape::F32x4, VFloatBinOp::Min)?,
+        O::F32x4RelaxedMax => v_fbin(lo, VShape::F32x4, VFloatBinOp::Max)?,
+        O::F64x2RelaxedMin => v_fbin(lo, VShape::F64x2, VFloatBinOp::Min)?,
+        O::F64x2RelaxedMax => v_fbin(lo, VShape::F64x2, VFloatBinOp::Max)?,
+        O::I32x4RelaxedTruncF32x4S => v_convert(lo, VCvtOp::I32x4TruncSatF32x4S)?,
+        O::I32x4RelaxedTruncF32x4U => v_convert(lo, VCvtOp::I32x4TruncSatF32x4U)?,
+        O::I32x4RelaxedTruncF64x2SZero => v_convert(lo, VCvtOp::I32x4TruncSatF64x2SZero)?,
+        O::I32x4RelaxedTruncF64x2UZero => v_convert(lo, VCvtOp::I32x4TruncSatF64x2UZero)?,
+        O::I16x8RelaxedQ15mulrS => v_q15mulr(lo)?,
+        // relaxed_laneselect(a, b, mask) = mask ? a : b for a valid (all-0/all-1) mask — exactly
+        // `bitselect`, the deterministic behavior the proposal permits.
+        O::I8x16RelaxedLaneselect
+        | O::I16x8RelaxedLaneselect
+        | O::I32x4RelaxedLaneselect
+        | O::I64x2RelaxedLaneselect => {
+            let (mask, _) = lo.pop()?;
+            let (b, _) = lo.pop()?;
+            let (a, _) = lo.pop()?;
+            let v = lo.emit(Inst::Bitselect { a, b, mask });
+            lo.push(v, ValType::V128);
+        }
+        O::I8x16RelaxedSwizzle => {
             let (b, _) = lo.pop()?;
             let (a, _) = lo.pop()?;
             let v = lo.emit(Inst::Swizzle { a, b });

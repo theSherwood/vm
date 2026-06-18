@@ -371,6 +371,74 @@ fn f32x4_pmin_pmax() {
     assert!(run("f32x4.pmax", 1.0, f32::NAN).to_bits() == 1.0f32.to_bits());
 }
 
+/// **Relaxed SIMD** through the wasm bridge — each op runs one spec-allowed deterministic behavior,
+/// interp == JIT (enforced by `eval`). `relaxed_madd`/`nmadd` are a genuine fused FMA (one rounding,
+/// matching Rust's `mul_add`); the rest alias to the deterministic op SVM already lowers. This is the
+/// shape a real `clang -mrelaxed-simd` kernel emits.
+#[test]
+fn relaxed_simd_madd_and_friends() {
+    // relaxed_madd(a,b,c) = a*b + c (fused). Splat three scalars, read lane 0.
+    let madd = |op: &str, a: f32, b: f32, c: f32| {
+        let wat = format!(
+            "(module (func (export \"f\") (param $a f32) (param $b f32) (param $c f32) (result f32)
+               (f32x4.extract_lane 0 ({op} (f32x4.splat (local.get $a))
+                  (f32x4.splat (local.get $b)) (f32x4.splat (local.get $c))))))"
+        );
+        f32(eval(
+            &wat,
+            "f",
+            &[Value::F32(a), Value::F32(b), Value::F32(c)],
+        ))
+    };
+    for (a, b, c) in [(2.0f32, 3.0, 4.0), (1e20, 1e20, -1e30), (0.1, 0.2, 0.3)] {
+        assert_eq!(
+            madd("f32x4.relaxed_madd", a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "relaxed_madd {a} {b} {c}"
+        );
+        assert_eq!(
+            madd("f32x4.relaxed_nmadd", a, b, c).to_bits(),
+            (-a).mul_add(b, c).to_bits(),
+            "relaxed_nmadd {a} {b} {c}"
+        );
+    }
+
+    // relaxed_min/max alias to the deterministic wasm min/max.
+    let minmax = |op: &str, a: f32, b: f32| {
+        let wat = format!(
+            "(module (func (export \"f\") (param $a f32) (param $b f32) (result f32)
+               (f32x4.extract_lane 0 ({op} (f32x4.splat (local.get $a)) (f32x4.splat (local.get $b))))))"
+        );
+        f32(eval(&wat, "f", &[Value::F32(a), Value::F32(b)]))
+    };
+    assert_eq!(minmax("f32x4.relaxed_min", 2.0, 5.0), 2.0);
+    assert_eq!(minmax("f32x4.relaxed_max", 2.0, 5.0), 5.0);
+
+    // relaxed_trunc aliases to trunc_sat (saturating, NaN→0).
+    let trunc = |x: f32| {
+        let wat = "(module (func (export \"f\") (param $x f32) (result i32)
+               (i32x4.extract_lane 0 (i32x4.relaxed_trunc_f32x4_s (f32x4.splat (local.get $x))))))";
+        match eval(wat, "f", &[Value::F32(x)]) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        }
+    };
+    assert_eq!(trunc(3.9), 3);
+    assert_eq!(trunc(-3.9), -3);
+    assert_eq!(trunc(f32::NAN), 0, "trunc_sat maps NaN→0");
+
+    // relaxed_laneselect aliases to bitselect (mask all-1 lane ⇒ take a).
+    let wat = "(module (func (export \"f\") (result i32)
+        (i32x4.extract_lane 0 (i32x4.relaxed_laneselect
+          (i32x4.splat (i32.const 0xAAAA)) (i32x4.splat (i32.const 0x5555))
+          (i32x4.splat (i32.const 0xFFFFFFFF))))))";
+    assert_eq!(
+        eval(wat, "f", &[]),
+        Value::I32(0xAAAA),
+        "all-1 mask selects a"
+    );
+}
+
 #[test]
 fn f64x2_pmin_pmax() {
     let pm = |op: &str| {

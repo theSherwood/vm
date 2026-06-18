@@ -1948,6 +1948,18 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+    /// Lane-wise **fused multiply-add** (the relaxed-SIMD `relaxed_madd`/`relaxed_nmadd`): each lane
+    /// is `a·b + c` (`neg == false`) or `−a·b + c` (`neg == true`), computed with a **single rounding**
+    /// (IEEE-754 FMA). Float shapes (`f32x4`/`f64x2`); `a`/`b`/`c`/result are `v128`. SVM picks the
+    /// fused behavior (one of the two the relaxed proposal permits) consistently in both backends —
+    /// Cranelift `fma` and Rust `f*::mul_add` are both correctly-rounded, so the differential holds.
+    VFma {
+        shape: VShape,
+        neg: bool,
+        a: ValIdx,
+        b: ValIdx,
+        c: ValIdx,
+    },
     /// `v128.any_true`: `i32` `1` if **any** bit of the 128-bit vector is set, else `0`
     /// (shape-agnostic). `a` is `v128`, result `i32`.
     VAnyTrue {

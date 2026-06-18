@@ -729,6 +729,19 @@ fn check_inst(
             cx.expect(*b, ValType::V128)?;
             ValType::V128
         }
+        // Fused multiply-add (`relaxed_madd`/`nmadd`): a ternary float-lane op.
+        Inst::VFma { shape, a, b, c, .. } => {
+            if !shape.is_float() {
+                return Err(VerifyError::BadSimdShape {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            cx.expect(*a, ValType::V128)?;
+            cx.expect(*b, ValType::V128)?;
+            cx.expect(*c, ValType::V128)?;
+            ValType::V128
+        }
         Inst::VFloatUn { shape, a, .. } => {
             if !shape.is_float() {
                 return Err(VerifyError::BadSimdShape {

@@ -2714,6 +2714,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VExtAddPairwise { .. } => {}
                 // Q15 rounding multiply → native `sqmul_round_sat`.
                 Inst::VQ15MulrSat { .. } => {}
+                // Fused multiply-add (relaxed_madd/nmadd) → vector `fma` (one rounding; the same
+                // correctly-rounded result the interp's `mul_add` gives, so the differential holds).
+                Inst::VFma { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -3837,6 +3840,22 @@ fn lower_block(
                 let x = vcast(b, get(&vals, *a)?, I16X8);
                 let y = vcast(b, get(&vals, *rb)?, I16X8);
                 let r = b.ins().sqmul_round_sat(x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VFma {
+                shape,
+                neg,
+                a,
+                b: rb,
+                c,
+            } => {
+                let ty = vec_ty(*shape);
+                let xa = vcast(b, get(&vals, *a)?, ty);
+                // `nmadd` is `−a·b + c`: negate the product by negating `a`.
+                let x = if *neg { b.ins().fneg(xa) } else { xa };
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let z = vcast(b, get(&vals, *c)?, ty);
+                let r = b.ins().fma(x, y, z);
                 vcast(b, r, I8X16)
             }
             Inst::VSatBin {

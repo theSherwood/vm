@@ -90,6 +90,8 @@ fn simd_text_and_binary_roundtrip() {
           v14 = f32x4.neg v4\n\
           v140 = f32x4.pmin v4 v4\n\
           v141 = f32x4.pmax v4 v4\n\
+          v1400 = f32x4.fma v4 v4 v4\n\
+          v1401 = f64x2.fnma v4 v4 v4\n\
           v142 = i8x16.popcnt v2\n\
           v143 = i8x16.avgr_u v2 v3\n\
           v144 = i16x8.avgr_u v2 v3\n\
@@ -361,6 +363,71 @@ fn diff_f32x4_pminmax_nan() {
             f32x4_pminmax("pmax", a, b).to_bits(),
             pmax.to_bits(),
             "pmax nan {a} {b}"
+        );
+    }
+}
+
+// Fused multiply-add (`Inst::VFma`, the relaxed-SIMD `relaxed_madd`/`nmadd`): `±a·b + c` with a
+// single rounding. The oracle is Rust's `mul_add` (the correctly-rounded IEEE FMA); `diff1` pins
+// interp == JIT, so this also confirms Cranelift's vector `fma` legalizes and matches `mul_add`.
+#[test]
+fn diff_f32x4_fma() {
+    let fma = |op: &str, a: f32, b: f32, c: f32| -> f32 {
+        let s = format!(
+            "func (f32, f32, f32) -> (f32) {{\n\
+            block0(v0: f32, v1: f32, v2: f32):\n\
+              v3 = f32x4.splat v0\n\
+              v4 = f32x4.splat v1\n\
+              v5 = f32x4.splat v2\n\
+              v6 = f32x4.{op} v3 v4 v5\n\
+              v7 = f32x4.extract_lane 0 v6\n  return v7\n}}\n"
+        );
+        f32::from_bits(diff1(&s, &[Value::F32(a), Value::F32(b), Value::F32(c)]) as u32)
+    };
+    // A case where fused (one rounding) differs from mul+add (two): large*small + large.
+    for (a, b, c) in [
+        (2.0f32, 3.0, 4.0),
+        (1.0000001, 1.0000001, -1.0),
+        (1e20, 1e20, -1e30),
+        (0.1, 0.2, 0.3),
+    ] {
+        assert_eq!(
+            fma("fma", a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "fma {a} {b} {c}"
+        );
+        assert_eq!(
+            fma("fnma", a, b, c).to_bits(),
+            (-a).mul_add(b, c).to_bits(),
+            "fnma {a} {b} {c}"
+        );
+    }
+}
+
+#[test]
+fn diff_f64x2_fma() {
+    let fma = |op: &str, a: f64, b: f64, c: f64| -> f64 {
+        let s = format!(
+            "func (f64, f64, f64) -> (f64) {{\n\
+            block0(v0: f64, v1: f64, v2: f64):\n\
+              v3 = f64x2.splat v0\n\
+              v4 = f64x2.splat v1\n\
+              v5 = f64x2.splat v2\n\
+              v6 = f64x2.{op} v3 v4 v5\n\
+              v7 = f64x2.extract_lane 1 v6\n  return v7\n}}\n"
+        );
+        f64::from_bits(diff1(&s, &[Value::F64(a), Value::F64(b), Value::F64(c)]) as u64)
+    };
+    for (a, b, c) in [(2.0f64, 3.0, 4.0), (1e300, 1e300, -1e308), (0.1, 0.2, 0.3)] {
+        assert_eq!(
+            fma("fma", a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "fma {a} {b} {c}"
+        );
+        assert_eq!(
+            fma("fnma", a, b, c).to_bits(),
+            (-a).mul_add(b, c).to_bits(),
+            "fnma {a} {b} {c}"
         );
     }
 }

@@ -6216,6 +6216,19 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::VQ15MulrSat { a, b } => {
             Reg::from_v128(simd_q15mulr(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
         }
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => Reg::from_v128(simd_fma(
+            *shape,
+            *neg,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+            get(vals, *c)?.v128(),
+        )),
         Inst::VAnyTrue { a } => {
             Reg::from_i32((get(vals, *a)?.v128().iter().any(|&b| b != 0)) as i32)
         }
@@ -6768,6 +6781,35 @@ fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> 
             }
         }
         // Verifier rejects an integer shape here; total fall-through returns zero.
+        _ => {}
+    }
+    o
+}
+
+/// Lane-wise fused multiply-add (`relaxed_madd`/`nmadd`): `±a·b + c` with a single rounding.
+/// `f*::mul_add` is the correctly-rounded IEEE-754 FMA — bit-identical to Cranelift's `fma`, so the
+/// interp↔JIT differential holds. `neg` negates the product (the `nmadd` form, `−a·b + c`).
+fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let z = f32::from_bits(lane_read(&c, i, 4) as u32);
+                let x = if neg { -x } else { x };
+                lane_write(&mut o, i, 4, x.mul_add(y, z).to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let z = f64::from_bits(lane_read(&c, i, 8));
+                let x = if neg { -x } else { x };
+                lane_write(&mut o, i, 8, x.mul_add(y, z).to_bits());
+            }
+        }
         _ => {}
     }
     o

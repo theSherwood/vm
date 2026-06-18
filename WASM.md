@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (105 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (106 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -29,7 +29,8 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
 - **memory64** — the 64-bit address path.
 - **Finished proposals**: sign-extension ops; non-trapping float→int (`trunc_sat`); bulk-memory
   `memory.copy`/`memory.fill`; **fixed-128 SIMD** (the complete fixed-width v128 op set, D58 — all
-  arith/bitwise/shuffle/compare/convert/widen/narrow/dot/extmul/q15 lanes; only relaxed-SIMD is out);
+  arith/bitwise/shuffle/compare/convert/widen/narrow/dot/extmul/q15 lanes + most of **relaxed SIMD**
+  via deterministic lowerings incl. a fused FMA — only the i8×i7 relaxed dot remains);
   **threads** —
   the full `*.atomic.*` set (full-width i32/i64 map 1:1 onto IR atomics; the narrow 8/16-bit forms
   emulate via a 32-bit word-CAS loop) + `atomic.fence`, `shared`+imported memory, and the
@@ -194,14 +195,24 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   under contention on both backends).
 - [ ] **Imported globals & imported tables.** Dynamic-linking / PIC (`__memory_base`/`__table_base`/
   `__stack_pointer` imports). Statically-linked output defines its own, so this only bites `-shared`/PIC.
-- [ ] **Relaxed SIMD** (`f32x4.relaxed_madd`, `relaxed_min`/`max`, `i32x4.relaxed_trunc_*`,
-  `i8x16.relaxed_swizzle`/`relaxed_laneselect`, `relaxed_dot_*`; clang `-mrelaxed-simd`). A separate
-  proposal of ~20 ops whose results are **implementation-defined within a spec-allowed set** — they
-  let an engine emit one native instruction (x86 FMA, ARM rounding, `blendv`, `pmaddubsw`) without the
-  fix-up sequence deterministic SIMD needs to be bit-identical across architectures. Currently a clean
-  `Unsupported` (they hit the `worker_op` catch-all). **Default stance: deliberately out of scope** —
-  with a concrete opt-in path if a real program ever needs the speed. The reasoning, since it's a
-  recurring question:
+- [~] **Relaxed SIMD — 18 of 20 done** (`-mrelaxed-simd`). A separate proposal of ~20 ops whose
+  results are **implementation-defined within a spec-allowed set** — they let an engine emit one native
+  instruction (x86 FMA, ARM rounding, `blendv`, `pmaddubsw`) without the fix-up sequence deterministic
+  SIMD needs to be bit-identical across architectures. SVM ships them via the **deterministic-choice**
+  realization: each op lowers to *one* spec-allowed behavior computed identically in both backends, so
+  the interp↔JIT differential holds (no value-insensitive exclusion needed yet):
+  - `relaxed_madd`/`relaxed_nmadd` (f32x4/f64x2) → a genuine **fused FMA** (`Inst::VFma`; Cranelift
+    `fma`, interp `f*::mul_add` — both correctly-rounded, so bit-identical). This is the *one op that
+    gets a real speedup* (the usual reason to reach for `-mrelaxed-simd`), and it stays differentiable.
+  - `relaxed_min`/`max` → the deterministic `fmin`/`fmax`; `relaxed_trunc_*` (4) → `trunc_sat`;
+    `relaxed_laneselect` (4) → `bitselect` (exact for a valid all-0/all-1 mask); `relaxed_swizzle` →
+    `swizzle`; `relaxed_q15mulr_s` → `q15mulr_sat`. All alias existing deterministic ops — transpiler
+    arms only, no new IR. `crates/svm/tests/simd.rs` (FMA vs `mul_add`, incl. fused≠mul+add cases) +
+    `svm-wasm/tests/simd.rs` (the `-mrelaxed-simd` shape on both backends).
+  - **Remaining (2):** `i16x8.relaxed_dot_i8x16_i7x16_s` + `i32x4.relaxed_dot_i8x16_i7x16_add_s` (the
+    `pmaddubsw`-shaped i8×i7 dot) — fiddly deterministic semantics (the "i7" operand's high bit), still
+    a clean `Unsupported`.
+  The deterministic-default rationale, since it's a recurring question:
   - **The base-SIMD "fixups" are op *semantics*, not a determinism tax.** `i32x4.trunc_sat_f32x4_s`
     *means* "saturate out-of-range, NaN→0"; the clamp instructions Cranelift emits on x86 are the cost
     of computing **that operation**, not a surcharge SVM adds. Emitting raw `cvttps2dq` instead
@@ -222,15 +233,16 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
     relaxed lowering makes interp and JIT legitimately diverge in *value* (not just NaN bits), so that
     evidence evaporates for those ops. That's a security-model cost, in the exact dimension SVM
     competes on vs. "just run Wasmtime."
-  - **Opt-in path (if ever built):** extend the existing *NaN-insensitive-per-lane* differential
-    precedent from "ignore NaN payload bits" to "ignore the result of this *op*". Emit the fast native
-    relaxed lowering, mark only the relaxed ops **value-insensitive** in the differential, and keep the
-    full byte-exact oracle for every other op in the module. That gives max-speed relaxed SIMD as a
-    per-op opt-in for perf users (e.g. ML/DSP kernels built with `-mrelaxed-simd`) without globally
-    weakening the JIT-trust story — strictly better than flipping the default to non-deterministic.
-    Until a concrete program needs it, the deterministic default + clean `Unsupported` stands. (A
-    cheaper interim: lower each relaxed op to its *deterministic* cousin — always spec-allowed, keeps
-    interp==JIT — so a `-mrelaxed-simd` binary *runs correctly* but without the relaxed speedup.)
+  - **What's shipped is the deterministic-choice realization** (above): each relaxed op runs one
+    spec-allowed behavior, so a `-mrelaxed-simd` binary *runs correctly* and `relaxed_madd` even gets
+    the real FMA speedup, all while keeping interp==JIT. No global default was flipped.
+  - **Future native-speed opt-in (if ever needed):** for the ops where the deterministic choice is
+    slower than the native one (`relaxed_trunc`'s saturation fixup, `relaxed_min/max`'s NaN handling),
+    extend the existing *NaN-insensitive-per-lane* differential precedent from "ignore NaN payload
+    bits" to "ignore the result of this *op*": emit the fast native lowering, mark only those ops
+    **value-insensitive** in the differential, keep the byte-exact oracle for everything else. That
+    buys max-speed relaxed SIMD per-op without globally weakening the JIT-trust story — strictly better
+    than flipping the default. Not built; the deterministic lowerings cover correctness today.
 - [ ] **Multiple memories** and **multiple tables** (`lib.rs` rejects both).
 - [ ] **Typed function references** (the function-references proposal) and **extended const
   expressions** (arithmetic in global/data-offset initializers — currently only constants).
@@ -280,9 +292,10 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 5. **SIMD remainder** 🟢 — **DONE.** The full fixed-width v128 op set transpiles + runs on both
    backends (compares, min/max, shifts, abs/neg, reductions, saturating add/sub, widen, narrow, all
    10 conversions, pmin/pmax, popcnt, `avgr_u`, dot product, extmul, extadd_pairwise, q15mulr_sat).
-   Only relaxed-SIMD (non-deterministic) is out of scope.
+   **Relaxed SIMD** is 18/20 done via deterministic lowerings (incl. a fused FMA); only the i8×i7
+   relaxed dot remains.
 6. **Narrow-atomic CAS-loop** 🟢 — **DONE.** Then **reference types** 🟡 (externref→handle, funcref→index).
-7. EH, relaxed SIMD, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
+7. EH, the i8×i7 relaxed dot, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
 
 Code map: the rejection sites are the `unsup(...)` calls in `crates/svm-wasm/src/lib.rs` (section
 parse + the `worker_op` operator catch-all `other => unsup("operator {…}")`); tests live in

@@ -178,6 +178,7 @@ mod op {
         pub const VEXTMUL: u8 = 0x1E; // shape (wide), op (VWidenOp), a, b
         pub const VEXTADD: u8 = 0x1F; // shape (wide), signed (u8), a
         pub const VQ15MULR: u8 = 0x20; // a, b (i16x8 implicit)
+        pub const VFMA: u8 = 0x21; // shape, neg (u8), a, b, c
     }
 
     // Terminators (decoded in a separate context from instruction opcodes).
@@ -893,6 +894,21 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => {
+            out.push(op::SIMD);
+            out.push(op::simd::VFMA);
+            out.push(shape.index());
+            out.push(*neg as u8);
+            write_uleb(out, *a as u64);
+            write_uleb(out, *b as u64);
+            write_uleb(out, *c as u64);
+        }
         Inst::VAnyTrue { a } => {
             out.push(op::SIMD);
             out.push(op::simd::VANY_TRUE);
@@ -1142,6 +1158,17 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             a: c.idx()?,
             b: c.idx()?,
         },
+        op::simd::VFMA => {
+            let shape = dec_shape(c)?;
+            let neg = c.byte()? != 0;
+            Inst::VFma {
+                shape,
+                neg,
+                a: c.idx()?,
+                b: c.idx()?,
+                c: c.idx()?,
+            }
+        }
         op::simd::VANY_TRUE => Inst::VAnyTrue { a: c.idx()? },
         op::simd::VALL_TRUE => Inst::VAllTrue {
             shape: dec_shape(c)?,

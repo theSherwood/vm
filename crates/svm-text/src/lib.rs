@@ -474,6 +474,17 @@ fn print_inst(inst: &Inst) -> String {
             )
         }
         Inst::VQ15MulrSat { a, b } => format!("i16x8.q15mulr_sat_s v{a} v{b}"),
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => format!(
+            "{}.{} v{a} v{b} v{c}",
+            shape.name(),
+            if *neg { "fnma" } else { "fma" }
+        ),
         Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
         Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
         Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
@@ -1991,6 +2002,18 @@ impl<'a> Parser<'a> {
                 let a = self.value(names)?;
                 let b = self.value(names)?;
                 return Ok(Inst::VPMinMax { shape, op: o, a, b });
+            }
+            if suffix == "fma" || suffix == "fnma" {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                let c = self.value(names)?;
+                return Ok(Inst::VFma {
+                    shape,
+                    neg: suffix == "fnma",
+                    a,
+                    b,
+                    c,
+                });
             }
         } else if let Some(o) = VIntBinOp::from_name(suffix) {
             let a = self.value(names)?;
