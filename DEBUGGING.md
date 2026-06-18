@@ -774,11 +774,11 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     a `debug.var`). Vars the optimizer dropped correctly show `<optimized out>` (faithful native
     behavior — the interpreter tier stays the always-faithful inspection fallback). *Effort (whole
     stage): high.*
-- [~] **Stage 4 — W3-JIT unwind / backtrace. — `bt` works (4a done); CFA-var + fiber walk pending.**
-  Emit Cranelift unwind info as DWARF CFI so gdb can unwind JIT'd frames (`bt`) and compute the CFA
-  (which also lights up the deferred Stage 3 `CfaOffset`/frame-relative variable locations). The
-  fiber-rooted walk (§23/D57 migratable fibers) is the runtime-specific finale. ✅ **`bt` across guest
-  frames with source confirmed under gdb 15.1.**
+- [~] **Stage 4 — W3-JIT unwind / backtrace. — `bt` + spilled vars work (4a/4b done); fiber walk
+  pending.** Emit Cranelift unwind info as DWARF CFI so gdb can unwind JIT'd frames (`bt`) and compute
+  the CFA (which also lit up the spilled, frame-relative variable locations). The fiber-rooted walk
+  (§23/D57 migratable fibers) is the runtime-specific finale. ✅ **`bt` across guest frames with source
+  and `print` of a spilled variable both confirmed under gdb 15.1.**
   - [x] **4a — `.debug_frame` CFI + `DW_AT_frame_base`. — built.** `dwarf::debug_frame` hand-rolls a
     `.debug_frame` (one DWARF v4 CIE with the steady-state frame-pointer rules — CFA = `rbp+16`,
     return address at CFA−8, saved `rbp` at CFA−16, valid because `preserve_frame_pointers=true` gives
@@ -792,9 +792,18 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     in the 1–2-instruction prologue window — fine for body breakpoints; precise per-prologue CFI would
     need Cranelift's private instruction list or `gimli`. The unwind stops at the host boundary: the
     buffer-ABI trampoline has no FDE, which is expected — the *guest* stack is what unwinds.)
-  - [ ] **4b — light up the deferred Stage 3 locations.** With a frame base now defined, emit the
-    `CfaOffset` variable ranges (Stage 3a) as `DW_OP_fbreg`, and the `Window`/`Fixed` memory forms via
-    the window-base register (label `mem_base` like a variable, then `DW_OP_breg{mem} + off`).
+  - [x] **4b — spilled (CFA-relative) variables as `DW_OP_fbreg`. — built.** With a frame base now
+    defined (4a), `emit_loclist` turns a `VarMachineLoc::CfaOffset(off)` range into a `DW_OP_fbreg
+    <off>` location-list entry — `frame_base + off = CFA + off`, the spill slot Cranelift stored the
+    value to — while register ranges stay `DW_OP_reg`. ✅ **Confirmed under gdb 15.1:** a variable the
+    regalloc spilled to the stack `print`s its value (`$1 = 30`, `whatis` → `int`) by reading the
+    CFA-relative slot. Test (`jit_srcloc.rs`): a fixture of many `call` results kept live across a
+    final call deterministically forces spills, and every variable range — register *and* spill — is
+    reconstructed verbatim in `.debug_loc` (`DW_OP_fbreg` for the `CfaOffset` ranges). **The guest
+    *window*-memory forms (`Window`/`WindowVia`/`Fixed`) remain deferred:** guest memory has no
+    compile-time/frame-independent address (the window base is a per-run pointer; globals have no
+    frame), so they need a different mechanism (a runtime base registered with gdb, or a JIT reader
+    plugin) rather than static DWARF.
   - [ ] **4c — fiber-rooted backtrace.** Walk the out-of-band control stack rooted at a **fiber
     handle** (not the OS thread — §23/D57 migratable fibers) to materialize a per-fiber call stack
     with source frames across suspend/resume boundaries. *Acceptance:* `bt` shows the guest call stack

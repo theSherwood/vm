@@ -136,6 +136,7 @@ const DW_ATE_UNSIGNED: u8 = 0x07;
 
 // DWARF location-expression opcodes (Stage 3c variable locations).
 const DW_OP_REG0: u8 = 0x50; // `DW_OP_reg0`..`DW_OP_reg31` name registers 0..31 directly
+const DW_OP_FBREG: u8 = 0x91; // `DW_OP_fbreg <sleb>` — frame_base + offset (an address)
 const DW_OP_REGX: u8 = 0x90; // `DW_OP_regx <uleb>` for register numbers ≥ 32
 const DW_OP_CALL_FRAME_CFA: u8 = 0x9c; // the subprogram frame base (Stage 4a): the CFI-computed CFA
 
@@ -452,30 +453,38 @@ pub fn debug_info(
     (info, abbrev, loc)
 }
 
-/// Append a DWARF v4 `.debug_loc` location list for the register-resident ranges of `ranges`,
-/// returning its section offset (for the variable's `DW_AT_location`), or `None` if there are none.
-/// A leading base-address-selection entry pins the base to 0 so the per-range `[lo, hi)` are the
-/// absolute machine addresses (the JIT objfile loads with a zero bias, like `.debug_line`); each
-/// entry's expression is the single `DW_OP_reg{N}` naming where the value lives there.
+/// The DWARF location expression for one machine location (Stage 3c register / Stage 4b spill slot):
+/// `DW_OP_reg{N}` names the register a value currently lives in, while `DW_OP_fbreg <off>` names the
+/// address `frame_base + off` — and since every subprogram's `DW_AT_frame_base` is
+/// `DW_OP_call_frame_cfa` (Stage 4a), that is the spill slot at `CFA + off` the value was stored to.
+fn loc_expr(loc: VarMachineLoc) -> Vec<u8> {
+    match loc {
+        VarMachineLoc::Reg(d) => dw_op_reg(d),
+        VarMachineLoc::CfaOffset(off) => {
+            let mut e = vec![DW_OP_FBREG];
+            sleb(&mut e, off);
+            e
+        }
+    }
+}
+
+/// Append a DWARF v4 `.debug_loc` location list for `ranges`, returning its section offset (for the
+/// variable's `DW_AT_location`), or `None` if empty. A leading base-address-selection entry pins the
+/// base to 0 so the per-range `[lo, hi)` are absolute machine addresses (the JIT objfile loads with a
+/// zero bias, like `.debug_line`); each entry's expression names where the value lives there — a
+/// register (Stage 3c) or, for a spilled value, the CFA-relative slot (Stage 4b).
 fn emit_loclist(loc: &mut Vec<u8>, ranges: &[VarRange]) -> Option<u32> {
-    let reg_ranges: Vec<(u64, u64, u16)> = ranges
-        .iter()
-        .filter_map(|r| match r.loc {
-            VarMachineLoc::Reg(d) => Some((r.lo, r.hi, d)),
-            VarMachineLoc::CfaOffset(_) => None, // needs frame-base/CFI (Stage 4)
-        })
-        .collect();
-    if reg_ranges.is_empty() {
+    if ranges.is_empty() {
         return None;
     }
     let off = loc.len() as u32;
     // Base-address selection: largest-target sentinel, then base = 0 ⇒ absolute begin/end below.
     loc.extend_from_slice(&u64::MAX.to_le_bytes());
     loc.extend_from_slice(&0u64.to_le_bytes());
-    for (lo, hi, reg) in reg_ranges {
-        loc.extend_from_slice(&lo.to_le_bytes());
-        loc.extend_from_slice(&hi.to_le_bytes());
-        let expr = dw_op_reg(reg);
+    for r in ranges {
+        loc.extend_from_slice(&r.lo.to_le_bytes());
+        loc.extend_from_slice(&r.hi.to_le_bytes());
+        let expr = loc_expr(r.loc);
         loc.extend_from_slice(&(expr.len() as u16).to_le_bytes());
         loc.extend_from_slice(&expr);
     }

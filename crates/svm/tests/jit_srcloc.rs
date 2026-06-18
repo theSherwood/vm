@@ -568,3 +568,149 @@ fn jit_emits_debug_frame_cfi_for_unwinding() {
     let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
     assert!(bare.debug_frame_section().is_empty());
 }
+
+/// A function that forces register spills (Stage 4b): thirteen `call` results all kept live across
+/// the summation, so the regalloc must park several of them in CFA-relative stack slots — yielding
+/// `VarMachineLoc::CfaOffset` variable ranges (where `DW_OP_reg` doesn't apply and `DW_OP_fbreg`
+/// does). `func 1` is the trivial callee. Calls are used (not arithmetic on the param) because the
+/// optimizer rematerializes/folds plain computed values, dropping their value labels.
+const SPILL_DBG: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = call 1(v0)
+  v2 = call 1(v0)
+  v3 = call 1(v0)
+  v4 = call 1(v0)
+  v5 = call 1(v0)
+  v6 = call 1(v0)
+  v7 = call 1(v0)
+  v8 = call 1(v0)
+  v9 = call 1(v0)
+  v10 = call 1(v0)
+  v11 = call 1(v0)
+  v12 = call 1(v0)
+  v13 = call 1(v0)
+  v14 = i32.add v1 v2
+  v15 = i32.add v14 v3
+  v16 = i32.add v15 v4
+  v17 = i32.add v16 v5
+  v18 = i32.add v17 v6
+  v19 = i32.add v18 v7
+  v20 = i32.add v19 v8
+  v21 = i32.add v20 v9
+  v22 = i32.add v21 v10
+  v23 = i32.add v22 v11
+  v24 = i32.add v23 v12
+  v25 = i32.add v24 v13
+  return v25
+}
+
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 3
+  v2 = i32.mul v0 v1
+  return v2
+}
+
+debug.file 0 "spill.c"
+debug.loc 0 0 1 0 2 5
+debug.type 0 base "int" signed 4
+debug.var 0 "t" ssalist 1 0 0 1 "int" 0
+debug.var 0 "u" ssalist 1 0 1 2 "int" 0
+debug.var 0 "w" ssalist 1 0 2 3 "int" 0
+"#;
+
+#[test]
+fn jit_emits_fbreg_loclists_for_spilled_variables() {
+    // Stage 4b: a source variable Cranelift spilled to a CFA-relative stack slot
+    // (`VarMachineLoc::CfaOffset`) becomes a `DW_OP_fbreg <off>` location-list entry — resolving
+    // against the subprogram's `DW_AT_frame_base = DW_OP_call_frame_cfa` (Stage 4a) — while its
+    // register ranges stay `DW_OP_reg`. Validated against real regalloc output: every range's loclist
+    // entry is reconstructed and found verbatim in `.debug_loc`. The end-to-end `print` is the
+    // `gdb_attach` example under gdb.
+    let cm = compile(SPILL_DBG);
+    let vars = cm.var_locations();
+    let loc = cm.debug_loc_section();
+
+    // The fixture is built to force spills: at least one variable range is a CFA-relative slot.
+    assert!(
+        vars.iter()
+            .flat_map(|v| &v.ranges)
+            .any(|r| matches!(r.loc, VarMachineLoc::CfaOffset(_))),
+        "the spill fixture yields at least one CfaOffset range"
+    );
+
+    // Mirror the emitter's expression encoding so we can find each range's entry in `.debug_loc`.
+    let expr = |l: VarMachineLoc| -> Vec<u8> {
+        match l {
+            VarMachineLoc::Reg(d) if d < 32 => vec![0x50 + d as u8],
+            VarMachineLoc::Reg(d) => {
+                let mut e = vec![0x90u8];
+                let mut v = d as u64;
+                loop {
+                    let mut b = (v & 0x7f) as u8;
+                    v >>= 7;
+                    if v != 0 {
+                        b |= 0x80;
+                    }
+                    e.push(b);
+                    if v == 0 {
+                        break;
+                    }
+                }
+                e
+            }
+            VarMachineLoc::CfaOffset(off) => {
+                let mut e = vec![0x91u8]; // DW_OP_fbreg
+                let mut v = off;
+                loop {
+                    let mut b = (v & 0x7f) as u8;
+                    v >>= 7; // arithmetic shift
+                    let done = (v == 0 && b & 0x40 == 0) || (v == -1 && b & 0x40 != 0);
+                    if !done {
+                        b |= 0x80;
+                    }
+                    e.push(b);
+                    if done {
+                        break;
+                    }
+                }
+                e
+            }
+        }
+    };
+
+    // Every range of every tracked variable is present in `.debug_loc` as `lo | hi | exprlen | expr`,
+    // with `DW_OP_fbreg` for the spilled (CfaOffset) ranges and `DW_OP_reg` for the register ranges.
+    let mut saw_fbreg = false;
+    for v in vars {
+        for r in &v.ranges {
+            let e = expr(r.loc);
+            if e[0] == 0x91 {
+                saw_fbreg = true;
+            }
+            let mut entry = Vec::new();
+            entry.extend_from_slice(&r.lo.to_le_bytes());
+            entry.extend_from_slice(&r.hi.to_le_bytes());
+            entry.extend_from_slice(&(e.len() as u16).to_le_bytes());
+            entry.extend_from_slice(&e);
+            assert!(
+                loc.windows(entry.len()).any(|w| w == entry.as_slice()),
+                "{}'s {:?} range is encoded in .debug_loc",
+                v.name,
+                r.loc
+            );
+        }
+    }
+    assert!(saw_fbreg, "a spilled variable produced a DW_OP_fbreg entry");
+
+    // The `.debug_info` still parses with these richer loclists referenced (only `func 0` carries
+    // source lines, so it is the lone subprogram).
+    let (info, abbrev) = cm.debug_info_sections();
+    let parsed = svm_wasm::dwarf_info::parse(&info, &abbrev, &[]).expect("the CU parses");
+    assert_eq!(
+        parsed.subs.len(),
+        1,
+        "the source-mapped function is a subprogram"
+    );
+}
