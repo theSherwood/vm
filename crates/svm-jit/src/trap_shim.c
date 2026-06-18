@@ -67,15 +67,32 @@ static _Thread_local uintptr_t g_trap_pc = 0;
 static _Thread_local uintptr_t g_trap_rets[SVM_TRAP_MAXFRAMES];
 static _Thread_local int g_trap_nrets = 0;
 
-/* Walk the frame-pointer chain from `fp` (the faulting frame) toward the stack base, recording each
- * frame's return address. The JIT's `preserve_frame_pointers` gives every guest frame a `{ saved_fp,
- * ret_addr }` record: `*fp` is the caller's saved frame pointer, `*(fp+1)` the return address. The
- * walk moves *up* (increasing addresses, away from the low-address stack guard the fault sits near),
- * and is bounded — aligned, non-null, strictly-increasing links, within a generous span, and a frame
- * cap — so a corrupt chain terminates instead of looping or reading wild memory. The host stops at
- * the first return address that isn't guest code (it owns the address→source map), so capturing a
- * few trailing host frames here is harmless. Async-signal-safe: only stack reads + thread-local
- * writes. */
+/* Walk the frame-pointer chain from `fp` toward the stack base, appending each frame's return address
+ * to `rets[]` from index `n`; returns the new count. The JIT's `preserve_frame_pointers` gives every
+ * guest frame a `{ saved_fp, ret_addr }` record: `*fp` is the caller's saved frame pointer, `*(fp+1)`
+ * the return address. The walk moves *up* (increasing addresses, away from the low-address stack
+ * guard a fault sits near) and is bounded — aligned, non-null, strictly-increasing links, within a
+ * generous span, and the frame cap — so a corrupt chain terminates instead of looping or reading wild
+ * memory. The host stops at the first return address that isn't guest code (it owns the
+ * address→source map), so capturing a few trailing host frames here is harmless. Reads-only. */
+static int svm_walk_fp_chain(uintptr_t fp, uintptr_t *rets, int n) {
+    uintptr_t cur = fp;
+    const uintptr_t start = fp;
+    const uintptr_t span = 8u * 1024 * 1024; /* don't chase a corrupt chain off the stack */
+    while (n < SVM_TRAP_MAXFRAMES && cur != 0 && (cur & (sizeof(uintptr_t) - 1)) == 0 &&
+           cur >= start && cur - start < span) {
+        uintptr_t next = *(uintptr_t *)cur;
+        uintptr_t ret = *(uintptr_t *)(cur + sizeof(uintptr_t));
+        rets[n++] = ret;
+        if (next <= cur) /* frame pointers grow toward the base; a non-increasing link is the end */
+            break;
+        cur = next;
+    }
+    return n;
+}
+
+/* Memory-fault capture: extract the faulting (pc, fp) from the signal ucontext and walk the chain.
+ * Async-signal-safe: only stack reads + thread-local writes. */
 static void svm_capture_frame(void *uc) {
     uintptr_t pc = 0, fp = 0;
 #if defined(__linux__) && defined(__x86_64__)
@@ -97,21 +114,26 @@ static void svm_capture_frame(void *uc) {
 #else
     (void)uc; /* an arch we don't decode: pc/fp stay 0 → the host yields an empty backtrace */
 #endif
-    g_trap_pc = pc;
+    g_trap_pc = pc; /* the exact faulting instruction (symbolized directly by the host) */
+    g_trap_nrets = svm_walk_fp_chain(fp, g_trap_rets, 0);
+    g_trap_valid = 1;
+}
+
+/* Explicit-check trap capture (§5 W3 Stage 2): the JIT calls this from a trap site (div-by-zero,
+ * `unreachable`, `OutOfFuel`, indirect-call-type) *before* storing the trap kind and returning —
+ * those returns unwind every guest frame, so the chain must be walked here, while it is live. Unlike
+ * a memory fault there is no signal context: this helper's own frame links back to the trapping guest
+ * frame via the frame pointer (the JIT is built with `preserve_frame_pointers`, this shim with
+ * `-fno-omit-frame-pointer`). The trap site is a *return address* (just past the `call` here), so it
+ * goes in `rets[0]` (symbolized at `ret - 1`, like every caller) and `pc` is left 0. */
+void svm_capture_explicit_trap(void) {
+    uintptr_t my_fp = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t guest_fp = *(uintptr_t *)my_fp;                      /* the trapping guest frame */
+    uintptr_t trap_site = *(uintptr_t *)(my_fp + sizeof(uintptr_t)); /* return addr into it */
+    g_trap_pc = 0;
     int n = 0;
-    uintptr_t cur = fp;
-    const uintptr_t start = fp;
-    const uintptr_t span = 8u * 1024 * 1024; /* backstop: don't chase a corrupt chain off the stack */
-    while (n < SVM_TRAP_MAXFRAMES && cur != 0 && (cur & (sizeof(uintptr_t) - 1)) == 0 &&
-           cur >= start && cur - start < span) {
-        uintptr_t next = *(uintptr_t *)cur;
-        uintptr_t ret = *(uintptr_t *)(cur + sizeof(uintptr_t));
-        g_trap_rets[n++] = ret;
-        if (next <= cur) /* frame pointers grow toward the base; a non-increasing link is the end */
-            break;
-        cur = next;
-    }
-    g_trap_nrets = n;
+    g_trap_rets[n++] = trap_site;
+    g_trap_nrets = svm_walk_fp_chain(guest_fp, g_trap_rets, n);
     g_trap_valid = 1;
 }
 

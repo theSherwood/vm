@@ -62,7 +62,7 @@ use cranelift_codegen::ir::types::{
 };
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, Function,
-    InstBuilder, JumpTableData, MemFlags, SourceLoc, StackSlotData, StackSlotKind, Type,
+    InstBuilder, JumpTableData, MemFlags, SigRef, SourceLoc, StackSlotData, StackSlotKind, Type,
     UserFuncName, Value, ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
@@ -2525,12 +2525,14 @@ impl CompiledModule {
             )
         };
 
-        // §5 W3 Stage 1 — build a trap-time backtrace from the stack the guard handler already walked
-        // and captured (the faulting `pc` + the frame-pointer chain's return addresses). The walk had
-        // to happen in the handler: a fault unwinds back onto this same stack, which the teardown
-        // below then reuses, so the frames are gone here. Symbolizing is pure (no stack reads), so it
-        // can run any time after the fault — no reference into `*this` outlives this statement.
-        let trap_backtrace = match faulted.then(mem::take_trap_frame).flatten() {
+        // §5 W3 — build a trap-time backtrace from the stack a trap already walked + captured during
+        // the run: the SIGSEGV/SIGBUS handler for a memory fault (Stage 1), or the explicit-trap
+        // helper at the trap site for a div-by-zero / `unreachable` / `OutOfFuel` / indirect-call-type
+        // trap (Stage 2). Either way the frames had to be walked while live (a trap unwinds the guest
+        // stack — by `siglongjmp` onto the reused stack, or by ordinary returns), so the capture is a
+        // thread-local the host only symbolizes here (pure; no `*this` ref outlives this statement).
+        // Taken unconditionally so it also clears any capture and stays empty on a non-trapping run.
+        let trap_backtrace = match mem::take_trap_frame() {
             Some((pc, rets)) => (*this).trap_backtrace(pc, &rets),
             None => Vec::new(),
         };
@@ -3480,6 +3482,28 @@ struct Lower<'a> {
     /// Cranelift records its machine-location ranges. `None` ⇒ no `-g` vars (no labels, codegen
     /// unchanged).
     var_labels: Option<&'a VarLabelMap>,
+    /// §5 W3 Stage 2 explicit-trap backtrace: `Some((sigref, addr))` to bake a call to the
+    /// trap-capture helper (`svm_capture_explicit_trap`) into every [`emit_trap`] site, so an
+    /// explicit trap (div-by-zero, `unreachable`, `OutOfFuel`, indirect-call-type) records a source
+    /// backtrace before it unwinds — the way memory faults do via the signal handler. `None` without
+    /// `-g` (the backtrace would be empty) or where the helper isn't linked (non-unix), leaving the
+    /// trap path byte-identical to before.
+    trap_capture: Option<(SigRef, i64)>,
+}
+
+/// The address of the §5 W3 Stage 2 explicit-trap capture helper (`svm_capture_explicit_trap` in
+/// `trap_shim.c`): baked into each [`emit_trap`] site under `-g`. `0` where the helper isn't linked
+/// (the shim is unix-only), which disables the explicit-trap backtrace there.
+#[cfg(unix)]
+fn trap_capture_addr() -> i64 {
+    extern "C" {
+        fn svm_capture_explicit_trap();
+    }
+    svm_capture_explicit_trap as unsafe extern "C" fn() as usize as i64
+}
+#[cfg(not(unix))]
+fn trap_capture_addr() -> i64 {
+    0
 }
 
 /// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
@@ -3562,6 +3586,15 @@ fn build_clif(
     } else {
         None
     };
+    // §5 W3 Stage 2: under `-g`, import the trap-capture helper's `() -> ()` host-C signature and bake
+    // its address, so `emit_trap` can record an explicit trap's source backtrace before unwinding.
+    // Disabled without `-g` (the backtrace would be empty) or where the helper isn't linked.
+    let trap_capture = match trap_capture_addr() {
+        addr if srclocs.is_some() && addr != 0 => {
+            Some((b.import_signature(module.make_signature()), addr))
+        }
+        _ => None,
+    };
     let lower = Lower {
         mem_var,
         fn_table_var,
@@ -3583,6 +3616,7 @@ fn build_clif(
         srclocs,
         func_idx,
         var_labels,
+        trap_capture,
     };
 
     // Jump into IR block 0 passing the function parameters (entry params after the three context
@@ -5000,6 +5034,16 @@ fn read_call_results(
 /// every trap in the entry function (or its dispatch), so that suffices; propagating a
 /// trap *out of a callee* would need a post-call check, added when a case needs it.
 fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
+    // §5 W3 Stage 2: record a source backtrace for this explicit trap *before* it unwinds — the trap
+    // stores its kind and returns, and that return propagates up tearing down every guest frame, so
+    // the helper must walk the frame-pointer chain from this live site now. The current op's
+    // `SourceLoc` is in effect, so the call inherits it and symbolizes to the trapping op's line.
+    // Only present under `-g` (else the backtrace would be empty); the trap path is otherwise
+    // unchanged.
+    if let Some((sigref, addr)) = lower.trap_capture {
+        let helper = b.ins().iconst(I64, addr);
+        b.ins().call_indirect(sigref, helper, &[]);
+    }
     let cell = b.use_var(lower.trap_var);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
     b.ins().store(MemFlags::trusted(), code, cell, 0);

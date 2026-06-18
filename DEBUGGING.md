@@ -413,10 +413,22 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   (`jit_trap_backtrace.rs`, unix):* an out-of-bounds store reports a backtrace naming the faulting
   function + line; a callee fault walks the caller chain (`[func1@store, func0@call]`); a
   non-trapping run leaves it empty. Stable under parallel + serial runs.
-- [ ] **Stage 2 — explicit-check trap backtrace.** Capture the trap pc + frame chain at the
-  explicit-check sites (div-by-zero et al.) — likely snapshotting `rbp` at the check, or accumulating
-  return addresses as the trap propagates up `emit_trap_propagate`. *Acceptance:* a div-by-zero trap
-  carries the same source backtrace shape as the memory-fault path.
+- [x] **Stage 2 — explicit-check trap backtrace.** An explicit trap has no signal — the lowered check
+  stores its kind and `return`s, unwinding the guest frames — so the capture happens *at the trap
+  site*: `emit_trap` (the single origin every explicit trap routes through — div/rem, `unreachable`,
+  `OutOfFuel`, indirect-call-type) emits a `call svm_capture_explicit_trap` before the store+return,
+  gated on `-g`. The helper walks the frame-pointer chain from its caller (the trapping guest frame,
+  found via `__builtin_frame_address`) into the *same* thread-local the signal path uses, so the host
+  symbolizes both identically; the trap site rides in `rets[0]` (symbolized at `ret − 1`, like every
+  caller) since it's a return address. The current op's `SourceLoc` is in effect at `emit_trap`, so
+  the line is precise for ops that carry a `debug.loc` (div/rem, `unreachable`); `OutOfFuel`/the
+  back-edge checks attribute the right *function* but an approximate line. *Tests:* a div-by-zero
+  names the div line; a callee div-by-zero walks the caller chain `[func1@div, func0@call]`.
+- [ ] **Stage 3 — fiber attribution + the kill message.** Root the walk at the trapping **fiber**
+  (not the OS thread — §23/D57), and fold the backtrace into the `Trap`/kill report the host already
+  surfaces. *Acceptance:* the trace names the right fiber under work-stealing migration. (The capture
+  is thread-local today, so a trap on a spawned vCPU/worker thread isn't yet seen by the run thread —
+  this stage threads it through.)
 - [ ] **Stage 3 — fiber attribution + the kill message.** Root the walk at the trapping **fiber**
   (not the OS thread — §23/D57), and fold the backtrace into the `Trap`/kill report the host already
   surfaces. *Acceptance:* the trace names the right fiber under work-stealing migration.
@@ -426,9 +438,10 @@ backtrace mis-renders a kill message, never affects confinement. The capture sta
 in the fault handler (no allocation — a fixed thread-local buffer; symbolization is deferred to the
 host in normal context).
 
-**Progress:** Stages 0–1 **done** (the memory-fault trap-time backtrace is live, unix; Windows
-degrades to empty pending a VEH-side capture). Next: Stage 2 (explicit-check traps — div-by-zero
-et al., whose stack unwinds before the host sees them) → Stage 3 (fiber attribution + kill message).
+**Progress:** Stages 0–2 **done** (trap-time backtraces for both memory faults *and* explicit-check
+traps are live, unix; Windows degrades to empty pending a VEH-side capture). Next: Stage 3 — fiber
+attribution (the capture is thread-local, so a trap on a spawned vCPU/worker thread isn't yet seen by
+the run thread) + folding the backtrace into the host's kill/`Trap` report.
 
 ---
 

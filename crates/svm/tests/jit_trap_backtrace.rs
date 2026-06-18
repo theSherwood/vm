@@ -1,12 +1,15 @@
-//! §5 W3 Stage 1 — the **JIT trap-time backtrace**. When a JIT'd guest takes a memory fault, the §5
-//! detect-and-kill guard handler captures the faulting frame *before the stack unwinds*, and the
-//! engine walks the frame-pointer chain + symbolizes it into a source backtrace exposed by
+//! §5 W3 — the **JIT trap-time backtrace**. When a JIT'd guest traps, the engine walks the
+//! frame-pointer chain + symbolizes it into a source backtrace exposed by
 //! [`CompiledModule::last_trap_backtrace`]. Always on — no debugger, no attach — and the `-g` debug
-//! locs the module already carries make it `file:line`. The fault itself is the same overrun-the-
-//! window-into-the-guard-page case `escape_oracle` exercises (`DEBUGGING.md` §5).
+//! locs the module already carries make it `file:line`. Two capture paths:
+//!   - **Stage 1, memory faults** — the §5 detect-and-kill guard handler (`trap_shim.c`) walks the
+//!     chain in the SIGSEGV/SIGBUS handler, while the stack is intact (the overrun-the-window case
+//!     `escape_oracle` exercises).
+//!   - **Stage 2, explicit-check traps** (div-by-zero, …) — the lowering calls a capture helper at
+//!     the trap site *before* it stores the kind and unwinds, since there is no signal there.
 //!
-//! Unix-only: the capture lives in the SIGSEGV/SIGBUS handler (`trap_shim.c`); the Windows VEH path
-//! is a follow-up, so there it degrades to an empty backtrace rather than a wrong one.
+//! Unix-only: both captures live in `trap_shim.c`; the Windows VEH path is a follow-up, so there it
+//! degrades to an empty backtrace rather than a wrong one.
 
 #![cfg(unix)]
 
@@ -120,6 +123,82 @@ fn trap_backtrace_walks_the_caller_chain() {
     assert_eq!(bt[1].func, 0, "caller frame = function 0");
     assert_eq!(
         bt[1].line, 20,
+        "caller symbolized to the call-site line (ret-1 lands in the call)"
+    );
+}
+
+/// A single-frame **explicit-check** trap: `v0 / 0` traps `DivByZero` via the lowered zero-divisor
+/// check (no signal — the lowering stores the kind and returns). The div is block0 instruction 1
+/// (the `const 0` is 0), mapped to source line 30.
+const DIV_BY_ZERO_DBG: &str = "\
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 0
+  v2 = i32.div_s v0 v1
+  return v2
+}
+debug.file 0 \"div.c\"
+debug.loc 0 0 1 0 30 3
+";
+
+/// Function 0 calls function 1, which divides by zero — the explicit-trap capture must walk the
+/// frame-pointer chain across both frames (call not in tail position, as in the memory-fault case).
+/// The call is func0 instruction 0 (line 40); the div is func1 instruction 1 (line 30).
+const CALL_THEN_DIV_DBG: &str = "\
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = call 1 (v0)
+  v2 = i32.const 1
+  v3 = i32.add v1 v2
+  return v3
+}
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1 = i32.const 0
+  v2 = i32.div_s v0 v1
+  return v2
+}
+debug.file 0 \"div.c\"
+debug.loc 0 0 0 0 40 5
+debug.loc 1 0 1 0 30 3
+";
+
+#[test]
+fn explicit_trap_backtrace_names_the_div() {
+    let mut cm = compile(DIV_BY_ZERO_DBG);
+    let (outcome, _) = cm.run(&[7], None, None, None).expect("run");
+    assert!(
+        matches!(outcome, JitOutcome::Trapped(TrapKind::DivByZero)),
+        "v0/0 must trap DivByZero, got {outcome:?}"
+    );
+    let bt = cm.last_trap_backtrace();
+    assert_eq!(bt.len(), 1, "the one faulting guest frame, got {bt:?}");
+    assert_eq!(bt[0].func, 0, "the trapping frame is function 0");
+    assert_eq!(bt[0].line, 30, "symbolized to the div's source line");
+}
+
+#[test]
+fn explicit_trap_backtrace_walks_the_caller_chain() {
+    let mut cm = compile(CALL_THEN_DIV_DBG);
+    let (outcome, _) = cm.run(&[7], None, None, None).expect("run");
+    assert!(
+        matches!(outcome, JitOutcome::Trapped(TrapKind::DivByZero)),
+        "the callee's div-by-zero must trap DivByZero, got {outcome:?}"
+    );
+    let bt = cm.last_trap_backtrace();
+    assert_eq!(
+        bt.len(),
+        2,
+        "innermost callee (func1) + its caller (func0), got {bt:?}"
+    );
+    assert_eq!(
+        (bt[0].func, bt[0].line),
+        (1, 30),
+        "innermost frame = function 1 at the div line"
+    );
+    assert_eq!(bt[1].func, 0, "caller frame = function 0");
+    assert_eq!(
+        bt[1].line, 40,
         "caller symbolized to the call-site line (ret-1 lands in the call)"
     );
 }
