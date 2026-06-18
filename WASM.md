@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (107 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (108 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -28,9 +28,10 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
   multi-value** block types; `call`; `call_indirect` (§3c type-id check); `memory.size`/`memory.grow`.
 - **memory64** — the 64-bit address path.
 - **Finished proposals**: sign-extension ops; non-trapping float→int (`trunc_sat`); bulk-memory
-  `memory.copy`/`memory.fill`; **fixed-128 SIMD** (the complete fixed-width v128 op set, D58 — all
-  arith/bitwise/shuffle/compare/convert/widen/narrow/dot/extmul/q15 lanes + most of **relaxed SIMD**
-  via deterministic lowerings incl. a fused FMA and the signed-i8 relaxed dot);
+  `memory.copy`/`memory.fill`; **fixed-128 SIMD** (the complete v128 op set, D58 — all
+  arith/bitwise/shuffle/compare/convert/widen/narrow/dot/extmul/q15 lanes + the memory variants
+  (splat-load/load-extend/load-zero/load+store-lane) + all of **relaxed SIMD** via deterministic
+  lowerings incl. a fused FMA and the signed-i8 relaxed dot);
   **threads** —
   the full `*.atomic.*` set (full-width i32/i64 map 1:1 onto IR atomics; the narrow 8/16-bit forms
   emulate via a 32-bit word-CAS loop) + `atomic.fence`, `shared`+imported memory, and the
@@ -106,11 +107,16 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   `ref.null`/`ref.func`/`ref.is_null`, typed `select (result t)`. Natural SVM fit: `externref` →
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
-- [x] **SIMD remainder — DONE.** The full fixed-width v128 op set now transpiles + runs on both
-  backends. Built over the proven 5-step pattern (IR variant → verifier lane rule → interp ref →
-  JIT Cranelift → transpiler arm); a few ops bail on the JIT where Cranelift can't legalize them
-  (`i8x16.mul`, `i64x2` min/max — the interp still covers them and wasm never emits them). Only the
-  **relaxed-SIMD** extension (non-deterministic FMA/swizzle/etc.) is intentionally out of scope.
+- [x] **SIMD — DONE (fixed-width v128 *and* relaxed).** The whole wasm SIMD surface transpiles + runs
+  on both backends: every arithmetic/lane/convert/shuffle op, the **memory variants** (splat-load,
+  load-extend, load-zero, load/store-lane), and the **relaxed-SIMD** extension. Built over the proven
+  5-step pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a
+  few ops bail on the JIT where Cranelift can't legalize them (`i8x16.mul`, `i64x2` min/max — the
+  interp still covers them and wasm never emits them).
+  - [x] **SIMD memory variants — DONE.** `v128.load{8,16,32,64}_splat`, `load{8x8,16x4,32x2}_{s,u}`,
+    `load{32,64}_zero`, `load/store{8,16,32,64}_lane` (clang `-msimd128` emits these constantly to
+    broadcast/gather). No new IR — each composes a scalar `Load`/`Store` with `Splat`/`ReplaceLane`/
+    `ExtractLane`/`VWiden`. `svm-wasm/tests/simd.rs` (all shapes, interp == JIT).
   - [x] **Integer lane compares — DONE.** `i8x16`/`i16x8`/`i32x4` `{eq,ne,lt,gt,le,ge}` s/u + the
     `i64x2` signed set → a per-lane all-ones/all-zeros mask (`Inst::VIntCmp`, one Cranelift `icmp`).
     `crates/svm/tests/simd.rs` (round-trip + interp==JIT, oracle = Rust's own compares) and
@@ -292,11 +298,11 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 3. **Tail calls** 🟡 — common LLVM output, likely near-free (IR terminators exist).
 4. **Passive *data* segments + `memory.init`/`data.drop`** 🟡 — DONE. (The *table* bulk ops + passive
    *element* segments remain — they need a mutable runtime table; lower audience.)
-5. **SIMD remainder** 🟢 — **DONE.** The full fixed-width v128 op set transpiles + runs on both
-   backends (compares, min/max, shifts, abs/neg, reductions, saturating add/sub, widen, narrow, all
-   10 conversions, pmin/pmax, popcnt, `avgr_u`, dot product, extmul, extadd_pairwise, q15mulr_sat).
-   **Relaxed SIMD** is fully done (all 20) via deterministic lowerings (incl. a fused FMA and the
-   signed-i8 dot).
+5. **SIMD** 🟢 — **DONE (entire surface).** The full v128 op set transpiles + runs on both backends:
+   compares, min/max, shifts, abs/neg, reductions, saturating add/sub, widen, narrow, all 10
+   conversions, pmin/pmax, popcnt, `avgr_u`, dot product, extmul, extadd_pairwise, q15mulr_sat, the
+   memory variants (splat-load/load-extend/load-zero/load+store-lane), **and** all 20 relaxed-SIMD ops
+   via deterministic lowerings (incl. a fused FMA and the signed-i8 dot).
 6. **Narrow-atomic CAS-loop** 🟢 — **DONE.** Then **reference types** 🟡 (externref→handle, funcref→index).
 7. EH, multiple memories/tables, imported globals/tables — on demand. GC stays ⚪.
 

@@ -466,6 +466,58 @@ fn relaxed_simd_i8_dot() {
     assert_eq!(got, 148, "24 + 24 + 100");
 }
 
+/// SIMD memory variants — splat-load, load-zero, load-extend, load/store-lane (the shapes clang
+/// `-msimd128` emits constantly). Each composes a scalar load/store with a lane op; `eval` runs both
+/// backends. A real auto-vectorized loop with a broadcast load exercises exactly these.
+#[test]
+fn simd_memory_variants() {
+    // load32_splat: broadcast a scalar to every lane (read lane 3 to prove it reached the top).
+    let splat = r#"(module (memory 1) (data (i32.const 0) "\78\56\34\12")
+      (func (export "f") (result i32)
+        (i32x4.extract_lane 3 (v128.load32_splat (i32.const 0)))))"#;
+    assert_eq!(eval(splat, "f", &[]), Value::I32(0x12345678u32 as i32));
+
+    // load8_splat: broadcast a byte; lane 9 = the byte.
+    let bsplat = r#"(module (memory 1) (data (i32.const 0) "\2a")
+      (func (export "f") (result i32)
+        (i8x16.extract_lane_u 9 (v128.load8_splat (i32.const 0)))))"#;
+    assert_eq!(eval(bsplat, "f", &[]), Value::I32(42));
+
+    // load32_zero: lane 0 = scalar (-1), lane 1 = 0 ⇒ sum −1.
+    let zero = r#"(module (memory 1) (data (i32.const 0) "\ff\ff\ff\ff")
+      (func (export "f") (result i32)
+        (i32.add
+          (i32x4.extract_lane 0 (v128.load32_zero (i32.const 0)))
+          (i32x4.extract_lane 1 (v128.load32_zero (i32.const 0))))))"#;
+    assert_eq!(eval(zero, "f", &[]), Value::I32(-1));
+
+    // load8x8_u: load 8 bytes [10,20,30,…], zero-extend to i16x8; lane 2 = 30.
+    let ext = r#"(module (memory 1) (data (i32.const 0) "\0a\14\1e\28\32\3c\46\50")
+      (func (export "f") (result i32)
+        (i16x8.extract_lane_u 2 (v128.load8x8_u (i32.const 0)))))"#;
+    assert_eq!(eval(ext, "f", &[]), Value::I32(30));
+
+    // load16x4_s: load 4 i16 incl. a negative one, sign-extend to i32x4; lane 0 = -1.
+    let exts = r#"(module (memory 1) (data (i32.const 0) "\ff\ff\01\00\02\00\03\00")
+      (func (export "f") (result i32)
+        (i32x4.extract_lane 0 (v128.load16x4_s (i32.const 0)))))"#;
+    assert_eq!(eval(exts, "f", &[]), Value::I32(-1));
+
+    // load32_lane: splice a loaded scalar into lane 2 of a splatted vector.
+    let llane = r#"(module (memory 1) (data (i32.const 0) "\ad\de\00\00")
+      (func (export "f") (result i32)
+        (i32x4.extract_lane 2
+          (v128.load32_lane 2 (i32.const 0) (i32x4.splat (i32.const 7))))))"#;
+    assert_eq!(eval(llane, "f", &[]), Value::I32(0xdead));
+
+    // store32_lane: extract lane 1 of a const vector, store it, load it back.
+    let slane = r#"(module (memory 1)
+      (func (export "f") (result i32)
+        (v128.store32_lane 1 (i32.const 16) (v128.const i32x4 100 200 300 400))
+        (i32.load (i32.const 16))))"#;
+    assert_eq!(eval(slane, "f", &[]), Value::I32(200));
+}
+
 #[test]
 fn f64x2_pmin_pmax() {
     let pm = |op: &str| {
