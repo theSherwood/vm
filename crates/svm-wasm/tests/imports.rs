@@ -320,6 +320,52 @@ fn import_two_handles_thread_through_defined_call() {
     assert_eq!(got, 1i64.wrapping_add(mix(5)).wrapping_add(mix(7)));
 }
 
+/// **`wasi:thread/spawn` *alongside* a capability import** (§12 — the per-thread handle stash). The
+/// spawning thread writes its capability handle into a reserved window slot before each spawn; the
+/// synthesized shim reads it back on the new thread and threads it into `wasi_thread_start`, so a
+/// spawned worker can `cap.call`. Here each of `n` workers computes `work(its start_arg)` (the
+/// `Blocking` capability, a deterministic `mix`) and atomically adds it to a shared sum — which is
+/// `Σ mix(i)` on every interleaving (so interp's M:N executor and the JIT's real OS threads must
+/// agree). This proves capabilities reach spawned threads, the gap this slice closes.
+#[test]
+fn spawn_alongside_capability_import() {
+    let wat = r#"
+(module
+  (import "10" "0" (func $work (param i64) (result i64)))     ;; Blocking cap (handle slot 0)
+  (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
+  (memory 1 1 shared)
+  (func (export "wasi_thread_start") (param $tid i32) (param $start_arg i32)
+    ;; sum (i64 at mem[8]) += work(start_arg)
+    (drop (i64.atomic.rmw.add (i32.const 8)
+            (call $work (i64.extend_i32_u (local.get $start_arg)))))
+    (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))   ;; remaining -= 1
+    (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))
+  (func (export "run") (param $n i32) (result i64)
+    (local $i i32) (local $r i32)
+    (i32.atomic.store (i32.const 4) (local.get $n))           ;; remaining = n
+    (block $spawned (loop $sp
+      (br_if $spawned (i32.ge_u (local.get $i) (local.get $n)))
+      (drop (call $spawn (local.get $i)))                     ;; start_arg = i
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $sp)))
+    (block $finished (loop $wait
+      (local.set $r (i32.atomic.load (i32.const 4)))
+      (br_if $finished (i32.eqz (local.get $r)))
+      (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 2000000000)))
+      (br $wait)))
+    (i64.atomic.load (i32.const 8))))
+"#;
+    let n = 6i64;
+    let got = run_import(
+        wat,
+        "run",
+        |h| h.grant_blocking(std::time::Duration::ZERO, None),
+        &[Value::I32(n as i32)],
+    );
+    let want: i64 = (0..n).map(mix).fold(0i64, |a, x| a.wrapping_add(x));
+    assert_eq!(got, want, "Σ mix(i) over {n} spawned workers using the cap");
+}
+
 /// An **imported memory** is now supported (the wasi-threads shape — the host owns the one shared
 /// linear memory). SVM treats it exactly like a defined memory: the window's linear region at offset
 /// 0. (Imported table/global/tag stay unsupported.)

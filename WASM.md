@@ -6,7 +6,7 @@ from the stack machine, so the §1a benchmark thesis can be measured on the **sa
 runs. It is an **untrusted** frontend — everything it emits is re-verified by `svm-verify`, so a gap
 here is a *capability* limit, never a safety one.
 
-**Status: feature-complete for *typical clang/rustc -O2 output*** (104 tests across
+**Status: feature-complete for *typical clang/rustc -O2 output*** (105 tests across
 `transpile.rs`/`imports.rs`/`simd.rs`/`atomics.rs`/`threads.rs`/`start.rs`/`tailcall.rs`/`bulk.rs`).
 Real clang programs + two real C
 libraries (jsmn, B-Con SHA-256) run **byte-identical to native**; a real `clang -msimd128 -O2` saxpy
@@ -77,8 +77,8 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   machinery generalized `handle: Option<ValIdx>` → `handles: Vec<ValIdx>`; the old "one interface only"
   rejection is gone. Differential tests (interp == JIT) cover two distinct interfaces (Clock + Blocking)
   bound to two handles, threaded through both the entry and a cross-function `call`. (The
-  `wasi:thread/spawn` import remains separately special-cased — *alongside* caps still needs the
-  per-thread handle stash.)
+  `wasi:thread/spawn` import is separately special-cased; capabilities now reach spawned threads via
+  the window handle stash — see the threads section.)
 
 ### 🟡 Fail-closed feature gaps (clean `Unsupported`)
 
@@ -202,9 +202,17 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   within a function it lowers to branches, but cross-frame propagation needs an exception channel (a
   generalization of the existing per-call trap-cell check) — a perf tax + calling-convention change,
   and clang/Rust only emit it under opt-in (`-fwasm-exceptions`). Low ROI.
-- [ ] **`wasi:thread/spawn` *alongside* capability imports** (needs the per-thread handle stash). The
-  broader "imports spanning multiple capability interfaces" limitation is tracked as the 🟠
-  *named multi-capability import binding* item above.
+- [x] **`wasi:thread/spawn` *alongside* capability imports — DONE.** A spawned thread reaches the
+  module's capabilities via a **window handle stash**: a reserved region of `n_handles` i32 slots just
+  past the tid counter. The spawning function holds its capability handles as the multi-handle prefix,
+  so `spawn_op` stores them into the stash right before `thread.spawn` (program order → happens-before
+  the new thread); the synthesized shim reads them back on the new vCPU and threads them into
+  `wasi_thread_start` (which carries the N-handle prefix like every defined function). No runtime
+  change — the powerbox/host is already shared across vCPUs (interp `Arc<Mutex<Host>>`, JIT baked-in
+  `cap_ctx`), so an i32 handle is valid on any thread. Transpiler-only; `n_handles == 0` is
+  byte-identical to the old threads-only shim. `tests/imports.rs`: `n` spawned workers each `cap.call`
+  `work(start_arg)` and atomically sum the results to `Σ mix(i)` — interleaving-invariant, so interp's
+  M:N executor and the JIT's OS threads agree.
 
 ### ⚪ Non-goal (by design)
 
