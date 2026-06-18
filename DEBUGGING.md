@@ -720,8 +720,13 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     step is manual, not CI). CI-testable parts done (`jit_srcloc.rs`): the ELF re-parses and its
     embedded `.debug_line`/`.debug_info` **round-trip through the readers** out of the wrapper, the
     DWARF carries real finalized-code addresses, and register/drop drive the descriptor
-    linked-list + `action_flag` (`JIT_REGISTER_FN` → `JIT_UNREGISTER_FN`) as gdb expects.
-    *Manual acceptance still to confirm with a real gdb attach.* *Effort: high.*
+    linked-list + `action_flag` (`JIT_REGISTER_FN` → `JIT_UNREGISTER_FN`) as gdb expects. The CU
+    DIE carries `DW_AT_stmt_list` (→ `.debug_line` offset 0) — without it gdb loads the function but
+    no source lines, so a `break file.c:N` never binds. ✅ **Manual acceptance confirmed:** under gdb
+    15.1, `break compute.c:3` binds to the live JIT'd address (`fn0+3`) and stops there when the code
+    runs (`Breakpoint 1, fn0 () at compute.c:3`); see the `gdb_attach` example
+    (`crates/svm/examples/gdb_attach.rs`) for the repro harness + the exact `gdb --batch` invocation.
+    *Effort: high.*
 - [ ] **Stage 3 — W6-JIT value locations + DWARF variables (inspect source vars).** Label the IR
   values backing source variables with `ValueLabel`s during codegen; read back `ValueLabelsRanges`
   after compile; emit `DW_TAG_variable` DIEs with DWARF location lists (`DW_OP_reg`/`DW_OP_breg`/
@@ -760,9 +765,9 @@ DWARF variable locations) finally land — they are stages here, not separate wo
 GDB JIT registration: `gdb::build_elf` / `CompiledModule::{elf_object, register_with_gdb}` and the
 `__jit_debug_descriptor`/`__jit_debug_register_code` interface), all round-tripped through the
 readers / asserted against the descriptor state in CI. The "set a breakpoint on a `.c` line in gdb"
-milestone is reachable now; only the **manual gdb-attach confirmation** remains for Stage 2.
-**Next: Stage 3** — W6-JIT value locations + `DW_TAG_variable` DIEs (inspect source vars in gdb).
-Each stage is independently shippable.
+milestone is **confirmed** — a real gdb 15.1 binds `break compute.c:3` to the live JIT'd address and
+stops there (repro: the `gdb_attach` example). **Next: Stage 3** — W6-JIT value locations +
+`DW_TAG_variable` DIEs (inspect source vars in gdb). Each stage is independently shippable.
 
 ---
 

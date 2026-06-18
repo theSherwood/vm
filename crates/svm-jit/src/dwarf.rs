@@ -101,11 +101,13 @@ pub fn debug_line(ranges: &[SrcRange], files: &[String]) -> Vec<u8> {
 const DW_TAG_COMPILE_UNIT: u64 = 0x11;
 const DW_TAG_SUBPROGRAM: u64 = 0x2e;
 const DW_AT_NAME: u64 = 0x03;
+const DW_AT_STMT_LIST: u64 = 0x10;
 const DW_AT_LOW_PC: u64 = 0x11;
 const DW_AT_HIGH_PC: u64 = 0x12;
 const DW_FORM_ADDR: u64 = 0x01;
 const DW_FORM_DATA8: u64 = 0x07;
 const DW_FORM_STRING: u64 = 0x08;
+const DW_FORM_SEC_OFFSET: u64 = 0x17;
 
 /// Emit a minimal `.debug_info` + `.debug_abbrev` pair (Stage 2b): one compile-unit DIE whose
 /// children are a `DW_TAG_subprogram` per function — `(name, low_pc, high_pc)`, where `high_pc` is
@@ -119,6 +121,11 @@ pub fn debug_info(funcs: &[(u32, u64, u64)]) -> (Vec<u8>, Vec<u8>) {
     abbrev.push(1); // DW_CHILDREN_yes
     uleb(&mut abbrev, DW_AT_NAME);
     uleb(&mut abbrev, DW_FORM_STRING);
+    // `DW_AT_stmt_list` points gdb at this CU's `.debug_line` program (offset 0 — the JIT gives each
+    // module its own ELF with a single line program). Without it gdb loads the function but no source
+    // lines, so a `break file.c:N` never binds.
+    uleb(&mut abbrev, DW_AT_STMT_LIST);
+    uleb(&mut abbrev, DW_FORM_SEC_OFFSET);
     uleb(&mut abbrev, 0);
     uleb(&mut abbrev, 0); // end of code-1 attrs
     uleb(&mut abbrev, 2);
@@ -139,6 +146,7 @@ pub fn debug_info(funcs: &[(u32, u64, u64)]) -> (Vec<u8>, Vec<u8>) {
     let mut dies = Vec::new();
     uleb(&mut dies, 1); // CU DIE
     dies.extend_from_slice(b"svm-jit\0"); // DW_AT_name
+    dies.extend_from_slice(&0u32.to_le_bytes()); // DW_AT_stmt_list → .debug_line offset 0
     for &(func, lo, hi) in funcs {
         uleb(&mut dies, 2); // subprogram DIE
         dies.extend_from_slice(format!("fn{func}\0").as_bytes()); // DW_AT_name (synthesized)
