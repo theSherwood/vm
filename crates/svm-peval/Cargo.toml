@@ -1,0 +1,17 @@
+[package]
+name = "svm-peval"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Stage-0 is a pure IR→IR pass: the only dependency is the IR definition itself.
+svm-ir.workspace = true
+
+[dev-dependencies]
+# The differential harness: re-verify the optimized module, then run original vs
+# optimized through the reference interpreter and assert byte-identical results/traps.
+svm-verify.workspace = true
+svm-interp.workspace = true
