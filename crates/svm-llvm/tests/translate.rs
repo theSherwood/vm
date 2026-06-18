@@ -1209,6 +1209,22 @@ fn printf_unsigned_formats() {
 }
 
 #[test]
+fn printf_flag_formats() {
+    // The full flag matrix on integer conversions, checked byte-for-byte vs native `printf`:
+    //   `-` left-justify, `+`/space forced sign, `0` zero-pad (incl. the previously-fail-closed
+    //   zero-padded signed), and `#` (the `0x` hex prefix, suppressed for zero).
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 printf(\"|%-6d|%-6d|\\n\", 42, -42); \
+                 printf(\"|%+d|%+d|% d|% d|\\n\", 42, -42, 42, -42); \
+                 printf(\"|%05d|%05d|%+05d|\\n\", 42, -42, 42); \
+                 printf(\"|%#x|%#x|%#08x|\\n\", 255u, 0u, 0xabcu); \
+                 printf(\"|%-8x|%08x|\\n\", 0xbeefu, 0xbeefu); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_flags", src, b"");
+}
+
+#[test]
 fn printf_string_formats() {
     // `%s` (runtime `strlen`) plain and right-justified in a field width, mixed with `%d`/`%c` so
     // clang keeps it a real varargs `printf` (not a `puts` rewrite). A pointer that is *not* a string

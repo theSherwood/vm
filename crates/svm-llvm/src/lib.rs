@@ -2938,12 +2938,12 @@ enum FmtSeg {
     /// A verbatim run — bytes `[off, off+len)` of the format global, written directly.
     Lit { off: usize, len: usize },
     /// An integer conversion: `base` (10/16, lowercase), `signed` (`%d`) vs unsigned (`%u`/`%x`),
-    /// `0`-flag zero-pad, field `width`.
+    /// field `width`, and the layout `flags` (`0`/`-`/`+`/space/`#`).
     Int {
         base: u64,
         signed: bool,
-        zero: bool,
         width: u32,
+        flags: FmtFlags,
     },
     /// `%c` — the argument's low byte.
     Char,
@@ -2952,6 +2952,23 @@ enum FmtSeg {
     Str { width: u32 },
     /// `%%` — a literal percent.
     Percent,
+}
+
+/// `printf` integer-conversion layout flags (`0`/`-`/`+`/space/`#`), already normalized for the
+/// standard precedence: `-` (left-justify) suppresses `0` (zero-pad), and `+` (force sign) suppresses
+/// ` ` (space-before-positive).
+#[derive(Clone, Copy, Default)]
+struct FmtFlags {
+    /// `0` — pad with leading zeros (between the sign/prefix and the digits).
+    zero: bool,
+    /// `-` — left-justify in the field (trailing spaces).
+    left: bool,
+    /// `+` — always emit a sign for a signed conversion (`+` for non-negatives).
+    plus: bool,
+    /// ` ` — emit a leading space before a non-negative signed conversion.
+    space: bool,
+    /// `#` — alternate form; for `%x` prefixes a non-zero value with `0x`.
+    alt: bool,
 }
 
 /// Parse a (NUL-free) `printf` format string into segments. Fail-closed on anything not yet
@@ -2982,17 +2999,26 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
             lit_start = i;
             continue;
         }
-        // Flags — only `0` (zero-pad) so far; `-`/`+`/` `/`#` change layout, fail-closed.
-        let mut zero = false;
+        // Flags (any order, repeatable): `0` zero-pad, `-` left-justify, `+` force sign, ` ` space
+        // before positive, `#` alternate form.
+        let mut flags = FmtFlags::default();
         while i < fmt.len() {
             match fmt[i] {
-                b'0' => {
-                    zero = true;
-                    i += 1;
-                }
-                b'-' | b'+' | b' ' | b'#' => return Err(bad("flag (-/+/space/#)")),
+                b'0' => flags.zero = true,
+                b'-' => flags.left = true,
+                b'+' => flags.plus = true,
+                b' ' => flags.space = true,
+                b'#' => flags.alt = true,
                 _ => break,
             }
+            i += 1;
+        }
+        // Standard precedence: `-` overrides `0`; `+` overrides ` `.
+        if flags.left {
+            flags.zero = false;
+        }
+        if flags.plus {
+            flags.space = false;
         }
         // Field width (decimal). `*` (dynamic) and `.` (precision) are deferred.
         let mut width = 0u32;
@@ -3012,24 +3038,24 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
         }
         let conv = *fmt.get(i).ok_or_else(|| bad("trailing conversion"))?;
         i += 1;
-        // A signed `%d`/`%i` with a zero-pad width needs the sign before the zeros — not yet handled,
-        // so fail closed on that one combination (plain/space-padded `%d` is fine).
-        let int = |base, signed| {
-            if signed && zero && width > 0 {
-                Err(bad("zero-padded signed %d (sign+pad combo)"))
-            } else {
-                Ok(FmtSeg::Int {
-                    base,
-                    signed,
-                    zero,
-                    width,
-                })
+        // `#` (alternate) is only meaningful for `%x` here (the `0x` prefix); on `%d`/`%i`/`%u` it is
+        // a no-op, so drop it to keep the emitter's prefix logic hex-only.
+        let int = |base: u64, signed| {
+            let mut f = flags;
+            if base != 16 {
+                f.alt = false;
+            }
+            FmtSeg::Int {
+                base,
+                signed,
+                width,
+                flags: f,
             }
         };
         segs.push(match conv {
-            b'd' | b'i' => int(10, true)?,
-            b'u' => int(10, false)?,
-            b'x' => int(16, false)?,
+            b'd' | b'i' => int(10, true),
+            b'u' => int(10, false),
+            b'x' => int(16, false),
             b'c' => FmtSeg::Char,
             b's' => FmtSeg::Str { width },
             other => return Err(bad(&format!("conversion %{}", other as char))),
@@ -3655,8 +3681,8 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
             FmtSeg::Int {
                 base,
                 signed,
-                zero,
                 width,
+                flags,
             } => {
                 let arg = c.arguments.get(argi).ok_or_else(|| {
                     Error::Unsupported("printf: more conversions than args".into())
@@ -3708,87 +3734,164 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                     };
                     (mag, None)
                 };
-                // Pre-fill the pad region of the scratch buffer (`width` constant byte-stores), then
-                // `utoa` writes the digits backward over its high end; the unfilled low pad remains.
-                if width > 0 {
-                    let padch = ctx.push(Inst::ConstI32(if zero { b'0' } else { b' ' } as i32));
-                    for k in 0..width as u64 {
-                        let a = ctx.const_i64((FMT_BUF_END - width as u64 + k) as i64);
-                        ctx.push_effect(Inst::Store {
-                            op: svm_ir::StoreOp::I32_8,
-                            addr: a,
-                            value: padch,
-                            offset: 0,
-                            align: 0,
-                        });
-                    }
-                }
-                let basec = ctx.const_i64(base as i64);
-                let bufend = ctx.const_i64(FMT_BUF_END as i64);
-                let start = ctx.push(Inst::Call {
-                    func: utoa,
-                    args: vec![mag, basec, bufend],
-                }); // i64 start pointer (digits at [start, bufend))
-                    // The leading `-` for a negative `%d`: store it just below the digits unconditionally
-                    // (harmless for non-negatives — it is only included in the write window when `neg`).
-                let content_start = match neg {
-                    Some(neg) => {
-                        let one = ctx.const_i64(1);
-                        let sm1 = ctx.push(Inst::IntBin {
-                            ty: IntTy::I64,
-                            op: BinOp::Sub,
-                            a: start,
-                            b: one,
-                        });
-                        let dash = ctx.push(Inst::ConstI32(b'-' as i32));
-                        ctx.push_effect(Inst::Store {
-                            op: svm_ir::StoreOp::I32_8,
-                            addr: sm1,
-                            value: dash,
-                            offset: 0,
-                            align: 0,
-                        });
-                        ctx.push(Inst::IntBin {
-                            ty: IntTy::I64,
-                            op: BinOp::Sub,
-                            a: start,
-                            b: neg,
-                        }) // start - (neg ? 1 : 0)
-                    }
-                    None => start,
-                };
-                let len = ctx.push(Inst::IntBin {
-                    ty: IntTy::I64,
-                    op: BinOp::Sub,
-                    a: bufend,
-                    b: content_start,
-                });
-                if width > 0 {
-                    // write `max(len, width)` bytes ending at `bufend` (pad + sign + digits).
-                    let wv = ctx.const_i64(width as i64);
-                    let gt = ctx.push(Inst::IntCmp {
-                        ty: IntTy::I64,
-                        op: CmpOp::GtU,
-                        a: len,
-                        b: wv,
-                    });
-                    let maxlen = ctx.push(Inst::Select {
-                        cond: gt,
-                        a: len,
-                        b: wv,
-                    });
-                    let wstart = ctx.push(Inst::IntBin {
-                        ty: IntTy::I64,
-                        op: BinOp::Sub,
-                        a: bufend,
-                        b: maxlen,
-                    });
-                    ctx.emit_write(wstart, maxlen)?;
-                } else {
-                    ctx.emit_write(content_start, len)?;
-                }
+                emit_printf_int_field(ctx, mag, base, neg, width, flags, utoa)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Emit the `Stream.write`s for one `printf` integer conversion with full flag/width handling, to
+/// match C `printf` byte-for-byte. `mag` is the unsigned magnitude (i64); `neg` is the runtime `0/1`
+/// "is negative" flag for a signed conversion (`None` for unsigned). `__svm_utoa` formats the digits
+/// backward into the high end of the scratch buffer (`[FMT_BUF, FMT_BUF_END)`); this routine adds the
+/// sign / `0x` prefix (stored just below the digits) and the field padding around them.
+///
+/// The justify/pad *layout* is compile-time (from `flags`); only the digit count and pad length are
+/// runtime. The pad bytes come from a constant pad-char run pre-filled at the *low* end of the buffer
+/// (`[FMT_BUF, FMT_BUF+width)`), which never overlaps the bytes actually read for the field (the pad
+/// write is always strictly below the digits), so a single fill serves any runtime pad length.
+fn emit_printf_int_field(
+    ctx: &mut BlockCtx,
+    mag: ValIdx,
+    base: u64,
+    neg: Option<ValIdx>,
+    width: u32,
+    flags: FmtFlags,
+    utoa: u32,
+) -> Result<(), Error> {
+    let sub = |ctx: &mut BlockCtx, a: ValIdx, b: ValIdx| {
+        ctx.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Sub,
+            a,
+            b,
+        })
+    };
+    let store8 = |ctx: &mut BlockCtx, addr: ValIdx, value: ValIdx| {
+        ctx.push_effect(Inst::Store {
+            op: svm_ir::StoreOp::I32_8,
+            addr,
+            value,
+            offset: 0,
+            align: 0,
+        });
+    };
+
+    // Pre-fill the low pad run with the pad char (`'0'` only for a non-left zero-pad, else `' '`),
+    // *before* `utoa` so any overlap with the digit region is harmlessly overwritten by the digits.
+    let pad_char = if flags.zero { b'0' } else { b' ' };
+    if width > 0 {
+        let padch = ctx.push(Inst::ConstI32(pad_char as i32));
+        for k in 0..width as u64 {
+            let a = ctx.const_i64((FMT_BUF + k) as i64);
+            store8(ctx, a, padch);
+        }
+    }
+
+    let basec = ctx.const_i64(base as i64);
+    let bufend = ctx.const_i64(FMT_BUF_END as i64);
+    let start = ctx.push(Inst::Call {
+        func: utoa,
+        args: vec![mag, basec, bufend],
+    }); // digits at [start, bufend)
+    let one = ctx.const_i64(1);
+
+    // Prefix (sign for signed, `0x` for `#x`): store the bytes just below `start`; `prefixlen`
+    // (0/1/2, runtime) selects how many are included in the field.
+    let prefixlen = match neg {
+        Some(negv) => {
+            // Sign char + whether it is present. `+`/space force a sign on non-negatives.
+            let (sign, plen) = if flags.plus || flags.space {
+                let pos = ctx.push(Inst::ConstI32(if flags.plus { b'+' } else { b' ' } as i32));
+                let dash = ctx.push(Inst::ConstI32(b'-' as i32));
+                // `neg` is an i64 0/1; `Select`'s condition is an i32 boolean.
+                let zero64 = ctx.const_i64(0);
+                let negb = ctx.push(Inst::IntCmp {
+                    ty: IntTy::I64,
+                    op: CmpOp::Ne,
+                    a: negv,
+                    b: zero64,
+                });
+                let s = ctx.push(Inst::Select {
+                    cond: negb,
+                    a: dash,
+                    b: pos,
+                });
+                (s, ctx.const_i64(1))
+            } else {
+                let dash = ctx.push(Inst::ConstI32(b'-' as i32));
+                (dash, negv) // present only when negative
+            };
+            let sm1 = sub(ctx, start, one);
+            store8(ctx, sm1, sign);
+            plen
+        }
+        None if flags.alt => {
+            // `%#x`: a `0x` prefix, but only for a non-zero value.
+            let z = ctx.const_i64(0);
+            let nz = ctx.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Ne,
+                a: mag,
+                b: z,
+            });
+            let x = ctx.push(Inst::ConstI32(b'x' as i32));
+            let zero_ch = ctx.push(Inst::ConstI32(b'0' as i32));
+            let sm1 = sub(ctx, start, one);
+            store8(ctx, sm1, x);
+            let two = ctx.const_i64(2);
+            let sm2 = sub(ctx, start, two);
+            store8(ctx, sm2, zero_ch);
+            ctx.push(Inst::Select {
+                cond: nz,
+                a: two,
+                b: z,
+            })
+        }
+        None => ctx.const_i64(0),
+    };
+
+    let content_start = sub(ctx, start, prefixlen); // = bufend - contentlen
+    let contentlen = sub(ctx, bufend, content_start);
+
+    // No field width: just the content (pad/justify don't apply).
+    if width == 0 {
+        ctx.emit_write(content_start, contentlen)?;
+        return Ok(());
+    }
+
+    // pad = max(0, width - contentlen).
+    let wv = ctx.const_i64(width as i64);
+    let gt = ctx.push(Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::GtU,
+        a: wv,
+        b: contentlen,
+    });
+    let diff = sub(ctx, wv, contentlen);
+    let zero = ctx.const_i64(0);
+    let pad = ctx.push(Inst::Select {
+        cond: gt,
+        a: diff,
+        b: zero,
+    });
+    let padbuf = ctx.const_i64(FMT_BUF as i64);
+
+    if flags.left {
+        // Left-justify: content, then trailing spaces.
+        ctx.emit_write(content_start, contentlen)?;
+        ctx.emit_write(padbuf, pad)?;
+    } else if flags.zero {
+        // Zero-pad: prefix, then zeros, then digits (so the sign/`0x` precedes the zeros).
+        let ndigits = sub(ctx, bufend, start);
+        ctx.emit_write(content_start, prefixlen)?;
+        ctx.emit_write(padbuf, pad)?;
+        ctx.emit_write(start, ndigits)?;
+    } else {
+        // Right-justify with spaces: leading spaces, then content.
+        ctx.emit_write(padbuf, pad)?;
+        ctx.emit_write(content_start, contentlen)?;
     }
     Ok(())
 }
