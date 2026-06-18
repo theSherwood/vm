@@ -368,6 +368,27 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               claiming a fiber Running in another vCPU's chain is `FiberFault`, matching the
               tree-walker). Lifts the thread+fiber compile rejection. Harness: the `MIGRATE` pattern
               (fiber suspended on root, resumed on a spawned thread → 75) bit-identical to `run`.
+        - [x] **1c-5g** — §14 **executor children** (`Instantiator.instantiate` / `join`, ops 0/1):
+              a child runs on the cooperative scheduler (unlike an inline coroutine), confined to a
+              power-of-two sub-window (`nested_view` over the **shared** backing) with an attenuated
+              powerbox (an `Instantiator` + an `AddressSpace`, each over `[0, child_size)`) and a
+              `quota` fuel sub-budget. Each scheduler task now carries an `env: Option<usize>`: `None`
+              = the shared domain (root + its `thread.spawn` siblings); `Some(k)` = a confined
+              `ChildEnv { mem, host, table, fuel }` (a fresh **natural** dispatch table — no installed
+              §22 units, like the tree-walker's `DomainTable::new(&cfuncs, 0)`). `step_vcpu` takes a
+              bundled `RunCtx { table, fuel, mem, host }` selected per task, so the per-op hot loop is
+              untouched. `instantiate` validates the entry sig + carve in `drive` (the task-set owner),
+              builds the child, and registers it in the spawner's `threads` namespace; `join` reuses
+              the §12 thread-join machinery (`InstJoin` checks the cap authority, then emits
+              `Outcome::ThreadJoin`). A thread spawned by a confined child inherits its `env` (shares
+              its window). `compile_module` reclassifies ops 0/1 as scheduler-driven (not coroutine),
+              so instantiate now composes with threads/coroutines; only instantiate+`cont.*` fibers is
+              still rejected (the run-shared fiber registry would leak across the child domain → tree
+              walker fall-back). New harness `bytecode_instantiate.rs` (shared-backing round-trip →
+              42123, depth-2 nesting → 77, two-arg child driving its own `AddressSpace.unmap` → 0,
+              out-of-range carve → −EINVAL, child trap propagating through `join`) bit-identical to
+              `run_with_host`. Still deferred: the separate-**module** variants (ops 5/6/7, needing a
+              granted `Module` handle) and demand/fault-yield coroutines (op 4).
     - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
           stepping report tree-walker-identical locations. New harness: debug-trace equality.
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:

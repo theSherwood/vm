@@ -13,7 +13,9 @@
 //! (`cont.*`/`suspend`, cooperative single-vCPU switching in [`step_vcpu`]); and §12 **threads**
 //! (`thread.spawn`/`join` + `memory.wait`/`notify`) on a cooperative single-threaded scheduler
 //! ([`drive`]) over one shared `Mem`; and §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume`
-//! + `Yielder.yield`, inline-driven over a confined `nested_view` child window). Faithful for the
+//! + `Yielder.yield`, inline-driven over a confined `nested_view` child window) and §14 **executor
+//! children** (`Instantiator.instantiate`/`join`, scheduler-driven over a confined child env with an
+//! attenuated `Instantiator`+`AddressSpace` powerbox and a `quota` sub-budget). Faithful for the
 //! interleaving-invariant programs the oracle uses; and §22 **guest-driven JIT units**
 //! (`Jit.install`/`uninstall`/`invoke` + cross-module `call_indirect` into an installed unit) over a
 //! multi-module [`Domain`] (a runtime dispatch table spanning `mods`; `invoke` runs a unit nested
@@ -21,13 +23,15 @@
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
 //! `return_call_indirect`, reusing the current window — O(1) deep tail recursion). [`compile_module`]
-//! returns `None` when a function needs a seam not yet driven here — `Instantiator` executor children
-//! (`instantiate`/`join`) and demand/module variants, `gc.roots`, `call.import`, or durability — so
-//! callers (`super::run_with_host_fast`) fall back to the tree-walker for those.
+//! returns `None` when a function needs a seam not yet driven here — the separate-**module**
+//! instantiate variants (ops 5/6/7), demand/fault-yield coroutines, instantiate-mixed-with-fibers,
+//! `gc.roots`, `call.import`, or durability — so callers (`super::run_with_host_fast`) fall back to
+//! the tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
-//! tree-walker (`bytecode_diff.rs`, `bytecode_{caps,fibers,threads,coroutines,dynlink}.rs`).
+//! tree-walker (`bytecode_diff.rs`,
+//! `bytecode_{caps,fibers,threads,coroutines,instantiate,dynlink}.rs`).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
@@ -275,6 +279,26 @@ enum Op {
         handle: u32,
         dst: u32,
     },
+    /// §14 `Instantiator.instantiate(entry, off, size_log2, quota)` (op 0): spawn a **confined
+    /// executor child** running `entry` over `[off, off+2^size_log2)` of the holder's range, with an
+    /// attenuated `Instantiator`+`AddressSpace` powerbox over its own window; its handle (or `EINVAL`)
+    /// lands at `dst`. `handle` is the Instantiator cap (authority). Scheduler-driven (joinable).
+    Instantiate {
+        handle: u32,
+        entry: u32,
+        off: u32,
+        size_log2: u32,
+        quota: u32,
+        dst: u32,
+    },
+    /// §14 `Instantiator.join(child)` (op 1): park until executor child `child` finishes; its result
+    /// (or trap) lands at `dst`. `handle` is the Instantiator cap (authority). The join itself reuses
+    /// the §12 thread machinery — children share one handle namespace (`threads`) with `thread.spawn`.
+    InstJoin {
+        handle: u32,
+        child: u32,
+        dst: u32,
+    },
     /// §12 `memory.wait`: futex wait (`ty`-wide) on `addr` while it equals `expected`, up to
     /// `timeout` ns; the status (0/1/2) lands at `dst`. Scheduler-driven.
     MemoryWait {
@@ -446,34 +470,48 @@ impl Domain {
 
 /// Lower every function, or `None` if any uses an op outside this slice's subset.
 pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
-    // Coroutines (§14) are driven inline as single-vCPU children with a Yielder-only powerbox. A
-    // coroutine module that *also* uses fibers or threads would need the child to participate in
-    // those seams (a coroutine child can use `cont.*`/`thread.*` in the tree-walker), which the
-    // inline coroutine driver here doesn't service — so reject the combination (→ tree-walker
-    // fallback). Plain coroutine, plain fiber, and plain thread modules are each fine.
+    // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
+    // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
+    // would need the child to participate in those seams (a coroutine child can use `cont.*`/`thread.*`
+    // in the tree-walker), which the inline coroutine driver here doesn't service — so reject the
+    // combination (→ tree-walker fallback). §14 **executor children** (`instantiate`/`join`, ops 0/1)
+    // are different: they run on the scheduler like threads, not inline — so they classify as
+    // scheduler-driven, not as coroutines. The one combination they can't yet service is `cont.*`
+    // fibers (a confined child would share the run-shared fiber registry — a divergence), so reject
+    // instantiate+fiber. Plain coroutine / fiber / thread / instantiate modules are each fine, as are
+    // instantiate+thread and instantiate+coroutine.
     let mut has_coro = false;
-    let mut has_fiber_or_thread = false;
+    let mut has_fiber = false;
+    let mut has_thread = false;
+    let mut has_instantiate = false;
     for f in funcs {
         for b in &f.blocks {
             for inst in &b.insts {
                 match inst {
+                    // ops 0/1 = instantiate/join (executor children); everything else on
+                    // INSTANTIATOR/YIELDER is the inline coroutine round-trip.
+                    Inst::CapCall {
+                        type_id: super::iface::INSTANTIATOR,
+                        op: 0 | 1,
+                        ..
+                    } => has_instantiate = true,
                     Inst::CapCall {
                         type_id: super::iface::INSTANTIATOR | super::iface::YIELDER,
                         ..
                     } => has_coro = true,
-                    Inst::ContNew { .. }
-                    | Inst::ContResume { .. }
-                    | Inst::Suspend { .. }
-                    | Inst::ThreadSpawn { .. }
+                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => {
+                        has_fiber = true
+                    }
+                    Inst::ThreadSpawn { .. }
                     | Inst::ThreadJoin { .. }
                     | Inst::MemoryWait { .. }
-                    | Inst::MemoryNotify { .. } => has_fiber_or_thread = true,
+                    | Inst::MemoryNotify { .. } => has_thread = true,
                     _ => {}
                 }
             }
         }
     }
-    if has_coro && has_fiber_or_thread {
+    if (has_coro && (has_fiber || has_thread)) || (has_instantiate && has_fiber) {
         return None;
     }
 
@@ -803,9 +841,25 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
         } => {
             use super::iface;
             match (*type_id, *op) {
-                // §14 cooperative coroutine round-trip — spawn_coroutine / resume / yield. (The other
-                // Instantiator ops — instantiate/join executor children, demand/module variants — and
-                // the JIT / SharedRegion-grant variants need seams this slice doesn't drive: reject.)
+                // §14 executor children — instantiate (op 0) spawns a confined child on the scheduler;
+                // join (op 1) parks until it finishes, reusing the §12 thread join machinery (children
+                // share the `threads` handle namespace). The separate-module / demand variants (5/6/7
+                // and op 4) and the JIT / SharedRegion-grant variants need seams this slice doesn't
+                // drive: reject (fall back).
+                (iface::INSTANTIATOR, 0) if args.len() >= 4 => Op::Instantiate {
+                    handle: g(*handle),
+                    entry: g(args[0]),
+                    off: g(args[1]),
+                    size_log2: g(args[2]),
+                    quota: g(args[3]),
+                    dst,
+                },
+                (iface::INSTANTIATOR, 1) if !args.is_empty() => Op::InstJoin {
+                    handle: g(*handle),
+                    child: g(args[0]),
+                    dst,
+                },
+                // §14 cooperative coroutine round-trip — spawn_coroutine / resume / yield.
                 (iface::INSTANTIATOR, 2) if args.len() >= 3 => Op::SpawnCoroutine {
                     handle: g(*handle),
                     entry: g(args[0]),
@@ -1051,6 +1105,20 @@ enum Outcome {
         handle: i32,
         dst: u32,
     },
+    /// §14 `Instantiator.instantiate`: the authority `(ibase, isize)` is resolved; the driver builds a
+    /// **confined executor child** running entry `entry` over `[ibase+off, +2^size_log2)` with its own
+    /// attenuated powerbox and `quota` fuel, registers it (handle = thread slot), and writes the handle
+    /// (or `EINVAL`) to `dst`. Unlike a coroutine, the child runs on the scheduler — joinable via the
+    /// shared thread machinery (`Instantiator.join` compiles to [`Outcome::ThreadJoin`]).
+    Instantiate {
+        ibase: u64,
+        isize: u64,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
+        quota: i64,
+        dst: u32,
+    },
     /// `memory.wait`: futex wait on confined address `base` (already validated); `dst` gets the
     /// status (0 woken / 1 not-equal / 2 timed-out).
     MemoryWait {
@@ -1239,6 +1307,17 @@ enum VcpuStop {
         handle: i32,
         dst: u32,
     },
+    /// §14 `Instantiator.instantiate` — the driver (which owns the task set / extra environments)
+    /// builds the confined executor child and registers it as a joinable thread.
+    Instantiate {
+        ibase: u64,
+        isize: u64,
+        entry: i64,
+        off: i64,
+        size_log2: i64,
+        quota: i64,
+        dst: u32,
+    },
     Wait {
         base: u64,
         expected: u64,
@@ -1274,6 +1353,18 @@ enum VcpuStop {
     },
 }
 
+/// The per-vCPU execution environment a [`step_vcpu`] runs against: the dispatch `table` it uses
+/// (the shared domain table, or a §14 confined child's own natural table), its `fuel` budget, its
+/// linear `mem`, and its capability `host`. The root vCPU and its `thread.spawn` siblings share the
+/// domain's (env `None`); a §14 `instantiate` child carries its own confined [`ChildEnv`]. Bundled so
+/// [`step_vcpu`] takes one ref instead of four (and so the per-task selection has a single type).
+struct RunCtx<'a> {
+    table: &'a Table,
+    fuel: &'a mut u64,
+    mem: &'a mut Option<Mem>,
+    host: &'a mut Host,
+}
+
 /// Run one vCPU (its active `Vm` and any fibers it switches among) until it finishes or hits a
 /// multi-vCPU event. Fiber `Outcome`s are serviced here exactly as `run_inner`'s `cont.*` arms switch
 /// the active frame stack; `thread.*`/`memory.*` `Outcome`s are handed up to [`drive`]. `budget` only
@@ -1282,16 +1373,18 @@ fn step_vcpu(
     vt: &mut VTask,
     fibers: &mut Vec<FiberState>,
     dom: &Domain,
-    fuel: &mut u64,
-    mem: &mut Option<Mem>,
-    host: &mut Host,
+    ctx: &mut RunCtx,
     budget: u64,
 ) -> Result<VcpuStop, Trap> {
     loop {
-        match vt
-            .active
-            .resume(&dom.mods, &dom.table, fuel, mem, host, budget)?
-        {
+        match vt.active.resume(
+            &dom.mods,
+            ctx.table,
+            &mut *ctx.fuel,
+            &mut *ctx.mem,
+            &mut *ctx.host,
+            budget,
+        )? {
             // Budget exhausted (sliced harness only): re-enter the same activation; its cursor is
             // already persisted, so this is transparent.
             Outcome::Suspended => {}
@@ -1377,6 +1470,25 @@ fn step_vcpu(
                 return Ok(VcpuStop::Spawn { func, sp, arg, dst })
             }
             Outcome::ThreadJoin { handle, dst } => return Ok(VcpuStop::Join { handle, dst }),
+            Outcome::Instantiate {
+                ibase,
+                isize: isz,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+            } => {
+                return Ok(VcpuStop::Instantiate {
+                    ibase,
+                    isize: isz,
+                    entry,
+                    off,
+                    size_log2,
+                    quota,
+                    dst,
+                })
+            }
             Outcome::MemoryWait {
                 base,
                 expected,
@@ -1430,7 +1542,7 @@ fn step_vcpu(
             } => {
                 let h = spawn_coroutine(
                     &mut vt.coroutines,
-                    mem,
+                    ctx.mem,
                     &dom.mods[0],
                     entry,
                     (ibase, isz, off, size_log2),
@@ -1447,7 +1559,7 @@ fn step_vcpu(
                 if let Some(yd) = coro.awaiting.take() {
                     coro.vm.set(yd, Reg::from_i64(value)); // deliver the resume value to the `yield`
                 }
-                match resume_coro(&mut coro, &dom.mods, fuel)? {
+                match resume_coro(&mut coro, &dom.mods, &mut *ctx.fuel)? {
                     CoStop::Yield(yv) => {
                         vt.coroutines[ch as usize] = Some(coro); // suspended — re-parked for next resume
                         vt.active.set(dst, Reg::from_i32(super::FIBER_SUSPENDED));
@@ -1524,11 +1636,28 @@ fn spawn_coroutine(
 const FIBER_PARAMS: [ValType; 2] = [ValType::I64, ValType::I64];
 const FIBER_RESULTS: [ValType; 1] = [ValType::I64];
 
+/// A §14 `instantiate` child's confined runtime, owned by [`drive`] alongside the task set. Its `mem`
+/// is a `nested_view` sub-window sharing the parent's backing (the §14 shared data plane), its `host`
+/// an attenuated powerbox (an `Instantiator` + an `AddressSpace`, each over `[0, child_size)`), its
+/// `table` a fresh **natural** dispatch table over module 0 (no access to installed §22 units — like
+/// the tree-walker's fresh `DomainTable::new(&cfuncs, 0)`), and `fuel` a sub-allocated quota.
+struct ChildEnv {
+    mem: Option<Mem>,
+    host: Host,
+    table: Table,
+    fuel: u64,
+}
+
 /// A scheduled vCPU and its blocking state.
 struct TaskSlot {
     vt: VTask,
-    /// This vCPU's `thread.spawn` children (handle = index → global task index). `None` = joined.
+    /// This vCPU's `thread.spawn` / `instantiate` children (handle = index → global task index).
+    /// `None` = joined. (Both seams share one handle namespace, matching the tree-walker's `threads`.)
     threads: Vec<Option<usize>>,
+    /// The runtime environment this vCPU steps against: `None` = the shared domain (root + its
+    /// `thread.spawn` siblings); `Some(k)` = the confined `extra_envs[k]` of a §14 `instantiate` child
+    /// (and any threads it spawns, which share its window — they inherit the same env index).
+    env: Option<usize>,
     state: TaskState,
 }
 
@@ -1569,8 +1698,12 @@ fn drive(
     let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
         vt: VTask::new(&dom.mods[0], entry as usize, args)?,
         threads: Vec::new(),
+        env: None,
         state: TaskState::Runnable,
     }];
+    // §14 `instantiate` children's confined environments (handle = `env` index). The root and its
+    // `thread.spawn` siblings use the shared `mem`/`host`/`dom.table` instead (`env == None`).
+    let mut extra_envs: Vec<ChildEnv> = Vec::new();
     // The §12 fiber registry is **run-shared** (one handle namespace per domain) so a fiber created
     // or suspended on one vCPU can be resumed on another (D57 migration).
     let mut fibers: Vec<FiberState> = Vec::new();
@@ -1610,15 +1743,28 @@ fn drive(
             continue;
         };
 
-        match step_vcpu(
-            &mut tasks[ti].vt,
-            &mut fibers,
-            &dom,
-            fuel,
-            mem,
-            host,
-            budget,
-        ) {
+        // Select this vCPU's environment: the shared one (root + thread siblings), or its own
+        // confined `instantiate` env. `tasks[ti].vt` and the chosen env borrow disjoint storage
+        // (`tasks` vs `extra_envs` / the `mem`/`host`/`fuel` params), so the split borrow is sound.
+        let mut ctx = match tasks[ti].env {
+            None => RunCtx {
+                table: &dom.table,
+                fuel: &mut *fuel,
+                mem: &mut *mem,
+                host: &mut *host,
+            },
+            Some(k) => {
+                let e = &mut extra_envs[k];
+                RunCtx {
+                    table: &e.table,
+                    fuel: &mut e.fuel,
+                    mem: &mut e.mem,
+                    host: &mut e.host,
+                }
+            }
+        };
+        let stop = step_vcpu(&mut tasks[ti].vt, &mut fibers, &dom, &mut ctx, budget);
+        match stop {
             Err(trap) => complete(&mut tasks, ti, Err(trap)),
             Ok(VcpuStop::Done(vals)) => complete(&mut tasks, ti, Ok(vals)),
             Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
@@ -1640,9 +1786,121 @@ fn drive(
                     &[Value::I64(sp), Value::I64(arg)],
                 )?;
                 let cidx = tasks.len();
+                // A thread shares its spawner's window/powerbox — so it inherits the spawner's env
+                // (the shared domain for a root-spawned thread, or the same confined `instantiate`
+                // env for one spawned by a confined child).
+                let env = tasks[ti].env;
                 tasks.push(TaskSlot {
                     vt: child,
                     threads: Vec::new(),
+                    env,
+                    state: TaskState::Runnable,
+                });
+                let handle = tasks[ti].threads.len() as i32;
+                tasks[ti].threads.push(Some(cidx));
+                tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+            }
+            Ok(VcpuStop::Instantiate {
+                ibase,
+                isize: isz,
+                entry,
+                off,
+                size_log2,
+                quota,
+                dst,
+            }) => {
+                // Validate the child entry signature against module 0 (a same-module child): it
+                // returns one `i64` and takes either its `Instantiator` (one `i64`) or its
+                // `Instantiator`+`AddressSpace` (two) — its starter caps over its own window.
+                let c0 = &dom.mods[0];
+                let want_as = c0
+                    .sigs
+                    .get(entry as usize)
+                    .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
+                    r[..] == [ValType::I64]
+                        && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
+                });
+                // The carve must be a power-of-two-aligned sub-window within `[0, isize)` — a child
+                // gets only what the holder sub-allocates (§14/D19).
+                let child_size = if (0..64).contains(&size_log2) {
+                    1u64 << size_log2
+                } else {
+                    0
+                };
+                let off_u = off as u64;
+                let fits = child_size != 0
+                    && child_size <= isz
+                    && off_u & (child_size - 1) == 0
+                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+                if !ok_entry || !fits {
+                    tasks[ti]
+                        .vt
+                        .active
+                        .set(dst, Reg::from_i32(super::EINVAL as i32));
+                    continue;
+                }
+                let live = tasks
+                    .iter()
+                    .filter(|t| !matches!(t.state, TaskState::Done(_)))
+                    .count();
+                if live >= super::MAX_VCPUS {
+                    complete(&mut tasks, ti, Err(Trap::ThreadFault)); // instantiate bomb
+                    continue;
+                }
+                // The parent's window base (holder-relative `ibase`/`off` → backing-absolute, so
+                // nesting composes) and fuel (the child's quota is sub-allocated from, and capped by,
+                // the parent's) come from the parent's environment.
+                let (pbase, pfuel) = match tasks[ti].env {
+                    None => (mem.as_ref().map_or(0, |m| m.window.base()), *fuel),
+                    Some(k) => (
+                        extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
+                        extra_envs[k].fuel,
+                    ),
+                };
+                let abs_base = pbase + ibase + off_u;
+                let child_mem = match tasks[ti].env {
+                    None => mem
+                        .as_ref()
+                        .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+                    Some(k) => extra_envs[k]
+                        .mem
+                        .as_ref()
+                        .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+                };
+                // Attenuated powerbox: an `Instantiator` (so the child can itself nest — confinement
+                // composes to any depth) and an `AddressSpace` (so it manages its own pages), each
+                // over its *own* `[0, child_size)` window. These are its entry arguments.
+                let mut child_host = Host::new();
+                let cinst = child_host.grant_instantiator(0, child_size);
+                let cas = child_host.grant_address_space(0, child_size);
+                let child_args = if want_as {
+                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                } else {
+                    vec![Value::I64(cinst as i64)]
+                };
+                let child_fuel = if quota <= 0 {
+                    pfuel
+                } else {
+                    (quota as u64).min(pfuel)
+                };
+                // A nested child is its **own** domain: a fresh natural table over module 0 (no access
+                // to installed §22 units — matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
+                let c0 = &dom.mods[0];
+                let child_table = build_table(c0.progs.len(), 0);
+                let child_vt = VTask::new(c0, entry as usize, &child_args)?;
+                let eidx = extra_envs.len();
+                extra_envs.push(ChildEnv {
+                    mem: child_mem,
+                    host: child_host,
+                    table: child_table,
+                    fuel: child_fuel,
+                });
+                let cidx = tasks.len();
+                tasks.push(TaskSlot {
+                    vt: child_vt,
+                    threads: Vec::new(),
+                    env: Some(eidx),
                     state: TaskState::Runnable,
                 });
                 let handle = tasks[ti].threads.len() as i32;
@@ -2391,6 +2649,49 @@ impl Vm {
                 }
                 Op::ThreadJoin { handle, dst } => {
                     let handle = r!(*handle).i32();
+                    let dst = *dst;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::ThreadJoin { handle, dst });
+                }
+                // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
+                // (a forged/ungranted cap is an inert CapFault in place), then the driver builds the
+                // confined child (it owns the task set + the per-child environments).
+                Op::Instantiate {
+                    handle,
+                    entry,
+                    off,
+                    size_log2,
+                    quota,
+                    dst,
+                } => {
+                    let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
+                    let entry = r!(*entry).i64();
+                    let off = r!(*off).i64();
+                    let size_log2 = r!(*size_log2).i64();
+                    let quota = r!(*quota).i64();
+                    let dst = *dst;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::Instantiate {
+                        ibase,
+                        isize: isz,
+                        entry,
+                        off,
+                        size_log2,
+                        quota,
+                        dst,
+                    });
+                }
+                // §14 `join` — check the Instantiator authority, then reuse the thread join machinery
+                // (executor children live in the same `threads` handle namespace as `thread.spawn`).
+                Op::InstJoin { handle, child, dst } => {
+                    host.resolve_instantiator(r!(*handle).i32())?; // authority
+                    let handle = r!(*child).i32();
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
