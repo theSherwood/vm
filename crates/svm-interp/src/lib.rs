@@ -39,6 +39,108 @@ pub enum Value {
     Ref(u64),
 }
 
+/// A raw value **slot** — the interpreter's in-frame storage for one live SSA value, replacing
+/// the 24-byte tagged [`Value`] on the hot path. A scalar lives in `lo` as its bit pattern in the
+/// low bits (mirroring the JIT / cap `val_to_slot` ABI, so `Reg::i64` equals `val_to_slot`); a
+/// `v128` uses both words (little-endian: `lo` = bytes 0..8, `hi` = bytes 8..16). Reads are
+/// **op-directed** — the executing instruction's static type says how to interpret the slot, so
+/// there is no per-value tag to match and no `Result` to thread. `Value` stays the public type;
+/// conversions happen only at the API / capability / debugger boundaries.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+struct Reg {
+    lo: u64,
+    hi: u64,
+}
+
+impl Reg {
+    #[inline]
+    fn from_i32(x: i32) -> Reg {
+        Reg {
+            lo: x as i64 as u64,
+            hi: 0,
+        } // sign-extend, matching `val_to_slot`
+    }
+    #[inline]
+    fn from_i64(x: i64) -> Reg {
+        Reg {
+            lo: x as u64,
+            hi: 0,
+        }
+    }
+    #[inline]
+    fn from_f32(x: f32) -> Reg {
+        Reg {
+            lo: x.to_bits() as u64,
+            hi: 0,
+        }
+    }
+    #[inline]
+    fn from_f64(x: f64) -> Reg {
+        Reg {
+            lo: x.to_bits(),
+            hi: 0,
+        }
+    }
+    #[inline]
+    fn from_v128(b: [u8; 16]) -> Reg {
+        Reg {
+            lo: u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+            hi: u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]),
+        }
+    }
+    #[inline]
+    fn i32(self) -> i32 {
+        self.lo as i32
+    }
+    #[inline]
+    fn i64(self) -> i64 {
+        self.lo as i64
+    }
+    #[inline]
+    fn f32(self) -> f32 {
+        f32::from_bits(self.lo as u32)
+    }
+    #[inline]
+    fn f64(self) -> f64 {
+        f64::from_bits(self.lo)
+    }
+    #[inline]
+    fn v128(self) -> [u8; 16] {
+        let lo = self.lo.to_le_bytes();
+        let hi = self.hi.to_le_bytes();
+        [
+            lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3],
+            hi[4], hi[5], hi[6], hi[7],
+        ]
+    }
+    /// Boundary in: pack a typed [`Value`] (entry args, host results) into a slot.
+    #[inline]
+    fn from_value(v: Value) -> Reg {
+        match v {
+            Value::I32(x) => Reg::from_i32(x),
+            Value::I64(x) => Reg::from_i64(x),
+            Value::F32(x) => Reg::from_f32(x),
+            Value::F64(x) => Reg::from_f64(x),
+            Value::V128(b) => Reg::from_v128(b),
+            Value::Ref(x) => Reg { lo: x, hi: 0 },
+        }
+    }
+    /// Boundary out: reconstruct a typed [`Value`] (API results, debugger reads). The type comes
+    /// from the function/cap signature or the debugger's value-type lookup — the slot itself is
+    /// untyped.
+    #[inline]
+    fn to_value(self, ty: ValType) -> Value {
+        match ty {
+            ValType::I32 => Value::I32(self.i32()),
+            ValType::I64 => Value::I64(self.i64()),
+            ValType::F32 => Value::F32(self.f32()),
+            ValType::F64 => Value::F64(self.f64()),
+            ValType::V128 => Value::V128(self.v128()),
+            ValType::Ref => Value::Ref(self.lo),
+        }
+    }
+}
+
 /// Reasons execution stopped without producing results.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Trap {
@@ -185,6 +287,31 @@ pub struct FrameInfo {
     pub vals: Vec<Value>,
     /// The source location of `pc`, if the module carries debug info (DEBUGGING.md §6/W4).
     pub source: Option<SourceLoc>,
+}
+
+/// The source-level types of `frame`'s block-local SSA values, so the debugger can reconstruct a
+/// typed [`Value`] from an (untyped) storage [`Reg`]. Reuses the verifier's assignment (single
+/// source of truth). Only the guest's own program (module 0) is typed here — installed §22 units
+/// resolve against a different function space, so their values fall back to a raw `i64` view.
+fn frame_value_types(v: &VCpu, frame: &Frame) -> Vec<ValType> {
+    if frame.module != 0 {
+        return Vec::new();
+    }
+    match v.funcs.get(frame.func as usize) {
+        Some(f) => svm_verify::func_value_types(f, &v.funcs, v.mem.is_some())
+            .into_iter()
+            .nth(frame.block)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Reconstruct a typed [`Value`] for block-local value `idx` of `frame` (debugger boundary). A
+/// value whose type can't be derived (a §22 unit frame, or an out-of-range index on an unverified
+/// module) reads back as a raw `i64` — total, never panics.
+fn frame_value(frame: &Frame, types: &[ValType], idx: usize) -> Option<Value> {
+    let slot = frame.vals.get(idx)?;
+    Some(slot.to_value(types.get(idx).copied().unwrap_or(ValType::I64)))
 }
 
 /// A watched window range (DEBUGGING.md W2). Stop when an op accesses `[addr, addr+len)` with a
@@ -1201,9 +1328,16 @@ impl Inspector {
                         block: f.block,
                         inst: f.inst,
                     };
+                    let types = frame_value_types(v, f);
+                    let vals = f
+                        .vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| s.to_value(types.get(i).copied().unwrap_or(ValType::I64)))
+                        .collect();
                     FrameInfo {
                         pc,
-                        vals: f.vals.clone(),
+                        vals,
                         source: self.source_loc(pc),
                     }
                 })
@@ -1269,25 +1403,22 @@ impl Inspector {
                     .ok()?;
                 Some(VarValue::Bytes(bytes))
             };
+            let types = frame_value_types(v, frame);
             match &var.loc {
-                VarLoc::Ssa { value } => frame
-                    .vals
-                    .get(*value as usize)
-                    .copied()
-                    .map(VarValue::Value),
-                VarLoc::SsaList(locs) => frame
-                    .vals
-                    .get(resolve(locs)? as usize)
-                    .copied()
-                    .map(VarValue::Value),
+                VarLoc::Ssa { value } => {
+                    frame_value(frame, &types, *value as usize).map(VarValue::Value)
+                }
+                VarLoc::SsaList(locs) => {
+                    frame_value(frame, &types, resolve(locs)? as usize).map(VarValue::Value)
+                }
                 VarLoc::Window { off } => {
                     // Address = data-SP (block param v0) + off.
-                    window_read(as_i64(*frame.vals.first()?).ok()? as u64, *off)
+                    window_read(frame.vals.first()?.i64() as u64, *off)
                 }
                 VarLoc::WindowVia { base, off } => {
                     // Address = (the per-pc base SSA value, e.g. a wasm frame pointer) + off.
                     let base_val = frame.vals.get(resolve(base)? as usize)?;
-                    window_read(as_i64(*base_val).ok()? as u64, *off)
+                    window_read(base_val.i64() as u64, *off)
                 }
                 // A module-scoped global at a fixed absolute window address (frame-independent).
                 VarLoc::Fixed { addr } => window_read(*addr, 0),
@@ -1313,10 +1444,10 @@ impl Inspector {
                 .iter()
                 .find(|x| var_in_scope(x.func, frame.func) && x.name == name)?;
             let base = match &var.loc {
-                VarLoc::Window { off } => as_i64(*frame.vals.first()?).ok()? as u64 + *off as u64,
+                VarLoc::Window { off } => frame.vals.first()?.i64() as u64 + *off as u64,
                 VarLoc::WindowVia { base, off } => {
                     let idx = loclist_value(base, frame.block, frame.inst)?;
-                    as_i64(*frame.vals.get(idx as usize)?).ok()? as u64 + *off as u64
+                    frame.vals.get(idx as usize)?.i64() as u64 + *off as u64
                 }
                 VarLoc::Fixed { addr } => *addr,
                 VarLoc::Ssa { .. } | VarLoc::SsaList(_) => return None,
@@ -1331,7 +1462,9 @@ impl Inspector {
         self.with_focused(|v| {
             let n = v.frames.len();
             let idx = n.checked_sub(1 + frame_from_top)?;
-            v.frames.get(idx)?.vals.get(value_idx).copied()
+            let frame = v.frames.get(idx)?;
+            let types = frame_value_types(v, frame);
+            frame_value(frame, &types, value_idx)
         })
         .flatten()
     }
@@ -1913,7 +2046,7 @@ impl MemAccess {
 /// decision point (mirrors what `load`/`store`/`atomic_*`/`prepare_wait` confine to). A confinement
 /// failure (out-of-reserved) ⇒ [`MemAccess::None`]: the op will trap and the thread ends, contributing
 /// no ordering constraint.
-fn access_of(inst: &Inst, vals: &[Value], mem: &Option<Mem>) -> MemAccess {
+fn access_of(inst: &Inst, vals: &[Reg], mem: &Option<Mem>) -> MemAccess {
     // Fiber ops touch the run-shared registry, not the window — classified before the memory
     // check (a module with no linear memory can still race on fibers via handles in args).
     // `gc.roots` reads every fiber's frames, so it is conservatively dependent on all of them too
@@ -1932,7 +2065,7 @@ fn access_of(inst: &Inst, vals: &[Value], mem: &Option<Mem>) -> MemAccess {
         return MemAccess::None;
     };
     let range = |addr: ValIdx, offset: u64, width: u32, write: bool| -> MemAccess {
-        match get(vals, addr).and_then(as_i64) {
+        match get(vals, addr).map(|s| s.i64()) {
             Ok(a) => match m.confine_checked(a as u64, offset, width) {
                 Ok(base) => MemAccess::Range { base, width, write },
                 Err(_) => MemAccess::None,
@@ -2476,8 +2609,8 @@ struct Frame {
     /// Index of the **next** instruction to execute within that block. Saved across a
     /// nested call so the caller resumes just past the `call` when the callee returns.
     inst: usize,
-    /// Block-local SSA values produced so far (entry = the call arguments).
-    vals: Vec<Value>,
+    /// Block-local SSA values produced so far (entry = the call arguments), as raw [`Reg`]s.
+    vals: Vec<Reg>,
 }
 
 /// One slot of a vCPU's **`call_indirect` dispatch table** — the explicit, module-aware
@@ -4126,7 +4259,7 @@ impl VCpu {
                 module: 0,
                 block: 0,
                 inst: 0,
-                vals: args.to_vec(),
+                vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
             }],
             root_parked: None,
             parked_frames: 0,
@@ -4186,7 +4319,7 @@ impl VCpu {
                 module: INVOKE_MODULE,
                 block: 0,
                 inst: 0,
-                vals: args.to_vec(),
+                vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
             }],
             root_parked: None,
             parked_frames: 0,
@@ -4224,17 +4357,12 @@ impl VCpu {
     /// op apart colliding is ~2^-64; the values fully determine the hash (floats by bit pattern).
     fn local_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        fn hash_vals(h: &mut std::collections::hash_map::DefaultHasher, vals: &[Value]) {
+        fn hash_vals(h: &mut std::collections::hash_map::DefaultHasher, vals: &[Reg]) {
             vals.len().hash(h);
             for v in vals {
-                match v {
-                    Value::I32(x) => (0u8, *x as i64).hash(h),
-                    Value::I64(x) => (1u8, *x).hash(h),
-                    Value::F32(x) => (2u8, x.to_bits() as u64).hash(h),
-                    Value::F64(x) => (3u8, x.to_bits()).hash(h),
-                    Value::V128(b) => (4u8, *b).hash(h),
-                    Value::Ref(x) => (5u8, *x).hash(h),
-                }
+                // Untyped raw slots: hash the two words directly (the fingerprint is only compared
+                // pre/post one turn of this vCPU, so any stable encoding is fine).
+                (v.lo, v.hi).hash(h);
             }
         }
         fn hash_frames(h: &mut std::collections::hash_map::DefaultHasher, frames: &[Frame]) {
@@ -4318,11 +4446,11 @@ impl VCpu {
             // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
             let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
             let sp = match frames.first().and_then(|f| f.vals.first()) {
-                Some(Value::I64(x)) => *x,
+                Some(r) => r.i64(),
                 _ => 0,
             };
             if let Some(f) = frames.last_mut() {
-                f.vals.push(Value::I64(0)); // placeholder resume value (inert; not spilled by Yield)
+                f.vals.push(Reg::from_i64(0)); // placeholder resume value (inert; not spilled by Yield)
             }
             if let Some(m) = self.mem.as_mut() {
                 m.durable_set_sp(shadow_region_base(shadow_context_index(slot)));
@@ -4394,6 +4522,36 @@ fn is_visible(inst: &Inst) -> bool {
 /// Drive a vCPU until it finishes (`Inner::Done`) or parks on a blocking op (`Inner::Park`). On
 /// re-entry it first completes the parked op recorded in `pending`. The owned `funcs` is borrowed
 /// locally as `fs` so the loop can mutate the other fields.
+/// Finish a memory-op result in the eval loop. Pushes the loaded value (if any). For a
+/// coroutine child's *recoverable* in-window page fault (`fault_yields`), it rewinds the op and
+/// returns `Some(Inner::CoFault)` so the loop suspends to the parent (which supplies the page)
+/// instead of trapping; any other fault propagates. `Ok(None)` means "handled, keep going". This
+/// is the one home for the §14 fault-driven-yield decision, shared by the fast-pathed memory ops
+/// and the `eval_inst` fallback so the logic isn't repeated per arm.
+#[inline]
+fn handle_mem(
+    r: Result<Option<Reg>, Trap>,
+    frame: &mut Frame,
+    fault_yields: bool,
+    mem: &Option<Mem>,
+) -> Result<Option<Inner>, Trap> {
+    match r {
+        Ok(Some(v)) => {
+            frame.vals.push(v);
+            Ok(None)
+        }
+        Ok(None) => Ok(None),
+        Err(Trap::MemoryFault) if fault_yields => match mem.as_ref().and_then(|m| m.take_fault()) {
+            Some(addr) => {
+                frame.inst -= 1; // re-execute the access on resume
+                Ok(Some(Inner::CoFault(addr)))
+            }
+            None => Err(Trap::MemoryFault),
+        },
+        Err(t) => Err(t),
+    }
+}
+
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut budget = quantum; // instructions left before a forced `Yield` (deterministic explorer)
                               // Resuming from a park: finish the op the scheduler woke us for.
@@ -4408,19 +4566,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
             let vals = out.result?; // a child trap propagates as this vCPU's trap
             let top = v.frames.len() - 1;
-            v.frames[top]
-                .vals
-                .push(vals.first().copied().unwrap_or(Value::I64(0)));
+            v.frames[top].vals.push(Reg::from_value(
+                vals.first().copied().unwrap_or(Value::I64(0)),
+            ));
         }
         Some(Pending::Wait(status)) => {
             let top = v.frames.len() - 1;
-            v.frames[top].vals.push(Value::I32(status));
+            v.frames[top].vals.push(Reg::from_i32(status));
         }
         Some(Pending::CoResume(value)) => {
             // The parent's `resume` delivered `value` — push it as the child `Yielder` cap.call's
             // result so the coroutine continues past its `yield`.
             let top = v.frames.len() - 1;
-            v.frames[top].vals.push(Value::I64(value));
+            v.frames[top].vals.push(Reg::from_i64(value));
         }
         None => {}
     }
@@ -4472,7 +4630,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // notably a loop back-edge, run every iteration — allocates nothing (the displaced buffer
     // becomes the next edge's scratch). Lives across the whole `run_inner` call, so the two
     // buffers ping-pong for free once warmed.
-    let mut edge_buf: Vec<Value> = Vec::new();
+    let mut edge_buf: Vec<Reg> = Vec::new();
+    // Reusable scratch for `return` results. The common case (a callee returning to a caller in
+    // the same fiber) gathers results here and copies them straight into the caller's value
+    // file, so a call/return pair no longer allocates a results `Vec` per return. The rarer
+    // root/fiber exits read out of the same buffer.
+    let mut ret_buf: Vec<Reg> = Vec::new();
+
+    // Resolve the running frame against *its* module (module 0 = this vCPU's program;
+    // `INVOKE_MODULE` = the invoked unit; ≥ 1 = an installed Jit unit), cloning the module's `Arc`
+    // into a local so the shared `dt` is never borrowed across the loop body. This is **cached
+    // across loop iterations**: re-resolving (an atomic `Arc` refcount bump) on every block entry
+    // showed up on the hot path — a branch / loop back-edge re-enters this loop, and almost always
+    // stays in the same module — so we only re-resolve when `module` actually changes. A module's
+    // code never mutates in place (units are append-only; module 0 is fixed), so a same-id reuse is
+    // sound.
+    let mut cur_module = frames.last().map(|f| f.module).unwrap_or(0);
+    let mut cur_funcs: Arc<[Func]> =
+        resolve_module(&funcs, units, invoked, dt, cur_module).ok_or(Trap::Malformed)?;
 
     // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
     // `return` pops and appends results to the caller (which resumes past the call); a tail
@@ -4480,13 +4655,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // fiber's stack is in `frames` — see the comments on those arms.
     'frames: loop {
         let top = frames.len() - 1;
-        // Resolve the running frame against *its* module (module 0 = this vCPU's program;
-        // `INVOKE_MODULE` = the invoked unit; ≥ 1 = an installed Jit unit). Clone the module's `Arc`
-        // into a local so the shared `dt` is never borrowed across the loop body. `block` borrows
-        // `cur` (the owned local), *not* `frames`, so the loop body is free to push/pop/mutate
-        // `frames` (and move it on a fiber switch) while holding it.
-        let cur_funcs: Arc<[Func]> = resolve_module(&funcs, units, invoked, dt, frames[top].module)
-            .ok_or(Trap::Malformed)?;
+        if frames[top].module != cur_module {
+            cur_module = frames[top].module;
+            cur_funcs =
+                resolve_module(&funcs, units, invoked, dt, cur_module).ok_or(Trap::Malformed)?;
+        }
         let fs: &[Func] = &cur_funcs;
         let block = fs
             .get(frames[top].func as usize)
@@ -4579,7 +4752,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         &funcs,
                         units,
                         invoked,
-                        as_i32(get(&frames[top].vals, *idx)?)?,
+                        get_i32(&frames[top].vals, *idx)?,
                         ty,
                     )?;
                     let argv = collect(&frames[top].vals, args)?;
@@ -4614,15 +4787,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if *op != 0 {
                         return Err(Trap::CapFault);
                     }
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.resolve_yielder(h)?; // authority: a forged/wrong handle is inert
                     }
-                    let value = as_i64(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?)?;
+                    let value = get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                     return Ok(Inner::CoYield(value));
                 }
                 // §13/§14 cross-domain **`grant`** (SharedRegion op 4): install this region — the
@@ -4640,15 +4810,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     let backing = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.resolve_region(h)?
                     };
-                    let ch = as_i32(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?)?;
+                    let ch = get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                     let coro = coroutines
                         .get_mut(ch as usize)
                         .and_then(|c| c.as_mut())
@@ -4661,7 +4828,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     frames[top]
                         .vals
-                        .push(Value::I64(child_handle.map_or(EMFILE, |h| h as i64)));
+                        .push(Reg::from_i64(child_handle.map_or(EMFILE, |h| h as i64)));
                 }
                 Inst::CapCall {
                     type_id: iface::INSTANTIATOR,
@@ -4670,7 +4837,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     let (ibase, isize) = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.resolve_instantiator(h)?
@@ -4685,10 +4852,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let (op, child_mod, askip): (u32, Option<ModArc>, usize) = match *op {
                         mop @ 5..=7 => {
                             // The module handle crosses as an i64 arg (the slot ABI); low 32 bits.
-                            let mh = as_i64(get(
-                                &frames[top].vals,
-                                *args.first().ok_or(Trap::Malformed)?,
-                            )?)? as i32;
+                            let mh =
+                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
+                                    as i32;
                             let g = {
                                 let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                                 let g = hg.resolve_module(mh)?;
@@ -4714,10 +4880,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // directly (it sees the superset) before/after, so there is no scalar arg.
                         0 => {
                             let argn = |i: usize| -> Result<i64, Trap> {
-                                as_i64(get(
+                                Ok(get(
                                     &frames[top].vals,
                                     *args.get(i + askip).ok_or(Trap::Malformed)?,
-                                )?)
+                                )?
+                                .i64())
                             };
                             let entry = argn(0)? as u64;
                             let off = argn(1)? as u64;
@@ -4753,7 +4920,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
                             if !ok_entry || !fits || !mod_ok {
-                                frames[top].vals.push(Value::I32(EINVAL as i32));
+                                frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
                                 // `ibase`/`off` are holder-relative; the backing-absolute base
                                 // adds the holder's own window base (0 for a top-level holder), so
@@ -4829,7 +4996,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         threads.push(Some(child_id));
                                         frames[top]
                                             .vals
-                                            .push(Value::I32((threads.len() - 1) as i32));
+                                            .push(Reg::from_i32((threads.len() - 1) as i32));
                                     }
                                     None => return Err(Trap::ThreadFault),
                                 }
@@ -4838,10 +5005,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // join(child) -> result: park only this fiber until the child finishes (its
                         // result/trap is delivered on resume via `Pending::Join`); siblings run on.
                         1 => {
-                            let ch = as_i32(get(
-                                &frames[top].vals,
-                                *args.first().ok_or(Trap::Malformed)?,
-                            )?)?;
+                            let ch =
+                                get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
                             *pending = Some(Pending::Join { slot });
@@ -4857,10 +5022,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         2 | 4 => {
                             let demand = op == 4;
                             let argn = |i: usize| -> Result<i64, Trap> {
-                                as_i64(get(
+                                Ok(get(
                                     &frames[top].vals,
                                     *args.get(i + askip).ok_or(Trap::Malformed)?,
-                                )?)
+                                )?
+                                .i64())
                             };
                             let entry = argn(0)? as u64;
                             let off = argn(1)? as u64;
@@ -4885,7 +5051,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && off & (child_size - 1) == 0
                                 && off.checked_add(child_size).is_some_and(|e| e <= isize);
                             if !ok_entry || !fits || !mod_ok {
-                                frames[top].vals.push(Value::I32(EINVAL as i32));
+                                frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
                                 // `ibase`/`off` are holder-relative; the backing-absolute base
                                 // adds the holder's own window base (0 for a top-level holder), so
@@ -4944,7 +5110,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }));
                                 frames[top]
                                     .vals
-                                    .push(Value::I32((coroutines.len() - 1) as i32));
+                                    .push(Reg::from_i32((coroutines.len() - 1) as i32));
                             }
                         }
                         // resume(child, value) -> (status: i32, value: i64): drive the coroutine
@@ -4955,14 +5121,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // (the parent has placed its bytes in the shared window) and re-runs the access.
                         // A child trap propagates to us.
                         3 => {
-                            let ch = as_i32(get(
-                                &frames[top].vals,
-                                *args.first().ok_or(Trap::Malformed)?,
-                            )?)?;
-                            let value = as_i64(get(
-                                &frames[top].vals,
-                                *args.get(1).ok_or(Trap::Malformed)?,
-                            )?)?;
+                            let ch =
+                                get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
+                            let value =
+                                get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?;
                             let slot = ch as usize;
                             let mut coro = match coroutines.get_mut(slot).and_then(|c| c.take()) {
                                 Some(c) => c,
@@ -4981,21 +5143,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 Ok(Inner::CoYield(yv)) => {
                                     coro.awaiting_resume = true;
                                     coroutines[slot] = Some(coro);
-                                    frames[top].vals.push(Value::I32(FIBER_SUSPENDED));
-                                    frames[top].vals.push(Value::I64(yv));
+                                    frames[top].vals.push(Reg::from_i32(FIBER_SUSPENDED));
+                                    frames[top].vals.push(Reg::from_i64(yv));
                                 }
                                 Ok(Inner::CoFault(addr)) => {
                                     coro.faulted_page = Some(addr);
                                     coroutines[slot] = Some(coro);
-                                    frames[top].vals.push(Value::I32(CORO_FAULTED));
-                                    frames[top].vals.push(Value::I64(addr as i64));
+                                    frames[top].vals.push(Reg::from_i32(CORO_FAULTED));
+                                    frames[top].vals.push(Reg::from_i64(addr as i64));
                                 }
                                 Ok(Inner::Done(result)) => {
                                     // Finished — `coroutines[slot]` stays `None` (a later resume inert).
-                                    frames[top].vals.push(Value::I32(FIBER_RETURNED));
-                                    frames[top]
-                                        .vals
-                                        .push(result.first().copied().unwrap_or(Value::I64(0)));
+                                    frames[top].vals.push(Reg::from_i32(FIBER_RETURNED));
+                                    frames[top].vals.push(Reg::from_value(
+                                        result.first().copied().unwrap_or(Value::I64(0)),
+                                    ));
                                 }
                                 // A coroutine that parks used a blocking concurrency op (it has no
                                 // executor driving it) — unsupported; surface as a fault.
@@ -5032,11 +5194,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
-                    let ch = val_to_slot(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?) as i32;
+                    let h = get_i32(&frames[top].vals, *handle)?;
+                    let ch =
+                        get(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
                     let unit_funcs = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         let domain = hg.resolve_jit_domain(h)?;
@@ -5054,7 +5214,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(slot) => slot as i64,
                         None => ENOSPC,
                     };
-                    frames[top].vals.push(Value::I64(res));
+                    frames[top].vals.push(Reg::from_i64(res));
                 }
                 // `Jit.uninstall(slot)` (iface 11 op 4, DESIGN.md §22 reclaim): clear a
                 // previously-installed table slot so the index is reusable and a stale
@@ -5068,15 +5228,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.resolve_jit_domain(h)?; // authority: a forged handle is inert
                     }
-                    let slot = val_to_slot(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?) as usize;
+                    let slot = get(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?.i64()
+                        as usize;
                     // A guest may only clear slots it installed (`≥ funcs.len()`, the module-0
                     // function count) — `dt.uninstall` enforces the range + filled checks.
                     let res = if dt.uninstall(slot, funcs.len()) {
@@ -5084,7 +5242,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         EINVAL
                     };
-                    frames[top].vals.push(Value::I64(res));
+                    frames[top].vals.push(Reg::from_i64(res));
                 }
                 Inst::CapCall {
                     type_id: iface::JIT,
@@ -5093,14 +5251,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     sig,
                 } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     // arg0 = the CompiledCode handle; the rest are the invoke args. Args cross in
                     // the i64-slot ABI (the handle rides the low 32 bits of its slot, like every
                     // handle-as-arg — e.g. the Instantiator's module ops), so read it as a slot.
-                    let ch = val_to_slot(get(
-                        &frames[top].vals,
-                        *args.first().ok_or(Trap::Malformed)?,
-                    )?) as i32;
+                    let ch =
+                        get(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
                     let unit_funcs = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         let domain = hg.resolve_jit_domain(h)?;
@@ -5123,7 +5279,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // exactly the JIT trampoline's decode.
                     let mut child_args = Vec::with_capacity(entry.params.len());
                     for (a, ty) in args[1..].iter().zip(entry.params.clone()) {
-                        let slot = val_to_slot(get(&frames[top].vals, *a)?);
+                        let slot = get(&frames[top].vals, *a)?.i64();
                         child_args.push(slot_to_val(ty, slot));
                     }
                     // Nested run over the SAME window/fuel/powerbox: move them into an
@@ -5157,7 +5313,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Ok(Inner::Done(results)) => {
                             // Results cross back as slots (arity already checked equal).
                             for (v, ty) in results.iter().zip(&sig.results) {
-                                frames[top].vals.push(slot_to_val(*ty, val_to_slot(*v)));
+                                frames[top]
+                                    .vals
+                                    .push(Reg::from_value(slot_to_val(*ty, val_to_slot(*v))));
                             }
                         }
                         // The unit cannot park/yield (concurrency is rejected at compile);
@@ -5179,10 +5337,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // (mask + type_id/generation check) and dispatch to the mock host.
                     // Args/results cross as i64 slots (the shared host-dispatch ABI).
                     // Synchronous in the reference (the async/submit-complete ABI is §12).
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
-                        argv.push(val_to_slot(get(&frames[top].vals, *a)?));
+                        argv.push(get(&frames[top].vals, *a)?.i64());
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     // Lock the shared powerbox for the duration of this one cap.call (brief; no nested
@@ -5190,7 +5348,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results = hg.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
                     for (s, ty) in results.iter().zip(&sig.results) {
-                        frames[top].vals.push(slot_to_val(*ty, *s));
+                        frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
                 }
                 // §7 reflection (`cap.self.count`): how many capabilities this domain holds. Routed
@@ -5198,29 +5356,29 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapSelfCount => {
                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let r = hg.self_dispatch(0, &[])?;
-                    frames[top].vals.push(Value::I32(r[0] as i32));
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
                 }
                 // §7 reflection (`cap.self.get`): the `idx`-th held capability as `(handle, type_id)`
                 // (op 1). An out-of-range index is fail-closed (the guest bounds it by the count).
                 Inst::CapSelfGet { idx } => {
-                    let i = as_i32(get(&frames[top].vals, *idx)?)? as i64;
+                    let i = get_i32(&frames[top].vals, *idx)? as i64;
                     let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let r = hg.self_dispatch(1, &[i])?;
                     drop(hg);
-                    frames[top].vals.push(Value::I32(r[0] as i32));
-                    frames[top].vals.push(Value::I32(r[1] as i32));
+                    frames[top].vals.push(Reg::from_i32(r[0] as i32));
+                    frames[top].vals.push(Reg::from_i32(r[1] as i32));
                 }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
                 // both backends, the unified namespace). No switch.
                 Inst::ContNew { func, sp } => {
-                    let funcref = as_i32(get(&frames[top].vals, *func)?)?;
-                    let stack_base = as_i64(get(&frames[top].vals, *sp)?)?;
+                    let funcref = get_i32(&frames[top].vals, *func)?;
+                    let stack_base = get_i64(&frames[top].vals, *sp)?;
                     // `durable` runs assign the new fiber a distinct shadow region (and refuse if
                     // the reserve is full); a non-durable run ignores the region bookkeeping.
                     let handle =
                         registry.create(funcref, stack_base, spawn_quota.max_fibers, durable)?;
-                    frames[top].vals.push(Value::I32(handle));
+                    frames[top].vals.push(Reg::from_i32(handle));
                 }
                 // §12 fiber resume: **claim** fiber `k` — any vCPU may, so a fiber suspended on
                 // one vCPU migrates to whichever claims it next; exactly one racing claimant wins
@@ -5228,8 +5386,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // `(status, value)` are appended to *this* frame later, when `k` suspends or
                 // returns control here (see `Suspend` and `Return`).
                 Inst::ContResume { k, arg } => {
-                    let kh = as_i32(get(&frames[top].vals, *k)?)?;
-                    let av = as_i64(get(&frames[top].vals, *arg)?)?;
+                    let kh = get_i32(&frames[top].vals, *k)?;
+                    let av = get_i64(&frames[top].vals, *arg)?;
                     // Materialize the target's frames: start a `Pending` fiber, or continue a
                     // parked one (delivering `arg` as the result of its `suspend`).
                     let (target, claimed) = registry.claim(kh)?;
@@ -5249,14 +5407,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 module: 0,
                                 block: 0,
                                 inst: 0,
-                                vals: vec![Value::I64(sp), Value::I64(av)],
+                                vals: vec![Reg::from_i64(sp), Reg::from_i64(av)],
                             }]
                         }
                         Claimed::Live(mut f) => {
                             f.last_mut()
                                 .ok_or(Trap::Malformed)?
                                 .vals
-                                .push(Value::I64(av));
+                                .push(Reg::from_i64(av));
                             f
                         }
                     };
@@ -5285,7 +5443,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if *cur == ROOT_FIBER {
                         return Err(Trap::FiberFault); // no resumer (the root cannot suspend)
                     }
-                    let v = as_i64(get(&frames[top].vals, *value)?)?;
+                    let v = get_i64(&frames[top].vals, *value)?;
                     let leaving = *cur;
                     registry.park_suspended(*cur, std::mem::take(frames));
                     chain.pop();
@@ -5300,8 +5458,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     *parked_frames -= frames.len();
                     let rtop = frames.len() - 1;
-                    frames[rtop].vals.push(Value::I32(FIBER_SUSPENDED));
-                    frames[rtop].vals.push(Value::I64(v));
+                    frames[rtop].vals.push(Reg::from_i32(FIBER_SUSPENDED));
+                    frames[rtop].vals.push(Reg::from_i64(v));
                     continue 'frames;
                 }
                 // §GC conservative root enumeration (`gc.roots`): collect the deduplicated set of
@@ -5320,10 +5478,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     buf,
                     cap,
                 } => {
-                    let lo = as_i64(get(&frames[top].vals, *heap_lo)?)? as u64;
-                    let hi = as_i64(get(&frames[top].vals, *heap_hi)?)? as u64;
-                    let dst = as_i64(get(&frames[top].vals, *buf)?)? as u64;
-                    let cap = as_i64(get(&frames[top].vals, *cap)?)?.max(0) as usize;
+                    let lo = get_i64(&frames[top].vals, *heap_lo)? as u64;
+                    let hi = get_i64(&frames[top].vals, *heap_hi)? as u64;
+                    let dst = get_i64(&frames[top].vals, *buf)? as u64;
+                    let cap = get_i64(&frames[top].vals, *cap)?.max(0) as usize;
                     let mut roots = std::collections::BTreeSet::new();
                     gc_scan_frames(frames, lo, hi, &mut roots);
                     if let Some(rp) = root_parked.as_ref() {
@@ -5344,7 +5502,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // capability writing its result buffer.
                     let m = mem.as_mut().ok_or(Trap::Malformed)?;
                     m.write_bytes_impl(dst, &bytes).ok_or(Trap::MemoryFault)?;
-                    frames[top].vals.push(Value::I64(total as i64));
+                    frames[top].vals.push(Reg::from_i64(total as i64));
                 }
                 // §12 thread spawn: enqueue a new vCPU (green thread) running `funcs[func](arg)` over
                 // the *shared* memory (the `Arc<Region>` bytes + §13 `Arc` regions; the child snapshots
@@ -5357,8 +5515,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::Malformed);
                     }
                     let entry = *func;
-                    let spv = as_i64(get(&frames[top].vals, *sp)?)?; // the thread's data-stack base
-                    let av = as_i64(get(&frames[top].vals, *arg)?)?;
+                    let spv = get_i64(&frames[top].vals, *sp)?; // the thread's data-stack base
+                    let av = get_i64(&frames[top].vals, *arg)?;
                     // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): a child inherits the *current*
                     // state word — under a freeze it spawns into `UNWINDING` so it too unwinds at its next
                     // safepoint. (A child existing *before* the freeze point is reconstructed by the
@@ -5412,7 +5570,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             threads.push(Some(child_id));
                             frames[top]
                                 .vals
-                                .push(Value::I32((threads.len() - 1) as i32));
+                                .push(Reg::from_i32((threads.len() - 1) as i32));
                         }
                         None => return Err(Trap::ThreadFault), // live cap (a thread-bomb)
                     }
@@ -5421,7 +5579,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // result. A forged / out-of-range / already-joined handle is inert (masked + checked
                 // like a fiber handle); a trap in the joined vCPU propagates here (on resume).
                 Inst::ThreadJoin { handle } => {
-                    let h = as_i32(get(&frames[top].vals, *handle)?)?;
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     let slot = resolve_thread(threads, h)?;
                     let child = threads[slot].ok_or(Trap::ThreadFault)?;
                     *pending = Some(Pending::Join { slot });
@@ -5437,9 +5595,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     timeout,
                 } => {
                     let width = atomic_width(*ty);
-                    let a = as_i64(get(&frames[top].vals, *addr)?)? as u64;
-                    let exp = store_bits(get(&frames[top].vals, *expected)?) & width_mask(width);
-                    let to_ns = as_i64(get(&frames[top].vals, *timeout)?)?;
+                    let a = get_i64(&frames[top].vals, *addr)? as u64;
+                    let exp = get(&frames[top].vals, *expected)?.lo & width_mask(width);
+                    let to_ns = get_i64(&frames[top].vals, *timeout)?;
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let base = m.prepare_wait(a, *ty)?;
                     let wait = if to_ns < 0 {
@@ -5456,36 +5614,180 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 // §12 futex notify: wake up to `count` vCPUs parked on the confined address.
                 Inst::MemoryNotify { addr, count } => {
-                    let a = as_i64(get(&frames[top].vals, *addr)?)? as u64;
+                    let a = get_i64(&frames[top].vals, *addr)? as u64;
                     // The count is **unsigned** "wake up to N" (wasm's `memory.atomic.notify` count is
                     // u32; the wake-all idiom is `-1` = u32::MAX). `notify` caps at the real waiter
                     // count, so reinterpreting the i32 bits as u32 is safe and faithful.
-                    let n = as_i32(get(&frames[top].vals, *count)?)? as u32;
+                    let n = get_i32(&frames[top].vals, *count)? as u32;
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let base = m.confine_for_notify(a)?;
                     frames[top]
                         .vals
-                        .push(Value::I32(sched.notify(base, n) as i32));
+                        .push(Reg::from_i32(sched.notify(base, n) as i32));
                 }
-                // Everything else: one value, or none for `Store`/`AtomicStore`.
-                other => {
-                    match eval_inst(other, &frames[top].vals, mem) {
-                        Ok(Some(v)) => frames[top].vals.push(v),
-                        Ok(None) => {}
-                        // §14 fault-driven yield: a coroutine child's access to an unmapped page in its
-                        // window suspends to the parent (which supplies the page) instead of trapping.
-                        // `take_fault` is `Some` only for a *recoverable* in-window page fault (not an
-                        // out-of-window fault, which traps). Rewind to re-execute the access on resume.
-                        Err(Trap::MemoryFault) if fault_yields => {
-                            match mem.as_ref().and_then(|m| m.take_fault()) {
-                                Some(addr) => {
-                                    frames[top].inst -= 1;
-                                    return Ok(Inner::CoFault(addr));
-                                }
-                                None => return Err(Trap::MemoryFault),
-                            }
+                // Fast paths for the **pure** value ops (no memory, no SIMD): dispatch here and
+                // push the result directly, instead of through the `eval_inst` call (and its
+                // `Option<Reg>` return). `eval_inst` is a very large function that never inlines,
+                // so the call dominated the per-op cost on scalar/float code — eliminating it for
+                // these ops is the bulk of the eval-loop speedup. The operation *semantics* live in
+                // shared helpers (`bin64`/`fbin64`/`cast`/…) called from both here and `eval_inst`,
+                // so only thin dispatch glue is repeated; `eval_inst` keeps a (now-unreachable, but
+                // exhaustive and identical) copy of these arms and remains the path for memory,
+                // SIMD, and the no-result/control ops.
+                Inst::ConstI32(c) => frames[top].vals.push(Reg::from_i32(*c)),
+                Inst::ConstI64(c) => frames[top].vals.push(Reg::from_i64(*c)),
+                Inst::ConstF32(bits) => frames[top].vals.push(Reg::from_f32(f32::from_bits(*bits))),
+                Inst::ConstF64(bits) => frames[top].vals.push(Reg::from_f64(f64::from_bits(*bits))),
+                Inst::IntBin { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => {
+                            Reg::from_i32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?)
                         }
-                        Err(t) => return Err(t),
+                        IntTy::I64 => {
+                            Reg::from_i64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?)
+                        }
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::IntCmp { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?),
+                        IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?),
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::IntUn { ty, op, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => Reg::from_i32(intun32(*op, get_i32(vals, *a)?)),
+                        IntTy::I64 => Reg::from_i64(intun64(*op, get_i64(vals, *a)?)),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::Eqz { ty, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => get_i32(vals, *a)? == 0,
+                        IntTy::I64 => get_i64(vals, *a)? == 0,
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::Convert { op, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match op {
+                        ConvOp::ExtendI32S => Reg::from_i64(get_i32(vals, *a)? as i64),
+                        ConvOp::ExtendI32U => Reg::from_i64(get_i32(vals, *a)? as u32 as i64),
+                        ConvOp::WrapI64 => Reg::from_i32(get_i64(vals, *a)? as i32),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::Select { cond, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = if get_i32(vals, *cond)? != 0 {
+                        get(vals, *a)?
+                    } else {
+                        get(vals, *b)?
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::FBin { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        FloatTy::F32 => {
+                            Reg::from_f32(fbin32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?))
+                        }
+                        FloatTy::F64 => {
+                            Reg::from_f64(fbin64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?))
+                        }
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::FUn { ty, op, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
+                        FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::FCmp { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        FloatTy::F32 => fcmp32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?),
+                        FloatTy::F64 => fcmp64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?),
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::FToISat { op, a } => {
+                    let r = fto_i(*op, get(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::FToITrap { op, a } => {
+                    let r = trunc_trap(*op, get(&frames[top].vals, *a)?)?;
+                    frames[top].vals.push(r);
+                }
+                Inst::IToFConv { op, a } => {
+                    let r = i_to_f(*op, get(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::PtrAdd { a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = Reg::from_i64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?));
+                    frames[top].vals.push(r);
+                }
+                Inst::PtrCast { a, .. } => {
+                    let r = Reg::from_i64(get_i64(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::Cast { op, a } => {
+                    let r = cast(*op, get(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::RefFunc { func } => frames[top].vals.push(Reg::from_i32(*func as i32)),
+                // Everything else: one value, or none for `Store`/`AtomicStore`.
+                // Fast-path the two common scalar memory ops out of the `eval_inst` call; the
+                // §14 fault-driven-yield handling is shared via `handle_mem`. The expensive part
+                // (confinement + page-protection in `Mem`) is unchanged — only the dispatch call
+                // is removed.
+                Inst::Load {
+                    op, addr, offset, ..
+                } => {
+                    let r = (|| -> Result<Option<Reg>, Trap> {
+                        let a = get_i64(&frames[top].vals, *addr)? as u64;
+                        let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                        Ok(Some(Reg::from_value(m.load(a, *offset, *op)?)))
+                    })();
+                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                        return Ok(inner);
+                    }
+                }
+                Inst::Store {
+                    op,
+                    addr,
+                    value,
+                    offset,
+                    ..
+                } => {
+                    let r = (|| -> Result<Option<Reg>, Trap> {
+                        let a = get_i64(&frames[top].vals, *addr)? as u64;
+                        let v = Value::I64(get(&frames[top].vals, *value)?.i64());
+                        mem.as_mut()
+                            .ok_or(Trap::Malformed)?
+                            .store(a, *offset, *op, v)?;
+                        Ok(None)
+                    })();
+                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                        return Ok(inner);
+                    }
+                }
+                // Everything else (other memory ops, SIMD, no-result/control): one `eval_inst`
+                // call, through the same fault-yield handling.
+                other => {
+                    let r = eval_inst(other, &frames[top].vals, mem);
+                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                        return Ok(inner);
                     }
                 }
             }
@@ -5506,7 +5808,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 else_blk,
                 else_args,
             } => {
-                let (target, edge_args) = if as_i32(get(&frames[top].vals, *cond)?)? != 0 {
+                let (target, edge_args) = if get_i32(&frames[top].vals, *cond)? != 0 {
                     (*then_blk, then_args)
                 } else {
                     (*else_blk, else_args)
@@ -5521,7 +5823,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 targets,
                 default,
             } => {
-                let i = as_i32(get(&frames[top].vals, *idx)?)? as u32 as usize;
+                let i = get_i32(&frames[top].vals, *idx)? as u32 as usize;
                 let (target, edge_args) = targets.get(i).unwrap_or(default);
                 collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
                 std::mem::swap(&mut frames[top].vals, &mut edge_buf);
@@ -5529,13 +5831,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 frames[top].inst = 0;
             }
             Terminator::Return(out) => {
-                let results = collect(&frames[top].vals, out)?;
+                collect_into(&mut ret_buf, &frames[top].vals, out)?;
                 let popped = frames.pop();
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
-                    caller.vals.extend(results);
+                    // Copy results straight in — no per-return results `Vec`.
+                    caller.vals.extend_from_slice(&ret_buf);
                 } else if *cur == ROOT_FIBER {
-                    return Ok(Inner::Done(results)); // the root returned: this vCPU is done
+                    // The root returned: this vCPU is done. Reconstruct typed result `Value`s from
+                    // the returning function's result signature (the public boundary is `Value`).
+                    let results = match popped.as_ref().and_then(|p| fs.get(p.func as usize)) {
+                        Some(f) => ret_buf
+                            .iter()
+                            .zip(&f.results)
+                            .map(|(s, ty)| s.to_value(*ty))
+                            .collect(),
+                        None => ret_buf.iter().map(|s| s.to_value(ValType::I64)).collect(),
+                    };
+                    return Ok(Inner::Done(results));
                 } else {
                     // A fiber's function returned: hand its single `i64` back to the resumer
                     // with status RETURNED; the fiber is now `Done` (resuming again traps) —
@@ -5564,7 +5877,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             Some(f) => (
                                 f.func as i32,
                                 match f.vals.first() {
-                                    Some(Value::I64(x)) => *x,
+                                    Some(r) => r.i64(),
                                     _ => 0,
                                 },
                             ),
@@ -5593,10 +5906,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     *parked_frames -= frames.len();
                     let rtop = frames.len() - 1;
-                    frames[rtop].vals.push(Value::I32(FIBER_RETURNED));
+                    frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
                     frames[rtop]
                         .vals
-                        .push(results.into_iter().next().unwrap_or(Value::I64(0)));
+                        .push(ret_buf.first().copied().unwrap_or(Reg::from_i64(0)));
                 }
             }
             Terminator::Unreachable => return Err(Trap::Unreachable),
@@ -5620,7 +5933,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     &funcs,
                     units,
                     invoked,
-                    as_i32(get(&frames[top].vals, *idx)?)?,
+                    get_i32(&frames[top].vals, *idx)?,
                     ty,
                 )?;
                 let argv = collect(&frames[top].vals, args)?;
@@ -5636,54 +5949,53 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     }
 }
 
-fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Option<Value>, Trap> {
-    // `Store` is the only instruction that produces no value.
-    if let Inst::Store {
-        op,
-        addr,
-        value,
-        offset,
-        ..
-    } = inst
-    {
-        let m = mem.as_mut().ok_or(Trap::Malformed)?;
-        let a = as_i64(get(vals, *addr)?)? as u64;
-        let v = get(vals, *value)?;
-        m.store(a, *offset, *op, v)?;
-        return Ok(None);
-    }
-    // §12 atomic store — the other no-result memory op.
-    if let Inst::AtomicStore {
-        ty,
-        addr,
-        value,
-        offset,
-        ..
-    } = inst
-    {
-        let m = mem.as_mut().ok_or(Trap::Malformed)?;
-        let a = as_i64(get(vals, *addr)?)? as u64;
-        let v = get(vals, *value)?;
-        m.atomic_store(a, *offset, *ty, v)?;
-        return Ok(None);
-    }
-    // §17 `v128.store` — the third no-result memory op (a 16-byte masked write, D58).
-    if let Inst::V128Store {
-        addr,
-        value,
-        offset,
-        ..
-    } = inst
-    {
-        let m = mem.as_mut().ok_or(Trap::Malformed)?;
-        let a = as_i64(get(vals, *addr)?)? as u64;
-        let v = as_v128(get(vals, *value)?)?;
-        m.store_v128(a, *offset, v)?;
-        return Ok(None);
-    }
+fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<Reg>, Trap> {
+    // Single dispatch over `inst`: value-producing ops yield the produced [`Reg`]; the
+    // no-result ops (`Store`/`AtomicStore`/`V128Store`, fences, and the control/fiber ops
+    // serviced in the eval loop) take a `return Ok(None)` arm. Operand reads are op-directed
+    // (`get_i32`/`get_f64`/`Reg::v128`, …) — the instruction's static type says how to read the
+    // untyped slot, so there is no per-value tag to match. The `Mem` wrappers stay `Value`-based;
+    // we convert at that boundary (`Value::I64(slot.i64())` covers any scalar store, since the
+    // store keeps only the low `width` bytes; loads come back typed → `Reg::from_value`).
     let v = match inst {
-        Inst::ConstI32(c) => Value::I32(*c),
-        Inst::ConstI64(c) => Value::I64(*c),
+        // ----- §3a/§12/§17 no-result memory writes (the only value-less data ops) -----
+        Inst::Store {
+            op,
+            addr,
+            value,
+            offset,
+            ..
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = get_i64(vals, *addr)? as u64;
+            m.store(a, *offset, *op, Value::I64(get(vals, *value)?.i64()))?;
+            return Ok(None);
+        }
+        Inst::AtomicStore {
+            ty,
+            addr,
+            value,
+            offset,
+            ..
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = get_i64(vals, *addr)? as u64;
+            m.atomic_store(a, *offset, *ty, Value::I64(get(vals, *value)?.i64()))?;
+            return Ok(None);
+        }
+        Inst::V128Store {
+            addr,
+            value,
+            offset,
+            ..
+        } => {
+            let m = mem.as_mut().ok_or(Trap::Malformed)?;
+            let a = get_i64(vals, *addr)? as u64;
+            m.store_v128(a, *offset, get(vals, *value)?.v128())?;
+            return Ok(None);
+        }
+        Inst::ConstI32(c) => Reg::from_i32(*c),
+        Inst::ConstI64(c) => Reg::from_i64(*c),
         // §7 named imports must be lowered to `cap.call` by `resolve_imports` before
         // execution; a stray `CallImport` is fail-closed (it carries no `type_id`/`op`).
         Inst::CallImport { .. } => return Err(Trap::Malformed),
@@ -5691,97 +6003,79 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         // (like `cap.call`), never here.
         Inst::CapSelfCount | Inst::CapSelfGet { .. } => return Err(Trap::Malformed),
         Inst::IntBin { ty, op, a, b } => match ty {
-            IntTy::I32 => Value::I32(bin32(
-                *op,
-                as_i32(get(vals, *a)?)?,
-                as_i32(get(vals, *b)?)?,
-            )?),
-            IntTy::I64 => Value::I64(bin64(
-                *op,
-                as_i64(get(vals, *a)?)?,
-                as_i64(get(vals, *b)?)?,
-            )?),
+            IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?),
+            IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?),
         },
         Inst::IntCmp { ty, op, a, b } => {
             let r = match ty {
-                IntTy::I32 => cmp32(*op, as_i32(get(vals, *a)?)?, as_i32(get(vals, *b)?)?),
-                IntTy::I64 => cmp64(*op, as_i64(get(vals, *a)?)?, as_i64(get(vals, *b)?)?),
+                IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?),
+                IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?),
             };
-            Value::I32(r as i32)
+            Reg::from_i32(r as i32)
         }
         Inst::IntUn { ty, op, a } => match ty {
-            IntTy::I32 => Value::I32(intun32(*op, as_i32(get(vals, *a)?)?)),
-            IntTy::I64 => Value::I64(intun64(*op, as_i64(get(vals, *a)?)?)),
+            IntTy::I32 => Reg::from_i32(intun32(*op, get_i32(vals, *a)?)),
+            IntTy::I64 => Reg::from_i64(intun64(*op, get_i64(vals, *a)?)),
         },
         Inst::Eqz { ty, a } => {
             let r = match ty {
-                IntTy::I32 => as_i32(get(vals, *a)?)? == 0,
-                IntTy::I64 => as_i64(get(vals, *a)?)? == 0,
+                IntTy::I32 => get_i32(vals, *a)? == 0,
+                IntTy::I64 => get_i64(vals, *a)? == 0,
             };
-            Value::I32(r as i32)
+            Reg::from_i32(r as i32)
         }
         Inst::Convert { op, a } => match op {
-            ConvOp::ExtendI32S => Value::I64(as_i32(get(vals, *a)?)? as i64),
-            ConvOp::ExtendI32U => Value::I64(as_i32(get(vals, *a)?)? as u32 as i64),
-            ConvOp::WrapI64 => Value::I32(as_i64(get(vals, *a)?)? as i32),
+            ConvOp::ExtendI32S => Reg::from_i64(get_i32(vals, *a)? as i64),
+            ConvOp::ExtendI32U => Reg::from_i64(get_i32(vals, *a)? as u32 as i64),
+            ConvOp::WrapI64 => Reg::from_i32(get_i64(vals, *a)? as i32),
         },
         Inst::Select { cond, a, b } => {
-            if as_i32(get(vals, *cond)?)? != 0 {
+            if get_i32(vals, *cond)? != 0 {
                 get(vals, *a)?
             } else {
                 get(vals, *b)?
             }
         }
-        Inst::ConstF32(bits) => Value::F32(f32::from_bits(*bits)),
-        Inst::ConstF64(bits) => Value::F64(f64::from_bits(*bits)),
+        Inst::ConstF32(bits) => Reg::from_f32(f32::from_bits(*bits)),
+        Inst::ConstF64(bits) => Reg::from_f64(f64::from_bits(*bits)),
         Inst::FBin { ty, op, a, b } => match ty {
-            FloatTy::F32 => Value::F32(fbin32(
-                *op,
-                as_f32(get(vals, *a)?)?,
-                as_f32(get(vals, *b)?)?,
-            )),
-            FloatTy::F64 => Value::F64(fbin64(
-                *op,
-                as_f64(get(vals, *a)?)?,
-                as_f64(get(vals, *b)?)?,
-            )),
+            FloatTy::F32 => Reg::from_f32(fbin32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?)),
+            FloatTy::F64 => Reg::from_f64(fbin64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?)),
         },
         Inst::FUn { ty, op, a } => match ty {
-            FloatTy::F32 => Value::F32(fun32(*op, as_f32(get(vals, *a)?)?)),
-            FloatTy::F64 => Value::F64(fun64(*op, as_f64(get(vals, *a)?)?)),
+            FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
+            FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
         },
         Inst::FCmp { ty, op, a, b } => {
             let r = match ty {
-                FloatTy::F32 => fcmp32(*op, as_f32(get(vals, *a)?)?, as_f32(get(vals, *b)?)?),
-                FloatTy::F64 => fcmp64(*op, as_f64(get(vals, *a)?)?, as_f64(get(vals, *b)?)?),
+                FloatTy::F32 => fcmp32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?),
+                FloatTy::F64 => fcmp64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?),
             };
-            Value::I32(r as i32)
+            Reg::from_i32(r as i32)
         }
-        Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?)?,
+        Inst::FToISat { op, a } => fto_i(*op, get(vals, *a)?),
         Inst::FToITrap { op, a } => trunc_trap(*op, get(vals, *a)?)?,
-        Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?)?,
-        Inst::PtrAdd { a, b } => {
-            Value::I64(as_i64(get(vals, *a)?)?.wrapping_add(as_i64(get(vals, *b)?)?))
-        }
+        Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?),
+        Inst::PtrAdd { a, b } => Reg::from_i64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?)),
         // `ptr.from_int`/`ptr.to_int` are a no-op off-CHERI: pass the i64 through.
-        Inst::PtrCast { a, .. } => Value::I64(as_i64(get(vals, *a)?)?),
-        Inst::Cast { op, a } => cast(*op, get(vals, *a)?)?,
+        Inst::PtrCast { a, .. } => Reg::from_i64(get_i64(vals, *a)?),
+        Inst::Cast { op, a } => cast(*op, get(vals, *a)?),
         // A funcref is just the function index as plain i32 data (§3c).
-        Inst::RefFunc { func } => Value::I32(*func as i32),
+        Inst::RefFunc { func } => Reg::from_i32(*func as i32),
         Inst::Load {
             op, addr, offset, ..
         } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            m.load(a, *offset, *op)?
+            let a = get_i64(vals, *addr)? as u64;
+            Reg::from_value(m.load(a, *offset, *op)?)
         }
         // The `order` is carried but execution is seq-cst (a sound strengthening; see `svm_ir::Ordering`).
         Inst::AtomicLoad {
             ty, addr, offset, ..
         } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            m.atomic_load(a, *offset, *ty)?
+            let a = get_i64(vals, *addr)? as u64;
+            Reg::from_value(m.atomic_load(a, *offset, *ty)?)
         }
         Inst::AtomicRmw {
             ty,
@@ -5792,9 +6086,9 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             ..
         } => {
             let m = mem.as_mut().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            let v = get(vals, *value)?;
-            m.atomic_rmw(a, *offset, *ty, *op, v)?
+            let a = get_i64(vals, *addr)? as u64;
+            let v = Value::I64(get(vals, *value)?.i64());
+            Reg::from_value(m.atomic_rmw(a, *offset, *ty, *op, v)?)
         }
         Inst::AtomicCmpxchg {
             ty,
@@ -5805,10 +6099,10 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
             ..
         } => {
             let m = mem.as_mut().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            let exp = get(vals, *expected)?;
-            let rep = get(vals, *replacement)?;
-            m.atomic_cmpxchg(a, *offset, *ty, exp, rep)?
+            let a = get_i64(vals, *addr)? as u64;
+            let exp = Value::I64(get(vals, *expected)?.i64());
+            let rep = Value::I64(get(vals, *replacement)?.i64());
+            Reg::from_value(m.atomic_cmpxchg(a, *offset, *ty, exp, rep)?)
         }
         // §12 standalone fence — issue the real hardware fence (a `Relaxed` fence is a no-op; `std`
         // would panic on it). Both backends are otherwise seq-cst, so this is the one place ordering
@@ -5826,156 +6120,149 @@ fn eval_inst(inst: &Inst, vals: &[Value], mem: &mut Option<Mem>) -> Result<Optio
         }
 
         // ----- §17 SIMD reference lane semantics (the differential oracle, D58) -----
-        Inst::ConstV128(b) => Value::V128(*b),
+        Inst::ConstV128(b) => Reg::from_v128(*b),
         Inst::V128Load { addr, offset, .. } => {
             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-            let a = as_i64(get(vals, *addr)?)? as u64;
-            m.load_v128(a, *offset)?
+            let a = get_i64(vals, *addr)? as u64;
+            Reg::from_value(m.load_v128(a, *offset)?)
         }
-        Inst::Splat { shape, a } => Value::V128(simd_splat(*shape, store_bits(get(vals, *a)?))),
+        Inst::Splat { shape, a } => Reg::from_v128(simd_splat(*shape, get(vals, *a)?.lo)),
         Inst::ExtractLane {
             shape,
             lane,
             signed,
             a,
-        } => simd_extract(*shape, *lane, *signed, as_v128(get(vals, *a)?)?),
-        Inst::ReplaceLane { shape, lane, a, b } => Value::V128(simd_replace(
+        } => simd_extract(*shape, *lane, *signed, get(vals, *a)?.v128()),
+        Inst::ReplaceLane { shape, lane, a, b } => Reg::from_v128(simd_replace(
             *shape,
             *lane,
-            as_v128(get(vals, *a)?)?,
-            store_bits(get(vals, *b)?),
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.lo,
         )),
-        Inst::VIntBin { shape, op, a, b } => Value::V128(simd_vint_bin(
+        Inst::VIntBin { shape, op, a, b } => Reg::from_v128(simd_vint_bin(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
-        Inst::VIntCmp { shape, op, a, b } => Value::V128(simd_vint_cmp(
+        Inst::VIntCmp { shape, op, a, b } => Reg::from_v128(simd_vint_cmp(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
-        Inst::VFloatCmp { shape, op, a, b } => Value::V128(simd_vfloat_cmp(
+        Inst::VFloatCmp { shape, op, a, b } => Reg::from_v128(simd_vfloat_cmp(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
-        Inst::VShift { shape, op, a, amt } => Value::V128(simd_vshift(
+        Inst::VShift { shape, op, a, amt } => Reg::from_v128(simd_vshift(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_i32(get(vals, *amt)?)? as u32,
+            get(vals, *a)?.v128(),
+            get_i32(vals, *amt)? as u32,
         )),
         Inst::VIntUn { shape, op, a } => {
-            Value::V128(simd_vint_un(*shape, *op, as_v128(get(vals, *a)?)?))
+            Reg::from_v128(simd_vint_un(*shape, *op, get(vals, *a)?.v128()))
         }
-        Inst::VSatBin { shape, op, a, b } => Value::V128(simd_vsat_bin(
+        Inst::VSatBin { shape, op, a, b } => Reg::from_v128(simd_vsat_bin(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
         Inst::VWiden { shape, op, a } => {
-            Value::V128(simd_widen(*shape, *op, as_v128(get(vals, *a)?)?))
+            Reg::from_v128(simd_widen(*shape, *op, get(vals, *a)?.v128()))
         }
-        Inst::VNarrow { shape, op, a, b } => Value::V128(simd_narrow(
+        Inst::VNarrow { shape, op, a, b } => Reg::from_v128(simd_narrow(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
-        Inst::VConvert { op, a } => Value::V128(simd_convert(*op, as_v128(get(vals, *a)?)?)),
-        Inst::VPMinMax { shape, op, a, b } => Value::V128(simd_pminmax(
+        Inst::VConvert { op, a } => Reg::from_v128(simd_convert(*op, get(vals, *a)?.v128())),
+        Inst::VPMinMax { shape, op, a, b } => Reg::from_v128(simd_pminmax(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
         Inst::VPopcnt { a } => {
-            let v = as_v128(get(vals, *a)?)?;
+            let v = get(vals, *a)?.v128();
             let mut o = [0u8; 16];
             for i in 0..16 {
                 o[i] = v[i].count_ones() as u8;
             }
-            Value::V128(o)
+            Reg::from_v128(o)
         }
-        Inst::VAvgr { shape, a, b } => Value::V128(simd_avgr(
+        Inst::VAvgr { shape, a, b } => Reg::from_v128(simd_avgr(
             *shape,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
         Inst::VDot { a, b } => {
-            Value::V128(simd_dot(as_v128(get(vals, *a)?)?, as_v128(get(vals, *b)?)?))
+            Reg::from_v128(simd_dot(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
         }
-        Inst::VExtMul { shape, op, a, b } => Value::V128(simd_extmul(
+        Inst::VExtMul { shape, op, a, b } => Reg::from_v128(simd_extmul(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
-        Inst::VExtAddPairwise { shape, signed, a } => Value::V128(simd_extadd_pairwise(
-            *shape,
-            *signed,
-            as_v128(get(vals, *a)?)?,
-        )),
-        Inst::VQ15MulrSat { a, b } => Value::V128(simd_q15mulr(
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
-        )),
+        Inst::VExtAddPairwise { shape, signed, a } => {
+            Reg::from_v128(simd_extadd_pairwise(*shape, *signed, get(vals, *a)?.v128()))
+        }
+        Inst::VQ15MulrSat { a, b } => {
+            Reg::from_v128(simd_q15mulr(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
+        }
         Inst::VAnyTrue { a } => {
-            Value::I32((as_v128(get(vals, *a)?)?.iter().any(|&b| b != 0)) as i32)
+            Reg::from_i32((get(vals, *a)?.v128().iter().any(|&b| b != 0)) as i32)
         }
-        Inst::VAllTrue { shape, a } => Value::I32(simd_all_true(*shape, as_v128(get(vals, *a)?)?)),
-        Inst::VBitmask { shape, a } => Value::I32(simd_bitmask(*shape, as_v128(get(vals, *a)?)?)),
-        Inst::VFloatBin { shape, op, a, b } => Value::V128(simd_vfloat_bin(
+        Inst::VAllTrue { shape, a } => Reg::from_i32(simd_all_true(*shape, get(vals, *a)?.v128())),
+        Inst::VBitmask { shape, a } => Reg::from_i32(simd_bitmask(*shape, get(vals, *a)?.v128())),
+        Inst::VFloatBin { shape, op, a, b } => Reg::from_v128(simd_vfloat_bin(
             *shape,
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
         Inst::VFloatUn { shape, op, a } => {
-            Value::V128(simd_vfloat_un(*shape, *op, as_v128(get(vals, *a)?)?))
+            Reg::from_v128(simd_vfloat_un(*shape, *op, get(vals, *a)?.v128()))
         }
-        Inst::VBitBin { op, a, b } => Value::V128(simd_vbit_bin(
+        Inst::VBitBin { op, a, b } => Reg::from_v128(simd_vbit_bin(
             *op,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
         Inst::VNot { a } => {
-            let x = as_v128(get(vals, *a)?)?;
+            let x = get(vals, *a)?.v128();
             let mut o = [0u8; 16];
             for i in 0..16 {
                 o[i] = !x[i];
             }
-            Value::V128(o)
+            Reg::from_v128(o)
         }
-        Inst::Bitselect { a, b, mask } => Value::V128(simd_bitselect(
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
-            as_v128(get(vals, *mask)?)?,
+        Inst::Bitselect { a, b, mask } => Reg::from_v128(simd_bitselect(
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+            get(vals, *mask)?.v128(),
         )),
-        Inst::Shuffle { lanes, a, b } => Value::V128(simd_shuffle(
+        Inst::Shuffle { lanes, a, b } => Reg::from_v128(simd_shuffle(
             lanes,
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
         )),
-        Inst::Swizzle { a, b } => Value::V128(simd_swizzle(
-            as_v128(get(vals, *a)?)?,
-            as_v128(get(vals, *b)?)?,
-        )),
+        Inst::Swizzle { a, b } => {
+            Reg::from_v128(simd_swizzle(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
+        }
         // The §17/D58 feature-detect hook: a deterministic constant in the fixed-128 MVP, so it
         // stays identical across the interp↔JIT oracle.
-        Inst::SimdWidthBytes => Value::I32(16),
+        Inst::SimdWidthBytes => Reg::from_i32(16),
 
-        // Handled before/around the match (or in `run_func` for the §12 fiber ops, which
-        // switch stacks); listed for exhaustiveness (no panic).
-        Inst::Store { .. }
-        | Inst::AtomicStore { .. }
-        | Inst::V128Store { .. }
-        | Inst::Call { .. }
+        // Handled in `run_func` for the §12 fiber ops (which switch stacks) and in the eval
+        // loop for calls/cap-calls; listed for exhaustiveness (no panic).
+        Inst::Call { .. }
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
         | Inst::ContNew { .. }
@@ -6022,7 +6309,7 @@ fn simd_splat(shape: VShape, bits: u64) -> [u8; 16] {
 
 /// `<shape>.extract_lane`: read lane `lane` as the shape's scalar [`Value`]. Narrow integer
 /// lanes sign- or zero-extend into the `i32` result per `signed`.
-fn simd_extract(shape: VShape, lane: u8, signed: bool, v: [u8; 16]) -> Value {
+fn simd_extract(shape: VShape, lane: u8, signed: bool, v: [u8; 16]) -> Reg {
     let bytes = shape.lane_bytes() as usize;
     // Lane index is verifier-bounded; clamp defensively so this stays total on raw input.
     let lane = (lane as usize).min(shape.lanes() as usize - 1);
@@ -6036,12 +6323,12 @@ fn simd_extract(shape: VShape, lane: u8, signed: bool, v: [u8; 16]) -> Value {
             } else {
                 raw as i32
             };
-            Value::I32(ext)
+            Reg::from_i32(ext)
         }
-        VShape::I32x4 => Value::I32(raw as i32),
-        VShape::I64x2 => Value::I64(raw as i64),
-        VShape::F32x4 => Value::F32(f32::from_bits(raw as u32)),
-        VShape::F64x2 => Value::F64(f64::from_bits(raw)),
+        VShape::I32x4 => Reg::from_i32(raw as i32),
+        VShape::I64x2 => Reg::from_i64(raw as i64),
+        VShape::F32x4 => Reg::from_f32(f32::from_bits(raw as u32)),
+        VShape::F64x2 => Reg::from_f64(f64::from_bits(raw)),
     }
 }
 
@@ -6759,17 +7046,17 @@ fn fmax64(a: f64, b: f64) -> f64 {
 }
 
 // Float→int casts are saturating with NaN→0 (Rust `as` matches wasm `trunc_sat`).
-fn fto_i(op: FToI, v: Value) -> Result<Value, Trap> {
-    Ok(match op {
-        FToI::F32I32S => Value::I32(as_f32(v)? as i32),
-        FToI::F32I32U => Value::I32(as_f32(v)? as u32 as i32),
-        FToI::F32I64S => Value::I64(as_f32(v)? as i64),
-        FToI::F32I64U => Value::I64(as_f32(v)? as u64 as i64),
-        FToI::F64I32S => Value::I32(as_f64(v)? as i32),
-        FToI::F64I32U => Value::I32(as_f64(v)? as u32 as i32),
-        FToI::F64I64S => Value::I64(as_f64(v)? as i64),
-        FToI::F64I64U => Value::I64(as_f64(v)? as u64 as i64),
-    })
+fn fto_i(op: FToI, a: Reg) -> Reg {
+    match op {
+        FToI::F32I32S => Reg::from_i32(a.f32() as i32),
+        FToI::F32I32U => Reg::from_i32(a.f32() as u32 as i32),
+        FToI::F32I64S => Reg::from_i64(a.f32() as i64),
+        FToI::F32I64U => Reg::from_i64(a.f32() as u64 as i64),
+        FToI::F64I32S => Reg::from_i32(a.f64() as i32),
+        FToI::F64I32U => Reg::from_i32(a.f64() as u32 as i32),
+        FToI::F64I64S => Reg::from_i64(a.f64() as i64),
+        FToI::F64I64U => Reg::from_i64(a.f64() as u64 as i64),
+    }
 }
 
 /// Trapping float→int conversion (`trunc`, vs the saturating `trunc_sat`): NaN and
@@ -6777,11 +7064,11 @@ fn fto_i(op: FToI, v: Value) -> Result<Value, Trap> {
 /// unless the truncation toward zero fits the target — `f > MIN-1 && f < MAX+1`
 /// (using the exact float boundary constants; the `i64` signed lower bound is
 /// closed because `-2^63 - 1` is not representable and rounds to `-2^63`).
-fn trunc_trap(op: FToI, v: Value) -> Result<Value, Trap> {
+fn trunc_trap(op: FToI, a: Reg) -> Result<Reg, Trap> {
     let (from, to, signed) = op.parts();
     let f: f64 = match from {
-        FloatTy::F32 => as_f32(v)? as f64,
-        FloatTy::F64 => as_f64(v)?,
+        FloatTy::F32 => a.f32() as f64,
+        FloatTy::F64 => a.f64(),
     };
     if f.is_nan() {
         return Err(Trap::BadConversion);
@@ -6801,35 +7088,35 @@ fn trunc_trap(op: FToI, v: Value) -> Result<Value, Trap> {
     }
     // In range, so the cast is exact (truncating toward zero, no saturation).
     Ok(match (to, signed) {
-        (IntTy::I32, true) => Value::I32(f as i32),
-        (IntTy::I32, false) => Value::I32(f as u32 as i32),
-        (IntTy::I64, true) => Value::I64(f as i64),
-        (IntTy::I64, false) => Value::I64(f as u64 as i64),
+        (IntTy::I32, true) => Reg::from_i32(f as i32),
+        (IntTy::I32, false) => Reg::from_i32(f as u32 as i32),
+        (IntTy::I64, true) => Reg::from_i64(f as i64),
+        (IntTy::I64, false) => Reg::from_i64(f as u64 as i64),
     })
 }
 
-fn i_to_f(op: IToF, v: Value) -> Result<Value, Trap> {
-    Ok(match op {
-        IToF::I32F32S => Value::F32(as_i32(v)? as f32),
-        IToF::I32F32U => Value::F32(as_i32(v)? as u32 as f32),
-        IToF::I64F32S => Value::F32(as_i64(v)? as f32),
-        IToF::I64F32U => Value::F32(as_i64(v)? as u64 as f32),
-        IToF::I32F64S => Value::F64(as_i32(v)? as f64),
-        IToF::I32F64U => Value::F64(as_i32(v)? as u32 as f64),
-        IToF::I64F64S => Value::F64(as_i64(v)? as f64),
-        IToF::I64F64U => Value::F64(as_i64(v)? as u64 as f64),
-    })
+fn i_to_f(op: IToF, a: Reg) -> Reg {
+    match op {
+        IToF::I32F32S => Reg::from_f32(a.i32() as f32),
+        IToF::I32F32U => Reg::from_f32(a.i32() as u32 as f32),
+        IToF::I64F32S => Reg::from_f32(a.i64() as f32),
+        IToF::I64F32U => Reg::from_f32(a.i64() as u64 as f32),
+        IToF::I32F64S => Reg::from_f64(a.i32() as f64),
+        IToF::I32F64U => Reg::from_f64(a.i32() as u32 as f64),
+        IToF::I64F64S => Reg::from_f64(a.i64() as f64),
+        IToF::I64F64U => Reg::from_f64(a.i64() as u64 as f64),
+    }
 }
 
-fn cast(op: CastOp, v: Value) -> Result<Value, Trap> {
-    Ok(match op {
-        CastOp::Demote => Value::F32(as_f64(v)? as f32),
-        CastOp::Promote => Value::F64(as_f32(v)? as f64),
-        CastOp::ReinterpI32F32 => Value::F32(f32::from_bits(as_i32(v)? as u32)),
-        CastOp::ReinterpF32I32 => Value::I32(as_f32(v)?.to_bits() as i32),
-        CastOp::ReinterpI64F64 => Value::F64(f64::from_bits(as_i64(v)? as u64)),
-        CastOp::ReinterpF64I64 => Value::I64(as_f64(v)?.to_bits() as i64),
-    })
+fn cast(op: CastOp, a: Reg) -> Reg {
+    match op {
+        CastOp::Demote => Reg::from_f32(a.f64() as f32),
+        CastOp::Promote => Reg::from_f64(a.f32() as f64),
+        CastOp::ReinterpI32F32 => Reg::from_f32(f32::from_bits(a.i32() as u32)),
+        CastOp::ReinterpF32I32 => Reg::from_i32(a.f32().to_bits() as i32),
+        CastOp::ReinterpI64F64 => Reg::from_f64(f64::from_bits(a.i64() as u64)),
+        CastOp::ReinterpF64I64 => Reg::from_i64(a.f64().to_bits() as i64),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -10274,17 +10561,13 @@ fn gc_scan_frames(frames: &[Frame], lo: u64, hi: u64, out: &mut std::collections
     };
     for f in frames {
         for v in &f.vals {
-            match v {
-                Value::I32(x) => consider(*x as u32 as u64),
-                Value::I64(x) => consider(*x as u64),
-                Value::Ref(x) => consider(*x),
-                Value::F32(x) => consider(x.to_bits() as u64),
-                Value::F64(x) => consider(x.to_bits()),
-                Value::V128(b) => {
-                    consider(u64::from_le_bytes(b[0..8].try_into().unwrap()));
-                    consider(u64::from_le_bytes(b[8..16].try_into().unwrap()));
-                }
-            }
+            // Untyped raw slots: scan both 64-bit words, like the JIT scans raw control-stack
+            // words (a `v128` contributes both halves; a scalar's high half is 0, which the GC
+            // heap range never contains, so `consider` filters it out). An `i32` slot is
+            // sign-extended in `lo` — exactly the JIT slot ABI — so the two backends' candidate
+            // words now align (still sound over-approximations, GC.md §3.2).
+            consider(v.lo);
+            consider(v.hi);
         }
     }
 }
@@ -10509,11 +10792,34 @@ fn step(fuel: &mut u64) -> Result<(), Trap> {
 }
 
 #[inline]
-fn get(vals: &[Value], v: ValIdx) -> Result<Value, Trap> {
+fn get(vals: &[Reg], v: ValIdx) -> Result<Reg, Trap> {
     vals.get(v as usize).copied().ok_or(Trap::Malformed)
 }
 
-fn collect(vals: &[Value], idxs: &[ValIdx]) -> Result<Vec<Value>, Trap> {
+// Typed operand reads: pull the needed scalar out of the (untyped) value slot. The executing
+// instruction's static type picks which getter to call, so the bit pattern is interpreted
+// correctly without a per-value tag. `Malformed` on an out-of-range index, as before.
+#[inline]
+fn get_i32(vals: &[Reg], v: ValIdx) -> Result<i32, Trap> {
+    Ok(get(vals, v)?.i32())
+}
+
+#[inline]
+fn get_i64(vals: &[Reg], v: ValIdx) -> Result<i64, Trap> {
+    Ok(get(vals, v)?.i64())
+}
+
+#[inline]
+fn get_f32(vals: &[Reg], v: ValIdx) -> Result<f32, Trap> {
+    Ok(get(vals, v)?.f32())
+}
+
+#[inline]
+fn get_f64(vals: &[Reg], v: ValIdx) -> Result<f64, Trap> {
+    Ok(get(vals, v)?.f64())
+}
+
+fn collect(vals: &[Reg], idxs: &[ValIdx]) -> Result<Vec<Reg>, Trap> {
     idxs.iter().map(|&v| get(vals, v)).collect()
 }
 
@@ -10524,7 +10830,7 @@ fn collect(vals: &[Value], idxs: &[ValIdx]) -> Result<Vec<Value>, Trap> {
 /// alloc/free dominated. `dst` is cleared first; on a bad index it returns `Malformed`
 /// (leaving `dst` partially filled, which the caller discards as it traps), exactly as
 /// `collect` would have.
-fn collect_into(dst: &mut Vec<Value>, vals: &[Value], idxs: &[ValIdx]) -> Result<(), Trap> {
+fn collect_into(dst: &mut Vec<Reg>, vals: &[Reg], idxs: &[ValIdx]) -> Result<(), Trap> {
     dst.clear();
     dst.reserve(idxs.len());
     for &v in idxs {
@@ -10566,29 +10872,6 @@ fn slot_to_val(ty: ValType, s: i64) -> Value {
     }
 }
 
-fn as_i32(v: Value) -> Result<i32, Trap> {
-    match v {
-        Value::I32(x) => Ok(x),
-        _ => Err(Trap::Malformed),
-    }
-}
-
-#[inline]
-fn as_v128(v: Value) -> Result<[u8; 16], Trap> {
-    match v {
-        Value::V128(b) => Ok(b),
-        _ => Err(Trap::Malformed),
-    }
-}
-
-#[inline]
-fn as_i64(v: Value) -> Result<i64, Trap> {
-    match v {
-        Value::I64(x) => Ok(x),
-        _ => Err(Trap::Malformed),
-    }
-}
-
 /// Whether a variable scoped to `var_func` is visible in a frame of function `frame_func`: its own
 /// function, or a [`svm_ir::GLOBAL_SCOPE`] module-scoped global (visible in every frame).
 fn var_in_scope(var_func: u32, frame_func: u32) -> bool {
@@ -10603,22 +10886,6 @@ fn loclist_value(locs: &[SsaLoc], block: usize, inst: usize) -> Option<u32> {
         .filter(|l| l.block as usize == block && l.inst as usize <= inst)
         .max_by_key(|l| l.inst)
         .map(|l| l.value)
-}
-
-#[inline]
-fn as_f32(v: Value) -> Result<f32, Trap> {
-    match v {
-        Value::F32(x) => Ok(x),
-        _ => Err(Trap::Malformed),
-    }
-}
-
-#[inline]
-fn as_f64(v: Value) -> Result<f64, Trap> {
-    match v {
-        Value::F64(x) => Ok(x),
-        _ => Err(Trap::Malformed),
-    }
 }
 
 #[cfg(test)]

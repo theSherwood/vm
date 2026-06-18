@@ -626,6 +626,7 @@ dependencies = [
  "svm-ir",
  "svm-mask",
  "svm-mem",
+ "svm-verify",
 ]
 
 [[package]]
