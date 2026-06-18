@@ -850,14 +850,18 @@ sequenced slice:
    concurrently live) rather than return — otherwise the second fiber would reuse the first's freed
    region. *(vCPU-context recycling — a joined `thread.spawn` child's top-down context — is a smaller
    follow-up; the durable cap that bites is fibers, handled here.)*
-4. **[~] Cross-backend parity + fuzz.** The recycled freeze/thaw leg is now exercised **on both
-   backends**: with the mid-run trigger mirrored to the JIT,
-   `svm/tests/durable_fibers_jit.rs::jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit`
-   arms both the interp and the JIT to freeze a recycled (generation 1) parked fiber at the same
-   safepoint, confirms a **byte-identical durable reserve + residue**, and **thaws the artifact on the
-   JIT** to the uninterrupted result. *Remaining (smaller):* fold fiber churn into the randomized
-   `durgen`/`fiber_fuzz` generators so the recycled freeze/thaw path is fuzzed, not just pinned by these
-   hand-written end-to-end tests.
+4. **[x] Cross-backend parity + fuzz — done.** The recycled freeze/thaw leg is exercised on both
+   backends, both hand-written and **fuzzed**:
+   - *Pinned:* `svm/tests/durable_fibers_jit.rs::jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit`
+     arms both backends to freeze a recycled (generation 1) parked fiber at the same safepoint,
+     confirms a **byte-identical durable reserve + residue**, and **thaws the artifact on the JIT**.
+   - *Fuzzed:* a recycling-churn generator (`durgen::gen_recycle_fiber_module` — recycle a slot 1..=3
+     times → the real fiber lands at generation 1..=3, parked, frozen mid-run via `arm_freeze_after`)
+     drives two properties: `durgen::fuzz_recycle_fiber_one` (interpreter freeze→thaw equals the
+     uninterrupted run, residue carries the bumped generation) over 400 seeds in
+     `durable_fuzz.rs`, and `durjit::fuzz_recycle_fiber_one_xbackend` (interp/JIT armed-freeze to a
+     byte-identical reserve + §12 artifact, then thaw on the JIT) over 64 seeds in `durable_jit.rs`.
+     LibFuzzer targets `durable_recycle` / `durable_recycle_jit` do the heavy continuous run.
 
 ### Mid-run freeze trigger ("freeze after N safepoints") — DONE (both backends)
 
@@ -886,11 +890,11 @@ Note this is the **deterministic test trigger**, not the bounded-latency STW sto
 polls + `Blocking.work` cancellation — see the latency caveat); a poll-free compute loop still won't
 reach a safepoint.
 
-**Recycling status:** steps 1 + 3 give complete **non-durable** slot recycling on both backends (table
-bounded by peak concurrent fibers, ABA-guarded by generation-carrying handles); step 2 is **end-to-end on
-both backends** (recycled durable freeze/thaw round-trip, byte-identical artifacts), unblocked by the
-mid-run trigger above. The recycling arc is functionally complete; the only follow-up is folding fiber
-churn into the randomized fuzz generators (step 4's remaining bullet).
+**Recycling status — DONE (all four steps, both backends).** Steps 1 + 3 give complete **non-durable**
+slot recycling (table bounded by peak concurrent fibers, ABA-guarded by generation-carrying handles);
+step 2 carries the generation through the snapshot format; the mid-run freeze trigger makes a recycled
+*durable* freeze/thaw round-trip reachable; and step 4 exercises it on both backends, hand-written and
+fuzzed (byte-identical artifacts). The arc is complete — no recycling follow-ups remain.
 
 #### 3.1 implementation plan (next-session pickup)
 

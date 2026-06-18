@@ -26,3 +26,15 @@ fn fiber_freeze_thaw_equivalence_over_generated_modules() {
         durgen::fuzz_fiber_one(&mut g);
     }
 }
+
+#[test]
+fn recycled_fiber_freeze_thaw_equivalence_over_generated_modules() {
+    // Recycling step 4: churn modules that recycle a slot (1..=3 times → generation 1..=3) before
+    // parking the real fiber, frozen *mid-run* via `arm_freeze_after`. The residue must carry the
+    // bumped generation and the thaw must reproduce the uninterrupted run. The libFuzzer target
+    // `durable_recycle` does the heavy continuous run.
+    for seed in 0..400u64 {
+        let mut g = durgen::Gen::from_seed(seed);
+        durgen::fuzz_recycle_fiber_one(&mut g);
+    }
+}
