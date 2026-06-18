@@ -362,7 +362,7 @@ than miscompiling, so these are latent/extension hazards, not silent-miscompile 
 | --- | --- | --- | --- |
 | R8 | **Call-chain propagation landed; deepest-frame assumption resolved.** The transform now instruments any may-suspend function (transitive `cap.call` closure over the direct-call graph) whose single block suspends on one op: a leaf `cap.call` (reload result + flip `NORMAL`) **or** a propagated `Call` (reload pre-call live set + **re-issue the call**, leaving the state `REWINDING` so the callee rewinds). Real multi-frame stacks; only the innermost leaf flips to `NORMAL`. Covered by `tests/chain.rs` (2-/3-level chains, live-value-across-call) and the generator now emits depth-`1..=4` chains, so the interp (`durable_fuzz`) and cross-backend (`durable_jit`) properties exercise it. **Multiple resume points** and **multi-block CFGs** (branches, loops, joins) now land too — each block is split at its suspend ops, branch targets are remapped, and a global `br_table` dispatch routes the thaw (`tests/multipoint.rs`, `tests/multiblock.rs`; the generator emits multi-frame/multi-point/multi-block modules). Out of scope: `call_indirect`/indirect tail calls to may-suspend targets (treated non-suspending); direct tail calls into may-suspend callees (rejected). A chain deeper than the reserve holds traps cleanly on freeze (R9 overflow guard), rather than overflowing. | §2, §12.7, `svm-durable` | addressed (Phase-1 scope) |
 | R9 | **Placement, not an isolation boundary — cheap for MVP.** The control state + shadow stack are a reserved low slice `[0, DURABLE_RESERVE)` (one 64 KiB page) of the domain's *own* window; guest memory is `[DURABLE_RESERVE, window)`, part of the same budget-accounted allotment (the wasm shadow-stack / `__heap_base` convention). Because the window is per-domain and runtime-masked, a guest that writes the reserve corrupts only **its own** durability — never another domain or the host — and it **fails safe**: a forged resume id hits the `br_table` default → `Unreachable`; a wild shadow-SP stays masked in-window; the host validates the artifact (module hash) on restore. **MVP path:** `transform_module_assume_confined` instruments memory-using guests on the cooperating-toolchain contract that the guest's data/heap is based at `DURABLE_RESERVE` (`tests/guest_memory.rs` shows guest memory round-tripping). Strict `transform_module` still fails closed (`GuestUsesMemory`) for untrusted modules. **Optional defense-in-depth (not MVP):** hard isolation against an *adversarial* guest — guard-paged per-fiber placement (§12.7) or per-access confinement. The shadow stack now **traps on overflow**: the freeze-path `UNWIND` check refuses a push whose top would cross `DURABLE_RESERVE`, so a too-deep call chain fails safe (a clean trap) instead of growing into guest memory (`tests/overflow.rs`). See **[DECISION D-shadow-overflow]** below for why this lives in the transform rather than a unified backend recursion ceiling. | §12.7, `svm-durable` | mitigated (placement + fail-safe + overflow trap; hard isolation optional) |
-| R10 | **No concurrency protection on the in-window control state** (state word, shadow-SP). Fine at single-vCPU; a hazard once fibers/multi-vCPU arrive (relates to R1, but specifically about the control words racing). | §3, §12.7 | open |
+| R10 | **No concurrency protection on the in-window control state** (state word, shadow-SP). Fine at single-vCPU; a hazard once fibers/multi-vCPU arrive (relates to R1, but specifically about the control words racing). *Mitigated for slice 3.2.1:* a freeze/thaw run (state ≠ `NORMAL`) is forced **single-worker**, and the runtime swaps both control words per-vCPU per dispatch — so the words are never touched concurrently. A lock-free parallel STW (Phase 4 / async freeze) is still open. | §3, §12.7 | mitigated (single-worker STW) |
 | R11 | **Equivalence now fuzzed (Phase-1 scope), both single-backend and cross-backend.** The §7/§12.6 property runs over a generator of **in-scope** durable modules: (a) interpreter-only — *inert in `NORMAL`* (instrumented == un-instrumented) and *round-trip* (freeze→serialize→restore→thaw ≡ uninterrupted, reload-not-reissue) — `crates/svm-durable/tests/durable_fuzz.rs` + libFuzzer `fuzz/fuzz_targets/durable.rs`; (b) cross-backend — interp vs Cranelift JIT agree on the NORMAL result, leave a **byte-identical freeze artifact**, and a JIT thaw of the **interpreter-frozen** artifact under a different host clock reproduces the result — `crates/svm/tests/durable_jit.rs` + libFuzzer `fuzz/fuzz_targets/durable_jit.rs`. Both stable drivers run in CI without nightly. Coverage broadens automatically as the transform generalizes (R8). | §7, §12.6 | addressed (Phase-1 scope) |
 
 **[DECISION D-shadow-overflow — RESOLVED: freeze-path guard in the transform, not a unified backend recursion ceiling.]** The shadow stack mirrors the call stack (one frame per suspended activation), so it can only overflow the reserve if the call stack is very deep. We bound it with a check on the freeze-path `UNWIND` (trap if a push would cross `DURABLE_RESERVE`) rather than forcing both backends to a common call-depth ceiling. Rationale: shadow overflow is a **tooling-tier** concern (`svm-durable`, +0 TCB), and the guard sits on the **cold** freeze path, so it costs nothing on the per-call hot path; unifying the ceiling would mean an **escape-TCB JIT codegen change** (the JIT has no depth counter today — recursion rides the native stack; the interp caps at `MAX_CALL_DEPTH = 256`) with a permanent per-call cost, to fix an edge case. Consequence: a domain recursed deeper than the reserve holds simply **cannot be frozen** (the freeze traps) — a safe, coherent limitation. Cross-backend recursion *determinism* (interp 256 vs JIT native-stack) remains a separate, latent, un-exercised divergence; unifying the ceiling is the deliberate fix to make **on its own merits** if/when it matters (the overflow guard then becomes a redundant cheap backstop).
@@ -742,8 +742,41 @@ analogue of an idle fiber's re-park. Tested both backends incl. **reload-not-rei
 in-flight `cap.call` (`svm-durable/tests/fiber.rs::active_resume_chain_fiber_freezes_and_thaws`,
 `durable_fibers_jit.rs::interp_frozen_active_chain_fiber_thaws_on_the_jit`).
 
-Remaining: **multi-vCPU** (3.2 proper — per-context state words + cooperative STW; also enables
-spawned-fiber durability) and **Phase 4** back-edge polls for bounded-latency (async) freeze.
+**[~] Slice 3.2.1 — first multi-vCPU freeze/thaw (interp; no live fibers).** A domain whose root
+has spawned a `thread.spawn` child freezes mid-run and thaws to equal the uninterrupted run
+(`svm-snapshot/tests/roundtrip.rs::multivcpu_freeze_serialize_restore_thaw_through_the_codec`,
+`svm-durable/tests/multivcpu.rs`). The choreography is **transform-free** — `svm-durable` only gains
+*typing* for `thread.spawn`/`thread.join` (they aren't checkpoints; they're copied verbatim and their
+results spill/reload like any scalar). Mechanism:
+
+- **Single-worker freeze/thaw.** The shared control words are touched only under `UNWINDING`/
+  `REWINDING`, so the runtime forces `workers = 1` exactly when the window's initial state ≠ `NORMAL`
+  (ordinary `NORMAL` runs — incl. `NORMAL` durable — keep full parallelism). This serializes the
+  control-word access (closing R10 for this slice without a lock) and lets the runtime swap the
+  *current context* per dispatch.
+- **Per-vCPU control words.** Each vCPU is context = its **task id** (root = 0), owning shadow region
+  `shadow_region_base(task)`. On each dispatch the runtime swaps *both* the state word and the active
+  shadow-SP into the shared window for the running vCPU, saving them back on park — settling §12.8(c):
+  the state word must be per-context too, because a rewinding vCPU flips it to `NORMAL` after reloading
+  and must not disturb a sibling still rewinding.
+- **Residue.** Each unwinding child records a `FrozenVCpu` (`task, func, args, shadow_sp`); the root's
+  extent is its implicit residue (`Host::frozen_root_sp`) since the shared active-SP word ends up
+  holding the *last* child's extent at freeze end. The snapshot control section (tag 2) carries both,
+  appended after the fiber residue and only when spawned vCPUs exist — so fiber-only/single-vCPU
+  artifacts stay byte-identical (the §12.6 re-freeze invariant still holds).
+- **Thaw.** `restore` re-seeds the residue; `drive` re-spawns the frozen children under `REWINDING`
+  with their extents restored (they rewind from their frozen point, then run forward) and rebuilds the
+  root's join table — because the root's rewind *skips* its prologue `thread.spawn` (the `REWINDING`
+  prologue jumps straight to the resume ARM).
+
+Scope/limits (follow-ups): no live fibers (the multi-vCPU + fibers context unification — vCPU contexts
+use task ids, fibers use slot+1, which would collide); flat (root-spawned) children only (nested spawns
+need per-parent join-table residue); shallow stacks (the unwind guard is reserve-relative, so per-region
+capping is unenforced); and `context = task id` bounds a durable domain to ~15 *lifetime* spawns (a dense
+live-context allocator is the fix). JIT parity is 3.3's multi-vCPU follow-up.
+
+Remaining: **multi-vCPU proper** (3.2.2 — the fiber/vCPU context unification, nested spawns, dense
+context allocation; JIT parity) and **Phase 4** back-edge polls for bounded-latency (async) freeze.
 
 #### 3.1 implementation plan (next-session pickup)
 

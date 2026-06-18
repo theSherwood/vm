@@ -253,3 +253,126 @@ fn freeze_refuses_a_non_durable_handle() {
         other => panic!("expected NonDurableHandle refusal, got {other:?}"),
     }
 }
+
+// Multi-vCPU (slice 3.2.1): the root spawns a child over the shared window; both read the (advancing)
+// clock once, then the root joins and sums. Frozen mid-run, the artifact must carry each vCPU's
+// continuation (its own window shadow region) + the control-section residue (spawned vCPUs + the
+// root's extent). The handle stash uses linear memory, so transform on the confined path.
+const SRC_MULTIVCPU: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 65536
+  i32.store v1 v0
+  v2 = i64.const 0
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v2 v3
+  v5 = i32.const 0
+  v6 = cap.call 2 0 (i32) -> (i64) v0 (v5)
+  v7 = thread.join v4
+  v8 = i64.add v6 v7
+  return v8
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65536
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 10
+  v7 = i64.add v5 v6
+  return v7
+}
+"#;
+
+#[test]
+fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
+    let mut m = svm_text::parse_module(SRC_MULTIVCPU).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = svm_durable::transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Baseline: clock 42 → reads {42, 43}; result = 42 + (43 + 10) = 95 (order-invariant sum).
+    let baseline = {
+        let mut host = Host::new();
+        host.set_durable(true);
+        host.clock_ns = 42;
+        let clk = host.grant_clock();
+        let mut fuel = 100_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut host,
+        );
+        r.expect("uninterrupted")
+    };
+    assert_eq!(baseline, vec![Value::I64(95)], "uninterrupted: 42 + (43 + 10)");
+
+    // Freeze run: UNWINDING → both vCPUs unwind into their own regions; capture the window.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    fhost.clock_ns = 42;
+    let clk = fhost.grant_clock();
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 100_000u64;
+    let (frozen, snapshot) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(frozen.is_ok(), "freeze returns a placeholder: {frozen:?}");
+    assert_eq!(fhost.frozen_vcpus().len(), 1, "one spawned vCPU flattened");
+
+    // Serialize the real artifact (carrying the control section's vCPU residue + root extent).
+    let artifact = freeze(&inst, &snapshot, &fhost).expect("freeze");
+
+    // Restore into a FRESH host whose clock has advanced (D-scope: resources aren't in the artifact).
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.clock_ns = 1000; // far past the saved reads; a re-issue would be observable
+    let window = restore(&artifact, &inst, &mut thost).expect("restore");
+    assert_eq!(
+        thost.frozen_vcpus().len(),
+        1,
+        "restore re-seeded the spawned vCPU residue"
+    );
+
+    // §12.6 invariant 1 — canonical: re-serializing the freshly-restored domain reproduces the
+    // artifact byte-for-byte (control section, vCPU residue included).
+    assert_eq!(
+        freeze(&inst, &window, &thost).expect("re-freeze"),
+        artifact,
+        "re-serialize of a restored multi-vCPU domain is byte-identical"
+    );
+
+    // Thaw: REWINDING re-enter. The child is re-spawned and rewinds; the root rewinds, joins, sums.
+    // Both clock reads reload (42, 43 → 95), not re-issue (which would use clock 1000+ → ≠ 95).
+    let mut win = window;
+    write_state(&mut win, STATE_REWINDING);
+    let clk = {
+        let caps = thost.capture_durable_handles().expect("durable");
+        ((caps[0].generation << 8) | caps[0].slot) as i32
+    };
+    let mut fuel = 100_000u64;
+    let (thawed, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(thawed, Ok(baseline), "thawed multi-vCPU run equals the uninterrupted run");
+    assert_eq!(thawed, Ok(vec![Value::I64(95)]), "saved clock reads reloaded, not re-issued");
+}
