@@ -47,8 +47,10 @@ use svm_ir::Module;
 
 /// Container magic (§12.2): "SVM-Durable".
 const MAGIC: &[u8; 4] = b"SVMD";
-/// Format version; bump on an incompatible change (§12.2).
-const FORMAT_VERSION: u16 = 1;
+/// Format version; bump on an incompatible change (§12.2). v2 (recycling step 2): each fiber residue
+/// record carries its **generation** (the high bits of a recycled-slot guest handle), so a thaw
+/// re-seeds a recycled fiber at the generation its handle expects.
+const FORMAT_VERSION: u16 = 2;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -226,6 +228,7 @@ pub fn freeze_with_prots(
                 write_uleb(b, f.func as u32 as u64);
                 write_uleb(b, f.sp as u64);
                 write_uleb(b, f.shadow_sp);
+                write_uleb(b, f.generation as u64); // recycling step 2 (format v2)
             }
             if !vcpus.is_empty() {
                 write_uleb(b, vcpus.len() as u64);
@@ -423,11 +426,13 @@ fn decode_control(
         let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
         let sp = cr.uleb()? as i64;
         let shadow_sp = cr.uleb()?;
+        let generation = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
         fibers.push(FrozenFiber {
             slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
             func,
             sp,
             shadow_sp,
+            generation,
         });
     }
     // Spawned-vCPU residue (slice 3.2.1): present iff the header declares spawned vCPUs.

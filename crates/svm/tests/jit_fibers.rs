@@ -268,3 +268,102 @@ fn fiber_uses_data_stack_and_memory() {
         }\n";
     assert_jit_matches_interp(src);
 }
+
+// ---- Recycling ABA guard, cross-backend (DURABILITY.md §12.8 steps 1/3) ----
+//
+// A fiber guest handle carries a generation in its high bits (`FIBER_GEN_SHIFT == 16`), and
+// `cont.resume` rejects a handle whose generation doesn't match the slot's current one — the ABA
+// guard that makes slot recycling safe. The interpreter pins this directly
+// (`svm-durable/tests/fiber.rs::{forged_fiber_generation_is_rejected,
+// recycling_reuses_a_freed_slot_with_a_bumped_generation}`) and the JIT registry has a unit test
+// (`fiber_registry::claim_gen_rejects_a_stale_generation`); these pin the **wired** JIT path
+// (`cont.resume` → `fiber_resume` → `resolve` + `claim_gen`) against the interpreter oracle, so the
+// generation guard is enforced identically end-to-end on both backends.
+
+/// A genuine handle (slot 0, generation 0) resumes; a forged generation-1 handle for the same slot
+/// (`(1 << 16) | 0 == 65536`, which the slot mask clamps back to slot 0) faults — on both backends.
+#[test]
+fn fiber_forged_generation_faults_identically() {
+    // Genuine handle: the fiber runs and returns 99.
+    assert_jit_matches_interp(
+        "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v4 = i64.const 0\n\
+        \x20 v5, v6 = cont.resume v2 v4\n\
+        \x20 return v6\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 99\n\
+        \x20 return v2\n\
+        }\n",
+    );
+    // Forged handle `(1 << 16) | 0`: same slot 0, generation 1 ≠ 0 ⇒ FiberFault on both backends.
+    assert_jit_matches_interp(
+        "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i32.const 65536\n\
+        \x20 v4 = i64.const 0\n\
+        \x20 v5, v6 = cont.resume v3 v4\n\
+        \x20 return v6\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 99\n\
+        \x20 return v2\n\
+        }\n",
+    );
+}
+
+/// A finished fiber's slot is recycled at a bumped generation: the next `cont.new` reuses slot 0 at
+/// generation 1 (handle `(1 << 16) | 0 == 65536`), and the *stale* generation-0 handle to the former
+/// occupant then faults even though slot 0 is live. Both backends must agree on each.
+#[test]
+fn recycled_slot_generation_guard_agrees() {
+    // Fiber A (slot 0, gen 0) finishes; the next cont.new reuses slot 0 at gen 1 — returning the i32
+    // handle makes the reuse observable (65536). Both backends must produce the same handle.
+    assert_jit_matches_interp(
+        "func () -> (i32) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = cont.new v0 v1\n\
+        \x20 return v6\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 7\n\
+        \x20 return v2\n\
+        }\n",
+    );
+    // After slot 0 is recycled (now gen 1), resuming A's stale gen-0 handle (i32 0) must fault on
+    // both backends — even though slot 0 is live — because the generation no longer matches.
+    assert_jit_matches_interp(
+        "func () -> (i64) {\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = cont.new v0 v1\n\
+        \x20 v9 = i32.const 0\n\
+        \x20 v7, v8 = cont.resume v9 v3\n\
+        \x20 return v8\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 7\n\
+        \x20 return v2\n\
+        }\n",
+    );
+}

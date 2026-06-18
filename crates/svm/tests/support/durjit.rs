@@ -26,14 +26,17 @@
 pub mod durgen;
 
 use core::ffi::c_void;
-use durgen::{gen_module, Gen, SIZE_LOG2, WINDOW};
+use durgen::{gen_module, gen_recycle_fiber_module, Gen, RecycleModule, SIZE_LOG2, WINDOW};
 use svm_durable::{
-    init_durable_window, read_state, transform_module, write_state, SHADOW_SP_OFF, STATE_NORMAL,
-    STATE_REWINDING, STATE_UNWINDING,
+    arm_freeze_after, init_durable_window, read_state, transform_module, write_state,
+    DURABLE_RESERVE, SHADOW_SP_OFF, STATE_NORMAL, STATE_REWINDING, STATE_UNWINDING,
 };
-use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use svm_interp::{run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Trap, Value};
 use svm_ir::{Module, ValType};
-use svm_jit::{compile_and_run_capture_reserved_with_host, JitError, JitOutcome};
+use svm_jit::{
+    compile_and_run_capture_reserved_with_host, compile_and_run_capture_reserved_with_host_durable,
+    FrozenFiber as JitFrozen, JitError, JitOutcome,
+};
 use svm_snapshot::{freeze, restore};
 
 fn from_slot(t: ValType, s: i64) -> Value {
@@ -222,4 +225,151 @@ pub fn fuzz_one_xbackend(g: &mut Gen) {
         STATE_NORMAL,
         "JIT thaw must flip the state word back to NORMAL\n{inst:#?}"
     );
+}
+
+/// Cross-backend recycling freeze/thaw property (recycling step 4): a churn module recycles a slot
+/// to generation > 0, parks the real fiber there, and is frozen **mid-run** via `arm_freeze_after`.
+/// The interpreter and the JIT must flatten the recycled fiber to a **byte-identical** durable
+/// reserve + §12 artifact (residue generation included), and the interp-frozen artifact must **thaw
+/// on the JIT** to the uninterrupted result — the recycled durable round-trip, both backends.
+pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
+    let RecycleModule {
+        module: m,
+        arm,
+        generation,
+    } = gen_recycle_fiber_module(g);
+    let inst = transform_module(&m).expect("an in-scope recycling fiber module must transform");
+    svm_verify::verify_module(&inst).expect("instrumented recycling IR must verify");
+
+    // Interpreter reference: uninterrupted baseline, then the mid-run armed freeze (B parked at the
+    // recycled generation).
+    let base = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut h,
+        );
+        r.expect("generated recycling programs are trap-free")
+    };
+    let (isnap, ihost, ifibers) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let mut win = init_durable_window(WINDOW);
+        arm_freeze_after(&mut win, arm);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) =
+            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+        assert!(
+            r.is_ok(),
+            "interp armed freeze returns a placeholder\n{inst:#?}"
+        );
+        let fibers = h.frozen_fibers().to_vec();
+        (snap, h, fibers)
+    };
+    assert_eq!(
+        (ifibers[0].slot, ifibers[0].generation),
+        (0, generation),
+        "interp froze the recycled slot 0 at the bumped generation\n{inst:#?}"
+    );
+
+    // JIT armed freeze (skip on Unsupported / host allocation pressure, like `jit_run`).
+    let mut jhost = Host::new();
+    let mut jwin = init_durable_window(WINDOW);
+    arm_freeze_after(&mut jwin, arm);
+    let (jout, jsnap, jfibers) = match compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[],
+        &jwin,
+        &[],
+        &[], // freeze: no seed
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+    ) {
+        Ok(t) => t,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => panic!("JIT failed to compile a verified recycling module: {e:?}\n{inst:#?}"),
+    };
+    assert!(
+        matches!(jout, JitOutcome::Returned(_)),
+        "JIT armed freeze returns a placeholder\n{inst:#?}"
+    );
+    assert_eq!(
+        (jfibers[0].slot, jfibers[0].generation),
+        (0, generation),
+        "JIT froze the recycled slot 0 at the bumped generation\n{inst:#?}"
+    );
+
+    // (2) The two backends armed-freeze the recycled fiber into a byte-identical durable reserve...
+    let reserve = DURABLE_RESERVE as usize;
+    assert_eq!(
+        &isnap[..reserve],
+        &jsnap[..reserve],
+        "interp/JIT armed-freeze the recycled fiber into a byte-identical durable reserve\n{inst:#?}"
+    );
+    // ...and through the §12 codec to a byte-identical artifact (residue generation included).
+    let art_i = freeze(&inst, &isnap, &ihost).expect("interp recycle freeze serializes");
+    let mut jhost2 = Host::new();
+    jhost2.set_frozen_fibers(
+        jfibers
+            .iter()
+            .map(|f| InterpFrozen {
+                slot: f.slot,
+                func: f.func,
+                sp: f.sp,
+                shadow_sp: f.shadow_sp,
+                generation: f.generation,
+            })
+            .collect(),
+    );
+    let art_j = freeze(&inst, &jsnap, &jhost2).expect("JIT recycle freeze serializes");
+    assert_eq!(
+        art_i, art_j,
+        "interp/JIT produce a byte-identical §12 artifact for the recycled fiber\n{inst:#?}"
+    );
+
+    // (3) Thaw portability: restore the interp artifact and resume on the JIT — the gen-bearing
+    // handle resolves to the re-seeded fiber, which re-parks; forward execution reproduces `base`.
+    let mut thost = Host::new();
+    let mut thaw_win = restore(&art_i, &inst, &mut thost).expect("recycled artifact restores");
+    write_state(&mut thaw_win, STATE_REWINDING);
+    let seed: Vec<JitFrozen> = thost
+        .frozen_fibers()
+        .iter()
+        .map(|f| JitFrozen {
+            slot: f.slot,
+            func: f.func,
+            sp: f.sp,
+            shadow_sp: f.shadow_sp,
+            generation: f.generation,
+        })
+        .collect();
+    assert_eq!(seed.len(), 1, "the artifact carried the recycled fiber");
+    let mut jhost3 = Host::new();
+    let jthaw = match compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[],
+        &thaw_win,
+        &[],
+        &seed,
+        SIZE_LOG2,
+        svm_run::cap_thunk,
+        &mut jhost3 as *mut Host as *mut c_void,
+    ) {
+        Ok((o, _, _)) => o,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => panic!("JIT failed to thaw the recycled artifact: {e:?}\n{inst:#?}"),
+    };
+    assert_returned_eq(&inst, &base, jthaw, "recycle-thaw");
 }

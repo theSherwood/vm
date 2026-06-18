@@ -76,6 +76,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "durable_recycle"
+path = "fuzz_targets/durable_recycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "durable_recycle_jit"
+path = "fuzz_targets/durable_recycle_jit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wasm_transpile"
 path = "fuzz_targets/wasm_transpile.rs"
 test = false
