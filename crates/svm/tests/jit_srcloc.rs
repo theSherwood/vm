@@ -569,11 +569,13 @@ fn jit_emits_debug_frame_cfi_for_unwinding() {
     assert!(bare.debug_frame_section().is_empty());
 }
 
-/// A function that forces register spills (Stage 4b): thirteen `call` results all kept live across
-/// the summation, so the regalloc must park several of them in CFA-relative stack slots — yielding
-/// `VarMachineLoc::CfaOffset` variable ranges (where `DW_OP_reg` doesn't apply and `DW_OP_fbreg`
-/// does). `func 1` is the trivial callee. Calls are used (not arithmetic on the param) because the
-/// optimizer rematerializes/folds plain computed values, dropping their value labels.
+/// A function that forces register spills (Stage 4b): thirteen `call` results kept live **across a
+/// barrier `call`**, so only the callee-saved registers can carry them across — far fewer than
+/// thirteen on every target (≈5 on x86-64, ≈10 on aarch64) — and the regalloc must park the rest in
+/// CFA-relative stack slots, yielding `VarMachineLoc::CfaOffset` variable ranges (`DW_OP_fbreg`, not
+/// `DW_OP_reg`). All thirteen are labeled, so at least one is guaranteed to spill regardless of
+/// target register file. `func 1` is the trivial callee. Calls are used (not arithmetic on the param)
+/// because the optimizer rematerializes/folds plain computed values, dropping their value labels.
 const SPILL_DBG: &str = r#"
 func (i32) -> (i32) {
 block0(v0: i32):
@@ -590,19 +592,21 @@ block0(v0: i32):
   v11 = call 1(v0)
   v12 = call 1(v0)
   v13 = call 1(v0)
-  v14 = i32.add v1 v2
-  v15 = i32.add v14 v3
-  v16 = i32.add v15 v4
-  v17 = i32.add v16 v5
-  v18 = i32.add v17 v6
-  v19 = i32.add v18 v7
-  v20 = i32.add v19 v8
-  v21 = i32.add v20 v9
-  v22 = i32.add v21 v10
-  v23 = i32.add v22 v11
-  v24 = i32.add v23 v12
-  v25 = i32.add v24 v13
-  return v25
+  v14 = call 1(v0)
+  v15 = i32.add v1 v2
+  v16 = i32.add v15 v3
+  v17 = i32.add v16 v4
+  v18 = i32.add v17 v5
+  v19 = i32.add v18 v6
+  v20 = i32.add v19 v7
+  v21 = i32.add v20 v8
+  v22 = i32.add v21 v9
+  v23 = i32.add v22 v10
+  v24 = i32.add v23 v11
+  v25 = i32.add v24 v12
+  v26 = i32.add v25 v13
+  v27 = i32.add v26 v14
+  return v27
 }
 
 func (i32) -> (i32) {
@@ -615,9 +619,19 @@ block0(v0: i32):
 debug.file 0 "spill.c"
 debug.loc 0 0 1 0 2 5
 debug.type 0 base "int" signed 4
-debug.var 0 "t" ssalist 1 0 0 1 "int" 0
-debug.var 0 "u" ssalist 1 0 1 2 "int" 0
-debug.var 0 "w" ssalist 1 0 2 3 "int" 0
+debug.var 0 "s1" ssalist 1 0 0 1 "int" 0
+debug.var 0 "s2" ssalist 1 0 0 2 "int" 0
+debug.var 0 "s3" ssalist 1 0 0 3 "int" 0
+debug.var 0 "s4" ssalist 1 0 0 4 "int" 0
+debug.var 0 "s5" ssalist 1 0 0 5 "int" 0
+debug.var 0 "s6" ssalist 1 0 0 6 "int" 0
+debug.var 0 "s7" ssalist 1 0 0 7 "int" 0
+debug.var 0 "s8" ssalist 1 0 0 8 "int" 0
+debug.var 0 "s9" ssalist 1 0 0 9 "int" 0
+debug.var 0 "s10" ssalist 1 0 0 10 "int" 0
+debug.var 0 "s11" ssalist 1 0 0 11 "int" 0
+debug.var 0 "s12" ssalist 1 0 0 12 "int" 0
+debug.var 0 "s13" ssalist 1 0 0 13 "int" 0
 "#;
 
 #[test]
