@@ -413,6 +413,12 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   (`jit_trap_backtrace.rs`, unix):* an out-of-bounds store reports a backtrace naming the faulting
   function + line; a callee fault walks the caller chain (`[func1@store, func0@call]`); a
   non-trapping run leaves it empty. Stable under parallel + serial runs.
+- [x] **Differential oracle (the built-in check this slice was premised on).** The interpreter
+  reifies its call stack as `Vec<Frame>` and leaves it intact on a trap (returns `Err` without
+  unwinding), so an `Inspector` driven to the trap exposes the trap-time stack via `backtrace()` — no
+  interpreter changes. A test asserts the JIT's `last_trap_backtrace()` equals the interpreter's
+  frames `(func, file, line)`, innermost first, across both trap families × single/multi-frame. This
+  is the project's standard interp↔JIT differential validation, now closed for trap backtraces.
 - [x] **Stage 2 — explicit-check trap backtrace.** An explicit trap has no signal — the lowered check
   stores its kind and `return`s, unwinding the guest frames — so the capture happens *at the trap
   site*: `emit_trap` (the single origin every explicit trap routes through — div/rem, `unreachable`,
@@ -441,8 +447,9 @@ backtrace mis-renders a kill message, never affects confinement. The capture sta
 in the fault handler (no allocation — a fixed thread-local buffer; symbolization is deferred to the
 host in normal context).
 
-**Progress:** Stages 0–3 **done** — the JIT trap-time backtrace is live for both memory faults *and*
-explicit-check traps, attributed across spawned vCPUs, and folded into the host's kill message (unix;
+**Progress:** Stages 0–3 **done** + the interp↔JIT **differential oracle** wired — the JIT trap-time
+backtrace is live for both memory faults *and* explicit-check traps, attributed across spawned vCPUs,
+folded into the host's kill message, and validated frame-for-frame against the interpreter (unix;
 Windows degrades to empty pending a VEH-side capture). This closes Pillar 2 (W3) on the JIT. Possible
 follow-ups: per-fiber naming under work-stealing migration, and a Windows VEH-side capture.
 

@@ -13,6 +13,7 @@
 
 #![cfg(unix)]
 
+use svm_interp::{Inspector, Stop, Value};
 use svm_ir::DEFAULT_RESERVED_LOG2;
 use svm_jit::{CompiledModule, JitOutcome, Quota, TrapKind, INERT_CAP_THUNK};
 use svm_text::parse_module;
@@ -242,6 +243,59 @@ fn trap_backtrace_attributes_a_spawned_vcpu_trap() {
         bt.iter().any(|f| f.func == 1 && f.line == 50),
         "the trap that originated on the spawned vCPU is symbolized to func1's div line, got {bt:?}"
     );
+}
+
+/// The **differential oracle** the W3 scope was premised on: the JIT's trap-time backtrace must match
+/// the *interpreter's* call stack at the same trap. The interpreter reifies its stack as `Vec<Frame>`
+/// and leaves it intact on a trap (it returns `Err` without unwinding), so an `Inspector` driven to
+/// the trap exposes it via `backtrace()` — no interpreter changes needed. Compares `(func, file,
+/// line)` per frame, innermost first (both engines order that way). Single-threaded guests only (the
+/// `Inspector` is single-threaded); the spawned-vCPU case is covered separately.
+fn assert_jit_backtrace_matches_interp(src: &str, arg: i32) {
+    let m = parse_module(src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+
+    // Interpreter oracle: drive to the trap, read its trap-time call stack.
+    let mut insp = Inspector::attach(&m, 0, &[Value::I32(arg)], u64::MAX);
+    let stop = insp.run_until_stop();
+    assert!(
+        matches!(stop, Stop::Finished(Err(_))),
+        "the guest must trap on the interpreter, got {stop:?}"
+    );
+    let interp: Vec<(u32, String, u32)> = insp
+        .backtrace()
+        .iter()
+        .map(|f| {
+            let s = f
+                .source
+                .as_ref()
+                .expect("each guest frame carries a source loc under -g");
+            (f.pc.func, s.file.clone(), s.line)
+        })
+        .collect();
+
+    // JIT under test.
+    let mut cm = compile(src);
+    cm.run(&[arg as i64], None, None, None).expect("run");
+    let jit: Vec<(u32, String, u32)> = cm
+        .last_trap_backtrace()
+        .iter()
+        .map(|f| (f.func, f.file.clone(), f.line))
+        .collect();
+
+    assert_eq!(
+        jit, interp,
+        "JIT trap backtrace must match the interpreter oracle for:\n{src}"
+    );
+}
+
+#[test]
+fn jit_trap_backtrace_matches_the_interpreter_oracle() {
+    // Both trap families (memory fault + explicit check), single- and multi-frame.
+    assert_jit_backtrace_matches_interp(STORE_OOB_DBG, 0);
+    assert_jit_backtrace_matches_interp(CALL_THEN_FAULT_DBG, 0);
+    assert_jit_backtrace_matches_interp(DIV_BY_ZERO_DBG, 7);
+    assert_jit_backtrace_matches_interp(CALL_THEN_DIV_DBG, 7);
 }
 
 #[test]
