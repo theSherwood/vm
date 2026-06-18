@@ -1325,6 +1325,35 @@ impl CompiledModule {
         &self.src_ranges
     }
 
+    /// A backtrace of a **suspended fiber** (W5 JIT/DWARF Stage 4c — the W3-JIT fiber-rooted stack
+    /// walk). Rooted at a fiber *handle* (§23/D57 migratable fibers, not the OS thread), it scans the
+    /// parked fiber's live control stack `[ctx, top)` low→high (innermost frame first) and symbolizes
+    /// every word that lands in this module's JIT'd guest code — each is a return address, i.e. a
+    /// guest call frame. A conservative scan (like the GC-root walk) rather than a frame-pointer
+    /// chase, so it is robust to the host runtime glue sitting between the guest frames and the
+    /// suspend switch. Adjacent duplicate positions are collapsed. Empty if `handle` names no parked
+    /// fiber or the module carried no `-g`. Host-side tooling, off the running guest's path (§2a).
+    #[cfg(fiber_rt)]
+    pub fn fiber_backtrace(&self, handle: i32) -> Vec<JitFrameLoc> {
+        let Some(table) = self.fiber_table.as_ref() else {
+            return Vec::new();
+        };
+        table
+            .with_parked_stack(handle, |stack| {
+                let mut frames: Vec<JitFrameLoc> = Vec::new();
+                for w in stack.chunks_exact(8) {
+                    let pc = u64::from_le_bytes(w.try_into().unwrap()) as usize;
+                    if let Some(loc) = self.symbolize(pc) {
+                        if frames.last() != Some(&loc) {
+                            frames.push(loc);
+                        }
+                    }
+                }
+                frames
+            })
+            .unwrap_or_default()
+    }
+
     /// The per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a): for each `-g` source
     /// variable whose value the JIT could track, the `[lo, hi)` machine ranges over which it lives in
     /// a register or CFA-relative slot. The seed for the Stage 3c `DW_AT_location` loclists. Empty

@@ -774,11 +774,11 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     a `debug.var`). Vars the optimizer dropped correctly show `<optimized out>` (faithful native
     behavior — the interpreter tier stays the always-faithful inspection fallback). *Effort (whole
     stage): high.*
-- [~] **Stage 4 — W3-JIT unwind / backtrace. — `bt` + spilled vars work (4a/4b done); fiber walk
-  pending.** Emit Cranelift unwind info as DWARF CFI so gdb can unwind JIT'd frames (`bt`) and compute
-  the CFA (which also lit up the spilled, frame-relative variable locations). The fiber-rooted walk
-  (§23/D57 migratable fibers) is the runtime-specific finale. ✅ **`bt` across guest frames with source
-  and `print` of a spilled variable both confirmed under gdb 15.1.**
+- [x] **Stage 4 — W3-JIT unwind / backtrace. — built.** DWARF CFI (`.debug_frame`) so gdb unwinds
+  JIT'd frames (`bt`) and computes the CFA (4a); spilled variables as `DW_OP_fbreg` against that CFA
+  (4b); and a host-side fiber-rooted backtrace of a suspended fiber's guest stack (4c). ✅ **`bt`
+  across guest frames with source and `print` of a spilled variable both confirmed under gdb 15.1;
+  the per-fiber walk is CI-tested.**
   - [x] **4a — `.debug_frame` CFI + `DW_AT_frame_base`. — built.** `dwarf::debug_frame` hand-rolls a
     `.debug_frame` (one DWARF v4 CIE with the steady-state frame-pointer rules — CFA = `rbp+16`,
     return address at CFA−8, saved `rbp` at CFA−16, valid because `preserve_frame_pointers=true` gives
@@ -804,10 +804,17 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     compile-time/frame-independent address (the window base is a per-run pointer; globals have no
     frame), so they need a different mechanism (a runtime base registered with gdb, or a JIT reader
     plugin) rather than static DWARF.
-  - [ ] **4c — fiber-rooted backtrace.** Walk the out-of-band control stack rooted at a **fiber
-    handle** (not the OS thread — §23/D57 migratable fibers) to materialize a per-fiber call stack
-    with source frames across suspend/resume boundaries. *Acceptance:* `bt` shows the guest call stack
-    with source for a suspended fiber. *Effort (whole stage): med–high.*
+  - [x] **4c — fiber-rooted backtrace. — built.** `CompiledModule::fiber_backtrace(handle)` walks a
+    **suspended fiber's** out-of-band control stack — rooted at the fiber *handle* (§23/D57 migratable
+    fibers), not the OS thread. The fiber runtime exposes the parked stack via
+    `SharedFiberTable::with_parked_stack` (the slot lock held, only for a fiber not running on a vCPU;
+    `Fiber::ctx` is the saved SP, `parked_extent()` gives `[ctx, top)`); the walk conservatively scans
+    that region low→high (innermost first) and symbolizes every word that lands in this module's guest
+    code — robust to the host runtime glue between the guest frames and the suspend switch (the
+    GC-root-scan precedent), no fragile frame-pointer chase. Test (`jit_fibers.rs`): a fiber entry
+    calls a helper that `suspend`s; the root resumes once and returns, leaving it parked; the
+    backtrace is exactly `[helper @ fib.c:9 (innermost), entry @ fib.c:5]`, and a module with no
+    created fiber yields an empty walk. *Effort (whole stage): med–high.*
 - [ ] **Stage 5 — DAP-over-JIT (optional; editor parity at native speed).** Either drive the JIT
   under `svm-dap` (breakpoints via software `int3` patching or single-step over DWARF line
   boundaries) so VS Code debugs native-speed code, **or** keep the interpreter as the DAP stepping

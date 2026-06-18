@@ -252,6 +252,33 @@ impl SharedFiberTable {
         Some(Arc::clone(&t[slot]))
     }
 
+    /// Run `f` over a **parked** fiber's live control-stack bytes `[ctx, top)` (W5 JIT/DWARF Stage 4c:
+    /// the fiber-rooted backtrace). `None` if `handle` resolves to no live fiber, or to one currently
+    /// *running* on a vCPU (whose saved `ctx` is stale and does not bound its frames). The slot's
+    /// fiber lock is held across `f`, so the fiber cannot be resumed underneath it. Host-side tooling,
+    /// off the runtime path (§2a) — only reads the parked stack.
+    pub(crate) fn with_parked_stack<R>(
+        &self,
+        handle: i32,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        let slot = self.resolve(handle)?;
+        if slot.running_on.load(Ordering::Acquire) != NOT_RUNNING {
+            return None; // a running fiber's `ctx` is the stale pre-resume context (see parked_extent)
+        }
+        let guard = slot.fiber.lock().unwrap_or_else(|e| e.into_inner());
+        let fib = guard.as_ref()?;
+        if fib.is_done() {
+            return None;
+        }
+        let (lo, hi) = fib.parked_extent();
+        let len = (hi as usize).checked_sub(lo as usize)?;
+        // SAFETY: the fiber is parked and its lock is held, so `[lo, hi)` is a stable, mapped region
+        // of its control stack (the live frames) for the duration of `f`; we only read it.
+        let bytes = unsafe { std::slice::from_raw_parts(lo, len) };
+        Some(f(bytes))
+    }
+
     /// The handles of every **voluntarily-suspended** (`RUNNABLE`) fiber — the parked fibers the
     /// durable freeze driver flattens (DURABILITY.md §12.8). Collected once: flattening a fiber
     /// makes zero forward progress (its post-suspend poll unwinds immediately), so it spawns no new
