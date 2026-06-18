@@ -942,3 +942,477 @@ fn private_rename_allows_dynamic_heap_access() {
         Ok(vec![Value::I64(107)])
     );
 }
+
+// ===========================================================================================
+// Cross-function `call`: a direct call (and a `return_call` tail call) is inlined at the call
+// site — the callee's CFG is traced in the caller's context, sharing the same abstract memory,
+// so the call disappears and the callee's residual is spliced in. The callee must trace as a
+// single straight-line path (its internal branches resolve statically; static recursion unrolls);
+// a callee whose control flow stays dynamic returns `Unsupported`.
+// ===========================================================================================
+
+/// No direct or tail call survives in the residual — every call was inlined.
+fn assert_no_calls(residual: &Module) {
+    for block in &residual.funcs[0].blocks {
+        assert!(
+            !block.insts.iter().any(|i| matches!(i, Inst::Call { .. })),
+            "residual still contains a direct call — not inlined"
+        );
+        assert!(
+            !matches!(block.term, Terminator::ReturnCall { .. }),
+            "residual still contains a tail call — not inlined"
+        );
+    }
+}
+
+fn imul(a: u32, b: u32) -> Inst {
+    Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Mul,
+        a,
+        b,
+    }
+}
+
+#[test]
+fn inlines_direct_call_leaf_helper() {
+    // main(x) = square(square(x)) = x^4 ; square(a) = a * a. Both calls inline to plain muls.
+    let m = Module {
+        funcs: vec![
+            // 0: main(x) -> i64
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::Call {
+                            func: 1,
+                            args: vec![0],
+                        }, // 1: square(x)
+                        Inst::Call {
+                            func: 1,
+                            args: vec![1],
+                        }, // 2: square(square(x))
+                    ],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            // 1: square(a) -> i64
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: a
+                    insts: vec![imul(0, 0)],    // 1: a*a
+                    term: Terminator::Return(vec![1]),
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+
+    for x in [0i64, 1, 2, -3, 7, 1000, i64::MIN] {
+        let s = x.wrapping_mul(x);
+        let expect = s.wrapping_mul(s);
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)]),
+            "residual diverged at x={x}"
+        );
+        // The inlined residual also JIT-compiles to native.
+        let jit = match svm_jit::compile_and_run(&residual, 0, &[x]) {
+            Ok(svm_jit::JitOutcome::Returned(v)) => v[0],
+            o => panic!("unexpected jit outcome {o:?}"),
+        };
+        assert_eq!(jit, expect, "jit residual at x={x}");
+    }
+}
+
+#[test]
+fn inlines_static_recursion_unrolled() {
+    // main(base) = pow(base, 3) ; pow(b, e) = if e == 0 { 1 } else { b * pow(b, e - 1) }.
+    // The exponent is static, so the recursion and its base-case test resolve at every level and
+    // the whole thing unrolls into base * base * base * 1 — no call, no branch.
+    let m = Module {
+        funcs: vec![
+            // 0: main(base)
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: base
+                    insts: vec![
+                        Inst::ConstI64(3), // 1: e = 3
+                        Inst::Call {
+                            func: 1,
+                            args: vec![0, 1],
+                        }, // 2: pow(base, 3)
+                    ],
+                    term: Terminator::Return(vec![2]),
+                }],
+            },
+            // 1: pow(b, e)
+            Func {
+                params: vec![ValType::I64, ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![
+                    // block 0(b, e): branch on e == 0
+                    Block {
+                        params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
+                        insts: vec![
+                            Inst::ConstI64(0), // 2
+                            Inst::IntCmp {
+                                ty: IntTy::I64,
+                                op: CmpOp::Eq,
+                                a: 1,
+                                b: 2,
+                            }, // 3: e == 0
+                        ],
+                        term: Terminator::BrIf {
+                            cond: 3,
+                            then_blk: 1,
+                            then_args: vec![],
+                            else_blk: 2,
+                            else_args: vec![0, 1],
+                        },
+                    },
+                    // block 1(): base case -> 1
+                    Block {
+                        params: vec![],
+                        insts: vec![Inst::ConstI64(1)], // 0
+                        term: Terminator::Return(vec![0]),
+                    },
+                    // block 2(b, e): b * pow(b, e - 1)
+                    Block {
+                        params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
+                        insts: vec![
+                            Inst::ConstI64(1), // 2
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Sub,
+                                a: 1,
+                                b: 2,
+                            }, // 3: e - 1
+                            Inst::Call {
+                                func: 1,
+                                args: vec![0, 3],
+                            }, // 4: pow(b, e - 1)
+                            imul(0, 4),        // 5: b * rec
+                        ],
+                        term: Terminator::Return(vec![5]),
+                    },
+                ],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+    // No data-dependent branch survives: the unrolled body is straight-line.
+    assert!(residual.funcs[0]
+        .blocks
+        .iter()
+        .all(|b| matches!(b.term, Terminator::Return(_))));
+
+    for base in [0i64, 1, 2, -3, 5, 11] {
+        let expect = base.wrapping_mul(base).wrapping_mul(base);
+        assert_eq!(run(&m, &[Value::I64(base)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(base)]),
+            Ok(vec![Value::I64(expect)]),
+            "residual diverged at base={base}"
+        );
+    }
+}
+
+#[test]
+fn inlines_direct_tail_call() {
+    // main(x) = return_call dbl(x) ; dbl(a) = a + a. The tail call becomes a plain return.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![],
+                    term: Terminator::ReturnCall {
+                        func: 1,
+                        args: vec![0],
+                    },
+                }],
+            },
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: a
+                    insts: vec![Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Add,
+                        a: 0,
+                        b: 0,
+                    }], // 1: a + a
+                    term: Terminator::Return(vec![1]),
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize(&m, 0, &[SpecArg::Dynamic]).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_calls(&residual);
+
+    for x in [0i64, 3, -7, 1000] {
+        let expect = x.wrapping_add(x);
+        assert_eq!(run(&m, &[Value::I64(x)]), Ok(vec![Value::I64(expect)]));
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
+
+#[test]
+fn dynamic_branch_in_callee_is_unsupported() {
+    // main(x) = pick(x) ; pick(a) = if a != 0 { a * 2 } else { a + 1 }. With `a` dynamic the
+    // callee's branch can't be traced straight-line, so the inline gives up (Unsupported). With a
+    // *static* argument the branch resolves and the call inlines.
+    let m = Module {
+        funcs: vec![
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![Inst::Call {
+                        func: 1,
+                        args: vec![0],
+                    }], // 1
+                    term: Terminator::Return(vec![1]),
+                }],
+            },
+            Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![
+                    Block {
+                        params: vec![ValType::I64], // 0: a
+                        insts: vec![
+                            Inst::ConstI64(0), // 1
+                            Inst::IntCmp {
+                                ty: IntTy::I64,
+                                op: CmpOp::Ne,
+                                a: 0,
+                                b: 1,
+                            }, // 2: a != 0
+                        ],
+                        term: Terminator::BrIf {
+                            cond: 2,
+                            then_blk: 1,
+                            then_args: vec![0],
+                            else_blk: 2,
+                            else_args: vec![0],
+                        },
+                    },
+                    Block {
+                        params: vec![ValType::I64],                 // 0: a
+                        insts: vec![Inst::ConstI64(2), imul(0, 1)], // 1, 2: a * 2
+                        term: Terminator::Return(vec![2]),
+                    },
+                    Block {
+                        params: vec![ValType::I64], // 0: a
+                        insts: vec![
+                            Inst::ConstI64(1), // 1
+                            Inst::IntBin {
+                                ty: IntTy::I64,
+                                op: BinOp::Add,
+                                a: 0,
+                                b: 1,
+                            }, // 2: a + 1
+                        ],
+                        term: Terminator::Return(vec![2]),
+                    },
+                ],
+            },
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    assert_eq!(
+        specialize(&m, 0, &[SpecArg::Dynamic]),
+        Err(svm_peval::SpecError::Unsupported)
+    );
+
+    // Static argument: a = 5 -> the `a != 0` test resolves true -> 5 * 2 = 10, no call left.
+    let folded = specialize(&m, 0, &[SpecArg::ConstI64(5)]).expect("static arg inlines");
+    verify_module(&folded).expect("residual re-verifies");
+    assert_no_calls(&folded);
+    assert_eq!(run(&folded, &[]), Ok(vec![Value::I64(10)]));
+}
+
+// A call-threaded variant of the accumulator interpreter: the per-opcode arithmetic is factored
+// into helper functions invoked by `call` from inside the dispatch loop. Specialization must fold
+// the dispatch *and* inline the helpers, leaving the bare compiled program.
+fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
+    let i64t = || ValType::I64;
+    let load = |op, addr, offset| Inst::Load {
+        op,
+        addr,
+        offset,
+        align: 0,
+    };
+    let add = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+
+    // entry / header / halt / set are identical to `build_interpreter`.
+    let entry = Block {
+        params: vec![i64t()],
+        insts: vec![Inst::ConstI64(0), Inst::ConstI64(0)], // 1: acc, 2: pc
+        term: Terminator::Br {
+            target: 1,
+            args: vec![1, 2, 0],
+        },
+    };
+    let header = Block {
+        params: vec![i64t(), i64t(), i64t()], // 0: acc, 1: pc, 2: input
+        insts: vec![
+            Inst::ConstI64(0),          // 3: base
+            add(3, 1),                  // 4: addr
+            load(LoadOp::I32_8U, 4, 0), // 5: op
+            load(LoadOp::I64, 4, 1),    // 6: imm
+        ],
+        term: Terminator::BrTable {
+            idx: 5,
+            targets: vec![
+                (2, vec![0]),          // HALT  -> halt(acc)
+                (3, vec![0, 1, 6, 2]), // SETI  -> set
+                (4, vec![0, 1, 6, 2]), // ADDI  -> add
+                (5, vec![0, 1, 6, 2]), // MULI  -> mul
+                (6, vec![0, 1, 6, 2]), // ADDIN -> addin
+            ],
+            default: (2, vec![0]),
+        },
+    };
+    let halt = Block {
+        params: vec![i64t()],
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    let set = Block {
+        params: vec![i64t(), i64t(), i64t(), i64t()],
+        insts: vec![Inst::ConstI64(9), add(1, 4)], // 4, 5: npc
+        term: Terminator::Br {
+            target: 1,
+            args: vec![2, 5, 3],
+        },
+    };
+
+    // The three arithmetic bodies route the accumulator update through a helper `call`.
+    // params: 0: acc, 1: pc, 2: imm, 3: input. The call result (nacc) lands at index 4.
+    let call_step = |callee: u32, arg: u32| Block {
+        params: vec![i64t(), i64t(), i64t(), i64t()],
+        insts: vec![
+            Inst::Call {
+                func: callee,
+                args: vec![0, arg],
+            }, // 4: nacc
+            Inst::ConstI64(9), // 5
+            add(1, 5),         // 6: npc
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![4, 6, 3],
+        },
+    };
+    let add_blk = call_step(1, 2); // ADDI:  f_add(acc, imm)
+    let mul_blk = call_step(2, 2); // MULI:  f_mul(acc, imm)
+    let addin_blk = call_step(1, 3); // ADDIN: f_add(acc, input)
+
+    let helper = |op| Func {
+        params: vec![i64t(), i64t()],
+        results: vec![i64t()],
+        blocks: vec![Block {
+            params: vec![i64t(), i64t()], // 0: a, 1: b
+            insts: vec![Inst::IntBin {
+                ty: IntTy::I64,
+                op,
+                a: 0,
+                b: 1,
+            }], // 2
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+
+    Module {
+        funcs: vec![
+            Func {
+                params: vec![i64t()],
+                results: vec![i64t()],
+                blocks: vec![entry, header, halt, set, add_blk, mul_blk, addin_blk],
+            },
+            helper(BinOp::Add), // func 1
+            helper(BinOp::Mul), // func 2
+        ],
+        memory: Some(Memory { size_log2: 16 }),
+        data: vec![Data {
+            offset: 0,
+            readonly: true,
+            bytes: encode(program),
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn inlines_calls_in_specialized_dispatch_loop() {
+    // acc = ((10 + 5) + input) * 3, with every arithmetic step issued as a helper `call`.
+    let program = [(SETI, 10), (ADDI, 5), (ADDIN, 0), (MULI, 3), (HALT, 0)];
+    let interp = build_call_interpreter(&program);
+    verify_module(&interp).expect("interpreter verifies");
+
+    let residual = specialize(&interp, 0, &[SpecArg::Dynamic]).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    let opt = optimize_module(&residual);
+    verify_module(&opt).expect("optimized residual re-verifies");
+
+    // Both the dispatch table and the helper calls are gone.
+    assert_no_dispatch_left(&residual);
+    assert_no_calls(&residual);
+    // After cleanup the whole program is a single straight-line block: input -> +15 -> *3.
+    assert_eq!(opt.funcs[0].blocks.len(), 1);
+
+    for input in [0i64, 1, 2, -5, 100, i64::MIN] {
+        let expect = (15i64.wrapping_add(input)).wrapping_mul(3);
+        assert_eq!(
+            run(&interp, &[Value::I64(input)]),
+            Ok(vec![Value::I64(expect)])
+        );
+        assert_eq!(
+            run(&residual, &[Value::I64(input)]),
+            Ok(vec![Value::I64(expect)]),
+            "residual diverged at input={input}"
+        );
+        assert_eq!(
+            run(&opt, &[Value::I64(input)]),
+            Ok(vec![Value::I64(expect)])
+        );
+    }
+}
