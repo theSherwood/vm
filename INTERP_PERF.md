@@ -134,6 +134,18 @@ the seams intact), then evaluate (B) as a stretch once (A)'s ceiling is measured
 See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place wins.
 
 ### Phase 1 — compile pass + per-block bytecode (shape A)
+
+> **ROI spike (done — `crates/svm/tests/bytecode_spike.rs`):** a self-contained flat-bytecode
+> compiler+executor for the ALU kernel measured **~3.5× faster** than the tree-walker (62.5 → 17.9
+> ns/iter), *keeping the per-op fuel check, under `forbid(unsafe)`*. The win comes from a flat op
+> array (no `frames[top]` indexing, no per-block re-resolution), a preallocated **global-slot**
+> register file (each SSA value a function-wide slot → no per-edge `Vec`/swap, no `push`), branches
+> copying straight into the target block's param slots, and a small dispatch enum. The integrated
+> version must use 16-byte `Reg` and keep *all* seams, so it'll land higher than 17.9 ns — but even at
+> 2× the spike this is a large, clearly worthwhile win (it revises the earlier ≤1.8× guess up). The
+> global-slot model is the main departure from today's per-frame `Vec<Reg>` and is what the real
+> compiler must adopt.
+
 - Add a `compile` step: per function, a cached `Program` of per-block compiled ops. Each op carries
   pre-resolved operand **slot offsets**, its result slot, and (for terminators) resolved block
   targets. Built once per run (indexed by `FuncIdx`), reusing `svm_verify` types for slot widths.
@@ -197,7 +209,8 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
 ## Phase tracker
 
 - [x] **Phase 0** — contained in-place wins (PR #52). alu ~319 → ~66 ns (~5×).
-- [ ] **Phase 1** — compile pass + per-block resolved bytecode (shape A) + equality harness.
+- [~] **Phase 1** — compile pass + resolved bytecode (shape A) + equality harness.
+      ROI spike done (~3.5× on ALU, `bytecode_spike.rs`); full seam-preserving integration next.
 - [ ] **Phase 2** — memory-op specialization + software fast-path.
 - [ ] **Phase 3** — per-op seam overhead (fuel-at-back-edges if provably safe; debug/preempt hoist).
 - [ ] **Phase 4** — (stretch) fully flat bytecode + threaded dispatch.
