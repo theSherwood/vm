@@ -851,15 +851,24 @@ generally useful (any frontend's `-O2` hits them):
       evaluator (slice AL — + `*.with.overflow` intrinsics and `i64` switches). Auto-vectorization is
       disabled (SIMD is §17); `--edition 2021`. Broaden (`Result`/`?`, `BTreeMap`, generics with
       bounds, `&mut` aliasing) as gaps surface.
-- [~] **SIMD / auto-vectorization** (slice AN — first light). The breadth lanes disable vectorization;
-      ingesting *real* `-O2` vectorized output is its own arc. **Integer reductions land:** a `<4 x i32>`
-      lane op lowers to `v128` (`VIntBin i32x4` for `add`/`sub`/`mul`, whole-vector `VBitBin` for
-      `and`/`or`/`xor`; `bin_ty` returns a harmless `I32` so the pre-`bin` width probe doesn't choke on
+- [~] **SIMD / auto-vectorization — `i32x4` lands; full ingestion is blocked on vector legalization**
+      (slices AN/AO). The on-ramp ingests `-O2`-auto-vectorized **`i32x4`** code: a `<4 x i32>` lane op →
+      `v128` (`VIntBin` for `add`/`sub`/`mul`/`smax`/`smin`/`umax`/`umin`, whole-vector `VBitBin` for
+      `and`/`or`/`xor`; `bin_ty` yields a harmless `I32` so the pre-`bin` width probe doesn't choke on
       `v128`), and `llvm.vector.reduce.{add,mul,and,or,xor,smax,smin,umax,umin}.v4i32` unrolls to a lane
-      fold (extract + scalar combine). Test: `simd_int_reduction_first_light` — a `noinline` int `sum`
-      vectorizes to `<4 x i32>` + `reduce.add`, `run(7) = 2610` (exit `50`) vs native. *Next:* wider
-      shapes (`<16 x i8>`/`<8 x i16>`/`<2 x i64>`), float reductions (`fadd`/`fmul`), vector
-      `icmp`/`select`/shifts, and re-enabling vectorization on the C/C++/Rust lanes.
+      fold (extract + scalar combine / `cmp`+`select`). Tests (a `check_vectorized_vs_native` harness,
+      vectorization *enabled*): `simd_int_reduction_first_light` (sum → `reduce.add`, `2610`/exit `50`),
+      `simd_int_max_reduction` (max → `reduce.smax`), both vs native.
+      - **Blocker — fixed-128 `v128` vs LLVM's arbitrary-width vectors.** Enabling vectorization on the
+        breadth lanes shows the corpus emits vectors **wider than 128 bits** (`<16 x i32>` = 512-bit,
+        `<16 x i64>`, `<4 x i64>`) plus assorted shapes (`<8 x i8>`, `<2 x i64>`, `<16 x i8>`). LLVM's
+        `-O2` vectorizer produces these "virtual" wide vectors expecting the backend's **type-
+        legalization** to split them into legal-width chunks; svm-ir's `v128` is fixed-128, so ingesting
+        them needs a legalization/splitting pass — a large separate effort (the SelectionDAG analog). So
+        the C/C++/Rust breadth lanes **keep `-fno-*-vectorize`** (the correct fail-closed posture), and
+        full auto-vec ingestion is deferred behind that pass. Bounded follow-ups within 128 bits: the
+        other shapes (`i8x16`/`i16x8`/`i64x2`, via a general `is_vec128` + shape-aware lowering), `fadd`/
+        `fmul` reductions (need `-ffast-math`; not emitted by plain `-O2`), vector `icmp`/`select`.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 - [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`

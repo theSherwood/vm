@@ -3431,6 +3431,25 @@ fn lower_int_intrinsic(
         return Ok(None);
     }
     let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
+    // A `<4 x i32>` min/max (auto-vectorized) lowers to the lane-wise `VIntBin` (§17); the other
+    // bit intrinsics have no vector form here. (Float vector min/max go through the float path.)
+    if is_vec4(args[0].get_type(types).as_ref()) {
+        let op = match base {
+            "llvm.smax" => svm_ir::VIntBinOp::MaxS,
+            "llvm.smin" => svm_ir::VIntBinOp::MinS,
+            "llvm.umax" => svm_ir::VIntBinOp::MaxU,
+            "llvm.umin" => svm_ir::VIntBinOp::MinU,
+            other => return unsup(format!("vector `{other}` (only min/max)")),
+        };
+        let a = ctx.operand(args[0])?;
+        let b = ctx.operand(args[1])?;
+        return Ok(Some(ctx.push(Inst::VIntBin {
+            shape: svm_ir::VShape::I32x4,
+            op,
+            a,
+            b,
+        })));
+    }
     let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
     let cmp_select = |ctx: &mut BlockCtx, op: CmpOp| -> Result<ValIdx, Error> {
         let a = ctx.operand(args[0])?;

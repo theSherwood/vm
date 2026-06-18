@@ -2837,3 +2837,23 @@ fn simd_int_reduction_first_light() {
         int main(void) { return run(7); }\n";
     check_vectorized_vs_native("simd_reduce", src, 7);
 }
+
+/// SIMD — an auto-vectorized **max reduction** (`llvm.vector.reduce.smax.v4i32`, + any `<4 x i32>`
+/// lane `smax`). `run(seed)` fills a global with a wave of values and takes the max, vs native —
+/// exercising the min/max reduce fold (`cmp`+`select`).
+#[test]
+fn simd_int_max_reduction() {
+    let src = "int amax(const int *a, int n);\n\
+        static int data[24];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 24; i++) data[i] = ((i * 7 + seed) & 31) - 13;\n\
+        \x20 return amax(data, 24) + 20;\n\
+        }\n\
+        __attribute__((noinline)) int amax(const int *a, int n) {\n\
+        \x20 int m = a[0];\n\
+        \x20 for (int i = 1; i < n; i++) if (a[i] > m) m = a[i];\n\
+        \x20 return m;\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check_vectorized_vs_native("simd_max", src, 3);
+}
