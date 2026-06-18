@@ -811,10 +811,21 @@ sequenced slice:
      `MAX_FIBERS = 1<<16`); `cont.resume`'s `claim` rejects a generation mismatch. All generations are 0
      until step 3, so a handle is exactly its slot — byte-identical to before and to the JIT. Pinned by
      `svm-durable/tests/fiber.rs::forged_fiber_generation_is_rejected`. Cross-backend parity unaffected.
-   - **[ ] JIT side remaining.** `svm-jit/src/fiber_registry.rs` already bumps a generation on `finish`
-     (`recycle_owned` staged/unwired) but `claim` takes the generation from the *current* word — switch
-     resume-by-handle to a generation-checked claim (`try_steal`-style) using the handle's generation,
-     and have `cont.new` emit `(generation << FIBER_GEN_SHIFT) | slot`. Needs a loom re-check.
+   - **[~] JIT side done.** `svm-jit`'s `fiber_rt` `cont.new` now emits `(generation << FIBER_GEN_SHIFT)
+     | slot` (`generation()` of the fresh slot — 0) and `cont.resume` claims via the new generation-
+     checked `Ownership::claim_gen(handle_gen)` instead of `claim` (which read the generation from the
+     current word and so couldn't reject a stale handle). Behavior-preserving at generation 0
+     (handle == slot); cross-backend parity verified (`durable_jit`/`durable_fibers_jit` byte-identical).
+     Loom re-checked: `loom_claim_gen_is_exclusive_across_threads` (single-owner still holds — the
+     generation check only *adds* a reject), plus `claim_gen_rejects_a_stale_generation` /
+     `claim_gen_matches_claim_at_generation_zero`. `claim` is retained (`#[allow(dead_code)]`) as the
+     ungated primitive + ABA characterization.
+
+   With step 1 complete on both backends, **step 3** (recycle-on-finish) can wire `recycle_owned` on the
+   live path: a finished slot's generation is already bumped, the handle carries it, and the claim
+   rejects stale handles — so reuse is now ABA-safe. Remaining within step 1's spirit: the JIT freeze
+   driver's `runnable_handles()`/`fiber_region_base(handle as usize)` still treat the handle as the raw
+   slot (correct only at generation 0); step 3 must encode/extract there once generations can be nonzero.
 2. **Snapshot format: carry generations.** The control-section fiber/vCPU residue records each entity's
    generation so a thaw re-establishes the same handle namespace. Bump `FORMAT_VERSION` (or gate behind
    "any recycled slot") to keep pre-recycling artifacts byte-identical.

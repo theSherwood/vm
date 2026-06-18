@@ -104,6 +104,23 @@ fn fiber_region_base(slot: usize) -> u64 {
     SHADOW_BASE + (slot as u64 + 1) * SHADOW_STRIDE
 }
 
+/// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
+/// (recycling step 1). MUST match `svm_interp`'s `FIBER_GEN_SHIFT` — the handle namespace is
+/// cross-backend, so a frozen handle means the same on both. `MAX_FIBERS` bounds a slot to the low 16
+/// bits. A handle is `(generation << FIBER_GEN_SHIFT) | slot`; a fresh slot's generation is 0, so a
+/// non-recycled run's handle is exactly its slot (byte-identical to before this slice and to the interp).
+const FIBER_GEN_SHIFT: u32 = 16;
+
+/// Encode a fiber guest handle from its registry `slot` and (16-bit-truncated) `generation`.
+fn fiber_handle(slot: usize, generation: u64) -> i32 {
+    (((generation as u32) << FIBER_GEN_SHIFT) | slot as u32) as i32
+}
+
+/// The generation a guest fiber handle carries (its high bits above the slot).
+fn fiber_handle_generation(handle: i32) -> u64 {
+    ((handle as u32) >> FIBER_GEN_SHIFT) as u64
+}
+
 /// Read the active shadow-SP word from the durable window. `mem_base` is the window's host base.
 /// # Safety: only called on a durable run, where `[SHADOW_SP_OFF, +8)` is committed RW reserve.
 unsafe fn read_shadow_sp(mem_base: u64) -> u64 {
@@ -218,7 +235,9 @@ impl SharedFiberTable {
             func,
             sp,
         }));
-        Some(slot as i32)
+        // The guest handle carries the slot's generation (recycling step 1); a fresh slot is
+        // generation 0, so this is exactly `slot` until recycling is wired.
+        Some(fiber_handle(slot, t[slot].own.generation()))
     }
 
     /// Durable **thaw** re-seeding (DURABILITY.md §12.8 slice 3.3.3): re-create a frozen fiber at
@@ -514,8 +533,11 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         // **The 3c claim:** any vCPU may resume a fresh (`OWNED`) or suspended (`RUNNABLE`) fiber;
         // the acquire CAS arbitrates — exactly one racing claimant wins, and the winner
         // synchronizes-with the suspending thread's release, so the saved stack context is fully
-        // visible even when *another* OS thread suspended it (the migration edge).
-        if !slot.own.claim() {
+        // visible even when *another* OS thread suspended it (the migration edge). The claim is
+        // **generation-checked** (recycling step 1): the generation carried in the guest handle must
+        // match the slot's, so a stale handle to a recycled slot's former occupant faults. All
+        // generations are 0 until recycling is wired, so this equals the old `claim()` (handle == slot).
+        if !slot.own.claim_gen(fiber_handle_generation(handle)) {
             fault(trap_out);
             *status_out = 1;
             return 0;
