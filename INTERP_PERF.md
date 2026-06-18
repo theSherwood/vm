@@ -304,12 +304,25 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               multi-suspend loop, forged-resume fault, root-suspend fault) — all bit-identical to
               `run`. **Migration** (a fiber resumed on a *different* vCPU) needs the thread pool, so it
               rides on 1c-5c.
-        - [ ] **1c-5c** — threads (`thread.spawn`/`join`) + `memory.wait`/`notify`: `Vm` as a
-              schedulable task in the M:N executor (`drive`/`Scheduler`) + fiber migration. Harness:
-              concurrent-outcome equality (DPOR-style). The hard one (pool + DPOR).
+        - [x] **1c-5c** — threads (`thread.spawn`/`join` + `memory.wait`/`notify`). Key insight from
+              the oracle study: concurrent oracle programs are **interleaving-invariant**, so the
+              bytecode engine needs a *correct* scheduler, not DPOR/M:N replication. `drive` became a
+              **cooperative single-threaded scheduler** over `VTask`s (the per-vCPU fiber world) all
+              sharing one `Mem` (single-threaded ⇒ shared memory is trivially consistent;
+              `fork_for_thread` confirmed the tree-walker shares the backing via `Arc`). New
+              `Outcome::Thread*`/`Memory*` escape `Vm::resume` to the scheduler via `step_vcpu`; join
+              parks on a child, `notify`/child-completion wakes, a stuck set advances a logical clock
+              to the next `wait` deadline (else deadlock → `ThreadFault`, matching the explorer); the
+              run ends when the **root** vCPU completes (trap propagates through `join`). Lowest-index
+              scheduling keeps it deterministic. New TDD harness `bytecode_threads.rs` (tiny atomic=2,
+              8×500 atomic counter=4000, futex handoff=987654 exercising wait/notify, forged-join
+              fault) — bit-identical to `run`. **Fiber migration** (run-shared registry) is deferred:
+              modules using *both* threads and fibers are compile-rejected (→ fallback) for now.
         - [ ] **1c-5d** — coroutines via `Instantiator` (`spawn_coroutine`/`resume`, `Yielder`,
-              `SharedRegion` grant) — inline-driven like fibers, reuses the `drive` switch machinery.
+              `SharedRegion` grant) — inline-driven like fibers, reuses the `step_vcpu` switch logic.
         - [ ] **1c-5e** — cross-module units (`install`/`invoke` indirect calls; tail calls).
+        - [ ] **1c-5f** — fiber **migration**: run-shared fiber registry across `VTask`s; lifts the
+              thread+fiber compile rejection.
     - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
           stepping report tree-walker-identical locations. New harness: debug-trace equality.
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:

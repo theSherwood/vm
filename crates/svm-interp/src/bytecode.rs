@@ -9,17 +9,20 @@
 //! dispatch/layout.
 //!
 //! Scope so far: scalar + memory + SIMD/`v128` + fences + direct & indirect calls; the synchronous
-//! capability seam (generic `cap.call` + `cap.self.*`, via `host.cap_dispatch_slots`); and §12
-//! **fibers** (`cont.new`/`cont.resume`/`suspend`, cooperative single-vCPU switching driven by
-//! [`drive`]). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long tail is delegated to
-//! the reference [`super::eval_inst`] (same semantics, no re-implementation). [`compile_module`]
-//! returns `None` when a function needs a seam not yet driven here — threads / `memory.wait` (M:N
-//! pool + DPOR), `Instantiator`/`Yielder` coroutines, cross-module `install`/`invoke`, tail calls,
-//! durability — so callers (`super::run_with_host_fast`) fall back to the tree-walker for those.
+//! capability seam (generic `cap.call` + `cap.self.*`, via `host.cap_dispatch_slots`); §12 **fibers**
+//! (`cont.*`/`suspend`, cooperative single-vCPU switching in [`step_vcpu`]); and §12 **threads**
+//! (`thread.spawn`/`join` + `memory.wait`/`notify`) on a cooperative single-threaded scheduler
+//! ([`drive`]) over one shared `Mem` — faithful for the interleaving-invariant programs the oracle
+//! uses. Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long tail is delegated to the
+//! reference [`super::eval_inst`] (same semantics, no re-implementation). [`compile_module`] returns
+//! `None` when a function needs a seam not yet driven here — `Instantiator`/`Yielder` coroutines,
+//! cross-module `install`/`invoke`, tail calls, durability, **or** a module mixing threads *and*
+//! fibers (migration needs a run-shared registry) — so callers (`super::run_with_host_fast`) fall
+//! back to the tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
-//! tree-walker (`bytecode_diff.rs`, `bytecode_caps.rs`, `bytecode_fibers.rs`).
+//! tree-walker (`bytecode_diff.rs`, `bytecode_caps.rs`, `bytecode_fibers.rs`, `bytecode_threads.rs`).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
@@ -254,6 +257,34 @@ enum Op {
         value: u32,
         dst: u32,
     },
+    /// §12 `thread.spawn`: spawn a vCPU running `func` (a direct func index) with `(sp, arg)`; its
+    /// handle lands at `dst`. Scheduler-driven.
+    ThreadSpawn {
+        func: u32,
+        sp: u32,
+        arg: u32,
+        dst: u32,
+    },
+    /// §12 `thread.join`: park until child `handle` finishes; its result (or trap) lands at `dst`.
+    ThreadJoin {
+        handle: u32,
+        dst: u32,
+    },
+    /// §12 `memory.wait`: futex wait (`ty`-wide) on `addr` while it equals `expected`, up to
+    /// `timeout` ns; the status (0/1/2) lands at `dst`. Scheduler-driven.
+    MemoryWait {
+        ty: IntTy,
+        addr: u32,
+        expected: u32,
+        timeout: u32,
+        dst: u32,
+    },
+    /// §12 `memory.notify`: wake up to `count` waiters on `addr`; the woken count lands at `dst`.
+    MemoryNotify {
+        addr: u32,
+        count: u32,
+        dst: u32,
+    },
     Ret {
         srcs: Box<[u32]>,
     },
@@ -288,6 +319,33 @@ pub struct Compiled {
 
 /// Lower every function, or `None` if any uses an op outside this slice's subset.
 pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
+    // The bytecode engine drives threads with a **per-vCPU** fiber registry, whereas the tree-walker
+    // shares one fiber-handle namespace across a domain's vCPUs (so a fiber can migrate, and handles
+    // are domain-global). A module that uses *both* threads and fibers would therefore diverge on
+    // handle numbering / migration, so reject the combination here (→ tree-walker fallback) until the
+    // run-shared registry lands (Slice 1c-5c migration follow-up).
+    let mut has_threads = false;
+    let mut has_fibers = false;
+    for f in funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::ThreadSpawn { .. }
+                    | Inst::MemoryWait { .. }
+                    | Inst::MemoryNotify { .. } => has_threads = true,
+                    Inst::ThreadJoin { .. } => has_threads = true,
+                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => {
+                        has_fibers = true
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if has_threads && has_fibers {
+        return None;
+    }
+
     let arities: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     let mut progs = Vec::with_capacity(funcs.len());
     for f in funcs {
@@ -638,14 +696,38 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             value: g(*value),
             dst,
         },
-        // Control / host / cross-module ops this slice doesn't drive (they need the M:N scheduler
-        // worker pool or the dispatch table) — fall back to the tree-walker.
-        Inst::CallImport { .. }
-        | Inst::ThreadSpawn { .. }
-        | Inst::ThreadJoin { .. }
-        | Inst::MemoryWait { .. }
-        | Inst::MemoryNotify { .. }
-        | Inst::GcRoots { .. } => return None,
+        // §12 threads / futex — cooperative multi-vCPU, serviced by the `drive` scheduler. (A module
+        // mixing threads *and* fibers is rejected at the module level — see `compile_module` — until
+        // the run-shared fiber registry / migration lands.)
+        Inst::ThreadSpawn { func, sp, arg } => Op::ThreadSpawn {
+            func: *func,
+            sp: g(*sp),
+            arg: g(*arg),
+            dst,
+        },
+        Inst::ThreadJoin { handle } => Op::ThreadJoin {
+            handle: g(*handle),
+            dst,
+        },
+        Inst::MemoryWait {
+            ty,
+            addr,
+            expected,
+            timeout,
+        } => Op::MemoryWait {
+            ty: *ty,
+            addr: g(*addr),
+            expected: g(*expected),
+            timeout: g(*timeout),
+            dst,
+        },
+        Inst::MemoryNotify { addr, count } => Op::MemoryNotify {
+            addr: g(*addr),
+            count: g(*count),
+            dst,
+        },
+        // Cross-module / GC ops this slice doesn't drive (dispatch table / root scan) — fall back.
+        Inst::CallImport { .. } | Inst::GcRoots { .. } => return None,
         // Everything else is a pure value op or a no-result store that the reference `eval_inst`
         // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
         // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
@@ -745,9 +827,9 @@ fn run(
 }
 
 /// Why [`Vm::resume`] returned. `Done`/`Suspended` are the run-to-completion + budget cases; the
-/// `Cont*`/`Suspend` cases are §12 fiber switches the [`drive`] loop services (the `Vm` itself owns
-/// no fiber registry — that is per-vCPU driver state). A trap is the `Err` arm of `resume`'s
-/// `Result` and is terminal, like the tree-walker.
+/// `Cont*`/`Suspend` cases are §12 fiber switches handled within [`step_vcpu`] (a vCPU's own fiber
+/// registry); the `Thread*`/`Memory*` cases are §12 multi-vCPU events handled by the [`drive`]
+/// scheduler. A trap is the `Err` arm of `resume`'s `Result` and is terminal, like the tree-walker.
 enum Outcome {
     Done(Vec<Value>),
     Suspended,
@@ -768,6 +850,33 @@ enum Outcome {
         value: i64,
         dst: u32,
     },
+    /// `thread.spawn`: spawn a vCPU running `func(sp, arg)`; its handle lands at `dst`.
+    ThreadSpawn {
+        func: u32,
+        sp: i64,
+        arg: i64,
+        dst: u32,
+    },
+    /// `thread.join`: park until child `handle` finishes; its result (or trap) lands at `dst`.
+    ThreadJoin {
+        handle: i32,
+        dst: u32,
+    },
+    /// `memory.wait`: futex wait on confined address `base` (already validated); `dst` gets the
+    /// status (0 woken / 1 not-equal / 2 timed-out).
+    MemoryWait {
+        base: u64,
+        expected: u64,
+        width: u32,
+        timeout: u64,
+        dst: u32,
+    },
+    /// `memory.notify`: wake up to `count` waiters on `base`; the woken count lands at `dst`.
+    MemoryNotify {
+        base: u64,
+        count: i32,
+        dst: u32,
+    },
 }
 
 /// A §12 fiber's state in the driver's per-vCPU registry (handle = index). Non-durable only — a
@@ -783,61 +892,107 @@ enum FiberState {
     Done,
 }
 
-/// The root activation's id in the resume chain (it has no fiber handle).
+/// The root activation's id in a vCPU's resume chain (it has no fiber handle).
 const ROOT_FIBER: usize = usize::MAX;
 
-/// Drive one vCPU — the entry activation plus any §12 fibers it spawns — to completion. Owns the
-/// fiber registry and the resume `chain` (parked resumers, each with the `Vm` to restore and the
-/// `cont.resume` result slot awaiting `(status, value)`); the active `Vm` runs until it returns a
-/// fiber [`Outcome`], at which point control switches here, exactly as `run_inner`'s `cont.*` arms
-/// switch the active frame stack. `budget` only slices *where* the active `Vm` pauses (Slice 1c-2);
-/// it never changes results.
-fn drive(
+/// One vCPU's continuation: its active `Vm` plus its §12 fiber world (per-vCPU registry + resume
+/// `chain`). A `thread.spawn` creates a fresh `VTask`; the scheduler runs them cooperatively over one
+/// shared `Mem` (single-threaded, so shared memory is sequentially consistent — the determinate
+/// programs the oracle uses give the same result on any correct schedule).
+struct VTask {
+    active: Vm,
+    /// `ROOT_FIBER` or the handle of the fiber currently running in this vCPU.
+    active_id: usize,
+    /// Parked resumers: `(fiber id, its Vm, the `cont.resume` result slot awaiting (status, value))`.
+    chain: Vec<(usize, Vm, u32)>,
+    /// This vCPU's fiber registry (handle = index). Per-vCPU — combined thread+fiber modules are
+    /// rejected by the compiler until the run-shared registry (migration) lands in a later slice.
+    fibers: Vec<FiberState>,
+}
+
+impl VTask {
+    fn new(c: &Compiled, entry: usize, args: &[Value]) -> Result<VTask, Trap> {
+        Ok(VTask {
+            active: Vm::new(c, entry, args)?,
+            active_id: ROOT_FIBER,
+            chain: Vec::new(),
+            fibers: Vec::new(),
+        })
+    }
+}
+
+/// Why [`step_vcpu`] returned control to the scheduler: the vCPU finished, or it hit a multi-vCPU
+/// (`thread.*` / `memory.*`) event the scheduler must service. Intra-vCPU fiber switches never reach
+/// here — `step_vcpu` handles them against the vCPU's own registry.
+enum VcpuStop {
+    Done(Vec<Value>),
+    Spawn {
+        func: u32,
+        sp: i64,
+        arg: i64,
+        dst: u32,
+    },
+    Join {
+        handle: i32,
+        dst: u32,
+    },
+    Wait {
+        base: u64,
+        expected: u64,
+        width: u32,
+        timeout: u64,
+        dst: u32,
+    },
+    Notify {
+        base: u64,
+        count: i32,
+        dst: u32,
+    },
+}
+
+/// Run one vCPU (its active `Vm` and any fibers it switches among) until it finishes or hits a
+/// multi-vCPU event. Fiber `Outcome`s are serviced here exactly as `run_inner`'s `cont.*` arms switch
+/// the active frame stack; `thread.*`/`memory.*` `Outcome`s are handed up to [`drive`]. `budget` only
+/// slices *where* the active `Vm` pauses (Slice 1c-2); it never changes results.
+fn step_vcpu(
+    vt: &mut VTask,
     c: &Compiled,
-    entry: FuncIdx,
-    args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut Host,
     budget: u64,
-) -> Result<Vec<Value>, Trap> {
-    let mut active = Vm::new(c, entry as usize, args)?;
-    let mut active_id: usize = ROOT_FIBER;
-    let mut chain: Vec<(usize, Vm, u32)> = Vec::new();
-    let mut fibers: Vec<FiberState> = Vec::new();
-
+) -> Result<VcpuStop, Trap> {
     loop {
-        match active.resume(c, fuel, mem, host, budget)? {
+        match vt.active.resume(c, fuel, mem, host, budget)? {
             // Budget exhausted (sliced harness only): re-enter the same activation; its cursor is
             // already persisted, so this is transparent.
             Outcome::Suspended => {}
-            Outcome::Done(vals) => match chain.pop() {
-                // The root finished: that is the whole run's result.
-                None => return Ok(vals),
-                // A fiber's function returned: mark it Done and hand `(RETURNED, retval)` to the
-                // resumer it switched away from.
+            Outcome::Done(vals) => match vt.chain.pop() {
+                // The vCPU's root activation finished.
+                None => return Ok(VcpuStop::Done(vals)),
+                // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` to its resumer.
                 Some((rid, resumer, rdst)) => {
-                    fibers[active_id] = FiberState::Done;
+                    vt.fibers[vt.active_id] = FiberState::Done;
                     let retval = vals.first().copied().unwrap_or(Value::I64(0));
-                    active = resumer;
-                    active_id = rid;
-                    active.set(rdst, Reg::from_i32(super::FIBER_RETURNED));
-                    active.set(rdst + 1, Reg::from_value(retval));
+                    vt.active = resumer;
+                    vt.active_id = rid;
+                    vt.active.set(rdst, Reg::from_i32(super::FIBER_RETURNED));
+                    vt.active.set(rdst + 1, Reg::from_value(retval));
                 }
             },
             Outcome::ContNew { funcref, sp, dst } => {
-                if fibers.len() + 1 >= super::MAX_FIBERS {
+                if vt.fibers.len() + 1 >= super::MAX_FIBERS {
                     return Err(Trap::FiberFault);
                 }
-                let h = fibers.len() as i32;
-                fibers.push(FiberState::Pending { funcref, sp });
-                active.set(dst, Reg::from_i32(h));
+                let h = vt.fibers.len() as i32;
+                vt.fibers.push(FiberState::Pending { funcref, sp });
+                vt.active.set(dst, Reg::from_i32(h));
             }
             Outcome::ContResume { kh, arg, dst } => {
                 let k = kh as usize;
                 // Claim fiber `k`: a pending fiber starts (call `funcref(sp, arg)`), a parked one
                 // continues (the new `arg` becomes its `suspend`'s result). Anything else is inert.
-                let target = match fibers.get_mut(k) {
+                let target = match vt.fibers.get_mut(k) {
                     Some(slot @ FiberState::Pending { .. }) => {
                         let (funcref, sp) = match std::mem::replace(slot, FiberState::Running) {
                             FiberState::Pending { funcref, sp } => (funcref, sp),
@@ -869,22 +1024,44 @@ fn drive(
                     }
                     _ => return Err(Trap::FiberFault), // forged / Running / Done
                 };
-                let resumer = std::mem::replace(&mut active, target);
-                chain.push((active_id, resumer, dst));
-                active_id = k;
+                let resumer = std::mem::replace(&mut vt.active, target);
+                vt.chain.push((vt.active_id, resumer, dst));
+                vt.active_id = k;
             }
             Outcome::FiberSuspend { value, dst } => {
                 // Pop the resumer to switch back to; an empty chain means the root tried to
                 // `suspend`, which is a `FiberFault` (the root has no resumer).
-                let (rid, resumer, rdst) = chain.pop().ok_or(Trap::FiberFault)?;
-                let suspended = std::mem::replace(&mut active, resumer);
-                fibers[active_id] = FiberState::Parked {
+                let (rid, resumer, rdst) = vt.chain.pop().ok_or(Trap::FiberFault)?;
+                let suspended = std::mem::replace(&mut vt.active, resumer);
+                vt.fibers[vt.active_id] = FiberState::Parked {
                     vm: suspended,
                     suspend_dst: dst,
                 };
-                active_id = rid;
-                active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
-                active.set(rdst + 1, Reg::from_i64(value));
+                vt.active_id = rid;
+                vt.active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
+                vt.active.set(rdst + 1, Reg::from_i64(value));
+            }
+            Outcome::ThreadSpawn { func, sp, arg, dst } => {
+                return Ok(VcpuStop::Spawn { func, sp, arg, dst })
+            }
+            Outcome::ThreadJoin { handle, dst } => return Ok(VcpuStop::Join { handle, dst }),
+            Outcome::MemoryWait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            } => {
+                return Ok(VcpuStop::Wait {
+                    base,
+                    expected,
+                    width,
+                    timeout,
+                    dst,
+                })
+            }
+            Outcome::MemoryNotify { base, count, dst } => {
+                return Ok(VcpuStop::Notify { base, count, dst })
             }
         }
     }
@@ -893,6 +1070,218 @@ fn drive(
 /// `fiber_sig` params/results, inlined so the driver can compare without allocating a `FuncType`.
 const FIBER_PARAMS: [ValType; 2] = [ValType::I64, ValType::I64];
 const FIBER_RESULTS: [ValType; 1] = [ValType::I64];
+
+/// A scheduled vCPU and its blocking state.
+struct TaskSlot {
+    vt: VTask,
+    /// This vCPU's `thread.spawn` children (handle = index → global task index). `None` = joined.
+    threads: Vec<Option<usize>>,
+    state: TaskState,
+}
+
+enum TaskState {
+    Runnable,
+    /// Parked on `thread.join` of task `child`; deliver its result to `dst` and wake.
+    BlockedJoin {
+        child: usize,
+        slot: usize,
+        dst: u32,
+    },
+    /// Parked on `memory.wait` at futex key `key` until notified or `deadline` (logical clock).
+    BlockedWait {
+        key: u64,
+        deadline: u64,
+        dst: u32,
+    },
+    /// Finished — its result (or trap) is retained for a joiner.
+    Done(Result<Vec<Value>, Trap>),
+}
+
+/// Drive a whole domain — the entry vCPU plus any `thread.spawn` children — to completion on a
+/// **cooperative single-threaded scheduler** sharing one `Mem`. The oracle's concurrent programs are
+/// interleaving-invariant (verified by the tree-walker via stress / seed-sweep / DPOR), so any
+/// correct schedule yields the same result; a deterministic lowest-index-first pick keeps it
+/// reproducible. Blocking (`join` / `wait`) parks a task; `notify` / child completion wakes it; a
+/// stuck set advances a logical clock to the next `wait` deadline (or deadlocks → `ThreadFault`,
+/// matching the deterministic explorer). The run ends when the **root** vCPU completes.
+fn drive(
+    c: &Compiled,
+    entry: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+    budget: u64,
+) -> Result<Vec<Value>, Trap> {
+    let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
+        vt: VTask::new(c, entry as usize, args)?,
+        threads: Vec::new(),
+        state: TaskState::Runnable,
+    }];
+    let mut clock: u64 = 0;
+
+    loop {
+        // The root's result is the run's result (other vCPUs' effects are already reflected in it).
+        if let TaskState::Done(res) = &tasks[0].state {
+            return res.clone();
+        }
+        let Some(ti) = tasks
+            .iter()
+            .position(|t| matches!(t.state, TaskState::Runnable))
+        else {
+            // No runnable task: fire the earliest `wait` timeout, else it is a deadlock.
+            let next = tasks
+                .iter()
+                .filter_map(|t| match t.state {
+                    TaskState::BlockedWait { deadline, .. } => Some(deadline),
+                    _ => None,
+                })
+                .min();
+            match next {
+                Some(d) => {
+                    clock = clock.max(d);
+                    for t in &mut tasks {
+                        if let TaskState::BlockedWait { deadline, dst, .. } = t.state {
+                            if deadline <= clock {
+                                t.vt.active.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
+                                t.state = TaskState::Runnable;
+                            }
+                        }
+                    }
+                }
+                None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
+            }
+            continue;
+        };
+
+        match step_vcpu(&mut tasks[ti].vt, c, fuel, mem, host, budget) {
+            Err(trap) => complete(&mut tasks, ti, Err(trap)),
+            Ok(VcpuStop::Done(vals)) => complete(&mut tasks, ti, Ok(vals)),
+            Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
+                if func as usize >= c.progs.len() {
+                    complete(&mut tasks, ti, Err(Trap::Malformed));
+                    continue;
+                }
+                let live = tasks
+                    .iter()
+                    .filter(|t| !matches!(t.state, TaskState::Done(_)))
+                    .count();
+                if live >= super::MAX_VCPUS {
+                    complete(&mut tasks, ti, Err(Trap::ThreadFault)); // thread bomb
+                    continue;
+                }
+                let child = VTask::new(c, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
+                let cidx = tasks.len();
+                tasks.push(TaskSlot {
+                    vt: child,
+                    threads: Vec::new(),
+                    state: TaskState::Runnable,
+                });
+                let handle = tasks[ti].threads.len() as i32;
+                tasks[ti].threads.push(Some(cidx));
+                tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+            }
+            Ok(VcpuStop::Join { handle, dst }) => {
+                let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
+                    Ok(s) => s,
+                    Err(t) => {
+                        complete(&mut tasks, ti, Err(t));
+                        continue;
+                    }
+                };
+                let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
+                match &tasks[child].state {
+                    TaskState::Done(res) => {
+                        // The child already finished: deliver now (a child trap propagates here).
+                        let res = res.clone();
+                        tasks[ti].threads[slot] = None;
+                        match res {
+                            Ok(vals) => {
+                                let v = vals.first().copied().unwrap_or(Value::I64(0));
+                                tasks[ti].vt.active.set(dst, Reg::from_value(v));
+                            }
+                            Err(t) => complete(&mut tasks, ti, Err(t)),
+                        }
+                    }
+                    _ => {
+                        tasks[ti].state = TaskState::BlockedJoin { child, slot, dst };
+                    }
+                }
+            }
+            Ok(VcpuStop::Wait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            }) => {
+                // Re-read the value (the cooperative analogue of the futex compare-under-lock): if it
+                // already changed, return not-equal; else park until notified or timed out.
+                let cur = mem
+                    .as_ref()
+                    .map(|m| m.atomic_value(base, width))
+                    .unwrap_or(0);
+                if cur != expected {
+                    tasks[ti]
+                        .vt
+                        .active
+                        .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
+                } else {
+                    tasks[ti].state = TaskState::BlockedWait {
+                        key: base,
+                        deadline: clock.saturating_add(timeout),
+                        dst,
+                    };
+                }
+            }
+            Ok(VcpuStop::Notify { base, count, dst }) => {
+                // Wake up to `count` waiters on `base`, lowest task index first (deterministic).
+                let want = count as u32;
+                let mut woken = 0u32;
+                for t in &mut tasks {
+                    if woken >= want {
+                        break;
+                    }
+                    if let TaskState::BlockedWait { key, dst: wdst, .. } = t.state {
+                        if key == base {
+                            t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
+                            t.state = TaskState::Runnable;
+                            woken += 1;
+                        }
+                    }
+                }
+                tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
+            }
+        }
+    }
+}
+
+/// Mark task `ti` finished with `res`, then wake any vCPU parked on `thread.join` of it: an `Ok`
+/// result is delivered into the joiner's `dst` (it becomes runnable); a trap propagates — the joiner
+/// completes with the same trap (transitively, via the worklist).
+fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
+    let mut work = vec![(ti, res)];
+    while let Some((done, res)) = work.pop() {
+        tasks[done].state = TaskState::Done(res.clone());
+        for (j, t) in tasks.iter_mut().enumerate() {
+            let TaskState::BlockedJoin { child, slot, dst } = t.state else {
+                continue;
+            };
+            if child != done {
+                continue;
+            }
+            t.threads[slot] = None;
+            match &res {
+                Ok(vals) => {
+                    let v = vals.first().copied().unwrap_or(Value::I64(0));
+                    t.vt.active.set(dst, Reg::from_value(v));
+                    t.state = TaskState::Runnable;
+                }
+                Err(trap) => work.push((j, Err(trap.clone()))),
+            }
+        }
+    }
+}
 
 /// The reified bytecode continuation — everything a suspended activation needs to resume, held as
 /// an explicit value rather than on the host Rust call stack. The register file (`regs`), the stack
@@ -1339,6 +1728,74 @@ impl Vm {
                     self.base = base;
                     self.pc = pc + 1;
                     return Ok(Outcome::FiberSuspend { value, dst });
+                }
+                // §12 multi-vCPU ops escape to the `drive` scheduler (which owns the task set). Each
+                // advances past itself and persists the cursor, so the scheduler resumes this
+                // activation right after the op with the op's `dst` filled in.
+                Op::ThreadSpawn { func, sp, arg, dst } => {
+                    let sp = r!(*sp).i64();
+                    let arg = r!(*arg).i64();
+                    let (func, dst) = (*func, *dst);
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::ThreadSpawn { func, sp, arg, dst });
+                }
+                Op::ThreadJoin { handle, dst } => {
+                    let handle = r!(*handle).i32();
+                    let dst = *dst;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::ThreadJoin { handle, dst });
+                }
+                Op::MemoryWait {
+                    ty,
+                    addr,
+                    expected,
+                    timeout,
+                    dst,
+                } => {
+                    // Validate the address (confine/align/prot — traps surface here), mirroring
+                    // `Inst::MemoryWait`; the scheduler does the value compare + park/wake.
+                    let width = super::atomic_width(*ty);
+                    let a = r!(*addr).i64() as u64;
+                    let expected = r!(*expected).lo & super::width_mask(width);
+                    let to_ns = r!(*timeout).i64();
+                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                    let base_addr = m.prepare_wait(a, *ty)?;
+                    let max = super::MAX_WAIT.as_nanos() as u64;
+                    let timeout = if to_ns < 0 {
+                        max
+                    } else {
+                        (to_ns as u64).min(max)
+                    };
+                    let dst = *dst;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::MemoryWait {
+                        base: base_addr,
+                        expected,
+                        width,
+                        timeout,
+                        dst,
+                    });
+                }
+                Op::MemoryNotify { addr, count, dst } => {
+                    let a = r!(*addr).i64() as u64;
+                    let count = r!(*count).i32();
+                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                    let base_addr = m.confine_for_notify(a)?;
+                    let dst = *dst;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::MemoryNotify {
+                        base: base_addr,
+                        count,
+                        dst,
+                    });
                 }
                 Op::Unreachable => return Err(Trap::Unreachable),
                 Op::Eval {
