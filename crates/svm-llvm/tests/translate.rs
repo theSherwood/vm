@@ -1280,6 +1280,52 @@ fn main_argc_argv() {
 }
 
 #[test]
+fn main_argc_argv_envp() {
+    // `int main(int argc, char** argv, char** envp)`: the synthesized `_start` parses the §3e blob's
+    // `envc` env strings (packed right after the argv strings) into a second NULL-terminated `char**`
+    // parked just above `argv[]`, and passes it as the third parameter — checked byte-for-byte vs
+    // native with a controlled, `env_clear`ed environment. Covers walking `envp` to its NULL
+    // terminator and `argv`/`envp` coexisting at the entry stack base.
+    let src = "#include <stdio.h>\n\
+               int main(int argc, char** argv, char** envp){ \
+                 printf(\"argc=%d\\n\", argc); \
+                 for (int i = 0; argv[i]; i++) printf(\"argv[%d]=%s\\n\", i, argv[i]); \
+                 int n = 0; for (char** e = envp; *e; e++) { printf(\"env[%d]=%s\\n\", n++, *e); } \
+                 return n; }";
+    // Empty env (just the NULL terminator), then a multi-entry environment. The entries are passed in
+    // sorted-by-key order because `std::process::Command` stores its env in a `BTreeMap`, so native's
+    // child `environ` is key-sorted; the SVM blob preserves the order we hand it, so we match by
+    // pre-sorting (`EMPTY` < `FOO` < `PATH`).
+    check_powerbox_vs_native_args("envp0", src, &["prog"], &[]);
+    check_powerbox_vs_native_args(
+        "envpN",
+        src,
+        &["prog", "a"],
+        &["EMPTY=", "FOO=bar", "PATH=/x:/y"],
+    );
+}
+
+#[test]
+fn getenv_lookup() {
+    // `getenv` on a `main(void)` program (so it exercises the synthesized `__svm_getenv` decoupled
+    // from any argv parsing): it scans the §3e blob's env strings for `KEY=`, returning the value
+    // pointer or NULL. Covers a hit, a miss, and the prefix guard (`"F"` must not match `"FOO=..."`),
+    // checked byte-for-byte vs native `getenv` with a controlled, `env_clear`ed environment.
+    let src = "#include <stdio.h>\n#include <stdlib.h>\n\
+               int main(void){ \
+                 char* a = getenv(\"FOO\"); char* b = getenv(\"PATH\"); \
+                 char* c = getenv(\"MISSING\"); char* d = getenv(\"F\"); \
+                 printf(\"FOO=%s\\n\", a ? a : \"(null)\"); \
+                 printf(\"PATH=%s\\n\", b ? b : \"(null)\"); \
+                 printf(\"MISSING=%s\\n\", c ? c : \"(null)\"); \
+                 printf(\"F=%s\\n\", d ? d : \"(null)\"); \
+                 return 0; }";
+    check_powerbox_vs_native_args("getenv1", src, &["prog"], &["FOO=bar", "PATH=/x:/y"]);
+    // No environment at all: every lookup must be NULL (the blob reads envc == 0).
+    check_powerbox_vs_native_args("getenv0", src, &["prog"], &[]);
+}
+
+#[test]
 fn printf_precision_formats() {
     // Integer min-digit precision (`%.Nd`/`%.Nx`, incl. `%.0` of zero → no digits, and precision
     // overriding the `0` flag → space field padding) and string truncating precision (`%.Ns`),

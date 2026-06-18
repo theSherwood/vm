@@ -583,7 +583,7 @@ Notes:
 - **transcendentals/libm**: prefer a **guest** `libm` (the demo or a bundled header supplies
   `sqrt`/`sin`/… as guest code) over any host math capability — keeps math in the sandbox. `sqrt`
   already lowers to the SVM op (slice F); `sin`/`cos`/`exp`/`pow` need guest implementations.
-- **`argc`/`argv`**: **DONE** — see *Slice BE* below. (`envp`/`environ`/`getenv` is still deferred.)
+- **`argc`/`argv`**: **DONE** — see *Slice BE* below. `envp`/`getenv`: **DONE** — see *Slice BF*.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
@@ -632,15 +632,34 @@ VM. All `char**` construction lives in the on-ramp:
   `argc`, walks the `argc` packed strings building `argv[]` (each entry points *into* the blob — no
   copy) with the `argv[argc] == NULL` terminator at the entry SP, parks `main`'s frame a page above,
   and calls `main(main_sp, argc, argv)`. The window now reserves stack whenever this entry is used
-  (it dereferences the SP, unlike the no-arg `_start`). `main(void)` is unchanged; a `main(int)` or
-  `main(…, envp)` is fail-closed (`envp`/`environ`/`getenv` is the next slice — the blob already
-  carries `envc`).
+  (it dereferences the SP, unlike the no-arg `_start`). `main(void)` is unchanged; a `main(int)` is
+  fail-closed. (`main(…, envp)` and `getenv` are now supported — *Slice BF*.)
 - **Runner** (`svm-run`): `run_powerbox_with_args` builds the blob from `(args, env)`, seeds it into
   the window's low bytes via the JIT's `init_mem` (applied *before* data segments, which sit at/above
   `POWERBOX_ARGS_END`, so they never overlap), and rejects an over-large or NUL-bearing arg vector.
-  The CLI forwards its post-`--` arguments (`svm-run prog.svmb -- a b c`; `argv[0]` = the file name,
-  empty environment — no ambient env leak). Test: `main_argc_argv` (byte-for-byte vs native with a
-  controlled `argv`, via the new `check_powerbox_vs_native_args`).
+  The CLI forwards its post-`--` arguments (`svm-run prog.svmb -- a b c`; `argv[0]` = the file name).
+  When *no* `-- args` are given it seeds **nothing** (`init_mem` stays `None`, byte-identical to a
+  bare run) — both to avoid perturbing the guest's initial state and because the blob is unused by a
+  `main(void)`; a program wanting `argc>=1` must be invoked with `--`. The environment is always empty
+  unless explicitly supplied — no ambient host env leaks in. Test: `main_argc_argv` (byte-for-byte vs
+  native with a controlled `argv`, via the new `check_powerbox_vs_native_args`).
+
+**Slice BF (DONE) — `envp` + `getenv` (the env half of the §3e blob).** The blob already packs the
+environment (`{argc, envc}` then the `argc` argv strings followed by the `envc` env strings, each
+`KEY=VALUE`), so this slice is **frontend-only** — the runner/blob/test plumbing was built in BE.
+- **`main(int, char**, char** envp)`** (arity 4): `synth_start_argv` (now an 11-block CFG when
+  `wants_envp`) finishes `argv[]` as before, then runs a mirror loop over the `envc` env strings —
+  packed right where the argv walk ended — building a second NULL-terminated `char**` parked just
+  above `argv[]`, and calls `main(main_sp, argc, argv, envp)` with the frame a page above *both*
+  arrays. A 2-param `main` is still fail-closed. Test: `main_argc_argv_envp` (empty + multi-entry env,
+  passed key-sorted to match `std::process::Command`'s `BTreeMap` ordering).
+- **`getenv(name)`**: a synthesized `__svm_getenv` helper (gated on `calls_external("getenv")`, which
+  also forces a powerbox `_start` since it has no import of its own). It reads the blob in the reserved
+  low scratch directly — no `environ` global, no `_start` coupling — so it works at any `main` arity
+  and returns `NULL` when the host seeded no env (the window reads `argc==envc==0`). It skips the
+  `argc` argv strings, then compares each env key against `name` char-by-char, returning the value
+  pointer just past the `=` on a full match landing on `=` (so `"F"` does not match `"FOO=…"`). Test:
+  `getenv_lookup` (hit, miss, prefix guard, and the no-env case).
 
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for

@@ -156,7 +156,7 @@
 //! (`%f`/`%e`/`%g` — need exact-decimal/bignum formatting), `*` (dynamic width/precision), and
 //! non-constant formats; general (non-rotate) funnel shifts, `llvm.bitreverse`, transcendental math
 //! as *external* libm calls (the program must supply it as guest code — see slice AB), other SIMD
-//! (`<2 x double>`, `<8 x i16>`, dynamic lanes), `i33`, and `main(…, char** envp)`/`getenv`.
+//! (`<2 x double>`, `<8 x i16>`, dynamic lanes), and `i33`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -269,6 +269,10 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
     // `__svm_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
+    // `getenv` is a synthesized helper that scans the §3e blob's env strings directly. It needs no
+    // capability or import of its own, but it *does* need the powerbox window (the blob lives in the
+    // reserved low scratch), so it forces a `_start` below.
+    let need_getenv = calls_external(m, &defined_names, "getenv") && has_main;
     // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
     // declared arity), sized to the highest capability index the program uses: exit(2) always,
     // memory(3) for `malloc`/Memory builtins, addrspace(4) for the SharedRegion builtins, ioring(5)
@@ -296,8 +300,12 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         .global_vars
         .iter()
         .any(|g| name_str(&g.name) == "llvm.global_ctors");
-    let synth =
-        (!imports.is_empty() || need_malloc || uses_blocking || has_global_ctors) && has_main;
+    let synth = (!imports.is_empty()
+        || need_malloc
+        || uses_blocking
+        || has_global_ctors
+        || need_getenv)
+        && has_main;
     // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
     if need_malloc {
@@ -354,6 +362,7 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         strlen: take(need_printf),
         realloc: take(need_realloc),
         memmove: take(need_memmove),
+        getenv: take(need_getenv),
     };
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
@@ -404,23 +413,27 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     }
 
     // Does the program's `main` take `argc`/`argv` (so the synthesized entry is `synth_start_argv`)?
-    // Its IR arity is the threaded SP + the C params: 1 ⇒ `main(void)`, 3 ⇒ `main(int, char**)`; a
-    // 2- or ≥4-param `main` (e.g. `envp`) is a fail-closed later slice. Computed here (not just at the
-    // `synth_start` call) because the argv `_start` *uses* the data stack — it parks `argv[]` at the
-    // entry SP and relocates `main`'s frame a page above — so the window must reserve stack space.
+    // Its IR arity is the threaded SP + the C params: 1 ⇒ `main(void)`, 3 ⇒ `main(int, char**)`,
+    // 4 ⇒ `main(int, char**, char** envp)`; a 2-param `main` is a fail-closed error. Computed here (not
+    // just at the `synth_start` call) because the argv `_start` *uses* the data stack — it parks
+    // `argv[]` (and `envp[]`) at the entry SP and relocates `main`'s frame a page above — so the
+    // window must reserve stack space.
     let main_arity = if synth {
         funcs[(name2idx["main"] - base) as usize].params.len()
     } else {
         1
     };
-    if !matches!(main_arity, 1 | 3) {
+    if !matches!(main_arity, 1 | 3 | 4) {
         return Err(Error::Unsupported(format!(
-            "main with {} parameter(s): only main(void) and main(int, char**) are supported \
-             (envp/getenv is a later slice)",
+            "main with {} parameter(s): only main(void), main(int, char**), and \
+             main(int, char**, char** envp) are supported",
             main_arity - 1
         )));
     }
-    let wants_argv = main_arity == 3;
+    // `argc`/`argv` for a 3- *or* 4-param `main`; the 4-param form additionally gets `envp` (the
+    // §3e blob's env strings parsed into a second `char**` array parked above `argv[]`).
+    let wants_argv = main_arity == 3 || main_arity == 4;
+    let wants_envp = main_arity == 4;
 
     // The window: globals low, then the data stack from `entry_sp` growing up; `mapped` covers the
     // globals plus a stack reserve, with a faulting guard beyond (reserved > mapped, §5). Declared if
@@ -466,6 +479,7 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
             n_handles,
             heap_base,
             &ctors,
+            wants_envp,
         );
         funcs.insert(0, start);
     }
@@ -492,6 +506,9 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     }
     if need_memmove {
         funcs.push(synth_memmove());
+    }
+    if need_getenv {
+        funcs.push(synth_getenv());
     }
     Ok(Translated {
         module: Module {
@@ -2090,7 +2107,7 @@ fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<
 /// `main(void)`) and [`synth_start_argv`] (`main(int, char**)`): `(main_idx, main_results, entry_sp,
 /// n_handles, heap_base, ctors) -> Func`. A `type` alias so the dispatch can pick one by function
 /// pointer without tripping `clippy::type_complexity`.
-type StartBuilder = fn(u32, &[ValType], u64, usize, Option<u64>, &[u32]) -> Func;
+type StartBuilder = fn(u32, &[ValType], u64, usize, Option<u64>, &[u32], bool) -> Func;
 
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
 /// capabilities. It takes the `n_handles` granted handles as `i32` params (the §3e powerbox shape
@@ -2106,6 +2123,7 @@ fn synth_start(
     n_handles: usize,
     heap_base: Option<u64>,
     ctors: &[u32],
+    _wants_envp: bool,
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
@@ -2179,13 +2197,16 @@ fn synth_start(
     }
 }
 
-/// The `_start` for a `main(int argc, char** argv)`: same handle-stash + heap-seed prologue as
-/// [`synth_start`], then it parses the §3e args buffer (`svm_ir::POWERBOX_ARGS_BASE`, seeded by the
-/// host) into a C `argv[]`. It reads `argc`, walks the `argc` packed NUL-terminated strings (each
-/// `argv[i]` points *into* the buffer — no copy), writes the pointer array (plus the required
-/// `argv[argc] == NULL`) at the entry data-stack base, then calls `main(main_sp, argc, argv)` with
-/// `main`'s frame parked one page above the array. This is the only place the C `char**` convention
-/// exists — the powerbox ABI itself only delivers the neutral byte blob.
+/// The `_start` for a `main(int argc, char** argv)` (and, when `wants_envp`, `main(…, char** envp)`):
+/// same handle-stash + heap-seed prologue as [`synth_start`], then it parses the §3e args buffer
+/// (`svm_ir::POWERBOX_ARGS_BASE`, seeded by the host) into a C `argv[]`. It reads `argc`, walks the
+/// `argc` packed NUL-terminated strings (each `argv[i]` points *into* the buffer — no copy), and
+/// writes the pointer array (plus the required `argv[argc] == NULL`) at the entry data-stack base.
+/// For a 4-param `main` it then parses the `envc` env strings (packed right after the argv strings)
+/// into a second NULL-terminated `envp[]` parked just above `argv[]`. Finally it calls
+/// `main(main_sp, argc, argv[, envp])` with `main`'s frame parked one page above the array(s). This is
+/// the only place the C `char**` convention exists — the powerbox ABI itself only delivers the
+/// neutral byte blob.
 fn synth_start_argv(
     main_idx: u32,
     main_results: &[ValType],
@@ -2193,6 +2214,7 @@ fn synth_start_argv(
     n_handles: usize,
     heap_base: Option<u64>,
     ctors: &[u32],
+    wants_envp: bool,
 ) -> Func {
     use svm_ir::{LoadOp, StoreOp};
     let args_base = svm_ir::POWERBOX_ARGS_BASE as i64;
@@ -2295,7 +2317,9 @@ fn synth_start_argv(
             then_blk: 2,
             then_args: vec![0, 1, 2],
             else_blk: 5,
-            else_args: vec![0],
+            // The env strings begin where the argv walk left off, so when we need `envp` carry `p`
+            // (= &first env string) into block 5; the argv-only path drops it.
+            else_args: if wants_envp { vec![0, 2] } else { vec![0] },
         },
     };
 
@@ -2357,53 +2381,224 @@ fn synth_start_argv(
         },
     };
 
-    // ---- block 5: done(argc=0) — argv[argc] = NULL, compute main_sp, run ctors, call main. ----
-    let mut d: Vec<Inst> = vec![
-        Inst::ConstI64(entry_sp as i64), // v1 = argv base
+    // ---- block 5 (argv-only `main(int, char**)`): done(argc) — argv[argc] = NULL, compute main_sp
+    // one page above the array, run ctors, call main(main_sp, argc, argv). ----
+    if !wants_envp {
+        let mut d: Vec<Inst> = vec![
+            Inst::ConstI64(entry_sp as i64), // v1 = argv base
+            Inst::ConstI64(8),               // v2
+            mul(0, 2),                       // v3 = argc*8
+            add(1, 3),                       // v4 = &argv[argc]
+            Inst::ConstI64(0),               // v5
+            store64(4, 5),                   // argv[argc] = NULL
+            Inst::ConstI64(1),               // v6
+            add(0, 6),                       // v7 = argc+1
+            mul(7, 2),                       // v8 = (argc+1)*8
+            add(1, 8),                       // v9 = entry_sp + array bytes
+            Inst::ConstI64(page - 1),        // v10
+            add(9, 10),                      // v11
+            Inst::ConstI64(!(page - 1)),     // v12
+            and(11, 12),                     // v13 = main_sp (page-aligned)
+            Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: 0,
+            }, // v14 = argc (i32)
+        ];
+        // ctors run on the real frame (`main_sp`); each is `(i64 sp) -> ()`, appending no value.
+        for &ctor in ctors {
+            d.push(Inst::Call {
+                func: ctor,
+                args: vec![13],
+            });
+        }
+        // main(main_sp, argc, argv) — argv is the pointer array at the entry SP (v1).
+        d.push(Inst::Call {
+            func: main_idx,
+            args: vec![13, 14, 1],
+        });
+        let term = if main_results.is_empty() {
+            Terminator::Return(vec![])
+        } else {
+            Terminator::Return(vec![15]) // main's result (params 1 + 14 value insts before the call)
+        };
+        let b5 = Block {
+            params: vec![ValType::I64],
+            insts: d,
+            term,
+        };
+        return Func {
+            results: main_results.to_vec(),
+            blocks: vec![b0, b1, b2, b3, b4, b5],
+            params: vec![ValType::I32; n_handles],
+        };
+    }
+
+    // ===== `main(int, char**, char** envp)`: parse the blob's `envc` env strings into a second =====
+    // pointer array parked just above `argv[]`, then call `main(main_sp, argc, argv, envp)`. The env
+    // loop (blocks 6..9) mirrors the argv loop; `envc` is the second u32 at `args_base + 4`, and the
+    // env strings immediately follow the argv strings, so block 1 handed us `p` already pointing at
+    // the first one.
+    let load_i32 = |addr: ValIdx| Inst::Load {
+        op: LoadOp::I32,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+
+    // ---- block 5: argv_done(argc=0, p=1) — terminate argv[], compute envp_base, load envc, loop. ----
+    let b5 = Block {
+        params: vec![ValType::I64, ValType::I64], // argc, p (= &first env string)
+        insts: vec![
+            Inst::ConstI64(entry_sp as i64), // v2 = argv base
+            Inst::ConstI64(8),               // v3
+            mul(0, 3),                       // v4 = argc*8
+            add(2, 4),                       // v5 = &argv[argc]
+            Inst::ConstI64(0),               // v6
+            store64(5, 6),                   // argv[argc] = NULL
+            Inst::ConstI64(1),               // v7
+            add(0, 7),                       // v8 = argc+1
+            mul(8, 3),                       // v9 = (argc+1)*8
+            add(2, 9),                       // v10 = envp_base (just above argv[])
+            Inst::ConstI64(args_base + 4),   // v11
+            load_i32(11),                    // v12 = envc (u32)
+            Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: 12,
+            }, // v13 = envc (i64)
+            Inst::ConstI64(0), // v14 = j = 0
+        ],
+        term: Terminator::Br {
+            target: 6,
+            args: vec![13, 14, 1, 10], // env_head(envc, j=0, q=p, envp_base)
+        },
+    };
+
+    // ---- block 6: env_head(envc=0, j=1, q=2, envp_base=3) — continue while j <u envc, else done. ----
+    let b6 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::LtU,
+            a: 1,
+            b: 0,
+        }], // v4 = j < envc
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 7,
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 10,
+            else_args: vec![0, 3], // env_done(envc, envp_base)
+        },
+    };
+
+    // ---- block 7: env_body(envc=0, j=1, q=2, envp_base=3) — envp[j] = q, then scan q. ----
+    let b7 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(8), // v4
+            mul(1, 4),         // v5 = j*8
+            add(3, 5),         // v6 = &envp[j]
+            store64(6, 2),     // envp[j] = q
+        ],
+        term: Terminator::Br {
+            target: 8,
+            args: vec![0, 1, 2, 3, 2], // env_scan(envc, j, q, envp_base, r=q)
+        },
+    };
+
+    // ---- block 8: env_scan(envc=0, j=1, q=2, envp_base=3, r=4) — advance r to the byte past NUL. ----
+    let b8 = Block {
+        params: vec![
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+        ],
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 4,
+                offset: 0,
+                align: 0,
+            }, // v5 = *r
+            Inst::ConstI64(1), // v6
+            add(4, 6),         // v7 = r+1
+            Inst::ConstI32(0), // v8
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Eq,
+                a: 5,
+                b: 8,
+            }, // v9 = (*r == 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 9,
+            then_blk: 9,
+            then_args: vec![0, 1, 7, 3], // env_next(envc, j, q_next = r+1, envp_base)
+            else_blk: 8,
+            else_args: vec![0, 1, 2, 3, 7], // env_scan(envc, j, q, envp_base, r+1)
+        },
+    };
+
+    // ---- block 9: env_next(envc=0, j=1, q_next=2, envp_base=3) — j++ and loop. ----
+    let b9 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(1), // v4
+            add(1, 4),         // v5 = j+1
+        ],
+        term: Terminator::Br {
+            target: 6,
+            args: vec![0, 5, 2, 3], // env_head(envc, j+1, q_next, envp_base)
+        },
+    };
+
+    // ---- block 10: env_done(envc=0, envp_base=1) — envp[envc] = NULL, compute main_sp above both
+    // arrays, run ctors, call main(main_sp, argc, argv, envp). ----
+    let mut e: Vec<Inst> = vec![
         Inst::ConstI64(8),               // v2
-        mul(0, 2),                       // v3 = argc*8
-        add(1, 3),                       // v4 = &argv[argc]
+        mul(0, 2),                       // v3 = envc*8
+        add(1, 3),                       // v4 = &envp[envc]
         Inst::ConstI64(0),               // v5
-        store64(4, 5),                   // argv[argc] = NULL
+        store64(4, 5),                   // envp[envc] = NULL
         Inst::ConstI64(1),               // v6
-        add(0, 6),                       // v7 = argc+1
-        mul(7, 2),                       // v8 = (argc+1)*8
-        add(1, 8),                       // v9 = entry_sp + array bytes
+        add(0, 6),                       // v7 = envc+1
+        mul(7, 2),                       // v8 = (envc+1)*8
+        add(1, 8),                       // v9 = top of the envp array
         Inst::ConstI64(page - 1),        // v10
         add(9, 10),                      // v11
         Inst::ConstI64(!(page - 1)),     // v12
-        and(11, 12),                     // v13 = main_sp (page-aligned)
-        Inst::Convert {
-            op: ConvOp::WrapI64,
-            a: 0,
-        }, // v14 = argc (i32)
+        and(11, 12),                     // v13 = main_sp (page-aligned above both arrays)
+        Inst::ConstI64(args_base),       // v14
+        load_i32(14),                    // v15 = argc (i32)
+        Inst::ConstI64(entry_sp as i64), // v16 = argv base
     ];
-    // ctors run on the real frame (`main_sp`); each is `(i64 sp) -> ()`, appending no value.
     for &ctor in ctors {
-        d.push(Inst::Call {
+        e.push(Inst::Call {
             func: ctor,
             args: vec![13],
         });
     }
-    // main(main_sp, argc, argv) — argv is the pointer array at the entry SP (v1).
-    d.push(Inst::Call {
+    // main(main_sp, argc, argv, envp): argv is at the entry SP (v16), envp just above it (v1).
+    e.push(Inst::Call {
         func: main_idx,
-        args: vec![13, 14, 1],
+        args: vec![13, 15, 16, 1],
     });
     let term = if main_results.is_empty() {
         Terminator::Return(vec![])
     } else {
-        Terminator::Return(vec![15]) // main's result (params 1 + 14 value insts before the call)
+        Terminator::Return(vec![17]) // main's result (params 2 + 15 value insts before the call)
     };
-    let b5 = Block {
-        params: vec![ValType::I64],
-        insts: d,
+    let b10 = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: e,
         term,
     };
 
     Func {
         results: main_results.to_vec(),
-        blocks: vec![b0, b1, b2, b3, b4, b5],
+        blocks: vec![b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10],
         params: vec![ValType::I32; n_handles],
     }
 }
@@ -2567,6 +2762,9 @@ struct Helpers {
     realloc: Option<u32>,
     /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
     memmove: Option<u32>,
+    /// `__svm_getenv(name:i64) -> i64` — scan the §3e env strings for `name=`, returning the value
+    /// pointer (just past the `=`) or NULL. Reads the blob in the reserved low scratch directly.
+    getenv: Option<u32>,
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
@@ -3173,6 +3371,263 @@ fn synth_strlen() -> Func {
         params,
         results: vec![ValType::I64],
         blocks: vec![entry, lp, done],
+    }
+}
+
+/// Synthesize `__svm_getenv(name:i64) -> i64` (the C `getenv`). Scans the §3e args blob
+/// (`POWERBOX_ARGS_BASE`: `{argc:u32, envc:u32}` then the packed argv + env strings) for the first env
+/// entry whose key equals the NUL-terminated `name` followed by `=`, returning a pointer to the value
+/// (just past the `=`) or NULL. Reads the blob directly from the reserved low scratch — no `environ`
+/// global, no coupling to `_start` — so it works at any `main` arity (and returns NULL when the host
+/// seeded no env, since the window then reads `argc==envc==0`). Three phases: skip the `argc` argv
+/// strings to reach the env section, then for each of the `envc` env strings compare it against `name`
+/// char by char; a full `name` match landing on `=` yields the value pointer.
+fn synth_getenv() -> Func {
+    use svm_ir::LoadOp;
+    let args_base = svm_ir::POWERBOX_ARGS_BASE as i64;
+    let add = |a: ValIdx, b: ValIdx| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+    let load8 = |addr: ValIdx| Inst::Load {
+        op: LoadOp::I32_8U,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let load32 = |addr: ValIdx| Inst::Load {
+        op: LoadOp::I32,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let eq32 = |a: ValIdx, b: ValIdx| Inst::IntCmp {
+        ty: IntTy::I32,
+        op: CmpOp::Eq,
+        a,
+        b,
+    };
+    let ltu64 = |a: ValIdx, b: ValIdx| Inst::IntCmp {
+        ty: IntTy::I64,
+        op: CmpOp::LtU,
+        a,
+        b,
+    };
+
+    // block 0: entry(name=0) — load argc, jump into the argv-skip loop.
+    let b0 = Block {
+        params: vec![ValType::I64], // name
+        insts: vec![
+            Inst::ConstI64(args_base), // v1
+            load32(1),                 // v2 = argc (u32)
+            Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: 2,
+            }, // v3 = argc (i64)
+            Inst::ConstI64(args_base + 8), // v4 = p0 (first string)
+            Inst::ConstI64(0),         // v5 = i = 0
+        ],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 3, 5, 4], // skip_head(name, argc, i, p)
+        },
+    };
+
+    // block 1: skip_head(name=0, argc=1, i=2, p=3) — while i <u argc skip a string, else env_setup.
+    let b1 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![ltu64(2, 1)], // v4 = i < argc
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 2,
+            then_args: vec![0, 1, 2, 3],
+            else_blk: 4,
+            else_args: vec![0, 3], // env_setup(name, env_start = p)
+        },
+    };
+
+    // block 2: skip_scan(name=0, argc=1, i=2, p=3) — advance p past this string's NUL.
+    let b2 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![
+            load8(3),          // v4 = *p
+            Inst::ConstI64(1), // v5
+            add(3, 5),         // v6 = p+1
+            Inst::ConstI32(0), // v7
+            eq32(4, 7),        // v8 = (*p == 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 3,
+            then_args: vec![0, 1, 2, 6], // skip_next(name, argc, i, p_next)
+            else_blk: 2,
+            else_args: vec![0, 1, 2, 6], // skip_scan(name, argc, i, p+1)
+        },
+    };
+
+    // block 3: skip_next(name=0, argc=1, i=2, p=3) — i++ and loop.
+    let b3 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![Inst::ConstI64(1), add(2, 4)], // v4=1, v5 = i+1
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 1, 5, 3],
+        },
+    };
+
+    // block 4: env_setup(name=0, p=1) — load envc, enter the env-match loop.
+    let b4 = Block {
+        params: vec![ValType::I64, ValType::I64],
+        insts: vec![
+            Inst::ConstI64(args_base + 4), // v2
+            load32(2),                     // v3 = envc (u32)
+            Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: 3,
+            }, // v4 = envc (i64)
+            Inst::ConstI64(0),             // v5 = j = 0
+        ],
+        term: Terminator::Br {
+            target: 5,
+            args: vec![0, 4, 5, 1], // env_head(name, envc, j, p)
+        },
+    };
+
+    // block 5: env_head(name=0, envc=1, j=2, p=3) — while j <u envc try a match, else return NULL.
+    let b5 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![ltu64(2, 1)], // v4 = j < envc
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 6,
+            then_args: vec![0, 1, 2, 3, 0, 3], // cmp(name, envc, j, p, a=name, b=p)
+            else_blk: 13,
+            else_args: vec![],
+        },
+    };
+
+    // block 6: cmp(name=0, envc=1, j=2, p=3, a=4, b=5) — *a==0 ⇒ key ended, check '='; else compare.
+    let b6 = Block {
+        params: vec![ValType::I64; 6],
+        insts: vec![
+            load8(4),          // v6 = *a (name char)
+            Inst::ConstI32(0), // v7
+            eq32(6, 7),        // v8 = (*a == 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 9,
+            then_args: vec![0, 1, 2, 3, 5], // check_sep(name, envc, j, p, b)
+            else_blk: 7,
+            else_args: vec![0, 1, 2, 3, 4, 5, 6], // cmp2(.., a, b, ca=*a)
+        },
+    };
+
+    // block 7: cmp2(name=0, envc=1, j=2, p=3, a=4, b=5, ca=6) — *a==*b ? advance : skip this entry.
+    // `ca` (the just-read name byte) is an i32, the rest are pointers/counts.
+    let b7 = Block {
+        params: vec![
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I64,
+            ValType::I32,
+        ],
+        insts: vec![
+            load8(5),   // v7 = *b
+            eq32(6, 7), // v8 = (ca == *b)
+        ],
+        term: Terminator::BrIf {
+            cond: 8,
+            then_blk: 8,
+            then_args: vec![0, 1, 2, 3, 4, 5], // cmp_adv(name, envc, j, p, a, b)
+            else_blk: 11,
+            else_args: vec![0, 1, 2, 3, 3], // env_scan(name, envc, j, p, r = p)
+        },
+    };
+
+    // block 8: cmp_adv(name=0, envc=1, j=2, p=3, a=4, b=5) — a++, b++ and re-compare.
+    let b8 = Block {
+        params: vec![ValType::I64; 6],
+        insts: vec![
+            Inst::ConstI64(1), // v6
+            add(4, 6),         // v7 = a+1
+            add(5, 6),         // v8 = b+1
+        ],
+        term: Terminator::Br {
+            target: 6,
+            args: vec![0, 1, 2, 3, 7, 8],
+        },
+    };
+
+    // block 9: check_sep(name=0, envc=1, j=2, p=3, b=4) — key matched; is *b the '=' separator?
+    let b9 = Block {
+        params: vec![ValType::I64; 5],
+        insts: vec![
+            load8(4),                    // v5 = *b
+            Inst::ConstI32(b'=' as i32), // v6
+            eq32(5, 6),                  // v7 = (*b == '=')
+        ],
+        term: Terminator::BrIf {
+            cond: 7,
+            then_blk: 10,
+            then_args: vec![4], // found(b)
+            else_blk: 11,
+            else_args: vec![0, 1, 2, 3, 3], // env_scan(..) — `name` was only a key prefix
+        },
+    };
+
+    // block 10: found(b=0) — the value is the byte just past the '='.
+    let b10 = Block {
+        params: vec![ValType::I64],
+        insts: vec![Inst::ConstI64(1), add(0, 1)], // v1=1, v2 = b+1
+        term: Terminator::Return(vec![2]),
+    };
+
+    // block 11: env_scan(name=0, envc=1, j=2, p=3, r=4) — advance r past this entry's NUL.
+    let b11 = Block {
+        params: vec![ValType::I64; 5],
+        insts: vec![
+            load8(4),          // v5 = *r
+            Inst::ConstI64(1), // v6
+            add(4, 6),         // v7 = r+1
+            Inst::ConstI32(0), // v8
+            eq32(5, 8),        // v9 = (*r == 0)
+        ],
+        term: Terminator::BrIf {
+            cond: 9,
+            then_blk: 12,
+            then_args: vec![0, 1, 2, 7], // env_next(name, envc, j, p_next = r+1)
+            else_blk: 11,
+            else_args: vec![0, 1, 2, 3, 7], // env_scan(.., r+1)
+        },
+    };
+
+    // block 12: env_next(name=0, envc=1, j=2, p_next=3) — j++ and loop.
+    let b12 = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        insts: vec![Inst::ConstI64(1), add(2, 4)], // v4=1, v5 = j+1
+        term: Terminator::Br {
+            target: 5,
+            args: vec![0, 1, 5, 3],
+        },
+    };
+
+    // block 13: not_found() — return NULL.
+    let b13 = Block {
+        params: vec![],
+        insts: vec![Inst::ConstI64(0)], // v0
+        term: Terminator::Return(vec![0]),
+    };
+
+    Func {
+        params: vec![ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13],
     }
 }
 
@@ -3876,6 +4331,19 @@ fn lower_io_call(
         "printf" => {
             lower_printf(ctx, c)?;
             let r = ctx.push(Inst::ConstI32(0));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `getenv(name)`: the synthesized `__svm_getenv` scans the §3e env strings for `name=`.
+        "getenv" => {
+            let Some(f) = ctx.helpers.getenv else {
+                return Ok(false); // no powerbox entry → fail-closed
+            };
+            let name = ctx.operand(&c.arguments[0].0)?;
+            let r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![name],
+            });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
