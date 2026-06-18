@@ -13,7 +13,44 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I3 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — on `claude/debug-jit-backtrace`
+### I3 — `durable_jit` cross-backend fuzz flakes on Windows CI under cumulative JIT-commit pressure (S4)
+
+**Where:** `crates/svm/tests/durable_jit.rs::freeze_thaw_cross_backend_over_generated_modules`
+(the no-nightly cross-backend freeze/thaw driver), via `support/durjit.rs::fuzz_one_xbackend` →
+`svm-jit` compile + guest-window commit. Windows runners only.
+
+**Symptom:** intermittently the test binary aborts mid-run with
+`memory allocation of 131072 bytes failed` followed by exit code `0xc0000409`
+(`STATUS_STACK_BUFFER_OVERRUN`). Observed on PR #70 (a `svm-peval`-only change that cannot touch
+this path); the exact base commit was green on the same job, and Linux/macOS always pass — i.e. a
+flake, not a regression.
+
+**Root cause.** Each of the 64 seeds JIT-compiles ~3× and commits a fresh guest window, so the
+process's *cumulative* committed VA climbs across the run. On a memory-tight Windows runner the
+commit limit (`os error 1455`) is reached, and the **next ordinary heap allocation** — here a
+128 KiB (`131072`) `Vec`/`Box` — gets a null back. Rust's global-allocator OOM path
+(`handle_alloc_error`) then **aborts** the process, which Windows reports as
+`STATUS_STACK_BUFFER_OVERRUN`. This is the same Windows eager-commit memory-pressure *family* as
+**I1** and shares its abort signature, but a **distinct** site: I1 was the fiber control-stack
+`VirtualAlloc` (now fallible → `Trap::FiberFault`); this is a generic heap allocation that cannot be
+made to trap gracefully — once commit is exhausted, *some* allocation aborts. The test already
+*bounds* the pressure (seed count capped at 64; the heavier recycled variant is
+`#[cfg(not(windows))]`-gated) — that mitigation is just still marginal on the tightest runners.
+
+**Fix sketch (deferred — re-run clears it):**
+1. Reduce the Windows blast radius further: lower the seed count behind `#[cfg(windows)]` (e.g. 32),
+   or drop the JIT window reservation size for this driver so each commit costs less VA.
+2. Reclaim VA between seeds — free/unmap each compiled blob + guest window before the next seed
+   instead of letting them accumulate for the whole test (the libFuzzer target does the heavy run
+   anyway, so the in-tree smoke needn't hold every artifact live).
+3. Or split the driver so each seed (or small batch) runs in its own process, capping peak commit.
+
+Until then, treat a `STATUS_STACK_BUFFER_OVERRUN` / `os error 1455` abort in this specific test on
+Windows as a flake: re-run the failed job (`rerun_failed_jobs`).
+
+---
+
+### I4 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — on `claude/debug-jit-backtrace`
 
 **Where:** `crates/svm-jit/src/lib.rs` (`trap_capture_addr()` returns `0` on non-unix, so `emit_trap`
 bakes no explicit-trap capture call), `crates/svm-jit/src/trap_shim.c` (the unix-only
@@ -45,6 +82,11 @@ div-by-zero — keeps its source-line assertion under `#[cfg(unix)]` for this re
   (`_AddressOfReturnAddress`) variant of `svm_capture_explicit_trap`, reusing `svm_walk_fp_chain`.
 - **Test:** un-gate `trap_kill_message_carries_a_source_backtrace` on Windows once explicit-trap capture
   lands; validate via the `windows-latest` CI job.
+
+---
+
+_(I1 below is open-adjacent — its abort mechanism is fixed, but I3 is the residual same-family flake.
+I2 resolved below.)_
 
 ---
 

@@ -8,6 +8,10 @@
 //! flow is bounded by `fuel` (a stand-in for §5 metering), so it always terminates.
 #![forbid(unsafe_code)]
 
+/// Phase-1b bytecode-dispatch engine (see `INTERP_PERF.md`) — a flat, operand-resolved execution
+/// path, not yet the default; gated by the equality harness against this interpreter.
+pub mod bytecode;
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -213,6 +217,23 @@ pub fn run_traced(
 ) -> (Result<Vec<Value>, Trap>, Vec<IrPc>) {
     let mut host = Host::new();
     run_with_host_traced(m, func, args, fuel, &mut host)
+}
+
+/// The **fast** interpreter entry (INTERP_PERF.md Slice 1c): run on the [`bytecode`] engine when the
+/// module is eligible, else fall back to the tree-walker [`run`]. The two are bit-for-bit equivalent
+/// on the eligible set (the `bytecode_diff` harness gates this), so this is a transparent speedup.
+///
+/// `run` itself stays the tree-walker — it is the reference **oracle** the JIT (and the bytecode
+/// engine) are differentially checked against, so it must not change. Speed-sensitive callers that
+/// are *not* themselves the oracle use `run_fast`.
+pub fn run_fast(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+) -> Result<Vec<Value>, Trap> {
+    let mut host = Host::new();
+    run_with_host_fast(m, func, args, fuel, &mut host)
 }
 
 // ===========================================================================================
@@ -1539,6 +1560,32 @@ pub fn run_with_host_traced(
         mm
     });
     drive(&m.funcs, func, args, fuel, &mut mem, host)
+}
+
+/// Host-carrying counterpart of [`run_fast`]: try the [`bytecode`] engine first, fall back to the
+/// tree-walker [`run_with_host`]. The bytecode engine drives no runtime seams yet (no scheduler,
+/// powerbox, fibers, threads, durability), so it is used only when the run needs none of them:
+///
+/// * the host is **not durable** (durability needs the shadow-stack swap in [`drive`]), and
+/// * [`bytecode::compile_and_run`] accepts the module — it returns `None` for any op that needs a
+///   seam (capability / thread / fiber / continuation / `memory.wait` ops), so an accepted module is
+///   pure compute + memory + (direct/indirect) calls, which a granted-capability host never affects.
+///
+/// On the `None` fallback path `compile_and_run` rejects the module *before* executing, so `fuel` is
+/// untouched and the tree-walker runs with the full budget.
+pub fn run_with_host_fast(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
+    if !host.is_durable() {
+        if let Some(result) = bytecode::compile_and_run_with_host(m, func, args, fuel, host) {
+            return result;
+        }
+    }
+    run_with_host(m, func, args, fuel, host)
 }
 
 /// Run the entry vCPU on the M:N executor: submit the root, become a worker on the calling thread,
@@ -9925,6 +9972,13 @@ struct Mem {
     /// overwhelmingly common case — the per-byte path skips the address-space lock entirely and goes
     /// straight to `back`, since no page can be `Backed`. Shared with forked vCPUs.
     has_regions: Arc<AtomicBool>,
+    /// Fast-path flag: set once the address space is **ever** mutated (`map`/`unmap`/`protect`, §13
+    /// region alias, demand/supply paging) — monotonic, dirtied at the [`Mem::space_write`] choke
+    /// point. While clear — the overwhelmingly common case (no syscalls, no coroutines, no regions)
+    /// — [`Mem::check_prot`] knows every in-prefix page is plain RW and skips the address-space
+    /// `RwLock` read entirely. Shared with the same topology as `space` (cloned for a forked thread,
+    /// fresh for a §14 child, which has its own address space).
+    prot_dirty: Arc<AtomicBool>,
     /// §14 fault-driven-yield side-channel: the confined address of the most recent **recoverable**
     /// page fault (an in-window access to an unmapped/read-only page — `check_prot` sets it,
     /// `confine_checked` clears it to [`NO_FAULT`]). A coroutine child with `fault_yields` reads it
@@ -9976,6 +10030,7 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -9998,6 +10053,7 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -10009,6 +10065,11 @@ impl Mem {
         self.space.read().unwrap_or_else(|e| e.into_inner())
     }
     fn space_write(&self) -> std::sync::RwLockWriteGuard<'_, AddrSpace> {
+        // Any address-space mutation (the only reason to take the write lock) disables the lock-free
+        // `check_prot` fast path, monotonically. Set *before* acquiring the lock so a concurrent
+        // reader never observes a clear flag after a mutation has begun (a false positive just makes
+        // it take the read lock — always safe; a false negative would not be).
+        self.prot_dirty.store(true, Ordering::Release);
         self.space.write().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -10023,6 +10084,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::clone(&self.space),
             has_regions: Arc::clone(&self.has_regions),
+            prot_dirty: Arc::clone(&self.prot_dirty),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -10047,6 +10109,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -10075,6 +10138,12 @@ impl Mem {
         // §14 child).
         let rel = base.wrapping_sub(self.window.base());
         let last = rel + width as u64 - 1;
+        // Lock-free fast path: the address space has never been mutated, so every page is in its
+        // region default — RW inside `[0, mapped)`. An in-prefix access is unconditionally fine and
+        // skips the `RwLock` read entirely (the hot, overwhelmingly common case).
+        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+            return Ok(());
+        }
         let space = self.space_read();
         if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
@@ -10530,16 +10599,31 @@ impl Mem {
     }
 
     fn read_le(&self, base: u64, width: u32) -> u64 {
+        // Hoist the `has_regions` check out of the per-byte loop: when no §13 region is aliased in
+        // (the common case) read straight from `back`, one `has_regions` load instead of `width`.
+        // Still per-byte (each `Region::byte` is a relaxed atomic — defined under §12 races).
         let mut raw = 0u64;
-        for k in 0..width as u64 {
-            raw |= (self.byte(base + k) as u64) << (8 * k);
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..width as u64 {
+                raw |= (self.back.byte(base + k) as u64) << (8 * k);
+            }
+        } else {
+            for k in 0..width as u64 {
+                raw |= (self.byte(base + k) as u64) << (8 * k);
+            }
         }
         raw
     }
 
     fn write_le(&mut self, base: u64, width: u32, raw: u64) {
-        for k in 0..width as u64 {
-            self.set_byte(base + k, (raw >> (8 * k)) as u8);
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..width as u64 {
+                self.back.set_byte(base + k, (raw >> (8 * k)) as u8);
+            }
+        } else {
+            for k in 0..width as u64 {
+                self.set_byte(base + k, (raw >> (8 * k)) as u8);
+            }
         }
     }
 
