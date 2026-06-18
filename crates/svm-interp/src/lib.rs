@@ -5378,6 +5378,32 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .vals
                         .push(Reg::from_i32(sched.notify(base, n) as i32));
                 }
+                // Fast paths for the hottest pure ops: dispatch here instead of through the
+                // `eval_inst` call (and its `Option<Reg>` return), reusing the same shared
+                // semantic helpers (`bin32`/`bin64`/`cmp32`/`cmp64`) — only the thin dispatch glue
+                // is duplicated, never the operation semantics. Everything else falls through.
+                Inst::ConstI64(c) => frames[top].vals.push(Reg::from_i64(*c)),
+                Inst::ConstI32(c) => frames[top].vals.push(Reg::from_i32(*c)),
+                Inst::IntBin { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => {
+                            Reg::from_i32(bin32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?)?)
+                        }
+                        IntTy::I64 => {
+                            Reg::from_i64(bin64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?)?)
+                        }
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::IntCmp { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?),
+                        IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?),
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
                 // Everything else: one value, or none for `Store`/`AtomicStore`.
                 other => {
                     match eval_inst(other, &frames[top].vals, mem) {
