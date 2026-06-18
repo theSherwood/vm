@@ -38,8 +38,18 @@ job while every other job is green.
 lost-wakeup / missed-notification race between the steal path and the park/unpark of idle worker
 threads (or in the guest scheduler's termination detection), exposed only under a particular
 interleaving. Needs root-causing from a stuck instance (attach `gdb`/`lldb` and dump all thread
-backtraces, or add steal/park tracing). **Not** caused by the argc/argv work (PR #66): the demos and
-the fiber/thread runtime are unchanged by it, and they pass consistently with that change applied.
+backtraces, or add steal/park tracing). The fiber/work-stealing **runtime is not modified** by the
+argc/argv work (PR #66).
+
+**Sensitivity clue (PR #66):** the race is sharp enough that a *tiny startup perturbation* flips it
+from rare to frequent. PR #66 originally had the `svm-run` CLI seed the §3e args buffer (a few-byte
+`init_mem` memcpy during window setup, before the guest runs) for **every** program, including these
+`main(void)` demos. That harmless, never-read seeding — only a few microseconds of extra setup —
+took the hang from "0 in ~50 sequential runs" to **reliable on the first iteration** under
+`cargo test --test run --test-threads=8` (parallel load). Reverting to *not* seeding when there are
+no actual program args (so a bare run is byte-identical to before) restored the rare baseline (≥6
+clean parallel iterations). So whatever the root cause, it is acutely sensitive to worker-thread
+start timing — a strong hint for a park/unpark or steal-loop wakeup race.
 
 **Fix sketch:**
 1. Root-cause via thread backtraces of a hung process (reproduce by looping the `svm-run` binary on

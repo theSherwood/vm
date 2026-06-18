@@ -104,11 +104,19 @@ fn try_main() -> Result<(), String> {
             max_fibers: env_usize("SVM_MAX_FIBERS", dq.max_fibers),
             max_vcpus: env_usize("SVM_MAX_VCPUS", dq.max_vcpus),
         };
-        // `argv` = the input file name (argv[0]) followed by the post-`--` guest args. The
-        // environment is deliberately *empty* (no ambient host env leaks into the sandbox, §3e/§7).
-        let argv: Vec<&[u8]> = std::iter::once(file.as_bytes())
-            .chain(guest_args.iter().map(|s| s.as_bytes()))
-            .collect();
+        // The guest's `argv`: when the user passes `-- <args>`, the input file name is `argv[0]`
+        // and the post-`--` tokens follow. When *no* `--` args are given, pass an empty vector so the
+        // runner seeds **no** args buffer (`init_mem` stays `None`, byte-identical to a bare run) —
+        // a program that wants `argc>=1` must be invoked with `--`. (Seeding the window for every run
+        // is both pointless for `main(void)` programs and an unnecessary perturbation of the guest's
+        // initial state.) The environment is deliberately empty — no ambient host env leaks in (§3e/§7).
+        let argv: Vec<&[u8]> = if guest_args.is_empty() {
+            Vec::new()
+        } else {
+            std::iter::once(file.as_bytes())
+                .chain(guest_args.iter().map(|s| s.as_bytes()))
+                .collect()
+        };
         let run = run_powerbox_with_args_and_limits(&module, &stdin, &argv, &[], deadline, quota)?;
         // Flush captured output to the real streams (process::exit skips destructors, so flush
         // explicitly), then terminate with the guest's exit code.
