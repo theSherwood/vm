@@ -88,7 +88,11 @@ fn trap_backtrace_names_the_faulting_store() {
         "the overrunning store must be caught as a MemoryFault, got {outcome:?}"
     );
     let bt = cm.last_trap_backtrace();
-    assert_eq!(bt.len(), 1, "exactly the one faulting guest frame, got {bt:?}");
+    assert_eq!(
+        bt.len(),
+        1,
+        "exactly the one faulting guest frame, got {bt:?}"
+    );
     assert_eq!(bt[0].func, 0, "the faulting frame is function 0");
     assert_eq!(bt[0].line, 10, "symbolized to the store's source line");
     assert_eq!(bt[0].file, "fault.c", "and its source file");
@@ -103,14 +107,21 @@ fn trap_backtrace_walks_the_caller_chain() {
         "the overrunning store in the callee must trap MemoryFault, got {outcome:?}"
     );
     let bt = cm.last_trap_backtrace();
-    assert_eq!(bt.len(), 2, "innermost callee (func1) + its caller (func0), got {bt:?}");
+    assert_eq!(
+        bt.len(),
+        2,
+        "innermost callee (func1) + its caller (func0), got {bt:?}"
+    );
     assert_eq!(
         (bt[0].func, bt[0].line),
         (1, 10),
         "innermost frame = function 1 at the store line"
     );
     assert_eq!(bt[1].func, 0, "caller frame = function 0");
-    assert_eq!(bt[1].line, 20, "caller symbolized to the call-site line (ret-1 lands in the call)");
+    assert_eq!(
+        bt[1].line, 20,
+        "caller symbolized to the call-site line (ret-1 lands in the call)"
+    );
 }
 
 #[test]
@@ -134,5 +145,8 @@ block0(v0: i32):
     );
     // And the trapping module does populate one (sanity vs the empty case above).
     let _ = cm.run(&[0], None, None, None).expect("run");
-    assert!(!cm.last_trap_backtrace().is_empty(), "the trapping module has a backtrace");
+    assert!(
+        !cm.last_trap_backtrace().is_empty(),
+        "the trapping module has a backtrace"
+    );
 }

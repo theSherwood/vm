@@ -1195,7 +1195,12 @@ mod trap_capture_tests {
     use super::{symbolize_capture, JitFrameLoc};
 
     fn loc(func: u32, line: u32) -> JitFrameLoc {
-        JitFrameLoc { func, file: "f.c".into(), line, col: 0 }
+        JitFrameLoc {
+            func,
+            file: "f.c".into(),
+            line,
+            col: 0,
+        }
     }
 
     #[test]
@@ -1209,7 +1214,11 @@ mod trap_capture_tests {
             _ => None,
         };
         let frames = symbolize_capture(0x100, &[0x19a, 0x29a, 0x999], sym);
-        assert_eq!(frames, vec![loc(2, 5), loc(1, 10), loc(0, 20)], "three guest frames, host trimmed");
+        assert_eq!(
+            frames,
+            vec![loc(2, 5), loc(1, 10), loc(0, 20)],
+            "three guest frames, host trimmed"
+        );
     }
 
     #[test]
@@ -1220,7 +1229,11 @@ mod trap_capture_tests {
             _ => None,
         };
         let frames = symbolize_capture(0x10, &[0x20, 0x30, 0x40], sym);
-        assert_eq!(frames, vec![loc(0, 7)], "duplicate adjacent positions collapse");
+        assert_eq!(
+            frames,
+            vec![loc(0, 7)],
+            "duplicate adjacent positions collapse"
+        );
     }
 }
 

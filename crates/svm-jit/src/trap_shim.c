@@ -12,7 +12,11 @@
  * thread-local, so concurrent JIT runs on different threads are independent: the handler
  * runs on the faulting thread and reads that thread's state.
  */
-#define _GNU_SOURCE /* glibc gates REG_RIP/REG_RBP in <sys/ucontext.h> behind this. */
+/* Feature-test macros must precede every include. `_XOPEN_SOURCE` exposes the (macOS-deprecated)
+ * ucontext routines + `ucontext_t` mcontext on Apple SDKs; `_GNU_SOURCE` gates glibc's REG_RIP/REG_RBP
+ * in <sys/ucontext.h>. Both are harmless where unneeded. */
+#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
