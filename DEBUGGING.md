@@ -703,9 +703,12 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     the next. `CompiledModule::debug_line_section()` exposes it. Test (`jit_srcloc.rs`): the emitted
     bytes **round-trip through `svm_wasm::dwarf_line::parse`** and reconstruct the exact
     machine-address → (file, line) map; a non-`-g` module emits nothing.
-  - [ ] **2b — `.debug_info`.** A CU DIE + per-function `DW_TAG_subprogram` (name, `low_pc`/
-    `high_pc`) + `.debug_abbrev` (+ `.debug_str`), round-tripped through `svm_wasm::dwarf_info::parse`
-    (validates the address ranges; the reader drops names).
+  - [x] **2b — `.debug_info`.** `dwarf::debug_info` emits a CU DIE + a `DW_TAG_subprogram` per
+    function (synthesized `fnN` name, `DW_AT_low_pc` + `DW_AT_high_pc` offset form) with a matching
+    `.debug_abbrev`; `CompiledModule::debug_info_sections()` derives each function's `[low_pc,
+    high_pc)` as the span of its source-mapped ranges. Test (`jit_srcloc.rs`): the pair
+    **round-trips through `svm_wasm::dwarf_info::parse`** to one subprogram whose `low_pc`/`high_pc`
+    match the function's machine extent.
   - [ ] **2c — in-memory ELF + GDB JIT registration.** Wrap the code + DWARF sections in a minimal
     ELF (`.text` header pointing at the JIT memory) and register it via the GDB JIT interface
     (`__jit_debug_register_code` + `__jit_debug_descriptor` + the `jit_code_entry` list).
@@ -744,10 +747,11 @@ DWARF variable locations) finally land — they are stages here, not separate wo
   like the rest of the waist — a malformed DWARF mis-renders, never escapes. Keep it off the
   verifier/runtime hot path.
 
-**Progress:** Stages 0–1 **built** (source-loc threading + `symbolize`) and Stage **2a built** (the
-`.debug_line` emitter, round-tripped through the reader). **Next: 2b** (`.debug_info` CU +
-subprogram DIEs) then **2c** (in-memory ELF + GDB JIT registration) for the headline "set a
-breakpoint on a `.c` line in gdb" milestone. Each stage is independently shippable.
+**Progress:** Stages 0–1 **built** (source-loc threading + `symbolize`); Stage 2 **2a + 2b built**
+(the `.debug_line` and `.debug_info`/`.debug_abbrev` emitters, both round-tripped through the
+readers). **Next: 2c** — wrap the finalized code + these DWARF sections in a minimal in-memory ELF
+and register it via the GDB JIT interface for the headline "set a breakpoint on a `.c` line in gdb"
+milestone (the gdb-attach acceptance step is manual, not CI). Each stage is independently shippable.
 
 ---
 

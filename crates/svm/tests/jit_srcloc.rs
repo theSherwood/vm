@@ -138,3 +138,36 @@ fn jit_emits_debug_line_that_round_trips_through_the_reader() {
     let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
     assert!(bare.debug_line_section().is_empty());
 }
+
+#[test]
+fn jit_emits_debug_info_subprograms_that_round_trip() {
+    // Stage 2b: the synthesized `.debug_info` + `.debug_abbrev`, parsed back by the project's DWARF
+    // info reader, recovers one `DW_TAG_subprogram` per function covering its machine extent — what
+    // lets gdb/lldb map a stopped address to its function.
+    let cm = compile(COMPUTE_DBG);
+    let (info, abbrev) = cm.debug_info_sections();
+    assert!(
+        !info.is_empty() && !abbrev.is_empty(),
+        "a -g module emits .debug_info"
+    );
+
+    let parsed = svm_wasm::dwarf_info::parse(&info, &abbrev, &[]).expect("the emitted CU parses");
+    assert_eq!(parsed.subs.len(), 1, "one subprogram (the single function)");
+
+    // Its [low_pc, high_pc) is the span of func 0's source-mapped machine ranges.
+    let lo = cm.src_ranges().iter().map(|r| r.lo).min().unwrap();
+    let hi = cm.src_ranges().iter().map(|r| r.hi).max().unwrap();
+    assert_eq!(
+        parsed.subs[0].low_pc, lo,
+        "subprogram low_pc = function start"
+    );
+    assert_eq!(
+        parsed.subs[0].high_pc, hi,
+        "subprogram high_pc = function end"
+    );
+
+    // A non-`-g` module emits nothing.
+    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    let (bi, ba) = bare.debug_info_sections();
+    assert!(bi.is_empty() && ba.is_empty());
+}

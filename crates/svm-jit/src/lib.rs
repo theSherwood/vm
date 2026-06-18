@@ -1277,6 +1277,30 @@ impl CompiledModule {
         dwarf::debug_line(&self.src_ranges, &self.src_files)
     }
 
+    /// The synthesized DWARF `(.debug_info, .debug_abbrev)` for this module's finalized code (W5
+    /// JIT/DWARF Stage 2b): a compile unit with one `DW_TAG_subprogram` per function (its machine
+    /// `[low_pc, high_pc)` extent, derived as the span of its source-mapped ops), so gdb/lldb map a
+    /// stopped address to its function. Both empty without `-g`.
+    pub fn debug_info_sections(&self) -> (Vec<u8>, Vec<u8>) {
+        if self.src_ranges.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        // Per-function machine extent = the span of its source-mapped ranges.
+        let mut per_fn: std::collections::BTreeMap<u32, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        for r in &self.src_ranges {
+            let e = per_fn.entry(r.func).or_insert((r.lo, r.hi));
+            e.0 = e.0.min(r.lo);
+            e.1 = e.1.max(r.hi);
+        }
+        let mut funcs: Vec<(u32, u64, u64)> = per_fn
+            .into_iter()
+            .map(|(f, (lo, hi))| (f, lo, hi))
+            .collect();
+        funcs.sort_by_key(|&(_, lo, _)| lo);
+        dwarf::debug_info(&funcs)
+    }
+
     /// Compile the whole module (the compile half of the old one-shot `compile_and_run*`):
     /// declare + define every function, the entry's buffer-ABI trampoline, finalize once, and
     /// build the function table. Everything *baked into code* — the confinement mask, the

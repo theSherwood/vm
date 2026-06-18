@@ -96,3 +96,63 @@ pub fn debug_line(ranges: &[SrcRange], files: &[String]) -> Vec<u8> {
     out.extend_from_slice(&prog);
     out
 }
+
+// DWARF tag / attribute / form constants for the minimal `.debug_info` we emit (Stage 2b).
+const DW_TAG_COMPILE_UNIT: u64 = 0x11;
+const DW_TAG_SUBPROGRAM: u64 = 0x2e;
+const DW_AT_NAME: u64 = 0x03;
+const DW_AT_LOW_PC: u64 = 0x11;
+const DW_AT_HIGH_PC: u64 = 0x12;
+const DW_FORM_ADDR: u64 = 0x01;
+const DW_FORM_DATA8: u64 = 0x07;
+const DW_FORM_STRING: u64 = 0x08;
+
+/// Emit a minimal `.debug_info` + `.debug_abbrev` pair (Stage 2b): one compile-unit DIE whose
+/// children are a `DW_TAG_subprogram` per function — `(name, low_pc, high_pc)`, where `high_pc` is
+/// the DWARF4 *offset* form (`hi - lo`). `funcs` is `(func index, lo, hi)` machine ranges. This is
+/// what lets gdb/lldb map a stopped address to its function (and, with `.debug_line`, its source).
+pub fn debug_info(funcs: &[(u32, u64, u64)]) -> (Vec<u8>, Vec<u8>) {
+    // `.debug_abbrev`: code 1 = compile_unit (children), code 2 = subprogram (no children).
+    let mut abbrev = Vec::new();
+    uleb(&mut abbrev, 1);
+    uleb(&mut abbrev, DW_TAG_COMPILE_UNIT);
+    abbrev.push(1); // DW_CHILDREN_yes
+    uleb(&mut abbrev, DW_AT_NAME);
+    uleb(&mut abbrev, DW_FORM_STRING);
+    uleb(&mut abbrev, 0);
+    uleb(&mut abbrev, 0); // end of code-1 attrs
+    uleb(&mut abbrev, 2);
+    uleb(&mut abbrev, DW_TAG_SUBPROGRAM);
+    abbrev.push(0); // DW_CHILDREN_no
+    uleb(&mut abbrev, DW_AT_NAME);
+    uleb(&mut abbrev, DW_FORM_STRING);
+    uleb(&mut abbrev, DW_AT_LOW_PC);
+    uleb(&mut abbrev, DW_FORM_ADDR);
+    uleb(&mut abbrev, DW_AT_HIGH_PC);
+    uleb(&mut abbrev, DW_FORM_DATA8);
+    uleb(&mut abbrev, 0);
+    uleb(&mut abbrev, 0); // end of code-2 attrs
+    abbrev.push(0); // end of the abbrev table
+
+    // `.debug_info` DIE tree: CU DIE (code 1) then a subprogram DIE (code 2) per function, closed
+    // by a null DIE.
+    let mut dies = Vec::new();
+    uleb(&mut dies, 1); // CU DIE
+    dies.extend_from_slice(b"svm-jit\0"); // DW_AT_name
+    for &(func, lo, hi) in funcs {
+        uleb(&mut dies, 2); // subprogram DIE
+        dies.extend_from_slice(format!("fn{func}\0").as_bytes()); // DW_AT_name (synthesized)
+        dies.extend_from_slice(&lo.to_le_bytes()); // DW_AT_low_pc (8-byte address)
+        dies.extend_from_slice(&hi.saturating_sub(lo).to_le_bytes()); // DW_AT_high_pc (offset)
+    }
+    uleb(&mut dies, 0); // end the CU's children
+
+    let mut info = Vec::new();
+    let unit_len = 2 /* version */ + 4 /* abbrev_offset */ + 1 /* addr_size */ + dies.len();
+    info.extend_from_slice(&(unit_len as u32).to_le_bytes()); // unit_length (DWARF32)
+    info.extend_from_slice(&4u16.to_le_bytes()); // version
+    info.extend_from_slice(&0u32.to_le_bytes()); // debug_abbrev_offset (table starts at 0)
+    info.push(8); // address_size
+    info.extend_from_slice(&dies);
+    (info, abbrev)
+}
