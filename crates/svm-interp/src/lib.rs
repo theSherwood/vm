@@ -5378,12 +5378,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .vals
                         .push(Reg::from_i32(sched.notify(base, n) as i32));
                 }
-                // Fast paths for the hottest pure ops: dispatch here instead of through the
-                // `eval_inst` call (and its `Option<Reg>` return), reusing the same shared
-                // semantic helpers (`bin32`/`bin64`/`cmp32`/`cmp64`) — only the thin dispatch glue
-                // is duplicated, never the operation semantics. Everything else falls through.
-                Inst::ConstI64(c) => frames[top].vals.push(Reg::from_i64(*c)),
+                // Fast paths for the **pure** value ops (no memory, no SIMD): dispatch here and
+                // push the result directly, instead of through the `eval_inst` call (and its
+                // `Option<Reg>` return). `eval_inst` is a very large function that never inlines,
+                // so the call dominated the per-op cost on scalar/float code — eliminating it for
+                // these ops is the bulk of the eval-loop speedup. The operation *semantics* live in
+                // shared helpers (`bin64`/`fbin64`/`cast`/…) called from both here and `eval_inst`,
+                // so only thin dispatch glue is repeated; `eval_inst` keeps a (now-unreachable, but
+                // exhaustive and identical) copy of these arms and remains the path for memory,
+                // SIMD, and the no-result/control ops.
                 Inst::ConstI32(c) => frames[top].vals.push(Reg::from_i32(*c)),
+                Inst::ConstI64(c) => frames[top].vals.push(Reg::from_i64(*c)),
+                Inst::ConstF32(bits) => frames[top].vals.push(Reg::from_f32(f32::from_bits(*bits))),
+                Inst::ConstF64(bits) => frames[top].vals.push(Reg::from_f64(f64::from_bits(*bits))),
                 Inst::IntBin { ty, op, a, b } => {
                     let vals = &frames[top].vals;
                     let r = match ty {
@@ -5404,6 +5411,94 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     frames[top].vals.push(Reg::from_i32(r as i32));
                 }
+                Inst::IntUn { ty, op, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => Reg::from_i32(intun32(*op, get_i32(vals, *a)?)),
+                        IntTy::I64 => Reg::from_i64(intun64(*op, get_i64(vals, *a)?)),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::Eqz { ty, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => get_i32(vals, *a)? == 0,
+                        IntTy::I64 => get_i64(vals, *a)? == 0,
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::Convert { op, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match op {
+                        ConvOp::ExtendI32S => Reg::from_i64(get_i32(vals, *a)? as i64),
+                        ConvOp::ExtendI32U => Reg::from_i64(get_i32(vals, *a)? as u32 as i64),
+                        ConvOp::WrapI64 => Reg::from_i32(get_i64(vals, *a)? as i32),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::Select { cond, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = if get_i32(vals, *cond)? != 0 {
+                        get(vals, *a)?
+                    } else {
+                        get(vals, *b)?
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::FBin { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        FloatTy::F32 => {
+                            Reg::from_f32(fbin32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?))
+                        }
+                        FloatTy::F64 => {
+                            Reg::from_f64(fbin64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?))
+                        }
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::FUn { ty, op, a } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
+                        FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::FCmp { ty, op, a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        FloatTy::F32 => fcmp32(*op, get_f32(vals, *a)?, get_f32(vals, *b)?),
+                        FloatTy::F64 => fcmp64(*op, get_f64(vals, *a)?, get_f64(vals, *b)?),
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::FToISat { op, a } => {
+                    let r = fto_i(*op, get(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::FToITrap { op, a } => {
+                    let r = trunc_trap(*op, get(&frames[top].vals, *a)?)?;
+                    frames[top].vals.push(r);
+                }
+                Inst::IToFConv { op, a } => {
+                    let r = i_to_f(*op, get(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::PtrAdd { a, b } => {
+                    let vals = &frames[top].vals;
+                    let r = Reg::from_i64(get_i64(vals, *a)?.wrapping_add(get_i64(vals, *b)?));
+                    frames[top].vals.push(r);
+                }
+                Inst::PtrCast { a, .. } => {
+                    let r = Reg::from_i64(get_i64(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::Cast { op, a } => {
+                    let r = cast(*op, get(&frames[top].vals, *a)?);
+                    frames[top].vals.push(r);
+                }
+                Inst::RefFunc { func } => frames[top].vals.push(Reg::from_i32(*func as i32)),
                 // Everything else: one value, or none for `Store`/`AtomicStore`.
                 other => {
                     match eval_inst(other, &frames[top].vals, mem) {
