@@ -4,6 +4,7 @@
 //!   cargo test -p svm --release --test interp_perf -- --nocapture --ignored
 
 use std::hint::black_box;
+use std::process::Command;
 use std::time::Instant;
 
 use svm_interp::Value;
@@ -105,10 +106,26 @@ fn ns_per_iter(reps: u32, big: i64, small: i64, mut call: impl FnMut(i64) -> i64
     best
 }
 
+/// Steady-state ns/iter for the matching CPython kernel (`interp_perf.py`) — a calibration point
+/// so the comparison isn't just interp-vs-JIT but interp-vs-(CPython, JIT). Best-effort: returns
+/// `None` if `python3` isn't on PATH or the script errors, so the benchmark still runs without it.
+fn python_ns(py_key: &str, big: i64) -> Option<f64> {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/interp_perf.py");
+    let out = Command::new("python3")
+        .args([script, py_key, &big.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
 /// Run one hand-written kernel through both backends and print the per-iteration ns and the
-/// interp/JIT ratio. `interp_big`/`jit_big` are the "big" loop counts for the subtraction
-/// method — the interp is ~100x slower, so it gets a smaller `big` to keep the test snappy.
-fn bench(name: &str, src: &str, interp_big: i64, jit_big: i64) {
+/// interp/JIT ratio (plus a CPython reference for the same computation). `interp_big`/`jit_big`
+/// are the "big" loop counts for the subtraction method — the interp is much slower than the JIT,
+/// so it gets a smaller `big` to keep the test snappy. `py_key` selects the matching CPython kernel.
+fn bench(name: &str, src: &str, py_key: &str, interp_big: i64, jit_big: i64) {
     let m = svm::text::parse_module(src).expect("parse");
     svm::verify::verify_module(&m).expect("verify");
     assert_eq!(
@@ -119,10 +136,13 @@ fn bench(name: &str, src: &str, interp_big: i64, jit_big: i64) {
 
     let i = ns_per_iter(5, interp_big, 1_000, |n| interp_call(&m, n));
     let j = ns_per_iter(5, jit_big, 1_000, |n| jit_call(&m, n));
-    println!("\n{name} (same IR through interp and JIT, ns/iter):");
-    println!("  interp : {i:>9.3} ns/iter");
-    println!("  jit    : {j:>9.3} ns/iter");
-    println!("  ratio  : {:>9.1}x  (interp / jit)", i / j);
+    println!("\n{name} (ns/iter):");
+    println!("  interp : {i:>9.3}");
+    println!("  jit    : {j:>9.3}   (interp/jit {:>7.1}x)", i / j);
+    match python_ns(py_key, interp_big) {
+        Some(p) => println!("  python : {p:>9.3}   (interp/python {:>5.2}x)", i / p),
+        None => println!("  python :         -   (python3 unavailable)"),
+    }
 }
 
 // acc = load(load(acc) stored at a fixed address) + i, for i in 0..n. Each iteration does an
@@ -154,7 +174,7 @@ block3(v15: i64):
 #[test]
 #[ignore = "benchmark; run explicitly with --nocapture --ignored"]
 fn interp_vs_jit_throughput() {
-    bench("alu recurrence", ALU, 200_000, 5_000_000);
-    bench("call/return loop", CALL, 100_000, 5_000_000);
-    bench("memory load/store loop", MEM, 100_000, 5_000_000);
+    bench("alu recurrence", ALU, "alu", 200_000, 5_000_000);
+    bench("call/return loop", CALL, "call", 100_000, 5_000_000);
+    bench("memory load/store loop", MEM, "mem", 100_000, 5_000_000);
 }

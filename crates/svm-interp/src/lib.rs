@@ -4637,19 +4637,29 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // root/fiber exits read out of the same buffer.
     let mut ret_buf: Vec<Reg> = Vec::new();
 
+    // Resolve the running frame against *its* module (module 0 = this vCPU's program;
+    // `INVOKE_MODULE` = the invoked unit; ≥ 1 = an installed Jit unit), cloning the module's `Arc`
+    // into a local so the shared `dt` is never borrowed across the loop body. This is **cached
+    // across loop iterations**: re-resolving (an atomic `Arc` refcount bump) on every block entry
+    // showed up on the hot path — a branch / loop back-edge re-enters this loop, and almost always
+    // stays in the same module — so we only re-resolve when `module` actually changes. A module's
+    // code never mutates in place (units are append-only; module 0 is fixed), so a same-id reuse is
+    // sound.
+    let mut cur_module = frames.last().map(|f| f.module).unwrap_or(0);
+    let mut cur_funcs: Arc<[Func]> =
+        resolve_module(&funcs, units, invoked, dt, cur_module).ok_or(Trap::Malformed)?;
+
     // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
     // `return` pops and appends results to the caller (which resumes past the call); a tail
     // call replaces the top in place (O(1) frames). `cont.resume`/`suspend` switch which
     // fiber's stack is in `frames` — see the comments on those arms.
     'frames: loop {
         let top = frames.len() - 1;
-        // Resolve the running frame against *its* module (module 0 = this vCPU's program;
-        // `INVOKE_MODULE` = the invoked unit; ≥ 1 = an installed Jit unit). Clone the module's `Arc`
-        // into a local so the shared `dt` is never borrowed across the loop body. `block` borrows
-        // `cur` (the owned local), *not* `frames`, so the loop body is free to push/pop/mutate
-        // `frames` (and move it on a fiber switch) while holding it.
-        let cur_funcs: Arc<[Func]> = resolve_module(&funcs, units, invoked, dt, frames[top].module)
-            .ok_or(Trap::Malformed)?;
+        if frames[top].module != cur_module {
+            cur_module = frames[top].module;
+            cur_funcs =
+                resolve_module(&funcs, units, invoked, dt, cur_module).ok_or(Trap::Malformed)?;
+        }
         let fs: &[Func] = &cur_funcs;
         let block = fs
             .get(frames[top].func as usize)
