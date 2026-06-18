@@ -9621,6 +9621,13 @@ struct Mem {
     /// overwhelmingly common case — the per-byte path skips the address-space lock entirely and goes
     /// straight to `back`, since no page can be `Backed`. Shared with forked vCPUs.
     has_regions: Arc<AtomicBool>,
+    /// Fast-path flag: set once the address space is **ever** mutated (`map`/`unmap`/`protect`, §13
+    /// region alias, demand/supply paging) — monotonic, dirtied at the [`Mem::space_write`] choke
+    /// point. While clear — the overwhelmingly common case (no syscalls, no coroutines, no regions)
+    /// — [`Mem::check_prot`] knows every in-prefix page is plain RW and skips the address-space
+    /// `RwLock` read entirely. Shared with the same topology as `space` (cloned for a forked thread,
+    /// fresh for a §14 child, which has its own address space).
+    prot_dirty: Arc<AtomicBool>,
     /// §14 fault-driven-yield side-channel: the confined address of the most recent **recoverable**
     /// page fault (an in-window access to an unmapped/read-only page — `check_prot` sets it,
     /// `confine_checked` clears it to [`NO_FAULT`]). A coroutine child with `fault_yields` reads it
@@ -9672,6 +9679,7 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -9694,6 +9702,7 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -9705,6 +9714,11 @@ impl Mem {
         self.space.read().unwrap_or_else(|e| e.into_inner())
     }
     fn space_write(&self) -> std::sync::RwLockWriteGuard<'_, AddrSpace> {
+        // Any address-space mutation (the only reason to take the write lock) disables the lock-free
+        // `check_prot` fast path, monotonically. Set *before* acquiring the lock so a concurrent
+        // reader never observes a clear flag after a mutation has begun (a false positive just makes
+        // it take the read lock — always safe; a false negative would not be).
+        self.prot_dirty.store(true, Ordering::Release);
         self.space.write().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -9719,6 +9733,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::clone(&self.space),
             has_regions: Arc::clone(&self.has_regions),
+            prot_dirty: Arc::clone(&self.prot_dirty),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -9743,6 +9758,7 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
+            prot_dirty: Arc::new(AtomicBool::new(false)),
             last_fault: AtomicU64::new(NO_FAULT),
             writes: 0,
         }
@@ -9771,6 +9787,12 @@ impl Mem {
         // §14 child).
         let rel = base.wrapping_sub(self.window.base());
         let last = rel + width as u64 - 1;
+        // Lock-free fast path: the address space has never been mutated, so every page is in its
+        // region default — RW inside `[0, mapped)`. An in-prefix access is unconditionally fine and
+        // skips the `RwLock` read entirely (the hot, overwhelmingly common case).
+        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+            return Ok(());
+        }
         let space = self.space_read();
         if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
@@ -10205,16 +10227,31 @@ impl Mem {
     }
 
     fn read_le(&self, base: u64, width: u32) -> u64 {
+        // Hoist the `has_regions` check out of the per-byte loop: when no §13 region is aliased in
+        // (the common case) read straight from `back`, one `has_regions` load instead of `width`.
+        // Still per-byte (each `Region::byte` is a relaxed atomic — defined under §12 races).
         let mut raw = 0u64;
-        for k in 0..width as u64 {
-            raw |= (self.byte(base + k) as u64) << (8 * k);
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..width as u64 {
+                raw |= (self.back.byte(base + k) as u64) << (8 * k);
+            }
+        } else {
+            for k in 0..width as u64 {
+                raw |= (self.byte(base + k) as u64) << (8 * k);
+            }
         }
         raw
     }
 
     fn write_le(&mut self, base: u64, width: u32, raw: u64) {
-        for k in 0..width as u64 {
-            self.set_byte(base + k, (raw >> (8 * k)) as u8);
+        if !self.has_regions.load(Ordering::Relaxed) {
+            for k in 0..width as u64 {
+                self.back.set_byte(base + k, (raw >> (8 * k)) as u8);
+            }
+        } else {
+            for k in 0..width as u64 {
+                self.set_byte(base + k, (raw >> (8 * k)) as u8);
+            }
         }
     }
 

@@ -162,6 +162,15 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
 - **Success:** full oracle green; measurable drop on alu/call kernels; no API change.
 
 ### Phase 2 — memory-op specialization + software fast-path
+- **[done] Lock-free `check_prot` fast path.** `check_prot` took a `RwLock` *read* guard on **every**
+  access just to test `prot.is_empty()`. Added a monotonic `Mem::prot_dirty` flag, set once at the
+  `space_write` choke point (the only path that mutates the address space — `map`/`unmap`/`protect`,
+  §13 region alias, demand/supply paging). While clear (the common case: no syscalls, no coroutines,
+  no regions) an in-prefix access skips the lock entirely. Also hoisted the per-byte `has_regions`
+  check out of `read_le`/`write_le`. Benefits the **default tree-walker** (and the bytecode engine),
+  not just the compiled path. Measured on the tree-walker memory kernel: ~176 → ~147 ns (~17%).
+  All oracle suites byte-identical (jit_diff, escape_oracle, shared_region, address_space,
+  durable_prot_capture, concurrent_escape_fuzz, dpor, coroutine, threads, simd).
 - Width-specialized load/store handlers in the compiled form; drop the `Value`↔slot round-trip at
   the `Mem` boundary (store raw slot bits; load returns slot bits directly).
 - Inline the common-case confinement: a single mask + a mapped/writable bit-test, falling back to
@@ -233,6 +242,8 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   - [ ] **Slice 1c** — switch the default path over, re-expressing the seams (debug/`IrPc`, fibers,
         threads, durability, capabilities, scheduler preemption, fault rewind) + the full op set
         (tail calls, cross-module `install`/`invoke` indirect calls, host/fiber ops).
-- [ ] **Phase 2** — memory-op specialization + software fast-path.
+- [~] **Phase 2** — memory-op specialization + software fast-path.
+  - [x] Lock-free `check_prot` fast path (`prot_dirty` flag) + `read_le`/`write_le` `has_regions`
+        hoist. Tree-walker memory kernel ~176 → ~147 ns (~17%); all oracle suites byte-identical.
 - [ ] **Phase 3** — per-op seam overhead (fuel-at-back-edges if provably safe; debug/preempt hoist).
 - [ ] **Phase 4** — (stretch) fully flat bytecode + threaded dispatch.
