@@ -331,7 +331,7 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               `run_with_host`. Deferred (rare, complex, ~0 corpus): `instantiate`/`join` executor
               children, demand-paging / fault-yield (`CoFault`), and the module-spawning variants
               (ops 5/6/7). Coroutine modules are single-vCPU (no fibers/threads) by compile-rejection.
-        - [~] **1c-5e** — cross-module §22 units. **Decision (post-clear):** since the tree-walker is
+        - [x] **1c-5e** — cross-module §22 units. **Decision (post-clear):** since the tree-walker is
               oracle-only, bytecode is the real fallback when the JIT backend isn't viable, so a guest
               holding the `Jit` cap must get guest-JIT on bytecode too (no production fall-back path).
             - [x] **5e-1** — multi-module foundation + `install`/`uninstall` + cross-module
@@ -354,7 +354,13 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
                   i64-slot ABI. New harness case `invoke_unit_that_calls_installed_unit_agrees`
                   (install A, invoke B where B calls A → 14, the §22 new→new path) bit-identical to
                   `run_with_host`. `run_fast` now routes install/invoke guests to bytecode.
-            - [ ] **5e-3** — tail calls (`return_call`/`return_call_indirect`).
+            - [x] **5e-3** — tail calls (`return_call`/`return_call_indirect`): reuse the current
+                  activation window (no stack growth, O(1) deep tail recursion), staying in-module for
+                  direct / dispatching the runtime table for indirect. New harness
+                  `bytecode_tailcall.rs` (factorial accumulator, 100k-deep recursion, indirect with a
+                  type-mismatch trap) bit-identical to `run`. The generator *does* emit tail calls, so
+                  corpus coverage rose to **3978/4000 (99.45%)** (the rest is the deferred
+                  `instantiate`/`join` executor children, `gc.roots`, `call.import`, demand coroutines).
         - [x] **1c-5f** — fiber **migration**: the fiber registry moved out of `VTask` into a
               **run-shared** `Vec<FiberState>` owned by `drive` (one domain-wide handle namespace),
               passed to `step_vcpu`; only the resume `chain` stays per-vCPU. A fiber created/suspended

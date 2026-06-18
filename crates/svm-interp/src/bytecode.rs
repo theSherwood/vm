@@ -19,10 +19,11 @@
 //! multi-module [`Domain`] (a runtime dispatch table spanning `mods`; `invoke` runs a unit nested
 //! over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
-//! registry is run-shared, so fibers migrate across vCPUs). [`compile_module`] returns `None` when a
-//! function needs a seam not yet driven here — `Instantiator` executor children (`instantiate`/
-//! `join`) and demand/module variants, tail calls, or durability — so callers
-//! (`super::run_with_host_fast`) fall back to the tree-walker for those.
+//! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
+//! `return_call_indirect`, reusing the current window — O(1) deep tail recursion). [`compile_module`]
+//! returns `None` when a function needs a seam not yet driven here — `Instantiator` executor children
+//! (`instantiate`/`join`) and demand/module variants, `gc.roots`, `call.import`, or durability — so
+//! callers (`super::run_with_host_fast`) fall back to the tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
@@ -343,6 +344,20 @@ enum Op {
     Ret {
         srcs: Box<[u32]>,
     },
+    /// `return_call`: a direct tail call — reuse the current activation window (no stack growth),
+    /// staying in the caller's module; on return the callee returns to *this* activation's caller.
+    TailCall {
+        callee: u32,
+        args: Box<[u32]>,
+    },
+    /// `return_call_indirect`: an indirect tail call — resolve through the runtime dispatch table
+    /// (possibly cross-module), then reuse the current window like [`Op::TailCall`].
+    TailCallIndirect {
+        idx: u32,
+        args: Box<[u32]>,
+        want_params: Box<[ValType]>,
+        want_results: Box<[ValType]>,
+    },
     Unreachable,
     /// Long-tail value/store ops (SIMD, `v128` load/store, fences) delegated to the reference
     /// [`super::eval_inst`] — same semantics, no duplication. The original instruction keeps its
@@ -549,8 +564,18 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
                 srcs: vs.iter().map(|v| g(*v)).collect(),
             }),
             Terminator::Unreachable => ops.push(Op::Unreachable),
-            // Tail calls / indirect tail calls: not in this slice.
-            _ => return None,
+            // Tail calls reuse the current activation window (no stack growth): a direct tail call
+            // stays in the caller's module; an indirect one dispatches through the runtime table.
+            Terminator::ReturnCall { func, args } => ops.push(Op::TailCall {
+                callee: *func,
+                args: args.iter().map(|a| g(*a)).collect(),
+            }),
+            Terminator::ReturnCallIndirect { ty, idx, args } => ops.push(Op::TailCallIndirect {
+                idx: g(*idx),
+                args: args.iter().map(|a| g(*a)).collect(),
+                want_params: ty.params.clone().into(),
+                want_results: ty.results.clone().into(),
+            }),
         }
     }
     // Patch branch targets from block index to entry pc.
@@ -2223,6 +2248,58 @@ impl Vm {
                         pc = cpc;
                     }
                 },
+                // Tail calls reuse the *current* window (`base` unchanged) instead of pushing a
+                // return entry, so the callee returns to this activation's caller. Args may alias the
+                // destination prefix, so gather into `scratch` then scatter (like edge copies).
+                Op::TailCall { callee, args } => {
+                    let callee = *callee as usize;
+                    let need = base + c.progs[callee].nslots as usize;
+                    if self.regs.len() < need {
+                        self.regs.resize(need, Reg::default());
+                    }
+                    self.scratch.clear();
+                    for a in args.iter() {
+                        self.scratch.push(self.regs[base + *a as usize]);
+                    }
+                    for (i, &v) in self.scratch.iter().enumerate() {
+                        self.regs[base + i] = v;
+                    }
+                    cur = callee;
+                    pc = 0;
+                }
+                Op::TailCallIndirect {
+                    idx,
+                    args,
+                    want_params,
+                    want_results,
+                } => {
+                    let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
+                    let (tmod, tfunc) = match table[slot] {
+                        Some(e) => (e.0 as usize, e.1 as usize),
+                        None => return Err(Trap::IndirectCallType),
+                    };
+                    let (cp, cr) = &mods[tmod].sigs[tfunc];
+                    if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    let need = base + mods[tmod].progs[tfunc].nslots as usize;
+                    if self.regs.len() < need {
+                        self.regs.resize(need, Reg::default());
+                    }
+                    self.scratch.clear();
+                    for a in args.iter() {
+                        self.scratch.push(self.regs[base + *a as usize]);
+                    }
+                    for (i, &v) in self.scratch.iter().enumerate() {
+                        self.regs[base + i] = v;
+                    }
+                    if tmod != module {
+                        module = tmod;
+                        c = &mods[tmod];
+                    }
+                    cur = tfunc;
+                    pc = 0;
+                }
                 Op::CapCall {
                     type_id,
                     op,
