@@ -596,9 +596,10 @@ modifiers (the LLVM arg carries the real width — `%lx` ⇒ an `i64` arg). All 
 code**; only the bytes cross the boundary. Tests: `demo_hexdump_vs_native` (a `hexdump -C` clone, vs
 native, with stdin) + `printf_unsigned_formats` (mixed widths/pads/`%lx`/`%c`/`%%`).
 - *Deferred:* `%s` (runtime strlen), `%f`/`%g`/`%e` (float formatting), precision/`*`/`-`/`+`/space/`#`,
-  non-constant format strings. **(Most landed — slices BA–BC below.)**
+  non-constant format strings. **(`%s`, the flags, and precision landed — slices BA–BD below; float
+  stays fail-closed, needing exact-decimal/bignum formatting.)**
 
-**Slices BA–BC (DONE) — the `printf` breadth batch (no new demo; the format engine widened, each
+**Slices BA–BD (DONE) — the `printf` breadth batch (no new demo; the format engine widened, each
 checked byte-for-byte vs native `printf`).**
 - **BA — `%s`** (runtime `strlen`): a synthesized `__svm_strlen` (counted forward scan) + a
   right-justified field-width pad; the string bytes are written straight from the argument pointer.
@@ -607,16 +608,18 @@ checked byte-for-byte vs native `printf`).**
   combo): the int formatter is rebuilt as a flag-aware `emit_printf_int_field` — left-justify, forced
   sign, the `0x` alternate-form prefix (suppressed for zero), with the justify/pad *layout* decided at
   translate time and only digit/pad lengths runtime. Test: `printf_flag_formats`.
-- **BC — `%f`** (finite, correctly-rounded) + `.N` precision parsing: the integer part via
-  `__svm_utoa`, the `prec` fractional digits via the **exact** decimal extraction (`f*=10; d=⌊f⌋;
-  f-=d`, each step exact for `f ∈ [0,1)`), then round-half-to-even on the exact residual with the
-  carry propagating into the integer part — matching glibc. Branch-free + inline (precision is
-  compile-time, so the extraction unrolls); the int/float paths share the sign-prefix + width/justify
-  tail. Test: `printf_float_formats`.
-- *Still deferred:* `%e`/`%g` (scientific / shortest), integer/string **precision** (min-digits /
-  max-chars), `*` (dynamic width/precision), non-constant format strings, and `%f` for **non-finite**
-  (`inf`/`nan`) or `|value| ≥ 2^64` (the straight-line engine has no branch target for the `"inf"`/
-  `"nan"` spelling — a synthesized `__svm_ftoa` helper with real control flow is the widening path).
+- **BD — precision**: `.N` parsing; integer **min-digit** precision (`%.Nd`/`%.Nx` — zero-extend the
+  digit region; precision disables the `0` flag per C; `%.0` of `0` prints no digits) and string
+  **truncating** precision (`%.Ns` → `min(strlen, N)`). Shared `pf_*` helpers (`pf_sign_prefix`/
+  `pf_field_layout`/`pf_prefill_pad`). Test: `printf_precision_formats`.
+- **Float (`%f`/`%e`/`%g`) — deliberately fail-closed `Unsupported`.** A first `%f` cut (exact-looking
+  `f*=10; d=⌊f⌋; f-=d` digit extraction) was **reverted**: `f*10` rounds for full-mantissa fractions,
+  so it diverges from glibc at the rounding boundary (e.g. `%.17f` of `0.1` → on-ramp
+  `0.10000000000000000` vs native `...001`). Matching glibc byte-for-byte requires *correctly-rounded
+  exact decimal conversion* (Dragon4/Ryū-class **big-integer** arithmetic — the fraction numerator
+  alone needs > 64 bits for small magnitudes), which an `f64`-arithmetic approximation cannot give
+  without silently breaking the on-ramp's byte-exact contract. Deferred to a bignum-backed formatter.
+- *Also still deferred:* `*` (dynamic width/precision) and non-constant format strings.
 
 **Slice X (DONE) — `realloc` + signed `printf` `%d` (lands `sortvec`).** `__svm_malloc` now writes a
 16-byte **size header** before the data (keeping it 16-aligned), so the header survives for

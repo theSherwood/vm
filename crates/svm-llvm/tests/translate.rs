@@ -1209,19 +1209,18 @@ fn printf_unsigned_formats() {
 }
 
 #[test]
-fn printf_float_formats() {
-    // `%f` (finite) checked byte-for-byte vs native `printf`: default precision (6), explicit
-    // precision, round-half-to-even at `%.0f` (2.5→2, 3.5→4), a rounding carry (9.999→10.00),
-    // negatives, and width/justify/sign/zero-pad combos. `mk` keeps one value runtime (not folded).
+fn printf_precision_formats() {
+    // Integer min-digit precision (`%.Nd`/`%.Nx`, incl. `%.0` of zero → no digits, and precision
+    // overriding the `0` flag → space field padding) and string truncating precision (`%.Ns`),
+    // checked byte-for-byte vs native `printf`. `s` is a non-literal pointer (runtime strlen).
     let src = "#include <stdio.h>\n\
-               double mk(int n){ return (double)n / 8.0; }\n\
                int main(void){ \
-                 printf(\"%f %f %f\\n\", 3.14159, 0.0, -2.71828); \
-                 printf(\"%.2f %.0f %.0f %.5f\\n\", 9.999, 2.5, 3.5, 1.0/3.0); \
-                 printf(\"|%10.3f|%-10.3f|%+08.2f|\\n\", 3.14159, 3.14159, -3.5); \
-                 printf(\"%.6f %.1f\\n\", 0.1, mk(5)); \
+                 const char* s = \"hello world\"; \
+                 printf(\"|%.4d|%.4d|%.0d|%8.4d|%-8.4d|\\n\", 42, -42, 0, 42, 42); \
+                 printf(\"|%.4x|%#.4x|%08.4d|\\n\", 0xabu, 0xabu, 42); \
+                 printf(\"|%.5s|%.20s|%8.3s|\\n\", s, s, s); \
                  return 0; }";
-    check_powerbox_vs_native("printf_f", src, b"");
+    check_powerbox_vs_native("printf_prec", src, b"");
 }
 
 #[test]

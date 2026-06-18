@@ -2931,32 +2931,27 @@ fn global_name_of(op: &Operand) -> Option<String> {
 /// stays an ordinary call). Result-fidelity notes (the *stdout bytes* are exact regardless): `putc`
 /// yields the written char, `fwrite` the item count `nmemb`, `puts`/`fputs`/`fflush` a `0` success.
 /// A parsed `printf` format-string segment (the constant format is parsed at translate time, §ramp
-/// Lane C). Integer conversions (`%d`/`%i`/`%u`/`%x`) with the `-`/`+`/` `/`0`/`#` flags, `%c`, `%s`
-/// (runtime strlen), `%f` (finite, with precision), and `%%` are handled; `%e`/`%g`, integer/string
-/// precision, and `*` (dynamic width/precision) are a later slice (fail-closed `Unsupported`).
+/// Lane C). Integer conversions (`%d`/`%i`/`%u`/`%x`) with the `-`/`+`/` `/`0`/`#` flags + field
+/// width + min-digit precision, `%c`, `%s` (runtime strlen, with width + truncating precision), and
+/// `%%` are handled; float conversions (`%f`/`%e`/`%g`), `*` (dynamic width/precision), and
+/// non-constant format strings are fail-closed `Unsupported` (float needs exact-decimal/bignum).
 enum FmtSeg {
     /// A verbatim run — bytes `[off, off+len)` of the format global, written directly.
     Lit { off: usize, len: usize },
     /// An integer conversion: `base` (10/16, lowercase), `signed` (`%d`) vs unsigned (`%u`/`%x`),
-    /// field `width`, and the layout `flags` (`0`/`-`/`+`/space/`#`).
+    /// field `width`, optional `prec` (minimum digit count — zero-extended), and the layout `flags`.
     Int {
         base: u64,
         signed: bool,
         width: u32,
+        prec: Option<u32>,
         flags: FmtFlags,
     },
     /// `%c` — the argument's low byte.
     Char,
     /// `%s` — a NUL-terminated string argument (runtime `strlen`), right-justified in field `width`
-    /// (space-padded; the `0` flag and precision are not yet handled — see `parse_format`).
-    Str { width: u32 },
-    /// `%f` — a fixed-point `f64` with `prec` fractional digits (finite `|value| < 2^64`), with the
-    /// field `width` and `flags`. (`%e`/`%g` are a later slice.)
-    Float {
-        prec: u32,
-        width: u32,
-        flags: FmtFlags,
-    },
+    /// (space-padded), optionally truncated to `prec` bytes.
+    Str { width: u32, prec: Option<u32> },
     /// `%%` — a literal percent.
     Percent,
 }
@@ -3061,6 +3056,15 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
         i += 1;
         // `#` (alternate) is only meaningful for `%x` here (the `0x` prefix); on `%d`/`%i`/`%u` it is
         // a no-op, so drop it to keep the emitter's prefix logic hex-only.
+        // An integer min-digits precision is bounded so the zero-extension fits the scratch buffer.
+        if let Some(p) = prec {
+            if p as u64 + 2 >= FMT_BUF_END - FMT_BUF {
+                return Err(bad("precision too large"));
+            }
+        }
+        // `#` (alternate) is only meaningful for `%x` here (the `0x` prefix); on `%d`/`%i`/`%u` it is
+        // a no-op, so drop it to keep the emitter's prefix logic hex-only. A precision also disables
+        // the `0` flag (C standard) for integers — handled in `emit_printf_int_field`.
         let int = |base: u64, signed| {
             let mut f = flags;
             if base != 16 {
@@ -3070,36 +3074,25 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
                 base,
                 signed,
                 width,
+                prec,
                 flags: f,
             }
         };
-        // Integer/string precision (min-digits / max-chars) is a later slice — fail closed so an
-        // unhandled `.N` is never silently dropped. `%f` consumes its precision below.
-        let no_int_prec = |seg: FmtSeg| {
-            if prec.is_some() {
-                Err(bad("precision on a non-float conversion"))
-            } else {
-                Ok(seg)
-            }
-        };
         segs.push(match conv {
-            b'd' | b'i' => no_int_prec(int(10, true))?,
-            b'u' => no_int_prec(int(10, false))?,
-            b'x' => no_int_prec(int(16, false))?,
-            b'c' => no_int_prec(FmtSeg::Char)?,
-            b's' => no_int_prec(FmtSeg::Str { width })?,
-            b'f' => {
-                // C default precision for `%f` is 6. Bound it so `10^prec` and the rendered field fit
-                // the scratch buffer / an `i64` (larger is a fail-closed `Unsupported`).
-                let p = prec.unwrap_or(6);
-                if p > 17 {
-                    return Err(bad("%f precision > 17"));
-                }
-                FmtSeg::Float {
-                    prec: p,
-                    width,
-                    flags,
-                }
+            b'd' | b'i' => int(10, true),
+            b'u' => int(10, false),
+            b'x' => int(16, false),
+            b'c' => FmtSeg::Char,
+            b's' => FmtSeg::Str { width, prec },
+            // Float formatting (`%f`/`%e`/`%g`) is deliberately fail-closed: matching glibc
+            // byte-for-byte requires *exact* decimal conversion (correctly-rounded, à la Dragon4/
+            // Ryū — big-integer arithmetic). An `f64`-arithmetic approximation diverges from native
+            // at the rounding boundary (e.g. `%.17f` of `0.1`), which would break the on-ramp's
+            // byte-exact contract — so it stays `Unsupported` until a bignum formatter lands.
+            b'f' | b'e' | b'g' | b'F' | b'E' | b'G' => {
+                return Err(bad(
+                    "float conversion (needs exact-decimal/bignum formatting)",
+                ))
             }
             other => return Err(bad(&format!("conversion %{}", other as char))),
         });
@@ -3669,7 +3662,7 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                 let one = ctx.const_i64(1);
                 ctx.emit_write(scratch, one)?;
             }
-            FmtSeg::Str { width } => {
+            FmtSeg::Str { width, prec } => {
                 let arg = c.arguments.get(argi).ok_or_else(|| {
                     Error::Unsupported("printf: more conversions than args".into())
                 })?;
@@ -3679,10 +3672,25 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                     .helpers
                     .strlen
                     .ok_or_else(|| Error::Unsupported("printf: strlen helper missing".into()))?;
-                let len = ctx.push(Inst::Call {
+                let mut len = ctx.push(Inst::Call {
                     func: strlen,
                     args: vec![ptr],
                 });
+                // Precision truncates: write at most `prec` bytes (`len = min(strlen, prec)`).
+                if let Some(p) = prec {
+                    let pv = ctx.const_i64(p as i64);
+                    let lt = ctx.push(Inst::IntCmp {
+                        ty: IntTy::I64,
+                        op: CmpOp::LtU,
+                        a: len,
+                        b: pv,
+                    });
+                    len = ctx.push(Inst::Select {
+                        cond: lt,
+                        a: len,
+                        b: pv,
+                    });
+                }
                 // Right-justify in `width`: emit `max(0, width - len)` leading spaces from a
                 // pre-filled scratch run, then the string bytes straight from its pointer.
                 if width > 0 {
@@ -3725,6 +3733,7 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                 base,
                 signed,
                 width,
+                prec,
                 flags,
             } => {
                 let arg = c.arguments.get(argi).ok_or_else(|| {
@@ -3777,19 +3786,7 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                     };
                     (mag, None)
                 };
-                emit_printf_int_field(ctx, mag, base, neg, width, flags, utoa)?;
-            }
-            FmtSeg::Float { prec, width, flags } => {
-                let arg = c.arguments.get(argi).ok_or_else(|| {
-                    Error::Unsupported("printf: more conversions than args".into())
-                })?;
-                argi += 1;
-                // Varargs promote `float` → `double`, so the argument is always an `f64`.
-                if !matches!(val_type(arg.0.get_type(ctx.types).as_ref())?, ValType::F64) {
-                    return Err(Error::Unsupported("printf %f: non-double argument".into()));
-                }
-                let v = ctx.operand(&arg.0)?;
-                emit_printf_float_field(ctx, v, prec, width, flags, utoa)?;
+                emit_printf_int_field(ctx, mag, base, neg, width, prec, flags, utoa)?;
             }
         }
     }
@@ -3911,32 +3908,96 @@ fn pf_field_layout(
     Ok(())
 }
 
-/// Emit the `Stream.write`s for one `printf` integer conversion with full flag/width handling, to
-/// match C `printf` byte-for-byte. `mag` is the unsigned magnitude (i64); `neg` is the runtime `0/1`
-/// "is negative" flag for a signed conversion (`None` for unsigned). `__svm_utoa` formats the digits
-/// backward into the high end of the scratch buffer; the sign / `0x` prefix and field padding are
-/// applied around them.
+/// Emit the `Stream.write`s for one `printf` integer conversion with full flag/width/precision
+/// handling, to match C `printf` byte-for-byte. `mag` is the unsigned magnitude (i64); `neg` is the
+/// runtime `0/1` "is negative" flag for a signed conversion (`None` for unsigned). `__svm_utoa`
+/// formats the digits backward into the high end of the scratch buffer; the sign / `0x` prefix and
+/// field padding are applied around them.
+///
+/// A precision is a *minimum digit count*: the digit region is zero-extended to `prec` digits (by
+/// pre-filling `'0'`s that `utoa` overwrites from the right), and a precision disables the `0` flag
+/// (C standard — field padding then uses spaces). `%.0d`/`%.0x` of `0` prints **no** digits.
+#[allow(clippy::too_many_arguments)]
 fn emit_printf_int_field(
     ctx: &mut BlockCtx,
     mag: ValIdx,
     base: u64,
     neg: Option<ValIdx>,
     width: u32,
+    prec: Option<u32>,
     flags: FmtFlags,
     utoa: u32,
 ) -> Result<(), Error> {
-    pf_prefill_pad(ctx, width, flags);
+    // A precision overrides the `0` flag: the field is space-padded around the (already zero-extended)
+    // digits.
+    let layout_flags = if prec.is_some() {
+        FmtFlags {
+            zero: false,
+            ..flags
+        }
+    } else {
+        flags
+    };
+    pf_prefill_pad(ctx, width, layout_flags);
+
+    let bufend_off = FMT_BUF_END;
+    // Zero-extension to `prec` digits: pre-fill `[bufend-prec, bufend)` with `'0'` *before* `utoa`,
+    // which overwrites the rightmost `ndigits` with the real digits — leaving `max(prec, ndigits)`.
+    if let Some(p) = prec {
+        if p > 0 {
+            let zc = ctx.push(Inst::ConstI32(b'0' as i32));
+            for k in 0..p as u64 {
+                let a = ctx.const_i64((bufend_off - p as u64 + k) as i64);
+                pf_store8(ctx, a, zc);
+            }
+        }
+    }
     let basec = ctx.const_i64(base as i64);
-    let bufend = ctx.const_i64(FMT_BUF_END as i64);
+    let bufend = ctx.const_i64(bufend_off as i64);
     let start = ctx.push(Inst::Call {
         func: utoa,
         args: vec![mag, basec, bufend],
-    }); // digits at [start, bufend)
+    }); // real digits at [start, bufend)
 
-    // Prefix (sign for signed, `0x` for `#x`): store the bytes just below `start`; `prefixlen`
+    // The effective leftmost digit, after precision zero-extension / `%.0` suppression.
+    let eff_start = match prec {
+        None => start,
+        Some(p) if p > 0 => {
+            // min(start, bufend - p): use all real digits if more than `p`, else the padded region.
+            let limit = ctx.const_i64((bufend_off - p as u64) as i64);
+            let lt = ctx.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::LtU,
+                a: start,
+                b: limit,
+            });
+            ctx.push(Inst::Select {
+                cond: lt,
+                a: start,
+                b: limit,
+            })
+        }
+        Some(_) => {
+            // `%.0`: value `0` prints nothing; any other value keeps its digits.
+            let z = ctx.const_i64(0);
+            let is0 = ctx.push(Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: mag,
+                b: z,
+            });
+            ctx.push(Inst::Select {
+                cond: is0,
+                a: bufend,
+                b: start,
+            })
+        }
+    };
+
+    // Prefix (sign for signed, `0x` for `#x`): store the bytes just below `eff_start`; `prefixlen`
     // (0/1/2, runtime) selects how many are included in the field.
     let prefixlen = match neg {
-        Some(negv) => pf_sign_prefix(ctx, start, negv, flags),
+        Some(negv) => pf_sign_prefix(ctx, eff_start, negv, flags),
         None if flags.alt => {
             // `%#x`: a `0x` prefix, but only for a non-zero value.
             let z = ctx.const_i64(0);
@@ -3949,10 +4010,10 @@ fn emit_printf_int_field(
             let x = ctx.push(Inst::ConstI32(b'x' as i32));
             let zero_ch = ctx.push(Inst::ConstI32(b'0' as i32));
             let one = ctx.const_i64(1);
-            let sm1 = pf_sub(ctx, start, one);
+            let sm1 = pf_sub(ctx, eff_start, one);
             pf_store8(ctx, sm1, x);
             let two = ctx.const_i64(2);
-            let sm2 = pf_sub(ctx, start, two);
+            let sm2 = pf_sub(ctx, eff_start, two);
             pf_store8(ctx, sm2, zero_ch);
             ctx.push(Inst::Select {
                 cond: nz,
@@ -3962,205 +4023,15 @@ fn emit_printf_int_field(
         }
         None => ctx.const_i64(0),
     };
-    let content_start = pf_sub(ctx, start, prefixlen);
-    pf_field_layout(ctx, start, content_start, prefixlen, width, flags)
-}
-
-/// Emit the `Stream.write`s for one `printf` `%f` conversion, byte-for-byte vs C `printf` for any
-/// **finite** `|value| < 2^64`. `value` is the (signed) `f64` argument; `prec` the fractional-digit
-/// count. The magnitude is formatted by [`render_float_magnitude`] (exact, branch-free); the sign and
-/// field width are applied by the shared [`pf_sign_prefix`]/[`pf_field_layout`] tail.
-///
-/// Non-finite inputs (`inf`/`nan`) are **out of range** here — the straight-line format engine has no
-/// place to branch to the `"inf"`/`"nan"` spelling — as is `|value| ≥ 2^64`. A program needing those
-/// is the (rare) trigger to widen this (e.g. a synthesized `__svm_ftoa` helper with real control flow).
-fn emit_printf_float_field(
-    ctx: &mut BlockCtx,
-    value: ValIdx,
-    prec: u32,
-    width: u32,
-    flags: FmtFlags,
-    utoa: u32,
-) -> Result<(), Error> {
-    pf_prefill_pad(ctx, width, flags);
-    // sign: `value < 0` (false for NaN). `absv = |value|`.
-    let zero_f = ctx.push(Inst::ConstF64(0));
-    let isneg = ctx.push(Inst::FCmp {
-        ty: FloatTy::F64,
-        op: FCmpOp::Lt,
-        a: value,
-        b: zero_f,
-    });
-    let neg = ctx.push(Inst::Convert {
-        op: ConvOp::ExtendI32U,
-        a: isneg,
-    });
-    let negval = ctx.push(Inst::FBin {
-        ty: FloatTy::F64,
-        op: FBinOp::Sub,
-        a: zero_f,
-        b: value,
-    });
-    let absv = ctx.push(Inst::Select {
-        cond: isneg,
-        a: negval,
-        b: value,
-    });
-    let start = render_float_magnitude(ctx, absv, prec, utoa);
-    let prefixlen = pf_sign_prefix(ctx, start, neg, flags);
-    let content_start = pf_sub(ctx, start, prefixlen);
-    pf_field_layout(ctx, start, content_start, prefixlen, width, flags)
-}
-
-/// Format the non-negative finite `absv` (`f64`, `< 2^64`) as `"<int>.<frac>"` backward into the high
-/// end of the scratch buffer, returning the start pointer (digits at `[start, FMT_BUF_END)`). Exact
-/// and branch-free: the integer part is `__svm_utoa`; the `prec` fractional digits come from the
-/// classic exact decimal extraction (`f *= 10; d = ⌊f⌋; f -= d`, each step exact for `f ∈ [0,1)`),
-/// then round-half-to-even on the exact residual, with the carry propagating into the integer part —
-/// matching glibc's correctly-rounded `%f`. `prec` is compile-time, so the extraction unrolls.
-fn render_float_magnitude(ctx: &mut BlockCtx, absv: ValIdx, prec: u32, utoa: u32) -> ValIdx {
-    let f64bin = |ctx: &mut BlockCtx, op: FBinOp, a: ValIdx, b: ValIdx| {
-        ctx.push(Inst::FBin {
-            ty: FloatTy::F64,
-            op,
-            a,
-            b,
-        })
-    };
-    let i64bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
-        ctx.push(Inst::IntBin {
-            ty: IntTy::I64,
-            op,
-            a,
-            b,
-        })
-    };
-    let f64_to_u64 = |ctx: &mut BlockCtx, a: ValIdx| {
-        ctx.push(Inst::FToISat {
-            op: FToI::F64I64U,
-            a,
-        })
-    };
-    let u64_to_f64 = |ctx: &mut BlockCtx, a: ValIdx| {
-        ctx.push(Inst::IToFConv {
-            op: IToF::I64F64U,
-            a,
-        })
-    };
-
-    let ten_f = ctx.push(Inst::ConstF64(10.0f64.to_bits()));
-    let ten_i = ctx.const_i64(10);
-    // ip = ⌊absv⌋ (exact for absv < 2^64); f = absv - ip ∈ [0,1).
-    let mut ip = f64_to_u64(ctx, absv);
-    let ipf = u64_to_f64(ctx, ip);
-    let mut f = f64bin(ctx, FBinOp::Sub, absv, ipf);
-
-    // Extract `prec` decimal digits of the fraction into `fracnum` (each step exact).
-    let mut fracnum = ctx.const_i64(0);
-    for _ in 0..prec {
-        f = f64bin(ctx, FBinOp::Mul, f, ten_f);
-        let d = f64_to_u64(ctx, f); // ⌊f⌋, 0..9
-        let fm10 = i64bin(ctx, BinOp::Mul, fracnum, ten_i);
-        fracnum = i64bin(ctx, BinOp::Add, fm10, d);
-        let df = u64_to_f64(ctx, d);
-        f = f64bin(ctx, FBinOp::Sub, f, df);
-    }
-
-    // Round half to even on the exact residual `f ∈ [0,1)`. The "even" digit is the last kept one:
-    // `fracnum`'s low digit when `prec > 0`, else `ip`'s.
-    let half = ctx.push(Inst::ConstF64(0.5f64.to_bits()));
-    let gt = ctx.push(Inst::FCmp {
-        ty: FloatTy::F64,
-        op: FCmpOp::Gt,
-        a: f,
-        b: half,
-    });
-    let eq = ctx.push(Inst::FCmp {
-        ty: FloatTy::F64,
-        op: FCmpOp::Eq,
-        a: f,
-        b: half,
-    });
-    let parity_src = if prec > 0 { fracnum } else { ip };
-    let one_i = ctx.const_i64(1);
-    let odd_bit = i64bin(ctx, BinOp::And, parity_src, one_i);
-    let zero_i = ctx.const_i64(0);
-    let odd = ctx.push(Inst::IntCmp {
-        ty: IntTy::I64,
-        op: CmpOp::Ne,
-        a: odd_bit,
-        b: zero_i,
-    });
-    let eq_and_odd = ctx.push(Inst::IntBin {
-        ty: IntTy::I32,
-        op: BinOp::And,
-        a: eq,
-        b: odd,
-    });
-    let roundup = ctx.push(Inst::IntBin {
-        ty: IntTy::I32,
-        op: BinOp::Or,
-        a: gt,
-        b: eq_and_odd,
-    });
-    let roundup64 = ctx.push(Inst::Convert {
-        op: ConvOp::ExtendI32U,
-        a: roundup,
-    });
-    fracnum = i64bin(ctx, BinOp::Add, fracnum, roundup64);
-
-    // Carry out of the fraction (`fracnum == 10^prec`) bumps the integer part and zeroes the fraction.
-    let pow = ctx.const_i64(10i64.pow(prec));
-    let carry = ctx.push(Inst::IntCmp {
-        ty: IntTy::I64,
-        op: CmpOp::GeU,
-        a: fracnum,
-        b: pow,
-    });
-    let carry64 = ctx.push(Inst::Convert {
-        op: ConvOp::ExtendI32U,
-        a: carry,
-    });
-    let cm = i64bin(ctx, BinOp::Mul, carry64, pow);
-    fracnum = i64bin(ctx, BinOp::Sub, fracnum, cm);
-    ip = i64bin(ctx, BinOp::Add, ip, carry64);
-
-    // Render backward from the buffer end: fraction digits (zero-padded), the `.`, then the integer.
-    let bufend = ctx.const_i64(FMT_BUF_END as i64);
-    if prec == 0 {
-        let base10 = ctx.const_i64(10);
-        return ctx.push(Inst::Call {
-            func: utoa,
-            args: vec![ip, base10, bufend],
-        });
-    }
-    let mut fn_v = fracnum;
-    for k in 1..=prec as u64 {
-        let dmod = i64bin(ctx, BinOp::RemU, fn_v, ten_i);
-        let dmod32 = ctx.push(Inst::Convert {
-            op: ConvOp::WrapI64,
-            a: dmod,
-        });
-        let zc32 = ctx.push(Inst::ConstI32('0' as i32));
-        let ch = ctx.push(Inst::IntBin {
-            ty: IntTy::I32,
-            op: BinOp::Add,
-            a: dmod32,
-            b: zc32,
-        });
-        let addr = ctx.const_i64((FMT_BUF_END - k) as i64);
-        pf_store8(ctx, addr, ch);
-        fn_v = i64bin(ctx, BinOp::DivU, fn_v, ten_i);
-    }
-    // '.' just below the fraction, then the integer digits ending at the '.'.
-    let dot_pos = ctx.const_i64((FMT_BUF_END - prec as u64 - 1) as i64);
-    let dot = ctx.push(Inst::ConstI32('.' as i32));
-    pf_store8(ctx, dot_pos, dot);
-    let base10 = ctx.const_i64(10);
-    ctx.push(Inst::Call {
-        func: utoa,
-        args: vec![ip, base10, dot_pos],
-    })
+    let content_start = pf_sub(ctx, eff_start, prefixlen);
+    pf_field_layout(
+        ctx,
+        eff_start,
+        content_start,
+        prefixlen,
+        width,
+        layout_flags,
+    )
 }
 
 /// The largest constant byte length we unroll a `memcpy`/`memset` into chunked load/stores; a
