@@ -5469,21 +5469,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::GcRoots {
                     heap_lo,
                     heap_hi,
+                    mask,
                     buf,
                     cap,
                 } => {
                     let lo = get_i64(&frames[top].vals, *heap_lo)? as u64;
                     let hi = get_i64(&frames[top].vals, *heap_hi)? as u64;
+                    let mask = get_i64(&frames[top].vals, *mask)? as u64;
+                    // Security: the payload mask may only clear the top byte (low 56 bits all-ones),
+                    // else a host pointer could be folded into the guest window and leak host-address
+                    // bits past the range filter (GC.md §3, §6). The verifier rejects a constant
+                    // fold-down mask statically; this defends an unverified module / non-constant mask.
+                    if mask | 0xFF00_0000_0000_0000 != u64::MAX {
+                        return Err(Trap::Malformed);
+                    }
                     let dst = get_i64(&frames[top].vals, *buf)? as u64;
                     let cap = get_i64(&frames[top].vals, *cap)?.max(0) as usize;
                     let mut roots = std::collections::BTreeSet::new();
-                    gc_scan_frames(frames, lo, hi, &mut roots);
+                    gc_scan_frames(frames, lo, hi, mask, &mut roots);
                     if let Some(rp) = root_parked.as_ref() {
-                        gc_scan_frames(rp, lo, hi, &mut roots);
+                        gc_scan_frames(rp, lo, hi, mask, &mut roots);
                     }
                     for fib in registry.lock().fibers.iter() {
                         if let RegFiber::Parked(f) | RegFiber::Running(Some(f)) = fib {
-                            gc_scan_frames(f, lo, hi, &mut roots);
+                            gc_scan_frames(f, lo, hi, mask, &mut roots);
                         }
                     }
                     let total = roots.len();
@@ -10543,14 +10552,24 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
 }
 
 /// Scan a fiber's frames for candidate root words in `[lo, hi)` and insert them into `out` (§GC
-/// `gc.roots`). Conservative: every SSA value whose raw bits land in range is a candidate — the
-/// interpreter scans typed `Value`s (the JIT scans raw control-stack words; both are sound
-/// over-approximations that may differ in false positives, GC.md §3.2). `v128` contributes both of
-/// its 64-bit halves.
-fn gc_scan_frames(frames: &[Frame], lo: u64, hi: u64, out: &mut std::collections::BTreeSet<u64>) {
+/// `gc.roots`). Each word is first masked (`m = w & mask`); the **masked** value is what's range-
+/// tested and inserted, so a guest with tagged pointers (tag in the top byte) recovers the bare
+/// offset (`mask = !0` is the untagged case). Conservative: every SSA value whose masked bits land
+/// in range is a candidate — the interpreter scans typed `Value`s (the JIT scans raw control-stack
+/// words; both are sound over-approximations that may differ in false positives, GC.md §3.2).
+/// `v128` contributes both of its 64-bit halves. `mask` is caller-validated to top-byte-strip only,
+/// so a host pointer stays large and is excluded by the range test.
+fn gc_scan_frames(
+    frames: &[Frame],
+    lo: u64,
+    hi: u64,
+    mask: u64,
+    out: &mut std::collections::BTreeSet<u64>,
+) {
     let mut consider = |w: u64| {
-        if w >= lo && w < hi {
-            out.insert(w);
+        let m = w & mask;
+        if m >= lo && m < hi {
+            out.insert(m);
         }
     };
     for f in frames {

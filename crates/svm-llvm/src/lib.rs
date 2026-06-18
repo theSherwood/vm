@@ -199,6 +199,13 @@ pub struct Translated {
     pub module: Module,
     /// The value to pass as the entry's first (`sp`) argument.
     pub entry_sp: u64,
+    /// Exported function symbols: each *defined* function's name paired with its final index in
+    /// `module.funcs` (`base + i`, accounting for a synthesized `_start` prologue). This feeds a
+    /// `svm_ir::LinkUnit.exports` so a separate program module can resolve a `call.import` of these
+    /// names through `svm_ir::link` — the separate-artifact path (compile a runtime once, link many
+    /// programs against it). Synthesized helpers (`_start`, `memset`, `malloc`, …) carry no source
+    /// name and are not exported.
+    pub exports: Vec<(String, u32)>,
 }
 
 /// Translate a legalized LLVM bitcode file (`*.bc`). The bitcode must come from the pinned LLVM
@@ -471,6 +478,13 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
             debug_info: dbg.finish(),
         },
         entry_sp,
+        // Each defined function's name → its final `module.funcs` index (`base + i`), the same
+        // mapping `name2idx` holds, emitted in defined order for determinism.
+        exports: defined
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.clone(), base + i as u32))
+            .collect(),
     })
 }
 
@@ -3148,11 +3162,16 @@ fn lower_vm_builtin(
         "__vm_gc_roots" => {
             let heap_lo = ctx.operand_i64(vm_arg(c, 0)?)?;
             let heap_hi = ctx.operand_i64(vm_arg(c, 1)?)?;
-            let buf = ctx.operand_i64(vm_arg(c, 2)?)?;
-            let cap = ctx.operand_i64(vm_arg(c, 3)?)?;
+            // §GC tagged-pointer payload mask: each scanned word is AND-ed with this before the range
+            // test (and emitted), so a tag in the high byte is stripped to the bare offset. The VM
+            // constrains it to top-byte-strip only (no host-address leak); `~0UL` is the untagged case.
+            let mask = ctx.operand_i64(vm_arg(c, 2)?)?;
+            let buf = ctx.operand_i64(vm_arg(c, 3)?)?;
+            let cap = ctx.operand_i64(vm_arg(c, 4)?)?;
             let r = ctx.push(Inst::GcRoots {
                 heap_lo,
                 heap_hi,
+                mask,
                 buf,
                 cap,
             });
