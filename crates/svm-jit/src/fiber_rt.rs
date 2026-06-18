@@ -864,13 +864,9 @@ pub(crate) unsafe fn seed_frozen_fibers(
             fault(trap_out);
             return false;
         };
-        let got = r.table.seed_frozen(
-            Box::new(fiber),
-            f.func,
-            f.sp,
-            f.shadow_sp,
-            f.generation,
-        );
+        let got = r
+            .table
+            .seed_frozen(Box::new(fiber), f.func, f.sp, f.shadow_sp, f.generation);
         debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
         debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
     }
