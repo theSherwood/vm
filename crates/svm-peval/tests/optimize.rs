@@ -166,12 +166,10 @@ fn resolves_branch_and_prunes_dead_block() {
     };
 
     let opt = check_equiv(&m, &[vec![Value::I64(5)], vec![Value::I64(-100)]]);
-    // The else-block is gone; the conditional became an unconditional branch.
-    assert_eq!(opt.funcs[0].blocks.len(), 2);
-    assert!(matches!(
-        opt.funcs[0].blocks[0].term,
-        Terminator::Br { target: 1, .. }
-    ));
+    // The branch resolves, the else-block is pruned, and the lone taken successor merges back
+    // into the entry — leaving a single block that returns x + 10.
+    assert_eq!(opt.funcs[0].blocks.len(), 1);
+    assert!(matches!(opt.funcs[0].blocks[0].term, Terminator::Return(_)));
     assert_eq!(run(&opt, &[Value::I64(5)]), Ok(vec![Value::I64(15)]));
 }
 
@@ -206,7 +204,9 @@ fn resolves_br_table_and_prunes() {
     };
 
     let opt = check_equiv(&m, &[vec![]]);
-    assert_eq!(opt.funcs[0].blocks.len(), 2); // entry + selected target only
+    // Table resolves to one edge, the unselected blocks are pruned, and the lone target merges
+    // into the entry — a single block returning 200.
+    assert_eq!(opt.funcs[0].blocks.len(), 1);
     assert_eq!(run(&opt, &[]), Ok(vec![Value::I32(200)]));
 }
 
@@ -354,6 +354,119 @@ fn preserves_loops_with_nonconstant_conditions() {
     // All four blocks survive (nothing constant-foldable controls the flow).
     assert_eq!(opt.funcs[0].blocks.len(), 4);
     assert_eq!(run(&opt, &[Value::I32(5)]), Ok(vec![Value::I32(15)]));
+}
+
+// ----- CFG cleanup: block merging + dead-parameter elimination -----
+
+#[test]
+fn merges_straight_line_chain() {
+    // (x: i64) -> i64 : entry -> b1 -> b2, all unconditional, computing x + 1.
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![
+                Block {
+                    params: vec![ValType::I64], // x
+                    insts: vec![],
+                    term: Terminator::Br {
+                        target: 1,
+                        args: vec![0],
+                    },
+                },
+                Block {
+                    params: vec![ValType::I64], // a
+                    insts: vec![
+                        Inst::ConstI64(1), // 1
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 0,
+                            b: 1,
+                        }, // 2 = a + 1
+                    ],
+                    term: Terminator::Br {
+                        target: 2,
+                        args: vec![2],
+                    },
+                },
+                Block {
+                    params: vec![ValType::I64], // b
+                    insts: vec![],
+                    term: Terminator::Return(vec![0]),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+
+    let opt = check_equiv(&m, &[vec![Value::I64(10)], vec![Value::I64(-1)]]);
+    // The whole chain fuses into one block.
+    assert_eq!(opt.funcs[0].blocks.len(), 1);
+    assert_eq!(run(&opt, &[Value::I64(10)]), Ok(vec![Value::I64(11)]));
+}
+
+#[test]
+fn drops_dead_block_parameter_across_predecessors() {
+    // A diamond whose join block has two predecessors (so it cannot be merged) and an unused
+    // `junk` parameter that both edges supply. The parameter and both edge args must be dropped.
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![
+                Block {
+                    params: vec![ValType::I64], // 0: x
+                    insts: vec![
+                        Inst::ConstI64(0), // 1
+                        Inst::IntCmp {
+                            ty: IntTy::I64,
+                            op: CmpOp::Ne,
+                            a: 0,
+                            b: 1,
+                        }, // 2: x != 0
+                        Inst::ConstI64(111), // 3: junkA
+                        Inst::ConstI64(222), // 4: junkB
+                    ],
+                    term: Terminator::BrIf {
+                        cond: 2,
+                        then_blk: 1,
+                        then_args: vec![0, 3], // join(x, junkA)
+                        else_blk: 1,
+                        else_args: vec![1, 4], // join(0, junkB)
+                    },
+                },
+                Block {
+                    params: vec![ValType::I64, ValType::I64], // 0: v, 1: junk (unused)
+                    insts: vec![],
+                    term: Terminator::Return(vec![0]),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+
+    let opt = check_equiv(
+        &m,
+        &[
+            vec![Value::I64(5)],
+            vec![Value::I64(0)],
+            vec![Value::I64(-9)],
+        ],
+    );
+    // The join keeps its two predecessors (not merged), but the dead `junk` parameter is gone,
+    // and with it the now-dead 111/222 constants.
+    assert!(opt.funcs[0].blocks.iter().all(|b| b.params.len() <= 1));
+    assert!(!opt.funcs[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::ConstI64(111) | Inst::ConstI64(222))));
+    assert!(opt.funcs[0]
+        .blocks
+        .iter()
+        .any(|b| matches!(b.term, Terminator::BrIf { .. })));
+    assert_eq!(run(&opt, &[Value::I64(5)]), Ok(vec![Value::I64(5)]));
 }
 
 // ----- Stage 0.x: dead-value elimination -----
@@ -540,15 +653,14 @@ fn dce_removes_dead_branch_condition() {
     };
 
     let opt = check_equiv(&m, &[vec![Value::I64(5)]]);
-    assert_eq!(opt.funcs[0].blocks.len(), 2);
+    // The condition computation is dead and gone; the resolved branch's lone successor merges
+    // into the entry, which now just returns x.
+    assert_eq!(opt.funcs[0].blocks.len(), 1);
     assert!(
         opt.funcs[0].blocks[0].insts.is_empty(),
         "dead condition computation should be gone"
     );
-    assert!(matches!(
-        opt.funcs[0].blocks[0].term,
-        Terminator::Br { target: 1, .. }
-    ));
+    assert!(matches!(opt.funcs[0].blocks[0].term, Terminator::Return(_)));
     assert_eq!(run(&opt, &[Value::I64(5)]), Ok(vec![Value::I64(5)]));
 }
 

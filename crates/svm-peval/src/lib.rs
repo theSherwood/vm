@@ -9,7 +9,7 @@
 //!   See [`mod@specialize`].
 //!
 //! The optimizer is a closed-module, semantics-preserving pass that proves the
-//! `rewrite → re-verify → run` loop end to end. It does four things:
+//! `rewrite → re-verify → run` loop end to end. It iterates the following to a fixpoint:
 //!
 //! 1. **Constant folding.** A pure, single-result integer op whose operands are all known
 //!    constants is replaced *in place* with the equivalent `const`. Because the
@@ -34,6 +34,12 @@
 //!    design — anything that can fault (loads, atomics, trapping conversions) or has an
 //!    effect (stores, calls, fences, fiber/thread ops) is *kept* even if its result is
 //!    unused, so trap and effect behavior is identical to the source.
+//! 5. **Block merging.** A block reached by exactly one edge — an unconditional `br` from its
+//!    sole predecessor — is fused into that predecessor (its parameters bind to the branch
+//!    arguments). This collapses the `br`-chains the specializer emits into straight-line code.
+//! 6. **Dead block-parameter elimination.** A block parameter never referenced in its block is
+//!    dropped, along with the matching argument in every predecessor edge — a cross-edge
+//!    transform, paired with merging so residuals don't carry threaded-through dead state.
 //!
 //! **Untrusted for escape (§2a / §20a posture).** Like the LLVM on-ramp, this pass is
 //! *not* in the escape-TCB: its output is meant to be re-verified with
@@ -43,13 +49,13 @@
 //! traps — including a randomized fuzz over dead-heavy arithmetic DAGs that stresses the
 //! renumbering/remapper.
 //!
-//! **Still out of scope** (later increments): float constant folding (NaN/rounding
-//! fidelity); dead **block-parameter** elimination and **block merging** (collapsing a block
-//! into its single unconditional predecessor) — both cross-edge transforms; and lifting an
-//! interpreter's value stack out of memory into SSA so memory-backed interpreters specialize
-//! too (the specializer's Stage 2).
+//! **Still out of scope** (later increments): float constant folding (NaN/rounding fidelity),
+//! and lifting an interpreter's value stack out of memory into SSA so memory-backed interpreters
+//! specialize too (the specializer's Stage 2).
 
-use svm_ir::{BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx};
+use svm_ir::{
+    BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx, ValType,
+};
 
 mod specialize;
 pub use specialize::{specialize, SpecArg, SpecError};
@@ -102,16 +108,28 @@ pub fn optimize_module(m: &Module) -> Module {
     }
 }
 
-/// Optimize a single function: fold + resolve branches per block, prune dead blocks, then
-/// drop dead values within each surviving block. `fn_results` is the per-`FuncIdx` result
-/// arity (for `Inst::result_count`).
+/// Optimize a single function to a fixpoint: fold + resolve branches, prune dead blocks, merge
+/// straight-line chains, drop dead block parameters, and drop dead values — repeating until
+/// nothing changes. Every pass only simplifies, so this terminates; the cap guards pathologies.
 pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
-    let folded: Vec<Block> = f.blocks.iter().map(|b| fold_block(b, fn_results)).collect();
-    let pruned = prune_unreachable(folded);
+    let mut blocks: Vec<Block> = f.blocks.iter().map(|b| fold_block(b, fn_results)).collect();
+    for _ in 0..1000 {
+        let before = blocks.clone();
+        blocks = prune_unreachable(blocks);
+        blocks = merge_blocks(blocks, fn_results);
+        blocks = drop_dead_params(blocks, fn_results);
+        blocks = blocks.iter().map(|b| dce_block(b, fn_results)).collect();
+        // Re-fold: merging brings a constant's definition into the same block as its use, and
+        // dropping params can expose new constants — both newly foldable here.
+        blocks = blocks.iter().map(|b| fold_block(b, fn_results)).collect();
+        if blocks == before {
+            break;
+        }
+    }
     Func {
         params: f.params.clone(),
         results: f.results.clone(),
-        blocks: pruned.iter().map(|b| dce_block(b, fn_results)).collect(),
+        blocks,
     }
 }
 
@@ -850,5 +868,230 @@ fn dce_block(b: &Block, fn_results: &[usize]) -> Block {
         params: b.params.clone(),
         insts,
         term,
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// CFG cleanup: block merging + dead block-parameter elimination.
+// ---------------------------------------------------------------------------------------
+
+/// Total number of SSA values a block defines: its parameters plus every instruction result.
+fn val_count(b: &Block, fn_results: &[usize]) -> u32 {
+    let mut n = b.params.len() as u32;
+    for inst in &b.insts {
+        n += inst.result_count(fn_results) as u32;
+    }
+    n
+}
+
+/// Number of incoming edges to each block (counting multiplicity — a `br_table` listing a block
+/// twice counts twice), so a count of exactly 1 means a single, unique predecessor edge.
+fn pred_counts(blocks: &[Block]) -> Vec<u32> {
+    let mut c = vec![0u32; blocks.len()];
+    for b in blocks {
+        for s in term_successors(&b.term) {
+            c[s as usize] += 1;
+        }
+    }
+    c
+}
+
+/// Merge any block reached by exactly one edge — an unconditional `br` from its sole predecessor —
+/// into that predecessor, to a fixpoint. The successor's parameters bind to the branch arguments
+/// and its body/terminator are appended (operands renumbered). The entry block is never merged
+/// away. This collapses the `br`-chains the specializer emits into straight-line code.
+fn merge_blocks(mut blocks: Vec<Block>, fn_results: &[usize]) -> Vec<Block> {
+    loop {
+        let preds = pred_counts(&blocks);
+        // Find a predecessor `a` whose terminator is an unconditional `br` to a mergeable `b`.
+        let mut found = None;
+        for (a, blk) in blocks.iter().enumerate() {
+            if let Terminator::Br { target, .. } = blk.term {
+                let b = target as usize;
+                if b != a && b != 0 && preds[b] == 1 {
+                    found = Some((a, b));
+                    break;
+                }
+            }
+        }
+        let (a, b) = match found {
+            Some(pair) => pair,
+            None => return blocks,
+        };
+
+        // Pull what we need out of both blocks before mutating.
+        let args: Vec<ValIdx> = match &blocks[a].term {
+            Terminator::Br { args, .. } => args.clone(),
+            _ => unreachable!("selected block must end in `br`"),
+        };
+        let base = val_count(&blocks[a], fn_results);
+        let nparams_b = blocks[b].params.len() as u32;
+        let b_insts = blocks[b].insts.clone();
+        let b_term = blocks[b].term.clone();
+
+        // Remap a B-local value: a parameter becomes the matching branch argument; an instruction
+        // result moves to a fresh index appended after A's existing values.
+        let remap = |v: ValIdx| -> ValIdx {
+            if v < nparams_b {
+                args[v as usize]
+            } else {
+                base + (v - nparams_b)
+            }
+        };
+
+        let a_blk = &mut blocks[a];
+        for mut inst in b_insts {
+            map_operands(&mut inst, &mut |v| remap(v));
+            a_blk.insts.push(inst);
+        }
+        let mut term = b_term;
+        map_term_operands(&mut term, &mut |v| remap(v));
+        a_blk.term = term;
+
+        remove_block(&mut blocks, b);
+    }
+}
+
+/// Remove block `b` and renumber the surviving blocks' terminator targets. Nothing references `b`
+/// at the call site (its sole predecessor has just absorbed it).
+fn remove_block(blocks: &mut Vec<Block>, b: usize) {
+    let old_len = blocks.len();
+    blocks.remove(b);
+    let map: Vec<u32> = (0..old_len)
+        .map(|i| if i > b { (i - 1) as u32 } else { i as u32 })
+        .collect();
+    for blk in blocks.iter_mut() {
+        remap_targets(&mut blk.term, &map);
+    }
+}
+
+/// Drop block parameters that are never referenced within their block, and the matching argument
+/// in every predecessor edge. One pass over all blocks (cascades are caught by the outer fixpoint).
+/// The entry block's parameters are the function signature and are never dropped.
+fn drop_dead_params(blocks: Vec<Block>, fn_results: &[usize]) -> Vec<Block> {
+    let n = blocks.len();
+    // Dead parameter positions per block (entry excluded).
+    let mut dropped: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, blk) in blocks.iter().enumerate().skip(1) {
+        let used = used_values(blk, fn_results);
+        for (p, &u) in used.iter().take(blk.params.len()).enumerate() {
+            if !u {
+                dropped[b].push(p);
+            }
+        }
+    }
+    if dropped.iter().all(Vec::is_empty) {
+        return blocks;
+    }
+
+    // Renumber each block to remove its own dead params, then drop the matching edge arguments.
+    let mut out: Vec<Block> = blocks
+        .iter()
+        .enumerate()
+        .map(|(b, blk)| {
+            if dropped[b].is_empty() {
+                blk.clone()
+            } else {
+                remove_params(blk, &dropped[b])
+            }
+        })
+        .collect();
+    for blk in out.iter_mut() {
+        drop_edge_args(&mut blk.term, &dropped);
+    }
+    out
+}
+
+/// Which SSA values a block references (as an instruction or terminator operand).
+fn used_values(b: &Block, fn_results: &[usize]) -> Vec<bool> {
+    let mut used = vec![false; val_count(b, fn_results) as usize];
+    for inst in &b.insts {
+        each_operand(inst, |v| used[v as usize] = true);
+    }
+    let mut term = b.term.clone();
+    map_term_operands(&mut term, &mut |v| {
+        used[v as usize] = true;
+        v
+    });
+    used
+}
+
+/// Rebuild a block with the parameters at `dropped` positions removed, renumbering every value
+/// (the dropped params are unused, so no operand ever references them).
+fn remove_params(b: &Block, dropped: &[usize]) -> Block {
+    let nparams = b.params.len();
+    let is_dropped = |p: usize| dropped.contains(&p);
+    // old value index -> new value index (None only for the dropped params, never referenced).
+    let mut map: Vec<Option<u32>> = Vec::new();
+    let mut next = 0u32;
+    for p in 0..nparams {
+        if is_dropped(p) {
+            map.push(None);
+        } else {
+            map.push(Some(next));
+            next += 1;
+        }
+    }
+    // Instruction results all shift down by the number of dropped params.
+    let drop_n = dropped.len() as u32;
+    let lookup = move |v: ValIdx| -> ValIdx {
+        if (v as usize) < nparams {
+            map[v as usize].expect("a dropped parameter must be unused")
+        } else {
+            v - drop_n
+        }
+    };
+
+    let params: Vec<ValType> = b
+        .params
+        .iter()
+        .enumerate()
+        .filter(|(p, _)| !is_dropped(*p))
+        .map(|(_, t)| *t)
+        .collect();
+    let mut insts = b.insts.clone();
+    for inst in insts.iter_mut() {
+        map_operands(inst, &mut |v| lookup(v));
+    }
+    let mut term = b.term.clone();
+    map_term_operands(&mut term, &mut |v| lookup(v));
+    Block {
+        params,
+        insts,
+        term,
+    }
+}
+
+/// In a terminator, remove the edge arguments at the dropped-parameter positions of each target.
+fn drop_edge_args(term: &mut Terminator, dropped: &[Vec<usize>]) {
+    let trim = |args: &mut Vec<ValIdx>, target: u32| {
+        for &p in dropped[target as usize].iter().rev() {
+            args.remove(p);
+        }
+    };
+    match term {
+        Terminator::Br { target, args } => trim(args, *target),
+        Terminator::BrIf {
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+            ..
+        } => {
+            trim(then_args, *then_blk);
+            trim(else_args, *else_blk);
+        }
+        Terminator::BrTable {
+            targets, default, ..
+        } => {
+            for (t, args) in targets.iter_mut() {
+                trim(args, *t);
+            }
+            trim(&mut default.1, default.0);
+        }
+        Terminator::Return(_)
+        | Terminator::ReturnCall { .. }
+        | Terminator::ReturnCallIndirect { .. }
+        | Terminator::Unreachable => {}
     }
 }

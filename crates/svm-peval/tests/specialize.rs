@@ -175,6 +175,9 @@ fn futamura_specializes_accumulator_program() {
 
     // The dispatch loop is gone: no opcode loads, no br_table.
     assert_no_dispatch_left(&residual);
+    // After cleanup the whole straight-line program is a single block: input -> +15 -> *3.
+    assert_eq!(opt.funcs[0].blocks.len(), 1);
+    assert!(matches!(opt.funcs[0].blocks[0].term, Terminator::Return(_)));
 
     for input in [0i64, 1, 2, -5, 100, i64::MIN] {
         let expect = (15i64.wrapping_add(input)).wrapping_mul(3);
@@ -206,18 +209,14 @@ fn futamura_constant_program_folds_to_a_constant() {
         );
     }
 
-    // The entire program computation has folded away: the optimized residual contains no
-    // arithmetic and no loads — only constant moves and branches. (It is still a chain of
-    // `br`-connected blocks because block *merging* — collapsing a block into its single
-    // unconditional predecessor — is a later increment; the values are all constant.)
+    // After cleanup the whole thing collapses to a single block that returns the constant 42.
     let opt = optimize_module(&residual);
     verify_module(&opt).expect("optimized residual verifies");
-    for block in &opt.funcs[0].blocks {
-        assert!(!block
-            .insts
-            .iter()
-            .any(|i| matches!(i, Inst::IntBin { .. } | Inst::Load { .. })));
-    }
+    assert_eq!(opt.funcs[0].blocks.len(), 1);
+    assert!(matches!(
+        opt.funcs[0].blocks[0].insts.last(),
+        Some(Inst::ConstI64(42))
+    ));
 }
 
 // ----- direct branch-specialization tests (no interpreter) -----
