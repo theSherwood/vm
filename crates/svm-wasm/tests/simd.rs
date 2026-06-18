@@ -518,6 +518,28 @@ fn simd_memory_variants() {
     assert_eq!(eval(slane, "f", &[]), Value::I32(200));
 }
 
+/// SIMD float rounding — `f32x4`/`f64x2` `.ceil/.floor/.trunc/.nearest` (the gap the spec-conformance
+/// pass surfaced). `nearest` is round-to-nearest-ties-to-even. `eval` pins interp == JIT.
+#[test]
+fn simd_float_rounding() {
+    let round = |op: &str, x: f32| {
+        let wat = format!(
+            "(module (func (export \"f\") (param $x f32) (result f32)
+               (f32x4.extract_lane 0 ({op} (f32x4.splat (local.get $x))))))"
+        );
+        f32(eval(&wat, "f", &[Value::F32(x)]))
+    };
+    assert_eq!(round("f32x4.ceil", 2.3), 3.0);
+    assert_eq!(round("f32x4.floor", 2.7), 2.0);
+    assert_eq!(round("f32x4.trunc", -2.7), -2.0);
+    assert_eq!(round("f32x4.nearest", 2.5), 2.0, "ties to even");
+    assert_eq!(round("f32x4.nearest", 3.5), 4.0, "ties to even");
+    // f64x2 path.
+    let wat = "(module (func (export \"f\") (param $x f64) (result f64)
+        (f64x2.extract_lane 1 (f64x2.floor (f64x2.splat (local.get $x))))))";
+    assert_eq!(f64(eval(wat, "f", &[Value::F64(-1.2)])), -2.0);
+}
+
 #[test]
 fn f64x2_pmin_pmax() {
     let pm = |op: &str| {

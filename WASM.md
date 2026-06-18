@@ -40,6 +40,28 @@ memory64). Fold completed sections into `DESIGN.md` / drop this file once the ac
 
 ---
 
+## Spec conformance
+
+`tests/spec.rs` runs the official WebAssembly spec corpus (`.wast`) through the transpiler +
+interpreter and reports, per file, how the value assertions land. It is a **report, not a gate**
+(gated on the `SPEC_DIR` env var — unset in CI, so it skips): point it at a checkout and read the
+summary —
+`SPEC_DIR=…/spec/test/core cargo test -p svm-wasm --test spec -- --nocapture`.
+
+Scope caveat: SVM runs **one entry over a fresh window per call**, with no persistent module
+*instance* across invokes, so assertions that depend on cross-invoke state (write memory then read it,
+mutate a global) can't be reproduced and are reported `skip`. The pass is meaningful for **pure**
+assertions — `(invoke "op" const-args) → result` — which is the shape of essentially all the
+numeric/conversion/**SIMD** value tests. (`assert_trap` on an OOB access is `trap-divergence`, not a
+fail — SVM masks into its window per §1a.)
+
+Result over the numeric + full SIMD suites (~60 files): **36.7k value assertions pass, 0 fail.** The
+pass surfaced exactly one real gap — SIMD float rounding (`f32x4`/`f64x2` `.ceil/.floor/.trunc/.nearest`)
+— now fixed. The residual `unsupported` is the **reference-types** modules (`select.wast` etc., the
+tracked gap below) plus a handful of multi-module const-form edge cases.
+
+---
+
 ## Gaps (tracked)
 
 Severity key: **🔴 silent** (transpiles but mis-behaves — fix first), **🟠 host-blocker** (blocks real
@@ -108,11 +130,14 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   capability-handle (an i32 host-table index), `funcref` → funcref-index (already powers
   `call_indirect`); the table-mutation ops are the fiddly part. Low audience (C/C++/Rust don't emit it).
 - [x] **SIMD — DONE (fixed-width v128 *and* relaxed).** The whole wasm SIMD surface transpiles + runs
-  on both backends: every arithmetic/lane/convert/shuffle op, the **memory variants** (splat-load,
-  load-extend, load-zero, load/store-lane), and the **relaxed-SIMD** extension. Built over the proven
-  5-step pattern (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a
-  few ops bail on the JIT where Cranelift can't legalize them (`i8x16.mul`, `i64x2` min/max — the
-  interp still covers them and wasm never emits them).
+  on both backends: every arithmetic/lane/convert/shuffle op, the **float rounding** lanes
+  (`f32x4`/`f64x2` `.ceil/.floor/.trunc/.nearest`), the **memory variants** (splat-load, load-extend,
+  load-zero, load/store-lane), and the **relaxed-SIMD** extension. Built over the proven 5-step pattern
+  (IR variant → verifier lane rule → interp ref → JIT Cranelift → transpiler arm); a few ops bail on
+  the JIT where Cranelift can't legalize them (`i8x16.mul`, `i64x2` min/max — the interp still covers
+  them and wasm never emits them). **Validated against the official spec corpus** (see *spec
+  conformance* below): every numeric + SIMD value vector matches, **0 failures across 36.7k
+  assertions**.
   - [x] **SIMD memory variants — DONE.** `v128.load{8,16,32,64}_splat`, `load{8x8,16x4,32x2}_{s,u}`,
     `load{32,64}_zero`, `load/store{8,16,32,64}_lane` (clang `-msimd128` emits these constantly to
     broadcast/gather). No new IR — each composes a scalar `Load`/`Store` with `Splat`/`ReplaceLane`/

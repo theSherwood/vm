@@ -22,3 +22,6 @@ svm-jit = { path = "../svm-jit" }
 # itself emits only verifier-checked IR and never links the runtime.
 svm-run = { path = "../svm-run" }
 wat = "1"
+# `wast` parses the `.wast` directive format (modules + `assert_return`/`assert_trap`) for the
+# spec-conformance harness (`tests/spec.rs`). Only exercised when `SPEC_DIR` points at the corpus.
+wast = "251"

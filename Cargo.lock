@@ -725,6 +725,7 @@ dependencies = [
  "svm-text",
  "svm-verify",
  "wasmparser",
+ "wast",
  "wat",
 ]
 

@@ -5083,6 +5083,10 @@ fn vf_un(op: VFloatUnOp) -> FUnOp {
         VFloatUnOp::Abs => FUnOp::Abs,
         VFloatUnOp::Neg => FUnOp::Neg,
         VFloatUnOp::Sqrt => FUnOp::Sqrt,
+        VFloatUnOp::Ceil => FUnOp::Ceil,
+        VFloatUnOp::Floor => FUnOp::Floor,
+        VFloatUnOp::Trunc => FUnOp::Trunc,
+        VFloatUnOp::Nearest => FUnOp::Nearest,
     }
 }
 
