@@ -1022,6 +1022,52 @@ pub fn compile_and_run_capture_reserved_with_host_durable(
     Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
 }
 
+/// [`compile_and_run_capture_reserved_with_host_durable`] that also returns the **spawned-vCPU**
+/// freeze residue (DURABILITY.md §12.8 slice 3.3): a durable freeze runs single-worker, so each
+/// `thread.spawn`ed child runs **inline** and, if it unwinds under the freeze, records a
+/// [`FrozenVCpu`] (entry func, `(sp, arg)` operands, flattened shadow-SP). Returned alongside the
+/// flattened fibers so the snapshot can record the whole multi-vCPU domain (a thaw re-attaches the
+/// children). Use this for multi-vCPU durable modules; the fiber-only entry drops the vCPU residue.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host_durable`].
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_durable_mv(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    init_prots: &[WindowProt],
+    seed: &[FrozenFiber],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>), JitError> {
+    let mut cm = CompiledModule::compile(
+        m,
+        func,
+        cap_thunk,
+        cap_ctx,
+        reserved_log2,
+        None,
+        None,
+        None,
+        None,
+        Quota::default(),
+        0,
+    )?;
+    cm.restore_prots = init_prots.to_vec();
+    cm.frozen_seed = seed.to_vec();
+    cm.durable = true;
+    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP), None)?;
+    Ok((
+        outcome,
+        win,
+        std::mem::take(&mut cm.frozen_out),
+        std::mem::take(&mut cm.frozen_vcpus_out),
+    ))
+}
+
 /// [`compile_and_run_capture_reserved_with_host`] + the §9/§12 **async-ring host seam**
 /// ([`AsyncHostHooks`]): wires this run's futex-`notify` into the embedder's `Host` so an offload-pool
 /// worker can wake a vCPU parked in `IoRing.submit_async`, and drains the pool before teardown. Use it
@@ -1280,6 +1326,10 @@ pub struct CompiledModule {
     /// Durable **freeze** residue (slice 3.3.3): the fibers the freeze driver flattened this run,
     /// read back by the durable entry point. Empty unless a freeze flattened fibers.
     frozen_out: Vec<FrozenFiber>,
+    /// Durable **freeze** residue (slice 3.3): the spawned vCPUs that unwound under the freeze (each
+    /// run inline single-worker by `thread.spawn`). Drained from the `Domain` after the root unwinds,
+    /// read back by the durable entry point. Empty unless a freeze caught a live child.
+    frozen_vcpus_out: Vec<FrozenVCpu>,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -1668,15 +1718,19 @@ impl CompiledModule {
         // namespace + a per-domain §15 quota, matching the interpreter's run-shared registry). This is
         // the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
         // builds its own over the same table from `fiber_cfg` (`os_thread_rt`). Created whenever the
-        // module uses `cont.*`.
+        // module uses `cont.*` **or** `thread.spawn` — a threaded module needs the table for the
+        // durable vCPU-context allocator (slice 3.3), even when it uses no fibers (the table is then
+        // dormant: a fiber-free module never resumes a fiber, so the root's runtime just routes the
+        // durable shadow-SP swap).
         #[cfg(fiber_rt)]
-        let fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>> = if uses_fibers {
-            Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
-                quota.max_fibers,
-            )))
-        } else {
-            None
-        };
+        let fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>> =
+            if uses_fibers || uses_threads {
+                Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
+                    quota.max_fibers,
+                )))
+            } else {
+                None
+            };
         #[cfg(fiber_rt)]
         let mut fiber_rt: Option<Box<fiber_rt::FiberRuntime>> = fiber_table.as_ref().map(|t| {
             Box::new(fiber_rt::FiberRuntime::new(
@@ -2046,6 +2100,7 @@ impl CompiledModule {
             durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
+            frozen_vcpus_out: Vec::new(),
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -2339,6 +2394,7 @@ impl CompiledModule {
                     t.fiber_cfg,
                     t.fiber_table.clone(), // the domain-shared table spawned vCPUs build over
                     t.epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
+                    t.durable, // slice 3.3: run spawned children inline (single-worker) under a freeze/thaw
                 );
             }
             // §9/§12 async ring: publish this run's futex-`notify` into the embedder's `Host` so an offload
@@ -2448,6 +2504,17 @@ impl CompiledModule {
                 let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
                 fiber_rt::freeze_drive(rt, trap_cell.as_ptr() as u64);
                 (*this).frozen_out = fiber_rt::take_frozen(rt); // read back by the durable entry
+            }
+            // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
+            // request, returning the handle) so the root could unwind first — matching the interp,
+            // which enqueues a child and runs it only after the spawning vCPU yields. Now that the
+            // root has unwound and its fibers are flattened, run the deferred children **inline**
+            // (single-worker) in spawn order: each unwinds into its own top-down context and records a
+            // `FrozenVCpu`. This reproduces the interp's dispatch order (root → root's fibers →
+            // children), so the side-effect interleaving — and the frozen window — is byte-identical.
+            if let Some(d) = &(*this).domain {
+                d.drive_frozen_spawns();
+                (*this).frozen_vcpus_out = d.take_frozen_vcpus();
             }
         }
 

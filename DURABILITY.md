@@ -1,7 +1,8 @@
 # Durable Domains — Snapshot / Restore / Clone
 
 > **Status: Phases 1–2 landed + Phase 3.1 (single-fiber freeze/thaw) complete on the interpreter
-> + Phase 3.3 (JIT parity) complete single-vCPU; 3.2 (multi-vCPU) ahead.** This file is the single source of truth for the *design and
+> + Phase 3.3 (JIT parity) complete single-vCPU and **multi-vCPU freeze side** (deferred single-worker
+> `thread.spawn` + `FrozenVCpu` residue); multi-vCPU JIT thaw side ahead.** This file is the single source of truth for the *design and
 > implementation status* of durable domains. Built so far: the `svm-durable` IR→IR transform
 > (arbitrary single-vCPU CFGs **+ the §12 fiber control ops**), the `svm-interp` handle-table
 > durability primitives (§12.5) **+ the per-fiber shadow-SP swap / freeze driver (D-fiber-cont
@@ -818,20 +819,30 @@ vCPUs running concurrently mid-freeze. The JIT just needs the **same serializati
 because it runs `thread.spawn` children as concurrent 1:1 OS threads (`os_thread_rt::run_child`) with no
 cooperative dispatch boundary.
 
-**Mechanism (mirror the interp, inline):** when the window state ≠ `NORMAL`, the JIT's `thread_spawn`
-thunk runs the child **inline on the spawning thread** (single-worker) instead of spawning an OS thread:
-reserve the child a top-down shadow context (a `vcpu` occupancy allocator on `SharedFiberTable`,
-mirroring the interp's `vcpu_mask`), save the running shadow-SP and point `SHADOW_SP_OFF` at the child's
-region, run the child entry via the existing guarded-range path, capture its flattened extent as a
-**`FrozenVCpu`** residue (a JIT mirror of `svm_interp::FrozenVCpu`) when it unwinds under `UNWINDING`,
-then restore the shadow-SP and publish the child's result to its `Done` cell synchronously (so the
-trailing `thread_join` resolves immediately). `NORMAL` durable runs keep concurrent OS threads (matching
+**Mechanism (mirror the interp, deferred single-worker):** when the window state ≠ `NORMAL`, the JIT's
+`thread_spawn` thunk does **not** start an OS thread. It reserves the child a top-down shadow context (a
+`vcpu` occupancy allocator on `SharedFiberTable`, mirroring the interp's `vcpu_mask`) and a completion
+cell, *records* the spawn request, and returns the handle — then the child runs **inline after the
+spawning vCPU yields** (`Domain::drive_frozen_spawns`, called from `run_inner` once the root has unwound
+and its fibers are flattened). This **deferral is load-bearing for byte-identity**: both backends run the
+same instrumented IR, so the root unwinds at its first checkpoint *before* it reaches `thread.join`;
+running each child only after the root yields reproduces the interp's exact dispatch order (root → root's
+fibers → children, in spawn order) and therefore the same side-effect interleaving (e.g. which vCPU reads
+the clock first). Running the child *immediately* at the spawn point instead reverses that interleaving
+and diverges the frozen window. Each deferred child runs in its own context (point `SHADOW_SP_OFF` at its
+region, run the child entry via the existing guarded-range path), captures its flattened extent as a
+**`FrozenVCpu`** residue (a JIT mirror of `svm_interp::FrozenVCpu`) when it unwinds under `UNWINDING`, and
+publishes its result to its `Done` cell; the last child leaves the active shadow-SP at its own extent,
+matching the interp's dispatch-last convention. `NORMAL` durable runs keep concurrent OS threads (matching
 the interp's multi-worker `NORMAL`).
 
 **Decomposition:**
-- **PR-1 (freeze side):** the inline single-worker path + `FrozenVCpu` residue + vCPU-context allocator;
-  pinned by a byte-identical durable-reserve + artifact parity test for a root+child domain (the
-  multi-vCPU analog of `jit_freeze_driver_flattens_a_fiber_matching_interp`).
+- **PR-1 (freeze side) — DONE:** the deferred single-worker path (`defer_spawn` /
+  `Domain::drive_frozen_spawns`) + `FrozenVCpu` residue + vCPU-context allocator, exported through
+  `compile_and_run_capture_reserved_with_host_durable_mv`. Pinned by `durable_multivcpu_jit`'s
+  `jit_freezes_a_spawned_vcpu_matching_interp`: a root+child domain freezes to a **byte-identical durable
+  reserve** and a **field-identical `FrozenVCpu` residue** vs the interpreter (the multi-vCPU analog of
+  `jit_freeze_driver_flattens_a_fiber_matching_interp`).
 - **PR-2 (thaw side):** runtime re-attach of frozen children before the root re-enters under
   `REWINDING` (the root's rewind skips its prologue `thread.spawn`), rebuilding the join table — the
   analog of the interp `drive` thaw re-spawn; pinned by an interp-frozen multi-vCPU artifact thawing on
