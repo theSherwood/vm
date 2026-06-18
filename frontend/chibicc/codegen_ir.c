@@ -2700,6 +2700,14 @@ static bool is_debuggable_local(Obj *fn, Obj *v) {
          v != fn->alloca_bottom;
 }
 
+// Is this a module-scoped global we emit a `debug.var ... global ... fixed <addr>` for? A named,
+// non-function definition with storage in this module — i.e. a real source global, not a function,
+// an `extern` declaration, or an anonymous (`.L..`) string literal.
+static bool is_debuggable_global(Obj *g) {
+  return !g->is_function && g->is_definition && g->name && g->name[0] != '\0' &&
+         g->name[0] != '.';
+}
+
 // Intern the structured type of every named local of `fn`, so the type table is fully populated
 // before it (and the `debug.var` lines that reference it) are emitted.
 static void intern_func_var_types(Obj *fn) {
@@ -2736,6 +2744,26 @@ static void emit_debug_vars(Obj *fn, int func_idx) {
     } else {
       cg("debug.var %d \"%s\" win %d \"%s\" %d\n", func_idx, v->name, v->offset, ty, tid);
     }
+  }
+}
+
+// Intern the structured type of every source global, so the type table is fully populated before
+// the `debug.var ... global` lines that reference it.
+static void intern_global_types(Obj *prog) {
+  for (Obj *g = prog; g; g = g->next)
+    if (is_debuggable_global(g))
+      intern_type(g->ty);
+}
+
+// Emit a module-scoped `debug.var ... global ... fixed <addr>` for each source global: it lives at
+// the fixed window offset `g->offset` (assigned by `layout_globals`), visible in every frame.
+static void emit_debug_globals(Obj *prog) {
+  for (Obj *g = prog; g; g = g->next) {
+    if (!is_debuggable_global(g))
+      continue;
+    const char *ty = dbg_typename(g->ty);
+    int tid = intern_type(g->ty); // cached from `intern_global_types`
+    cg("debug.var global \"%s\" fixed %d \"%s\" %d\n", g->name, g->offset, ty, tid);
   }
 }
 
@@ -2803,8 +2831,10 @@ void codegen_ir(Obj *prog, FILE *out) {
     }
     for (int i = 0; i < nfuncs; i++)
       intern_func_var_types(funcs[i]);
+    intern_global_types(prog);
     emit_type_table();
     for (int i = 0; i < nfuncs; i++)
       emit_debug_vars(funcs[i], start_off + i);
+    emit_debug_globals(prog);
   }
 }

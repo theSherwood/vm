@@ -1263,6 +1263,20 @@ LLVM `-O0 -g` guest ingests `counter` (a `Fixed` int reading its data-segment `7
 reads `42`**. *Not yet:* lexical-scope narrowing (globals are whole-module; a header `static` shadowed
 by a local would need scope ranges — the §6 design's deferred `IrPc`-range scopes).
 
+**Slice 29 — chibicc emits globals (the second producer of the slice-28 primitive).** Slice 28 put
+the global primitives (`VarLoc::Fixed` + `GLOBAL_SCOPE`) in the *neutral core* precisely so every
+frontend gets them; this cashes that in for **chibicc**, the project's primary C frontend. Under
+`-g`, `codegen_ir.c` now emits a `debug.var global "<name>" fixed <addr>` for each source global —
+a named, non-function definition (skipping `extern` decls and anonymous `.L` string literals) at the
+fixed window offset `layout_globals` already assigned it, with its structured type interned
+alongside the per-function locals. So a C guest's globals are inspectable by name **in every frame**,
+exactly as the LLVM path's are — the *same* §6 `Fixed`/`GLOBAL_SCOPE` machinery driven by a second,
+independent producer (no consumer changes: the interpreter/DAP already resolve it from slice 28).
+Test (`c_frontend.rs`, the chibicc lane): an `int counter`/`struct P origin` guest emits the
+`global … fixed` lines and `counter` reads its data-segment `7` at a breakpoint inside `bump`. (The
+wasm DWARF producer emitting globals — `DW_TAG_variable` at module scope with a `DW_OP_addr`
+location — is the natural third-producer follow-up.)
+
 ### Open questions (S4/S5/S2)
 
 - *Probe dispatch in the hot loop*: monomorphized generic (`Probe` type param on `run_inner`)
