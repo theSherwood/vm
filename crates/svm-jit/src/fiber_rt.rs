@@ -351,7 +351,7 @@ impl SharedFiberTable {
     /// off the runtime path (§2a) — only reads the parked stack.
     pub(crate) fn with_parked_stack<R>(
         &self,
-        handle: i32,
+        handle: i64,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Option<R> {
         let (_, slot) = self.resolve(handle)?;
