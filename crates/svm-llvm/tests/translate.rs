@@ -1209,6 +1209,22 @@ fn printf_unsigned_formats() {
 }
 
 #[test]
+fn printf_float_formats() {
+    // `%f` (finite) checked byte-for-byte vs native `printf`: default precision (6), explicit
+    // precision, round-half-to-even at `%.0f` (2.5→2, 3.5→4), a rounding carry (9.999→10.00),
+    // negatives, and width/justify/sign/zero-pad combos. `mk` keeps one value runtime (not folded).
+    let src = "#include <stdio.h>\n\
+               double mk(int n){ return (double)n / 8.0; }\n\
+               int main(void){ \
+                 printf(\"%f %f %f\\n\", 3.14159, 0.0, -2.71828); \
+                 printf(\"%.2f %.0f %.0f %.5f\\n\", 9.999, 2.5, 3.5, 1.0/3.0); \
+                 printf(\"|%10.3f|%-10.3f|%+08.2f|\\n\", 3.14159, 3.14159, -3.5); \
+                 printf(\"%.6f %.1f\\n\", 0.1, mk(5)); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_f", src, b"");
+}
+
+#[test]
 fn printf_flag_formats() {
     // The full flag matrix on integer conversions, checked byte-for-byte vs native `printf`:
     //   `-` left-justify, `+`/space forced sign, `0` zero-pad (incl. the previously-fail-closed
