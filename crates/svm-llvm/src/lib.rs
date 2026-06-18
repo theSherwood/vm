@@ -349,6 +349,9 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         memcpy: take(need_memcpy),
         malloc: take(need_malloc),
         utoa: take(need_printf),
+        // `%s` needs a runtime strlen; synthesized alongside `utoa` whenever `printf` is present
+        // (one small function — `%s`-free printf programs carry an unused helper, negligible).
+        strlen: take(need_printf),
         realloc: take(need_realloc),
         memmove: take(need_memmove),
     };
@@ -454,6 +457,7 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
     }
     if need_printf {
         funcs.push(synth_utoa());
+        funcs.push(synth_strlen());
     }
     if need_realloc {
         funcs.push(synth_realloc(
@@ -2291,6 +2295,8 @@ struct Helpers {
     malloc: Option<u32>,
     /// `__svm_utoa(value:i64, base:i64, bufend:i64) -> i64` — unsigned→ASCII for `printf`.
     utoa: Option<u32>,
+    /// `__svm_strlen(p:i64) -> i64` — the NUL-terminated byte length, for `printf` `%s`.
+    strlen: Option<u32>,
     /// `__svm_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
     realloc: Option<u32>,
     /// `__svm_memmove(dst:i64, src:i64, len:i64)` — overlap-safe (direction-aware) byte copy.
@@ -2834,6 +2840,76 @@ fn synth_utoa() -> Func {
     }
 }
 
+/// Synthesize `__svm_strlen(p:i64) -> i64` — the NUL-terminated byte length, for `printf` `%s`. A
+/// counted scan: walk forward from `p` until the zero byte, returning `cur - p`.
+///
+/// ```text
+///   entry(p):            → loop(p, p)            ; cur=p, start=p
+///   loop(cur, start):    b = *cur (i8)
+///     b != 0 ? loop(cur+1, start) : done(cur-start)
+///   done(len):           return len
+/// ```
+fn synth_strlen() -> Func {
+    use svm_ir::LoadOp;
+    let params = vec![ValType::I64]; // p
+    let entry = Block {
+        params: params.clone(),
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0, 0], // loop(p, p)
+        },
+    };
+    let lp = Block {
+        params: vec![ValType::I64, ValType::I64], // cur, start
+        insts: vec![
+            Inst::Load {
+                op: LoadOp::I32_8U,
+                addr: 0,
+                offset: 0,
+                align: 0,
+            }, // v2 = *cur
+            Inst::ConstI32(0), // v3
+            Inst::IntCmp {
+                ty: IntTy::I32,
+                op: CmpOp::Ne,
+                a: 2,
+                b: 3,
+            }, // v4 = *cur != 0
+            Inst::ConstI64(1), // v5
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 5,
+            }, // v6 = cur + 1
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: 0,
+                b: 1,
+            }, // v7 = cur - start
+        ],
+        term: Terminator::BrIf {
+            cond: 4,
+            then_blk: 1,
+            then_args: vec![6, 1], // loop(cur+1, start)
+            else_blk: 2,
+            else_args: vec![7], // done(cur-start)
+        },
+    };
+    let done = Block {
+        params: vec![ValType::I64], // len
+        insts: vec![],
+        term: Terminator::Return(vec![0]),
+    };
+    Func {
+        params,
+        results: vec![ValType::I64],
+        blocks: vec![entry, lp, done],
+    }
+}
+
 /// The global-variable name a pointer operand points at, if it is a direct `@global` reference (the
 /// shape clang passes a string literal to `puts`/`fputs`). A computed pointer returns `None`.
 fn global_name_of(op: &Operand) -> Option<String> {
@@ -2855,8 +2931,9 @@ fn global_name_of(op: &Operand) -> Option<String> {
 /// stays an ordinary call). Result-fidelity notes (the *stdout bytes* are exact regardless): `putc`
 /// yields the written char, `fwrite` the item count `nmemb`, `puts`/`fputs`/`fflush` a `0` success.
 /// A parsed `printf` format-string segment (the constant format is parsed at translate time, §ramp
-/// Lane C). Integer conversions (`%d`/`%i`/`%u`/`%x`), `%c`, and `%%` are handled; `%s`, `%f`,
-/// precision, `*`, and the `-`/`+`/` `/`#` flags are a later slice (fail-closed `Unsupported`).
+/// Lane C). Integer conversions (`%d`/`%i`/`%u`/`%x`), `%c`, `%s` (runtime strlen), and `%%` are
+/// handled; `%f`, precision, `*`, and the `-`/`+`/` `/`#` flags are a later slice (fail-closed
+/// `Unsupported`).
 enum FmtSeg {
     /// A verbatim run — bytes `[off, off+len)` of the format global, written directly.
     Lit { off: usize, len: usize },
@@ -2870,6 +2947,9 @@ enum FmtSeg {
     },
     /// `%c` — the argument's low byte.
     Char,
+    /// `%s` — a NUL-terminated string argument (runtime `strlen`), right-justified in field `width`
+    /// (space-padded; the `0` flag and precision are not yet handled — see `parse_format`).
+    Str { width: u32 },
     /// `%%` — a literal percent.
     Percent,
 }
@@ -2951,7 +3031,7 @@ fn parse_format(fmt: &[u8]) -> Result<Vec<FmtSeg>, Error> {
             b'u' => int(10, false)?,
             b'x' => int(16, false)?,
             b'c' => FmtSeg::Char,
-            b's' => return Err(bad("%s — later slice")),
+            b's' => FmtSeg::Str { width },
             other => return Err(bad(&format!("conversion %{}", other as char))),
         });
         lit_start = i;
@@ -3519,6 +3599,58 @@ fn lower_printf(ctx: &mut BlockCtx, c: &llvm_ir::instruction::Call) -> Result<()
                 let scratch = ctx.scratch_byte(v);
                 let one = ctx.const_i64(1);
                 ctx.emit_write(scratch, one)?;
+            }
+            FmtSeg::Str { width } => {
+                let arg = c.arguments.get(argi).ok_or_else(|| {
+                    Error::Unsupported("printf: more conversions than args".into())
+                })?;
+                argi += 1;
+                let ptr = ctx.operand_i64(&arg.0)?;
+                let strlen = ctx
+                    .helpers
+                    .strlen
+                    .ok_or_else(|| Error::Unsupported("printf: strlen helper missing".into()))?;
+                let len = ctx.push(Inst::Call {
+                    func: strlen,
+                    args: vec![ptr],
+                });
+                // Right-justify in `width`: emit `max(0, width - len)` leading spaces from a
+                // pre-filled scratch run, then the string bytes straight from its pointer.
+                if width > 0 {
+                    let space = ctx.push(Inst::ConstI32(b' ' as i32));
+                    for k in 0..width as u64 {
+                        let a = ctx.const_i64((FMT_BUF + k) as i64);
+                        ctx.push_effect(Inst::Store {
+                            op: svm_ir::StoreOp::I32_8,
+                            addr: a,
+                            value: space,
+                            offset: 0,
+                            align: 0,
+                        });
+                    }
+                    let wv = ctx.const_i64(width as i64);
+                    let gt = ctx.push(Inst::IntCmp {
+                        ty: IntTy::I64,
+                        op: CmpOp::GtU,
+                        a: wv,
+                        b: len,
+                    });
+                    let diff = ctx.push(Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Sub,
+                        a: wv,
+                        b: len,
+                    });
+                    let zero = ctx.const_i64(0);
+                    let padlen = ctx.push(Inst::Select {
+                        cond: gt,
+                        a: diff,
+                        b: zero,
+                    });
+                    let padbuf = ctx.const_i64(FMT_BUF as i64);
+                    ctx.emit_write(padbuf, padlen)?;
+                }
+                ctx.emit_write(ptr, len)?;
             }
             FmtSeg::Int {
                 base,

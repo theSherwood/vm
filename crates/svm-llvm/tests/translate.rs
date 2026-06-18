@@ -1209,6 +1209,21 @@ fn printf_unsigned_formats() {
 }
 
 #[test]
+fn printf_string_formats() {
+    // `%s` (runtime `strlen`) plain and right-justified in a field width, mixed with `%d`/`%c` so
+    // clang keeps it a real varargs `printf` (not a `puts` rewrite). A pointer that is *not* a string
+    // literal (the `b+1` tail) exercises the runtime strlen, not a constant length. stdout + exit vs
+    // native.
+    let src = "#include <stdio.h>\n\
+               int main(void){ \
+                 const char* a = \"hi\"; const char* b = \"world\"; \
+                 printf(\"[%s] [%8s] n=%d\\n\", a, b, 3); \
+                 printf(\"%s|%s|%c\\n\", b + 1, a, '!'); \
+                 return 0; }";
+    check_powerbox_vs_native("printf_s", src, b"");
+}
+
+#[test]
 fn vec2_float_struct() {
     // A `{float,float}` struct passed/returned by value — clang coerces it to `<2 x float>` and does
     // `extractelement`/`insertelement`/lane-wise `fadd`. Scalarized to a packed i64. addv({1.5,2.5},
