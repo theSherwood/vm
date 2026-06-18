@@ -718,7 +718,16 @@ fn build_debug_info(
     op_locs.sort_by_key(|e| e.0);
     let mut files: Vec<String> = Vec::new();
     let mut locs: Vec<Loc> = Vec::new();
+    // `(code address → source line)` rows, used to map a DWARF lexical block's PC range to a
+    // source-line scope (§6 shadowing).
+    let mut line_rows: Vec<(u64, u32)> = Vec::new();
     if let Some(prog) = debug_line.and_then(dwarf_line::parse) {
+        line_rows = prog
+            .rows
+            .iter()
+            .filter(|r| !r.end_sequence)
+            .map(|r| (r.address, r.line))
+            .collect();
         if prog.files.len() > 1 {
             // DWARF file indices are 1-based; flatten to a 0-based table for `Loc::file`.
             files = prog.files[1..].to_vec();
@@ -752,7 +761,7 @@ fn build_debug_info(
         }
     }
     // Source variables from `.debug_info` (DEBUGGING.md W4 — wasm variable ingest).
-    let (types, vars) = ingest_variables(&blobs, &op_locs, &local_locs);
+    let (types, vars) = ingest_variables(&blobs, &op_locs, &local_locs, &line_rows);
 
     if locs.is_empty() && vars.is_empty() && blobs.is_empty() {
         return None;
@@ -775,6 +784,7 @@ fn ingest_variables(
     blobs: &[svm_ir::ProducerBlob],
     op_locs: &[(u32, u32, u32, u32)],
     local_locs: &[(u32, u32, u32, u32, u32)],
+    line_rows: &[(u64, u32)],
 ) -> (Vec<TypeDef>, Vec<VarInfo>) {
     let sec = |name: &str| {
         blobs
@@ -815,6 +825,17 @@ fn ingest_variables(
                 .and_then(|id| types.get(id as usize))
                 .map(type_render_name)
                 .unwrap_or_else(|| "?".to_string());
+            // §6 lexical scope: a var nested in a `DW_TAG_lexical_block` is in scope from its
+            // declaration line to the block's last source line (mapped from the block's code range
+            // via the line table). Directly in the subprogram ⇒ function-wide (`None`).
+            let scope = v.scope_pc.and_then(|(lo, hi)| {
+                let end = line_rows
+                    .iter()
+                    .filter(|&&(a, _)| a >= lo && a < hi)
+                    .map(|&(_, l)| l)
+                    .max()?;
+                Some((v.decl_line, end))
+            });
             vars.push(VarInfo {
                 func,
                 name: v.name.clone(),
@@ -824,6 +845,7 @@ fn ingest_variables(
                     off: v.fbreg,
                 },
                 type_id,
+                scope,
             });
         }
     }
@@ -843,6 +865,7 @@ fn ingest_variables(
             ty,
             loc: VarLoc::Fixed { addr: g.addr },
             type_id,
+            scope: None,
         });
     }
     (types, vars)

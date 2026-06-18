@@ -615,9 +615,38 @@ type names (`i32`, `Pair`, an `x.rs` file) and asserts the interpreter + DAP rea
 correctly using only the structured layout — locking the consumer's frontend-agnosticism into CI
 (the D-DBG-7 waist holds: consumers depend only on the neutral `DebugInfo`, never on a producer).
 
-**Not yet (other W5 gaps).** Float expressions and short-circuit `&&`/`||` in `evaluate`;
-conditional breakpoints are honored by forward `continue` but not yet by `reverseContinue` (it
-stops at any breakpoint pc); and the JIT/DWARF tier for gdb/lldb on native code.
+**Built — reverse-continue honors conditional breakpoints (W5).** `reverseContinue` now skips a
+breakpoint hit whose `condition` is false when walking *backward*, identical to forward `continue`,
+so it lands on the previous hit that actually fires (not just any breakpoint pc). The condition
+check moved to a shared `Session::condition_holds` used by both directions. Test (`dap.rs`): with
+`i != 2` over a loop hitting `i=3,2,1`, reverse-continuing from the `i=1` stop skips the
+false-condition `i=2` hit back to `i=3`. (Float expressions and short-circuit `&&`/`||` in `evaluate`
+landed earlier — see `expr.rs`.)
+
+**Built — lexical-scope resolution of shadowed variables (§6).** A source variable now carries an
+optional `scope` — a `(start_line, end_line)` source-line range — so a name with multiple
+declarations (an inner-block redeclaration, or a local shadowing a global) resolves to the binding
+**in scope at the stopped pc**, not just the first declared. The consumer maps the stopped pc → its
+source line and, among same-name candidates, keeps those whose scope covers it, choosing the
+innermost (largest `start_line`; a function-wide `None` is outermost) — in `read_var`/`var_addr`
+(so `evaluate`/watch/conditions follow) and the DAP Variables pane (one entry per name, the visible
+shadow). chibicc emits it: each local's declaration line plus its enclosing block's closing-`}` line
+(stamped at scope-exit in the parser; a parameter/top-level local stays function-wide). The waist
+threads the field through text (`debug.var … scope <s> <e>`), binary, and the schema. Source-line
+ranges (not `IrPc` ranges) because a frontend knows source spans at parse time and the consumer
+already maps a pc to a line. Test (`c_frontend.rs`): a C function with an inner-block `int x`
+shadowing an outer `int x` reads `x = 105` inside the block and `x = 6` after it.
+
+**All three producers now emit scopes.** The **wasm** DWARF reader recovers a variable's enclosing
+`DW_TAG_lexical_block` `[low_pc, high_pc)` and maps it — via the line table the source-line half
+already parses — to a `(decl_line, block_last_line)` scope; the **LLVM** DI reader reads each
+`DILocalVariable`'s `DILexicalBlock` scope and, since `DILexicalBlock` carries no end line, derives
+it from the `!dbg` `DILocation`s of the instructions in the block (walking the location's scope
+chain). Both correlate by the same source-line `scope` field the consumer resolves — so a clang
+guest (wasm or `-O0` LLVM) with an inner-block `int x` shadowing an outer one resolves to the inner
+shadow inside the block and the outer after it, exactly as chibicc does (the LLVM lane verifies it at
+runtime; the wasm lane structurally, since a bare `WindowVia` frame read needs `__stack_pointer`
+setup the direct call doesn't do). *Not yet:* the JIT/DWARF tier for gdb/lldb on native code.
 
 ---
 
@@ -1260,8 +1289,9 @@ Because the primitives live in the neutral core, **chibicc and wasm get globals 
 they emit them. Tests: the schema round-trips a `Fixed`/`global` var through text **and** binary; an
 LLVM `-O0 -g` guest ingests `counter` (a `Fixed` int reading its data-segment `7`) and `origin` (a
 `Fixed` `struct P`), and over DAP a global **appears in the Variables pane** and **`evaluate("total")`
-reads `42`**. *Not yet:* lexical-scope narrowing (globals are whole-module; a header `static` shadowed
-by a local would need scope ranges — the §6 design's deferred `IrPc`-range scopes).
+reads `42`**. (Lexical-scope narrowing — a `static`/local shadowing a same-name binding resolving to
+the right one — landed later via the `scope` field; see the W5 "Built — lexical-scope resolution"
+note.)
 
 **Slice 29 — chibicc emits globals (the second producer of the slice-28 primitive).** Slice 28 put
 the global primitives (`VarLoc::Fixed` + `GLOBAL_SCOPE`) in the *neutral core* precisely so every

@@ -852,6 +852,84 @@ breadth-proof capstone: not a unit test of a feature, but a recognizable program
 - Test: `rust_json_tokenizer_capstone` — 14 tokens over the doc, folded digest `% 251 = 135`, on-ramp
   == native. 102 translate tests green, fmt + clippy clean.
 
+**Slice AP (DONE) — lane-wise vector integer conversions (`zext`/`sext`/`trunc`).** With the vector
+legalization landed (I2 / PR #56), the first of the four vector-op classes that block re-enabling
+auto-vectorization on the breadth lanes. svm-ir has **no vector-convert op**, so a `<N x iA> → <N x iB>`
+widen/narrow **scalarizes**: explode the source into `N` per-lane scalars, convert each in its `i32`/
+`i64` container via the same `emit_ext`/`emit_trunc` the scalar path uses, then repack into the
+destination representation. The converter (`lower_vec_int_convert` + `vec_explode_int`/`vec_implode_int`/
+`build_v128_from_lanes`, dispatched from the `Trunc`/`ZExt`/`SExt` arms when the operand is a vector)
+handles **every source↔dest representation pairing**: the packed-`i64` `<2 x i32>`, a single `v128`,
+and a legalized wide value (chunks via `ExtractLane`/`Splat`+`ReplaceLane`, tail lanes already scalar).
+This lands the 4 conversion-blocked demos (`var_memset`, `revsum`, `heapgrow`, `simd_i16x8`) when
+vectorization is on — confirmed by flipping the lanes (9 fails → 5). Float-lane vector conversions stay
+`Unsupported` (fail-closed; a later slice with the `<N x i1>` mask work).
+- Tests: `simd_conv_{zext_u8_to_i32,sext_i32_to_i64,trunc_i64_to_i32,trunc_to_u8}` — `check_vectorized_vs_native`
+  (vectorization *enabled*), each a real `clang -O2` loop verified to emit the conversion, vs native.
+  Covers `zext <4 x i8>→<4 x i32>`, `sext <2 x i32>→<2 x i64>`, `trunc <2 x i64>→<2 x i32>`, and
+  `trunc <8 x i16>→<8 x i8>` / `<8 x i32>→<8 x i16>`. 125 translate tests green, fmt + clippy clean.
+- **Remaining before the breadth-lane flip:** the `<N x i1>` mask machinery landed (slice AS, lands
+  `crc32`); `perlin`/`clay` additionally need **float vector conversions** (`fptosi`/`sitofp` on
+  `<2 x float>`), **`llvm.fmuladd.v2f32`**, and the **`<2 x i16>`** small-vector case — a follow-on
+  slice (AT). The lanes are **all-or-nothing**, so they stay `-fno-*-vectorize` until those land and
+  all of `perlin`/`crc32`/`clay`/`xxhash`/`async_io`/the conversion demos pass together.
+
+**Slice AQ (DONE) — auto-vectorized vector rotate (`llvm.fshl.v4i32` / `fshr`).** The second vector-op
+class (lands `xxhash` when vectorized). svm-ir's `VShift` takes only a *scalar* shift amount, but the
+auto-vectorizer emits **per-lane-varying constant** amounts (xxHash's `<1,7,12,18>`), so the on-ramp
+scalarizes the **rotate idiom** (`a == b`, the only funnel-shift form clang emits for `(x<<n)|(x>>(w-n))`)
+lane-wise: explode the data + amount lanes (reusing slice AP's `vec_explode_int`), rotate each lane with
+the scalar `IntBin Rotl`/`Rotr` (count masked mod lane width — no shift-by-width edge), and repack the
+`v128` (`build_v128_from_lanes`). Handled in `lower_int_intrinsic`'s `vec128` branch; a general
+(non-rotate) or float-shape funnel shift stays `Unsupported`.
+- Test: `simd_vector_rotate_fshl` — a `(x<<13)|(x>>19)` rotate loop (`check_vectorized_vs_native`,
+  vectorization enabled, verified to emit `llvm.fshl.v4i32`), vs native. 126 translate tests green.
+
+**Slice AR (DONE) — general constant-mask wide shuffle (`shufflevector`).** The third vector-op class
+(lands `vm_async_io_runtime` when vectorized). The single-`v128` `shufflevector` already lowered to
+`Inst::Shuffle` (a byte mask); the **legalized wide** path only handled the broadcast (splat) form.
+Generalized to **any constant mask**: explode both operands' lanes (`wide_explode_lanes`, shape-generic
+`ExtractLane` + tail), gather each result lane from the `operand0 ++ operand1` concatenation per the
+mask, and repack via `bind_lanes_as_vector` (a single `v128` when the result is one `v128`'s worth, else
+a wide chunks+tail value). Subsumes the old splat case. This is the shape `async_io`'s `<8 x i8>`
+byte-reversal (`<7,6,…,0>`) emits. A non-constant mask stays `Unsupported` (fail-closed).
+- Test: `simd_wide_shuffle_reverse` — an `__builtin_shufflevector` `<8 x i8>` byte-reverse
+  (`check_vectorized_vs_native`), vs native. 127 translate tests green, fmt + clippy clean.
+
+**Slice AS (DONE) — `<N x i1>` boolean-mask machinery (vector `icmp`/`fcmp`/`select`/movemask).** The
+fourth vector-op class (lands `crc32` when vectorized). svm-ir has **no first-class `<N x i1>` type**,
+so a mask is held **lane-wise** (`mask_lanes`: `N` scalar `0`/`1`s, the `<N x i1>` analog of the `agg`/
+`wide_vals` side-tables) and every producer/consumer is scalarized in a new `lower_mask` pass
+(dispatched after `lower_wide`): vector `icmp`/`fcmp` → `N` scalar `IntCmp`/`FCmp` (narrow lanes
+extended per the predicate's signedness); `select` (mask condition) → per-lane scalar `select` over the
+exploded data (`vec_explode`/`vec_implode`, now float-capable — they reinterpret `<2 x float>` lanes);
+`extractelement` → the lane; `insertelement`/`shufflevector` → build/permute the lanes; `bitcast … to
+iN` (the SIMD **movemask**) → OR the lanes into a bitmap (handles the odd `i4`); `freeze` → identity.
+`scan_func` records an `<N x i1>` result with a placeholder type (never used as a scalar). Masks are
+block-local (like `agg`); a mask crossing a block edge stays `Unsupported` (fail-closed).
+- Test: `simd_mask_icmp_select` — an `(a[i]==b[i]) ? … : …` loop → `icmp eq <4 x i32>` + `select`
+  (`check_vectorized_vs_native`), vs native. `crc32` exercises `icmp`+`select`+`extractelement` end to
+  end. (`bitcast`-to-`iN` / `insertelement`-splat are exercised by `clay`, slice AT.) 128 translate
+  tests green, fmt + clippy clean.
+
+**Slice AT (DONE) — float vector conversions + vec2 FMA + cross-representation shuffle; the breadth
+lanes re-enable vectorization (the capstone).** The remaining gaps that blocked `perlin`/`clay`:
+- **Float vector conversions** (`fptosi`/`fptoui`/`sitofp`/`uitofp`/`fpext`/`fptrunc`) scalarize lane-
+  wise via `lower_vec_fp_convert` (the float analog of slice AP's int converter) — lands perlin's
+  `<2 x float>`↔`<2 x i32>` gradient math.
+- **`llvm.fmuladd.v2f32`** (and the other `<2 x float>` float intrinsics) scalarize lane-wise and
+  repack the packed-`i64` vec2 (`vec_pack`).
+- **Cross-representation shuffle**: a `shufflevector` whose operands and result use *different*
+  representations (`<2 x float> ++ <2 x float>` → a `<4 x float>` `v128`) falls back to a generic
+  explode/gather/repack (`bind_shuffle_result`), beyond the same-shape `Inst::Shuffle` fast path.
+- **Capstone:** with all of `conversions`/`rotate`/`shuffle`/`masks` + these landed, the C/C++/Rust
+  breadth-lane compile helpers **drop `-fno-*-vectorize` / `-vectorize-*=false`** — every demo now
+  translates its real `-O2` auto-vectorized bitcode (SIMD and all), byte-identical to native. The
+  fixed-128 chunk legalization (not flag suppression) preserves interp↔JIT/durable determinism.
+- Verification: **128 translate tests green with vectorization enabled across every lane** — the C
+  corpus (`sha256`/`xxhash`/`perlin`/`crc32`/`clay`/`regex`/`jsmn`/`heapgrow`/…), C++, Rust, the
+  powerbox/async/JIT demos, and the focused `simd_*` shape/op-class tests. fmt + clippy clean.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple
@@ -862,24 +940,26 @@ breadth-proof capstone: not a unit test of a feature, but a recognizable program
       evaluator (slice AL — + `*.with.overflow` intrinsics and `i64` switches). Auto-vectorization is
       disabled (SIMD is §17); `--edition 2021`. Broaden (`Result`/`?`, `BTreeMap`, generics with
       bounds, `&mut` aliasing) as gaps surface.
-- [~] **SIMD / auto-vectorization — `i32x4` lands; full ingestion is blocked on vector legalization**
-      (slices AN/AO). The on-ramp ingests `-O2`-auto-vectorized **`i32x4`** code: a `<4 x i32>` lane op →
-      `v128` (`VIntBin` for `add`/`sub`/`mul`/`smax`/`smin`/`umax`/`umin`, whole-vector `VBitBin` for
-      `and`/`or`/`xor`; `bin_ty` yields a harmless `I32` so the pre-`bin` width probe doesn't choke on
-      `v128`), and `llvm.vector.reduce.{add,mul,and,or,xor,smax,smin,umax,umin}.v4i32` unrolls to a lane
-      fold (extract + scalar combine / `cmp`+`select`). Tests (a `check_vectorized_vs_native` harness,
-      vectorization *enabled*): `simd_int_reduction_first_light` (sum → `reduce.add`, `2610`/exit `50`),
-      `simd_int_max_reduction` (max → `reduce.smax`), both vs native.
-      - **Blocker — fixed-128 `v128` vs LLVM's arbitrary-width vectors.** Enabling vectorization on the
-        breadth lanes shows the corpus emits vectors **wider than 128 bits** (`<16 x i32>` = 512-bit,
-        `<16 x i64>`, `<4 x i64>`) plus assorted shapes (`<8 x i8>`, `<2 x i64>`, `<16 x i8>`). LLVM's
-        `-O2` vectorizer produces these "virtual" wide vectors expecting the backend's **type-
-        legalization** to split them into legal-width chunks; svm-ir's `v128` is fixed-128, so ingesting
-        them needs a legalization/splitting pass — a large separate effort (the SelectionDAG analog). So
-        the C/C++/Rust breadth lanes **keep `-fno-*-vectorize`** (the correct fail-closed posture), and
-        full auto-vec ingestion is deferred behind that pass. Bounded follow-ups within 128 bits: the
-        other shapes (`i8x16`/`i16x8`/`i64x2`, via a general `is_vec128` + shape-aware lowering), `fadd`/
-        `fmul` reductions (need `-ffast-math`; not emitted by plain `-O2`), vector `icmp`/`select`.
+- [x] **SIMD / auto-vectorization — full `-O2` ingestion; the breadth lanes vectorize (slices AN–AT).**
+      The on-ramp ingests real `-O2`/`-mavx2` auto-vectorized bitcode end to end, so the C/C++/Rust
+      breadth lanes dropped `-fno-*-vectorize`. The pipeline:
+      - **128-bit lane ops** (slice AN/AO): a `<4 x i32>`/etc. lane op → `v128` (`VIntBin`/`VBitBin`/
+        `VFloatBin`), `llvm.vector.reduce.*` → a lane fold, `llvm.{s,u}{min,max}` → `VIntBin`.
+      - **Vector legalization** (I2 / PR #56): the fixed-128 SelectionDAG-`LegalizeTypes` analog
+        (`wide_vec_layout`/`lower_wide`) splits wider-than-128 / sub-128 vectors into `v128` chunks +
+        a scalar tail; all six 128-bit shapes lower. Fixed-128 chunking (not host detection) preserves
+        interp↔JIT/durable determinism.
+      - **Integer conversions** (slice AP): `zext`/`sext`/`trunc` scalarize lane-wise across every
+        representation. **Rotate** (slice AQ): `llvm.fshl`/`fshr` (rotate idiom) scalarize per lane.
+        **Shuffle** (slice AR + AT): general constant-mask gather, incl. wide and cross-representation
+        (`<2 x float> ++ <2 x float>` → `<4 x float>`). **`<N x i1>` masks** (slice AS): a lane-wise
+        scalarized `mask_lanes` rep — vector `icmp`/`fcmp`/`select`/`extractelement`/`insertelement`/
+        `bitcast`-to-`iN` (movemask). **Float conversions + vec2 FMA** (slice AT): `fptosi`/`sitofp`/…
+        and `fmuladd.v2f32` scalarize lane-wise.
+      - Verified by the whole 128-test suite running vectorized (the real C/C++/Rust corpus + focused
+        `simd_*` shape/op-class pins). Remaining fail-closed (no corpus need): a *general* (non-rotate)
+        funnel shift, a *non-constant* shuffle mask, a wide float `vector.reduce`, a mask crossing a
+        block edge.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 - [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`

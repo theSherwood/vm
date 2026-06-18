@@ -19,7 +19,7 @@ use svm_ir::{
     FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, SsaLoc,
     StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
     VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
-    VarLoc, DEFAULT_RESERVED_LOG2,
+    VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
 };
 use svm_mask::Window;
 use svm_mem::{Region, RmwOp};
@@ -1386,10 +1386,7 @@ impl Inspector {
             if frame.module != 0 {
                 return None;
             }
-            let var = di
-                .vars
-                .iter()
-                .find(|x| var_in_scope(x.func, frame.func) && x.name == name)?;
+            let var = pick_var(di, frame.func, name, frame.block, frame.inst)?;
             // Resolve a location list (S2) at the frame's current pc (nearest-preceding within the
             // stopped block). `None` ⇒ no covering entry, the var isn't live here.
             let resolve = |locs: &[SsaLoc]| loclist_value(locs, frame.block, frame.inst);
@@ -1439,10 +1436,7 @@ impl Inspector {
             if frame.module != 0 {
                 return None;
             }
-            let var = di
-                .vars
-                .iter()
-                .find(|x| var_in_scope(x.func, frame.func) && x.name == name)?;
+            let var = pick_var(di, frame.func, name, frame.block, frame.inst)?;
             let base = match &var.loc {
                 VarLoc::Window { off } => frame.vals.first()?.i64() as u64 + *off as u64,
                 VarLoc::WindowVia { base, off } => {
@@ -5475,21 +5469,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::GcRoots {
                     heap_lo,
                     heap_hi,
+                    mask,
                     buf,
                     cap,
                 } => {
                     let lo = get_i64(&frames[top].vals, *heap_lo)? as u64;
                     let hi = get_i64(&frames[top].vals, *heap_hi)? as u64;
+                    let mask = get_i64(&frames[top].vals, *mask)? as u64;
+                    // Security: the payload mask may only clear the top byte (low 56 bits all-ones),
+                    // else a host pointer could be folded into the guest window and leak host-address
+                    // bits past the range filter (GC.md §3, §6). The verifier rejects a constant
+                    // fold-down mask statically; this defends an unverified module / non-constant mask.
+                    if mask | 0xFF00_0000_0000_0000 != u64::MAX {
+                        return Err(Trap::Malformed);
+                    }
                     let dst = get_i64(&frames[top].vals, *buf)? as u64;
                     let cap = get_i64(&frames[top].vals, *cap)?.max(0) as usize;
                     let mut roots = std::collections::BTreeSet::new();
-                    gc_scan_frames(frames, lo, hi, &mut roots);
+                    gc_scan_frames(frames, lo, hi, mask, &mut roots);
                     if let Some(rp) = root_parked.as_ref() {
-                        gc_scan_frames(rp, lo, hi, &mut roots);
+                        gc_scan_frames(rp, lo, hi, mask, &mut roots);
                     }
                     for fib in registry.lock().fibers.iter() {
                         if let RegFiber::Parked(f) | RegFiber::Running(Some(f)) = fib {
-                            gc_scan_frames(f, lo, hi, &mut roots);
+                            gc_scan_frames(f, lo, hi, mask, &mut roots);
                         }
                     }
                     let total = roots.len();
@@ -10591,14 +10594,24 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
 }
 
 /// Scan a fiber's frames for candidate root words in `[lo, hi)` and insert them into `out` (§GC
-/// `gc.roots`). Conservative: every SSA value whose raw bits land in range is a candidate — the
-/// interpreter scans typed `Value`s (the JIT scans raw control-stack words; both are sound
-/// over-approximations that may differ in false positives, GC.md §3.2). `v128` contributes both of
-/// its 64-bit halves.
-fn gc_scan_frames(frames: &[Frame], lo: u64, hi: u64, out: &mut std::collections::BTreeSet<u64>) {
+/// `gc.roots`). Each word is first masked (`m = w & mask`); the **masked** value is what's range-
+/// tested and inserted, so a guest with tagged pointers (tag in the top byte) recovers the bare
+/// offset (`mask = !0` is the untagged case). Conservative: every SSA value whose masked bits land
+/// in range is a candidate — the interpreter scans typed `Value`s (the JIT scans raw control-stack
+/// words; both are sound over-approximations that may differ in false positives, GC.md §3.2).
+/// `v128` contributes both of its 64-bit halves. `mask` is caller-validated to top-byte-strip only,
+/// so a host pointer stays large and is excluded by the range test.
+fn gc_scan_frames(
+    frames: &[Frame],
+    lo: u64,
+    hi: u64,
+    mask: u64,
+    out: &mut std::collections::BTreeSet<u64>,
+) {
     let mut consider = |w: u64| {
-        if w >= lo && w < hi {
-            out.insert(w);
+        let m = w & mask;
+        if m >= lo && m < hi {
+            out.insert(m);
         }
     };
     for f in frames {
@@ -10918,6 +10931,52 @@ fn slot_to_val(ty: ValType, s: i64) -> Value {
 /// function, or a [`svm_ir::GLOBAL_SCOPE`] module-scoped global (visible in every frame).
 fn var_in_scope(var_func: u32, frame_func: u32) -> bool {
     var_func == frame_func || var_func == svm_ir::GLOBAL_SCOPE
+}
+
+/// The source line at pc `(func, block, inst)` — the nearest-preceding `debug.loc` within the block
+/// (the same semantics as [`Inspector::source_loc`]). `None` ⇒ no source mapping at this pc.
+fn source_line_at(di: &DebugInfo, func: u32, block: usize, inst: usize) -> Option<u32> {
+    di.locs
+        .iter()
+        .filter(|l| l.func == func && l.block as usize == block && l.inst as usize <= inst)
+        .max_by_key(|l| l.inst)
+        .map(|l| l.line)
+}
+
+/// Whether a variable's lexical `scope` covers source line `line`. A function-wide var (`None`)
+/// always covers; a `Some((start, end))` covers `line ∈ [start, end]`. When the pc has no source
+/// line (`line == None`), scopes can't be evaluated, so every var is treated as covering (the
+/// function-wide back-compat behavior).
+fn scope_covers(scope: Option<(u32, u32)>, line: Option<u32>) -> bool {
+    match (scope, line) {
+        (None, _) | (_, None) => true,
+        (Some((s, e)), Some(l)) => s <= l && l <= e,
+    }
+}
+
+/// Pick the source variable named `name` that is **innermost in scope** at the stopped pc, resolving
+/// C shadowing (an inner-block redeclaration, or a local shadowing a global): among same-name
+/// candidates visible in `frame_func`, keep those whose lexical scope covers the stopped source
+/// line, and choose the most deeply nested (largest `start_line`; a function-wide `None` is the
+/// outermost). Ties keep the first (declaration order).
+fn pick_var<'a>(
+    di: &'a DebugInfo,
+    frame_func: u32,
+    name: &str,
+    block: usize,
+    inst: usize,
+) -> Option<&'a VarInfo> {
+    let line = source_line_at(di, frame_func, block, inst);
+    let depth = |x: &VarInfo| x.scope.map_or(0, |(s, _)| s);
+    let mut best: Option<&VarInfo> = None;
+    for x in di.vars.iter().filter(|x| {
+        var_in_scope(x.func, frame_func) && x.name == name && scope_covers(x.scope, line)
+    }) {
+        if best.is_none_or(|b| depth(x) > depth(b)) {
+            best = Some(x);
+        }
+    }
+    best
 }
 
 /// Resolve a debug-info location list (`SsaList` / `WindowVia` base) at pc `(block, inst)`: the

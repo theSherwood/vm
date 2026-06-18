@@ -190,6 +190,10 @@ fn print_debug_info(s: &mut String, m: &Module) {
         if let Some(tid) = v.type_id {
             let _ = write!(s, " {tid}");
         }
+        // Optional lexical scope (§6 shadowing): `scope <start_line> <end_line>`.
+        if let Some((a, b)) = v.scope {
+            let _ = write!(s, " scope {a} {b}");
+        }
         s.push('\n');
     }
     // Opaque per-producer rich blobs (§6): `debug.blob "<producer>" "<escaped bytes>"`.
@@ -388,9 +392,10 @@ fn print_inst(inst: &Inst) -> String {
         Inst::GcRoots {
             heap_lo,
             heap_hi,
+            mask,
             buf,
             cap,
-        } => format!("gc.roots v{heap_lo} v{heap_hi} v{buf} v{cap}"),
+        } => format!("gc.roots v{heap_lo} v{heap_hi} v{mask} v{buf} v{cap}"),
         // §12 real threads (OS-thread vCPUs over shared memory).
         Inst::ThreadSpawn { func, sp, arg } => format!("thread.spawn {func} v{sp} v{arg}"),
         Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
@@ -995,12 +1000,21 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     Some(Tok::Int(_)) => Some(p.parse_u32()?),
                     _ => None,
                 };
+                // Optional lexical scope (§6 shadowing): `scope <start_line> <end_line>`.
+                let scope = match p.peek() {
+                    Some(Tok::Ident(s)) if s == "scope" => {
+                        p.next()?;
+                        Some((p.parse_u32()?, p.parse_u32()?))
+                    }
+                    _ => None,
+                };
                 dbg_vars.push(VarInfo {
                     func,
                     name,
                     ty,
                     loc,
                     type_id,
+                    scope,
                 });
             }
             // Opaque per-producer rich blob (§6): `debug.blob "<producer>" "<bytes>"`.
@@ -1198,6 +1212,11 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_str()?; // type
                 if matches!(p.peek(), Some(Tok::Int(_))) {
                     p.parse_int()?; // optional structured type id
+                }
+                if matches!(p.peek(), Some(Tok::Ident(s)) if s == "scope") {
+                    p.next()?;
+                    p.parse_int()?; // start line
+                    p.parse_int()?; // end line
                 }
             }
             Some(Tok::Ident(s)) if s == "debug.blob" => {
@@ -1735,11 +1754,13 @@ impl<'a> Parser<'a> {
         if op == "gc.roots" {
             let heap_lo = self.value(names)?;
             let heap_hi = self.value(names)?;
+            let mask = self.value(names)?;
             let buf = self.value(names)?;
             let cap = self.value(names)?;
             return Ok(Inst::GcRoots {
                 heap_lo,
                 heap_hi,
+                mask,
                 buf,
                 cap,
             });

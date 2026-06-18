@@ -840,6 +840,65 @@ fn dap_conditional_breakpoint_stops_only_when_true() {
     assert_eq!((l["i"].as_str(), l["acc"].as_str()), ("1", "5"));
 }
 
+/// `reverseContinue` honors conditional breakpoints, like forward `continue` (DEBUGGING.md W5): it
+/// skips a breakpoint hit whose condition is false when walking *backward*, so it lands on the
+/// previous hit that actually fires. With `i != 2` over a loop hitting i=3,2,1, the hit immediately
+/// before the i=1 stop (i=2) has a false condition — reverseContinue must skip it back to i=3.
+#[test]
+fn dap_reverse_continue_honors_conditional_breakpoints() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("sum.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![
+                    ("line", Json::i(7)),
+                    ("condition", Json::s("i != 2")),
+                ])]),
+            ),
+        ]),
+    ));
+
+    // Forward: i=3 fires; the next firing hit skips i=2 (condition false) → i=1.
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert_eq!(locals(&mut s).get("i").map(String::as_str), Some("3"));
+    s.handle(&req(5, "continue", Json::obj(vec![])));
+    assert_eq!(
+        locals(&mut s).get("i").map(String::as_str),
+        Some("1"),
+        "skipped i=2 forward"
+    );
+
+    // reverseContinue from i=1 → skips the false-condition i=2 hit, landing on i=3 (not i=2).
+    let out = s.handle(&req(6, "reverseContinue", Json::obj(vec![])));
+    assert_eq!(
+        event(&out, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason"),
+        Some(&Json::s("breakpoint"))
+    );
+    assert_eq!(
+        locals(&mut s).get("i").map(String::as_str),
+        Some("3"),
+        "reverse skipped the false-condition i=2 hit back to i=3"
+    );
+}
+
 /// `evaluate` computes an integer expression over the frame's variables (watch / REPL / condition).
 #[test]
 fn dap_evaluate_computes_an_expression() {

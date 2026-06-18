@@ -49,11 +49,13 @@ assumption the backend's `LegalizeTypes` pass will split them. The on-ramp had n
    carried across the backedge as a wide phi) expands into `K = chunks + tail` consecutive block
    params, supplied as `K` branch args on every edge (`translate_block`/`branch_args`).
 
-**Remaining (still fail-closed, clean `Unsupported` — not regressions, narrower follow-ons):** vector
-**shifts** (`shl`/`lshr`/`ashr` — `VIntBinOp` has no shift op), **general cross-chunk shuffles**
-(only the splat form is lowered), vector `select`/`icmp` **masks** and `llvm.masked.*` (gather/scatter/
-masked load-store), and wide-vector **function params/returns**. The breadth lanes still compile with
-`-fno-*-vectorize` (re-enabling them is a separate step that may surface the above).
+**Follow-ons (now landed, slices AP–AT — the breadth lanes re-enabled vectorization):** vector integer
++ float **conversions** (lane-wise scalarize), **rotate** (`llvm.fshl`/`fshr`), **general cross-chunk +
+cross-representation shuffles**, and `<N x i1>` **masks** (vector `icmp`/`fcmp`/`select`/`extractelement`/
+`bitcast`-movemask, held lane-wise). The C/C++/Rust breadth lanes now compile **without**
+`-fno-*-vectorize` and translate their real `-O2` SIMD output. Still fail-closed (no corpus need yet):
+a *general* (non-rotate) funnel shift, a *non-constant* shuffle mask, `llvm.masked.*` (gather/scatter/
+masked load-store), wide-vector **function params/returns**, and a mask crossing a block edge.
 
 **Verification:** `cargo test -p svm-llvm --test translate` (115 pass). New tests cover every 128-bit
 shape, the wide splitter (`<8 x i32>`/`<4 x i64>` chunks, `<8 x i8>` all-tail), a real loop-carried

@@ -90,6 +90,12 @@ pub enum VerifyError {
     /// concrete `cap.call`s by `svm_ir::resolve_imports` at instantiation *before*
     /// verification; an unresolved import in a module presented for execution is fail-closed.
     UnresolvedImport { func: u32, block: u32, import: u32 },
+    /// A `gc.roots` carried a **constant** payload mask that clears more than the top byte (its
+    /// low 56 bits are not all-ones). Such a mask could fold a canonical host pointer down into the
+    /// guest window and leak host-address bits past the range filter (GC.md §3, §6). Only
+    /// top-byte-strip masks (`mask | 0xFF00_0000_0000_0000 == !0`) are allowed; the runtime also
+    /// rejects a non-constant mask that violates this at execution.
+    GcRootsMaskUnsafe { func: u32, block: u32, mask: u64 },
 }
 
 /// Verify an entire module. `Ok(())` is the only "accept".
@@ -133,6 +139,9 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
     }
 
     let nblocks = f.blocks.len() as u32;
+    // Per-function result arity, for `Inst::result_count` (used to trace a `gc.roots` constant mask
+    // through the block's value numbering).
+    let fn_results: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     for (bi, b) in f.blocks.iter().enumerate() {
         let bi = bi as u32;
         // Seed the local type vector with the block's declared parameter types.
@@ -302,6 +311,20 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                 types.push(ValType::I32); // the thread handle
                 continue;
             }
+            // Security: a `gc.roots` payload mask may only clear the top byte. When the mask is a
+            // constant we can reject a fold-down mask statically (a non-constant mask is enforced at
+            // runtime on both backends). `mask | 0xFF00_..._0000 == !0` ⇔ the low 56 bits are all 1.
+            if let Inst::GcRoots { mask, .. } = inst {
+                if let Some(m) = const_i64_in_block(b, &fn_results, *mask) {
+                    if (m as u64) | 0xFF00_0000_0000_0000 != u64::MAX {
+                        return Err(VerifyError::GcRootsMaskUnsafe {
+                            func: fi,
+                            block: bi,
+                            mask: m as u64,
+                        });
+                    }
+                }
+            }
             // A value-producing instruction appends its result type; `Store` does not.
             if let Some(result) = check_inst(fi, bi, inst, &types, has_memory)? {
                 types.push(result);
@@ -367,6 +390,26 @@ fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType
 /// Check one instruction's operands against the running type vector and return the
 /// result type to append (`None` for `Store`). Operands must reference
 /// strictly-earlier indices.
+/// The constant `i64` an operand resolves to, if it's defined by an `i64.const` **earlier in this
+/// block** (the only place a value can be defined in this block-param SSA — see `verify_func`).
+/// Returns `None` for a block parameter or any non-constant definition. Mirrors the value
+/// numbering of `verify_func`: params occupy `0..params.len()`, then each instruction owns its
+/// `result_count` consecutive indices.
+fn const_i64_in_block(b: &svm_ir::Block, fn_results: &[usize], v: ValIdx) -> Option<i64> {
+    let mut idx = b.params.len() as u32;
+    for inst in &b.insts {
+        let n = inst.result_count(fn_results) as u32;
+        if v >= idx && v < idx + n {
+            return match inst {
+                Inst::ConstI64(c) => Some(*c),
+                _ => None,
+            };
+        }
+        idx += n;
+    }
+    None
+}
+
 fn check_inst(
     fi: u32,
     bi: u32,
@@ -589,6 +632,7 @@ fn check_inst(
         Inst::GcRoots {
             heap_lo,
             heap_hi,
+            mask,
             buf,
             cap,
         } => {
@@ -600,8 +644,12 @@ fn check_inst(
             }
             cx.expect(*heap_lo, ValType::I64)?;
             cx.expect(*heap_hi, ValType::I64)?;
+            cx.expect(*mask, ValType::I64)?;
             cx.expect(*buf, ValType::I64)?;
             cx.expect(*cap, ValType::I64)?;
+            // The top-byte-strip constraint on a *constant* `mask` is checked in `verify_func`'s
+            // block loop (which can trace the operand to its defining `i64.const`); a non-constant
+            // mask is enforced defensively at runtime on both backends.
             ValType::I64
         }
         // §12 thread join: an i32 thread handle in, the joined vCPU's i64 result out. (The handle

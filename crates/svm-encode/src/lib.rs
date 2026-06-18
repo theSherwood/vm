@@ -139,7 +139,7 @@ mod op {
     pub const ATOMIC_FENCE: u8 = 0xE9; // order byte
 
     // §GC (GC.md) conservative root enumeration.
-    pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, buf, cap -> i64 count
+    pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, mask, buf, cap -> i64 count
 
     // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
     // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
@@ -387,6 +387,15 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
             Some(t) => {
                 out.push(1);
                 write_uleb(out, t as u64);
+            }
+        }
+        // Optional lexical scope `(start_line, end_line)` (§6 shadowing resolution).
+        match v.scope {
+            None => out.push(0),
+            Some((s, e)) => {
+                out.push(1);
+                write_uleb(out, s as u64);
+                write_uleb(out, e as u64);
             }
         }
     }
@@ -661,12 +670,14 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::GcRoots {
             heap_lo,
             heap_hi,
+            mask,
             buf,
             cap,
         } => {
             out.push(op::GC_ROOTS);
             write_uleb(out, *heap_lo as u64);
             write_uleb(out, *heap_hi as u64);
+            write_uleb(out, *mask as u64);
             write_uleb(out, *buf as u64);
             write_uleb(out, *cap as u64);
         }
@@ -1548,12 +1559,18 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
             1 => Some(c.idx()?),
             b => return Err(DecodeError::BadOptionFlag(b)),
         };
+        let scope = match c.byte()? {
+            0 => None,
+            1 => Some((c.idx()?, c.idx()?)),
+            b => return Err(DecodeError::BadOptionFlag(b)),
+        };
         vars.push(VarInfo {
             func,
             name,
             ty,
             loc,
             type_id,
+            scope,
         });
     }
     // Opaque per-producer rich blobs (§6): bounded count, then producer + length-prefixed bytes.
@@ -1777,6 +1794,7 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::GC_ROOTS => Inst::GcRoots {
             heap_lo: c.idx()?,
             heap_hi: c.idx()?,
+            mask: c.idx()?,
             buf: c.idx()?,
             cap: c.idx()?,
         },
@@ -2158,6 +2176,7 @@ mod debug_tests {
                     ty: "struct Point".into(),
                     loc: VarLoc::Window { off: 24 },
                     type_id: Some(4),
+                    scope: Some((4, 9)),
                 },
                 VarInfo {
                     func: 0,
@@ -2165,6 +2184,7 @@ mod debug_tests {
                     ty: "int".into(),
                     loc: VarLoc::Ssa { value: 3 },
                     type_id: None,
+                    scope: None,
                 },
                 VarInfo {
                     func: 0,
@@ -2172,6 +2192,7 @@ mod debug_tests {
                     ty: "int".into(),
                     loc: VarLoc::Window { off: -8 },
                     type_id: Some(0),
+                    scope: None,
                 },
                 // A location list (S2): the holding SSA value varies by pc.
                 VarInfo {
@@ -2191,6 +2212,7 @@ mod debug_tests {
                         },
                     ]),
                     type_id: Some(0),
+                    scope: None,
                 },
                 // A runtime-base window var (wasm/DWARF fbreg case): base loclist + a negative off.
                 VarInfo {
@@ -2213,6 +2235,7 @@ mod debug_tests {
                         off: -8,
                     },
                     type_id: Some(0),
+                    scope: None,
                 },
                 // A module-scoped global at a fixed absolute window address (the GLOBAL_SCOPE
                 // sentinel func + Fixed loc).
@@ -2222,6 +2245,7 @@ mod debug_tests {
                     ty: "int".into(),
                     loc: VarLoc::Fixed { addr: 64 },
                     type_id: Some(0),
+                    scope: None,
                 },
             ],
             // An opaque per-producer rich blob (incl. non-UTF-8 / NUL bytes — verbatim DWARF).

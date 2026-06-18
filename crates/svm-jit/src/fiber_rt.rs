@@ -773,20 +773,32 @@ fn current_sp() -> usize {
 }
 
 /// Scan raw native-stack words in `[low, high)` (host byte addresses), inserting every 8-byte word
-/// that falls in the guest heap window `[heap_lo, heap_hi)` into `out`. Conservative: every aligned
-/// word is treated as a candidate root (spilled pointers are 8-byte aligned on the control stack).
-/// An empty/inverted range scans nothing.
+/// that — after masking with `payload_mask` (`m = w & payload_mask`) — falls in the guest heap window
+/// `[heap_lo, heap_hi)` into `out`. The **masked** value `m` is what's range-tested and inserted, so a
+/// guest with tagged pointers (tag in the top byte) recovers the bare offset (`payload_mask = !0` is
+/// the untagged case). Conservative: every aligned word is treated as a candidate root (spilled
+/// pointers are 8-byte aligned on the control stack). An empty/inverted range scans nothing.
+/// `payload_mask` is caller-validated to top-byte-strip only, so a host pointer stays large and is
+/// excluded by the range test (no host-address leak — GC.md §3, §6).
 ///
 /// # Safety
 /// `[low, high)` must be a readable region of a *quiescent* native stack — a parked fiber's saved
 /// extent, a paused resume-chain ancestor's stack, or the calling computation's own frames at a GC
 /// safepoint. Reading a stack a *concurrent* thread is mutating (no stop-the-world) is a data race.
-unsafe fn scan_words(low: usize, high: usize, heap_lo: u64, heap_hi: u64, out: &mut BTreeSet<u64>) {
+unsafe fn scan_words(
+    low: usize,
+    high: usize,
+    heap_lo: u64,
+    heap_hi: u64,
+    payload_mask: u64,
+    out: &mut BTreeSet<u64>,
+) {
     let mut p = (low + 7) & !7usize; // first 8-aligned address at or above `low`
     while p.saturating_add(8) <= high {
         let w = (p as *const u64).read_unaligned();
-        if w >= heap_lo && w < heap_hi {
-            out.insert(w);
+        let m = w & payload_mask;
+        if m >= heap_lo && m < heap_hi {
+            out.insert(m);
         }
         p += 8;
     }
@@ -821,12 +833,15 @@ unsafe fn scan_words(low: usize, high: usize, heap_lo: u64, heap_hi: u64, out: &
 ///
 /// # Safety
 /// `mem_base`/`mask`/`mapped`/`sub_base`/`trap_out` are the threaded guest-window context (as for
-/// `cap.call`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
-/// out-of-window `buf`, or a non-STW call (a fiber running on another vCPU) faults (`FiberFault`).
+/// `cap.call`). `payload_mask` is the §GC tagged-pointer mask (distinct from the window-confinement
+/// `mask`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
+/// out-of-window `buf`, a non-STW call (a fiber running on another vCPU), or a `payload_mask` that
+/// clears more than the top byte faults (`FiberFault`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn gc_roots(
     heap_lo: u64,
     heap_hi: u64,
+    payload_mask: u64,
     buf: u64,
     cap: i64,
     mem_base: u64,
@@ -837,6 +852,14 @@ pub(crate) unsafe extern "C" fn gc_roots(
 ) -> i64 {
     let rt = current();
     if rt.is_null() {
+        fault(trap_out);
+        return 0;
+    }
+    // Security: the payload mask may only clear the top byte (low 56 bits all-ones), else a host
+    // pointer could be folded into the guest window and leak host-address bits past the range filter
+    // (GC.md §3, §6). The verifier rejects a constant fold-down mask statically; this defends an
+    // unverified module / non-constant mask, mirroring the interpreter's runtime check.
+    if payload_mask | 0xFF00_0000_0000_0000 != u64::MAX {
         fault(trap_out);
         return 0;
     }
@@ -865,7 +888,14 @@ pub(crate) unsafe extern "C" fn gc_roots(
                 } else {
                     fib.parked_extent()
                 };
-                scan_words(lo as usize, hi as usize, heap_lo, heap_hi, &mut roots);
+                scan_words(
+                    lo as usize,
+                    hi as usize,
+                    heap_lo,
+                    heap_hi,
+                    payload_mask,
+                    &mut roots,
+                );
             }
         }
     }
@@ -879,7 +909,14 @@ pub(crate) unsafe extern "C" fn gc_roots(
             None => current_sp(),
             Some(&y) => (*y).resumer_sp() as usize,
         };
-        scan_words(root_low, rt.root_entry_sp, heap_lo, heap_hi, &mut roots);
+        scan_words(
+            root_low,
+            rt.root_entry_sp,
+            heap_lo,
+            heap_hi,
+            payload_mask,
+            &mut roots,
+        );
     }
 
     let total = roots.len();

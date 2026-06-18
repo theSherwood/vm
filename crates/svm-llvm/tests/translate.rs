@@ -11,22 +11,17 @@ use svm_interp::Value;
 use svm_ir::ValType;
 use svm_jit::JitOutcome;
 
-/// Compile a C snippet to legalized LLVM bitcode with the pinned pipeline (LLVM.md §4):
-/// `-O2` runs `mem2reg`/SROA (the §3a two-stack split for free); `-fno-*-vectorize` keeps SIMD
-/// out of the MVP. Returns `None` (skip, don't fail) when `clang` is unavailable.
+/// Compile a C snippet to legalized LLVM bitcode with the pinned pipeline (LLVM.md §4): `-O2` runs
+/// `mem2reg`/SROA (the §3a two-stack split for free) **and auto-vectorization** — the on-ramp now
+/// ingests the full SIMD output (slices AN–AT: i32x4 → legalization → conversions/rotate/shuffle/
+/// `<N x i1>` masks). Returns `None` (skip, don't fail) when `clang` is unavailable.
 fn compile_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
     let bc = dir.join(format!("svm_llvm_{}_{}.bc", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
-        .args([
-            "-O2",
-            "-emit-llvm",
-            "-c",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
+        .args(["-O2", "-emit-llvm", "-c"])
         .arg(&c)
         .arg("-o")
         .arg(&bc)
@@ -62,14 +57,7 @@ fn compile_g(name: &str, src: &str, opt: &str) -> Option<PathBuf> {
     let bc = dir.join(format!("svm_llvm_g_{}_{}.bc", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
-        .args([
-            opt,
-            "-g",
-            "-emit-llvm",
-            "-c",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
+        .args([opt, "-g", "-emit-llvm", "-c"])
         .arg(&c)
         .arg("-o")
         .arg(&bc)
@@ -850,13 +838,7 @@ fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
         .join(rel);
     let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_{}.bc", std::process::id(), name));
     let status = Command::new("clang")
-        .args([
-            "-O2",
-            "-emit-llvm",
-            "-c",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
+        .args(["-O2", "-emit-llvm", "-c"])
         .arg(&path)
         .arg("-o")
         .arg(&bc)
@@ -1518,12 +1500,13 @@ long worker(long arg) {
 #[cfg(unix)]
 fn vm_gc_roots_smoke() {
     let src = r#"
-long __vm_gc_roots(long heap_lo, long heap_hi, void *buf, long cap);
+long __vm_gc_roots(long heap_lo, long heap_hi, long mask, void *buf, long cap);
 static long out[64];
 int f(void) {
   /* a live, in-range candidate pointer (into `out` itself) the conservative scan may see */
   volatile long *root = out;
-  long n = __vm_gc_roots(0, 1 << 20, out, 64);
+  /* mask = ~0 is the untagged (identity) case: every scanned word is tested as-is. */
+  long n = __vm_gc_roots(0, 1 << 20, ~0L, out, 64);
   (void)root;
   /* `n` is the total candidates found (may exceed cap=64; a tiny frame stays well under 1024) —
      the assertion is that the op ran, returned a sane non-negative count, and didn't trap. */
@@ -1540,6 +1523,152 @@ int f(void) {
     if let Some(r) = run_interp("vm_gc", src, &[]) {
         assert_eq!(r, vec![Value::I32(1)], "gc.roots count out of [0, cap]");
     }
+}
+
+// ---- Separate-artifact on-ramp: the export map + the `svm-llvm-translate` CLI ------------------
+
+/// A hand-written caller that resolves `twice` **by name**, used to prove the export map links:
+/// `svm_ir::link` rewrites the `call.import` to a direct cross-unit call. Every translated function
+/// takes the §3d data-stack pointer `sp` as its first parameter, so `twice` is `(i64 sp, i64 x) ->
+/// (i64)`; `twice` has no `alloca`s, so any `sp` works — the caller passes `0`. (`v1` is the unused
+/// capability-handle operand `call.import` carries; resolving to a direct call drops it.)
+#[cfg(unix)]
+const TWICE_CALLER: &str = "\
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  v3 = call.import \"twice\" (i64, i64) -> (i64) v1 (v2, v0)
+  return v3
+}
+";
+
+/// Link a translated runtime (its module + export map) against [`TWICE_CALLER`] and assert the
+/// cross-unit `twice(21) == 42` call resolves on the interpreter — the shared core of both the
+/// in-process ([`exports_feed_a_link_unit`]) and CLI ([`translate_cli_emits_module_and_syms`]) paths.
+#[cfg(unix)]
+fn assert_links_and_runs(runtime_module: svm_ir::Module, exports: Vec<(String, u32)>) {
+    use svm_ir::{link, LinkUnit};
+    assert!(
+        exports.iter().any(|(n, _)| n == "twice"),
+        "the runtime must export `twice`; got {exports:?}"
+    );
+    let runtime = LinkUnit {
+        module: runtime_module,
+        exports,
+        ..Default::default()
+    };
+    let app = LinkUnit {
+        module: svm_text::parse_module(TWICE_CALLER).expect("parse caller"),
+        ..Default::default()
+    };
+    let linked = link(&[runtime, app]).expect("link runtime + caller");
+    svm_verify::verify_module(&linked).expect("verify linked program");
+    // The caller is the last function (concatenated after the runtime's functions). twice(21) = 42.
+    let entry = (linked.funcs.len() - 1) as u32;
+    let mut fuel = 10_000_000u64;
+    let r = svm_interp::run(&linked, entry, &[Value::I64(21)], &mut fuel).expect("run linked");
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "cross-unit call to translated `twice`"
+    );
+}
+
+/// **Ask 1 — the export map.** `Translated::exports` pairs each defined function with its final
+/// `module.funcs` index (`base + i`), so a separately-compiled program can `call.import` a runtime
+/// function and have `svm_ir::link` resolve it. Translate a two-function library and link a caller
+/// against it purely by name.
+#[test]
+#[cfg(unix)]
+fn exports_feed_a_link_unit() {
+    let src = r#"
+long twice(long x) { return x + x; }
+long inc(long x) { return x + 1; }
+"#;
+    let Some(bc) = compile_to_bc("exports", src) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    // Every export indexes a real function, and both library functions are present.
+    for (name, idx) in &t.exports {
+        assert!(
+            (*idx as usize) < t.module.funcs.len(),
+            "export {name} → {idx} is out of range"
+        );
+    }
+    assert!(
+        t.exports.iter().any(|(n, _)| n == "inc"),
+        "inc must be exported; got {:?}",
+        t.exports
+    );
+    assert_links_and_runs(t.module, t.exports);
+}
+
+/// **Ask 2 — the `svm-llvm-translate` CLI.** Translate a library `.bc` to a `.svm` module plus a
+/// `.syms` export sidecar, then re-read both, rebuild the export map from the sidecar, and link a
+/// caller against the module — the scriptable, separate-artifact analogue of `exports_feed_a_link_unit`.
+/// Also smoke-tests the binary (`.svmb`) output path (it must `decode_module`).
+#[test]
+#[cfg(unix)]
+fn translate_cli_emits_module_and_syms() {
+    let src = r#"
+long twice(long x) { return x + x; }
+"#;
+    let Some(bc) = compile_to_bc("cli", src) else {
+        return;
+    };
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let out = dir.join(format!("svm_llvm_cli_{pid}.svm"));
+    let syms = dir.join(format!("svm_llvm_cli_{pid}.syms"));
+    let outb = dir.join(format!("svm_llvm_cli_{pid}.svmb"));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_svm-llvm-translate"))
+        .arg(&bc)
+        .arg("-o")
+        .arg(&out)
+        .arg("--emit-syms")
+        .arg(&syms)
+        .status()
+        .expect("run svm-llvm-translate");
+    assert!(status.success(), "CLI exited non-zero");
+
+    // Binary path: `-o *.svmb` selects `encode_module`; the bytes must round-trip through the decoder.
+    let statusb = Command::new(env!("CARGO_BIN_EXE_svm-llvm-translate"))
+        .arg(&bc)
+        .arg("-o")
+        .arg(&outb)
+        .status()
+        .expect("run svm-llvm-translate (binary)");
+    assert!(statusb.success(), "CLI (binary) exited non-zero");
+    svm_encode::decode_module(&std::fs::read(&outb).expect("read .svmb"))
+        .expect("decode binary module");
+
+    // Re-read the text module + parse the `name idx` sidecar into an export map.
+    let module = svm_text::parse_module(&std::fs::read_to_string(&out).expect("read .svm"))
+        .expect("parse emitted module");
+    let syms_txt = std::fs::read_to_string(&syms).expect("read .syms");
+    let exports: Vec<(String, u32)> = syms_txt
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut it = l.split_whitespace();
+            let name = it.next().expect("sidecar name").to_string();
+            let idx = it
+                .next()
+                .expect("sidecar idx")
+                .parse()
+                .expect("sidecar idx int");
+            (name, idx)
+        })
+        .collect();
+
+    assert_links_and_runs(module, exports);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&syms);
+    let _ = std::fs::remove_file(&outb);
 }
 
 // ---- §7 capability reflection: `__vm_cap_count` / `__vm_cap_at` → `cap.self.count` / `.get` -----
@@ -1907,23 +2036,15 @@ int main(void) {
 // ============================================================================================
 
 /// Compile a freestanding C++ snippet to legalized LLVM-18 bitcode: `-fno-exceptions -fno-rtti`
-/// keeps EH/RTTI out (the §18 stance), `-O2` runs mem2reg/SROA, `-fno-*-vectorize` keeps SIMD out.
-/// Returns `None` (skip) if `clang++` is unavailable.
+/// keeps EH/RTTI out (the §18 stance), `-O2` runs mem2reg/SROA and auto-vectorization (the on-ramp
+/// ingests the SIMD output). Returns `None` (skip) if `clang++` is unavailable.
 fn compile_cpp_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let cc = dir.join(format!("svm_llvm_{}_{}.cpp", std::process::id(), name));
     let bc = dir.join(format!("svm_llvm_cpp_{}_{}.bc", std::process::id(), name));
     std::fs::write(&cc, src).expect("write C++ source");
     let status = Command::new("clang++")
-        .args([
-            "-O2",
-            "-emit-llvm",
-            "-c",
-            "-fno-exceptions",
-            "-fno-rtti",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
+        .args(["-O2", "-emit-llvm", "-c", "-fno-exceptions", "-fno-rtti"])
         .arg(&cc)
         .arg("-o")
         .arg(&bc)
@@ -2154,16 +2275,10 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
             "opt-level=2",
             "-C",
             "overflow-checks=off",
-            // Keep `-O2` codegen in the on-ramp's **scalar** subset: disable LLVM auto-vectorization
-            // so a loop/slice reduction stays scalar instead of becoming an `<N x iM>` vector the
-            // on-ramp's SIMD support (slice Y: `<4 x float>`/`v128`) doesn't cover for integers.
-            // Whether `-O2` vectorizes is host-CPU-sensitive, so without this the Rust breadth tests
-            // are flaky (e.g. a `&[i32]` sum becoming `<4 x i32>` → `Unsupported("v128")`). The Rust
-            // tests target *core/scalar* Rust, not SIMD (the SIMD path is covered by the C tests).
-            "-C",
-            "llvm-args=-vectorize-loops=false",
-            "-C",
-            "llvm-args=-vectorize-slp=false",
+            // `-O2` auto-vectorization stays **enabled**: the on-ramp now ingests the full SIMD
+            // output (slices AN–AT — legalization + conversions/rotate/shuffle/`<N x i1>` masks), so a
+            // `&[i32]` reduction becoming `<N x i32>` + a horizontal reduce is fine. (Determinism is
+            // preserved by the fixed-128 chunk legalization, not by suppressing vectorization.)
         ])
         .arg(&rs)
         .arg("-o")
@@ -3160,13 +3275,14 @@ fn compute() -> i32 {
 }
 
 // ============================================================================================
-// SIMD — ingesting `-O2` **auto-vectorized** output (§17/D58 `v128`). The C/C++/Rust breadth lanes
-// disable vectorization (`-fno-*-vectorize`); these tests *enable* it, so the on-ramp consumes the
-// `<4 x i32>` lane ops + horizontal `llvm.vector.reduce.*` a real `-O2` reduction loop emits.
+// SIMD — focused tests pinning specific `-O2` **auto-vectorized** shapes (§17/D58 `v128`). The
+// C/C++/Rust breadth lanes now vectorize too (slices AN–AT), so the real corpus demos exercise SIMD
+// end to end; these tests additionally pin each shape/op-class (conversions, rotate, shuffle, masks)
+// to a known value for non-vacuity.
 // ============================================================================================
 
-/// Like [`compile_to_bc`] but with **auto-vectorization enabled** (no `-fno-*-vectorize`), so a
-/// reduction loop lowers to `<4 x i32>` SIMD + `llvm.vector.reduce.*`.
+/// Like [`compile_to_bc`] (auto-vectorization is enabled in both now), kept as the explicit SIMD
+/// harness so a reduction loop's `<4 x i32>` + `llvm.vector.reduce.*` is pinned to a known value.
 fn compile_to_bc_vectorized(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
@@ -3382,8 +3498,8 @@ fn simd_i64x2_mul_add_extract() {
 
 /// `<16 x i8>` lane add through a `v128` load → add → store (`i8x16` load/`VIntBin` Add/store).
 /// Two distinct input arrays so `a + b` stays a real lane add (a self-add would strength-reduce to
-/// a vector shift, which is a separate unsupported op). The scalar tail-sum reads the stored bytes
-/// back from memory (stays scalar under `-fno-vectorize`).
+/// a vector shift). The tail-sum reads the stored bytes back from memory and folds them (auto-
+/// vectorized like the rest of the suite — the on-ramp ingests its `zext`/reduce lowering too).
 #[test]
 fn simd_i8x16_add_load_store() {
     let src = "void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
@@ -3568,6 +3684,117 @@ fn simd_i32x8_loop_accumulator() {
     check("simd_i32x8_loop", src, &[Value::I32(3)], &[Value::I32(168)]);
 }
 
+// ── Auto-vectorized lane-wise integer conversions (`zext`/`sext`/`trunc`) ──────────────────────
+// svm-ir has no vector-convert op, so the on-ramp scalarizes a `<N x iA> → <N x iB>` widen/narrow:
+// explode the source to lane scalars, convert each in its `i32`/`i64` container, repack into the
+// destination representation (packed-`i64` `<2 x i32>`, a single `v128`, or legalized wide chunks +
+// tail). These `check_vectorized_vs_native` tests ingest **real `clang -O2`** output that emits the
+// conversion (verified to vectorize), covering every source↔dest representation pairing: a wide-tail
+// source widening to a `v128` (`zext <4 x i8> → <4 x i32>`), a `v128` narrowing to a wide tail
+// (`trunc <8 x i32> → <8 x i8>`), a wide source narrowing to a `v128` (`trunc <2 x i64> → <2 x i32>`),
+// and a packed-`i64` `<2 x i32>` widening to a `v128` (`sext <2 x i32> → <2 x i64>`).
+
+/// `zext <4 x i8> → <4 x i32>` (a `u8 → int` widening store loop: wide-tail source widened to a
+/// `v128`), plus the seeding store's `trunc <16 x i32> → <16 x i8>`. A fixed-index read-back (no
+/// horizontal reduction) keeps the conversion the only vector op under test.
+#[test]
+fn simd_conv_zext_u8_to_i32() {
+    let src = "static unsigned char b[128]; static int out[128]; \
+               int run(int seed){ for(int i=0;i<128;i++) b[i]=(unsigned char)(seed+i); \
+               for(int i=0;i<128;i++) out[i]=b[i]; \
+               return (out[0]+out[63]+out[127]) & 0xff; } \
+               int main(void){ return run(7); }";
+    check_vectorized_vs_native("simd_conv_zext", src, 7);
+}
+
+/// `sext <2 x i32> → <2 x i64>` — a sign-extending `int → long long` store loop (the packed-`i64`
+/// `<2 x i32>` representation widened to an `i64x2` `v128`), the exact shape `heapgrow` emits.
+#[test]
+fn simd_conv_sext_i32_to_i64() {
+    let src = "int run(int seed){ int in[64]; long long out[64]; \
+               for(int i=0;i<64;i++) in[i]=seed-i; \
+               for(int i=0;i<64;i++) out[i]=(long long)in[i]; \
+               long long s=0; for(int i=0;i<64;i++) s+=out[i]; return (int)(s & 0xff); } \
+               int main(void){ return run(9); }";
+    check_vectorized_vs_native("simd_conv_sext", src, 9);
+}
+
+/// `trunc <2 x i64> → <2 x i32>` — a narrowing `long long → int` store loop (a wide `i64x2` source
+/// narrowed to a `v128`), the shape `revsum`/`heapgrow` emit.
+#[test]
+fn simd_conv_trunc_i64_to_i32() {
+    let src = "int run(int seed){ long long in[64]; int out[64]; \
+               for(int i=0;i<64;i++) in[i]=(long long)seed*1000+i; \
+               for(int i=0;i<64;i++) out[i]=(int)in[i]; \
+               int s=0; for(int i=0;i<64;i++) s+=out[i]; return s & 0xff; } \
+               int main(void){ return run(4); }";
+    check_vectorized_vs_native("simd_conv_trunc64", src, 4);
+}
+
+/// `trunc <8 x i16> → <8 x i8>` and `trunc <8 x i32> → <8 x i16>` (a `u16 → u8` narrowing store
+/// loop: `v128`/wide sources narrowed to a wide all-tail / `v128` destination). Fixed-index read-back
+/// keeps the conversions the only vector ops under test.
+#[test]
+fn simd_conv_trunc_to_u8() {
+    let src = "static unsigned short in[128]; static unsigned char out[128]; \
+               int run(int seed){ for(int i=0;i<128;i++) in[i]=(unsigned short)(seed*7+i); \
+               for(int i=0;i<128;i++) out[i]=(unsigned char)in[i]; \
+               return (out[0]+out[63]+out[127]) & 0xff; } \
+               int main(void){ return run(5); }";
+    check_vectorized_vs_native("simd_conv_trunc8", src, 5);
+}
+
+/// **Auto-vectorized vector rotate (`llvm.fshl.v4i32`).** A `(x<<13)|(x>>19)` rotate loop, which
+/// `clang -O2` recognizes as a funnel shift and vectorizes to `llvm.fshl.v4i32`. svm-ir's `VShift`
+/// takes only a scalar amount, so the on-ramp scalarizes the rotate idiom (`a == b`) lane-wise — each
+/// lane a scalar `Rotl`/`Rotr` (mask-mod-width, no shift-by-width edge) — then repacks the `v128`.
+/// This is the shape xxHash's `XXH32_round` emits. Fixed-index read-back avoids a vector reduction.
+#[test]
+fn simd_vector_rotate_fshl() {
+    let src = "static unsigned int a[64]; static unsigned int out[64]; \
+               int run(int seed){ for(int i=0;i<64;i++) a[i]=(unsigned)(seed*2654435761u + i); \
+               for(int i=0;i<64;i++){ unsigned x=a[i]; out[i]=(x<<13)|(x>>19); } \
+               return (int)((out[0]^out[31]^out[63]) & 0xff); } \
+               int main(void){ return run(7); }";
+    check_vectorized_vs_native("simd_rotate", src, 7);
+}
+
+/// **Wide non-splat shuffle (`shufflevector <8 x i8>` byte-reverse `<7,6,…,0>`).** A sub-128 vector
+/// (8 bytes → 0 chunks, 8 scalar tail lanes) permuted by a general constant mask — the legalized
+/// analog of the single-`v128` `Inst::Shuffle` path. The on-ramp explodes both operands' lanes,
+/// gathers per the mask (each result lane picks from the `a ++ b` concat), and repacks. This is the
+/// shape the `async_io` demo's byte-reversal emits; here forced via `__builtin_shufflevector`.
+#[test]
+fn simd_wide_shuffle_reverse() {
+    let src = "typedef unsigned char v8qi __attribute__((vector_size(8))); \
+               void rev8(const unsigned char *P, unsigned char *O); \
+               static unsigned char a[8], out[8]; \
+               int run(int seed){ for(int i=0;i<8;i++) a[i]=(unsigned char)(seed+i*3); \
+               rev8(a, out); \
+               return (out[0]*1 + out[3]*5 + out[7]*7) & 0xff; } \
+               __attribute__((noinline)) void rev8(const unsigned char *P, unsigned char *O){ \
+               v8qi v = *(const v8qi*)P; \
+               v8qi r = __builtin_shufflevector(v, v, 7,6,5,4,3,2,1,0); \
+               *(v8qi*)O = r; } \
+               int main(void){ return run(4); }";
+    check_vectorized_vs_native("simd_wide_shuffle", src, 4);
+}
+
+/// **`<N x i1>` boolean mask — vector `icmp` + `select`.** A `(a[i]==b[i]) ? a[i] : b[i]+1` loop,
+/// which `clang -O2` vectorizes to `icmp eq <4 x i32>` (producing a `<4 x i1>` mask) feeding
+/// `select <4 x i1>, …`. svm-ir has no first-class `<N x i1>`, so the on-ramp holds the mask lane-wise
+/// (per-lane scalar compare) and lowers the `select` as a per-lane scalar `select` over the exploded
+/// data, repacked. The same machinery (plus mask `extractelement`) carries the real `crc32` demo.
+#[test]
+fn simd_mask_icmp_select() {
+    let src = "static int a[64], b[64], out[64]; \
+               int run(int seed){ for(int i=0;i<64;i++){ a[i]=seed+i; b[i]=seed*2-i; } \
+               for(int i=0;i<64;i++) out[i] = (a[i]==b[i]) ? a[i] : (b[i]+1); \
+               return (out[0]+out[15]+out[31]+out[63]) & 0xff; } \
+               int main(void){ return run(8); }";
+    check_vectorized_vs_native("simd_mask_select", src, 8);
+}
+
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
 /// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
 /// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and
@@ -3664,4 +3891,81 @@ fn compute() -> i32 {
     );
     // Pin it (non-vacuous): 14 tokens over the doc, folded digest % 251 = 135.
     assert_eq!(svm, 135, "json tokenizer: expected digest 135, got {svm}");
+}
+
+/// §6 lexical-scope ingest from LLVM DI: an inner-block redeclaration (`DILexicalBlock`) is scoped
+/// to its block (decl line → the block's last instruction line, since `DILexicalBlock` has no end
+/// line), so reading `x` resolves to the in-scope shadow at the stopped pc — the LLVM producer
+/// driving the same shadowing resolution as chibicc/wasm.
+#[test]
+fn llvm_o0_resolves_shadowed_locals_by_lexical_scope() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+    use svm_ir::VarLoc;
+
+    let src = "\
+int f(int n) {
+  int x = n + 1;
+  {
+    int x = n + 100;
+    n = n + x;
+  }
+  return x + n;
+}
+";
+    let Some(bc) = compile_to_bc_o0g("shadow", src) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    // Two `x` vars; exactly one carries a lexical scope (the inner block), the other function-wide.
+    let xs: Vec<_> = di.vars.iter().filter(|v| v.name == "x").collect();
+    assert_eq!(xs.len(), 2, "both shadows ingested");
+    for x in &xs {
+        assert!(
+            matches!(x.loc, VarLoc::Window { .. }),
+            "x is a -O0 Window var"
+        );
+    }
+    let scoped: Vec<_> = xs.iter().filter_map(|v| v.scope).collect();
+    assert_eq!(
+        scoped.len(),
+        1,
+        "one inner-block scope; the outer is function-wide"
+    );
+    let (start, _end) = scoped[0];
+    assert_eq!(start, 4, "inner x scope starts at its declaration line");
+
+    // Runtime: read `x` resolves the right shadow at the stopped pc.
+    let pc_for_line = |line: u32| {
+        let l = di.locs.iter().find(|l| l.line == line)?;
+        Some(IrPc {
+            module: 0,
+            func: l.func,
+            block: l.block as usize,
+            inst: l.inst as usize,
+        })
+    };
+    let read_x_at = |line: u32| {
+        let mut insp = Inspector::attach(
+            &t.module,
+            0,
+            &[Value::I64(t.entry_sp as i64), Value::I32(5)],
+            5_000_000,
+        );
+        insp.set_breakpoint(pc_for_line(line).unwrap_or_else(|| panic!("no pc for line {line}")));
+        assert!(
+            matches!(insp.run_until_stop(), Stop::Break { .. }),
+            "stop at line {line}"
+        );
+        match insp.read_var(0, "x", 4) {
+            Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[..4].try_into().unwrap()),
+            other => panic!("expected window bytes for x, got {other:?}"),
+        }
+    };
+    // Line 5 = `n = n + x` (inside the block): inner x = n + 100 = 105.
+    assert_eq!(read_x_at(5), 105, "inner shadow resolved inside the block");
+    // Line 7 = `return x + n` (after the block): outer x = n + 1 = 6.
+    assert_eq!(read_x_at(7), 6, "outer x resolved after the block");
 }

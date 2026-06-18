@@ -3369,17 +3369,20 @@ fn lower_block(
         if let Inst::GcRoots {
             heap_lo,
             heap_hi,
+            mask,
             buf,
             cap,
         } = inst
         {
-            // gc_roots(heap_lo, heap_hi, buf, cap, mem_base, mask, mapped, sub_base, trap_out) -> i64
-            // count. The thunk walks the live fiber stacks (runtime via the thread-local), filters
-            // to `[heap_lo, heap_hi)`, and writes the first `cap` deduped words to guest `buf` —
-            // confining/bounds-checking it with the same `mask`/`mapped`/`sub_base` as `mask_addr`,
-            // so a forged/out-of-window buffer faults (propagated below).
+            // gc_roots(heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, sub_base,
+            // trap_out) -> i64 count. The thunk walks the live fiber stacks (runtime via the
+            // thread-local), masks each word with `payload_mask` (§GC tagged pointers; distinct from
+            // the window-confinement `mask`), filters the masked value to `[heap_lo, heap_hi)`, and
+            // writes the first `cap` deduped words to guest `buf` — confining/bounds-checking it with
+            // the same `mask`/`mapped`/`sub_base` as `mask_addr`, so a forged buffer faults (below).
             let lo = get(&vals, *heap_lo)?;
             let hi = get(&vals, *heap_hi)?;
+            let payload_mask = get(&vals, *mask)?;
             let dst = get(&vals, *buf)?;
             let cap_v = get(&vals, *cap)?;
             let mem_base = b.use_var(lower.mem_var);
@@ -3388,7 +3391,7 @@ fn lower_block(
             let subv = b.ins().iconst(I64, lower.sub_base as i64);
             let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for _ in 0..9 {
+            for _ in 0..10 {
                 tsig.params.push(AbiParam::new(I64));
             }
             tsig.returns.push(AbiParam::new(I64));
@@ -3397,7 +3400,18 @@ fn lower_block(
             let call = b.ins().call_indirect(
                 tref,
                 thunk,
-                &[lo, hi, dst, cap_v, mem_base, maskv, mappedv, subv, trap_out],
+                &[
+                    lo,
+                    hi,
+                    payload_mask,
+                    dst,
+                    cap_v,
+                    mem_base,
+                    maskv,
+                    mappedv,
+                    subv,
+                    trap_out,
+                ],
             );
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
