@@ -13,7 +13,35 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-_(none — I2 resolved below)_
+### I3 — JIT trap-time backtrace is unix-only; Windows degrades to an empty backtrace (S3) — on `claude/debug-jit-backtrace`
+
+**Where:** `crates/svm-jit/src/trap_shim.c` (the capture + frame-pointer walk), `crates/svm-jit/src/mem.rs`
+(the `pal::take_trap_frame` dispatch — the windows branch returns `None`), `crates/svm-jit/src/lib.rs`
+(`trap_capture_addr()` returns `0` on non-unix, so `emit_trap` bakes no explicit-trap capture call).
+
+**Is:** the always-on JIT trap-time backtrace (DEBUGGING.md §5 / W3 — `CompiledModule::last_trap_backtrace()`,
+folded into the host kill message) works on **unix only**. The capture for both trap families lives in the
+unix-only C shim: memory faults are walked in the SIGSEGV/SIGBUS handler (`svm_capture_frame`), and explicit
+checks (div/rem-by-zero, `unreachable`, `OutOfFuel`, indirect-call-type) call `svm_capture_explicit_trap` at
+the trap site. On **Windows** the guard is a Rust Vectored Exception Handler (no C shim) and
+`trap_capture_addr()` is `0`, so nothing is captured: a Windows JIT trap still reports the correct
+`TrapKind` and a correct kill, but `last_trap_backtrace()` is **empty** and the kill message carries no
+source frames. Not a correctness or escape hazard — purely missing observability on one platform. (The
+`trap_kill_message_carries_a_source_backtrace` test gates its source-line assertion on `#[cfg(unix)]` for
+exactly this reason.)
+
+**Fix sketch (a Windows VEH-side capture, mirroring the unix path):**
+1. **Memory faults:** in the VEH (`mem.rs` windows `pal::veh`), before restoring the captured `CONTEXT` and
+   unwinding, read the faulting `Rip`/`Rbp` from `EXCEPTION_POINTERS->ContextRecord` and walk the
+   frame-pointer chain (a Rust port of `svm_walk_fp_chain`, or a small windows C shim) into a thread-local;
+   have the windows `pal::take_trap_frame` read it instead of returning `None`.
+2. **Explicit checks:** provide a windows capture helper whose address `trap_capture_addr()` returns, so
+   `emit_trap` bakes the same `call <helper>` it does on unix. The helper needs the trapping frame pointer;
+   the unix C shim uses `__builtin_frame_address`, so either compile a tiny windows C shim with
+   `-fno-omit-frame-pointer` (cleanest — reuses `svm_capture_explicit_trap`/`svm_walk_fp_chain` verbatim) or
+   read `rbp` via a `core::arch::asm!`/naked Rust shim.
+3. **Test:** un-gate the `#[cfg(unix)]` assertion above; add a windows-run analog of `jit_trap_backtrace.rs`
+   (that file is `#![cfg(unix)]` today). Validate via the `windows-latest` CI job.
 
 ---
 
