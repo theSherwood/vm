@@ -636,15 +636,32 @@ pub enum VFloatUnOp {
     Abs,
     Neg,
     Sqrt,
+    Ceil,
+    Floor,
+    Trunc,
+    Nearest,
 }
 
 impl VFloatUnOp {
-    pub const ALL: [VFloatUnOp; 3] = [VFloatUnOp::Abs, VFloatUnOp::Neg, VFloatUnOp::Sqrt];
+    // Appended (not reordered) so the binary `index` of Abs/Neg/Sqrt stays stable.
+    pub const ALL: [VFloatUnOp; 7] = [
+        VFloatUnOp::Abs,
+        VFloatUnOp::Neg,
+        VFloatUnOp::Sqrt,
+        VFloatUnOp::Ceil,
+        VFloatUnOp::Floor,
+        VFloatUnOp::Trunc,
+        VFloatUnOp::Nearest,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             VFloatUnOp::Abs => "abs",
             VFloatUnOp::Neg => "neg",
             VFloatUnOp::Sqrt => "sqrt",
+            VFloatUnOp::Ceil => "ceil",
+            VFloatUnOp::Floor => "floor",
+            VFloatUnOp::Trunc => "trunc",
+            VFloatUnOp::Nearest => "nearest",
         }
     }
     pub fn index(self) -> u8 {

@@ -88,6 +88,8 @@ fn simd_text_and_binary_roundtrip() {
           v12 = f32x4.sqrt v8\n\
           v13 = f32x4.abs v4\n\
           v14 = f32x4.neg v4\n\
+          v130 = f32x4.ceil v4\n\
+          v131 = f64x2.nearest v4\n\
           v140 = f32x4.pmin v4 v4\n\
           v141 = f32x4.pmax v4 v4\n\
           v1400 = f32x4.fma v4 v4 v4\n\
