@@ -50,15 +50,15 @@
 //! renumbering/remapper.
 //!
 //! **Still out of scope** (later increments): float constant folding (NaN/rounding fidelity),
-//! and lifting an interpreter's value stack out of memory into SSA so memory-backed interpreters
-//! specialize too (the specializer's Stage 2).
+//! and broadening the specializer's instruction coverage (calls, SIMD, atomics). Value-stack
+//! renaming for memory-backed interpreters is done — see [`mod@specialize`] (Stage 2).
 
 use svm_ir::{
     BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx, ValType,
 };
 
 mod specialize;
-pub use specialize::{specialize, SpecArg, SpecError};
+pub use specialize::{specialize, specialize_with, SpecArg, SpecError};
 
 /// A value known to be a constant at optimization time. Tracks integers only (the only types
 /// folded); floats/v128 are recorded as "unknown". Shared with the [`specialize`] engine.

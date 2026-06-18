@@ -1,11 +1,11 @@
-//! Stage 1 — the **first Futamura projection** over the IR (see `PEVAL.md`).
+//! Stage 1–2 — the **first Futamura projection** over the IR (see `PEVAL.md`).
 //!
-//! [`specialize`] takes a function (an *interpreter*) and a list of which parameters are
-//! **static** (a known constant at specialization time) versus **dynamic** (a runtime value),
-//! and produces a residual function specialized to the static inputs. Combined with a
-//! **readonly data segment** holding a guest program — the IR's existing notion of immutable
-//! "constant memory" — specializing the interpreter against that program folds the opcode
-//! loads to constants, resolves the dispatch `br_table` to a single edge, and unrolls the
+//! [`specialize`] / [`specialize_with`] take a function (an *interpreter*) and a list of which
+//! parameters are **static** (a known constant at specialization time) versus **dynamic** (a
+//! runtime value), and produce a residual function specialized to the static inputs. Combined
+//! with a **readonly data segment** holding a guest program — the IR's existing notion of
+//! immutable "constant memory" — specializing the interpreter against that program folds the
+//! opcode loads to constants, resolves the dispatch `br_table` to a single edge, and unrolls the
 //! interpreter loop following the program. The dispatch loop disappears; what's left is the
 //! *compiled* program. `spec(interp, program)(input) ≡ interp(program, input)`.
 //!
@@ -19,25 +19,34 @@
 //! - A **load from a constant address inside a readonly data segment** folds to the bytes
 //!   there ([`read_const_mem`]) — the "constant memory" read. Any other load is emitted
 //!   residually (faithful), so mutable memory is never wrongly folded.
-//! - The **context** is `(source block, the constant valuation of its block parameters)`. One
-//!   residual block is generated per context and memoized, so distinct constants (e.g. the
-//!   program counter) drive loop unrolling, while repeated contexts (a real guest loop, or a
-//!   dynamic-carried loop) reconnect — bounding termination. Dynamic block parameters become
-//!   the residual block's parameters; constant ones are baked in.
+//! - **Value-stack renaming (Stage 2).** A caller may designate a private byte range (the
+//!   interpreter's operand stack / locals) as *renameable* ([`specialize_with`]). Stores into it
+//!   at constant, full-width (`i32`/`i64`) addresses update an **abstract memory** instead of
+//!   emitting a store; loads read that abstract memory instead of emitting a load — so the
+//!   in-memory stack is lifted into SSA and disappears from the residual. Soundness is kept by
+//!   construction: the region is assumed zero-initialized and private, every write to it is a
+//!   tracked constant-address store, and any access that can't be resolved abstractly (a dynamic
+//!   address that might alias the region, a partial-width overlap, a call) returns
+//!   [`SpecError::Unsupported`] rather than guessing.
+//! - The **context** threaded through the CFG is `(source block, the constant valuation of its
+//!   block parameters, the constant valuation of the live abstract-memory cells)`. One residual
+//!   block is generated per context and memoized, so distinct constants (e.g. the program
+//!   counter / stack pointer) drive loop unrolling, while repeated contexts reconnect — bounding
+//!   termination. Dynamic block parameters *and* dynamic memory cells become the residual block's
+//!   parameters; constant ones are baked in.
 //!
 //! **Untrusted for escape** like the rest of the crate: the residual is meant to be
 //! re-verified before it runs. The differential harness (`tests/specialize.rs`) is the spec —
 //! the residual must equal the interpreter on the reference interpreter for every input.
 //!
-//! **Scope (Stage 1).** The engine specializes the integer/const/load/branch subset an
-//! accumulator-style interpreter needs; an instruction outside that subset (stores, calls,
-//! floats, SIMD, atomics, fibers, …) returns [`SpecError::Unsupported`] rather than guessing.
-//! Lifting the interpreter's value stack out of memory into SSA (so memory-backed interpreters
-//! specialize too) is Stage 2.
+//! **Scope.** The engine specializes the integer / const / load / store / branch subset a
+//! stack- or accumulator-style interpreter needs; an instruction outside that subset (calls,
+//! floats, SIMD, atomics, fibers, …), or a memory access it can't resolve, returns
+//! [`SpecError::Unsupported`] rather than guessing.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use svm_ir::{ConvOp, Func, Inst, IntTy, LoadOp, Module, Terminator, ValType};
+use svm_ir::{ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType};
 
 use crate::{fold_int_bin, fold_int_cmp, fold_int_un, Known};
 
@@ -59,7 +68,7 @@ pub enum SpecError {
     BadFunc,
     /// `args.len()` did not match the function's parameter count.
     ArityMismatch,
-    /// An instruction outside the Stage-1 subset appeared (see the module scope note).
+    /// An instruction (or a memory access) outside the supported subset appeared.
     Unsupported,
     /// The residual exceeded the block budget — a likely-divergent specialization.
     Budget,
@@ -74,34 +83,56 @@ enum Abs {
     Dyn(u32),
 }
 
-/// One residual block still to be generated: a source block plus the constant valuation of its
-/// parameters (the dynamic ones, in order, become the residual block's parameters).
+/// The constant valuation of one threaded lane (a block parameter or a memory cell): `Some` for a
+/// baked-in constant, `None` for a dynamic value carried as a residual block parameter.
+type ParamPattern = Vec<Option<Known>>;
+/// Live abstract-memory cells at a program point, sorted by address: `(addr, width, value)`.
+type MemPattern = Vec<(u64, u32, Option<Known>)>;
+
+/// One residual block still to be generated: a source block plus the constant valuation of the
+/// state threaded into it (parameters, then memory cells).
 struct Task {
     src_block: u32,
-    pattern: Vec<Option<Known>>,
+    params: ParamPattern,
+    mem: MemPattern,
 }
 
 /// The default ceiling on residual blocks before we declare likely divergence.
 const DEFAULT_BUDGET: usize = 1 << 16;
 
-/// Specialize `module.funcs[func]` against the static/dynamic binding in `args`, producing a
-/// module with a single residual function (index 0). The original memory and data segments are
-/// carried through, so any residual loads still resolve.
+/// Specialize with no renameable memory region (Stage 1 behavior).
 pub fn specialize(module: &Module, func: u32, args: &[SpecArg]) -> Result<Module, SpecError> {
+    specialize_with(module, func, args, None)
+}
+
+/// Specialize `module.funcs[func]` against the static/dynamic binding in `args`, optionally with
+/// a renameable memory region `[lo, hi)` (Stage 2 value-stack renaming). Produces a module with a
+/// single residual function (index 0); the original memory and data segments are carried through,
+/// so any residual loads still resolve.
+///
+/// The renameable region must be **private** to the function and **zero-initialized** (no data
+/// segment overlapping it): the engine elides its stores and reads, so it assumes nothing else
+/// observes or mutates those bytes.
+pub fn specialize_with(
+    module: &Module,
+    func: u32,
+    args: &[SpecArg],
+    rename: Option<(u64, u64)>,
+) -> Result<Module, SpecError> {
     let f = module.funcs.get(func as usize).ok_or(SpecError::BadFunc)?;
     if args.len() != f.params.len() {
         return Err(SpecError::ArityMismatch);
     }
 
     // The entry context, and the residual function's parameters (the dynamic args, in order).
-    let mut pattern = Vec::with_capacity(args.len());
+    let mut params = Vec::with_capacity(args.len());
     let mut residual_params = Vec::new();
     for (i, arg) in args.iter().enumerate() {
         match arg {
-            SpecArg::ConstI32(v) => pattern.push(Some(Known::I32(*v))),
-            SpecArg::ConstI64(v) => pattern.push(Some(Known::I64(*v))),
+            SpecArg::ConstI32(v) => params.push(Some(Known::I32(*v))),
+            SpecArg::ConstI64(v) => params.push(Some(Known::I64(*v))),
             SpecArg::Dynamic => {
-                pattern.push(None);
+                params.push(None);
                 residual_params.push(f.params[i]);
             }
         }
@@ -110,11 +141,12 @@ pub fn specialize(module: &Module, func: u32, args: &[SpecArg]) -> Result<Module
     let mut spec = Spec {
         module,
         f,
+        rename,
         memo: HashMap::new(),
         queue: VecDeque::new(),
         next_id: 0,
     };
-    spec.intern(0, pattern);
+    spec.intern(0, params, Vec::new());
 
     let mut blocks = Vec::new();
     while let Some(task) = spec.queue.pop_front() {
@@ -141,25 +173,31 @@ pub fn specialize(module: &Module, func: u32, args: &[SpecArg]) -> Result<Module
 struct Spec<'a> {
     module: &'a Module,
     f: &'a Func,
-    /// `(source block, constant pattern) → residual block id`. The memo that makes the loop
-    /// terminate and that closes residual loops.
-    memo: HashMap<(u32, Vec<Option<Known>>), u32>,
+    rename: Option<(u64, u64)>,
+    /// `(source block, param pattern, memory pattern) → residual block id`. The memo that makes
+    /// the loop terminate and that closes residual loops.
+    memo: HashMap<(u32, ParamPattern, MemPattern), u32>,
     queue: VecDeque<Task>,
     next_id: u32,
 }
 
 impl Spec<'_> {
-    /// Get (or create) the residual block id for a `(source block, pattern)` context, enqueuing
-    /// it for generation the first time it is seen. Ids are assigned in enqueue order and blocks
-    /// are produced in that same (FIFO) order, so id == position in the output `blocks`.
-    fn intern(&mut self, src_block: u32, pattern: Vec<Option<Known>>) -> u32 {
-        if let Some(&id) = self.memo.get(&(src_block, pattern.clone())) {
+    /// Get (or create) the residual block id for a context, enqueuing it the first time it is
+    /// seen. Ids are assigned in enqueue order and blocks are produced in that same (FIFO) order,
+    /// so id == position in the output `blocks`.
+    fn intern(&mut self, src_block: u32, params: ParamPattern, mem: MemPattern) -> u32 {
+        let key = (src_block, params, mem);
+        if let Some(&id) = self.memo.get(&key) {
             return id;
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.memo.insert((src_block, pattern.clone()), id);
-        self.queue.push_back(Task { src_block, pattern });
+        self.queue.push_back(Task {
+            src_block: key.0,
+            params: key.1.clone(),
+            mem: key.2.clone(),
+        });
+        self.memo.insert(key, id);
         id
     }
 
@@ -167,11 +205,13 @@ impl Spec<'_> {
         let f = self.f;
         let src = &f.blocks[task.src_block as usize];
 
-        // Bind parameters: constants are baked in; dynamics become residual block parameters.
+        // Reconstruct the threaded state. Dynamic lanes become residual block parameters in a
+        // canonical order: the dynamic block parameters first, then the dynamic memory cells (by
+        // address). Constant lanes are baked back in.
         let mut env: Vec<Abs> = Vec::with_capacity(src.params.len());
         let mut params: Vec<ValType> = Vec::new();
         let mut rnext: u32 = 0;
-        for (i, slot) in task.pattern.iter().enumerate() {
+        for (i, slot) in task.params.iter().enumerate() {
             match slot {
                 Some(k) => env.push(Abs::Const(*k)),
                 None => {
@@ -181,14 +221,28 @@ impl Spec<'_> {
                 }
             }
         }
+        let mut mem: BTreeMap<u64, (u32, Abs)> = BTreeMap::new();
+        for &(addr, width, slot) in &task.mem {
+            match slot {
+                Some(k) => {
+                    mem.insert(addr, (width, Abs::Const(k)));
+                }
+                None => {
+                    mem.insert(addr, (width, Abs::Dyn(rnext)));
+                    rnext += 1;
+                    params.push(cell_type(width));
+                }
+            }
+        }
 
-        // Symbolically execute the body, emitting residual instructions for dynamic computation.
+        // Symbolically execute the body.
         let mut out: Vec<Inst> = Vec::new();
         for inst in &src.insts {
-            let res = self.eval_inst(inst, &env, &mut out, &mut rnext)?;
-            env.push(res);
+            if let Some(res) = self.eval_inst(inst, &env, &mut mem, &mut out, &mut rnext)? {
+                env.push(res);
+            }
         }
-        let term = self.eval_term(&src.term, &env, &mut out, &mut rnext)?;
+        let term = self.eval_term(&src.term, &env, &mem, &mut out, &mut rnext)?;
 
         Ok(svm_ir::Block {
             params,
@@ -197,16 +251,17 @@ impl Spec<'_> {
         })
     }
 
-    /// Abstractly evaluate one instruction, returning the abstract value of its (single) result
-    /// and emitting any residual instruction needed. Errors on an out-of-subset instruction.
+    /// Abstractly evaluate one instruction. Returns the abstract value of its result (`None` for a
+    /// result-less instruction such as a store), emitting any residual instruction needed.
     fn eval_inst(
         &self,
         inst: &Inst,
         env: &[Abs],
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
         rnext: &mut u32,
-    ) -> Result<Abs, SpecError> {
-        Ok(match *inst {
+    ) -> Result<Option<Abs>, SpecError> {
+        let abs = match *inst {
             Inst::ConstI32(v) => Abs::Const(Known::I32(v)),
             Inst::ConstI64(v) => Abs::Const(Known::I64(v)),
 
@@ -214,7 +269,7 @@ impl Spec<'_> {
                 let (av, bv) = (env[a as usize], env[b as usize]);
                 if let (Abs::Const(x), Abs::Const(y)) = (av, bv) {
                     if let Some(k) = fold_int_bin(ty, op, x, y) {
-                        return Ok(Abs::Const(k));
+                        return Ok(Some(Abs::Const(k)));
                     }
                 }
                 let a = materialize(av, out, rnext);
@@ -226,7 +281,7 @@ impl Spec<'_> {
                 let (av, bv) = (env[a as usize], env[b as usize]);
                 if let (Abs::Const(x), Abs::Const(y)) = (av, bv) {
                     if let Some(k) = fold_int_cmp(ty, op, x, y) {
-                        return Ok(Abs::Const(k));
+                        return Ok(Some(Abs::Const(k)));
                     }
                 }
                 let a = materialize(av, out, rnext);
@@ -238,7 +293,7 @@ impl Spec<'_> {
                 let av = env[a as usize];
                 if let Abs::Const(x) = av {
                     if let Some(k) = fold_int_un(ty, op, x) {
-                        return Ok(Abs::Const(k));
+                        return Ok(Some(Abs::Const(k)));
                     }
                 }
                 let a = materialize(av, out, rnext);
@@ -253,7 +308,7 @@ impl Spec<'_> {
                         IntTy::I64 => x.as_i64().map(|v| v == 0),
                     };
                     if let Some(b) = z {
-                        return Ok(Abs::Const(Known::I32(b as i32)));
+                        return Ok(Some(Abs::Const(Known::I32(b as i32))));
                     }
                 }
                 let a = materialize(av, out, rnext);
@@ -269,23 +324,22 @@ impl Spec<'_> {
                         ConvOp::WrapI64 => x.as_i64().map(|v| Known::I32(v as i32)),
                     };
                     if let Some(k) = folded {
-                        return Ok(Abs::Const(k));
+                        return Ok(Some(Abs::Const(k)));
                     }
                 }
                 let a = materialize(av, out, rnext);
                 out.push(Inst::Convert { op, a });
                 Abs::Dyn(bump(rnext))
             }
-            // `select` with a constant condition forwards the chosen operand's abstract value
-            // directly — no residual instruction, even if the chosen value is itself dynamic.
+            // `select` with a constant condition forwards the chosen operand's abstract value.
             Inst::Select { cond, a, b } => {
                 if let Abs::Const(c) = env[cond as usize] {
                     if let Some(c) = c.as_i32() {
-                        return Ok(if c != 0 {
+                        return Ok(Some(if c != 0 {
                             env[a as usize]
                         } else {
                             env[b as usize]
-                        });
+                        }));
                     }
                 }
                 let cond = materialize(env[cond as usize], out, rnext);
@@ -294,37 +348,164 @@ impl Spec<'_> {
                 out.push(Inst::Select { cond, a, b });
                 Abs::Dyn(bump(rnext))
             }
-            // A load from a constant address inside a readonly segment folds to those bytes;
-            // anything else is emitted faithfully (mutable memory is never folded).
+
             Inst::Load {
                 op,
                 addr,
                 offset,
                 align,
-            } => {
-                if let Abs::Const(Known::I64(base)) = env[addr as usize] {
-                    if let Some(k) = read_const_mem(self.module, base as u64, offset, op) {
-                        return Ok(Abs::Const(k));
+            } => return self.eval_load(op, addr, offset, align, env, mem, out, rnext),
+            Inst::Store {
+                op,
+                addr,
+                value,
+                offset,
+                align,
+            } => return self.eval_store(op, addr, value, offset, align, env, mem, out, rnext),
+
+            _ => return Err(SpecError::Unsupported),
+        };
+        Ok(Some(abs))
+    }
+
+    /// A load: fold from a renameable cell, fold from readonly data, or emit a residual load.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_load(
+        &self,
+        op: LoadOp,
+        addr: u32,
+        offset: u64,
+        align: u8,
+        env: &[Abs],
+        mem: &BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Option<Abs>, SpecError> {
+        let width = op.info().2 as u64;
+        if let Abs::Const(Known::I64(base)) = env[addr as usize] {
+            let base = base as u64;
+            let eff = base.wrapping_add(offset);
+            if within_region(self.rename, eff, width) {
+                // The renameable region must be resolved entirely abstractly.
+                let rw = match renameable_load_width(op) {
+                    Some(w) => w as u64,
+                    None => return Err(SpecError::Unsupported), // narrow / float access into stack
+                };
+                if rw == width {
+                    if let Some(&(wc, val)) = mem.get(&eff) {
+                        if wc as u64 == width {
+                            return Ok(Some(val));
+                        }
                     }
+                    if mem
+                        .iter()
+                        .any(|(&b, &(wc, _))| b < eff + width && eff < b + wc as u64)
+                    {
+                        return Err(SpecError::Unsupported); // partial overlap — can't resolve
+                    }
+                    // Untouched region cell ⇒ the zero-initialized backing.
+                    let zero = match op.info().1 {
+                        ValType::I32 => Known::I32(0),
+                        ValType::I64 => Known::I64(0),
+                        _ => return Err(SpecError::Unsupported),
+                    };
+                    return Ok(Some(Abs::Const(zero)));
                 }
+                return Err(SpecError::Unsupported);
+            }
+            // Outside the region: a readonly constant-memory read folds; otherwise residual.
+            if let Some(k) = read_const_mem(self.module, base, offset, op) {
+                return Ok(Some(Abs::Const(k)));
+            }
+            let addr = materialize(env[addr as usize], out, rnext);
+            out.push(Inst::Load {
+                op,
+                addr,
+                offset,
+                align,
+            });
+            return Ok(Some(Abs::Dyn(bump(rnext))));
+        }
+        // Dynamic address: with a region active it might alias the renamed stack — refuse.
+        if self.rename.is_some() {
+            return Err(SpecError::Unsupported);
+        }
+        let addr = materialize(env[addr as usize], out, rnext);
+        out.push(Inst::Load {
+            op,
+            addr,
+            offset,
+            align,
+        });
+        Ok(Some(Abs::Dyn(bump(rnext))))
+    }
+
+    /// A store: rename into the abstract region, or emit a residual store outside it.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_store(
+        &self,
+        op: StoreOp,
+        addr: u32,
+        value: u32,
+        offset: u64,
+        align: u8,
+        env: &[Abs],
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Option<Abs>, SpecError> {
+        let width = store_width(op) as u64;
+        if let Abs::Const(Known::I64(base)) = env[addr as usize] {
+            let base = base as u64;
+            let eff = base.wrapping_add(offset);
+            if within_region(self.rename, eff, width) {
+                let rw = match renameable_store_width(op) {
+                    Some(w) => w as u64,
+                    None => return Err(SpecError::Unsupported),
+                };
+                if rw != width {
+                    return Err(SpecError::Unsupported);
+                }
+                // Invalidate any overlapping cell, then record this one. No residual store.
+                mem.retain(|&b, &mut (wc, _)| !(b < eff + width && eff < b + wc as u64));
+                mem.insert(eff, (width as u32, env[value as usize]));
+                return Ok(None);
+            }
+            if disjoint_from_region(self.rename, eff, width) {
                 let addr = materialize(env[addr as usize], out, rnext);
-                out.push(Inst::Load {
+                let value = materialize(env[value as usize], out, rnext);
+                out.push(Inst::Store {
                     op,
                     addr,
+                    value,
                     offset,
                     align,
                 });
-                Abs::Dyn(bump(rnext))
+                return Ok(None);
             }
-
-            _ => return Err(SpecError::Unsupported),
-        })
+            return Err(SpecError::Unsupported); // straddles the region boundary
+        }
+        // Dynamic address: with a region active it might alias the renamed stack — refuse.
+        if self.rename.is_some() {
+            return Err(SpecError::Unsupported);
+        }
+        let addr = materialize(env[addr as usize], out, rnext);
+        let value = materialize(env[value as usize], out, rnext);
+        out.push(Inst::Store {
+            op,
+            addr,
+            value,
+            offset,
+            align,
+        });
+        Ok(None)
     }
 
     fn eval_term(
         &mut self,
         term: &Terminator,
         env: &[Abs],
+        mem: &BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
         rnext: &mut u32,
     ) -> Result<Terminator, SpecError> {
@@ -337,7 +518,7 @@ impl Spec<'_> {
                 Terminator::Return(vals)
             }
             Terminator::Br { target, args } => {
-                let (target, args) = self.branch_to(*target, args, env, out, rnext);
+                let (target, args) = self.branch_to(*target, args, env, mem);
                 Terminator::Br { target, args }
             }
             Terminator::BrIf {
@@ -355,15 +536,13 @@ impl Spec<'_> {
                     } else {
                         (*else_blk, else_args)
                     };
-                    let (target, args) = self.branch_to(blk, args, env, out, rnext);
+                    let (target, args) = self.branch_to(blk, args, env, mem);
                     Terminator::Br { target, args }
                 }
                 // Dynamic condition: specialize both successors and keep the branch.
                 Abs::Dyn(cond) => {
-                    let (then_blk, then_args) =
-                        self.branch_to(*then_blk, then_args, env, out, rnext);
-                    let (else_blk, else_args) =
-                        self.branch_to(*else_blk, else_args, env, out, rnext);
+                    let (then_blk, then_args) = self.branch_to(*then_blk, then_args, env, mem);
+                    let (else_blk, else_args) = self.branch_to(*else_blk, else_args, env, mem);
                     Terminator::BrIf {
                         cond,
                         then_blk,
@@ -378,19 +557,18 @@ impl Spec<'_> {
                 targets,
                 default,
             } => match env[*idx as usize] {
-                // Static index: select the one edge (the interpreter's `targets[i] else default`).
                 Abs::Const(c) => {
                     let i = c.as_i32().ok_or(SpecError::Unsupported)? as u32 as usize;
                     let (blk, args) = targets.get(i).unwrap_or(default);
-                    let (target, args) = self.branch_to(*blk, args, env, out, rnext);
+                    let (target, args) = self.branch_to(*blk, args, env, mem);
                     Terminator::Br { target, args }
                 }
                 Abs::Dyn(idx) => {
                     let targets = targets
                         .iter()
-                        .map(|(blk, args)| self.branch_to(*blk, args, env, out, rnext))
+                        .map(|(blk, args)| self.branch_to(*blk, args, env, mem))
                         .collect();
-                    let default = self.branch_to(default.0, &default.1, env, out, rnext);
+                    let default = self.branch_to(default.0, &default.1, env, mem);
                     Terminator::BrTable {
                         idx,
                         targets,
@@ -399,36 +577,45 @@ impl Spec<'_> {
                 }
             },
             Terminator::Unreachable => Terminator::Unreachable,
-            // Tail calls are control transfers out of the function — out of Stage-1 subset.
             Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. } => {
                 return Err(SpecError::Unsupported)
             }
         })
     }
 
-    /// Resolve one outgoing edge: split the edge arguments into the constant ones (which join the
-    /// successor's context) and the dynamic ones (which are passed as residual block arguments),
-    /// intern the resulting context, and return `(residual block id, dynamic args)`.
+    /// Resolve one outgoing edge. The successor inherits the current abstract memory (memory
+    /// persists across the branch). Constant lanes — block-argument constants and constant memory
+    /// cells — join the context; dynamic lanes are passed as residual block arguments, in the
+    /// canonical order (dynamic parameters first, then dynamic memory cells by address).
     fn branch_to(
         &mut self,
         target: u32,
         args: &[u32],
         env: &[Abs],
-        _out: &mut [Inst],
-        _rnext: &mut u32,
+        mem: &BTreeMap<u64, (u32, Abs)>,
     ) -> (u32, Vec<u32>) {
-        let mut pattern = Vec::with_capacity(args.len());
+        let mut params = Vec::with_capacity(args.len());
         let mut dyn_args = Vec::new();
         for &a in args {
             match env[a as usize] {
-                Abs::Const(k) => pattern.push(Some(k)),
+                Abs::Const(k) => params.push(Some(k)),
                 Abs::Dyn(i) => {
-                    pattern.push(None);
+                    params.push(None);
                     dyn_args.push(i);
                 }
             }
         }
-        let id = self.intern(target, pattern);
+        let mut mem_pat = Vec::with_capacity(mem.len());
+        for (&addr, &(width, val)) in mem.iter() {
+            match val {
+                Abs::Const(k) => mem_pat.push((addr, width, Some(k))),
+                Abs::Dyn(i) => {
+                    mem_pat.push((addr, width, None));
+                    dyn_args.push(i);
+                }
+            }
+        }
+        let id = self.intern(target, params, mem_pat);
         (id, dyn_args)
     }
 }
@@ -449,6 +636,60 @@ fn bump(rnext: &mut u32) -> u32 {
     let i = *rnext;
     *rnext += 1;
     i
+}
+
+/// The block-parameter type of a renameable memory cell of the given byte width.
+fn cell_type(width: u32) -> ValType {
+    match width {
+        4 => ValType::I32,
+        _ => ValType::I64,
+    }
+}
+
+/// Whether `[eff, eff+width)` lies fully inside the renameable region.
+fn within_region(region: Option<(u64, u64)>, eff: u64, width: u64) -> bool {
+    match region {
+        Some((lo, hi)) => eff >= lo && eff.checked_add(width).is_some_and(|end| end <= hi),
+        None => false,
+    }
+}
+
+/// Whether `[eff, eff+width)` is entirely outside the renameable region (vacuously true if none).
+fn disjoint_from_region(region: Option<(u64, u64)>, eff: u64, width: u64) -> bool {
+    match region {
+        Some((lo, hi)) => eff
+            .checked_add(width)
+            .is_some_and(|end| end <= lo || eff >= hi),
+        None => true,
+    }
+}
+
+/// The byte width of a store op.
+fn store_width(op: StoreOp) -> u32 {
+    match op {
+        StoreOp::I32 | StoreOp::F32 | StoreOp::I64_32 => 4,
+        StoreOp::I64 | StoreOp::F64 => 8,
+        StoreOp::I32_8 | StoreOp::I64_8 => 1,
+        StoreOp::I32_16 | StoreOp::I64_16 => 2,
+    }
+}
+
+/// Full-width integer load ops are renameable (4 or 8 bytes); narrow/float loads are not.
+fn renameable_load_width(op: LoadOp) -> Option<u32> {
+    match op {
+        LoadOp::I32 => Some(4),
+        LoadOp::I64 => Some(8),
+        _ => None,
+    }
+}
+
+/// Full-width integer store ops are renameable (4 or 8 bytes); narrow/float stores are not.
+fn renameable_store_width(op: StoreOp) -> Option<u32> {
+    match op {
+        StoreOp::I32 => Some(4),
+        StoreOp::I64 => Some(8),
+        _ => None,
+    }
 }
 
 /// Read an integer load from constant memory: the effective address `base + offset` must lie
