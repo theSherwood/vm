@@ -390,16 +390,29 @@ reifies its call stack as `Vec<Frame>`, so the JIT trap backtrace is differentia
   frames are gone by the time the host observes the trap. These need the PC/frames captured *at* the
   check (or accumulated along the propagate path), a harder, separate step.
 
+**The wrinkle that bit, and the fix.** The first cut captured only `(rip, rbp)` in the handler and
+walked the `rbp` chain *on the host* after the fault. That is **unsound**: `siglongjmp` unwinds back
+onto the *same* stack the post-fault host code (and the symbolization itself) then reuses, so the
+dead guest frames are overwritten before the host can read them — the walk read clobbered slots and
+flaked (`fp − sp` was ~100 bytes; the guest frames overlapped the live host frames). The walk must
+therefore happen **entirely in the handler**, while the stack is intact: it chases the chain and
+stashes the faulting `pc` + each frame's raw return address; the host only *symbolizes* (pure
+arithmetic, no stack reads). The handler walk moves *up* toward the stack base (away from the
+low-address guard the fault sits near) and is bounded — aligned, non-null, strictly-increasing
+links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-signal-safely.
+
 **Stages (each independently shippable, differential-tested vs the interpreter):**
-- [ ] **Stage 0 — the frame-pointer walker.** A reusable `walk_frames(rip, rbp, bounds) -> Vec<pc>`
-  that, given a starting machine pc + frame pointer, walks the `rbp` chain (`[rbp+8]` = return addr,
-  `rbp = [rbp]`) bounded to the active stack region, returning the pcs innermost-first. Factor the
-  existing `fiber_backtrace` scan toward sharing this. Test: a synthetic frame chain walks correctly.
-- [ ] **Stage 1 — memory-fault backtrace.** Capture `(rip, rbp)` in `svm_handler` into a thread-local
-  before `siglongjmp`; after the guarded call returns a fault, walk + `symbolize` into a
-  `Vec<JitFrameLoc>` attached to the `MemoryFault` outcome (a `CompiledModule::last_trap_backtrace()`
-  or an enriched outcome). *Acceptance:* an out-of-bounds store reports a backtrace naming the
-  faulting function + line; it matches the interpreter's frames for the same guest.
+- [x] **Stage 0 — the symbolize-and-classify core.** `symbolize_capture(pc, rets, sym)` (pure): the
+  innermost frame from `pc` (the faulting instruction, symbolized directly), then one per captured
+  return address (callers at `ret - 1`, inside the call), stopping at the first non-guest frame;
+  adjacent duplicates collapse. (The frame-pointer *walk* itself lives in `trap_shim.c`'s handler —
+  see the wrinkle above.) Unit-tested with a synthetic capture + a fake symbolizer.
+- [x] **Stage 1 — memory-fault backtrace.** The `svm_handler` walks the chain and stashes
+  `pc + rets[]`; `mem::take_trap_frame` reads them; `CompiledModule::trap_backtrace` symbolizes them
+  into a `Vec<JitFrameLoc>` published by `last_trap_backtrace()` after every `run`. *Tests
+  (`jit_trap_backtrace.rs`, unix):* an out-of-bounds store reports a backtrace naming the faulting
+  function + line; a callee fault walks the caller chain (`[func1@store, func0@call]`); a
+  non-trapping run leaves it empty. Stable under parallel + serial runs.
 - [ ] **Stage 2 — explicit-check trap backtrace.** Capture the trap pc + frame chain at the
   explicit-check sites (div-by-zero et al.) — likely snapshotting `rbp` at the check, or accumulating
   return addresses as the trap propagates up `emit_trap_propagate`. *Acceptance:* a div-by-zero trap
@@ -409,11 +422,13 @@ reifies its call stack as `Vec<Frame>`, so the JIT trap backtrace is differentia
   surfaces. *Acceptance:* the trace names the right fiber under work-stealing migration.
 
 **Trust/TCB.** Pure host-side observability, off the runtime hot path and the escape-TCB: a wrong
-backtrace mis-renders a kill message, never affects confinement. The capture must stay
-async-signal-safe in the fault handler (no allocation; symbolization is deferred).
+backtrace mis-renders a kill message, never affects confinement. The capture stays async-signal-safe
+in the fault handler (no allocation — a fixed thread-local buffer; symbolization is deferred to the
+host in normal context).
 
-**Progress:** *scoping.* Next: Stage 0 (the shared frame walker) → Stage 1 (the memory-fault
-backtrace, the highest-value tractable first win).
+**Progress:** Stages 0–1 **done** (the memory-fault trap-time backtrace is live, unix; Windows
+degrades to empty pending a VEH-side capture). Next: Stage 2 (explicit-check traps — div-by-zero
+et al., whose stack unwinds before the host sees them) → Stage 3 (fiber attribution + kill message).
 
 ---
 

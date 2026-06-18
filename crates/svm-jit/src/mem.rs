@@ -251,6 +251,15 @@ pub(crate) fn install_guard() {
     pal::install_guard();
 }
 
+/// The trap stack the guard handler captured at the most recent caught memory fault on this thread,
+/// read-and-cleared (§5 W3 trap-time backtrace): the faulting `pc` and the frame-pointer chain's raw
+/// return addresses (the handler walked them while the guest stack was intact). `None` if nothing
+/// was captured (no fault since the last take, or an arch the handler doesn't decode). The host
+/// symbolizes them via [`CompiledModule::trap_backtrace`].
+pub(crate) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
+    pal::take_trap_frame()
+}
+
 /// Run an `Entry`-shaped `code` with faults in `[lo, hi)` caught (detect-and-kill), for a window
 /// fault range obtained from [`GuestWindow::fault_range`]. Used to run a fiber resume on a worker (a
 /// guest memory fault inside the fiber unwinds back here — the fiber stack is abandoned, the domain is
@@ -448,6 +457,19 @@ mod pal {
             lo: usize,
             hi: usize,
         ) -> i32;
+        fn svm_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
+    }
+
+    /// Read and clear the trap stack the SIGSEGV/SIGBUS handler captured at the most recent caught
+    /// guard fault (§5 W3 trap-time backtrace): the faulting `pc` and the frame-pointer chain's raw
+    /// return addresses. `None` if none was captured. Must match `SVM_TRAP_MAXFRAMES` in the shim.
+    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
+        const MAX: usize = 64;
+        let mut pc = 0usize;
+        let mut rets = [0usize; MAX];
+        // SAFETY: reads+clears the shim's thread-locals into `pc` + the `MAX`-slot `rets` buffer.
+        let n = unsafe { svm_take_trap_frame(&mut pc, rets.as_mut_ptr(), MAX as i32) };
+        (n >= 0).then(|| (pc, rets[..n as usize].to_vec()))
     }
 
     pub(super) fn page_size() -> usize {
@@ -857,6 +879,13 @@ mod pal {
         });
     }
 
+    /// The VEH doesn't yet capture the trap stack for the §5 W3 trap-time backtrace (a Windows
+    /// follow-up: walk the chain from the `EXCEPTION_POINTERS` CONTEXT). For now the host gets an
+    /// empty backtrace on Windows guard faults.
+    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
+        None
+    }
+
     /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.
     ///
     /// # Safety
@@ -937,6 +966,9 @@ mod pal {
         _hi: usize,
     ) -> bool {
         false
+    }
+    pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
+        None
     }
 }
 

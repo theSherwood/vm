@@ -1159,6 +1159,70 @@ pub struct JitFrameLoc {
     pub col: u32,
 }
 
+/// Symbolize a captured trap stack into source frames (§5 W3 Stage 1): the innermost frame from the
+/// faulting `pc`, then one per **return address** in `rets` (the frame-pointer chain the guard
+/// handler walked while the guest stack was intact), stopping at the first that isn't guest code per
+/// `sym`. A return address points at the instruction *after* the call, so callers are symbolized at
+/// `ret - 1` — landing inside the call instruction, the caller's real source position (the standard
+/// backtrace adjustment); the innermost `pc` is the faulting instruction itself, symbolized
+/// directly. Adjacent duplicate positions are collapsed, as in [`CompiledModule::fiber_backtrace`].
+/// Pure (the handler already did the stack reads): the seed for [`CompiledModule::trap_backtrace`].
+fn symbolize_capture(
+    pc: usize,
+    rets: &[usize],
+    sym: impl Fn(usize) -> Option<JitFrameLoc>,
+) -> Vec<JitFrameLoc> {
+    let mut frames: Vec<JitFrameLoc> = Vec::new();
+    if let Some(loc) = sym(pc) {
+        frames.push(loc);
+    }
+    for &ret in rets {
+        match sym(ret.wrapping_sub(1)) {
+            Some(loc) => {
+                if frames.last() != Some(&loc) {
+                    frames.push(loc);
+                }
+            }
+            None => break, // reached the host boundary (the outermost guest frame's caller) — stop.
+        }
+    }
+    frames
+}
+
+#[cfg(test)]
+mod trap_capture_tests {
+    use super::{symbolize_capture, JitFrameLoc};
+
+    fn loc(func: u32, line: u32) -> JitFrameLoc {
+        JitFrameLoc { func, file: "f.c".into(), line, col: 0 }
+    }
+
+    #[test]
+    fn symbolizes_pc_directly_callers_at_ret_minus_one_and_stops_at_host() {
+        // pc → func2; ret0-1 → func1; ret1-1 → func0; ret2-1 → host (None, stop). A guest entry
+        // is fed `pc` directly but callers via `ret - 1` (the byte inside the call instruction).
+        let sym = |a: usize| match a {
+            0x100 => Some(loc(2, 5)),  // pc (faulting instruction)
+            0x199 => Some(loc(1, 10)), // ret0 (0x19a) - 1
+            0x299 => Some(loc(0, 20)), // ret1 (0x29a) - 1
+            _ => None,
+        };
+        let frames = symbolize_capture(0x100, &[0x19a, 0x29a, 0x999], sym);
+        assert_eq!(frames, vec![loc(2, 5), loc(1, 10), loc(0, 20)], "three guest frames, host trimmed");
+    }
+
+    #[test]
+    fn collapses_adjacent_duplicate_positions() {
+        // A recursive self-call: the same source position on consecutive frames collapses to one.
+        let sym = |a: usize| match a {
+            0x10 | 0x1f | 0x2f => Some(loc(0, 7)),
+            _ => None,
+        };
+        let frames = symbolize_capture(0x10, &[0x20, 0x30, 0x40], sym);
+        assert_eq!(frames, vec![loc(0, 7)], "duplicate adjacent positions collapse");
+    }
+}
+
 /// `(func, block) → [(block-local value index, value-label id)]` — the source variables to stamp
 /// with a Cranelift `ValueLabel` during lowering (W5 JIT/DWARF Stage 3a). Built once per compile from
 /// the §6 `debug_info.vars`' SSA-resident `VarLoc`s, only when the module carries `-g`. The label id
@@ -1243,6 +1307,11 @@ pub struct CompiledModule {
     /// the guarded call so a mid-run [`Self::invoke_extra`] can arm its nested recovery.
     /// `None` ⇒ no run in flight (invoke is rejected).
     live_fault_range: Option<(usize, usize)>,
+    /// The source backtrace of the most recent [`Self::run`] that **trapped** (§5 W3 Stage 1):
+    /// innermost guest frame first, symbolized from the trap site the guard handler captured.
+    /// Empty after a non-trapping run (or a trap with no usable frame). Read via
+    /// [`Self::last_trap_backtrace`]; host-side, off the runtime path (§2a).
+    last_trap_backtrace: Vec<JitFrameLoc>,
     // --- the per-run window *plan* (the window itself is allocated in `run`; the mask and
     // --- extents are baked into the code, so they were fixed at compile time).
     win_mapped: usize,
@@ -1355,6 +1424,28 @@ impl CompiledModule {
                 frames
             })
             .unwrap_or_default()
+    }
+
+    /// Symbolize a JIT **trap** into a source backtrace (§5 W3 Stage 1): the innermost frame from the
+    /// faulting `pc`, then one frame per guest caller from `rets` — the frame-pointer chain's return
+    /// addresses the SIGSEGV/SIGBUS handler walked *while the guest stack was intact* and stashed
+    /// (`mem::take_trap_frame`); the walk can't run on the host side because the trap unwinds back
+    /// onto the same stack the host then reuses. Callers are symbolized at `ret - 1` (inside the call
+    /// instruction); adjacent duplicate positions are collapsed, as in [`Self::fiber_backtrace`].
+    /// Empty when the module carried no `-g` (nothing symbolizes) or the capture is host-only. The
+    /// engine stashes the last run's trap in [`Self::last_trap_backtrace`]. Pure host-side tooling,
+    /// off the running guest's path (§2a).
+    pub fn trap_backtrace(&self, pc: usize, rets: &[usize]) -> Vec<JitFrameLoc> {
+        symbolize_capture(pc, rets, |a| self.symbolize(a))
+    }
+
+    /// The source backtrace of this module's most recent [`Self::run`] that **trapped** (§5 W3 Stage
+    /// 1): innermost guest frame first, symbolized from the trap site captured during that run. Empty
+    /// when the last run returned/exited, the trap carried no usable frame (an explicit-check trap —
+    /// Stage 2 — or a platform whose handler doesn't decode the fault frame), or the module carried
+    /// no `-g`. Host-side, off the runtime path (§2a) — fold it into a kill/trap report.
+    pub fn last_trap_backtrace(&self) -> &[JitFrameLoc] {
+        &self.last_trap_backtrace
     }
 
     /// The per-source-variable machine-location lists (W5 JIT/DWARF Stage 3a): for each `-g` source
@@ -2022,6 +2113,7 @@ impl CompiledModule {
             next_extra: 0,
             extra_bytes: 0,
             live_fault_range: None,
+            last_trap_backtrace: Vec::new(),
             win_mapped,
             win_reserved,
             win_size,
@@ -2419,6 +2511,16 @@ impl CompiledModule {
             )
         };
 
+        // §5 W3 Stage 1 — build a trap-time backtrace from the stack the guard handler already walked
+        // and captured (the faulting `pc` + the frame-pointer chain's return addresses). The walk had
+        // to happen in the handler: a fault unwinds back onto this same stack, which the teardown
+        // below then reuses, so the frames are gone here. Symbolizing is pure (no stack reads), so it
+        // can run any time after the fault — no reference into `*this` outlives this statement.
+        let trap_backtrace = match faulted.then(mem::take_trap_frame).flatten() {
+            Some((pc, rets)) => (*this).trap_backtrace(pc, &rets),
+            None => Vec::new(),
+        };
+
         // Durable freeze driver (DURABILITY.md §12.8 slice 3.3.2): on a durable **freeze** run
         // (state word UNWINDING) the root has now unwound into context 0's shadow region; flatten
         // every still-parked fiber into its own region before the window is snapshotted, so the
@@ -2478,6 +2580,10 @@ impl CompiledModule {
         // The window dies with this run; the code, function table, and runtimes stay alive in
         // `*this` for the next `run` / `define_extra` / drop.
         drop(window);
+
+        // Publish the trap-time backtrace captured above for `last_trap_backtrace` (empty on a
+        // non-trapping run — every successful run resets it).
+        (*this).last_trap_backtrace = trap_backtrace;
 
         // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
         // synchronization point); Relaxed suffices.
