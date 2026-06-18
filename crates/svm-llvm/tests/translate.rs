@@ -4,7 +4,7 @@
 //! hand-computed result. This is the chibicc-as-oracle differential (LLVM.md §5) plus the §18
 //! interp↔JIT differential, applied to the LLVM on-ramp.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use svm_interp::Value;
@@ -3187,6 +3187,30 @@ fn compile_to_bc_vectorized(name: &str, src: &str) -> Option<PathBuf> {
     }
 }
 
+/// Like [`compile_to_bc_vectorized`] but targeting **AVX2** (`-mavx2`), so the auto-vectorizer emits
+/// wider-than-128-bit vectors (`<8 x i32>`, and `<16 x i32>` under interleave) — the exact shapes
+/// the I2 legalization pass splits into `v128` chunks. The bitcode only *names* AVX vectors; the SVM
+/// JIT still lowers each chunk to SSE2/NEON, so no AVX2 hardware is needed to run the result.
+fn compile_to_bc_avx(name: &str, src: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_simd_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args(["-O2", "-mavx2", "-emit-llvm", "-c"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
 /// Run `run(seed)` (function 0) from **vectorized** bitcode on both backends and assert it equals a
 /// native `cc` build's exit code (the on-ramp's SIMD lowering vs the scalar native result — they
 /// compute the same value).
@@ -3194,6 +3218,22 @@ fn check_vectorized_vs_native(name: &str, src: &str, seed: i32) {
     let Some(bc) = compile_to_bc_vectorized(name, src) else {
         return;
     };
+    check_simd_bc_vs_native(name, &bc, seed);
+}
+
+/// Like [`check_vectorized_vs_native`] but ingests **AVX2** auto-vectorized bitcode (wider-than-128
+/// shapes), which the I2 legalization pass splits into `v128` chunks. The native oracle is a plain
+/// scalar `cc` build of the same loop (gcc needs no `-mavx2`), so SVM-chunked == native-scalar.
+fn check_avx_vs_native(name: &str, src: &str, seed: i32) {
+    let Some(bc) = compile_to_bc_avx(name, src) else {
+        return;
+    };
+    check_simd_bc_vs_native(name, &bc, seed);
+}
+
+/// Shared body: build the source's `.c` natively with `cc`, run it, then translate `bc`, verify, and
+/// run `run(seed)` (function 0) on both backends — asserting interp == JIT == native exit code.
+fn check_simd_bc_vs_native(name: &str, bc: &Path, seed: i32) {
     let exe =
         std::env::temp_dir().join(format!("svm_llvm_simdnat_{}_{}", std::process::id(), name));
     let c = std::env::temp_dir().join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
@@ -3207,7 +3247,7 @@ fn check_vectorized_vs_native(name: &str, src: &str, seed: i32) {
         .code()
         .unwrap() as u8;
 
-    let t = svm_llvm::translate_bc_path(&bc).expect("translate vectorized bitcode");
+    let t = svm_llvm::translate_bc_path(bc).expect("translate vectorized bitcode");
     let module = t.module;
     svm_verify::verify_module(&module).expect("verify translated IR");
     let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
@@ -3266,6 +3306,266 @@ fn simd_int_max_reduction() {
         }\n\
         int main(void) { return run(3); }\n";
     check_vectorized_vs_native("simd_max", src, 3);
+}
+
+/// **Capstone — ingesting *real* `-O2 -mavx2` auto-vectorized output.** The motivating I2 case: the
+/// same reduction loop, vectorized for AVX2, emits a wider-than-128 `<8 x i32>` accumulator +
+/// `llvm.vector.reduce.add.v8i32` (and `<16 x i32>` under interleave). The legalization pass splits
+/// each into `v128` chunks, so the on-ramp now ingests it (previously a fail-closed `Unsupported`),
+/// running byte-identical to the native scalar oracle on both backends.
+#[test]
+fn simd_autovec_avx2_reduction() {
+    let src = "int sum(const int *a, int n);\n\
+        static int data[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) data[i] = seed + i * i;\n\
+        \x20 return sum(data, 64);\n\
+        }\n\
+        __attribute__((noinline)) int sum(const int *a, int n) {\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < n; i++) s += a[i];\n\
+        \x20 return s;\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_avx_vs_native("simd_avx2_reduce", src, 7);
+}
+
+/// `-O2 -mavx2` auto-vectorized **elementwise** kernel (`c[i] = a[i]*b[i] + a[i]`) — wide `<8 x i32>`
+/// lane multiply/add across `v128` chunks (no horizontal reduce), vs the native scalar oracle.
+#[test]
+fn simd_autovec_avx2_elementwise() {
+    let src = "void mul(const int *a, const int *b, int *c, int n);\n\
+        static int A[64], B[64], C[64];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) { A[i] = seed + i; B[i] = i * 2 + 1; }\n\
+        \x20 mul(A, B, C, 64);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 64; i++) s += C[i];\n\
+        \x20 return s;\n\
+        }\n\
+        __attribute__((noinline)) void mul(const int *a, const int *b, int *c, int n) {\n\
+        \x20 for (int i = 0; i < n; i++) c[i] = a[i] * b[i] + a[i];\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_avx_vs_native("simd_avx2_elem", src, 4);
+}
+
+// ============================================================================================
+// SIMD — the **other 128-bit lane shapes** (`i8x16`/`i16x8`/`i64x2`/`f64x2`), beyond the original
+// `i32x4`/`f32x4`. These use explicit `vector_size(16)` types compiled with vectorization *off*
+// (`compile_to_bc` / `check_vs_native`), so the on-ramp sees exactly the declared 128-bit shape —
+// no auto-vectorizer widening. A `noinline` helper takes opaque pointers so clang must emit real
+// `<N x T>` loads/ops, not scalarize them. Each `vec128_shape` op (load/store, `VIntBin`,
+// `VFloatBin`, `ExtractLane`) is exercised against the native oracle on both backends.
+// ============================================================================================
+
+/// `<2 x i64>` lane multiply + add + per-lane extract (`i64x2` `VIntBin` Mul/Add, `ExtractLane`).
+/// `run(7)`: a={7,9}, b={3,5}, c=a*b+b={24,50}; c[0]+c[1]=74.
+#[test]
+fn simd_i64x2_mul_add_extract() {
+    let src = "long long vdot(const long long *A, const long long *B);\n\
+        static long long A[2], B[2];\n\
+        int run(int seed) {\n\
+        \x20 A[0] = seed; A[1] = seed + 2; B[0] = 3; B[1] = 5;\n\
+        \x20 return (int)(vdot(A, B) & 0xff);\n\
+        }\n\
+        typedef long long i64x2 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) long long vdot(const long long *A, const long long *B) {\n\
+        \x20 i64x2 a = *(const i64x2 *)A;\n\
+        \x20 i64x2 b = *(const i64x2 *)B;\n\
+        \x20 i64x2 c = a * b + b;\n\
+        \x20 return c[0] + c[1];\n\
+        }\n\
+        int main(void) { return run(7); }\n";
+    check_vs_native("simd_i64x2", src, 7);
+}
+
+/// `<16 x i8>` lane add through a `v128` load → add → store (`i8x16` load/`VIntBin` Add/store).
+/// Two distinct input arrays so `a + b` stays a real lane add (a self-add would strength-reduce to
+/// a vector shift, which is a separate unsupported op). The scalar tail-sum reads the stored bytes
+/// back from memory (stays scalar under `-fno-vectorize`).
+#[test]
+fn simd_i8x16_add_load_store() {
+    let src = "void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[16], F[16], E[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(3 * i + 1); }\n\
+        \x20 vadd(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 16; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char u8x16 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 u8x16 a = *(const u8x16 *)P;\n\
+        \x20 u8x16 b = *(const u8x16 *)Q;\n\
+        \x20 *(u8x16 *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i8x16", src, 5);
+}
+
+/// `<8 x i16>` lane multiply through a `v128` load → mul → store (`i16x8` `VIntBin` Mul). Wraps
+/// mod 2^16 per lane; the scalar read-back truncates to the lane width.
+#[test]
+fn simd_i16x8_mul_load_store() {
+    let src = "void vmul(const unsigned short *P, const unsigned short *Q, unsigned short *O);\n\
+        static unsigned short D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = (unsigned short)(seed + i); F[i] = (unsigned short)(i + 1); }\n\
+        \x20 vmul(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned short u16x8 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) void vmul(const unsigned short *P, const unsigned short *Q, unsigned short *O) {\n\
+        \x20 u16x8 a = *(const u16x8 *)P;\n\
+        \x20 u16x8 b = *(const u16x8 *)Q;\n\
+        \x20 *(u16x8 *)O = a * b;\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check_vs_native("simd_i16x8", src, 2);
+}
+
+/// `<2 x double>` lane multiply + add (`f64x2` `VFloatBin` Mul/Add). Finite values only, so the
+/// per-lane-NaN differential caveat (§17) doesn't apply; the derived integer result is exact.
+#[test]
+fn simd_f64x2_mul_add() {
+    let src = "double vfma(const double *A, const double *B);\n\
+        static double A[2], B[2];\n\
+        int run(int seed) {\n\
+        \x20 A[0] = seed; A[1] = seed + 1; B[0] = 2.0; B[1] = 3.0;\n\
+        \x20 return (int)vfma(A, B);\n\
+        }\n\
+        typedef double f64x2 __attribute__((vector_size(16)));\n\
+        __attribute__((noinline)) double vfma(const double *A, const double *B) {\n\
+        \x20 f64x2 a = *(const f64x2 *)A;\n\
+        \x20 f64x2 b = *(const f64x2 *)B;\n\
+        \x20 f64x2 c = a * b + b;\n\
+        \x20 return c[0] + c[1];\n\
+        }\n\
+        int main(void) { return run(4); }\n";
+    check_vs_native("simd_f64x2", src, 4);
+}
+
+// ============================================================================================
+// SIMD — **wider-than-128-bit** vectors legalized to fixed-128 `v128` chunks + a scalar tail (I2
+// fix-sketch step 1). These use explicit `vector_size` types (compiled with vectorization off) so
+// the on-ramp sees an exact wide shape, and `noinline` helpers with opaque pointers force real wide
+// loads/ops — all *within a single block* (no control flow), exercising the in-block splitter. The
+// `<8 x i32>` / `<4 x i64>` cases split into 2 clean `v128` chunks (no tail); the `<8 x i8>` case is
+// sub-128 and fully scalarized into the tail (0 chunks, 8 lane scalars).
+// ============================================================================================
+
+/// `<8 x i32>` (256-bit) elementwise add → split into **2 `i32x4` chunks** (load/`VIntBin`/store).
+#[test]
+fn simd_i32x8_add_store() {
+    let src = "void vadd8(const int *P, const int *Q, int *O);\n\
+        static int D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = seed + i; F[i] = 2 * i + 1; }\n\
+        \x20 vadd8(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) void vadd8(const int *P, const int *Q, int *O) {\n\
+        \x20 v8si a = *(const v8si *)P, b = *(const v8si *)Q;\n\
+        \x20 *(v8si *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i32x8", src, 5);
+}
+
+/// `<8 x i32>` horizontal `llvm.vector.reduce.add.v8i32` (via `__builtin_reduce_add`) over 2 chunks
+/// — the wide-reduce fold (extract every lane of both chunks, sum). `__builtin_reduce_*` is a clang
+/// builtin (`cc`/gcc lacks it), so this uses `check` with a computed expected value (interp == JIT)
+/// rather than the native oracle. `run(3)`: Σ(3 + i²) for i in 0..8 = 24 + 140 = 164.
+#[test]
+fn simd_i32x8_reduce_add() {
+    let src = "int vred8(const int *P);\n\
+        static int D[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) D[i] = seed + i * i;\n\
+        \x20 return vred8(D);\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) int vred8(const int *P) {\n\
+        \x20 v8si a = *(const v8si *)P;\n\
+        \x20 return __builtin_reduce_add(a);\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check("simd_i32x8_red", src, &[Value::I32(3)], &[Value::I32(164)]);
+}
+
+/// `<4 x i64>` (256-bit) lane multiply + horizontal `reduce.add.v4i64` over **2 `i64x2` chunks**.
+/// `run(2)`: Σ (2+i)·(i+1) for i in 0..4 = 2 + 6 + 12 + 20 = 40.
+#[test]
+fn simd_i64x4_mul_reduce() {
+    let src = "long long vred4(const long long *P, const long long *Q);\n\
+        static long long D[4], F[4];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 4; i++) { D[i] = seed + i; F[i] = i + 1; }\n\
+        \x20 return (int)vred4(D, F);\n\
+        }\n\
+        typedef long long v4di __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) long long vred4(const long long *P, const long long *Q) {\n\
+        \x20 v4di a = *(const v4di *)P, b = *(const v4di *)Q;\n\
+        \x20 v4di c = a * b;\n\
+        \x20 return __builtin_reduce_add(c);\n\
+        }\n\
+        int main(void) { return run(2); }\n";
+    check("simd_i64x4", src, &[Value::I32(2)], &[Value::I32(40)]);
+}
+
+/// `<8 x i8>` (64-bit, sub-128) elementwise add — **fully scalarized into the tail** (0 chunks, 8
+/// lane scalars: a 16-byte `v128.load` would overrun its 8-byte image, so each lane is a byte op).
+#[test]
+fn simd_i8x8_add_tail() {
+    let src = "void vadd8b(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\
+        static unsigned char D[8], F[8], E[8];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 8; i++) { D[i] = (unsigned char)(seed + i); F[i] = (unsigned char)(3 * i + 1); }\n\
+        \x20 vadd8b(D, F, E);\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 8; i++) s += E[i];\n\
+        \x20 return s & 0xff;\n\
+        }\n\
+        typedef unsigned char v8qi __attribute__((vector_size(8)));\n\
+        __attribute__((noinline)) void vadd8b(const unsigned char *P, const unsigned char *Q, unsigned char *O) {\n\
+        \x20 v8qi a = *(const v8qi *)P, b = *(const v8qi *)Q;\n\
+        \x20 *(v8qi *)O = a + b;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    check_vs_native("simd_i8x8", src, 5);
+}
+
+/// **Cross-block wide vector.** A reduction loop carries an `<8 x i32>` accumulator across the loop
+/// backedge as a *wide phi* — the case the legalization fan-out exists for: one wide LLVM value
+/// becomes `K` block params (2 `i32x4` chunks here) supplied as `K` branch args on every edge into
+/// the loop header. `n` is opaque (a `noinline` param), so the loop is a real backedge, not unrolled.
+/// `run(3)`: Σ(3 + i) for i in 0..16 = 48 + 120 = 168.
+#[test]
+fn simd_i32x8_loop_accumulator() {
+    let src = "int vsum(const int *P, int n);\n\
+        static int D[16];\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 16; i++) D[i] = seed + i;\n\
+        \x20 return vsum(D, 16);\n\
+        }\n\
+        typedef int v8si __attribute__((vector_size(32)));\n\
+        __attribute__((noinline)) int vsum(const int *P, int n) {\n\
+        \x20 v8si acc = {0, 0, 0, 0, 0, 0, 0, 0};\n\
+        \x20 for (int i = 0; i < n; i += 8) {\n\
+        \x20   v8si a = *(const v8si *)(P + i);\n\
+        \x20   acc += a;\n\
+        \x20 }\n\
+        \x20 return __builtin_reduce_add(acc);\n\
+        }\n\
+        int main(void) { return run(3); }\n";
+    check("simd_i32x8_loop", src, &[Value::I32(3)], &[Value::I32(168)]);
 }
 
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
