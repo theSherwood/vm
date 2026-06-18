@@ -15,13 +15,14 @@
 //! ([`drive`]) over one shared `Mem`; and §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume`
 //! + `Yielder.yield`, inline-driven over a confined `nested_view` child window). Faithful for the
 //! interleaving-invariant programs the oracle uses; and §22 **guest-driven JIT units**
-//! (`Jit.install`/`uninstall` + cross-module `call_indirect` into an installed unit) over a multi-
-//! module [`Domain`] (a runtime dispatch table spanning `mods`). Hot scalar/memory ops dispatch
-//! inline; the SIMD/`v128`/fence long tail is delegated to the reference [`super::eval_inst`]. Threads
-//! and fibers compose (the fiber registry is run-shared, so fibers migrate across vCPUs).
-//! [`compile_module`] returns `None` when a function needs a seam not yet driven here — `Instantiator`
-//! executor children (`instantiate`/`join`) and demand/module variants, `Jit.invoke`, tail calls, or
-//! durability — so callers (`super::run_with_host_fast`) fall back to the tree-walker for those.
+//! (`Jit.install`/`uninstall`/`invoke` + cross-module `call_indirect` into an installed unit) over a
+//! multi-module [`Domain`] (a runtime dispatch table spanning `mods`; `invoke` runs a unit nested
+//! over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
+//! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
+//! registry is run-shared, so fibers migrate across vCPUs). [`compile_module`] returns `None` when a
+//! function needs a seam not yet driven here — `Instantiator` executor children (`instantiate`/
+//! `join`) and demand/module variants, tail calls, or durability — so callers
+//! (`super::run_with_host_fast`) fall back to the tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
@@ -37,8 +38,8 @@ use svm_ir::{
 
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
-    intun32, intun64, slot_to_val, step, trunc_trap, GuestMem, Host, Mem, Reg, Trap, Value,
-    DEFAULT_RESERVED_LOG2,
+    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, GuestMem, Host, Mem, Reg, Trap,
+    Value, DEFAULT_RESERVED_LOG2,
 };
 
 /// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative).
@@ -326,6 +327,18 @@ enum Op {
         handle: u32,
         slot: u32,
         dst: u32,
+    },
+    /// §22 `Jit.invoke(code, args…)` (op 1): run the unit named by `code` synchronously over the
+    /// shared window/powerbox; its results land at `dst…`. `params`/`results` are the unit entry's
+    /// expected signature (the `cap.call` sig minus the leading code-handle param), used to marshal
+    /// args/results through the i64-slot ABI.
+    JitInvoke {
+        handle: u32,
+        code: u32,
+        args: Box<[u32]>,
+        dst: u32,
+        params: Box<[ValType]>,
+        results: Box<[ValType]>,
     },
     Ret {
         srcs: Box<[u32]>,
@@ -799,7 +812,16 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     slot: g(args[0]),
                     dst,
                 },
-                (iface::JIT, 1) => return None,
+                (iface::JIT, 1) if !args.is_empty() => Op::JitInvoke {
+                    handle: g(*handle),
+                    code: g(args[0]),
+                    args: args[1..].iter().map(|a| g(*a)).collect(),
+                    dst,
+                    // The cap.call sig is `(i64 code, params…) -> (results…)`; the unit entry's
+                    // params are sig.params without the leading code-handle.
+                    params: sig.params.get(1..).unwrap_or(&[]).to_vec().into(),
+                    results: sig.results.clone().into(),
+                },
                 (iface::INSTANTIATOR, _) | (iface::YIELDER, _) => return None,
                 (iface::SHARED_REGION, 4) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
@@ -1053,6 +1075,16 @@ enum Outcome {
         slot: i64,
         dst: u32,
     },
+    /// §22 `invoke`: run code-handle `code` over the shared window; `argv` are the args as i64 slots,
+    /// `params`/`results` type them for the slot ABI; results → `dst…`.
+    JitInvoke {
+        h: i32,
+        code: i32,
+        argv: Box<[i64]>,
+        dst: u32,
+        params: Box<[ValType]>,
+        results: Box<[ValType]>,
+    },
 }
 
 /// A §12 fiber's state in the driver's per-vCPU registry (handle = index). Non-durable only — a
@@ -1143,6 +1175,30 @@ fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoS
     }
 }
 
+/// Run an invoked §22 unit (`Jit.invoke`) synchronously: a fresh `Vm` for `module`'s entry (func 0)
+/// over the shared window/powerbox and the **shared** dispatch table (so the unit's `call_indirect`
+/// reaches installed units), to completion. An invoked unit is concurrency-/seam-free — the
+/// tree-walker `CapFault`s if it parks, spawns, yields, or re-installs — so anything but a plain
+/// return is an inert `CapFault`; a trap propagates to the invoker.
+fn run_invoke(
+    dom: &Domain,
+    module: usize,
+    args: &[Value],
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
+    let mut vm = Vm::new(&dom.mods[module], 0, args)?;
+    vm.module = module;
+    loop {
+        match vm.resume(&dom.mods, &dom.table, fuel, mem, host, u64::MAX)? {
+            Outcome::Done(vals) => return Ok(vals),
+            Outcome::Suspended => {}
+            _ => return Err(Trap::CapFault),
+        }
+    }
+}
+
 /// Why [`step_vcpu`] returned control to the scheduler: the vCPU finished, or it hit a multi-vCPU
 /// (`thread.*` / `memory.*`) event the scheduler must service. Intra-vCPU fiber switches never reach
 /// here — `step_vcpu` handles them against the vCPU's own registry.
@@ -1181,6 +1237,15 @@ enum VcpuStop {
         h: i32,
         slot: i64,
         dst: u32,
+    },
+    /// §22 `Jit.invoke` — the driver runs the unit synchronously over the shared window.
+    JitInvoke {
+        h: i32,
+        code: i32,
+        argv: Box<[i64]>,
+        dst: u32,
+        params: Box<[ValType]>,
+        results: Box<[ValType]>,
     },
 }
 
@@ -1310,6 +1375,23 @@ fn step_vcpu(
             }
             Outcome::JitUninstall { h, slot, dst } => {
                 return Ok(VcpuStop::JitUninstall { h, slot, dst })
+            }
+            Outcome::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            } => {
+                return Ok(VcpuStop::JitInvoke {
+                    h,
+                    code,
+                    argv,
+                    dst,
+                    params,
+                    results,
+                })
             }
             // §14 coroutines are cooperative and driven **inline** here (never via the thread
             // scheduler), exactly as `run_inner` recurses for `resume`.
@@ -1655,6 +1737,65 @@ fn drive(
                     super::EINVAL
                 };
                 tasks[ti].vt.active.set(dst, Reg::from_i64(res));
+            }
+            Ok(VcpuStop::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            }) => {
+                // Resolve unit funcs (authority + cross-domain) and compile, as for install.
+                let funcs = match host.resolve_jit_domain(h).and_then(|domain| {
+                    let (cd, cu) = host.resolve_jit_code(code)?;
+                    if cd != domain {
+                        return Err(Trap::CapFault);
+                    }
+                    host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+                }) {
+                    Ok(f) => f,
+                    Err(t) => {
+                        complete(&mut tasks, ti, Err(t));
+                        continue;
+                    }
+                };
+                let unit = match compile_module(&funcs) {
+                    Some(u) => u,
+                    None => {
+                        complete(&mut tasks, ti, Err(Trap::Malformed));
+                        continue;
+                    }
+                };
+                // Arity-check the unit entry (func 0) against the call's (code-stripped) signature.
+                let arity_ok = unit
+                    .sigs
+                    .first()
+                    .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+                if !arity_ok {
+                    complete(&mut tasks, ti, Err(Trap::CapFault));
+                    continue;
+                }
+                // Marshal args via the slot ABI, push the unit as a transient module, run it.
+                let child_args: Vec<Value> = params
+                    .iter()
+                    .zip(argv.iter())
+                    .map(|(ty, s)| slot_to_val(*ty, *s))
+                    .collect();
+                let umod = dom.mods.len();
+                dom.mods.push(unit);
+                match run_invoke(&dom, umod, &child_args, fuel, mem, host) {
+                    Ok(vals) => {
+                        for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
+                            let re = slot_to_val(*ty, val_to_slot(*v));
+                            tasks[ti].vt.active.set(dst + i as u32, Reg::from_value(re));
+                        }
+                    }
+                    Err(t) => {
+                        complete(&mut tasks, ti, Err(t));
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -2304,6 +2445,33 @@ impl Vm {
                     self.base = base;
                     self.pc = pc + 1;
                     return Ok(Outcome::JitUninstall { h, slot, dst });
+                }
+                Op::JitInvoke {
+                    handle,
+                    code,
+                    args,
+                    dst,
+                    params,
+                    results,
+                } => {
+                    let h = r!(*handle).i32();
+                    let code = r!(*code).i64() as i32;
+                    let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
+                    // `params`/`results` live in this op (in `mods`), which the driver may reallocate
+                    // when it pushes the invoked unit — so hand owned copies up.
+                    let (dst, params, results) = (*dst, params.clone(), results.clone());
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::JitInvoke {
+                        h,
+                        code,
+                        argv,
+                        dst,
+                        params,
+                        results,
+                    });
                 }
                 Op::Unreachable => return Err(Trap::Unreachable),
                 Op::Eval {

@@ -347,8 +347,13 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
                   uninstall→call_indirect traps `IndirectCallType`) bit-identical to `run_with_host`.
                   **Known gap:** a unit using an op the bytecode engine can't lower traps `Malformed`
                   (no mid-run fall-back) — same coverage edge as a top-level module.
-            - [ ] **5e-2** — `Jit.invoke` (op 1): nested concurrency-free run of a unit over the
-                  shared table; target the `dynlink_cap` compile→install→link→invoke = 127 flow.
+            - [x] **5e-2** — `Jit.invoke` (op 1): `run_invoke` runs the unit's entry synchronously as
+                  a transient module over the shared window/powerbox + shared dispatch table (so the
+                  unit's `call_indirect` reaches installed units), concurrency-free (park/spawn/yield/
+                  re-install → inert `CapFault`, matching the tree-walker); args/results marshal via the
+                  i64-slot ABI. New harness case `invoke_unit_that_calls_installed_unit_agrees`
+                  (install A, invoke B where B calls A → 14, the §22 new→new path) bit-identical to
+                  `run_with_host`. `run_fast` now routes install/invoke guests to bytecode.
             - [ ] **5e-3** — tail calls (`return_call`/`return_call_indirect`).
         - [x] **1c-5f** — fiber **migration**: the fiber registry moved out of `VTask` into a
               **run-shared** `Vec<FiberState>` owned by `drive` (one domain-wide handle namespace),
