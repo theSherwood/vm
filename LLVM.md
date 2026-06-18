@@ -841,6 +841,17 @@ generally useful (any frontend's `-O2` hits them):
 - Test: `rust_box_string_expr_evaluator` — `eval("2+3*4-(5-1)*2+10") = 16`, rendered string is 26
   chars, `(16+26) % 251 = 42`, on-ramp == native. 101 translate tests green, fmt + clippy clean.
 
+**Slice AM (DONE) — the Rust capstone: a `jsmn`-style JSON tokenizer (a real `no_std` program).** The
+Rust analog of the C corpus's `jsmn` demo: scan a JSON document (`&[u8]`) into a heap `Vec` of typed
+tokens (`enum Kind { Obj, Arr, Str, Prim }` + span), handling `\`-escaped strings, whitespace, and bare
+primitives, then fold a deterministic digest over the tokens. **Needed zero translator changes** — a
+real Rust library runs end to end on the slices already in place (`Vec<struct>` heap + growth, enums,
+`&[u8]` scanning, `match` on bytes, enum→int cast), byte-identical to native `rustc`. This is the
+breadth-proof capstone: not a unit test of a feature, but a recognizable program, the way `jsmn`/
+`sha256`/`clay` validated C beyond the per-feature slices.
+- Test: `rust_json_tokenizer_capstone` — 14 tokens over the doc, folded digest `% 251 = 135`, on-ramp
+  == native. 102 translate tests green, fmt + clippy clean.
+
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
       virtual dtors, templates, static init via `@llvm.global_ctors`. Broaden as gaps surface (multiple

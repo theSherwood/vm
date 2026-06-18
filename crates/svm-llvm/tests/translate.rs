@@ -2748,3 +2748,101 @@ fn compute() -> i32 {
     // Pin it (non-vacuous): eval = 16, render = `(((2+(3*4))-((5-1)*2))+10)` (26 chars); 42 % 251 = 42.
     assert_eq!(svm, 42, "expr evaluator: expected 42, got {svm}");
 }
+
+/// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
+/// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
+/// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and
+/// bare primitives, then fold a deterministic digest over the tokens. Exercises enums, `Vec<struct>`
+/// (heap, growth via the guest allocator), `&[u8]` scanning, `match` on bytes, and an enum-to-int
+/// cast — a recognizable real Rust library end to end, byte-identical to native `rustc`.
+#[test]
+fn rust_json_tokenizer_capstone() {
+    let items = r##"
+extern crate alloc;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+#[derive(Clone, Copy)]
+enum Kind { Obj, Arr, Str, Prim }
+
+#[derive(Clone, Copy)]
+struct Tok { kind: Kind, start: usize, end: usize }
+
+fn is_ws(c: u8) -> bool { matches!(c, b' ' | b'\t' | b'\n' | b'\r') }
+
+fn tokenize(js: &[u8]) -> Vec<Tok> {
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut i = 0usize;
+    while i < js.len() {
+        let c = js[i];
+        if c == b'{' {
+            toks.push(Tok { kind: Kind::Obj, start: i, end: i });
+            i += 1;
+        } else if c == b'[' {
+            toks.push(Tok { kind: Kind::Arr, start: i, end: i });
+            i += 1;
+        } else if c == b'"' {
+            let start = i + 1;
+            i += 1;
+            while i < js.len() && js[i] != b'"' {
+                if js[i] == b'\\' { i += 1; } // skip the escaped char
+                i += 1;
+            }
+            toks.push(Tok { kind: Kind::Str, start, end: i });
+            i += 1; // closing quote
+        } else if is_ws(c) || c == b':' || c == b',' || c == b'}' || c == b']' {
+            i += 1;
+        } else {
+            let start = i;
+            while i < js.len()
+                && !is_ws(js[i])
+                && js[i] != b','
+                && js[i] != b'}'
+                && js[i] != b']'
+            {
+                i += 1;
+            }
+            toks.push(Tok { kind: Kind::Prim, start, end: i });
+        }
+    }
+    toks
+}
+
+fn compute() -> i32 {
+    let doc = br#"{ "name": "v\"m", "tags": ["a", "b", "c"], "n": 42, "ok": true, "x": null }"#;
+    let toks = tokenize(doc);
+    let mut acc: i64 = toks.len() as i64;
+    for t in toks.iter() {
+        acc = acc
+            .wrapping_mul(31)
+            .wrapping_add(t.kind as i64)
+            .wrapping_add(t.end.wrapping_sub(t.start) as i64);
+    }
+    acc.rem_euclid(251) as i32
+}
+"##;
+    let (Some(svm), Some(native)) = (
+        rust_alloc_onramp("rs_json", items),
+        rust_alloc_native("rs_json", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        svm, native,
+        "json tokenizer: on-ramp {svm} vs native {native}"
+    );
+    // Pin it (non-vacuous): 14 tokens over the doc, folded digest % 251 = 135.
+    assert_eq!(svm, 135, "json tokenizer: expected digest 135, got {svm}");
+}
