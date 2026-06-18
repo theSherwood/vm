@@ -73,6 +73,25 @@ impl Session {
         let width = scalar_width(&debug.types, var.type_id, &var.ty);
         var_to_i64(&self.inspector.read_var(frame_idx, name, width)?)
     }
+
+    /// Whether a breakpoint stop at `pc` should fire: `true` for an unconditional breakpoint, or a
+    /// `condition` that evaluates nonzero in the stopped (innermost) frame. A malformed/unresolvable
+    /// condition also fires (so the user notices rather than silently skipping). Shared by forward
+    /// `continue` and reverse `reverseContinue` so both honor conditional breakpoints identically.
+    fn condition_holds(&self, pc: IrPc) -> bool {
+        let Some(cond) = self.conditions.get(&pc) else {
+            return true; // unconditional
+        };
+        let func = match self.inspector.backtrace().first() {
+            Some(f) => f.pc.func,
+            None => return true,
+        };
+        let resolve = |name: &str| self.resolve_var(0, func, name);
+        match expr::eval_int(cond, &resolve) {
+            Some(v) => v != 0,
+            None => true,
+        }
+    }
 }
 
 /// An event to emit after a response: `(event-name, body)`.
@@ -640,25 +659,9 @@ impl DapServer {
         }
     }
 
-    /// Whether a stop at `pc` should surface: `true` for an unconditional breakpoint or a condition
-    /// that evaluates nonzero in the stopped (innermost) frame. A malformed/unresolvable condition
-    /// also stops (so the user notices rather than silently skipping).
+    /// Whether a stop at `pc` should surface (delegates to [`Session::condition_holds`]).
     fn condition_holds(&self, pc: IrPc) -> bool {
-        let Some(session) = self.session.as_ref() else {
-            return true;
-        };
-        let Some(cond) = session.conditions.get(&pc) else {
-            return true; // unconditional
-        };
-        let func = match session.inspector.backtrace().first() {
-            Some(f) => f.pc.func,
-            None => return true,
-        };
-        let resolve = |name: &str| session.resolve_var(0, func, name);
-        match expr::eval_int(cond, &resolve) {
-            Some(v) => v != 0,
-            None => true,
-        }
+        self.session.as_ref().is_none_or(|s| s.condition_holds(pc))
     }
 
     fn on_step(&mut self, kind: StepKind) -> (bool, Json, Vec<Event>) {
@@ -748,12 +751,17 @@ impl DapServer {
         let target = pos(&session.inspector);
         session.inspector.seek(0);
         let mut prev: Option<u64> = None;
-        while let Stop::Break { .. } = session.inspector.run_until_stop() {
+        while let Stop::Break { reason, pc } = session.inspector.run_until_stop() {
             let t = pos(&session.inspector);
-            if t < target {
-                prev = Some(t);
-            } else {
+            if t >= target {
                 break; // reached (or passed) where we started
+            }
+            // Honor conditional breakpoints, like forward `continue`: a breakpoint whose condition is
+            // false is not a real stop, so don't treat it as the previous breakpoint. Other stop
+            // reasons (watchpoints, cap.call) always count.
+            let fires = !matches!(reason, StopReason::Breakpoint) || session.condition_holds(pc);
+            if fires {
+                prev = Some(t);
             }
         }
         let (landed, reason) = match prev {

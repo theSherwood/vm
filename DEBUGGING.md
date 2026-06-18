@@ -615,9 +615,17 @@ type names (`i32`, `Pair`, an `x.rs` file) and asserts the interpreter + DAP rea
 correctly using only the structured layout — locking the consumer's frontend-agnosticism into CI
 (the D-DBG-7 waist holds: consumers depend only on the neutral `DebugInfo`, never on a producer).
 
-**Not yet (other W5 gaps).** Float expressions and short-circuit `&&`/`||` in `evaluate`;
-conditional breakpoints are honored by forward `continue` but not yet by `reverseContinue` (it
-stops at any breakpoint pc); and the JIT/DWARF tier for gdb/lldb on native code.
+**Built — reverse-continue honors conditional breakpoints (W5).** `reverseContinue` now skips a
+breakpoint hit whose `condition` is false when walking *backward*, identical to forward `continue`,
+so it lands on the previous hit that actually fires (not just any breakpoint pc). The condition
+check moved to a shared `Session::condition_holds` used by both directions. Test (`dap.rs`): with
+`i != 2` over a loop hitting `i=3,2,1`, reverse-continuing from the `i=1` stop skips the
+false-condition `i=2` hit back to `i=3`. (Float expressions and short-circuit `&&`/`||` in `evaluate`
+landed earlier — see `expr.rs`.)
+
+**Not yet (other W5 gaps).** The JIT/DWARF tier for gdb/lldb on native code; and lexical-scope
+narrowing for variables (`IrPc`-range scopes — a shadowed/block-scoped local resolving to the right
+binding).
 
 ---
 
