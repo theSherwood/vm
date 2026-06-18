@@ -274,6 +274,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::ConstF64(bits) => format!("f64.const {:?}", f64::from_bits(*bits)),
         Inst::FBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::FUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
+        Inst::Fma { ty, a, b, c } => format!("{}.fma v{a} v{b} v{c}", ty.prefix()),
         Inst::FCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::FToISat { op, a } => format!("{} v{a}", op.name()),
         Inst::FToITrap { op, a } => format!("{} v{a}", op.trap_name()),
@@ -392,9 +393,10 @@ fn print_inst(inst: &Inst) -> String {
         Inst::GcRoots {
             heap_lo,
             heap_hi,
+            mask,
             buf,
             cap,
-        } => format!("gc.roots v{heap_lo} v{heap_hi} v{buf} v{cap}"),
+        } => format!("gc.roots v{heap_lo} v{heap_hi} v{mask} v{buf} v{cap}"),
         // §12 real threads (OS-thread vCPUs over shared memory).
         Inst::ThreadSpawn { func, sp, arg } => format!("thread.spawn {func} v{sp} v{arg}"),
         Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
@@ -459,6 +461,7 @@ fn print_inst(inst: &Inst) -> String {
         Inst::VPopcnt { a } => format!("i8x16.popcnt v{a}"),
         Inst::VAvgr { shape, a, b } => format!("{}.avgr_u v{a} v{b}", shape.name()),
         Inst::VDot { a, b } => format!("i32x4.dot_i16x8_s v{a} v{b}"),
+        Inst::VDotI8 { a, b } => format!("i16x8.dot_i8x16_s v{a} v{b}"),
         Inst::VExtMul { shape, op, a, b } => {
             let (low, signed) = op.parts();
             let src = shape.narrower().map(|s| s.name()).unwrap_or("?");
@@ -478,6 +481,17 @@ fn print_inst(inst: &Inst) -> String {
             )
         }
         Inst::VQ15MulrSat { a, b } => format!("i16x8.q15mulr_sat_s v{a} v{b}"),
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => format!(
+            "{}.{} v{a} v{b} v{c}",
+            shape.name(),
+            if *neg { "fnma" } else { "fma" }
+        ),
         Inst::VAnyTrue { a } => format!("v128.any_true v{a}"),
         Inst::VAllTrue { shape, a } => format!("{}.all_true v{a}", shape.name()),
         Inst::VBitmask { shape, a } => format!("{}.bitmask v{a}", shape.name()),
@@ -1742,11 +1756,13 @@ impl<'a> Parser<'a> {
         if op == "gc.roots" {
             let heap_lo = self.value(names)?;
             let heap_hi = self.value(names)?;
+            let mask = self.value(names)?;
             let buf = self.value(names)?;
             let cap = self.value(names)?;
             return Ok(Inst::GcRoots {
                 heap_lo,
                 heap_hi,
+                mask,
                 buf,
                 cap,
             });
@@ -1871,6 +1887,11 @@ impl<'a> Parser<'a> {
             let a = self.value(names)?;
             let b = self.value(names)?;
             return Ok(Inst::VDot { a, b });
+        }
+        if op == "i16x8.dot_i8x16_s" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            return Ok(Inst::VDotI8 { a, b });
         }
         if op == "i16x8.q15mulr_sat_s" {
             let a = self.value(names)?;
@@ -2009,6 +2030,18 @@ impl<'a> Parser<'a> {
                 let a = self.value(names)?;
                 let b = self.value(names)?;
                 return Ok(Inst::VPMinMax { shape, op: o, a, b });
+            }
+            if suffix == "fma" || suffix == "fnma" {
+                let a = self.value(names)?;
+                let b = self.value(names)?;
+                let c = self.value(names)?;
+                return Ok(Inst::VFma {
+                    shape,
+                    neg: suffix == "fnma",
+                    a,
+                    b,
+                    c,
+                });
             }
         } else if let Some(o) = VIntBinOp::from_name(suffix) {
             let a = self.value(names)?;
@@ -2176,6 +2209,12 @@ impl<'a> Parser<'a> {
                 op: o,
                 a: self.value(names)?,
             });
+        }
+        if suffix == "fma" {
+            let a = self.value(names)?;
+            let b = self.value(names)?;
+            let c = self.value(names)?;
+            return Ok(Inst::Fma { ty, a, b, c });
         }
         if let Some(o) = FCmpOp::from_name(suffix) {
             let a = self.value(names)?;

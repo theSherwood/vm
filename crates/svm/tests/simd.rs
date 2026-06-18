@@ -90,10 +90,13 @@ fn simd_text_and_binary_roundtrip() {
           v14 = f32x4.neg v4\n\
           v140 = f32x4.pmin v4 v4\n\
           v141 = f32x4.pmax v4 v4\n\
+          v1400 = f32x4.fma v4 v4 v4\n\
+          v1401 = f64x2.fnma v4 v4 v4\n\
           v142 = i8x16.popcnt v2\n\
           v143 = i8x16.avgr_u v2 v3\n\
           v144 = i16x8.avgr_u v2 v3\n\
           v145 = i32x4.dot_i16x8_s v2 v3\n\
+          v1450 = i16x8.dot_i8x16_s v2 v3\n\
           v146 = i16x8.extmul_low_i8x16_s v2 v3\n\
           v147 = i32x4.extmul_high_i16x8_u v2 v3\n\
           v148 = i64x2.extmul_low_i32x4_s v2 v3\n\
@@ -365,6 +368,120 @@ fn diff_f32x4_pminmax_nan() {
     }
 }
 
+// Fused multiply-add (`Inst::VFma`, the relaxed-SIMD `relaxed_madd`/`nmadd`): `±a·b + c` with a
+// single rounding. The oracle is Rust's `mul_add` (the correctly-rounded IEEE FMA); `diff1` pins
+// interp == JIT, so this also confirms Cranelift's vector `fma` legalizes and matches `mul_add`.
+#[test]
+fn diff_f32x4_fma() {
+    let fma = |op: &str, a: f32, b: f32, c: f32| -> f32 {
+        let s = format!(
+            "func (f32, f32, f32) -> (f32) {{\n\
+            block0(v0: f32, v1: f32, v2: f32):\n\
+              v3 = f32x4.splat v0\n\
+              v4 = f32x4.splat v1\n\
+              v5 = f32x4.splat v2\n\
+              v6 = f32x4.{op} v3 v4 v5\n\
+              v7 = f32x4.extract_lane 0 v6\n  return v7\n}}\n"
+        );
+        f32::from_bits(diff1(&s, &[Value::F32(a), Value::F32(b), Value::F32(c)]) as u32)
+    };
+    // A case where fused (one rounding) differs from mul+add (two): large*small + large.
+    for (a, b, c) in [
+        (2.0f32, 3.0, 4.0),
+        (1.0000001, 1.0000001, -1.0),
+        (1e20, 1e20, -1e30),
+        (0.1, 0.2, 0.3),
+    ] {
+        assert_eq!(
+            fma("fma", a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "fma {a} {b} {c}"
+        );
+        assert_eq!(
+            fma("fnma", a, b, c).to_bits(),
+            (-a).mul_add(b, c).to_bits(),
+            "fnma {a} {b} {c}"
+        );
+    }
+}
+
+#[test]
+fn diff_f64x2_fma() {
+    let fma = |op: &str, a: f64, b: f64, c: f64| -> f64 {
+        let s = format!(
+            "func (f64, f64, f64) -> (f64) {{\n\
+            block0(v0: f64, v1: f64, v2: f64):\n\
+              v3 = f64x2.splat v0\n\
+              v4 = f64x2.splat v1\n\
+              v5 = f64x2.splat v2\n\
+              v6 = f64x2.{op} v3 v4 v5\n\
+              v7 = f64x2.extract_lane 1 v6\n  return v7\n}}\n"
+        );
+        f64::from_bits(diff1(&s, &[Value::F64(a), Value::F64(b), Value::F64(c)]) as u64)
+    };
+    for (a, b, c) in [(2.0f64, 3.0, 4.0), (1e300, 1e300, -1e308), (0.1, 0.2, 0.3)] {
+        assert_eq!(
+            fma("fma", a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "fma {a} {b} {c}"
+        );
+        assert_eq!(
+            fma("fnma", a, b, c).to_bits(),
+            (-a).mul_add(b, c).to_bits(),
+            "fnma {a} {b} {c}"
+        );
+    }
+}
+
+// Scalar fused multiply-add (`Inst::Fma`, the shared primitive svm-llvm's `llvm.fma`/`fmuladd` emit):
+// `a·b + c`, one rounding. Oracle = Rust's `mul_add`; `diff1` pins interp == JIT (Cranelift scalar
+// `fma` == `mul_add`). Covers both f32 and f64.
+#[test]
+fn diff_scalar_fma() {
+    let f32fma = |a: f32, b: f32, c: f32| -> f32 {
+        let s = "func (f32, f32, f32) -> (f32) {\n\
+            block0(v0: f32, v1: f32, v2: f32):\n\
+              v3 = f32.fma v0 v1 v2\n  return v3\n}\n";
+        f32::from_bits(diff1(s, &[Value::F32(a), Value::F32(b), Value::F32(c)]) as u32)
+    };
+    let f64fma = |a: f64, b: f64, c: f64| -> f64 {
+        let s = "func (f64, f64, f64) -> (f64) {\n\
+            block0(v0: f64, v1: f64, v2: f64):\n\
+              v3 = f64.fma v0 v1 v2\n  return v3\n}\n";
+        f64::from_bits(diff1(s, &[Value::F64(a), Value::F64(b), Value::F64(c)]) as u64)
+    };
+    for (a, b, c) in [(2.0f32, 3.0, 4.0), (1e20, 1e20, -1e30), (0.1, 0.2, 0.3)] {
+        assert_eq!(
+            f32fma(a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "f32.fma {a} {b} {c}"
+        );
+    }
+    for (a, b, c) in [(2.0f64, 3.0, 4.0), (1e300, 1e300, -1e308), (0.1, 0.2, 0.3)] {
+        assert_eq!(
+            f64fma(a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "f64.fma {a} {b} {c}"
+        );
+    }
+    // Text + binary round-trip of the scalar `Fma` op (both widths).
+    let m = build(
+        "func (f32, f64) -> (f32) {\n\
+        block0(v0: f32, v1: f64):\n\
+          v2 = f32.fma v0 v0 v0\n  v3 = f64.fma v1 v1 v1\n  return v2\n}\n",
+    );
+    assert_eq!(
+        parse_module(&print_module(&m)).expect("reparse"),
+        m,
+        "text round-trip"
+    );
+    assert_eq!(
+        decode_module(&encode_module(&m)).expect("decode"),
+        m,
+        "binary round-trip"
+    );
+}
+
 // `i8x16.popcnt` — per-byte population count (`Inst::VPopcnt`, fixed i8x16 shape). Splat a byte
 // pattern across all 16 lanes, read lane 0 back; the oracle is Rust's `count_ones`. `diff1`
 // pins interp == JIT.
@@ -508,6 +625,45 @@ fn diff_i32x4_dot() {
         .wrapping_mul(-32768)
         .wrapping_add((-32768i32).wrapping_mul(-32768));
     assert_eq!(diff1(&s, &[]), want as u32 as i64, "dot overflow lane");
+}
+
+// `i16x8.dot_i8x16_s` — the signed i8 dot into i16 lanes (`Inst::VDotI8`, the deterministic
+// relaxed_dot_i8x16_i7x16_s). Two const i8x16 vectors, an i16 lane read back; oracle = the wrapping
+// pair-sum. Includes the corner where the i16 sum wraps (−128·−128 + −128·−128 = 32768 → −32768).
+#[test]
+fn diff_i16x8_dot_i8() {
+    let a: [i8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let b: [i8; 16] = [-1, 1, -2, 2, -3, 3, -4, 4, 1, 1, 1, 1, 1, 1, 1, 1];
+    let bytes = |v: &[i8; 16]| {
+        v.iter()
+            .map(|x| (*x as u8).to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for lane in 0..8u8 {
+        let s = format!(
+            "func () -> (i32) {{\nblock0():\n\
+               v0 = v128.const {}\n\
+               v1 = v128.const {}\n\
+               v2 = i16x8.dot_i8x16_s v0 v1\n\
+               v3 = i16x8.extract_lane_s {lane} v2\n  return v3\n}}\n",
+            bytes(&a),
+            bytes(&b)
+        );
+        let j = lane as usize;
+        let want = (a[2 * j] as i32 * b[2 * j] as i32 + a[2 * j + 1] as i32 * b[2 * j + 1] as i32)
+            as i16 as i32;
+        assert_eq!(diff1(&s, &[]) as i32, want, "dot_i8 lane {lane}");
+    }
+    // Wrap corner: lane 0 of all-(-128) → −128·−128 + −128·−128 = 32768, wraps to −32768 in i16.
+    let row = "128 128 0 0 0 0 0 0 0 0 0 0 0 0 0 0"; // i8 −128 = 0x80
+    let s = format!(
+        "func () -> (i32) {{\nblock0():\n\
+           v0 = v128.const {row}\n  v1 = v128.const {row}\n\
+           v2 = i16x8.dot_i8x16_s v0 v1\n\
+           v3 = i16x8.extract_lane_s 0 v2\n  return v3\n}}\n"
+    );
+    assert_eq!(diff1(&s, &[]) as i32, -32768, "dot_i8 wrap corner");
 }
 
 #[test]

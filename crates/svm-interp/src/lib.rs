@@ -1620,7 +1620,9 @@ fn drive(
             let mut seed: Vec<FrozenFiber> = thaw_fibers;
             seed.sort_by_key(|f| f.slot);
             for (expected, ff) in seed.into_iter().enumerate() {
-                let got = root.registry.seed_frozen(ff.func, ff.sp, ff.shadow_sp);
+                let got = root
+                    .registry
+                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation);
                 debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
                 debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
             }
@@ -1630,14 +1632,19 @@ fn drive(
         // resume ARM), so a child that existed before the freeze point is **not** re-created by the
         // root — the runtime re-creates it here, under `REWINDING`, with its flattened shadow-SP
         // restored, so it rewinds from its frozen point and runs forward. Children re-spawn in
-        // ascending task (= spawn) order, landing on the same dense task ids → the same per-context
-        // shadow regions, and the root's `threads` (join) table is rebuilt to map each handle slot to
-        // its child — so the root's re-executed `thread.join` (after its checkpoint) resolves. Only the
-        // root's direct children are handled (the no-fiber, flat 2-vCPU scope of 3.2.1); nested spawns
-        // and the multi-vCPU + fibers combination are follow-ups.
+        // ascending task (= spawn) order; their regions return via the restored shadow-SP, and the
+        // root's `threads` (join) table is rebuilt to map each handle slot to its child — so the root's
+        // re-executed `thread.join` (after its checkpoint) resolves. As of slice 3.2.2 the root may
+        // also own fibers (top-down vCPU contexts vs. up-growing fiber contexts no longer collide).
+        // Only the root's *direct* children are handled (flat spawns); nested spawns and a *spawned*
+        // child owning fibers (per-child freeze_drive) are follow-ups.
         {
             let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
             vseed.sort_by_key(|f| f.task);
+            // Re-establish the durable vCPU-context count (slice 3.2.2): the re-spawned children
+            // reclaim the top `n` contexts (their regions return via the restored shadow-SP below), so
+            // a post-thaw spawn allocates below them.
+            root.registry.seed_vcpu_count(vseed.len());
             for ff in vseed {
                 let cid = s.next_task;
                 s.next_task += 1;
@@ -3735,6 +3742,14 @@ pub const STATE_OFF: u64 = 0;
 pub const STATE_NORMAL: i32 = 0;
 pub const STATE_UNWINDING: i32 = 1;
 pub const STATE_REWINDING: i32 = 2;
+/// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down
+/// [`ARM_COUNTDOWN_OFF`] at each safepoint and promotes the word to `UNWINDING` at 0; transparent to
+/// the instrumented IR (which tests only `UNWINDING`/`REWINDING`). Must equal `svm_durable::STATE_ARMED`.
+pub const STATE_ARMED: i32 = 3;
+/// Window byte offset of the `i64` **arm countdown** (safepoints left before an `ARMED` run promotes
+/// to `UNWINDING`). Decremented by the runtime at each safepoint; inert unless `ARMED`. Must equal
+/// `svm_durable::ARM_COUNTDOWN_OFF`.
+pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
 /// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
 /// on each fiber switch. Must equal `svm_durable::SHADOW_SP_OFF`.
@@ -3766,6 +3781,46 @@ fn shadow_region_base(ctx_idx: usize) -> u64 {
 /// `cont.new` checks before handing out a new fiber's region.
 fn shadow_region_fits(ctx_idx: usize) -> bool {
     shadow_region_base(ctx_idx) + SHADOW_STRIDE <= DURABLE_RESERVE
+}
+
+/// The highest usable shadow-context index: the reserve holds `DURABLE_RESERVE / SHADOW_STRIDE`
+/// contexts and index 0 is the root, so `1..=MAX_SHADOW_CTX` are the non-root regions.
+const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
+
+/// A spawned vCPU's shadow-context index (DURABILITY.md §12.8 slice 3.2.2): the `n`-th spawned vCPU
+/// (0-based, in spawn order) owns context `MAX_SHADOW_CTX - n`. Fibers grow **up** from context 1
+/// (`slot + 1`) and vCPUs grow **down** from the top, so the two pools share the reserve without
+/// colliding until `fibers + vcpus` would exhaust it (a clean capacity refusal) — unifying the
+/// per-context layout that slice 3.2.1 could only use no-fiber. Keeping fibers at `slot + 1`
+/// preserves cross-backend artifact parity (the JIT mirrors that formula). `None` if no region is
+/// free (it would underflow to the root or collide with a fiber).
+fn vcpu_shadow_context(nth: usize, fibers: usize) -> Option<usize> {
+    let ctx = MAX_SHADOW_CTX.checked_sub(nth)?;
+    (ctx >= 1 && ctx > fibers).then_some(ctx)
+}
+
+/// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
+/// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 16`, so a slot always fits in the
+/// low 16 bits and the generation occupies bits 16.. of the `i32` handle. A handle is
+/// `(generation << FIBER_GEN_SHIFT) | slot` — and since a fresh slot's generation is 0, a non-recycled
+/// run's handle is exactly its slot (byte-identical to before this slice, and to the JIT, which
+/// likewise hands out `slot`). The generation lets a later **recycled** slot reject a stale handle to
+/// its former occupant (the ABA guard the JIT's `Ownership` word already carries internally).
+const FIBER_GEN_SHIFT: u32 = 16;
+
+/// The generation bits a fiber guest handle carries (the field above the slot): the handle conveys
+/// only the low 16 bits of a slot's full generation, so a stale handle is rejected modulo `2^16` (a
+/// vast ABA window — recycling step 3). Matches `svm_jit`'s `FIBER_HANDLE_GEN_MASK`.
+const FIBER_GEN_MASK: u32 = (1 << 16) - 1;
+
+/// Encode a fiber guest handle from its registry `slot` and `generation` (low 16 bits).
+fn fiber_handle(slot: usize, generation: u32) -> i32 {
+    (((generation & FIBER_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u32) as i32
+}
+
+/// The generation field a guest fiber handle carries (the high bits above the slot).
+fn fiber_handle_generation(handle: i32) -> u32 {
+    (handle as u32) >> FIBER_GEN_SHIFT
 }
 
 /// Re-point the active shadow-SP word from the outgoing context's region to the incoming one's,
@@ -3828,6 +3883,11 @@ pub struct FrozenFiber {
     /// Window offset of the flattened shadow-SP — the extent of its frozen continuation, restored
     /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
     pub shadow_sp: u64,
+    /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
+    /// *recycled* (generation > 0) fiber still resolves (`(generation << 16) | slot`). 0 for a
+    /// non-recycled fiber — then the handle is exactly its slot, and the artifact is unchanged in
+    /// meaning (see the snapshot codec, which is format v2).
+    pub generation: u32,
 }
 
 /// A **spawned vCPU** (a `thread.spawn` child) flattened for freeze (DURABILITY.md §12.8 slice 3.2.1).
@@ -3917,6 +3977,19 @@ struct FiberRegistry {
 struct RegState {
     fibers: Vec<RegFiber>,
     shadow: Vec<u64>,
+    /// Per-slot **generation** (recycling step 1): bumped when a slot is freed for reuse, and carried
+    /// in the guest handle's high bits ([`FIBER_GEN_SHIFT`]) so a stale handle to a slot's former
+    /// occupant is rejected on `claim`. Grows with `fibers`/`shadow` (same index).
+    gens: Vec<u32>,
+    /// Freed slots reclaimable for a new fiber (recycling step 3), a **min-heap** so `create` reuses the
+    /// *lowest* free slot — keeping contexts dense and low (within `MAX_SHADOW_CTX`, and clear of the
+    /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
+    /// lifetime total. A finished slot's generation is already bumped, so reuse is ABA-safe.
+    free: BinaryHeap<Reverse<usize>>,
+    /// Count of durable vCPU contexts handed out (slice 3.2.2): the root spawns children that grow
+    /// **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1, so this counter (with
+    /// `fibers.len()`) bounds the shared reserve — `fibers.len() + vcpus <= MAX_SHADOW_CTX`.
+    vcpus: usize,
 }
 
 impl FiberRegistry {
@@ -3925,6 +3998,9 @@ impl FiberRegistry {
             mx: Mutex::new(RegState {
                 fibers: Vec::new(),
                 shadow: Vec::new(),
+                gens: Vec::new(),
+                free: BinaryHeap::new(),
+                vcpus: 0,
             }),
         }
     }
@@ -3940,6 +4016,12 @@ impl FiberRegistry {
         self.lock().shadow.get(slot).copied().unwrap_or(SHADOW_BASE)
     }
 
+    /// The `slot`'s current generation (recycling step 2) — recorded in its [`FrozenFiber`] residue at
+    /// freeze so a thaw re-seeds it at the same generation. 0 for an out-of-range slot.
+    fn generation(&self, slot: usize) -> u32 {
+        self.lock().gens.get(slot).copied().unwrap_or(0)
+    }
+
     /// Record the fiber in `slot`'s shadow-SP (called when it stops being the running context).
     fn set_saved_sp(&self, slot: usize, sp: u64) {
         let mut t = self.lock();
@@ -3948,25 +4030,59 @@ impl FiberRegistry {
         }
     }
 
-    /// `cont.new`: allocate the next slot — the guest handle — under the §15 quota, which is
-    /// **per run** now that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the
-    /// off-table root computation, so a quota value admits exactly the creations the JIT's
-    /// `fibers.len() + 1 >= max_fibers` check admits for a single-vCPU run.
+    /// Reserve the next durable vCPU shadow-context (slice 3.2.2): the `thread.spawn` path calls this
+    /// to claim a top-down region (`MAX_SHADOW_CTX`, `−1`, …) for a freshly spawned child. `None` if
+    /// the reserve is full (the vCPU pool growing down would meet the fiber pool growing up) — a clean
+    /// `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
+    fn reserve_vcpu_context(&self) -> Option<usize> {
+        let mut t = self.lock();
+        let ctx = vcpu_shadow_context(t.vcpus, t.fibers.len())?;
+        t.vcpus += 1;
+        Some(ctx)
+    }
+
+    /// Seed the durable vCPU-context count a **thaw** re-establishes (slice 3.2.2): the re-spawned
+    /// children occupy the top `n` contexts (their regions come back via the restored shadow-SP), so a
+    /// post-thaw spawn allocates below them. Set once after re-seeding, before forward execution.
+    fn seed_vcpu_count(&self, n: usize) {
+        self.lock().vcpus = n;
+    }
+
+    /// `cont.new`: allocate a slot — the guest handle — under the §15 quota, which is **per run** now
+    /// that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the off-table root
+    /// computation. **Recycling (step 3):** the lowest freed slot is reused (its already-bumped
+    /// generation kept, so a stale handle to its former occupant fails `claim`); only when none is free
+    /// does the table grow. So the table is bounded by the *peak concurrent* fiber count, not the
+    /// lifetime total — and the quota / durable-reserve checks (on the grow path / the allocated
+    /// context) likewise bound concurrency rather than lifetime.
     fn create(&self, func: i32, sp: i64, max_fibers: usize, durable: bool) -> Result<i32, Trap> {
         let mut t = self.lock();
-        if t.fibers.len() + 1 >= max_fibers {
+        let reuse = t.free.peek().map(|&Reverse(s)| s);
+        // Growing (no free slot ⇒ every existing slot is live) must honor the concurrency quota.
+        if reuse.is_none() && t.fibers.len() + 1 >= max_fibers {
             return Err(Trap::FiberFault);
         }
-        let slot = t.fibers.len();
+        let slot = reuse.unwrap_or(t.fibers.len());
         // A durable fiber needs a distinct shadow region; refuse if the reserve has no room (a
         // clean `FiberFault`, like exhausting the quota — never an overflow into another
-        // context's region). The fiber's context index is `slot + 1` (the root is context 0).
-        if durable && !shadow_region_fits(slot + 1) {
+        // context's region). The fiber's context index is `slot + 1` (the root is context 0). The
+        // fiber pool grows up from 1 and the spawned-vCPU pool grows down from `MAX_SHADOW_CTX`
+        // (slice 3.2.2), so this fiber also mustn't meet the vCPUs: `(slot+1) + vcpus <= MAX`.
+        if durable && (!shadow_region_fits(slot + 1) || slot + 1 + t.vcpus > MAX_SHADOW_CTX) {
             return Err(Trap::FiberFault);
         }
-        t.fibers.push(RegFiber::Pending { func, sp });
-        t.shadow.push(shadow_region_base(slot + 1)); // fresh region: empty stack at its base
-        Ok(slot as i32)
+        let generation = if reuse.is_some() {
+            t.free.pop();
+            t.fibers[slot] = RegFiber::Pending { func, sp };
+            t.shadow[slot] = shadow_region_base(slot + 1); // reused region: empty stack at its base
+            t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
+        } else {
+            t.fibers.push(RegFiber::Pending { func, sp });
+            t.shadow.push(shadow_region_base(slot + 1));
+            t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
+            0
+        };
+        Ok(fiber_handle(slot, generation))
     }
 
     /// `cont.resume`: resolve the (forgeable) handle — **masked** into the power-of-two-padded
@@ -3981,6 +4097,13 @@ impl FiberRegistry {
         let mask = t.fibers.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
         let slot = (handle as u32 as usize) & mask;
         if slot >= t.fibers.len() {
+            return Err(Trap::FiberFault);
+        }
+        // Generation check (recycling step 1/3): reject a handle whose generation doesn't match the
+        // slot's current one — a stale handle to a slot's former occupant after the slot was recycled
+        // (`finish` bumped the generation). Compared modulo `2^16` (the handle's field width); a forged
+        // non-zero generation is rejected, exactly as a forged slot is masked-and-lost.
+        if fiber_handle_generation(handle) != (t.gens[slot] & FIBER_GEN_MASK) {
             return Err(Trap::FiberFault);
         }
         match std::mem::replace(&mut t.fibers[slot], RegFiber::Running(None)) {
@@ -4023,11 +4146,16 @@ impl FiberRegistry {
         t.fibers[slot] = RegFiber::Parked(frames);
     }
 
-    /// The claimant's current fiber returned: the slot is `Done` (resuming it again faults).
+    /// The claimant's current fiber returned: the slot is `Done`. **Recycling (step 3):** bump the
+    /// slot's generation (so any stale guest handle to it now fails `claim` — the ABA guard) and add it
+    /// to the free list, reclaimable for a new `cont.new`. Resuming the *old* handle faults either way
+    /// (a `Done` slot, or — once reused — a generation mismatch).
     fn finish(&self, slot: usize) {
         let mut t = self.lock();
         debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
         t.fibers[slot] = RegFiber::Done;
+        t.gens[slot] = t.gens[slot].wrapping_add(1);
+        t.free.push(Reverse(slot));
     }
 
     /// Freeze (slice 3.2 active-chain): the running fiber base-returned **while unwinding for a
@@ -4060,11 +4188,12 @@ impl FiberRegistry {
     /// thaw `cont.resume` re-enters its entry under `REWINDING`) with its flattened shadow-SP in the
     /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
     /// dense handle namespace; returns the slot, which must equal the recorded one.
-    fn seed_frozen(&self, func: i32, sp: i64, shadow_sp: u64) -> usize {
+    fn seed_frozen(&self, func: i32, sp: i64, shadow_sp: u64, generation: u32) -> usize {
         let mut t = self.lock();
         let slot = t.fibers.len();
         t.fibers.push(RegFiber::Pending { func, sp });
         t.shadow.push(shadow_sp);
+        t.gens.push(generation); // restore the freeze-time generation so a recycled handle resolves
         slot
     }
 }
@@ -4466,6 +4595,7 @@ impl VCpu {
                 func,
                 sp,
                 shadow_sp,
+                generation: self.registry.generation(slot),
             });
         }
         // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
@@ -4717,6 +4847,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             let inst = &block.insts[frames[top].inst];
             step(fuel)?;
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
+
+            // Mid-run freeze trigger (DURABILITY.md §12, "freeze after N safepoints"): on a durable run
+            // armed via `STATE_ARMED`, count down at each **fiber safepoint** (`cont.resume`/`suspend`)
+            // and promote to `UNWINDING` at 0, so *this* op's trailing poll begins the freeze. Inert
+            // unless armed; gated on `durable` so an ordinary run is untouched. Lets a run freeze after
+            // forward progress (e.g. once a fiber is recycled), which the freeze-before-start harness
+            // cannot reach. Counting only the fiber ops (routed through runtime thunks on both backends)
+            // keeps the trigger point identical interp↔JIT — cap.call is *not* counted (the JIT's
+            // cap.call thunk is host-supplied, so there is no cross-backend choke for it); a cap.call
+            // freeze is already reachable at the first safepoint, and a production async trigger handles
+            // general mid-run freeze.
+            if durable && matches!(inst, Inst::ContResume { .. } | Inst::Suspend { .. }) {
+                if let Some(m) = mem.as_mut() {
+                    m.durable_tick_arm();
+                }
+            }
 
             match inst {
                 // Non-tail calls push a new frame and switch to it; the callee's results
@@ -5469,21 +5615,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::GcRoots {
                     heap_lo,
                     heap_hi,
+                    mask,
                     buf,
                     cap,
                 } => {
                     let lo = get_i64(&frames[top].vals, *heap_lo)? as u64;
                     let hi = get_i64(&frames[top].vals, *heap_hi)? as u64;
+                    let mask = get_i64(&frames[top].vals, *mask)? as u64;
+                    // Security: the payload mask may only clear the top byte (low 56 bits all-ones),
+                    // else a host pointer could be folded into the guest window and leak host-address
+                    // bits past the range filter (GC.md §3, §6). The verifier rejects a constant
+                    // fold-down mask statically; this defends an unverified module / non-constant mask.
+                    if mask | 0xFF00_0000_0000_0000 != u64::MAX {
+                        return Err(Trap::Malformed);
+                    }
                     let dst = get_i64(&frames[top].vals, *buf)? as u64;
                     let cap = get_i64(&frames[top].vals, *cap)?.max(0) as usize;
                     let mut roots = std::collections::BTreeSet::new();
-                    gc_scan_frames(frames, lo, hi, &mut roots);
+                    gc_scan_frames(frames, lo, hi, mask, &mut roots);
                     if let Some(rp) = root_parked.as_ref() {
-                        gc_scan_frames(rp, lo, hi, &mut roots);
+                        gc_scan_frames(rp, lo, hi, mask, &mut roots);
                     }
                     for fib in registry.lock().fibers.iter() {
                         if let RegFiber::Parked(f) | RegFiber::Running(Some(f)) = fib {
-                            gc_scan_frames(f, lo, hi, &mut roots);
+                            gc_scan_frames(f, lo, hi, mask, &mut roots);
                         }
                     }
                     let total = roots.len();
@@ -5520,6 +5675,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .as_ref()
                         .map(|m| m.durable_state())
                         .unwrap_or(STATE_NORMAL);
+                    // Durable multi-vCPU (slice 3.2.2): reserve this child's shadow context top-down
+                    // (`MAX_SHADOW_CTX`, −1, …) so it can't collide with a fiber's `slot+1` region.
+                    // Fail closed (`ThreadFault`) if the reserve is full — the vCPU pool growing down
+                    // would meet the fiber pool growing up. (Non-durable runs never touch the reserve.)
+                    let child_ctx = if durable {
+                        match registry.reserve_vcpu_context() {
+                            Some(c) => c,
+                            None => return Err(Trap::ThreadFault),
+                        }
+                    } else {
+                        0
+                    };
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                     let child_host = Arc::clone(host); // inherit the domain powerbox
                     let child_fuel = *fuel; // the child's own metering budget (a copy)
@@ -5550,10 +5717,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.registry = creg;
                         child.memop = memop; // inherit the explorer's memory-op granularity
                         child.durable = durable; // durability is a domain property (shared window/registry)
-                                                 // Durable multi-vCPU (slice 3.2.1): this child is context `task id`, so its shadow
-                                                 // stack lives in its own region; it carries its own state word (swapped in by the
-                                                 // runtime when it runs). Retain `(entry, [sp, arg])` so a freeze emits its residue.
-                        child.root_shadow_sp = shadow_region_base(id as usize);
+                                                 // Durable multi-vCPU (slice 3.2.2): this child owns the top-down context reserved
+                                                 // above, so its shadow stack lives in its own region; it carries its own state word
+                                                 // (swapped in by the runtime). Retain `(entry, [sp, arg])` so a freeze emits residue.
+                        child.root_shadow_sp = shadow_region_base(child_ctx);
                         child.dstate = child_state;
                         child.spawn_residue = Some((entry, vec![spv, av]));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
@@ -5883,6 +6050,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             func,
                             sp,
                             shadow_sp,
+                            generation: registry.generation(leaving),
                         });
                     } else {
                         registry.finish(*cur);
@@ -6039,6 +6207,15 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::FUn { ty, op, a } => match ty {
             FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
             FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
+        },
+        Inst::Fma { ty, a, b, c } => match ty {
+            // `mul_add` is the correctly-rounded fused FMA — bit-identical to Cranelift's `fma`.
+            FloatTy::F32 => {
+                Reg::from_f32(get_f32(vals, *a)?.mul_add(get_f32(vals, *b)?, get_f32(vals, *c)?))
+            }
+            FloatTy::F64 => {
+                Reg::from_f64(get_f64(vals, *a)?.mul_add(get_f64(vals, *b)?, get_f64(vals, *c)?))
+            }
         },
         Inst::FCmp { ty, op, a, b } => {
             let r = match ty {
@@ -6198,6 +6375,9 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::VDot { a, b } => {
             Reg::from_v128(simd_dot(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
         }
+        Inst::VDotI8 { a, b } => {
+            Reg::from_v128(simd_dot_i8(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
+        }
         Inst::VExtMul { shape, op, a, b } => Reg::from_v128(simd_extmul(
             *shape,
             *op,
@@ -6210,6 +6390,19 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::VQ15MulrSat { a, b } => {
             Reg::from_v128(simd_q15mulr(get(vals, *a)?.v128(), get(vals, *b)?.v128()))
         }
+        Inst::VFma {
+            shape,
+            neg,
+            a,
+            b,
+            c,
+        } => Reg::from_v128(simd_fma(
+            *shape,
+            *neg,
+            get(vals, *a)?.v128(),
+            get(vals, *b)?.v128(),
+            get(vals, *c)?.v128(),
+        )),
         Inst::VAnyTrue { a } => {
             Reg::from_i32((get(vals, *a)?.v128().iter().any(|&b| b != 0)) as i32)
         }
@@ -6711,6 +6904,21 @@ fn simd_dot(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
     o
 }
 
+/// `i16x8.dot_i8x16_s`: signed `i8` dot of adjacent pairs into `i16` lanes (wrapping) — the
+/// deterministic `relaxed_dot_i8x16_i7x16_s`. Products of `i8`s fit in `i16`; the pair sum wraps.
+fn simd_dot_i8(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    for j in 0..8 {
+        let a0 = lane_sext(lane_read(&a, 2 * j, 1), 1) as i32;
+        let a1 = lane_sext(lane_read(&a, 2 * j + 1, 1), 1) as i32;
+        let b0 = lane_sext(lane_read(&b, 2 * j, 1), 1) as i32;
+        let b1 = lane_sext(lane_read(&b, 2 * j + 1, 1), 1) as i32;
+        let r = a0 * b0 + a1 * b1; // exact in i32; wraps when written at i16 width
+        lane_write(&mut o, j, 2, r as u16 as u64);
+    }
+    o
+}
+
 /// `<shape>.all_true`: `1` iff every lane is non-zero.
 fn simd_all_true(shape: VShape, a: [u8; 16]) -> i32 {
     let bytes = shape.lane_bytes() as usize;
@@ -6762,6 +6970,35 @@ fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> 
             }
         }
         // Verifier rejects an integer shape here; total fall-through returns zero.
+        _ => {}
+    }
+    o
+}
+
+/// Lane-wise fused multiply-add (`relaxed_madd`/`nmadd`): `±a·b + c` with a single rounding.
+/// `f*::mul_add` is the correctly-rounded IEEE-754 FMA — bit-identical to Cranelift's `fma`, so the
+/// interp↔JIT differential holds. `neg` negates the product (the `nmadd` form, `−a·b + c`).
+fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match shape {
+        VShape::F32x4 => {
+            for i in 0..4 {
+                let x = f32::from_bits(lane_read(&a, i, 4) as u32);
+                let y = f32::from_bits(lane_read(&b, i, 4) as u32);
+                let z = f32::from_bits(lane_read(&c, i, 4) as u32);
+                let x = if neg { -x } else { x };
+                lane_write(&mut o, i, 4, x.mul_add(y, z).to_bits() as u64);
+            }
+        }
+        VShape::F64x2 => {
+            for i in 0..2 {
+                let x = f64::from_bits(lane_read(&a, i, 8));
+                let y = f64::from_bits(lane_read(&b, i, 8));
+                let z = f64::from_bits(lane_read(&c, i, 8));
+                let x = if neg { -x } else { x };
+                lane_write(&mut o, i, 8, x.mul_add(y, z).to_bits());
+            }
+        }
         _ => {}
     }
     o
@@ -10194,6 +10431,27 @@ impl Mem {
         let _ = self.write_bytes_impl(STATE_OFF, &state.to_le_bytes());
     }
 
+    /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`): if the run
+    /// is `STATE_ARMED`, decrement the arm countdown at [`ARM_COUNTDOWN_OFF`] and, when it reaches 0,
+    /// promote the state word to `UNWINDING` — so the safepoint's trailing poll begins the freeze. A
+    /// no-op unless armed (the common case: one `i32` read per safepoint, no write), so an unarmed run
+    /// is byte-identical. Call once per fiber safepoint — see the `run_inner` dispatch.
+    fn durable_tick_arm(&mut self) {
+        if self.durable_state() != STATE_ARMED {
+            return;
+        }
+        let n = self
+            .read_bytes_impl(ARM_COUNTDOWN_OFF, 8)
+            .and_then(|b| b.try_into().ok())
+            .map(i64::from_le_bytes)
+            .unwrap_or(0)
+            - 1;
+        let _ = self.write_bytes_impl(ARM_COUNTDOWN_OFF, &n.to_le_bytes());
+        if n <= 0 {
+            self.durable_set_state(STATE_UNWINDING);
+        }
+    }
+
     fn read_le(&self, base: u64, width: u32) -> u64 {
         let mut raw = 0u64;
         for k in 0..width as u64 {
@@ -10543,14 +10801,24 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
 }
 
 /// Scan a fiber's frames for candidate root words in `[lo, hi)` and insert them into `out` (§GC
-/// `gc.roots`). Conservative: every SSA value whose raw bits land in range is a candidate — the
-/// interpreter scans typed `Value`s (the JIT scans raw control-stack words; both are sound
-/// over-approximations that may differ in false positives, GC.md §3.2). `v128` contributes both of
-/// its 64-bit halves.
-fn gc_scan_frames(frames: &[Frame], lo: u64, hi: u64, out: &mut std::collections::BTreeSet<u64>) {
+/// `gc.roots`). Each word is first masked (`m = w & mask`); the **masked** value is what's range-
+/// tested and inserted, so a guest with tagged pointers (tag in the top byte) recovers the bare
+/// offset (`mask = !0` is the untagged case). Conservative: every SSA value whose masked bits land
+/// in range is a candidate — the interpreter scans typed `Value`s (the JIT scans raw control-stack
+/// words; both are sound over-approximations that may differ in false positives, GC.md §3.2).
+/// `v128` contributes both of its 64-bit halves. `mask` is caller-validated to top-byte-strip only,
+/// so a host pointer stays large and is excluded by the range test.
+fn gc_scan_frames(
+    frames: &[Frame],
+    lo: u64,
+    hi: u64,
+    mask: u64,
+    out: &mut std::collections::BTreeSet<u64>,
+) {
     let mut consider = |w: u64| {
-        if w >= lo && w < hi {
-            out.insert(w);
+        let m = w & mask;
+        if m >= lo && m < hi {
+            out.insert(m);
         }
     };
     for f in frames {

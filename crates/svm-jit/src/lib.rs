@@ -337,6 +337,9 @@ pub struct FrozenFiber {
     pub func: i32,
     pub sp: i64,
     pub shadow_sp: u64,
+    /// The slot's generation at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
+    /// recycled fiber still resolves. 0 for a non-recycled fiber. Mirrors `svm_interp::FrozenFiber`.
+    pub generation: u32,
 }
 
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
@@ -3088,6 +3091,7 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 | Inst::Eqz { .. }
                 | Inst::FBin { .. }
                 | Inst::FUn { .. }
+                | Inst::Fma { .. }
                 | Inst::FCmp { .. }
                 | Inst::FToISat { .. }
                 | Inst::FToITrap { .. }
@@ -3152,8 +3156,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VPopcnt { .. } => {}
                 // `avgr_u` (`i8x16`/`i16x8` only, verifier-enforced) → native `avg_round`.
                 Inst::VAvgr { .. } => {}
-                // `i32x4.dot_i16x8_s` → `swiden_low/high` + `imul` + `iadd_pairwise` (all legalize).
-                Inst::VDot { .. } => {}
+                // `i32x4.dot_i16x8_s` / `i16x8.dot_i8x16_s` → `swiden_low/high` + `imul` +
+                // `iadd_pairwise` (all legalize).
+                Inst::VDot { .. } | Inst::VDotI8 { .. } => {}
                 // Extended multiply → widen low/high both operands + `imul` on the wide shape.
                 // `imul` legalizes for every wide shape (incl. `i64x2`, unlike `i8x16.mul`).
                 Inst::VExtMul { .. } => {}
@@ -3161,6 +3166,9 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 Inst::VExtAddPairwise { .. } => {}
                 // Q15 rounding multiply → native `sqmul_round_sat`.
                 Inst::VQ15MulrSat { .. } => {}
+                // Fused multiply-add (relaxed_madd/nmadd) → vector `fma` (one rounding; the same
+                // correctly-rounded result the interp's `mul_add` gives, so the differential holds).
+                Inst::VFma { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
                 // Saturating add/sub (`i8x16`/`i16x8` only, verifier-enforced) lower to native
@@ -3838,17 +3846,20 @@ fn lower_block(
         if let Inst::GcRoots {
             heap_lo,
             heap_hi,
+            mask,
             buf,
             cap,
         } = inst
         {
-            // gc_roots(heap_lo, heap_hi, buf, cap, mem_base, mask, mapped, sub_base, trap_out) -> i64
-            // count. The thunk walks the live fiber stacks (runtime via the thread-local), filters
-            // to `[heap_lo, heap_hi)`, and writes the first `cap` deduped words to guest `buf` —
-            // confining/bounds-checking it with the same `mask`/`mapped`/`sub_base` as `mask_addr`,
-            // so a forged/out-of-window buffer faults (propagated below).
+            // gc_roots(heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, sub_base,
+            // trap_out) -> i64 count. The thunk walks the live fiber stacks (runtime via the
+            // thread-local), masks each word with `payload_mask` (§GC tagged pointers; distinct from
+            // the window-confinement `mask`), filters the masked value to `[heap_lo, heap_hi)`, and
+            // writes the first `cap` deduped words to guest `buf` — confining/bounds-checking it with
+            // the same `mask`/`mapped`/`sub_base` as `mask_addr`, so a forged buffer faults (below).
             let lo = get(&vals, *heap_lo)?;
             let hi = get(&vals, *heap_hi)?;
+            let payload_mask = get(&vals, *mask)?;
             let dst = get(&vals, *buf)?;
             let cap_v = get(&vals, *cap)?;
             let mem_base = b.use_var(lower.mem_var);
@@ -3857,7 +3868,7 @@ fn lower_block(
             let subv = b.ins().iconst(I64, lower.sub_base as i64);
             let trap_out = b.use_var(lower.trap_var);
             let mut tsig = module.make_signature();
-            for _ in 0..9 {
+            for _ in 0..10 {
                 tsig.params.push(AbiParam::new(I64));
             }
             tsig.returns.push(AbiParam::new(I64));
@@ -3866,7 +3877,18 @@ fn lower_block(
             let call = b.ins().call_indirect(
                 tref,
                 thunk,
-                &[lo, hi, dst, cap_v, mem_base, maskv, mappedv, subv, trap_out],
+                &[
+                    lo,
+                    hi,
+                    payload_mask,
+                    dst,
+                    cap_v,
+                    mem_base,
+                    maskv,
+                    mappedv,
+                    subv,
+                    trap_out,
+                ],
             );
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
@@ -4040,6 +4062,11 @@ fn lower_block(
             Inst::FUn { op, a, .. } => {
                 let x = get(&vals, *a)?;
                 float_un(b, *op, x)
+            }
+            Inst::Fma { a, b: rb, c, .. } => {
+                // Scalar fused multiply-add — `a·b + c`, one rounding (matches the interp's `mul_add`).
+                let (x, y, z) = (get(&vals, *a)?, get(&vals, *rb)?, get(&vals, *c)?);
+                b.ins().fma(x, y, z)
             }
             Inst::FCmp { op, a, b: rb, .. } => {
                 let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
@@ -4263,6 +4290,20 @@ fn lower_block(
                 let r = b.ins().iadd_pairwise(pl, ph);
                 vcast(b, r, I8X16)
             }
+            Inst::VDotI8 { a, b: rb } => {
+                // The i8→i16 signed dot, same shape as `VDot` one width down: widen each i8x16 to
+                // two i16x8 halves, multiply, pairwise-add. (Deterministic relaxed_dot_i8x16_i7x16_s.)
+                let x = vcast(b, get(&vals, *a)?, I8X16);
+                let y = vcast(b, get(&vals, *rb)?, I8X16);
+                let xl = b.ins().swiden_low(x);
+                let xh = b.ins().swiden_high(x);
+                let yl = b.ins().swiden_low(y);
+                let yh = b.ins().swiden_high(y);
+                let pl = b.ins().imul(xl, yl);
+                let ph = b.ins().imul(xh, yh);
+                let r = b.ins().iadd_pairwise(pl, ph);
+                vcast(b, r, I8X16)
+            }
             Inst::VExtMul {
                 shape,
                 op,
@@ -4309,6 +4350,22 @@ fn lower_block(
                 let x = vcast(b, get(&vals, *a)?, I16X8);
                 let y = vcast(b, get(&vals, *rb)?, I16X8);
                 let r = b.ins().sqmul_round_sat(x, y);
+                vcast(b, r, I8X16)
+            }
+            Inst::VFma {
+                shape,
+                neg,
+                a,
+                b: rb,
+                c,
+            } => {
+                let ty = vec_ty(*shape);
+                let xa = vcast(b, get(&vals, *a)?, ty);
+                // `nmadd` is `−a·b + c`: negate the product by negating `a`.
+                let x = if *neg { b.ins().fneg(xa) } else { xa };
+                let y = vcast(b, get(&vals, *rb)?, ty);
+                let z = vcast(b, get(&vals, *c)?, ty);
+                let r = b.ins().fma(x, y, z);
                 vcast(b, r, I8X16)
             }
             Inst::VSatBin {

@@ -32,4 +32,14 @@ fn shadow_layout_constants_agree_across_crates() {
         svm_interp::STATE_UNWINDING,
         "the UNWINDING state value must match (the freeze-driver trigger)"
     );
+    assert_eq!(
+        svm_durable::STATE_ARMED,
+        svm_interp::STATE_ARMED,
+        "the ARMED state value must match (the mid-run freeze trigger the runtime promotes)"
+    );
+    assert_eq!(
+        svm_durable::ARM_COUNTDOWN_OFF,
+        svm_interp::ARM_COUNTDOWN_OFF,
+        "the arm-countdown offset must match (the runtime decrements what `arm_freeze_after` writes)"
+    );
 }

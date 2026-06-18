@@ -16,3 +16,25 @@ fn freeze_thaw_cross_backend_over_generated_modules() {
         durjit::fuzz_one_xbackend(&mut g);
     }
 }
+
+// Not on Windows: this fuzz compiles the JIT twice per seed (freeze + thaw), and running alongside
+// `freeze_thaw_cross_backend_over_generated_modules` in the same test binary pushes the process's
+// cumulative JIT allocations far enough from the statically-linked runtime thunks that a PC-relative
+// relocation overflows `i32` (>2 GiB) inside cranelift-jit (`compiled_blob.rs` `perform_relocations`
+// panics with `TryFromIntError`) — an address-space-drift limitation of the Windows JIT, not a
+// backend divergence, and partly ASLR-nondeterministic. Windows keeps full recycled coverage via the
+// hand-written `durable_fibers_jit::jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit`
+// and the 400-seed interpreter fuzz `durable_fuzz::recycled_fiber_freeze_thaw_equivalence_over_generated_modules`
+// (no JIT, so no drift). The libFuzzer target `durable_recycle_jit` does the heavy run elsewhere.
+#[cfg(not(windows))]
+#[test]
+fn recycled_fiber_freeze_thaw_cross_backend_over_generated_modules() {
+    // Recycling step 4, cross-backend: churn modules recycle a slot (generation 1..=3), park the
+    // real fiber there, and are frozen *mid-run* via `arm_freeze_after`. The interp and JIT must
+    // armed-freeze the recycled fiber to a byte-identical reserve + §12 artifact, and the
+    // interp-frozen artifact must thaw on the JIT to the uninterrupted result.
+    for seed in 0..64u64 {
+        let mut g = durjit::durgen::Gen::from_seed(seed);
+        durjit::fuzz_recycle_fiber_one_xbackend(&mut g);
+    }
+}

@@ -157,3 +157,147 @@ fn two_vcpu_domain_freezes_and_thaws() {
         "thawed two-vCPU domain reloads the saved clock reads (95), not re-issued ones (99)"
     );
 }
+
+// Slice 3.2.2 — the vCPU + fiber combination 3.2.1 could not do. The root spawns a child vCPU AND
+// owns a fiber: with `context = task id` the child (task 1) and the fiber (slot 0 → context 1) would
+// collide; the top-down vCPU layout puts the child at MAX_SHADOW_CTX while the fiber stays at context
+// 1. The root spawns the child, creates a fiber that suspends (yielding 5, parked at the freeze), then
+// unwinds at its `cont.resume` (its first may-suspend point). On thaw the parked fiber re-seeds and
+// the child re-spawns into non-overlapping regions; the child's clock read reloads, not re-issues.
+const SRC_FIBER_AND_VCPU: &str = r#"
+func (i32) -> (i64) {
+block0(v0: i32):
+  v1 = i64.const 65536
+  i32.store v1 v0
+  v2 = i64.const 0
+  v3 = i64.const 0
+  v4 = thread.spawn 1 v2 v3
+  v5 = ref.func 2
+  v6 = i64.const 4096
+  v7 = cont.new v5 v6
+  v8 = i64.const 0
+  v9, v10 = cont.resume v7 v8
+  v13 = thread.join v4
+  v14 = i64.add v10 v13
+  return v14
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 65536
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = cap.call 2 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.const 10
+  v7 = i64.add v5 v6
+  return v7
+}
+func (i64, i64) -> (i64) {
+block0(v0: i64, v1: i64):
+  v2 = i64.const 5
+  v3 = suspend v2
+  v4 = i64.const 1000
+  v5 = i64.add v3 v4
+  return v5
+}
+"#;
+
+fn instrument_src(src: &str) -> Module {
+    let mut m = svm_text::parse_module(src).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = transform_module_assume_confined(&m).expect("transform");
+    svm_verify::verify_module(&inst).expect("verify");
+    inst
+}
+
+#[test]
+fn vcpu_and_fiber_coexist_through_freeze_thaw() {
+    let inst = instrument_src(SRC_FIBER_AND_VCPU);
+
+    // Baseline: fiber yields 5; child reads clock (42) + 10 = 52; result = 5 + 52 = 57.
+    let want = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &init_durable_window(WINDOW),
+            SIZE_LOG2,
+            &mut h,
+        );
+        r.expect("uninterrupted")
+    };
+    assert_eq!(want, vec![Value::I64(57)], "uninterrupted: 5 + (42 + 10)");
+
+    // Freeze: UNWINDING. The root unwinds at cont.resume with the fiber parked (context 1); the child
+    // unwinds into its top-down context. Capture window + both residues.
+    let (frozen_fibers, frozen_vcpus, root_sp, snap, clock_after) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut win = init_durable_window(WINDOW);
+        write_state(&mut win, STATE_UNWINDING);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+        (
+            h.frozen_fibers().to_vec(),
+            h.frozen_vcpus().to_vec(),
+            h.frozen_root_sp().expect("root extent recorded"),
+            snap,
+            h.clock_ns,
+        )
+    };
+    assert_eq!(frozen_fibers.len(), 1, "the root's fiber was flattened");
+    assert_eq!(frozen_vcpus.len(), 1, "the spawned vCPU was captured");
+    assert_eq!(frozen_vcpus[0].task, 1, "child is task 1");
+    assert!(
+        clock_after > 42,
+        "the freeze ran the child's clock read once"
+    );
+
+    // Thaw on a host whose clock has advanced: the child reloads 42, not re-issues (which would use
+    // clock_after). The fiber re-seeds and the child re-spawns into non-overlapping regions.
+    let r_thaw = {
+        let mut win = snap.clone();
+        write_state(&mut win, STATE_REWINDING);
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = clock_after;
+        let clk = h.grant_clock();
+        h.set_frozen_fibers(frozen_fibers);
+        h.set_frozen_vcpus(frozen_vcpus);
+        h.set_frozen_root_sp(root_sp);
+        let mut fuel = 1_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        r
+    };
+    assert_eq!(
+        r_thaw,
+        Ok(want),
+        "thawed vCPU+fiber domain reloads the saved clock read (57), not a re-issued one"
+    );
+}

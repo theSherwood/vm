@@ -371,6 +371,153 @@ fn f32x4_pmin_pmax() {
     assert!(run("f32x4.pmax", 1.0, f32::NAN).to_bits() == 1.0f32.to_bits());
 }
 
+/// **Relaxed SIMD** through the wasm bridge — each op runs one spec-allowed deterministic behavior,
+/// interp == JIT (enforced by `eval`). `relaxed_madd`/`nmadd` are a genuine fused FMA (one rounding,
+/// matching Rust's `mul_add`); the rest alias to the deterministic op SVM already lowers. This is the
+/// shape a real `clang -mrelaxed-simd` kernel emits.
+#[test]
+fn relaxed_simd_madd_and_friends() {
+    // relaxed_madd(a,b,c) = a*b + c (fused). Splat three scalars, read lane 0.
+    let madd = |op: &str, a: f32, b: f32, c: f32| {
+        let wat = format!(
+            "(module (func (export \"f\") (param $a f32) (param $b f32) (param $c f32) (result f32)
+               (f32x4.extract_lane 0 ({op} (f32x4.splat (local.get $a))
+                  (f32x4.splat (local.get $b)) (f32x4.splat (local.get $c))))))"
+        );
+        f32(eval(
+            &wat,
+            "f",
+            &[Value::F32(a), Value::F32(b), Value::F32(c)],
+        ))
+    };
+    for (a, b, c) in [(2.0f32, 3.0, 4.0), (1e20, 1e20, -1e30), (0.1, 0.2, 0.3)] {
+        assert_eq!(
+            madd("f32x4.relaxed_madd", a, b, c).to_bits(),
+            a.mul_add(b, c).to_bits(),
+            "relaxed_madd {a} {b} {c}"
+        );
+        assert_eq!(
+            madd("f32x4.relaxed_nmadd", a, b, c).to_bits(),
+            (-a).mul_add(b, c).to_bits(),
+            "relaxed_nmadd {a} {b} {c}"
+        );
+    }
+
+    // relaxed_min/max alias to the deterministic wasm min/max.
+    let minmax = |op: &str, a: f32, b: f32| {
+        let wat = format!(
+            "(module (func (export \"f\") (param $a f32) (param $b f32) (result f32)
+               (f32x4.extract_lane 0 ({op} (f32x4.splat (local.get $a)) (f32x4.splat (local.get $b))))))"
+        );
+        f32(eval(&wat, "f", &[Value::F32(a), Value::F32(b)]))
+    };
+    assert_eq!(minmax("f32x4.relaxed_min", 2.0, 5.0), 2.0);
+    assert_eq!(minmax("f32x4.relaxed_max", 2.0, 5.0), 5.0);
+
+    // relaxed_trunc aliases to trunc_sat (saturating, NaN→0).
+    let trunc = |x: f32| {
+        let wat = "(module (func (export \"f\") (param $x f32) (result i32)
+               (i32x4.extract_lane 0 (i32x4.relaxed_trunc_f32x4_s (f32x4.splat (local.get $x))))))";
+        match eval(wat, "f", &[Value::F32(x)]) {
+            Value::I32(v) => v,
+            _ => unreachable!(),
+        }
+    };
+    assert_eq!(trunc(3.9), 3);
+    assert_eq!(trunc(-3.9), -3);
+    assert_eq!(trunc(f32::NAN), 0, "trunc_sat maps NaN→0");
+
+    // relaxed_laneselect aliases to bitselect (mask all-1 lane ⇒ take a).
+    let wat = "(module (func (export \"f\") (result i32)
+        (i32x4.extract_lane 0 (i32x4.relaxed_laneselect
+          (i32x4.splat (i32.const 0xAAAA)) (i32x4.splat (i32.const 0x5555))
+          (i32x4.splat (i32.const 0xFFFFFFFF))))))";
+    assert_eq!(
+        eval(wat, "f", &[]),
+        Value::I32(0xAAAA),
+        "all-1 mask selects a"
+    );
+}
+
+/// The two relaxed **i8×i7 dot** ops (the deterministic signed-i8 lowering): the i16 dot and the
+/// i32 dot-with-accumulate. Splatted bytes a=3, b=4 → each i16 lane = 3·4+3·4 = 24; the i32 add
+/// variant widen-pairwise-adds two i16 lanes (24+24) and adds the accumulator. `eval` pins interp==JIT.
+#[test]
+fn relaxed_simd_i8_dot() {
+    // i16x8.relaxed_dot_i8x16_i7x16_s: lane = a·b + a·b = 2·(a·b).
+    let dot = "(module (func (export \"f\") (param $a i32) (param $b i32) (result i32)
+        (i16x8.extract_lane_s 0 (i16x8.relaxed_dot_i8x16_i7x16_s
+          (i8x16.splat (local.get $a)) (i8x16.splat (local.get $b))))))";
+    let got = match eval(dot, "f", &[Value::I32(3), Value::I32(4)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(got, 24, "3·4 + 3·4");
+
+    // i32x4.relaxed_dot_i8x16_i7x16_add_s: extadd_pairwise(dot) + c. dot lanes are all 24, so each
+    // i32 lane = 24 + 24 + c = 48 + c. Accumulator c splatted to 100 ⇒ 148.
+    let dota = "(module (func (export \"f\") (param $a i32) (param $b i32) (param $c i32) (result i32)
+        (i32x4.extract_lane 0 (i32x4.relaxed_dot_i8x16_i7x16_add_s
+          (i8x16.splat (local.get $a)) (i8x16.splat (local.get $b)) (i32x4.splat (local.get $c))))))";
+    let got = match eval(dota, "f", &[Value::I32(3), Value::I32(4), Value::I32(100)]) {
+        Value::I32(v) => v,
+        _ => unreachable!(),
+    };
+    assert_eq!(got, 148, "24 + 24 + 100");
+}
+
+/// SIMD memory variants — splat-load, load-zero, load-extend, load/store-lane (the shapes clang
+/// `-msimd128` emits constantly). Each composes a scalar load/store with a lane op; `eval` runs both
+/// backends. A real auto-vectorized loop with a broadcast load exercises exactly these.
+#[test]
+fn simd_memory_variants() {
+    // load32_splat: broadcast a scalar to every lane (read lane 3 to prove it reached the top).
+    let splat = r#"(module (memory 1) (data (i32.const 0) "\78\56\34\12")
+      (func (export "f") (result i32)
+        (i32x4.extract_lane 3 (v128.load32_splat (i32.const 0)))))"#;
+    assert_eq!(eval(splat, "f", &[]), Value::I32(0x12345678u32 as i32));
+
+    // load8_splat: broadcast a byte; lane 9 = the byte.
+    let bsplat = r#"(module (memory 1) (data (i32.const 0) "\2a")
+      (func (export "f") (result i32)
+        (i8x16.extract_lane_u 9 (v128.load8_splat (i32.const 0)))))"#;
+    assert_eq!(eval(bsplat, "f", &[]), Value::I32(42));
+
+    // load32_zero: lane 0 = scalar (-1), lane 1 = 0 ⇒ sum −1.
+    let zero = r#"(module (memory 1) (data (i32.const 0) "\ff\ff\ff\ff")
+      (func (export "f") (result i32)
+        (i32.add
+          (i32x4.extract_lane 0 (v128.load32_zero (i32.const 0)))
+          (i32x4.extract_lane 1 (v128.load32_zero (i32.const 0))))))"#;
+    assert_eq!(eval(zero, "f", &[]), Value::I32(-1));
+
+    // load8x8_u: load 8 bytes [10,20,30,…], zero-extend to i16x8; lane 2 = 30.
+    let ext = r#"(module (memory 1) (data (i32.const 0) "\0a\14\1e\28\32\3c\46\50")
+      (func (export "f") (result i32)
+        (i16x8.extract_lane_u 2 (v128.load8x8_u (i32.const 0)))))"#;
+    assert_eq!(eval(ext, "f", &[]), Value::I32(30));
+
+    // load16x4_s: load 4 i16 incl. a negative one, sign-extend to i32x4; lane 0 = -1.
+    let exts = r#"(module (memory 1) (data (i32.const 0) "\ff\ff\01\00\02\00\03\00")
+      (func (export "f") (result i32)
+        (i32x4.extract_lane 0 (v128.load16x4_s (i32.const 0)))))"#;
+    assert_eq!(eval(exts, "f", &[]), Value::I32(-1));
+
+    // load32_lane: splice a loaded scalar into lane 2 of a splatted vector.
+    let llane = r#"(module (memory 1) (data (i32.const 0) "\ad\de\00\00")
+      (func (export "f") (result i32)
+        (i32x4.extract_lane 2
+          (v128.load32_lane 2 (i32.const 0) (i32x4.splat (i32.const 7))))))"#;
+    assert_eq!(eval(llane, "f", &[]), Value::I32(0xdead));
+
+    // store32_lane: extract lane 1 of a const vector, store it, load it back.
+    let slane = r#"(module (memory 1)
+      (func (export "f") (result i32)
+        (v128.store32_lane 1 (i32.const 16) (v128.const i32x4 100 200 300 400))
+        (i32.load (i32.const 16))))"#;
+    assert_eq!(eval(slane, "f", &[]), Value::I32(200));
+}
+
 #[test]
 fn f64x2_pmin_pmax() {
     let pm = |op: &str| {
