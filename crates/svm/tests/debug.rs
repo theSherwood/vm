@@ -457,6 +457,7 @@ debug.var 0 "buf" win 16 "char"
 debug.var 0 "p" win 24 "struct" 3
 debug.var 0 "k" ssalist 2 0 0 0 1 1 2 "int"
 debug.var 0 "w" winvia 2 0 0 1 1 3 5 -8 "int"
+debug.var global "g" fixed 64 "int" 0
 debug.blob "x.dw" "ab\x00\xffcd"
 "#;
     let m = parse_module(src).expect("parse");
@@ -468,7 +469,13 @@ debug.blob "x.dw" "ab\x00\xffcd"
     assert_eq!(di.files, vec!["a.c".to_string()]);
     assert_eq!(di.locs.len(), 1);
     assert_eq!(di.types.len(), 4);
-    assert_eq!(di.vars.len(), 5);
+    assert_eq!(di.vars.len(), 6);
+
+    // The module-scoped global parsed as a `Fixed` absolute-address var under the `GLOBAL_SCOPE`
+    // sentinel func (visible in every frame).
+    assert_eq!(di.vars[5].func, svm_ir::GLOBAL_SCOPE);
+    assert_eq!(di.vars[5].loc, svm_ir::VarLoc::Fixed { addr: 64 });
+    assert_eq!(di.vars[5].type_id, Some(0));
 
     // The runtime-base window var (winvia) parsed its base loclist + offset.
     let svm_ir::VarLoc::WindowVia { base, off } = &di.vars[4].loc else {

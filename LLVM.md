@@ -914,6 +914,27 @@ metadata (we drop `llvm.dbg.*` regardless) and a few C-API-only getters (which c
 `inkwell` equally — both are LLVM-C-API-bound), neither of which touches the scalar+memory+
 call MVP. No mature *pure-Rust* bitcode reader exists, so any programmatic read links
 libLLVM; D54 sanctions that as a build/dev-time dep (Q4 keeps it off the runtime path).
+
+**Debug-info nuance (the §6/D-DBG-7 waist).** The "debug metadata gap" above is *one-sided*:
+`llvm-ir` **does** expose per-instruction `!DILocation` (line/col/file, via `HasDebugLoc`), so the
+on-ramp populates the §6 neutral core's **source-line half** from it (`DebugAcc` in
+`crates/svm-llvm/src/lib.rs` → `DebugInfo.locs`; DEBUGGING.md slice 24) — making LLVM the *third*
+producer to feed the frontend-neutral waist. The **structured DI graph**
+(`DILocalVariable`/`DIType`/`llvm.dbg.value`) is missing from `llvm-ir` (`Metadata::from_llvm_ref` is
+`unimplemented!`, `MetadataOperand` is payloadless), so the **fallback-reader** decision above is now
+realized concretely: `crates/svm-llvm/src/di.rs` walks the DI nodes **directly through `llvm-sys`**
+(the LLVM-C debug-info API), re-parsing the `.bc` into its own context. Slice 25 lands the `-O0 -g`
+case — every C local is an `alloca` + `dbg.declare`, recovered as a `TypeDef`-typed `VarLoc::Window`
+correlated to the IR by *alloca ordinal* (stable across the two parses). The LLVM-C DI API has no
+getters for the `baseType`/`elements` edges or the base-type `encoding`, so the type graph is walked
+via the generic MDNode-operand bridge at the positional indices LLVM 18 uses (pinned + tested), and
+`encoding` is inferred from the C name. Slice 26 adds the `-O2`/`-Og` `dbg.value` case (promoted
+scalars, which LLVM solves for free — its intrinsics survive mem2reg/SROA): a `dbg.value` bound to a
+function **argument** becomes a `VarLoc::SsaList` over the arg's live range (the arg is ValueId `k`,
+threaded as a block parameter, so its block-local index is its position in each block's param list).
+At `-Og`/`-O2` most *other* locals are optimized to `poison`/constants, so parameters are the main
+recoverable variable; `dbg.value` bindings to instruction-result / φ values (needing a value→ValueId
+ordinal correlation and per-pc `SsaLoc.inst`) are a follow-up of limited yield.
 **Fallback order if `llvm-ir` bites:** `inkwell` (maintained, version-tracking wrapper) →
 hand-rolled `.ll` parser over `opt -S` (zero libLLVM link, but a rot-prone parser we own).
 

@@ -69,7 +69,7 @@ impl Session {
         let var = debug
             .vars
             .iter()
-            .find(|v| v.func == func && v.name == name)?;
+            .find(|v| (v.func == func || v.func == svm_ir::GLOBAL_SCOPE) && v.name == name)?;
         let width = scalar_width(&debug.types, var.type_id, &var.ty);
         var_to_i64(&self.inspector.read_var(frame_idx, name, width)?)
     }
@@ -473,14 +473,18 @@ impl DapServer {
         let vars: Vec<(String, String, VarLoc, Option<TypeId>)> = debug
             .vars
             .iter()
-            .filter(|v| v.func == frame.pc.func)
+            .filter(|v| v.func == frame.pc.func || v.func == svm_ir::GLOBAL_SCOPE)
             .map(|v| (v.name.clone(), v.ty.clone(), v.loc.clone(), v.type_id))
             .collect();
         let mut out = Vec::new();
         for (name, ty, loc, type_id) in vars {
-            // A memory-located aggregate/array (`Window` or the wasm `WindowVia`) is expandable:
-            // name a `Place` at its base address (resolved per pc by the Inspector).
-            let is_mem = matches!(loc, VarLoc::Window { .. } | VarLoc::WindowVia { .. });
+            // A memory-located aggregate/array (`Window`, the wasm `WindowVia`, or a global's
+            // `Fixed` address) is expandable: name a `Place` at its base address (resolved per pc by
+            // the Inspector).
+            let is_mem = matches!(
+                loc,
+                VarLoc::Window { .. } | VarLoc::WindowVia { .. } | VarLoc::Fixed { .. }
+            );
             if let Some(tid_ref) = type_id.filter(|&t| is_mem && self.is_expandable(t)) {
                 if let Some(base) = self.session.as_ref()?.inspector.var_addr(frame_idx, &name) {
                     let summary = self.place_summary(base, tid_ref);
@@ -801,7 +805,7 @@ impl DapServer {
         let bare = session.debug.as_ref().and_then(|d| {
             d.vars
                 .iter()
-                .find(|v| v.func == func && v.name == expr)
+                .find(|v| (v.func == func || v.func == svm_ir::GLOBAL_SCOPE) && v.name == expr)
                 .map(|v| (d, v))
         });
         if let Some((debug, var)) = bare {
@@ -1179,11 +1183,12 @@ impl expr::Resolver for EvalEnv<'_> {
         let var = self
             .vars
             .iter()
-            .find(|v| v.func == self.func && v.name == name)?;
+            .find(|v| (v.func == self.func || v.func == svm_ir::GLOBAL_SCOPE) && v.name == name)?;
         match &var.loc {
-            // A memory-located var (`Window` data-SP slot or the wasm `WindowVia` runtime base) is a
-            // typed `Place` (so member/index/expansion work), resolved per pc by the Inspector.
-            VarLoc::Window { .. } | VarLoc::WindowVia { .. } => {
+            // A memory-located var (`Window` data-SP slot, the wasm `WindowVia` runtime base, or a
+            // global's `Fixed` address) is a typed `Place` (so member/index/expansion work),
+            // resolved per pc by the Inspector.
+            VarLoc::Window { .. } | VarLoc::WindowVia { .. } | VarLoc::Fixed { .. } => {
                 let addr = self.inspector.var_addr(self.frame_idx, name)?;
                 match var.type_id {
                     Some(type_id) => Some(expr::Value::Place { addr, type_id }),

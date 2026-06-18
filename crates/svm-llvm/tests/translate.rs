@@ -40,6 +40,49 @@ fn compile_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     }
 }
 
+/// Compile a C snippet to legalized bitcode **with debug info** (`-g`). Uses `-Og` (optimize for
+/// debugging): mem2reg/SROA still run — so scalars arrive promoted, the legalized shape the on-ramp
+/// needs — while the per-statement line table is preserved (`-O2` collapses a tiny function's lines
+/// onto one). So the §6 source-line ingest can be exercised against real, multi-line clang debug
+/// metadata. `None` (skip) if clang is unavailable.
+fn compile_to_bc_g(name: &str, src: &str) -> Option<PathBuf> {
+    compile_g(name, src, "-Og")
+}
+
+/// Compile at `-O0 -g`: every C local stays an `alloca` + `llvm.dbg.declare`, the shape the §6
+/// **variable** ingest reads (a `dbg.declare` → a `Window` frame slot). `None` (skip) if clang is
+/// unavailable.
+fn compile_to_bc_o0g(name: &str, src: &str) -> Option<PathBuf> {
+    compile_g(name, src, "-O0")
+}
+
+fn compile_g(name: &str, src: &str, opt: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let c = dir.join(format!("svm_llvm_g_{}_{}.c", std::process::id(), name));
+    let bc = dir.join(format!("svm_llvm_g_{}_{}.bc", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
+    let status = Command::new("clang")
+        .args([
+            opt,
+            "-g",
+            "-emit-llvm",
+            "-c",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+        ])
+        .arg(&c)
+        .arg("-o")
+        .arg(&bc)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(bc),
+        _ => {
+            eprintln!("note: skipping {name} (clang unavailable)");
+            None
+        }
+    }
+}
+
 fn to_slot(v: &Value) -> i64 {
     match v {
         Value::I32(x) => *x as i64,
@@ -2103,8 +2146,6 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     let status = Command::new("rustc")
         .args([
             "+1.81.0",
-            "--edition",
-            "2021",
             "--emit=llvm-bc",
             "--crate-type=lib",
             "-C",
@@ -2113,10 +2154,12 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
             "opt-level=2",
             "-C",
             "overflow-checks=off",
-            // Keep SIMD out of the MVP (matching the C/C++ lanes' `-fno-*-vectorize`): `-O2`
-            // auto-vectorizes reductions/loops into `<N x iM>` + horizontal reduces, which is a
-            // separate §17/D58 concern. The native oracle keeps vectorizing — an integer reduction is
-            // associative, so scalar (on-ramp) and vectorized (native) agree.
+            // Keep `-O2` codegen in the on-ramp's **scalar** subset: disable LLVM auto-vectorization
+            // so a loop/slice reduction stays scalar instead of becoming an `<N x iM>` vector the
+            // on-ramp's SIMD support (slice Y: `<4 x float>`/`v128`) doesn't cover for integers.
+            // Whether `-O2` vectorizes is host-CPU-sensitive, so without this the Rust breadth tests
+            // are flaky (e.g. a `&[i32]` sum becoming `<4 x i32>` → `Unsupported("v128")`). The Rust
+            // tests target *core/scalar* Rust, not SIMD (the SIMD path is covered by the C tests).
             "-C",
             "llvm-args=-vectorize-loops=false",
             "-C",
@@ -2200,15 +2243,7 @@ fn rust_compute_native(n: i32) -> Option<i32> {
     )
     .expect("write Rust source");
     match Command::new("rustc")
-        .args([
-            "+1.81.0",
-            "--edition",
-            "2021",
-            "-C",
-            "opt-level=2",
-            "-C",
-            "overflow-checks=off",
-        ])
+        .args(["+1.81.0", "-C", "opt-level=2", "-C", "overflow-checks=off"])
         .arg(&rs)
         .arg("-o")
         .arg(&exe)
@@ -2244,6 +2279,381 @@ fn rust_no_std_matches_native() {
             "compute({n}): on-ramp {svm} vs native rustc {native} (i33 wrap mismatch?)"
         );
     }
+}
+
+// ---- §6 / D-DBG-7: the debug-info waist (LLVM as the third producer) -------------------------
+
+/// The LLVM on-ramp populates the §6 frontend-neutral debug-info waist's **source-line half** from
+/// each instruction's `!DILocation` — the third independent frontend (after chibicc and the wasm
+/// DWARF producer) to feed the *same* neutral core, the cross-check that the waist isn't coupled to
+/// any one frontend (DEBUGGING.md §6). (The variable/type half is covered by the `_o0_`/`_og_`
+/// tests; here `n` rides in as an argument var, asserted minimally.)
+#[test]
+fn llvm_dilocation_maps_into_the_debug_info_waist() {
+    // A chain of dependent statements over a runtime input: each keeps its own source line and
+    // lowers to a real (non-terminator) arithmetic op, so several distinct lines reach the IR pcs
+    // (clang can't constant-fold the chain away, and nothing collapses onto one line).
+    let src = "\
+int chain(int n) {
+  int a = n + 1;
+  int b = a * 3;
+  int c = b - 2;
+  int d = c * c;
+  return d + a;
+}
+";
+    let Some(bc) = compile_to_bc_g("dilocation", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    // The debug section is strippable / untrusted-for-escape — it must not affect verification.
+    svm_verify::verify_module(&t.module).expect("verify");
+
+    let di = t
+        .module
+        .debug_info
+        .as_ref()
+        .expect("debug info populated from !DILocation");
+
+    // The file table names the C source (clang records its compile path).
+    assert!(
+        di.files.iter().any(|f| f.ends_with(".c")),
+        "file table names the C source: {:?}",
+        di.files
+    );
+    // Source lines are mapped onto IR pcs.
+    assert!(!di.locs.is_empty(), "some source locations were mapped");
+    // The parameter `n` is ingested via `dbg.value` (the variable half — exercised in depth by the
+    // `_o0_`/`_og_` tests).
+    assert!(
+        di.vars.iter().any(|v| v.name == "n"),
+        "the parameter is ingested"
+    );
+
+    // Every loc resolves to an in-range IR `(func, block, inst)` — the cross-check that the
+    // LLVM-instruction → SVM-op mapping is self-consistent.
+    for l in &di.locs {
+        assert!((l.file as usize) < di.files.len(), "loc file in range");
+        let f = l.func as usize;
+        assert!(f < t.module.funcs.len(), "loc func {f} in range");
+        let b = l.block as usize;
+        assert!(b < t.module.funcs[f].blocks.len(), "loc block in range");
+        assert!(
+            (l.inst as usize) < t.module.funcs[f].blocks[b].insts.len(),
+            "loc inst in range"
+        );
+        assert!(l.line >= 1, "a real source line");
+    }
+
+    // The body spans several source lines (the multiply/add at line 4, the return at line 5) — not
+    // everything collapsed onto the function's opening line.
+    let lines: std::collections::BTreeSet<u32> = di.locs.iter().map(|l| l.line).collect();
+    assert!(
+        lines.len() >= 3,
+        "the statement chain maps several distinct source lines: {lines:?}"
+    );
+}
+
+/// A non-`-g` build carries **no** debug section — the waist is absent (zero cost), byte-identical
+/// to before this producer existed.
+#[test]
+fn llvm_without_g_has_no_debug_info() {
+    let Some((m, _)) = translate_verified("no_g", "int id(int x) { return x; }") else {
+        return;
+    };
+    assert!(m.debug_info.is_none(), "no -g ⇒ no debug section");
+}
+
+/// The §6 **variable/type half** for LLVM: a direct `llvm-sys` walk of the `-O0 -g` DI metadata
+/// recovers each source local's name + structured type and correlates it to the IR by alloca
+/// ordinal, landing it in the waist as a `Window` var — the LLVM analog of the wasm DWARF
+/// aggregate/pointer/array ingest (DEBUGGING.md slice 25). Mirrors the wasm
+/// `wasm_dwarf_ingests_aggregate_pointer_and_array_types` test over the same struct/array/pointer
+/// shapes, the cross-frontend cross-check that the structured-type waist is genuinely neutral.
+#[test]
+fn llvm_o0_ingests_aggregate_pointer_and_array_variables() {
+    use svm_ir::{TypeDef, VarLoc};
+
+    // `pp = &p` forces the struct to stay in memory (a real dbg.declare/alloca, not a dbg.value).
+    let src = "\
+struct Point { int x; int y; };
+int dist(int n) {
+  struct Point p;
+  int row[3];
+  struct Point *pp = &p;
+  p.x = n; p.y = n + 1;
+  row[0] = n;
+  return p.x + p.y + row[0] + pp->x;
+}
+";
+    let Some(bc) = compile_to_bc_o0g("llvm_vars", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify"); // debug info is escape-irrelevant
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    let var = |n: &str| {
+        di.vars.iter().find(|v| v.name == n).unwrap_or_else(|| {
+            panic!(
+                "var {n}: {:?}",
+                di.vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+            )
+        })
+    };
+    let var_type = |n: &str| &di.types[var(n).type_id.expect("typed") as usize];
+
+    // Every local is a `Window` frame slot (the alloca's data-stack offset); offsets are distinct.
+    let mut offs = Vec::new();
+    for n in ["p", "row", "pp"] {
+        let VarLoc::Window { off } = var(n).loc else {
+            panic!("{n} is a Window var, got {:?}", var(n).loc);
+        };
+        assert!(off >= 0 && (off as u64) < t.module.funcs[0].blocks.len() as u64 * 4096);
+        offs.push(off);
+    }
+    offs.sort();
+    offs.dedup();
+    assert_eq!(offs.len(), 3, "p/row/pp occupy distinct frame slots");
+
+    // `struct Point p` — aggregate x@0, y@4, both 4-byte ints, size 8.
+    let TypeDef::Aggregate { name, size, fields } = var_type("p") else {
+        panic!("p is a struct, got {:?}", var_type("p"));
+    };
+    assert_eq!(name, "struct Point");
+    assert_eq!(*size, 8);
+    assert_eq!(
+        fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.offset))
+            .collect::<Vec<_>>(),
+        vec![("x", 0), ("y", 4)]
+    );
+    assert!(matches!(
+        &di.types[fields[0].ty as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `int row[3]` — array of 3 ints.
+    let TypeDef::Array { elem, count, .. } = var_type("row") else {
+        panic!("row is an array, got {:?}", var_type("row"));
+    };
+    assert_eq!(*count, 3);
+    assert!(matches!(
+        &di.types[*elem as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `struct Point *pp` — pointer whose pointee is the same aggregate as `p`.
+    let TypeDef::Pointer { pointee, name, .. } = var_type("pp") else {
+        panic!("pp is a pointer, got {:?}", var_type("pp"));
+    };
+    assert_eq!(name, "struct Point *");
+    assert!(matches!(
+        &di.types[*pointee as usize],
+        TypeDef::Aggregate { name, .. } if name == "struct Point"
+    ));
+}
+
+/// Runtime proof that the alloca-ordinal correlation lands on the **right** frame slots: stop the
+/// interpreter just before `dist` returns and read each source variable back through the §6 waist
+/// (`Window` reads at the resolved data-stack offset). Locks that the `dbg.declare` address →
+/// alloca ordinal → frame offset chain is correct, not merely structurally plausible.
+#[test]
+fn llvm_o0_variables_read_at_runtime() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+
+    let src = "\
+struct Point { int x; int y; };
+int dist(int n) {
+  struct Point p;
+  int row[3];
+  struct Point *pp = &p;
+  p.x = n; p.y = n + 1;
+  row[0] = n;
+  return p.x + p.y + row[0] + pp->x;
+}
+";
+    let Some(bc) = compile_to_bc_o0g("llvm_vars_rt", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+
+    // Break at the last instruction of the last block — `dist` is branch-free at -O0, so by here
+    // every store (p.x=n, p.y=n+1, row[0]=n) has executed.
+    let lb = t.module.funcs[0].blocks.len() - 1;
+    let li = t.module.funcs[0].blocks[lb].insts.len() - 1;
+    let n = 5i32;
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: lb,
+        inst: li,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped at the return"
+    );
+
+    let i32_at = |vv: Option<VarValue>, off: usize| -> i32 {
+        match vv {
+            Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[off..off + 4].try_into().unwrap()),
+            other => panic!("expected window bytes, got {other:?}"),
+        }
+    };
+    // `struct Point p` reads x = n, y = n + 1 (8 bytes: x then y).
+    let p = insp.read_var(0, "p", 8);
+    assert_eq!(i32_at(p.clone(), 0), n, "p.x");
+    assert_eq!(i32_at(p, 4), n + 1, "p.y");
+    // `int row[3]` — element 0 was set to n.
+    assert_eq!(i32_at(insp.read_var(0, "row", 4), 0), n, "row[0]");
+}
+
+/// The §6 variable half at **`-O2`/`-Og`**: `llvm.dbg.value` binds a source variable to an SSA
+/// value rather than memory (mem2reg/SROA promoted it). The `di` reader recovers `dbg.value`
+/// bindings to a function **argument** and the translator emits a `VarLoc::SsaList` over the
+/// argument's live range (its block-local index per block) — the LLVM frontend exercising the same
+/// location-list machinery chibicc and wasm use, the case where LLVM's debug intrinsics surviving
+/// optimization make the parameter inspectable for free (DEBUGGING.md slice 26).
+#[test]
+fn llvm_og_ingests_argument_via_dbg_value_ssalist() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+    use svm_ir::{Encoding, TypeDef, VarLoc};
+
+    // A loop keeps `n` live across multiple blocks, so the SsaList spans more than the entry block.
+    let src = "\
+int scaled(int n) {
+  int total = 0;
+  for (int k = 0; k < 4; k++)
+    total += n;
+  return total;
+}
+";
+    let Some(bc) = compile_to_bc_g("og_arg", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    // `n` (the argument) is ingested as a typed SSA-located var with at least one location-list
+    // entry (no `Window` slot — it was promoted to a register).
+    let n_var = di.vars.iter().find(|v| v.name == "n").unwrap_or_else(|| {
+        panic!(
+            "n ingested: {:?}",
+            di.vars.iter().map(|v| &v.name).collect::<Vec<_>>()
+        )
+    });
+    let VarLoc::SsaList(locs) = &n_var.loc else {
+        panic!("n is an SsaList var, got {:?}", n_var.loc);
+    };
+    assert!(!locs.is_empty(), "n has location-list entries");
+    for l in locs {
+        assert!(
+            (l.block as usize) < t.module.funcs[0].blocks.len(),
+            "entry block in range"
+        );
+    }
+    assert!(matches!(
+        &di.types[n_var.type_id.expect("typed") as usize],
+        TypeDef::Base {
+            encoding: Encoding::Signed,
+            size: 4,
+            ..
+        }
+    ));
+
+    // Runtime: stop in the entry block and read `n` back through the SsaList → the argument value.
+    let n = 7i32;
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(n)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    // The first entry-block instruction is a step point with the argument already live.
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped in entry"
+    );
+    assert_eq!(
+        insp.read_var(0, "n", 4),
+        Some(VarValue::Value(Value::I32(n))),
+        "n reads the arg"
+    );
+}
+
+/// The §6 **module-scoped global** half (DEBUGGING.md slice 28): a source-level global variable is
+/// ingested from its `!dbg` `DIGlobalVariableExpression` as a `GLOBAL_SCOPE` `VarLoc::Fixed` var at
+/// the global's window address (correlated by symbol name to the globals layout) — visible in every
+/// frame, with its structured type. Reads back its data-segment value at runtime.
+#[test]
+fn llvm_ingests_source_globals_as_fixed_vars() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+    use svm_ir::{TypeDef, VarLoc};
+
+    let src = "\
+int counter = 7;
+struct P { int a; int b; } origin = { 3, 4 };
+int bump(int n) { counter = counter + n; return counter + origin.a; }
+";
+    let Some(bc) = compile_to_bc_o0g("globals", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    let g = |n: &str| {
+        di.vars
+            .iter()
+            .find(|v| v.name == n && v.func == svm_ir::GLOBAL_SCOPE)
+            .unwrap_or_else(|| panic!("global {n} ingested"))
+    };
+    // `counter` is a fixed-address int global; `origin` a fixed-address struct (expandable).
+    let counter = g("counter");
+    let VarLoc::Fixed { addr: counter_addr } = counter.loc else {
+        panic!("counter is Fixed, got {:?}", counter.loc);
+    };
+    assert!(matches!(
+        &di.types[counter.type_id.expect("typed") as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+    let origin = g("origin");
+    assert!(matches!(origin.loc, VarLoc::Fixed { .. }));
+    assert!(matches!(
+        &di.types[origin.type_id.expect("typed") as usize],
+        TypeDef::Aggregate { name, .. } if name == "struct P"
+    ));
+    assert_ne!(counter_addr, 0, "a real window address");
+
+    // Runtime: at `bump`'s entry the data segment holds counter = 7; read it through the global.
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(10)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped at entry"
+    );
+    let read_i32 = |insp: &Inspector| match insp.read_var(0, "counter", 4) {
+        Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[..4].try_into().unwrap()),
+        other => panic!("expected window bytes, got {other:?}"),
+    };
+    assert_eq!(
+        read_i32(&insp),
+        7,
+        "counter's initial value, read globally at entry"
+    );
 }
 
 // --- Rust breadth, deeper: `core`-using programs (enums/`match`, slices, iterators, `Option`) ----
