@@ -452,14 +452,13 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         // The C++ global constructors (`@llvm.global_ctors`) `_start` runs before `main` (their
         // funcrefs resolve through `name2idx`, now built).
         let ctors = collect_global_ctors(m, &name2idx)?;
-        // Both entries share a signature; `synth_start_argv` adds the §3e args-buffer → `argv[]`
+        // Both entries share `StartBuilder`; `synth_start_argv` adds the §3e args-buffer → `argv[]`
         // parsing for a `main(int, char**)`, `synth_start` is the plain `main(void)` entry.
-        let build_start: fn(u32, &[ValType], u64, usize, Option<u64>, &[u32]) -> Func =
-            if wants_argv {
-                synth_start_argv
-            } else {
-                synth_start
-            };
+        let build_start: StartBuilder = if wants_argv {
+            synth_start_argv
+        } else {
+            synth_start
+        };
         let start = build_start(
             main_idx,
             &main_results,
@@ -2086,6 +2085,12 @@ fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<
     entries.sort_by_key(|&(p, _)| p); // ascending priority: lower runs first (C++ [basic.start])
     Ok(entries.into_iter().map(|(_, idx)| idx).collect())
 }
+
+/// The shared signature of the two synthesized powerbox entries, [`synth_start`] (plain
+/// `main(void)`) and [`synth_start_argv`] (`main(int, char**)`): `(main_idx, main_results, entry_sp,
+/// n_handles, heap_base, ctors) -> Func`. A `type` alias so the dispatch can pick one by function
+/// pointer without tripping `clippy::type_complexity`.
+type StartBuilder = fn(u32, &[ValType], u64, usize, Option<u64>, &[u32]) -> Func;
 
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
 /// capabilities. It takes the `n_handles` granted handles as `i32` params (the §3e powerbox shape
