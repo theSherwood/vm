@@ -37,9 +37,10 @@
 //! `thread.spawn` — a `wasi:thread/spawn` import becomes a real OS-thread vCPU over the shared window
 //! via a synthesized shim (concurrency in the VM, DESIGN §1a; the same bytes `wasmtime-wasi-threads`
 //! runs — `tests/threads.rs`). Imports spanning multiple capability interfaces bind (one handle per
-//! interface). Still a clean [`Error::Unsupported`] (the niche features typical clang output doesn't
-//! emit): the `table.*` bulk ops and passive *element* segments; imported table/global/tag;
-//! wasi:thread/spawn *alongside* capability imports (the per-thread handle stash); reference types;
+//! interface), and capabilities reach spawned threads via a window handle stash (so
+//! `wasi:thread/spawn` works *alongside* capability imports). Still a clean [`Error::Unsupported`]
+//! (the niche features typical clang output doesn't emit): the `table.*` bulk ops and passive
+//! *element* segments; imported table/global/tag; reference types;
 //! multi-memory/multi-table. **Passive data segments + `memory.init`/`data.drop`**
 //! are supported (a constant-offset init unrolls to const-stores of the segment's known bytes).
 
@@ -549,15 +550,16 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // functions, so its index is `bodies.len()`). The shim adapts SVM's thread-entry ABI to the
     // `wasi_thread_start` export.
     let spawn_shim = bodies.len() as u32;
+    // The capability-handle stash sits just past the tid counter: `n_handles` i32 slots. A spawning
+    // thread writes its handle prefix here before `thread.spawn`; the shim reads it on the new thread
+    // (§12 — capability imports *alongside* spawn). Empty (offset unreferenced) for a cap-free module.
+    let n_handles = handle_modules.len() as u32;
+    let stash_base = tid_slot + 4;
     if spawn_import.is_some() {
-        if imports.iter().any(|(t, _, _, _)| *t != u32::MAX) {
-            return unsup(
-                "wasi:thread/spawn alongside capability imports — needs the per-thread handle stash \
-                 (threads-only modules are supported in this slice)",
-            );
-        }
         // The host calls `wasi_thread_start(tid, start_arg)` on each spawned thread; require the export
-        // and that it is `(i32, i32) -> ()` (with no capability handle, since threads-only).
+        // and that its **wasm** type is `(i32, i32) -> ()`. (When the module also has capability
+        // imports it carries the N-handle IR prefix like every defined function — the shim supplies
+        // those handles from the stash; the wasm-level type the host sees is unchanged.)
         let wts = exports
             .iter()
             .find(|(n, _)| n == WASI_THREAD_START_EXPORT)
@@ -576,6 +578,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         spawn_import,
         spawn_shim,
         tid_slot,
+        stash_base,
+        n_handles,
     };
 
     let func_sigs: Vec<(Vec<ValType>, Vec<ValType>)> = func_type_idx
@@ -633,7 +637,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             .find(|(n, _)| n == WASI_THREAD_START_EXPORT)
             .map(|(_, i)| *i)
             .expect("validated above");
-        funcs.push(build_spawn_shim(wts));
+        funcs.push(build_spawn_shim(wts, threads.stash_base, threads.n_handles));
     }
 
     // `(start $f)`: run the start function once before any export. SVM has no instantiation hook (a
@@ -673,7 +677,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         .max(after_mem)
         .max(mem_bytes)
         .max(if spawn_import.is_some() {
-            tid_slot + 4
+            // tid counter + the capability-handle stash (`n_handles` i32 slots after it).
+            stash_base + (n_handles as u64) * 4
         } else {
             0
         });
@@ -1047,6 +1052,13 @@ struct ThreadCfg {
     /// each thread gets a unique positive tid (avoiding the spawn-handle circularity). Reads 0 in a
     /// fresh window, so the first tid is 1.
     tid_slot: u64,
+    /// Window byte offset of the **capability-handle stash**: `n_handles` consecutive i32 slots a
+    /// spawning thread writes its handles into (it has them as its multi-handle prefix) so a spawned
+    /// thread's shim can read them back and thread them into `wasi_thread_start`. Unused (and the
+    /// region unreserved) when `n_handles == 0`.
+    stash_base: u64,
+    /// Number of capability-handle slots in the stash (= the module's distinct import interfaces).
+    n_handles: u32,
 }
 
 struct Lower<'a> {
@@ -1312,40 +1324,72 @@ impl Lower<'_> {
 
 /// Synthesize the §12 spawn shim: a `(i64 sp, i64 arg) -> (i64)` IR function (the `thread.spawn`
 /// entry ABI) that unpacks `(tid, start_arg)` from its packed `arg` and calls the module's
-/// `wasi_thread_start(tid, start_arg)` export (IR index `wts`), then returns 0. The data-SP `sp` is
-/// unused (svm-wasm keeps the C stack in linear memory). `wasi_thread_start` is `(i32, i32) -> ()`
-/// here — threads-only modules thread no capability handle, so it carries no leading handle param.
-fn build_spawn_shim(wts: u32) -> Func {
+/// `wasi_thread_start` export (IR index `wts`), then returns 0. The data-SP `sp` is unused (svm-wasm
+/// keeps the C stack in linear memory).
+///
+/// When the module also has capability imports (`n_handles > 0`), `wasi_thread_start` carries the
+/// N-handle prefix like every defined function, so the shim first **reads the N capability handles
+/// from the window stash** (`stash_base + i*4`, written by the spawning thread in [`spawn_op`]) and
+/// passes them ahead of `(tid, start_arg)`. With `n_handles == 0` this is byte-identical to the old
+/// threads-only shim.
+fn build_spawn_shim(wts: u32, stash_base: u64, n_handles: u32) -> Func {
     // values: v0=sp v1=arg | v2..  (a 0-result `call` appends no value)
-    let insts = vec![
-        Inst::ConstI64(32), // v2
-        Inst::IntBin {
-            ty: IntTy::I64,
-            op: BinOp::ShrU,
-            a: 1, // arg
-            b: 2, // 32
-        }, // v3 = arg >> 32
-        Inst::Convert {
-            op: ConvOp::WrapI64,
-            a: 3,
-        }, // v4 = tid (i32)
-        Inst::Convert {
-            op: ConvOp::WrapI64,
-            a: 1,
-        }, // v5 = start_arg (i32, low 32 of arg)
-        Inst::Call {
-            func: wts,
-            args: vec![4, 5],
-        }, // no result
-        Inst::ConstI64(0),  // v6
-    ];
+    let mut insts: Vec<Inst> = Vec::new();
+    let mut next: u32 = 2;
+    // Load each capability handle from the stash (an i32 per slot). The host's capability table is
+    // shared across vCPUs, so a handle written by the spawning thread is valid on this one.
+    let mut handle_vals: Vec<u32> = Vec::with_capacity(n_handles as usize);
+    for i in 0..n_handles as u64 {
+        insts.push(Inst::ConstI64((stash_base + i * 4) as i64));
+        let addr = next;
+        next += 1;
+        insts.push(Inst::Load {
+            op: LoadOp::I32,
+            addr,
+            offset: 0,
+            align: 2,
+        });
+        handle_vals.push(next);
+        next += 1;
+    }
+    // tid = arg >> 32 (i32); start_arg = arg's low 32 (i32).
+    insts.push(Inst::ConstI64(32));
+    let c32 = next;
+    next += 1;
+    insts.push(Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::ShrU,
+        a: 1, // arg
+        b: c32,
+    });
+    let arg_hi = next;
+    next += 1;
+    insts.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: arg_hi,
+    });
+    let tid = next;
+    next += 1;
+    insts.push(Inst::Convert {
+        op: ConvOp::WrapI64,
+        a: 1, // arg
+    });
+    let start_arg = next;
+    next += 1;
+    // call wasi_thread_start(handles.., tid, start_arg) — a 0-result call (appends no value).
+    let mut args = handle_vals;
+    args.push(tid);
+    args.push(start_arg);
+    insts.push(Inst::Call { func: wts, args });
+    insts.push(Inst::ConstI64(0));
+    let ret = next;
     Func {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
             params: vec![ValType::I64, ValType::I64],
             insts,
-            term: Terminator::Return(vec![6]),
+            term: Terminator::Return(vec![ret]),
         }],
     }
 }
@@ -1978,6 +2022,24 @@ fn spawn_op(lo: &mut Lower) -> Result<(), Error> {
         a: hi,
         b: lo64,
     });
+    // Stash this thread's capability handles so the spawned thread's shim can thread them into
+    // `wasi_thread_start`. The spawning function holds them as its multi-handle prefix (`lo.handles`),
+    // and the host's capability table is shared across vCPUs, so the same i32 handle is valid there.
+    // The stores precede `thread.spawn` in program order, which establishes the happens-before to the
+    // new thread. (No-op for a cap-free module, where `handles` is empty.)
+    let handles = lo.handles.clone();
+    for (i, &h) in handles.iter().enumerate() {
+        let addr = lo.emit(Inst::ConstI64(
+            (lo.threads.stash_base + i as u64 * 4) as i64,
+        ));
+        lo.emit_void(Inst::Store {
+            op: StoreOp::I32,
+            addr,
+            value: h,
+            offset: 0,
+            align: 2,
+        });
+    }
     // The shim ignores its data-SP (svm-wasm keeps the C stack in linear memory via `__stack_pointer`),
     // so any constant works.
     let sp0 = lo.emit(Inst::ConstI64(0));
