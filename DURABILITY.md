@@ -775,8 +775,48 @@ need per-parent join-table residue); shallow stacks (the unwind guard is reserve
 capping is unenforced); and `context = task id` bounds a durable domain to ~15 *lifetime* spawns (a dense
 live-context allocator is the fix). JIT parity is 3.3's multi-vCPU follow-up.
 
-Remaining: **multi-vCPU proper** (3.2.2 — the fiber/vCPU context unification, nested spawns, dense
-context allocation; JIT parity) and **Phase 4** back-edge polls for bounded-latency (async) freeze.
+**[~] Slice 3.2.2 — vCPU + fiber context unification (collision fix; interp).** A durable domain may
+now have spawned vCPUs **and** live fibers at once. Fibers keep growing **up** from context 1
+(`slot+1`, untouched — preserves cross-backend artifact parity, since the JIT mirrors that formula),
+and spawned vCPUs grow **down** from `MAX_SHADOW_CTX`; the two pools share the reserve and a capacity
+guard (`fibers + vcpus <= MAX_SHADOW_CTX`) refuses cleanly (`FiberFault`/`ThreadFault`) before they
+meet — never an overlap. Contexts stay *derived* from slot/task (reproduced deterministically on thaw),
+so no snapshot-format change and no new residue fields. The `FiberRegistry` gained a vCPU-context
+counter (`reserve_vcpu_context` hands out the next top-down region under the lock; `cont.new`
+cross-checks the combined bound; thaw re-seeds the count). Tested: a root that owns a fiber **and**
+spawns a vCPU freezes/thaws correctly, in-memory (`svm-durable/tests/multivcpu.rs`) and through the
+codec (the control section carries both fiber and vCPU residue; canonical re-freeze stays
+byte-identical — `svm-snapshot/tests/roundtrip.rs`). Cross-backend parity unaffected (fibers unchanged;
+the JIT has no multi-vCPU durable path yet).
+
+Remaining for 3.2: **context recycling** (the next sub-slice — lifts the `MAX_SHADOW_CTX` lifetime cap),
+**nested spawns** + a *spawned* child owning fibers (per-child `freeze_drive`), and **JIT multi-vCPU
+parity** (3.3). Then **Phase 4** back-edge polls for bounded-latency (async) freeze.
+
+##### Context recycling plan (next sub-slice)
+
+Today neither backend recycles fiber slots or vCPU contexts (they grow monotonically), so a long-lived
+durable domain that churns fibers/threads eventually exhausts the `MAX_SHADOW_CTX` (~15) reserve. Lifting
+that needs recycling, which is **only safe with generation-carrying handles** — a freed slot/context can
+be reused, so a stale or forged handle to the old occupant must be rejected, not silently aliased to the
+new one. This is a **cross-backend** change (both registries + the snapshot format), best done in its own
+sequenced slice:
+
+1. **Generation-carrying fiber handles (both backends).** Make a fiber handle `(generation, slot)` and
+   validate the generation on `cont.resume`/`thread.join`-style use; bump the generation when a slot is
+   freed. The interp registry and `svm-jit/src/fiber_registry.rs` already bump a generation on finish
+   (`recycle_owned` is staged but unwired) — wire it, in lockstep, and carry the generation in the
+   handle namespace (matching the loom-checked `Ownership` protocol). *Behavior-preserving until step 3.*
+2. **Snapshot format: carry generations.** The control-section fiber/vCPU residue records each entity's
+   generation so a thaw re-establishes the same handle namespace. Bump `FORMAT_VERSION` (or gate behind
+   "any recycled slot") to keep pre-recycling artifacts byte-identical.
+3. **Recycle on finish.** A finished fiber's slot and a joined vCPU's context return to a per-domain
+   free-list (fibers bottom-up, vCPUs top-down); the next `cont.new`/`thread.spawn` reuses the lowest
+   free region. The top-down vCPU pool and `slot+1` fiber pool from 3.2.2 each gain a free-list; the
+   capacity guard becomes "no free region in either pool."
+4. **Cross-backend parity + fuzz.** Extend `durable_jit`/`durable_fibers_jit` to churn fibers (create →
+   finish → recreate) so the recycled-slot + generation path is exercised on both backends and the
+   artifacts stay byte-identical.
 
 #### 3.1 implementation plan (next-session pickup)
 
