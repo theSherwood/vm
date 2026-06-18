@@ -64,6 +64,17 @@ mod form {
 }
 const DW_OP_FBREG: u8 = 0x91;
 const DW_OP_WASM_LOCATION: u8 = 0xed;
+const DW_OP_ADDR: u8 = 0x03;
+
+/// A module-scoped global recovered from a CU-level `DW_TAG_variable` with a `DW_OP_addr` location
+/// (a fixed linear-memory address = a fixed window address in the wasm→IR model).
+pub struct DwarfGlobal {
+    pub name: String,
+    /// The `DW_OP_addr` linear-memory address.
+    pub addr: u64,
+    /// CU-relative DIE offset of the variable's `DW_AT_type` (resolve via [`DwarfInfo::types`]).
+    pub type_ref: u32,
+}
 
 /// A source variable recovered from a `DW_TAG_formal_parameter` / `DW_TAG_variable`.
 pub struct DwarfVar {
@@ -120,10 +131,12 @@ pub enum DwarfType {
     },
 }
 
-/// The decoded subset: subprograms (in `.debug_info` order) + type DIEs keyed by DIE offset.
+/// The decoded subset: subprograms (in `.debug_info` order) + type DIEs keyed by DIE offset +
+/// module-scoped globals.
 pub struct DwarfInfo {
     pub subs: Vec<DwarfSub>,
     pub types: BTreeMap<u32, DwarfType>,
+    pub globals: Vec<DwarfGlobal>,
 }
 
 struct Cur<'a> {
@@ -292,6 +305,13 @@ fn frame_base_local(expr: &[u8]) -> Option<u32> {
     Some(c.uleb()? as u32)
 }
 
+/// `DW_OP_addr <addr>` → the fixed linear-memory address (a global's location); else `None`.
+fn addr_offset(expr: &[u8], addr_size: usize) -> Option<u64> {
+    let mut c = Cur { b: expr, p: 0 };
+    (c.u8()? == DW_OP_ADDR).then_some(())?;
+    c.uint(addr_size)
+}
+
 /// Parse `.debug_info` (with `.debug_abbrev` + `.debug_str`), extracting subprograms + base types.
 pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
     let mut c = Cur { b: info, p: 0 };
@@ -317,6 +337,7 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
 
     let mut subs: Vec<DwarfSub> = Vec::new();
     let mut types: BTreeMap<u32, DwarfType> = BTreeMap::new();
+    let mut globals: Vec<DwarfGlobal> = Vec::new();
 
     // A proper DIE-tree walk: every `DW_CHILDREN_yes` DIE is pushed; its terminating null DIE pops.
     // A var attaches to the nearest open subprogram, a member to the nearest aggregate, a subrange
@@ -383,6 +404,16 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
                             subs[*si].vars.push(DwarfVar {
                                 name,
                                 fbreg,
+                                type_ref: ty,
+                            });
+                        }
+                    } else if ab.tag == tag::VARIABLE {
+                        // A `DW_TAG_variable` located by a fixed `DW_OP_addr` (no frame base) is a
+                        // module-scoped global at that linear-memory (= window) address.
+                        if let Some(addr) = addr_offset(&loc, addr_size) {
+                            globals.push(DwarfGlobal {
+                                name,
+                                addr,
                                 type_ref: ty,
                             });
                         }
@@ -490,5 +521,9 @@ pub fn parse(info: &[u8], abbrev: &[u8], str_sec: &[u8]) -> Option<DwarfInfo> {
         }
     }
 
-    Some(DwarfInfo { subs, types })
+    Some(DwarfInfo {
+        subs,
+        types,
+        globals,
+    })
 }

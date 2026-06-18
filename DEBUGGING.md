@@ -1277,6 +1277,21 @@ Test (`c_frontend.rs`, the chibicc lane): an `int counter`/`struct P origin` gue
 wasm DWARF producer emitting globals — `DW_TAG_variable` at module scope with a `DW_OP_addr`
 location — is the natural third-producer follow-up.)
 
+**Slice 30 — the wasm DWARF producer emits globals (the third producer, completing the trifecta).**
+The `dwarf_info` reader now also recovers a **CU-level `DW_TAG_variable` located by `DW_OP_addr`** (a
+fixed linear-memory address, no frame base) as a `DwarfGlobal { name, addr, type_ref }`, distinct
+from the in-subprogram `DW_OP_fbreg` locals. Since the wasm→IR model maps **linear memory directly
+to the window**, that `DW_OP_addr` *is* the window address, so the producer emits a `GLOBAL_SCOPE`
+`VarLoc::Fixed` var (visible in every frame) with its structured type — again with **no consumer
+changes** (the slice-28 interpreter/DAP path already resolves it). So all **three** frontends —
+chibicc, LLVM, and the wasm DWARF on-ramp — now emit module-scoped globals through the *same* §6
+`Fixed`/`GLOBAL_SCOPE` machinery, the strongest possible demonstration that the waist's global
+support is genuinely frontend-neutral. Tests (`debug_line.rs`, new `global_clang.wasm` fixture): a
+clang wasm guest's `int counter` / `struct Point origin` ingest as `Fixed` globals with their types,
+and `counter` **reads its data-segment `7` at runtime** at a breakpoint inside `bump` (confirming the
+`DW_OP_addr` → window-address mapping). The `Fixed`/`GLOBAL_SCOPE` primitive is now exercised
+end-to-end by every producer and both consumers.
+
 ### Open questions (S4/S5/S2)
 
 - *Probe dispatch in the hot loop*: monomorphized generic (`Probe` type param on `run_inner`)

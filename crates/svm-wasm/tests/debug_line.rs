@@ -229,3 +229,89 @@ fn wasm_dwarf_variables_ingested_into_the_waist() {
         ));
     }
 }
+
+// Built with: clang --target=wasm32 -g -O0 -nostdlib -Wl,--no-entry -Wl,--export-all
+//   int counter = 7; struct Point { int x; int y; } origin = { 3, 4 };
+//   int bump(int n) { counter = counter + n; return counter + origin.x; }
+const GLOBALS: &[u8] = include_bytes!("fixtures/global_clang.wasm");
+
+#[test]
+fn wasm_dwarf_ingests_module_scoped_globals() {
+    // The wasm DWARF producer as the *third* emitter of the §6 module-scoped-global primitive (slice
+    // 28 / 30): a CU-level `DW_TAG_variable` at a fixed `DW_OP_addr` becomes a `GLOBAL_SCOPE`
+    // `VarLoc::Fixed` var at that linear-memory (= window) address, with its structured type.
+    use svm_ir::{TypeDef, VarLoc};
+
+    let t = svm_wasm::transpile(GLOBALS).expect("transpile");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    let g = |n: &str| {
+        di.vars
+            .iter()
+            .find(|v| v.name == n && v.func == svm_ir::GLOBAL_SCOPE)
+            .unwrap_or_else(|| {
+                panic!(
+                    "global {n}: {:?}",
+                    di.vars
+                        .iter()
+                        .map(|v| (&v.name, v.func))
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+
+    // `int counter` — a fixed-address int global.
+    let counter = g("counter");
+    let VarLoc::Fixed { addr } = counter.loc else {
+        panic!("counter is Fixed, got {:?}", counter.loc);
+    };
+    assert!(addr != 0, "a real linear-memory address");
+    assert!(matches!(
+        &di.types[counter.type_id.expect("typed") as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+
+    // `struct Point origin` — a fixed-address aggregate.
+    let origin = g("origin");
+    assert!(matches!(origin.loc, VarLoc::Fixed { .. }));
+    assert!(matches!(
+        &di.types[origin.type_id.expect("typed") as usize],
+        TypeDef::Aggregate { name, fields, .. } if name == "struct Point" && fields.len() == 2
+    ));
+}
+
+#[test]
+fn wasm_global_reads_its_value_at_runtime() {
+    // The fixed linear address maps to the window directly, so the data-segment value reads back: at
+    // `bump`'s entry the global `counter` holds its initializer 7.
+    use svm_interp::{Inspector, IrPc, Stop, Value, VarValue};
+
+    let t = svm_wasm::transpile(GLOBALS).expect("transpile");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let bump = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "bump")
+        .expect("bump export")
+        .1;
+
+    let mut insp = Inspector::attach(&t.module, bump, &[Value::I32(10)], 5_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: bump,
+        block: 0,
+        inst: 0,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped at bump entry"
+    );
+    let v = insp.read_var(0, "counter", 4).expect("counter readable");
+    let got = match v {
+        VarValue::Bytes(b) => i32::from_le_bytes(b[..4].try_into().unwrap()),
+        VarValue::Value(Value::I32(n)) => n,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(got, 7, "counter's initializer read through the global");
+}
