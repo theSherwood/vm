@@ -564,6 +564,16 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
     })
 }
 
+/// Build the linear-memory window from `m`'s memory declaration + data segments, exactly like
+/// [`crate::run`] (a module with no memory yields `None`).
+fn build_mem(m: &Module) -> Option<Mem> {
+    m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        mm.init_data(&m.data);
+        mm
+    })
+}
+
 /// Compile `m`'s function `func` and run it on the bytecode engine, or `None` if it (or any
 /// function it can reach by direct call) uses an op outside this slice's subset. Builds a fresh
 /// linear-memory window from `m`'s memory declaration + data segments, exactly like
@@ -578,12 +588,38 @@ pub fn compile_and_run(
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
-        mm.init_data(&m.data);
-        mm
-    });
+    let mut mem = build_mem(m);
     Some(run(&c, func, args, fuel, &mut mem))
+}
+
+/// Like [`compile_and_run`], but drives the reified [`Vm`] in slices of at most `slice` ops,
+/// suspending and resuming at op boundaries until the entry function completes (or traps). The
+/// result must be **bit-identical** to [`compile_and_run`] for any `slice ≥ 1` — that equality is
+/// what proves the suspend/resume machinery (Slice 1c-2) preserves the continuation exactly. Test
+/// surface for the "interrupt-anywhere" harness; not a production entry point.
+pub fn compile_and_run_sliced(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    slice: u64,
+) -> Option<Result<Vec<Value>, Trap>> {
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some(Err(Trap::Malformed));
+    }
+    let mut mem = build_mem(m);
+    let mut vm = match Vm::new(&c, func as usize, args) {
+        Ok(v) => v,
+        Err(t) => return Some(Err(t)),
+    };
+    loop {
+        match vm.resume(&c, fuel, &mut mem, slice.max(1)) {
+            Ok(Outcome::Done(vals)) => return Some(Ok(vals)),
+            Ok(Outcome::Suspended) => continue,
+            Err(t) => return Some(Err(t)),
+        }
+    }
 }
 
 fn run(
@@ -594,7 +630,22 @@ fn run(
     mem: &mut Option<Mem>,
 ) -> Result<Vec<Value>, Trap> {
     let mut vm = Vm::new(c, entry as usize, args)?;
-    vm.resume(c, fuel, mem)
+    // The production path never preempts itself: an unlimited budget makes `resume` run straight to
+    // completion, with the per-op budget branch perfectly predicted (so the hot loop is unchanged).
+    loop {
+        match vm.resume(c, fuel, mem, u64::MAX)? {
+            Outcome::Done(vals) => return Ok(vals),
+            Outcome::Suspended => continue,
+        }
+    }
+}
+
+/// Why [`Vm::resume`] returned: the entry activation completed (`Done`), or it hit its op budget at
+/// an op boundary with the cursor persisted into the `Vm` (`Suspended`) — call `resume` again to
+/// continue. (A trap is the `Err` arm of `resume`'s `Result` and is terminal, like the tree-walker.)
+enum Outcome {
+    Done(Vec<Value>),
+    Suspended,
 }
 
 /// The reified bytecode continuation — everything a suspended activation needs to resume, held as
@@ -640,18 +691,22 @@ impl Vm {
         })
     }
 
-    /// Run the continuation until the entry activation returns (or traps). Per-op fuel/preemption is
-    /// charged here, one charge per op, exactly as the run-to-completion form did.
+    /// Run the continuation for at most `budget` ops, then return [`Outcome::Suspended`] at the next
+    /// op boundary with the cursor persisted into `self` (resume by calling again); return
+    /// [`Outcome::Done`] when the entry activation returns, or `Err` on a trap. Per-op fuel is
+    /// charged here, one charge per op, exactly as the run-to-completion form did — slicing only
+    /// chooses *where* to pause, never *what* runs, so the result is independent of `budget`.
     ///
-    /// Slice 1c-1: the only non-trap exit is completion. The cursor lives in locals for the duration
-    /// of the loop (so the optimizer keeps `cur`/`base`/`pc` in registers); the future suspension
-    /// exits will write those locals back into `self` before returning a "suspended" outcome.
+    /// The cursor (`cur`/`base`/`pc`) lives in locals for the duration of the loop so the optimizer
+    /// keeps it in registers; it is written back to `self` only when the loop exits (suspend), which
+    /// is also what a future blocking-op / debug-stop seam will do before yielding.
     fn resume(
         &mut self,
         c: &Compiled,
         fuel: &mut u64,
         mem: &mut Option<Mem>,
-    ) -> Result<Vec<Value>, Trap> {
+        mut budget: u64,
+    ) -> Result<Outcome, Trap> {
         let mut cur = self.cur;
         let mut base = self.base;
         let mut pc = self.pc;
@@ -675,6 +730,14 @@ impl Vm {
         }
 
         loop {
+            if budget == 0 {
+                // Pause at this op boundary: persist the cursor so a later `resume` continues here.
+                self.cur = cur;
+                self.base = base;
+                self.pc = pc;
+                return Ok(Outcome::Suspended);
+            }
+            budget -= 1;
             step(fuel)?;
             match &c.progs[cur].ops[pc] {
                 Op::Const { dst, val } => {
@@ -933,11 +996,12 @@ impl Vm {
                 Op::Ret { srcs } => match self.stack.pop() {
                     None => {
                         let tys = &c.result_types[cur];
-                        return Ok(srcs
-                            .iter()
-                            .zip(tys)
-                            .map(|(s, ty)| self.regs[base + *s as usize].to_value(*ty))
-                            .collect());
+                        return Ok(Outcome::Done(
+                            srcs.iter()
+                                .zip(tys)
+                                .map(|(s, ty)| self.regs[base + *s as usize].to_value(*ty))
+                                .collect(),
+                        ));
                     }
                     Some((cprog, cbase, cpc, ret_abs)) => {
                         for (i, s) in srcs.iter().enumerate() {

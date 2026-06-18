@@ -252,9 +252,15 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
           `Vec<Frame>`; holding it as data (not host-stack frames) is the prerequisite for every
           suspension seam. Behavior unchanged (existing harness green); perf-neutral (hot cursor
           kept in locals — ratios alu 1.49× / call 1.90× / mem 1.16×, in line with pre-refactor).
-    - [ ] **1c-2** — suspension seam: break `resume`'s loop at preemption points (budget hit,
-          blocking op) returning a `Suspended`/`Done`/`Trap` outcome with the cursor persisted into
-          `Vm`; resume from a persisted `Vm`. New harness: schedule/interleaving equality.
+    - [x] **1c-2** — suspension seam: `Vm::resume` now takes an op `budget` and returns
+          `Outcome::{Done, Suspended}` (trap = the `Err` arm); on `Suspended` it persists the cursor
+          into `self` at the op boundary, so a later `resume` continues exactly where it paused. The
+          production `run` passes an unlimited budget (the predicted branch is free — ratios alu
+          1.64× / call 2.07× / mem 1.16×). New "interrupt-anywhere" harness
+          (`bytecode_suspend_resume_preserves_result`): slicing the run at every op boundary
+          (slice = 1/3/17) is bit-identical to running straight through, across the generated corpus.
+          This is the machinery the scheduler/blocking-op/debug-stop seams drive; wiring it to an
+          actual scheduler is 1c-4.
     - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
           stepping report tree-walker-identical locations. New harness: debug-trace equality.
     - [ ] **1c-4** — wire as the default execution path behind the existing entry points (fall back

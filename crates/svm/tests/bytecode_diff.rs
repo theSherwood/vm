@@ -93,6 +93,44 @@ fn bytecode_matches_interp_on_generated_modules() {
     );
 }
 
+#[test]
+fn bytecode_suspend_resume_preserves_result() {
+    // Slice 1c-2: slicing a run at op boundaries (suspend, persist the `Vm`, resume) must be
+    // bit-identical to running straight through, for any slice size — that is what proves the
+    // reified continuation is exact. A subset of the corpus with a bounded fuel cap keeps the
+    // slice=1 (suspend after *every* op) case cheap.
+    let cap = 100_000u64;
+    let mut checked = 0u32;
+    for seed in (0..4000u64).step_by(16) {
+        let mut g = Gen::from_seed(seed);
+        let m = gen_module(&mut g);
+        if m.funcs.is_empty() {
+            continue;
+        }
+        let args = gen_args(&mut g, &m.funcs[0].params);
+        let mut fw = cap;
+        let Some(whole) = bytecode::compile_and_run(&m, 0, &args, &mut fw) else {
+            continue;
+        };
+        if matches!(whole, Err(Trap::OutOfFuel)) {
+            continue;
+        }
+        for slice in [1u64, 3, 17] {
+            let mut fs = cap;
+            let sliced = bytecode::compile_and_run_sliced(&m, 0, &args, &mut fs, slice)
+                .expect("supported (the whole run above compiled)");
+            assert!(
+                results_eq(&sliced, &whole),
+                "suspend/resume changed the result\n seed={seed} slice={slice}\n whole ={whole:?}\n sliced={sliced:?}\n module:\n{}",
+                svm::text::print_module(&m)
+            );
+        }
+        checked += 1;
+    }
+    println!("suspend/resume equality verified on {checked} modules");
+    assert!(checked > 10, "too few modules exercised ({checked})");
+}
+
 // ---- kernels: equality + perf (production counterpart of bytecode_spike) -----------------------
 
 const ALU: &str = r#"
