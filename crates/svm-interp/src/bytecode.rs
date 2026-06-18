@@ -24,17 +24,20 @@
 //! over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
-//! `return_call_indirect`, reusing the current window — O(1) deep tail recursion); and §GC
-//! **`gc.roots`** (conservative root enumeration over the whole vCPU continuation — sound, not
-//! bit-identical, per GC.md §3.2). [`compile_module`] returns `None` when a function needs a seam not
-//! yet driven here — instantiate-mixed-with-fibers, `gc.roots`-mixed-with-threads, or durability — so
-//! callers (`super::run_with_host_fast`) fall back to the tree-walker for those.
+//! `return_call_indirect`, reusing the current window — O(1) deep tail recursion); §GC **`gc.roots`**
+//! (conservative root enumeration over the whole vCPU continuation — sound, not bit-identical, per
+//! GC.md §3.2); and **durability** freeze/thaw for single-fiber vCPUs (IR-driven by the `svm-durable`
+//! transform — the engine just runs the transformed module over a seeded window, via
+//! [`compile_and_run_capture_reserved_with_host`]). [`compile_module`] returns `None` when a function
+//! needs a seam not yet driven here — instantiate-mixed-with-fibers, `gc.roots`-mixed-with-threads, or
+//! **multi-fiber** durable freeze — so callers (`super::run_with_host_fast`) fall back to the
+//! tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
 //! tree-walker (`bytecode_diff.rs`, `bytecode_{caps,fibers,threads,coroutines,instantiate,
-//! separate_module,demand_coroutine,tailcall,debug,gc_roots,dynlink}.rs`; `gc_roots` checks soundness
-//! rather than equality).
+//! separate_module,demand_coroutine,tailcall,debug,gc_roots,durable,dynlink}.rs`; `gc_roots` checks
+//! soundness rather than equality; `durable` checks freeze/thaw artifact + round-trip equality).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
@@ -1185,6 +1188,60 @@ pub fn compile_and_run_capture(
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
+        .unwrap_or_default();
+    Some((r, snap))
+}
+
+/// Durability seam (Slice 1c-6): the bytecode mirror of [`crate::run_capture_reserved_with_host`] —
+/// seed the window with `init_mem` (which for a durable run carries the state word + shadow region),
+/// run `m`'s transformed entry over a caller-prepared `host` (the powerbox), and snapshot the window
+/// (the `SNAP_CAP` span, matching the tree-walker / JIT durable capture). Single-vCPU, single-fiber
+/// freeze/thaw is **driven entirely by the transform's emitted IR** — the engine just runs it; this
+/// is the entry the freeze/thaw harness (`bytecode_durable.rs`) and the `super::run_with_host_fast`
+/// fast path use. `None` if the module is outside the engine's subset.
+pub fn compile_and_run_capture_reserved_with_host(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    reserved_log2: u8,
+    host: &mut Host,
+) -> Option<Capture> {
+    // Durable freeze/thaw is established here only for **single-fiber** vCPUs: a freeze of a
+    // multi-fiber run needs the per-fiber shadow-SP swap + the freeze driver that flattens idle fibers
+    // (DURABILITY.md §12.8), which this engine doesn't drive — so refuse a module using `cont.*` /
+    // `thread.*` (the caller falls back to the tree-walker), lest it write a silently-wrong artifact.
+    let fiberish = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::ContNew { .. }
+                    | Inst::ContResume { .. }
+                    | Inst::Suspend { .. }
+                    | Inst::ThreadSpawn { .. }
+                    | Inst::ThreadJoin { .. }
+            )
+        })
+    });
+    if fiberish {
+        return None;
+    }
+    let c = compile_module(&m.funcs)?;
+    if func as usize >= c.progs.len() {
+        return Some((Err(Trap::Malformed), Vec::new()));
+    }
+    let dom = Domain::new(c, host.jit_table_log2());
+    let mut mem = m.memory.map(|mc| {
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        mm.seed(init_mem);
+        mm.init_data(&m.data);
+        mm
+    });
+    let r = run(dom, func, args, fuel, &mut mem, host);
+    let snap = mem
+        .as_ref()
+        .map(|mm| mm.snapshot_window(super::SNAP_CAP))
         .unwrap_or_default();
     Some((r, snap))
 }

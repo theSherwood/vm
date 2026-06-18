@@ -462,8 +462,26 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               over-approximation), tagged-pointer mask, caller-frame-across-call, parked-fiber root, and
               fold-down-mask rejection (`Malformed`, the §6 host-leak guard). Window memory is read back
               via a new `bytecode::compile_and_run_capture` (mirrors `run_capture_reserved`).
-    - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:
-          snapshot equality.
+        - [x] **1c-6** — durability **freeze/thaw** (single-vCPU, single-fiber). The key realization
+              (DURABILITY.md §2): freeze/thaw is **IR-driven** — the `svm-durable` transform rewrites a
+              module so that, with the in-window state word `UNWINDING`, each function flattens its live
+              continuation into the in-window shadow stack and returns; `REWINDING` rebuilds it. The
+              native/bytecode continuation is **never** serialized, so for a single-fiber program the
+              bytecode engine supports freeze/thaw simply by *running the transformed module over a
+              seeded window* — and (verified by reading the `svm-snapshot` codec) a single-vCPU
+              no-fiber §12 artifact's residue section (the only consumer of the freeze driver's
+              `frozen_root_sp`/fibers/vcpus) is **omitted**, so the artifact depends only on the module
+              digest + window image + handle table, all of which the bytecode engine reproduces. New
+              entry `bytecode::compile_and_run_capture_reserved_with_host` (mirrors
+              `run_capture_reserved_with_host`); it **refuses** `cont.*`/`thread.*` modules (multi-fiber
+              freeze needs the per-fiber shadow-SP swap + the idle-fiber freeze driver — deferred), so
+              the caller falls back. New harness `bytecode_durable.rs` checks against the tree-walker
+              oracle + the §12 codec: NORMAL run agrees; UNWINDING freeze yields a **byte-identical**
+              snapshot *and* artifact; restore+re-freeze is byte-identical (§12.6 canonical invariant);
+              and thawing the bytecode artifact (REWINDING, clock continued) reproduces the
+              uninterrupted result and ends NORMAL. Cases: two clock reads (one value spilled across
+              the suspend) and multiple live values spilled. Deferred: **multi-fiber** freeze/thaw
+              (shadow-SP swap + freeze driver + fiber residue) and multi-vCPU.
 - [~] **Phase 2** — memory-op specialization + software fast-path.
   - [x] Lock-free `check_prot` fast path (`prot_dirty` flag) + `read_le`/`write_le` `has_regions`
         hoist. Tree-walker memory kernel ~176 → ~147 ns (~17%); all oracle suites byte-identical.
