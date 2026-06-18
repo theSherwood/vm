@@ -224,9 +224,15 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
         no re-implementation), run against each block's sub-window so no operand remap is needed.
         Harness coverage of the generated corpus rose to ~1114/4000 (28%); the rest is
         `call_indirect` / host / fiber / thread / cap programs (later slices). Still non-default.
+  - [x] **Slice 1c-b** — `call_indirect` through module 0's natural function table (slot `i` ⇒ func
+        `i`, power-of-two padding traps; resolved signature type-checked against the call site, a
+        forged/mistyped slot is an inert `IndirectCallType` trap — same semantics as
+        `dispatch_indirect`). Self-contained only (no `install`/`invoke` cross-module units — those
+        need the shared `DomainTable` + scheduler, a later slice). Harness coverage rose to
+        ~1770/4000 (44%), all bit-identical. Still non-default.
   - [ ] **Slice 1c** — switch the default path over, re-expressing the seams (debug/`IrPc`, fibers,
         threads, durability, capabilities, scheduler preemption, fault rewind) + the full op set
-        (SIMD, call_indirect, tail calls, host/fiber ops).
+        (tail calls, cross-module `install`/`invoke` indirect calls, host/fiber ops).
 - [ ] **Phase 2** — memory-op specialization + software fast-path.
 - [ ] **Phase 3** — per-op seam overhead (fuel-at-back-edges if provably safe; debug/preempt hoist).
 - [ ] **Phase 4** — (stretch) fully flat bytecode + threaded dispatch.

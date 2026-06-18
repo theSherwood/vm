@@ -194,6 +194,17 @@ enum Op {
         args: Box<[u32]>,
         dst: u32,
     },
+    /// `call_indirect` through module 0's natural function table (slot `i` ⇒ func `i`; padding to a
+    /// power of two traps). Resolved at run time from `idx` masked to the table length, then the
+    /// resolved function's signature is checked against `want_params`/`want_results` (a forged or
+    /// mistyped slot is an inert [`Trap::IndirectCallType`], matching [`super::dispatch_indirect`]).
+    CallIndirect {
+        idx: u32,
+        args: Box<[u32]>,
+        dst: u32,
+        want_params: Box<[ValType]>,
+        want_results: Box<[ValType]>,
+    },
     Ret {
         srcs: Box<[u32]>,
     },
@@ -219,6 +230,11 @@ struct Program {
 pub struct Compiled {
     progs: Vec<Program>,
     result_types: Vec<Vec<ValType>>,
+    /// Per-function `(params, results)` for `call_indirect` type-checking — the natural module-0
+    /// function table indexes these directly (slot `i` ⇒ func `i`).
+    sigs: Vec<(Vec<ValType>, Vec<ValType>)>,
+    /// `len - 1` of the natural table (`next_power_of_two(n_funcs)`), the `call_indirect` slot mask.
+    table_mask: usize,
 }
 
 /// Lower every function, or `None` if any uses an op outside this slice's subset.
@@ -228,9 +244,15 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     for f in funcs {
         progs.push(compile_func(f, &arities)?);
     }
+    let table_mask = funcs.len().next_power_of_two().max(1) - 1;
     Some(Compiled {
         progs,
         result_types: funcs.iter().map(|f| f.results.clone()).collect(),
+        sigs: funcs
+            .iter()
+            .map(|f| (f.params.clone(), f.results.clone()))
+            .collect(),
+        table_mask,
     })
 }
 
@@ -507,10 +529,19 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
         },
+        // `call_indirect` through module 0's natural table — self-contained (no install/invoke),
+        // so the compile-time signature table resolves it. Cross-module units (install/invoke) are
+        // still a later slice; here every reachable slot is a module-0 function.
+        Inst::CallIndirect { ty, idx, args } => Op::CallIndirect {
+            idx: g(*idx),
+            args: args.iter().map(|a| g(*a)).collect(),
+            dst,
+            want_params: ty.params.clone().into(),
+            want_results: ty.results.clone().into(),
+        },
         // Control / host / cross-module ops this slice doesn't drive (they need the scheduler,
         // host powerbox, fiber registry, or dispatch table) — fall back to the tree-walker.
-        Inst::CallIndirect { .. }
-        | Inst::CapCall { .. }
+        Inst::CapCall { .. }
         | Inst::CapSelfCount
         | Inst::CapSelfGet { .. }
         | Inst::CallImport { .. }
@@ -802,6 +833,38 @@ fn run(
             }
             Op::Call { callee, args, dst } => {
                 let callee = *callee as usize;
+                let nb = base + c.progs[cur].nslots as usize;
+                let need = nb + c.progs[callee].nslots as usize;
+                if regs.len() < need {
+                    regs.resize(need, Reg::default());
+                }
+                for (i, a) in args.iter().enumerate() {
+                    regs[nb + i] = regs[base + *a as usize];
+                }
+                stack.push((cur, base, pc + 1, base + *dst as usize));
+                cur = callee;
+                base = nb;
+                pc = 0;
+            }
+            Op::CallIndirect {
+                idx,
+                args,
+                dst,
+                want_params,
+                want_results,
+            } => {
+                // Resolve through the natural module-0 table (slot i ⇒ func i), then type-check the
+                // resolved signature — a forged/mistyped slot is an inert IndirectCallType trap.
+                let slot = (r!(*idx).i32() as u32 as usize) & c.table_mask;
+                let callee = if slot < c.sigs.len() {
+                    slot
+                } else {
+                    return Err(Trap::IndirectCallType);
+                };
+                let (cp, cr) = &c.sigs[callee];
+                if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
+                    return Err(Trap::IndirectCallType);
+                }
                 let nb = base + c.progs[cur].nslots as usize;
                 let need = nb + c.progs[callee].nslots as usize;
                 if regs.len() < need {
