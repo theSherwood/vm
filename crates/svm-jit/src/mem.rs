@@ -807,6 +807,63 @@ mod pal {
         static GUARD: Cell<Option<Frame>> = const { Cell::new(None) };
         // Set by the VEH before it restores the context, read after RtlCaptureContext returns.
         static TRIPPED: Cell<bool> = const { Cell::new(false) };
+        // §5 W3 trap-time backtrace: the faulting `(pc, frame-pointer-chain return addresses)` the VEH
+        // captures from the access-violation `CONTEXT` *before* it overwrites that context with the
+        // recovery one. Read + cleared by `take_trap_frame`. A fixed buffer (no allocation in the VEH).
+        static TRAP_VALID: Cell<bool> = const { Cell::new(false) };
+        static TRAP_PC: Cell<usize> = const { Cell::new(0) };
+        static TRAP_RETS: Cell<[usize; TRAP_MAXFRAMES]> = const { Cell::new([0; TRAP_MAXFRAMES]) };
+        static TRAP_N: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Max trap-backtrace frames captured (matches the unix shim's `SVM_TRAP_MAXFRAMES`).
+    const TRAP_MAXFRAMES: usize = 64;
+
+    /// Walk the frame-pointer chain from `fp` into `out`, returning the count — the Rust analog of the
+    /// unix shim's `svm_walk_fp_chain` (DEBUGGING.md §5/W3). The JIT's `preserve_frame_pointers` gives
+    /// every guest frame a `{ saved_fp, ret_addr }` record (`*fp` = caller's saved fp, `*(fp+1)` = its
+    /// return address). Bounded — aligned, non-null, strictly-increasing links, a span backstop, the
+    /// frame cap — so a corrupt chain terminates instead of looping or reading wild memory.
+    ///
+    /// # Safety
+    /// `fp` must be a live frame pointer of guest JIT code (the faulting `CONTEXT`'s `Rbp`); reads the
+    /// intact-at-fault guest stack. Called only from the VEH, before anything unwinds.
+    unsafe fn walk_fp_chain(fp: usize, out: &mut [usize; TRAP_MAXFRAMES]) -> usize {
+        const SPAN: usize = 8 * 1024 * 1024; // don't chase a corrupt chain off the stack
+        let align = core::mem::size_of::<usize>() - 1;
+        let (mut cur, start) = (fp, fp);
+        let mut n = 0;
+        while n < TRAP_MAXFRAMES
+            && cur != 0
+            && cur & align == 0
+            && cur >= start
+            && cur - start < SPAN
+        {
+            let next = *(cur as *const usize);
+            let ret = *((cur + core::mem::size_of::<usize>()) as *const usize);
+            out[n] = ret;
+            n += 1;
+            if next <= cur {
+                break; // frame pointers grow toward the base; a non-increasing link is the end
+            }
+            cur = next;
+        }
+        n
+    }
+
+    /// Capture the trap-time backtrace from the faulting `CONTEXT` (§5/W3): the faulting `Rip` is the
+    /// innermost frame (symbolized directly by the host), and the `Rbp` chain gives the callers. Called
+    /// from the VEH while the guest stack is still intact, before the recovery context is restored.
+    ///
+    /// # Safety
+    /// `ctx` is the live faulting context for an in-window access violation in guest JIT code.
+    unsafe fn capture_trap_frame(ctx: &CONTEXT) {
+        let mut rets = [0usize; TRAP_MAXFRAMES];
+        let n = walk_fp_chain(ctx.Rbp as usize, &mut rets);
+        TRAP_PC.with(|c| c.set(ctx.Rip as usize));
+        TRAP_RETS.with(|c| c.set(rets));
+        TRAP_N.with(|c| c.set(n));
+        TRAP_VALID.with(|c| c.set(true));
     }
 
     #[cfg(fiber_rt)]
@@ -838,6 +895,9 @@ mod pal {
             if let Some(f) = GUARD.with(|g| g.get()) {
                 if addr >= f.lo && addr < f.hi {
                     TRIPPED.with(|t| t.set(true));
+                    // §5 W3: capture the trap-time backtrace from the faulting context *before* the
+                    // `copy_nonoverlapping` below overwrites it with the recovery context.
+                    capture_trap_frame(&*ep.ContextRecord);
                     // Restore the captured context → resume right after RtlCaptureContext in
                     // `run_guarded` (the unix siglongjmp analogue). The abandoned JIT frames hold no
                     // Rust destructors.
@@ -879,11 +939,20 @@ mod pal {
         });
     }
 
-    /// The VEH doesn't yet capture the trap stack for the §5 W3 trap-time backtrace (a Windows
-    /// follow-up: walk the chain from the `EXCEPTION_POINTERS` CONTEXT). For now the host gets an
-    /// empty backtrace on Windows guard faults.
+    /// Read and clear the trap stack the VEH captured at the most recent caught **memory fault**
+    /// (§5/W3): the faulting `pc` + the frame-pointer chain's return addresses. `None` if none was
+    /// captured. (Explicit-check traps — div-by-zero etc. — are not yet captured on Windows: that
+    /// path needs the trap-site frame pointer, and MSVC has no `__builtin_frame_address`; see ISSUES
+    /// I3. So a Windows explicit trap still yields an empty backtrace.)
     pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>)> {
-        None
+        if !TRAP_VALID.with(|c| c.get()) {
+            return None;
+        }
+        TRAP_VALID.with(|c| c.set(false));
+        let pc = TRAP_PC.with(|c| c.get());
+        let n = TRAP_N.with(|c| c.get());
+        let rets = TRAP_RETS.with(|c| c.get());
+        Some((pc, rets[..n].to_vec()))
     }
 
     /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.

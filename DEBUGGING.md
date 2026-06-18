@@ -457,9 +457,13 @@ host in normal context).
 
 **Progress:** Stages 0–3 **done** + the interp↔JIT **differential oracle** wired — the JIT trap-time
 backtrace is live for both memory faults *and* explicit-check traps, attributed across spawned vCPUs,
-folded into the host's kill message, and validated frame-for-frame against the interpreter (unix;
-Windows degrades to empty pending a VEH-side capture). This closes Pillar 2 (W3) on the JIT. Possible
-follow-ups: per-fiber naming under work-stealing migration, and a Windows VEH-side capture.
+folded into the host's kill message, and validated frame-for-frame against the interpreter. **Memory
+faults now capture cross-platform** — unix via the SIGSEGV/SIGBUS handler, Windows via the Vectored
+Exception Handler (it walks the faulting `CONTEXT`'s `Rbp` chain in `mem.rs`, validated by
+`memfault_kill_message_carries_a_source_backtrace` on the `windows-latest` CI job). This closes Pillar
+2 (W3) on the JIT. Remaining (ISSUES I3): **Windows explicit-check** traps still lack a backtrace
+(no signal to capture from + MSVC has no `__builtin_frame_address` — fix via Cranelift
+`get_frame_pointer`); and per-fiber naming under work-stealing migration.
 
 ---
 

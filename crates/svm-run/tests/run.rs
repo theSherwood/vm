@@ -352,6 +352,35 @@ fn trap_kill_message_carries_a_source_backtrace() {
     );
 }
 
+/// §5 W3 — a **memory-fault** kill message carries the source backtrace on **every** platform: the
+/// capture is the SIGSEGV/SIGBUS handler on unix and the Vectored Exception Handler on Windows, so an
+/// out-of-bounds store that the §5 guard catches names the store's `file:line` cross-platform. (The
+/// explicit-check-trap path — `trap_kill_message_carries_a_source_backtrace`, div-by-zero — is
+/// unix-only; see ISSUES I3.) An 8-byte store at 65532 in a 64 KiB window overruns into the guard.
+#[test]
+fn memfault_kill_message_carries_a_source_backtrace() {
+    let m = load(
+        "memory 16\n\
+         func (i32, i32, i32) -> (i32) {\n\
+         block0(v0: i32, v1: i32, v2: i32):\n\
+         \x20 v3 = i64.const 65532\n\
+         \x20 v4 = i64.const 0\n\
+         \x20 i64.store v3 v4\n\
+         \x20 v5 = i32.const 0\n\
+         \x20 return v5\n\
+         }\n\
+         debug.file 0 \"mem.c\"\n\
+         debug.loc 0 0 2 0 9 5\n",
+    );
+    let err = run_powerbox_with_deadline(&m, b"", None)
+        .expect_err("the overrun must be detect-and-killed");
+    assert!(err.contains("MemoryFault"), "names the trap kind: {err}");
+    assert!(
+        err.contains("mem.c:9"),
+        "the kill message carries the trap-time source backtrace: {err}"
+    );
+}
+
 /// Arming the kill-path must not penalize a well-behaved guest: a fast program finishes normally —
 /// and *quickly* — because the watchdog wakes the instant the run completes (it never blocks the
 /// full deadline).

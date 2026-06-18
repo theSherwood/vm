@@ -13,35 +13,38 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I3 — JIT trap-time backtrace is unix-only; Windows degrades to an empty backtrace (S3) — on `claude/debug-jit-backtrace`
+### I3 — Windows JIT trap-time backtrace covers memory faults but not explicit-check traps (S3) — on `claude/debug-jit-backtrace`
 
-**Where:** `crates/svm-jit/src/trap_shim.c` (the capture + frame-pointer walk), `crates/svm-jit/src/mem.rs`
-(the `pal::take_trap_frame` dispatch — the windows branch returns `None`), `crates/svm-jit/src/lib.rs`
-(`trap_capture_addr()` returns `0` on non-unix, so `emit_trap` bakes no explicit-trap capture call).
+**Where:** `crates/svm-jit/src/lib.rs` (`trap_capture_addr()` returns `0` on non-unix, so `emit_trap`
+bakes no explicit-trap capture call), `crates/svm-jit/src/trap_shim.c` (the unix-only
+`svm_capture_explicit_trap`).
 
-**Is:** the always-on JIT trap-time backtrace (DEBUGGING.md §5 / W3 — `CompiledModule::last_trap_backtrace()`,
-folded into the host kill message) works on **unix only**. The capture for both trap families lives in the
-unix-only C shim: memory faults are walked in the SIGSEGV/SIGBUS handler (`svm_capture_frame`), and explicit
-checks (div/rem-by-zero, `unreachable`, `OutOfFuel`, indirect-call-type) call `svm_capture_explicit_trap` at
-the trap site. On **Windows** the guard is a Rust Vectored Exception Handler (no C shim) and
-`trap_capture_addr()` is `0`, so nothing is captured: a Windows JIT trap still reports the correct
-`TrapKind` and a correct kill, but `last_trap_backtrace()` is **empty** and the kill message carries no
-source frames. Not a correctness or escape hazard — purely missing observability on one platform. (The
-`trap_kill_message_carries_a_source_backtrace` test gates its source-line assertion on `#[cfg(unix)]` for
-exactly this reason.)
+**Update (memory faults: fixed on Windows).** The Windows Vectored Exception Handler now captures the
+trap-time backtrace for **memory faults**, mirroring the unix SIGSEGV/SIGBUS path: `mem.rs`'s windows
+`pal::veh` reads the faulting `Rip`/`Rbp` from `EXCEPTION_POINTERS->ContextRecord` and walks the
+frame-pointer chain (a Rust `walk_fp_chain`) into a thread-local before restoring the recovery context;
+the windows `pal::take_trap_frame` reads it. So `last_trap_backtrace()` + the kill message now carry
+source frames for a Windows guard fault (covered cross-platform by
+`memfault_kill_message_carries_a_source_backtrace` in `svm-run`'s `run.rs`).
 
-**Fix sketch (a Windows VEH-side capture, mirroring the unix path):**
-1. **Memory faults:** in the VEH (`mem.rs` windows `pal::veh`), before restoring the captured `CONTEXT` and
-   unwinding, read the faulting `Rip`/`Rbp` from `EXCEPTION_POINTERS->ContextRecord` and walk the
-   frame-pointer chain (a Rust port of `svm_walk_fp_chain`, or a small windows C shim) into a thread-local;
-   have the windows `pal::take_trap_frame` read it instead of returning `None`.
-2. **Explicit checks:** provide a windows capture helper whose address `trap_capture_addr()` returns, so
-   `emit_trap` bakes the same `call <helper>` it does on unix. The helper needs the trapping frame pointer;
-   the unix C shim uses `__builtin_frame_address`, so either compile a tiny windows C shim with
-   `-fno-omit-frame-pointer` (cleanest — reuses `svm_capture_explicit_trap`/`svm_walk_fp_chain` verbatim) or
-   read `rbp` via a `core::arch::asm!`/naked Rust shim.
-3. **Test:** un-gate the `#[cfg(unix)]` assertion above; add a windows-run analog of `jit_trap_backtrace.rs`
-   (that file is `#![cfg(unix)]` today). Validate via the `windows-latest` CI job.
+**Still open: explicit-check traps on Windows.** Div/rem-by-zero, `unreachable`, `OutOfFuel`, and
+indirect-call-type traps store a `TrapKind` and return — there is no signal/exception to capture from, so
+on unix the lowering bakes a `call svm_capture_explicit_trap` at the trap site (`trap_capture_addr()`).
+On Windows that address is `0`, so these still produce an **empty** backtrace (correct `TrapKind` + kill,
+no frames). Not a correctness or escape hazard. (The `trap_kill_message_carries_a_source_backtrace` test —
+div-by-zero — keeps its source-line assertion under `#[cfg(unix)]` for this reason.)
+
+**Fix sketch (explicit-trap capture on Windows):** the unix helper finds its caller's frame via
+`__builtin_frame_address`, which **MSVC lacks**, so:
+- *Option A (cleanest, builtin-free, also de-special-cases unix):* have the JIT pass the trapping frame
+  pointer to the helper as an argument via Cranelift's `get_frame_pointer` (confirmed present in
+  cranelift-codegen 0.132 x64). Caveat: `get_frame_pointer` gives the guest fn's `rbp` (the callers), but
+  **not** the innermost trap-site pc — recover it (e.g. also bake the trap op's machine pc, or read the
+  helper's own return address) so the innermost frame's line isn't lost.
+- *Option B:* a tiny windows C shim compiled with `/Oy-` exporting an MSVC-intrinsic
+  (`_AddressOfReturnAddress`) variant of `svm_capture_explicit_trap`, reusing `svm_walk_fp_chain`.
+- **Test:** un-gate `trap_kill_message_carries_a_source_backtrace` on Windows once explicit-trap capture
+  lands; validate via the `windows-latest` CI job.
 
 ---
 
