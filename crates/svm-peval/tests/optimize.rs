@@ -4,7 +4,10 @@
 //! actually happened (folds collapsed, dead blocks vanished, trapping ops preserved).
 
 use svm_interp::{Trap, Value};
-use svm_ir::{BinOp, Block, CmpOp, Func, Inst, IntTy, Module, Terminator, ValType};
+use svm_ir::{
+    BinOp, Block, CmpOp, Func, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, StoreOp, Terminator,
+    ValType,
+};
 use svm_peval::optimize_module;
 use svm_verify::verify_module;
 
@@ -75,12 +78,10 @@ fn folds_integer_arithmetic_chain() {
     );
 
     let opt = check_equiv(&m, &[vec![]]);
-    // Both IntBins collapsed to constants in place (indices preserved).
-    assert!(matches!(opt.funcs[0].blocks[0].insts[2], Inst::ConstI64(5)));
-    assert!(matches!(
-        opt.funcs[0].blocks[0].insts[4],
-        Inst::ConstI64(20)
-    ));
+    // Fold + DCE collapse the whole chain to a single constant (the dead intermediates go).
+    let insts = &opt.funcs[0].blocks[0].insts;
+    assert_eq!(insts.len(), 1);
+    assert!(matches!(insts[0], Inst::ConstI64(20)));
     assert_eq!(run(&opt, &[]), Ok(vec![Value::I64(20)]));
 }
 
@@ -107,8 +108,11 @@ fn folds_compare_and_conversion() {
         3,
     );
     let opt = check_equiv(&m, &[vec![]]);
-    assert!(matches!(opt.funcs[0].blocks[0].insts[2], Inst::ConstI32(1)));
-    assert!(matches!(opt.funcs[0].blocks[0].insts[3], Inst::ConstI64(1)));
+    // Compare + convert fold, then DCE drops the now-dead i32 sources, leaving one i64 const.
+    let insts = &opt.funcs[0].blocks[0].insts;
+    assert_eq!(insts.len(), 1);
+    assert!(matches!(insts[0], Inst::ConstI64(1)));
+    assert_eq!(run(&opt, &[]), Ok(vec![Value::I64(1)]));
 }
 
 #[test]
@@ -350,4 +354,284 @@ fn preserves_loops_with_nonconstant_conditions() {
     // All four blocks survive (nothing constant-foldable controls the flow).
     assert_eq!(opt.funcs[0].blocks.len(), 4);
     assert_eq!(run(&opt, &[Value::I32(5)]), Ok(vec![Value::I32(15)]));
+}
+
+// ----- Stage 0.x: dead-value elimination -----
+
+#[test]
+fn drops_dead_arithmetic_keeps_live_path() {
+    // (x: i64) -> i64 : a dead 100+200 chain alongside the live x+7.
+    let m = single_block_fn(
+        vec![ValType::I64],
+        vec![ValType::I64],
+        vec![
+            Inst::ConstI64(100), // 1
+            Inst::ConstI64(200), // 2
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1,
+                b: 2,
+            }, // 3 = 300 (dead)
+            Inst::ConstI64(7),   // 4
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 0,
+                b: 4,
+            }, // 5 = x + 7 (live)
+        ],
+        5,
+    );
+
+    let opt = check_equiv(&m, &[vec![Value::I64(10)], vec![Value::I64(-1)]]);
+    let insts = &opt.funcs[0].blocks[0].insts;
+    // Only the live const 7 and the live add survive; the dead 100/200/300 chain is gone.
+    assert_eq!(insts.len(), 2);
+    assert!(matches!(insts[0], Inst::ConstI64(7)));
+    assert!(matches!(insts[1], Inst::IntBin { op: BinOp::Add, .. }));
+    assert_eq!(run(&opt, &[Value::I64(10)]), Ok(vec![Value::I64(17)]));
+}
+
+#[test]
+fn keeps_dead_load_but_drops_dead_arithmetic() {
+    // A load can fault, so a *dead* load must be kept; a dead pure add is removed.
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![],
+            results: vec![ValType::I32],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![
+                    Inst::ConstI64(0), // 0 : addr
+                    Inst::Load {
+                        op: LoadOp::I32,
+                        addr: 0,
+                        offset: 0,
+                        align: 0,
+                    }, // 1 : dead result, but kept (can fault)
+                    Inst::ConstI32(3), // 2
+                    Inst::ConstI32(4), // 3
+                    Inst::IntBin {
+                        ty: IntTy::I32,
+                        op: BinOp::Add,
+                        a: 2,
+                        b: 3,
+                    }, // 4 = 7 (dead)
+                    Inst::ConstI32(7), // 5
+                ],
+                term: Terminator::Return(vec![5]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+
+    let opt = check_equiv(&m, &[vec![]]);
+    let insts = &opt.funcs[0].blocks[0].insts;
+    assert_eq!(insts.len(), 3); // addr const, the load, and the returned const 7
+    assert_eq!(
+        insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Load { .. }))
+            .count(),
+        1,
+        "the dead load must be preserved"
+    );
+    assert!(
+        !insts.iter().any(|i| matches!(i, Inst::IntBin { .. })),
+        "the dead add must be removed"
+    );
+    assert_eq!(run(&opt, &[]), Ok(vec![Value::I32(7)]));
+}
+
+#[test]
+fn keeps_store_effect_across_renumbering() {
+    // A store has a side effect (and produces no SSA result), so it is kept even with a dead
+    // pure op before it — and the zero-result store must not corrupt value renumbering.
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![],
+            results: vec![ValType::I32],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![
+                    Inst::ConstI64(8),  // 0 : addr
+                    Inst::ConstI32(42), // 1 : value
+                    Inst::ConstI32(5),  // 2 (dead)
+                    Inst::ConstI32(6),  // 3 (dead)
+                    Inst::IntBin {
+                        ty: IntTy::I32,
+                        op: BinOp::Mul,
+                        a: 2,
+                        b: 3,
+                    }, // 4 = 30 (dead)
+                    Inst::Store {
+                        op: StoreOp::I32,
+                        addr: 0,
+                        value: 1,
+                        offset: 0,
+                        align: 0,
+                    }, // (no result)
+                    Inst::ConstI32(0),  // 5
+                ],
+                term: Terminator::Return(vec![5]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+
+    let opt = check_equiv(&m, &[vec![]]);
+    let insts = &opt.funcs[0].blocks[0].insts;
+    assert_eq!(
+        insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Store { .. }))
+            .count(),
+        1,
+        "the store must be preserved"
+    );
+    assert!(!insts.iter().any(|i| matches!(i, Inst::IntBin { .. })));
+    assert_eq!(run(&opt, &[]), Ok(vec![Value::I32(0)]));
+}
+
+#[test]
+fn dce_removes_dead_branch_condition() {
+    // After the constant `br_if` resolves to `br`, the whole condition computation is dead.
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![
+                Block {
+                    params: vec![ValType::I64], // x = 0
+                    insts: vec![
+                        Inst::ConstI32(5), // 1
+                        Inst::ConstI32(5), // 2
+                        Inst::IntCmp {
+                            ty: IntTy::I32,
+                            op: CmpOp::Eq,
+                            a: 1,
+                            b: 2,
+                        }, // 3 = 1
+                    ],
+                    term: Terminator::BrIf {
+                        cond: 3,
+                        then_blk: 1,
+                        then_args: vec![0],
+                        else_blk: 2,
+                        else_args: vec![0],
+                    },
+                },
+                Block {
+                    params: vec![ValType::I64],
+                    insts: vec![],
+                    term: Terminator::Return(vec![0]),
+                },
+                Block {
+                    params: vec![ValType::I64],
+                    insts: vec![Inst::ConstI64(999)],
+                    term: Terminator::Return(vec![1]),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+
+    let opt = check_equiv(&m, &[vec![Value::I64(5)]]);
+    assert_eq!(opt.funcs[0].blocks.len(), 2);
+    assert!(
+        opt.funcs[0].blocks[0].insts.is_empty(),
+        "dead condition computation should be gone"
+    );
+    assert!(matches!(
+        opt.funcs[0].blocks[0].term,
+        Terminator::Br { target: 1, .. }
+    ));
+    assert_eq!(run(&opt, &[Value::I64(5)]), Ok(vec![Value::I64(5)]));
+}
+
+/// A tiny deterministic LCG so the fuzz is reproducible without a dependency.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33 ^ self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+#[test]
+fn fuzz_arithmetic_dag_equivalence_and_shrinks() {
+    // Build random all-`i64` straight-line DAGs of pure, non-trapping ops, optimize, and
+    // assert the residual re-verifies and is byte-identical on the interpreter. This hammers
+    // the value renumbering + operand remapper that dead-value elimination relies on. Most
+    // produced values are dead, so the optimizer should usually shrink the block.
+    const NONTRAP: [BinOp; 11] = [
+        BinOp::Add,
+        BinOp::Sub,
+        BinOp::Mul,
+        BinOp::And,
+        BinOp::Or,
+        BinOp::Xor,
+        BinOp::Shl,
+        BinOp::ShrS,
+        BinOp::ShrU,
+        BinOp::Rotl,
+        BinOp::Rotr,
+    ];
+    const UNOPS: [IntUnOp; 6] = [
+        IntUnOp::Clz,
+        IntUnOp::Ctz,
+        IntUnOp::Popcnt,
+        IntUnOp::Extend8S,
+        IntUnOp::Extend16S,
+        IntUnOp::Extend32S,
+    ];
+
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    let mut shrunk = 0usize;
+
+    for _ in 0..400 {
+        let n = 1 + rng.below(40);
+        let mut insts: Vec<Inst> = Vec::with_capacity(n);
+        insts.push(Inst::ConstI64(rng.next() as i64)); // index 0 is always defined
+        for i in 1..n {
+            match rng.below(3) {
+                0 => insts.push(Inst::ConstI64(rng.next() as i64)),
+                1 => insts.push(Inst::IntBin {
+                    ty: IntTy::I64,
+                    op: NONTRAP[rng.below(NONTRAP.len())],
+                    a: rng.below(i) as u32,
+                    b: rng.below(i) as u32,
+                }),
+                _ => insts.push(Inst::IntUn {
+                    ty: IntTy::I64,
+                    op: UNOPS[rng.below(UNOPS.len())],
+                    a: rng.below(i) as u32,
+                }),
+            }
+        }
+        let ret = rng.below(insts.len()) as u32;
+        let m = single_block_fn(vec![], vec![ValType::I64], insts, ret);
+
+        let before = m.funcs[0].blocks[0].insts.len();
+        let opt = check_equiv(&m, &[vec![]]);
+        let after = opt.funcs[0].blocks[0].insts.len();
+        assert!(after <= before, "optimizer must never grow the block");
+        if after < before {
+            shrunk += 1;
+        }
+    }
+
+    assert!(
+        shrunk > 0,
+        "dead-value elimination should fire on random DAGs"
+    );
 }

@@ -4,8 +4,7 @@
 //! This is the **generic IR→IR optimizer**: a closed-module, semantics-preserving pass
 //! that proves the `rewrite → re-verify → run` loop end to end before any
 //! interpreter-specialization machinery (constant memory, contexts, value-stack renaming)
-//! is built on top. It does three things, and *only* the three that need **no value
-//! renumbering** — keeping Stage 0 small and obviously correct:
+//! is built on top. It does four things:
 //!
 //! 1. **Constant folding.** A pure, single-result integer op whose operands are all known
 //!    constants is replaced *in place* with the equivalent `const`. Because the
@@ -19,20 +18,30 @@
 //!    selection rule (`cond != 0`; `targets[idx as u32] else default`).
 //! 3. **Dead-block elimination.** After branch resolution, blocks unreachable from the
 //!    entry are dropped and the remaining blocks renumbered (terminator targets remapped).
-//!    This only touches `BlockIdx`es in terminators, never value operands — again no value
-//!    renumbering.
+//! 4. **Dead-value elimination (Stage 0.x).** Within each block, an instruction that is
+//!    pure *and* cannot trap *and* has no side effect (see [`is_removable_if_dead`]) is
+//!    removed when none of its results are used by a live instruction or the terminator.
+//!    This is the transform that makes folding *pay off* — once a `br_if` resolves, the
+//!    code that computed its condition becomes dead and disappears. Removing an instruction
+//!    shifts every later block-local value index, so this is the one transform that
+//!    **renumbers values**: it relies on the exhaustive operand remapper ([`map_operands`]
+//!    / [`map_term_operands`]) to rewrite every surviving operand. Conservatism is by
+//!    design — anything that can fault (loads, atomics, trapping conversions) or has an
+//!    effect (stores, calls, fences, fiber/thread ops) is *kept* even if its result is
+//!    unused, so trap and effect behavior is identical to the source.
 //!
 //! **Untrusted for escape (§2a / §20a posture).** Like the LLVM on-ramp, this pass is
 //! *not* in the escape-TCB: its output is meant to be re-verified with
 //! `svm_verify::verify_module` before it runs, so a bug here is a clean verify error, never
 //! an escape. The differential harness (`tests/optimize.rs`) is the correctness spec:
 //! `optimized(args) == original(args)` on the reference interpreter, for results *and*
-//! traps.
+//! traps — including a randomized fuzz over dead-heavy arithmetic DAGs that stresses the
+//! renumbering/remapper.
 //!
-//! **Deliberately out of scope for Stage 0** (needs the full operand-remapper / value
-//! renumbering, tracked as the next increment): intra-block dead-*value* elimination,
-//! value forwarding through `select`/copies, float folding (NaN/rounding fidelity), and
-//! anything that reads or rewrites memory (the "constant memory" analysis is Stage 1).
+//! **Still out of scope** (later increments): float constant folding (NaN/rounding
+//! fidelity), value forwarding through `select`/copies, dead **block-parameter**
+//! elimination (a cross-edge transform — it must rewrite every predecessor's branch args),
+//! and anything that reads or rewrites memory (the "constant memory" analysis is Stage 1).
 
 use svm_ir::{BinOp, Block, CmpOp, ConvOp, Func, Inst, IntTy, IntUnOp, Module, Terminator, ValIdx};
 
@@ -84,14 +93,16 @@ pub fn optimize_module(m: &Module) -> Module {
     }
 }
 
-/// Optimize a single function: fold + resolve branches per block, then prune dead blocks.
-/// `fn_results` is the per-`FuncIdx` result arity (for `Inst::result_count`).
+/// Optimize a single function: fold + resolve branches per block, prune dead blocks, then
+/// drop dead values within each surviving block. `fn_results` is the per-`FuncIdx` result
+/// arity (for `Inst::result_count`).
 pub fn optimize_func(f: &Func, fn_results: &[usize]) -> Func {
     let folded: Vec<Block> = f.blocks.iter().map(|b| fold_block(b, fn_results)).collect();
+    let pruned = prune_unreachable(folded);
     Func {
         params: f.params.clone(),
         results: f.results.clone(),
-        blocks: prune_unreachable(folded),
+        blocks: pruned.iter().map(|b| dce_block(b, fn_results)).collect(),
     }
 }
 
@@ -459,4 +470,376 @@ fn prune_unreachable(blocks: Vec<Block>) -> Vec<Block> {
             b
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------------------
+// Stage 0.x: intra-block dead-value elimination.
+// ---------------------------------------------------------------------------------------
+
+/// Whether a dead instruction (no live results) is safe to **remove**. True only for the
+/// whitelist of ops that are *pure*, *cannot trap*, and have *no side effect*, so deleting
+/// one changes nothing observable. Everything else — anything that can fault (loads,
+/// atomics, trapping float→int, `cap.self.get`), writes memory or state (stores, `gc.roots`),
+/// transfers control / spawns / blocks (calls, `cap`/`cont`/`thread`/`memory.wait` ops,
+/// fences), or is otherwise unclassified — defaults to **not** removable (kept). The
+/// default direction is the safe one: a missed removal only forgoes an optimization, never
+/// changes behavior.
+pub fn is_removable_if_dead(inst: &Inst) -> bool {
+    match inst {
+        // `div`/`rem` trap on a zero (or signed-overflow) divisor; the rest of `IntBin` is pure.
+        Inst::IntBin { op, .. } => !matches!(
+            op,
+            BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU
+        ),
+        Inst::ConstI32(_)
+        | Inst::ConstI64(_)
+        | Inst::ConstF32(_)
+        | Inst::ConstF64(_)
+        | Inst::ConstV128(_)
+        | Inst::IntCmp { .. }
+        | Inst::IntUn { .. }
+        | Inst::Eqz { .. }
+        | Inst::Convert { .. }
+        | Inst::Select { .. }
+        | Inst::FBin { .. }
+        | Inst::FUn { .. }
+        | Inst::FCmp { .. }
+        // saturating float→int does not trap (the trapping variant, `FToITrap`, does not appear here)
+        | Inst::FToISat { .. }
+        | Inst::IToFConv { .. }
+        | Inst::Cast { .. }
+        | Inst::RefFunc { .. }
+        | Inst::PtrAdd { .. }
+        | Inst::PtrCast { .. }
+        | Inst::SimdWidthBytes
+        // all SIMD lane ops below are pure register-to-register (no memory, no trap)
+        | Inst::Splat { .. }
+        | Inst::ExtractLane { .. }
+        | Inst::ReplaceLane { .. }
+        | Inst::VIntBin { .. }
+        | Inst::VIntCmp { .. }
+        | Inst::VFloatCmp { .. }
+        | Inst::VShift { .. }
+        | Inst::VIntUn { .. }
+        | Inst::VSatBin { .. }
+        | Inst::VWiden { .. }
+        | Inst::VNarrow { .. }
+        | Inst::VConvert { .. }
+        | Inst::VPMinMax { .. }
+        | Inst::VPopcnt { .. }
+        | Inst::VAvgr { .. }
+        | Inst::VDot { .. }
+        | Inst::VExtMul { .. }
+        | Inst::VExtAddPairwise { .. }
+        | Inst::VQ15MulrSat { .. }
+        | Inst::VAnyTrue { .. }
+        | Inst::VAllTrue { .. }
+        | Inst::VBitmask { .. }
+        | Inst::VFloatBin { .. }
+        | Inst::VFloatUn { .. }
+        | Inst::VBitBin { .. }
+        | Inst::VNot { .. }
+        | Inst::Bitselect { .. }
+        | Inst::Shuffle { .. }
+        | Inst::Swizzle { .. } => true,
+        _ => false,
+    }
+}
+
+/// Apply `f` to **every value operand** of an instruction, in place. Exhaustive on purpose
+/// (no wildcard arm): adding an `Inst` variant that carries a `ValIdx` must fail to compile
+/// here rather than silently skip an operand and miscompile after renumbering. `FuncIdx`
+/// immediates (`RefFunc`/`ThreadSpawn::func`) are *not* value operands and are left alone.
+pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
+    match inst {
+        // No value operands.
+        Inst::ConstI32(_)
+        | Inst::ConstI64(_)
+        | Inst::ConstF32(_)
+        | Inst::ConstF64(_)
+        | Inst::ConstV128(_)
+        | Inst::RefFunc { .. }
+        | Inst::CapSelfCount
+        | Inst::AtomicFence { .. }
+        | Inst::SimdWidthBytes => {}
+
+        // Exactly one operand, named `a`.
+        Inst::IntUn { a, .. }
+        | Inst::Eqz { a, .. }
+        | Inst::Convert { a, .. }
+        | Inst::FUn { a, .. }
+        | Inst::FToISat { a, .. }
+        | Inst::FToITrap { a, .. }
+        | Inst::IToFConv { a, .. }
+        | Inst::Cast { a, .. }
+        | Inst::PtrCast { a, .. }
+        | Inst::Load { addr: a, .. }
+        | Inst::AtomicLoad { addr: a, .. }
+        | Inst::V128Load { addr: a, .. }
+        | Inst::CapSelfGet { idx: a }
+        | Inst::Suspend { value: a }
+        | Inst::ThreadJoin { handle: a }
+        | Inst::Splat { a, .. }
+        | Inst::ExtractLane { a, .. }
+        | Inst::VIntUn { a, .. }
+        | Inst::VWiden { a, .. }
+        | Inst::VConvert { a, .. }
+        | Inst::VPopcnt { a, .. }
+        | Inst::VExtAddPairwise { a, .. }
+        | Inst::VAnyTrue { a, .. }
+        | Inst::VAllTrue { a, .. }
+        | Inst::VBitmask { a, .. }
+        | Inst::VFloatUn { a, .. }
+        | Inst::VNot { a, .. } => {
+            *a = f(*a);
+        }
+
+        // Exactly two operands, named `a` and `b`.
+        Inst::IntBin { a, b, .. }
+        | Inst::IntCmp { a, b, .. }
+        | Inst::FBin { a, b, .. }
+        | Inst::FCmp { a, b, .. }
+        | Inst::PtrAdd { a, b }
+        | Inst::Store {
+            addr: a, value: b, ..
+        }
+        | Inst::AtomicStore {
+            addr: a, value: b, ..
+        }
+        | Inst::V128Store {
+            addr: a, value: b, ..
+        }
+        | Inst::AtomicRmw {
+            addr: a, value: b, ..
+        }
+        | Inst::MemoryNotify {
+            addr: a, count: b, ..
+        }
+        | Inst::ContNew { func: a, sp: b }
+        | Inst::ContResume { k: a, arg: b }
+        | Inst::ThreadSpawn { sp: a, arg: b, .. }
+        | Inst::ReplaceLane { a, b, .. }
+        | Inst::VIntBin { a, b, .. }
+        | Inst::VIntCmp { a, b, .. }
+        | Inst::VFloatCmp { a, b, .. }
+        | Inst::VShift { a, amt: b, .. }
+        | Inst::VSatBin { a, b, .. }
+        | Inst::VNarrow { a, b, .. }
+        | Inst::VPMinMax { a, b, .. }
+        | Inst::VAvgr { a, b, .. }
+        | Inst::VDot { a, b }
+        | Inst::VExtMul { a, b, .. }
+        | Inst::VQ15MulrSat { a, b }
+        | Inst::VFloatBin { a, b, .. }
+        | Inst::VBitBin { a, b, .. }
+        | Inst::Shuffle { a, b, .. }
+        | Inst::Swizzle { a, b } => {
+            *a = f(*a);
+            *b = f(*b);
+        }
+
+        // Three operands.
+        Inst::Select { cond, a, b } => {
+            *cond = f(*cond);
+            *a = f(*a);
+            *b = f(*b);
+        }
+        Inst::Bitselect { a, b, mask } => {
+            *a = f(*a);
+            *b = f(*b);
+            *mask = f(*mask);
+        }
+        Inst::AtomicCmpxchg {
+            addr,
+            expected,
+            replacement,
+            ..
+        } => {
+            *addr = f(*addr);
+            *expected = f(*expected);
+            *replacement = f(*replacement);
+        }
+        Inst::MemoryWait {
+            addr,
+            expected,
+            timeout,
+            ..
+        } => {
+            *addr = f(*addr);
+            *expected = f(*expected);
+            *timeout = f(*timeout);
+        }
+        Inst::GcRoots {
+            heap_lo,
+            heap_hi,
+            mask,
+            buf,
+            cap,
+        } => {
+            *heap_lo = f(*heap_lo);
+            *heap_hi = f(*heap_hi);
+            *mask = f(*mask);
+            *buf = f(*buf);
+            *cap = f(*cap);
+        }
+
+        // Variable-length operand lists.
+        Inst::Call { args, .. } => {
+            for v in args.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        Inst::CallIndirect { idx, args, .. } => {
+            *idx = f(*idx);
+            for v in args.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        Inst::CapCall { handle, args, .. } | Inst::CallImport { handle, args, .. } => {
+            *handle = f(*handle);
+            for v in args.iter_mut() {
+                *v = f(*v);
+            }
+        }
+    }
+}
+
+/// Apply `f` to every **value** operand of a terminator (the branch condition / table index,
+/// all edge arguments, return / tail-call arguments). Block-index *targets* are untouched —
+/// those are remapped separately by [`remap_targets`].
+pub fn map_term_operands(t: &mut Terminator, f: &mut impl FnMut(ValIdx) -> ValIdx) {
+    match t {
+        Terminator::Br { args, .. } => {
+            for v in args.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        Terminator::BrIf {
+            cond,
+            then_args,
+            else_args,
+            ..
+        } => {
+            *cond = f(*cond);
+            for v in then_args.iter_mut().chain(else_args.iter_mut()) {
+                *v = f(*v);
+            }
+        }
+        Terminator::BrTable {
+            idx,
+            targets,
+            default,
+        } => {
+            *idx = f(*idx);
+            for (_, args) in targets.iter_mut() {
+                for v in args.iter_mut() {
+                    *v = f(*v);
+                }
+            }
+            for v in default.1.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        Terminator::Return(vals) => {
+            for v in vals.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        Terminator::ReturnCall { args, .. } => {
+            for v in args.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        Terminator::ReturnCallIndirect { idx, args, .. } => {
+            *idx = f(*idx);
+            for v in args.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        Terminator::Unreachable => {}
+    }
+}
+
+/// Visit (read-only) every value operand of an instruction. Implemented on a throwaway clone
+/// through [`map_operands`], so there is a single source of truth for "what the operands are".
+fn each_operand(inst: &Inst, mut visit: impl FnMut(ValIdx)) {
+    let mut tmp = inst.clone();
+    map_operands(&mut tmp, &mut |v| {
+        visit(v);
+        v
+    });
+}
+
+/// Remove dead values from one block: a backward liveness sweep marks every value used by a
+/// kept instruction or the terminator, removable instructions whose results are all dead are
+/// dropped, and the survivors are renumbered with every operand rewritten through the new map.
+fn dce_block(b: &Block, fn_results: &[usize]) -> Block {
+    let nparams = b.params.len() as u32;
+
+    // The first result index of each instruction, and the total value count of the block.
+    let mut result_start: Vec<u32> = Vec::with_capacity(b.insts.len());
+    let mut next = nparams;
+    for inst in &b.insts {
+        result_start.push(next);
+        next += inst.result_count(fn_results) as u32;
+    }
+    let total = next as usize;
+
+    // Liveness: terminator operands are roots; then sweep instructions back to front, keeping
+    // any with a live result (or that is not removable) and propagating liveness to its operands.
+    let mut live = vec![false; total];
+    {
+        let mut term = b.term.clone();
+        map_term_operands(&mut term, &mut |v| {
+            live[v as usize] = true;
+            v
+        });
+    }
+    let mut keep = vec![false; b.insts.len()];
+    for i in (0..b.insts.len()).rev() {
+        let inst = &b.insts[i];
+        let rc = inst.result_count(fn_results) as u32;
+        let start = result_start[i];
+        let any_live = (0..rc).any(|k| live[(start + k) as usize]);
+        if any_live || !is_removable_if_dead(inst) {
+            keep[i] = true;
+            each_operand(inst, |v| live[v as usize] = true);
+        }
+    }
+
+    // Old → new value index. Params keep their indices; kept results pack down after them;
+    // removed results have no new index (they are provably unused, so never looked up).
+    let mut map: Vec<Option<u32>> = vec![None; total];
+    for p in 0..nparams {
+        map[p as usize] = Some(p);
+    }
+    let mut new_next = nparams;
+    for (i, &start) in result_start.iter().enumerate() {
+        let rc = b.insts[i].result_count(fn_results) as u32;
+        if keep[i] {
+            for k in 0..rc {
+                map[(start + k) as usize] = Some(new_next);
+                new_next += 1;
+            }
+        }
+    }
+    let lookup = |v: ValIdx| map[v as usize].expect("a live operand must have a new index");
+
+    // Emit the survivors with operands (and the terminator) rewritten through the map.
+    let mut insts = Vec::with_capacity(new_next as usize);
+    for (i, inst) in b.insts.iter().enumerate() {
+        if keep[i] {
+            let mut inst = inst.clone();
+            map_operands(&mut inst, &mut |v| lookup(v));
+            insts.push(inst);
+        }
+    }
+    let mut term = b.term.clone();
+    map_term_operands(&mut term, &mut |v| lookup(v));
+
+    Block {
+        params: b.params.clone(),
+        insts,
+        term,
+    }
 }
