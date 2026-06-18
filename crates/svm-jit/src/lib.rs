@@ -343,6 +343,20 @@ pub struct FrozenFiber {
     pub generation: u64,
 }
 
+/// The host-side residue of a **spawned vCPU** (a `thread.spawn` child) flattened by a multi-vCPU
+/// durable freeze (DURABILITY.md §12.8 slice 3.3) — the JIT mirror of `svm_interp::FrozenVCpu`. Its
+/// continuation lives in its own in-window shadow region (`shadow_region_base(task)`); this carries
+/// what a thaw must re-attach: its task id (= shadow context index + spawn order), entry function +
+/// spawn args (to re-enter it), and the flattened shadow-SP extent. A multi-vCPU **freeze** returns
+/// one per flattened child; a **thaw** is handed them back to re-create the children.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FrozenVCpu {
+    pub task: usize,
+    pub func: i32,
+    pub args: Vec<i64>,
+    pub shadow_sp: u64,
+}
+
 /// The durable snapshot's window-image page granularity (must match `svm-snapshot`'s `PAGE` /
 /// `svm-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
 /// bytes. Host-page-independent for artifact portability; a 4 KiB codec page sits within one host
