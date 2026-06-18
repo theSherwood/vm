@@ -10,7 +10,7 @@
 //! The `.expect(...)` on `compile_and_run_with_host`'s `Option` is the gate: if the bytecode engine
 //! does not *support* a synchronous `cap.call` (returns `None` → would fall back), the test fails.
 
-use svm_interp::{bytecode, run_with_host, Host, Trap, Value};
+use svm_interp::{bytecode, run_with_host, Host, StreamRole, Trap, Value};
 use svm_text::parse_module;
 
 /// A fresh host granting one deterministic host-fn capability; returns the host and its handle.
@@ -121,6 +121,63 @@ fn cap_chained() {
 fn cap_in_loop() {
     check_cap(LOOP_CALL, &[Value::I64(10)]);
     check_cap(LOOP_CALL, &[Value::I64(0)]);
+}
+
+// ---- §7 reflection (cap.self.count / cap.self.get) --------------------------------------------
+
+/// A fresh host with a deterministic 3-cap powerbox (stream-out, exit, host-fn), granted in order so
+/// handle `i` is the `i`-th grant on every fresh host.
+fn host_with_powerbox() -> Host {
+    let mut h = Host::new();
+    let _ = h.grant_stream(StreamRole::Out); // handle 0, type_id 0
+    let _ = h.grant_exit(); // handle 1, type_id 1
+    let _ = h.grant_host_fn(Box::new(|_o, _a, _m| Ok(vec![0]))); // handle 2, type_id 13
+    h
+}
+
+fn check_self(src: &str, args: &[Value]) {
+    let m = parse_module(src).expect("parse");
+
+    let mut h_tw = host_with_powerbox();
+    let mut f_tw = 1_000_000u64;
+    let tw = run_with_host(&m, 0, args, &mut f_tw, &mut h_tw);
+
+    let mut h_bc = host_with_powerbox();
+    let mut f_bc = 1_000_000u64;
+    let bc = bytecode::compile_and_run_with_host(&m, 0, args, &mut f_bc, &mut h_bc)
+        .expect("bytecode engine must support cap.self.* (Slice 1c-5a)");
+
+    assert_eq!(tw, bc, "cap.self.*: tree-walker != bytecode\n{src}");
+}
+
+const SELF_COUNT: &str = r#"
+func () -> (i32) {
+block0():
+  v0 = cap.self.count
+  return v0
+}
+"#;
+
+/// `cap.self.get(i)` returns `(handle, type_id)`; sum them so the result depends on both.
+const SELF_GET: &str = r#"
+func (i32) -> (i32) {
+block0(v0: i32):
+  v1, v2 = cap.self.get v0
+  v3 = i32.add v1 v2
+  return v3
+}
+"#;
+
+#[test]
+fn cap_self_count() {
+    check_self(SELF_COUNT, &[]);
+}
+
+#[test]
+fn cap_self_get() {
+    check_self(SELF_GET, &[Value::I32(0)]);
+    check_self(SELF_GET, &[Value::I32(1)]);
+    check_self(SELF_GET, &[Value::I32(2)]);
 }
 
 /// A forged/out-of-range handle must trap identically on both engines (inert `CapFault`), not

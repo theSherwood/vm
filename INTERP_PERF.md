@@ -286,9 +286,11 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               `sig.results`); `host` is threaded through `Vm::resume` / `run`, and a new
               `compile_and_run_with_host` is what `run_with_host_fast` now calls. The executor/fiber
               capability variants (`Instantiator`/`Yielder`/`JIT`/`SharedRegion` op 4) are rejected by
-              the compiler → tree-walker fallback. New TDD harness `bytecode_caps.rs` (hand-authored
-              host-fn modules: sum-args, op-selector, chained, in-loop, forged-handle-traps) — all
-              bit-identical to `run_with_host`; `.expect(Some)` gates that bytecode actually drove it.
+              the compiler → tree-walker fallback. Also covers the synchronous §7 reflection ops
+              `cap.self.count` / `cap.self.get` (reuse `host.self_dispatch`). New TDD harness
+              `bytecode_caps.rs` (hand-authored host-fn modules: sum-args, op-selector, chained,
+              in-loop, forged-handle-traps, self-count, self-get) — all bit-identical to
+              `run_with_host`; `.expect(Some)` gates that bytecode actually drove it (didn't fall back).
         - [ ] **1c-5b** — `Vm` as a schedulable task in the executor (`drive`/`Scheduler`): the
               foundation threads/fibers ride on. Harness: schedule/interleaving equality.
         - [ ] **1c-5c** — threads (`thread.spawn`/`join`) + `memory.wait`/`notify`. Harness:

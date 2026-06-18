@@ -221,6 +221,16 @@ enum Op {
         dst: u32,
         results: Box<[ValType]>,
     },
+    /// §7 reflection `cap.self.count` — number of caps this domain holds (one `i32` result).
+    CapSelfCount {
+        dst: u32,
+    },
+    /// §7 reflection `cap.self.get` — the `idx`-th held cap as `(handle, type_id)` (two `i32`
+    /// results in `dst`, `dst+1`).
+    CapSelfGet {
+        idx: u32,
+        dst: u32,
+    },
     Ret {
         srcs: Box<[u32]>,
     },
@@ -584,11 +594,13 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 results: sig.results.clone().into(),
             }
         }
+        // §7 reflection — synchronous self-powerbox queries (no scheduler/fiber); reuse the host's
+        // `self_dispatch`, the same path the tree-walker and the JIT thunk take.
+        Inst::CapSelfCount => Op::CapSelfCount { dst },
+        Inst::CapSelfGet { idx } => Op::CapSelfGet { idx: g(*idx), dst },
         // Control / host / cross-module ops this slice doesn't drive (they need the scheduler,
         // fiber registry, or dispatch table) — fall back to the tree-walker.
-        Inst::CapSelfCount
-        | Inst::CapSelfGet { .. }
-        | Inst::CallImport { .. }
+        Inst::CallImport { .. }
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
         | Inst::Suspend { .. }
@@ -1099,6 +1111,20 @@ impl Vm {
                     for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
                         self.regs[base + *dst as usize + i] = Reg::from_value(slot_to_val(*ty, *s));
                     }
+                    pc += 1;
+                }
+                Op::CapSelfCount { dst } => {
+                    // §7 reflection op 0 — same `self_dispatch` the tree-walker uses; one i32 result.
+                    let res = host.self_dispatch(0, &[])?;
+                    r!(*dst) = Reg::from_i32(res[0] as i32);
+                    pc += 1;
+                }
+                Op::CapSelfGet { idx, dst } => {
+                    // §7 reflection op 1 — the idx-th held cap as (handle, type_id), two i32 results.
+                    let i = r!(*idx).i32() as i64;
+                    let res = host.self_dispatch(1, &[i])?;
+                    self.regs[base + *dst as usize] = Reg::from_i32(res[0] as i32);
+                    self.regs[base + *dst as usize + 1] = Reg::from_i32(res[1] as i32);
                     pc += 1;
                 }
                 Op::Unreachable => return Err(Trap::Unreachable),
