@@ -823,9 +823,12 @@ sequenced slice:
 
    With step 1 complete on both backends, **step 3** (recycle-on-finish) can wire `recycle_owned` on the
    live path: a finished slot's generation is already bumped, the handle carries it, and the claim
-   rejects stale handles — so reuse is now ABA-safe. Remaining within step 1's spirit: the JIT freeze
-   driver's `runnable_handles()`/`fiber_region_base(handle as usize)` still treat the handle as the raw
-   slot (correct only at generation 0); step 3 must encode/extract there once generations can be nonzero.
+   rejects stale handles — so reuse is now ABA-safe. *(Resolved in step 3: the JIT freeze driver's
+   `runnable_handles()` now encodes the generation and `fiber_region_base` is only ever passed a real
+   resolved slot — never a raw handle — so the freeze/thaw path is generation-correct on both backends.
+   The wired JIT `cont.resume` → `resolve` + `claim_gen` ABA guard is pinned end-to-end against the
+   interpreter oracle by `jit_fibers.rs::{fiber_forged_generation_faults_identically,
+   recycled_slot_generation_guard_agrees}`, and the recycled freeze/thaw path by the step-4 fuzz.)*
 2. **[x] Snapshot format: carry generations — done, end-to-end (interp).** `FrozenFiber` (both backends)
    gains a `generation`; the freeze records it (interp `registry.generation(slot)`, JIT
    `slot.own.generation()` read before `finish` bumps it), the control section carries it (format **v2**,
