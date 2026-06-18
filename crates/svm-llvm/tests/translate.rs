@@ -3643,6 +3643,27 @@ fn simd_vector_rotate_fshl() {
     check_vectorized_vs_native("simd_rotate", src, 7);
 }
 
+/// **Wide non-splat shuffle (`shufflevector <8 x i8>` byte-reverse `<7,6,…,0>`).** A sub-128 vector
+/// (8 bytes → 0 chunks, 8 scalar tail lanes) permuted by a general constant mask — the legalized
+/// analog of the single-`v128` `Inst::Shuffle` path. The on-ramp explodes both operands' lanes,
+/// gathers per the mask (each result lane picks from the `a ++ b` concat), and repacks. This is the
+/// shape the `async_io` demo's byte-reversal emits; here forced via `__builtin_shufflevector`.
+#[test]
+fn simd_wide_shuffle_reverse() {
+    let src = "typedef unsigned char v8qi __attribute__((vector_size(8))); \
+               void rev8(const unsigned char *P, unsigned char *O); \
+               static unsigned char a[8], out[8]; \
+               int run(int seed){ for(int i=0;i<8;i++) a[i]=(unsigned char)(seed+i*3); \
+               rev8(a, out); \
+               return (out[0]*1 + out[3]*5 + out[7]*7) & 0xff; } \
+               __attribute__((noinline)) void rev8(const unsigned char *P, unsigned char *O){ \
+               v8qi v = *(const v8qi*)P; \
+               v8qi r = __builtin_shufflevector(v, v, 7,6,5,4,3,2,1,0); \
+               *(v8qi*)O = r; } \
+               int main(void){ return run(4); }";
+    check_vectorized_vs_native("simd_wide_shuffle", src, 4);
+}
+
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
 /// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
 /// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and

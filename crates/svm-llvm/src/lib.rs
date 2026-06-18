@@ -6270,57 +6270,42 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             let Some(src) = wide_vec_layout(sv.operand0.get_type(types).as_ref()) else {
                 return Ok(false);
             };
-            // The result lanes (the mask length); a wide shuffle is only supported in its **splat**
-            // (broadcast) form — every mask lane the same source lane, what an `insertelement`+
-            // `shufflevector zeroinitializer` idiom (a scalar broadcast) emits. A general cross-chunk
-            // shuffle stays `Unsupported` (fail-closed).
+            // A **general constant-mask** wide shuffle: each result lane picks a source lane from the
+            // `operand0 ++ operand1` concatenation (a `<8 x i8>` byte-reverse `<7,6,…,0>`, a broadcast
+            // `zeroinitializer`, …). Scalarize: explode both operands' lanes, gather per the mask,
+            // repack into the result's representation. svm-ir's in-block `Inst::Shuffle` covers the
+            // single-`v128` case; this is its legalized analog for wider/sub-128 (chunk+tail) vectors.
+            let total = src.total_lanes();
             let mask: Vec<i64> = match sv.mask.as_ref() {
-                Constant::AggregateZero(_) => vec![0; src.total_lanes()],
+                Constant::AggregateZero(_) => vec![0; total],
                 Constant::Vector(m) => m
                     .iter()
                     .map(|e| match e.as_ref() {
                         Constant::Int { value, .. } => *value as i64,
-                        _ => 0,
+                        _ => 0, // undef/poison mask lane → source lane 0
                     })
                     .collect(),
                 _ => return unsup("wide shufflevector: non-constant mask"),
             };
-            let j = mask.first().copied().unwrap_or(0);
-            if mask.is_empty()
-                || mask.iter().any(|&m| m != j)
-                || j < 0
-                || j as usize >= src.total_lanes()
-            {
-                return unsup("wide shufflevector: only a broadcast (splat) of one source lane");
+            let a_parts = ctx.wide_operand(&sv.operand0, src)?;
+            let a_lanes = wide_explode_lanes(ctx, &a_parts, src);
+            let b_parts = ctx.wide_operand(&sv.operand1, src)?;
+            let b_lanes = wide_explode_lanes(ctx, &b_parts, src);
+            let mut res = Vec::with_capacity(mask.len());
+            for &mr in &mask {
+                let idx = if mr < 0 { 0 } else { mr as usize };
+                // `idx` in `0..total` selects `operand0`, `total..2*total` selects `operand1`; an
+                // out-of-range (undef) lane reads `operand0` lane 0 (a defined value, §3c).
+                let pick = if idx < total {
+                    a_lanes[idx]
+                } else if idx < 2 * total {
+                    b_lanes[idx - total]
+                } else {
+                    a_lanes[0]
+                };
+                res.push(pick);
             }
-            let parts = ctx.wide_operand(&sv.operand0, src)?;
-            let lpc = src.shape.lanes() as usize;
-            let chunked = src.full_chunks * lpc;
-            let j = j as usize;
-            let scalar = if j < chunked {
-                ctx.push(Inst::ExtractLane {
-                    shape: src.shape,
-                    lane: (j % lpc) as u8,
-                    signed: false,
-                    a: parts[j / lpc],
-                })
-            } else {
-                parts[src.full_chunks + (j - chunked)]
-            };
-            // Build the result by its own layout (result lane count = mask length).
-            let m = mask.len();
-            let (rc, rt) = (m / lpc, m % lpc);
-            let mut out = Vec::with_capacity(rc + rt);
-            for _ in 0..rc {
-                out.push(ctx.push(Inst::Splat {
-                    shape: src.shape,
-                    a: scalar,
-                }));
-            }
-            for _ in 0..rt {
-                out.push(scalar);
-            }
-            ctx.bind_wide(&sv.dest, out);
+            bind_lanes_as_vector(ctx, &sv.dest, &res, src.shape);
             Ok(true)
         }
         I::Call(c) => {
@@ -6868,6 +6853,54 @@ fn vec_explode_int(ctx: &mut BlockCtx, op: &Operand, types: &Types) -> Result<Ve
         return Ok(out);
     }
     unsup("vector convert: unsupported source vector shape")
+}
+
+/// Explode a legalized **wide** value (its `parts` = chunk `v128`s + tail scalars, per `layout`) into
+/// its `total_lanes` per-lane scalars — `ExtractLane` for each chunk lane, then the already-scalar
+/// tail lanes. Shape-generic (integer or float lanes); the inverse is [`bind_lanes_as_vector`].
+fn wide_explode_lanes(ctx: &mut BlockCtx, parts: &[ValIdx], layout: WideLayout) -> Vec<ValIdx> {
+    let lpc = layout.shape.lanes() as usize;
+    let mut out = Vec::with_capacity(layout.total_lanes());
+    for &chunk in parts.iter().take(layout.full_chunks) {
+        for l in 0..lpc {
+            out.push(ctx.push(Inst::ExtractLane {
+                shape: layout.shape,
+                lane: l as u8,
+                signed: false,
+                a: chunk,
+            }));
+        }
+    }
+    for t in 0..layout.tail_lanes {
+        out.push(parts[layout.full_chunks + t]);
+    }
+    out
+}
+
+/// Bind `dest` to a vector built from `lanes` (of lane type `shape`), choosing the representation by
+/// the lane count: exactly one `v128`'s worth → a single `v128` ([`finish`]); otherwise a legalized
+/// wide value (`full_chunks` `v128`s + a scalar tail, [`BlockCtx::bind_wide`]). Used to land a wide
+/// shuffle's gathered result lanes.
+fn bind_lanes_as_vector(ctx: &mut BlockCtx, dest: &Name, lanes: &[ValIdx], shape: svm_ir::VShape) {
+    let lpc = shape.lanes() as usize;
+    if lanes.len() == lpc {
+        let v = build_v128_from_lanes(ctx, shape, lanes);
+        let _ = finish(ctx, dest, v);
+        return;
+    }
+    let full_chunks = lanes.len() / lpc;
+    let mut parts = Vec::with_capacity(full_chunks + lanes.len() % lpc);
+    for ci in 0..full_chunks {
+        parts.push(build_v128_from_lanes(
+            ctx,
+            shape,
+            &lanes[ci * lpc..ci * lpc + lpc],
+        ));
+    }
+    for &l in &lanes[full_chunks * lpc..] {
+        parts.push(l);
+    }
+    ctx.bind_wide(dest, parts);
 }
 
 /// Build a single `v128` of `shape` from its `lane scalars` (`Splat` lane 0, then `ReplaceLane` the

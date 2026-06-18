@@ -868,10 +868,10 @@ vectorization is on — confirmed by flipping the lanes (9 fails → 5). Float-l
   (vectorization *enabled*), each a real `clang -O2` loop verified to emit the conversion, vs native.
   Covers `zext <4 x i8>→<4 x i32>`, `sext <2 x i32>→<2 x i64>`, `trunc <2 x i64>→<2 x i32>`, and
   `trunc <8 x i16>→<8 x i8>` / `<8 x i32>→<8 x i16>`. 125 translate tests green, fmt + clippy clean.
-- **Remaining before the breadth-lane flip (2 classes, 4 demos):** `<N x i1>` masks (vector `icmp`/
-  `select` → `perlin`/`crc32`/`clay`), non-splat cross-chunk shuffle (→ `vm_async_io_runtime`). The
-  lanes are **all-or-nothing** (a lane flips only when every demo on it passes), so they stay
-  `-fno-*-vectorize` until all classes land.
+- **Remaining before the breadth-lane flip (1 class, 3 demos):** `<N x i1>` masks (vector `icmp`/
+  `select`/`extractelement`/`bitcast`-to-`iN` → `perlin`/`crc32`/`clay`). The lanes are
+  **all-or-nothing** (a lane flips only when every demo on it passes), so they stay `-fno-*-vectorize`
+  until this last class lands.
 
 **Slice AQ (DONE) — auto-vectorized vector rotate (`llvm.fshl.v4i32` / `fshr`).** The second vector-op
 class (lands `xxhash` when vectorized). svm-ir's `VShift` takes only a *scalar* shift amount, but the
@@ -883,6 +883,17 @@ the scalar `IntBin Rotl`/`Rotr` (count masked mod lane width — no shift-by-wid
 (non-rotate) or float-shape funnel shift stays `Unsupported`.
 - Test: `simd_vector_rotate_fshl` — a `(x<<13)|(x>>19)` rotate loop (`check_vectorized_vs_native`,
   vectorization enabled, verified to emit `llvm.fshl.v4i32`), vs native. 126 translate tests green.
+
+**Slice AR (DONE) — general constant-mask wide shuffle (`shufflevector`).** The third vector-op class
+(lands `vm_async_io_runtime` when vectorized). The single-`v128` `shufflevector` already lowered to
+`Inst::Shuffle` (a byte mask); the **legalized wide** path only handled the broadcast (splat) form.
+Generalized to **any constant mask**: explode both operands' lanes (`wide_explode_lanes`, shape-generic
+`ExtractLane` + tail), gather each result lane from the `operand0 ++ operand1` concatenation per the
+mask, and repack via `bind_lanes_as_vector` (a single `v128` when the result is one `v128`'s worth, else
+a wide chunks+tail value). Subsumes the old splat case. This is the shape `async_io`'s `<8 x i8>`
+byte-reversal (`<7,6,…,0>`) emits. A non-constant mask stays `Unsupported` (fail-closed).
+- Test: `simd_wide_shuffle_reverse` — an `__builtin_shufflevector` `<8 x i8>` byte-reverse
+  (`check_vectorized_vs_native`), vs native. 127 translate tests green, fmt + clippy clean.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
