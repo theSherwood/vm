@@ -1441,6 +1441,9 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     // A small by-value struct (a call/`insertvalue` result) is tracked field-wise via
                     // the aggregate side-table, never used as a scalar — record a placeholder type.
                     Err(_) if struct_field_vtypes(ty.as_ref(), types).is_some() => ValType::I64,
+                    // An `<N x i1>` boolean mask (vector `icmp`/`fcmp`) is tracked lane-wise via
+                    // `mask_lanes`, never used as a scalar — record a placeholder type.
+                    Err(_) if i1_vector_lanes(ty.as_ref()).is_some() => ValType::I32,
                     Err(e) => return Err(e),
                 };
                 s.ty.push(vt);
@@ -3736,8 +3739,8 @@ fn lower_int_intrinsic(
                 return unsup(format!("general vector funnel shift `{name}` (non-rotate)"));
             }
             let lane_ty = int_ty(shape.lane_val())?;
-            let data = vec_explode_int(ctx, args[0], types)?;
-            let amts = vec_explode_int(ctx, args[2], types)?;
+            let data = vec_explode(ctx, args[0], types, false)?;
+            let amts = vec_explode(ctx, args[2], types, false)?;
             let op = if base == "llvm.fshl" {
                 BinOp::Rotl
             } else {
@@ -4643,6 +4646,12 @@ struct BlockCtx<'a> {
     /// several IR values — but, unlike `agg`, these *do* cross block boundaries (a vectorized loop's
     /// wide accumulator), fanned out into per-part block params by `block_params`/`branch_args`.
     wide_vals: HashMap<ValueId, Vec<ValIdx>>,
+    /// Scalarized boolean-mask SSA values (`<N x i1>`, from a vector `icmp`/`fcmp`): value-id → its
+    /// `N` per-lane `i1` scalars (each `0`/`1` in an `i32` container). svm-ir has no first-class
+    /// `<N x i1>` type, so a mask is held lane-wise — `select` selects per lane, `extractelement`
+    /// reads a lane, `bitcast … to iN` ORs the lanes into a bitmap. Like `agg`, assumed not to cross
+    /// block boundaries (clang produces and consumes a mask in one block).
+    mask_lanes: HashMap<ValueId, Vec<ValIdx>>,
     next_val: ValIdx,
 }
 
@@ -5170,6 +5179,7 @@ fn translate_block(
         idx_of: HashMap::new(),
         agg: HashMap::new(),
         wide_vals: HashMap::new(),
+        mask_lanes: HashMap::new(),
         next_val: 0,
     };
     for (vid, pos) in scalar_seed {
@@ -5217,6 +5227,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     // Wider-than-128 / sub-128 vector ops legalize to fixed-128 `v128` chunks + a scalar tail (I2
     // step 1), handled entirely here. `Ok(false)` means no wide vector is involved — fall through.
     if lower_wide(ctx, instr, types)? {
+        return Ok(());
+    }
+
+    // `<N x i1>` boolean masks (vector `icmp`/`fcmp`/`select`/movemask) have no first-class svm-ir
+    // type; they are held lane-wise and scalarized here. `Ok(false)` ⇒ not a mask op — fall through.
+    if lower_mask(ctx, instr, types)? {
         return Ok(());
     }
 
@@ -6354,6 +6370,255 @@ fn lower_wide(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
     }
 }
 
+/// `Some(N)` if `ty` is an `<N x i1>` boolean-mask vector (the type a vector `icmp`/`fcmp` produces).
+fn i1_vector_lanes(ty: &Type) -> Option<usize> {
+    match ty {
+        Type::VectorType {
+            element_type,
+            num_elements,
+            scalable: false,
+        } => {
+            matches!(element_type.as_ref(), Type::IntegerType { bits: 1 }).then_some(*num_elements)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a `<N x i1>` mask operand to its `N` scalarized lane values (each `0`/`1` in an `i32`). A
+/// local reads its recorded `mask_lanes`; a constant mask materializes per-lane `0`/`1` consts.
+fn mask_operand(ctx: &mut BlockCtx, op: &Operand, n: usize) -> Result<Vec<ValIdx>, Error> {
+    match op {
+        Operand::LocalOperand { name, .. } => {
+            let vid = *ctx
+                .s
+                .name2id
+                .get(name)
+                .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}")))?;
+            ctx.mask_lanes.get(&vid).cloned().ok_or_else(|| {
+                Error::Unsupported(format!("mask value {vid} not available in block"))
+            })
+        }
+        // `poison`/`undef` (the base of an `insertelement` mask build) and `zeroinitializer` are all
+        // false; an explicit constant mask is its per-lane `i1` values.
+        Operand::ConstantOperand(c) => {
+            let bit = |e: &Constant| -> i32 { matches!(e, Constant::Int { value: 1, .. }) as i32 };
+            let lanes: Vec<i32> = match c.as_ref() {
+                Constant::Vector(elems) => elems.iter().map(|e| bit(e.as_ref())).collect(),
+                _ => vec![0; n], // AggregateZero / Undef / Poison / Null
+            };
+            Ok(lanes
+                .into_iter()
+                .take(n)
+                .chain(std::iter::repeat(0))
+                .take(n)
+                .map(|b| ctx.push(Inst::ConstI32(b)))
+                .collect())
+        }
+        Operand::MetadataOperand => unsup("metadata mask operand"),
+    }
+}
+
+/// Lower the **`<N x i1>` boolean-mask** instructions a vectorized program produces. svm-ir has no
+/// first-class `<N x i1>` type, so a mask is held lane-wise (`mask_lanes`: `N` scalar `0`/`1`s) and
+/// every producer/consumer is scalarized: vector `icmp`/`fcmp` → per-lane scalar compare; `select`
+/// (mask condition) → per-lane scalar `select` over the exploded data; `extractelement` → the lane;
+/// `insertelement`/`shufflevector` → build/permute the lanes; `bitcast … to iN` (the SIMD movemask)
+/// → OR the lanes into a bitmap; `freeze` → identity. Returns `true` if handled (dispatched after
+/// [`lower_wide`], before the scalar match). Each form re-verifies under `svm-verify`.
+fn lower_mask(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<bool, Error> {
+    use Instruction as I;
+    match instr {
+        // Vector integer compare → `N` scalar `IntCmp`s (narrow lanes extended per the predicate's
+        // signedness so the `i32` compare orders them correctly, §3b).
+        I::ICmp(x) if vec_lane_shape(x.operand0.get_type(types).as_ref()).is_some() => {
+            let Some(shape) = vec_lane_shape(x.operand0.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let op = icmp_op(x.predicate);
+            let signed = matches!(
+                x.predicate,
+                IntPredicate::SLT | IntPredicate::SLE | IntPredicate::SGT | IntPredicate::SGE
+            );
+            let lane_ty = int_ty(shape.lane_val())?;
+            let a = vec_explode(ctx, &x.operand0, types, signed)?;
+            let b = vec_explode(ctx, &x.operand1, types, signed)?;
+            let mut m = Vec::with_capacity(a.len());
+            for (&av, &bv) in a.iter().zip(b.iter()) {
+                m.push(ctx.push(Inst::IntCmp {
+                    ty: lane_ty,
+                    op,
+                    a: av,
+                    b: bv,
+                }));
+            }
+            bind_mask(ctx, &x.dest, m);
+            Ok(true)
+        }
+        // Vector float compare → `N` scalar `FCmp`s.
+        I::FCmp(x) if vec_lane_shape(x.operand0.get_type(types).as_ref()).is_some() => {
+            let Some(shape) = vec_lane_shape(x.operand0.get_type(types).as_ref()) else {
+                return Ok(false);
+            };
+            let op = fcmp_op(x.predicate)?;
+            let lane_ty = float_ty(shape.lane_val())?;
+            let a = vec_explode(ctx, &x.operand0, types, false)?;
+            let b = vec_explode(ctx, &x.operand1, types, false)?;
+            let mut m = Vec::with_capacity(a.len());
+            for (&av, &bv) in a.iter().zip(b.iter()) {
+                m.push(ctx.push(Inst::FCmp {
+                    ty: lane_ty,
+                    op,
+                    a: av,
+                    b: bv,
+                }));
+            }
+            bind_mask(ctx, &x.dest, m);
+            Ok(true)
+        }
+        // `select <N x i1> mask, a, b` → a per-lane scalar `select` over the exploded data, repacked.
+        I::Select(x) if i1_vector_lanes(x.condition.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(x.condition.get_type(types).as_ref()).unwrap();
+            let mask = mask_operand(ctx, &x.condition, n)?;
+            let a = vec_explode(ctx, &x.true_value, types, false)?;
+            let b = vec_explode(ctx, &x.false_value, types, false)?;
+            let mut out = Vec::with_capacity(n);
+            for k in 0..n {
+                out.push(ctx.push(Inst::Select {
+                    cond: mask[k],
+                    a: a[k],
+                    b: b[k],
+                }));
+            }
+            let res_ty = x.true_value.get_type(types);
+            vec_implode(ctx, &x.dest, &out, res_ty.as_ref(), types)?;
+            Ok(true)
+        }
+        // `extractelement <N x i1> mask, k` → lane `k` (a clean `0`/`1`).
+        I::ExtractElement(ee) if i1_vector_lanes(ee.vector.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(ee.vector.get_type(types).as_ref()).unwrap();
+            let k = const_int(&ee.index)
+                .ok_or_else(|| Error::Unsupported("mask extractelement: dynamic lane".into()))?
+                as usize;
+            if k >= n {
+                return unsup("mask extractelement: lane out of range");
+            }
+            let mask = mask_operand(ctx, &ee.vector, n)?;
+            finish(ctx, &ee.dest, mask[k])?;
+            Ok(true)
+        }
+        // `insertelement <N x i1> base, i1 x, k` → the base lanes with lane `k` replaced by `x`.
+        I::InsertElement(ie) if i1_vector_lanes(ie.vector.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(ie.vector.get_type(types).as_ref()).unwrap();
+            let k = const_int(&ie.index)
+                .ok_or_else(|| Error::Unsupported("mask insertelement: dynamic lane".into()))?
+                as usize;
+            if k >= n {
+                return unsup("mask insertelement: lane out of range");
+            }
+            let mut lanes = mask_operand(ctx, &ie.vector, n)?;
+            lanes[k] = ctx.operand(&ie.element)?;
+            bind_mask(ctx, &ie.dest, lanes);
+            Ok(true)
+        }
+        // `shufflevector` of masks: gather result lanes from the `a ++ b` concat per the constant mask
+        // (the splat `zeroinitializer` form broadcasts lane 0 — what an `insertelement`+`shuffle`
+        // mask-splat emits).
+        I::ShuffleVector(sv) if i1_vector_lanes(sv.operand0.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(sv.operand0.get_type(types).as_ref()).unwrap();
+            let a = mask_operand(ctx, &sv.operand0, n)?;
+            let b = mask_operand(ctx, &sv.operand1, n)?;
+            let mask: Vec<i64> = match sv.mask.as_ref() {
+                Constant::AggregateZero(_) => vec![0; n],
+                Constant::Vector(m) => m
+                    .iter()
+                    .map(|e| match e.as_ref() {
+                        Constant::Int { value, .. } => *value as i64,
+                        _ => 0,
+                    })
+                    .collect(),
+                _ => return unsup("mask shufflevector: non-constant mask"),
+            };
+            let mut out = Vec::with_capacity(mask.len());
+            for &mr in &mask {
+                let idx = if mr < 0 { 0 } else { mr as usize };
+                out.push(if idx < n {
+                    a[idx]
+                } else if idx < 2 * n {
+                    b[idx - n]
+                } else {
+                    a[0]
+                });
+            }
+            bind_mask(ctx, &sv.dest, out);
+            Ok(true)
+        }
+        // `bitcast <N x i1> to iN` — the SIMD **movemask**: gather lane `i` into bit `i` of an integer.
+        I::BitCast(x) if i1_vector_lanes(x.operand.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(x.operand.get_type(types).as_ref()).unwrap();
+            let lanes = mask_operand(ctx, &x.operand, n)?;
+            let to_bits = int_bits(x.to_type.as_ref())
+                .ok_or_else(|| Error::Unsupported("mask bitcast to non-int".into()))?;
+            // Lanes are `0`/`1` in `i32`; OR each into its bit position. `iN` with `N ≤ 32` builds in
+            // an `i32` container, wider in `i64` (extend each lane first).
+            let wide = to_bits > 32;
+            let lane_ty = if wide { IntTy::I64 } else { IntTy::I32 };
+            let mut acc = ctx.push(if wide {
+                Inst::ConstI64(0)
+            } else {
+                Inst::ConstI32(0)
+            });
+            for (i, &l) in lanes.iter().enumerate() {
+                let lw = if wide {
+                    ctx.push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a: l,
+                    })
+                } else {
+                    l
+                };
+                let shifted = if i == 0 {
+                    lw
+                } else {
+                    let sh = ctx.push(if wide {
+                        Inst::ConstI64(i as i64)
+                    } else {
+                        Inst::ConstI32(i as i32)
+                    });
+                    ctx.push(Inst::IntBin {
+                        ty: lane_ty,
+                        op: BinOp::Shl,
+                        a: lw,
+                        b: sh,
+                    })
+                };
+                acc = ctx.push(Inst::IntBin {
+                    ty: lane_ty,
+                    op: BinOp::Or,
+                    a: acc,
+                    b: shifted,
+                });
+            }
+            finish(ctx, &x.dest, acc)?;
+            Ok(true)
+        }
+        // `freeze` of a mask is the identity (the lanes are already defined `0`/`1`, §3c).
+        I::Freeze(f) if i1_vector_lanes(f.operand.get_type(types).as_ref()).is_some() => {
+            let n = i1_vector_lanes(f.operand.get_type(types).as_ref()).unwrap();
+            let lanes = mask_operand(ctx, &f.operand, n)?;
+            bind_mask(ctx, &f.dest, lanes);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Record `dest`'s scalarized mask lanes (the `<N x i1>` analog of [`BlockCtx::bind_wide`]).
+fn bind_mask(ctx: &mut BlockCtx, dest: &Name, lanes: Vec<ValIdx>) {
+    if let Some(&vid) = ctx.s.name2id.get(dest) {
+        ctx.mask_lanes.insert(vid, lanes);
+    }
+}
+
 /// Emit a binary integer op and return `(dest, result-index)`.
 fn bin<'d>(
     ctx: &mut BlockCtx,
@@ -6790,18 +7055,21 @@ fn vec_int_lane_bits(ty: &Type) -> Option<u32> {
     }
 }
 
-/// Explode an **integer** vector operand into its `N` per-lane scalars, each the lane's raw value in
-/// its natural `i32`/`i64` container (zero-extended — the per-lane conversion re-canonicalizes from
-/// the known source width). Covers all three integer-vector representations: a `<2 x i32>` packed in
-/// an `i64` (lane 0 = low half), a single `v128` (one `ExtractLane` per lane), and a legalized wide
-/// value (`ExtractLane` per chunk lane, then the already-scalar tail lanes).
-fn vec_explode_int(ctx: &mut BlockCtx, op: &Operand, types: &Types) -> Result<Vec<ValIdx>, Error> {
+/// Explode a vector operand into its `N` per-lane scalars, each the lane's value in its natural
+/// `i32`/`i64`/`f32`/`f64` container (integer lanes zero-extended — a per-lane conversion
+/// re-canonicalizes from the known source width; float lanes are the lane's value). Covers all three
+/// vector representations: a `<2 x {i32,float}>` packed in an `i64` (lane 0 = low half), a single
+/// `v128` (one `ExtractLane` per lane), and a legalized wide value (`ExtractLane` per chunk lane, then
+/// the already-scalar tail lanes).
+fn vec_explode(
+    ctx: &mut BlockCtx,
+    op: &Operand,
+    types: &Types,
+    signed: bool,
+) -> Result<Vec<ValIdx>, Error> {
     let ty = op.get_type(types);
     let ty = ty.as_ref();
     if let Some(lane) = vec2_lane_ty(ty) {
-        if lane != ValType::I32 {
-            return unsup("vector convert of a <2 x float> (later slice)");
-        }
         let v = ctx.operand(op)?; // the packed i64
         let lo = ctx.push(Inst::Convert {
             op: ConvOp::WrapI64,
@@ -6818,6 +7086,18 @@ fn vec_explode_int(ctx: &mut BlockCtx, op: &Operand, types: &Types) -> Result<Ve
             op: ConvOp::WrapI64,
             a: hi64,
         });
+        // A `<2 x float>`'s lanes are the two 32-bit halves reinterpreted as `f32`.
+        if lane == ValType::F32 {
+            let f0 = ctx.push(Inst::Cast {
+                op: CastOp::ReinterpI32F32,
+                a: lo,
+            });
+            let f1 = ctx.push(Inst::Cast {
+                op: CastOp::ReinterpI32F32,
+                a: hi,
+            });
+            return Ok(vec![f0, f1]);
+        }
         return Ok(vec![lo, hi]);
     }
     if let Some(shape) = vec128_shape(ty) {
@@ -6827,7 +7107,7 @@ fn vec_explode_int(ctx: &mut BlockCtx, op: &Operand, types: &Types) -> Result<Ve
                 ctx.push(Inst::ExtractLane {
                     shape,
                     lane: l,
-                    signed: false,
+                    signed,
                     a: v,
                 })
             })
@@ -6842,7 +7122,7 @@ fn vec_explode_int(ctx: &mut BlockCtx, op: &Operand, types: &Types) -> Result<Ve
                 out.push(ctx.push(Inst::ExtractLane {
                     shape: layout.shape,
                     lane: l as u8,
-                    signed: false,
+                    signed,
                     a: chunk,
                 }));
             }
@@ -6852,7 +7132,7 @@ fn vec_explode_int(ctx: &mut BlockCtx, op: &Operand, types: &Types) -> Result<Ve
         }
         return Ok(out);
     }
-    unsup("vector convert: unsupported source vector shape")
+    unsup("vector explode: unsupported source vector shape")
 }
 
 /// Explode a legalized **wide** value (its `parts` = chunk `v128`s + tail scalars, per `layout`) into
@@ -6918,10 +7198,10 @@ fn build_v128_from_lanes(ctx: &mut BlockCtx, shape: svm_ir::VShape, lanes: &[Val
     v
 }
 
-/// Repack `N` converted lane scalars into the destination integer vector `to_type`, binding `dest`
-/// in whichever representation that type uses (a `<2 x i32>` packed `i64`, a single `v128`, or a
-/// legalized wide value). The inverse of [`vec_explode_int`].
-fn vec_implode_int(
+/// Repack `N` lane scalars into the destination vector `to_type`, binding `dest` in whichever
+/// representation that type uses (a `<2 x {i32,float}>` packed `i64`, a single `v128`, or a
+/// legalized wide value). The inverse of [`vec_explode`].
+fn vec_implode(
     ctx: &mut BlockCtx,
     dest: &Name,
     lanes: &[ValIdx],
@@ -6929,17 +7209,27 @@ fn vec_implode_int(
     _types: &Types,
 ) -> Result<(), Error> {
     if let Some(lane) = vec2_lane_ty(to_type) {
-        if lane != ValType::I32 {
-            return unsup("vector convert to a <2 x float> (later slice)");
-        }
+        // Each lane's 32-bit image: an `i32` directly, or a `<2 x float>` lane reinterpreted from `f32`.
+        let as_i32 = |ctx: &mut BlockCtx, l: ValIdx| {
+            if lane == ValType::F32 {
+                ctx.push(Inst::Cast {
+                    op: CastOp::ReinterpF32I32,
+                    a: l,
+                })
+            } else {
+                l
+            }
+        };
+        let l0 = as_i32(ctx, lanes[0]);
+        let l1 = as_i32(ctx, lanes[1]);
         // Pack lane 0 into the low 32 bits, lane 1 into the high 32 bits of an `i64`.
         let lo = ctx.push(Inst::Convert {
             op: ConvOp::ExtendI32U,
-            a: lanes[0],
+            a: l0,
         });
         let hi = ctx.push(Inst::Convert {
             op: ConvOp::ExtendI32U,
-            a: lanes[1],
+            a: l1,
         });
         let sh = ctx.const_i64(32);
         let hishift = ctx.push(Inst::IntBin {
@@ -6998,7 +7288,7 @@ fn lower_vec_int_convert(
         .ok_or_else(|| Error::Unsupported("vector conversion of non-integer lanes".into()))?;
     let to_bits = vec_int_lane_bits(to_type)
         .ok_or_else(|| Error::Unsupported("vector conversion to non-integer lanes".into()))?;
-    let lanes_in = vec_explode_int(ctx, operand, types)?;
+    let lanes_in = vec_explode(ctx, operand, types, false)?;
     let mut out = Vec::with_capacity(lanes_in.len());
     for v in lanes_in {
         out.push(match kind {
@@ -7007,7 +7297,7 @@ fn lower_vec_int_convert(
             VConv::Trunc => emit_trunc(ctx, v, from_bits, to_bits),
         });
     }
-    vec_implode_int(ctx, dest, &out, to_type, types)
+    vec_implode(ctx, dest, &out, to_type, types)
 }
 
 fn translate_term(

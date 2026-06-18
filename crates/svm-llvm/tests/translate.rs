@@ -3664,6 +3664,21 @@ fn simd_wide_shuffle_reverse() {
     check_vectorized_vs_native("simd_wide_shuffle", src, 4);
 }
 
+/// **`<N x i1>` boolean mask — vector `icmp` + `select`.** A `(a[i]==b[i]) ? a[i] : b[i]+1` loop,
+/// which `clang -O2` vectorizes to `icmp eq <4 x i32>` (producing a `<4 x i1>` mask) feeding
+/// `select <4 x i1>, …`. svm-ir has no first-class `<N x i1>`, so the on-ramp holds the mask lane-wise
+/// (per-lane scalar compare) and lowers the `select` as a per-lane scalar `select` over the exploded
+/// data, repacked. The same machinery (plus mask `extractelement`) carries the real `crc32` demo.
+#[test]
+fn simd_mask_icmp_select() {
+    let src = "static int a[64], b[64], out[64]; \
+               int run(int seed){ for(int i=0;i<64;i++){ a[i]=seed+i; b[i]=seed*2-i; } \
+               for(int i=0;i<64;i++) out[i] = (a[i]==b[i]) ? a[i] : (b[i]+1); \
+               return (out[0]+out[15]+out[31]+out[63]) & 0xff; } \
+               int main(void){ return run(8); }";
+    check_vectorized_vs_native("simd_mask_select", src, 8);
+}
+
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
 /// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
 /// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and

@@ -868,10 +868,11 @@ vectorization is on — confirmed by flipping the lanes (9 fails → 5). Float-l
   (vectorization *enabled*), each a real `clang -O2` loop verified to emit the conversion, vs native.
   Covers `zext <4 x i8>→<4 x i32>`, `sext <2 x i32>→<2 x i64>`, `trunc <2 x i64>→<2 x i32>`, and
   `trunc <8 x i16>→<8 x i8>` / `<8 x i32>→<8 x i16>`. 125 translate tests green, fmt + clippy clean.
-- **Remaining before the breadth-lane flip (1 class, 3 demos):** `<N x i1>` masks (vector `icmp`/
-  `select`/`extractelement`/`bitcast`-to-`iN` → `perlin`/`crc32`/`clay`). The lanes are
-  **all-or-nothing** (a lane flips only when every demo on it passes), so they stay `-fno-*-vectorize`
-  until this last class lands.
+- **Remaining before the breadth-lane flip:** the `<N x i1>` mask machinery landed (slice AS, lands
+  `crc32`); `perlin`/`clay` additionally need **float vector conversions** (`fptosi`/`sitofp` on
+  `<2 x float>`), **`llvm.fmuladd.v2f32`**, and the **`<2 x i16>`** small-vector case — a follow-on
+  slice (AT). The lanes are **all-or-nothing**, so they stay `-fno-*-vectorize` until those land and
+  all of `perlin`/`crc32`/`clay`/`xxhash`/`async_io`/the conversion demos pass together.
 
 **Slice AQ (DONE) — auto-vectorized vector rotate (`llvm.fshl.v4i32` / `fshr`).** The second vector-op
 class (lands `xxhash` when vectorized). svm-ir's `VShift` takes only a *scalar* shift amount, but the
@@ -894,6 +895,22 @@ a wide chunks+tail value). Subsumes the old splat case. This is the shape `async
 byte-reversal (`<7,6,…,0>`) emits. A non-constant mask stays `Unsupported` (fail-closed).
 - Test: `simd_wide_shuffle_reverse` — an `__builtin_shufflevector` `<8 x i8>` byte-reverse
   (`check_vectorized_vs_native`), vs native. 127 translate tests green, fmt + clippy clean.
+
+**Slice AS (DONE) — `<N x i1>` boolean-mask machinery (vector `icmp`/`fcmp`/`select`/movemask).** The
+fourth vector-op class (lands `crc32` when vectorized). svm-ir has **no first-class `<N x i1>` type**,
+so a mask is held **lane-wise** (`mask_lanes`: `N` scalar `0`/`1`s, the `<N x i1>` analog of the `agg`/
+`wide_vals` side-tables) and every producer/consumer is scalarized in a new `lower_mask` pass
+(dispatched after `lower_wide`): vector `icmp`/`fcmp` → `N` scalar `IntCmp`/`FCmp` (narrow lanes
+extended per the predicate's signedness); `select` (mask condition) → per-lane scalar `select` over the
+exploded data (`vec_explode`/`vec_implode`, now float-capable — they reinterpret `<2 x float>` lanes);
+`extractelement` → the lane; `insertelement`/`shufflevector` → build/permute the lanes; `bitcast … to
+iN` (the SIMD **movemask**) → OR the lanes into a bitmap (handles the odd `i4`); `freeze` → identity.
+`scan_func` records an `<N x i1>` result with a placeholder type (never used as a scalar). Masks are
+block-local (like `agg`); a mask crossing a block edge stays `Unsupported` (fail-closed).
+- Test: `simd_mask_icmp_select` — an `(a[i]==b[i]) ? … : …` loop → `icmp eq <4 x i32>` + `select`
+  (`check_vectorized_vs_native`), vs native. `crc32` exercises `icmp`+`select`+`extractelement` end to
+  end. (`bitcast`-to-`iN` / `insertelement`-splat are exercised by `clay`, pending slice AT.) 128
+  translate tests green, fmt + clippy clean.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
