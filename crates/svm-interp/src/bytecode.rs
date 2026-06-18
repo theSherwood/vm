@@ -593,325 +593,378 @@ fn run(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
 ) -> Result<Vec<Value>, Trap> {
-    let entry = entry as usize;
-    let mut regs: Vec<Reg> = vec![Reg::default(); c.progs[entry].nslots as usize];
-    for (i, a) in args.iter().enumerate() {
-        *regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(*a);
-    }
-    let mut cur = entry;
-    let mut base = 0usize;
-    let mut pc = 0usize;
-    // Suspended callers: (prog, base, resume pc, absolute first result slot).
-    let mut stack: Vec<(usize, usize, usize, usize)> = Vec::new();
-    let mut scratch: Vec<Reg> = Vec::new(); // edge-copy staging (parallel-copy safety)
+    let mut vm = Vm::new(c, entry as usize, args)?;
+    vm.resume(c, fuel, mem)
+}
 
-    macro_rules! r {
-        ($i:expr) => {
-            regs[base + $i as usize]
-        };
-    }
-    // Apply edge copies parallel-safely (a self-loop can alias src/dst): gather then scatter.
-    macro_rules! edge {
-        ($copies:expr) => {{
-            scratch.clear();
-            for &(s, _) in $copies.iter() {
-                scratch.push(regs[base + s as usize]);
-            }
-            for (k, &(_, d)) in $copies.iter().enumerate() {
-                regs[base + d as usize] = scratch[k];
-            }
-        }};
+/// The reified bytecode continuation — everything a suspended activation needs to resume, held as
+/// an explicit value rather than on the host Rust call stack. The register file (`regs`), the stack
+/// of suspended caller activations (`stack`), and the `(cur, base, pc)` cursor together fully
+/// describe a paused vCPU: the flat analogue of the tree-walker's `Vec<Frame>`.
+///
+/// Holding the continuation as data (not as live host-stack frames) is the structural prerequisite
+/// for the scheduler / fiber / thread / debug seams (INTERP_PERF.md Slice 1c): a later slice breaks
+/// [`Vm::resume`]'s loop at suspension points (preemption budget, blocking op, debug stop), persists
+/// the cursor back into `self`, and hands this struct to the caller to park / hash / resume — exactly
+/// what `park_suspended(frames)` does for the tree-walker today.
+struct Vm {
+    /// Function-wide register file, shared across activations by register windows (`[base, base +
+    /// nslots)` per activation). Grows on demand as calls open deeper windows.
+    regs: Vec<Reg>,
+    /// Suspended caller activations: `(prog, base, resume pc, absolute first result slot)`.
+    stack: Vec<(usize, usize, usize, usize)>,
+    /// The running activation's program (function index), window base, and op cursor.
+    cur: usize,
+    base: usize,
+    pc: usize,
+    /// Edge-copy staging buffer (parallel-copy safety); kept here so it is reused across resumes.
+    scratch: Vec<Reg>,
+}
+
+impl Vm {
+    /// Open the entry activation: a zero-based window sized to the entry function, seeded with the
+    /// call arguments. Total — an out-of-range entry or arg overflow is a clean `Malformed` trap.
+    fn new(c: &Compiled, entry: usize, args: &[Value]) -> Result<Vm, Trap> {
+        let prog = c.progs.get(entry).ok_or(Trap::Malformed)?;
+        let mut regs: Vec<Reg> = vec![Reg::default(); prog.nslots as usize];
+        for (i, a) in args.iter().enumerate() {
+            *regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(*a);
+        }
+        Ok(Vm {
+            regs,
+            stack: Vec::new(),
+            cur: entry,
+            base: 0,
+            pc: 0,
+            scratch: Vec::new(),
+        })
     }
 
-    loop {
-        step(fuel)?;
-        match &c.progs[cur].ops[pc] {
-            Op::Const { dst, val } => {
-                r!(*dst) = *val;
-                pc += 1;
-            }
-            Op::IntBin { dst, a, b, ty, op } => {
-                let v = match ty {
-                    IntTy::I32 => Reg::from_i32(bin32(*op, r!(*a).i32(), r!(*b).i32())?),
-                    IntTy::I64 => Reg::from_i64(bin64(*op, r!(*a).i64(), r!(*b).i64())?),
-                };
-                r!(*dst) = v;
-                pc += 1;
-            }
-            Op::IntCmp { dst, a, b, ty, op } => {
-                let res = match ty {
-                    IntTy::I32 => cmp32(*op, r!(*a).i32(), r!(*b).i32()),
-                    IntTy::I64 => cmp64(*op, r!(*a).i64(), r!(*b).i64()),
-                };
-                r!(*dst) = Reg::from_i32(res as i32);
-                pc += 1;
-            }
-            Op::IntUn { dst, a, ty, op } => {
-                r!(*dst) = match ty {
-                    IntTy::I32 => Reg::from_i32(intun32(*op, r!(*a).i32())),
-                    IntTy::I64 => Reg::from_i64(intun64(*op, r!(*a).i64())),
-                };
-                pc += 1;
-            }
-            Op::Eqz { dst, a, ty } => {
-                let res = match ty {
-                    IntTy::I32 => r!(*a).i32() == 0,
-                    IntTy::I64 => r!(*a).i64() == 0,
-                };
-                r!(*dst) = Reg::from_i32(res as i32);
-                pc += 1;
-            }
-            Op::Convert { dst, a, op } => {
-                r!(*dst) = match op {
-                    ConvOp::ExtendI32S => Reg::from_i64(r!(*a).i32() as i64),
-                    ConvOp::ExtendI32U => Reg::from_i64(r!(*a).i32() as u32 as i64),
-                    ConvOp::WrapI64 => Reg::from_i32(r!(*a).i64() as i32),
-                };
-                pc += 1;
-            }
-            Op::Select { dst, cond, a, b } => {
-                r!(*dst) = if r!(*cond).i32() != 0 { r!(*a) } else { r!(*b) };
-                pc += 1;
-            }
-            Op::FBin { dst, a, b, ty, op } => {
-                r!(*dst) = match ty {
-                    FloatTy::F32 => Reg::from_f32(fbin32(*op, r!(*a).f32(), r!(*b).f32())),
-                    FloatTy::F64 => Reg::from_f64(fbin64(*op, r!(*a).f64(), r!(*b).f64())),
-                };
-                pc += 1;
-            }
-            Op::FUn { dst, a, ty, op } => {
-                r!(*dst) = match ty {
-                    FloatTy::F32 => Reg::from_f32(fun32(*op, r!(*a).f32())),
-                    FloatTy::F64 => Reg::from_f64(fun64(*op, r!(*a).f64())),
-                };
-                pc += 1;
-            }
-            Op::FCmp { dst, a, b, ty, op } => {
-                let res = match ty {
-                    FloatTy::F32 => fcmp32(*op, r!(*a).f32(), r!(*b).f32()),
-                    FloatTy::F64 => fcmp64(*op, r!(*a).f64(), r!(*b).f64()),
-                };
-                r!(*dst) = Reg::from_i32(res as i32);
-                pc += 1;
-            }
-            Op::FToISat { dst, a, op } => {
-                r!(*dst) = fto_i(*op, r!(*a));
-                pc += 1;
-            }
-            Op::FToITrap { dst, a, op } => {
-                r!(*dst) = trunc_trap(*op, r!(*a))?;
-                pc += 1;
-            }
-            Op::IToFConv { dst, a, op } => {
-                r!(*dst) = i_to_f(*op, r!(*a));
-                pc += 1;
-            }
-            Op::Cast { dst, a, op } => {
-                r!(*dst) = cast(*op, r!(*a));
-                pc += 1;
-            }
-            Op::PtrAdd { dst, a, b } => {
-                r!(*dst) = Reg::from_i64(r!(*a).i64().wrapping_add(r!(*b).i64()));
-                pc += 1;
-            }
-            Op::PtrCast { dst, a } => {
-                r!(*dst) = Reg::from_i64(r!(*a).i64());
-                pc += 1;
-            }
-            Op::RefFunc { dst, func } => {
-                r!(*dst) = Reg::from_i32(*func as i32);
-                pc += 1;
-            }
-            Op::Load {
-                dst,
-                addr,
-                op,
-                offset,
-            } => {
-                let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                let a = r!(*addr).i64() as u64;
-                r!(*dst) = Reg::from_value(m.load(a, *offset, *op)?);
-                pc += 1;
-            }
-            Op::Store {
-                addr,
-                value,
-                op,
-                offset,
-            } => {
-                let a = r!(*addr).i64() as u64;
-                let v = Value::I64(r!(*value).i64());
-                mem.as_mut()
-                    .ok_or(Trap::Malformed)?
-                    .store(a, *offset, *op, v)?;
-                pc += 1;
-            }
-            Op::AtomicLoad {
-                dst,
-                addr,
-                ty,
-                offset,
-            } => {
-                let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                let a = r!(*addr).i64() as u64;
-                r!(*dst) = Reg::from_value(m.atomic_load(a, *offset, *ty)?);
-                pc += 1;
-            }
-            Op::AtomicStore {
-                addr,
-                value,
-                ty,
-                offset,
-            } => {
-                let a = r!(*addr).i64() as u64;
-                let v = Value::I64(r!(*value).i64());
-                mem.as_mut()
-                    .ok_or(Trap::Malformed)?
-                    .atomic_store(a, *offset, *ty, v)?;
-                pc += 1;
-            }
-            Op::AtomicRmw {
-                dst,
-                addr,
-                value,
-                ty,
-                op,
-                offset,
-            } => {
-                let a = r!(*addr).i64() as u64;
-                let v = Value::I64(r!(*value).i64());
-                let res = mem
-                    .as_mut()
-                    .ok_or(Trap::Malformed)?
-                    .atomic_rmw(a, *offset, *ty, *op, v)?;
-                r!(*dst) = Reg::from_value(res);
-                pc += 1;
-            }
-            Op::AtomicCmpxchg {
-                dst,
-                addr,
-                expected,
-                replacement,
-                ty,
-                offset,
-            } => {
-                let a = r!(*addr).i64() as u64;
-                let exp = Value::I64(r!(*expected).i64());
-                let rep = Value::I64(r!(*replacement).i64());
-                let res = mem
-                    .as_mut()
-                    .ok_or(Trap::Malformed)?
-                    .atomic_cmpxchg(a, *offset, *ty, exp, rep)?;
-                r!(*dst) = Reg::from_value(res);
-                pc += 1;
-            }
-            Op::Br { copies, target } => {
-                edge!(copies);
-                pc = *target as usize;
-            }
-            Op::BrIf {
-                cond,
-                then_copies,
-                then_pc,
-                else_copies,
-                else_pc,
-            } => {
-                if r!(*cond).i32() != 0 {
-                    edge!(then_copies);
-                    pc = *then_pc as usize;
-                } else {
-                    edge!(else_copies);
-                    pc = *else_pc as usize;
+    /// Run the continuation until the entry activation returns (or traps). Per-op fuel/preemption is
+    /// charged here, one charge per op, exactly as the run-to-completion form did.
+    ///
+    /// Slice 1c-1: the only non-trap exit is completion. The cursor lives in locals for the duration
+    /// of the loop (so the optimizer keeps `cur`/`base`/`pc` in registers); the future suspension
+    /// exits will write those locals back into `self` before returning a "suspended" outcome.
+    fn resume(
+        &mut self,
+        c: &Compiled,
+        fuel: &mut u64,
+        mem: &mut Option<Mem>,
+    ) -> Result<Vec<Value>, Trap> {
+        let mut cur = self.cur;
+        let mut base = self.base;
+        let mut pc = self.pc;
+
+        macro_rules! r {
+            ($i:expr) => {
+                self.regs[base + $i as usize]
+            };
+        }
+        // Apply edge copies parallel-safely (a self-loop can alias src/dst): gather then scatter.
+        macro_rules! edge {
+            ($copies:expr) => {{
+                self.scratch.clear();
+                for &(s, _) in $copies.iter() {
+                    self.scratch.push(self.regs[base + s as usize]);
                 }
-            }
-            Op::BrTable { idx, arms, default } => {
-                let i = r!(*idx).i32() as u32 as usize;
-                let (copies, target) = arms.get(i).unwrap_or(default);
-                edge!(copies);
-                pc = *target as usize;
-            }
-            Op::Call { callee, args, dst } => {
-                let callee = *callee as usize;
-                let nb = base + c.progs[cur].nslots as usize;
-                let need = nb + c.progs[callee].nslots as usize;
-                if regs.len() < need {
-                    regs.resize(need, Reg::default());
+                for (k, &(_, d)) in $copies.iter().enumerate() {
+                    self.regs[base + d as usize] = self.scratch[k];
                 }
-                for (i, a) in args.iter().enumerate() {
-                    regs[nb + i] = regs[base + *a as usize];
+            }};
+        }
+
+        loop {
+            step(fuel)?;
+            match &c.progs[cur].ops[pc] {
+                Op::Const { dst, val } => {
+                    r!(*dst) = *val;
+                    pc += 1;
                 }
-                stack.push((cur, base, pc + 1, base + *dst as usize));
-                cur = callee;
-                base = nb;
-                pc = 0;
-            }
-            Op::CallIndirect {
-                idx,
-                args,
-                dst,
-                want_params,
-                want_results,
-            } => {
-                // Resolve through the natural module-0 table (slot i ⇒ func i), then type-check the
-                // resolved signature — a forged/mistyped slot is an inert IndirectCallType trap.
-                let slot = (r!(*idx).i32() as u32 as usize) & c.table_mask;
-                let callee = if slot < c.sigs.len() {
-                    slot
-                } else {
-                    return Err(Trap::IndirectCallType);
-                };
-                let (cp, cr) = &c.sigs[callee];
-                if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
-                    return Err(Trap::IndirectCallType);
+                Op::IntBin { dst, a, b, ty, op } => {
+                    let v = match ty {
+                        IntTy::I32 => Reg::from_i32(bin32(*op, r!(*a).i32(), r!(*b).i32())?),
+                        IntTy::I64 => Reg::from_i64(bin64(*op, r!(*a).i64(), r!(*b).i64())?),
+                    };
+                    r!(*dst) = v;
+                    pc += 1;
                 }
-                let nb = base + c.progs[cur].nslots as usize;
-                let need = nb + c.progs[callee].nslots as usize;
-                if regs.len() < need {
-                    regs.resize(need, Reg::default());
+                Op::IntCmp { dst, a, b, ty, op } => {
+                    let res = match ty {
+                        IntTy::I32 => cmp32(*op, r!(*a).i32(), r!(*b).i32()),
+                        IntTy::I64 => cmp64(*op, r!(*a).i64(), r!(*b).i64()),
+                    };
+                    r!(*dst) = Reg::from_i32(res as i32);
+                    pc += 1;
                 }
-                for (i, a) in args.iter().enumerate() {
-                    regs[nb + i] = regs[base + *a as usize];
+                Op::IntUn { dst, a, ty, op } => {
+                    r!(*dst) = match ty {
+                        IntTy::I32 => Reg::from_i32(intun32(*op, r!(*a).i32())),
+                        IntTy::I64 => Reg::from_i64(intun64(*op, r!(*a).i64())),
+                    };
+                    pc += 1;
                 }
-                stack.push((cur, base, pc + 1, base + *dst as usize));
-                cur = callee;
-                base = nb;
-                pc = 0;
-            }
-            Op::Ret { srcs } => match stack.pop() {
-                None => {
-                    let tys = &c.result_types[cur];
-                    return Ok(srcs
-                        .iter()
-                        .zip(tys)
-                        .map(|(s, ty)| regs[base + *s as usize].to_value(*ty))
-                        .collect());
+                Op::Eqz { dst, a, ty } => {
+                    let res = match ty {
+                        IntTy::I32 => r!(*a).i32() == 0,
+                        IntTy::I64 => r!(*a).i64() == 0,
+                    };
+                    r!(*dst) = Reg::from_i32(res as i32);
+                    pc += 1;
                 }
-                Some((cprog, cbase, cpc, ret_abs)) => {
-                    for (i, s) in srcs.iter().enumerate() {
-                        regs[ret_abs + i] = regs[base + *s as usize];
+                Op::Convert { dst, a, op } => {
+                    r!(*dst) = match op {
+                        ConvOp::ExtendI32S => Reg::from_i64(r!(*a).i32() as i64),
+                        ConvOp::ExtendI32U => Reg::from_i64(r!(*a).i32() as u32 as i64),
+                        ConvOp::WrapI64 => Reg::from_i32(r!(*a).i64() as i32),
+                    };
+                    pc += 1;
+                }
+                Op::Select { dst, cond, a, b } => {
+                    r!(*dst) = if r!(*cond).i32() != 0 { r!(*a) } else { r!(*b) };
+                    pc += 1;
+                }
+                Op::FBin { dst, a, b, ty, op } => {
+                    r!(*dst) = match ty {
+                        FloatTy::F32 => Reg::from_f32(fbin32(*op, r!(*a).f32(), r!(*b).f32())),
+                        FloatTy::F64 => Reg::from_f64(fbin64(*op, r!(*a).f64(), r!(*b).f64())),
+                    };
+                    pc += 1;
+                }
+                Op::FUn { dst, a, ty, op } => {
+                    r!(*dst) = match ty {
+                        FloatTy::F32 => Reg::from_f32(fun32(*op, r!(*a).f32())),
+                        FloatTy::F64 => Reg::from_f64(fun64(*op, r!(*a).f64())),
+                    };
+                    pc += 1;
+                }
+                Op::FCmp { dst, a, b, ty, op } => {
+                    let res = match ty {
+                        FloatTy::F32 => fcmp32(*op, r!(*a).f32(), r!(*b).f32()),
+                        FloatTy::F64 => fcmp64(*op, r!(*a).f64(), r!(*b).f64()),
+                    };
+                    r!(*dst) = Reg::from_i32(res as i32);
+                    pc += 1;
+                }
+                Op::FToISat { dst, a, op } => {
+                    r!(*dst) = fto_i(*op, r!(*a));
+                    pc += 1;
+                }
+                Op::FToITrap { dst, a, op } => {
+                    r!(*dst) = trunc_trap(*op, r!(*a))?;
+                    pc += 1;
+                }
+                Op::IToFConv { dst, a, op } => {
+                    r!(*dst) = i_to_f(*op, r!(*a));
+                    pc += 1;
+                }
+                Op::Cast { dst, a, op } => {
+                    r!(*dst) = cast(*op, r!(*a));
+                    pc += 1;
+                }
+                Op::PtrAdd { dst, a, b } => {
+                    r!(*dst) = Reg::from_i64(r!(*a).i64().wrapping_add(r!(*b).i64()));
+                    pc += 1;
+                }
+                Op::PtrCast { dst, a } => {
+                    r!(*dst) = Reg::from_i64(r!(*a).i64());
+                    pc += 1;
+                }
+                Op::RefFunc { dst, func } => {
+                    r!(*dst) = Reg::from_i32(*func as i32);
+                    pc += 1;
+                }
+                Op::Load {
+                    dst,
+                    addr,
+                    op,
+                    offset,
+                } => {
+                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                    let a = r!(*addr).i64() as u64;
+                    r!(*dst) = Reg::from_value(m.load(a, *offset, *op)?);
+                    pc += 1;
+                }
+                Op::Store {
+                    addr,
+                    value,
+                    op,
+                    offset,
+                } => {
+                    let a = r!(*addr).i64() as u64;
+                    let v = Value::I64(r!(*value).i64());
+                    mem.as_mut()
+                        .ok_or(Trap::Malformed)?
+                        .store(a, *offset, *op, v)?;
+                    pc += 1;
+                }
+                Op::AtomicLoad {
+                    dst,
+                    addr,
+                    ty,
+                    offset,
+                } => {
+                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                    let a = r!(*addr).i64() as u64;
+                    r!(*dst) = Reg::from_value(m.atomic_load(a, *offset, *ty)?);
+                    pc += 1;
+                }
+                Op::AtomicStore {
+                    addr,
+                    value,
+                    ty,
+                    offset,
+                } => {
+                    let a = r!(*addr).i64() as u64;
+                    let v = Value::I64(r!(*value).i64());
+                    mem.as_mut()
+                        .ok_or(Trap::Malformed)?
+                        .atomic_store(a, *offset, *ty, v)?;
+                    pc += 1;
+                }
+                Op::AtomicRmw {
+                    dst,
+                    addr,
+                    value,
+                    ty,
+                    op,
+                    offset,
+                } => {
+                    let a = r!(*addr).i64() as u64;
+                    let v = Value::I64(r!(*value).i64());
+                    let res = mem
+                        .as_mut()
+                        .ok_or(Trap::Malformed)?
+                        .atomic_rmw(a, *offset, *ty, *op, v)?;
+                    r!(*dst) = Reg::from_value(res);
+                    pc += 1;
+                }
+                Op::AtomicCmpxchg {
+                    dst,
+                    addr,
+                    expected,
+                    replacement,
+                    ty,
+                    offset,
+                } => {
+                    let a = r!(*addr).i64() as u64;
+                    let exp = Value::I64(r!(*expected).i64());
+                    let rep = Value::I64(r!(*replacement).i64());
+                    let res = mem
+                        .as_mut()
+                        .ok_or(Trap::Malformed)?
+                        .atomic_cmpxchg(a, *offset, *ty, exp, rep)?;
+                    r!(*dst) = Reg::from_value(res);
+                    pc += 1;
+                }
+                Op::Br { copies, target } => {
+                    edge!(copies);
+                    pc = *target as usize;
+                }
+                Op::BrIf {
+                    cond,
+                    then_copies,
+                    then_pc,
+                    else_copies,
+                    else_pc,
+                } => {
+                    if r!(*cond).i32() != 0 {
+                        edge!(then_copies);
+                        pc = *then_pc as usize;
+                    } else {
+                        edge!(else_copies);
+                        pc = *else_pc as usize;
                     }
-                    cur = cprog;
-                    base = cbase;
-                    pc = cpc;
                 }
-            },
-            Op::Unreachable => return Err(Trap::Unreachable),
-            Op::Eval {
-                inst,
-                block_base,
-                dst,
-            } => {
-                // Run the op against this block's sub-window with its original block-local operand
-                // indices; reuse the reference semantics. `eval_inst` borrows the window immutably
-                // and `mem` mutably (disjoint), so we read the result before writing it back.
-                let win_lo = base + *block_base as usize;
-                let win_hi = base + c.progs[cur].nslots as usize;
-                let r = super::eval_inst(inst, &regs[win_lo..win_hi], mem)?;
-                if let Some(v) = r {
-                    regs[base + *dst as usize] = v;
+                Op::BrTable { idx, arms, default } => {
+                    let i = r!(*idx).i32() as u32 as usize;
+                    let (copies, target) = arms.get(i).unwrap_or(default);
+                    edge!(copies);
+                    pc = *target as usize;
                 }
-                pc += 1;
+                Op::Call { callee, args, dst } => {
+                    let callee = *callee as usize;
+                    let nb = base + c.progs[cur].nslots as usize;
+                    let need = nb + c.progs[callee].nslots as usize;
+                    if self.regs.len() < need {
+                        self.regs.resize(need, Reg::default());
+                    }
+                    for (i, a) in args.iter().enumerate() {
+                        self.regs[nb + i] = self.regs[base + *a as usize];
+                    }
+                    self.stack.push((cur, base, pc + 1, base + *dst as usize));
+                    cur = callee;
+                    base = nb;
+                    pc = 0;
+                }
+                Op::CallIndirect {
+                    idx,
+                    args,
+                    dst,
+                    want_params,
+                    want_results,
+                } => {
+                    // Resolve through the natural module-0 table (slot i ⇒ func i), then type-check
+                    // the resolved signature — a forged/mistyped slot is an inert IndirectCallType
+                    // trap.
+                    let slot = (r!(*idx).i32() as u32 as usize) & c.table_mask;
+                    let callee = if slot < c.sigs.len() {
+                        slot
+                    } else {
+                        return Err(Trap::IndirectCallType);
+                    };
+                    let (cp, cr) = &c.sigs[callee];
+                    if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    let nb = base + c.progs[cur].nslots as usize;
+                    let need = nb + c.progs[callee].nslots as usize;
+                    if self.regs.len() < need {
+                        self.regs.resize(need, Reg::default());
+                    }
+                    for (i, a) in args.iter().enumerate() {
+                        self.regs[nb + i] = self.regs[base + *a as usize];
+                    }
+                    self.stack.push((cur, base, pc + 1, base + *dst as usize));
+                    cur = callee;
+                    base = nb;
+                    pc = 0;
+                }
+                Op::Ret { srcs } => match self.stack.pop() {
+                    None => {
+                        let tys = &c.result_types[cur];
+                        return Ok(srcs
+                            .iter()
+                            .zip(tys)
+                            .map(|(s, ty)| self.regs[base + *s as usize].to_value(*ty))
+                            .collect());
+                    }
+                    Some((cprog, cbase, cpc, ret_abs)) => {
+                        for (i, s) in srcs.iter().enumerate() {
+                            self.regs[ret_abs + i] = self.regs[base + *s as usize];
+                        }
+                        cur = cprog;
+                        base = cbase;
+                        pc = cpc;
+                    }
+                },
+                Op::Unreachable => return Err(Trap::Unreachable),
+                Op::Eval {
+                    inst,
+                    block_base,
+                    dst,
+                } => {
+                    // Run the op against this block's sub-window with its original block-local operand
+                    // indices; reuse the reference semantics. `eval_inst` borrows the window immutably
+                    // and `mem` mutably (disjoint), so we read the result before writing it back.
+                    let win_lo = base + *block_base as usize;
+                    let win_hi = base + c.progs[cur].nslots as usize;
+                    let r = super::eval_inst(inst, &self.regs[win_lo..win_hi], mem)?;
+                    if let Some(v) = r {
+                        self.regs[base + *dst as usize] = v;
+                    }
+                    pc += 1;
+                }
             }
         }
     }

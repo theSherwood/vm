@@ -239,9 +239,30 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
         `dispatch_indirect`). Self-contained only (no `install`/`invoke` cross-module units — those
         need the shared `DomainTable` + scheduler, a later slice). Harness coverage rose to
         ~1770/4000 (44%), all bit-identical. Still non-default.
-  - [ ] **Slice 1c** — switch the default path over, re-expressing the seams (debug/`IrPc`, fibers,
-        threads, durability, capabilities, scheduler preemption, fault rewind) + the full op set
-        (tail calls, cross-module `install`/`invoke` indirect calls, host/fiber ops).
+  - [ ] **Slice 1c** — make bytecode the default production path, with the tree-walker **demoted to
+        the test-only differential oracle** (not retired — its simplicity is its value; both JIT and
+        bytecode are checked against it in the test build). Decision recorded 2026-06-18: we accept a
+        permanent two-interpreter maintenance cost (every future seam change lands in both) in
+        exchange for a fast production interpreter. The seam-heavy work needs **new kinds of
+        equality harness** (ordering / state-shape / snapshot equality, not just return-value
+        equality), since fiber/scheduler/debug/durability parity is about *how* a run unfolds, not
+        only its result. Decomposed into bisectable sub-slices:
+    - [x] **1c-1** — reify the continuation: `bytecode::run` split into `Vm { regs, stack, cur,
+          base, pc, scratch }` + `Vm::new`/`Vm::resume`. The flat analogue of the tree-walker's
+          `Vec<Frame>`; holding it as data (not host-stack frames) is the prerequisite for every
+          suspension seam. Behavior unchanged (existing harness green); perf-neutral (hot cursor
+          kept in locals — ratios alu 1.49× / call 1.90× / mem 1.16×, in line with pre-refactor).
+    - [ ] **1c-2** — suspension seam: break `resume`'s loop at preemption points (budget hit,
+          blocking op) returning a `Suspended`/`Done`/`Trap` outcome with the cursor persisted into
+          `Vm`; resume from a persisted `Vm`. New harness: schedule/interleaving equality.
+    - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
+          stepping report tree-walker-identical locations. New harness: debug-trace equality.
+    - [ ] **1c-4** — wire as the default execution path behind the existing entry points (fall back
+          to the tree-walker for not-yet-covered modules), making bytecode the JIT diff oracle.
+    - [ ] **1c-5** — remaining op set + cross-module units (tail calls, `install`/`invoke` indirect
+          calls, host/fiber/thread/cap ops) on the reified machine.
+    - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:
+          snapshot equality.
 - [~] **Phase 2** — memory-op specialization + software fast-path.
   - [x] Lock-free `check_prot` fast path (`prot_dirty` flag) + `read_le`/`write_le` `has_regions`
         hoist. Tree-walker memory kernel ~176 → ~147 ns (~17%); all oracle suites byte-identical.
