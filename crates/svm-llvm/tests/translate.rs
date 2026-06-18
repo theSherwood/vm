@@ -2154,6 +2154,16 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
             "opt-level=2",
             "-C",
             "overflow-checks=off",
+            // Keep `-O2` codegen in the on-ramp's **scalar** subset: disable LLVM auto-vectorization
+            // so a loop/slice reduction stays scalar instead of becoming an `<N x iM>` vector the
+            // on-ramp's SIMD support (slice Y: `<4 x float>`/`v128`) doesn't cover for integers.
+            // Whether `-O2` vectorizes is host-CPU-sensitive, so without this the Rust breadth tests
+            // are flaky (e.g. a `&[i32]` sum becoming `<4 x i32>` → `Unsupported("v128")`). The Rust
+            // tests target *core/scalar* Rust, not SIMD (the SIMD path is covered by the C tests).
+            "-C",
+            "llvm-args=-vectorize-loops=false",
+            "-C",
+            "llvm-args=-vectorize-slp=false",
         ])
         .arg(&rs)
         .arg("-o")
