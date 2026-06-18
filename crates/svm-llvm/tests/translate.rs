@@ -1518,12 +1518,13 @@ long worker(long arg) {
 #[cfg(unix)]
 fn vm_gc_roots_smoke() {
     let src = r#"
-long __vm_gc_roots(long heap_lo, long heap_hi, void *buf, long cap);
+long __vm_gc_roots(long heap_lo, long heap_hi, long mask, void *buf, long cap);
 static long out[64];
 int f(void) {
   /* a live, in-range candidate pointer (into `out` itself) the conservative scan may see */
   volatile long *root = out;
-  long n = __vm_gc_roots(0, 1 << 20, out, 64);
+  /* mask = ~0 is the untagged (identity) case: every scanned word is tested as-is. */
+  long n = __vm_gc_roots(0, 1 << 20, ~0L, out, 64);
   (void)root;
   /* `n` is the total candidates found (may exceed cap=64; a tiny frame stays well under 1024) —
      the assertion is that the op ran, returned a sane non-negative count, and didn't trap. */
@@ -1540,6 +1541,152 @@ int f(void) {
     if let Some(r) = run_interp("vm_gc", src, &[]) {
         assert_eq!(r, vec![Value::I32(1)], "gc.roots count out of [0, cap]");
     }
+}
+
+// ---- Separate-artifact on-ramp: the export map + the `svm-llvm-translate` CLI ------------------
+
+/// A hand-written caller that resolves `twice` **by name**, used to prove the export map links:
+/// `svm_ir::link` rewrites the `call.import` to a direct cross-unit call. Every translated function
+/// takes the §3d data-stack pointer `sp` as its first parameter, so `twice` is `(i64 sp, i64 x) ->
+/// (i64)`; `twice` has no `alloca`s, so any `sp` works — the caller passes `0`. (`v1` is the unused
+/// capability-handle operand `call.import` carries; resolving to a direct call drops it.)
+#[cfg(unix)]
+const TWICE_CALLER: &str = "\
+func (i64) -> (i64) {
+block0(v0: i64):
+  v1 = i64.const 0
+  v2 = i64.const 0
+  v3 = call.import \"twice\" (i64, i64) -> (i64) v1 (v2, v0)
+  return v3
+}
+";
+
+/// Link a translated runtime (its module + export map) against [`TWICE_CALLER`] and assert the
+/// cross-unit `twice(21) == 42` call resolves on the interpreter — the shared core of both the
+/// in-process ([`exports_feed_a_link_unit`]) and CLI ([`translate_cli_emits_module_and_syms`]) paths.
+#[cfg(unix)]
+fn assert_links_and_runs(runtime_module: svm_ir::Module, exports: Vec<(String, u32)>) {
+    use svm_ir::{link, LinkUnit};
+    assert!(
+        exports.iter().any(|(n, _)| n == "twice"),
+        "the runtime must export `twice`; got {exports:?}"
+    );
+    let runtime = LinkUnit {
+        module: runtime_module,
+        exports,
+        ..Default::default()
+    };
+    let app = LinkUnit {
+        module: svm_text::parse_module(TWICE_CALLER).expect("parse caller"),
+        ..Default::default()
+    };
+    let linked = link(&[runtime, app]).expect("link runtime + caller");
+    svm_verify::verify_module(&linked).expect("verify linked program");
+    // The caller is the last function (concatenated after the runtime's functions). twice(21) = 42.
+    let entry = (linked.funcs.len() - 1) as u32;
+    let mut fuel = 10_000_000u64;
+    let r = svm_interp::run(&linked, entry, &[Value::I64(21)], &mut fuel).expect("run linked");
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "cross-unit call to translated `twice`"
+    );
+}
+
+/// **Ask 1 — the export map.** `Translated::exports` pairs each defined function with its final
+/// `module.funcs` index (`base + i`), so a separately-compiled program can `call.import` a runtime
+/// function and have `svm_ir::link` resolve it. Translate a two-function library and link a caller
+/// against it purely by name.
+#[test]
+#[cfg(unix)]
+fn exports_feed_a_link_unit() {
+    let src = r#"
+long twice(long x) { return x + x; }
+long inc(long x) { return x + 1; }
+"#;
+    let Some(bc) = compile_to_bc("exports", src) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    // Every export indexes a real function, and both library functions are present.
+    for (name, idx) in &t.exports {
+        assert!(
+            (*idx as usize) < t.module.funcs.len(),
+            "export {name} → {idx} is out of range"
+        );
+    }
+    assert!(
+        t.exports.iter().any(|(n, _)| n == "inc"),
+        "inc must be exported; got {:?}",
+        t.exports
+    );
+    assert_links_and_runs(t.module, t.exports);
+}
+
+/// **Ask 2 — the `svm-llvm-translate` CLI.** Translate a library `.bc` to a `.svm` module plus a
+/// `.syms` export sidecar, then re-read both, rebuild the export map from the sidecar, and link a
+/// caller against the module — the scriptable, separate-artifact analogue of `exports_feed_a_link_unit`.
+/// Also smoke-tests the binary (`.svmb`) output path (it must `decode_module`).
+#[test]
+#[cfg(unix)]
+fn translate_cli_emits_module_and_syms() {
+    let src = r#"
+long twice(long x) { return x + x; }
+"#;
+    let Some(bc) = compile_to_bc("cli", src) else {
+        return;
+    };
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let out = dir.join(format!("svm_llvm_cli_{pid}.svm"));
+    let syms = dir.join(format!("svm_llvm_cli_{pid}.syms"));
+    let outb = dir.join(format!("svm_llvm_cli_{pid}.svmb"));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_svm-llvm-translate"))
+        .arg(&bc)
+        .arg("-o")
+        .arg(&out)
+        .arg("--emit-syms")
+        .arg(&syms)
+        .status()
+        .expect("run svm-llvm-translate");
+    assert!(status.success(), "CLI exited non-zero");
+
+    // Binary path: `-o *.svmb` selects `encode_module`; the bytes must round-trip through the decoder.
+    let statusb = Command::new(env!("CARGO_BIN_EXE_svm-llvm-translate"))
+        .arg(&bc)
+        .arg("-o")
+        .arg(&outb)
+        .status()
+        .expect("run svm-llvm-translate (binary)");
+    assert!(statusb.success(), "CLI (binary) exited non-zero");
+    svm_encode::decode_module(&std::fs::read(&outb).expect("read .svmb"))
+        .expect("decode binary module");
+
+    // Re-read the text module + parse the `name idx` sidecar into an export map.
+    let module = svm_text::parse_module(&std::fs::read_to_string(&out).expect("read .svm"))
+        .expect("parse emitted module");
+    let syms_txt = std::fs::read_to_string(&syms).expect("read .syms");
+    let exports: Vec<(String, u32)> = syms_txt
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut it = l.split_whitespace();
+            let name = it.next().expect("sidecar name").to_string();
+            let idx = it
+                .next()
+                .expect("sidecar idx")
+                .parse()
+                .expect("sidecar idx int");
+            (name, idx)
+        })
+        .collect();
+
+    assert_links_and_runs(module, exports);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&syms);
+    let _ = std::fs::remove_file(&outb);
 }
 
 // ---- §7 capability reflection: `__vm_cap_count` / `__vm_cap_at` → `cap.self.count` / `.get` -----

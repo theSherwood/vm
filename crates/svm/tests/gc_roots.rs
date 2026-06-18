@@ -15,8 +15,9 @@ use svm_interp::{run, Value};
 use svm_text::{parse_module, print_module};
 use svm_verify::verify_module;
 
-/// `gc.roots` survives text and binary round-trips (new `GC_ROOTS` opcode + the 4-operand/1-result
-/// shape) so it flows through the whole pipeline like any other instruction.
+/// `gc.roots` survives text and binary round-trips (new `GC_ROOTS` opcode + the 5-operand/1-result
+/// shape: `heap_lo heap_hi mask buf cap`) so it flows through the whole pipeline like any other
+/// instruction. `mask = -1` is the untagged (identity) payload mask.
 #[test]
 fn gc_roots_round_trips() {
     let src = "memory 16\n\
@@ -24,9 +25,10 @@ fn gc_roots_round_trips() {
         block0():\n\
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 4096\n\
+        \x20 vmask = i64.const -1\n\
         \x20 v2 = i64.const 0\n\
         \x20 v3 = i64.const 8\n\
-        \x20 v4 = gc.roots v0 v1 v2 v3\n\
+        \x20 v4 = gc.roots v0 v1 vmask v2 v3\n\
         \x20 return v4\n\
         }\n";
     let m = parse_module(src).expect("parse");
@@ -71,7 +73,8 @@ fn gc_roots_finds_caller_frame_root() {
         \x20 v2 = i64.const 24576\n\
         \x20 v3 = i64.const 0\n\
         \x20 v4 = i64.const 8\n\
-        \x20 v5 = gc.roots v1 v2 v3 v4\n\
+        \x20 vmask = i64.const -1\n\
+        \x20 v5 = gc.roots v1 v2 vmask v3 v4\n\
         \x20 v6 = i64.load v3\n\
         \x20 v7 = i64.const 8\n\
         \x20 v8 = i64.load v7\n\
@@ -93,7 +96,8 @@ fn gc_roots_excludes_out_of_range() {
         \x20 v2 = i64.const 36864\n\
         \x20 v3 = i64.const 0\n\
         \x20 v4 = i64.const 8\n\
-        \x20 v5 = gc.roots v1 v2 v3 v4\n\
+        \x20 vmask = i64.const -1\n\
+        \x20 v5 = gc.roots v1 v2 vmask v3 v4\n\
         \x20 v6 = i64.load v3\n\
         \x20 return v5 v6\n\
         }\n";
@@ -118,7 +122,8 @@ fn gc_roots_scans_suspended_fiber_stack() {
         \x20 v7 = i64.const 28928\n\
         \x20 v8 = i64.const 0\n\
         \x20 v9 = i64.const 8\n\
-        \x20 v10 = gc.roots v6 v7 v8 v9\n\
+        \x20 vmask = i64.const -1\n\
+        \x20 v10 = gc.roots v6 v7 vmask v8 v9\n\
         \x20 v11 = i64.const 8\n\
         \x20 v12 = i64.load v11\n\
         \x20 return v10 v12\n\
@@ -152,7 +157,8 @@ fn gc_roots_is_unsupported_on_the_jit_without_fibers() {
         \x20 v2 = i64.const 4096\n\
         \x20 v3 = i64.const 0\n\
         \x20 v4 = i64.const 8\n\
-        \x20 v5 = gc.roots v1 v2 v3 v4\n\
+        \x20 vmask = i64.const -1\n\
+        \x20 v5 = gc.roots v1 v2 vmask v3 v4\n\
         \x20 return v5\n\
         }\n";
     let m = parse_module(src).expect("parse");
@@ -202,7 +208,8 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
         \x20 v7 = i64.const 28753\n\
         \x20 v8 = i64.const 0\n\
         \x20 v9 = i64.const 8\n\
-        \x20 v10 = gc.roots v6 v7 v8 v9\n\
+        \x20 vmask = i64.const -1\n\
+        \x20 v10 = gc.roots v6 v7 vmask v8 v9\n\
         \x20 v11 = i64.const 0\n\
         \x20 v12 = i64.load v11\n\
         \x20 v13 = i64.const 8\n\
@@ -287,7 +294,8 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         \x20 v15 = i64.const 28753\n\
         \x20 v16 = i64.const 0\n\
         \x20 v17 = i64.const 8\n\
-        \x20 v18 = gc.roots v14 v15 v16 v17\n\
+        \x20 vmask = i64.const -1\n\
+        \x20 v18 = gc.roots v14 v15 vmask v16 v17\n\
         \x20 v19 = i64.const 136\n\
         \x20 v20 = i32.const 1\n\
         \x20 i32.atomic.store.release v19 v20\n\
@@ -424,16 +432,18 @@ fn build_multi_fiber_module(roots: &[i64], lo: i64, hi: i64) -> svm_ir::Module {
     writeln!(src, "  v{} = i64.const {hi}", v + 1).unwrap();
     writeln!(src, "  v{} = i64.const 0", v + 2).unwrap(); // buf offset
     writeln!(src, "  v{} = i64.const {BUF_WORDS}", v + 3).unwrap(); // cap
+    writeln!(src, "  v{} = i64.const -1", v + 4).unwrap(); // payload mask (untagged identity)
     writeln!(
         src,
-        "  v{} = gc.roots v{v} v{} v{} v{}",
-        v + 4,
+        "  v{} = gc.roots v{v} v{} v{} v{} v{}",
+        v + 5,
         v + 1,
+        v + 4,
         v + 2,
         v + 3
     )
     .unwrap();
-    writeln!(src, "  return v{}", v + 4).unwrap();
+    writeln!(src, "  return v{}", v + 5).unwrap();
     src.push_str("}\n");
     // Shared fiber body: keep `arg` (v1) live across the suspend, then return it.
     src.push_str("func (i64, i64) -> (i64) {\nblock0(v0: i64, v1: i64):\n");
@@ -573,4 +583,185 @@ fn gc_roots_multi_fiber_soundness_sweep() {
         checked == 64,
         "expected to check 64 random multi-fiber configs"
     );
+}
+
+// ---- §GC payload mask: tagged-pointer roots + the host-leak safety constraint -------------------
+
+/// The tagged-pointer constant a guest holds as a live root: tag `0x03` in the top byte, bare window
+/// offset `0x7050` below. A naive scan (mask `-1`) would see the *huge* tagged word and reject it as
+/// out-of-window; the §GC payload mask strips the tag so the bare offset is recovered.
+const TAGGED_7050: i64 = (0x03 << 56) | 0x7050; // 0x0300_0000_0000_7050
+/// Top-byte-strip mask (`0x00FF_FFFF_FFFF_FFFF`) — clears the tag byte, preserves the low 56 bits.
+const STRIP_MASK: i64 = 0x00FF_FFFF_FFFF_FFFF;
+/// A **fold-down** mask that keeps only the low 24 bits (`0x00FF_FFFF`): it would pull a host pointer
+/// down into the guest window and leak host-address bits. The verifier + both runtimes reject it.
+const FOLD_DOWN_MASK: i64 = 0x00FF_FFFF;
+
+/// **The payload mask recovers a tagged root** (interpreter). A fiber parks holding the tagged word
+/// `TAGGED_7050` live across its `suspend` (so it sits in the reified frame the run-shared registry
+/// exposes). The root scans `[0x7000, 0x7100)` with `STRIP_MASK`: the tag byte is stripped, so the
+/// bare offset `0x7050` is enumerated alongside `heap_lo` (0x7000, which masks to itself). The raw
+/// tagged word never appears — only its masked offset crosses the boundary. (With mask `-1` the
+/// tagged word is huge and excluded, so the count would be 1; the recovered `0x7050` is the proof.)
+#[test]
+fn gc_roots_strips_pointer_tag_via_mask() {
+    let src = format!(
+        "memory 16\n\
+        func () -> (i64, i64, i64) {{\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const {TAGGED_7050}\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.const 28672\n\
+        \x20 v7 = i64.const 28928\n\
+        \x20 vmask = i64.const {STRIP_MASK}\n\
+        \x20 v8 = i64.const 0\n\
+        \x20 v9 = i64.const 8\n\
+        \x20 v10 = gc.roots v6 v7 vmask v8 v9\n\
+        \x20 v11 = i64.const 0\n\
+        \x20 v12 = i64.load v11\n\
+        \x20 v13 = i64.const 8\n\
+        \x20 v14 = i64.load v13\n\
+        \x20 return v10 v12 v14\n\
+        }}\n\
+        func (i64, i64) -> (i64) {{\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 v3 = suspend v2\n\
+        \x20 return v1\n\
+        }}\n"
+    );
+    // {heap_lo 0x7000, masked tagged root 0x7050} ⇒ count 2, ascending; the raw tagged word (huge)
+    // is filtered, so only the bare offset 0x7050 lands in the buffer.
+    assert_eq!(run_i64s(&src), vec![2, 0x7000, 0x7050]);
+}
+
+/// **The payload mask recovers a tagged root on the JIT** (native-stack scan). The fiber receives the
+/// tagged word as its `arg` and keeps it live across `suspend`, so the switch spills the *tagged*
+/// word onto the fiber's control stack. Scanning the one-word window `[0x7050, 0x7051)` with
+/// `STRIP_MASK`, the JIT's walker masks that spilled word down to `0x7050` and reports it — proving
+/// the mask is applied to raw stack words too (with mask `-1` the huge tagged word can't match the
+/// window, so its recovery here is the proof). Soundness framing, not interp↔JIT equality (§3.2).
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn gc_roots_strips_pointer_tag_on_the_jit() {
+    use svm_jit::{compile_and_run, JitOutcome};
+    let src = format!(
+        "memory 16\n\
+        func () -> (i64, i64) {{\n\
+        block0():\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const {TAGGED_7050}\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.const 28752\n\
+        \x20 v7 = i64.const 28753\n\
+        \x20 vmask = i64.const {STRIP_MASK}\n\
+        \x20 v8 = i64.const 0\n\
+        \x20 v9 = i64.const 8\n\
+        \x20 v10 = gc.roots v6 v7 vmask v8 v9\n\
+        \x20 v11 = i64.const 0\n\
+        \x20 v12 = i64.load v11\n\
+        \x20 return v10 v12\n\
+        }}\n\
+        func (i64, i64) -> (i64) {{\n\
+        block0(v0: i64, v1: i64):\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 v3 = suspend v2\n\
+        \x20 return v1\n\
+        }}\n"
+    );
+    let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}"));
+    verify_module(&m).expect("verify");
+    let slots = match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+        JitOutcome::Returned(s) => s,
+        other => panic!("jit did not return: {other:?}"),
+    };
+    let (count, buf0) = (slots[0], slots[1]);
+    assert!(
+        count >= 1,
+        "the masked tagged root must be recovered (count {count})"
+    );
+    assert!(
+        buf0 == 0x7050,
+        "the tag byte must be stripped to the bare offset 0x7050; got buf0={buf0:#x}"
+    );
+}
+
+/// **The verifier rejects a constant fold-down mask.** A `gc.roots` whose mask clears more than the
+/// top byte (here the low-24-bits `FOLD_DOWN_MASK`) could fold a host pointer into the guest window
+/// and leak host-address bits past the range filter (GC.md §3, §6). The verifier traces the constant
+/// mask and fails closed.
+#[test]
+fn gc_roots_rejects_fold_down_mask_in_verifier() {
+    let src = format!(
+        "memory 16\n\
+        func () -> (i64) {{\n\
+        block0():\n\
+        \x20 v0 = i64.const 0\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 vmask = i64.const {FOLD_DOWN_MASK}\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 v3 = i64.const 8\n\
+        \x20 v4 = gc.roots v0 v1 vmask v2 v3\n\
+        \x20 return v4\n\
+        }}\n"
+    );
+    let m = parse_module(&src).expect("parse");
+    assert!(
+        matches!(
+            verify_module(&m),
+            Err(svm_verify::VerifyError::GcRootsMaskUnsafe { .. })
+        ),
+        "verifier must reject a fold-down gc.roots mask"
+    );
+}
+
+/// **Both runtimes defend against a fold-down mask** even when the module skips verification (an
+/// unverified / adversarial module). The interpreter and the JIT each check the mask at the op and
+/// trap rather than fold a host word into the reported set.
+#[test]
+fn gc_roots_runtime_rejects_fold_down_mask() {
+    use svm_interp::Trap;
+    let src = format!(
+        "memory 16\n\
+        func () -> (i64) {{\n\
+        block0():\n\
+        \x20 v0 = i64.const 0\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 vmask = i64.const {FOLD_DOWN_MASK}\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 v3 = i64.const 8\n\
+        \x20 v4 = gc.roots v0 v1 vmask v2 v3\n\
+        \x20 return v4\n\
+        }}\n"
+    );
+    let m = parse_module(&src).expect("parse");
+    // Deliberately skip `verify_module` — this is the unverified-module defense path.
+    let mut fuel = 1_000_000u64;
+    assert!(
+        matches!(run(&m, 0, &[], &mut fuel), Err(Trap::Malformed)),
+        "interpreter must trap on a fold-down mask"
+    );
+
+    // The JIT applies the same check inside its `gc_roots` thunk (where the substrate supports the op).
+    #[cfg(any(
+        all(unix, target_arch = "x86_64"),
+        all(unix, target_arch = "aarch64"),
+        all(windows, target_arch = "x86_64")
+    ))]
+    {
+        use svm_jit::{compile_and_run, JitOutcome};
+        match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+            JitOutcome::Trapped(_) => {}
+            other => panic!("JIT must trap on a fold-down mask; got {other:?}"),
+        }
+    }
 }

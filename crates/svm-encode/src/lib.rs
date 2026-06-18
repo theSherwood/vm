@@ -139,7 +139,7 @@ mod op {
     pub const ATOMIC_FENCE: u8 = 0xE9; // order byte
 
     // §GC (GC.md) conservative root enumeration.
-    pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, buf, cap -> i64 count
+    pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, mask, buf, cap -> i64 count
 
     // §17 SIMD (D58). One prefix byte, then a sub-opcode (à la wasm's 0xFD) — keeps the
     // crowded primary opcode space free. Each `simd::*` sub-op's payload is documented inline.
@@ -660,12 +660,14 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         Inst::GcRoots {
             heap_lo,
             heap_hi,
+            mask,
             buf,
             cap,
         } => {
             out.push(op::GC_ROOTS);
             write_uleb(out, *heap_lo as u64);
             write_uleb(out, *heap_hi as u64);
+            write_uleb(out, *mask as u64);
             write_uleb(out, *buf as u64);
             write_uleb(out, *cap as u64);
         }
@@ -1750,6 +1752,7 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
         op::GC_ROOTS => Inst::GcRoots {
             heap_lo: c.idx()?,
             heap_hi: c.idx()?,
+            mask: c.idx()?,
             buf: c.idx()?,
             cap: c.idx()?,
         },
