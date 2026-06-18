@@ -25,13 +25,15 @@
 //!   residually (faithful), so unpromised mutable memory is never folded.
 //! - **Value-stack renaming (Stage 2).** A caller may designate a private byte range (the
 //!   interpreter's operand stack / locals) as *renameable* ([`specialize_with`]). Stores into it
-//!   at constant, full-width (`i32`/`i64`) addresses update an **abstract memory** instead of
-//!   emitting a store; loads read that abstract memory instead of emitting a load — so the
-//!   in-memory stack is lifted into SSA and disappears from the residual. Soundness is kept by
-//!   construction: the region is assumed zero-initialized and private, every write to it is a
-//!   tracked constant-address store, and any access that can't be resolved abstractly (a dynamic
-//!   address that might alias the region, a partial-width overlap, a call) returns
-//!   [`SpecError::Unsupported`] rather than guessing.
+//!   at constant addresses update an **abstract memory** instead of emitting a store; loads read
+//!   that abstract memory instead of emitting a load — so the in-memory stack is lifted into SSA
+//!   and disappears from the residual. Narrow (`i8`/`i16`/`i32`-of-`i64`) cells are renamed too: a
+//!   constant cell keeps its raw bytes and is re-extended (sign/zero) per the load op, so char/short
+//!   locals fold exactly. Soundness is kept by construction: the region is assumed zero-initialized
+//!   and private, every write to it is a tracked constant-address store, and any access that can't
+//!   be resolved abstractly (a dynamic address that might alias the region, a *narrow store of a
+//!   dynamic value* — which would need residual masking to read back — a partial-width overlap, a
+//!   call) returns [`SpecError::Unsupported`] rather than guessing.
 //! - The **context** threaded through the CFG is `(source block, the constant valuation of its
 //!   block parameters, the constant valuation of the live abstract-memory cells)`. One residual
 //!   block is generated per context and memoized, so distinct constants (e.g. the program
@@ -572,32 +574,39 @@ impl Spec<'_> {
             let base = base as u64;
             let eff = base.wrapping_add(offset);
             if within_region(self.config.rename, eff, width) {
-                // The renameable region must be resolved entirely abstractly.
-                let rw = match renameable_load_width(op) {
-                    Some(w) => w as u64,
-                    None => return Err(SpecError::Unsupported), // narrow / float access into stack
-                };
-                if rw == width {
-                    if let Some(&(wc, val)) = mem.get(&eff) {
-                        if wc as u64 == width {
-                            return Ok(Some(val));
-                        }
-                    }
-                    if mem
-                        .iter()
-                        .any(|(&b, &(wc, _))| b < eff + width && eff < b + wc as u64)
-                    {
-                        return Err(SpecError::Unsupported); // partial overlap — can't resolve
-                    }
-                    // Untouched region cell ⇒ the zero-initialized backing.
-                    let zero = match op.info().1 {
-                        ValType::I32 => Known::I32(0),
-                        ValType::I64 => Known::I64(0),
-                        _ => return Err(SpecError::Unsupported),
-                    };
-                    return Ok(Some(Abs::Const(zero)));
+                // The renameable region must be resolved entirely abstractly. Only integer loads
+                // can be (the abstract domain tracks integer cells); a float load into it can't.
+                if !matches!(op.info().1, ValType::I32 | ValType::I64) {
+                    return Err(SpecError::Unsupported);
                 }
-                return Err(SpecError::Unsupported);
+                // An exact cell — same address *and* width — resolves directly. A constant cell's
+                // raw bytes are re-extended per this load op (so an `i8` cell loaded `*_u`/`*_s`
+                // zero-/sign-extends correctly); a dynamic cell is only renamed at its full natural
+                // width, where loading it back is the identity (no residual fixup needed).
+                if let Some(&(wc, val)) = mem.get(&eff) {
+                    if wc as u64 == width {
+                        return Ok(Some(match val {
+                            Abs::Const(k) => {
+                                let raw = known_raw(k, width);
+                                Abs::Const(extend_loaded(raw, op).ok_or(SpecError::Unsupported)?)
+                            }
+                            Abs::Dyn(i) if is_full_natural_load(op, width) => Abs::Dyn(i),
+                            Abs::Dyn(_) => return Err(SpecError::Unsupported),
+                        }));
+                    }
+                }
+                // Anything else touching the cell (a different-width or straddling access) can't be
+                // resolved abstractly without composing bytes — refuse rather than guess.
+                if mem
+                    .iter()
+                    .any(|(&b, &(wc, _))| b < eff + width && eff < b + wc as u64)
+                {
+                    return Err(SpecError::Unsupported);
+                }
+                // Untouched region cell ⇒ the zero-initialized backing, extended per the load.
+                return Ok(Some(Abs::Const(
+                    extend_loaded(0, op).ok_or(SpecError::Unsupported)?,
+                )));
             }
             // Outside the region: a readonly constant-memory read folds; otherwise residual.
             if let Some(k) = read_const_mem(self.config, self.module, base, offset, op) {
@@ -646,16 +655,23 @@ impl Spec<'_> {
             let base = base as u64;
             let eff = base.wrapping_add(offset);
             if within_region(self.config.rename, eff, width) {
-                let rw = match renameable_store_width(op) {
-                    Some(w) => w as u64,
-                    None => return Err(SpecError::Unsupported),
-                };
-                if rw != width {
+                // Only integer stores can be renamed (the abstract domain tracks integer cells).
+                if !matches!(op.info().1, ValType::I32 | ValType::I64) {
                     return Err(SpecError::Unsupported);
                 }
+                let cell = match env[value as usize] {
+                    // A constant is truncated to the store width and kept as the cell's raw bytes,
+                    // so a later load re-extends it correctly (an `i8` store of `0x1FF` ⇒ `0xFF`).
+                    Abs::Const(k) => Abs::Const(cell_const(known_raw(k, width), width)),
+                    // A dynamic value is only renamed when stored at its full natural width — then
+                    // loading it back at that width is the identity. A *narrow* dynamic store would
+                    // need residual masking to read back soundly, so refuse it instead.
+                    Abs::Dyn(i) if is_full_natural_store(op, width) => Abs::Dyn(i),
+                    Abs::Dyn(_) => return Err(SpecError::Unsupported),
+                };
                 // Invalidate any overlapping cell, then record this one. No residual store.
                 mem.retain(|&b, &mut (wc, _)| !(b < eff + width && eff < b + wc as u64));
-                mem.insert(eff, (width as u32, env[value as usize]));
+                mem.insert(eff, (width as u32, cell));
                 return Ok(None);
             }
             if disjoint_from_region(self.config.rename, eff, width) {
@@ -896,51 +912,53 @@ fn store_width(op: StoreOp) -> u32 {
     }
 }
 
-/// Full-width integer load ops are renameable (4 or 8 bytes); narrow/float loads are not.
-fn renameable_load_width(op: LoadOp) -> Option<u32> {
-    match op {
-        LoadOp::I32 => Some(4),
-        LoadOp::I64 => Some(8),
-        _ => None,
+/// The low `width` bytes, as the unsigned in-memory content (`width >= 8` ⇒ all bytes).
+fn width_mask(width: u64) -> u64 {
+    if width >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * width)) - 1
     }
 }
 
-/// Full-width integer store ops are renameable (4 or 8 bytes); narrow/float stores are not.
-fn renameable_store_width(op: StoreOp) -> Option<u32> {
-    match op {
-        StoreOp::I32 => Some(4),
-        StoreOp::I64 => Some(8),
-        _ => None,
+/// The raw little-endian content (zero-extended) a constant cell of `width` bytes holds.
+fn known_raw(k: Known, width: u64) -> u64 {
+    let v = match k {
+        Known::I32(x) => x as u32 as u64,
+        Known::I64(x) => x as u64,
+    };
+    v & width_mask(width)
+}
+
+/// The canonical constant a renamed cell stores for `width` raw bytes: `i64` for a full 8-byte
+/// cell, `i32` otherwise — matching the pre-existing full-width representation so memo contexts
+/// (which key on the constant) stay canonical across widths.
+fn cell_const(raw: u64, width: u64) -> Known {
+    if width == 8 {
+        Known::I64(raw as i64)
+    } else {
+        Known::I32(raw as u32 as i32)
     }
 }
 
-/// Read an integer load from constant memory. The effective address `base + offset` must lie
-/// fully in range (so the interpreter would not fault) and resolve to bytes the caller has
-/// promised constant — a `const_overlay`, a `const_region`, or (the default) a **readonly** data
-/// segment. Returns the loaded value, sign/zero-extended per `op`, matching the interpreter's
-/// little-endian load exactly. Returns `None` (⇒ emit a residual load) otherwise.
-fn read_const_mem(
-    config: &SpecConfig,
-    module: &Module,
-    base: u64,
-    offset: u64,
-    op: LoadOp,
-) -> Option<Known> {
+/// Whether a dynamic value stored by `op` occupies its full natural width — `i32.store`/`i64.store`.
+/// Only then is renaming a dynamic cell sound without a residual fixup (the stored value's high bits
+/// survive, so a same-width load reads it back unchanged).
+fn is_full_natural_store(op: StoreOp, width: u64) -> bool {
+    matches!((op, width), (StoreOp::I32, 4) | (StoreOp::I64, 8))
+}
+
+/// The load counterpart of [`is_full_natural_store`]: `i32.load`/`i64.load` read a full natural cell
+/// back as the identity, so a dynamic cell may be returned directly.
+fn is_full_natural_load(op: LoadOp, width: u64) -> bool {
+    matches!((op, width), (LoadOp::I32, 4) | (LoadOp::I64, 8))
+}
+
+/// Apply load `op`'s width + sign/zero extension to the assembled little-endian content `raw`,
+/// producing the loaded integer constant exactly as the interpreter would. Returns `None` for a
+/// float load (the abstract domain tracks integer constants only).
+fn extend_loaded(raw: u64, op: LoadOp) -> Option<Known> {
     let (_, vt, width, signed) = op.info();
-    if !matches!(vt, ValType::I32 | ValType::I64) {
-        return None;
-    }
-    let mem = module.memory?;
-    let eff = base.checked_add(offset)?;
-    let end = eff.checked_add(width as u64)?;
-    if end > mem.size() {
-        return None; // could fault at the window top — let the residual load reproduce it
-    }
-    let bytes = const_bytes(config, module, eff, width)?;
-    let mut raw: u64 = 0;
-    for (i, &byte) in bytes.iter().enumerate() {
-        raw |= (byte as u64) << (8 * i);
-    }
     Some(match (vt, width, signed) {
         (ValType::I32, 1, false) => Known::I32(raw as u8 as i32),
         (ValType::I32, 1, true) => Known::I32(raw as u8 as i8 as i32),
@@ -956,6 +974,36 @@ fn read_const_mem(
         (ValType::I64, 8, _) => Known::I64(raw as i64),
         _ => return None,
     })
+}
+
+/// Read an integer load from constant memory. The effective address `base + offset` must lie
+/// fully in range (so the interpreter would not fault) and resolve to bytes the caller has
+/// promised constant — a `const_overlay`, a `const_region`, or (the default) a **readonly** data
+/// segment. Returns the loaded value, sign/zero-extended per `op`, matching the interpreter's
+/// little-endian load exactly. Returns `None` (⇒ emit a residual load) otherwise.
+fn read_const_mem(
+    config: &SpecConfig,
+    module: &Module,
+    base: u64,
+    offset: u64,
+    op: LoadOp,
+) -> Option<Known> {
+    let (_, vt, width, _) = op.info();
+    if !matches!(vt, ValType::I32 | ValType::I64) {
+        return None;
+    }
+    let mem = module.memory?;
+    let eff = base.checked_add(offset)?;
+    let end = eff.checked_add(width as u64)?;
+    if end > mem.size() {
+        return None; // could fault at the window top — let the residual load reproduce it
+    }
+    let bytes = const_bytes(config, module, eff, width)?;
+    let mut raw: u64 = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        raw |= (byte as u64) << (8 * i);
+    }
+    extend_loaded(raw, op)
 }
 
 /// Resolve `width` constant bytes at window address `eff`, if the caller has promised that range

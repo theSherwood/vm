@@ -8,8 +8,8 @@
 
 use svm_interp::{Trap, Value};
 use svm_ir::{
-    BinOp, Block, CmpOp, Data, FBinOp, FloatTy, Func, Inst, IntTy, LoadOp, Memory, Module, StoreOp,
-    Terminator, ValType,
+    BinOp, Block, CmpOp, ConvOp, Data, FBinOp, FloatTy, Func, Inst, IntTy, LoadOp, Memory, Module,
+    StoreOp, Terminator, ValType,
 };
 use svm_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
@@ -1415,4 +1415,220 @@ fn inlines_calls_in_specialized_dispatch_loop() {
             Ok(vec![Value::I64(expect)])
         );
     }
+}
+
+// ===========================================================================================
+// Stage 2 — narrow (i8/i16) renamed cells: sub-word stores/loads into the private region are
+// renamed into SSA like full-width ones. A constant cell keeps its raw bytes and re-extends per
+// the load op (sign/zero); a *dynamic* narrow access (which would need residual masking to read
+// back) and any partial-width overlap stay refused.
+// ===========================================================================================
+
+#[test]
+fn narrow_constant_cells_round_trip_with_extension() {
+    // Store i8/i16/i32/i64 constants into the renamed region and read them back at matching widths
+    // with every sign/zero extension. The interpreter is the oracle for the whole matrix.
+    let region = (STACK_LO, STACK_LO + 64);
+    let (a0, a1, a2, a3) = (
+        STACK_LO as i64,
+        (STACK_LO + 8) as i64,
+        (STACK_LO + 16) as i64,
+        (STACK_LO + 24) as i64,
+    );
+    let st = |op, addr, value| Inst::Store {
+        op,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let ld = |op, addr| Inst::Load {
+        op,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let ext = |a| Inst::Convert {
+        op: ConvOp::ExtendI32S,
+        a,
+    };
+    let add = |a, b| Inst::IntBin {
+        ty: IntTy::I64,
+        op: BinOp::Add,
+        a,
+        b,
+    };
+
+    let insts = vec![
+        Inst::ConstI64(a0),                    // 0
+        Inst::ConstI32(0x1FF),                 // 1: low byte 0xFF
+        st(StoreOp::I32_8, 0, 1),              // [a0] = 0xFF
+        Inst::ConstI64(a1),                    // 2
+        Inst::ConstI32(0x12345),               // 3: low half 0x2345
+        st(StoreOp::I32_16, 2, 3),             // [a1] = 0x2345
+        Inst::ConstI64(a2),                    // 4
+        Inst::ConstI32(-7),                    // 5
+        st(StoreOp::I32, 4, 5),                // [a2] = -7
+        Inst::ConstI64(a3),                    // 6
+        Inst::ConstI64(0x1122_3344_5566_7788), // 7
+        st(StoreOp::I64, 6, 7),                // [a3] = big
+        ld(LoadOp::I32_8U, 0),                 // 8  -> 0xFF   (i32)
+        ld(LoadOp::I32_8S, 0),                 // 9  -> -1     (i32)
+        ld(LoadOp::I32_16U, 2),                // 10 -> 0x2345 (i32)
+        ld(LoadOp::I64_16S, 2),                // 11 -> 0x2345 (i64)
+        ld(LoadOp::I32, 4),                    // 12 -> -7     (i32)
+        ld(LoadOp::I64, 6),                    // 13 -> big    (i64)
+        ext(8),                                // 14
+        ext(9),                                // 15
+        ext(10),                               // 16
+        ext(12),                               // 17
+        add(14, 15),                           // 18
+        add(18, 16),                           // 19
+        add(19, 17),                           // 20
+        add(20, 11),                           // 21
+        add(21, 13),                           // 22
+    ];
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![],
+                insts,
+                term: Terminator::Return(vec![22]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize_with(&m, 0, &[], Some(region)).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_memory_ops(&residual); // every narrow cell renamed away
+    let opt = optimize_module(&residual);
+    verify_module(&opt).expect("optimized residual re-verifies");
+    assert_eq!(opt.funcs[0].blocks.len(), 1);
+
+    let expect = run(&m, &[]);
+    assert!(expect.is_ok(), "interpreter ran");
+    assert_eq!(run(&residual, &[]), expect, "residual matches interp");
+    assert_eq!(run(&opt, &[]), expect);
+}
+
+#[test]
+fn narrow_store_overwrites_overlapping_cell() {
+    // A narrow store invalidates the wider cell it overlaps: write i32, then i8 at the same slot,
+    // and the i8 load sees the new byte (matching the interpreter's byte-level memory).
+    let region = (STACK_LO, STACK_LO + 8);
+    let st = |op, addr, value| Inst::Store {
+        op,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let ld = |op, addr| Inst::Load {
+        op,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+    let m = Module {
+        funcs: vec![Func {
+            params: vec![],
+            results: vec![ValType::I32],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![
+                    Inst::ConstI64(STACK_LO as i64),       // 0
+                    Inst::ConstI32(0x4433_2211u32 as i32), // 1
+                    st(StoreOp::I32, 0, 1),                // [A] = 0x44332211 (cell A,4)
+                    Inst::ConstI32(0xAB),                  // 2
+                    st(StoreOp::I32_8, 0, 2),              // [A] = 0xAB  (invalidates A,4 -> A,1)
+                    ld(LoadOp::I32_8U, 0),                 // 3 -> 0xAB
+                ],
+                term: Terminator::Return(vec![3]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&m).expect("verifies");
+
+    let residual = specialize_with(&m, 0, &[], Some(region)).expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_memory_ops(&residual);
+    assert_eq!(run(&residual, &[]), run(&m, &[]));
+    assert_eq!(run(&m, &[]), Ok(vec![Value::I32(0xAB)]));
+}
+
+#[test]
+fn narrow_dynamic_and_overlap_loads_are_unsupported() {
+    let region = (STACK_LO, STACK_LO + 8);
+    let st = |op, addr, value| Inst::Store {
+        op,
+        addr,
+        value,
+        offset: 0,
+        align: 0,
+    };
+    let ld = |op, addr| Inst::Load {
+        op,
+        addr,
+        offset: 0,
+        align: 0,
+    };
+
+    // A narrow store of a *dynamic* value can't be renamed (reading it back needs residual masking).
+    let dyn_narrow_store = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![ValType::I64], // 0: x
+                insts: vec![
+                    Inst::ConstI64(STACK_LO as i64), // 1
+                    st(StoreOp::I64_8, 1, 0),        // [A] = low byte of x (dynamic)
+                ],
+                term: Terminator::Return(vec![0]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&dyn_narrow_store).expect("verifies");
+    assert_eq!(
+        specialize_with(&dyn_narrow_store, 0, &[SpecArg::Dynamic], Some(region)),
+        Err(svm_peval::SpecError::Unsupported)
+    );
+
+    // A full-width dynamic cell read back at a narrower width is a partial overlap — refused.
+    let narrow_load_of_wide_cell = Module {
+        funcs: vec![Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![Block {
+                params: vec![ValType::I64], // 0: x
+                insts: vec![
+                    Inst::ConstI64(STACK_LO as i64), // 1
+                    st(StoreOp::I64, 1, 0),          // [A] = x (cell A,8 dynamic)
+                    ld(LoadOp::I64_8U, 1),           // 2: low byte -> overlap, can't resolve
+                ],
+                term: Terminator::Return(vec![2]),
+            }],
+        }],
+        memory: Some(Memory { size_log2: 16 }),
+        ..Default::default()
+    };
+    verify_module(&narrow_load_of_wide_cell).expect("verifies");
+    assert_eq!(
+        specialize_with(
+            &narrow_load_of_wide_cell,
+            0,
+            &[SpecArg::Dynamic],
+            Some(region)
+        ),
+        Err(svm_peval::SpecError::Unsupported)
+    );
 }

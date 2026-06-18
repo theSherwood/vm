@@ -31,6 +31,12 @@ with the differential oracle (residual == interp == JIT) as its correctness spec
   stays dynamically-branching returns `Unsupported`. `tests/specialize.rs` (leaf helper, unrolled
   static recursion, tail call, a call-threaded interpreter whose helper calls fold away, and the
   dynamic-branch boundary).
+- **Narrow (`i8`/`i16`/`i32`-of-`i64`) renamed cells** — sub-word stores/loads into the rename
+  region are lifted into SSA like full-width ones. A constant cell keeps its raw bytes and is
+  re-extended (sign/zero) per the load op, so char/short locals fold exactly; a narrow store of a
+  *dynamic* value and any partial-width overlap stay refused (`Unsupported`). `tests/specialize.rs`
+  (the full extension matrix vs the interpreter oracle, narrow-over-wide invalidation, and the
+  dynamic/overlap boundary).
 - **AOT pipeline** (`tests/aot.rs`): `specialize → verify → encode_module → decode_module →
   run/JIT`, all agreeing — the shippable-artifact path.
 - **ROI** (`tests/bench.rs`, `#[ignore]`): specialization ~5–6× on either backend; end-to-end
@@ -43,13 +49,9 @@ with the differential oracle (residual == interp == JIT) as its correctness spec
   `Unsupported`. Inlining its CFG as residual blocks (splitting the caller block at the call and
   threading live values through the callee) is the remaining step; indirect calls
   (`call_indirect`) are also still out of scope.
-- **Narrow (`i8`/`i16`) renamed cells** — char/short locals kept *on the renamed operand stack*
-  (sub-word abstract cells with extension + partial-overlap handling). Word-width already works;
-  narrow memory outside the rename region already works (residual / readonly fold).
 - **Float/SIMD constant folding** — float/SIMD ops pass through unfolded (the abstract domain
   tracks integer constants only). NaN/rounding fidelity is the reason to be deliberate here.
 - **Guest-side engine** — porting the specializer inside the sandbox on the §22 `Jit` capability
   (dynamic-language IC-style recompilation). The residual IR + back half are shared; deferred.
 
-Drop this file once dynamic-control-flow `call` + narrow cells land (the rest are enhancements, not
-gaps).
+Drop this file once dynamic-control-flow `call` lands (the rest are enhancements, not gaps).
