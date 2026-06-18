@@ -2645,3 +2645,506 @@ int bump(int n) { counter = counter + n; return counter + origin.a; }
         "counter's initial value, read globally at entry"
     );
 }
+
+// --- Rust breadth, deeper: `core`-using programs (enums/`match`, slices, iterators, `Option`) ----
+
+/// Translate a `no_std` Rust crate whose `items` define `#[no_mangle] pub extern "C" fn
+/// run(n: i32) -> i32` (+ any types/helpers), run `run(n)` on both backends (interp == JIT), and
+/// return the result. `None` if the toolchain is unavailable.
+fn rust_run_onramp(name: &str, items: &str, n: i32) -> Option<i32> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n{items}\n"
+    );
+    let bc = compile_rust_to_bc(name, &src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify translated Rust IR");
+    let idx = module
+        .funcs
+        .iter()
+        .position(|f| f.params == [ValType::I64, ValType::I32] && f.results == [ValType::I32])
+        .expect("run present") as u32;
+    let mut fuel = 200_000_000u64;
+    let interp = match svm_interp::run(
+        &module,
+        idx,
+        &[Value::I64(t.entry_sp as i64), Value::I32(n)],
+        &mut fuel,
+    )
+    .expect("interp run")
+    .as_slice()
+    {
+        [Value::I32(x)] => *x,
+        other => panic!("run: expected one i32, got {other:?}"),
+    };
+    let jit = match svm_jit::compile_and_run(&module, idx, &[t.entry_sp as i64, n as i64])
+        .expect("jit run")
+    {
+        JitOutcome::Returned(s) => s[0] as i32,
+        other => panic!("unexpected JIT outcome {other:?}"),
+    };
+    assert_eq!(interp, jit, "run({n}): interp {interp} vs JIT {jit}");
+    Some(interp)
+}
+
+/// Native oracle: the same `items` (with `run`) compiled by `rustc 1.81` into a std binary printing
+/// `run(n)`, run natively.
+fn rust_run_native(name: &str, items: &str, n: i32) -> Option<i32> {
+    let dir = std::env::temp_dir();
+    // Per-test unique paths (`name`) — tests run in parallel, so a shared path would race.
+    let rs = dir.join(format!("svm_llvm_{}_{}_rsrun.rs", std::process::id(), name));
+    let exe = dir.join(format!("svm_llvm_{}_{}_rsrun", std::process::id(), name));
+    std::fs::write(
+        &rs,
+        format!("{items}\nfn main() {{ println!(\"{{}}\", run({n})); }}\n"),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args([
+            "+1.81.0",
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    let out = Command::new(&exe).output().expect("run native rust");
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("parse native run"),
+    )
+}
+
+/// Drive `items` (which define `run(i32)->i32`) through both lanes for each `n`, asserting the on-ramp
+/// matches native `rustc`.
+fn check_rust_run_vs_native(name: &str, items: &str, ns: &[i32]) {
+    for &n in ns {
+        let (Some(svm), Some(native)) = (
+            rust_run_onramp(name, items, n),
+            rust_run_native(name, items, n),
+        ) else {
+            return; // toolchain unavailable — skip
+        };
+        assert_eq!(
+            svm, native,
+            "{name}: run({n}) on-ramp {svm} vs native {native}"
+        );
+    }
+}
+
+/// **Real Rust** — idiomatic `core` (a `#[repr(u8)]` enum dispatched by `match`, fixed arrays +
+/// slice iteration, `Option` + `match`, an iterator `find` with a closure) through the on-ramp,
+/// byte-identical to native `rustc`. A bytecode-style fold over a data array, then an `Option`-typed
+/// search — the shapes a real `no_std` Rust program is built from. Exercises enum discriminants →
+/// `switch`/`br_table`, slice indexing, niche-optimized `Option<i32>`, and `-O2` iterator lowering.
+#[test]
+fn rust_core_enum_slice_option() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    enum Op { Add, Mul, Xor, Sub }
+    fn apply(op: Op, a: i32, x: i32) -> i32 {
+        match op {
+            Op::Add => a.wrapping_add(x),
+            Op::Mul => a.wrapping_mul(x),
+            Op::Xor => a ^ x,
+            Op::Sub => a.wrapping_sub(x),
+        }
+    }
+    let prog = [Op::Add, Op::Mul, Op::Xor, Op::Sub, Op::Add];
+    let data = [3i32, 1, 4, 1, 5, 9, 2, 6];
+    let mut acc = n;
+    let mut k = 0usize;
+    for &x in data.iter() {
+        acc = apply(prog[k % prog.len()], acc, x);
+        k += 1;
+    }
+    acc = acc.wrapping_add(match data.iter().copied().find(|&v| v > n) {
+        Some(v) => v,
+        None => -1,
+    });
+    acc
+}
+"#;
+    check_rust_run_vs_native("rs_core", items, &[0, 1, 5, 100, -3, 1000]);
+}
+
+/// **Real Rust** — by-value `struct`s, an array-of-struct with slice iteration + field access, a
+/// by-value struct argument, signed `/`+`%`, and an iterator `map().max()` yielding `Option<i32>`.
+/// The aggregate/by-value-struct shapes (clang's small-struct coercion, slice J) and `-O2` iterator
+/// lowering, from the Rust frontend — byte-identical to native `rustc`.
+#[test]
+fn rust_core_structs_and_iterators() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    #[derive(Clone, Copy)]
+    struct Pt { x: i32, y: i32 }
+    fn norm(p: Pt) -> i32 { p.x.wrapping_mul(p.x).wrapping_add(p.y.wrapping_mul(p.y)) }
+    let pts = [
+        Pt { x: 1, y: 2 },
+        Pt { x: n, y: 3 },
+        Pt { x: 4, y: n / 2 },
+        Pt { x: n % 5, y: 7 },
+    ];
+    let mut s = 0i32;
+    for p in pts.iter() {
+        s = s.wrapping_add(norm(*p));
+    }
+    let best = pts.iter().map(|p| norm(*p)).max();
+    s.wrapping_add(match best { Some(m) => m, None => 0 })
+}
+"#;
+    check_rust_run_vs_native("rs_structs", items, &[0, 3, 10, -8, 100]);
+}
+
+/// **Real Rust panic paths** — a runtime division emits non-elidable div-by-zero + overflow checks
+/// whose panic branches call `core::panicking::panic_const_*` (external libcore). Under `panic=abort`
+/// the on-ramp lowers those to a trap (drop + the trailing `unreachable`), so the program *translates*
+/// — the gap that blocks essentially all real Rust. The divisor here is `(n & 7) + 1` through
+/// `black_box` (always ≥ 1, but opaque so the panic paths stay in the IR), so the non-panic path runs
+/// and `n / d` matches native `rustc` exactly. Without the fix, translation fails on the undefined
+/// `panic_const_div_by_zero` reference.
+#[test]
+fn rust_panic_path_div_traps_and_runs() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let tmp = (n & 7) + 1;                      // [1, 8] — never zero…
+    let d = unsafe { core::ptr::read_volatile(&tmp) }; // …but opaque (a volatile load), so the
+                                                // div-by-zero + overflow panic checks stay in the IR
+    (n / d).wrapping_add(n % d)
+}
+"#;
+    check_rust_run_vs_native("rs_panic", items, &[0, 1, 7, 100, -50, 1234]);
+}
+
+/// **Rust trait objects** — `&dyn Trait` dynamic dispatch through the on-ramp. Two types implement a
+/// trait; an array of `&dyn Shape` (each a `{data, vtable}` fat pointer) is iterated and the method is
+/// called dynamically — a vtable load + `call_indirect` per element, the Rust analog of the C++ vtable
+/// path (slice AG). Exercises Rust vtable globals (function-pointer initializers, slice K), fat-pointer
+/// aggregates, and dynamic dispatch — byte-identical to native `rustc`.
+#[test]
+fn rust_trait_object_dispatch() {
+    let items = r#"
+trait Shape {
+    fn area(&self) -> i32;
+}
+struct Sq(i32);
+struct Rect(i32, i32);
+impl Shape for Sq {
+    fn area(&self) -> i32 { self.0.wrapping_mul(self.0) }
+}
+impl Shape for Rect {
+    fn area(&self) -> i32 { self.0.wrapping_mul(self.1) }
+}
+
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let sq = Sq(n);
+    let rect = Rect(n, 3);
+    let shapes: [&dyn Shape; 2] = [&sq, &rect];
+    let mut total = 0i32;
+    for s in shapes.iter() {
+        total = total.wrapping_add(s.area()); // dynamic dispatch via the vtable
+    }
+    total
+}
+"#;
+    check_rust_run_vs_native("rs_traits", items, &[0, 2, 7, -4, 100]);
+}
+
+/// **Rust slices as arguments** — `&[i32]` (a `{ptr, len}` fat pointer) passed across a real
+/// (`#[inline(never)]`) call boundary, plus a sub-slice (`&data[1..4]`). Exercises the slice-arg ABI
+/// and bounds-checked range indexing (provably in-bounds → elided), vs native `rustc`.
+#[test]
+fn rust_slice_argument() {
+    let items = r#"
+#[inline(never)]
+fn sum(s: &[i32]) -> i32 {
+    let mut t = 0i32;
+    for &x in s { t = t.wrapping_add(x); }
+    t
+}
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let data = [n, n.wrapping_add(1), n.wrapping_add(2), 7, 5, 6];
+    sum(&data).wrapping_add(sum(&data[1..4]))
+}
+"#;
+    check_rust_run_vs_native("rs_slice", items, &[0, 10, -3]);
+}
+
+/// **Rust `Option::unwrap`** — the unwrap panic path (`core::panicking::panic` / `unwrap_failed`) is
+/// in the IR; under `panic=abort` it lowers to a trap (slice AI's recognizer). The value is always
+/// `Some` at runtime, so the non-panic path runs and matches native `rustc`.
+#[test]
+fn rust_option_unwrap() {
+    let items = r#"
+#[no_mangle]
+pub extern "C" fn run(n: i32) -> i32 {
+    let v: Option<i32> = if (n & 1) == 0 { Some(n.wrapping_mul(3)) } else { Some(n.wrapping_sub(1)) };
+    v.unwrap().wrapping_add(7) // always Some at runtime; the None panic path traps
+}
+"#;
+    check_rust_run_vs_native("rs_unwrap", items, &[0, 1, 8, -5]);
+}
+
+/// Run a `no_std` + `alloc` Rust crate (whose `items` define `fn compute() -> i32`) **through the
+/// powerbox**: the on-ramp synthesizes `#[no_mangle] extern "C" fn main` calling `compute`, so it gets
+/// a powerbox `_start` that grants the `Memory` handle and seeds the heap (the `vm_map`-growing bump
+/// allocator the program's `#[global_allocator]` reaches via `malloc`). Returns `compute()`'s value as
+/// the program's `u8` exit/return code, run on the JIT. `None` if the toolchain is unavailable.
+fn rust_alloc_onramp(name: &str, items: &str) -> Option<u8> {
+    let src = format!(
+        "#![no_std]\n#![no_main]\n\
+         #[panic_handler] fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n\
+         {items}\n\
+         #[no_mangle] pub extern \"C\" fn main() -> i32 {{ compute() }}\n"
+    );
+    let bc = compile_rust_to_bc(name, &src)?;
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate Rust bitcode");
+    assert!(
+        svm_run::is_powerbox_entry(&t.module),
+        "{name}: an alloc program must produce a powerbox entry (Memory granted)"
+    );
+    let module = svm_run::resolve_capability_imports(t.module).expect("resolve capability imports");
+    svm_verify::verify_module(&module).expect("verify translated Rust IR");
+    let run = svm_run::run_powerbox(&module, b"").expect("powerbox run");
+    Some(match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            _ => 0,
+        },
+    })
+}
+
+/// Native oracle: the same `items` (with `compute`) built as a std binary that `process::exit`s with
+/// `compute()`, run natively; its `u8` exit code is the ground truth.
+fn rust_alloc_native(name: &str, items: &str) -> Option<u8> {
+    let dir = std::env::temp_dir();
+    let rs = dir.join(format!("svm_llvm_{}_{}_alloc.rs", std::process::id(), name));
+    let exe = dir.join(format!("svm_llvm_{}_{}_alloc", std::process::id(), name));
+    std::fs::write(
+        &rs,
+        format!("{items}\nfn main() {{ std::process::exit(compute()); }}\n"),
+    )
+    .expect("write Rust source");
+    match Command::new("rustc")
+        .args([
+            "+1.81.0",
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "overflow-checks=off",
+        ])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    Some(
+        Command::new(&exe)
+            .status()
+            .expect("run native")
+            .code()
+            .unwrap_or(-1) as u8,
+    )
+}
+
+/// **Rust `alloc` / heap — `Vec` via a guest `#[global_allocator]`.** The headline for *real* Rust: a
+/// `no_std` + `alloc` crate whose global allocator routes to the guest `malloc`/`free`. Run through the
+/// powerbox (the on-ramp synthesizes `main` → `_start`, granting the `Memory` handle and the
+/// `vm_map`-growing bump allocator), `Vec::push` grows the heap (alloc + `memcpy` + free) and the sum
+/// is returned as the exit code — heap data structures from Rust, byte-identical to native `rustc`.
+#[test]
+fn rust_alloc_vec_via_global_allocator() {
+    let items = r#"
+extern crate alloc;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { malloc(layout.size()) }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) { free(ptr); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+fn compute() -> i32 {
+    let mut v: alloc::vec::Vec<i32> = Vec::new();
+    let mut i = 0i32;
+    while i < 64 {
+        v.push(i.wrapping_mul(i)); // grows the heap several times
+        i = i.wrapping_add(1);
+    }
+    let mut s: i32 = 0;
+    for &x in v.iter() {
+        s = s.wrapping_add(x);
+    }
+    s.rem_euclid(251) // a deterministic value in [0, 250] — fits the u8 exit code
+}
+"#;
+    let (Some(svm), Some(native)) = (
+        rust_alloc_onramp("rs_alloc", items),
+        rust_alloc_native("rs_alloc", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        svm, native,
+        "rust alloc/Vec: on-ramp exit {svm} vs native {native}"
+    );
+    // Pin the value so the differential can't pass vacuously: Σ i² for i in 0..64 = 85344; % 251 = 4.
+    assert_eq!(svm, 4, "rust alloc/Vec: expected 4, got {svm}");
+}
+
+/// **Rust `Box` + `String` — a mini expression evaluator (the heap capstone).** A recursive-descent
+/// parser over a byte slice builds a `Box`ed recursive AST (`enum Expr { Num, Add(Box,Box), … }` — the
+/// canonical use of `Box`), `eval` walks it recursively, and `render` serializes it back into a
+/// `String` (heap text via the guest allocator). The result + the rendered length is returned — `Box`,
+/// `String`, recursive enums, slice parsing, and the panic paths (a malformed parse would trap) all at
+/// once, byte-identical to native `rustc`. A tiny interpreter, right at home next to the guest-JIT demo.
+#[test]
+fn rust_box_string_expr_evaluator() {
+    let items = r#"
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::string::String;
+use core::alloc::{GlobalAlloc, Layout};
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+struct Guest;
+unsafe impl GlobalAlloc for Guest {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { malloc(l.size()) }
+    unsafe fn dealloc(&self, p: *mut u8, _l: Layout) { free(p); }
+}
+#[global_allocator]
+static GA: Guest = Guest;
+
+enum Expr {
+    Num(i64),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+}
+
+fn eval(e: &Expr) -> i64 {
+    match e {
+        Expr::Num(n) => *n,
+        Expr::Add(a, b) => eval(a).wrapping_add(eval(b)),
+        Expr::Sub(a, b) => eval(a).wrapping_sub(eval(b)),
+        Expr::Mul(a, b) => eval(a).wrapping_mul(eval(b)),
+    }
+}
+
+fn render(e: &Expr, out: &mut String) {
+    match e {
+        Expr::Num(n) => {
+            let mut v = *n;
+            if v == 0 { out.push('0'); }
+            let mut tmp = [0u8; 20];
+            let mut k = 0;
+            while v > 0 { tmp[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; }
+            while k > 0 { k -= 1; out.push(tmp[k] as char); }
+        }
+        Expr::Add(a, b) => { out.push('('); render(a, out); out.push('+'); render(b, out); out.push(')'); }
+        Expr::Sub(a, b) => { out.push('('); render(a, out); out.push('-'); render(b, out); out.push(')'); }
+        Expr::Mul(a, b) => { out.push('('); render(a, out); out.push('*'); render(b, out); out.push(')'); }
+    }
+}
+
+struct Parser<'a> { s: &'a [u8], pos: usize }
+impl<'a> Parser<'a> {
+    fn peek(&self) -> u8 { if self.pos < self.s.len() { self.s[self.pos] } else { 0 } }
+    fn bump(&mut self) -> u8 { let c = self.peek(); self.pos += 1; c }
+    fn number(&mut self) -> Box<Expr> {
+        let mut n: i64 = 0;
+        while self.peek().is_ascii_digit() {
+            n = n.wrapping_mul(10).wrapping_add((self.bump() - b'0') as i64);
+        }
+        Box::new(Expr::Num(n))
+    }
+    fn factor(&mut self) -> Box<Expr> {
+        if self.peek() == b'(' {
+            self.bump();
+            let e = self.expr();
+            self.bump(); // ')'
+            e
+        } else {
+            self.number()
+        }
+    }
+    fn term(&mut self) -> Box<Expr> {
+        let mut left = self.factor();
+        while self.peek() == b'*' {
+            self.bump();
+            let right = self.factor();
+            left = Box::new(Expr::Mul(left, right));
+        }
+        left
+    }
+    fn expr(&mut self) -> Box<Expr> {
+        let mut left = self.term();
+        loop {
+            match self.peek() {
+                b'+' => { self.bump(); let r = self.term(); left = Box::new(Expr::Add(left, r)); }
+                b'-' => { self.bump(); let r = self.term(); left = Box::new(Expr::Sub(left, r)); }
+                _ => break,
+            }
+        }
+        left
+    }
+}
+
+fn compute() -> i32 {
+    let input = b"2+3*4-(5-1)*2+10";          // = 2 + 12 - 8 + 10 = 16
+    let mut p = Parser { s: input, pos: 0 };
+    let ast = p.expr();
+    let result = eval(&ast);
+    let mut s = String::new();
+    render(&ast, &mut s);                       // a fully-parenthesized rendering
+    result.wrapping_add(s.len() as i64).rem_euclid(251) as i32
+}
+"#;
+    let (Some(svm), Some(native)) = (
+        rust_alloc_onramp("rs_expr", items),
+        rust_alloc_native("rs_expr", items),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        svm, native,
+        "expr evaluator: on-ramp {svm} vs native {native}"
+    );
+    // Pin it (non-vacuous): eval = 16, render = `(((2+(3*4))-((5-1)*2))+10)` (26 chars); 42 % 251 = 42.
+    assert_eq!(svm, 42, "expr evaluator: expected 42, got {svm}");
+}
