@@ -414,6 +414,23 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
               `bytecode_separate_module.rs` (a foreign coroutine module yielding 100 / 210 then
               returning 1019 → 1_001_329) bit-identical to `run_with_host`. Still deferred: demand
               variants (ops 4/7, fault-yield paging).
+        - [x] **1c-5j** — §14 **demand (fault-driven-yield) coroutines** (`spawn_demand_coroutine`
+              op 4, `spawn_demand_coroutine_module` op 7): completes §14 (ops 0–7). A demand child
+              starts with its whole window **unmapped** (`Mem::demand_page`), so an in-window access to
+              an unsupplied page is a *recoverable* fault that suspends to the parent (status `FAULTED`
+              = 2, value = the fault address) instead of trapping; the parent supplies the page
+              (`Mem::supply_page`, keeping the bytes) and resumes, and the child's rewound access
+              re-executes and reads it (the userfaultfd-style lazy-paging model). **The "rewind the
+              faulting op" needs no hot-loop change**: a demand coroutine is stepped one op at a time
+              (`budget = 1`) in `resume_coro`, so the budget boundary persists the cursor *at* the next
+              op before running it — when that op faults, the cursor already points at it, so the next
+              `resume` (after the parent supplies the page) retries exactly that access (the access
+              checks protection before any effect, so re-running is side-effect-clean). `Coro` gained
+              `fault_yields` / `faulted_page`; `CoStop` gained `Fault`; the `resume` op supplies the
+              page (not delivering a yield value) when `faulted_page` is set. New harness
+              `bytecode_demand_coroutine.rs` (op-4 fault→supply→read round-trip → 2_001_123, fault
+              address → 65536, op-7 lazy module data supply → 2_101_086) bit-identical to
+              `run_with_host`. **§14 is now fully covered on the bytecode engine.**
     - [ ] **1c-3** — debug seam: `pc → {block, inst}` reverse map so `IrPc`, breakpoints, and
           stepping report tree-walker-identical locations. New harness: debug-trace equality.
     - [ ] **1c-6** — durability seam: capture/restore a `Vm` across a coroutine yield. New harness:

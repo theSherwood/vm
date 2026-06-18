@@ -13,9 +13,11 @@
 //! (`cont.*`/`suspend`, cooperative single-vCPU switching in [`step_vcpu`]); and §12 **threads**
 //! (`thread.spawn`/`join` + `memory.wait`/`notify`) on a cooperative single-threaded scheduler
 //! ([`drive`]) over one shared `Mem`; and §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume`
-//! + `Yielder.yield`, inline-driven over a confined `nested_view` child window) and §14 **executor
-//! children** (`Instantiator.instantiate`/`join`, scheduler-driven over a confined child env with an
-//! attenuated `Instantiator`+`AddressSpace` powerbox and a `quota` sub-budget). Faithful for the
+//! + `Yielder.yield`, inline-driven over a confined `nested_view` child window — including the
+//! separate-**module** and **demand** (fault-driven-yield, lazy-paged) variants) and §14 **executor
+//! children** (`Instantiator.instantiate`/`join` + the separate-module variant, scheduler-driven over
+//! a confined child env with an attenuated `Instantiator`+`AddressSpace` powerbox and a `quota`
+//! sub-budget) — §14 is fully covered (ops 0–7). Faithful for the
 //! interleaving-invariant programs the oracle uses; and §22 **guest-driven JIT units**
 //! (`Jit.install`/`uninstall`/`invoke` + cross-module `call_indirect` into an installed unit) over a
 //! multi-module [`Domain`] (a runtime dispatch table spanning `mods`; `invoke` runs a unit nested
@@ -23,15 +25,14 @@
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
 //! `return_call_indirect`, reusing the current window — O(1) deep tail recursion). [`compile_module`]
-//! returns `None` when a function needs a seam not yet driven here — the demand-paged separate-module
-//! coroutine variant (op 7), demand/fault-yield coroutines (op 4), instantiate-mixed-with-fibers,
+//! returns `None` when a function needs a seam not yet driven here — instantiate-mixed-with-fibers,
 //! `gc.roots`, `call.import`, or durability — so callers (`super::run_with_host_fast`) fall back to
 //! the tree-walker for those.
 //!
 //! `run`/`run_with_host` stay the tree-walker (the reference oracle); the bytecode engine is reached
 //! via `run_fast`/`run_with_host_fast`. Correctness is gated by exact-equality harnesses against the
-//! tree-walker (`bytecode_diff.rs`,
-//! `bytecode_{caps,fibers,threads,coroutines,instantiate,dynlink}.rs`).
+//! tree-walker (`bytecode_diff.rs`, `bytecode_{caps,fibers,threads,coroutines,instantiate,
+//! separate_module,demand_coroutine,tailcall,dynlink}.rs`).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
@@ -337,11 +338,14 @@ enum Op {
         off: u32,
         size_log2: u32,
         dst: u32,
+        /// op 4 `spawn_demand_coroutine`: the child window starts unmapped (fault-driven yield).
+        demand: bool,
     },
     /// §14 `Instantiator.spawn_coroutine_module(module, entry, off, size_log2, fuel)` (op 6): like
     /// [`Op::SpawnCoroutine`], but the cooperative child runs a host-granted **separate** `Module`
     /// (`module` is its handle, the first i64 arg). The driver resolves + compiles the module and
     /// materializes its data into the carve; thereafter it is `resume`d inline like any coroutine.
+    /// `demand` selects op 7 `spawn_demand_coroutine_module` (data segments supplied lazily).
     SpawnCoroutineModule {
         handle: u32,
         module: u32,
@@ -349,6 +353,7 @@ enum Op {
         off: u32,
         size_log2: u32,
         dst: u32,
+        demand: bool,
     },
     /// §14 `Instantiator.resume(ch, value)` (op 3): drive coroutine `ch` inline until it yields or
     /// returns; `(status, value)` land at `dst`/`dst+1`. `handle` is the Instantiator cap.
@@ -902,23 +907,29 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     quota: g(args[4]),
                     dst,
                 },
-                // op 6 = spawn_coroutine_module: a coroutine child running a granted `Module` (the
-                // first arg); the carve args (entry/off/size_log2/fuel) follow.
-                (iface::INSTANTIATOR, 6) if args.len() >= 4 => Op::SpawnCoroutineModule {
-                    handle: g(*handle),
-                    module: g(args[0]),
-                    entry: g(args[1]),
-                    off: g(args[2]),
-                    size_log2: g(args[3]),
-                    dst,
-                },
-                // §14 cooperative coroutine round-trip — spawn_coroutine / resume / yield.
-                (iface::INSTANTIATOR, 2) if args.len() >= 3 => Op::SpawnCoroutine {
+                // op 6/7 = spawn_coroutine_module / spawn_demand_coroutine_module: a coroutine child
+                // running a granted `Module` (the first arg); the carve args (entry/off/size_log2/fuel)
+                // follow. op 7 demand-pages the child's window (data segments supplied lazily).
+                (iface::INSTANTIATOR, op @ (6 | 7)) if args.len() >= 4 => {
+                    Op::SpawnCoroutineModule {
+                        handle: g(*handle),
+                        module: g(args[0]),
+                        entry: g(args[1]),
+                        off: g(args[2]),
+                        size_log2: g(args[3]),
+                        dst,
+                        demand: op == 7,
+                    }
+                }
+                // §14 cooperative coroutine round-trip — spawn_coroutine (op 2) / spawn_demand_coroutine
+                // (op 4, window starts unmapped) / resume / yield.
+                (iface::INSTANTIATOR, op @ (2 | 4)) if args.len() >= 3 => Op::SpawnCoroutine {
                     handle: g(*handle),
                     entry: g(args[0]),
                     off: g(args[1]),
                     size_log2: g(args[2]),
                     dst,
+                    demand: op == 4,
                 },
                 (iface::INSTANTIATOR, 3) if args.len() >= 2 => Op::CoResume {
                     handle: g(*handle),
@@ -1208,6 +1219,7 @@ enum Outcome {
         off: i64,
         size_log2: i64,
         dst: u32,
+        demand: bool,
     },
     /// §14 `spawn_coroutine_module`: like [`Outcome::SpawnCoroutine`], plus the resolved `Module`
     /// handle `mh` whose granted program the coroutine child runs (the driver resolves + compiles it).
@@ -1219,6 +1231,7 @@ enum Outcome {
         off: i64,
         size_log2: i64,
         dst: u32,
+        demand: bool,
     },
     /// §14 `resume`: drive coroutine `ch` (authority already checked); `(status, value)` → `dst`.
     CoResume {
@@ -1314,11 +1327,20 @@ struct Coro {
     host: Host,
     table: Table,
     awaiting: Option<u32>,
+    /// §14 **demand** coroutine (ops 4/7): its window starts fully unmapped, so an in-window access to
+    /// an unsupplied page is a *recoverable* fault that suspends to the parent (which supplies the
+    /// page) instead of trapping. A plain coroutine (ops 2/6) leaves this `false`.
+    fault_yields: bool,
+    /// Set while suspended on a recoverable page fault: the confined address to **supply** on the next
+    /// `resume` (which then re-runs the rewound access). `None` otherwise.
+    faulted_page: Option<u64>,
 }
 
-/// Why [`resume_coro`] returned: the coroutine yielded a value, or its function returned.
+/// Why [`resume_coro`] returned: the coroutine yielded a value, hit a recoverable page fault (a
+/// **demand** child — the parent must supply the page), or its function returned.
 enum CoStop {
     Yield(i64),
+    Fault(u64),
     Done(Vec<Value>),
 }
 
@@ -1332,6 +1354,12 @@ fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoS
     // cap, so it cannot reach installed §22 units (matching the tree-walker, where a coroutine child
     // gets a fresh `DomainTable::new(&cfuncs, 0)`). `coro.vm.module` selects its program (module 0 for
     // a same-module coroutine, its own pushed index for a separate-module one).
+    //
+    // A **demand** child (`fault_yields`) is stepped **one op at a time** (`budget = 1`): the budget
+    // boundary persists the cursor *at* the next op before running it, so when that op faults the
+    // cursor already points at it — re-running after the parent supplies the page retries exactly that
+    // access, the §14 rewind, with **no** change to the hot loop (a plain coroutine runs unmetered).
+    let budget = if coro.fault_yields { 1 } else { u64::MAX };
     loop {
         match coro.vm.resume(
             mods,
@@ -1339,15 +1367,24 @@ fn resume_coro(coro: &mut Coro, mods: &[Compiled], fuel: &mut u64) -> Result<CoS
             fuel,
             &mut coro.mem,
             &mut coro.host,
-            u64::MAX,
-        )? {
-            Outcome::Done(vals) => return Ok(CoStop::Done(vals)),
-            Outcome::Suspended => {}
-            Outcome::CoYield { value, dst } => {
+            budget,
+        ) {
+            Ok(Outcome::Done(vals)) => return Ok(CoStop::Done(vals)),
+            Ok(Outcome::Suspended) => {} // budget exhausted (demand stepping) or normal — keep going
+            Ok(Outcome::CoYield { value, dst }) => {
                 coro.awaiting = Some(dst);
                 return Ok(CoStop::Yield(value));
             }
-            _ => return Err(Trap::FiberFault),
+            Ok(_) => return Err(Trap::FiberFault),
+            // A demand child's *recoverable* in-window page fault suspends to the parent; an
+            // out-of-window fault (`take_fault` → `None`) is a real trap that propagates.
+            Err(Trap::MemoryFault) if coro.fault_yields => {
+                match coro.mem.as_ref().and_then(|m| m.take_fault()) {
+                    Some(addr) => return Ok(CoStop::Fault(addr)),
+                    None => return Err(Trap::MemoryFault),
+                }
+            }
+            Err(t) => return Err(t),
         }
     }
 }
@@ -1425,6 +1462,7 @@ enum VcpuStop {
         off: i64,
         size_log2: i64,
         dst: u32,
+        demand: bool,
     },
     Wait {
         base: u64,
@@ -1668,6 +1706,7 @@ fn step_vcpu(
                 off,
                 size_log2,
                 dst,
+                demand,
             } => {
                 let h = spawn_coroutine(
                     &mut vt.coroutines,
@@ -1675,6 +1714,7 @@ fn step_vcpu(
                     &dom.mods[0],
                     entry,
                     (ibase, isz, off, size_log2),
+                    demand,
                 );
                 vt.active.set(dst, Reg::from_i32(h));
             }
@@ -1689,6 +1729,7 @@ fn step_vcpu(
                 off,
                 size_log2,
                 dst,
+                demand,
             } => {
                 return Ok(VcpuStop::SpawnCoroutineModule {
                     ibase,
@@ -1698,6 +1739,7 @@ fn step_vcpu(
                     off,
                     size_log2,
                     dst,
+                    demand,
                 })
             }
             Outcome::CoResume { ch, value, dst } => {
@@ -1707,7 +1749,13 @@ fn step_vcpu(
                     .get_mut(ch as usize)
                     .and_then(|c| c.take())
                     .ok_or(Trap::CapFault)?;
-                if let Some(yd) = coro.awaiting.take() {
+                if let Some(addr) = coro.faulted_page.take() {
+                    // Resuming after a recoverable page fault: **supply** the page (keeping the
+                    // parent's bytes), then re-run the rewound access — the value arg is unused.
+                    if let Some(m) = coro.mem.as_ref() {
+                        m.supply_page(addr);
+                    }
+                } else if let Some(yd) = coro.awaiting.take() {
                     coro.vm.set(yd, Reg::from_i64(value)); // deliver the resume value to the `yield`
                 }
                 match resume_coro(&mut coro, &dom.mods, &mut *ctx.fuel)? {
@@ -1715,6 +1763,13 @@ fn step_vcpu(
                         vt.coroutines[ch as usize] = Some(coro); // suspended — re-parked for next resume
                         vt.active.set(dst, Reg::from_i32(super::FIBER_SUSPENDED));
                         vt.active.set(dst + 1, Reg::from_i64(yv));
+                    }
+                    CoStop::Fault(addr) => {
+                        // A demand child faulted: remember the page to supply, report (FAULTED, addr).
+                        coro.faulted_page = Some(addr);
+                        vt.coroutines[ch as usize] = Some(coro);
+                        vt.active.set(dst, Reg::from_i32(super::CORO_FAULTED));
+                        vt.active.set(dst + 1, Reg::from_i64(addr as i64));
                     }
                     CoStop::Done(vals) => {
                         // Finished — the slot stays `None` (a later resume is inert/CapFault).
@@ -1742,6 +1797,8 @@ fn spawn_coroutine(
     entry: i64,
     // The Instantiator-relative carve geometry: `(holder base, holder size, offset, size_log2)`.
     carve: (u64, u64, i64, i64),
+    // §14 op 4 `spawn_demand_coroutine`: start every page unmapped (lazy paging / fault-driven yield).
+    demand: bool,
 ) -> i32 {
     let (ibase, isz, off, size_log2) = carve;
     // Coroutine entry is a fixed `(i64 yielder) -> (i64)`.
@@ -1765,9 +1822,13 @@ fn spawn_coroutine(
     // Holder-relative `ibase`/`off` → backing-absolute base (adds the holder's own window base, so
     // nesting composes); the child sees a zero-based `[0, child_size)` confined view.
     let abs_base = mem.as_ref().map_or(0, |m| m.window.base()) + ibase + off;
-    let child_mem = mem
-        .as_ref()
-        .map(|m| m.nested_view(abs_base, size_log2 as u8));
+    let child_mem = mem.as_ref().map(|m| {
+        let cm = m.nested_view(abs_base, size_log2 as u8);
+        if demand {
+            cm.demand_page(); // every page starts unmapped — faults suspend to us (lazy paging)
+        }
+        cm
+    });
     let mut child_host = Host::new();
     let cy = child_host.grant_yielder(); // the child's handle to suspend back to us
     let child_vm = match Vm::new(c, entry as u64 as usize, &[Value::I64(cy as i64)]) {
@@ -1780,6 +1841,8 @@ fn spawn_coroutine(
         host: child_host,
         table: build_table(c.progs.len(), 0), // same-module coroutine: natural table over module 0
         awaiting: None,
+        fault_yields: demand,
+        faulted_page: None,
     }));
     (coroutines.len() - 1) as i32
 }
@@ -2202,6 +2265,7 @@ fn drive(
                 off,
                 size_log2,
                 dst,
+                demand,
             }) => {
                 // Resolve + compile the granted module (forged handle → CapFault; uncoverable op →
                 // Malformed), exactly as for `instantiate_module`.
@@ -2264,7 +2328,15 @@ fn drive(
                             }
                         }
                     }
-                    pm.map(|m| m.nested_view(abs_base, size_log2 as u8))
+                    pm.map(|m| {
+                        let cm = m.nested_view(abs_base, size_log2 as u8);
+                        if demand {
+                            // op 7: every page starts unmapped — the materialized data segments are in
+                            // the shared backing but **supplied lazily** as the child first touches them.
+                            cm.demand_page();
+                        }
+                        cm
+                    })
                 };
                 // A coroutine gets a Yielder-only powerbox (its single entry arg); it holds no
                 // Instantiator, so its own spawn/resume CapFault inside `Vm::resume`.
@@ -2293,6 +2365,8 @@ fn drive(
                     host: child_host,
                     table: child_table,
                     awaiting: None,
+                    fault_yields: demand,
+                    faulted_page: None,
                 }));
                 let h = (tasks[ti].vt.coroutines.len() - 1) as i32;
                 tasks[ti].vt.active.set(dst, Reg::from_i32(h));
@@ -3181,12 +3255,13 @@ impl Vm {
                     off,
                     size_log2,
                     dst,
+                    demand,
                 } => {
                     let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
                     let entry = r!(*entry).i64();
                     let off = r!(*off).i64();
                     let size_log2 = r!(*size_log2).i64();
-                    let dst = *dst;
+                    let (dst, demand) = (*dst, *demand);
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
@@ -3198,6 +3273,7 @@ impl Vm {
                         off,
                         size_log2,
                         dst,
+                        demand,
                     });
                 }
                 Op::SpawnCoroutineModule {
@@ -3207,13 +3283,14 @@ impl Vm {
                     off,
                     size_log2,
                     dst,
+                    demand,
                 } => {
                     let (ibase, isz) = host.resolve_instantiator(r!(*handle).i32())?;
                     let mh = r!(*module_reg).i64() as i32;
                     let entry = r!(*entry).i64();
                     let off = r!(*off).i64();
                     let size_log2 = r!(*size_log2).i64();
-                    let dst = *dst;
+                    let (dst, demand) = (*dst, *demand);
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
@@ -3226,6 +3303,7 @@ impl Vm {
                         off,
                         size_log2,
                         dst,
+                        demand,
                     });
                 }
                 Op::CoResume {
