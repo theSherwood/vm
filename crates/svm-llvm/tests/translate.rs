@@ -11,22 +11,17 @@ use svm_interp::Value;
 use svm_ir::ValType;
 use svm_jit::JitOutcome;
 
-/// Compile a C snippet to legalized LLVM bitcode with the pinned pipeline (LLVM.md §4):
-/// `-O2` runs `mem2reg`/SROA (the §3a two-stack split for free); `-fno-*-vectorize` keeps SIMD
-/// out of the MVP. Returns `None` (skip, don't fail) when `clang` is unavailable.
+/// Compile a C snippet to legalized LLVM bitcode with the pinned pipeline (LLVM.md §4): `-O2` runs
+/// `mem2reg`/SROA (the §3a two-stack split for free) **and auto-vectorization** — the on-ramp now
+/// ingests the full SIMD output (slices AN–AT: i32x4 → legalization → conversions/rotate/shuffle/
+/// `<N x i1>` masks). Returns `None` (skip, don't fail) when `clang` is unavailable.
 fn compile_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
     let bc = dir.join(format!("svm_llvm_{}_{}.bc", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
-        .args([
-            "-O2",
-            "-emit-llvm",
-            "-c",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
+        .args(["-O2", "-emit-llvm", "-c"])
         .arg(&c)
         .arg("-o")
         .arg(&bc)
@@ -62,14 +57,7 @@ fn compile_g(name: &str, src: &str, opt: &str) -> Option<PathBuf> {
     let bc = dir.join(format!("svm_llvm_g_{}_{}.bc", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
-        .args([
-            opt,
-            "-g",
-            "-emit-llvm",
-            "-c",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
+        .args([opt, "-g", "-emit-llvm", "-c"])
         .arg(&c)
         .arg("-o")
         .arg(&bc)
@@ -850,13 +838,7 @@ fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
         .join(rel);
     let bc = std::env::temp_dir().join(format!("svm_llvm_demo_{}_{}.bc", std::process::id(), name));
     let status = Command::new("clang")
-        .args([
-            "-O2",
-            "-emit-llvm",
-            "-c",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
+        .args(["-O2", "-emit-llvm", "-c"])
         .arg(&path)
         .arg("-o")
         .arg(&bc)
@@ -1907,23 +1889,15 @@ int main(void) {
 // ============================================================================================
 
 /// Compile a freestanding C++ snippet to legalized LLVM-18 bitcode: `-fno-exceptions -fno-rtti`
-/// keeps EH/RTTI out (the §18 stance), `-O2` runs mem2reg/SROA, `-fno-*-vectorize` keeps SIMD out.
-/// Returns `None` (skip) if `clang++` is unavailable.
+/// keeps EH/RTTI out (the §18 stance), `-O2` runs mem2reg/SROA and auto-vectorization (the on-ramp
+/// ingests the SIMD output). Returns `None` (skip) if `clang++` is unavailable.
 fn compile_cpp_to_bc(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let cc = dir.join(format!("svm_llvm_{}_{}.cpp", std::process::id(), name));
     let bc = dir.join(format!("svm_llvm_cpp_{}_{}.bc", std::process::id(), name));
     std::fs::write(&cc, src).expect("write C++ source");
     let status = Command::new("clang++")
-        .args([
-            "-O2",
-            "-emit-llvm",
-            "-c",
-            "-fno-exceptions",
-            "-fno-rtti",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
+        .args(["-O2", "-emit-llvm", "-c", "-fno-exceptions", "-fno-rtti"])
         .arg(&cc)
         .arg("-o")
         .arg(&bc)
@@ -2154,16 +2128,10 @@ fn compile_rust_to_bc(name: &str, src: &str) -> Option<PathBuf> {
             "opt-level=2",
             "-C",
             "overflow-checks=off",
-            // Keep `-O2` codegen in the on-ramp's **scalar** subset: disable LLVM auto-vectorization
-            // so a loop/slice reduction stays scalar instead of becoming an `<N x iM>` vector the
-            // on-ramp's SIMD support (slice Y: `<4 x float>`/`v128`) doesn't cover for integers.
-            // Whether `-O2` vectorizes is host-CPU-sensitive, so without this the Rust breadth tests
-            // are flaky (e.g. a `&[i32]` sum becoming `<4 x i32>` → `Unsupported("v128")`). The Rust
-            // tests target *core/scalar* Rust, not SIMD (the SIMD path is covered by the C tests).
-            "-C",
-            "llvm-args=-vectorize-loops=false",
-            "-C",
-            "llvm-args=-vectorize-slp=false",
+            // `-O2` auto-vectorization stays **enabled**: the on-ramp now ingests the full SIMD
+            // output (slices AN–AT — legalization + conversions/rotate/shuffle/`<N x i1>` masks), so a
+            // `&[i32]` reduction becoming `<N x i32>` + a horizontal reduce is fine. (Determinism is
+            // preserved by the fixed-128 chunk legalization, not by suppressing vectorization.)
         ])
         .arg(&rs)
         .arg("-o")
@@ -3160,13 +3128,14 @@ fn compute() -> i32 {
 }
 
 // ============================================================================================
-// SIMD — ingesting `-O2` **auto-vectorized** output (§17/D58 `v128`). The C/C++/Rust breadth lanes
-// disable vectorization (`-fno-*-vectorize`); these tests *enable* it, so the on-ramp consumes the
-// `<4 x i32>` lane ops + horizontal `llvm.vector.reduce.*` a real `-O2` reduction loop emits.
+// SIMD — focused tests pinning specific `-O2` **auto-vectorized** shapes (§17/D58 `v128`). The
+// C/C++/Rust breadth lanes now vectorize too (slices AN–AT), so the real corpus demos exercise SIMD
+// end to end; these tests additionally pin each shape/op-class (conversions, rotate, shuffle, masks)
+// to a known value for non-vacuity.
 // ============================================================================================
 
-/// Like [`compile_to_bc`] but with **auto-vectorization enabled** (no `-fno-*-vectorize`), so a
-/// reduction loop lowers to `<4 x i32>` SIMD + `llvm.vector.reduce.*`.
+/// Like [`compile_to_bc`] (auto-vectorization is enabled in both now), kept as the explicit SIMD
+/// harness so a reduction loop's `<4 x i32>` + `llvm.vector.reduce.*` is pinned to a known value.
 fn compile_to_bc_vectorized(name: &str, src: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("svm_llvm_{}_{}.c", std::process::id(), name));
@@ -3382,8 +3351,8 @@ fn simd_i64x2_mul_add_extract() {
 
 /// `<16 x i8>` lane add through a `v128` load → add → store (`i8x16` load/`VIntBin` Add/store).
 /// Two distinct input arrays so `a + b` stays a real lane add (a self-add would strength-reduce to
-/// a vector shift, which is a separate unsupported op). The scalar tail-sum reads the stored bytes
-/// back from memory (stays scalar under `-fno-vectorize`).
+/// a vector shift). The tail-sum reads the stored bytes back from memory and folds them (auto-
+/// vectorized like the rest of the suite — the on-ramp ingests its `zext`/reduce lowering too).
 #[test]
 fn simd_i8x16_add_load_store() {
     let src = "void vadd(const unsigned char *P, const unsigned char *Q, unsigned char *O);\n\

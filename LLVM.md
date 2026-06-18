@@ -909,8 +909,26 @@ iN` (the SIMD **movemask**) → OR the lanes into a bitmap (handles the odd `i4`
 block-local (like `agg`); a mask crossing a block edge stays `Unsupported` (fail-closed).
 - Test: `simd_mask_icmp_select` — an `(a[i]==b[i]) ? … : …` loop → `icmp eq <4 x i32>` + `select`
   (`check_vectorized_vs_native`), vs native. `crc32` exercises `icmp`+`select`+`extractelement` end to
-  end. (`bitcast`-to-`iN` / `insertelement`-splat are exercised by `clay`, pending slice AT.) 128
-  translate tests green, fmt + clippy clean.
+  end. (`bitcast`-to-`iN` / `insertelement`-splat are exercised by `clay`, slice AT.) 128 translate
+  tests green, fmt + clippy clean.
+
+**Slice AT (DONE) — float vector conversions + vec2 FMA + cross-representation shuffle; the breadth
+lanes re-enable vectorization (the capstone).** The remaining gaps that blocked `perlin`/`clay`:
+- **Float vector conversions** (`fptosi`/`fptoui`/`sitofp`/`uitofp`/`fpext`/`fptrunc`) scalarize lane-
+  wise via `lower_vec_fp_convert` (the float analog of slice AP's int converter) — lands perlin's
+  `<2 x float>`↔`<2 x i32>` gradient math.
+- **`llvm.fmuladd.v2f32`** (and the other `<2 x float>` float intrinsics) scalarize lane-wise and
+  repack the packed-`i64` vec2 (`vec_pack`).
+- **Cross-representation shuffle**: a `shufflevector` whose operands and result use *different*
+  representations (`<2 x float> ++ <2 x float>` → a `<4 x float>` `v128`) falls back to a generic
+  explode/gather/repack (`bind_shuffle_result`), beyond the same-shape `Inst::Shuffle` fast path.
+- **Capstone:** with all of `conversions`/`rotate`/`shuffle`/`masks` + these landed, the C/C++/Rust
+  breadth-lane compile helpers **drop `-fno-*-vectorize` / `-vectorize-*=false`** — every demo now
+  translates its real `-O2` auto-vectorized bitcode (SIMD and all), byte-identical to native. The
+  fixed-128 chunk legalization (not flag suppression) preserves interp↔JIT/durable determinism.
+- Verification: **128 translate tests green with vectorization enabled across every lane** — the C
+  corpus (`sha256`/`xxhash`/`perlin`/`crc32`/`clay`/`regex`/`jsmn`/`heapgrow`/…), C++, Rust, the
+  powerbox/async/JIT demos, and the focused `simd_*` shape/op-class tests. fmt + clippy clean.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,
@@ -922,23 +940,26 @@ block-local (like `agg`); a mask crossing a block edge stays `Unsupported` (fail
       evaluator (slice AL — + `*.with.overflow` intrinsics and `i64` switches). Auto-vectorization is
       disabled (SIMD is §17); `--edition 2021`. Broaden (`Result`/`?`, `BTreeMap`, generics with
       bounds, `&mut` aliasing) as gaps surface.
-- [~] **SIMD / auto-vectorization — `i32x4` lands; full ingestion is blocked on vector legalization**
-      (slices AN/AO). The on-ramp ingests `-O2`-auto-vectorized **`i32x4`** code: a `<4 x i32>` lane op →
-      `v128` (`VIntBin` for `add`/`sub`/`mul`/`smax`/`smin`/`umax`/`umin`, whole-vector `VBitBin` for
-      `and`/`or`/`xor`; `bin_ty` yields a harmless `I32` so the pre-`bin` width probe doesn't choke on
-      `v128`), and `llvm.vector.reduce.{add,mul,and,or,xor,smax,smin,umax,umin}.v4i32` unrolls to a lane
-      fold (extract + scalar combine / `cmp`+`select`). Tests (a `check_vectorized_vs_native` harness,
-      vectorization *enabled*): `simd_int_reduction_first_light` (sum → `reduce.add`, `2610`/exit `50`),
-      `simd_int_max_reduction` (max → `reduce.smax`), both vs native.
-      - **Vector legalization landed (I2 / PR #56).** The fixed-128 SelectionDAG-`LegalizeTypes` analog
-        (`wide_vec_layout`/`lower_wide`) splits wider-than-128 / sub-128 vectors into `v128` chunks + a
-        scalar tail, and all six 128-bit shapes (`i8x16`/`i16x8`/`i32x4`/`i64x2`/`f32x4`/`f64x2`) lower.
-        **Vector integer conversions** (`zext`/`sext`/`trunc`, slice AP) now scalarize lane-wise across
-        every representation. So the breadth lanes can begin re-enabling vectorization; what remains
-        before flipping them (all-or-nothing per lane): **`<N x i1>` masks** (vector `icmp`/`select`),
-        **vector rotate** (`llvm.fshl`/`fshr`), and **non-splat cross-chunk shuffles**. Until all land,
-        the C/C++/Rust lanes keep `-fno-*-vectorize` (the correct fail-closed posture); targeted
-        `check_vectorized_vs_native` tests prove each capability with vectorization enabled.
+- [x] **SIMD / auto-vectorization — full `-O2` ingestion; the breadth lanes vectorize (slices AN–AT).**
+      The on-ramp ingests real `-O2`/`-mavx2` auto-vectorized bitcode end to end, so the C/C++/Rust
+      breadth lanes dropped `-fno-*-vectorize`. The pipeline:
+      - **128-bit lane ops** (slice AN/AO): a `<4 x i32>`/etc. lane op → `v128` (`VIntBin`/`VBitBin`/
+        `VFloatBin`), `llvm.vector.reduce.*` → a lane fold, `llvm.{s,u}{min,max}` → `VIntBin`.
+      - **Vector legalization** (I2 / PR #56): the fixed-128 SelectionDAG-`LegalizeTypes` analog
+        (`wide_vec_layout`/`lower_wide`) splits wider-than-128 / sub-128 vectors into `v128` chunks +
+        a scalar tail; all six 128-bit shapes lower. Fixed-128 chunking (not host detection) preserves
+        interp↔JIT/durable determinism.
+      - **Integer conversions** (slice AP): `zext`/`sext`/`trunc` scalarize lane-wise across every
+        representation. **Rotate** (slice AQ): `llvm.fshl`/`fshr` (rotate idiom) scalarize per lane.
+        **Shuffle** (slice AR + AT): general constant-mask gather, incl. wide and cross-representation
+        (`<2 x float> ++ <2 x float>` → `<4 x float>`). **`<N x i1>` masks** (slice AS): a lane-wise
+        scalarized `mask_lanes` rep — vector `icmp`/`fcmp`/`select`/`extractelement`/`insertelement`/
+        `bitcast`-to-`iN` (movemask). **Float conversions + vec2 FMA** (slice AT): `fptosi`/`sitofp`/…
+        and `fmuladd.v2f32` scalarize lane-wise.
+      - Verified by the whole 128-test suite running vectorized (the real C/C++/Rust corpus + focused
+        `simd_*` shape/op-class pins). Remaining fail-closed (no corpus need): a *general* (non-rotate)
+        funnel shift, a *non-constant* shuffle mask, a wide float `vector.reduce`, a mask crossing a
+        block edge.
 - [ ] Tail calls (`musttail` → `return_call`), if any corpus needs it (likely near-free).
 - [ ] Narrow-atomic CAS-loop emulation (§3b note 2), on demand.
 - [ ] Signed-`iN` ops (`ashr`/`sdiv`/`srem`/`sext`-to-`iN`/signed `icmp`-`iN`) — on demand (rare; `-O2`

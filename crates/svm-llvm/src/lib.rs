@@ -4345,6 +4345,69 @@ fn lower_float_intrinsic(
         };
         return Ok(Some(idx));
     }
+    // A `<2 x float>` float intrinsic (the auto-vectorizer's `fmuladd.v2f32` etc.) has no native
+    // svm-ir op — scalarize: explode the two `f32` lanes, apply the scalar float op per lane, repack
+    // the packed-`i64` vec2 (`vec_pack`). The single packed result is returned for `c.dest` to bind.
+    if is_vec2f(args[0].get_type(types).as_ref()) {
+        let lane_ty = FloatTy::F32;
+        let la = vec_explode(ctx, args[0], types, false)?;
+        let lane = |ctx: &mut BlockCtx, op: FUnOp, k: usize| {
+            ctx.push(Inst::FUn {
+                ty: lane_ty,
+                op,
+                a: la[k],
+            })
+        };
+        let (r0, r1) = match base {
+            "llvm.sqrt" => (lane(ctx, FUnOp::Sqrt, 0), lane(ctx, FUnOp::Sqrt, 1)),
+            "llvm.fabs" => (lane(ctx, FUnOp::Abs, 0), lane(ctx, FUnOp::Abs, 1)),
+            "llvm.floor" => (lane(ctx, FUnOp::Floor, 0), lane(ctx, FUnOp::Floor, 1)),
+            "llvm.ceil" => (lane(ctx, FUnOp::Ceil, 0), lane(ctx, FUnOp::Ceil, 1)),
+            "llvm.trunc" => (lane(ctx, FUnOp::Trunc, 0), lane(ctx, FUnOp::Trunc, 1)),
+            "llvm.rint" | "llvm.nearbyint" | "llvm.roundeven" => {
+                (lane(ctx, FUnOp::Nearest, 0), lane(ctx, FUnOp::Nearest, 1))
+            }
+            "llvm.minnum" | "llvm.minimum" | "llvm.maxnum" | "llvm.maximum" | "llvm.copysign" => {
+                let lb = vec_explode(ctx, args[1], types, false)?;
+                let op = match base {
+                    "llvm.minnum" | "llvm.minimum" => FBinOp::Min,
+                    "llvm.maxnum" | "llvm.maximum" => FBinOp::Max,
+                    _ => FBinOp::Copysign,
+                };
+                let bin = |ctx: &mut BlockCtx, k: usize| {
+                    ctx.push(Inst::FBin {
+                        ty: lane_ty,
+                        op,
+                        a: la[k],
+                        b: lb[k],
+                    })
+                };
+                (bin(ctx, 0), bin(ctx, 1))
+            }
+            // fmuladd(a,b,c) = a*b + c, lowered unfused (per lane).
+            "llvm.fmuladd" | "llvm.fma" => {
+                let lb = vec_explode(ctx, args[1], types, false)?;
+                let lc = vec_explode(ctx, args[2], types, false)?;
+                let fma = |ctx: &mut BlockCtx, k: usize| {
+                    let prod = ctx.push(Inst::FBin {
+                        ty: lane_ty,
+                        op: FBinOp::Mul,
+                        a: la[k],
+                        b: lb[k],
+                    });
+                    ctx.push(Inst::FBin {
+                        ty: lane_ty,
+                        op: FBinOp::Add,
+                        a: prod,
+                        b: lc[k],
+                    })
+                };
+                (fma(ctx, 0), fma(ctx, 1))
+            }
+            _ => return unsup(format!("vec2 float intrinsic `{base}`")),
+        };
+        return Ok(Some(ctx.vec_pack(r0, r1, ValType::F32)));
+    }
     let ty = match args.first() {
         Some(a) => float_ty(val_type(a.get_type(types).as_ref())?)?,
         None => return Ok(None),
@@ -5706,6 +5769,68 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             let b = ctx.operand(&x.operand1)?;
             (&x.dest, ctx.push(Inst::FCmp { ty, op, a, b }))
         }
+        // A lane-wise vector int↔float / float↔float conversion scalarizes through the unified
+        // float-vector converter; a scalar one keeps the direct path.
+        I::FPToSI(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::FToSI,
+                types,
+            )
+        }
+        I::FPToUI(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::FToUI,
+                types,
+            )
+        }
+        I::SIToFP(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::SIToF,
+                types,
+            )
+        }
+        I::UIToFP(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::UIToF,
+                types,
+            )
+        }
+        I::FPExt(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::FpExt,
+                types,
+            )
+        }
+        I::FPTrunc(x) if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() => {
+            return lower_vec_fp_convert(
+                ctx,
+                &x.dest,
+                &x.operand,
+                x.to_type.as_ref(),
+                FpConv::FpTrunc,
+                types,
+            )
+        }
         I::FPToSI(x) => (&x.dest, ftoi(ctx, &x.operand, &x.to_type, types, true)?),
         I::FPToUI(x) => (&x.dest, ftoi(ctx, &x.operand, &x.to_type, types, false)?),
         I::SIToFP(x) => (&x.dest, itof(ctx, &x.operand, &x.to_type, types, true)?),
@@ -5870,13 +5995,8 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                         b: v1,
                     }),
                 )
-            } else {
-                let lane_ty = vec2_lane_ty(vty.as_ref()).ok_or_else(|| {
-                    Error::Unsupported("shufflevector: unsupported vector".into())
-                })?;
-                if mask.len() != 2 {
-                    return unsup("shufflevector: result is not 2-lane");
-                }
+            } else if let Some(lane_ty) = vec2_lane_ty(vty.as_ref()).filter(|_| mask.len() == 2) {
+                // vec2 → vec2: pick + repack the two scalarized lanes.
                 let pick = |ctx: &mut BlockCtx, m: u64| {
                     if m < 2 {
                         ctx.vec_lane(v0, m, lane_ty)
@@ -5887,6 +6007,28 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 let l0 = pick(ctx, mask[0]);
                 let l1 = pick(ctx, mask[1]);
                 (&sv.dest, ctx.vec_pack(l0, l1, lane_ty))
+            } else {
+                // A shuffle whose operands and result use **different representations** (e.g. two
+                // `<2 x float>`s concatenated into a `<4 x float>` `v128`). Scalarize generically:
+                // explode both operands' lanes, gather per the mask, repack into the result's shape.
+                let Some(elem) = vec_lane_shape(vty.as_ref()) else {
+                    return unsup("shufflevector: unsupported vector");
+                };
+                let a = vec_explode(ctx, &sv.operand0, types, false)?;
+                let b = vec_explode(ctx, &sv.operand1, types, false)?;
+                let n = a.len();
+                let mut res = Vec::with_capacity(mask.len());
+                for &mr in &mask {
+                    let idx = mr as usize;
+                    res.push(if idx < n {
+                        a[idx]
+                    } else if idx < 2 * n {
+                        b[idx - n]
+                    } else {
+                        a[0]
+                    });
+                }
+                return bind_shuffle_result(ctx, &sv.dest, &res, elem);
             }
         }
         // `extractvalue` reads a field of a small by-value struct — alias the field's value (§3a).
@@ -7183,6 +7325,28 @@ fn bind_lanes_as_vector(ctx: &mut BlockCtx, dest: &Name, lanes: &[ValIdx], shape
     ctx.bind_wide(dest, parts);
 }
 
+/// Bind `dest` to a shuffle's gathered `lanes` (of element shape `elem`), choosing the result
+/// representation by lane count: a single `v128` (one `v128`'s worth of lanes), a packed-`i64` vec2
+/// (2 lanes of a 32-bit element), or a legalized wide value otherwise.
+fn bind_shuffle_result(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    lanes: &[ValIdx],
+    elem: svm_ir::VShape,
+) -> Result<(), Error> {
+    let m = lanes.len();
+    if m == elem.lanes() as usize {
+        let v = build_v128_from_lanes(ctx, elem, lanes);
+        return finish(ctx, dest, v);
+    }
+    if m == 2 && elem.lane_bytes() == 4 {
+        let packed = ctx.vec_pack(lanes[0], lanes[1], elem.lane_val());
+        return finish(ctx, dest, packed);
+    }
+    bind_lanes_as_vector(ctx, dest, lanes, elem);
+    Ok(())
+}
+
 /// Build a single `v128` of `shape` from its `lane scalars` (`Splat` lane 0, then `ReplaceLane` the
 /// rest). `lanes.len()` must equal `shape.lanes()`.
 fn build_v128_from_lanes(ctx: &mut BlockCtx, shape: svm_ir::VShape, lanes: &[ValIdx]) -> ValIdx {
@@ -7296,6 +7460,86 @@ fn lower_vec_int_convert(
             VConv::SExt => emit_ext(ctx, v, from_bits, to_bits, true),
             VConv::Trunc => emit_trunc(ctx, v, from_bits, to_bits),
         });
+    }
+    vec_implode(ctx, dest, &out, to_type, types)
+}
+
+/// Which int↔float / float↔float conversion a vector `fptosi`/`fptoui`/`sitofp`/`uitofp`/`fpext`/
+/// `fptrunc` applies per lane.
+#[derive(Clone, Copy)]
+enum FpConv {
+    FToSI,
+    FToUI,
+    SIToF,
+    UIToF,
+    FpExt,
+    FpTrunc,
+}
+
+/// Lower a lane-wise **int↔float / float↔float** vector conversion (the float analog of
+/// [`lower_vec_int_convert`]) — scalarize: explode the source lanes, apply the scalar `FToISat`/
+/// `IToFConv`/`Cast` per lane, repack. Lands the auto-vectorizer's `<2 x float>`↔`<2 x i32>`
+/// (perlin's gradient math) and the 128-bit float-vector convdersions. The lane types come from the
+/// source / destination vector shapes.
+fn lower_vec_fp_convert(
+    ctx: &mut BlockCtx,
+    dest: &Name,
+    operand: &Operand,
+    to_type: &Type,
+    kind: FpConv,
+    types: &Types,
+) -> Result<(), Error> {
+    let from_ty = operand.get_type(types);
+    let from_shape = vec_lane_shape(from_ty.as_ref())
+        .ok_or_else(|| Error::Unsupported("vector fp-convert: bad source shape".into()))?;
+    let to_shape = vec_lane_shape(to_type)
+        .ok_or_else(|| Error::Unsupported("vector fp-convert: bad dest shape".into()))?;
+    let lanes = vec_explode(ctx, operand, types, false)?;
+    let mut out = Vec::with_capacity(lanes.len());
+    for v in lanes {
+        let inst = match kind {
+            FpConv::FToSI => Inst::FToISat {
+                op: ftoi_op(
+                    float_ty(from_shape.lane_val())?,
+                    int_ty(to_shape.lane_val())?,
+                    true,
+                ),
+                a: v,
+            },
+            FpConv::FToUI => Inst::FToISat {
+                op: ftoi_op(
+                    float_ty(from_shape.lane_val())?,
+                    int_ty(to_shape.lane_val())?,
+                    false,
+                ),
+                a: v,
+            },
+            FpConv::SIToF => Inst::IToFConv {
+                op: itof_op(
+                    int_ty(from_shape.lane_val())?,
+                    float_ty(to_shape.lane_val())?,
+                    true,
+                ),
+                a: v,
+            },
+            FpConv::UIToF => Inst::IToFConv {
+                op: itof_op(
+                    int_ty(from_shape.lane_val())?,
+                    float_ty(to_shape.lane_val())?,
+                    false,
+                ),
+                a: v,
+            },
+            FpConv::FpExt => Inst::Cast {
+                op: CastOp::Promote,
+                a: v,
+            },
+            FpConv::FpTrunc => Inst::Cast {
+                op: CastOp::Demote,
+                a: v,
+            },
+        };
+        out.push(ctx.push(inst));
     }
     vec_implode(ctx, dest, &out, to_type, types)
 }
