@@ -220,6 +220,10 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
         exact-equality on 4000 generated modules + kernels). Standalone `compile_and_run` path, not
         yet the default. Perf vs the tree-walker: alu 1.46×, call 1.76×, mem 1.13× (uses 16-byte
         `Reg` + per-op fuel, so below the raw-`i64` spike; slot narrowing + mem fast-path are later).
+  - [x] **Slice 1c-a** — op coverage: SIMD/`v128`/fence long tail delegated to `eval_inst` (reuse,
+        no re-implementation), run against each block's sub-window so no operand remap is needed.
+        Harness coverage of the generated corpus rose to ~1114/4000 (28%); the rest is
+        `call_indirect` / host / fiber / thread / cap programs (later slices). Still non-default.
   - [ ] **Slice 1c** — switch the default path over, re-expressing the seams (debug/`IrPc`, fibers,
         threads, durability, capabilities, scheduler preemption, fault rewind) + the full op set
         (SIMD, call_indirect, tail calls, host/fiber ops).

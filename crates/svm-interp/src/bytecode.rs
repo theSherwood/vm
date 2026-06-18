@@ -8,13 +8,15 @@
 //! (`bin64`, `cmp32`, `fto_i`, …) and `Mem` — **no op semantics are duplicated here**, only the
 //! dispatch/layout.
 //!
-//! Scope (this slice): the scalar + memory + direct-call subset — enough to run the benchmark
-//! kernels and a large share of generated programs. [`compile_module`] returns `None` if any
-//! function uses an op this slice doesn't handle yet (SIMD/`v128`, `call_indirect`, tail calls,
-//! capability/fiber/thread/reflection ops, fences), so callers fall back to the tree-walker. It is
-//! **not yet wired as the default execution path**; correctness is gated by the equality harness
+//! Scope (this slice): scalar + memory + SIMD/`v128` + fences + direct calls. Hot scalar/memory ops
+//! dispatch inline; the SIMD/`v128`/fence long tail is delegated to the reference
+//! [`super::eval_inst`] (same semantics, no re-implementation). [`compile_module`] returns `None`
+//! when a function uses an op that needs a runtime seam this slice doesn't drive — `call_indirect`
+//! (dispatch table), tail calls, or capability/fiber/thread/reflection ops (host powerbox,
+//! scheduler, fiber registry) — so callers fall back to the tree-walker. It is **not yet wired as
+//! the default execution path**; correctness is gated by the equality harness
 //! (`crates/svm/tests/bytecode_diff.rs`) against the reference interpreter, and the remaining seams
-//! (debug, scheduler, fibers, durability, capabilities) are added in later Phase-1b slices.
+//! (debug, scheduler, fibers, durability, capabilities) plus those ops land in later slices.
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
@@ -196,6 +198,15 @@ enum Op {
         srcs: Box<[u32]>,
     },
     Unreachable,
+    /// Long-tail value/store ops (SIMD, `v128` load/store, fences) delegated to the reference
+    /// [`super::eval_inst`] — same semantics, no duplication. The original instruction keeps its
+    /// **block-local** operand indices, so it's run against the sub-window `regs[base + block_base
+    /// ..]`; `dst` is the frame-relative result slot (unused when `eval_inst` yields no value).
+    Eval {
+        inst: Box<Inst>,
+        block_base: u32,
+        dst: u32,
+    },
 }
 
 struct Program {
@@ -243,7 +254,7 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
         for inst in &b.insts {
             let dst = base[bi] + local;
             local += inst.result_count(arities) as u32;
-            ops.push(compile_inst(inst, dst, &g)?);
+            ops.push(compile_inst(inst, dst, base[bi], &g)?);
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
         let edge = |bidx: usize, args: &[u32]| -> Edge {
@@ -320,7 +331,7 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
     Some(Program { ops, nslots })
 }
 
-fn compile_inst(inst: &Inst, dst: u32, g: &impl Fn(u32) -> u32) -> Option<Op> {
+fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32) -> Option<Op> {
     Some(match inst {
         Inst::ConstI32(c) => Op::Const {
             dst,
@@ -496,9 +507,29 @@ fn compile_inst(inst: &Inst, dst: u32, g: &impl Fn(u32) -> u32) -> Option<Op> {
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
         },
-        // Everything else (SIMD, call_indirect, capability/fiber/thread/reflection, fences) — not
-        // in this slice. Fall back to the tree-walker.
-        _ => return None,
+        // Control / host / cross-module ops this slice doesn't drive (they need the scheduler,
+        // host powerbox, fiber registry, or dispatch table) — fall back to the tree-walker.
+        Inst::CallIndirect { .. }
+        | Inst::CapCall { .. }
+        | Inst::CapSelfCount
+        | Inst::CapSelfGet { .. }
+        | Inst::CallImport { .. }
+        | Inst::ContNew { .. }
+        | Inst::ContResume { .. }
+        | Inst::Suspend { .. }
+        | Inst::ThreadSpawn { .. }
+        | Inst::ThreadJoin { .. }
+        | Inst::MemoryWait { .. }
+        | Inst::MemoryNotify { .. }
+        | Inst::GcRoots { .. } => return None,
+        // Everything else is a pure value op or a no-result store that the reference `eval_inst`
+        // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
+        // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
+        other => Op::Eval {
+            inst: Box::new(other.clone()),
+            block_base,
+            dst,
+        },
     })
 }
 
@@ -803,6 +834,22 @@ fn run(
                 }
             },
             Op::Unreachable => return Err(Trap::Unreachable),
+            Op::Eval {
+                inst,
+                block_base,
+                dst,
+            } => {
+                // Run the op against this block's sub-window with its original block-local operand
+                // indices; reuse the reference semantics. `eval_inst` borrows the window immutably
+                // and `mem` mutably (disjoint), so we read the result before writing it back.
+                let win_lo = base + *block_base as usize;
+                let win_hi = base + c.progs[cur].nslots as usize;
+                let r = super::eval_inst(inst, &regs[win_lo..win_hi], mem)?;
+                if let Some(v) = r {
+                    regs[base + *dst as usize] = v;
+                }
+                pc += 1;
+            }
         }
     }
 }
