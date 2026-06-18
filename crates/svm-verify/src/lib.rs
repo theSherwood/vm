@@ -258,7 +258,7 @@ fn verify_func(fi: u32, f: &Func, funcs: &[Func], has_memory: bool) -> Result<()
                     bi,
                     types: &types,
                 };
-                cx.expect(*k, ValType::I32)?; // forgeable fiber handle
+                cx.expect(*k, ValType::I64)?; // forgeable fiber handle (i64: 16-bit slot + 48-bit generation)
                 cx.expect(*arg, ValType::I64)?;
                 types.push(ValType::I32); // status
                 types.push(ValType::I64); // value
@@ -623,13 +623,13 @@ fn check_inst(
             cx.expect(*replacement, ty.val())?;
             ty.val()
         }
-        // §12 fibers. `cont.new` takes an i32 funcref, yields an i32 handle; `suspend`
-        // takes an i64, yields the i64 of the next resume. (`cont.resume` is multi-result
-        // and handled in the main loop.)
+        // §12 fibers. `cont.new` takes an i32 funcref, yields an i64 handle (16-bit slot +
+        // 48-bit generation); `suspend` takes an i64, yields the i64 of the next resume.
+        // (`cont.resume` is multi-result and handled in the main loop.)
         Inst::ContNew { func, sp } => {
             cx.expect(*func, ValType::I32)?;
             cx.expect(*sp, ValType::I64)?; // the fiber's data-stack base
-            ValType::I32
+            ValType::I64
         }
         Inst::Suspend { value } => {
             cx.expect(*value, ValType::I64)?;

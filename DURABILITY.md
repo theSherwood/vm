@@ -899,6 +899,27 @@ step 2 carries the generation through the snapshot format; the mid-run freeze tr
 *durable* freeze/thaw round-trip reachable; and step 4 exercises it on both backends, hand-written and
 fuzzed (byte-identical artifacts). The arc is complete — no recycling follow-ups remain.
 
+### Fiber handles are `i64` (48-bit generation) — DONE (both backends)
+
+The fiber guest handle widened from `i32` to **`i64`**: 16-bit slot (`MAX_FIBERS = 1<<16`) + **48-bit
+generation**. The ABA guard's generation field was only 16 bits while the handle was an `i32`, so a
+stale handle to a slot recycled exactly a multiple of 2¹⁶ times could falsely re-match (memory-safe and
+domain-local — the wrong *own* continuation — but a real violation of the "stale handles fault"
+invariant, and 65536 is small for a forever-running durable service). 48 bits moves wraparound to 2⁴⁸
+recycles — unreachable in practice (centuries even at 10⁶ finishes/s).
+
+The change is a type-system change anchored at the verifier (`cont.new` yields `i64`; `cont.resume`'s
+handle operand is `i64`; the `status` result stays `i32`), mirrored through **three** value-type
+copies — `svm-verify`, the `svm-durable` transform's own `result_types` (used to spill/reload the
+handle across suspends), and both backends' runtime/codegen — plus the `FIBER_GEN_MASK` /
+`FIBER_HANDLE_GEN_MASK` widening (interp + JIT), the `FrozenFiber.generation` field (`u32`→`u64`), and
+the C/LLVM on-ramps (`int64_t` handle; chibicc widens the resume handle, mirroring svm-llvm
+`operand_i64`). **Snapshot format bumped to v3:** the residue generation alone is wire-compatible
+(`uleb`), but a handle held live across a suspend now spills **8** bytes in the shadow stack instead of
+4 — the window-image layout changed, so a v2 artifact would mis-thaw and is rejected. Covered by the
+existing fiber/recycling suites (all migrated to `i64` handles): `jit_fibers`, `fiber_fuzz`,
+`fiber_migrate`, `durable`/`durable_jit` recycle fuzz, the C-frontend fiber demos, and the LLVM on-ramp.
+
 #### 3.1 implementation plan (next-session pickup)
 
 Done: the transform recognizes the fiber ops + NORMAL-inert (PR #27, branch

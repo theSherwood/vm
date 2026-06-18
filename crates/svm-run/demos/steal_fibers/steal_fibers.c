@@ -30,8 +30,8 @@
 #include <stdlib.h>
 
 /* VM fiber primitive (cont.* — a stackful coroutine; see DESIGN.md §23). */
-int  __vm_fiber_new(long (*f)(long), void *stack);
-long __vm_fiber_resume(int k, long arg, int *done);
+long __vm_fiber_new(long (*f)(long), void *stack);
+long __vm_fiber_resume(long k, long arg, int *done);
 long __vm_fiber_suspend(long value);
 /* VM atomic primitives (lock-free over the shared window). */
 long __vm_atomic_add(void *p, long v); /* fetch-add, returns old */
@@ -54,7 +54,7 @@ typedef struct {
   int len;
 } queue_t;
 
-static int     g_handles[NTASKS]; /* fiber handle of each task (created on main, read-only after) */
+static long    g_handles[NTASKS]; /* fiber handle of each task (created on main, read-only after) */
 static queue_t g_injector;        /* all tasks start here (the global "inject" queue) */
 static queue_t g_local[NWORKERS]; /* per-worker deques */
 static long    g_total = 0;       /* work units done (atomic) */

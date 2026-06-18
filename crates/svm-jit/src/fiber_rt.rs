@@ -43,7 +43,7 @@
 //! is ever held across a switch — only a `*mut Fiber` to the boxed, address-stable fiber being
 //! resumed, exclusive because its slot is `RUNNING` and only the claimant proceeds.
 
-use crate::fiber_registry::Ownership;
+use crate::fiber_registry::{Ownership, FIBER_HANDLE_GEN_MASK};
 use crate::{FnEntry, TrapKind};
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -136,18 +136,19 @@ fn fiber_region_base(slot: usize) -> u64 {
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
 /// (recycling step 1). MUST match `svm_interp`'s `FIBER_GEN_SHIFT` — the handle namespace is
 /// cross-backend, so a frozen handle means the same on both. `MAX_FIBERS` bounds a slot to the low 16
-/// bits. A handle is `(generation << FIBER_GEN_SHIFT) | slot`; a fresh slot's generation is 0, so a
-/// non-recycled run's handle is exactly its slot (byte-identical to before this slice and to the interp).
+/// bits; the `i64` handle leaves 48 bits for the generation. A handle is
+/// `(generation << FIBER_GEN_SHIFT) | slot`; a fresh slot's generation is 0, so a non-recycled run's
+/// handle is exactly its slot (byte-identical to before and to the interp).
 const FIBER_GEN_SHIFT: u32 = 16;
 
-/// Encode a fiber guest handle from its registry `slot` and (16-bit-truncated) `generation`.
-fn fiber_handle(slot: usize, generation: u64) -> i32 {
-    (((generation as u32) << FIBER_GEN_SHIFT) | slot as u32) as i32
+/// Encode a fiber guest handle from its registry `slot` and (48-bit-masked) `generation`.
+fn fiber_handle(slot: usize, generation: u64) -> i64 {
+    (((generation & FIBER_HANDLE_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u64) as i64
 }
 
 /// The generation a guest fiber handle carries (its high bits above the slot).
-fn fiber_handle_generation(handle: i32) -> u64 {
-    ((handle as u32) >> FIBER_GEN_SHIFT) as u64
+fn fiber_handle_generation(handle: i64) -> u64 {
+    (handle as u64) >> FIBER_GEN_SHIFT
 }
 
 /// Read the active shadow-SP word from the durable window. `mem_base` is the window's host base.
@@ -265,7 +266,7 @@ impl SharedFiberTable {
     /// at the kept (bumped) generation, so a stale handle to its former occupant still fails
     /// `claim_gen` — and only when none is free does the table grow. `None` if a racing allocation
     /// filled the domain quota since [`Self::has_room`].
-    fn create(&self, fiber: Box<Fiber>, func: i32, sp: i64) -> Option<i32> {
+    fn create(&self, fiber: Box<Fiber>, func: i32, sp: i64) -> Option<i64> {
         let mut t = self.lock();
         let reuse = t.free.peek().map(|&Reverse(s)| s);
         if reuse.is_none() && t.slots.len() + 1 >= self.max_fibers {
@@ -333,10 +334,10 @@ impl SharedFiberTable {
     /// like `call_indirect` — and the same shape as the interp registry, so a forged handle now
     /// resolves over the same domain-wide namespace on both backends). Returns the **slot index** (for
     /// the per-context region + recycling) and the slot. Out of range ⇒ `None`.
-    fn resolve(&self, handle: i32) -> Option<(usize, Arc<FiberSlot>)> {
+    fn resolve(&self, handle: i64) -> Option<(usize, Arc<FiberSlot>)> {
         let t = self.lock();
         let mask = t.slots.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
-        let slot = (handle as u32 as usize) & mask;
+        let slot = (handle as u64 as usize) & mask; // the generation bits are above the slot mask
         if slot >= t.slots.len() {
             return None;
         }
@@ -379,7 +380,7 @@ impl SharedFiberTable {
     /// durable freeze driver flattens (DURABILITY.md §12.8). Collected once: flattening a fiber
     /// makes zero forward progress (its post-suspend poll unwinds immediately), so it spawns no new
     /// parked fibers, and it ends `FREE` — the set never grows.
-    fn runnable_handles(&self) -> Vec<i32> {
+    fn runnable_handles(&self) -> Vec<i64> {
         self.lock()
             .slots
             .iter()
@@ -554,7 +555,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
     trap_out: u64,
     funcref: i32,
     sp: u64,
-) -> i32 {
+) -> i64 {
     let rt = current();
     if rt.is_null() {
         fault(trap_out);
@@ -612,7 +613,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
 /// # Safety
 /// `status_out`/`trap_out` are live `*mut i64` cells. The running vCPU's runtime is [`CURRENT_RT`].
 pub(crate) unsafe extern "C" fn fiber_resume(
-    handle: i32,
+    handle: i64,
     arg: i64,
     status_out: *mut i64,
     trap_out: u64,
@@ -748,7 +749,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
                     shadow_sp: flat_sp,
                     // Recorded before the `finish` below bumps it — the freeze-time generation, so a
                     // thaw re-seeds this (possibly recycled) fiber at the generation its handle carries.
-                    generation: slot.own.generation() as u32,
+                    generation: slot.own.generation(),
                 });
             }
             // Drop the fiber (unmapping its stack) and free the slot — `finish` bumps the
@@ -895,13 +896,9 @@ pub(crate) unsafe fn seed_frozen_fibers(
             fault(trap_out);
             return false;
         };
-        let got = r.table.seed_frozen(
-            Box::new(fiber),
-            f.func,
-            f.sp,
-            f.shadow_sp,
-            f.generation as u64,
-        );
+        let got = r
+            .table
+            .seed_frozen(Box::new(fiber), f.func, f.sp, f.shadow_sp, f.generation);
         debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
         debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
     }
