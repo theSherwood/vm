@@ -13,56 +13,55 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I2 — LLVM on-ramp cannot ingest auto-vectorized output wider than 128 bits (no vector legalization) (S3)
-
-**Where:** `crates/svm-llvm/src/lib.rs` — `val_type` / `type_size` (vector type recognition) and the
-vector lowering paths (`bin` vec branch, `lower_int_intrinsic` vec branch, `lower_vector_reduce`,
-`is_vec4`). Reached when translating bitcode compiled with auto-vectorization **enabled** (the
-`check_vectorized_vs_native` test harness; the C/C++/Rust breadth lanes deliberately pass
-`-fno-*-vectorize` / `-vectorize-loops=false`, so they don't hit it).
-
-**Symptom:** translating a `clang -O2`-vectorized program fails **fail-closed** with
-`Error::Unsupported("type <16 x i32> (Milestone 1+)")` (or `<16 x i64>`, `<4 x i64>`, `<8 x i8>`,
-`<2 x i64>`, `<16 x i8>`, etc.). No wrong result, no escape — the verifier never sees bad IR; the
-translator just refuses. Observed when probing whether the breadth lanes could re-enable vectorization
-(slices AN/AO): ~7 corpus tests surfaced these shapes.
-
-**Root cause:** svm-ir's SIMD type is a **fixed-128-bit `v128`** (§17/D58). LLVM's `-O2` loop/SLP
-vectorizer emits **arbitrary-width "virtual" vectors** — both wider than 128 bits (`<16 x i32>` =
-512-bit, from the chosen vectorization factor × interleave/unroll) and assorted sub-/non-`i32x4`
-128-bit shapes — on the assumption that the target backend's **type-legalization** pass (LLVM
-SelectionDAG `LegalizeTypes`) will split/scalarize them into legal-width chunks before instruction
-selection. The on-ramp has no such pass: it maps `<4 x {i32,float}>` (and 2-lane → packed `i64`)
-directly and rejects everything else. So it can ingest *controlled* 128-bit `i32x4` vector code
-(slices AN/AO: lane add/sub/mul/and/or/xor/min-max + `llvm.vector.reduce.*.v4i32`) but not the
-mixed/oversized shapes real auto-vec produces.
-
-**Current posture (intended):** the C/C++/Rust breadth lanes keep `-fno-*-vectorize`, so they hand the
-on-ramp scalar IR and run byte-identical to native. This is the correct fail-closed stance — the
-on-ramp never silently mis-translates a vector it can't represent (§2a: a gap is a clean error, never
-an escape). `i32x4` auto-vec *is* supported and tested for code that produces only that shape.
-
-**Fix sketch (deferred — it's its own project):**
-1. **A vector-legalization pass in `svm-llvm`** (the SelectionDAG `LegalizeTypes` analog): split a
-   `<N x T>` whose byte-width > 16 into `ceil(N·sizeof T / 16)` `v128` chunks (and a scalar tail),
-   rewriting each vector op as per-chunk ops; scalarize widths with no clean split. This is the real
-   unblock and the bulk of the work. Alternatively, run `opt`/`llc`-style legalization **out of
-   process** (the PNaCl `pnacl-abi-simplify` model the on-ramp already uses for `mem2reg`), if a pass
-   exists that lowers vectors to ≤128-bit without selecting machine code.
-2. **Generalize the 128-bit shapes first** (bounded, independent): a `is_vec128` recognizer +
-   shape-aware lowering for `i8x16`/`i16x8`/`i64x2` (and the narrow `<8 x i8>` etc. via widen), so all
-   legal-width shapes work even before the splitter lands.
-3. **Cheap experiment worth trying before (1):** `clang -mprefer-vector-width=128
-   -mllvm -force-vector-interleave=1` may constrain the vectorizer to 128-bit, un-interleaved output —
-   if it removes the wide shapes, much real auto-vec code would translate with only step (2). Unproven.
-
-**Why not now:** the breadth proof (C/C++/Rust running real programs byte-identical to native) is
-complete with vectorization off; full auto-vec ingestion is a perf/fidelity nicety gated on a
-substantial legalization pass, not a correctness blocker. Tracked here so it isn't rediscovered.
+_(none — I2 resolved below)_
 
 ---
 
 ## Resolved
+
+### I2 — LLVM on-ramp now ingests auto-vectorized output wider than 128 bits (vector legalization landed) (S3) — fixed on `claude/dreamy-newton-ni7epv`
+
+**Where:** `crates/svm-llvm/src/lib.rs` — vector type recognition (`vec_lane_shape`/`vec128_shape`/
+`wide_vec_layout`, `val_type`/`type_size`/`type_align`), the `lower_wide` legalization pass + its
+`BlockCtx` helpers, and the block-boundary fan-out in `translate_block`/`branch_args`.
+
+**Was:** translating a `clang -O2`-vectorized program fail-closed with
+`Error::Unsupported("type <16 x i32> (Milestone 1+)")` (or `<16 x i64>`, `<4 x i64>`, `<8 x i8>`,
+`<2 x i64>`, `<16 x i8>`, etc.). The on-ramp mapped only `<4 x {i32,float}>` (and the 2-lane → packed
+`i64` case) to a `v128` and rejected every other shape, because svm-ir's SIMD type is a fixed-128-bit
+`v128` (§17/D58) while LLVM's `-O2`/SLP vectorizer emits arbitrary-width "virtual" vectors on the
+assumption the backend's `LegalizeTypes` pass will split them. The on-ramp had no such pass.
+
+**Fix (landed, the §17 fixed-128 SelectionDAG-`LegalizeTypes` analog — the chunk width is fixed at
+128 bits, never host-detected, to preserve the interp↔JIT/durable-fiber determinism contract):**
+
+1. **128-bit shapes generalized** (fix-sketch step 2): a single `vec_lane_shape`/`vec128_shape`
+   recognizer maps any 16-byte LLVM vector to its `VShape`, threaded through every 128-bit lowering
+   site, replacing the `i32x4`/`f32x4`-only helpers. svm-ir/verify/jit/interp already supported all
+   six `VShape`s, so this was frontend-only. Now `i8x16`/`i16x8`/`i64x2`/`f64x2` all work.
+2. **Wide / sub-128 legalization** (fix-sketch step 1): `wide_vec_layout` splits a `<N×T>` into
+   `full_chunks` 16-byte `v128`s + `tail_lanes` scalar lanes; `lower_wide` (dispatched at the top of
+   `translate_inst`) rewrites each wide op per-chunk + per-tail — load/store, int/float lane arith,
+   bitwise, lane min/max, horizontal `vector.reduce.*`, extract/insert, constants, and the broadcast
+   (splat) `shufflevector`. A wide value is held as `wide_vals[vid] = [chunks…, tail…]`, mirroring the
+   `agg` multi-value pattern.
+3. **Cross-block fan-out**: a wide value that crosses a block edge (a vectorized loop's accumulator
+   carried across the backedge as a wide phi) expands into `K = chunks + tail` consecutive block
+   params, supplied as `K` branch args on every edge (`translate_block`/`branch_args`).
+
+**Remaining (still fail-closed, clean `Unsupported` — not regressions, narrower follow-ons):** vector
+**shifts** (`shl`/`lshr`/`ashr` — `VIntBinOp` has no shift op), **general cross-chunk shuffles**
+(only the splat form is lowered), vector `select`/`icmp` **masks** and `llvm.masked.*` (gather/scatter/
+masked load-store), and wide-vector **function params/returns**. The breadth lanes still compile with
+`-fno-*-vectorize` (re-enabling them is a separate step that may surface the above).
+
+**Verification:** `cargo test -p svm-llvm --test translate` (115 pass). New tests cover every 128-bit
+shape, the wide splitter (`<8 x i32>`/`<4 x i64>` chunks, `<8 x i8>` all-tail), a real loop-carried
+wide phi (verified `phi <8 x i32>` in the IR), and two **capstones ingesting genuine `-O2 -mavx2`
+auto-vectorized bitcode** (a `<8 x i32>` reduction and an elementwise kernel) byte-identical to the
+native scalar oracle on both the interpreter and the JIT.
+
+---
 
 ### I1 — A fiber-stack OS allocation failure aborts the process instead of trapping (S2) — fixed on `claude/fiber-stack-lazy-commit`
 
