@@ -681,14 +681,19 @@ DWARF variable locations) finally land — they are stages here, not separate wo
 
 **Staged plan (slices — update status as they land):**
 
-- [ ] **Stage 0 — SourceLoc threading (foundation).** During JIT codegen, map each IR op's W4
-  `debug.loc` to a `cranelift SourceLoc` (a `u32` index into a per-module `(file,line,col)` side
-  table) via `set_srcloc`. No debugger yet. *Deliverable:* the compiled output's source-loc map is
-  populated; a unit test reads it back. *Effort: low.*
-- [ ] **Stage 1 — JIT address→source map + trap symbolization (first user-visible win).** After
-  `finalize`, read Cranelift's `MachSrcLoc`/address ranges to build `machine_pc → (func, file,
-  line)`. Symbolize a JIT trap/panic into a source-line frame (no debugger, no DWARF yet) — the
-  cheapest win and the test vehicle for Stages 2–4. Overlaps W3-JIT. *Effort: low–med.*
+- [x] **Stage 0 — SourceLoc threading (foundation). — Built.** `svm-jit`'s `lower_block` stamps each
+  emitted op with a `cranelift SourceLoc` = its `debug_info.locs` index, via a `(func,block,inst) →
+  index` map (`SrcLocMap`) built in `compile` only when the module carries `-g` (threaded through
+  the `Lower` struct, so the non-debug path is byte-identical). No debugger yet.
+- [x] **Stage 1 — JIT address→source map + `symbolize`. — Built.** After `finalize`, each function's
+  captured `MachSrcLoc` ranges (relative offsets, filtered to non-default) resolve against its
+  `get_finalized_function` base into a sorted, disjoint `Vec<SrcRange>` (`[lo,hi)` machine address →
+  `func`/`file`/`line`/`col`); `CompiledModule::symbolize(pc) -> Option<JitFrameLoc>` binary-searches
+  it. Test (`jit_srcloc.rs`): a `-g` compute module's three body lines all map to non-empty machine
+  ranges, `symbolize(range.lo)` round-trips line+file, an unmapped pc → `None`, and a non-`-g` build
+  has an empty map. *Trap symbolization* (mapping a live trap pc, which the explicit-check traps
+  don't capture today, vs the memory-fault signal pc) folds into Stage 4 / W3-JIT — the map and
+  `symbolize` are the substrate.
 - [ ] **Stage 2 — `.debug_line` + `.debug_info` synthesis + GDB JIT registration (line-level
   gdb/lldb).** Hand-roll a DWARF writer (inverse of `dwarf_line`/`dwarf_info`): a `.debug_line`
   line-number program over the JIT'd machine addresses (from Stage 1), and a `.debug_info` CU +
@@ -730,9 +735,10 @@ DWARF variable locations) finally land — they are stages here, not separate wo
   like the rest of the waist — a malformed DWARF mis-renders, never escapes. Keep it off the
   verifier/runtime hot path.
 
-**Recommended entry point for the next session:** Stage 0 → Stage 1 (low-risk, self-contained,
-no debugger or DWARF yet, immediately testable via JIT trap symbolization), then Stage 2 for the
-headline gdb milestone. Each stage is independently shippable.
+**Progress:** Stages 0–1 are **built** (`svm-jit` source-loc threading + `symbolize`; see notes
+above). **Next: Stage 2** — synthesize `.debug_line`/`.debug_info` from the Stage 1 address map and
+register an in-memory ELF via the GDB JIT interface, for the headline "set a breakpoint on a `.c`
+line in gdb" milestone. Each stage is independently shippable.
 
 ---
 

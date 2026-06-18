@@ -62,7 +62,8 @@ use cranelift_codegen::ir::types::{
 };
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, Function,
-    InstBuilder, JumpTableData, MemFlags, StackSlotData, StackSlotKind, Type, UserFuncName, Value,
+    InstBuilder, JumpTableData, MemFlags, SourceLoc, StackSlotData, StackSlotKind, Type,
+    UserFuncName, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -1110,6 +1111,40 @@ pub struct DefinedFn {
     pub type_id: u32,
 }
 
+/// `(func, block, inst) → index into the module's `debug_info.locs`` — the source-loc lookup the
+/// JIT codegen consults to stamp each emitted op with a `cranelift SourceLoc` (W5 JIT/DWARF tier,
+/// Stage 0). Built once per compile only when the module carries `-g` debug info.
+type SrcLocMap = std::collections::HashMap<(u32, u32, u32), u32>;
+
+/// Per-function captured `MachSrcLoc` ranges before address resolution: `(func index, [(start
+/// offset, end offset, `debug_info.locs` index)])`, relative to the function's start until
+/// `finalize` resolves the base address (W5 JIT/DWARF Stage 1).
+type RawSrcLocs = Vec<(u32, Vec<(u32, u32, u32)>)>;
+
+/// A machine-address → source range in finalized JIT code (W5 JIT/DWARF tier, Stage 1): the absolute
+/// `[lo, hi)` code range a source position covers, resolved after `finalize` from Cranelift's
+/// per-function `MachSrcLoc` ranges (relative offsets) + the function's finalized base address.
+/// Strippable host-side tooling, untrusted-for-escape (§2a) — never read by running guest code.
+#[derive(Clone, Copy, Debug)]
+pub struct SrcRange {
+    pub lo: u64,
+    pub hi: u64,
+    pub func: u32,
+    pub file: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// A symbolized JIT code address (W5 JIT/DWARF tier): the source position [`CompiledModule::
+/// symbolize`] resolves a machine `pc` to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JitFrameLoc {
+    pub func: u32,
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+
 pub struct CompiledModule {
     /// The padded function table `call_indirect` dispatches through. Its address is threaded as
     /// a runtime argument (not baked), but running code reads it — boxed so it never moves, and
@@ -1194,12 +1229,43 @@ pub struct CompiledModule {
     /// vCPU's runtime are built over — one handle namespace + one §15 fiber quota per domain.
     #[cfg(fiber_rt)]
     fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>>,
+    /// Machine-address → source map for finalized code (W5 JIT/DWARF Stage 1), sorted by `lo`.
+    /// Empty unless the module carried `-g` debug info. Host-side tooling, off the runtime path.
+    src_ranges: Vec<SrcRange>,
+    /// Source file paths (from `debug_info.files`), indexed by [`SrcRange::file`].
+    src_files: Vec<String>,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
     /// (declaration order), after everything that points into it.
     module: JITModule,
 }
 
 impl CompiledModule {
+    /// Symbolize a finalized-code machine address to its source position (W5 JIT/DWARF Stage 1), or
+    /// `None` if `pc` is outside any source-mapped op (a non-`-g` build, a trampoline, a prologue
+    /// gap). The [`SrcRange`] map is sorted and disjoint, so this is a binary search. Host-side
+    /// tooling, off the running guest's path (§2a) — the seed for trap symbolization + DWARF emit.
+    pub fn symbolize(&self, pc: usize) -> Option<JitFrameLoc> {
+        let pc = pc as u64;
+        let i = self.src_ranges.partition_point(|r| r.lo <= pc);
+        let r = self.src_ranges[..i].last().filter(|r| pc < r.hi)?;
+        Some(JitFrameLoc {
+            func: r.func,
+            file: self
+                .src_files
+                .get(r.file as usize)
+                .cloned()
+                .unwrap_or_default(),
+            line: r.line,
+            col: r.col,
+        })
+    }
+
+    /// The finalized machine-address → source map (W5 JIT/DWARF Stage 1), sorted by address. Empty
+    /// unless the module carried `-g`. For tooling/tests and the forthcoming DWARF line-program emit.
+    pub fn src_ranges(&self) -> &[SrcRange] {
+        &self.src_ranges
+    }
+
     /// Compile the whole module (the compile half of the old one-shot `compile_and_run*`):
     /// declare + define every function, the entry's buffer-ABI trampoline, finalize once, and
     /// build the function table. Everything *baked into code* — the confinement mask, the
@@ -1471,10 +1537,23 @@ impl CompiledModule {
         #[cfg(not(fiber_rt))]
         let inst = InstEnv::null();
 
+        // W5 JIT/DWARF tier (Stages 0–1): when the module carries `-g` debug info, build the
+        // `(func,block,inst) → debug_info.locs` index lookup that stamps each op with a `SourceLoc`,
+        // and capture each function's `MachSrcLoc` ranges (relative offsets) to resolve to a
+        // machine-address → source map after finalize. Off the runtime path; absent ⇒ no-op.
+        let srcloc_map: Option<SrcLocMap> = m.debug_info.as_ref().map(|di| {
+            di.locs
+                .iter()
+                .enumerate()
+                .map(|(i, l)| ((l.func, l.block, l.inst), i as u32))
+                .collect()
+        });
+        let mut raw_srclocs: RawSrcLocs = Vec::new();
+
         // Define each function body. `clear_context` after each define resets the cached
         // CFG/domtree so the next function never compiles against a stale CFG.
         let mut ctx = module.make_context();
-        for (f, id) in m.funcs.iter().zip(&ids) {
+        for (fi, (f, id)) in m.funcs.iter().zip(&ids).enumerate() {
             build_clif(
                 &mut module,
                 &ids,
@@ -1491,10 +1570,26 @@ impl CompiledModule {
                 sub_base,
                 epoch_addr,
                 (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
+                fi as u32,
+                srcloc_map.as_ref(),
             )?;
             module
                 .define_function(*id, &mut ctx)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
+            if srcloc_map.is_some() {
+                if let Some(cc) = ctx.compiled_code() {
+                    let ranges: Vec<(u32, u32, u32)> = cc
+                        .buffer
+                        .get_srclocs_sorted()
+                        .iter()
+                        .filter(|s| !s.loc.is_default())
+                        .map(|s| (s.start, s.end, s.loc.bits()))
+                        .collect();
+                    if !ranges.is_empty() {
+                        raw_srclocs.push((fi as u32, ranges));
+                    }
+                }
+            }
             module.clear_context(&mut ctx);
         }
 
@@ -1528,6 +1623,33 @@ impl CompiledModule {
         module
             .finalize_definitions()
             .map_err(|e| JitError::Backend(e.to_string()))?;
+
+        // W5 JIT/DWARF Stage 1: now that code is finalized, resolve each captured `MachSrcLoc` range
+        // (relative to its function's start) to an absolute machine address, building the sorted
+        // `machine-pc → source` map `symbolize` consults. Empty without `-g`.
+        let (src_ranges, src_files) = match m.debug_info.as_ref() {
+            Some(di) => {
+                let mut ranges = Vec::new();
+                for (fi, rs) in &raw_srclocs {
+                    let base = module.get_finalized_function(ids[*fi as usize]) as u64;
+                    for &(start, end, loc) in rs {
+                        if let Some(l) = di.locs.get(loc as usize) {
+                            ranges.push(SrcRange {
+                                lo: base + start as u64,
+                                hi: base + end as u64,
+                                func: l.func,
+                                file: l.file,
+                                line: l.line,
+                                col: l.col,
+                            });
+                        }
+                    }
+                }
+                ranges.sort_by_key(|r| r.lo);
+                (ranges, di.files.clone())
+            }
+            None => (Vec::new(), Vec::new()),
+        };
 
         // Now that code is finalized, hand the root fiber runtime its call-trampoline address (and keep it
         // to seed the thread `Domain`'s `Env`, which spawned vCPUs use to call their entry).
@@ -1611,6 +1733,8 @@ impl CompiledModule {
             },
             #[cfg(fiber_rt)]
             fiber_table,
+            src_ranges,
+            src_files,
             module,
         })
     }
@@ -2119,6 +2243,8 @@ impl CompiledModule {
                 self.sub_base,
                 self.epoch_addr,
                 self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
+                0,
+                None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
             )?;
             self.module
                 .define_function(*id, &mut ctx)
@@ -2492,6 +2618,8 @@ fn compile_child(
             0,                 // top-level confinement over the child's own window
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
             (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
+            0,
+            None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
         )?;
         module
             .define_function(*id, &mut ctx)
@@ -2895,6 +3023,11 @@ struct Lower<'a> {
     /// ([`uses_sret`] of its results), else `None`. A `Return` stores results through it; a tail
     /// call forwards it (the tail callee shares the caller's result type, so its sret-ness matches).
     sret_var: Option<Variable>,
+    /// `-g` source-loc lookup (W5 JIT/DWARF Stage 0): `(func, block, inst) → debug_info.locs` index.
+    /// `None` ⇒ no debug info, so no `SourceLoc`s are stamped (codegen is byte-identical to before).
+    srclocs: Option<&'a SrcLocMap>,
+    /// This function's index, the `func` half of the [`Self::srclocs`] key.
+    func_idx: u32,
 }
 
 /// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
@@ -2924,6 +3057,8 @@ fn build_clif(
     sub_base: u64,
     epoch_addr: i64,
     fn_table_mask: u64,
+    func_idx: u32,
+    srclocs: Option<&SrcLocMap>,
 ) -> Result<(), JitError> {
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
@@ -2992,6 +3127,8 @@ fn build_clif(
         epoch_addr,
         ids,
         distinct,
+        srclocs,
+        func_idx,
     };
 
     // Jump into IR block 0 passing the function parameters (entry params after the three context
@@ -3008,7 +3145,7 @@ fn build_clif(
     b.ins().jump(blocks[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(module, &mut b, blk, blocks[i], &blocks, &lower)?;
+        lower_block(module, &mut b, blk, i, blocks[i], &blocks, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -3175,6 +3312,7 @@ fn lower_block(
     module: &mut JITModule,
     b: &mut FunctionBuilder,
     blk: &Block,
+    block_idx: usize,
     cb: cranelift_codegen::ir::Block,
     blocks: &[cranelift_codegen::ir::Block],
     lower: &Lower,
@@ -3188,7 +3326,15 @@ fn lower_block(
     let mut ubs: Vec<u64> = vec![UB_TOP; vals.len()];
     let size = lower.mask.wrapping_add(1);
 
-    for inst in &blk.insts {
+    for (inst_idx, inst) in blk.insts.iter().enumerate() {
+        // W5 JIT/DWARF Stage 0: stamp the ops this IR instruction lowers to with a `SourceLoc`
+        // (= its `debug_info.locs` index), so the finalized code's address map carries source
+        // positions. Only when the module has `-g` debug info; otherwise codegen is unchanged.
+        if let Some(map) = lower.srclocs {
+            if let Some(&loc) = map.get(&(lower.func_idx, block_idx as u32, inst_idx as u32)) {
+                b.set_srcloc(SourceLoc::new(loc));
+            }
+        }
         // `call`/`call_indirect` append 0..N results — handle before the single-value
         // match (which produces exactly one value).
         if let Inst::Call { func, args } = inst {
