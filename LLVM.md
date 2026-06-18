@@ -868,10 +868,21 @@ vectorization is on — confirmed by flipping the lanes (9 fails → 5). Float-l
   (vectorization *enabled*), each a real `clang -O2` loop verified to emit the conversion, vs native.
   Covers `zext <4 x i8>→<4 x i32>`, `sext <2 x i32>→<2 x i64>`, `trunc <2 x i64>→<2 x i32>`, and
   `trunc <8 x i16>→<8 x i8>` / `<8 x i32>→<8 x i16>`. 125 translate tests green, fmt + clippy clean.
-- **Remaining before the breadth-lane flip (3 classes, 5 demos):** `<N x i1>` masks (vector `icmp`/
-  `select` → `perlin`/`crc32`/`clay`), vector rotate (`llvm.fshl`/`fshr` → `xxhash`), non-splat
-  cross-chunk shuffle (→ `vm_async_io_runtime`). The lanes are **all-or-nothing** (a lane flips only
-  when every demo on it passes), so they stay `-fno-*-vectorize` until all four classes land.
+- **Remaining before the breadth-lane flip (2 classes, 4 demos):** `<N x i1>` masks (vector `icmp`/
+  `select` → `perlin`/`crc32`/`clay`), non-splat cross-chunk shuffle (→ `vm_async_io_runtime`). The
+  lanes are **all-or-nothing** (a lane flips only when every demo on it passes), so they stay
+  `-fno-*-vectorize` until all classes land.
+
+**Slice AQ (DONE) — auto-vectorized vector rotate (`llvm.fshl.v4i32` / `fshr`).** The second vector-op
+class (lands `xxhash` when vectorized). svm-ir's `VShift` takes only a *scalar* shift amount, but the
+auto-vectorizer emits **per-lane-varying constant** amounts (xxHash's `<1,7,12,18>`), so the on-ramp
+scalarizes the **rotate idiom** (`a == b`, the only funnel-shift form clang emits for `(x<<n)|(x>>(w-n))`)
+lane-wise: explode the data + amount lanes (reusing slice AP's `vec_explode_int`), rotate each lane with
+the scalar `IntBin Rotl`/`Rotr` (count masked mod lane width — no shift-by-width edge), and repack the
+`v128` (`build_v128_from_lanes`). Handled in `lower_int_intrinsic`'s `vec128` branch; a general
+(non-rotate) or float-shape funnel shift stays `Unsupported`.
+- Test: `simd_vector_rotate_fshl` — a `(x<<13)|(x>>19)` rotate loop (`check_vectorized_vs_native`,
+  vectorization enabled, verified to emit `llvm.fshl.v4i32`), vs native. 126 translate tests green.
 
 ### Milestone 2 — beyond chibicc's C subset 🟡
 - [x] **C++ without EH/RTTI** — first light (slice AG): classes, vtables/virtual dispatch, `new`/`delete`,

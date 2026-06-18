@@ -3628,6 +3628,21 @@ fn simd_conv_trunc_to_u8() {
     check_vectorized_vs_native("simd_conv_trunc8", src, 5);
 }
 
+/// **Auto-vectorized vector rotate (`llvm.fshl.v4i32`).** A `(x<<13)|(x>>19)` rotate loop, which
+/// `clang -O2` recognizes as a funnel shift and vectorizes to `llvm.fshl.v4i32`. svm-ir's `VShift`
+/// takes only a scalar amount, so the on-ramp scalarizes the rotate idiom (`a == b`) lane-wise — each
+/// lane a scalar `Rotl`/`Rotr` (mask-mod-width, no shift-by-width edge) — then repacks the `v128`.
+/// This is the shape xxHash's `XXH32_round` emits. Fixed-index read-back avoids a vector reduction.
+#[test]
+fn simd_vector_rotate_fshl() {
+    let src = "static unsigned int a[64]; static unsigned int out[64]; \
+               int run(int seed){ for(int i=0;i<64;i++) a[i]=(unsigned)(seed*2654435761u + i); \
+               for(int i=0;i<64;i++){ unsigned x=a[i]; out[i]=(x<<13)|(x>>19); } \
+               return (int)((out[0]^out[31]^out[63]) & 0xff); } \
+               int main(void){ return run(7); }";
+    check_vectorized_vs_native("simd_rotate", src, 7);
+}
+
 /// **Rust capstone — a `jsmn`-style JSON tokenizer (a real `no_std` program).** The analog of the C
 /// corpus's `jsmn` demo, in Rust: scan a JSON document (`&[u8]`) into a heap `Vec` of typed tokens
 /// (`enum Kind { Obj, Arr, Str, Prim }` + span), handling strings (with `\`-escapes), whitespace, and

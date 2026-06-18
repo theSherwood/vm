@@ -3723,6 +3723,37 @@ fn lower_int_intrinsic(
     // the operand's shape; the other bit intrinsics have no vector form here. (Float vector min/max
     // go through the float path.)
     if let Some(shape) = vec128_shape(args[0].get_type(types).as_ref()) {
+        // A vector funnel shift (`llvm.fshl`/`fshr`) in the **rotate idiom** (`a == b`). svm-ir's
+        // `VShift` takes only a *scalar* amount, but the auto-vectorizer emits per-lane-varying
+        // constant amounts (e.g. xxHash's `<1,7,12,18>`), so scalarize: rotate each lane by its own
+        // amount, then repack into the `v128` (the lane `Rotl`/`Rotr` masks the count mod width, so
+        // there is no shift-by-width edge case, mirroring the scalar rotate path).
+        if matches!(base, "llvm.fshl" | "llvm.fshr") {
+            if shape.is_float() {
+                return unsup("vector funnel shift on a float shape");
+            }
+            if args[0] != args[1] {
+                return unsup(format!("general vector funnel shift `{name}` (non-rotate)"));
+            }
+            let lane_ty = int_ty(shape.lane_val())?;
+            let data = vec_explode_int(ctx, args[0], types)?;
+            let amts = vec_explode_int(ctx, args[2], types)?;
+            let op = if base == "llvm.fshl" {
+                BinOp::Rotl
+            } else {
+                BinOp::Rotr
+            };
+            let mut out = Vec::with_capacity(data.len());
+            for (&d, &s) in data.iter().zip(amts.iter()) {
+                out.push(ctx.push(Inst::IntBin {
+                    ty: lane_ty,
+                    op,
+                    a: d,
+                    b: s,
+                }));
+            }
+            return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
+        }
         let op = match base {
             "llvm.smax" => svm_ir::VIntBinOp::MaxS,
             "llvm.smin" => svm_ir::VIntBinOp::MinS,
