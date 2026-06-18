@@ -2305,6 +2305,8 @@ pub struct Loc {
 /// A source variable and its value location (`DEBUGGING.md` §6 / S2). Carries a neutral render
 /// name (`ty`) and, when known, a [`TypeId`] into [`DebugInfo::types`] for its structured layout
 /// (`type_id`). Function-scoped for slice 1; lexical `IrPc`-range scopes are a later refinement.
+/// A **module-scoped global** (source-level `static`/global variable) uses `func == `[`GLOBAL_SCOPE`]
+/// — visible in every frame — and a [`VarLoc::Fixed`] absolute window address.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct VarInfo {
     pub func: u32,
@@ -2343,7 +2345,17 @@ pub enum VarLoc {
     ///
     /// [`Window`]: VarLoc::Window
     WindowVia { base: Vec<SsaLoc>, off: i64 },
+    /// A variable at a **fixed absolute window address** — a module-scoped global (source-level
+    /// `static`/global): `read = window[addr ..]`, frame-independent. Paired with `func ==
+    /// `[`GLOBAL_SCOPE`] so it is visible in every frame. (Unlike [`Window`], which is `data-SP +
+    /// off`, this is an absolute address — globals live low in the window, below the data stack.)
+    Fixed { addr: u64 },
 }
+
+/// The sentinel [`VarInfo::func`] of a **module-scoped global** (no owning function): it resolves in
+/// every frame, not just one function's. Real function indices are `0..funcs.len()`, so `u32::MAX`
+/// never collides.
+pub const GLOBAL_SCOPE: u32 = u32::MAX;
 
 /// One entry of a [`VarLoc::SsaList`] location list: within block `block`, from instruction `inst`
 /// onward (until a later entry in the same block), the variable is held by block-local SSA value

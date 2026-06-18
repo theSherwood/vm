@@ -257,3 +257,132 @@ int dist(int n) {
         "p.x + p.y = 2n+1"
     );
 }
+
+#[test]
+fn dap_inspects_an_llvm_source_global() {
+    // A source global is inspectable in *every* frame (GLOBAL_SCOPE) through the DAP stack: it
+    // appears in the Variables pane and `evaluate` reads it by name.
+    let src = "\
+int total = 42;
+int add(int n) { total = total + n; return total; }
+";
+    let Some(bc) = compile_o0g("global", src) else {
+        return;
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let path = t.module.debug_info.as_ref().unwrap().files[0].clone();
+    let text = svm_text::print_module(&t.module);
+
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(&text)),
+            ("function", Json::i(0)),
+            (
+                "args",
+                Json::Arr(vec![Json::i(t.entry_sp as i64), Json::i(8)]),
+            ),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "launch ok"
+    );
+    // Break at the function body (line 2) — the data segment holds total = 42 at entry.
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s(&path))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(2))])]),
+            ),
+        ]),
+    ));
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert!(event(&out, "stopped").is_some(), "stops in add()");
+
+    // The global appears in the frame's Variables (it's GLOBAL_SCOPE → visible in every frame).
+    let out = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let frame_id = response(&out)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        6,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(frame_id))]),
+    ));
+    let scope_ref = response(&out)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let out = s.handle(&req(
+        7,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(scope_ref))]),
+    ));
+    let resp = response(&out);
+    let names: Vec<&str> = resp
+        .get("body")
+        .unwrap()
+        .get("variables")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"total"),
+        "the global appears in the Variables pane: {names:?}"
+    );
+
+    // evaluate reads the global by name → its initial data-segment value.
+    let out = s.handle(&req(
+        8,
+        "evaluate",
+        Json::obj(vec![
+            ("expression", Json::s("total")),
+            ("frameId", Json::i(frame_id)),
+        ]),
+    ));
+    let r = response(&out);
+    assert_eq!(
+        r.get("success"),
+        Some(&Json::Bool(true)),
+        "evaluate succeeds"
+    );
+    assert_eq!(
+        r.get("body")
+            .unwrap()
+            .get("result")
+            .and_then(|v| v.as_str()),
+        Some("42"),
+        "total reads its initial value globally"
+    );
+}

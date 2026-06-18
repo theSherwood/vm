@@ -1255,7 +1255,7 @@ impl Inspector {
             let var = di
                 .vars
                 .iter()
-                .find(|x| x.func == frame.func && x.name == name)?;
+                .find(|x| var_in_scope(x.func, frame.func) && x.name == name)?;
             // Resolve a location list (S2) at the frame's current pc (nearest-preceding within the
             // stopped block). `None` ⇒ no covering entry, the var isn't live here.
             let resolve = |locs: &[SsaLoc]| loclist_value(locs, frame.block, frame.inst);
@@ -1289,6 +1289,8 @@ impl Inspector {
                     let base_val = frame.vals.get(resolve(base)? as usize)?;
                     window_read(as_i64(*base_val).ok()? as u64, *off)
                 }
+                // A module-scoped global at a fixed absolute window address (frame-independent).
+                VarLoc::Fixed { addr } => window_read(*addr, 0),
             }
         })
         .flatten()
@@ -1309,13 +1311,14 @@ impl Inspector {
             let var = di
                 .vars
                 .iter()
-                .find(|x| x.func == frame.func && x.name == name)?;
+                .find(|x| var_in_scope(x.func, frame.func) && x.name == name)?;
             let base = match &var.loc {
                 VarLoc::Window { off } => as_i64(*frame.vals.first()?).ok()? as u64 + *off as u64,
                 VarLoc::WindowVia { base, off } => {
                     let idx = loclist_value(base, frame.block, frame.inst)?;
                     as_i64(*frame.vals.get(idx as usize)?).ok()? as u64 + *off as u64
                 }
+                VarLoc::Fixed { addr } => *addr,
                 VarLoc::Ssa { .. } | VarLoc::SsaList(_) => return None,
             };
             Some(base)
@@ -10308,6 +10311,12 @@ fn as_i64(v: Value) -> Result<i64, Trap> {
         Value::I64(x) => Ok(x),
         _ => Err(Trap::Malformed),
     }
+}
+
+/// Whether a variable scoped to `var_func` is visible in a frame of function `frame_func`: its own
+/// function, or a [`svm_ir::GLOBAL_SCOPE`] module-scoped global (visible in every frame).
+fn var_in_scope(var_func: u32, frame_func: u32) -> bool {
+    var_func == frame_func || var_func == svm_ir::GLOBAL_SCOPE
 }
 
 /// Resolve a debug-info location list (`SsaList` / `WindowVia` base) at pc `(block, inst)`: the

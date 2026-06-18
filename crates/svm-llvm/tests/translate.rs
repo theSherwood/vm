@@ -2577,3 +2577,71 @@ int scaled(int n) {
         "n reads the arg"
     );
 }
+
+/// The §6 **module-scoped global** half (DEBUGGING.md slice 28): a source-level global variable is
+/// ingested from its `!dbg` `DIGlobalVariableExpression` as a `GLOBAL_SCOPE` `VarLoc::Fixed` var at
+/// the global's window address (correlated by symbol name to the globals layout) — visible in every
+/// frame, with its structured type. Reads back its data-segment value at runtime.
+#[test]
+fn llvm_ingests_source_globals_as_fixed_vars() {
+    use svm_interp::{Inspector, IrPc, Stop, VarValue};
+    use svm_ir::{TypeDef, VarLoc};
+
+    let src = "\
+int counter = 7;
+struct P { int a; int b; } origin = { 3, 4 };
+int bump(int n) { counter = counter + n; return counter + origin.a; }
+";
+    let Some(bc) = compile_to_bc_o0g("globals", src) else {
+        return; // toolchain unavailable — skip
+    };
+    let t = svm_llvm::translate_bc_path(&bc).expect("translate bitcode");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let di = t.module.debug_info.as_ref().expect("debug info");
+
+    let g = |n: &str| {
+        di.vars
+            .iter()
+            .find(|v| v.name == n && v.func == svm_ir::GLOBAL_SCOPE)
+            .unwrap_or_else(|| panic!("global {n} ingested"))
+    };
+    // `counter` is a fixed-address int global; `origin` a fixed-address struct (expandable).
+    let counter = g("counter");
+    let VarLoc::Fixed { addr: counter_addr } = counter.loc else {
+        panic!("counter is Fixed, got {:?}", counter.loc);
+    };
+    assert!(matches!(
+        &di.types[counter.type_id.expect("typed") as usize],
+        TypeDef::Base { size: 4, .. }
+    ));
+    let origin = g("origin");
+    assert!(matches!(origin.loc, VarLoc::Fixed { .. }));
+    assert!(matches!(
+        &di.types[origin.type_id.expect("typed") as usize],
+        TypeDef::Aggregate { name, .. } if name == "struct P"
+    ));
+    assert_ne!(counter_addr, 0, "a real window address");
+
+    // Runtime: at `bump`'s entry the data segment holds counter = 7; read it through the global.
+    let args = [Value::I64(t.entry_sp as i64), Value::I32(10)];
+    let mut insp = Inspector::attach(&t.module, 0, &args, 50_000_000);
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 0,
+    });
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { .. }),
+        "stopped at entry"
+    );
+    let read_i32 = |insp: &Inspector| match insp.read_var(0, "counter", 4) {
+        Some(VarValue::Bytes(b)) => i32::from_le_bytes(b[..4].try_into().unwrap()),
+        other => panic!("expected window bytes, got {other:?}"),
+    };
+    assert_eq!(
+        read_i32(&insp),
+        7,
+        "counter's initial value, read globally at entry"
+    );
+}

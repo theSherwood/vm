@@ -376,6 +376,10 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
                 }
                 write_sleb(out, *off);
             }
+            VarLoc::Fixed { addr } => {
+                out.push(4);
+                write_uleb(out, *addr);
+            }
         }
         match v.type_id {
             None => out.push(0),
@@ -1509,6 +1513,7 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
                     off: c.sleb()?,
                 }
             }
+            4 => VarLoc::Fixed { addr: c.uleb()? },
             b => return Err(DecodeError::BadVarLoc(b)),
         };
         let type_id = match c.byte()? {
@@ -2180,6 +2185,15 @@ mod debug_tests {
                         ],
                         off: -8,
                     },
+                    type_id: Some(0),
+                },
+                // A module-scoped global at a fixed absolute window address (the GLOBAL_SCOPE
+                // sentinel func + Fixed loc).
+                VarInfo {
+                    func: svm_ir::GLOBAL_SCOPE,
+                    name: "counter".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::Fixed { addr: 64 },
                     type_id: Some(0),
                 },
             ],

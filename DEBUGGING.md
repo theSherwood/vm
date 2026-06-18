@@ -1244,6 +1244,25 @@ frontend's debug output is fully DAP-inspectable, the same as chibicc's and wasm
 new `svm-dap` dev-dep on the LLVM-only lane): a `-O0 -g` `struct Point` guest stops at its `return`
 line and expands to `x=5, y=6`, with `evaluate` yielding `11`.
 
+**Slice 28 — module-scoped globals (a schema-level waist extension across all consumers).** Source
+**global** variables don't fit the function-scoped, data-SP-relative local model, so the §6 waist
+gains two small, frontend-neutral primitives: a `VarLoc::Fixed { addr }` (an *absolute* window
+address, not `data-SP + off`) and a `GLOBAL_SCOPE` sentinel `VarInfo::func` (`u32::MAX`, visible in
+*every* frame). These thread through the whole stack — `svm-ir` (the variant + sentinel), `svm-encode`
+(tag 4), `svm-text` (`debug.var global "<n>" fixed <addr>`, in both the parser **and** the
+header-prescan), `svm-interp` (`read_var`/`var_addr` resolve `Fixed`; a `var_in_scope` helper ORs the
+sentinel into every lookup), and `svm-dap` (globals show in each frame's Variables pane and resolve in
+`evaluate`). The LLVM producer then reads each global's `!dbg` `DIGlobalVariableExpression` (via a
+direct `llvm-sys` walk — `LLVMGlobalCopyAllMetadata` → `DIGlobalVariable`, op 1 = name / op 3 = type)
+and correlates it by **symbol name** to `globals_layout`'s window address → a `Fixed` global with its
+structured type. So a C guest's `int counter`/`struct P origin` are inspectable by name in any frame.
+Because the primitives live in the neutral core, **chibicc and wasm get globals for free** the moment
+they emit them. Tests: the schema round-trips a `Fixed`/`global` var through text **and** binary; an
+LLVM `-O0 -g` guest ingests `counter` (a `Fixed` int reading its data-segment `7`) and `origin` (a
+`Fixed` `struct P`), and over DAP a global **appears in the Variables pane** and **`evaluate("total")`
+reads `42`**. *Not yet:* lexical-scope narrowing (globals are whole-module; a header `static` shadowed
+by a local would need scope ranges — the §6 design's deferred `IrPc`-range scopes).
+
 ### Open questions (S4/S5/S2)
 
 - *Probe dispatch in the hot loop*: monomorphized generic (`Probe` type param on `run_inner`)

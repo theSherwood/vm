@@ -375,6 +375,23 @@ fn translate_impl(m: &LModule, di: Option<&di::LlvmDebug>) -> Result<Translated,
         funcs.push(func);
     }
 
+    // §6 module-scoped globals: a source global at a fixed window address. The `di` reader gives the
+    // LLVM symbol; `globals_layout` placed it at `globals[symbol]`, so emit a `GLOBAL_SCOPE`
+    // `VarLoc::Fixed` var (visible in every frame). A global with no laid-out address is skipped.
+    if let Some(di) = di {
+        for gv in &di.globals {
+            if let Some(&addr) = globals.get(&gv.symbol) {
+                dbg.vars.push(VarInfo {
+                    func: svm_ir::GLOBAL_SCOPE,
+                    name: gv.name.clone(),
+                    ty: gv.ty.clone(),
+                    loc: VarLoc::Fixed { addr },
+                    type_id: gv.type_id,
+                });
+            }
+        }
+    }
+
     // The window: globals low, then the data stack from `entry_sp` growing up; `mapped` covers the
     // globals plus a stack reserve, with a faulting guard beyond (reserved > mapped, §5). Declared if
     // any function uses the data stack, the module has globals, or it uses the powerbox (the handle

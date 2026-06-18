@@ -68,12 +68,24 @@ pub struct DiVar {
     pub ty: String,
 }
 
-/// The reader's result: a structured `types` table (the §6 `TypeDef` graph) plus the per-function
-/// variable lists, keyed by LLVM function name (= the translator's `Function::name`).
+/// A module-scoped source global recovered from a global's `!dbg` `DIGlobalVariableExpression`:
+/// its source `name`, the LLVM `symbol` (the correlation key into the translator's globals layout →
+/// a window address), and its structured [`TypeId`].
+pub struct DiGlobal {
+    pub symbol: String,
+    pub name: String,
+    pub type_id: Option<TypeId>,
+    pub ty: String,
+}
+
+/// The reader's result: a structured `types` table (the §6 `TypeDef` graph), the per-function local
+/// variable lists (keyed by LLVM function name = the translator's `Function::name`), and the
+/// module-scoped globals.
 #[derive(Default)]
 pub struct LlvmDebug {
     pub types: Vec<TypeDef>,
     pub vars: HashMap<String, Vec<DiVar>>,
+    pub globals: Vec<DiGlobal>,
 }
 
 /// Read the `-g` debug variables/types from a bitcode file, or `None` when the module carries no
@@ -115,7 +127,8 @@ unsafe fn read_debug_unsafe(path: &str) -> Option<LlvmDebug> {
             }
             f = LLVMGetNextFunction(f);
         }
-        if out.vars.is_empty() {
+        out.globals = read_globals(ctx, module, &mut out.types, &mut interner);
+        if out.vars.is_empty() && out.globals.is_empty() {
             None
         } else {
             Some(out)
@@ -213,6 +226,66 @@ unsafe fn read_function_vars(
         });
     });
     vars
+}
+
+/// Walk the module's global variables, recovering each source global with a `!dbg`
+/// `DIGlobalVariableExpression` (name + structured type). The LLVM symbol name correlates to the
+/// translator's globals layout (→ a window address); the source name is from the `DIGlobalVariable`.
+unsafe fn read_globals(
+    ctx: LLVMContextRef,
+    module: LLVMModuleRef,
+    types: &mut Vec<TypeDef>,
+    interner: &mut HashMap<usize, TypeId>,
+) -> Vec<DiGlobal> {
+    let dbg_kind = LLVMGetMDKindID(c"dbg".as_ptr(), 3);
+    let mut out = Vec::new();
+    let mut g = LLVMGetFirstGlobal(module);
+    while !g.is_null() {
+        let symbol = value_name(g);
+        if symbol.is_empty() {
+            g = LLVMGetNextGlobal(g);
+            continue;
+        }
+        let mut n = 0usize;
+        let entries = LLVMGlobalCopyAllMetadata(g, &mut n);
+        for i in 0..n {
+            if LLVMValueMetadataEntriesGetKind(entries, i as u32) != dbg_kind {
+                continue;
+            }
+            let gve = LLVMValueMetadataEntriesGetMetadata(entries, i as u32);
+            if gve.is_null()
+                || !matches!(
+                    LLVMGetMetadataKind(gve),
+                    LLVMMetadataKind::LLVMDIGlobalVariableExpressionMetadataKind
+                )
+            {
+                continue;
+            }
+            // `DIGlobalVariableExpression` → its `DIGlobalVariable` (op 1 = name, op 3 = type, the
+            // same layout as `DILocalVariable`).
+            let var = LLVMDIGlobalVariableExpressionGetVariable(gve);
+            if var.is_null() {
+                continue;
+            }
+            let name = op_string(ctx, var, 1).unwrap_or_else(|| symbol.clone());
+            let type_id = op_md(ctx, var, 3).and_then(|t| intern_type(ctx, t, types, interner));
+            let ty = type_id
+                .map(|id| render_name(&types[id as usize]))
+                .unwrap_or_else(|| "void".to_string());
+            out.push(DiGlobal {
+                symbol: symbol.clone(),
+                name,
+                type_id,
+                ty,
+            });
+            break; // one DI global per symbol
+        }
+        if !entries.is_null() {
+            LLVMDisposeValueMetadataEntries(entries);
+        }
+        g = LLVMGetNextGlobal(g);
+    }
+    out
 }
 
 /// Recursively intern a `DIType` metadata node into the §6 `TypeDef` graph, returning its index.
