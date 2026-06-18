@@ -213,8 +213,16 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
 ## Phase tracker
 
 - [x] **Phase 0** — contained in-place wins (PR #52). alu ~319 → ~66 ns (~5×).
-- [~] **Phase 1** — compile pass + resolved bytecode (shape A) + equality harness.
-      ROI spike done (~3.5× on ALU, `bytecode_spike.rs`); full seam-preserving integration next.
+- [~] **Phase 1** — compile pass + resolved bytecode + equality harness.
+  - [x] ROI spike (`bytecode_spike.rs`): ~3.5× ALU, ~3.0× call.
+  - [x] **Slice 1b** — production compiler + register-window executor (`svm-interp/src/bytecode.rs`,
+        scalar + memory + direct-call subset) + equality harness (`crates/svm/tests/bytecode_diff.rs`,
+        exact-equality on 4000 generated modules + kernels). Standalone `compile_and_run` path, not
+        yet the default. Perf vs the tree-walker: alu 1.46×, call 1.76×, mem 1.13× (uses 16-byte
+        `Reg` + per-op fuel, so below the raw-`i64` spike; slot narrowing + mem fast-path are later).
+  - [ ] **Slice 1c** — switch the default path over, re-expressing the seams (debug/`IrPc`, fibers,
+        threads, durability, capabilities, scheduler preemption, fault rewind) + the full op set
+        (SIMD, call_indirect, tail calls, host/fiber ops).
 - [ ] **Phase 2** — memory-op specialization + software fast-path.
 - [ ] **Phase 3** — per-op seam overhead (fuel-at-back-edges if provably safe; debug/preempt hoist).
 - [ ] **Phase 4** — (stretch) fully flat bytecode + threaded dispatch.
