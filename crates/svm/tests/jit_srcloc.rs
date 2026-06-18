@@ -523,3 +523,48 @@ fn jit_emits_variable_loclists_matching_the_value_locations() {
     // produces no location lists.
     assert!(compile(COMPUTE_DBG).debug_loc_section().is_empty());
 }
+
+#[test]
+fn jit_emits_debug_frame_cfi_for_unwinding() {
+    // Stage 4a: a `.debug_frame` whose CIE carries the frame-pointer unwind rules and whose single
+    // FDE covers the function — what lets gdb unwind a stopped JIT frame (`bt`) and compute the CFA
+    // the subprograms' `DW_AT_frame_base` refers to. Validated structurally here (the readers have no
+    // CFI parser); the real `bt` check is the `gdb_attach` example under gdb (DEBUGGING.md §7, 4a).
+    let cm = compile(VAR_DBG);
+    let f = cm.debug_frame_section();
+    assert!(!f.is_empty(), "a -g module emits .debug_frame");
+
+    // CIE: length, CIE_id sentinel, v4, empty augmentation, 8-byte addresses.
+    let cie_len = u32::from_le_bytes(f[0..4].try_into().unwrap()) as usize;
+    assert_eq!(&f[4..8], &[0xff, 0xff, 0xff, 0xff], "CIE_id sentinel");
+    assert_eq!(f[8], 4, "CIE version 4");
+    assert_eq!(f[9], 0, "empty augmentation");
+    assert_eq!(f[10], 8, "address_size");
+    assert_eq!(f[11], 0, "segment selector size");
+    let cie_end = 4 + cie_len;
+    // The CIE must define the frame-pointer CFA: DW_CFA_def_cfa r6 (rbp), offset 16.
+    assert!(
+        f[..cie_end].windows(3).any(|w| w == [0x0c, 0x06, 0x10]),
+        "CIE defines CFA = rbp + 16"
+    );
+
+    // One FDE (one function), referencing the CIE at offset 0 and covering the function's extent.
+    let fde = &f[cie_end..];
+    let fde_len = u32::from_le_bytes(fde[0..4].try_into().unwrap()) as usize;
+    assert_eq!(
+        &fde[4..8],
+        &[0, 0, 0, 0],
+        "FDE CIE_pointer → CIE at offset 0"
+    );
+    let lo = u64::from_le_bytes(fde[8..16].try_into().unwrap());
+    let range = u64::from_le_bytes(fde[16..24].try_into().unwrap());
+    let exp_lo = cm.src_ranges().iter().map(|r| r.lo).min().unwrap();
+    let exp_hi = cm.src_ranges().iter().map(|r| r.hi).max().unwrap();
+    assert_eq!(lo, exp_lo, "FDE starts at the function's low_pc");
+    assert_eq!(range, exp_hi - exp_lo, "FDE spans the function extent");
+    assert_eq!(cie_end + 4 + fde_len, f.len(), "exactly one CIE + one FDE");
+
+    // A non-`-g` module emits no frame info.
+    let bare = compile("func (i32) -> (i32) {\nblock0(v0: i32):\n  return v0\n}\n");
+    assert!(bare.debug_frame_section().is_empty());
+}

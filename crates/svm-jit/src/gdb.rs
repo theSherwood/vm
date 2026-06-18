@@ -75,6 +75,7 @@ fn push_shdr(
 /// and a `.symtab`/`.strtab` naming one `STT_FUNC` per function at its real `[lo, hi)` so a stop
 /// in JIT'd code resolves to a function even before the DWARF is consulted. `funcs` is `(func index,
 /// lo, hi)` (absolute machine addresses); `[code_base, code_base + code_size)` spans them all.
+#[allow(clippy::too_many_arguments)]
 pub fn build_elf(
     code_base: u64,
     code_size: u64,
@@ -83,6 +84,7 @@ pub fn build_elf(
     debug_abbrev: &[u8],
     debug_line: &[u8],
     debug_loc: &[u8],
+    debug_frame: &[u8],
 ) -> Vec<u8> {
     // Section name string table (`.shstrtab`): a leading NUL, then each name NUL-terminated. Record
     // each name's offset for the headers.
@@ -92,12 +94,13 @@ pub fn build_elf(
         ".debug_info",
         ".debug_line",
         ".debug_loc",
+        ".debug_frame",
         ".symtab",
         ".strtab",
         ".shstrtab",
     ];
     let mut shstrtab = vec![0u8];
-    let mut name_off = [0u32; 8];
+    let mut name_off = [0u32; 9];
     for (i, n) in names.iter().enumerate() {
         name_off[i] = shstrtab.len() as u32;
         shstrtab.extend_from_slice(n.as_bytes());
@@ -135,6 +138,7 @@ pub fn build_elf(
     let (info_off, info_sz) = off(&mut body, debug_info);
     let (line_off, line_sz) = off(&mut body, debug_line);
     let (loc_off, loc_sz) = off(&mut body, debug_loc);
+    let (frame_off, frame_sz) = off(&mut body, debug_frame);
     let (sym_off, sym_sz) = off(&mut body, &symtab);
     let (str_off, str_sz) = off(&mut body, &strtab);
     let (shstr_off, shstr_sz) = off(&mut body, &shstrtab);
@@ -144,8 +148,8 @@ pub fn build_elf(
         body.push(0);
     }
     let shoff = (EHDR_LEN + body.len()) as u64;
-    let shnum: u16 = 9; // NULL + .text + 4×debug + symtab + strtab + shstrtab
-    let shstrndx: u16 = 8;
+    let shnum: u16 = 10; // NULL + .text + 5×debug + symtab + strtab + shstrtab
+    let shstrndx: u16 = 9;
 
     // --- ELF header ---
     let mut out = Vec::with_capacity(EHDR_LEN + body.len() + shnum as usize * SHDR_LEN);
@@ -241,19 +245,32 @@ pub fn build_elf(
     push_shdr(
         &mut out,
         name_off[5],
+        SHT_PROGBITS,
+        0,
+        0,
+        frame_off,
+        frame_sz,
+        0,
+        0,
+        1,
+        0,
+    ); // [6] .debug_frame
+    push_shdr(
+        &mut out,
+        name_off[6],
         SHT_SYMTAB,
         0,
         0,
         sym_off,
         sym_sz,
-        7,                                                     // sh_link → .strtab (section 7)
+        8,                                                     // sh_link → .strtab (section 8)
         (sym_sz / SYM_LEN as u64) as u32 - funcs.len() as u32, // sh_info: first global = local count (just the null symbol)
         8,
         SYM_LEN as u64,
-    ); // [6] .symtab
+    ); // [7] .symtab
     push_shdr(
         &mut out,
-        name_off[6],
+        name_off[7],
         SHT_STRTAB,
         0,
         0,
@@ -263,10 +280,10 @@ pub fn build_elf(
         0,
         1,
         0,
-    ); // [7] .strtab
+    ); // [8] .strtab
     push_shdr(
         &mut out,
-        name_off[7],
+        name_off[8],
         SHT_STRTAB,
         0,
         0,
@@ -276,7 +293,7 @@ pub fn build_elf(
         0,
         1,
         0,
-    ); // [8] .shstrtab
+    ); // [9] .shstrtab
 
     out
 }

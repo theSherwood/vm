@@ -774,10 +774,31 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     a `debug.var`). Vars the optimizer dropped correctly show `<optimized out>` (faithful native
     behavior — the interpreter tier stays the always-faithful inspection fallback). *Effort (whole
     stage): high.*
-- [ ] **Stage 4 — W3-JIT unwind / backtrace.** Emit Cranelift unwind info; walk the out-of-band
-  control stack rooted at a **fiber handle** (not the OS thread — §23/D57 migratable fibers) to
-  materialize a per-fiber call stack with source frames. *Acceptance:* `bt` in gdb shows the guest
-  call stack with source. *Effort: med–high.*
+- [~] **Stage 4 — W3-JIT unwind / backtrace. — `bt` works (4a done); CFA-var + fiber walk pending.**
+  Emit Cranelift unwind info as DWARF CFI so gdb can unwind JIT'd frames (`bt`) and compute the CFA
+  (which also lights up the deferred Stage 3 `CfaOffset`/frame-relative variable locations). The
+  fiber-rooted walk (§23/D57 migratable fibers) is the runtime-specific finale. ✅ **`bt` across guest
+  frames with source confirmed under gdb 15.1.**
+  - [x] **4a — `.debug_frame` CFI + `DW_AT_frame_base`. — built.** `dwarf::debug_frame` hand-rolls a
+    `.debug_frame` (one DWARF v4 CIE with the steady-state frame-pointer rules — CFA = `rbp+16`,
+    return address at CFA−8, saved `rbp` at CFA−16, valid because `preserve_frame_pointers=true` gives
+    every function a uniform `rbp` frame — plus one FDE per function over its `[lo, hi)`); the GDB-JIT
+    ELF gains a `.debug_loc`+`.debug_frame` (now 10 sections), and every subprogram carries
+    `DW_AT_frame_base = DW_OP_call_frame_cfa`. ✅ **Confirmed under gdb 15.1:** breaking in a callee
+    `fn1` and running `bt` walks the **guest call stack with source** — `#0 fn1 () at two.c:9` /
+    `#1 … in fn0 () at two.c:3` — across a real guest `call`. CI (`jit_srcloc.rs`): the CIE rules +
+    one-FDE-per-function structure validated byte-wise; `readelf --debug-dump=frames` parses it
+    (`DW_CFA_def_cfa: r6 (rbp) ofs 16`, FDE over the function). (The steady-state CIE is inexact only
+    in the 1–2-instruction prologue window — fine for body breakpoints; precise per-prologue CFI would
+    need Cranelift's private instruction list or `gimli`. The unwind stops at the host boundary: the
+    buffer-ABI trampoline has no FDE, which is expected — the *guest* stack is what unwinds.)
+  - [ ] **4b — light up the deferred Stage 3 locations.** With a frame base now defined, emit the
+    `CfaOffset` variable ranges (Stage 3a) as `DW_OP_fbreg`, and the `Window`/`Fixed` memory forms via
+    the window-base register (label `mem_base` like a variable, then `DW_OP_breg{mem} + off`).
+  - [ ] **4c — fiber-rooted backtrace.** Walk the out-of-band control stack rooted at a **fiber
+    handle** (not the OS thread — §23/D57 migratable fibers) to materialize a per-fiber call stack
+    with source frames across suspend/resume boundaries. *Acceptance:* `bt` shows the guest call stack
+    with source for a suspended fiber. *Effort (whole stage): med–high.*
 - [ ] **Stage 5 — DAP-over-JIT (optional; editor parity at native speed).** Either drive the JIT
   under `svm-dap` (breakpoints via software `int3` patching or single-step over DWARF line
   boundaries) so VS Code debugs native-speed code, **or** keep the interpreter as the DAP stepping

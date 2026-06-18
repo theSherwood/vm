@@ -110,6 +110,7 @@ const DW_TAG_SUBPROGRAM: u64 = 0x2e;
 const DW_TAG_VARIABLE: u64 = 0x34;
 const DW_AT_LOCATION: u64 = 0x02;
 const DW_AT_NAME: u64 = 0x03;
+const DW_AT_FRAME_BASE: u64 = 0x40;
 const DW_AT_BYTE_SIZE: u64 = 0x0b;
 const DW_AT_STMT_LIST: u64 = 0x10;
 const DW_AT_LOW_PC: u64 = 0x11;
@@ -125,6 +126,7 @@ const DW_FORM_STRING: u64 = 0x08;
 const DW_FORM_UDATA: u64 = 0x0f;
 const DW_FORM_REF4: u64 = 0x13;
 const DW_FORM_SEC_OFFSET: u64 = 0x17;
+const DW_FORM_EXPRLOC: u64 = 0x18;
 
 // DWARF base-type encodings (`DW_ATE_*`) — the inverse of `dwarf_info`'s `encoding` byte.
 const DW_ATE_BOOLEAN: u8 = 0x02;
@@ -135,6 +137,14 @@ const DW_ATE_UNSIGNED: u8 = 0x07;
 // DWARF location-expression opcodes (Stage 3c variable locations).
 const DW_OP_REG0: u8 = 0x50; // `DW_OP_reg0`..`DW_OP_reg31` name registers 0..31 directly
 const DW_OP_REGX: u8 = 0x90; // `DW_OP_regx <uleb>` for register numbers ≥ 32
+const DW_OP_CALL_FRAME_CFA: u8 = 0x9c; // the subprogram frame base (Stage 4a): the CFI-computed CFA
+
+// DWARF call-frame (CFI) constants for the `.debug_frame` we emit (Stage 4a). x86-64 DWARF register
+// numbers: `rbp` = 6, return-address column = 16.
+const DW_CFA_DEF_CFA: u8 = 0x0c; // def_cfa(reg, offset)
+const DW_CFA_OFFSET: u8 = 0x80; // `| reg` — saved at CFA + factored_offset*data_align
+const DWREG_RBP: u8 = 6;
+const DWREG_RA: u8 = 16;
 
 /// The single-opcode location expression naming DWARF register `reg` (where a value currently
 /// lives) — `DW_OP_reg{N}` for the low registers, else `DW_OP_regx <reg>`.
@@ -210,7 +220,8 @@ fn abbrev_table() -> Vec<u8> {
             (DW_AT_STMT_LIST, DW_FORM_SEC_OFFSET),
         ],
     );
-    // Subprogram: name + low_pc + high_pc (DWARF4 offset form). Children (Stage 3c adds var DIEs).
+    // Subprogram: name + low_pc + high_pc (DWARF4 offset form) + frame_base (= the CFI CFA, Stage 4a,
+    // so frame-relative variable locations resolve). Children (Stage 3c var DIEs).
     entry(
         ABBR_SUBPROGRAM,
         DW_TAG_SUBPROGRAM,
@@ -219,6 +230,7 @@ fn abbrev_table() -> Vec<u8> {
             (DW_AT_NAME, DW_FORM_STRING),
             (DW_AT_LOW_PC, DW_FORM_ADDR),
             (DW_AT_HIGH_PC, DW_FORM_DATA8),
+            (DW_AT_FRAME_BASE, DW_FORM_EXPRLOC),
         ],
     );
     entry(
@@ -392,6 +404,10 @@ pub fn debug_info(
         dw_str(&mut dies, &format!("fn{func}")); // DW_AT_name (synthesized)
         dies.extend_from_slice(&lo.to_le_bytes()); // DW_AT_low_pc (8-byte address)
         dies.extend_from_slice(&hi.saturating_sub(lo).to_le_bytes()); // DW_AT_high_pc (offset)
+                                                                      // DW_AT_frame_base = DW_OP_call_frame_cfa (a 1-byte expression): the frame base is the CFA
+                                                                      // the `.debug_frame` CFI computes, so `DW_OP_fbreg` variable locations resolve (Stage 4a/4b).
+        uleb(&mut dies, 1);
+        dies.push(DW_OP_CALL_FRAME_CFA);
 
         for v in vars.iter().filter(|v| v.func == func) {
             // A location list for the register-resident ranges (the only kind expressible without
@@ -467,4 +483,57 @@ fn emit_loclist(loc: &mut Vec<u8>, ranges: &[VarRange]) -> Option<u32> {
     loc.extend_from_slice(&0u64.to_le_bytes());
     loc.extend_from_slice(&0u64.to_le_bytes());
     Some(off)
+}
+
+/// Finalize one `.debug_frame` entry: pad the post-length `content` with `DW_CFA_nop` so the whole
+/// entry (the 4-byte length + content) is 8-byte aligned (the addressing-unit boundary CFI entries
+/// must start on), then write `length || content`.
+fn frame_entry(out: &mut Vec<u8>, mut content: Vec<u8>) {
+    while !(4 + content.len()).is_multiple_of(8) {
+        content.push(0); // DW_CFA_nop
+    }
+    out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+    out.extend_from_slice(&content);
+}
+
+/// Emit a `.debug_frame` (DWARF v4 CFI) describing the JIT's uniform frame-pointer frame so gdb can
+/// unwind a stopped JIT frame (`bt`) and compute the CFA (the subprogram frame base — Stage 4a). One
+/// CIE carries the steady-state rules — CFA = `rbp + 16`, return address saved at CFA−8, caller
+/// `rbp` at CFA−16 — which hold throughout every function body because `preserve_frame_pointers`
+/// gives each one a `push rbp; mov rbp, rsp` frame; one FDE per function applies them over `[lo,
+/// hi)`. The rules are inexact only in the 1–2-instruction prologue/epilogue window (before `rbp` is
+/// established), which source-line breakpoints never land in; precise per-prologue CFI would need
+/// Cranelift's private instruction list or `gimli`.
+pub fn debug_frame(funcs: &[(u32, u64, u64)]) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    // CIE at offset 0 (FDEs reference it by that offset).
+    let mut cie = Vec::new();
+    cie.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // CIE_id — marks a CIE in `.debug_frame`
+    cie.push(4); // version
+    cie.push(0); // augmentation: "" (empty, NUL-terminated)
+    cie.push(8); // address_size
+    cie.push(0); // segment_selector_size
+    uleb(&mut cie, 1); // code_alignment_factor
+    sleb(&mut cie, -8); // data_alignment_factor
+    uleb(&mut cie, DWREG_RA as u64); // return_address_register
+                                     // Initial instructions: the steady-state frame-pointer rules.
+    cie.push(DW_CFA_DEF_CFA);
+    uleb(&mut cie, DWREG_RBP as u64);
+    uleb(&mut cie, 16); // CFA = rbp + 16
+    cie.push(DW_CFA_OFFSET | DWREG_RA);
+    uleb(&mut cie, 1); // return address at CFA + 1*(-8) = CFA − 8
+    cie.push(DW_CFA_OFFSET | DWREG_RBP);
+    uleb(&mut cie, 2); // caller rbp at CFA + 2*(-8) = CFA − 16
+    frame_entry(&mut out, cie);
+
+    // One FDE per function, applying the CIE rules over the function's machine extent.
+    for &(_, lo, hi) in funcs {
+        let mut fde = Vec::new();
+        fde.extend_from_slice(&0u32.to_le_bytes()); // CIE_pointer → the CIE at offset 0
+        fde.extend_from_slice(&lo.to_le_bytes()); // initial_location
+        fde.extend_from_slice(&hi.saturating_sub(lo).to_le_bytes()); // address_range
+        frame_entry(&mut out, fde);
+    }
+    out
 }

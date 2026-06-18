@@ -1370,6 +1370,17 @@ impl CompiledModule {
         self.synth_debug_info().2
     }
 
+    /// The synthesized DWARF `.debug_frame` CFI (W5 JIT/DWARF Stage 4a): one CIE with the JIT's
+    /// uniform frame-pointer unwind rules + one FDE per function, so gdb can unwind a stopped JIT
+    /// frame (`bt`) and compute the CFA the subprograms' `DW_AT_frame_base` refers to. Empty without
+    /// `-g`.
+    pub fn debug_frame_section(&self) -> Vec<u8> {
+        if self.src_ranges.is_empty() {
+            return Vec::new();
+        }
+        dwarf::debug_frame(&self.func_extents())
+    }
+
     /// Each function's machine `[low_pc, high_pc)` extent, derived as the span (min `lo`, max `hi`)
     /// of its source-mapped ranges, sorted by start address. The basis for both the `.debug_info`
     /// subprograms (Stage 2b) and the ELF `.symtab`/`.text` extent (Stage 2c). Empty without `-g`.
@@ -1402,6 +1413,7 @@ impl CompiledModule {
         let code_end = funcs.iter().map(|f| f.2).max().unwrap_or(0);
         let (info, abbrev, loc) = self.synth_debug_info();
         let line = self.debug_line_section();
+        let frame = self.debug_frame_section();
         gdb::build_elf(
             code_base,
             code_end.saturating_sub(code_base),
@@ -1410,6 +1422,7 @@ impl CompiledModule {
             &abbrev,
             &line,
             &loc,
+            &frame,
         )
     }
 
