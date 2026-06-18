@@ -95,8 +95,12 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
         block0(v0: i64, v1: i64):\n\
         \x20 v2 = i32.wrap_i64 v1\n\
         \x20 v3 = cap.call 13 0 () -> (i64) v2 ()\n\
-        \x20 return v3\n\
+        \x20 v4 = suspend v3\n\
+        \x20 return v4\n\
         }\n";
+    // The fibers `suspend` (rather than return) so both stay concurrently live in their own slots —
+    // otherwise §12.8 recycling step 3 would reclaim fiber A's finished slot for fiber B, routing B
+    // into A's region (context 1) instead of a distinct one (context 2).
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
 

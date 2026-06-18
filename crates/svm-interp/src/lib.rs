@@ -3671,9 +3671,14 @@ fn vcpu_shadow_context(nth: usize, fibers: usize) -> Option<usize> {
 /// its former occupant (the ABA guard the JIT's `Ownership` word already carries internally).
 const FIBER_GEN_SHIFT: u32 = 16;
 
-/// Encode a fiber guest handle from its registry `slot` and `generation`.
+/// The generation bits a fiber guest handle carries (the field above the slot): the handle conveys
+/// only the low 16 bits of a slot's full generation, so a stale handle is rejected modulo `2^16` (a
+/// vast ABA window — recycling step 3). Matches `svm_jit`'s `FIBER_HANDLE_GEN_MASK`.
+const FIBER_GEN_MASK: u32 = (1 << 16) - 1;
+
+/// Encode a fiber guest handle from its registry `slot` and `generation` (low 16 bits).
 fn fiber_handle(slot: usize, generation: u32) -> i32 {
-    ((generation << FIBER_GEN_SHIFT) | slot as u32) as i32
+    (((generation & FIBER_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u32) as i32
 }
 
 /// The generation field a guest fiber handle carries (the high bits above the slot).
@@ -3832,9 +3837,13 @@ struct RegState {
     shadow: Vec<u64>,
     /// Per-slot **generation** (recycling step 1): bumped when a slot is freed for reuse, and carried
     /// in the guest handle's high bits ([`FIBER_GEN_SHIFT`]) so a stale handle to a slot's former
-    /// occupant is rejected on `claim`. Grows with `fibers`/`shadow` (same index). All 0 until slot
-    /// recycling is wired (step 3), so a handle is exactly its slot — unchanged behavior.
+    /// occupant is rejected on `claim`. Grows with `fibers`/`shadow` (same index).
     gens: Vec<u32>,
+    /// Freed slots reclaimable for a new fiber (recycling step 3), a **min-heap** so `create` reuses the
+    /// *lowest* free slot — keeping contexts dense and low (within `MAX_SHADOW_CTX`, and clear of the
+    /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
+    /// lifetime total. A finished slot's generation is already bumped, so reuse is ABA-safe.
+    free: BinaryHeap<Reverse<usize>>,
     /// Count of durable vCPU contexts handed out (slice 3.2.2): the root spawns children that grow
     /// **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1, so this counter (with
     /// `fibers.len()`) bounds the shared reserve — `fibers.len() + vcpus <= MAX_SHADOW_CTX`.
@@ -3848,6 +3857,7 @@ impl FiberRegistry {
                 fibers: Vec::new(),
                 shadow: Vec::new(),
                 gens: Vec::new(),
+                free: BinaryHeap::new(),
                 vcpus: 0,
             }),
         }
@@ -3890,16 +3900,21 @@ impl FiberRegistry {
         self.lock().vcpus = n;
     }
 
-    /// `cont.new`: allocate the next slot — the guest handle — under the §15 quota, which is
-    /// **per run** now that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the
-    /// off-table root computation, so a quota value admits exactly the creations the JIT's
-    /// `fibers.len() + 1 >= max_fibers` check admits for a single-vCPU run.
+    /// `cont.new`: allocate a slot — the guest handle — under the §15 quota, which is **per run** now
+    /// that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the off-table root
+    /// computation. **Recycling (step 3):** the lowest freed slot is reused (its already-bumped
+    /// generation kept, so a stale handle to its former occupant fails `claim`); only when none is free
+    /// does the table grow. So the table is bounded by the *peak concurrent* fiber count, not the
+    /// lifetime total — and the quota / durable-reserve checks (on the grow path / the allocated
+    /// context) likewise bound concurrency rather than lifetime.
     fn create(&self, func: i32, sp: i64, max_fibers: usize, durable: bool) -> Result<i32, Trap> {
         let mut t = self.lock();
-        if t.fibers.len() + 1 >= max_fibers {
+        let reuse = t.free.peek().map(|&Reverse(s)| s);
+        // Growing (no free slot ⇒ every existing slot is live) must honor the concurrency quota.
+        if reuse.is_none() && t.fibers.len() + 1 >= max_fibers {
             return Err(Trap::FiberFault);
         }
-        let slot = t.fibers.len();
+        let slot = reuse.unwrap_or(t.fibers.len());
         // A durable fiber needs a distinct shadow region; refuse if the reserve has no room (a
         // clean `FiberFault`, like exhausting the quota — never an overflow into another
         // context's region). The fiber's context index is `slot + 1` (the root is context 0). The
@@ -3908,10 +3923,18 @@ impl FiberRegistry {
         if durable && (!shadow_region_fits(slot + 1) || slot + 1 + t.vcpus > MAX_SHADOW_CTX) {
             return Err(Trap::FiberFault);
         }
-        t.fibers.push(RegFiber::Pending { func, sp });
-        t.shadow.push(shadow_region_base(slot + 1)); // fresh region: empty stack at its base
-        t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot (recycling step 1)
-        Ok(fiber_handle(slot, 0))
+        let generation = if reuse.is_some() {
+            t.free.pop();
+            t.fibers[slot] = RegFiber::Pending { func, sp };
+            t.shadow[slot] = shadow_region_base(slot + 1); // reused region: empty stack at its base
+            t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
+        } else {
+            t.fibers.push(RegFiber::Pending { func, sp });
+            t.shadow.push(shadow_region_base(slot + 1));
+            t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
+            0
+        };
+        Ok(fiber_handle(slot, generation))
     }
 
     /// `cont.resume`: resolve the (forgeable) handle — **masked** into the power-of-two-padded
@@ -3928,11 +3951,11 @@ impl FiberRegistry {
         if slot >= t.fibers.len() {
             return Err(Trap::FiberFault);
         }
-        // Generation check (recycling step 1): reject a handle whose generation doesn't match the
-        // slot's current one — a stale handle to a slot's former occupant after the slot was recycled.
-        // All generations are 0 until recycling is wired, so this is inert for a non-recycled run (a
-        // forged non-zero generation is rejected, exactly as a forged slot is masked-and-lost).
-        if fiber_handle_generation(handle) != t.gens[slot] {
+        // Generation check (recycling step 1/3): reject a handle whose generation doesn't match the
+        // slot's current one — a stale handle to a slot's former occupant after the slot was recycled
+        // (`finish` bumped the generation). Compared modulo `2^16` (the handle's field width); a forged
+        // non-zero generation is rejected, exactly as a forged slot is masked-and-lost.
+        if fiber_handle_generation(handle) != (t.gens[slot] & FIBER_GEN_MASK) {
             return Err(Trap::FiberFault);
         }
         match std::mem::replace(&mut t.fibers[slot], RegFiber::Running(None)) {
@@ -3975,11 +3998,16 @@ impl FiberRegistry {
         t.fibers[slot] = RegFiber::Parked(frames);
     }
 
-    /// The claimant's current fiber returned: the slot is `Done` (resuming it again faults).
+    /// The claimant's current fiber returned: the slot is `Done`. **Recycling (step 3):** bump the
+    /// slot's generation (so any stale guest handle to it now fails `claim` — the ABA guard) and add it
+    /// to the free list, reclaimable for a new `cont.new`. Resuming the *old* handle faults either way
+    /// (a `Done` slot, or — once reused — a generation mismatch).
     fn finish(&self, slot: usize) {
         let mut t = self.lock();
         debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
         t.fibers[slot] = RegFiber::Done;
+        t.gens[slot] = t.gens[slot].wrapping_add(1);
+        t.free.push(Reverse(slot));
     }
 
     /// Freeze (slice 3.2 active-chain): the running fiber base-returned **while unwinding for a

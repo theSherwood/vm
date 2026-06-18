@@ -826,16 +826,30 @@ sequenced slice:
    rejects stale handles — so reuse is now ABA-safe. Remaining within step 1's spirit: the JIT freeze
    driver's `runnable_handles()`/`fiber_region_base(handle as usize)` still treat the handle as the raw
    slot (correct only at generation 0); step 3 must encode/extract there once generations can be nonzero.
-2. **Snapshot format: carry generations.** The control-section fiber/vCPU residue records each entity's
-   generation so a thaw re-establishes the same handle namespace. Bump `FORMAT_VERSION` (or gate behind
-   "any recycled slot") to keep pre-recycling artifacts byte-identical.
-3. **Recycle on finish.** A finished fiber's slot and a joined vCPU's context return to a per-domain
-   free-list (fibers bottom-up, vCPUs top-down); the next `cont.new`/`thread.spawn` reuses the lowest
-   free region. The top-down vCPU pool and `slot+1` fiber pool from 3.2.2 each gain a free-list; the
-   capacity guard becomes "no free region in either pool."
-4. **Cross-backend parity + fuzz.** Extend `durable_jit`/`durable_fibers_jit` to churn fibers (create →
-   finish → recreate) so the recycled-slot + generation path is exercised on both backends and the
-   artifacts stay byte-identical.
+2. **[ ] Snapshot format: carry generations.** The control-section fiber residue records each fiber's
+   generation so a **thaw** of a *recycled* (generation > 0) domain re-establishes the same handle
+   namespace (`seed_frozen` restores the generation; a guest's gen-N handle still resolves post-thaw).
+   Gate behind "any recycled slot" / bump `FORMAT_VERSION` to keep pre-recycling artifacts byte-identical.
+   Until this lands, recycling is sound for **non-durable** runs and a durable run that *freezes* a
+   recycled fiber flattens it correctly, but a *thaw* re-seeds it at generation 0 — so a recycled
+   durable round-trip isn't complete yet.
+3. **[~] Recycle on finish — done, both backends.** A finished fiber's slot returns to a per-registry
+   **min-heap** free list (`free`), and `cont.new` reuses the lowest free slot before growing — so the
+   table is bounded by *peak concurrent* fibers, not the lifetime total, lifting the `MAX_SHADOW_CTX`
+   cap to *concurrent* fibers. The reused slot keeps its bumped generation (interp keeps `gens[slot]`;
+   the JIT replaces the slot's `Ownership` via `new_owned_at(gen)`), so a stale handle to the former
+   occupant fails `claim`/`claim_gen` — the ABA guard from step 1. The JIT freeze driver's
+   `runnable_handles()` now encodes the generation and `resolve` returns the slot index (so
+   `fiber_region_base` uses the real slot, not the raw handle). Pinned by
+   `recycling_reuses_a_freed_slot_with_a_bumped_generation` (interp) and the cross-backend `fiber_fuzz`
+   churn differential. Two shadow-routing tests were updated so their fibers `suspend` (stay
+   concurrently live) rather than return — otherwise the second fiber would reuse the first's freed
+   region. *(vCPU-context recycling — a joined `thread.spawn` child's top-down context — is a smaller
+   follow-up; the durable cap that bites is fibers, handled here.)*
+4. **[ ] Cross-backend parity + fuzz.** Extend the durable generators (`durgen`) to churn fibers
+   (create → finish → recreate) so the recycled-slot + generation + thaw path is exercised on both
+   backends and the artifacts stay byte-identical. (The interp↔JIT `fiber_fuzz` already churns and
+   agrees on the *run*; this adds the freeze/thaw leg, and depends on step 2.)
 
 #### 3.1 implementation plan (next-session pickup)
 

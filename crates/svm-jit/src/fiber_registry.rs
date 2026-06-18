@@ -95,8 +95,17 @@ pub(crate) struct Ownership {
 impl Ownership {
     /// A freshly created fiber, **owned by its creator** and not yet in the steal pool (generation 0).
     pub(crate) fn new_owned() -> Ownership {
+        Ownership::new_owned_at(0)
+    }
+
+    /// A freshly created fiber at a **carried generation** — for **recycling a freed slot** (step 3):
+    /// a reused slot keeps its finished occupant's (already-bumped) generation, so a stale guest handle
+    /// to that occupant still fails `claim_gen`. (Replacing the slot's `Ownership` rather than mutating
+    /// it in place keeps the `FiberSlot`'s immutable `func`/`sp` simple; the generation is read off the
+    /// `FREE` slot just before replacement.)
+    pub(crate) fn new_owned_at(generation: u64) -> Ownership {
         Ownership {
-            word: AtomicU64::new(pack(0, OWNED)),
+            word: AtomicU64::new(pack(generation, OWNED)),
         }
     }
 

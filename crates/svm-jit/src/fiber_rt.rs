@@ -46,7 +46,8 @@
 use crate::fiber_registry::Ownership;
 use crate::{FnEntry, TrapKind};
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use svm_fiber::{Fiber, State, Yielder};
@@ -189,8 +190,17 @@ pub(crate) struct FiberSlot {
 /// exactly the interpreter registry's numbering) and the per-domain §15 fiber quota. Slots are not
 /// recycled yet (matching the interp registry; recycling + generation-carrying handles are a later
 /// slice on both backends together — `finish` already bumps the slot generation under the hood).
+/// The fiber table's locked state: the slots, plus the freed-slot **min-heap** (recycling step 3).
+struct TableState {
+    slots: Vec<Arc<FiberSlot>>,
+    /// Freed slots reclaimable for a new fiber, lowest first — the same policy as the interp registry
+    /// (so handle values match across backends). A freed slot keeps its bumped generation, so reuse
+    /// is ABA-safe; the table is bounded by the *peak concurrent* fiber count, not the lifetime total.
+    free: BinaryHeap<Reverse<usize>>,
+}
+
 pub(crate) struct SharedFiberTable {
-    slots: Mutex<Vec<Arc<FiberSlot>>>,
+    state: Mutex<TableState>,
     /// §15 quota: max fibers (incl. the implicit root computation) for the **whole domain**,
     /// clamped to [`MAX_FIBERS`] — per-run like the interpreter's, not per-vCPU.
     max_fibers: usize,
@@ -201,43 +211,67 @@ pub(crate) struct SharedFiberTable {
 impl SharedFiberTable {
     pub(crate) fn new(max_fibers: usize) -> SharedFiberTable {
         SharedFiberTable {
-            slots: Mutex::new(Vec::new()),
+            state: Mutex::new(TableState {
+                slots: Vec::new(),
+                free: BinaryHeap::new(),
+            }),
             max_fibers: max_fibers.clamp(1, MAX_FIBERS),
             next_owner: AtomicU64::new(0),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Vec<Arc<FiberSlot>>> {
-        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, TableState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Quota pre-check (no allocation yet): would one more fiber exceed the domain budget? Checked
     /// *before* the fiber's stack is mmap'd so a fiber-bomb is a clean `FiberFault` that never
-    /// touches the OS map limit.
+    /// touches the OS map limit. A free slot is always room (recycling reuses, doesn't grow).
     fn has_room(&self) -> bool {
-        self.lock().len() + 1 < self.max_fibers
+        let t = self.lock();
+        !t.free.is_empty() || t.slots.len() + 1 < self.max_fibers
     }
 
-    /// Allocate the next slot for a fresh (`OWNED`) fiber; the returned slot index is the guest
-    /// handle. `None` if a racing allocation filled the domain quota since [`Self::has_room`].
+    /// Allocate a slot for a fresh (`OWNED`) fiber; the returned guest handle carries the slot's
+    /// generation. **Recycling (step 3):** the lowest freed slot is reused — its `Ownership` replaced
+    /// at the kept (bumped) generation, so a stale handle to its former occupant still fails
+    /// `claim_gen` — and only when none is free does the table grow. `None` if a racing allocation
+    /// filled the domain quota since [`Self::has_room`].
     fn create(&self, fiber: Box<Fiber>, func: i32, sp: i64) -> Option<i32> {
         let mut t = self.lock();
-        if t.len() + 1 >= self.max_fibers {
+        let reuse = t.free.peek().map(|&Reverse(s)| s);
+        if reuse.is_none() && t.slots.len() + 1 >= self.max_fibers {
             return None;
         }
-        let slot = t.len();
-        t.push(Arc::new(FiberSlot {
-            own: Ownership::new_owned(),
+        let slot = reuse.unwrap_or(t.slots.len());
+        // A reused slot keeps its finished occupant's generation (the ABA guard); a fresh slot is 0.
+        let generation = if reuse.is_some() {
+            t.slots[slot].own.generation()
+        } else {
+            0
+        };
+        let new_slot = Arc::new(FiberSlot {
+            own: Ownership::new_owned_at(generation),
             running_on: AtomicU64::new(NOT_RUNNING),
             fiber: Mutex::new(Some(fiber)),
-            // Fresh fiber: its shadow region starts empty (SP at the region base).
+            // Fresh/reused: the shadow region starts empty (SP at the region base).
             shadow_sp: AtomicU64::new(fiber_region_base(slot)),
             func,
             sp,
-        }));
-        // The guest handle carries the slot's generation (recycling step 1); a fresh slot is
-        // generation 0, so this is exactly `slot` until recycling is wired.
-        Some(fiber_handle(slot, t[slot].own.generation()))
+        });
+        if reuse.is_some() {
+            t.free.pop();
+            t.slots[slot] = new_slot;
+        } else {
+            t.slots.push(new_slot);
+        }
+        Some(fiber_handle(slot, generation))
+    }
+
+    /// Return a finished slot to the free list (recycling step 3); its generation was bumped by
+    /// [`Ownership::finish`], so a later `cont.new` may reuse it ABA-safely.
+    fn free_slot(&self, slot: usize) {
+        self.lock().free.push(Reverse(slot));
     }
 
     /// Durable **thaw** re-seeding (DURABILITY.md §12.8 slice 3.3.3): re-create a frozen fiber at
@@ -246,8 +280,8 @@ impl SharedFiberTable {
     /// with its flattened shadow-SP restored so the swap re-points the active word to its region.
     fn seed_frozen(&self, fiber: Box<Fiber>, func: i32, sp: i64, shadow_sp: u64) -> usize {
         let mut t = self.lock();
-        let slot = t.len();
-        t.push(Arc::new(FiberSlot {
+        let slot = t.slots.len();
+        t.slots.push(Arc::new(FiberSlot {
             own: Ownership::new_owned(),
             running_on: AtomicU64::new(NOT_RUNNING),
             fiber: Mutex::new(Some(fiber)),
@@ -260,15 +294,16 @@ impl SharedFiberTable {
 
     /// Resolve a (forgeable) handle: **masked** into the power-of-two-padded table (Spectre-safe,
     /// like `call_indirect` — and the same shape as the interp registry, so a forged handle now
-    /// resolves over the same domain-wide namespace on both backends). Out of range ⇒ `None`.
-    fn resolve(&self, handle: i32) -> Option<Arc<FiberSlot>> {
+    /// resolves over the same domain-wide namespace on both backends). Returns the **slot index** (for
+    /// the per-context region + recycling) and the slot. Out of range ⇒ `None`.
+    fn resolve(&self, handle: i32) -> Option<(usize, Arc<FiberSlot>)> {
         let t = self.lock();
-        let mask = t.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
+        let mask = t.slots.len().next_power_of_two() - 1; // len 0 ⇒ mask 0 ⇒ slot 0, caught below
         let slot = (handle as u32 as usize) & mask;
-        if slot >= t.len() {
+        if slot >= t.slots.len() {
             return None;
         }
-        Some(Arc::clone(&t[slot]))
+        Some((slot, Arc::clone(&t.slots[slot])))
     }
 
     /// The handles of every **voluntarily-suspended** (`RUNNABLE`) fiber — the parked fibers the
@@ -277,10 +312,11 @@ impl SharedFiberTable {
     /// parked fibers, and it ends `FREE` — the set never grows.
     fn runnable_handles(&self) -> Vec<i32> {
         self.lock()
+            .slots
             .iter()
             .enumerate()
             .filter(|(_, s)| s.own.is_runnable())
-            .map(|(i, _)| i as i32)
+            .map(|(i, s)| fiber_handle(i, s.own.generation())) // gen-carrying (recycling step 1/3)
             .collect()
     }
 }
@@ -523,9 +559,9 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // somewhere in a resume chain), a racing resume, or a finished fiber all *lose the claim* and
     // fault. No lock or `&mut` is held past this block; the `Arc` keeps the slot (and the boxed
     // fiber it owns) stable across the switch.
-    let (slot, fib): (Arc<FiberSlot>, *mut Fiber) = {
+    let (slot_idx, slot, fib): (usize, Arc<FiberSlot>, *mut Fiber) = {
         let rt = &*rt;
-        let Some(slot) = rt.table.resolve(handle) else {
+        let Some((slot_idx, slot)) = rt.table.resolve(handle) else {
             fault(trap_out);
             *status_out = 1;
             return 0;
@@ -569,7 +605,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
                 return 0;
             }
         };
-        (slot, fib)
+        (slot_idx, slot, fib)
     };
     // Durable shadow-SP swap (DURABILITY.md §12.8, D-fiber-cont option A): `fiber_resume` brackets a
     // fiber's residency, so the whole swap lives here (no change to `fiber_suspend`). On entry save
@@ -629,22 +665,21 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // `freeze_drive` — both Complete here. Record its residue so a thaw re-seeds it; a
             // genuine return (non-instrumented fiber, empty region) is left as an ordinary finish.
             let flat_sp = slot.shadow_sp.load(Ordering::Relaxed);
-            if durable
-                && flat_sp > fiber_region_base(handle as usize)
-                && window_is_unwinding(mem_base)
-            {
+            if durable && flat_sp > fiber_region_base(slot_idx) && window_is_unwinding(mem_base) {
                 (*current()).frozen.push(crate::FrozenFiber {
-                    slot: handle as usize,
+                    slot: slot_idx,
                     func: slot.func,
                     sp: slot.sp,
                     shadow_sp: flat_sp,
                 });
             }
             // Drop the fiber (unmapping its stack) and free the slot — `finish` bumps the
-            // generation, so any stale claim of this slot keeps failing.
+            // generation, so any stale claim of this slot keeps failing; the slot returns to the free
+            // list for recycling (step 3).
             slot.fiber.lock().unwrap_or_else(|e| e.into_inner()).take();
             slot.running_on.store(NOT_RUNNING, Ordering::Release);
             slot.own.finish();
+            (*current()).table.free_slot(slot_idx);
             *status_out = 1;
             v as i64
         }
@@ -869,8 +904,8 @@ pub(crate) unsafe extern "C" fn gc_roots(
     // running fiber's whole usable stack (a sound superset — its exact SP is not known here). A
     // `FREE` (completed) slot holds no fiber (`take`n on finish) and is skipped.
     {
-        let slots = rt.table.lock();
-        for slot in slots.iter() {
+        let t = rt.table.lock();
+        for slot in t.slots.iter() {
             let guard = slot.fiber.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(fib) = guard.as_ref() {
                 let (lo, hi) = if slot.own.is_running() {
