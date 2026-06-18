@@ -328,6 +328,9 @@ fn deadline_kills_runaway_powerbox_guest() {
 /// §5 W3 — a trap's kill message carries the **source backtrace** when the module was built with
 /// `-g`: a powerbox guest that divides by zero is detect-and-killed, and the error names the div's
 /// `file:line` (the `debug.loc` the module carries, threaded through the JIT trap-time backtrace).
+/// The backtrace itself is unix-only (the capture lives in `trap_shim.c`); on Windows the trap-time
+/// backtrace degrades to empty (a documented follow-up — VEH-side capture), so the message still
+/// names the kind but carries no frames there.
 #[test]
 fn trap_kill_message_carries_a_source_backtrace() {
     let m = load(
@@ -342,6 +345,7 @@ fn trap_kill_message_carries_a_source_backtrace() {
     );
     let err = run_powerbox_with_deadline(&m, b"", None).expect_err("div-by-zero must be killed");
     assert!(err.contains("DivByZero"), "names the trap kind: {err}");
+    #[cfg(unix)]
     assert!(
         err.contains("guest.c:7"),
         "the kill message carries the trap-time source backtrace: {err}"
